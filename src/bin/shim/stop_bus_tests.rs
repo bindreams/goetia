@@ -6,7 +6,9 @@ use std::sync::mpsc;
 
 use super::*;
 use crate::os::fake::{Fake, FakeGuard, FakeProcess, KillReply, WAIT_FAILED, WaitReply, WaiterEnd};
-use crate::test_support::{assert_failures, assert_one_failure, bus, fallback_refused_failure, tree_refused_failure};
+use crate::test_support::{
+    assert_failures, assert_one_failure, fallback_refused_failure, supervisor, tree_refused_failure,
+};
 
 const ID: &str = "goetia-shim-stop-bus-test";
 
@@ -15,14 +17,14 @@ fn spawn_child(fake: &Fake) -> Arc<dyn Spawned> {
     Arc::from(fake.os().spawn(cosca::run(["daemon"])).expect("spawn the daemon"))
 }
 
-/// A bus, then the waiter, then the daemon: the order `service::launch` makes them in. See
+/// A supervisor, then the waiter, then the daemon: the order `service::launch` makes them in. See
 /// [`Waiter`].
-fn launched(fake: &FakeGuard, daemon: &FakeProcess) -> (Arc<StopBus>, Waiter, Arc<dyn Spawned>) {
-    let bus = bus(fake);
+fn launched(fake: &FakeGuard, daemon: &FakeProcess) -> (Arc<Supervisor>, Waiter, Arc<dyn Spawned>) {
+    let supervisor = supervisor(fake);
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
-    let waiter = bus.waiter(ID).expect("make the waiter thread");
-    (bus, waiter, spawn_child(fake))
+    let waiter = supervisor.waiter(ID).expect("make the waiter thread");
+    (supervisor, waiter, spawn_child(fake))
 }
 
 /// The waiter is joined inside the call, so no later log can arrive.
@@ -30,7 +32,7 @@ fn launched(fake: &FakeGuard, daemon: &FakeProcess) -> (Arc<StopBus>, Waiter, Ar
 fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::running();
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     // `wait_for_child_or_stop` runs on its own, un-scoped `'static` thread (not
     // `std::thread::scope`, which this test itself would then also have to join): if the teardown
@@ -41,9 +43,9 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
-        let bus = Arc::clone(&bus);
+        let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
             let _ = tx.send(outcome);
         });
     }
@@ -51,7 +53,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     // No wait needed before this: `wait_for_child_or_stop`'s internal `Condvar::wait_while` checks
     // its predicate before ever blocking, so a stop requested before the waiter thread has even
     // started its own wait is not missed.
-    bus.request_stop();
+    supervisor.bus.request_stop();
 
     let outcome = rx
         .recv()
@@ -87,19 +89,19 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
         .wait(WaitReply::Blocks)
         .kill_tree(KillReply::Refuses)
         .kill(KillReply::Refuses);
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
-        let bus = Arc::clone(&bus);
+        let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
-            let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+            let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
             let _ = tx.send(outcome);
         });
     }
 
-    bus.request_stop();
+    supervisor.bus.request_stop();
 
     // Blocks forever if the call joined a waiter whose wait nothing can make return.
     let outcome = rx
@@ -149,19 +151,19 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
 fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new().wait(WaitReply::Blocks).kill_tree(KillReply::Panics);
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     // Requested before the call, so it reaches the kill — and the panic — without blocking first:
     // `wait_while` checks its predicate before ever waiting.
-    bus.request_stop();
+    supervisor.bus.request_stop();
 
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);
-        let bus = Arc::clone(&bus);
+        let supervisor = Arc::clone(&supervisor);
         std::thread::spawn(move || {
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+                supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
             }))
             .is_err();
             // Dropped before the send, so the reference count asserted below is not a race against
@@ -209,10 +211,10 @@ fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_dow
 fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new().wait(WaitReply::Exits(0));
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     // No stop requested: the child exiting on its own is the only wakeup source.
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::ChildExited));
     assert_eq!(
@@ -231,9 +233,9 @@ fn wait_for_child_or_stop_returns_child_exited_when_the_child_exits_on_its_own()
 #[skuld::test]
 fn a_waiter_that_is_never_handed_a_child_ends_on_its_own() {
     let fake = FakeGuard::new();
-    let bus = bus(&fake);
+    let supervisor = supervisor(&fake);
     fake.will_make_thread();
-    let waiter = bus.waiter(ID).expect("make the waiter thread");
+    let waiter = supervisor.waiter(ID).expect("make the waiter thread");
 
     // Closing the only `Sender` is the whole mechanism: the thread's first act is `rx.recv()`,
     // which returns `Err` and returns.
@@ -254,9 +256,9 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
         .kill_tree(KillReply::Ends);
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -280,9 +282,9 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
         .wait(WaitReply::Fails(None))
         .kill_tree(KillReply::Refuses)
         .kill(KillReply::Refuses);
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(!daemon.ended(), "the daemon ended though neither kill worked");
@@ -295,10 +297,10 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
 fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new().wait(WaitReply::Panics).kill_tree(KillReply::Ends);
-    let (bus, waiter, child) = launched(&fake, &daemon);
-    bus.request_stop();
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
+    supervisor.bus.request_stop();
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::Stopping),
@@ -317,10 +319,10 @@ fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_
         .wait(WaitReply::Blocks)
         .kill_tree(KillReply::Refuses)
         .kill(KillReply::Ends);
-    let (bus, waiter, child) = launched(&fake, &daemon);
-    bus.request_stop();
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
+    supervisor.bus.request_stop();
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::DaemonMayRun),
@@ -342,9 +344,9 @@ fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_
 fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new().wait(WaitReply::Panics).kill_tree(KillReply::Ends);
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: None }),
@@ -362,9 +364,9 @@ fn a_failed_background_wait_carries_its_os_error() {
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(Some(5)))
         .kill_tree(KillReply::Ends);
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
         matches!(outcome, WaitOutcome::WaitFailed { os_error: Some(5) }),
@@ -386,10 +388,10 @@ fn a_stop_wins_over_a_failed_background_wait() {
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
         .kill_tree(KillReply::Ends);
-    let (bus, waiter, child) = launched(&fake, &daemon);
-    bus.request_stop();
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
+    supervisor.bus.request_stop();
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::Stopping));
     assert!(daemon.killed());
@@ -410,9 +412,9 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
         .wait(WaitReply::Fails(None))
         .kill_tree(KillReply::Refuses)
         .kill(KillReply::Ends);
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(daemon.killed());
@@ -429,13 +431,13 @@ fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
         .wait(WaitReply::Fails(None))
         .kill_tree(KillReply::Refuses)
         .kill(KillReply::Refuses);
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(
-        !bus.request_stop(),
+        !supervisor.bus.request_stop(),
         "a stop was acknowledged over a daemon that may still be running"
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
@@ -450,13 +452,13 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
         .wait(WaitReply::Fails(None))
         .kill_tree(KillReply::Refuses)
         .kill(KillReply::Ends);
-    let (bus, waiter, child) = launched(&fake, &daemon);
+    let (supervisor, waiter, child) = launched(&fake, &daemon);
 
-    let outcome = bus.wait_for_child_or_stop(waiter, &child, ID, || {});
+    let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
     assert!(
-        !bus.request_stop(),
+        !supervisor.bus.request_stop(),
         "a stop was acknowledged over a daemon whose tree may still be running"
     );
     assert!(daemon.killed());
@@ -468,8 +470,7 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
 
 #[skuld::test]
 fn a_stop_after_a_failure_was_decided_is_refused() {
-    let fake = FakeGuard::new();
-    let bus = bus(&fake);
+    let bus = StopBus::default();
 
     assert_eq!(bus.settle(Reported::DaemonExit(7)), Reported::DaemonExit(7));
 
@@ -481,8 +482,7 @@ fn a_stop_after_a_failure_was_decided_is_refused() {
 
 #[skuld::test]
 fn a_stop_before_a_failure_was_decided_turns_the_failure_into_a_clean_stop() {
-    let fake = FakeGuard::new();
-    let bus = bus(&fake);
+    let bus = StopBus::default();
 
     assert!(bus.request_stop());
 
@@ -492,8 +492,7 @@ fn a_stop_before_a_failure_was_decided_turns_the_failure_into_a_clean_stop() {
 
 #[skuld::test]
 fn a_clean_exit_does_not_refuse_a_later_stop() {
-    let fake = FakeGuard::new();
-    let bus = bus(&fake);
+    let bus = StopBus::default();
 
     assert_eq!(bus.settle(Reported::Clean), Reported::Clean);
 
@@ -502,8 +501,7 @@ fn a_clean_exit_does_not_refuse_a_later_stop() {
 
 #[skuld::test]
 fn a_repeated_stop_is_accepted_again() {
-    let fake = FakeGuard::new();
-    let bus = bus(&fake);
+    let bus = StopBus::default();
 
     assert!(bus.request_stop());
     assert!(bus.request_stop());

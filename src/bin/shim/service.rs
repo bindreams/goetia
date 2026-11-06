@@ -24,7 +24,7 @@ use windows_sys::Win32::System::Services::{
 
 use crate::logging::Log;
 use crate::os::{Real, Spawned, spawn_error_code};
-use crate::stop_bus::{StopBus, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
+use crate::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
 
@@ -58,8 +58,8 @@ fn service_main(_scm_args: Vec<OsString>) {
 
 fn run_service(id: &str) {
     let log = Arc::new(Log::real());
-    let stop_bus = Arc::new(StopBus::new(Arc::new(Real), Arc::clone(&log)));
-    let status_handle = match register_control_handler(id, &stop_bus) {
+    let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
+    let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
         Err(e) => {
             log.failure(id, &format!("register SCM control handler: {e}"));
@@ -97,7 +97,7 @@ fn run_service(id: &str) {
     log_version_skew(&log, id, &blob.spec, &blob.version, goetia::version());
     let reported = run_daemon(
         &blob.spec,
-        &stop_bus,
+        &supervisor,
         id,
         || report_running(&log, id, status_handle),
         || report_stopping(&log, id, status_handle),
@@ -261,13 +261,13 @@ fn stopped_report_failure(e: &std::io::Error) -> String {
 /// reads both as a failed start under every restart policy.
 fn run_daemon(
     spec: &DaemonSpec,
-    stop_bus: &Arc<StopBus>,
+    supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
     on_stopping: impl FnOnce(),
 ) -> Reported {
-    let log = stop_bus.log();
-    let (child, waiter) = match launch(spec, stop_bus, id) {
+    let log = &*supervisor.log;
+    let (child, waiter) = match launch(spec, supervisor, id) {
         Ok(launched) => launched,
         Err(reported) => return reported,
     };
@@ -275,7 +275,7 @@ fn run_daemon(
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
     // leaves a daemon that may be running.
-    match stop_bus.wait_for_child_or_stop(waiter, &child, id, on_stopping) {
+    match supervisor.wait_for_child_or_stop(waiter, &child, id, on_stopping) {
         WaitOutcome::ChildExited => {
             let code = match child.wait() {
                 Ok(status) => {
@@ -290,11 +290,11 @@ fn run_daemon(
                     None
                 }
             };
-            end_tree_before_report(stop_bus.settle(exit_report(code)), child.as_ref(), log, id)
+            end_tree_before_report(supervisor.bus.settle(exit_report(code)), child.as_ref(), log, id)
         }
         // The failure is already logged; the daemon's tree was terminated, so it is the shim that
         // failed.
-        WaitOutcome::WaitFailed { os_error } => stop_bus.settle(Reported::shim_failure(os_error)),
+        WaitOutcome::WaitFailed { os_error } => supervisor.bus.settle(Reported::shim_failure(os_error)),
         // `wait_for_child_or_stop` terminated the tree before returning this.
         WaitOutcome::Stopping => Reported::Clean,
         // Still reports STOPPED so the service stays stoppable and uninstallable.
@@ -335,16 +335,16 @@ fn exit_report(code: Option<i32>) -> Reported {
 ///
 /// The `Err` is what the service reports: the OS error of the failure, `ERROR_GEN_FAILURE`, or the
 /// incomplete stop for a daemon no Job Object contains.
-fn launch(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, id: &str) -> Result<(Arc<dyn Spawned>, Waiter), Reported> {
-    let log = stop_bus.log();
-    let waiter = match stop_bus.waiter(id) {
+fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<dyn Spawned>, Waiter), Reported> {
+    let log = &*supervisor.log;
+    let waiter = match supervisor.waiter(id) {
         Ok(waiter) => waiter,
         Err(e) => {
             log.failure(id, &thread_refused(&spec.command, &e));
             return Err(Reported::shim_failure(e.raw_os_error()));
         }
     };
-    match stop_bus.os().spawn(build_command(spec, log, id)) {
+    match supervisor.os.spawn(build_command(spec, log, id)) {
         Ok(child) => require_job_object(child, spec, log, id).map(|child| (Arc::from(child), waiter)),
         Err(e) => {
             log.failure(id, &spawn_failed(&spec.command, &e));

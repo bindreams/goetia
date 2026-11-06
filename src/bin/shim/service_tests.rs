@@ -22,14 +22,15 @@ use crate::os::fake::{
     FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WAIT_FAILED, WaitReply, WaiterEnd,
 };
 use crate::test_support::{
-    assert_failures, assert_one_failure, bus, daemon_spec, fallback_refused_failure, not_found, tree_refused_failure,
+    assert_failures, assert_one_failure, daemon_spec, fallback_refused_failure, not_found, supervisor,
+    tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
 
 /// [`super::run_daemon`] for the tests that do not look at the `STOP_PENDING` report.
-fn run_daemon(spec: &DaemonSpec, stop_bus: &Arc<StopBus>, on_running: impl FnOnce()) -> Reported {
-    super::run_daemon(spec, stop_bus, ID, on_running, || {})
+fn run_daemon(spec: &DaemonSpec, supervisor: &Supervisor, on_running: impl FnOnce()) -> Reported {
+    super::run_daemon(spec, supervisor, ID, on_running, || {})
 }
 
 /// Where [`spec`]'s daemon logs. The `Fake` opens nothing there.
@@ -83,7 +84,7 @@ fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
     // Reported, not panicked: a refused thread here surfaces as an `io::Result`, not a
     // `Scope::spawn` panic that would take the whole service process down with the daemon already
     // running.
-    let launched = launch(&spec(), &bus(&fake), ID);
+    let launched = launch(&spec(), &supervisor(&fake), ID);
 
     assert_eq!(
         launched.as_ref().err(),
@@ -118,7 +119,7 @@ fn a_daemon_is_spawned_once_the_thread_that_waits_on_it_exists() {
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
 
-    let launched = launch(&spec(), &bus(&fake), ID);
+    let launched = launch(&spec(), &supervisor(&fake), ID);
 
     assert!(launched.is_ok(), "launch failed with every thread available");
     assert_eq!(
@@ -153,7 +154,7 @@ fn a_daemon_that_cannot_be_spawned_is_logged_and_nothing_is_left_running() {
     fake.will_make_thread();
     fake.will_refuse_spawn(not_found());
 
-    let launched = launch(&spec(), &bus(&fake), ID);
+    let launched = launch(&spec(), &supervisor(&fake), ID);
 
     assert_eq!(
         launched.as_ref().err(),
@@ -174,7 +175,7 @@ fn the_os_code_of_a_refused_spawn_is_what_launch_reports() {
         ACCESS_DENIED,
     )));
 
-    let launched = launch(&spec(), &bus(&fake), ID);
+    let launched = launch(&spec(), &supervisor(&fake), ID);
 
     assert_eq!(
         launched.as_ref().err(),
@@ -193,7 +194,7 @@ fn a_log_file_that_cannot_be_opened_is_logged_and_the_daemon_still_runs() {
     fake.will_spawn(daemon.clone());
     fake.will_fail_open_log(Path::new(DAEMON_LOG));
 
-    let launched = launch(&spec(), &bus(&fake), ID);
+    let launched = launch(&spec(), &supervisor(&fake), ID);
 
     assert!(
         launched.is_ok(),
@@ -223,7 +224,7 @@ fn no_running_report_when_no_thread_can_be_made() {
     fake.will_refuse_thread();
     let mut running_reports = 0;
 
-    let reported = run_daemon(&spec(), &bus(&fake), || running_reports += 1);
+    let reported = run_daemon(&spec(), &supervisor(&fake), || running_reports += 1);
 
     assert_eq!(
         running_reports, 0,
@@ -241,7 +242,7 @@ fn no_running_report_when_the_spawn_fails() {
     fake.will_refuse_spawn(not_found());
     let mut running_reports = 0;
 
-    let reported = run_daemon(&spec(), &bus(&fake), || running_reports += 1);
+    let reported = run_daemon(&spec(), &supervisor(&fake), || running_reports += 1);
 
     assert_eq!(
         running_reports, 0,
@@ -255,15 +256,15 @@ fn no_running_report_when_the_spawn_fails() {
 #[skuld::test]
 fn running_is_reported_once_and_after_the_spawn() {
     let fake = FakeGuard::new();
-    let stop_bus = bus(&fake);
+    let supervisor = supervisor(&fake);
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::running());
     let mut running_reports = Vec::new();
 
     // The stop ends the pass once the report is made; the daemon runs until then.
-    let reported = run_daemon(&spec(), &stop_bus, || {
+    let reported = run_daemon(&spec(), &supervisor, || {
         running_reports.push(fake.calls(Op::Spawn));
-        stop_bus.request_stop();
+        supervisor.bus.request_stop();
     });
 
     assert_eq!(
@@ -291,7 +292,7 @@ fn a_daemon_that_exits_nonzero_is_one_pass() {
         ..spec()
     };
 
-    let reported = run_daemon(&daemon, &bus(&fake), || {});
+    let reported = run_daemon(&daemon, &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::DaemonExit(7));
     assert_eq!(fake.calls(Op::Spawn), 1, "the daemon was spawned again");
@@ -304,7 +305,7 @@ fn a_daemon_that_exits_zero_is_clean() {
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(0).kill_tree(KillReply::Ends));
 
-    let reported = run_daemon(&spec(), &bus(&fake), || {});
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::Clean);
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
@@ -313,7 +314,7 @@ fn a_daemon_that_exits_zero_is_clean() {
 #[skuld::test]
 fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     let fake = FakeGuard::new();
-    let stop_bus = bus(&fake);
+    let supervisor = supervisor(&fake);
     // Both kills are refused, so the daemon outlives `run_daemon`: the test ends it, which is what
     // lets the detached waiter thread be consumed.
     let daemon = FakeProcess::new()
@@ -323,8 +324,8 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
 
-    let reported = run_daemon(&spec(), &stop_bus, || {
-        stop_bus.request_stop();
+    let reported = run_daemon(&spec(), &supervisor, || {
+        supervisor.bus.request_stop();
     });
 
     assert_eq!(reported, Reported::incomplete_stop());
@@ -352,7 +353,7 @@ fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
 
-    let reported = run_daemon(&spec(), &bus(&fake), || {});
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::shim_failure(Some(5)));
     assert!(
@@ -377,7 +378,7 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
             .kill_tree(KillReply::Ends),
     );
 
-    let reported = run_daemon(&spec(), &bus(&fake), || {});
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::ShimFailure(ERROR_GEN_FAILURE));
     assert_one_failure(
@@ -394,7 +395,7 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
 #[skuld::test]
 fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
     let fake = FakeGuard::new();
-    let stop_bus = bus(&fake);
+    let supervisor = supervisor(&fake);
     fake.will_make_thread();
     fake.will_spawn(
         FakeProcess::new()
@@ -403,11 +404,11 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
             .kill(KillReply::Refuses),
     );
 
-    let reported = run_daemon(&spec(), &stop_bus, || {});
+    let reported = run_daemon(&spec(), &supervisor, || {});
 
     assert_eq!(reported, Reported::incomplete_stop());
     assert!(
-        !stop_bus.request_stop(),
+        !supervisor.bus.request_stop(),
         "the bus accepted a stop over a daemon that may still be running"
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
@@ -428,15 +429,15 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
 #[skuld::test]
 fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() {
     let fake = FakeGuard::new();
-    let stop_bus = bus(&fake);
+    let supervisor = supervisor(&fake);
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Refuses));
 
-    let reported = run_daemon(&spec(), &stop_bus, || {});
+    let reported = run_daemon(&spec(), &supervisor, || {});
 
     assert_eq!(reported, Reported::incomplete_stop());
     assert!(
-        !stop_bus.request_stop(),
+        !supervisor.bus.request_stop(),
         "the bus accepted a stop over a daemon whose tree may still be running"
     );
     assert_one_failure(&fake.take_failures(), ID, EXITED_TREE_UNKILLED);
@@ -452,7 +453,7 @@ fn a_clean_exit_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() 
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(0).kill_tree(KillReply::Refuses));
 
-    let reported = run_daemon(&spec(), &bus(&fake), || {});
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::incomplete_stop());
     assert_one_failure(&fake.take_failures(), ID, EXITED_TREE_UNKILLED);
@@ -466,7 +467,7 @@ fn a_clean_exit_whose_tree_is_terminated_is_clean() {
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(0).kill_tree(KillReply::Ends));
 
-    let reported = run_daemon(&spec(), &bus(&fake), || {});
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::Clean);
     assert_eq!(fake.take_failures(), Vec::<String>::new());
@@ -480,11 +481,11 @@ fn a_clean_exit_whose_tree_is_terminated_is_clean() {
 fn run_recording_stopping(
     fake: &FakeGuard,
     daemon: &DaemonSpec,
-    stop_bus: &Arc<StopBus>,
+    supervisor: &Supervisor,
     on_running: impl FnOnce(),
 ) -> (Reported, Vec<usize>) {
     let mut stopping = Vec::new();
-    let reported = super::run_daemon(daemon, stop_bus, ID, on_running, || {
+    let reported = super::run_daemon(daemon, supervisor, ID, on_running, || {
         stopping.push(fake.calls(Op::KillTree));
     });
     (reported, stopping)
@@ -505,7 +506,7 @@ fn the_stopping_status_accepts_no_control_and_records_no_exit() {
 #[skuld::test]
 fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
     let fake = FakeGuard::new();
-    let stop_bus = bus(&fake);
+    let supervisor = supervisor(&fake);
     let daemon = FakeProcess::running();
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
@@ -513,10 +514,10 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
 
     let reported = super::run_daemon(
         &spec(),
-        &stop_bus,
+        &supervisor,
         ID,
         || {
-            stop_bus.request_stop();
+            supervisor.bus.request_stop();
         },
         || {
             alive_when_stopping.push((fake.calls(Op::KillTree), !daemon.ended()));
@@ -539,7 +540,7 @@ fn a_daemon_that_exits_reports_stopping_before_its_tree_is_terminated() {
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Ends));
 
-    let (reported, stopping) = run_recording_stopping(&fake, &spec(), &bus(&fake), || {});
+    let (reported, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::DaemonExit(7));
     assert_eq!(
@@ -557,7 +558,7 @@ fn a_daemon_that_exits_cleanly_reports_stopping_before_its_tree_is_terminated() 
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(0).kill_tree(KillReply::Ends));
 
-    let (reported, stopping) = run_recording_stopping(&fake, &spec(), &bus(&fake), || {});
+    let (reported, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::Clean);
     assert_eq!(stopping, [0]);
@@ -574,7 +575,7 @@ fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
             .kill_tree(KillReply::Ends),
     );
 
-    let (reported, stopping) = run_recording_stopping(&fake, &spec(), &bus(&fake), || {});
+    let (reported, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::shim_failure(Some(5)));
     assert_eq!(stopping, [0]);
@@ -594,7 +595,7 @@ fn a_teardown_that_fails_still_reports_stopping_first() {
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Refuses));
 
-    let (reported, stopping) = run_recording_stopping(&fake, &spec(), &bus(&fake), || {});
+    let (reported, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::incomplete_stop());
     assert_eq!(stopping, [0]);
@@ -608,7 +609,7 @@ fn no_stopping_report_when_the_daemon_never_ran() {
     fake.will_make_thread();
     fake.will_refuse_spawn(not_found());
 
-    let (_, stopping) = run_recording_stopping(&fake, &spec(), &bus(&fake), || {});
+    let (_, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
 
     assert_eq!(
         stopping,
@@ -629,7 +630,7 @@ fn no_stopping_report_over_an_uncontained_daemon() {
             .kill_tree(KillReply::Ends),
     );
 
-    let (_, stopping) = run_recording_stopping(&fake, &spec(), &bus(&fake), || {});
+    let (_, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
 
     assert_eq!(
         stopping,
@@ -654,7 +655,7 @@ fn a_daemon_without_job_object_containment_is_killed_and_reported_possibly_runni
     fake.will_spawn(daemon.clone());
     let mut running_reports = 0;
 
-    let reported = run_daemon(&spec(), &bus(&fake), || running_reports += 1);
+    let reported = run_daemon(&spec(), &supervisor(&fake), || running_reports += 1);
 
     assert_eq!(reported, Reported::incomplete_stop());
     assert_eq!(running_reports, 0, "RUNNING was reported for an uncontained daemon");
@@ -675,7 +676,7 @@ fn an_uncontained_daemon_whose_tree_kill_failed_is_reported_possibly_running() {
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
 
-    let reported = run_daemon(&spec(), &bus(&fake), || {});
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::incomplete_stop());
     assert!(daemon.killed());
@@ -698,7 +699,7 @@ fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
 
-    let reported = run_daemon(&spec(), &bus(&fake), || {});
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::incomplete_stop());
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
@@ -733,7 +734,7 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
             .kill_tree(KillReply::Ends),
     );
 
-    let reported = run_daemon(&spec(), &bus(&fake), || {});
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::ShimFailure(ERROR_GEN_FAILURE));
     assert_one_failure(
@@ -750,19 +751,19 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
 #[skuld::test]
 fn a_stop_after_a_daemon_failure_was_decided_leaves_the_failure() {
     let fake = FakeGuard::new();
-    let stop_bus = bus(&fake);
+    let supervisor = supervisor(&fake);
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Ends));
 
-    let reported = run_daemon(&spec(), &stop_bus, || {});
+    let reported = run_daemon(&spec(), &supervisor, || {});
 
     assert_eq!(reported, Reported::DaemonExit(7));
     assert!(
-        !stop_bus.request_stop(),
+        !supervisor.bus.request_stop(),
         "a stop was accepted after the failure was decided"
     );
-    assert_eq!(handle_control(&stop_bus, SERVICE_CONTROL_STOP), NO_ERROR);
-    assert_eq!(stop_bus.settle(Reported::DaemonExit(7)), Reported::DaemonExit(7));
+    assert_eq!(handle_control(&supervisor.bus, SERVICE_CONTROL_STOP), NO_ERROR);
+    assert_eq!(supervisor.bus.settle(Reported::DaemonExit(7)), Reported::DaemonExit(7));
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
@@ -774,8 +775,8 @@ fn a_stop_after_a_daemon_failure_was_decided_leaves_the_failure() {
 #[skuld::test]
 fn a_control_after_a_stop_still_reaches_the_bus() {
     let fake = FakeGuard::new();
-    let stop_bus = bus(&fake);
-    let context = leak_handler_context(&stop_bus);
+    let supervisor = supervisor(&fake);
+    let context = leak_handler_context(&supervisor.bus);
     let control = |code| {
         // SAFETY: `context` came from `leak_handler_context` and is never freed.
         unsafe { control_handler(code, 0, std::ptr::null_mut(), context) }
@@ -786,7 +787,7 @@ fn a_control_after_a_stop_still_reaches_the_bus() {
     assert_eq!(control(SERVICE_CONTROL_STOP), NO_ERROR);
     assert_eq!(control(SERVICE_CONTROL_PAUSE), ERROR_CALL_NOT_IMPLEMENTED);
     assert_eq!(
-        stop_bus.settle(Reported::DaemonExit(7)),
+        supervisor.bus.settle(Reported::DaemonExit(7)),
         Reported::Clean,
         "the stop did not reach the bus"
     );
@@ -797,13 +798,13 @@ fn a_control_after_a_stop_still_reaches_the_bus() {
 #[skuld::test]
 fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
     let fake = FakeGuard::new();
-    let stop_bus = bus(&fake);
+    let supervisor = supervisor(&fake);
     // The accepted stop is what the pass acts on, so the exit status is never read: one wait.
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().wait(WaitReply::Exits(7)).kill_tree(KillReply::Ends));
 
-    let reported = run_daemon(&spec(), &stop_bus, || {
-        assert_eq!(handle_control(&stop_bus, SERVICE_CONTROL_STOP), NO_ERROR)
+    let reported = run_daemon(&spec(), &supervisor, || {
+        assert_eq!(handle_control(&supervisor.bus, SERVICE_CONTROL_STOP), NO_ERROR)
     });
 
     assert_eq!(reported, Reported::Clean);

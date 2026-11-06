@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::os::fake::{Fake, KILL_REFUSED};
-use crate::stop_bus::StopBus;
+use crate::stop_bus::Supervisor;
 
 // The shim is its own crate and cannot reach `DaemonSpec::for_test`; share the integration suites'
 // constructor.
@@ -17,9 +17,9 @@ pub(crate) fn not_found() -> cosca::error::Error {
     cosca::error::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
-/// A bus over `fake`'s `Os` and `Log`: the supervisor under test.
-pub(crate) fn bus(fake: &Fake) -> Arc<StopBus> {
-    Arc::new(StopBus::new(fake.os(), fake.log()))
+/// A supervisor over `fake`'s `Os` and `Log`: the one under test.
+pub(crate) fn supervisor(fake: &Fake) -> Arc<Supervisor> {
+    Arc::new(Supervisor::new(fake.os(), fake.log()))
 }
 
 /// Asserts `lines` is exactly one failure line for `id`: `goetia-shim[<id>]: ` then `expected`, with
