@@ -19,7 +19,7 @@ use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 
-use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn};
+use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, retrying, warn_left_behind};
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole host* — its exit code,
@@ -1177,38 +1177,59 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     }
 }
 
-/// Shell builtins only, so it forks nothing even at `TasksMax=1`: finds the `0::<path>` line of
-/// `/proc/self/cgroup` (cgroup v2), reports that cgroup's `pids.max` and `pids.current` on stderr
-/// (or, with no such line, every line it saw), then `exec`s goetia (`$0 "$@"`) in the same process.
-const SCOPE_PIDS_PREAMBLE: &str = r#"cg=; seen=; while read -r line; do seen="$seen[$line]"; case $line in 0::*) cg=${line#0::};; esac; done < /proc/self/cgroup; if [ -n "$cg" ]; then max=unreadable; cur=unreadable; read -r max < "/sys/fs/cgroup$cg/pids.max"; read -r cur < "/sys/fs/cgroup$cg/pids.current"; echo "scope at start: cgroup=$cg pids.max=$max pids.current=$cur" >&2; else echo "scope at start: no cgroup v2 path in /proc/self/cgroup: $seen" >&2; fi; exec "$0" "$@""#;
+/// Shell builtins only, so it forks nothing and the scope's task count is unchanged: finds the
+/// scope's cgroup in `/proc/self/cgroup` (the `pids` hierarchy's line on a cgroup v1 or hybrid
+/// host, else the `0::<path>` line of v2), reports that cgroup's `pids.max` and `pids.current` on
+/// stderr, naming the tree it read (or, with no such line, every line it saw), then `exec`s goetia
+/// (`$0 "$@"`) in the same process. `printf`, not `echo`: dash's `echo` interprets the `\x2d` in
+/// systemd's cgroup paths.
+const SCOPE_PIDS_PREAMBLE: &str = r#"
+cg=; v1=; seen=
+while read -r line; do
+  seen="$seen[$line]"
+  rest=${line#*:}; controllers=${rest%%:*}; path=${rest#*:}
+  case $line in 0::*) cg=$path;; esac
+  case ",$controllers," in *,pids,*) v1=$path;; esac
+done < /proc/self/cgroup
+tree=; dir=
+if [ -n "$v1" ]; then tree=v1; dir=/sys/fs/cgroup/pids$v1
+elif [ -n "$cg" ]; then tree=v2; dir=/sys/fs/cgroup$cg; fi
+if [ -n "$dir" ]; then
+  max=unreadable; cur=unreadable
+  read -r max < "$dir/pids.max"; read -r cur < "$dir/pids.current"
+  printf '%s\n' "scope at start: tree=$tree cgroup=$dir pids.max=$max pids.current=$cur" >&2
+else
+  printf '%s\n' "scope at start: no pids cgroup in /proc/self/cgroup: $seen" >&2
+fi
+exec "$0" "$@"
+"#;
 
-/// Ends the transient scope `unit` and clears the `failed` state a scope can be left in, which
-/// would make the next `systemd-run --unit` of the same name fail. Registered before the scope is
-/// made; a scope that never was, or is gone already, is "not loaded".
+/// Removes the transient scope `unit` the test made: one still loaded, or left `failed`. `stop`,
+/// then `reset-failed`, each retried for `CLEANUP_BOUND` and then let go with a warning; never
+/// panics, so it also runs while the test unwinds. A scope that never was, or is gone already, is
+/// "not loaded". Names are never reused, so this is cleanup, not what lets the next scope start.
 struct ScopeGuard(String);
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
         for verb in ["stop", "reset-failed"] {
-            let run = cmd::run("systemctl", &[verb, &self.0]);
-            if !run.ok() && run.code != Some(5) && !run.stderr.contains("not loaded") {
-                eprintln!("ScopeGuard[{}]: cleanup failed: {run}", self.0);
-            }
+            warn_left_behind(retrying(|| match cmd::try_run("systemctl", &[verb, &self.0]) {
+                Ok(run) if run.ok() || run.code == Some(5) || run.stderr.contains("not loaded") => None,
+                Ok(run) => Some(run.to_string()),
+                Err(e) => Some(e),
+            }));
         }
     }
 }
 
 /// `goetia <args>` in the transient scope `unit` allowed `tasks` tasks — threads and processes
-/// alike — so that making a thread, or spawning a process, fails once they are spent. At
-/// `tasks == 1`, where a success means the sweep tested nothing, the scope reports its own limit on
-/// stderr before goetia starts; every other count runs goetia directly.
+/// alike — so that making a thread, or spawning a process, fails once they are spent. The scope
+/// reports its own limit on stderr before goetia starts, at every count: any of them can end the
+/// sweep.
 fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new("systemd-run");
-    command.args(["--quiet", "--scope", "--unit", unit, "-p", &format!("TasksMax={tasks}")]);
-    if tasks == 1 {
-        command.args(["sh", "-c", SCOPE_PIDS_PREAMBLE]);
-    }
-    command
+    Command::new("systemd-run")
+        .args(["--quiet", "--scope", "--unit", unit, "-p", &format!("TasksMax={tasks}")])
+        .args(["sh", "-c", SCOPE_PIDS_PREAMBLE])
         .arg(env!("CARGO_BIN_EXE_goetia"))
         .args(args)
         .output()

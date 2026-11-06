@@ -42,16 +42,21 @@ impl fmt::Display for Run {
     }
 }
 
-pub fn run(program: &str, args: &[&str]) -> Run {
+/// Runs `program`; a failure to spawn it is the error, for a caller that must not panic.
+pub fn try_run(program: &str, args: &[&str]) -> Result<Run, String> {
     let output = Command::new(program)
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("spawn `{program}`: {e}"));
-    Run {
+        .map_err(|e| format!("spawn `{program}`: {e}"))?;
+    Ok(Run {
         program: program.to_string(),
         args: args.iter().map(|a| (*a).to_string()).collect(),
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    })
+}
+
+pub fn run(program: &str, args: &[&str]) -> Run {
+    try_run(program, args).unwrap_or_else(|e| panic!("{e}"))
 }
