@@ -1,5 +1,5 @@
 //! Removal of what a test created, retried for the transient failures cleanup meets (an antivirus
-//! holding a file, a process still exiting). Self-contained, so the shim's unit tests include it
+//! holding a file, a process still exiting). Self-contained, so the library's unit tests include it
 //! through `#[path]`.
 
 use std::time::{Duration, Instant};
@@ -51,6 +51,23 @@ impl DirGuard {
 impl Drop for DirGuard {
     fn drop(&mut self) {
         if let Some(problem) = remove_path_retrying(&self.0, true) {
+            eprintln!("warning: left behind: {problem}");
+        }
+    }
+}
+
+/// A file removed on drop like [`DirGuard`]'s tree. A symlink is unlinked, not followed.
+pub struct FileGuard(std::path::PathBuf);
+
+impl FileGuard {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self(path)
+    }
+}
+
+impl Drop for FileGuard {
+    fn drop(&mut self) {
+        if let Some(problem) = remove_path_retrying(&self.0, false) {
             eprintln!("warning: left behind: {problem}");
         }
     }

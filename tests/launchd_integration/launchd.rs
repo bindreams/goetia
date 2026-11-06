@@ -8,7 +8,7 @@
 //! `tests/support/service_guard.rs` documents). A few tests seed raw,
 //! non-Goetia content directly on disk instead of through the manager (a
 //! foreign plist, a hand-edited artifact); those use the narrower
-//! [`FileGuard`] instead, since `uninstall` would refuse to touch them.
+//! [`FileGuard`] (`support::cleanup`) instead, since `uninstall` would refuse to touch them.
 
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
@@ -23,6 +23,7 @@ use goetia::decide::Outcome;
 use goetia::manager::{self, Budget, Installed, ServiceManager, State};
 use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 
+use crate::support::cleanup::{DirGuard, FileGuard};
 use crate::support::{self, ConnectBack, ELEVATED, cmd};
 
 /// Held by every test whose assertion is about `list`'s answer for the
@@ -98,7 +99,7 @@ fn foreign_plist(label: &str) -> String {
 /// over them.
 fn binary_plist(label: &str) -> Vec<u8> {
     let source = std::env::temp_dir().join(format!("{label}-binary.plist"));
-    let _cleanup = FileGuard(source.clone());
+    let _cleanup = FileGuard::new(source.clone());
     write_bytes(&source, foreign_plist(label).as_bytes());
     cmd::run(
         "plutil",
@@ -169,21 +170,6 @@ impl Drop for Guard {
     }
 }
 
-/// Removes a plist written directly to disk (bypassing the manager) on
-/// drop — for content `uninstall` would refuse to touch because it carries
-/// no Goetia marker at all.
-struct FileGuard(PathBuf);
-
-impl Drop for FileGuard {
-    fn drop(&mut self) {
-        match std::fs::remove_file(&self.0) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("FileGuard[{}]: cleanup failed: {e}", self.0.display()),
-        }
-    }
-}
-
 // The deliverable: conformance ========================================================================================
 
 /// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen daemons in the shared
@@ -200,7 +186,7 @@ fn launchd_passes_conformance() {
     // `LaunchDaemons`.
     let _foreign_service = support::ServiceGuard::new(manager::conformance::FOREIGN_ID);
     let foreign_path = staging_path(manager::conformance::FOREIGN_ID);
-    let _foreign_cleanup = FileGuard(foreign_path.clone());
+    let _foreign_cleanup = FileGuard::new(foreign_path.clone());
     write_plist(&foreign_path, &foreign_plist(manager::conformance::FOREIGN_ID));
 
     // Seed `HAND_EDITED_ID`: install normally, then hand-edit the result so
@@ -223,7 +209,7 @@ fn launchd_passes_conformance() {
     // why this is not `NON_UTF8_PLIST`. Cleaned up here, like `FOREIGN_ID`, with the same backstop.
     let _undetermined_service = support::ServiceGuard::new(manager::conformance::UNDETERMINED_ID);
     let undetermined_path = staging_path(manager::conformance::UNDETERMINED_ID);
-    let _undetermined_cleanup = FileGuard(undetermined_path.clone());
+    let _undetermined_cleanup = FileGuard::new(undetermined_path.clone());
     let _ = std::fs::remove_file(&undetermined_path);
     std::os::unix::fs::symlink(
         format!("{}.plist", manager::conformance::UNDETERMINED_ID),
@@ -339,7 +325,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification() {
     let id = support::random_test_id();
     let path = staging_path(&id);
     let foreign_content = "not a goetia artifact, seeded directly\n";
-    let _cleanup = FileGuard(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
     write_plist(&path, foreign_content);
 
     let spec = sleepy(&id);
@@ -631,7 +617,7 @@ fn list_ignores_foreign_plists() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
     let path = staging_path(&id);
-    let _cleanup = FileGuard(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
     write_plist(&path, &foreign_plist(&id));
 
     let listed = mgr.list().expect("list");
@@ -660,7 +646,7 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
     let mut spec = sleepy(&id);
     spec.user = User::Name(user.to_string());
     let path = staging_path(&id);
-    let _cleanup = FileGuard(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
     write_plist(&path, &generate::plist(&spec, &Identity { user: user.to_string() }));
     let cannot_render = mgr
         .preview_install(&spec)
@@ -786,7 +772,7 @@ fn list_omits_a_non_utf8_plist_as_foreign() {
 
     let id = support::random_test_id();
     let path = enabled_path(&id);
-    let _cleanup = FileGuard(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
     write_bytes(&path, &NON_UTF8_PLIST);
 
     let listed = mgr
@@ -817,7 +803,7 @@ fn list_stays_clean_on_a_host_carrying_binary_plists() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
     let path = enabled_path(&id);
-    let _cleanup = FileGuard(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
     write_bytes(&path, &binary_plist(&id));
 
     let listed = mgr.list().expect("list");
@@ -847,7 +833,7 @@ fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
     let path = staging_path(&id);
-    let _cleanup = FileGuard(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
     write_bytes(&path, &NON_UTF8_PLIST);
 
     let spec = sleepy(&id);
@@ -959,7 +945,7 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
         .expect("nobody's gid");
 
     let copy_path = Path::new("/tmp").join(format!("goetia-unelevated-test-{}", support::random_test_id()));
-    let _cleanup = FileGuard(copy_path.clone());
+    let _cleanup = FileGuard::new(copy_path.clone());
     std::fs::copy(env!("CARGO_BIN_EXE_goetia"), &copy_path).expect("copy goetia binary to /tmp");
     std::fs::set_permissions(&copy_path, std::fs::Permissions::from_mode(0o755)).expect("chmod copy");
 
@@ -1184,8 +1170,8 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account() {
     let id = support::random_test_id();
     let cwd = Path::new("/tmp").join(format!("{id}-cwd"));
     let logs = Path::new("/tmp").join(format!("{id}-logs")).join("out.log");
-    let _cleanup_cwd = DirGuard(cwd.clone());
-    let _cleanup_logs_parent = DirGuard(logs.parent().unwrap().to_path_buf());
+    let _cleanup_cwd = DirGuard::new(cwd.clone());
+    let _cleanup_logs_parent = DirGuard::new(logs.parent().unwrap().to_path_buf());
 
     let mut spec = base_spec(&id, vec!["/bin/true".to_string()]);
     spec.user = User::Name("nobody".to_string());
@@ -1217,20 +1203,6 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account() {
     }
 }
 
-/// Removes a directory `install` created (bypassing the manager, which has
-/// no verb for it) on drop.
-struct DirGuard(PathBuf);
-
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        match std::fs::remove_dir_all(&self.0) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("DirGuard[{}]: cleanup failed: {e}", self.0.display()),
-        }
-    }
-}
-
 // Non-regular occupants ===============================================================================================
 
 /// Regression coverage for the `locate`/`persist_new` classification
@@ -1253,7 +1225,7 @@ fn install_over_a_directory_refuses_instead_of_recursing() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
     let path = staging_path(&id);
-    let _cleanup = DirGuard(path.clone());
+    let _cleanup = DirGuard::new(path.clone());
     std::fs::create_dir_all(&path).expect("seed a directory at the staging path");
 
     let spec = sleepy(&id);
@@ -1280,7 +1252,7 @@ fn install_over_a_directory_refuses_instead_of_recursing() {
 fn list_does_not_hang_on_a_fifo_in_the_plist_directory() {
     let id = support::random_test_id();
     let path = enabled_path(&id);
-    let _cleanup = FileGuard(path.clone());
+    let _cleanup = FileGuard::new(path.clone());
     mkfifo(&path);
 
     let listed = without_blocking("Launchd::list", || Launchd::new().list()).expect("list");
@@ -1342,7 +1314,7 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label() {
     // sequence: a predecessor job is still loaded when Goetia installs over
     // the same id.
     let decoy_dir = std::env::temp_dir().join(format!("{id}-decoy"));
-    let _decoy_cleanup = DirGuard(decoy_dir.clone());
+    let _decoy_cleanup = DirGuard::new(decoy_dir.clone());
     std::fs::create_dir_all(&decoy_dir).expect("decoy dir");
     let decoy = decoy_dir.join(format!("{id}.plist"));
     std::fs::write(

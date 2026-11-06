@@ -11,9 +11,8 @@
 //! reports nothing surfaces later only as a mysterious straggler in
 //! `systemctl` / `launchctl` / `services.msc`, long after the run that left it.
 
+use super::cleanup::remove_path;
 use super::{LAUNCHD_DAEMON_DIR, SYSTEMD_UNIT_DIR, cmd};
-
-pub use super::cleanup::{CLEANUP_BOUND, remove_path, remove_path_retrying};
 
 pub struct ServiceGuard {
     id: String,
