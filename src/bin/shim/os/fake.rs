@@ -52,7 +52,8 @@ pub(crate) enum Op {
 
 /// What a [`Spawned::wait`] does.
 pub(crate) enum WaitReply {
-    /// Return at once: the process has exited with this code.
+    /// Return at once: the process has exited with this code, or with the status it ended with
+    /// before.
     Exits(i32),
     /// Block until the process is ended, by a successful kill or [`FakeProcess::end`], and return
     /// its status.
@@ -114,9 +115,12 @@ fn status(code: i32) -> ExitStatus {
 }
 
 impl Proc {
-    fn end(&self, status: ExitStatus) {
-        lock(&self.state).exit.get_or_insert(status);
+    /// End the process with `status`, unless it ended already: the first ending wins. The status it
+    /// ended with.
+    fn end(&self, status: ExitStatus) -> ExitStatus {
+        let first = *lock(&self.state).exit.get_or_insert(status);
         self.ended.notify_all();
+        first
     }
 
     /// Block until the process is ended; its status.
@@ -242,10 +246,7 @@ impl Spawned for Instance {
         let reply = lock(&self.proc.state).waits.pop_front();
         match reply {
             None => self.unstated("wait"),
-            Some(WaitReply::Exits(code)) => {
-                self.proc.end(status(code));
-                Ok(status(code))
-            }
+            Some(WaitReply::Exits(code)) => Ok(self.proc.end(status(code))),
             Some(WaitReply::Blocks) => Ok(self.proc.wait_ended()),
             Some(WaitReply::Fails(Some(code))) => Err(cosca::error::Error::Io(io::Error::from_raw_os_error(code))),
             Some(WaitReply::Fails(None)) => Err(cosca::error::Error::Io(io::Error::other(WAIT_FAILED))),
