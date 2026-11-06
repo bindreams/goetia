@@ -2238,9 +2238,8 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
 
     let mut argv = vec!["-u", "nobody", "--", staged.to_str().expect("utf-8 temp path")];
     argv.extend_from_slice(args);
-    let output = Command::new("runuser")
+    Command::new("runuser")
         .args(&argv)
         .output()
-        .expect("spawn runuser -u nobody");
-    output
+        .expect("spawn runuser -u nobody")
 }
