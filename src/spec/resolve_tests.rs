@@ -130,6 +130,83 @@ fn rejects_control_characters_in_cwd_and_logs() {
     assert!(logs_err.to_string().contains("logs"));
 }
 
+// The rules check what the user wrote ---------------------------------------------------------------------------------
+
+#[skuld::test]
+fn rejects_a_relative_cwd_and_logs_ending_in_a_backslash_on_every_host() {
+    // `normalize` drops a trailing `\` on Windows, so only a check on the authored text refuses
+    // `data\`.
+    for field in ["cwd", "logs"] {
+        let yaml = format!("id: frpc\ncommand: [bin/frpc]\n{field}: 'data\\'\n");
+        let msg = resolve_yaml(&yaml).unwrap_err().to_string();
+        assert!(msg.contains(&format!("field `{field}` ends in a backslash")), "{msg}");
+    }
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_drive_relative_path_with_nul_gets_the_control_character_message() {
+    // `std::path::absolute` fails on the NUL and would print it; the check on the authored text
+    // comes first.
+    let yaml = r#"
+id: frpc
+command: [bin/frpc]
+cwd: "C:x\0y"
+"#;
+    let msg = resolve_yaml(yaml).unwrap_err().to_string();
+    assert!(msg.contains("field `cwd` contains a control character"), "{msg}");
+    assert!(!msg.contains('\0'), "{msg:?}");
+}
+
+#[skuld::test]
+fn a_manifest_with_two_defects_reports_the_earlier_field_first() {
+    // Each manifest has two defects; the first in field order is reported, though the second is
+    // one the resolution or an earlier-running check would find first.
+    let cases = [
+        ("name: \"a\\nb\"\ncwd: \"\"", "field `name`"),
+        ("cwd: \"\"\nlogs: \"a\\nb\"", "field `cwd` must not be empty"),
+        ("cwd: \"a\\nb\"\nlogs: \"c\\nd\"", "field `cwd`"),
+        ("cwd: \"a\\nb\"\nlogs: \"\"", "field `cwd` contains"),
+        ("logs: \"a\\nb\"\nenv: {\"A=B\": x}", "field `logs`"),
+        ("env: {A: \"a\\nb\"}\nuser: {name: \" \"}", "env[A]"),
+    ];
+    for (extra, expected) in cases {
+        let msg = resolve_yaml(&format!("id: frpc\ncommand: [bin/frpc]\n{extra}\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(expected),
+            "`{extra}`: expected `{expected}` first, got: {msg}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_manifest_directory_that_is_not_valid_utf8_is_refused_by_name() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = PathBuf::from(OsStr::from_bytes(b"/base/\xff"));
+    let msg = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\n"), &dir)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("manifest directory"), "{msg}");
+    assert!(msg.contains("not valid UTF-8"), "{msg}");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_manifest_directory_with_a_newline_is_refused_by_name() {
+    let dir = PathBuf::from("/base/a\nb");
+    let msg = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\n"), &dir)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("manifest directory"), "{msg}");
+    assert!(msg.contains("control character"), "{msg}");
+    assert!(!msg.contains("field `"), "{msg}");
+}
+
 // Resolution ==========================================================================================================
 
 #[skuld::test]

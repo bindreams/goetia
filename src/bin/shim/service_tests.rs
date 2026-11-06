@@ -27,6 +27,7 @@ use crate::test_support::{
     assert_failures, assert_one_failure, daemon_spec, fallback_refused_failure, not_found, supervisor,
     tree_refused_failure,
 };
+use goetia::spec::DaemonFields;
 
 const ID: &str = "goetia-shim-launch-test";
 
@@ -48,13 +49,14 @@ fn spec() -> DaemonSpec {
         "-Command",
         "Start-Sleep -Seconds 300",
     ];
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "goetia-shim launch test".to_string(),
         restart: Restart::Always,
         logs: Some(PathBuf::from(DAEMON_LOG)),
         kind: Kind::Simple,
         ..daemon_spec::spec(ID, command.map(str::to_string).to_vec())
-    }
+    })
+    .unwrap()
 }
 
 /// The line logged when no thread can be made to wait on the daemon.
@@ -302,11 +304,12 @@ fn a_daemon_that_exits_nonzero_is_one_pass() {
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Ends));
     // The shim ignores the restart policy: no respawn.
-    let daemon = DaemonSpec {
+    let daemon = DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         restart_delay: None,
-        ..spec()
-    };
+        ..spec().into_fields()
+    })
+    .unwrap();
 
     let reported = run_daemon(&daemon, &supervisor(&fake), || {});
 
@@ -885,7 +888,11 @@ fn a_stopped_report_is_stopped_and_accepts_no_control() {
 // Services registered by an earlier version ---------------------------------------------------------------------------
 
 fn spec_restarting(restart: Restart) -> DaemonSpec {
-    DaemonSpec { restart, ..spec() }
+    DaemonSpec::new(DaemonFields {
+        restart,
+        ..spec().into_fields()
+    })
+    .unwrap()
 }
 
 #[skuld::test]

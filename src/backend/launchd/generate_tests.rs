@@ -3,23 +3,22 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
+use crate::spec::DaemonFields;
 use crate::spec::{Id, Kind, User};
 
 // Fixtures ============================================================================================================
 //
-// Constructed literally, never via `spec::resolve()`: `resolve()` joins
-// relative paths against a base dir with `Path::join`, which inserts the
-// platform's native separator, so a spec built that way renders `\` on
-// Windows and `/` elsewhere and would break the snapshot assertions below on
-// two of three CI platforms. A `PathBuf` built directly from a forward-slash
-// literal (no `join`) keeps the exact bytes it was given on every platform.
+// Every `DaemonSpec` here is built through `DaemonSpec::new`, never `spec::resolve()`, and `new`
+// requires `cwd`/`logs` to be absolute, which is platform-defined (`Path::is_absolute()` is `false`
+// for a bare `/opt/frpc` on Windows). `abs` builds a path that is absolute on the host running the
+// test.
 
 fn full_spec() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
         command: vec!["frpc".to_string(), "-c".to_string(), "frpc.toml".to_string()],
-        cwd: Some(PathBuf::from("/opt/frpc")),
+        cwd: Some(abs("opt/frpc")),
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
             ("URL".to_string(), "http://x/a%20b".to_string()),
@@ -27,9 +26,10 @@ fn full_spec() -> DaemonSpec {
         user: User::Name("svc-frpc".to_string()),
         restart: Restart::Always,
         restart_delay: Some(Duration::new(2, 500_000_000)),
-        logs: Some(PathBuf::from("/var/log/frpc.log")),
+        logs: Some(abs("var/log/frpc.log")),
         kind: Kind::Managed,
-    }
+    })
+    .unwrap()
 }
 
 fn full_identity() -> Identity {
@@ -38,12 +38,6 @@ fn full_identity() -> Identity {
     }
 }
 
-// `blob::decode` (reached through `extract`) re-runs `spec::resolve`'s
-// invariant checks, including "cwd/logs must be absolute" — and
-// `Path::new("/opt/rt").is_absolute()` is `false` on Windows, so a spec
-// used for a round trip needs a path that is genuinely absolute on the
-// host platform, unlike the literal forward-slash paths the snapshot
-// fixtures above use (which are never decoded, only rendered).
 #[cfg(windows)]
 fn abs(p: &str) -> PathBuf {
     PathBuf::from(format!(r"C:\{p}"))
@@ -53,19 +47,12 @@ fn abs(p: &str) -> PathBuf {
     PathBuf::from(format!("/{p}"))
 }
 
-fn roundtrip_spec() -> DaemonSpec {
-    DaemonSpec {
-        cwd: Some(abs("opt/frpc")),
-        logs: Some(abs("var/log/frpc.log")),
-        ..full_spec()
-    }
-}
-
 fn minimal_spec() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
         ..DaemonSpec::for_test("frpc", vec!["frpc".to_string()])
-    }
+    })
+    .unwrap()
 }
 
 fn minimal_identity() -> Identity {
@@ -75,10 +62,11 @@ fn minimal_identity() -> Identity {
 }
 
 fn spec_with_restart(restart: Restart) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         restart,
-        ..minimal_spec()
-    }
+        ..minimal_spec().into_fields()
+    })
+    .unwrap()
 }
 
 // Snapshots ===========================================================================================================
@@ -147,7 +135,7 @@ fn plist_snapshot_full() {
          \t\t<string>frpc.toml</string>\n\
          \t</array>\n\
          \t<key>WorkingDirectory</key>\n\
-         \t<string>/opt/frpc</string>\n\
+         \t<string>{cwd}</string>\n\
          \t<key>EnvironmentVariables</key>\n\
          \t<dict>\n\
          \t\t<key>RUST_LOG</key>\n\
@@ -164,13 +152,15 @@ fn plist_snapshot_full() {
          \t<key>ThrottleInterval</key>\n\
          \t<integer>3</integer>\n\
          \t<key>StandardOutPath</key>\n\
-         \t<string>/var/log/frpc.log</string>\n\
+         \t<string>{logs}</string>\n\
          \t<key>StandardErrorPath</key>\n\
-         \t<string>/var/log/frpc.log</string>\n\
+         \t<string>{logs}</string>\n\
          </dict>\n\
          </plist>\n",
         version = crate::version(),
         blob = blob::encode(&spec),
+        cwd = abs("opt/frpc").display(),
+        logs = abs("var/log/frpc.log").display(),
     );
 
     assert_eq!(text, expected);
@@ -180,7 +170,7 @@ fn plist_snapshot_full() {
 
 #[skuld::test]
 fn plist_round_trips_through_extract() {
-    let spec = roundtrip_spec();
+    let spec = full_spec();
     let text = plist(&spec, &full_identity());
 
     let decoded = extract(&text)
@@ -194,7 +184,7 @@ fn plist_round_trips_through_extract() {
 
 #[skuld::test]
 fn plist_is_the_generation_invariant() {
-    let spec = roundtrip_spec();
+    let spec = full_spec();
     let id = full_identity();
     let text = plist(&spec, &id);
 
@@ -348,7 +338,7 @@ fn extract_tolerates_crlf_line_endings_in_the_metadata_comment() {
     // A plist that has been saved with CRLF line endings (e.g. by a Windows
     // editor) still carries a fully intact metadata comment — the sentinel
     // match must not be tied to the exact `\n` byte.
-    let spec = roundtrip_spec();
+    let spec = full_spec();
     let text = plist(&spec, &full_identity());
     let crlf = text.replace('\n', "\r\n");
 
@@ -363,11 +353,12 @@ fn extract_tolerates_crlf_line_endings_in_the_metadata_comment() {
 
 #[skuld::test]
 fn xml_special_characters_are_escaped() {
-    let mut spec = minimal_spec();
+    let mut spec = minimal_spec().into_fields();
     spec.command = vec!["frpc".to_string(), "a&b<c>d".to_string()];
     spec.env = BTreeMap::from([("K&L<M>N".to_string(), "x&y<z>w".to_string())]);
-    spec.cwd = Some(PathBuf::from("/opt/a&b<c>d"));
-    spec.logs = Some(PathBuf::from("/var/log/a&b<c>d"));
+    spec.cwd = Some(abs("opt/a&b<c>d"));
+    spec.logs = Some(abs("var/log/a&b<c>d"));
+    let spec = DaemonSpec::new(spec).unwrap();
 
     let text = plist(
         &spec,
@@ -393,11 +384,17 @@ fn xml_special_characters_are_escaped() {
         "UserName was not escaped:\n{text}"
     );
     assert!(
-        text.contains("<key>WorkingDirectory</key>\n\t<string>/opt/a&amp;b&lt;c&gt;d</string>"),
+        text.contains(&format!(
+            "<key>WorkingDirectory</key>\n\t<string>{}</string>",
+            abs("opt/a&amp;b&lt;c&gt;d").display()
+        )),
         "cwd was not escaped:\n{text}"
     );
     assert!(
-        text.contains("<key>StandardOutPath</key>\n\t<string>/var/log/a&amp;b&lt;c&gt;d</string>"),
+        text.contains(&format!(
+            "<key>StandardOutPath</key>\n\t<string>{}</string>",
+            abs("var/log/a&amp;b&lt;c&gt;d").display()
+        )),
         "logs was not escaped:\n{text}"
     );
     assert!(
@@ -411,27 +408,6 @@ fn xml_special_characters_are_escaped() {
     assert!(
         !text.contains("svc&name<x>y"),
         "raw unescaped UserName must not appear in the output"
-    );
-}
-
-#[skuld::test]
-fn xml_noncharacters_panic_loudly_rather_than_emit_invalid_xml() {
-    // XML 1.0's `Char` production excludes U+FFFE/U+FFFF entirely — no
-    // escape can represent them, and `spec::resolve`'s control-character
-    // gate does not reject them (`char::is_control()` doesn't cover
-    // noncharacters). Until that upstream gate closes, this generator must
-    // fail loudly rather than silently emit a plist no XML parser can load.
-    let mut spec = minimal_spec();
-    spec.command = vec!["frpc".to_string(), format!("bad{}arg", '\u{FFFF}')];
-
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plist(&spec, &minimal_identity())));
-    std::panic::set_hook(previous_hook);
-
-    assert!(
-        result.is_err(),
-        "plist() must panic rather than emit unrepresentable XML"
     );
 }
 
@@ -476,11 +452,12 @@ fn throttle_interval_rounds_up() {
     ];
 
     for (delay, expected) in cases {
-        let spec = DaemonSpec {
+        let spec = DaemonSpec::new(DaemonFields {
             restart: Restart::Always,
             restart_delay: Some(delay),
-            ..minimal_spec()
-        };
+            ..minimal_spec().into_fields()
+        })
+        .unwrap();
         let text = plist(&spec, &minimal_identity());
         let needle = format!("<key>ThrottleInterval</key>\n\t<integer>{expected}</integer>\n");
         assert!(
@@ -496,11 +473,12 @@ fn throttle_interval_rounding_does_not_overflow_at_the_duration_boundary() {
     // `Duration::MAX`, whose `subsec_nanos()` is 999_999_999): rounding up
     // with a plain `+ 1` would overflow, wrapping to 0 in release — the
     // exact "disables throttling" failure the rounding exists to prevent.
-    let spec = DaemonSpec {
+    let spec = DaemonSpec::new(DaemonFields {
         restart: Restart::Always,
         restart_delay: Some(Duration::MAX),
-        ..minimal_spec()
-    };
+        ..minimal_spec().into_fields()
+    })
+    .unwrap();
     let text = plist(&spec, &minimal_identity());
     let needle = format!("<key>ThrottleInterval</key>\n\t<integer>{}</integer>\n", u64::MAX);
     assert!(
@@ -511,11 +489,12 @@ fn throttle_interval_rounding_does_not_overflow_at_the_duration_boundary() {
 
 #[skuld::test]
 fn throttle_interval_omitted_without_restart_delay() {
-    let spec = DaemonSpec {
+    let spec = DaemonSpec::new(DaemonFields {
         restart: Restart::Always,
         restart_delay: None,
-        ..minimal_spec()
-    };
+        ..minimal_spec().into_fields()
+    })
+    .unwrap();
     let text = plist(&spec, &minimal_identity());
     assert!(
         !text.contains("ThrottleInterval"),
@@ -528,11 +507,12 @@ fn throttle_interval_omitted_when_restart_is_never() {
     // A `restart_delay` with `restart: never` has nothing to throttle: never
     // installs a KeepAlive at all, so an emitted ThrottleInterval would be
     // meaningless.
-    let spec = DaemonSpec {
+    let spec = DaemonSpec::new(DaemonFields {
         restart: Restart::Never,
         restart_delay: Some(Duration::from_secs(2)),
-        ..minimal_spec()
-    };
+        ..minimal_spec().into_fields()
+    })
+    .unwrap();
     let text = plist(&spec, &minimal_identity());
     assert!(
         !text.contains("ThrottleInterval"),
@@ -578,41 +558,6 @@ fn base64_alphabet_cannot_produce_a_comment_terminator() {
     );
 }
 
-// Non-UTF-8 paths =====================================================================================================
-
-#[cfg(windows)]
-fn non_utf8_path() -> PathBuf {
-    // A lone UTF-16 surrogate: a byte sequence `OsString` can hold on
-    // Windows but which is never valid UTF-8.
-    use std::os::windows::ffi::OsStringExt as _;
-    PathBuf::from(std::ffi::OsString::from_wide(&[0xD800]))
-}
-#[cfg(unix)]
-fn non_utf8_path() -> PathBuf {
-    use std::os::unix::ffi::OsStringExt as _;
-    PathBuf::from(std::ffi::OsString::from_vec(vec![0xFF, 0xFE]))
-}
-
-#[skuld::test]
-fn non_utf8_path_panics_loudly_rather_than_emit_a_corrupted_path() {
-    // `DaemonSpec` is only ever legitimately constructed from `String`
-    // sources (see `spec::resolve`/`blob::decode`), so a non-UTF-8 `cwd`
-    // violates that contract. `to_string_lossy` would silently substitute
-    // U+FFFD and emit a plist naming a path that does not exist; the
-    // generator must panic instead.
-    let spec = DaemonSpec {
-        cwd: Some(non_utf8_path()),
-        ..minimal_spec()
-    };
-
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plist(&spec, &minimal_identity())));
-    std::panic::set_hook(previous_hook);
-
-    assert!(result.is_err(), "plist() must panic on a non-UTF-8 cwd");
-}
-
 // without_metadata ====================================================================================================
 
 #[skuld::test]
@@ -633,10 +578,11 @@ fn without_metadata_drops_the_whole_comment_and_keeps_the_rest() {
 #[skuld::test]
 fn without_metadata_makes_a_spec_change_the_plist_does_not_render_vanish() {
     // `name` is in the blob and nowhere in the plist.
-    let renamed = DaemonSpec {
+    let renamed = DaemonSpec::new(DaemonFields {
         name: "another name".to_string(),
-        ..minimal_spec()
-    };
+        ..minimal_spec().into_fields()
+    })
+    .unwrap();
     let before = plist(&minimal_spec(), &minimal_identity());
     let after = plist(&renamed, &minimal_identity());
 
@@ -663,10 +609,11 @@ fn without_metadata_keeps_what_launchd_reads() {
         },
     );
     let other_command = plist(
-        &DaemonSpec {
+        &DaemonSpec::new(DaemonFields {
             command: vec!["frpc".to_string(), "--verbose".to_string()],
-            ..minimal_spec()
-        },
+            ..minimal_spec().into_fields()
+        })
+        .unwrap(),
         &minimal_identity(),
     );
 

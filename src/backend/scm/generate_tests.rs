@@ -1,4 +1,5 @@
 use super::*;
+use crate::spec::DaemonFields;
 use crate::spec::{Builtin, MAX_SC_ACTION_DELAY};
 
 // Fixtures ============================================================================================================
@@ -13,7 +14,7 @@ fn abs(p: &str) -> PathBuf {
 }
 
 fn managed_spec() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_string(),
         restart: Restart::OnFailure,
         restart_delay: Some(Duration::from_secs(5)),
@@ -21,11 +22,12 @@ fn managed_spec() -> DaemonSpec {
             "frpc",
             vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
         )
-    }
+    })
+    .unwrap()
 }
 
 fn simple_spec() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_string(),
         restart: Restart::OnFailure,
         kind: Kind::Simple,
@@ -37,7 +39,8 @@ fn simple_spec() -> DaemonSpec {
             "frpc",
             vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
         )
-    }
+    })
+    .unwrap()
 }
 
 fn identity() -> Identity {
@@ -83,9 +86,10 @@ fn managed_kind_executable_is_own_command() {
 
 #[skuld::test]
 fn managed_kind_renders_its_environment_lines() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.env.insert("B".to_string(), "2".to_string());
     spec.env.insert("A".to_string(), "1".to_string());
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     assert_eq!(reg.environment, ["A=1", "B=2"]);
@@ -100,8 +104,9 @@ fn managed_kind_renders_its_environment_lines() {
 fn simple_kind_renders_no_environment() {
     // SCM applies `Environment` to the shim, not the daemon (the shim applies `spec.env` itself), so
     // the registration carries none for `Kind::Simple`.
-    let mut spec = simple_spec();
+    let mut spec = simple_spec().into_fields();
     spec.env.insert("A".to_string(), "1".to_string());
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     assert!(reg.environment.is_empty(), "{:?}", reg.environment);
@@ -141,8 +146,9 @@ fn format_environment_lines_preserves_equals_signs_in_the_value() {
 
 #[skuld::test]
 fn root_user_maps_to_local_system() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.user = User::Root;
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     assert_eq!(reg.account, None, "User::Root must map to None (LocalSystem)");
@@ -150,8 +156,9 @@ fn root_user_maps_to_local_system() {
 
 #[skuld::test]
 fn named_user_account_uses_resolved_identity() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.user = User::Name("bindreams".to_string());
+    let spec = DaemonSpec::new(spec).unwrap();
     let id = identity();
     let reg = registration(&spec, &id, &shim_path()).unwrap();
 
@@ -262,8 +269,9 @@ fn every_canonical_builtin_needs_no_password() {
 
 #[skuld::test]
 fn registration_canonicalizes_a_builtin_account() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.user = User::Name("LocalService".to_string());
+    let spec = DaemonSpec::new(spec).unwrap();
     let id = Identity {
         user: "LocalService".to_string(),
     };
@@ -274,8 +282,9 @@ fn registration_canonicalizes_a_builtin_account() {
 
 #[skuld::test]
 fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.user = User::Root;
+    let spec = DaemonSpec::new(spec).unwrap();
     // The value `identity::resolve` actually returns for `User::Root`, not
     // a hand-written non-empty one — `root_user_maps_to_local_system`
     // (above) uses `identity()`'s non-empty fixture and so cannot catch
@@ -727,9 +736,10 @@ fn windows_style_split_matches_real_command_line_to_argv_w() {
 
 #[skuld::test]
 fn simple_kind_maps_restart_to_failure_actions_like_managed() {
-    let mut spec = simple_spec();
+    let mut spec = simple_spec().into_fields();
     spec.restart = Restart::OnFailure;
     spec.restart_delay = Some(Duration::from_secs(42));
+    let spec = DaemonSpec::new(spec).unwrap();
     let fa = build(&spec)
         .failure_actions
         .expect("restart: on-failure must configure recovery actions: SCM does every restart for a simple daemon");
@@ -740,15 +750,20 @@ fn simple_kind_maps_restart_to_failure_actions_like_managed() {
         "without the flag, a clean non-zero report never restarts"
     );
 
-    spec.restart = Restart::Never;
+    let spec = DaemonSpec::new(DaemonFields {
+        restart: Restart::Never,
+        ..spec.into_fields()
+    })
+    .unwrap();
     assert_eq!(build(&spec).failure_actions, None);
 }
 
 #[skuld::test]
 fn simple_kind_default_restart_delay_when_unset() {
-    let mut spec = simple_spec();
+    let mut spec = simple_spec().into_fields();
     spec.restart = Restart::OnFailure;
     spec.restart_delay = None;
+    let spec = DaemonSpec::new(spec).unwrap();
 
     let fa = build(&spec).failure_actions.expect("recovery actions");
     assert_eq!(fa.delay, DEFAULT_RESTART_DELAY);
@@ -758,12 +773,14 @@ fn simple_kind_default_restart_delay_when_unset() {
 fn the_two_kinds_get_the_same_failure_actions_for_every_restart_value() {
     for restart in [Restart::Never, Restart::OnFailure] {
         for restart_delay in [None, Some(Duration::from_secs(42))] {
-            let mut simple = simple_spec();
+            let mut simple = simple_spec().into_fields();
             simple.restart = restart;
             simple.restart_delay = restart_delay;
-            let mut managed = managed_spec();
+            let simple = DaemonSpec::new(simple).unwrap();
+            let mut managed = managed_spec().into_fields();
             managed.restart = restart;
             managed.restart_delay = restart_delay;
+            let managed = DaemonSpec::new(managed).unwrap();
 
             assert_eq!(
                 build(&simple).failure_actions,
@@ -788,8 +805,9 @@ fn managed_kind_sets_on_non_crash_failures() {
 
 #[skuld::test]
 fn managed_kind_maps_restart_delay_to_action_delay() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.restart_delay = Some(Duration::from_secs(42));
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     let fa = reg
@@ -800,8 +818,9 @@ fn managed_kind_maps_restart_delay_to_action_delay() {
 
 #[skuld::test]
 fn managed_kind_default_restart_delay_when_unset() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.restart_delay = None;
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     let fa = reg
@@ -812,8 +831,9 @@ fn managed_kind_default_restart_delay_when_unset() {
 
 #[skuld::test]
 fn managed_kind_with_restart_never_has_no_failure_actions() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.restart = Restart::Never;
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     assert_eq!(
@@ -825,10 +845,11 @@ fn managed_kind_with_restart_never_has_no_failure_actions() {
 #[skuld::test]
 fn registration_refuses_restart_always() {
     for spec in [managed_spec(), simple_spec()] {
-        let spec = DaemonSpec {
+        let spec = DaemonSpec::new(DaemonFields {
             restart: Restart::Always,
-            ..spec
-        };
+            ..spec.into_fields()
+        })
+        .unwrap();
         let err = registration(&spec, &identity(), &shim_path()).expect_err("`restart: always` must be refused");
 
         assert!(
@@ -845,7 +866,11 @@ fn registration_refuses_restart_always() {
 fn registration_accepts_never_and_on_failure() {
     for restart in [Restart::Never, Restart::OnFailure] {
         for spec in [managed_spec(), simple_spec()] {
-            let spec = DaemonSpec { restart, ..spec };
+            let spec = DaemonSpec::new(DaemonFields {
+                restart,
+                ..spec.into_fields()
+            })
+            .unwrap();
             registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
         }
     }
@@ -853,10 +878,13 @@ fn registration_accepts_never_and_on_failure() {
 
 #[skuld::test]
 fn managed_kind_clamps_absurdly_long_restart_delay() {
-    let mut spec = managed_spec();
     // One millisecond past what a DWORD of milliseconds (SC_ACTION.Delay)
     // can express.
-    spec.restart_delay = Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
+    let spec = DaemonSpec::new(DaemonFields {
+        restart_delay: Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1)),
+        ..managed_spec().into_fields()
+    })
+    .unwrap();
     let reg = registration(&spec, &identity(), &shim_path()).unwrap();
 
     let fa = reg
@@ -881,8 +909,9 @@ fn a_sub_millisecond_restart_delay_rounds_up_to_the_whole_millisecond_scm_stores
         (Duration::from_millis(7), 7),
         (Duration::ZERO, 0),
     ] {
-        let mut spec = managed_spec();
+        let mut spec = managed_spec().into_fields();
         spec.restart_delay = Some(delay);
+        let spec = DaemonSpec::new(spec).unwrap();
         let reg = build(&spec);
         let fa = reg.failure_actions.expect("on-failure configures recovery actions");
         assert_eq!(fa.delay, Duration::from_millis(stored_ms), "delay {delay:?}");
@@ -908,8 +937,9 @@ fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
         MAX_SC_ACTION_DELAY + Duration::from_nanos(1),
         Duration::MAX,
     ] {
-        let mut spec = managed_spec();
+        let mut spec = managed_spec().into_fields();
         spec.restart_delay = Some(delay);
+        let spec = DaemonSpec::new(spec).unwrap();
         let fa = build(&spec).failure_actions.expect("recovery actions");
         assert_eq!(fa.delay, MAX_SC_ACTION_DELAY, "delay {delay:?}");
     }
@@ -917,8 +947,9 @@ fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
 
 #[skuld::test]
 fn managed_kind_restart_delay_within_bound_does_not_clamp() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.restart_delay = Some(Duration::from_secs(42));
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = registration(&spec, &identity(), &shim_path()).unwrap();
 
     let fa = reg

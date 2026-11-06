@@ -4,15 +4,16 @@ use crate::error::Error;
 use crate::manager::fake::fake_tests::mk;
 use crate::manager::fake::{Fake, generate};
 use crate::manager::{Budget, Installed, ServiceManager, Step};
-use crate::spec::{DaemonSpec, Id, User};
+use crate::spec::{DaemonFields, DaemonSpec, Id, User};
 
 // Fixtures ============================================================================================================
 
 fn mk_as(id: &str, user: &str) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         user: User::Name(user.to_string()),
-        ..mk(id)
-    }
+        ..mk(id).into_fields()
+    })
+    .unwrap()
 }
 
 /// What `Fake::render` fails with for a seeded unresolvable account.
