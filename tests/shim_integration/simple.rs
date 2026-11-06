@@ -12,7 +12,7 @@ use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use crate::common::{LogDir, ShimGuard, conformance_mk, fixture_command, simple_spec};
+use crate::common::{LogDir, ShimGuard, conformance_mk, fixture_command, simple_spec, wait_for};
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED};
 
@@ -236,7 +236,10 @@ fn the_shim_reports_stop_pending_then_stopped() {
     let armed = actor
         .arm(WantState::Stopped, Budget::Unbounded.start())
         .expect("arm the STOP_PENDING notification");
-    assert!(matches!(armed, Armed::Registered(_)), "the arm: {armed:?}");
+    assert!(
+        matches!(armed, Armed::Registered(s) if s.state == QueriedState::Running),
+        "the arm: {armed:?}"
+    );
     service.stop().expect("send stop");
     let observed = actor
         .wait_callback(Budget::Unbounded.start())
@@ -245,19 +248,5 @@ fn the_shim_reports_stop_pending_then_stopped() {
     // The shim reports `SERVICE_ACCEPT_STOP` or nothing, so not accepting STOP is `controls_accepted == 0`.
     assert!(!actor.accepts_stop(), "no control is accepted while stopping");
 
-    // `STOPPED` alone: a service still stopping does not fire it, and one that stopped since the
-    // `STOP_PENDING` is seen in the status the arm returns, which a re-arm may not deliver.
-    let armed = actor
-        .arm(WantState::StoppedOnly, Budget::Unbounded.start())
-        .expect("arm the STOPPED notification");
-    match armed {
-        Armed::Registered(status) if status.state == QueriedState::Stopped => {}
-        Armed::Registered(_) => {
-            let observed = actor
-                .wait_callback(Budget::Unbounded.start())
-                .expect("wait for STOPPED");
-            assert_eq!(observed, Some(Observed::Stopped));
-        }
-        other => panic!("the STOPPED arm came to {other:?}"),
-    }
+    wait_for(&mut actor, WantState::StoppedOnly, QueriedState::Stopped);
 }

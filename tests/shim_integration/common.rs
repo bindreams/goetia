@@ -202,6 +202,48 @@ pub fn kill_process(pid: u32) {
     support::cmd::run("taskkill.exe", &["/F", "/PID", &pid.to_string()]).expect_ok();
 }
 
+/// Waits until `actor`'s service is in `done`, arming for `want`, and panics on any other terminal
+/// state, so a service that stopped fails the test and does not hang it. `ScmActor::arm`'s contract
+/// is the reason for the shape: a re-arm on an unchanged state does not fire, so the status each arm
+/// returns is decided on before the wait, and only a pending state waits and re-arms.
+pub fn wait_for(actor: &mut SystemScmActor, want: WantState, done: QueriedState) -> QueriedState {
+    fn check(reached: QueriedState, done: QueriedState) -> Option<QueriedState> {
+        match reached {
+            r if r == done => Some(r),
+            QueriedState::Running | QueriedState::Paused | QueriedState::Stopped => {
+                panic!("waiting for {done:?}, the service reached {reached:?}")
+            }
+            _ => None,
+        }
+    }
+    loop {
+        match actor
+            .arm(want, Budget::Unbounded.start())
+            .unwrap_or_else(|e| panic!("arm the {want:?} notification: {e}"))
+        {
+            Armed::Registered(status) => {
+                if let Some(reached) = check(status.state, done) {
+                    return reached;
+                }
+            }
+            other => panic!("waiting for {done:?}, the arm came to {other:?}"),
+        }
+        let reached = match actor
+            .wait_callback(Budget::Unbounded.start())
+            .unwrap_or_else(|e| panic!("wait for {done:?}: {e}"))
+        {
+            Some(Observed::Pending) => continue,
+            Some(Observed::Running) => QueriedState::Running,
+            Some(Observed::Paused) => QueriedState::Paused,
+            Some(Observed::Stopped) => QueriedState::Stopped,
+            None => panic!("an unbounded wait for {done:?} expired"),
+        };
+        if let Some(reached) = check(reached, done) {
+            return reached;
+        }
+    }
+}
+
 /// A handle on the shim process of a started service, taken while it runs so that the test can
 /// wait for the process to be gone. SCM has the final `STOPPED` record by then: the shim reports it
 /// before it exits.
@@ -223,30 +265,8 @@ impl ShimProcess {
         let service = manager
             .open_service(id, ServiceAccess::QUERY_STATUS)
             .unwrap_or_else(|e| panic!("open service {id}: {e}"));
-        // The status read with the registration decides first: a registration on a handle that has
-        // delivered does not fire for a state that is already current. A pending state re-arms.
         let mut actor = SystemScmActor::open(id).unwrap_or_else(|e| panic!("open {id} to wait for RUNNING: {e}"));
-        let mut armed = actor
-            .arm(WantState::Running, Budget::Unbounded.start())
-            .unwrap_or_else(|e| panic!("arm the RUNNING notification of {id}: {e}"));
-        loop {
-            match armed {
-                Armed::Registered(status) if status.state == QueriedState::Running => break,
-                Armed::Registered(_) => match actor
-                    .wait_callback(Budget::Unbounded.start())
-                    .unwrap_or_else(|e| panic!("wait for the RUNNING notification of {id}: {e}"))
-                {
-                    Some(Observed::Running) => break,
-                    Some(Observed::Pending) => {
-                        armed = actor
-                            .arm(WantState::Running, Budget::Unbounded.start())
-                            .unwrap_or_else(|e| panic!("re-arm the RUNNING notification of {id}: {e}"));
-                    }
-                    other => panic!("waiting for {id} to report RUNNING, SCM delivered {other:?}"),
-                },
-                other => panic!("waiting for {id} to report RUNNING, the arm came to {other:?}"),
-            }
-        }
+        wait_for(&mut actor, WantState::Running, QueriedState::Running);
         let running = service
             .query_status()
             .unwrap_or_else(|e| panic!("query status of {id}: {e}"));
