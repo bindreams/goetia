@@ -59,10 +59,13 @@ mod stock {
 
     use sha2::{Digest as _, Sha256};
     use tempfile::Builder;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
 
-    use super::super::acl::{Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, read_object};
+    use super::super::acl::{
+        Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, read_object, require_acls_under,
+    };
     use super::super::marker::read_retrying;
     use super::super::provider::ShimProvider;
     use crate::error::{Error, Result};
@@ -107,7 +110,10 @@ mod stock {
         }
 
         /// Checks `dir` with `folders`, creates what is missing of it, and leaves the file in place
-        /// and verified. See the module documentation.
+        /// and verified; see the module documentation. A volume that keeps no ACLs is refused
+        /// whatever `folders` says, since there the file's owner and permissions cannot be set or
+        /// verified. Runs under the install lock, as every `provide` does: two calls at once can
+        /// each set the other's fresh file aside.
         fn provide(&self, folders: &FolderCheck) -> Result<HostCommand> {
             let image = self.image()?;
             provide_in(&self.dir()?, &image, folders)
@@ -276,6 +282,7 @@ mod stock {
     fn provide_in(dir: &Path, image: &Image<'_>, folders: &FolderCheck) -> Result<HostCommand> {
         let command = preview_in(dir, image)?;
         folders.check(dir)?;
+        require_acls_under(dir)?;
         create_missing(dir)?;
         let file = Descriptor::for_file()?;
         match inspect(&command.exe, image, &file.wanted()?)? {
@@ -311,15 +318,19 @@ mod stock {
     }
 
     /// What `inspect` found at the file's path.
-    enum Existing {
+    pub(super) enum Existing {
         Absent,
         /// A regular file with the wanted owner and permissions and the bytes its name says.
         Good,
-        /// Anything else.
+        /// Anything else: another kind of object, or a file that cannot be opened or whose
+        /// permissions cannot be read as goetia reads them.
         Bad,
     }
 
-    fn inspect(path: &Path, image: &Image<'_>, wanted: &ObjectSecurity) -> Result<Existing> {
+    /// Whether the file at `path` is the shim. Only an answer from the system that says nothing
+    /// about the file is an error; a file that refuses to be opened or read is not the shim, and a
+    /// repair sets it aside.
+    pub(super) fn inspect(path: &Path, image: &Image<'_>, wanted: &ObjectSecurity) -> Result<Existing> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Existing::Absent),
@@ -328,8 +339,17 @@ mod stock {
         if !metadata.file_type().is_file() {
             return Ok(Existing::Bad);
         }
-        let file = File::open(path).map_err(|e| Error::os_at("open", path, e))?;
-        if !is_as_wanted(&read_object(&file, path.to_path_buf())?, wanted) {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(e) if refuses_to_open(&e) => return Ok(Existing::Bad),
+            Err(e) => return Err(Error::os_at("open", path, e)),
+        };
+        let actual = match read_object(&file, path.to_path_buf()) {
+            Ok(actual) => actual,
+            Err(e) if is_unreadable(&e) => return Ok(Existing::Bad),
+            Err(e) => return Err(e),
+        };
+        if !is_as_wanted(&actual, wanted) {
             return Ok(Existing::Bad);
         }
         let found = hash_reader(&file).map_err(|e| Error::os_at("read", path, e))?;
@@ -338,6 +358,12 @@ mod stock {
         } else {
             Existing::Bad
         })
+    }
+
+    /// Whether `error` from opening a file that exists is the file's doing: its permissions refuse
+    /// reading, or another process holds it without sharing.
+    fn refuses_to_open(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
     }
 
     /// Renames `path` to a name no other file has, which `shim_file` calls
@@ -366,18 +392,18 @@ mod stock {
     /// file that appeared at `path` meanwhile is not replaced.
     fn write_fresh(dir: &Path, path: &Path, image: &Image<'_>, wanted: &Descriptor) -> Result<()> {
         let prefix = image.stale_prefix();
-        let mut temporary = Builder::new()
+        let (mut file, temporary) = Builder::new()
             .prefix(&prefix)
             .suffix(STALE_SUFFIX)
             .make_in(dir, |temporary| wanted.create_file(temporary))
-            .map_err(|e| Error::os_at("create a file in", dir, e))?;
+            .map_err(|e| Error::os_at("create a file in", dir, e))?
+            .into_parts();
+        let written = file.write_all(image.bytes).and_then(|()| file.flush());
+        // Closed before the file is renamed into place, or deleted for a failed write: the handle
+        // allows neither.
+        drop(file);
+        written.map_err(|e| Error::os_at("write", &temporary, e))?;
         temporary
-            .write_all(image.bytes)
-            .and_then(|()| temporary.flush())
-            .map_err(|e| Error::os_at("write", temporary.path(), e))?;
-        // Closed before the rename.
-        temporary
-            .into_temp_path()
             .persist_noclobber(path)
             .map_err(|e| Error::os_at("place", path, e.error))
     }

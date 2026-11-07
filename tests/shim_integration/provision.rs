@@ -293,6 +293,61 @@ fn provide_replaces_a_loose_dacl() {
     );
 }
 
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn provide_repairs_a_file_that_denies_reading() {
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let mgr = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+    mgr.install(&spec, false).expect("install");
+    let file = shim_in(&folder);
+    // Administrators, which this test runs as, may not read the file's data: opening it is refused.
+    let path = file.to_string_lossy();
+    support::cmd::run("icacls", &[&path, "/deny", "*S-1-5-32-544:(RD)"]).expect_ok();
+    assert!(std::fs::File::open(&file).is_err(), "the denial must refuse an open");
+
+    let again = mgr.install(&spec, false).expect("install over a file nobody can read");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), shim_bytes());
+    assert_stock_file(&file);
+    let aside = stale_files(&folder);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(
+        security_of(&aside[0]).contains("(D;"),
+        "the file set aside is the one with the denial: {}",
+        security_of(&aside[0])
+    );
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn provide_replaces_a_directory_at_the_shim_s_name() {
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let mgr = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+    mgr.install(&spec, false).expect("install");
+    let file = shim_in(&folder);
+    std::fs::remove_file(&file).expect("delete the shim");
+    std::fs::create_dir(&file).expect("put a folder at its name");
+    std::fs::write(file.join("inside"), b"x").expect("fill it");
+
+    let again = mgr
+        .install(&spec, false)
+        .expect("install over a folder at the shim's name");
+
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), shim_bytes());
+    assert_stock_file(&file);
+    let aside = stale_files(&folder);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(aside[0].join("inside").is_file(), "the folder was set aside whole");
+}
+
 // Provisioning into %ProgramFiles%\Goetia =============================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]

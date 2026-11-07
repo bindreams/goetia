@@ -41,12 +41,12 @@ fn shim_file_refuses_what_is_not_a_shim_name() {
 #[cfg(windows)]
 mod windows {
     use std::io::{self, Cursor, Read};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::stock::*;
     use super::*;
-    use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
-    use crate::error::Error;
+    use crate::backend::scm::shim::acl::{CheckPermissions, Descriptor, FolderCheck};
+    use crate::error::{Error, Result};
     use crate::shim::{HostCommand, ShimProvider};
 
     fn disabled() -> FolderCheck {
@@ -202,5 +202,62 @@ mod windows {
             assert_eq!(streamed, whole, "step {step}");
         }
         assert_eq!(hash_reader(Cursor::new(Vec::new())).unwrap(), Image::new(b"").digest());
+    }
+
+    /// What `inspect` says of `path` when the file would otherwise be as wanted but for what the test
+    /// did to it: the test creates the file itself, so its owner and DACL are never the stock ones,
+    /// and every case below is `Bad` for that reason too unless `inspect` failed first.
+    fn inspected(path: &Path) -> Result<Existing> {
+        let wanted = Descriptor::for_file().unwrap().wanted().unwrap();
+        inspect(path, &Image::new(b"abc"), &wanted)
+    }
+
+    #[skuld::test]
+    fn nothing_at_the_name_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(matches!(inspected(&dir.path().join("none.exe")), Ok(Existing::Absent)));
+    }
+
+    #[skuld::test]
+    fn a_directory_at_the_name_is_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shim.exe");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("inside"), b"x").unwrap();
+
+        assert!(matches!(inspected(&path), Ok(Existing::Bad)));
+    }
+
+    #[skuld::test]
+    fn a_file_that_denies_reading_is_bad_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shim.exe");
+        std::fs::write(&path, b"abc").unwrap();
+        // Everyone is denied reading the data, the owner included: `File::open` is refused.
+        let denied = std::process::Command::new("icacls")
+            .arg(&path)
+            .args(["/deny", "*S-1-1-0:(RD)"])
+            .output()
+            .unwrap();
+        assert!(denied.status.success(), "{}", String::from_utf8_lossy(&denied.stdout));
+        assert!(std::fs::File::open(&path).is_err(), "the denial must refuse an open");
+
+        assert!(matches!(inspected(&path), Ok(Existing::Bad)));
+    }
+
+    #[skuld::test]
+    fn a_file_held_without_sharing_is_bad_not_an_error() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shim.exe");
+        std::fs::write(&path, b"abc").unwrap();
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        assert!(matches!(inspected(&path), Ok(Existing::Bad)));
     }
 }

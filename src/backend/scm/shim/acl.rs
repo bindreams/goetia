@@ -23,7 +23,7 @@ use std::path::PathBuf;
 #[cfg(windows)]
 pub(crate) use protected::{Descriptor, is_as_wanted};
 #[cfg(windows)]
-pub(crate) use system::read_object;
+pub(crate) use system::{is_unreadable, read_object, require_acls_under};
 
 #[cfg(windows)]
 use std::path::Path;
@@ -598,12 +598,45 @@ mod system {
         Ok(())
     }
 
+    /// What a read of an object's permissions fails with when the object holds something goetia
+    /// cannot read (an entry of a type it does not know, an account that is no SID), as opposed to
+    /// the system failing to answer. Carried as the error's source; see [`is_unreadable`].
+    #[derive(Debug)]
+    struct Unreadable(String);
+
+    impl std::fmt::Display for Unreadable {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl std::error::Error for Unreadable {}
+
+    fn unreadable(path: &Path, what: String) -> Error {
+        Error::os_at("read the permissions of", path, Unreadable(what))
+    }
+
+    /// Whether `error` is a read of permissions that failed because the object holds something
+    /// goetia cannot read, which says something about the object; any other failure says nothing.
+    pub(crate) fn is_unreadable(error: &Error) -> bool {
+        matches!(error, Error::Os { source, .. } if source.is::<Unreadable>())
+    }
+
+    /// Refuses with [`Unsafe`]'s error when the volume of `dir`, or of its first existing ancestor,
+    /// keeps no ACLs: on it no owner or permissions can be set or read back.
+    pub(crate) fn require_acls_under(dir: &Path) -> Result<()> {
+        let given = std::path::absolute(dir).map_err(|e| Error::os_at("resolve", dir, e))?;
+        let start = first_existing(&given)?;
+        let file = open(&start).map_err(|e| Error::os_at("read the permissions of", &start, e))?;
+        require_acls(file.as_raw_handle() as HANDLE, &display_path(&start))
+    }
+
     /// Copies the owner and the entries out of a security descriptor.
     ///
     /// # Safety
     /// `owner` and `dacl` are what `GetSecurityInfo` returned, and the descriptor they point into
     /// is live.
-    unsafe fn parse(owner: PSID, dacl: *mut ACL, path: &Path) -> Result<(Sid, Option<Vec<Ace>>)> {
+    pub(super) unsafe fn parse(owner: PSID, dacl: *mut ACL, path: &Path) -> Result<(Sid, Option<Vec<Ace>>)> {
         // SAFETY: the caller's contract covers `owner`.
         let owner = unsafe { copy_sid(owner, path)? };
         if dacl.is_null() {
@@ -636,10 +669,9 @@ mod system {
                 ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => true,
                 ACCESS_DENIED_ACE_TYPE | ACCESS_DENIED_CALLBACK_ACE_TYPE => false,
                 other => {
-                    return Err(Error::os_at(
-                        "read the permissions of",
+                    return Err(unreadable(
                         path,
-                        io::Error::other(format!("an entry of type {other}, which goetia cannot read")),
+                        format!("an entry of type {other}, which goetia cannot read"),
                     ));
                 }
             };
@@ -660,11 +692,7 @@ mod system {
         // SAFETY: `IsValidSid` checks the structure before `GetLengthSid` reads it; a null pointer
         // is rejected first.
         if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
-            return Err(Error::os_at(
-                "read the permissions of",
-                path,
-                io::Error::other("an account that is not a valid SID"),
-            ));
+            return Err(unreadable(path, "an account that is not a valid SID".to_string()));
         }
         // SAFETY: valid per the check above, so `GetLengthSid` bytes are readable from `sid`.
         let bytes = unsafe { std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize) };

@@ -304,7 +304,7 @@ fn bytes_that_are_not_a_sid_are_written_as_such_not_panicked_on() {
 
 #[cfg(windows)]
 mod windows {
-    use super::system::{display_path, identity_of, read_chain, resolve_target};
+    use super::system::{display_path, identity_of, is_unreadable, parse, read_chain, resolve_target};
     use super::*;
     use crate::error::Error;
     use std::io;
@@ -552,5 +552,70 @@ mod windows {
             panic!("a temp directory must be refused");
         };
         assert!(display_path(&target).starts_with(&path), "{path:?}");
+    }
+
+    /// An in-memory ACL holding one full-control entry of `ace_type` for `trustee`.
+    fn acl_with_entry(ace_type: u8, trustee: &Sid) -> Vec<u32> {
+        use windows_sys::Win32::Security::{ACL, ACL_REVISION, AddAce, InitializeAcl};
+        let mut ace = vec![0, 0];
+        ace.extend_from_slice(&((8 + trustee.len()) as u16).to_le_bytes());
+        ace.extend_from_slice(&0x1F_01FFu32.to_le_bytes());
+        ace.extend_from_slice(trustee);
+        let mut acl = vec![0u32; 64];
+        let pointer = acl.as_mut_ptr().cast::<ACL>();
+        // SAFETY: `acl` is a zeroed, 4-aligned buffer of the length passed; `ace` is as long as its
+        // header says.
+        unsafe {
+            assert_ne!(InitializeAcl(pointer, 256, ACL_REVISION), 0);
+            assert_ne!(
+                AddAce(pointer, ACL_REVISION, u32::MAX, ace.as_ptr().cast(), ace.len() as u32),
+                0
+            );
+        }
+        // `AddAce` refuses a type it does not know, so the type is written over an allowed entry's:
+        // the first entry follows the 8-byte ACL header.
+        acl[2] = (acl[2] & !0xFF) | u32::from(ace_type);
+        acl
+    }
+
+    #[skuld::test]
+    fn an_entry_goetia_cannot_read_is_told_from_a_read_that_failed() {
+        let owner = sid_from_parts(5, &[18]);
+        // A compound entry (type 4), which goetia does not read.
+        let mut acl = acl_with_entry(4, &owner);
+        let acl = acl.as_mut_ptr().cast();
+
+        // SAFETY: `owner` is a valid SID and `acl` a valid ACL, both live for the call.
+        let unreadable = unsafe { parse(owner.as_ptr() as _, acl, Path::new("f")) }.unwrap_err();
+
+        assert!(is_unreadable(&unreadable), "{unreadable:?}");
+        assert!(!is_unreadable(&Error::os_at(
+            "read the permissions of",
+            "f",
+            io::Error::other("an entry of type 4, which goetia cannot read")
+        )));
+    }
+
+    #[skuld::test]
+    fn an_entry_goetia_can_read_is_read() {
+        let owner = sid_from_parts(5, &[18]);
+        let mut acl = acl_with_entry(0, &owner);
+        let acl = acl.as_mut_ptr().cast();
+
+        // SAFETY: as above.
+        let (found, dacl) = unsafe { parse(owner.as_ptr() as _, acl, Path::new("f")) }.unwrap();
+
+        assert_eq!(found, owner);
+        assert_eq!(dacl.unwrap().len(), 1);
+    }
+
+    #[skuld::test]
+    fn an_owner_that_is_not_a_sid_is_unreadable_not_a_failed_read() {
+        let junk = [0xFFu8; 16];
+
+        // SAFETY: `junk` is readable for the call, which only validates it; a null DACL is allowed.
+        let unreadable = unsafe { parse(junk.as_ptr() as _, std::ptr::null_mut(), Path::new("f")) }.unwrap_err();
+
+        assert!(is_unreadable(&unreadable), "{unreadable:?}");
     }
 }
