@@ -1580,15 +1580,14 @@ fn load_preserves_authored_scalar_text_alongside_interpolation(#[fixture(temp_di
     // Every leaf stays the text the user wrote, all the way through
     // interpolation: nothing round-trips through a YAML value, so no scalar
     // is renormalised by a number/bool parse it never asked for.
-    write_fixture(
-        dir,
-        "id: frpc\nname: +5\ncommand: [/bin/frpc]\nenv:\n  A: 0.10\n  B: 1e3\n  \
-         C: 0x10\n  D: 0o22\n  E: True\n  F: 1.\n  G: 18446744073709551616\n  1.50: plain\n  \
-         H: ${TOKEN}\n",
-        Some("TOKEN=s3cret\n"),
-    );
+    let yaml = "id: frpc\nname: +5\ncommand: [/bin/frpc]\nenv:\n  A: 0.10\n  B: 1e3\n  \
+                C: 0x10\n  D: 0o22\n  E: True\n  F: 1.\n  G: 18446744073709551616\n  1.50: plain\n  \
+                H: ${TOKEN}\n";
+    write_fixture(dir, yaml, Some("TOKEN=s3cret\n"));
 
-    let (spec, _warnings) = load(dir).expect("manifest should load");
+    // Not as a systemd host: it refuses the key `1.50`, which no systemd unit can carry.
+    let (spec, _warnings) =
+        resolve_as(parse_manifest(yaml), dir, Some(BackendKind::Launchd)).expect("manifest should load");
     let env = &spec.env;
     assert_eq!(spec.name, "+5");
     assert_eq!(env["A"], "0.10");
