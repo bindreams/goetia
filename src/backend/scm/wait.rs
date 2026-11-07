@@ -210,11 +210,13 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
     Unconfirmed { pid: u32 },
 }
 
-/// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the exit of `held`, the service's
+/// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the end of `held`, the service's
 /// process as it was before the STOP was sent. SCM records `STOPPED` before the process exits (a shim
-/// reports it and then exits), so `STOPPED` alone leaves a file the process runs in use. `exit` waits
-/// for it under the same `deadline` and says whether it did; a process that outlasts the deadline
-/// is [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired), not an unconfirmed stop. No process
+/// reports it and then exits), so `STOPPED` alone leaves a file the process runs in use. `terminate`
+/// ends the process, as the documentation of `SetServiceStatus` allows once `SERVICE_STOPPED` is
+/// reported, and `exit` then waits for its exit under the same `deadline` and says whether it did; a
+/// process that outlasts the deadline is [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired),
+/// not an unconfirmed stop. A `terminate` that finds the process already exited is success. No process
 /// held (none reported, or none that could be opened) is the stop alone.
 ///
 /// An expired hold is sent the STOP all the same, and it ends there: SCM may have restarted the
@@ -227,6 +229,7 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     a: &mut A,
     deadline: Deadline,
     held: HoldOutcome<P>,
+    terminate: impl FnOnce(&P) -> io::Result<()>,
     exit: impl FnOnce(&P, Deadline) -> io::Result<Waited>,
 ) -> io::Result<StopAndAwaitExitOutcome<P>> {
     let held = match held {
@@ -246,12 +249,13 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     if stop_via_notify(a, deadline)? == Waited::Expired {
         return Ok(StopAndAwaitExitOutcome::ServiceExpired);
     }
-    Ok(match held {
-        Some(process) => match exit(&process, deadline)? {
-            Waited::Confirmed => StopAndAwaitExitOutcome::Stopped,
-            Waited::Expired => StopAndAwaitExitOutcome::ProcessExpired(process),
-        },
-        None => StopAndAwaitExitOutcome::Stopped,
+    let Some(process) = held else {
+        return Ok(StopAndAwaitExitOutcome::Stopped);
+    };
+    terminate(&process)?;
+    Ok(match exit(&process, deadline)? {
+        Waited::Confirmed => StopAndAwaitExitOutcome::Stopped,
+        Waited::Expired => StopAndAwaitExitOutcome::ProcessExpired(process),
     })
 }
 

@@ -515,6 +515,15 @@ impl Backend for Scm {
         super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::os(format!("start `{id}`"), e))
     }
 
+    /// With a wait, holds the service's process before the STOP, and once SCM reports the service
+    /// stopped ends that process through its handle (the documentation of `SetServiceStatus` allows
+    /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
+    /// runs is free when `stop` returns.
+    ///
+    /// The gap: if the held process crashes and Windows' recovery restarts the service before the
+    /// STOP is sent, the STOP reaches the new process, which goetia does not hold. `stop` can then
+    /// return while that process is still exiting, and an `uninstall` right after may leave the shim
+    /// file for the next sweep.
     fn stop(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
         // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
         // whatever is left of it.
@@ -531,13 +540,19 @@ impl Backend for Scm {
         // A bounded wait says nothing: the shim exits just after it reports `STOPPED`, so a wait is
         // the usual case. An unbounded one has no end that says why it is still blocked.
         let unbounded = deadline.at().is_none();
-        let outcome = super::wait::stop_and_await_exit(&mut actor, deadline, held, |held, deadline| {
-            held.wait_for_exit(deadline, || {
-                if unbounded {
-                    held.notice(id.as_str());
-                }
-            })
-        })
+        let outcome = super::wait::stop_and_await_exit(
+            &mut actor,
+            deadline,
+            held,
+            |held| held.terminate().map_err(|e| terminate_failed(held.pid(), e)),
+            |held, deadline| {
+                held.wait_for_exit(deadline, || {
+                    if unbounded {
+                        held.notice(id.as_str());
+                    }
+                })
+            },
+        )
         .map_err(|e| Error::os(format!("stop `{id}`"), e))?;
         match outcome {
             StopAndAwaitExitOutcome::Stopped => Ok(()),
@@ -1061,8 +1076,8 @@ fn hold_process_unbounded(id: &Id, not_done: &str) -> Result<Option<Held>> {
     holding(id, not_done, None, hold_if_possible_unbounded)
 }
 
-/// What [`hold_process`] and [`hold_process_unbounded`] share: `hold` run on a target observing `id`,
-/// with a failure to read SCM led by `not_done`, and `gone` when `id` is gone since it was read
+/// What [`hold_process`] and [`hold_process_unbounded`] share: `hold` run on a target for `id` whose
+/// process is opened with the rights to terminate it and to wait for its exit, with a failure to read SCM led by `not_done`, and `gone` when `id` is gone since it was read
 /// (`uninstall_locked` finds it gone too).
 fn holding<R>(
     id: &Id,
@@ -1079,8 +1094,17 @@ fn holding<R>(
         Err(Error::NotInstalled { .. }) => return Ok(gone),
         Err(e) => return Err(not_done(e)),
     };
-    let mut target = super::kill::SystemKillTarget::observing(service, id.as_str().to_string());
+    let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
     hold(&mut target).map_err(|e| not_done(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)))
+}
+
+/// The error of a terminate of the process `pid` that failed after SCM had recorded the service
+/// `STOPPED`: the service is stopped, and the error must not read as a failed stop.
+fn terminate_failed(pid: u32, e: std::io::Error) -> std::io::Error {
+    crate::error::within(
+        format!("the service is stopped, but terminating its process {pid} failed"),
+        e,
+    )
 }
 
 /// The error of a `stop` whose hold expired and whose STOP was sent with nothing held: the
@@ -1097,7 +1121,8 @@ fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
 
 impl Scm {
     /// What an uninstall does once `id` is stopped and deleted, for a service whose host was the shim
-    /// file `host`: waits, with no bound, for the process that was held (it is on its way out: SCM
+    /// file `host`: ends the process that was held, as the documentation of `SetServiceStatus`
+    /// allows once `SERVICE_STOPPED` is reported, and waits, with no bound, for it to exit (SCM
     /// recorded `STOPPED` before it exits, and a `stop` that waited has left none to hold), and for
     /// no other: a process it did not hold cannot be tied to the service it is uninstalling, and
     /// waiting for another service's stuck process would hold the install lock. Then sweeps the
@@ -1145,6 +1170,12 @@ impl Scm {
             })
         };
         if let Some(held) = held {
+            // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
+            // ended, through the handle held since before the stop.
+            if let Err(e) = held.terminate() {
+                failures.push(Error::os(format!("terminate `{id}`'s process {}", held.pid()), e).into());
+                return finish(failures);
+            }
             match held.wait_for_exit(Budget::Unbounded.start(), || held.notice(id.as_str())) {
                 Ok(Waited::Confirmed) => {}
                 Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),

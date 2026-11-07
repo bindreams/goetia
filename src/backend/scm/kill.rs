@@ -312,8 +312,7 @@ pub(in crate::backend::scm) mod system {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Services::{QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS};
     use windows_sys::Win32::System::Threading::{
-        INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        TerminateProcess, WaitForSingleObject,
+        INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
     use crate::backend::scm::wait::{
@@ -348,16 +347,6 @@ pub(in crate::backend::scm) mod system {
             }
         }
 
-        /// A target whose process is opened with the rights to wait for its exit and to read its
-        /// image, and no more: for a caller that never terminates it, which should not be refused for
-        /// lacking a right it does not use.
-        pub(in crate::backend::scm) fn observing(service: Service, id: String) -> Self {
-            Self {
-                access: PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-                ..Self::new(service, id)
-            }
-        }
-
         fn notice(&self, process: &Held) {
             process.notice(&self.id);
         }
@@ -384,6 +373,12 @@ pub(in crate::backend::scm) mod system {
 
         pub(in crate::backend::scm) fn pid(&self) -> u32 {
             self.pid
+        }
+
+        /// Ends the process through this handle, never by pid, and does not wait for it: a process
+        /// that has already exited, or is exiting, is success, and [`Self::wait_for_exit`] is the wait.
+        pub(in crate::backend::scm) fn terminate(&self) -> io::Result<()> {
+            request_termination(&self.handle).map(|_| ())
         }
 
         /// Blocks until the process has exited or `deadline` passes. [`wait_exit`] for a caller that
@@ -494,6 +489,16 @@ pub(in crate::backend::scm) mod system {
     /// `on_wait` runs once, just before blocking on a process that is terminating but has not yet
     /// exited, so a caller can tell a human why nothing returns.
     pub(super) fn terminate_process(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<Termination> {
+        match request_termination(process)? {
+            Termination::Terminated => Ok(Termination::Terminated),
+            Termination::AlreadyExited => wait_exit_unbounded(process, on_wait).map(|()| Termination::AlreadyExited),
+        }
+    }
+
+    /// Ask the process behind `process` to terminate, and do not wait: [`Termination::AlreadyExited`]
+    /// is a process that is exiting or has exited, which the caller waits on the handle for as it
+    /// needs.
+    fn request_termination(process: &OwnedHandle) -> io::Result<Termination> {
         // Exit code `1`: SCM sees a failure, the same as for a crash.
         // SAFETY: `process` is a live handle with `PROCESS_TERMINATE`.
         if unsafe { TerminateProcess(process.as_raw_handle(), 1) } != 0 {
@@ -502,11 +507,11 @@ pub(in crate::backend::scm) mod system {
         let e = io::Error::last_os_error();
         // `TerminateProcess` on a process that is already terminating fails with `ERROR_ACCESS_DENIED`
         // while its handle is not yet signalled. A denial on a handle opened with `PROCESS_TERMINATE`
-        // is therefore taken to mean 'terminating', and the exit is awaited on the handle.
+        // is therefore taken to mean 'terminating'.
         if e.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
             return Err(e);
         }
-        wait_exit_unbounded(process, on_wait).map(|()| Termination::AlreadyExited)
+        Ok(Termination::AlreadyExited)
     }
 
     /// Whether the process behind `process`, held with `SYNCHRONIZE`, has exited. A zero-timeout
