@@ -35,7 +35,7 @@ use crate::spec::{DaemonSpec, Restart, systemd_env_key_defect};
 /// `unit(&extract(&unit(spec, id)).unwrap().unwrap().spec, id)` must be
 /// byte-identical to `unit(spec, id)`.
 ///
-/// Fails with [`Error::Invalid`] only for a value systemd cannot carry; see [`refuse_unrepresentable`].
+/// Fails with [`Error::Invalid`] for the values [`refuse_unrepresentable`] lists.
 ///
 /// Emits `Type=exec` (requires systemd 240+, 2018): `systemd.service(5)` recommends it for
 /// long-running services "as it ensures that process setup errors (e.g. errors such as a missing
@@ -100,7 +100,8 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
     Ok(out)
 }
 
-/// Refuse what no encoding carries through systemd, with the measured reason.
+/// Refuse the values listed below, each with the measured reason. The list is what is refused,
+/// not everything systemd cannot carry.
 ///
 /// - The executable path of `ExecStart=` (after unquoting and specifiers) holding a backslash,
 ///   `"` or `'`: systemd refuses the whole unit with "Executable name contains special
