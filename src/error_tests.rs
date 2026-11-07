@@ -350,7 +350,7 @@ fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
         Some(Error::Blob { .. })
     ));
     assert!(matches!(
-        Error::Kept(Arc::new(loaded)).unkept().sentence().map(|s| s.error),
+        Error::Kept(Arc::new(loaded)).sentence().map(|s| s.error),
         Some(Error::Undetermined { .. })
     ));
     assert!(not_installed().sentence().map(|s| s.error).is_none());

@@ -63,11 +63,11 @@ impl fmt::Write for Sink<'_> {
 /// sits inside another's sentence is written to `Display`.
 ///
 /// Not escaped: the text lands in an error's `Display`, which the sink that prints it escapes. The
-/// report does not print a [`Sentence`](super::Sentence) through this, but writes the embedded error itself (see
-/// [`write_chain`]), so its remedies print once, last. The other
-/// users, `Occupant::Unreadable` and the SCM kill's `ReadAfterRefusedOpen`, hold `io::Error`s,
-/// which carry neither: a remedy lives on [`Error::Undetermined`] and a stderr on
-/// [`Error::Command`], and no goetia error is wrapped in an `io::Error`.
+/// report does not print a [`Sentence`](super::Sentence) through this, but writes the embedded error
+/// itself (see [`write_chain`]), so its remedies print once, last. The other users,
+/// `Occupant::Unreadable` and the SCM kill's `ReadAfterRefusedOpen`, hold `io::Error`s, which carry
+/// no remedy: a remedy lives on [`Error::Undetermined`], and no goetia error is wrapped in an
+/// `io::Error`.
 pub(crate) struct Chain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
 impl fmt::Display for Chain<'_> {

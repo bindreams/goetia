@@ -74,8 +74,8 @@ impl Reason {
         Unescaped(self)
     }
 
-    /// `Display`, written into `out`, so what a caller writes next is placed after a stderr this
-    /// ends on as the report places it.
+    /// `Display`, written into `out`, which decides how it is escaped: a caller writes what follows
+    /// into the same sink.
     pub(crate) fn write_to(&self, out: &mut Sink) -> fmt::Result {
         let mut remedies = Vec::new();
         match self {

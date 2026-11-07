@@ -412,7 +412,7 @@ pub enum Error {
     /// launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", loaded_state_in_doubt(id, read_failed, restore_failed.is_some()))]
+    #[error("{}", OwnSentence(self))]
     LoadedStateInDoubt {
         id: String,
         read_failed: Box<Error>,
@@ -473,7 +473,7 @@ pub enum Error {
     /// A `start` was judged as a `type: managed` service's, because the service's spec blob could not
     /// be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
     /// `source` is the failed start.
-    #[error("{}", start_as_managed_message(blob))]
+    #[error("{}", OwnSentence(self))]
     StartAsManaged {
         blob: Arc<Error>,
         #[source]
@@ -598,8 +598,8 @@ impl Error {
     /// The sentence this error's `Display` is, when it has an error set in it, which is not its
     /// [`source`](std::error::Error::source). [`report`](Error::report) writes that error itself,
     /// so its remedies print last: a variant that writes an error into its message must build the
-    /// message as a [`Sentence`] and return it here. A [`Kept`](Error::Kept) error is read through
-    /// [`unkept`](Error::unkept) first.
+    /// message as a [`Sentence`] and return it here, which its `Display` then writes. A
+    /// [`Kept`](Error::Kept) error answers as the error it holds.
     ///
     /// Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
     /// be classified here before it compiles.
@@ -650,8 +650,7 @@ impl Error {
             | Error::UnsupportedPlatform { .. }
             | Error::AccountLookup { .. }
             | Error::AlreadyExists { .. } => None,
-            // Read through `unkept`, as `report` does.
-            Error::Kept(_) => None,
+            Error::Kept(kept) => kept.sentence(),
         }
     }
 
@@ -692,10 +691,12 @@ impl Error {
         }
     }
 
-    /// The diagnostic of a failed [`Command`](Error::Command), which `Display` leaves out.
+    /// The diagnostic of a failed [`Command`](Error::Command), which `Display` leaves out. A
+    /// [`Kept`](Error::Kept) error answers as the error it holds.
     pub(crate) fn stderr(&self) -> Option<&str> {
         match self {
             Error::Command { stderr, .. } => Some(stderr),
+            Error::Kept(kept) => kept.stderr(),
             _ => None,
         }
     }
@@ -928,6 +929,21 @@ pub(crate) struct Sentence<'a> {
 impl fmt::Display for Sentence<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}{}{}", self.before, Chain(self.error), self.after)
+    }
+}
+
+/// The `Display` of the variants that write an error into their message: [`Error::sentence`] is
+/// their one mapping from fields to message.
+struct OwnSentence<'a>(&'a Error);
+
+impl fmt::Display for OwnSentence<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sentence = self.0.sentence();
+        debug_assert!(sentence.is_some(), "{:?} has no sentence", self.0);
+        match sentence {
+            Some(sentence) => sentence.fmt(f),
+            None => Ok(()),
+        }
     }
 }
 
