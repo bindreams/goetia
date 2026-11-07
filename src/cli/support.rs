@@ -19,32 +19,30 @@ pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<DaemonSp
     Ok(spec)
 }
 
-/// `prefix` and then what `body` writes through a [`Sink`], which escapes it and starts every
-/// line goetia continues after a child's stderr with `prefix` again. `prefix` is written as it is.
+/// `prefix` and then what `body` writes through a [`Sink`], which escapes it. `prefix` is written
+/// as it is: the caller has escaped it.
 pub(super) fn render_line(prefix: &str, body: impl FnOnce(&mut Sink) -> fmt::Result) -> String {
     let mut line = prefix.to_string();
-    body(&mut Sink::new(&mut line, true).continuing_with(prefix)).expect("writing to a String cannot fail");
+    body(&mut Sink::new(&mut line, true)).expect("writing to a String cannot fail");
     line
 }
 
-/// Writes one line to `err`: `label: ` and `scope: ` (when there is one), then `body`, which
-/// continues under the same prefix. Every human line of `error:` and `warning:` goes through here,
-/// so none can forget to escape or to keep its prefix on a continuation.
+/// Writes one line to `err`: `label: ` and `scope: ` (when there is one), then `body`. The scope
+/// and what `body` writes through its [`Sink`] are escaped; `label` is written as it is.
 pub(crate) fn print_line(
     err: &mut dyn Write,
     label: &str,
     scope: Option<&str>,
     body: impl FnOnce(&mut Sink) -> fmt::Result,
 ) {
-    let _ = writeln!(err, "{}", render_line(&line_prefix(label, scope), body));
+    let _ = writeln!(err, "{}", render_line(&line_prefix(Some(label), scope), body));
 }
 
-/// `label: ` and, when there is a `scope`, its escaped text and `: `.
-fn line_prefix(label: &str, scope: Option<&str>) -> String {
-    match scope {
-        Some(scope) => format!("{label}: {}: ", escape(scope)),
-        None => format!("{label}: "),
-    }
+/// `label: ` and `scope: `, each when there is one; the scope's text is escaped.
+pub(super) fn line_prefix(label: Option<&str>, scope: Option<&str>) -> String {
+    let label = label.map(|label| format!("{label}: "));
+    let scope = scope.map(|scope| format!("{}: ", escape(scope)));
+    label.into_iter().chain(scope).collect()
 }
 
 /// Writes `error: [id: ]what` and the report of `e`, which says what failed; `what` is goetia's

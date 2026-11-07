@@ -108,8 +108,8 @@ fn a_report_leaves_a_windows_path_and_a_persian_name_as_written() {
     );
 }
 
-/// A child's diagnostic is multi-line by nature: the report keeps its line feeds and tabs, indents
-/// the lines after the first, and the variant's own text holds none of it.
+/// A child's diagnostic is multi-line by nature: the report keeps its line feeds and tabs at
+/// column 0, and the variant's own text holds none of it.
 #[skuld::test]
 fn a_commands_stderr_keeps_its_layout_and_loses_the_rest_of_the_set() {
     let e = command("first\n\tsecond\u{1b}[31m\u{202e}\r");
@@ -120,10 +120,9 @@ fn a_commands_stderr_keeps_its_layout_and_loses_the_rest_of_the_set() {
     assert_eq!(
         e.report().to_string(),
         format!(
-            r"`systemctl start x` failed ({}): first{}{}second\u{{1b}}[31m\u{{202e}}\u{{d}}",
+            r"`systemctl start x` failed ({}): first{}second\u{{1b}}[31m\u{{202e}}\u{{d}}",
             exit_status(1),
-            "\n  ",
-            "\t"
+            "\n\t"
         )
     );
 }
@@ -157,30 +156,7 @@ fn a_chain_leaves_escaping_to_the_sink_and_a_reason_is_one() {
 #[skuld::test]
 fn a_commands_stderr_keeps_a_carriage_return_that_ends_a_line() {
     let text = command("one\r\ntwo\rthree").report().to_string();
-    assert!(text.ends_with(concat!(": one\r\n  two", r"\u{d}", "three")), "{text:?}");
-}
-
-/// Goetia's own lines start at column 0, so no line of a child's stderr after the first may: a
-/// stderr that says `error: ...` would otherwise read as goetia saying it.
-#[skuld::test]
-fn no_line_of_a_commands_stderr_starts_where_goetias_own_lines_do() {
-    let e = command("first\nerror: forged\n\n\tindented\r\nwarning: forged");
-    let text = e.report().to_string();
-    let lines: Vec<&str> = text.split('\n').collect();
-    assert_eq!(lines.len(), 5, "{text:?}");
-    for line in &lines[1..] {
-        assert!(
-            line.trim_end_matches('\r').is_empty() || line.starts_with("  "),
-            "{line:?} in {text:?}"
-        );
-    }
-    assert!(text.contains("\n  error: forged\n"), "{text:?}");
-    // Written for JSON, the text is as it came.
-    assert!(
-        e.report_unescaped()
-            .to_string()
-            .ends_with("first\nerror: forged\n\n\tindented\r\nwarning: forged")
-    );
+    assert!(text.ends_with(concat!(": one\r\ntwo", r"\u{d}", "three")), "{text:?}");
 }
 
 /// A [`Reason`] prints as the report does, a child's stderr included.
@@ -188,93 +164,12 @@ fn no_line_of_a_commands_stderr_starts_where_goetias_own_lines_do() {
 fn a_reason_wrapping_a_command_error_prints_its_stderr_as_the_report_does() {
     let e = command("first\nsecond");
     let expected = e.report().to_string();
-    assert!(expected.ends_with(": first\n  second"), "{expected:?}");
+    assert!(expected.ends_with(": first\nsecond"), "{expected:?}");
     assert_eq!(Reason::failed(e).to_string(), expected);
 }
 
-/// Goetia's own text never continues on a line of a child's stderr: after a multi-line block it
-/// starts a line of its own, whichever part of the report it is.
-#[skuld::test]
-fn goetias_text_after_a_stderr_block_starts_a_new_line() {
-    let status = exit_status(1);
-    let block = format!("`systemctl start x` failed ({status}): a\n  b");
-
-    // A `Both`'s `; then:`.
-    let both = Error::Both {
-        first: Box::new(command("a\nb")),
-        then: Box::new(os("read", "/p", "denied")),
-    };
-    assert_eq!(
-        both.report().to_string(),
-        format!("{block}\n; then: failed to read /p: denied")
-    );
-
-    // A remedy.
-    let remedied = Error::Both {
-        first: Box::new(undetermined("re-run as root")),
-        then: Box::new(command("a\nb")),
-    };
-    assert!(
-        remedied
-            .report()
-            .to_string()
-            .ends_with(&format!("{block}\n. re-run as root")),
-        "{}",
-        remedied.report()
-    );
-
-    // An `Around` reason's `after`, and then its remedy.
-    let around = Reason::around(
-        "while starting: ",
-        Error::Both {
-            first: Box::new(undetermined("re-run as root")),
-            then: Box::new(command("a\nb")),
-        },
-        " (see above)",
-    );
-    assert!(
-        around
-            .to_string()
-            .ends_with(&format!("{block}\n (see above). re-run as root")),
-        "{around}"
-    );
-
-    // The `: source` chain.
-    let sourced = Error::StartAsManaged {
-        blob: Arc::new(command("a\nb")),
-        source: Box::new(os("start", "/q", "stopped")),
-    };
-    assert!(
-        sourced
-            .report()
-            .to_string()
-            .ends_with("\n): failed to start /q: stopped"),
-        "{}",
-        sourced.report()
-    );
-}
-
-/// A one-line stderr has no indented line, so what follows it stays on its line; a block that
-/// already ends in a line feed needs no second one.
-#[skuld::test]
-fn only_a_block_that_does_not_end_the_line_breaks_it() {
-    let status = exit_status(1);
-    let both = |stderr| Error::Both {
-        first: Box::new(command(stderr)),
-        then: Box::new(os("read", "/p", "denied")),
-    };
-    assert_eq!(
-        both("a").report().to_string(),
-        format!("`systemctl start x` failed ({status}): a; then: failed to read /p: denied")
-    );
-    assert_eq!(
-        both("a\nb\n").report().to_string(),
-        format!("`systemctl start x` failed ({status}): a\n  b\n; then: failed to read /p: denied")
-    );
-}
-
 /// An error set inside another's sentence is written as the report writes any error: its stderr
-/// keeps its layout, and the rest of the sentence starts a line of its own.
+/// keeps its layout, and the rest of the sentence continues after it.
 #[skuld::test]
 fn an_embedded_errors_stderr_keeps_its_layout() {
     let status = exit_status(1);
@@ -285,7 +180,7 @@ fn an_embedded_errors_stderr_keeps_its_layout() {
     let text = e.report().to_string();
     assert!(
         text.contains(&format!(
-            "judged as a `type: managed` service's (`systemctl start x` failed ({status}): a\n  error: forged\n): "
+            "judged as a `type: managed` service's (`systemctl start x` failed ({status}): a\nerror: forged): "
         )),
         "{text:?}"
     );
@@ -297,21 +192,13 @@ fn an_embedded_errors_stderr_keeps_its_layout() {
     let text = e.report().to_string();
     assert!(
         text.contains(&format!(
-            "(`systemctl start x` failed ({status}): a\n  b\n), so goetia cannot tell"
+            "(`systemctl start x` failed ({status}): a\nb), so goetia cannot tell"
         )),
         "{text:?}"
     );
     // `Display` and the report for JSON keep it as it came.
     assert!(e.to_string().contains(": a\nb), so goetia"), "{e}");
     assert!(e.report_unescaped().to_string().contains(": a\nb), so goetia"));
-}
-
-/// The report as written into a sink whose lines start with `prefix`, as the CLI's `error:` lines do.
-fn under(prefix: &str, e: &Error) -> String {
-    let mut text = String::new();
-    e.write_report(&mut Sink::new(&mut text, true).continuing_with(prefix))
-        .expect("writing to a String cannot fail");
-    text
 }
 
 /// A kept error is handed out as it was: a kept `Both` prints both halves, and a remedy in either.
@@ -328,75 +215,6 @@ fn a_kept_both_prints_both_halves_and_its_remedies() {
     assert_eq!(kept.report().to_string(), expected);
     let twice = Error::Kept(Arc::new(kept));
     assert_eq!(twice.report().to_string(), expected);
-}
-
-/// After a stderr block, goetia's continuation starts with the prefix the message's first line has,
-/// so a script that keeps the `error:` lines keeps the second failure and the remedy.
-#[skuld::test]
-fn goetias_continuation_after_a_stderr_block_starts_with_the_messages_prefix() {
-    let status = exit_status(1);
-    let block = format!("`systemctl start x` failed ({status}): a\n  b");
-    let prefix = "error: frpc: ";
-
-    let both = Error::Both {
-        first: Box::new(command("a\nb")),
-        then: Box::new(os("read", "/p", "denied")),
-    };
-    assert_eq!(
-        under(prefix, &both),
-        format!("{block}\n{prefix}; then: failed to read /p: denied")
-    );
-
-    let remedied = Error::Both {
-        first: Box::new(undetermined("re-run as root")),
-        then: Box::new(command("a\nb")),
-    };
-    assert!(
-        under(prefix, &remedied).ends_with(&format!("{block}\n{prefix}. re-run as root")),
-        "{}",
-        under(prefix, &remedied)
-    );
-
-    let sourced = Error::StartAsManaged {
-        blob: Arc::new(command("a\nb")),
-        source: Box::new(os("start", "/q", "stopped")),
-    };
-    assert!(
-        under(prefix, &sourced).ends_with(&format!("\n{prefix}): failed to start /q: stopped")),
-        "{}",
-        under(prefix, &sourced)
-    );
-
-    // A line that has no stderr block before it is not a continuation.
-    let plain = os("read", "/p", "denied");
-    assert_eq!(under(prefix, &plain), plain.report().to_string());
-
-    // The unescaped writer keeps the text as it came and adds nothing.
-    let mut raw = String::new();
-    both.write_report(&mut Sink::new(&mut raw, false).continuing_with(prefix))
-        .unwrap();
-    assert_eq!(raw, both.report_unescaped().to_string());
-}
-
-/// A reason around an error is one sentence, written as an error's own sentence is.
-#[skuld::test]
-fn a_reason_around_an_error_continues_under_the_prefix_too() {
-    let around = Reason::around(
-        "while starting: ",
-        Error::Both {
-            first: Box::new(undetermined("re-run as root")),
-            then: Box::new(command("a\nb")),
-        },
-        " (see above)",
-    );
-    let mut text = String::new();
-    around
-        .write_to(&mut Sink::new(&mut text, true).continuing_with("warning: x: "))
-        .unwrap();
-    assert!(
-        text.ends_with("a\n  b\nwarning: x:  (see above). re-run as root"),
-        "{text:?}"
-    );
 }
 
 /// An error's `Display` is its sentence, so the report and `Display` cannot word it differently.

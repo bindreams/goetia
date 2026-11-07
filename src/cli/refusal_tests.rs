@@ -125,7 +125,7 @@ fn what_a_refusal_quotes_is_escaped_so_the_line_stays_one_line() {
 }
 
 /// A reason holding a command's stderr prints as `list` prints it: the line strict, the stderr in
-/// the layout, and goetia's recovery on a line of its own after it.
+/// the layout, and goetia's recovery continuing after it.
 #[skuld::test]
 fn an_unusable_refusal_writes_a_childs_stderr_in_the_layout() {
     let command = Error::Command {
@@ -135,13 +135,12 @@ fn an_unusable_refusal_writes_a_childs_stderr_in_the_layout() {
     };
     let reason = Reason::failed(command);
     let shown = reason.to_string();
-    assert!(shown.ends_with("first\n  error: forged\\u{1b}[31m"), "{shown:?}");
+    assert!(shown.ends_with("first\nerror: forged\\u{1b}[31m"), "{shown:?}");
     for mood in [Mood::Done, Mood::Would] {
         let (_, out, err) = reported(mood, |lines, out, err| {
             lines.unusable(&reason, Some("uninstall it"), out, err)
         });
-        // After the block, goetia's words continue under the prefix of the stream's own line.
-        let line = |prefix: &str| format!("{prefix}{}: {shown}\n{prefix}. uninstall it\n", refused(mood));
+        let line = |prefix: &str| format!("{prefix}{}: {shown}. uninstall it\n", refused(mood));
         assert_eq!(out, line("frpc: "), "{mood:?}");
         assert_eq!(err, line("error: frpc: "), "{mood:?}");
     }
@@ -158,26 +157,26 @@ fn only_a_conflict_or_a_refusal_is_a_refusal() {
     let create = Outcome::Create;
     assert!(matches!(
         lines.refusal(&create, &mut out, &mut err),
-        Err(NotRefused::Create)
+        ControlFlow::Continue(NotRefused::Create)
     ));
     let up_to_date = Outcome::UpToDate;
     assert!(matches!(
         lines.refusal(&up_to_date, &mut out, &mut err),
-        Err(NotRefused::UpToDate)
+        ControlFlow::Continue(NotRefused::UpToDate)
     ));
     let update = Outcome::Update {
         spec_diff: "d".to_string(),
     };
     assert!(matches!(
         lines.refusal(&update, &mut out, &mut err),
-        Err(NotRefused::Update { spec_diff: "d" })
+        ControlFlow::Continue(NotRefused::Update { spec_diff: "d" })
     ));
     let stale = Outcome::Stale {
         from_version: "0".to_string(),
     };
     assert!(matches!(
         lines.refusal(&stale, &mut out, &mut err),
-        Err(NotRefused::Stale { from_version: "0" })
+        ControlFlow::Continue(NotRefused::Stale { from_version: "0" })
     ));
     assert!(out.is_empty() && err.is_empty());
     for (outcome, code) in [
@@ -209,7 +208,7 @@ fn only_a_conflict_or_a_refusal_is_a_refusal() {
         ),
     ] {
         assert!(
-            matches!(lines.refusal(&outcome, &mut out, &mut err), Ok(c) if c == code),
+            matches!(lines.refusal(&outcome, &mut out, &mut err), ControlFlow::Break(c) if c == code),
             "{outcome:?}"
         );
     }

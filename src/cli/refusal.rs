@@ -6,11 +6,12 @@
 
 use std::fmt::{self, Write as _};
 use std::io::Write;
+use std::ops::ControlFlow;
 
 use super::ExitCode;
-use super::support::render_line;
+use super::support::{line_prefix, render_line};
 use crate::decide::{self, Outcome};
-use crate::error::{Reason, Sink, escape};
+use crate::error::{Reason, Sink};
 use crate::spec::Id;
 
 /// Whether the outcome happened or is the one the command would meet: `install` says `refused`,
@@ -21,11 +22,6 @@ pub(super) enum Mood {
     Would,
 }
 
-/// Writes the line of a conflict or a refusal of `id`, and returns its exit code. The line goes to
-/// `out` with the diff under it, and to `err` as `error: <line>`, so a script that only captures
-/// stderr still learns of it. A line a child's stderr breaks continues under its own prefix
-/// (`frpc: ` on `out`, `error: frpc: ` on `err`).
-///
 /// An [`Outcome`] that is neither a conflict nor a refusal: the caller reports it.
 pub(super) enum NotRefused<'a> {
     Create,
@@ -34,25 +30,28 @@ pub(super) enum NotRefused<'a> {
     Stale { from_version: &'a str },
 }
 
-/// A line is written as [`Error::report`](crate::error::Error::report) writes an error: goetia's
-/// own words through the strict writer, since the `recovery` and the id come from the artifact and
-/// the host and a line feed in either would start a line of its own, and a `reason`'s child's
-/// stderr in the layout, with goetia's words after it on a line of their own.
+/// The lines of a conflict or a refusal of `id`. A line is written as
+/// [`Error::report`](crate::error::Error::report) writes an error: goetia's own words through the
+/// strict writer, since the `recovery` and the id come from the artifact and the host and a line
+/// feed in either would start a line of its own, and a `reason`'s child's stderr with its layout.
 pub(super) struct Lines<'a> {
     pub(super) id: &'a Id,
     pub(super) mood: Mood,
 }
 
 impl Lines<'_> {
-    /// Writes the line of `outcome` when it is a conflict or a refusal and returns its exit code;
-    /// writes nothing and returns the outcome for every other one.
+    /// For a conflict or a refusal: writes its line and breaks with the exit code. The line goes
+    /// to `out` with the diff under it, and to `err` as `error: <line>`, so a script that only
+    /// captures stderr still learns of it. Any other outcome writes nothing and continues with
+    /// what the caller reports. Matches every [`Outcome`], so the compiler checks that none is
+    /// missed.
     pub(super) fn refusal<'o>(
         &self,
         outcome: &'o Outcome,
         out: &mut dyn Write,
         err: &mut dyn Write,
-    ) -> Result<ExitCode, NotRefused<'o>> {
-        Ok(match outcome {
+    ) -> ControlFlow<ExitCode, NotRefused<'o>> {
+        ControlFlow::Break(match outcome {
             Outcome::Conflict {
                 artifact_diff,
                 unclearable_recovery,
@@ -60,10 +59,10 @@ impl Lines<'_> {
             Outcome::RefuseForeign { recovery } => self.foreign(recovery, out, err),
             Outcome::RefuseOtherDaemon { installed } => self.other_daemon(installed, out, err),
             Outcome::RefuseUnusable { reason, recovery } => self.unusable(reason, recovery.as_deref(), out, err),
-            Outcome::Create => return Err(NotRefused::Create),
-            Outcome::UpToDate => return Err(NotRefused::UpToDate),
-            Outcome::Update { spec_diff } => return Err(NotRefused::Update { spec_diff }),
-            Outcome::Stale { from_version } => return Err(NotRefused::Stale { from_version }),
+            Outcome::Create => return ControlFlow::Continue(NotRefused::Create),
+            Outcome::UpToDate => return ControlFlow::Continue(NotRefused::UpToDate),
+            Outcome::Update { spec_diff } => return ControlFlow::Continue(NotRefused::Update { spec_diff }),
+            Outcome::Stale { from_version } => return ControlFlow::Continue(NotRefused::Stale { from_version }),
         })
     }
 
@@ -120,12 +119,12 @@ impl Lines<'_> {
     }
 
     /// Writes the line `body` writes, led by the id, to both streams: to `out` with `diff` under
-    /// it, and to `err` as `error: <line>`. Each stream's line continues under its own prefix.
+    /// it, and to `err` as `error: <line>`.
     fn emit(&self, diff: &str, out: &mut dyn Write, err: &mut dyn Write, body: impl Fn(&mut Sink) -> fmt::Result) {
-        let scope = format!("{}: ", escape(self.id.as_str()));
-        let _ = writeln!(out, "{}", render_line(&scope, &body));
+        let id = Some(self.id.as_str());
+        let _ = writeln!(out, "{}", render_line(&line_prefix(None, id), &body));
         let _ = write!(out, "{diff}");
-        let _ = writeln!(err, "{}", render_line(&format!("error: {scope}"), &body));
+        let _ = writeln!(err, "{}", render_line(&line_prefix(Some("error"), id), &body));
     }
 }
 

@@ -24,67 +24,33 @@ pub(super) fn write_report(e: &Error, out: &mut Sink) -> fmt::Result {
     write_remedies(out, &remedies)
 }
 
-const LAYOUT_INDENT: &str = "  ";
-
 /// Where error text goes. The one place it is written for a person is [`write_chain`], so the one
 /// place it is escaped: `escaped` is whether this destination is one. The text goes through
 /// [`fmt::Write`], which escapes it whole; a child's stderr is written with
-/// [`write_layout`](Sink::write_layout), which keeps its line feeds and tabs. Whatever goetia
-/// writes after a stderr of several lines starts a line of its own, headed by `continuation`: the
-/// prefix the message's first line has (`error: frpc: `), so a reader that keeps the lines of one
-/// kind keeps all of it.
+/// [`write_layout`](Sink::write_layout), which keeps its line feeds and tabs.
 pub(crate) struct Sink<'a> {
     out: &'a mut dyn fmt::Write,
     escaped: bool,
-    continuation: &'a str,
-    /// A stderr of several lines was the last thing written, and did not end its line: the next
-    /// write must not continue it.
-    break_before_next: bool,
 }
 
 impl<'a> Sink<'a> {
     pub(crate) fn new(out: &'a mut dyn fmt::Write, escaped: bool) -> Self {
-        Sink {
-            out,
-            escaped,
-            continuation: "",
-            break_before_next: false,
-        }
+        Sink { out, escaped }
     }
 
-    /// Starts each line goetia continues after a stderr with `prefix`, written as it is: the
-    /// caller has escaped it.
-    #[cfg(feature = "cli")]
-    pub(crate) fn continuing_with(mut self, prefix: &'a str) -> Self {
-        self.continuation = prefix;
-        self
-    }
-
-    /// Writes `text`, a child's diagnostic. For a person it keeps its line breaks and tabs, and
-    /// indents every line after the first, so that no line of it starts where goetia's own lines do
-    /// (a stderr of `error: ...` is not goetia saying it). A blank line has nothing to indent.
+    /// Writes `text`, a child's diagnostic, as it is laid out: for a person its line feeds, tabs
+    /// and CRLFs are kept and the rest of the escaped set is escaped.
     fn write_layout(&mut self, text: &str) -> fmt::Result {
-        if !self.escaped {
-            return self.out.write_str(text);
+        if self.escaped {
+            write_escaped_keeping_layout(self.out, text)
+        } else {
+            self.out.write_str(text)
         }
-        for (i, line) in text.split_inclusive('\n').enumerate() {
-            if i > 0 && !matches!(line, "\n" | "\r\n") {
-                self.out.write_str(LAYOUT_INDENT)?;
-            }
-            write_escaped_keeping_layout(self.out, line)?;
-        }
-        self.break_before_next = text.contains('\n') && !text.ends_with('\n');
-        Ok(())
     }
 }
 
 impl fmt::Write for Sink<'_> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        if self.break_before_next && !text.is_empty() {
-            self.break_before_next = false;
-            self.out.write_str("\n")?;
-            self.out.write_str(self.continuation)?;
-        }
         if self.escaped {
             write_escaped(self.out, text)
         } else {
@@ -98,7 +64,7 @@ impl fmt::Write for Sink<'_> {
 ///
 /// Not escaped: the text lands in an error's `Display`, which the sink that prints it escapes. The
 /// report does not print a [`Sentence`](super::Sentence) through this, but writes the embedded error itself (see
-/// [`write_chain`]), so its remedies print once, last, and its stderr keeps its layout. The other
+/// [`write_chain`]), so its remedies print once, last. The other
 /// users, `Occupant::Unreadable` and the SCM kill's `ReadAfterRefusedOpen`, hold `io::Error`s,
 /// which carry neither: a remedy lives on [`Error::Undetermined`] and a stderr on
 /// [`Error::Command`], and no goetia error is wrapped in an `io::Error`.
@@ -149,7 +115,7 @@ pub(super) fn write_chain<'a>(
 }
 
 /// Writes `sentence`: its error is written as any error is, so its remedies are collected into
-/// `remedies` and its stderr keeps its layout.
+/// `remedies`.
 pub(super) fn write_sentence<'a>(sentence: Sentence<'a>, out: &mut Sink, remedies: &mut Vec<&'a str>) -> fmt::Result {
     out.write_str(&sentence.before)?;
     write_chain(sentence.error, out, remedies)?;

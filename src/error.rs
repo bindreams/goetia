@@ -412,7 +412,7 @@ pub enum Error {
     /// launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", self.sentence().expect("`LoadedStateInDoubt` is a sentence"))]
+    #[error("{}", loaded_state_in_doubt(id, read_failed, restore_failed.is_some()))]
     LoadedStateInDoubt {
         id: String,
         read_failed: Box<Error>,
@@ -473,7 +473,7 @@ pub enum Error {
     /// A `start` was judged as a `type: managed` service's, because the service's spec blob could not
     /// be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
     /// `source` is the failed start.
-    #[error("{}", self.sentence().expect("`StartAsManaged` is a sentence"))]
+    #[error("{}", start_as_managed_message(blob))]
     StartAsManaged {
         blob: Arc<Error>,
         #[source]
@@ -597,8 +597,9 @@ impl Error {
 
     /// The sentence this error's `Display` is, when it has an error set in it, which is not its
     /// [`source`](std::error::Error::source). [`report`](Error::report) writes that error itself,
-    /// so its stderr keeps its layout and its remedies print last: a variant that writes an error
-    /// into its message must build the message as a [`Sentence`] and return it here.
+    /// so its remedies print last: a variant that writes an error into its message must build the
+    /// message as a [`Sentence`] and return it here. A [`Kept`](Error::Kept) error is read through
+    /// [`unkept`](Error::unkept) first.
     ///
     /// Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
     /// be classified here before it compiles.
@@ -610,7 +611,6 @@ impl Error {
                 restore_failed,
             } => Some(loaded_state_in_doubt(id, read_failed, restore_failed.is_some())),
             Error::StartAsManaged { blob, .. } => Some(start_as_managed_message(blob)),
-            Error::Kept(kept) => kept.sentence(),
             Error::Os { .. }
             | Error::Command { .. }
             | Error::Spawn { .. }
@@ -650,6 +650,8 @@ impl Error {
             | Error::UnsupportedPlatform { .. }
             | Error::AccountLookup { .. }
             | Error::AlreadyExists { .. } => None,
+            // Read through `unkept`, as `report` does.
+            Error::Kept(_) => None,
         }
     }
 
@@ -658,7 +660,7 @@ impl Error {
     /// `first; then: then`. What the CLI prints: [`Display`](fmt::Display) alone is the outermost
     /// context. The control and direction characters of what an error quotes are written as
     /// `\u{XXXX}`, as the CLI's other human sinks write them; a child's stderr keeps its line feeds
-    /// and tabs, and what follows one of several lines starts a line of its own.
+    /// and tabs.
     pub fn report(&self) -> impl fmt::Display + '_ {
         Report {
             error: self,
@@ -676,8 +678,7 @@ impl Error {
         }
     }
 
-    /// Writes [`report`](Error::report) into `out`, which decides how it is escaped and what
-    /// starts the lines goetia continues after a child's stderr.
+    /// Writes [`report`](Error::report) into `out`, which decides how it is escaped.
     #[cfg(feature = "cli")]
     pub(crate) fn write_report(&self, out: &mut Sink) -> fmt::Result {
         report::write_report(self, out)
@@ -695,7 +696,6 @@ impl Error {
     pub(crate) fn stderr(&self) -> Option<&str> {
         match self {
             Error::Command { stderr, .. } => Some(stderr),
-            Error::Kept(kept) => kept.stderr(),
             _ => None,
         }
     }

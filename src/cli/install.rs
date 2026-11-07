@@ -4,6 +4,7 @@
 //! control character, U+2028, U+2029 or a bidirectional control: see [`super::show`], guarantee 4.
 
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
@@ -138,8 +139,8 @@ pub fn run(
 fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let lines = Lines { id, mood: Mood::Done };
     let settled = match lines.refusal(outcome, out, err) {
-        Ok(code) => return code,
-        Err(settled) => settled,
+        ControlFlow::Break(code) => return code,
+        ControlFlow::Continue(settled) => settled,
     };
     match settled {
         NotRefused::Create => {

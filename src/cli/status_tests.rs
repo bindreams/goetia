@@ -47,7 +47,7 @@ fn a_failed_commands_stderr_is_printed_as_the_report_prints_it() {
     assert!(
         e.report()
             .to_string()
-            .ends_with(concat!(": first\n  error: forged", r"\u{1b}"))
+            .ends_with(concat!(": first\nerror: forged", r"\u{1b}"))
     );
     assert_eq!(
         report.errors[0].message,
