@@ -769,6 +769,24 @@ fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "no provider is consulted");
 }
 
+/// A stop whose hold expired and whose STOP was sent is the wait that ran out, led by the process SCM
+/// still named.
+#[skuld::test]
+fn an_unconfirmed_stop_names_the_process_scm_still_named_and_is_a_wait_timeout() {
+    let budget = Budget::Bounded(std::time::Duration::from_secs(5));
+
+    let error = unconfirmed_stop(&Id::try_from("frpc").unwrap(), 4242, budget);
+
+    assert_eq!(
+        error.report().to_string(),
+        "SCM still named process 4242 as `frpc`'s when the time ran out, and that process was gone, so the STOP sent \
+         after it may have reached another: `frpc` did not report stopped within 5s: goetia stopped waiting. The \
+         request was not cancelled, so `frpc` may still reach stopped; `goetia daemon status frpc` shows the \
+         manager's current view. Allow longer with `--timeout <duration>`, or wait indefinitely with `--no-timeout`."
+    );
+    assert!(error.is_indeterminate());
+}
+
 // uninstall's failures ================================================================================================
 
 fn uninstall_failure(state: &UninstallFailure) -> String {

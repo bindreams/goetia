@@ -22,8 +22,8 @@ use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 use crate::backend::scm::exit_status::RecordedExit;
 
 use super::{
-    Armed, Cancelled, Deadline, Observed, QueriedState, QueriedStatus, Registration, SERVICE_ACCEPT_STOP, StartReply,
-    WantState,
+    Armed, Cancelled, ControlStopOutcome, Deadline, Observed, QueriedState, QueriedStatus, Registration,
+    SERVICE_ACCEPT_STOP, StartReply, WantState,
 };
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
@@ -354,13 +354,13 @@ impl super::ScmActor for SystemScmActor {
         Ok(Armed::Registered(super::ScmActor::query_status(self)?))
     }
 
-    fn control_stop(&mut self) -> io::Result<()> {
+    fn control_stop(&mut self) -> io::Result<ControlStopOutcome> {
         let mut status = SERVICE_STATUS::default();
         // SAFETY: `self.service()?.raw_handle()` was opened with
         // `SERVICE_STOP` access; `status` is a valid, aligned out-param.
         let ok = unsafe { ControlService(self.service()?.raw_handle(), SERVICE_CONTROL_STOP, &mut status) };
         if ok != 0 {
-            return Ok(());
+            return Ok(ControlStopOutcome::Delivered);
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
@@ -370,7 +370,7 @@ impl super::ScmActor for SystemScmActor {
             // nothing and has nothing left to wait for; under
             // `stop_via_notify` the arm that follows reads `STOPPED`
             // and the wait completes on it.
-            Some(code) if code as u32 == ERROR_SERVICE_NOT_ACTIVE => Ok(()),
+            Some(code) if code as u32 == ERROR_SERVICE_NOT_ACTIVE => Ok(ControlStopOutcome::NotActive),
             _ => Err(err),
         }
     }

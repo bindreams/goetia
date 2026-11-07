@@ -258,19 +258,41 @@ fn await_scm_released_unbounded<T: KillTarget>(target: &mut T, pid: u32) -> io::
     }
 }
 
-/// [`hold_service_process`] for a caller that only wants the process to wait on: the process if it
-/// can be held, and `None` for a service with no process and for one whose process SCM vouches for
-/// but cannot be opened (a right removed by policy). The caller goes on without it; what that
-/// process runs is still found by its image. A failure to read SCM is still an error, and so is an
-/// expiry: neither says anything about the process, and what an expiry means is the caller's to say.
+/// How [`hold_if_possible`] ended, when SCM could be read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HoldOutcome<P> {
+    /// The service's process, held.
+    Held(P),
+    /// A service with no process, or one whose process SCM vouches for but cannot be opened (a right
+    /// removed by policy): the caller goes on without it, and what that process runs is still found
+    /// by its image.
+    NoProcess,
+    /// SCM still reported `pid`, whose process is gone, when the deadline ran out. There is nothing
+    /// to wait on, and what that means is the caller's.
+    Expired { pid: u32 },
+}
+
+/// [`hold_service_process`] for a caller that only wants the process to wait on. A failure to read
+/// SCM is an error: it says nothing about the process.
 pub(crate) fn hold_if_possible<T: KillTarget>(
     target: &mut T,
     deadline: Deadline,
-) -> std::result::Result<Option<T::Process>, HoldError> {
+) -> io::Result<HoldOutcome<T::Process>> {
     match hold_service_process(target, deadline) {
-        Ok(held) => Ok(held.map(|(_pid, process)| process)),
-        Err(HoldError::Refused(_)) => Ok(None),
-        Err(e) => Err(e),
+        Ok(Some((_pid, process))) => Ok(HoldOutcome::Held(process)),
+        Ok(None) | Err(HoldError::Refused(_)) => Ok(HoldOutcome::NoProcess),
+        Err(HoldError::Expired { pid }) => Ok(HoldOutcome::Expired { pid }),
+        Err(HoldError::Read(e)) => Err(e),
+    }
+}
+
+/// [`hold_if_possible`] with no bound, for the callers that wait without one: the process, or `None`
+/// for a service with none or one that cannot be opened.
+pub(crate) fn hold_if_possible_unbounded<T: KillTarget>(target: &mut T) -> io::Result<Option<T::Process>> {
+    match hold_if_possible(target, Budget::Unbounded.start())? {
+        HoldOutcome::Held(process) => Ok(Some(process)),
+        HoldOutcome::NoProcess => Ok(None),
+        HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline does not expire"),
     }
 }
 

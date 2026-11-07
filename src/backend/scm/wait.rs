@@ -16,6 +16,7 @@ use std::io;
 use std::ops::ControlFlow;
 
 use crate::backend::scm::exit_status::RecordedExit;
+use crate::backend::scm::kill::HoldOutcome;
 use crate::manager::budget::Deadline;
 use crate::spec::Kind;
 
@@ -95,6 +96,16 @@ pub enum Armed {
     Gone,
 }
 
+/// What `ControlService(STOP)` came to, when it was not refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlStopOutcome {
+    /// SCM took the STOP.
+    Delivered,
+    /// `ERROR_SERVICE_NOT_ACTIVE`: the service was `STOPPED` when the STOP arrived, so the STOP
+    /// reached no process.
+    NotActive,
+}
+
 /// The granular SCM operations `stop_via_notify`/`start_via_notify` need,
 /// isolated so the ordering can be unit-tested with a fake rather than a real
 /// service.
@@ -135,7 +146,7 @@ pub trait ScmActor {
     /// non-looping call into the SCM, so there is no iteration to bound, and
     /// what blocking they do is the SCM's own — not a wait this module
     /// created, and not one it can bound from the client side.
-    fn control_stop(&mut self) -> io::Result<()>;
+    fn control_stop(&mut self) -> io::Result<ControlStopOutcome>;
     /// `StartServiceW`. What an `ERROR_SERVICE_ALREADY_RUNNING` means is not
     /// decided here but by each caller, from the state the follow-up query
     /// reported — see [`StartReply`].
@@ -183,16 +194,6 @@ pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
     wait_after_stop(a, deadline, " Run `stop` again.", StopSeen::Requested)
 }
 
-/// How a hold of the service's process ended: what a `P` is held by whoever took it.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Hold<P> {
-    /// The process, or `None` for a service with no process and for one that cannot be opened.
-    Held(Option<P>),
-    /// SCM still reported a pid whose process is gone when the deadline ran out. There is nothing
-    /// left to wait on, and what that means is the caller's.
-    Expired,
-}
-
 /// How [`stop_and_await_exit`] ended.
 #[must_use = "an expiry is not a stop; decide what to report rather than discarding it"]
 #[derive(Debug, PartialEq, Eq)]
@@ -203,9 +204,10 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
     ServiceExpired,
     /// SCM confirmed `STOPPED`, and this held process had not exited when the deadline ran out.
     ProcessExpired(P),
-    /// The hold expired, so the STOP was sent with no process held, and nothing says that it took
-    /// effect or which process it reached: not a stop, whatever SCM answers afterwards.
-    Unconfirmed,
+    /// The hold expired, with SCM still naming process `pid`, which was gone, so the STOP was sent with
+    /// no process held, and nothing says that it took effect or which process it reached: not a stop,
+    /// whatever SCM answers afterwards.
+    Unconfirmed { pid: u32 },
 }
 
 /// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the exit of `held`, the service's
@@ -218,18 +220,27 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 /// An expired hold is sent the STOP all the same, and it ends there: SCM may have restarted the
 /// service since the pid it still reports, so the STOP may have reached a process that nothing
 /// holds, and a `STOPPED` after it says nothing of that one's exit. That is
-/// [`Unconfirmed`](StopAndAwaitExitOutcome::Unconfirmed), and nothing waits.
+/// [`Unconfirmed`](StopAndAwaitExitOutcome::Unconfirmed), and nothing waits. Unless the STOP found
+/// the service stopped ([`ControlStopOutcome::NotActive`]): it reached no process, and the one SCM
+/// named is gone.
 pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     a: &mut A,
     deadline: Deadline,
-    held: Hold<P>,
+    held: HoldOutcome<P>,
     exit: impl FnOnce(&P, Deadline) -> io::Result<Waited>,
 ) -> io::Result<StopAndAwaitExitOutcome<P>> {
     let held = match held {
-        Hold::Held(held) => held,
-        Hold::Expired => {
-            control_stop_or_underway(a)?;
-            return Ok(StopAndAwaitExitOutcome::Unconfirmed);
+        HoldOutcome::Held(process) => Some(process),
+        HoldOutcome::NoProcess => None,
+        HoldOutcome::Expired { pid } => {
+            return Ok(match control_stop_or_underway(a)? {
+                // SCM answers `ERROR_SERVICE_NOT_ACTIVE` only for a service it has recorded
+                // `STOPPED`, at the moment the STOP arrives, and a service that restarted since the
+                // pid was read is not `STOPPED`: so the pid's process is gone and the STOP reached
+                // no other. Nothing is left to race with.
+                ControlStopOutcome::NotActive => StopAndAwaitExitOutcome::Stopped,
+                ControlStopOutcome::Delivered => StopAndAwaitExitOutcome::Unconfirmed { pid },
+            });
         }
     };
     if stop_via_notify(a, deadline)? == Waited::Expired {
@@ -244,7 +255,8 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     })
 }
 
-/// [`ScmActor::control_stop`], where a stop already under way counts as sent.
+/// [`ScmActor::control_stop`], where a stop already under way counts as sent
+/// ([`ControlStopOutcome::Delivered`]).
 ///
 /// SCM refuses a STOP with 1061 (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) or 1052
 /// (`ERROR_INVALID_SERVICE_CONTROL`). Microsoft documents 1061 for a service that is `STOPPED`,
@@ -266,9 +278,9 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
 ///   fixture) measures this on CI.
 /// - `START_PENDING`: told as [`STARTING`].
 /// - any other state: the OS error.
-fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<()> {
+fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<ControlStopOutcome> {
     match a.control_stop() {
-        Err(e) if is_stop_refusal(&e) => decide_refused_stop(a, e, true),
+        Err(e) if is_stop_refusal(&e) => decide_refused_stop(a, e, true).map(|()| ControlStopOutcome::Delivered),
         other => other,
     }
 }
@@ -294,7 +306,7 @@ fn decide_refused_stop<A: ScmActor>(a: &mut A, e: io::Error, may_resend: bool) -
             } else {
                 match a.control_stop() {
                     Err(e) if is_stop_refusal(&e) => decide_refused_stop(a, e, false),
-                    other => other,
+                    other => other.map(|_| ()),
                 }
             }
         }
@@ -422,7 +434,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
                 match a.control_stop() {
-                    Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested),
+                    Ok(_) => return wait_after_stop(a, deadline, "", StopSeen::Requested),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
                         return wait_after_stop(a, deadline, "", StopSeen::Requested);
                     }
@@ -780,7 +792,7 @@ pub(crate) fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()>
 
 /// [`request_start`]'s mirror: issue the stop control and return.
 pub(crate) fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
-    control_stop_or_underway(a)
+    control_stop_or_underway(a).map(|_| ())
 }
 
 // handle teardown =====================================================================================================

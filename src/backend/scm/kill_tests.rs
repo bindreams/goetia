@@ -127,6 +127,7 @@ impl Scripted {
 }
 
 /// A held process: logs when it is closed, so a test sees how long the handle was held.
+#[derive(Debug)]
 struct Held {
     pid: u32,
     log: Log,
@@ -284,9 +285,7 @@ fn holding_follows_the_service_when_it_restarts_between_the_open_and_the_confirm
 fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
 
-    let error = hold_service_process(&mut target, unbounded())
-        .err()
-        .expect("a refused open");
+    let error = hold_service_process(&mut target, unbounded()).expect_err("a refused open");
 
     assert!(matches!(error, HoldError::Refused(_)), "{error:?}");
     assert_eq!(io::Error::from(error).to_string(), "access denied");
@@ -300,9 +299,7 @@ fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
 fn a_release_scm_does_not_make_by_the_deadline_expires_the_hold() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Gone], []).expiring_release();
 
-    let error = hold_service_process(&mut target, unbounded())
-        .err()
-        .expect("an expired hold");
+    let error = hold_service_process(&mut target, unbounded()).expect_err("an expired hold");
 
     assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
     assert_eq!(
@@ -322,9 +319,7 @@ fn a_release_scm_does_not_make_by_the_deadline_expires_the_hold() {
 fn an_arm_that_expires_expires_the_hold_with_nothing_to_cancel() {
     let mut target = Scripted::new([Some(100)], [Open::Gone], []).expiring_arm();
 
-    let error = hold_service_process(&mut target, unbounded())
-        .err()
-        .expect("an expired hold");
+    let error = hold_service_process(&mut target, unbounded()).expect_err("an expired hold");
 
     assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "arm_release"]));
@@ -338,8 +333,8 @@ fn an_expired_hold_is_not_let_go_by_hold_if_possible() {
     let mut arm = Scripted::new([Some(100)], [Open::Gone], []).expiring_arm();
 
     for target in [&mut release, &mut arm] {
-        let error = hold_if_possible(target, unbounded()).err().expect("an expiry");
-        assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
+        let outcome = hold_if_possible(target, unbounded()).expect("an expiry is an outcome, not a failure");
+        assert!(matches!(outcome, HoldOutcome::Expired { pid: 100 }), "{outcome:?}");
     }
 }
 
@@ -350,15 +345,41 @@ fn an_expired_hold_is_not_let_go_by_hold_if_possible() {
 fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
 
-    assert!(hold_if_possible(&mut target, unbounded()).unwrap().is_none());
+    let outcome = hold_if_possible(&mut target, unbounded()).unwrap();
+
+    assert!(matches!(outcome, HoldOutcome::NoProcess), "{outcome:?}");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+#[skuld::test]
+fn a_service_with_no_process_is_no_process_to_hold_if_possible() {
+    let mut target = Scripted::new([None], [], []);
+
+    let outcome = hold_if_possible(&mut target, unbounded()).unwrap();
+
+    assert!(matches!(outcome, HoldOutcome::NoProcess), "{outcome:?}");
 }
 
 #[skuld::test]
 fn a_process_that_can_be_opened_is_held_by_hold_if_possible() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found], []);
 
-    assert!(hold_if_possible(&mut target, unbounded()).unwrap().is_some());
+    let outcome = hold_if_possible(&mut target, unbounded()).unwrap();
+
+    assert!(matches!(outcome, HoldOutcome::Held(_)), "{outcome:?}");
+}
+
+/// The hold of a caller that waits without a bound answers with the process or none: its type has
+/// no expiry to handle.
+#[skuld::test]
+fn the_unbounded_hold_answers_with_the_process_or_none() {
+    let mut held = Scripted::new([Some(100), Some(100)], [Open::Found], []);
+    let mut refused = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
+    let mut none = Scripted::new([None], [], []);
+
+    assert!(hold_if_possible_unbounded(&mut held).unwrap().is_some());
+    assert!(hold_if_possible_unbounded(&mut refused).unwrap().is_none());
+    assert!(hold_if_possible_unbounded(&mut none).unwrap().is_none());
 }
 
 /// Only the refusal is let go. A failed read of SCM is not a process that cannot be opened: the
@@ -369,11 +390,8 @@ fn a_failed_read_of_scm_is_not_let_go_by_hold_if_possible() {
     let mut after_refusal = Scripted::new([Some(100), Some(100)], [Open::Fails], []).failing_read(2);
 
     for target in [&mut first, &mut after_refusal] {
-        let error = hold_if_possible(target, unbounded())
-            .err()
-            .expect("an SCM read failure");
-        assert!(matches!(error, HoldError::Read(_)), "{error:?}");
-        assert_eq!(io::Error::from(error).kind(), READ_FAILED_KIND);
+        let error = hold_if_possible(target, unbounded()).expect_err("an SCM read failure");
+        assert_eq!(error.kind(), READ_FAILED_KIND);
     }
 }
 

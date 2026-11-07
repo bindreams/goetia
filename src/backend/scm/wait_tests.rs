@@ -81,6 +81,8 @@ struct FakeScm {
 #[derive(Debug, Clone, Copy)]
 enum StopReply {
     Ok,
+    /// `ERROR_SERVICE_NOT_ACTIVE`: the service was already `STOPPED` when the STOP arrived.
+    NotActive,
     Os(i32),
 }
 
@@ -370,7 +372,7 @@ impl ScmActor for FakeScm {
         }
         Ok(Armed::Registered(status))
     }
-    fn control_stop(&mut self) -> std::io::Result<()> {
+    fn control_stop(&mut self) -> std::io::Result<ControlStopOutcome> {
         self.log.push("control_stop");
         self.shift("control_stop");
         match self.unanswered.take() {
@@ -381,8 +383,9 @@ impl ScmActor for FakeScm {
             StopReply::Ok => {
                 // The STOP is taken: a service not yet modelled is stopping.
                 self.state.get_or_insert(QueriedState::StopPending);
-                Ok(())
+                Ok(ControlStopOutcome::Delivered)
             }
+            StopReply::NotActive => Ok(ControlStopOutcome::NotActive),
             StopReply::Os(code) => Err(std::io::Error::from_raw_os_error(code)),
         }
     }
@@ -545,7 +548,7 @@ fn stop_and_await_exit_waits_for_the_held_process_after_stopped() {
     let deadline = Budget::Bounded(std::time::Duration::from_secs(3600)).start();
     let mut waited_for = vec![];
 
-    let outcome = stop_and_await_exit(&mut fake, deadline, Hold::Held(Some(7u32)), |process, by| {
+    let outcome = stop_and_await_exit(&mut fake, deadline, HoldOutcome::Held(7u32), |process, by| {
         waited_for.push((*process, by));
         Ok(Waited::Confirmed)
     });
@@ -561,7 +564,7 @@ fn stop_and_await_exit_waits_for_the_held_process_after_stopped() {
 fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
 
-    let outcome = stop_and_await_exit(&mut fake, unbounded(), Hold::Held(Some(7u32)), |_, _| {
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), HoldOutcome::Held(7u32), |_, _| {
         Ok(Waited::Expired)
     });
 
@@ -572,7 +575,7 @@ fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
 fn stop_and_await_exit_does_not_wait_for_a_process_when_stopped_was_not_confirmed() {
     let mut fake = FakeScm::new([None]);
 
-    let outcome = stop_and_await_exit(&mut fake, unbounded(), Hold::Held(Some(7u32)), |_, _| {
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), HoldOutcome::Held(7u32), |_, _| {
         panic!("the process is waited for once SCM has confirmed the stop")
     });
 
@@ -583,7 +586,7 @@ fn stop_and_await_exit_does_not_wait_for_a_process_when_stopped_was_not_confirme
 fn stop_and_await_exit_without_a_held_process_is_the_stop() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
 
-    let outcome = stop_and_await_exit(&mut fake, unbounded(), Hold::Held(None::<u32>), |_, _| {
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), HoldOutcome::<u32>::NoProcess, |_, _| {
         panic!("there is no process to wait for")
     });
 
@@ -594,7 +597,7 @@ fn stop_and_await_exit_without_a_held_process_is_the_stop() {
 fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
 
-    let outcome = stop_and_await_exit(&mut fake, unbounded(), Hold::Held(Some(7u32)), |_, _| {
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), HoldOutcome::Held(7u32), |_, _| {
         Err(io::Error::other("wait failed"))
     });
 
@@ -608,11 +611,26 @@ fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
 fn stop_and_await_exit_after_an_expired_hold_sends_the_stop_and_is_unconfirmed() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
 
-    let outcome = stop_and_await_exit(&mut fake, spent(), Hold::<u32>::Expired, |_, _| {
+    let outcome = stop_and_await_exit(&mut fake, spent(), HoldOutcome::<u32>::Expired { pid: 9 }, |_, _| {
         panic!("no process is held to wait for")
     });
 
-    assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Unconfirmed);
+    assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Unconfirmed { pid: 9 });
+    assert_eq!(fake.log, vec!["control_stop"]);
+}
+
+/// A STOP that finds the service stopped reached no process: SCM had recorded `STOPPED` before the
+/// STOP was sent, so the process it still named when the hold expired is gone, and no STOP can have
+/// reached a restarted one (a restart would not be `STOPPED`). The stop is done.
+#[skuld::test]
+fn stop_and_await_exit_after_an_expired_hold_is_stopped_when_the_stop_finds_the_service_stopped() {
+    let mut fake = FakeScm::new([]).stop_replies([StopReply::NotActive]);
+
+    let outcome = stop_and_await_exit(&mut fake, spent(), HoldOutcome::<u32>::Expired { pid: 9 }, |_, _| {
+        panic!("no process is held to wait for")
+    });
+
+    assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped);
     assert_eq!(fake.log, vec!["control_stop"]);
 }
 
@@ -624,7 +642,7 @@ fn stop_and_await_exit_after_an_expired_hold_reports_a_refused_stop() {
         .stop_replies([StopReply::Os(ERROR_INVALID_SERVICE_CONTROL)])
         .queried(QueriedState::Running, true);
 
-    let outcome = stop_and_await_exit(&mut fake, spent(), Hold::<u32>::Expired, |_, _| {
+    let outcome = stop_and_await_exit(&mut fake, spent(), HoldOutcome::<u32>::Expired { pid: 9 }, |_, _| {
         panic!("no process is held to wait for")
     });
 
