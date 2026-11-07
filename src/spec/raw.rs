@@ -28,8 +28,9 @@ use super::user::{RawUser, deserialize_user};
 /// **[`RawSpec::parse`] is the only way to get one from text.** The null
 /// rule is enforced by a second walk that `parse` runs over the same text,
 /// because it needs that text to report a position. Hence `RawSpec` has no
-/// `Deserialize`; the derive sits on the private `Wire`. The type is module-private to `spec` so
-/// that library consumers reach a spec only through [`load`](super::load).
+/// `Deserialize`; the derive sits on the private `Wire`. The type is
+/// module-private to `spec` so that library consumers reach a spec only
+/// through [`load`](super::load).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RawSpec {
     /// The installed service's name. Required, never overridable, and

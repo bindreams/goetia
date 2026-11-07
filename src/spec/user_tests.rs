@@ -65,18 +65,12 @@ fn a_user_that_is_neither_string_nor_mapping_is_refused_in_user_terms() {
     let expecting = "expected a username string, `root`, or a struct with exactly one of `name` or `id`";
     for user in ["[root]", "5.5", "true"] {
         for yaml in [
-            format!("id: x
-user: {user}
-"),
-            format!("id: x
-backend-specific:
-  scm:
-    user: {user}
-"),
+            format!("id: x\nuser: {user}\n"),
+            format!("id: x\nbackend-specific:\n  scm:\n    user: {user}\n"),
         ] {
             let err = RawSpec::parse(&yaml).unwrap_err().to_string();
             assert!(err.contains(expecting), "{yaml:?}: {err}");
-            for internal in ["RawUser", "UserWire", "RawSpec", "Wire"] {
+            for internal in ["RawUser", "RawSpec", "RawOverride", "Wire"] {
                 assert!(!err.contains(internal), "{yaml:?} leaks `{internal}`: {err}");
             }
         }

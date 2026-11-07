@@ -927,7 +927,7 @@ fn a_dollar_inside_a_substituted_value_survives_resolve_unchanged() {
 #[skuld::test]
 fn resolve_substitutes_rather_than_letting_a_reference_through() {
     // Interpolation lives inside `resolve`, not beside it in `load`: every
-    // path to a `DaemonSpec` goes through it, and a literal `${MISSING}`
+    // manifest's path to a `DaemonSpec` goes through it, and a literal `${MISSING}`
     // reaching a generated unit would be expanded by systemd itself,
     // silently, to an empty string.
     let yaml = "id: frpc\nname: ${ALSO_MISSING}\ncommand: [/bin/frpc, \"--flag=${MISSING}\"]\n";

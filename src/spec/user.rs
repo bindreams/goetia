@@ -114,7 +114,8 @@ impl<'de> Visitor<'de> for AccountIdVisitor {
 }
 
 /// `RawUser`'s serde shape. `user: {name: null}` reads as the text `null`, which only `parse`'s
-/// `no_null` walk refuses, so this is read only via [`deserialize_user`] under `RawSpec::parse`.
+/// `no_null` walk refuses, so production code reads it only via [`deserialize_user`] under
+/// `RawSpec::parse`.
 struct UserWire(RawUser);
 
 impl<'de> Deserialize<'de> for UserWire {
