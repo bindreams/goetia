@@ -79,9 +79,9 @@ mod stock {
     /// the stock shim, `None` in one built without.
     pub struct EmbeddedStockShim {
         bytes: Option<&'static [u8]>,
-        /// The SHA-256 of `bytes`, computed by the first use: the bytes are `'static`, and every
-        /// `preview` and `provide` of one install needs it.
-        pub(super) digest: OnceLock<[u8; 32]>,
+        /// `bytes` with their SHA-256, made by the first use: the bytes are `'static`, and every
+        /// `preview` and `provide` of one install needs the digest.
+        pub(super) image: OnceLock<Image<'static>>,
         dir: Option<PathBuf>,
     }
 
@@ -92,15 +92,14 @@ mod stock {
         pub fn new(bytes: Option<&'static [u8]>, dir: Option<PathBuf>) -> Self {
             Self {
                 bytes,
-                digest: OnceLock::new(),
+                image: OnceLock::new(),
                 dir,
             }
         }
 
-        fn image(&self) -> Result<Image<'static>> {
+        fn image(&self) -> Result<&Image<'static>> {
             let bytes = self.bytes.ok_or(Error::ShimNotEmbedded)?;
-            let digest = *self.digest.get_or_init(|| Sha256::digest(bytes).into());
-            Ok(Image { bytes, digest })
+            Ok(self.image.get_or_init(|| Image::new(bytes)))
         }
 
         fn dir(&self) -> Result<PathBuf> {
@@ -113,7 +112,7 @@ mod stock {
         /// [`Error::ShimNotEmbedded`]; with a relative `dir`, [`Error::ShimPathRelative`].
         fn preview(&self) -> Result<HostCommand> {
             let image = self.image()?;
-            preview_in(&self.dir()?, &image)
+            preview_in(&self.dir()?, image)
         }
 
         /// Checks `dir` with `folders`, creates what is missing of it, and leaves the file in place
@@ -123,7 +122,7 @@ mod stock {
         /// each set the other's fresh file aside.
         fn provide(&self, folders: &FolderCheck) -> Result<HostCommand> {
             let image = self.image()?;
-            provide_in(&self.dir()?, &image, folders)
+            provide_in(&self.dir()?, image, folders)
         }
 
         /// Deletes the shim files in `dir`, and what a repair or a crash left beside them, that no
