@@ -58,7 +58,7 @@ use super::raw::RawSpec;
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
 use super::{DaemonFields, DaemonSpec, Id, Kind, Restart, Warning};
-use crate::error::Error;
+use crate::error::{Error, escape_control, escaped_path};
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 
@@ -481,8 +481,10 @@ fn resolve_optional_path(
 /// Join a relative path against `base_dir`; leave an absolute path as-is.
 /// Uses `Path::is_absolute`, not a string prefix check, since POSIX and Windows differ.
 ///
-/// `base_dir` is checked (see [`check_base_dir`]) only when a path is joined to it, so a manifest
-/// directory that no field uses is never refused. The result is checked too ([`check_resolved`]).
+/// The result is checked ([`check_resolved`]), not `base_dir` on its own: a directory is refused
+/// only through a path that is joined to it and so would carry its defect into an artifact. A
+/// value a substitution may still change is left to [`DaemonSpec::new`], which judges the final
+/// path: `${D}` may be absolute, which no join would touch.
 ///
 /// Not a pure function of `(value, base_dir)`: `std::path::absolute`'s drive-relative fallback
 /// reads the per-drive current directory. But every pass `resolve` makes runs in one process
@@ -496,13 +498,12 @@ fn resolve_path_string(
     warnings: &mut Vec<Warning>,
 ) -> Result<String, Error> {
     let p = Path::new(raw);
+    // A path with its own prefix (`C:bin`) replaces `base_dir` in the join, so it is not under it.
+    let under_manifest_dir =
+        !p.is_absolute() && !matches!(p.components().next(), Some(std::path::Component::Prefix(_)));
     let joined = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        // A path with its own prefix (`C:bin`) replaces `base_dir` in the join, so it is not used.
-        if !matches!(p.components().next(), Some(std::path::Component::Prefix(_))) {
-            check_base_dir(id, field, base_dir)?;
-        }
         normalize(&base_dir.join(p))
     };
     // With an absolute `base_dir` a join stays relative only for a Windows drive-relative path
@@ -537,29 +538,32 @@ fn resolve_path_string(
         resolved
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
-    check_resolved(id, field, raw, &joined)?;
+    if !interpolate::would_substitution_change(raw) {
+        check_resolved(id, field, raw, &joined, under_manifest_dir)?;
+    }
     Ok(joined.to_string_lossy().into_owned())
 }
 
-/// The field rules for a resolved path. `base_dir` and `raw` have passed them, so only a
-/// drive-relative path can fail here, anchored to a per-drive current directory that carries a
-/// defect the authored text does not. The message says the field *resolved* to the bad value, since
-/// the user did not write it.
-fn check_resolved(id: &Id, field: &str, raw: &str, resolved: &Path) -> Result<(), Error> {
-    let defect = match resolved.to_str() {
-        None => Some("is not valid UTF-8".to_string()),
-        Some(text) => unemittable_defect(text),
+/// The field rules for a resolved path, which is what an artifact would carry. `raw` has passed
+/// them already, so the defect is one the user did not write: it came from the manifest directory
+/// (`under_manifest_dir`) or, for a drive-relative path, from the per-drive current directory. The
+/// message says the field *resolved* to the bad value and names its source.
+fn check_resolved(id: &Id, field: &str, raw: &str, resolved: &Path, under_manifest_dir: bool) -> Result<(), Error> {
+    let Some(defect) = path_defect(resolved) else {
+        return Ok(());
     };
-    match defect {
-        None => Ok(()),
-        Some(defect) => Err(invalid(
-            id,
-            &format!(
-                "field `{field}` is `{raw}`, which resolves to `{}`, which {defect}",
-                resolved.display()
-            ),
-        )),
-    }
+    let resolves = if under_manifest_dir {
+        "resolves under the manifest directory to"
+    } else {
+        "resolves to"
+    };
+    Err(invalid(
+        id,
+        &format!(
+            "field `{field}` is `{raw}`, which {resolves} {}, which {defect}",
+            escaped_path(resolved)
+        ),
+    ))
 }
 
 /// Make `dir` absolute against the process's working directory.
@@ -583,7 +587,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     // reader when the process's own cwd is what is gone.
     let cwd = std::env::current_dir().map_err(|source| {
         Error::os(
-            format!("read the current directory while resolving `{}`", dir.display()),
+            format!("read the current directory while resolving `{}`", escaped_path(dir)),
             source,
         )
     })?;
@@ -597,7 +601,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     } else {
         let resolved = std::path::absolute(&joined).map_err(|source| {
             Error::os(
-                format!("resolve manifest directory `{}` to an absolute path", dir.display()),
+                format!("resolve manifest directory `{}` to an absolute path", escaped_path(dir)),
                 source,
             )
         })?;
@@ -609,7 +613,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
                      current directory on that drive in whichever process runs goetia, not to a \
                      fixed location. Pass a full path (e.g. `C:\\repo`) or a `.`-relative one to \
                      `-f` instead.",
-                    dir.display()
+                    escaped_path(dir)
                 ),
             });
         }
@@ -617,28 +621,6 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
     Ok(joined)
-}
-
-/// The manifest directory, for the field `field` that is joined to it, so the join cannot carry a
-/// defect the field rules would blame on text the manifest wrote cleanly: it must be valid UTF-8,
-/// hold no control character, and not end in a backslash. The error is attributed to `field`, so
-/// it falls in field order.
-///
-/// The backslash rule is the field rule unchanged, which is an open owner question: it refuses a
-/// Windows drive or UNC root (`C:\`, `\\srv\share\`), the only form `normalize` leaves ending
-/// in one.
-fn check_base_dir(id: &Id, field: &str, dir: &Path) -> Result<(), Error> {
-    let defect = match dir.to_str() {
-        None => Some("is not valid UTF-8".to_string()),
-        Some(text) => unemittable_defect(text),
-    };
-    match defect {
-        None => Ok(()),
-        Some(defect) => Err(invalid(
-            id,
-            &format!("field `{field}`: the manifest directory {} {defect}", dir.display()),
-        )),
-    }
 }
 
 /// Canonicalise the process's current working directory; see [`absolutize`] for why this value,
@@ -785,14 +767,13 @@ impl PathField {
 /// `logs`, each `env` entry, `user`. The one list; [`resolve_shape`] runs it on the authored
 /// values and [`DaemonSpec::new`] on the final ones.
 ///
-/// `resolve` is called once for each of `command`, `cwd` and `logs` after that field's own rules
-/// pass (for `command`, only if it is present), and an error from it stops the walk. It lets the
-/// caller resolve a path at its place in the order.
+/// `resolve` is called once for each of `command`, `cwd` and `logs` that is present, after that
+/// field's own rules pass, and an error from it stops the walk. It lets the caller resolve a path
+/// at its place in the order.
 ///
 /// Beyond the rules both phases share, [`Phase::Authored`] refuses a `${...}` reference where
 /// substitution must not produce one (an `env` key, a `user.id`), and [`Phase::Final`] refuses an
-/// empty `command` and a relative `cwd` or `logs`. A path is checked as text; a non-UTF-8 one is
-/// refused first, so the message is exact.
+/// empty `command` and a relative `cwd` or `logs`.
 fn check_field_values(
     id: &Id,
     values: &FieldValues,
@@ -815,16 +796,7 @@ fn check_field_values(
     for (field, path) in [(PathField::Cwd, values.cwd), (PathField::Logs, values.logs)] {
         let name = field.name();
         if let Some(path) = path {
-            let Some(text) = path.to_str() else {
-                return Err(invalid(
-                    id,
-                    &format!(
-                        "field `{name}` is `{}`, which is not valid UTF-8",
-                        path.to_string_lossy()
-                    ),
-                ));
-            };
-            check_path_text(id, name, text)?;
+            check_path(id, name, path)?;
             if phase == Phase::Final {
                 reject_relative_path(id, name, path)?;
             }
@@ -864,10 +836,12 @@ fn check_command_args(id: &Id, command: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
-/// A `cwd` or `logs`, as the text of the path.
-fn check_path_text(id: &Id, field: &str, text: &str) -> Result<(), Error> {
-    reject_unemittable(id, field, text)?;
-    reject_empty(id, field, text)
+/// A `cwd` or `logs`. The message omits the path, as [`reject_control_chars`] omits a value.
+fn check_path(id: &Id, field: &str, path: &Path) -> Result<(), Error> {
+    if let Some(defect) = path_defect(path) {
+        return Err(invalid(id, &format!("field `{field}` {defect}")));
+    }
+    reject_empty(id, field, path)
 }
 
 fn check_env_entry(id: &Id, key: &str, value: &str) -> Result<(), Error> {
@@ -905,11 +879,14 @@ fn reject_unemittable(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// How `value` breaks [`reject_unemittable`], as a predicate to follow the name of what was
-/// checked; `None` if it does not. For a caller that names the value differently (a directory, a
-/// resolved path).
-fn unemittable_defect(value: &str) -> Option<String> {
-    control_defect(value).or_else(|| trailing_backslash_defect(value).map(str::to_string))
+/// How `path` breaks the path rules, as a predicate to follow the name of what was checked; `None`
+/// if it does not: it must be valid UTF-8 and pass [`reject_unemittable`]'s checks. The one list
+/// for an authored `cwd` or `logs` and for a resolved path; each caller supplies its own prefix.
+fn path_defect(path: &Path) -> Option<String> {
+    let Some(text) = path.to_str() else {
+        return Some("is not valid UTF-8".to_string());
+    };
+    control_defect(text).or_else(|| trailing_backslash_defect(text).map(str::to_string))
 }
 
 fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
@@ -977,8 +954,8 @@ fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Error> {
 /// `user.name` and `user.id` need the stronger [`reject_blank`]. Deliberately **not** applied
 /// to `name` (an empty `Description=` is harmless), `env` values (`FOO=` is a normal assignment)
 /// or `command[1..]` (an empty argv element is legitimate and every generator quotes it).
-fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Error> {
-    if value.is_empty() {
+fn reject_empty(id: &Id, field: &str, value: impl AsRef<std::ffi::OsStr>) -> Result<(), Error> {
+    if value.as_ref().is_empty() {
         return Err(invalid(id, &format!("field `{field}` must not be empty")));
     }
     Ok(())
@@ -1013,7 +990,10 @@ fn reject_blank(id: &Id, field: &str, value: &str) -> Result<(), Error> {
 /// systemd `Environment=` directive ambiguous about where the key ends.
 fn reject_env_key_with_equals(id: &Id, key: &str) -> Result<(), Error> {
     if key.contains('=') {
-        return Err(invalid(id, &format!("env key `{key}` must not contain `=`")));
+        return Err(invalid(
+            id,
+            &format!("env key `{}` must not contain `=`", escape_control(key)),
+        ));
     }
     Ok(())
 }

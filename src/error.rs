@@ -192,7 +192,7 @@ pub enum Error {
 
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
-    #[error("{path}:{line}: {message}", path = path.display())]
+    #[error("{path}:{line}: {message}", path = escaped_path(path))]
     EnvFile {
         path: PathBuf,
         line: usize,
@@ -831,16 +831,36 @@ fn unsupported_manager(client: &VersionReading, manager: &VersionReading) -> Str
 
 fn path_suffix(path: &Option<PathBuf>) -> String {
     path.as_deref()
-        .map(Path::display)
+        .map(escaped_path)
         .map(|p| format!(" {p}"))
         .unwrap_or_default()
 }
 
 fn read_at(path: &Option<PathBuf>) -> String {
     path.as_deref()
-        .map(Path::display)
+        .map(escaped_path)
         .map(|p| format!(" at {p}"))
         .unwrap_or_default()
+}
+
+/// `text` with every control character written as an escape (`\n`, `\u{1b}`), so a refused value
+/// that goes into a message cannot move the cursor or start a line of its own. Everything else is
+/// as written.
+pub(crate) fn escape_control(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `path` as a message shows it: [`escape_control`], read lossily.
+pub(crate) fn escaped_path(path: &Path) -> String {
+    escape_control(&path.to_string_lossy())
 }
 
 fn stderr_suffix(stderr: &str) -> String {

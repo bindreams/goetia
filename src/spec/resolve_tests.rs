@@ -191,7 +191,10 @@ fn a_manifest_directory_that_is_not_valid_utf8_is_refused_by_the_field_joined_to
     let msg = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\n"), &dir)
         .unwrap_err()
         .to_string();
-    assert!(msg.contains("field `command`: the manifest directory"), "{msg}");
+    assert!(
+        msg.contains("field `command` is `bin/frpc`, which resolves under the manifest directory to"),
+        "{msg}"
+    );
     assert!(msg.contains("is not valid UTF-8"), "{msg}");
 }
 
@@ -220,10 +223,11 @@ fn a_manifest_directory_with_a_newline_is_refused_by_the_field_joined_to_it() {
             .unwrap_err()
             .to_string();
         assert!(
-            msg.contains(&format!("field `{field}`: the manifest directory")),
+            msg.contains(&format!("field `{field}` is ")) && msg.contains("resolves under the manifest directory to"),
             "{msg}"
         );
         assert!(msg.contains("control character"), "{msg}");
+        assert!(!msg.contains('\n'), "the control character must be escaped: {msg:?}");
     }
 }
 
@@ -246,20 +250,29 @@ fn a_resolution_error_is_reported_in_field_order() {
             .unwrap_err()
             .to_string();
         assert!(
-            msg.contains(&format!("field `{field}`: the manifest directory")),
+            msg.contains(&format!("field `{field}` is ")) && msg.contains("resolves under the manifest directory to"),
             "`{body}`: {msg}"
         );
     }
 }
 
 #[skuld::test]
-fn a_bad_id_is_reported_before_a_bad_manifest_directory() {
+fn a_bad_id_is_reported_first_whatever_the_manifest_directory() {
+    // The id is checked before any path is resolved, so the directory's defect never answers first.
     let dir = base_dir().join("a\nb");
-    for id in ["${X}", "\"a\nb\""] {
+    for (id, expected) in [
+        ("${X}", "a daemon id cannot be interpolated"),
+        ("\"a\\nb\"", "does not match the required pattern"),
+    ] {
         let msg = resolve(parse_manifest(&format!("id: {id}\ncommand: [bin/frpc]\n")), &dir)
             .unwrap_err()
             .to_string();
+        assert!(msg.contains(expected), "id {id}: {msg}");
         assert!(!msg.contains("manifest directory"), "id {id}: {msg}");
+        assert!(
+            !msg.contains('\n'),
+            "id {id}: the control character must be escaped: {msg:?}"
+        );
     }
 }
 
@@ -268,13 +281,83 @@ fn a_resolved_path_the_field_rules_would_refuse_is_attributed_to_the_resolution(
     // A drive-relative `cwd: C:` resolves through the per-drive directory to a value the authored
     // rules never saw; the message must say so rather than blame the text the user wrote.
     let id = Id::try_from("frpc").unwrap();
-    let err = check_resolved(&id, "cwd", "C:", Path::new("/a\u{FFFE}")).unwrap_err();
+    let err = check_resolved(&id, "cwd", "C:", Path::new("/a\u{FFFE}"), false).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("field `cwd` is `C:`, which resolves to `/a\u{FFFE}`, which contains U+FFFE"),
+        msg.contains("field `cwd` is `C:`, which resolves to /a\u{FFFE}, which contains U+FFFE"),
         "{msg}"
     );
-    check_resolved(&id, "cwd", "C:", Path::new("/ordinary")).expect("an ordinary value passes");
+    check_resolved(&id, "cwd", "C:", Path::new("/ordinary"), false).expect("an ordinary value passes");
+}
+
+#[skuld::test]
+fn a_resolved_path_is_named_escaped() {
+    let id = Id::try_from("frpc").unwrap();
+    for under_manifest_dir in [false, true] {
+        let msg = check_resolved(&id, "cwd", "bin", Path::new("/a\nb\u{1b}"), under_manifest_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("/a\\nb\\u{1b}"), "{msg:?}");
+        assert!(!msg.contains('\n') && !msg.contains('\u{1b}'), "{msg:?}");
+    }
+}
+
+#[skuld::test]
+fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
+    let id = Id::try_from("frpc").unwrap();
+    let msg = check_resolved(&id, "cwd", "bin", Path::new("/a\nb/bin"), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("field `cwd` is `bin`, which resolves under the manifest directory to /a\\nb/bin, which contains a control character"),
+        "{msg}"
+    );
+}
+
+// What the directory alone cannot refuse -----------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_path_a_substitution_may_make_absolute_is_not_judged_against_the_manifest_directory() {
+    // `${D}` is absolute if `.env` says so; the shape phase cannot know, and `DaemonSpec::new`
+    // judges the final value.
+    let id = Id::try_from("frpc").unwrap();
+    let dir = base_dir().join("a\nb");
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    for body in [
+        "command: ['${D}']".to_string(),
+        format!("command: ['{abs}']\ncwd: ${{D}}"),
+        format!("command: ['{abs}']\nlogs: ${{D}}"),
+    ] {
+        let raw = parse_manifest(&format!("id: frpc\n{body}\n"));
+        resolve_shape(&id, raw, &dir).unwrap_or_else(|e| panic!("`{body}`: {e}"));
+    }
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_manifest_directory_ending_in_a_backslash_does_not_refuse_a_path_joined_to_it() {
+    // The joined path ends in `data`; only a directory spelled `…\` is unusual.
+    let dir = PathBuf::from("/base/a\\");
+    let yaml = "id: frpc\ncommand: [/opt/frpc]\nbackend-specific:\n  scm:\n    cwd: data\n";
+    resolve_as(parse_manifest(yaml), &dir, None).expect("only the joined path is judged");
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_root_relative_path_uses_only_the_directorys_drive() {
+    // `C:\base\a<newline>b` joined with `\data` is `C:\data`: nothing of the directory survives.
+    let dir = base_dir().join("a\nb");
+    let yaml = "id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: '\\data'\n";
+    let (spec, _) = resolve(parse_manifest(yaml), &dir).expect("the directory does not appear in the result");
+    assert_eq!(spec.cwd, Some(PathBuf::from(r"C:\data")));
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_drive_root_manifest_directory_joins_cleanly() {
+    let (spec, _) = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc.exe]\n"), Path::new(r"C:\"))
+        .expect("`C:\\` joined with `bin` is `C:\\bin`");
+    assert_eq!(spec.command[0], r"C:\bin\frpc.exe");
 }
 
 // Resolution ==========================================================================================================

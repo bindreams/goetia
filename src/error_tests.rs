@@ -805,3 +805,21 @@ fn an_undetermined_step_chain_gives_up_its_read_and_recovery() {
     let back = other.into_undetermined().expect_err("not an Undetermined");
     assert_eq!(back.report().to_string(), "check: daemon `x` is not installed");
 }
+
+#[skuld::test]
+fn a_path_in_a_message_never_carries_a_control_character_raw() {
+    let path = PathBuf::from("/a\nb\u{1b}/.env");
+    let messages = [
+        Error::os_at("read", path.clone(), std::io::Error::other("x")).to_string(),
+        Error::EnvFile {
+            path,
+            line: 2,
+            message: String::new(),
+        }
+        .to_string(),
+    ];
+    for msg in messages {
+        assert!(msg.contains("/a\\nb\\u{1b}/.env"), "{msg:?}");
+        assert!(!msg.contains('\n') && !msg.contains('\u{1b}'), "{msg:?}");
+    }
+}

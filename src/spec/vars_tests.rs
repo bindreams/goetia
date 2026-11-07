@@ -310,3 +310,12 @@ fn get_does_not_fall_back_to_an_ambient_variable() {
     let vars = load_str("GOETIA_TEST_OTHER=1\n").unwrap();
     assert_eq!(vars.get(&ambient_name), None);
 }
+
+#[skuld::test]
+fn a_control_character_in_the_file_is_escaped_in_the_error() {
+    let Err(Error::EnvFile { message, .. }) = load_str("a\u{1b}b\n") else {
+        panic!("a line with no `=` is an EnvFile error");
+    };
+    assert!(message.contains("a\\u{1b}b"), "{message:?}");
+    assert!(!message.contains('\u{1b}'), "{message:?}");
+}
