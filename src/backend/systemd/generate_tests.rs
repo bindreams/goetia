@@ -12,26 +12,15 @@ use crate::spec::{Id, Kind, User};
 // `DaemonSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds one
 // for the host.
 
-/// The program every fixture runs.
-fn program() -> String {
-    abs("bin/frpc").to_string_lossy().into_owned()
-}
-
-/// `program()` as `ExecStart=` spells it: a Windows path holds backslashes, which make systemd's
-/// quoting wrap the word and double them.
-fn program_in_exec_start() -> String {
-    if cfg!(windows) {
-        format!("\"{}\"", program().replace('\\', "\\\\"))
-    } else {
-        program()
-    }
-}
+/// The program every fixture runs. Forward slashes keep a Windows path free of the backslashes that
+/// make `ExecStart=` quote the word, so the expected unit spells it as is.
+const PROGRAM: &str = if cfg!(windows) { "C:/bin/frpc" } else { "/bin/frpc" };
 
 fn full_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
-        command: vec![program(), "-c".to_string(), "frpc.toml".to_string()],
+        command: vec![PROGRAM.to_string(), "-c".to_string(), "frpc.toml".to_string()],
         cwd: Some(abs("opt/frpc")),
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
@@ -56,7 +45,7 @@ fn minimal_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "frpc".to_string(),
-        command: vec![program()],
+        command: vec![PROGRAM.to_string()],
         cwd: None,
         env: BTreeMap::new(),
         user: User::Root,
@@ -104,7 +93,7 @@ fn unit_snapshot_full() {
          Schema=1\n\
          Version={version}\n\
          Spec={spec_b64}\n",
-        exec = program_in_exec_start(),
+        exec = PROGRAM,
         cwd = abs("opt/frpc").display(),
         logs = abs("var/log/frpc.log").display(),
         version = crate::version(),
@@ -137,7 +126,7 @@ fn unit_snapshot_minimal() {
          Schema=1\n\
          Version={version}\n\
          Spec={spec_b64}\n",
-        exec = program_in_exec_start(),
+        exec = PROGRAM,
         version = crate::version(),
         spec_b64 = blob::encode(&spec),
     );

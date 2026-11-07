@@ -4,20 +4,15 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::*;
-use crate::spec::test_support::abs;
+use crate::spec::test_support::{abs, program};
 
 // Fixtures ============================================================================================================
-
-/// The program every fixture runs.
-fn program() -> String {
-    abs("bin/frpc").to_string_lossy().into_owned()
-}
 
 fn full_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
-        command: vec![program(), "-c".to_string(), "frpc.toml".to_string()],
+        command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
         cwd: Some(abs("opt/frpc")),
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
@@ -36,7 +31,7 @@ fn minimal_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "frpc".to_string(),
-        command: vec![program()],
+        command: vec![program("frpc")],
         cwd: None,
         env: BTreeMap::new(),
         user: User::Root,
@@ -55,7 +50,7 @@ fn golden_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
-        command: vec![program(), "-c".to_string(), "frpc.toml".to_string()],
+        command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
         cwd: None,
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
@@ -74,7 +69,7 @@ fn base_wire_spec() -> WireSpec {
     WireSpec {
         id: "frpc".to_string(),
         name: "frpc".to_string(),
-        command: vec![program()],
+        command: vec![program("frpc")],
         cwd: Some(abs("opt/frpc").to_string_lossy().into_owned()),
         env: BTreeMap::from([("RUST_LOG".to_string(), "info".to_string())]),
         user: WireUser::Root,
@@ -151,11 +146,17 @@ fn blob_wire_names_are_pinned() {
     // Golden-bytes assertion: if this fails after an intentional wire
     // change, update the JSON below, and confirm the change was
     // intentional (a rename in `DaemonSpec` should not silently do this).
-    let program = serde_json::to_string(&program()).unwrap();
+    let program = serde_json::to_string(&program("frpc")).unwrap();
     let expected = format!(
         r#"{{"schema":1,"spec":{{"command":[{program},"-c","frpc.toml"],"cwd":null,"env":{{"RUST_LOG":"info","URL":"http://x/a%20b"}},"id":"frpc","kind":"managed","logs":null,"name":"Frpc Tunnel","restart":"always","restart_delay":{{"nanos":500000000,"secs":2}},"user":{{"kind":"name","name":"svc-frpc"}}}},"version":"0.1.0"}}"#
     );
     assert_eq!(encode_with_version(&golden_spec(), "0.1.0"), BASE64.encode(expected));
+}
+
+#[skuld::test]
+fn the_blob_alphabet_is_standard_and_padded() {
+    // `+`, `/` and `=` tell STANDARD from the URL-safe and unpadded variants.
+    assert_eq!(BASE64.encode([0xfb, 0xff]), "+/8=");
 }
 
 // Schema and invariant re-validation ==================================================================================

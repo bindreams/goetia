@@ -432,13 +432,23 @@ fn contract_violation(id: &Id, message: &str) -> Error {
     invalid(id, &format!("internal error: {message}; this is a bug in goetia"))
 }
 
-/// [`contract_violation`] whose cause is `source`, an error an earlier step should not have let through.
-fn contract_violation_from(id: &Id, message: &str, source: impl std::error::Error + Send + Sync + 'static) -> Error {
-    invalid_from(
-        id,
-        &format!("internal error: {message}; this is a bug in goetia"),
-        source,
-    )
+/// [`contract_violation`] for a field rule that refused what an earlier step should have let
+/// through. The rule's own message is folded in, so the daemon is named once.
+fn contract_violation_from(id: &Id, message: &str, cause: Error) -> Error {
+    match cause {
+        Error::Invalid {
+            message: rule, source, ..
+        } => Error::Invalid {
+            daemon: id.as_str().to_string(),
+            message: format!("internal error: {message}: {rule}; this is a bug in goetia"),
+            source,
+        },
+        other => invalid_from(
+            id,
+            &format!("internal error: {message}; this is a bug in goetia"),
+            other,
+        ),
+    }
 }
 
 /// What a substituted pass leaves of a [`Shaped`] value: it defers nothing, so the value is parsed

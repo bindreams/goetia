@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::spec::DaemonFields;
-use crate::spec::test_support::plain_fields;
+use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{Id, Kind, User};
 
 // Fixtures ============================================================================================================
@@ -16,7 +16,7 @@ fn full_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
-        command: vec![program(), "-c".to_string(), "frpc.toml".to_string()],
+        command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
         cwd: Some(abs("opt/frpc")),
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
@@ -37,15 +37,10 @@ fn full_identity() -> Identity {
     }
 }
 
-/// The program every fixture runs.
-fn program() -> String {
-    abs("bin/frpc").to_string_lossy().into_owned()
-}
-
 fn minimal_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
-        ..plain_fields("frpc", vec![program()])
+        ..plain_fields("frpc", vec![program("frpc")])
     })
     .unwrap()
 }
@@ -100,7 +95,7 @@ fn plist_snapshot_minimal() {
          </plist>\n",
         version = crate::version(),
         blob = blob::encode(&spec),
-        program = program(),
+        program = program("frpc"),
     );
 
     assert_eq!(text, expected);
@@ -155,7 +150,7 @@ fn plist_snapshot_full() {
          </plist>\n",
         version = crate::version(),
         blob = blob::encode(&spec),
-        program = program(),
+        program = program("frpc"),
         cwd = abs("opt/frpc").display(),
         logs = abs("var/log/frpc.log").display(),
     );
@@ -351,7 +346,7 @@ fn extract_tolerates_crlf_line_endings_in_the_metadata_comment() {
 #[skuld::test]
 fn xml_special_characters_are_escaped() {
     let mut spec = minimal_spec().into_fields();
-    spec.command = vec![program(), "a&b<c>d".to_string()];
+    spec.command = vec![program("frpc"), "a&b<c>d".to_string()];
     spec.env = BTreeMap::from([("K&L<M>N".to_string(), "x&y<z>w".to_string())]);
     spec.cwd = Some(abs("opt/a&b<c>d"));
     spec.logs = Some(abs("var/log/a&b<c>d"));
@@ -607,7 +602,7 @@ fn without_metadata_keeps_what_launchd_reads() {
     );
     let other_command = plist(
         &DaemonSpec::new(DaemonFields {
-            command: vec![program(), "--verbose".to_string()],
+            command: vec![program("frpc"), "--verbose".to_string()],
             ..minimal_spec().into_fields()
         })
         .unwrap(),

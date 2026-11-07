@@ -9,7 +9,7 @@ use super::*;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
 use crate::spec::Restart;
-use crate::spec::test_support::plain_fields;
+use crate::spec::test_support::{plain_fields, program};
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     ScmRegistration {
@@ -487,10 +487,7 @@ fn blob_of(kind: Kind) -> Blob {
         version: "0.1.0".to_string(),
         spec: DaemonSpec::new(DaemonFields {
             kind,
-            ..plain_fields(
-                "frpc",
-                vec![std::env::temp_dir().join("frpc").to_string_lossy().into_owned()],
-            )
+            ..plain_fields("frpc", vec![program("frpc")])
         })
         .unwrap(),
     }

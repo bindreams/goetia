@@ -1,22 +1,20 @@
 use super::*;
 use crate::spec::DaemonFields;
 use crate::spec::test_support::abs;
-use crate::spec::test_support::plain_fields;
+use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{Builtin, MAX_SC_ACTION_DELAY};
 
 // Fixtures ============================================================================================================
-
-/// The program both fixtures run.
-fn program() -> String {
-    abs("bin/frpc-agent").to_string_lossy().into_owned()
-}
 
 fn managed_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_string(),
         restart: Restart::OnFailure,
         restart_delay: Some(Duration::from_secs(5)),
-        ..plain_fields("frpc", vec![program(), "-c".to_string(), "frpc.toml".to_string()])
+        ..plain_fields(
+            "frpc",
+            vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
+        )
     })
     .unwrap()
 }
@@ -30,7 +28,10 @@ fn simple_spec() -> DaemonSpec {
         // asserts `frpc-agent` is absent from `arguments`, which would be
         // vacuously true if it happened to equal the id (also `frpc`, and
         // always present as the shim's sole argument).
-        ..plain_fields("frpc", vec![program(), "-c".to_string(), "frpc.toml".to_string()])
+        ..plain_fields(
+            "frpc",
+            vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
+        )
     })
     .unwrap()
 }

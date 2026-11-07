@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::blob::{self, Blob};
-use crate::spec::test_support::plain_fields;
+use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{DaemonFields, DaemonSpec, Kind, Restart};
 
 // Fixtures ============================================================================================================
@@ -30,14 +30,7 @@ fn spec_fixture() -> DaemonSpec {
         restart: Restart::OnFailure,
         logs: Some(std::env::temp_dir().join("frpc.log")),
         kind: Kind::Simple,
-        ..plain_fields(
-            "frpc",
-            vec![
-                std::env::temp_dir().join("frpc").to_string_lossy().into_owned(),
-                "-c".to_owned(),
-                "frpc.toml".to_owned(),
-            ],
-        )
+        ..plain_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()])
     })
     .unwrap()
 }

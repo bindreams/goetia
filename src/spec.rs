@@ -136,6 +136,7 @@ pub struct DaemonFields {
 /// - `cwd` and `logs`, when set, are absolute paths;
 /// - no emitted field (`name`, `command`, `cwd`, `logs`, `env` keys and values, `user`) holds a
 ///   control character or an XML noncharacter;
+/// - `cwd` and `logs` are valid UTF-8;
 /// - every `env` key is non-empty and has no `=`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonSpec(DaemonFields);

@@ -31,6 +31,11 @@ pub(crate) fn abs(p: &str) -> PathBuf {
     }
 }
 
+/// An absolute program path `bin/<name>` on the host, as a `command[0]`.
+pub(crate) fn program(name: &str) -> String {
+    abs(&format!("bin/{name}")).to_string_lossy().into_owned()
+}
+
 /// An absolute path that is not valid UTF-8, for the rule that refuses one.
 #[cfg(windows)]
 pub(crate) fn non_utf8_absolute_path() -> PathBuf {
