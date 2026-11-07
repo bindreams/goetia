@@ -14,7 +14,9 @@ use std::marker::PhantomData;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_INVALID_OWNER, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject};
 
 use super::acl::{Descriptor, account_name, is_trusted, kernel_object_owner};
@@ -47,10 +49,7 @@ impl InstallLock {
         // SAFETY: read straight after the call, before anything else can change it.
         let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         if raw.is_null() {
-            return Err(Error::os(
-                format!("create the install lock `{NAME}`"),
-                io::Error::last_os_error(),
-            ));
+            return Err(create_failed(io::Error::last_os_error()));
         }
         // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns.
         let mutex = unsafe { OwnedHandle::from_raw_handle(raw) };
@@ -76,6 +75,18 @@ impl InstallLock {
     }
 }
 
+/// The error for a failed `CreateMutexW`. The lock's owner is Administrators, which a token that
+/// does not have it enabled cannot give an object: that is `ERROR_INVALID_OWNER`, and it is the
+/// caller's lack of elevation ([`Error::ElevationRequired`]), not an OS failure.
+fn create_failed(source: io::Error) -> Error {
+    if source.raw_os_error() == Some(ERROR_INVALID_OWNER as i32) {
+        return Error::ElevationRequired {
+            subcommand: format!("create the install lock `{NAME}`"),
+        };
+    }
+    Error::os(format!("create the install lock `{NAME}`"), source)
+}
+
 impl Drop for InstallLock {
     fn drop(&mut self) {
         // SAFETY: the calling thread holds the mutex: it took it in `acquire` and `Self` is not
@@ -84,3 +95,7 @@ impl Drop for InstallLock {
         debug_assert_ne!(released, 0, "ReleaseMutex: {}", io::Error::last_os_error());
     }
 }
+
+#[cfg(test)]
+#[path = "lock_tests.rs"]
+mod lock_tests;

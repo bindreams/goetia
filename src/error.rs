@@ -571,8 +571,9 @@ pub enum Error {
     NoManager { evidence: String },
 
     /// A mutating CLI subcommand was invoked without the elevation
-    /// (root/Administrator) it requires. Never returned for `list`,
-    /// `status`, `show`, `diff`, or `install --dry-run`.
+    /// (root/Administrator) it requires, or, for a library caller on Windows, the install lock
+    /// could not be created for want of it (`subcommand` then names that action). Never returned
+    /// for `list`, `status`, `show`, `diff`, or `install --dry-run`.
     #[error("`{subcommand}` requires elevation (root/Administrator): re-run as root or Administrator")]
     ElevationRequired { subcommand: String },
 
