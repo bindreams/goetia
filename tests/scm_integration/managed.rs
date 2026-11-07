@@ -966,15 +966,17 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
     let service = service_key(&id, KEY_READ | KEY_WRITE);
     service.delete_subkey_all("Parameters").expect("remove Parameters");
     let link = create_raw_key(&service, &units("Parameters"), REG_OPTION_CREATE_LINK);
+    // Before the target: once `SymbolicLinkValue` is set, a write through the link key's handle is
+    // denied (STATUS_ACCESS_DENIED on CI).
+    for (name, value) in fields {
+        set_raw_value(&link, &units(&name), value.vtype as u32, &value.bytes);
+    }
     // No closing NUL, which is how a link's target is stored, so that the link resolves.
     let link_value: Vec<u8> = units(&target.nt_path())
         .into_iter()
         .flat_map(u16::to_le_bytes)
         .collect();
     set_raw_value(&link, &units("SymbolicLinkValue"), REG_LINK, &link_value);
-    for (name, value) in fields {
-        set_raw_value(&link, &units(&name), value.vtype as u32, &value.bytes);
-    }
     drop(link);
 
     let diff = assert_conflict_cleared_by_force(&mgr, &spec);
