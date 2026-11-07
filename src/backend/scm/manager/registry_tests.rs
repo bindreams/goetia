@@ -4,7 +4,7 @@ use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
 use winreg::types::ToRegValue as _;
 
 use crate::backend::test_elevation::{ELEVATED, elevated};
-use crate::backend::test_raw_registry::{create_raw_key, set_raw_value};
+use crate::backend::test_raw_registry::{create_link, create_raw_key};
 use crate::backend::test_scratch::ScratchKey;
 
 #[skuld::test]
@@ -437,8 +437,6 @@ fn an_event_message_file_needs_a_system_root() {
 /// goetia does not own: the link is deleted, a real key made, and the target left as it was.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_parameters_that_is_a_link_is_replaced_by_a_real_key_and_its_target_is_left_alone() {
-    const REG_LINK: u32 = 6;
-    const REG_OPTION_CREATE_LINK: u32 = 2;
     let unique = std::process::id();
     // The target first, so that it is removed last.
     let target = ScratchKey::new(&format!("parameters-link-target-{unique}"));
@@ -447,14 +445,7 @@ fn a_parameters_that_is_a_link_is_replaced_by_a_real_key_and_its_target_is_left_
     target_key.set_value("Keep", &"x").expect("write Keep");
     target_key.set_value("Marker", &"not goetia's").expect("write Marker");
     let service_key = service.create();
-    let link = create_raw_key(&service_key, &utf16("Parameters"), REG_OPTION_CREATE_LINK);
-    // No closing NUL, which is how a link's target is stored, so that the link resolves.
-    let link_value: Vec<u8> = utf16(&target.nt_path())
-        .into_iter()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    set_raw_value(&link, &utf16("SymbolicLinkValue"), REG_LINK, &link_value);
-    drop(link);
+    let _link = create_link(&service_key, "Parameters", &target.nt_path());
 
     let key = create_parameters_key(&service_key).expect("replace the link");
     key.set_value("Marker", &"goetia's").expect("write through the new key");

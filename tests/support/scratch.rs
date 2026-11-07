@@ -34,7 +34,6 @@ impl ScratchKey {
     }
 
     /// The key as the kernel names it, which is what a registry link's value holds.
-    #[allow(dead_code, reason = "the library's tests point no registry link at it")]
     pub fn nt_path(&self) -> String {
         format!(r"\Registry\Machine\{}", self.path)
     }

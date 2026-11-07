@@ -19,7 +19,7 @@ use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
 use crate::common::{self, conformance_mk, fixture_command};
 use crate::deny::Denied;
 use crate::install_helper::INSTALL_AS;
-use crate::support::raw_registry::{create_raw_key, set_raw_value};
+use crate::support::raw_registry::{create_link, create_raw_key, set_raw_value};
 use crate::support::registry::{
     create_parameters_key, parameters_key, service_key, try_parameters_key, try_service_key,
 };
@@ -841,25 +841,17 @@ fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes() {
 /// wiped. `--force` deletes the link itself and leaves the target as it was.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn force_install_deletes_a_stray_registry_link_and_leaves_its_target() {
-    const REG_LINK: u32 = 6;
-    const REG_OPTION_CREATE_LINK: u32 = 2;
     let mgr = Scm::new();
     let id = support::random_test_id();
+    // Declared first, so that it is removed last.
+    let target = ScratchKey::new(&format!("link-target-{id}"));
     let _guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, &id);
-    let target = ScratchKey::new(&format!("link-target-{id}"));
     let target_key = target.create();
     target_key.set_value("Keep", &"x").expect("write Keep");
     target_key.create_subkey("Child").expect("create Child");
     let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
-    let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
-    let link = create_raw_key(&parameters, &units("Link"), REG_OPTION_CREATE_LINK);
-    let link_value: Vec<u8> = units(&target.nt_path())
-        .into_iter()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    set_raw_value(&link, &units("SymbolicLinkValue"), REG_LINK, &link_value);
-    drop(link);
+    let _link = create_link(&parameters, "Link", &target.nt_path());
 
     assert_conflict_cleared_by_force(&mgr, &spec);
 
@@ -877,13 +869,11 @@ fn force_install_deletes_a_stray_registry_link_and_leaves_its_target() {
 /// its target: so a service whose `Parameters` was replaced by a link to a key holding goetia's four
 /// values is no longer goetia's. `list` omits it, `status` and `install`, forced or not, refuse it as
 /// foreign, and the target and the link are as they were.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_target_and_link_alone() {
-    const REG_LINK: u32 = 6;
-    const REG_OPTION_CREATE_LINK: u32 = 2;
     let mgr = Scm::new();
     let id = support::random_test_id();
-    // Before the service, so that the service and its link go first, while the target is there.
+    // Declared first, so that it is removed last.
     let target = ScratchKey::new(&format!("link-target-{id}"));
     let _guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, &id);
@@ -901,17 +891,10 @@ fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_t
             .expect("copy a value to the target");
     }
 
-    // `Parameters` becomes a link to it. No closing NUL, which is how a link's target is stored, so
-    // that the link resolves.
+    // `Parameters` becomes a link to it.
     let service = service_key(&id, KEY_READ | KEY_WRITE);
     service.delete_subkey_all("Parameters").expect("remove Parameters");
-    let link = create_raw_key(&service, &units("Parameters"), REG_OPTION_CREATE_LINK);
-    let link_value: Vec<u8> = units(&target.nt_path())
-        .into_iter()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    set_raw_value(&link, &units("SymbolicLinkValue"), REG_LINK, &link_value);
-    drop(link);
+    let _link = create_link(&service, "Parameters", &target.nt_path());
 
     let listed = mgr.list().expect("list");
     assert!(
@@ -941,6 +924,10 @@ fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_t
     let held = as_itself
         .get_raw_value("SymbolicLinkValue")
         .expect("Parameters is still a link");
+    let link_value: Vec<u8> = units(&target.nt_path())
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
     assert_eq!(held.bytes, link_value);
     let followed = parameters_key(&id, KEY_READ);
     for (name, value) in &fields {
