@@ -14,12 +14,12 @@ use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::System::Registry::RegSetValueExW;
-use winreg::RegKey;
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
+use winreg::enums::{KEY_READ, KEY_WRITE};
 
 use crate::common::{self, conformance_mk, fixture_command};
 use crate::deny::Denied;
 use crate::install_helper::INSTALL_AS;
+use crate::support::registry::{parameters_key, service_key, try_parameters_key};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole
@@ -588,15 +588,8 @@ fn managed_kind_environment_availability() {
 
 // `Environment` is part of the compared registration ==================================================================
 
-fn environment_key(id: &str, access: u32) -> RegKey {
-    let path = format!(r"{}\{id}", support::SCM_SERVICES_KEY);
-    RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(&path, access)
-        .unwrap_or_else(|e| panic!(r"open HKLM\{path}: {e}"))
-}
-
 fn environment_of(id: &str) -> Option<Vec<String>> {
-    match environment_key(id, KEY_READ).get_value::<Vec<String>, _>("Environment") {
+    match service_key(id, KEY_READ).get_value::<Vec<String>, _>("Environment") {
         Ok(lines) => Some(lines),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => panic!("read Environment of {id}: {e}"),
@@ -638,7 +631,7 @@ fn a_hand_edited_environment_is_a_conflict() {
     let _guard = ServiceGuard::new(&id);
     let spec = install_with_environment(&mgr, &id);
 
-    environment_key(&id, KEY_WRITE)
+    service_key(&id, KEY_WRITE)
         .set_value("Environment", &vec!["HAND_EDITED=1".to_string()])
         .expect("overwrite Environment");
 
@@ -654,7 +647,7 @@ fn a_deleted_environment_is_a_conflict() {
     let _guard = ServiceGuard::new(&id);
     let spec = install_with_environment(&mgr, &id);
 
-    environment_key(&id, KEY_WRITE)
+    service_key(&id, KEY_WRITE)
         .delete_value("Environment")
         .expect("delete Environment");
 
@@ -690,7 +683,7 @@ fn a_wrong_typed_environment_is_a_conflict() {
     let _guard = ServiceGuard::new(&id);
     let spec = install_with_environment(&mgr, &id);
 
-    environment_key(&id, KEY_WRITE)
+    service_key(&id, KEY_WRITE)
         .set_value("Environment", &INSTALLED_ENVIRONMENT)
         .expect("overwrite Environment with a REG_SZ");
 
@@ -709,7 +702,7 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
     let _guard = ServiceGuard::new(&id);
     let spec = install_with_environment(&mgr, &id);
 
-    let key = environment_key(&id, KEY_WRITE);
+    let key = service_key(&id, KEY_WRITE);
     let name = support::wide_null("Environment");
     let data = INSTALLED_ENVIRONMENT.as_bytes();
     // SAFETY: `key` holds an open handle with write access; `name` is NUL-terminated and `data` is
@@ -1173,10 +1166,7 @@ fn install_refuses_an_always_blob_as_unusable() {
         restart: Restart::Always,
         ..spec.clone()
     };
-    let path = format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY);
-    RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(&path, KEY_WRITE)
-        .unwrap_or_else(|e| panic!(r"open HKLM\{path}: {e}"))
+    parameters_key(&id, KEY_WRITE)
         .set_value("Spec", &goetia::blob::encode(&always))
         .expect("write Spec");
 
@@ -1249,11 +1239,9 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 
     // The deny ACE really took. Administrators do not bypass an explicit deny, but a test that
     // passed because the ACE never applied would certify nothing at all.
-    let path = format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY);
-    let blocked = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(&path, KEY_READ)
+    let blocked = try_parameters_key(&id, KEY_READ)
         .err()
-        .unwrap_or_else(|| panic!(r"the deny ACE did not apply: HKLM\{path} is still readable"));
+        .unwrap_or_else(|| panic!("the deny ACE did not apply: the Parameters of {id} are still readable"));
     assert_eq!(blocked.kind(), std::io::ErrorKind::PermissionDenied, "{blocked}");
 
     let err = mgr
@@ -1309,7 +1297,7 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
         .unwrap_or_else(|| panic!("a service whose marker was never read is neither claimed nor omitted: {listed:?}"))
         .to_string();
     assert!(
-        reason.contains(&format!(r"{}\{id}\Parameters", support::SCM_SERVICES_KEY)),
+        reason.contains(&support::registry::parameters_path(&id)),
         "the entry must name the key whose read did not complete: {reason}"
     );
     assert!(

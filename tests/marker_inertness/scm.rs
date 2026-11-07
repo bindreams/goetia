@@ -13,9 +13,9 @@
 use std::collections::BTreeMap;
 
 use winreg::RegKey;
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
+use winreg::enums::{KEY_READ, KEY_WRITE};
 
-use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard, cmd};
+use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard, cmd, registry};
 
 /// Byte-exact field names; renaming one changes every installed artifact.
 const PRIMARY: Names = Names {
@@ -65,20 +65,21 @@ fn scm_parameters_values_survive() {
     .expect_ok();
 
     let services = support::SCM_SERVICES_KEY;
-    let parameters = format!(r"{services}\{id}\Parameters");
-    let service = format!(r"{services}\{id}");
     let expected = written(&blob);
-    write(&parameters, PRIMARY, &expected);
-    write(&service, FALLBACK, &expected);
+    write(&registry::create_parameters_key(&id), PRIMARY, &expected);
+    write(&registry::create_service_key(&id), FALLBACK, &expected);
 
     let mut fallback_survived = BTreeMap::new();
     let mut check = |stage: &str| {
         assert_eq!(
-            read(&parameters, PRIMARY),
+            read(registry::try_parameters_key(&id, KEY_READ), PRIMARY),
             expected,
             "`Parameters` values did not survive {stage}"
         );
-        fallback_survived.insert(stage.to_string(), read(&service, FALLBACK) == expected);
+        fallback_survived.insert(
+            stage.to_string(),
+            read(registry::try_service_key(&id, KEY_READ), FALLBACK) == expected,
+        );
     };
 
     check("CreateService followed by the metadata write");
@@ -113,9 +114,11 @@ fn scm_parameters_values_survive() {
     // Control: the readback has to be able to come out negative. Without this,
     // "the values survived" is indistinguishable from a reader that reports
     // whatever it was asked about.
-    open(&parameters).delete_value(PRIMARY.marker).expect("delete Marker");
+    registry::parameters_key(&id, KEY_READ | KEY_WRITE)
+        .delete_value(PRIMARY.marker)
+        .expect("delete Marker");
     assert_ne!(
-        read(&parameters, PRIMARY),
+        read(registry::try_parameters_key(&id, KEY_READ), PRIMARY),
         expected,
         "the readback did not notice a deleted value, so it cannot detect pruning either"
     );
@@ -161,16 +164,7 @@ fn written(blob: &str) -> Metadata {
     }
 }
 
-fn open(path: &str) -> RegKey {
-    RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(path, KEY_READ | KEY_WRITE)
-        .unwrap_or_else(|e| panic!(r"open HKLM\{path}: {e}"))
-}
-
-fn write(path: &str, names: Names, values: &Metadata) {
-    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .create_subkey(path)
-        .unwrap_or_else(|e| panic!(r"create HKLM\{path}: {e}"));
+fn write(key: &RegKey, names: Names, values: &Metadata) {
     key.set_value(names.marker, values.marker.as_ref().unwrap())
         .expect("write marker");
     key.set_value(names.schema, values.schema.as_ref().unwrap())
@@ -179,8 +173,8 @@ fn write(path: &str, names: Names, values: &Metadata) {
         .expect("write spec");
 }
 
-fn read(path: &str, names: Names) -> Metadata {
-    let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(path, KEY_READ) else {
+fn read(key: std::io::Result<RegKey>, names: Names) -> Metadata {
+    let Ok(key) = key else {
         return Metadata {
             marker: None,
             schema: None,

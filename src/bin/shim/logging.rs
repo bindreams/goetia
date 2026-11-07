@@ -1,26 +1,46 @@
-//! Log-path resolution and the two failure-reporting channels a
-//! version-skewed or permission-denied shim can still reach.
+//! Where the shim writes a failure, and the two channels it reaches.
 //!
-//! **Why two channels.** `%ProgramData%\Goetia\logs\` is not writable by a
-//! non-admin service account, so a `user: someuser` daemon can die at boot
-//! before it can say why through a file at all — the event log's default
-//! ACL is far more permissive, so it is the more likely of the two to still
-//! work exactly when the file is not. And an old shim running against a
-//! newer blob fails to decode `Spec` before it ever learns the daemon's own
-//! `logs:` path, so [`default_log_path`] — derivable from the service id
-//! (`argv[1]`) alone, no blob required — is the only file destination a
-//! decode failure can ever target.
+//! **File.** Once the shim has decoded its spec ([`set_daemon_log`]), a failure goes into the
+//! daemon's own log, interleaved with the daemon's output. Before that, and whenever that file
+//! cannot be opened, it goes to [`default_log_path`]: an old shim running against a newer blob
+//! fails to decode `Spec` before it learns the daemon's `logs:` path, so the path derivable from
+//! the service id (`argv[1]`) alone is the only file destination a decode failure can target.
+//!
+//! **Event Log.** Every failure also goes to the Windows Event Log. `%ProgramData%\Goetia\logs\` is
+//! not writable by a non-admin service account, so a `user: someuser` daemon can die at boot
+//! before it can say why through a file at all; the event log's default ACL is far more
+//! permissive, so it is the more likely of the two to still work exactly when the file is not.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// `%ProgramData%\Goetia\logs\<id>.log` — derivable from `id` alone. This is
-/// also the OS-default `logs:` path for `type: simple` on Windows when
-/// `goetia.yaml` sets none, so a daemon that never overrides `logs:` has no
-/// fallback/real distinction at all.
+/// `%ProgramData%\Goetia\logs\<id>.log` — derivable from `id` alone. This is where a failure goes
+/// before the spec is decoded or when the daemon's log cannot be opened, and the daemon's own log
+/// when `goetia.yaml` sets no `logs:` ([`daemon_log_path`]).
 pub fn default_log_path(id: &str) -> PathBuf {
     programdata_dir().join("Goetia").join("logs").join(format!("{id}.log"))
+}
+
+/// The daemon's log: `logs` from its spec, or [`default_log_path`] when unset.
+pub fn daemon_log_path(id: &str, logs: Option<&Path>) -> PathBuf {
+    logs.map_or_else(|| default_log_path(id), Path::to_path_buf)
+}
+
+/// The daemon's log, once the spec is decoded. One shim serves one service, so one path.
+static DAEMON_LOG: OnceLock<PathBuf> = OnceLock::new();
+
+/// From now on, failures go to `path` (see [`daemon_log_path`]) instead of the default. Call right
+/// after the spec decodes. A second call must carry the same path; a different one is a caller bug,
+/// debug-asserted.
+pub fn set_daemon_log(path: PathBuf) {
+    if let Err(second) = DAEMON_LOG.set(path) {
+        debug_assert_eq!(
+            Some(&second),
+            DAEMON_LOG.get(),
+            "a second `set_daemon_log` must carry the same path"
+        );
+    }
 }
 
 fn programdata_dir() -> PathBuf {
@@ -37,8 +57,10 @@ pub fn open_append(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-pub fn append_line(file: &mut File, line: &str) {
-    let _ = writeln!(file, "{line}");
+/// Writes `line` and a newline in one `write`, so output another handle appends in between cannot
+/// split the line.
+pub fn append_line(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    out.write_all(format!("{line}\n").as_bytes())
 }
 
 // Windows Event Log ===================================================================================================
@@ -123,10 +145,9 @@ pub enum Severity {
     Warning,
 }
 
-/// Write `message` to the id-derived fallback log path and the Windows
-/// Event Log as an error — both best-effort, so a decode or spawn failure is never lost
-/// just because one of the two channels is itself unavailable (see the
-/// module doc comment for why each can independently fail).
+/// Write `message` to the log file and the Windows Event Log as an error — both best-effort,
+/// so a decode or spawn failure is never lost just because one of the two channels is itself
+/// unavailable.
 ///
 /// A test build journals the line instead; see `test_hook`.
 pub fn log_failure(id: &str, message: &str) {
@@ -143,7 +164,13 @@ fn log(id: &str, severity: Severity, message: &str) {
     let line = failure_line(id, message);
     eprintln!("{line}");
     #[cfg(not(test))]
-    write_channels(id, &line, default_log_path, |line| eventlog::report(severity, line));
+    write_channels(
+        id,
+        &line,
+        default_log_path,
+        DAEMON_LOG.get().map(PathBuf::as_path),
+        |line| eventlog::report(severity, line),
+    );
     #[cfg(test)]
     test_hook::report(id, severity, line);
 }
@@ -153,18 +180,33 @@ pub fn failure_line(id: &str, message: &str) -> String {
 }
 
 /// Compiled in every build so test builds still type-check the production channels. Takes the
-/// path derivation and the Event Log write as parameters so a test can drive the real composition
-/// against a temp path and a stub.
-fn write_channels(id: &str, line: &str, log_path: impl FnOnce(&str) -> PathBuf, event_log: impl FnOnce(&str)) {
-    write_fallback(&log_path(id), line);
+/// default path derivation, the daemon's log and the Event Log write as parameters so a test can
+/// drive the real composition against temp paths and a stub.
+fn write_channels(
+    id: &str,
+    line: &str,
+    default_log: impl FnOnce(&str) -> PathBuf,
+    daemon_log: Option<&Path>,
+    event_log: impl FnOnce(&str),
+) {
+    let _ = log_destinations(daemon_log, default_log(id))
+        .iter()
+        .any(|path| write_line(path, line));
     event_log(line);
 }
 
-/// Best-effort: a failure to open or write is ignored.
-fn write_fallback(path: &Path, line: &str) {
-    if let Ok(mut f) = open_append(path) {
-        append_line(&mut f, line);
+/// The files to try for a line, in order: the daemon's log, then the default. When they are the
+/// same path, it is tried once.
+fn log_destinations(daemon_log: Option<&Path>, default: PathBuf) -> Vec<PathBuf> {
+    match daemon_log {
+        Some(path) if path != default => vec![path.to_path_buf(), default],
+        Some(_) | None => vec![default],
     }
+}
+
+/// Whether `line` was written; open/write failures are reported, not raised.
+fn write_line(path: &Path, line: &str) -> bool {
+    open_append(path).and_then(|mut f| append_line(&mut f, line)).is_ok()
 }
 
 // test_hook ===========================================================================================================
