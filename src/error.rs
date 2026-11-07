@@ -256,8 +256,9 @@ pub enum Error {
         previewed.args
     )]
     ShimProviderDisagrees {
-        previewed: crate::shim::HostCommand,
-        provided: crate::shim::HostCommand,
+        // Boxed: two inline commands make `Error`, and every `Result` over it, large (`clippy::result_large_err`).
+        previewed: Box<crate::shim::HostCommand>,
+        provided: Box<crate::shim::HostCommand>,
     },
 
     /// A shim provider named its host, or the folder it keeps it in, by a path that is not

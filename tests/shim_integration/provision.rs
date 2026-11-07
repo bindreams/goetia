@@ -19,7 +19,7 @@ use goetia::manager::{Budget, ServiceManager as _, State};
 use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
-use goetia::spec::{DaemonSpec, User};
+use goetia::spec::{DaemonFields, DaemonSpec, User};
 use windows_sys::Win32::Foundation::{GENERIC_ALL, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
@@ -608,10 +608,11 @@ fn every_account_type_runs_the_shim() {
 
     let as_user = |label: &str, user: fn(&str) -> User| {
         runs_as(label, &mgr, |id, exe, port| {
-            let spec = DaemonSpec {
+            let spec = DaemonSpec::new(DaemonFields {
                 user: user(id),
-                ..simple_spec(id, fixture_command_with_exe(exe, "report", &[&port.to_string()]), &logs)
-            };
+                ..simple_spec(id, fixture_command_with_exe(exe, "report", &[&port.to_string()]), &logs).into_fields()
+            })
+            .unwrap();
             mgr.install(&spec, false)
                 .unwrap_or_else(|e| panic!("{label}: install: {}", e.report()));
         });
@@ -703,7 +704,7 @@ fn install_refuses_a_provider_that_disagrees() {
         Err(Error::ShimProviderDisagrees {
             previewed: said,
             provided: gave,
-        }) => assert_eq!((said, gave), (command(previewed), command(provided))),
+        }) => assert_eq!((*said, *gave), (command(previewed), command(provided))),
         other => panic!("a provider that provides what it did not preview must be refused, got {other:?}"),
     }
 }

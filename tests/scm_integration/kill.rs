@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use goetia::backend::scm::manager::Scm;
 use goetia::manager::{Budget, ServiceManager as _, State};
-use goetia::spec::{DaemonSpec, User};
+use goetia::spec::{DaemonFields, DaemonSpec, User};
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError, LUID};
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, ImpersonateSelf, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, RevertToSelf, SE_DEBUG_NAME,
@@ -104,14 +104,15 @@ fn kill_with_the_privilege_disabled(user: User) {
     // LocalService cannot execute the repo's own build tree; see `support::WorldReadableExe`.
     let exe = support::WorldReadableExe::new(&id);
     let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
-    let spec = DaemonSpec {
+    let spec = DaemonSpec::new(DaemonFields {
         user,
         restart_delay: Some(Duration::from_secs(1)),
         ..support::spec(
             &id,
             fixture_command_with_exe(&exe.path_str(), &id, started.port(), stopped.port(), "plain"),
         )
-    };
+    })
+    .unwrap();
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::Unbounded).expect("start");
     started.accept("the fixture to report SERVICE_RUNNING");

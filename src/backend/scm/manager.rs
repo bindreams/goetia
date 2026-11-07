@@ -293,7 +293,10 @@ impl Backend for Scm {
         let provided = shim.provide(&self.folders)?;
         let previewed = shim.preview()?;
         if provided != previewed {
-            return Err(Error::ShimProviderDisagrees { previewed, provided });
+            return Err(Error::ShimProviderDisagrees {
+                previewed: Box::new(previewed),
+                provided: Box::new(provided),
+            });
         }
         provided
             .exe

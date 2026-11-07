@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use super::*;
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, FolderCheck, HostCommand, ShimProvider, SweepFailure};
+use crate::spec::DaemonFields;
 use crate::spec::Restart;
+use crate::spec::test_support::{plain_fields, program};
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     ScmRegistration {
@@ -472,10 +474,11 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
 // Install refuses `restart: always` ===================================================================================
 
 fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         restart,
-        ..DaemonSpec::for_test("frpc", vec![r"C:\bin\frpc.exe".to_string()])
-    }
+        ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+    })
+    .unwrap()
 }
 
 // start_kind ----------------------------------------------------------------------------------------------------------
@@ -484,10 +487,11 @@ fn blob_of(kind: Kind) -> Blob {
     Blob {
         schema: 1,
         version: "0.1.0".to_string(),
-        spec: DaemonSpec {
+        spec: DaemonSpec::new(DaemonFields {
             kind,
-            ..DaemonSpec::for_test("frpc", vec!["frpc".to_string()])
-        },
+            ..plain_fields("frpc", vec![program("frpc")])
+        })
+        .unwrap(),
     }
 }
 
@@ -525,10 +529,11 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
 /// any other.
 #[skuld::test]
 fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
-    let spec = DaemonSpec {
+    let spec = DaemonSpec::new(DaemonFields {
         restart: Restart::Always,
-        ..blob_of(Kind::Simple).spec
-    };
+        ..blob_of(Kind::Simple).spec.into_fields()
+    })
+    .unwrap();
     // Hand-write the blob: `registration` refuses `always`.
     let parameters = BTreeMap::from([
         ("Marker".to_string(), crate::blob::MARKER.to_string()),
@@ -569,10 +574,11 @@ fn install_and_preview_install_refuse_restart_always() {
 // The shim provider ---------------------------------------------------------------------------------------------------
 
 fn simple_daemon() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
-        ..DaemonSpec::for_test("frpc", vec![r"C:\bin\frpc.exe".to_string()])
-    }
+        ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+    })
+    .unwrap()
 }
 
 /// A provider that records the calls it gets and answers with the commands it was given.

@@ -13,7 +13,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager as _, Step};
-use goetia::spec::{DaemonSpec, Restart};
+use goetia::spec::{DaemonFields, DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::{KEY_READ, KEY_WRITE};
 
@@ -30,11 +30,12 @@ const ONE_SECOND: Option<Duration> = Some(Duration::from_secs(1));
 const EARLIER_VERSION: &str = "0.0.0";
 
 fn on_failure(id: &str, command: Vec<String>, restart_delay: Option<Duration>, logs: &LogDir) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         restart_delay,
-        ..simple_spec(id, command, logs)
-    }
+        ..simple_spec(id, command, logs).into_fields()
+    })
+    .unwrap()
 }
 
 // SCM restarts ========================================================================================================
@@ -297,11 +298,12 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy() {
     for (restart, restart_delay) in [(Restart::Never, None), (Restart::OnFailure, hour)] {
         let id = support::random_test_id();
         let _guard = ShimGuard::new(&id);
-        let spec = DaemonSpec {
+        let spec = DaemonSpec::new(DaemonFields {
             restart,
             restart_delay,
-            ..simple_spec(&id, missing.clone(), &logs)
-        };
+            ..simple_spec(&id, missing.clone(), &logs).into_fields()
+        })
+        .unwrap();
         mgr.install(&spec, false).expect("install");
 
         let err = mgr
@@ -343,7 +345,7 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
         let id = support::random_test_id();
         let _guard = ShimGuard::new(&id);
         let reported = ConnectBack::listen();
-        let spec = DaemonSpec {
+        let spec = DaemonSpec::new(DaemonFields {
             restart,
             restart_delay: hour,
             ..simple_spec(
@@ -351,7 +353,9 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once() {
                 fixture_command("exit", &[&reported.port().to_string(), &code.to_string()]),
                 &logs,
             )
-        };
+            .into_fields()
+        })
+        .unwrap();
         mgr.install(&spec, false).expect("install");
 
         mgr.start(&spec.id, Budget::DEFAULT)
