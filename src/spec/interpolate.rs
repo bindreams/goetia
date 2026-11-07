@@ -502,7 +502,12 @@ fn substitute_at(
 }
 
 /// [`substitute`] for an optional field; `None` has nothing to substitute.
-fn substitute_option(text: &mut Option<String>, field: Field, vars: &Vars, from_env: &mut BTreeSet<Field>) -> Result<()> {
+fn substitute_option(
+    text: &mut Option<String>,
+    field: Field,
+    vars: &Vars,
+    from_env: &mut BTreeSet<Field>,
+) -> Result<()> {
     match text {
         Some(text) => substitute(text, field, vars, from_env),
         None => Ok(()),

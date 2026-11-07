@@ -1,6 +1,6 @@
 use super::*;
-use crate::spec::test_support::plain_fields;
 use crate::backend::Identity;
+use crate::spec::test_support::plain_fields;
 use crate::spec::{DaemonFields, DaemonSpec, Kind, Restart};
 
 fn spec_fixture() -> DaemonSpec {

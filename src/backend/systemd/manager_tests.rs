@@ -16,11 +16,11 @@ use super::dirs::ensure_dir;
 use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
-use crate::spec::test_support::plain_fields;
 use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
 use crate::spec::DaemonFields;
 use crate::spec::Kind;
+use crate::spec::test_support::plain_fields;
 
 use crate::backend::test_cleanup::{DirGuard, FileGuard, remove_or_warn};
 

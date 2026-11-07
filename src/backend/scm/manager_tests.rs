@@ -6,10 +6,10 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::spec::test_support::plain_fields;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
 use crate::spec::Restart;
+use crate::spec::test_support::plain_fields;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     ScmRegistration {

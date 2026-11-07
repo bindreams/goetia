@@ -430,7 +430,12 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         logs,
         kind,
     })
-    .map_err(|err| contract_violation(&daemon, &format!("the resolved daemon failed its own field rules: {err}")))
+    .map_err(|err| {
+        contract_violation(
+            &daemon,
+            &format!("the resolved daemon failed its own field rules: {err}"),
+        )
+    })
 }
 
 /// A defect of this crate, not of any manifest: something an earlier step ruled out happened. An

@@ -3,16 +3,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
-use crate::spec::test_support::plain_fields;
 use crate::spec::DaemonFields;
+use crate::spec::test_support::plain_fields;
 use crate::spec::{Id, Kind, User};
 
 // Fixtures ============================================================================================================
 //
-// Every `DaemonSpec` here is built through `DaemonSpec::new`, never `spec::resolve()`, and `new`
-// requires `cwd`/`logs` to be absolute, which is platform-defined (`Path::is_absolute()` is `false`
-// for a bare `/opt/frpc` on Windows). `abs` builds a path that is absolute on the host running the
-// test.
+// `DaemonSpec::new` requires absolute `cwd`/`logs`, which is platform-defined; `abs` builds one for the host.
 
 fn full_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {

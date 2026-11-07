@@ -313,24 +313,19 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
         logs: wire.logs.map(PathBuf::from),
         kind,
     })?;
-    // After the field rules, so a blob with several defects reports the same first one as before.
+    // After the field rules: a blob with several defects reports the first in field order.
     if let Some(delay) = &wire.restart_delay {
         check_nanos(&spec.id, delay)?;
     }
     Ok(spec)
 }
 
-/// `Duration::new` panics if `secs` plus the carry from `nanos >= 1_000_000_000` overflows, so
-/// this saturates instead. The result of an out-of-range `nanos` is never used: [`check_nanos`]
-/// refuses it right after.
+/// Saturates rather than panic on `nanos >= 1e9`; [`check_nanos`] refuses that value right after.
 fn duration_from_wire(wire: &WireDuration) -> Duration {
     Duration::from_secs(wire.secs).saturating_add(Duration::from_nanos(wire.nanos.into()))
 }
 
-/// A hand-tampered blob can carry `nanos >= 1_000_000_000`, so it is checked rather than
-/// trusted. This is a `DaemonSpec`-content invariant on an otherwise cleanly decoded envelope, so
-/// it is `Error::Invalid` like every field rule in `DaemonSpec::new` — not `Error::Blob`, which is
-/// reserved for a corrupt envelope (see `error.rs`).
+/// `nanos >= 1e9` is `Error::Invalid` (content), not `Error::Blob` (envelope).
 fn check_nanos(id: &Id, wire: &WireDuration) -> Result<(), Error> {
     if wire.nanos >= 1_000_000_000 {
         return Err(Error::Invalid {

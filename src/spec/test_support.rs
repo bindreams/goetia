@@ -7,10 +7,6 @@ use super::{DaemonFields, Id, Kind, Restart, User};
 
 /// A plain root, `restart: never`, `type: managed` daemon named `id`; panics on an invalid `Id`.
 /// Mirrors `tests/support/daemon_spec.rs` (integration tests cannot reach `#[cfg(test)]`).
-///
-/// Vary fields with struct-update syntax, then [`DaemonSpec::new`](super::DaemonSpec::new).
-/// `command` is taken as given, so a test passes the paths it wants rendered the same on every
-/// platform.
 pub(crate) fn plain_fields(id: &str, command: Vec<String>) -> DaemonFields {
     DaemonFields {
         id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),

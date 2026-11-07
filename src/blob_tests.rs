@@ -253,6 +253,16 @@ fn decode_rejects_invariant_violations() {
             }),
             "restart_delay",
         ),
+        (
+            "restart_delay that would overflow `Duration::new`",
+            Box::new(|s: &mut WireSpec| {
+                s.restart_delay = Some(WireDuration {
+                    secs: u64::MAX,
+                    nanos: u32::MAX,
+                })
+            }),
+            "restart_delay",
+        ),
     ];
 
     for (label, mutate, expected_substring) in cases {
@@ -264,6 +274,7 @@ fn decode_rejects_invariant_violations() {
             spec: wire,
         };
         let err = decode(&encode_wire_envelope(&envelope)).unwrap_err();
+        assert!(matches!(err, Error::Invalid { .. }), "case `{label}`: {err:?}");
         let message = err.to_string();
         assert!(
             message.contains(expected_substring),

@@ -160,8 +160,6 @@ cwd: "C:x\0y"
 
 #[skuld::test]
 fn a_manifest_with_two_defects_reports_the_earlier_field_first() {
-    // Each manifest has two defects; the first in field order is reported, though the second is
-    // one the resolution or an earlier-running check would find first.
     let cases = [
         ("name: \"a\\nb\"\ncwd: \"\"", "field `name`"),
         ("cwd: \"\"\nlogs: \"a\\nb\"", "field `cwd` must not be empty"),
@@ -232,8 +230,7 @@ fn a_manifest_directory_with_a_newline_is_refused_by_the_field_joined_to_it() {
 
 #[skuld::test]
 fn a_resolution_error_is_reported_in_field_order() {
-    // The directory is bad, so each relative path fails to resolve. The first in field order is
-    // reported, though a later defect (an `env` key, a `logs` control character) is also present.
+    // The directory is bad, so each relative path fails to resolve.
     let dir = base_dir().join("a\nb");
     let abs = base_dir().join("frpc").to_string_lossy().into_owned();
     let cases = [
@@ -253,6 +250,19 @@ fn a_resolution_error_is_reported_in_field_order() {
             "`{body}`: {msg}"
         );
     }
+}
+
+#[skuld::test]
+fn a_rule_error_is_reported_before_a_later_fields_resolution_error() {
+    let dir = base_dir().join("a\nb");
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let msg = resolve(
+        parse_manifest(&format!("id: frpc\ncommand: ['{abs}']\ncwd: \"c\\nd\"\nlogs: data\n")),
+        &dir,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(msg.contains("field `cwd` contains a control character"), "{msg}");
 }
 
 #[skuld::test]
@@ -296,9 +306,32 @@ fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
     );
 }
 
+#[skuld::test]
+fn a_directory_defect_is_not_attributed_to_env_when_env_supplied_the_field() {
+    let id = Id::try_from("frpc").unwrap();
+    let from_env = BTreeSet::from([Field::Cwd]);
+    let directory = check_resolved(&id, PathField::Cwd, "bin", Path::new("/a\u{FFFE}/bin"), true).unwrap_err();
+    let msg = directory.attributed(&from_env).to_string();
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+
+    let value = check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\u{FFFE}"), false).unwrap_err();
+    let msg = value.attributed(&from_env).to_string();
+    assert!(msg.contains("after substituting from .env: "), "{msg}");
+}
+
 /// A drive-relative path resolves through the per-drive current directory, which a manifest
 /// cannot touch: a drive with none (`Q:`) resolves to its root, `Q:\`, which a path rule refuses.
 /// That is `.env`'s when a reference wrote the `Q:`.
+#[cfg(windows)]
+#[skuld::test]
+fn a_defect_in_a_typed_drive_relative_path_is_not_attributed_to_env() {
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let yaml = format!("id: frpc\ncommand: ['{abs}']\ncwd: 'Q:'\n");
+    let msg = resolve(parse_manifest(&yaml), &base_dir()).unwrap_err().to_string();
+    assert!(msg.contains("field `cwd` is `Q:`, which resolves to `Q:\\`"), "{msg}");
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+}
+
 #[cfg(windows)]
 #[skuld::test]
 fn a_defect_in_a_drive_relative_path_a_reference_wrote_is_attributed_to_env() {
@@ -364,8 +397,7 @@ fn a_manifest_directory_defect_is_not_blamed_on_the_env_file() {
 }
 
 /// `type: simple$$` substitutes to `simple$`, which holds a `$` and no reference: the shape phase
-/// judges it, with `command`, rather than leaving it to completeness. A `$$` is the manifest's own
-/// escape: no `.env` is in it.
+/// judges it, with `command`, rather than leaving it to completeness.
 #[skuld::test]
 fn a_substituted_enum_with_a_dollar_left_is_judged_in_the_shape_phase() {
     let msg = resolve_yaml(
@@ -403,10 +435,28 @@ fn a_defect_in_a_field_no_reference_touched_is_not_attributed_to_env() {
     assert!(!msg.contains(".env"), "{msg}");
 }
 
-/// A default is the manifest's own text, not `.env`'s.
 #[skuld::test]
 fn a_defect_in_a_default_is_not_attributed_to_env() {
     let dir = fixture_dir("id: frpc\nrestart: ${R:-sometimes}\n", None);
+    let msg = load(dir.path()).unwrap_err().to_string();
+    assert!(msg.contains("field `restart` is `sometimes`"), "{msg}");
+    assert!(!msg.contains(".env"), "{msg}");
+}
+
+#[skuld::test]
+fn an_empty_env_value_is_attributed_to_env() {
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let dir = fixture_dir(&format!("id: frpc\ncommand: ['{abs}']\ncwd: ${{D}}\n"), Some("D=\n"));
+    let msg = load(dir.path()).unwrap_err().to_string();
+    assert!(
+        msg.contains("after substituting from .env: field `cwd` must not be empty"),
+        "{msg}"
+    );
+}
+
+#[skuld::test]
+fn a_default_that_replaces_an_empty_env_value_is_not_attributed_to_env() {
+    let dir = fixture_dir("id: frpc\nrestart: ${R:-sometimes}\n", Some("R=\n"));
     let msg = load(dir.path()).unwrap_err().to_string();
     assert!(msg.contains("field `restart` is `sometimes`"), "{msg}");
     assert!(!msg.contains(".env"), "{msg}");
@@ -478,8 +528,6 @@ fn a_manifest_directory_defect_under_a_substituted_path_is_attributed_to_the_dir
     assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
 }
 
-/// A pass that leaves a value to a later one has nothing to say about it: it neither resolves it
-/// nor warns about how it resolves.
 #[cfg(windows)]
 #[skuld::test]
 fn a_pending_value_with_a_dollar_raises_nothing() {

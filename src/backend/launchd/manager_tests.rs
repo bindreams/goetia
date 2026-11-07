@@ -8,11 +8,11 @@
 //! `tests/launchd_integration.rs` instead.
 
 use super::*;
-use crate::spec::test_support::plain_fields;
 use crate::backend::client::fake::{Entry, Fake, RoleKind, Waited, exited, fail, reply};
 use crate::backend::client::{Client, ClientError, Real};
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
+use crate::spec::test_support::plain_fields;
 use crate::spec::{Id, Kind, Restart, User};
 
 use crate::backend::test_cleanup::{FileGuard, remove_or_warn};

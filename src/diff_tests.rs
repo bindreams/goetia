@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::*;
-use crate::spec::test_support::plain_fields;
 use crate::spec::DaemonFields;
+use crate::spec::test_support::plain_fields;
 use crate::spec::{Kind, Restart};
 
-// `DaemonSpec` is built through `DaemonSpec::new`, never `resolve()`. The paths are absolute
-// because `new` requires it; no assertion reads them, so their platform spelling does not matter.
+// The paths are absolute because `DaemonSpec::new` requires it; no assertion reads them, so their
+// platform spelling does not matter.
 fn spec_fixture() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_owned(),

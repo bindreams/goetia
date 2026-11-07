@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use super::*;
-use crate::spec::test_support::plain_fields;
 use crate::manager::Budget;
 use crate::manager::conformance;
+use crate::spec::test_support::plain_fields;
 use crate::spec::{Id, Kind, Restart};
 
 // Fixtures ============================================================================================================
