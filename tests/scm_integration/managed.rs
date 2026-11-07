@@ -75,8 +75,9 @@ fn hand_edit(id: &str) {
 // Step 1: conformance =================================================================================================
 
 /// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
-/// `Parameters` for the length of the run, which puts an aggregate entry in every concurrent
-/// `list()` — the very answer this file's host-wide assertions are about.
+/// `Parameters` for the length of the run, which puts an `Undetermined` entry naming that id in
+/// every concurrent `list()` (a nameless aggregate if another service is unreadable too) — the
+/// very answer this file's host-wide assertions are about.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn scm_passes_conformance() {
     seed_foreign(conformance::FOREIGN_ID);

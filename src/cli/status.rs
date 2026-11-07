@@ -1,8 +1,7 @@
 //! `goetia daemon status [ID...]`
 //!
-//! Read-only: never checks elevation. With no ids, every entry renders
-//! through [`format_status_line`] — the exact per-id line, `pid` included —
-//! so `status` has one human shape regardless of how it was invoked.
+//! Read-only: never checks elevation. Every entry renders through
+//! [`format_status_line`], so `status` has one human shape however invoked.
 
 use std::io::Write;
 
@@ -42,9 +41,8 @@ pub fn run(
     let mut report = Report {
         daemons: Vec::new(),
         errors: Vec::new(),
-        // Never populated here: this form asks `status(&id)` about each
-        // named id, and an id it could not classify is that id's own
-        // failure, in `errors`. The third key is the `list()` path's.
+        // The `list()` path's key: here an id `status(&id)` could not
+        // classify is that id's own entry in `errors`.
         undetermined: Vec::new(),
     };
     for id_str in &args.ids {
@@ -89,9 +87,7 @@ fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &m
 
     match &index {
         Ok(index) => {
-            // An unusable entry is a `warning:` here rather than an
-            // `error:` line, as it has been since `list` and `status` first
-            // shared `partition_installed`.
+            // An unusable entry is a `warning:` here, not an `error:` line.
             print_unusable_warnings(&index.unusable, err);
             print_undetermined_warnings(&index.undetermined, err);
             print_daemons(&report, out);
@@ -124,9 +120,8 @@ fn print_daemons(report: &Report, out: &mut dyn Write) {
     }
 }
 
-/// The one human-readable shape `status` renders in — see the module doc
-/// comment. Formats a [`DaemonReport`] so the two invocation forms cannot
-/// drift: both build one before rendering anything.
+/// The one human-readable shape `status` renders in, shared by both
+/// invocation forms.
 fn format_status_line(daemon: &DaemonReport) -> String {
     format!(
         "{}: {} (enabled={}, pid={})",

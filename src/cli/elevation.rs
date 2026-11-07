@@ -1,9 +1,8 @@
 //! The real elevation check, one per platform.
 //!
-//! `dispatch`'s `is_elevated` parameter exists precisely so production code
-//! (`main.rs`) wires this in while tests inject their own closure instead —
-//! constructing a genuinely elevated or unelevated process from within a
-//! unit test is neither possible nor desirable.
+//! `main.rs` wires this into `dispatch`'s `is_elevated`; tests inject their
+//! own closure, since a unit test cannot construct an elevated or unelevated
+//! process.
 
 /// Whether the current process has root/Administrator privileges.
 #[cfg(unix)]

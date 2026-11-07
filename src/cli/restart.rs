@@ -1,19 +1,12 @@
 //! `goetia daemon restart <ID...>`
 //!
-//! Not a `ServiceManager` method of its own — `stop` then `start`, using the
-//! trait's own verbs (both idempotent, per their doc comments: `stop` on an
-//! already-stopped daemon is not an error) — except under a budget that does
-//! not wait, on a manager with one request-only restart
-//! (`ServiceManager::request_restart`). Does not change boot-enablement, same
-//! as either verb alone.
+//! `stop` then `start`, using the trait's own idempotent verbs, except under a
+//! budget that does not wait, on a manager with one request-only restart
+//! (`ServiceManager::request_restart`). Does not change boot-enablement.
 //!
-//! **One budget covers the whole restart, not each leg.** The user invoked a
-//! single operation, and taking twice the time it named because the
-//! operation happens to have two steps would be wrong — so [`restart`] starts
-//! one deadline and hands both legs a budget from it. Per id, not
-//! per invocation: [`run`] calls [`restart`] once per id, so
-//! `restart a b c --timeout 30s` promises each of the three 30s rather than
-//! leaving `c` whatever `a` and `b` did not spend.
+//! **One budget covers the whole restart, not each leg:** [`restart`] starts
+//! one deadline and hands both legs a budget from it. Per id, not per
+//! invocation: `restart a b c --timeout 30s` gives each of the three 30s.
 
 use std::io::Write;
 use std::time::Duration;
@@ -67,21 +60,18 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget) -> Result<()> {
 
 /// [`restart`], under a `deadline` that may already be spent.
 ///
-/// Under a budget that waits the legs need nothing between them: the stop
-/// leg is only ever handed a budget that waits (see [`stop_leg`]), so a
-/// `stop` that returned `Ok` has confirmed stopped, and one that ran out
-/// returned `WaitTimeout` instead, so the start is never reached. Under a
-/// budget that does not wait there is nothing to confirm and deliberately
-/// nothing is read — "don't wait, just do the steps", as one request where
-/// the manager has one. Either way no state is queried between the two,
-/// which is what keeps the exit code from being a stopwatch question.
+/// Under a budget that waits the legs need nothing between them: the stop leg
+/// is only ever handed a budget that waits (see [`stop_leg`]), so a `stop` that
+/// returned `Ok` has confirmed stopped, and one that ran out returned
+/// `WaitTimeout`, so the start is never reached. Under a budget that does not
+/// wait, nothing is confirmed or read. Either way no state is queried between
+/// the legs, which keeps the exit code from being a stopwatch question.
 fn restart_until(mgr: &dyn ServiceManager, id: &Id, budget: Budget, deadline: Deadline) -> Result<()> {
     // Before either leg sends anything, so that nothing either leg needs can
     // run out between the stop and the start and leave the daemon stopped.
     let mut sequence = mgr.prepare(&[Step::Stop, Step::Start], budget)?;
     if !budget.waits() {
-        // One request where the manager has one: nothing then happens
-        // between the stop and the start, and a refusal changed nothing, so
+        // One request where the manager has one; a refusal changed nothing, so
         // its error stands as it is.
         if let Some(requested) = mgr.request_restart(id) {
             return requested;
@@ -120,12 +110,11 @@ enum Leg {
 /// requested-but-unconfirmed start.
 ///
 /// Branching on the *requested* budget and not on `left` alone is
-/// load-bearing, twice over. `--timeout 0`'s deadline is expired from its
-/// first instant, so "nothing left means spent" would drop both legs from
-/// the one mode whose entire point is to issue them. And a spent bounded
-/// budget must not reach a leg as `left` itself — [`budget_for`]'s
-/// `Immediate` — because that means "do not wait": a stop issued under it
-/// returns `Ok` having confirmed nothing, and would read as a stop that did.
+/// load-bearing. `--timeout 0`'s deadline is expired from its first instant,
+/// so "nothing left means spent" would drop both legs from the one mode whose
+/// point is to issue them. And a spent bounded budget must not reach a leg as
+/// `left` itself ([`budget_for`]'s `Immediate`, "do not wait"): a stop issued
+/// under it returns `Ok` having confirmed nothing.
 fn leg(requested: Budget, left: Budget) -> Leg {
     if requested.waits() && !left.waits() {
         return Leg::Spent;
@@ -134,9 +123,9 @@ fn leg(requested: Budget, left: Budget) -> Leg {
 }
 
 /// A bounded budget with nothing left, as the stop leg is handed one: the
-/// least bound there is. It waits, so every backend takes the path a bounded
-/// stop that ran out takes — the stop issued, then `WaitTimeout`, or `Ok` if
-/// stopped is confirmed after all — and never `Immediate`'s, which on launchd
+/// least bound there is. It waits, so every backend takes the path of a
+/// bounded stop that ran out (stop issued, then `WaitTimeout`, or `Ok` if
+/// stopped is confirmed after all), never `Immediate`'s, which on launchd
 /// runs `bootout` to completion unbounded.
 const SPENT: Budget = Budget::Bounded(Duration::from_nanos(1));
 
@@ -152,15 +141,14 @@ fn stop_leg(requested: Budget, left: Budget) -> Budget {
 
 // wording =============================================================================================================
 
-/// The stop leg's expiry, re-worded before it propagates — whether the stop
-/// ran out of budget itself or the budget was spent before it was issued —
-/// and so is a stop in doubt, which may have stopped the daemon too. The
-/// variant is preserved (still exit `4`); the words change, because the
-/// shared texts — [`budget::timed_out`]'s, and the in-doubt request's — speak
-/// for a bare `stop` and disclose neither that the restart was abandoned nor
-/// that the daemon may be left down, and so does `waited` (see
-/// [`as_given`]). Every other failure passes through untouched: a stop that
-/// determinately failed changed nothing and is still exit `1`.
+/// The stop leg's expiry (the stop ran out of budget, or the budget was spent
+/// before it was issued), re-worded before it propagates: it is a stop in
+/// doubt, which may have stopped the daemon. The variant is preserved (exit
+/// `4`); the words change because the shared texts ([`budget::timed_out`]'s
+/// and the in-doubt request's) speak for a bare `stop` and do not say the
+/// restart was abandoned or that the daemon may be left down; `waited` is
+/// likewise re-based (see [`as_given`]). Every other failure passes through: a
+/// stop that determinately failed changed nothing and is still exit `1`.
 fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
     e.map_cause(|leaf| match leaf {
         Error::WaitTimeout {
@@ -185,13 +173,12 @@ fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
     })
 }
 
-/// The start leg's [`Leg::Spent`]: the stop *succeeded* — confirmed, under a
-/// budget that waited — and nothing of the budget was left to watch a start
-/// with, whether the stop spent it or it was gone before the stop was issued.
+/// The start leg's [`Leg::Spent`]: the stop *succeeded* (confirmed, under a
+/// budget that waited) and nothing of the budget was left to watch a start
+/// with.
 ///
-/// `awaited` is `"running"` — the state the restart was asked to reach and
-/// did not — rather than `"stopped"`, which it did reach and must not be
-/// reported as missed.
+/// `awaited` is `"running"`, the state the restart did not reach, not
+/// `"stopped"`, which it did.
 fn spent_before_start(id: &Id, budget: Budget) -> Error {
     match budget::timed_out(id.as_str(), "running", budget) {
         Error::WaitTimeout {
@@ -219,24 +206,19 @@ fn spent_before_start(id: &Id, budget: Budget) -> Error {
 fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
     let reworded = |leaf| rewrapped_start_leg(id, budget, leaf);
     match e.cause() {
-        // First, and ahead of the non-waiting arm below, so that both paths
-        // preserve it. [`Error::Unestablished`] says in as many words that
-        // what is installed at the id was never in doubt; absorbing an
-        // `Undetermined` start leg into it makes that false. Only the clause
-        // differs between the paths, because only what the stop leg
-        // established differs.
-        //
-        // The start may have reached the manager: kept as it is, ahead of the
-        // non-waiting arm below, whose "refused" it was not, and never called a
-        // failure to restart, which is what it did not establish.
+        // Ahead of the non-waiting arm below, so both paths preserve these:
+        // [`Error::Unestablished`] says what is installed at the id was never
+        // in doubt, which an `Undetermined` start leg contradicts; and a
+        // `RequestInDoubt` start may have reached the manager, so it was not
+        // "refused" and not a failure to restart. Only the clause differs
+        // between the paths, because only what the stop leg established differs.
         Error::Undetermined { .. } | Error::RequestInDoubt { .. } => e.map_cause(reworded),
-        // The stop was issued and not waited for, and the start that
-        // followed was refused — determinately (a launchd `bootstrap` that
-        // fails outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
+        // The stop was issued and not waited for, and the start that followed
+        // was refused: determinately (a launchd `bootstrap` that fails
+        // outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
         // service still coming down). systemd never gets here: its restart is
-        // one request. Either way nothing confirmed the stop,
-        // which may be in flight, done, or have had nothing to do, so where
-        // the daemon ended up is what nobody established.
+        // one request. Nothing confirmed the stop, so where the daemon ended
+        // up is what nobody established.
         _ if !budget.waits() => Error::Unestablished {
             id: id.as_str().to_string(),
             refused: Box::new(e),
@@ -283,9 +265,8 @@ fn rewrapped_start_leg(id: &Id, budget: Budget, leaf: Error) -> Error {
     }
 }
 
-/// How long a restart's expiry reports having waited: the `--timeout` the
-/// user gave, as plain `stop` reports it. A leg's own budget is only what
-/// was left of that one, and `restart` is one operation with one budget.
+/// How long a restart's expiry reports having waited: the `--timeout` the user
+/// gave, as plain `stop` reports it, not the leg's remainder.
 fn as_given(budget: Budget, leg_waited: Duration) -> Duration {
     match budget {
         Budget::Bounded(given) => given,
@@ -304,9 +285,8 @@ fn start_after_stop_clause(id: &Id, budget: Budget) -> String {
 }
 
 /// What the stop leg established, as the clause a start leg's failure hangs
-/// off. A budget that waited saw `stop` return `Ok`, which is a confirmed
-/// stop; one that did not wait confirmed nothing, and must not borrow the
-/// waiting path's wording to claim otherwise.
+/// off. A budget that waited saw `stop` return `Ok`, a confirmed stop; one
+/// that did not wait confirmed nothing and must not claim otherwise.
 fn after_stop_clause(budget: Budget) -> &'static str {
     if budget.waits() {
         "stopped but failed to restart"
