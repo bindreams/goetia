@@ -86,7 +86,7 @@ fn create_failed(source: io::Error) -> Error {
         Some(code) if code == ERROR_INVALID_OWNER as i32 || code == ERROR_ACCESS_DENIED as i32
     ) {
         return Error::ElevationRequired {
-            subcommand: format!("create the install lock `{NAME}`"),
+            what: format!("creating the install lock `{NAME}`"),
         };
     }
     Error::os(format!("create the install lock `{NAME}`"), source)

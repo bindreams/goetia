@@ -87,7 +87,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             evidence: String::new(),
         },
         Error::ElevationRequired {
-            subcommand: String::new(),
+            what: String::new(),
         },
         Error::UnsupportedPlatform {
             platform: String::new(),

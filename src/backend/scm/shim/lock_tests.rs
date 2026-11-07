@@ -13,10 +13,12 @@ fn a_lock_the_token_cannot_create_or_open_is_a_need_for_elevation() {
     for code in [ERROR_INVALID_OWNER, ERROR_ACCESS_DENIED] {
         let error = create_failed(io::Error::from_raw_os_error(code as i32));
 
-        let Error::ElevationRequired { subcommand } = &error else {
-            panic!("expected a need for elevation, got {error:?}");
-        };
-        assert!(subcommand.contains(NAME), "{subcommand}");
+        assert!(matches!(error, Error::ElevationRequired { .. }), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "creating the install lock `Global\\goetia-shim` requires elevation (root/Administrator): re-run as \
+             root or Administrator"
+        );
         assert!(!error.is_indeterminate());
     }
 }

@@ -180,7 +180,7 @@ pub(crate) fn require_elevation(
         err,
         "error: {}",
         Error::ElevationRequired {
-            subcommand: subcommand.to_string()
+            what: format!("`{subcommand}`")
         }
     );
     Err(ExitCode::Error)

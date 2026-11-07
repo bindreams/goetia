@@ -572,10 +572,11 @@ pub enum Error {
 
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires, or, for a library caller on Windows, the install lock
-    /// could not be created for want of it (`subcommand` then names that action). Never returned
-    /// for `list`, `status`, `show`, `diff`, or `install --dry-run`.
-    #[error("`{subcommand}` requires elevation (root/Administrator): re-run as root or Administrator")]
-    ElevationRequired { subcommand: String },
+    /// could not be created for want of it. `what` is the noun phrase that needs it, as the
+    /// message starts with it: the subcommand in backticks, or the action as a gerund. Never
+    /// returned for `list`, `status`, `show`, `diff`, or `install --dry-run`.
+    #[error("{what} requires elevation (root/Administrator): re-run as root or Administrator")]
+    ElevationRequired { what: String },
 
     /// [`crate::manager::native`] has no [`ServiceManager`] implementation
     /// for the running platform — anything but Linux, macOS or Windows. An
