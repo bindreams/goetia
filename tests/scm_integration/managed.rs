@@ -1706,6 +1706,17 @@ fn list_reads_a_service_whose_own_key_denies_the_reader_by_its_parameters_alone(
             }
         }
 
+        // What the host's `list` says is undetermined before the denial: other services may be
+        // unreadable, and two of them aggregate into one entry with no name.
+        let undetermined = |listed: &[Installed]| -> Vec<String> {
+            listed
+                .iter()
+                .filter(|entry| matches!(entry, Installed::Undetermined { .. }))
+                .map(|entry| format!("{entry:?}"))
+                .collect()
+        };
+        let baseline = undetermined(&mgr.list().expect("list before the denial"));
+
         let _denied = Denied::service_key(&id);
 
         // The deny took, as `ERROR_ACCESS_DENIED`: opening the service key to read it fails.
@@ -1718,14 +1729,8 @@ fn list_reads_a_service_whose_own_key_denies_the_reader_by_its_parameters_alone(
             .list()
             .expect("a service key denied to the reader must not fail `list`");
 
-        // No entry says this service's read did not complete. Another service on the host may be
-        // unreadable, so entries naming other ids are not looked at.
-        assert!(
-            !listed.iter().any(
-                |entry| matches!(entry, Installed::Undetermined { name, .. } if name.as_deref() == Some(id.as_str()))
-            ),
-            "{seed:?}: {listed:?}"
-        );
+        // The denial adds nothing undetermined: the same entries as before it, whatever they carry.
+        assert_eq!(undetermined(&listed), baseline, "{seed:?}: {listed:?}");
         let ours = listed
             .iter()
             .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id));

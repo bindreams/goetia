@@ -79,6 +79,14 @@ fn any_other_mid_read_failure_is_other() {
 }
 
 #[skuld::test]
+fn a_value_not_found_is_a_delete_that_is_done_and_any_other_failure_is_not() {
+    assert!(tolerate_not_found(Ok(())).is_ok());
+    assert!(tolerate_not_found(Err(io::Error::from(io::ErrorKind::NotFound))).is_ok());
+    // The key holding the value was marked deleted: the write was lost, which is not done.
+    assert!(tolerate_not_found(Err(io::Error::from_raw_os_error(KEY_DELETED))).is_err());
+}
+
+#[skuld::test]
 fn a_key_gone_or_deleted_is_a_delete_that_is_done_and_any_other_failure_is_not() {
     assert!(gone_is_done(Ok(())).is_ok());
     for code in [NOT_FOUND, KEY_DELETED] {

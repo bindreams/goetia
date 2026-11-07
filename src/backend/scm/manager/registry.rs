@@ -25,7 +25,7 @@ use crate::manager::{Installed, flow};
 mod counted;
 mod settle;
 pub use settle::Origin;
-use settle::{Failure, Settled, Stop, settle, stands};
+use settle::{Failure, Settled, Stop, settle, stands, tolerate_not_found};
 
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
@@ -348,19 +348,6 @@ fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
     drop(key);
     counted::delete_subkey(service, &name)?;
     counted::create_child(service, &name, access)
-}
-
-/// NotFound is success: the goal state is absent. For a value, and for a key opened relative to a
-/// held parent. KEY_DELETED is an error here: the key holding the value, or the parent, was marked
-/// deleted, so what the write targets is gone and the write was lost.
-///
-/// For a key below the one opened, [`settle::gone_is_done`] applies instead, which also takes a key
-/// marked deleted: that key is part of what is being deleted.
-fn tolerate_not_found(deleted: std::io::Result<()>) -> std::io::Result<()> {
-    match deleted {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
 }
 
 // Environment =========================================================================================================

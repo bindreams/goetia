@@ -1,10 +1,10 @@
 //! What a read under `Services\<name>` makes of a key that is gone.
 //!
 //! goetia writes `Parameters` and `Environment` in place, so its own writes take no key away, but
-//! for a `Parameters` that is a registry link, which `install --force` replaces. A key still goes
-//! missing when the service is uninstalled or another tool deletes it. A service
-//! that is gone is then absent; one that stands with a key that vanished is undetermined, with the
-//! cause, and is not waited on: a key another process took away has no event goetia can rely on.
+//! for a `Parameters` that is a registry link, which every write replaces. A key still goes missing
+//! when the service is uninstalled or another tool deletes it. A service that is gone is then
+//! absent; one that stands with a key that vanished is undetermined, with the cause, and is not
+//! waited on: a key another process took away has no event goetia can rely on.
 
 use std::io;
 
@@ -75,6 +75,19 @@ pub(super) enum Settled<T> {
 /// Whether `e` says the key is not there: not found, or deleted and held open by another process.
 pub(super) fn is_gone(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(ERROR_KEY_DELETED as i32)
+}
+
+/// NotFound is success: the goal state is absent. For a value, and for a key opened relative to a
+/// held parent. KEY_DELETED is an error here: the key holding the value, or the parent, was marked
+/// deleted, so what the write targets is gone and the write was lost.
+///
+/// For a key below the one opened, [`gone_is_done`] applies instead, which also takes a key marked
+/// deleted: that key is part of what is being deleted.
+pub(super) fn tolerate_not_found(deleted: io::Result<()>) -> io::Result<()> {
+    match deleted {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 /// `result`, except that a key not found or deleted is done: the goal of a delete is absent.

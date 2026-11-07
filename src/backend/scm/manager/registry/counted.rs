@@ -23,8 +23,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Registry::{KEY_ENUMERATE_SUB_KEYS, REG_OPTION_NON_VOLATILE};
 use winreg::RegKey;
 
-use super::settle::gone_is_done;
-use super::tolerate_not_found;
+use super::settle::{gone_is_done, tolerate_not_found};
 
 /// The access right to delete a key (`winnt.h`).
 const DELETE: u32 = 0x0001_0000;

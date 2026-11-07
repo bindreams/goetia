@@ -29,15 +29,6 @@ fn parameters_are_opened_in_one_step_below_services_for_reading_only() {
     assert_eq!(access, KEY_READ);
 }
 
-#[skuld::test]
-fn a_value_not_found_is_a_delete_that_is_done_and_any_other_failure_is_not() {
-    assert!(tolerate_not_found(Ok(())).is_ok());
-    assert!(tolerate_not_found(Err(std::io::Error::from(std::io::ErrorKind::NotFound))).is_ok());
-    // The key holding the value was marked deleted: the write was lost, which is not done.
-    let deleted = std::io::Error::from_raw_os_error(ERROR_KEY_DELETED as i32);
-    assert!(tolerate_not_found(Err(deleted)).is_err());
-}
-
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }

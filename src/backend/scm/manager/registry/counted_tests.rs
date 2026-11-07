@@ -2,6 +2,9 @@ use super::*;
 
 use std::io::ErrorKind;
 
+use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
+use winreg::enums::HKEY_LOCAL_MACHINE;
+
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
 
@@ -87,4 +90,86 @@ fn a_reply_too_short_for_the_key_flags_is_an_error_not_a_key_that_is_no_link() {
         let e = link_flag([0, 0, 0], written).unwrap_err();
         assert!(e.to_string().contains(&format!("{written} bytes")), "{e}");
     }
+}
+
+// Against the real registry ===========================================================================================
+
+/// Skuld precondition: the scratch keys are under `HKLM\SOFTWARE`, which an unelevated run cannot write.
+fn elevated() -> Result<(), String> {
+    if cosca::elevation::is_elevated() {
+        Ok(())
+    } else {
+        Err(r"writes keys under HKLM\SOFTWARE; re-run elevated".to_string())
+    }
+}
+
+/// A key under `HKLM\SOFTWARE`, with everything under it, removed on drop. Made before the key it
+/// names, so that a failed assertion still removes it.
+struct Scratch {
+    path: String,
+}
+
+impl Scratch {
+    fn new(test: &str) -> Self {
+        Self {
+            path: format!(r"SOFTWARE\goetia-counted-{}-{test}", std::process::id()),
+        }
+    }
+
+    fn create(&self) -> RegKey {
+        let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .create_subkey(&self.path)
+            .expect("create the scratch key");
+        key
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Err(e) = RegKey::predef(HKEY_LOCAL_MACHINE).delete_subkey_all(&self.path)
+            && e.kind() != ErrorKind::NotFound
+        {
+            eprintln!(r"Scratch: could not remove HKLM\{}: {e}", self.path);
+        }
+    }
+}
+
+fn units(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
+}
+
+/// KEY_DELETED at the open of `name` itself says that the held parent was marked deleted, which
+/// loses the delete's target: an error. A child that is not found is done.
+#[skuld::test(requires = [elevated])]
+fn a_child_of_a_parent_marked_deleted_is_an_error_and_a_child_not_found_is_done() {
+    let scratch = Scratch::new("parent");
+    let parent = scratch.create();
+
+    delete_subkey(&parent, &units("Missing")).expect("a child that is not there is done");
+
+    // Another handle deletes the parent; this one holds it open, so it is marked deleted.
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .delete_subkey(&scratch.path)
+        .expect("delete the parent through another handle");
+    let e = delete_subkey(&parent, &units("Child")).expect_err("the parent is marked deleted");
+
+    assert_eq!(e.raw_os_error(), Some(ERROR_KEY_DELETED as i32), "{e}");
+}
+
+/// Below the top a key marked deleted is part of what is being deleted: done.
+#[skuld::test(requires = [elevated])]
+fn a_key_marked_deleted_under_the_walk_is_done() {
+    let scratch = Scratch::new("below");
+    let parent = scratch.create();
+    let (top, _) = parent.create_subkey("Top").expect("create Top");
+    top.create_subkey("Leaf").expect("create Leaf");
+    drop(top);
+    let held = open_raw(parent.raw_handle(), &units("Top"), CHILD_ACCESS).expect("open Top");
+
+    // Another handle deletes the tree under the walk's open handle: `Top` is marked deleted.
+    parent
+        .delete_subkey_all("Top")
+        .expect("delete Top through another handle");
+
+    delete_tree(held).expect("a key deleted under the walk is done");
 }
