@@ -267,8 +267,7 @@ impl std::io::Write for Failing {
     }
 }
 
-/// The caller of the document's `write` sees the failure of the stream underneath, not a
-/// formatting error in its place.
+/// A caller sees the failure of the stream underneath, not a formatting error in its place.
 #[cfg(feature = "cli")]
 #[skuld::test]
 fn a_failing_inner_stream_returns_its_own_error_from_write_and_flush() {

@@ -231,6 +231,17 @@ struct FlakyManager {
     list_command_stderr: Option<String>,
 }
 
+/// The status of a command that exited with code 1.
+#[cfg(unix)]
+fn failed_status() -> std::process::ExitStatus {
+    std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
+}
+
+#[cfg(windows)]
+fn failed_status() -> std::process::ExitStatus {
+    std::os::windows::process::ExitStatusExt::from_raw(1)
+}
+
 /// The failure [`FlakyManager`] injects for `fail_list`/`unqueryable`: the
 /// shape a real backend produces when the tool it shells out to cannot
 /// answer.
@@ -409,7 +420,7 @@ impl ServiceManager for FlakyManager {
         if let Some(stderr) = &self.list_command_stderr {
             return Err(goetia::Error::Command {
                 command: "query-live-state".to_string(),
-                status: std::process::ExitStatus::default(),
+                status: failed_status(),
                 stderr: stderr.clone(),
             });
         }

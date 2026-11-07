@@ -54,6 +54,7 @@ where
     T: Into<std::ffi::OsString> + Clone,
 {
     Cli::try_parse_from(args).map_err(|e| {
+        // `render` is clap's text without colour: the stream would escape its ESC bytes.
         let mut stream = EscapedStream::new(if e.use_stderr() { err } else { out });
         let _ = write!(stream, "{}", e.render());
         let _ = stream.flush();
@@ -74,7 +75,7 @@ pub struct Cli {
     /// `unsupported` error document and exit `2`, before running anything.
     /// `global` so both `goetia --json daemon list` and
     /// `goetia daemon list --json` work. See [`dispatch`] for the exact
-    /// invariant and its clap-level carve-outs.
+    /// invariant.
     #[arg(long, global = true)]
     pub json: bool,
     /// Reserved for increased output verbosity (repeatable). Accepted and
@@ -189,13 +190,9 @@ pub enum DaemonCommand {
 /// render one, and every other subcommand is refused with one below, before
 /// it runs.
 ///
-/// Anything clap short-circuits on is a deliberate carve-out, because it
-/// happens before `dispatch` is ever called, in [`parse`]: `--help`/`--version` print
-/// their own text and exit `0`, and a usage error (`goetia --json daemon
-/// uninstall`, with `<IDS>` missing) prints clap's message to stderr, leaves
-/// stdout empty, and exits `2`. Rendering those as JSON would mean
-/// pre-scanning `std::env::args()` before parsing, or re-rendering clap's own
-/// diagnostics — both worse than the carve-out.
+/// What clap short-circuits on never reaches `dispatch`; [`parse`] answers it: `--help` and
+/// `--version` print their text and exit `0`, and a usage error (`goetia --json daemon uninstall`,
+/// with `<IDS>` missing) is plain text on stderr, with stdout empty, and exits `2`.
 pub fn dispatch(
     cli: &Cli,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,

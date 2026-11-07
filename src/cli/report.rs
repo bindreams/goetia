@@ -347,7 +347,7 @@ pub(crate) fn unsupported(subcommand: &str) -> Report {
 /// Writes the entries of `report.errors` as `error:` lines, each under its id when it has one.
 pub(crate) fn print_errors(report: &Report, err: &mut dyn Write) {
     for error in &report.errors {
-        print_line(err, "error", error.id.as_deref(), |sink| error.write_shown(sink));
+        print_line(err, Some("error"), error.id.as_deref(), |sink| error.write_shown(sink));
     }
 }
 
@@ -378,7 +378,7 @@ pub(crate) fn emit(report: &Report, out: &mut dyn Write, err: &mut dyn Write) ->
     match write(report, out) {
         Ok(()) => exit_code(report),
         Err(e) => {
-            print_line(err, "error", None, |sink| {
+            print_line(err, Some("error"), None, |sink| {
                 write!(sink, "failed to write the --json document to stdout: {e}")
             });
             ExitCode::Error

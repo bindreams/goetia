@@ -20,7 +20,7 @@ use clap::Args as ClapArgs;
 
 use super::ExitCode;
 use super::refusal::{Lines, Mood, NotRefused};
-use super::support::{line_prefix, load_and_warn, print_error, render_line};
+use super::support::{load_and_warn, print_error, print_line};
 use crate::error::Result;
 use crate::manager::ServiceManager;
 
@@ -81,10 +81,9 @@ pub fn run(
             let _ = write!(out, "{spec_diff}");
         }
         NotRefused::Stale { from_version } => {
-            let line = render_line(&line_prefix(None, Some(spec.id.as_str())), |sink| {
+            print_line(out, None, Some(spec.id.as_str()), |sink| {
                 write!(sink, "would be regenerated (built by goetia {from_version})")
             });
-            let _ = writeln!(out, "{line}");
         }
     }
     ExitCode::Drift

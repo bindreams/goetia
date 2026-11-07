@@ -9,7 +9,7 @@ use std::io::Write;
 use std::ops::ControlFlow;
 
 use super::ExitCode;
-use super::support::{line_prefix, render_line};
+use super::support::print_line;
 use crate::decide::{self, Outcome};
 use crate::error::{Reason, Sink};
 use crate::spec::Id;
@@ -119,9 +119,9 @@ impl Lines<'_> {
     /// it, and to `err` as `error: <line>`.
     fn emit(&self, diff: &str, out: &mut dyn Write, err: &mut dyn Write, body: impl Fn(&mut Sink) -> fmt::Result) {
         let id = Some(self.id.as_str());
-        let _ = writeln!(out, "{}", render_line(&line_prefix(None, id), &body));
+        print_line(out, None, id, &body);
         let _ = write!(out, "{diff}");
-        let _ = writeln!(err, "{}", render_line(&line_prefix(Some("error"), id), &body));
+        print_line(err, Some("error"), id, &body);
     }
 }
 

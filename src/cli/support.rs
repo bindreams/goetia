@@ -21,25 +21,25 @@ pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<DaemonSp
 
 /// `prefix` and then what `body` writes through a [`Sink`], which escapes it. `prefix` is written
 /// as it is: the caller has escaped it.
-pub(super) fn render_line(prefix: &str, body: impl FnOnce(&mut Sink) -> fmt::Result) -> String {
+fn render_line(prefix: &str, body: impl FnOnce(&mut Sink) -> fmt::Result) -> String {
     let mut line = prefix.to_string();
     body(&mut Sink::new(&mut line, true)).expect("writing to a String cannot fail");
     line
 }
 
-/// Writes one line to `err`: `label: ` and `scope: ` (when there is one), then `body`. The scope
-/// and what `body` writes through its [`Sink`] are escaped; `label` is written as it is.
+/// Writes one line to `to`: `label: ` and `scope: ` (each when there is one), then `body`. The
+/// scope and what `body` writes through its [`Sink`] are escaped; `label` is written as it is.
 pub(crate) fn print_line(
-    err: &mut dyn Write,
-    label: &str,
+    to: &mut dyn Write,
+    label: Option<&str>,
     scope: Option<&str>,
     body: impl FnOnce(&mut Sink) -> fmt::Result,
 ) {
-    let _ = writeln!(err, "{}", render_line(&line_prefix(Some(label), scope), body));
+    let _ = writeln!(to, "{}", render_line(&line_prefix(label, scope), body));
 }
 
 /// `label: ` and `scope: `, each when there is one; the scope's text is escaped.
-pub(super) fn line_prefix(label: Option<&str>, scope: Option<&str>) -> String {
+fn line_prefix(label: Option<&str>, scope: Option<&str>) -> String {
     let label = label.map(|label| format!("{label}: "));
     let scope = scope.map(|scope| format!("{}: ", escape(scope)));
     label.into_iter().chain(scope).collect()
@@ -48,7 +48,7 @@ pub(super) fn line_prefix(label: Option<&str>, scope: Option<&str>) -> String {
 /// Writes `error: [id: ]what` and the report of `e`, which says what failed; `what` is goetia's
 /// own words that lead it (`enable: `).
 pub(crate) fn print_error(err: &mut dyn Write, id: Option<&str>, what: &str, e: &Error) {
-    print_line(err, "error", id, |sink| {
+    print_line(err, Some("error"), id, |sink| {
         sink.write_str(what)?;
         e.write_report(sink)
     });
@@ -61,7 +61,7 @@ pub(crate) fn print_error(err: &mut dyn Write, id: Option<&str>, what: &str, e: 
 pub(crate) fn print_warnings(warnings: &[Warning], err: &mut dyn Write) {
     for warning in warnings {
         let id = warning.id.as_ref().map(Id::as_str);
-        print_line(err, "warning", id, |sink| sink.write_str(&warning.message));
+        print_line(err, Some("warning"), id, |sink| sink.write_str(&warning.message));
     }
 }
 
@@ -169,7 +169,7 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
 
 pub(crate) fn print_unusable_warnings(unusable: &BTreeMap<String, Reason>, err: &mut dyn Write) {
     for (name, reason) in unusable {
-        print_line(err, "warning", Some(name), |sink| {
+        print_line(err, Some("warning"), Some(name), |sink| {
             reason.installed_but_unusable().write_to(sink)
         });
     }
@@ -179,7 +179,7 @@ pub(crate) fn print_unusable_warnings(unusable: &BTreeMap<String, Reason>, err: 
 /// other. An aggregate's `reason` is a complete sentence and stands alone.
 pub(crate) fn print_undetermined_warnings(undetermined: &[UndeterminedEntry], err: &mut dyn Write) {
     for entry in undetermined {
-        print_line(err, "warning", entry.name.as_deref(), |sink| {
+        print_line(err, Some("warning"), entry.name.as_deref(), |sink| {
             if entry.name.is_some() {
                 sink.write_str("installation state could not be determined: ")?;
             }

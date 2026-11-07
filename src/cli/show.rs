@@ -136,20 +136,20 @@ fn show_from_installed(
         if let Some(entry) = index.ours.get(id) {
             specs.push(entry.spec.clone());
         } else if index.unusable.contains_key(id) {
-            print_line(err, "error", None, |sink| {
+            print_line(err, Some("error"), None, |sink| {
                 write!(sink, "daemon `{id}` is installed but unusable")
             });
             codes.push(ExitCode::Indeterminate);
         } else if let Some(entry) = index.undetermined_for(id) {
             // Either the listing could not classify this id, or an aggregate
             // entry may stand for it: absence is unestablished either way.
-            print_line(err, "error", None, |sink| {
+            print_line(err, Some("error"), None, |sink| {
                 write!(sink, "daemon `{id}`: installation state could not be determined: ")?;
                 entry.reason.write_to(sink)
             });
             codes.push(ExitCode::Indeterminate);
         } else {
-            print_line(err, "error", None, |sink| {
+            print_line(err, Some("error"), None, |sink| {
                 write!(sink, "daemon `{id}` is not installed")
             });
             codes.push(ExitCode::Error);

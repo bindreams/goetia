@@ -11,7 +11,7 @@ use clap::Args as ClapArgs;
 
 use super::ExitCode;
 use super::refusal::{Lines, Mood, NotRefused};
-use super::support::{line_prefix, load_and_warn, print_error, render_line, require_elevation};
+use super::support::{load_and_warn, print_error, print_line, require_elevation};
 use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::Outcome;
@@ -154,10 +154,9 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
             let _ = write!(out, "{spec_diff}");
         }
         NotRefused::Stale { from_version } => {
-            let line = render_line(&line_prefix(None, Some(id.as_str())), |sink| {
+            print_line(out, None, Some(id.as_str()), |sink| {
                 write!(sink, "regenerated (was built by goetia {from_version})")
             });
-            let _ = writeln!(out, "{line}");
         }
     }
     ExitCode::Success
