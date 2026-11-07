@@ -22,6 +22,9 @@ use winreg::types::FromRegValue as _;
 use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
 
+mod settle;
+use settle::{Failure, Settled, Stop, settle, stands};
+
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
 
@@ -51,6 +54,57 @@ fn registry_undetermined(name: &str, op: &str, path: &str, source: std::io::Erro
 
 // Parameters (the metadata blob) ======================================================================================
 
+/// What a read of a service's registry values found.
+pub enum RegistryReadOutcome<T> {
+    /// The service no longer exists.
+    ServiceGone,
+    Read(T),
+}
+
+/// Runs `pass` until it completes or [`settle`] ends it. `fail` makes the error for a failure that
+/// leaves the read undecided.
+fn read_settled<T>(
+    name: &str,
+    fail: impl Fn(Failure) -> Error,
+    mut pass: impl FnMut() -> std::result::Result<T, Stop<T>>,
+) -> Result<RegistryReadOutcome<T>> {
+    loop {
+        let stop = match pass() {
+            Ok(value) => return Ok(RegistryReadOutcome::Read(value)),
+            Err(stop) => stop,
+        };
+        match settle(stop, || service_stands(name)) {
+            Settled::Gone => return Ok(RegistryReadOutcome::ServiceGone),
+            Settled::Value(value) => return Ok(RegistryReadOutcome::Read(value)),
+            Settled::Retry => continue,
+            Settled::Failed(failure) => return Err(fail(failure)),
+        }
+    }
+}
+
+/// Whether `Services\<name>` exists, asked only after a read met a missing key.
+fn service_stands(name: &str) -> std::result::Result<bool, Failure> {
+    let path = service_key_path(name);
+    stands(
+        RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(&path, KEY_READ)
+            .map(drop),
+    )
+    .map_err(|source| Failure {
+        op: "open".to_string(),
+        path,
+        source,
+    })
+}
+
+fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
+    Failure {
+        op: op.to_string(),
+        path: path.to_string(),
+        source,
+    }
+}
+
 /// Every string-valued entry under `Services\<name>\Parameters`, keyed
 /// case-preserved (case-insensitive lookup of Goetia's own four fields is
 /// `generate::extract`'s job, not this function's). Values of a non-string
@@ -58,61 +112,71 @@ fn registry_undetermined(name: &str, op: &str, path: &str, source: std::io::Erro
 /// be one of Goetia's own fields, which are always strings, and are none of
 /// Goetia's business otherwise.
 ///
-/// An absent `Parameters` subkey — a service that exists but was never
-/// touched by Goetia's metadata write (including one whose install crashed
-/// between `CreateServiceW` and that write; see the module doc comment on
-/// `manager`) — reads back as an empty map, not an error: to
-/// `generate::extract`, that is indistinguishable from "no Goetia marker at
-/// all", which is exactly the correct classification (`Ownership::Foreign`).
-/// Absence is *established* there; every other failure establishes nothing,
-/// and is [`registry_undetermined`] — this key holds the only proof of
-/// ownership a `type: managed` service has, so a read of it that did not
-/// complete leaves goetia unable to say even that much.
-pub fn read_parameters(name: &str) -> Result<BTreeMap<String, String>> {
+/// The result classifies the id:
+///
+/// - A service with no `Parameters` key reads as an empty map: it has no goetia marker, so
+///   `generate::extract` finds none and the service is `Ownership::Foreign`. This covers a service
+///   goetia never touched and one whose install crashed between `CreateServiceW` and the metadata
+///   write (see the module doc comment on `manager`).
+/// - [`RegistryReadOutcome::ServiceGone`] when the service key is gone, whether the read found it
+///   so at the start or lost the `Parameters` key under it. A key swapped under a service that still
+///   stands is read again from the start.
+/// - [`registry_undetermined`] for every other failure, including a deleted key at open on a
+///   service that stands: this key holds the only proof of ownership a `type: managed` service
+///   has, so a read of it that did not complete leaves goetia unable to say even that much.
+///   Never Foreign.
+pub fn read_parameters(name: &str) -> Result<RegistryReadOutcome<BTreeMap<String, String>>> {
     let path = parameters_key_path(name);
-    let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_READ) {
-        Ok(k) => k,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(registry_undetermined(name, "open", &path, e)),
-    };
-
-    let mut out = BTreeMap::new();
-    for entry in key.enum_values() {
-        let (field, value) = entry.map_err(|e| registry_undetermined(name, "enumerate", &path, e))?;
-        if let Ok(s) = String::from_reg_value(&value) {
-            out.insert(field, s);
-        }
-    }
-    Ok(out)
+    read_settled(
+        name,
+        |f| registry_undetermined(name, &f.op, &f.path, f.source),
+        || {
+            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+                .open_subkey_with_flags(&path, KEY_READ)
+                .map_err(|e| Stop::at_open(failure("open", &path, e), Some(BTreeMap::new())))?;
+            let mut out = BTreeMap::new();
+            for entry in key.enum_values() {
+                let (field, value) = entry.map_err(|e| Stop::mid_read(failure("enumerate", &path, e)))?;
+                if let Ok(s) = String::from_reg_value(&value) {
+                    out.insert(field, s);
+                }
+            }
+            Ok(out)
+        },
+    )
 }
 
-/// Write `params` under `Services\<name>\Parameters` as the subkey's
-/// *entire* contents: any pre-existing value not in `params` is removed
-/// first, not merely left alone. A hand-edit that adds a stray value under
-/// `Parameters` must still be overwritable by `install --force` — leaving
+/// Write `params` under `Services\<name>\Parameters` as the key's *entire* contents, in place: every
+/// value is set and every other value is deleted, and the key itself is never deleted, so a
+/// concurrent reader sees the old values or the new ones and never a missing key. A hand-edit that
+/// adds a stray value under `Parameters` must still be overwritable by `install --force` — leaving
 /// it behind would mean `on_disk` (via [`read_parameters`], which reads
 /// everything present) never converges with `desired`/`regenerated` (which
 /// only ever have Goetia's own four fields), and `--force` would report
 /// success while the very artifact it was asked to fix keeps reporting
-/// `Conflict` on every subsequent `install`.
+/// `Conflict` on every subsequent `install`. A value whose name differs from a wanted one only in
+/// case is a stray too: the registry keeps the stored case on a set, and `on_disk` compares names
+/// exactly.
 pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result<()> {
-    let service_path = service_key_path(name);
-    let service_key = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(&service_path, KEY_WRITE)
-        .map_err(|e| registry_error("open", &service_path, e))?;
-
-    match service_key.delete_subkey_all("Parameters") {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(registry_error("delete", &parameters_key_path(name), e)),
+    let path = parameters_key_path(name);
+    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .create_subkey_with_flags(&path, KEY_READ | KEY_WRITE)
+        .map_err(|e| registry_error("create", &path, e))?;
+    let present: Vec<String> = key
+        .enum_values()
+        .map(|entry| entry.map(|(field, _)| field))
+        .collect::<std::io::Result<_>>()
+        .map_err(|e| registry_error("enumerate", &path, e))?;
+    for field in present.iter().filter(|field| !params.contains_key(*field)) {
+        match key.delete_value(field) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(registry_error(&format!("delete {field} under"), &path, e)),
+        }
     }
-
-    let (key, _) = service_key
-        .create_subkey("Parameters")
-        .map_err(|e| registry_error("create", &parameters_key_path(name), e))?;
     for (field, value) in params {
         key.set_value(field, value)
-            .map_err(|e| registry_error(&format!("write {field} under"), &parameters_key_path(name), e))?;
+            .map_err(|e| registry_error(&format!("write {field} under"), &path, e))?;
     }
     Ok(())
 }
@@ -128,17 +192,28 @@ struct RawValue {
 
 /// The lines of `Services\<name>\Environment`; empty when the value is absent. Errs only when the
 /// value cannot be read at all; anything that is not what [`write_environment`] writes reads as the
-/// marker lines [`environment_lines`] describes.
-pub fn read_environment(name: &str) -> Result<Vec<String>> {
+/// marker lines [`environment_lines`] describes. [`RegistryReadOutcome::ServiceGone`] when the service
+/// is gone, the same classification as [`read_parameters`]'s.
+pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
     let path = service_key_path(name);
-    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(&path, KEY_READ)
-        .map_err(|e| registry_error("open", &path, e))?;
-    match query_raw_value(&key, ENVIRONMENT_VALUE) {
-        Ok(value) => Ok(environment_lines(Some(value))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(environment_lines(None)),
-        Err(e) => Err(registry_error(&format!("read {ENVIRONMENT_VALUE} under"), &path, e)),
-    }
+    read_settled(
+        name,
+        |f| registry_error(&f.op, &f.path, f.source),
+        || {
+            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+                .open_subkey_with_flags(&path, KEY_READ)
+                .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
+            match query_raw_value(&key, ENVIRONMENT_VALUE) {
+                Ok(value) => Ok(environment_lines(Some(value))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(environment_lines(None)),
+                Err(e) => Err(Stop::mid_read(failure(
+                    &format!("read {ENVIRONMENT_VALUE} under"),
+                    &path,
+                    e,
+                ))),
+            }
+        },
+    )
 }
 
 /// `RegQueryValueExW` for `name` under `key`, whatever its type.

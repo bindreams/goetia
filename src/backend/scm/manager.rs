@@ -108,6 +108,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
+use self::registry::RegistryReadOutcome;
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::{
@@ -229,7 +230,10 @@ impl Backend for Scm {
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), e)),
         };
-        Ok(read_marker(registry::read_parameters(id.as_str())?, Some(service)).named(id, ScmSnapshot::new))
+        Ok(match registry::read_parameters(id.as_str())? {
+            RegistryReadOutcome::ServiceGone => ReadOutcome::Absent,
+            RegistryReadOutcome::Read(parameters) => read_marker(parameters, Some(service)).named(id, ScmSnapshot::new),
+        })
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
@@ -284,7 +288,9 @@ impl Backend for Scm {
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
             match registry::read_parameters(&name) {
-                Ok(params) => {
+                // Gone since `scan_services` listed it: not there to list.
+                Ok(RegistryReadOutcome::ServiceGone) => {}
+                Ok(RegistryReadOutcome::Read(params)) => {
                     let entry = ScanEntry::of(&name, read_marker(params, None), ScmSnapshot::new);
                     entries.push((name, entry));
                 }
@@ -413,7 +419,7 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
 /// value. `registry` itself stays private — this is the one read the shim
 /// needs, not the whole module.
 ///
-/// `Ok(None)` means no `Marker` at all: unreachable in practice (SCM only
+/// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no `Marker` at all: unreachable in practice (SCM only
 /// ever launches the shim against a service *this backend itself* created
 /// with `ImagePath` naming the shim, and `apply` always writes `Parameters`
 /// immediately after), but returned rather than folded into `Err` so a
@@ -422,8 +428,10 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
 /// `src/bin/shim/logging.rs`) needs exactly that distinction to phrase its
 /// failure message.
 pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
-    let params = registry::read_parameters(id)?;
-    generate::extract(&params)
+    match registry::read_parameters(id)? {
+        RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),
+        RegistryReadOutcome::Read(params) => generate::extract(&params),
+    }
 }
 
 /// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not
@@ -502,7 +510,10 @@ fn read_live_registration(
         // one-off `LocalSystem`-only filter.
         .and_then(|a| generate::canonical_account(&a));
     let failure_actions = read_failure_actions(service, name)?;
-    let environment = registry::read_environment(name)?;
+    let environment = match registry::read_environment(name)? {
+        RegistryReadOutcome::ServiceGone => return Err(Error::NotInstalled { id: name.to_string() }),
+        RegistryReadOutcome::Read(lines) => lines,
+    };
 
     Ok((
         ScmRegistration {
