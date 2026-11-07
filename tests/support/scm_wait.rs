@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 
-use goetia::backend::scm::wait::{QueriedState, SystemScmActor, Waited, WantState, wait_until};
+use goetia::backend::scm::wait::{QueriedState, SystemScmActor, Waited, WantState, wait_after_stop, wait_until};
 use goetia::manager::Budget;
 
 /// A notification actor on service `id`.
@@ -18,8 +18,8 @@ pub fn open(id: &str) -> SystemScmActor {
 pub fn wait_for_running(actor: &mut SystemScmActor, id: &str) {
     let waited = wait_until(
         actor,
-        WantState::Running,
-        WantState::Running,
+        WantState::RunningPausedOrStopped,
+        WantState::RunningPausedOrStopped,
         QueriedState::Running,
         Budget::Unbounded.start(),
         |sighting| match sighting.status.state {
@@ -37,40 +37,19 @@ pub fn wait_for_running(actor: &mut SystemScmActor, id: &str) {
     );
 }
 
-/// What the caller of [`wait_for_stopped`] already knows of the stop.
-#[derive(Clone, Copy)]
+/// What the caller of [`wait_for_stopped`] has seen of the stop.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StopSeen {
-    /// A stop was just sent and nothing has shown yet: the first reading may still be `RUNNING`, as a
-    /// control's own status shows the state it left. After the first notification, a settled state
-    /// other than `STOPPED` (a recovery restart's `RUNNING`) is a panic.
+    /// A stop was just sent and nothing has shown yet: the first reading may still be `RUNNING`.
     Requested,
-    /// `STOP_PENDING` was already seen: a settled `RUNNING` or `PAUSED`, even the first reading, is a
-    /// panic, as waiting on it would hang.
+    /// `STOP_PENDING` was already seen: a first reading of `RUNNING` or `PAUSED` is a failure.
     Pending,
 }
 
-/// Returns once `id` reports `STOPPED`; `stop` says what the caller has seen of the stop.
+/// Returns once `id` reports `STOPPED`, by the product's own stop wait. A service that is running
+/// again after it began to stop (a recovery restart) is a panic naming that.
 pub fn wait_for_stopped(actor: &mut SystemScmActor, id: &str, stop: StopSeen) {
-    let (first, rearm) = match stop {
-        StopSeen::Requested => (WantState::Stopped, WantState::StoppedOnly),
-        StopSeen::Pending => (WantState::StoppedOnly, WantState::StoppedOnly),
-    };
-    let waited = wait_until(
-        actor,
-        first,
-        rearm,
-        QueriedState::Stopped,
-        Budget::Unbounded.start(),
-        |sighting| match (stop, sighting.status.state) {
-            (StopSeen::Requested, _) if !sighting.pending_delivered => Ok(ControlFlow::Continue(())),
-            (_, QueriedState::StopPending) => Ok(ControlFlow::Continue(())),
-            (StopSeen::Requested, state)
-            | (StopSeen::Pending, state @ (QueriedState::Running | QueriedState::Paused)) => {
-                panic!("waiting for STOPPED, {id} reached {state:?}")
-            }
-            (StopSeen::Pending, _) => Ok(ControlFlow::Continue(())),
-        },
-    )
-    .unwrap_or_else(|e| panic!("wait for {id} to reach STOPPED: {e}"));
+    let waited = wait_after_stop(actor, Budget::Unbounded.start(), "", stop == StopSeen::Pending)
+        .unwrap_or_else(|e| panic!("wait for {id} to reach STOPPED: {e}"));
     assert_eq!(waited, Waited::Confirmed, "an unbounded wait for {id} to stop expired");
 }

@@ -814,6 +814,17 @@ fn a_stop_whose_service_restarted_before_the_re_arm_says_so_instead_of_waiting()
     }
 }
 
+/// A caller that has seen `STOP_PENDING` already is not waiting for a stop to begin: a service that
+/// reads `RUNNING` at the first arm is the failure, not a read to wait out.
+#[skuld::test]
+fn a_wait_after_a_seen_stop_pending_fails_on_a_first_read_of_running() {
+    let mut fake = FakeScm::new([]).starting_in(QueriedState::Running);
+    let err = wait_after_stop(&mut fake, unbounded(), "", true)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("is running again"), "{err}");
+}
+
 /// The same race when the service has stopped and stayed so: the re-arm reports `STOPPED` at once.
 #[skuld::test]
 fn a_stop_whose_service_stopped_before_the_re_arm_is_confirmed_by_the_read() {
