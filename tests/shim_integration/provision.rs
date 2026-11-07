@@ -20,7 +20,9 @@ use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
 use goetia::spec::{DaemonFields, DaemonSpec, User};
-use windows_sys::Win32::Foundation::{GENERIC_ALL, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1,
@@ -28,10 +30,12 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, SYNCHRONIZE};
-use windows_sys::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW, ReleaseMutex, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, MUTEX_ALL_ACCESS, OpenMutexW, ReleaseMutex, WaitForSingleObject,
+};
 
 use crate::common::{
     LogDir, ShimGuard, ShimProcess, UNIT_DIR_EXCLUSIVE, embedded_manager, embedded_shim, fixture_command,
@@ -778,9 +782,8 @@ impl ShimProvider for Gated {
     }
 }
 
-/// The lock's name: it is in a private namespace, which a process that holds the lock has the alias
-/// of, so this process can open it while an install on one of its threads holds it.
-const LOCK_NAME: &str = r"goetia-shim\install-lock";
+/// The lock's name.
+const LOCK_NAME: &str = r"Global\goetia-shim";
 
 /// The lock, opened to read its permissions and to wait on it.
 fn open_lock() -> OwnedHandle {
@@ -955,18 +958,71 @@ fn lock_is_for_system_and_administrators_only() {
     });
 }
 
-/// The lock is not a name a service account can take first: nothing of it is in `Global\`, where
-/// every service account holds the privilege to create objects.
+/// A mutex of the lock's name that an account other than SYSTEM, Administrators and TrustedInstaller
+/// owns (here, the user the test runs as) is refused before any wait, naming that account.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn lock_is_not_in_the_global_namespace() {
-    probing_the_lock_during_an_install(|_| {
-        for name in [r"Global\goetia-shim", r"Global\goetia-shim-install-lock"] {
-            let wide = support::wide_null(name);
-            // SAFETY: `wide` is NUL-terminated; a handle, if there is one, is closed below.
-            let raw = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide.as_ptr()) };
-            assert!(raw.is_null(), "`{name}` exists while an install holds the lock");
+fn a_lock_someone_else_created_first_is_refused() {
+    let whoami = support::cmd::run("whoami", &["/user", "/fo", "csv", "/nh"]).expect_ok();
+    let sid = whoami
+        .stdout
+        .trim()
+        .rsplit('"')
+        .nth(1)
+        .unwrap_or_else(|| panic!("no SID in {whoami}"))
+        .to_string();
+    let sddl = support::wide_null(&format!("O:{sid}D:(A;;GA;;;WD)"));
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `sddl` is NUL-terminated; `descriptor` is a valid out-pointer, freed below.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(
+        converted,
+        0,
+        "build the descriptor: {}",
+        std::io::Error::last_os_error()
+    );
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let name = support::wide_null(LOCK_NAME);
+    // SAFETY: `attributes` points at `descriptor`, live for the call; `name` is NUL-terminated.
+    let raw = unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) };
+    // SAFETY: read straight after the call; `descriptor` is freed once, after its last use.
+    let (existed, created) = unsafe {
+        let last = GetLastError();
+        let created = std::io::Error::last_os_error();
+        LocalFree(descriptor);
+        (last == ERROR_ALREADY_EXISTS, created)
+    };
+    assert!(!raw.is_null(), "create the lock as {sid}: {created}");
+    // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns. It closes at the end
+    // of the test, which is when the name goes.
+    let _foreign = unsafe { OwnedHandle::from_raw_handle(raw) };
+    assert!(!existed, "`{LOCK_NAME}` existed before this test made it");
+
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let mgr = embedded_manager(Some(folder), CheckPermissions::Disable);
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+
+    let refused = mgr.install(&spec, false);
+
+    match refused {
+        Err(Error::ShimLockForeign { account }) => {
+            assert!(!account.is_empty(), "the refusal names the owner");
         }
-    });
+        other => panic!("expected the foreign lock to be refused: {other:?}"),
+    }
 }
 
 // The sweep at install ================================================================================================

@@ -279,6 +279,15 @@ pub enum Error {
     )]
     SiblingShimMissing { path: PathBuf },
 
+    /// The machine-wide install lock exists and belongs to an account that is neither SYSTEM nor
+    /// Administrators, so what holds it cannot be trusted to serialise installs. `account` is its
+    /// name, or its SID when it has none.
+    #[error(
+        "the install lock `Global\\goetia-shim` is owned by {account}, which is not SYSTEM or Administrators, so it \
+         cannot be trusted to serialise installs: end that account's processes that hold it"
+    )]
+    ShimLockForeign { account: String },
+
     /// The `ImagePath` of the service `name` could be read neither from its registry key nor
     /// through SCM, which the chain holds, so what it references is unknown. A remedy, which follows
     /// the chain: see [`remedy`](Error::remedy).
@@ -631,6 +640,7 @@ impl Error {
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
+            | Error::ShimLockForeign { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -788,6 +798,7 @@ impl Error {
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
+            | Error::ShimLockForeign { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
