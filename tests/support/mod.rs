@@ -1,8 +1,8 @@
 //! Shared support for the integration suites.
 //!
 //! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only
-//! `daemon_spec` and `scm_wait` depend on the `goetia` crate; the marker-inertness
-//! probe's hand-written artifacts use the rest.
+//! `daemon_spec`, `kill` and `scm_wait` depend on the `goetia` crate; the
+//! marker-inertness probe's hand-written artifacts use the rest.
 
 #![allow(dead_code, unused_imports)]
 // Each probe module is `#[cfg]`-gated to one platform, so most of this is

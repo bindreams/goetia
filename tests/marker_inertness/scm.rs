@@ -16,6 +16,7 @@ use winreg::RegKey;
 use winreg::enums::{KEY_READ, KEY_WRITE};
 
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard, cmd, registry};
+use goetia::backend::scm::wait::StopSeen;
 
 /// Byte-exact field names; renaming one changes every installed artifact.
 const PRIMARY: Names = Names {
@@ -114,7 +115,7 @@ fn scm_parameters_values_survive() {
     support::scm_wait::wait_for_stopped(
         &mut support::scm_wait::open(guard.id()),
         guard.id(),
-        support::scm_wait::StopSeen::Requested,
+        StopSeen::Requested,
     );
     check("a start/stop cycle");
 

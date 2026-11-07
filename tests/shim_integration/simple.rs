@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use goetia::backend::scm::manager::Scm;
-use goetia::backend::scm::wait::{Armed, Observed, QueriedState, ScmActor as _, SystemScmActor, WantState};
+use goetia::backend::scm::wait::{Armed, Observed, QueriedState, ScmActor as _, StopSeen, SystemScmActor, WantState};
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
@@ -253,5 +253,5 @@ fn the_shim_reports_stop_pending_then_stopped() {
         "no control is accepted while stopping"
     );
 
-    support::scm_wait::wait_for_stopped(&mut actor, &id, support::scm_wait::StopSeen::Pending);
+    support::scm_wait::wait_for_stopped(&mut actor, &id, StopSeen::Pending);
 }
