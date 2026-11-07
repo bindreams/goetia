@@ -304,6 +304,36 @@ fn a_failed_read_of_the_installed_host_is_told_from_a_spec_that_cannot_be_regene
     ));
 }
 
+/// The read's failure is found under the wrappers a backend puts around it, as the classification of
+/// `NotInstalled` does: the whole error is kept, wrappers included.
+#[skuld::test]
+fn a_failed_read_of_the_installed_host_is_found_under_a_step_or_a_kept_error() {
+    let stepped = Error::Step {
+        what: "regenerate".to_string(),
+        source: Box::new(installed_host_unreadable()),
+    };
+    let kept = Error::Kept(Arc::new(installed_host_unreadable()));
+
+    for wrapped in [stepped, kept] {
+        match RegenerationFailure::of(wrapped) {
+            RegenerationFailure::HostUnreadable(whole) => {
+                assert!(
+                    whole.report().to_string().contains("failed to query configuration"),
+                    "{whole:?}"
+                )
+            }
+            RegenerationFailure::SpecUnregenerable(e) => panic!("classified as a spec failure: {e:?}"),
+        }
+    }
+    assert!(matches!(
+        RegenerationFailure::of(Error::Step {
+            what: "regenerate".to_string(),
+            source: Box::new(Error::os("resolve the account", std::io::Error::other("gone"))),
+        }),
+        RegenerationFailure::SpecUnregenerable(_)
+    ));
+}
+
 /// A failed read of what is installed is not a spec that cannot be regenerated.
 #[skuld::test]
 fn status_names_a_failed_read_of_the_installed_host_as_that() {
