@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use super::acl::FolderCheck;
 use super::provider::{HostCommand, ShimProvider};
+use super::sweep::SweepFailure;
 use crate::error::{Error, Result};
 
 /// A host at a fixed path with fixed arguments: the file an installer placed, or the program
@@ -39,7 +40,7 @@ impl ShimProvider for StandaloneShim {
         Ok(command)
     }
 
-    fn sweep(&self, _referenced: &[PathBuf]) -> Result<()> {
+    fn sweep(&self, _referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
         Ok(())
     }
 }

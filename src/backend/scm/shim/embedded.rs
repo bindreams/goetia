@@ -65,7 +65,7 @@ mod stock {
     };
     use super::super::marker::read_retrying;
     use super::super::provider::ShimProvider;
-    use super::super::sweep::sweep_folder;
+    use super::super::sweep::{SweepFailure, sweep_folder};
     use crate::error::{Error, Result};
     use crate::shim::HostCommand;
 
@@ -129,7 +129,7 @@ mod stock {
         /// Deletes the shim files in `dir`, and what a repair or a crash left beside them, that no
         /// path of `referenced` names, and removes `dir` when that leaves it empty and it is the
         /// default folder; see [`sweep_folder`].
-        fn sweep(&self, referenced: &[PathBuf]) -> Result<()> {
+        fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
             sweep_folder(absolute(&self.dir()?)?, referenced)
         }
     }
@@ -166,7 +166,7 @@ mod stock {
         }
 
         /// As [`EmbeddedStockShim`]'s, over the default folder, and whether or not the sibling is there.
-        fn sweep(&self, referenced: &[PathBuf]) -> Result<()> {
+        fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
             sweep_folder(&default_dir()?, referenced)
         }
     }

@@ -6,6 +6,8 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use super::acl::FolderCheck;
 #[cfg(windows)]
+use super::sweep::SweepFailure;
+#[cfg(windows)]
 use crate::error::Result;
 
 /// The command SCM launches for a `type: simple` service: a host built from `goetia::shim::main()`
@@ -33,6 +35,7 @@ pub trait ShimProvider: Send + Sync {
     /// Under the install lock, before an install provides and after an uninstall, and for an
     /// uninstall of an id that is not installed. `referenced` is every file a registered service
     /// or a running process names, as a path that has been normalised. Removes what this provider
-    /// wrote and nothing references, tries every file, and reports every failure after the last.
-    fn sweep(&self, referenced: &[PathBuf]) -> Result<()>;
+    /// wrote and nothing references, tries every file, and reports every failure after the last,
+    /// with the files it could not delete.
+    fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure>;
 }

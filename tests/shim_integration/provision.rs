@@ -16,7 +16,9 @@ use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::error::Error;
 use goetia::manager::{Budget, ServiceManager as _, State};
-use goetia::shim::{CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim};
+use goetia::shim::{
+    CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
+};
 use goetia::spec::{DaemonSpec, User};
 use windows_sys::Win32::Foundation::{GENERIC_ALL, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::Authorization::{
@@ -674,7 +676,7 @@ impl ShimProvider for Recording {
         Ok(self.provide.clone())
     }
 
-    fn sweep(&self, _referenced: &[PathBuf]) -> goetia::error::Result<()> {
+    fn sweep(&self, _referenced: &[PathBuf]) -> Result<(), SweepFailure> {
         self.calls.lock().unwrap().push("sweep");
         Ok(())
     }
@@ -770,7 +772,7 @@ impl ShimProvider for Gated {
         self.inner.provide(folders)
     }
 
-    fn sweep(&self, referenced: &[PathBuf]) -> goetia::error::Result<()> {
+    fn sweep(&self, referenced: &[PathBuf]) -> Result<(), SweepFailure> {
         self.inner.sweep(referenced)
     }
 }

@@ -155,19 +155,40 @@ pub(crate) fn image_of(
     })
 }
 
-/// What a failed delete is called in an `Os` error: [`undeleted`] reads it back.
-const DELETE: &str = "delete";
+/// A sweep that went wrong: the failures it met folded into one error, in the order they were met,
+/// and the paths it tried to delete and could not, in the same order. A sweep tries every file, so
+/// both are complete after the last; the paths are data, not read back out of the error's text.
+#[derive(Debug)]
+pub struct SweepFailure {
+    /// Boxed, as `Error::Both` boxes its parts: with the paths beside it, a bare `Error` would make
+    /// every `Result` of a sweep large.
+    pub error: Box<Error>,
+    pub not_deleted: Vec<PathBuf>,
+}
 
-/// The paths `error` names as not deleted (an `Os` error for a delete, however deep in `Step` and
-/// `Both` it is), in the order the failures were met.
-pub(crate) fn undeleted(error: &Error) -> Vec<PathBuf> {
-    match error {
-        Error::Both { first, then } => undeleted(first).into_iter().chain(undeleted(then)).collect(),
-        Error::Step { source, .. } => undeleted(source),
-        Error::Os {
-            what, path: Some(path), ..
-        } if what == DELETE => vec![path.clone()],
-        _ => Vec::new(),
+impl SweepFailure {
+    /// Every failure of `failures` as one, in the order given; `None` for none.
+    pub(crate) fn all(failures: impl IntoIterator<Item = SweepFailure>) -> Option<Self> {
+        let mut errors = Vec::new();
+        let mut not_deleted = Vec::new();
+        for failure in failures {
+            errors.push(*failure.error);
+            not_deleted.extend(failure.not_deleted);
+        }
+        Error::both_all(errors).map(|error| Self {
+            error: Box::new(error),
+            not_deleted,
+        })
+    }
+}
+
+/// A failure that deleted nothing it could name: a read, a lookup.
+impl From<Error> for SweepFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error: Box::new(error),
+            not_deleted: Vec::new(),
+        }
     }
 }
 
@@ -254,7 +275,7 @@ mod system {
     use super::super::processes::running_images;
     use windows_service::service_manager::ServiceManagerAccess;
 
-    use super::{DELETE, image_of, image_references, same_path, unreferenced};
+    use super::{SweepFailure, image_of, image_references, same_path, unreferenced};
     use crate::backend::scm::manager::{open_scm, read_image_through_scm, read_service_pid, registry};
     use crate::error::{Error, Reason, Result};
     use crate::manager::Installed;
@@ -381,19 +402,16 @@ mod system {
 
     /// Deletes the shim files in `dir`, and what a repair or a crash left beside them, that no path
     /// of `referenced` names, and removes `dir` when that leaves it empty and it is the default
-    /// folder. Every file is tried: the failures, each `Os { what: "delete", path }`, come back
-    /// together after the last, in the order the files were tried. A `dir` that does not exist has
-    /// nothing to sweep.
+    /// folder. Every file is tried: the failures come back together after the last, in the order
+    /// the files were tried, each failed delete an `Os { what: "delete", path }` and its path in
+    /// [`SweepFailure::not_deleted`]. A `dir` that does not exist has nothing to sweep.
     ///
     /// The one mechanism behind a provider's `sweep` and the sweep of the folder an uninstalled
     /// service's host was in.
-    pub(crate) fn sweep_folder(dir: &Path, referenced: &[PathBuf]) -> Result<()> {
+    pub(crate) fn sweep_folder(dir: &Path, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
         let swept = sweep_files(dir, referenced);
         let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_dir()?), &normalise(dir))));
-        match Error::both_all(swept.err().into_iter().chain(removed.err())) {
-            None => Ok(()),
-            Some(e) => Err(e),
-        }
+        SweepFailure::all(swept.err().into_iter().chain(removed.err())).map_or(Ok(()), Err)
     }
 
     /// Removes `dir` if it is empty and `is_default` says it is the default folder, which is asked
@@ -401,7 +419,10 @@ mod system {
     ///
     /// A folder that cannot be listed is not known to be empty, and the sweep of its files has said
     /// why it cannot be listed: it stays, without a second report.
-    pub(super) fn remove_if_empty_default(dir: &Path, is_default: impl FnOnce() -> Result<bool>) -> Result<()> {
+    pub(super) fn remove_if_empty_default(
+        dir: &Path,
+        is_default: impl FnOnce() -> Result<bool>,
+    ) -> std::result::Result<(), SweepFailure> {
         match fs::read_dir(dir) {
             Ok(mut listing) => {
                 if listing.next().is_some() {
@@ -415,14 +436,14 @@ mod system {
         }
         match fs::remove_dir(dir) {
             Err(e) if !matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty) => {
-                Err(Error::os_at(DELETE, dir, e))
+                Err(delete_failed(dir, e))
             }
             _ => Ok(()),
         }
     }
 
     /// The deletion half of [`sweep_folder`].
-    fn sweep_files(dir: &Path, referenced: &[PathBuf]) -> Result<()> {
+    fn sweep_files(dir: &Path, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
         let mut failures = Vec::new();
         let mut entries = Vec::new();
         match fs::read_dir(dir) {
@@ -432,12 +453,12 @@ mod system {
                         // A name that is no shim file's is dropped by `unreferenced`; a folder that a
                         // repair set aside whole is a shim file's name too.
                         Ok(entry) => entries.push((entry.file_name(), entry.file_type().is_ok_and(|t| t.is_dir()))),
-                        Err(e) => failures.push(Error::os_at("read an entry of", dir, e)),
+                        Err(e) => failures.push(Error::os_at("read an entry of", dir, e).into()),
                     }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(Error::os_at("read", dir, e)),
+            Err(e) => return Err(Error::os_at("read", dir, e).into()),
         }
         entries.sort();
 
@@ -455,11 +476,19 @@ mod system {
                 fs::remove_file(&path)
             };
             match removed {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => failures.push(Error::os_at(DELETE, path, e)),
+                Err(e) if e.kind() != io::ErrorKind::NotFound => failures.push(delete_failed(path, e)),
                 _ => {}
             }
         }
-        Error::both_all(failures).map_or(Ok(()), Err)
+        SweepFailure::all(failures).map_or(Ok(()), Err)
+    }
+
+    fn delete_failed(path: impl Into<PathBuf>, source: io::Error) -> SweepFailure {
+        let path = path.into();
+        SweepFailure {
+            error: Box::new(Error::os_at("delete", &path, source)),
+            not_deleted: vec![path],
+        }
     }
 }
 

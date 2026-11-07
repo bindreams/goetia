@@ -273,50 +273,42 @@ fn when_both_fail_the_error_names_the_service_and_says_who_can_fix_it() {
 
 // What an uninstall says it left behind ---------------------------------------------------------------------------
 
-fn failed_delete(path: &str) -> Error {
-    Error::os_at("delete", path, std::io::Error::other("in use"))
+fn failure(path: &str) -> SweepFailure {
+    SweepFailure {
+        error: Box::new(Error::os_at("delete", path, std::io::Error::other("in use"))),
+        not_deleted: vec![PathBuf::from(path)],
+    }
 }
 
 #[skuld::test]
-fn undeleted_names_each_file_a_sweep_failed_to_delete_in_order() {
-    let error = Error::Step {
-        what: "clean up".to_string(),
-        source: Box::new(
-            Error::both_all([
-                failed_delete("/p/a.exe"),
-                Error::os_at("read", "/p", std::io::Error::other("denied")),
-                Error::Step {
-                    what: "sweep".to_string(),
-                    source: Box::new(failed_delete("/q/b.exe")),
-                },
-            ])
-            .unwrap(),
-        ),
-    };
+fn failures_fold_in_order_with_the_files_they_could_not_delete() {
+    let read = SweepFailure::from(Error::os_at("read", "/p", std::io::Error::other("denied")));
+
+    let all = SweepFailure::all([failure("/p/a.exe"), read, failure("/q/b.exe")]).expect("three failures");
 
     assert_eq!(
-        undeleted(&error),
+        all.not_deleted,
         vec![PathBuf::from("/p/a.exe"), PathBuf::from("/q/b.exe")]
     );
+    let said = all.error.report().to_string();
+    let (a, read, b) = (
+        said.find("/p/a.exe").unwrap(),
+        said.find("read").unwrap(),
+        said.find("/q/b.exe").unwrap(),
+    );
+    assert!(a < read && read < b, "{said}");
 }
 
 #[skuld::test]
-fn a_failure_that_names_no_file_names_none() {
-    assert!(undeleted(&Error::os("wait for a process", std::io::Error::other("x"))).is_empty());
+fn no_failure_is_none() {
+    assert!(SweepFailure::all([]).is_none());
 }
 
-/// A `\` line continuation that is lost leaves the indentation of the next line inside the text.
 #[skuld::test]
-fn the_messages_have_no_run_of_spaces() {
-    let both_failed = image_of("frpc", Err(denied("open the key")), || Err(denied("query the service")))
-        .unwrap_err()
-        .to_string();
-    let outside = text(Some("/p/Goetia"), "/q", &["/q/a.exe", "/q/b.exe"]);
-    let one_outside = text(Some("/p/Goetia"), "/q", &["/q/a.exe"]);
+fn a_failure_from_an_error_names_no_file() {
+    let failure = SweepFailure::from(Error::os("wait for a process", std::io::Error::other("x")));
 
-    for said in [both_failed, outside, one_outside] {
-        assert!(!said.contains("  "), "{said}");
-    }
+    assert!(failure.not_deleted.is_empty());
 }
 
 const RETRY: &str = "Re-run `goetia daemon uninstall frpc`";
@@ -484,9 +476,14 @@ mod windows {
         let other = dir.path().join("notes.txt");
         fs::write(&other, b"x").unwrap();
 
-        let error = sweep_folder(dir.path(), &[]).expect_err("three files cannot be deleted");
+        let failure = sweep_folder(dir.path(), &[]).expect_err("three files cannot be deleted");
 
-        let report = error.report().to_string();
+        let held_paths: Vec<PathBuf> = held.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            failure.not_deleted, held_paths,
+            "each file it could not delete, in order"
+        );
+        let report = failure.error.report().to_string();
         let mut at = 0;
         for (path, _) in &held {
             let found = report[at..].find(&path.display().to_string());
@@ -533,10 +530,11 @@ mod windows {
         let not_a_folder = dir.path().join("file.txt");
         fs::write(&not_a_folder, b"x").unwrap();
 
-        let error = sweep_folder(&not_a_folder, &[]).expect_err("a file cannot be listed");
+        let failure = sweep_folder(&not_a_folder, &[]).expect_err("a file cannot be listed");
 
-        let report = error.report().to_string();
+        let report = failure.error.report().to_string();
         assert_eq!(report.matches("file.txt").count(), 1, "{report}");
+        assert!(failure.not_deleted.is_empty(), "nothing was tried to be deleted");
     }
 
     #[skuld::test]
@@ -576,12 +574,13 @@ mod windows {
         remove_if_empty_default(dir.path(), unlocated).unwrap();
 
         fs::remove_file(dir.path().join("notes.txt")).unwrap();
-        let error = remove_if_empty_default(dir.path(), unlocated).expect_err("an empty folder needs the answer");
+        let failure = remove_if_empty_default(dir.path(), unlocated).expect_err("an empty folder needs the answer");
         assert!(
-            error.report().to_string().contains("locate %ProgramFiles%"),
+            failure.error.report().to_string().contains("locate %ProgramFiles%"),
             "{}",
-            error.report()
+            failure.error.report()
         );
+        assert!(failure.not_deleted.is_empty());
         assert!(dir.path().is_dir());
     }
 

@@ -122,7 +122,7 @@ use crate::backend::scm::shim::marker;
 use crate::backend::scm::shim::processes::unowned_on;
 use crate::backend::scm::shim::provider::ShimProvider;
 use crate::backend::scm::shim::sweep::{
-    left_behind_text, normalise, referenced_hosts, same_path, sweep_folder, undeleted,
+    SweepFailure, left_behind_text, normalise, referenced_hosts, same_path, sweep_folder,
 };
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
@@ -287,7 +287,9 @@ impl Backend for Scm {
         }
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
-        let _ = referenced_hosts().and_then(|referenced| shim.sweep(&referenced));
+        if let Ok(referenced) = referenced_hosts() {
+            let _ = shim.sweep(&referenced);
+        }
         let provided = shim.provide(&self.folders)?;
         let previewed = shim.preview()?;
         if provided != previewed {
@@ -446,7 +448,7 @@ impl Backend for Scm {
             return Ok(());
         };
         let _lock = InstallLock::acquire()?;
-        referenced_hosts().and_then(|referenced| shim.sweep(&referenced))
+        shim.sweep(&referenced_hosts()?).map_err(|failure| *failure.error)
     }
 
     fn enable(&self, snapshot: ScmSnapshot) -> Result<()> {
@@ -1040,31 +1042,28 @@ impl Scm {
             .as_ref()
             .and_then(|shim| shim.preview().ok())
             .and_then(|command| command.exe.parent().map(normalise));
-        let left_behind = |source: Error| {
-            let files: Vec<PathBuf> = undeleted(&source).iter().map(|file| normalise(file)).collect();
+        let left_behind = |failure: SweepFailure| {
+            let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
             Error::Step {
                 what: left_behind_text(id, provider_folder.as_deref(), host.parent(), &files),
-                source: Box::new(source),
+                source: failure.error,
             }
         };
         if let Some(held) = held {
             held.wait_for_exit(id.as_str())
-                .map_err(|e| left_behind(Error::os(format!("wait for `{id}`'s process to exit"), e)))?;
+                .map_err(|e| left_behind(Error::os(format!("wait for `{id}`'s process to exit"), e).into()))?;
         }
         // The process of a service that stopped before it was held (SCM recorded `STOPPED`, with no
         // pid, while it was still exiting) is found by its image: it is no live service's.
-        for process in unowned_on(&host).map_err(left_behind)? {
+        for process in unowned_on(&host).map_err(|e| left_behind(e.into()))? {
             let waiting = || eprintln!("{id}: waiting for a process running {} to exit", host.display());
             wait_exit(&process, waiting).map_err(|e| {
-                left_behind(Error::os(
-                    format!("wait for a process running {} to exit", host.display()),
-                    e,
-                ))
+                left_behind(Error::os(format!("wait for a process running {} to exit", host.display()), e).into())
             })?;
         }
         // After the waits: what has exited no longer references its file. A process a live service
         // reports still does, and keeps the file for a later sweep.
-        let referenced = referenced_hosts().map_err(left_behind)?;
+        let referenced = referenced_hosts().map_err(|e| left_behind(e.into()))?;
         let mut failures = Vec::new();
         if let Some(shim) = &self.shim {
             failures.extend(shim.sweep(&referenced).err());
@@ -1076,7 +1075,7 @@ impl Scm {
         {
             failures.extend(sweep_folder(folder, &referenced).err());
         }
-        Error::both_all(failures).map_or(Ok(()), |e| Err(left_behind(e)))
+        SweepFailure::all(failures).map_or(Ok(()), |failure| Err(left_behind(failure)))
     }
 }
 

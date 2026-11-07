@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::manager::ServiceManager;
-use crate::shim::{CheckPermissions, FolderCheck, HostCommand, ShimProvider};
+use crate::shim::{CheckPermissions, FolderCheck, HostCommand, ShimProvider, SweepFailure};
 use crate::spec::Restart;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
@@ -605,7 +605,7 @@ impl ShimProvider for Recording {
         Ok(self.provide.clone())
     }
 
-    fn sweep(&self, _referenced: &[PathBuf]) -> Result<()> {
+    fn sweep(&self, _referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
         self.calls.lock().unwrap().push("sweep");
         Ok(())
     }

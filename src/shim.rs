@@ -9,6 +9,8 @@ pub use crate::backend::scm::shim::provider::HostCommand;
 pub use crate::backend::scm::shim::provider::ShimProvider;
 #[cfg(windows)]
 pub use crate::backend::scm::shim::standalone::StandaloneShim;
+#[cfg(windows)]
+pub use crate::backend::scm::shim::sweep::SweepFailure;
 
 /// The shim's entry point: hands control to SCM and never returns. On every other platform it
 /// prints that the shim is Windows-only and exits 1.
