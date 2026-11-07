@@ -130,6 +130,13 @@ pub struct DaemonFields {
 
 /// A daemon goetia has checked: it passed every field rule. Only [`DaemonSpec::new`] makes one;
 /// fields read through `Deref`, there is no `DerefMut`.
+///
+/// A generator may rely on all of these:
+/// - `command` is non-empty and `command[0]` is an absolute path;
+/// - `cwd` and `logs`, when set, are absolute paths;
+/// - no emitted field (`name`, `command`, `cwd`, `logs`, `env` keys and values, `user`) holds a
+///   control character or an XML noncharacter;
+/// - every `env` key is non-empty and has no `=`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonSpec(DaemonFields);
 

@@ -8,7 +8,10 @@ fn spec_fixture() -> DaemonSpec {
         name: "FRP tunnel client".to_owned(),
         restart: Restart::Always,
         kind: Kind::Simple,
-        ..plain_fields("frpc", vec!["frpc".to_owned()])
+        ..plain_fields(
+            "frpc",
+            vec![std::env::temp_dir().join("frpc").to_string_lossy().into_owned()],
+        )
     })
     .unwrap()
 }

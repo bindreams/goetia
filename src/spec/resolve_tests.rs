@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use skuld::temp_dir;
+
 use super::*;
 use crate::spec::interpolate;
 use crate::spec::vars::Vars;
@@ -321,7 +323,6 @@ fn a_directory_defect_is_not_attributed_to_env_when_env_supplied_the_field() {
 
 /// A drive-relative path resolves through the per-drive current directory, which a manifest
 /// cannot touch: a drive with none (`Q:`) resolves to its root, `Q:\`, which a path rule refuses.
-/// That is `.env`'s when a reference wrote the `Q:`.
 #[cfg(windows)]
 #[skuld::test]
 fn a_defect_in_a_typed_drive_relative_path_is_not_attributed_to_env() {
@@ -332,6 +333,7 @@ fn a_defect_in_a_typed_drive_relative_path_is_not_attributed_to_env() {
     assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
 }
 
+/// The defect is `.env`'s when a reference wrote the `Q:`.
 #[cfg(windows)]
 #[skuld::test]
 fn a_defect_in_a_drive_relative_path_a_reference_wrote_is_attributed_to_env() {
@@ -444,10 +446,14 @@ fn a_defect_in_a_default_is_not_attributed_to_env() {
 }
 
 #[skuld::test]
-fn an_empty_env_value_is_attributed_to_env() {
+fn an_empty_env_value_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
     let abs = base_dir().join("frpc").to_string_lossy().into_owned();
-    let dir = fixture_dir(&format!("id: frpc\ncommand: ['{abs}']\ncwd: ${{D}}\n"), Some("D=\n"));
-    let msg = load(dir.path()).unwrap_err().to_string();
+    write_fixture(
+        dir,
+        &format!("id: frpc\ncommand: ['{abs}']\ncwd: ${{D}}\n"),
+        Some("D=\n"),
+    );
+    let msg = load(dir).unwrap_err().to_string();
     assert!(
         msg.contains("after substituting from .env: field `cwd` must not be empty"),
         "{msg}"
@@ -455,9 +461,9 @@ fn an_empty_env_value_is_attributed_to_env() {
 }
 
 #[skuld::test]
-fn a_default_that_replaces_an_empty_env_value_is_not_attributed_to_env() {
-    let dir = fixture_dir("id: frpc\nrestart: ${R:-sometimes}\n", Some("R=\n"));
-    let msg = load(dir.path()).unwrap_err().to_string();
+fn a_default_that_replaces_an_empty_env_value_is_not_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\nrestart: ${R:-sometimes}\n", Some("R=\n"));
+    let msg = load(dir).unwrap_err().to_string();
     assert!(msg.contains("field `restart` is `sometimes`"), "{msg}");
     assert!(!msg.contains(".env"), "{msg}");
 }
@@ -1361,11 +1367,16 @@ command: ['\\?\C:']
 /// A fresh directory holding `goetia.yaml`, and `.env` when `env` is given.
 fn fixture_dir(yaml: &str, env: Option<&str>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir should be creatable");
-    std::fs::write(dir.path().join("goetia.yaml"), yaml).expect("fixture manifest should be writable");
-    if let Some(env) = env {
-        std::fs::write(dir.path().join(".env"), env).expect("fixture .env should be writable");
-    }
+    write_fixture(dir.path(), yaml, env);
     dir
+}
+
+/// [`fixture_dir`]'s files, written into `dir`.
+fn write_fixture(dir: &Path, yaml: &str, env: Option<&str>) {
+    std::fs::write(dir.join("goetia.yaml"), yaml).expect("fixture manifest should be writable");
+    if let Some(env) = env {
+        std::fs::write(dir.join(".env"), env).expect("fixture .env should be writable");
+    }
 }
 
 #[skuld::test]

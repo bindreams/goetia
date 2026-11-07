@@ -12,7 +12,10 @@ pub(crate) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         kind: Kind::Simple,
-        ..plain_fields(id, vec!["daemon".to_owned()])
+        ..plain_fields(
+            id,
+            vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
+        )
     })
     .unwrap()
 }

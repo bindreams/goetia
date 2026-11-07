@@ -29,6 +29,7 @@ impl Field {
             Field::Command(index) => format!("command[{index}]"),
             Field::Cwd => "cwd".to_string(),
             Field::Logs => "logs".to_string(),
+            // No substitution error asks for it; the arm only keeps the match total.
             Field::EnvKey => "env key".to_string(),
             Field::EnvValue(key) => format!("env[{key:?}]"),
             Field::User => "user".to_string(),

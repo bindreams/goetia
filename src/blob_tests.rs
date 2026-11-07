@@ -16,11 +16,16 @@ fn abs(p: &str) -> PathBuf {
     PathBuf::from(format!("/{p}"))
 }
 
+/// The program every fixture runs.
+fn program() -> String {
+    abs("bin/frpc").to_string_lossy().into_owned()
+}
+
 fn full_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
-        command: vec!["frpc".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+        command: vec![program(), "-c".to_string(), "frpc.toml".to_string()],
         cwd: Some(abs("opt/frpc")),
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
@@ -39,7 +44,7 @@ fn minimal_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "frpc".to_string(),
-        command: vec!["frpc".to_string()],
+        command: vec![program()],
         cwd: None,
         env: BTreeMap::new(),
         user: User::Root,
@@ -51,14 +56,14 @@ fn minimal_spec() -> DaemonSpec {
     .unwrap()
 }
 
-/// A spec with no `PathBuf` fields, so its wire bytes render identically
-/// on all three CI platforms (`PathBuf`'s `Display`/`to_string_lossy`
-/// differs by separator). Used only by `blob_wire_names_are_pinned`.
+/// A spec with no `cwd` or `logs`, so the only host-dependent part of its wire bytes is
+/// `command[0]` (`PathBuf`'s `Display`/`to_string_lossy` differs by separator). Used only by
+/// `blob_wire_names_are_pinned`, which splices that program into the expected JSON.
 fn golden_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
-        command: vec!["frpc".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+        command: vec![program(), "-c".to_string(), "frpc.toml".to_string()],
         cwd: None,
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
@@ -77,7 +82,7 @@ fn base_wire_spec() -> WireSpec {
     WireSpec {
         id: "frpc".to_string(),
         name: "frpc".to_string(),
-        command: vec!["frpc".to_string()],
+        command: vec![program()],
         cwd: Some(abs("opt/frpc").to_string_lossy().into_owned()),
         env: BTreeMap::from([("RUST_LOG".to_string(), "info".to_string())]),
         user: WireUser::Root,
@@ -152,11 +157,13 @@ fn encode_is_key_sorted_at_every_level() {
 #[skuld::test]
 fn blob_wire_names_are_pinned() {
     // Golden-bytes assertion: if this fails after an intentional wire
-    // change, recompute and update the constant below, and confirm the
-    // change was intentional (a rename in `DaemonSpec` should not
-    // silently do this).
-    const EXPECTED: &str = "eyJzY2hlbWEiOjEsInNwZWMiOnsiY29tbWFuZCI6WyJmcnBjIiwiLWMiLCJmcnBjLnRvbWwiXSwiY3dkIjpudWxsLCJlbnYiOnsiUlVTVF9MT0ciOiJpbmZvIiwiVVJMIjoiaHR0cDovL3gvYSUyMGIifSwiaWQiOiJmcnBjIiwia2luZCI6Im1hbmFnZWQiLCJsb2dzIjpudWxsLCJuYW1lIjoiRnJwYyBUdW5uZWwiLCJyZXN0YXJ0IjoiYWx3YXlzIiwicmVzdGFydF9kZWxheSI6eyJuYW5vcyI6NTAwMDAwMDAwLCJzZWNzIjoyfSwidXNlciI6eyJraW5kIjoibmFtZSIsIm5hbWUiOiJzdmMtZnJwYyJ9fSwidmVyc2lvbiI6IjAuMS4wIn0=";
-    assert_eq!(encode_with_version(&golden_spec(), "0.1.0"), EXPECTED);
+    // change, update the JSON below, and confirm the change was
+    // intentional (a rename in `DaemonSpec` should not silently do this).
+    let program = serde_json::to_string(&program()).unwrap();
+    let expected = format!(
+        r#"{{"schema":1,"spec":{{"command":[{program},"-c","frpc.toml"],"cwd":null,"env":{{"RUST_LOG":"info","URL":"http://x/a%20b"}},"id":"frpc","kind":"managed","logs":null,"name":"Frpc Tunnel","restart":"always","restart_delay":{{"nanos":500000000,"secs":2}},"user":{{"kind":"name","name":"svc-frpc"}}}},"version":"0.1.0"}}"#
+    );
+    assert_eq!(encode_with_version(&golden_spec(), "0.1.0"), BASE64.encode(expected));
 }
 
 // Schema and invariant re-validation ==================================================================================
@@ -185,6 +192,11 @@ fn decode_rejects_invariant_violations() {
             "empty command",
             Box::new(|s: &mut WireSpec| s.command = vec![]),
             "command",
+        ),
+        (
+            "relative command[0]",
+            Box::new(|s: &mut WireSpec| s.command = vec!["frpc".to_string()]),
+            "command[0]",
         ),
         (
             "relative cwd",

@@ -403,20 +403,13 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
     let command = command.unwrap_or_default();
     reject_empty_command(&id, &command).map_err(|_| missing_command_error(&id, backend))?;
 
-    // `command[0]` is absolutized in `resolve_shape`, where a `command` first exists; the field
-    // rules do not test it for absoluteness.
-    debug_assert!(
-        Path::new(&command[0]).is_absolute(),
-        "resolve must return an absolute command[0]; got {:?}",
-        command[0],
-    );
-
     let restart = settled(&id, "restart", restart)?.unwrap_or(Restart::Never);
     let restart_delay = settled(&id, "restart-delay", restart_delay)?;
     let kind = settled(&id, "type", kind)?.unwrap_or(Kind::Simple);
 
-    // The rules already ran on these values and on every path resolved, so `new` is what makes the
-    // result a `DaemonSpec`, not a check: it cannot refuse a manifest.
+    // The rules already ran on these values and on every path resolved (`command[0]` included, by
+    // `resolve_shape`), so `new` is what makes the result a `DaemonSpec`, not a check: it cannot
+    // refuse a manifest.
     let daemon = id.clone();
     DaemonSpec::new(DaemonFields {
         id,
@@ -430,18 +423,22 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         logs,
         kind,
     })
-    .map_err(|err| {
-        contract_violation(
-            &daemon,
-            &format!("the resolved daemon failed its own field rules: {err}"),
-        )
-    })
+    .map_err(|err| contract_violation_from(&daemon, "the resolved daemon failed its own field rules", err))
 }
 
 /// A defect of this crate, not of any manifest: something an earlier step ruled out happened. An
 /// error rather than a `debug_assert!`, which would abort the path that reports it.
 fn contract_violation(id: &Id, message: &str) -> Error {
     invalid(id, &format!("internal error: {message}; this is a bug in goetia"))
+}
+
+/// [`contract_violation`] whose cause is `source`, an error an earlier step should not have let through.
+fn contract_violation_from(id: &Id, message: &str, source: impl std::error::Error + Send + Sync + 'static) -> Error {
+    invalid_from(
+        id,
+        &format!("internal error: {message}; this is a bug in goetia"),
+        source,
+    )
 }
 
 /// What a substituted pass leaves of a [`Shaped`] value: it defers nothing, so the value is parsed
@@ -861,7 +858,7 @@ struct Verdict {
 ///
 /// Beyond the rules both phases share, [`Phase::Authored`] refuses a `${...}` reference where
 /// substitution must not produce one (an `env` key, a `user.id`), and [`Phase::Final`] refuses an
-/// empty `command` and a relative `cwd` or `logs`.
+/// empty `command` and a relative `command[0]`, `cwd` or `logs`.
 ///
 /// Every error says which [`Field`] it is about ([`Refused`]).
 fn check_field_values(id: &Id, values: &FieldValues, phase: Phase) -> Vec<Verdict> {
@@ -911,6 +908,10 @@ fn check_command(id: &Id, command: &[String], phase: Phase) -> Result<(), Refuse
     }
     if let Some(first) = command.first() {
         reject_empty(id, "command[0]", first).map_err(|err| Refused::at(Field::Command(0), err))?;
+        if phase == Phase::Final {
+            reject_relative_path(id, "command[0]", Path::new(first))
+                .map_err(|err| Refused::at(Field::Command(0), err))?;
+        }
     }
     Ok(())
 }
@@ -1108,7 +1109,7 @@ fn reject_env_key_with_equals(id: &Id, key: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// `cwd` and `logs` are always resolved to absolute paths here, so a relative one in a
+/// `command[0]`, `cwd` and `logs` are always resolved to absolute paths here, so a relative one in a
 /// `DaemonSpec` is already corrupt.
 fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<(), Error> {
     if !path.is_absolute() {

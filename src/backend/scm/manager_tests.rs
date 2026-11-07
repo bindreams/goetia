@@ -487,7 +487,10 @@ fn blob_of(kind: Kind) -> Blob {
         version: "0.1.0".to_string(),
         spec: DaemonSpec::new(DaemonFields {
             kind,
-            ..plain_fields("frpc", vec!["frpc".to_string()])
+            ..plain_fields(
+                "frpc",
+                vec![std::env::temp_dir().join("frpc").to_string_lossy().into_owned()],
+            )
         })
         .unwrap(),
     }

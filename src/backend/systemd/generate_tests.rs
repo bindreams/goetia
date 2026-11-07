@@ -9,7 +9,8 @@ use crate::spec::{Id, Kind, User};
 
 // Fixtures ============================================================================================================
 //
-// `DaemonSpec::new` requires absolute `cwd`/`logs`, which is platform-defined; `abs` builds one for the host.
+// `DaemonSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds one
+// for the host.
 
 #[cfg(windows)]
 fn abs(p: &str) -> PathBuf {
@@ -20,11 +21,26 @@ fn abs(p: &str) -> PathBuf {
     PathBuf::from(format!("/{p}"))
 }
 
+/// The program every fixture runs.
+fn program() -> String {
+    abs("bin/frpc").to_string_lossy().into_owned()
+}
+
+/// `program()` as `ExecStart=` spells it: a Windows path holds backslashes, which make systemd's
+/// quoting wrap the word and double them.
+fn program_in_exec_start() -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", program().replace('\\', "\\\\"))
+    } else {
+        program()
+    }
+}
+
 fn full_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
-        command: vec!["frpc".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+        command: vec![program(), "-c".to_string(), "frpc.toml".to_string()],
         cwd: Some(abs("opt/frpc")),
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
@@ -49,7 +65,7 @@ fn minimal_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "frpc".to_string(),
-        command: vec!["frpc".to_string()],
+        command: vec![program()],
         cwd: None,
         env: BTreeMap::new(),
         user: User::Root,
@@ -79,7 +95,7 @@ fn unit_snapshot_full() {
          \n\
          [Service]\n\
          Type=exec\n\
-         ExecStart=frpc -c frpc.toml\n\
+         ExecStart={exec} -c frpc.toml\n\
          WorkingDirectory={cwd}\n\
          Environment=RUST_LOG=info\n\
          Environment=URL=http://x/a%%20b\n\
@@ -97,6 +113,7 @@ fn unit_snapshot_full() {
          Schema=1\n\
          Version={version}\n\
          Spec={spec_b64}\n",
+        exec = program_in_exec_start(),
         cwd = abs("opt/frpc").display(),
         logs = abs("var/log/frpc.log").display(),
         version = crate::version(),
@@ -117,7 +134,7 @@ fn unit_snapshot_minimal() {
          \n\
          [Service]\n\
          Type=exec\n\
-         ExecStart=frpc\n\
+         ExecStart={exec}\n\
          User=0\n\
          Restart=no\n\
          \n\
@@ -129,6 +146,7 @@ fn unit_snapshot_minimal() {
          Schema=1\n\
          Version={version}\n\
          Spec={spec_b64}\n",
+        exec = program_in_exec_start(),
         version = crate::version(),
         spec_b64 = blob::encode(&spec),
     );
@@ -324,20 +342,32 @@ fn extract_finds_the_section_when_it_is_not_the_last_in_the_file() {
 
 // Escaping ============================================================================================================
 
+// The rendering tests below call `render_exec_start` on literal words: a word the rules refuse
+// (`+x` as the program) or a Unix path would not survive `DaemonSpec::new` on every host.
+
+fn words(words: &[&str]) -> Vec<String> {
+    words.iter().map(|word| word.to_string()).collect()
+}
+
+#[skuld::test]
+fn argv_with_spaces_and_quotes_is_quoted() {
+    assert_eq!(
+        render_exec_start(&words(&["/usr/bin/foo bar", "--title=say \"hi\""])),
+        "\"/usr/bin/foo bar\" \"--title=say \\\"hi\\\"\""
+    );
+}
+
 #[skuld::test]
 fn argv_with_spaces_and_quotes_round_trips() {
     let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["/usr/bin/foo bar".to_string(), "--title=say \"hi\"".to_string()];
+    spec.command = vec![
+        abs("bin/foo bar").to_string_lossy().into_owned(),
+        "--title=say \"hi\"".to_string(),
+    ];
     let spec = DaemonSpec::new(spec).unwrap();
     let id = minimal_identity();
 
     let text = unit(&spec, &id);
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(
-        exec_start_line,
-        "ExecStart=\"/usr/bin/foo bar\" \"--title=say \\\"hi\\\"\""
-    );
 
     // The escaping is purely for systemd's own command-line parser; the
     // blob carries the real argv independently, so it must round-trip
@@ -352,14 +382,10 @@ fn argv_lone_semicolon_is_quoted() {
     // (systemd.service(5)): "An argument solely consisting of ';' must
     // be escaped". Left unquoted, `find ... ;` would have everything
     // after the `;` parsed as a second command line.
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["/usr/bin/find".to_string(), "-exec".to_string(), ";".to_string()];
-    let spec = DaemonSpec::new(spec).unwrap();
-
-    let text = unit(&spec, &minimal_identity());
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(exec_start_line, "ExecStart=/usr/bin/find -exec \";\"");
+    assert_eq!(
+        render_exec_start(&words(&["/usr/bin/find", "-exec", ";"])),
+        "/usr/bin/find -exec \";\""
+    );
 }
 
 #[skuld::test]
@@ -368,18 +394,10 @@ fn argv_dollar_sign_is_doubled() {
     // substitution (systemd.service(5), "Command Lines"); an
     // unescaped `$` in a literal argument would be expanded or, if the
     // variable is unset, deleted from argv entirely.
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec![
-        "/usr/bin/report".to_string(),
-        "--home=${HOME}".to_string(),
-        "$ARGS".to_string(),
-    ];
-    let spec = DaemonSpec::new(spec).unwrap();
-
-    let text = unit(&spec, &minimal_identity());
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(exec_start_line, "ExecStart=/usr/bin/report --home=$${HOME} $$ARGS");
+    assert_eq!(
+        render_exec_start(&words(&["/usr/bin/report", "--home=${HOME}", "$ARGS"])),
+        "/usr/bin/report --home=$${HOME} $$ARGS"
+    );
 }
 
 #[skuld::test]
@@ -388,14 +406,10 @@ fn argv_command_prefix_character_on_the_executable_is_quoted() {
     // systemd command-prefix directive (e.g. `+` runs with elevated
     // privileges, bypassing `User=`) — a plain executable path that
     // happens to start with one must not be reinterpreted as it.
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["+not-a-privilege-directive".to_string()];
-    let spec = DaemonSpec::new(spec).unwrap();
-
-    let text = unit(&spec, &minimal_identity());
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(exec_start_line, "ExecStart=\"+not-a-privilege-directive\"");
+    assert_eq!(
+        render_exec_start(&words(&["+not-a-privilege-directive"])),
+        "\"+not-a-privilege-directive\""
+    );
 }
 
 #[skuld::test]
@@ -404,14 +418,7 @@ fn argv_command_prefix_character_on_a_later_argument_is_not_quoted() {
     // (the executable); a later argument starting with `-` is an
     // ordinary flag and must not be quoted just because it starts with
     // one of these characters.
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["/usr/bin/foo".to_string(), "-v".to_string()];
-    let spec = DaemonSpec::new(spec).unwrap();
-
-    let text = unit(&spec, &minimal_identity());
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(exec_start_line, "ExecStart=/usr/bin/foo -v");
+    assert_eq!(render_exec_start(&words(&["/usr/bin/foo", "-v"])), "/usr/bin/foo -v");
 }
 
 #[skuld::test]
@@ -419,7 +426,10 @@ fn percent_is_doubled_in_every_value() {
     let spec = DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "100% Uptime".to_string(),
-        command: vec!["cmd%1".to_string(), "arg%2 with space".to_string()],
+        command: vec![
+            abs("bin/cmd%1").to_string_lossy().into_owned(),
+            "arg%2 with space".to_string(),
+        ],
         cwd: Some(abs("opt/a%b")),
         env: BTreeMap::from([("K%EY".to_string(), "v%alue".to_string())]),
         user: User::Name("ignored-by-generate".to_string()),

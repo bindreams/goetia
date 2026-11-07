@@ -253,7 +253,7 @@ impl Fake {
         let spec = DaemonSpec::new(DaemonFields {
             id: Id::try_from(id).expect("seed_invalid_content needs a valid id"),
             name: id.to_string(),
-            command: vec!["daemon".to_string()],
+            command: vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
             cwd: None,
             env: std::collections::BTreeMap::new(),
             user: crate::spec::User::Root,

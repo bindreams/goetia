@@ -30,7 +30,14 @@ fn spec_fixture() -> DaemonSpec {
         restart: Restart::OnFailure,
         logs: Some(std::env::temp_dir().join("frpc.log")),
         kind: Kind::Simple,
-        ..plain_fields("frpc", vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()])
+        ..plain_fields(
+            "frpc",
+            vec![
+                std::env::temp_dir().join("frpc").to_string_lossy().into_owned(),
+                "-c".to_owned(),
+                "frpc.toml".to_owned(),
+            ],
+        )
     })
     .unwrap()
 }

@@ -71,6 +71,22 @@ fn new_refuses_an_empty_command_program() {
 }
 
 #[skuld::test]
+fn new_refuses_a_relative_command_program_and_accepts_a_relative_argument() {
+    let msg = message(DaemonFields {
+        command: vec!["bin/frpc".to_string()],
+        ..fields()
+    });
+    assert_eq!(msg, "field `command[0]` must be an absolute path, got `bin/frpc`");
+
+    let program = abs("bin/frpc").to_string_lossy().into_owned();
+    DaemonSpec::new(DaemonFields {
+        command: vec![program, "conf/frpc.toml".to_string()],
+        ..fields()
+    })
+    .expect("only the program must be absolute");
+}
+
+#[skuld::test]
 fn new_refuses_a_relative_cwd_and_logs() {
     let msg = message(DaemonFields {
         cwd: Some(PathBuf::from("relative")),
