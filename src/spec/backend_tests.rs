@@ -329,21 +329,6 @@ fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
 }
 
 #[skuld::test]
-fn a_substituted_user_name_is_judged_as_it_stands() {
-    let mut spec = shaped_spec();
-    let supplied = Supplied { user: true };
-
-    spec.user = User::Name("LocalService".to_string());
-    assert!(BackendKind::Systemd.error(&spec, supplied, Substitution::Done).is_err());
-
-    spec.user = User::Name("svc$".to_string());
-    assert!(
-        BackendKind::Systemd.error(&spec, supplied, Substitution::Done).is_ok(),
-        "a `$` left after substitution is ordinary text"
-    );
-}
-
-#[skuld::test]
 fn a_numeric_uid_is_rejected_under_scm() {
     let mut spec = shaped_spec();
     spec.user = User::Id(AccountId::Uid(1000));

@@ -129,6 +129,12 @@ pub(crate) fn would_substitution_change(s: &str) -> bool {
     s.contains('$')
 }
 
+/// Whether a reference, not an escape alone, made `substituted` of `authored`. A `$$` is the
+/// manifest's own `$`, and `.env` is not in it.
+pub(super) fn reference_changed(authored: &str, substituted: &str) -> bool {
+    substituted != authored.replace("$$", "$")
+}
+
 /// Whether the text a shape-phase judgement is handed may still hold `${...}` references.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Substitution {

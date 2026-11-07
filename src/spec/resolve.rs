@@ -46,7 +46,7 @@
 //! literal `$` (`SECRET=abc$def`) is legal and would fail a grammar check
 //! applied to substituted text.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -144,16 +144,22 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     // injection gate inspects final values here, and its `ShapedSpec` becomes the `DaemonSpec`.
     // No `check_spec_grammar`: a substituted `.env` value may legally carry a literal `$`.
     let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
-    let substituted: Result<(ShapedSpec, Vec<Warning>), Error> = (|| {
-        interpolate::spec(&mut native_merged, &vars).map_err(|e| annotate_step5_error(e, native_entry))?;
-        resolve_shape(&id, native_merged, base_dir, Substitution::Done)
+    let authored = native_merged.clone();
+    interpolate::spec(&mut native_merged, &vars).map_err(|e| annotate_step5_error(e, native_entry))?;
+    let changed = changed_fields(&authored, &native_merged);
+    // The one place an error of this pass is attributed to `.env`: by the field it is about.
+    let judged: Result<(ShapedSpec, Vec<Warning>), Refused> = (|| {
+        let (shaped, warnings) = resolve_shape(&id, native_merged, base_dir, Substitution::Done)?;
+        // `error` reads only `native_supplied` fields, and only `user`: it is the backend's verdict
+        // on what the override wrote, so it names the backend too.
+        if let Some(b) = native {
+            b.error(&shaped, native_supplied, Substitution::Done)
+                .map_err(|e| Refused::at(Field::User, attribute_to(e, b)))?;
+        }
+        Ok((shaped, warnings))
     })();
-    let (shaped, mut daemon_warnings) = substituted?;
-
-    // `error` reads only `native_supplied` fields, so attribute to the backend, not `.env`.
+    let (shaped, mut daemon_warnings) = judged.map_err(|refused| refused.attributed(&changed))?;
     if let Some(b) = native {
-        b.error(&shaped, native_supplied, Substitution::Done)
-            .map_err(|e| attribute_to(e, b))?;
         b.warn(&shaped, &mut daemon_warnings);
     }
 
@@ -216,11 +222,11 @@ fn attribute_to(err: Error, backend: BackendKind) -> Error {
     }
 }
 
-/// Annotation for an error of step 5's substitution: an `Error::Interpolate` gains a "merged with"
-/// path suffix, gated on `native_entry` (was this backend mentioned at all), not on `Supplied`
-/// (which fields did it write): `scm: {}` is an entry whose `Supplied` equals a missing entry's.
-/// Anything else is [`attributed`] as substituted. The native `BackendKind::error` verdict is
-/// annotated by `attribute_to` at its call site, since step 4 never ran it.
+/// Annotation for an error of step 5's substitution, which is always an `Error::Interpolate`: it
+/// gains a "merged with" path suffix, gated on `native_entry` (was this backend mentioned at all),
+/// not on `Supplied` (which fields did it write): `scm: {}` is an entry whose `Supplied` equals a
+/// missing entry's. The native `BackendKind::error` verdict is annotated by `attribute_to` at its
+/// call site, since step 4 never ran it.
 fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error {
     match err {
         Error::Interpolate { path, message } => {
@@ -230,46 +236,139 @@ fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error 
             };
             Error::Interpolate { path, message }
         }
-        other => attributed(Substitution::Done, other),
-    }
-}
-
-/// An error of a shape pass, as `substitution` makes it. Once substituted, an `Error::Invalid`
-/// gains an "after substituting from .env" prefix, and any other variant gains nothing: step 4's
-/// native arm already passed the pass on the uninterpolated spec, so substitution is what changed.
-/// The one defect `.env` did not put there is the manifest directory's, which a caller does not
-/// pass through here.
-fn attributed(substitution: Substitution, err: Error) -> Error {
-    if substitution == Substitution::Pending {
-        return err;
-    }
-    match err {
-        Error::Invalid {
-            daemon,
-            message,
-            source,
-        } => Error::Invalid {
-            daemon,
-            message: format!("after substituting from .env: {message}"),
-            source,
-        },
         other => other,
     }
 }
 
-/// Why [`resolve_shape`]'s walk of the field rules stopped.
-enum Refusal {
-    /// A rule refused a value. A substituted pass [`attributed`] it to `.env`.
-    Rule(Error),
-    /// Resolving a path refused it, with the attribution the resolution knows is its own: the
-    /// manifest directory's defect is not `.env`'s.
-    Path(Error),
+/// A value a rule judges, named so an error can say whose text is to blame.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Field {
+    Name,
+    /// An element of `command`; `Command(0)` is the program.
+    Command(usize),
+    Cwd,
+    Logs,
+    /// An `env` name, which substitution never changes ([`interpolate::spec`] refuses a `$` in one).
+    EnvKey,
+    /// The value of the `env` entry with this name.
+    EnvValue(String),
+    User,
+    Restart,
+    RestartDelay,
+    Kind,
 }
 
-impl From<Error> for Refusal {
-    fn from(err: Error) -> Self {
-        Refusal::Rule(err)
+/// An error about one field's value. In step 5 it is attributed to `.env` by [`Refused::attributed`],
+/// the one place that happens.
+#[derive(Debug)]
+struct Refused {
+    /// The field the error is about. `None` for a defect no field's text is to blame for: the
+    /// manifest directory's.
+    field: Option<Field>,
+    err: Error,
+}
+
+impl Refused {
+    fn at(field: Field, err: Error) -> Self {
+        Refused {
+            field: Some(field),
+            err,
+        }
     }
+
+    /// The error, prefixed "after substituting from .env" iff a reference changed the text of the
+    /// field it is about, so `changed` ([`changed_fields`]) holds it.
+    fn attributed(self, changed: &BTreeSet<Field>) -> Error {
+        match (self.field, self.err) {
+            (
+                Some(field),
+                Error::Invalid {
+                    daemon,
+                    message,
+                    source,
+                },
+            ) if changed.contains(&field) => Error::Invalid {
+                daemon,
+                message: format!("after substituting from .env: {message}"),
+                source,
+            },
+            (_, err) => err,
+        }
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.err.fmt(f)
+    }
+}
+
+impl From<Refused> for Error {
+    fn from(refused: Refused) -> Self {
+        refused.err
+    }
+}
+
+/// The fields whose text a reference changed: `authored` is the merged spec before step 5's
+/// substitution, `substituted` after it. Computed once, so no later error site decides it.
+fn changed_fields(authored: &RawSpec, substituted: &RawSpec) -> BTreeSet<Field> {
+    // Exhaustive, so a field added to `RawSpec` stops compiling here until someone decides whether
+    // it is attributed.
+    let RawSpec {
+        id: _,
+        name,
+        command,
+        cwd,
+        env,
+        user,
+        restart,
+        restart_delay,
+        logs,
+        kind,
+        backend_specific: _,
+    } = authored;
+    let now = substituted;
+    let text_changed = |before: &Option<String>, after: &Option<String>| match (before, after) {
+        (Some(before), Some(after)) => interpolate::reference_changed(before, after),
+        _ => false,
+    };
+
+    let mut changed = BTreeSet::new();
+    for (field, before, after) in [
+        (Field::Name, name, &now.name),
+        (Field::Cwd, cwd, &now.cwd),
+        (Field::Logs, logs, &now.logs),
+        (Field::Restart, restart, &now.restart),
+        (Field::RestartDelay, restart_delay, &now.restart_delay),
+        (Field::Kind, kind, &now.kind),
+    ] {
+        if text_changed(before, after) {
+            changed.insert(field);
+        }
+    }
+    let args = command.iter().flatten().zip(now.command.iter().flatten());
+    for (index, (before, after)) in args.enumerate() {
+        if interpolate::reference_changed(before, after) {
+            changed.insert(Field::Command(index));
+        }
+    }
+    for (key, before) in env {
+        if now
+            .env
+            .get(key)
+            .is_some_and(|after| interpolate::reference_changed(before, after))
+        {
+            changed.insert(Field::EnvValue(key.clone()));
+        }
+    }
+    let user_text = |user: &Option<RawUser>| match user {
+        Some(RawUser::Scalar(text) | RawUser::Name(text)) => Some(text.clone()),
+        None | Some(RawUser::Id(_)) => None,
+    };
+    if text_changed(&user_text(user), &user_text(&now.user)) {
+        changed.insert(Field::User);
+    }
+    changed
 }
 
 /// Shape only: injection gate, path resolution, the three `$`-aware
@@ -277,13 +376,13 @@ impl From<Error> for Refusal {
 /// [`require_complete`]'s job.
 ///
 /// `substitution` says whether the values may still hold references, which decides what is judged
-/// now and how an error is attributed ([`attributed`]).
+/// now. An error says which field it is about ([`Refused`]); attributing it is the caller's.
 fn resolve_shape(
     id: &Id,
     raw: RawSpec,
     base_dir: &Path,
     substitution: Substitution,
-) -> Result<(ShapedSpec, Vec<Warning>), Error> {
+) -> Result<(ShapedSpec, Vec<Warning>), Refused> {
     debug_assert!(
         raw.backend_specific.is_empty(),
         "resolve_shape must be handed a merged spec, never one still carrying overrides"
@@ -316,7 +415,7 @@ fn resolve_shape(
             user: &user,
         },
         Phase::Authored,
-        |field| -> Result<(), Refusal> {
+        |field| {
             let text = match field {
                 PathField::Command => raw.command.as_ref().and_then(|c| c.first()).map(String::as_str),
                 PathField::Cwd => raw.cwd.as_deref(),
@@ -325,8 +424,7 @@ fn resolve_shape(
             let Some(text) = text else {
                 return Ok(());
             };
-            let resolved = resolve_path_string(id, field.name(), text, base_dir, substitution, &mut warnings)
-                .map_err(Refusal::Path)?;
+            let resolved = resolve_path_string(id, field, text, base_dir, substitution, &mut warnings)?;
             match field {
                 PathField::Command => command0 = Some(resolved),
                 PathField::Cwd => cwd = Some(PathBuf::from(resolved)),
@@ -334,11 +432,7 @@ fn resolve_shape(
             }
             Ok(())
         },
-    )
-    .map_err(|refusal| match refusal {
-        Refusal::Rule(err) => attributed(substitution, err),
-        Refusal::Path(err) => err,
-    })?;
+    )?;
 
     let mut command = raw.command;
     if let Some((first, resolved)) = command.as_mut().and_then(|c| c.first_mut()).zip(command0) {
@@ -346,9 +440,15 @@ fn resolve_shape(
     }
     let env = raw.env;
 
-    let restart = shape(id, raw.restart, substitution, parse_restart)?;
-    let restart_delay = shape(id, raw.restart_delay, substitution, parse_restart_delay)?;
-    let kind = shape(id, raw.kind, substitution, parse_kind)?;
+    let restart = shape(id, Field::Restart, raw.restart, substitution, parse_restart)?;
+    let restart_delay = shape(
+        id,
+        Field::RestartDelay,
+        raw.restart_delay,
+        substitution,
+        parse_restart_delay,
+    )?;
+    let kind = shape(id, Field::Kind, raw.kind, substitution, parse_kind)?;
 
     Ok((
         ShapedSpec {
@@ -372,16 +472,17 @@ fn resolve_shape(
 /// substituted, none.
 fn shape<T>(
     id: &Id,
+    field: Field,
     raw: Option<String>,
     substitution: Substitution,
     parse: fn(&Id, &str) -> Result<T, Error>,
-) -> Result<Shaped<T>, Error> {
+) -> Result<Shaped<T>, Refused> {
     match raw {
         None => Ok(Shaped::Absent),
         Some(text) if substitution.defers(&text) => Ok(Shaped::Deferred),
         Some(text) => parse(id, &text)
             .map(Shaped::Parsed)
-            .map_err(|err| attributed(substitution, err)),
+            .map_err(|err| Refused::at(field, err)),
     }
 }
 
@@ -413,9 +514,9 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         command[0],
     );
 
-    let restart = settled(restart).unwrap_or(Restart::Never);
-    let restart_delay = settled(restart_delay);
-    let kind = settled(kind).unwrap_or(Kind::Simple);
+    let restart = settled(&id, "restart", restart)?.unwrap_or(Restart::Never);
+    let restart_delay = settled(&id, "restart-delay", restart_delay)?;
+    let kind = settled(&id, "type", kind)?.unwrap_or(Kind::Simple);
 
     // `resolve_shape` ran the field rules on the authored values and on every path it resolved, so
     // this refuses nothing a manifest can cause; it is what makes the result a `DaemonSpec`.
@@ -434,12 +535,19 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
 }
 
 /// What a substituted pass leaves of a [`Shaped`] value: it defers nothing, so the value is parsed
-/// or absent.
-fn settled<T>(shaped: Shaped<T>) -> Option<T> {
+/// or absent. A deferred one is a defect of this crate, reported as an error rather than a panic,
+/// since `load` is public.
+fn settled<T>(id: &Id, field: &str, shaped: Shaped<T>) -> Result<Option<T>, Error> {
     match shaped {
-        Shaped::Parsed(value) => Some(value),
-        Shaped::Absent => None,
-        Shaped::Deferred => unreachable!("a substituted pass defers nothing"),
+        Shaped::Parsed(value) => Ok(Some(value)),
+        Shaped::Absent => Ok(None),
+        Shaped::Deferred => {
+            debug_assert!(false, "a substituted pass defers nothing, yet `{field}` is deferred");
+            Err(invalid(
+                id,
+                &format!("internal error: field `{field}` was left to a substitution that has already run"),
+            ))
+        }
     }
 }
 
@@ -525,12 +633,13 @@ pub(crate) fn parse_restart_delay(id: &Id, raw: &str) -> Result<Duration, Error>
 /// "the base pass passed, so this failure is the override's" sound.
 fn resolve_path_string(
     id: &Id,
-    field: &str,
+    field: PathField,
     raw: &str,
     base_dir: &Path,
     substitution: Substitution,
     warnings: &mut Vec<Warning>,
-) -> Result<String, Error> {
+) -> Result<String, Refused> {
+    let name = field.name();
     // A value a later pass will see substituted is that pass's to resolve and to judge.
     if substitution.defers(raw) {
         return Ok(raw.to_string());
@@ -552,11 +661,11 @@ fn resolve_path_string(
         // symlinks and returns a `\\?\` path on Windows): resolves the way `GetFullPathNameW`
         // does, against the per-drive current directory of *this* process.
         let resolved = std::path::absolute(&joined).map_err(|source| {
-            attributed(
-                substitution,
+            Refused::at(
+                field.field(),
                 invalid_from(
                     id,
-                    &format!("field `{field}` is `{raw}`, which cannot be resolved to an absolute path"),
+                    &format!("field `{name}` is `{raw}`, which cannot be resolved to an absolute path"),
                     source,
                 ),
             )
@@ -567,7 +676,7 @@ fn resolve_path_string(
             warnings.push(Warning {
                 id: Some(id.clone()),
                 message: format!(
-                    "field `{field}` is `{raw}`, a drive-relative path; it is anchored to the \
+                    "field `{name}` is `{raw}`, a drive-relative path; it is anchored to the \
                      current directory on that drive in whichever process runs goetia, not to \
                      the manifest directory. Write a full path (e.g. `C:\\bin\\frpc.exe`) or a \
                      manifest-relative one (e.g. `.\\bin\\frpc.exe`) instead."
@@ -577,7 +686,7 @@ fn resolve_path_string(
         resolved
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
-    check_resolved(id, field, raw, &joined, under_manifest_dir, substitution)?;
+    check_resolved(id, field, raw, &joined, under_manifest_dir)?;
     Ok(joined
         .into_os_string()
         .into_string()
@@ -593,16 +702,16 @@ fn is_under_manifest_dir(p: &Path) -> bool {
 /// The field rules for a resolved path, which is what an artifact would carry. `raw` has passed
 /// them already, so the defect is one the user did not write: it came from the manifest directory
 /// (`under_manifest_dir`) or, for a drive-relative path, from the per-drive current directory. The
-/// message says the field *resolved* to the bad value and names its source; a defect that is not
-/// the directory's is [`attributed`] to `.env` once `substitution` is done.
+/// message says the field *resolved* to the bad value and names its source. The directory's defect
+/// is no field's: it carries none.
 fn check_resolved(
     id: &Id,
-    field: &str,
+    field: PathField,
     raw: &str,
     resolved: &Path,
     under_manifest_dir: bool,
-    substitution: Substitution,
-) -> Result<(), Error> {
+) -> Result<(), Refused> {
+    let name = field.name();
     let Some(defect) = path_defect(resolved) else {
         return Ok(());
     };
@@ -614,14 +723,13 @@ fn check_resolved(
     let err = invalid(
         id,
         &format!(
-            "field `{field}` is `{raw}`, which {resolves} `{}`, which {defect}",
+            "field `{name}` is `{raw}`, which {resolves} `{}`, which {defect}",
             resolved.display()
         ),
     );
-    Err(if under_manifest_dir {
-        err
-    } else {
-        attributed(substitution, err)
+    Err(Refused {
+        field: (!under_manifest_dir).then(|| field.field()),
+        err,
     })
 }
 
@@ -777,6 +885,7 @@ pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
         Phase::Final,
         |_| Ok(()),
     )
+    .map_err(Error::from)
 }
 
 /// The values the field rules read, as the caller holds them: authored text, or a finished
@@ -820,6 +929,20 @@ impl PathField {
             PathField::Logs => "logs",
         }
     }
+
+    /// The field a resolution error is about: for `command`, its program.
+    fn field(self) -> Field {
+        match self {
+            PathField::Command => Field::Command(0),
+            PathField::Cwd => Field::Cwd,
+            PathField::Logs => Field::Logs,
+        }
+    }
+}
+
+/// `check_field_values`' error: the rule's, at `field`.
+fn at(field: Field) -> impl FnOnce(Error) -> Refused {
+    move |err| Refused::at(field, err)
 }
 
 /// Every field rule, in the order a manifest's defects are reported: `name`, `command`, `cwd`,
@@ -834,23 +957,25 @@ impl PathField {
 /// substitution must not produce one (an `env` key, a `user.id`), and [`Phase::Final`] refuses an
 /// empty `command` and a relative `cwd` or `logs`.
 ///
-/// A rule's error is an `Error`; `resolve` may fail with a type of its own, which the caller can
-/// tell from a rule's.
-fn check_field_values<E: From<Error>>(
+/// Every error says which [`Field`] it is about ([`Refused`]); `resolve` may fail the same way.
+fn check_field_values(
     id: &Id,
     values: &FieldValues,
     phase: Phase,
-    mut resolve: impl FnMut(PathField) -> Result<(), E>,
-) -> Result<(), E> {
-    check_name(id, values.name)?;
+    mut resolve: impl FnMut(PathField) -> Result<(), Refused>,
+) -> Result<(), Refused> {
+    reject_unemittable(id, "name", values.name).map_err(at(Field::Name))?;
 
     if let Some(command) = values.command {
         if phase == Phase::Final {
-            reject_empty_command(id, command)?;
+            reject_empty_command(id, command).map_err(at(Field::Command(0)))?;
         }
-        check_command_args(id, command)?;
+        // Every element, `command[0]` included. Its emptiness is separate.
+        for (index, arg) in command.iter().enumerate() {
+            reject_unemittable(id, "command", arg).map_err(at(Field::Command(index)))?;
+        }
         if let Some(first) = command.first() {
-            reject_empty(id, "command[0]", first)?;
+            reject_empty(id, "command[0]", first).map_err(at(Field::Command(0)))?;
         }
         resolve(PathField::Command)?;
     }
@@ -858,9 +983,9 @@ fn check_field_values<E: From<Error>>(
     for (field, path) in [(PathField::Cwd, values.cwd), (PathField::Logs, values.logs)] {
         let name = field.name();
         if let Some(path) = path {
-            check_path(id, name, path)?;
+            check_path(id, name, path).map_err(at(field.field()))?;
             if phase == Phase::Final {
-                reject_relative_path(id, name, path)?;
+                reject_relative_path(id, name, path).map_err(at(field.field()))?;
             }
             resolve(field)?;
         }
@@ -870,9 +995,10 @@ fn check_field_values<E: From<Error>>(
         // Checked for every backend: `scm: {env: {"${K}": v}}` must be caught from Linux too.
         // `interpolate::spec` keeps its own copy, so it does not depend on this running first.
         if phase == Phase::Authored && interpolate::would_substitution_change(key) {
-            return Err(invalid(id, interpolate::ENV_NAME_MESSAGE).into());
+            return Err(Refused::at(Field::EnvKey, invalid(id, interpolate::ENV_NAME_MESSAGE)));
         }
-        check_env_entry(id, key, value)?;
+        check_env_key(id, key).map_err(at(Field::EnvKey))?;
+        reject_unemittable(id, &format!("env[{key}]"), value).map_err(at(Field::EnvValue(key.clone())))?;
     }
 
     // Same reason as the `env`-name rule above. `${S}` trims to `${S}`, never empty, so this and
@@ -881,21 +1007,9 @@ fn check_field_values<E: From<Error>>(
         && let User::Id(AccountId::Sid(s)) = values.user
         && interpolate::would_substitution_change(s)
     {
-        return Err(invalid(id, interpolate::USER_ID_MESSAGE).into());
+        return Err(Refused::at(Field::User, invalid(id, interpolate::USER_ID_MESSAGE)));
     }
-    Ok(check_user(id, values.user)?)
-}
-
-fn check_name(id: &Id, name: &str) -> Result<(), Error> {
-    reject_unemittable(id, "name", name)
-}
-
-/// Every `command` element, `command[0]` included. Its emptiness is separate: see [`reject_empty`].
-fn check_command_args(id: &Id, command: &[String]) -> Result<(), Error> {
-    for arg in command {
-        reject_unemittable(id, "command", arg)?;
-    }
-    Ok(())
+    check_user(id, values.user).map_err(at(Field::User))
 }
 
 /// A `cwd` or `logs`. The message omits the path, as [`reject_control_chars`] omits a value.
@@ -906,11 +1020,10 @@ fn check_path(id: &Id, field: &str, path: &Path) -> Result<(), Error> {
     reject_empty(id, field, path)
 }
 
-fn check_env_entry(id: &Id, key: &str, value: &str) -> Result<(), Error> {
+fn check_env_key(id: &Id, key: &str) -> Result<(), Error> {
     reject_env_key_with_equals(id, key)?;
     reject_unemittable(id, "env key", key)?;
-    reject_empty(id, "env key", key)?;
-    reject_unemittable(id, &format!("env[{key}]"), value)
+    reject_empty(id, "env key", key)
 }
 
 fn check_user(id: &Id, user: &User) -> Result<(), Error> {
