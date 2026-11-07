@@ -14,7 +14,7 @@ use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User}
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::System::Registry::RegSetValueExW;
-use winreg::enums::{KEY_READ, KEY_WRITE};
+use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
 
 use crate::common::{self, conformance_mk, fixture_command};
 use crate::deny::Denied;
@@ -882,6 +882,11 @@ fn force_install_removes_strays_that_winreg_cannot_enumerate() {
     assert_eq!(
         parameters.get_value::<String, _>("Marker").expect("read Marker"),
         marker
+    );
+    assert_eq!(
+        parameters.get_raw_value("Marker").expect("read Marker raw").vtype,
+        RegType::REG_SZ,
+        "--force writes Marker back as REG_SZ"
     );
 
     set_raw_value(&parameters, &units("Custom"), CUSTOM_TYPE, b"bytes");

@@ -468,6 +468,24 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
         read_marker(foreign, None),
         ReadOutcome::Foreign { recovery: None }
     ));
+    // Another service's own `Marker`, in a string type goetia does not write, is not goetia's.
+    let units = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain([0, 0])
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect()
+    };
+    let mut theirs = Parameters::default();
+    theirs.add_value("Marker".encode_utf16().collect(), 7, &units("theirs"));
+    assert!(matches!(
+        read_marker(theirs, None),
+        ReadOutcome::Foreign { recovery: None }
+    ));
+    // goetia's marker text in another string type is still goetia's, and the layout is drift.
+    let mut rewritten = Parameters::default();
+    rewritten.add_value("Marker".encode_utf16().collect(), 7, &units(crate::blob::MARKER));
+    assert_eq!(rewritten.strays.len(), 1);
+    assert!(matches!(read_marker(rewritten, None), ReadOutcome::Marked(_)));
     match read_marker(ours.clone(), None).named(&id, ScmSnapshot::new) {
         ReadOutcome::Marked(snapshot) => {
             assert_eq!(snapshot.id().as_str(), "frpc");

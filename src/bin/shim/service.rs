@@ -98,28 +98,49 @@ struct SpecStop {
 
 /// What `read` of the spec means for the shim. Only a definite answer is a [`Reported::Refused`],
 /// which SCM never restarts: the service is gone, it has no marker, or its spec cannot be decoded.
-/// A read that did not complete says nothing about the record, so it is a failure SCM restarts.
+/// An indeterminate read says nothing about the record, so it is a failure SCM restarts, carrying
+/// the OS error the read met, or `ERROR_INVALID_DATA` when there was none.
 fn spec_read(id: &str, read: goetia::error::Result<Option<Blob>>) -> Result<Blob, SpecStop> {
     let refused = |message: String| SpecStop {
         message,
         reported: Reported::Refused,
     };
-    match read {
-        Ok(Some(blob)) => Ok(blob),
-        Ok(None) => Err(refused(format!(
-            r"no Goetia metadata found under Services\{id}\Parameters (Marker absent): this service was not created by `goetia daemon install`"
-        ))),
-        Err(Error::NotInstalled { .. }) => Err(refused(format!(
-            r"Services\{id} is gone, or this service's record does not name it: no daemon was started"
-        ))),
-        Err(e @ (Error::Blob { .. } | Error::Invalid { .. })) => {
-            Err(refused(format!("decode metadata blob: {}", e.report())))
+    let e = match read {
+        Ok(Some(blob)) => return Ok(blob),
+        Ok(None) => {
+            return Err(refused(format!(
+                r"no Goetia marker found under Services\{id}\Parameters: this service was not created by `goetia daemon install`"
+            )));
         }
-        Err(e) => Err(SpecStop {
+        Err(e) => e,
+    };
+    if e.is_indeterminate() {
+        return Err(SpecStop {
             message: format!(r"read the metadata under Services\{id}\Parameters: {}", e.report()),
-            reported: Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
-        }),
+            reported: Reported::shim_failure(Some(os_error_in(&e).unwrap_or(ERROR_INVALID_DATA as i32))),
+        });
     }
+    Err(refused(match e.cause() {
+        Error::NotInstalled { .. } => {
+            format!(r"Services\{id} is gone, or this service's record does not name it: no daemon was started")
+        }
+        _ => format!("decode metadata blob: {}", e.report()),
+    }))
+}
+
+/// The first OS error code in `e`'s chain of sources, if any.
+fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    let mut link = Some(e);
+    while let Some(error) = link {
+        if let Some(code) = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+        {
+            return Some(code);
+        }
+        link = error.source();
+    }
+    None
 }
 
 /// Tell SCM the service stopped, then end the process. SCM restarts the service or not from

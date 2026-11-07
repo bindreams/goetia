@@ -418,12 +418,13 @@ fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<
 /// value. `registry` itself stays private — this is the one read the shim
 /// needs, not the whole module.
 ///
-/// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no `Marker` at all:
-/// unreachable in practice (SCM only ever launches the shim against a service *this backend itself*
-/// created with `ImagePath` naming the shim, and `apply` always writes `Parameters` immediately
-/// after), but returned rather than folded into `Err` so a caller can still tell "no marker" apart
-/// from "a marker that fails to decode" — the shim's own version-skew handling (see
-/// `src/bin/shim/logging.rs`) needs exactly that distinction to phrase its failure message.
+/// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no goetia `Marker` (none at
+/// all, or another service's own, see `parameters`): unreachable in practice (SCM only ever
+/// launches the shim against a service *this backend itself* created with `ImagePath` naming the
+/// shim, and `apply` always writes `Parameters` immediately after), but returned rather than folded
+/// into `Err` so a caller can still tell "no marker" apart from "a marker that fails to decode" —
+/// the shim's own version-skew handling (see `src/bin/shim/logging.rs`) needs exactly that
+/// distinction to phrase its failure message.
 pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     match registry::read_parameters(id)? {
         RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),

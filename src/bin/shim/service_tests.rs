@@ -919,6 +919,10 @@ fn a_gone_service_a_missing_marker_and_an_undecodable_spec_are_refused() {
             message: "id is not valid".to_string(),
             source: None,
         }),
+        Err(Error::Step {
+            what: "read the spec".to_string(),
+            source: Box::new(Error::NotInstalled { id: ID.to_string() }),
+        }),
     ];
 
     for read in reads {
@@ -929,21 +933,25 @@ fn a_gone_service_a_missing_marker_and_an_undecodable_spec_are_refused() {
 }
 
 /// A read that did not complete says nothing about the record, so the shim fails restartably (SCM
-/// retries it) and the message names the registry read, not decoding.
+/// retries it) and the message names the registry read, not decoding. The failure carries the OS
+/// error the read met, however deep in the chain.
 #[skuld::test]
 fn a_read_that_did_not_complete_is_a_restartable_failure_naming_the_read() {
     let io = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
-    let read = Err(undetermined(Error::Os {
-        what: r"enumerate HKLM\SYSTEM\CurrentControlSet\Services\x\Parameters".to_string(),
-        path: None,
-        source: Box::new(io),
-    }));
+    let read = Err(Error::Step {
+        what: "read the spec".to_string(),
+        source: Box::new(undetermined(Error::Os {
+            what: r"enumerate HKLM\SYSTEM\CurrentControlSet\Services\x\Parameters".to_string(),
+            path: None,
+            source: Box::new(io),
+        })),
+    });
 
     let stop = spec_read(ID, read)
         .map(|_| ())
         .expect_err("an undetermined read stops the shim");
 
-    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)));
+    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_ACCESS_DENIED as i32)));
     assert_ne!(stop.reported.scm_codes().0, 0, "SCM restarts a non-zero Win32 code");
     assert!(
         stop.message.starts_with("read the metadata under Services"),
@@ -952,6 +960,21 @@ fn a_read_that_did_not_complete_is_a_restartable_failure_naming_the_read() {
     );
     assert!(stop.message.contains("enumerate"), "{}", stop.message);
     assert!(!stop.message.contains("decode"), "{}", stop.message);
+}
+
+/// With no OS error to carry, the failure still restarts: `ERROR_INVALID_DATA`.
+#[skuld::test]
+fn an_incomplete_read_with_no_os_error_fails_with_invalid_data() {
+    let read = Err(undetermined(Error::Blob {
+        message: "no code here".to_string(),
+        source: None,
+    }));
+
+    let stop = spec_read(ID, read)
+        .map(|_| ())
+        .expect_err("an undetermined read stops the shim");
+
+    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)));
 }
 
 #[skuld::test]

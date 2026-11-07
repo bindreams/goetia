@@ -56,7 +56,7 @@ use crate::spec::{DaemonSpec, Kind, Restart, User, scm_restart_delay, windows_bu
 /// Byte-exact per the Global Constraints: the same four names every embed
 /// site (systemd's `[X-Goetia]`, launchd's comment block, SCM's
 /// `Parameters`) uses.
-const FIELD_MARKER: &str = "Marker";
+pub(crate) const FIELD_MARKER: &str = "Marker";
 const FIELD_SCHEMA: &str = "Schema";
 const FIELD_VERSION: &str = "Version";
 const FIELD_SPEC: &str = "Spec";

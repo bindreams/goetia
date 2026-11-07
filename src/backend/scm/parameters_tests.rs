@@ -1,4 +1,5 @@
 use super::*;
+use crate::blob;
 
 fn utf16(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
@@ -67,40 +68,67 @@ fn an_empty_field_value_is_a_field() {
 /// --force` rewrites as the exact `REG_SZ`.
 #[skuld::test]
 fn a_goetia_field_in_another_string_layout_is_a_field_and_a_layout_stray() {
-    let text = utf16("text");
-    let spellings: [(&str, u32, Vec<u8>); 7] = [
-        ("REG_EXPAND_SZ", vtype::REG_EXPAND_SZ, sz("text")),
-        (
-            "REG_MULTI_SZ",
-            vtype::REG_MULTI_SZ,
-            units_bytes(&[text.clone(), vec![0, 0]].concat()),
-        ),
-        ("REG_MULTI_SZ with one NUL", vtype::REG_MULTI_SZ, sz("text")),
-        (
-            "REG_SZ with two NULs",
-            vtype::REG_SZ,
-            units_bytes(&[text.clone(), vec![0, 0]].concat()),
-        ),
-        (
-            "REG_SZ with three NULs",
-            vtype::REG_SZ,
-            units_bytes(&[text.clone(), vec![0, 0, 0]].concat()),
-        ),
-        ("REG_SZ with no NUL", vtype::REG_SZ, units_bytes(&text)),
-        ("REG_EXPAND_SZ with no NUL", vtype::REG_EXPAND_SZ, units_bytes(&text)),
-    ];
-    for (what, vtype, data) in spellings {
-        for name in ["Marker", "sPeC"] {
+    for (name, text) in [("Marker", blob::MARKER), ("sPeC", "text")] {
+        let units = utf16(text);
+        let spellings: [(&str, u32, Vec<u8>); 7] = [
+            ("REG_EXPAND_SZ", vtype::REG_EXPAND_SZ, sz(text)),
+            (
+                "REG_MULTI_SZ",
+                vtype::REG_MULTI_SZ,
+                units_bytes(&[units.clone(), vec![0, 0]].concat()),
+            ),
+            ("REG_MULTI_SZ with one NUL", vtype::REG_MULTI_SZ, sz(text)),
+            (
+                "REG_SZ with two NULs",
+                vtype::REG_SZ,
+                units_bytes(&[units.clone(), vec![0, 0]].concat()),
+            ),
+            (
+                "REG_SZ with three NULs",
+                vtype::REG_SZ,
+                units_bytes(&[units.clone(), vec![0, 0, 0]].concat()),
+            ),
+            ("REG_SZ with no NUL", vtype::REG_SZ, units_bytes(&units)),
+            ("REG_EXPAND_SZ with no NUL", vtype::REG_EXPAND_SZ, units_bytes(&units)),
+        ];
+        for (what, vtype, data) in spellings {
             let parameters = parameters_of(utf16(name), vtype, &data);
 
             let field = field_named(name).unwrap();
             assert_eq!(
                 parameters.fields,
-                BTreeMap::from([(field.to_string(), "text".to_string())]),
+                BTreeMap::from([(field.to_string(), text.to_string())]),
                 "{what}, {name}"
             );
             assert_eq!(parameters.strays, [layout_stray(field, vtype)], "{what}, {name}");
         }
+    }
+}
+
+/// A third-party service may hold its own `Marker`, in any string type. Only goetia's text makes
+/// it goetia's field, so such a service stays foreign instead of reading as a broken goetia one.
+#[skuld::test]
+fn a_marker_in_another_string_layout_with_other_text_is_a_stray_and_no_field() {
+    let units = utf16("theirs");
+    let layouts: [(&str, u32, Vec<u8>); 4] = [
+        (
+            "REG_MULTI_SZ",
+            vtype::REG_MULTI_SZ,
+            units_bytes(&[units.clone(), vec![0, 0]].concat()),
+        ),
+        ("REG_EXPAND_SZ", vtype::REG_EXPAND_SZ, sz("theirs")),
+        (
+            "REG_SZ with two NULs",
+            vtype::REG_SZ,
+            units_bytes(&[units.clone(), vec![0, 0]].concat()),
+        ),
+        ("REG_SZ with no NUL", vtype::REG_SZ, units_bytes(&units)),
+    ];
+    for (what, vtype, data) in layouts {
+        let parameters = parameters_of(utf16("Marker"), vtype, &data);
+
+        assert!(parameters.fields.is_empty(), "{what}: {parameters:?}");
+        assert_eq!(parameters.strays, [value_stray(&utf16("Marker"), vtype)], "{what}");
     }
 }
 
@@ -245,12 +273,13 @@ fn a_stray_renders_its_name_as_it_is_stored_and_its_type() {
     );
 }
 
-/// The name is shown as it can be typed into regedit: a backslash is not doubled.
+/// A name shows as it can be typed into regedit: a backslash is not doubled, but a quote is
+/// escaped so that the name cannot close the quotes it is shown in.
 #[skuld::test]
-fn a_stray_name_with_a_backslash_or_quote_is_shown_unescaped() {
+fn a_stray_name_shows_its_backslash_as_it_is_and_escapes_its_quote() {
     assert_eq!(
         value_stray(&utf16(r#"a\b"c"#), vtype::REG_SZ).to_string(),
-        r#"value "a\b"c" of type REG_SZ"#
+        r#"value "a\b\"c" of type REG_SZ"#
     );
 }
 
@@ -262,14 +291,32 @@ fn a_stray_name_with_a_control_character_is_escaped_on_one_line() {
     assert_eq!(shown, r#"subkey "a\nb""#);
 }
 
+/// The characters escaped, and how, do not depend on what else the name holds.
 #[skuld::test]
-fn a_stray_name_that_is_not_valid_utf16_renders_without_losing_the_unit_or_escaping_twice() {
+fn a_name_is_escaped_the_same_whether_or_not_it_is_valid_utf16() {
+    let escaped = ["a\nb", "a\tb", "a\u{7f}b", r#"a"b"#, r"a\b", "a=b"];
+    let want = [r"a\nb", r"a\tb", r"a\u{7f}b", r#"a\"b"#, r"a\b", "a=b"];
+    for (text, want) in escaped.iter().zip(want) {
+        let mut broken = utf16(text);
+        broken.push(0xD800);
+
+        assert_eq!(shown_name(&utf16(text)), want, "{text:?}");
+        assert_eq!(
+            shown_name(&broken),
+            format!(r"(not valid UTF-16: {want}\u{{D800}})"),
+            "{text:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_stray_name_that_is_not_valid_utf16_renders_without_losing_the_unit() {
     let shown = Stray::Subkey {
         name: vec![0x41, 0xD800, 0x3D],
     }
     .to_string();
 
-    assert_eq!(shown, r#"subkey "(not valid UTF-16: A\u{D800}\x3D)""#);
+    assert_eq!(shown, r#"subkey "(not valid UTF-16: A\u{D800}=)""#);
 }
 
 #[skuld::test]

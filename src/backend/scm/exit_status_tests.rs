@@ -150,6 +150,14 @@ fn only_the_refusal_report_reads_back_as_a_refusal() {
     }
 }
 
+/// The shim refused before it launched anything, though the record is Win32 0.
+#[skuld::test]
+fn a_recorded_refusal_means_the_daemon_never_ran() {
+    let (win32, specific) = Reported::Refused.scm_codes();
+
+    assert!(!RecordedExit { win32, specific }.daemon_ran());
+}
+
 #[skuld::test]
 fn a_recorded_shim_failure_means_the_daemon_never_ran() {
     for reported in [

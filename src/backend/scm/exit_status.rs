@@ -47,9 +47,10 @@ pub enum Reported {
     /// The shim could not show that the daemon's tree was terminated, after a stop or a failure,
     /// or because no Job Object contained it; it may still be running.
     IncompleteStop,
-    /// The shim refused before it started any daemon: its service record is gone, names no
-    /// service, carries no goetia metadata or carries metadata that cannot be read. Win32 0, so
-    /// SCM's recovery does not start the same refusal again.
+    /// The shim refused before it started any daemon, on a definite answer: its service record is
+    /// gone, it holds no goetia marker, or its spec cannot be decoded. A read that did not complete
+    /// is a [`Reported::ShimFailure`] instead. Win32 0, so SCM's recovery does not start the same
+    /// refusal again.
     Refused,
 }
 
@@ -115,14 +116,14 @@ pub struct RecordedExit {
 impl RecordedExit {
     /// Whether the shim launched the daemon: [`Reported::Clean`] and [`Reported::DaemonExit`], where
     /// it then ended, and [`Reported::IncompleteStop`], where it may still be running. Any other
-    /// Win32 code is a shim failure before or around the launch.
+    /// Win32 code is a shim failure before or around the launch, and so is [`Reported::Refused`],
+    /// whose Win32 code is 0.
     ///
     /// This reads the Win32 code alone, so it also accepts the record of a host that exits before
     /// connecting to SCM: `(0, 0)` with wait hint 2000 (P25 c/d), the same as a failed SCM start
-    /// (P10), and [`Reported::Refused`]'s, whose Win32 code is 0. Callers must rule those out
-    /// first; `start_via_notify` does, see there.
+    /// (P10). Callers must rule that out first; `start_via_notify` does, see there.
     pub fn daemon_ran(self) -> bool {
-        self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR
+        !self.is_refusal() && (self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR)
     }
 
     /// Whether this is [`Reported::Refused`]'s record: the shim started no daemon.

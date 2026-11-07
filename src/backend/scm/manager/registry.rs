@@ -18,7 +18,7 @@ use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 
 use crate::backend::scm::generate::field_named;
-use crate::backend::scm::parameters::{Parameters, field_named_utf16, text_from_utf16, type_name};
+use crate::backend::scm::parameters::{Parameters, field_named_utf16, shown_name, text_from_utf16, type_name};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
 
@@ -176,25 +176,22 @@ struct RawEntry {
 /// The longest value name the registry holds, in UTF-16 units.
 const MAX_VALUE_NAME_UNITS: usize = 16_383;
 
-/// Runs a registry call that fills a value's data until it has all of it, from a buffer of
-/// `capacity` bytes. `call` gets the buffer, its size in bytes, which it lowers to what it wrote,
-/// and the type; it returns the status. `ERROR_MORE_DATA` grows the buffer to the size the call
-/// reported, and a size that did not grow would change nothing, so that status is returned as it
-/// is, as is any other failure.
+/// Runs a registry call that fills a value's data until it has all of it, into `buffer`. `call`
+/// gets the buffer, its size in bytes, which it lowers to what it wrote, and the type; it returns
+/// the status. `ERROR_MORE_DATA` grows `buffer` to the size the call reported, and a size that did
+/// not grow would change nothing, so that status is returned as it is, as is any other failure.
+/// On success the value is the type and the first `len` bytes of `buffer`, which stays as grown so
+/// that one buffer serves a whole enumeration.
 fn read_growing(
-    capacity: usize,
+    buffer: &mut Vec<u8>,
     mut call: impl FnMut(*mut u8, &mut u32, &mut u32) -> u32,
-) -> std::result::Result<RawValue, u32> {
-    let mut bytes = vec![0u8; capacity];
+) -> std::result::Result<(u32, usize), u32> {
     loop {
         let mut vtype = 0u32;
-        let mut len = bytes.len() as u32;
-        match call(bytes.as_mut_ptr(), &mut len, &mut vtype) {
-            ERROR_SUCCESS => {
-                bytes.truncate(len as usize);
-                return Ok(RawValue { vtype, bytes });
-            }
-            ERROR_MORE_DATA if len as usize > bytes.len() => bytes.resize(len as usize, 0),
+        let mut len = buffer.len() as u32;
+        match call(buffer.as_mut_ptr(), &mut len, &mut vtype) {
+            ERROR_SUCCESS => return Ok((vtype, len as usize)),
+            ERROR_MORE_DATA if len as usize > buffer.len() => buffer.resize(len as usize, 0),
             status => return Err(status),
         }
     }
@@ -208,8 +205,9 @@ fn enum_raw_values(key: &RegKey, with_data: bool) -> std::io::Result<Vec<RawEntr
     let mut entries = Vec::new();
     let mut name = vec![0u16; MAX_VALUE_NAME_UNITS + 1];
     let mut name_len = 0u32;
+    let mut buffer = vec![0u8; if with_data { 256 } else { 0 }];
     for index in 0u32.. {
-        let read = read_growing(if with_data { 256 } else { 0 }, |data, data_len, vtype| {
+        let read = read_growing(&mut buffer, |data, data_len, vtype| {
             name_len = name.len() as u32;
             // SAFETY: `key` holds an open handle; `name` is writable for `name_len` units, which
             // the call lowers to what it wrote; `data` is writable for `data_len` bytes, and is
@@ -229,9 +227,13 @@ fn enum_raw_values(key: &RegKey, with_data: bool) -> std::io::Result<Vec<RawEntr
             }
         });
         match read {
-            Ok(value) => entries.push(RawEntry {
+            Ok((vtype, len)) => entries.push(RawEntry {
                 name: name[..name_len as usize].to_vec(),
-                value,
+                value: RawValue {
+                    vtype,
+                    // With no data wanted the call reports a size and fills nothing.
+                    bytes: if with_data { buffer[..len].to_vec() } else { Vec::new() },
+                },
             }),
             Err(ERROR_NO_MORE_ITEMS) => break,
             Err(status) => return Err(std::io::Error::from_raw_os_error(status as i32)),
@@ -281,7 +283,7 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
     // The name goes to `RegDeleteValueW` as the UTF-16 units read, which `OsString` carries whole.
     for stray in strays(&present, params) {
         tolerate_not_found(key.delete_value(OsString::from_wide(stray)))
-            .map_err(|e| registry_error(&format!("delete {} under", text_from_utf16(stray)), &path, e))?;
+            .map_err(|e| registry_error(&format!("delete value \"{}\" under", shown_name(stray)), &path, e))?;
     }
 
     let subkeys: Vec<OsString> = key
@@ -289,8 +291,9 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
         .collect::<std::io::Result<_>>()
         .map_err(|e| registry_error("enumerate subkeys of", &path, e))?;
     for subkey in &subkeys {
+        let shown = shown_name(&subkey.encode_wide().collect::<Vec<_>>());
         tolerate_not_found(key.delete_subkey_all(subkey))
-            .map_err(|e| registry_error(&format!("delete subkey {} under", subkey.to_string_lossy()), &path, e))?;
+            .map_err(|e| registry_error(&format!("delete subkey \"{shown}\" under"), &path, e))?;
     }
     Ok(())
 }
@@ -343,13 +346,16 @@ pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> 
 /// `RegQueryValueExW` for `name` under `key`, whatever its type.
 fn query_raw_value(key: &RegKey, name: &str) -> std::io::Result<RawValue> {
     let wide_name = super::identity::wide_null(name);
-    read_growing(1024, |data, len, vtype| {
+    let mut buffer = vec![0u8; 1024];
+    let (vtype, len) = read_growing(&mut buffer, |data, len, vtype| {
         // SAFETY: `key` holds an open handle; `wide_name` is a NUL-terminated UTF-16 string that
         // outlives the call; `vtype` and `len` are valid out-params, and `data` is `len` writable
         // bytes.
         unsafe { RegQueryValueExW(key.raw_handle(), wide_name.as_ptr(), std::ptr::null(), vtype, data, len) }
     })
-    .map_err(|status| std::io::Error::from_raw_os_error(status as i32))
+    .map_err(|status| std::io::Error::from_raw_os_error(status as i32))?;
+    buffer.truncate(len);
+    Ok(RawValue { vtype, bytes: buffer })
 }
 
 /// [`read_environment`]'s parsing, apart from the registry so it is testable without one.

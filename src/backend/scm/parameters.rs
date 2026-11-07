@@ -6,14 +6,17 @@
 //! goetia writes four string values there (see `generate`). A value under one of those names that
 //! holds a string is read as that field whatever its string type and terminators, so a service a
 //! tool rewrote is still goetia's; a layout other than what goetia writes is a [`Stray::Layout`],
-//! which `install --force` rewrites. Everything else is a [`Stray`]: kept apart from the four so
-//! that no stray can be mistaken for one of them, and so that a stray the registry API refuses to
-//! describe (a name that is not UTF-16 text, a type no API knows) is still reported, and removable.
+//! which `install --force` rewrites. The exception is a `Marker` in another layout, which is
+//! goetia's only when its text is goetia's marker: another service may hold a `Marker` of its own.
+//! Everything else is a [`Stray`]: kept apart from the four so that no stray can be mistaken for
+//! one of them, and so that a stray the registry API refuses to describe (a name that is not
+//! UTF-16 text, a type no API knows) is still reported, and removable.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::backend::scm::generate::field_named;
+use crate::backend::scm::generate::{FIELD_MARKER, field_named};
+use crate::blob;
 
 /// The registry's value type numbers (`winnt.h`), as plain constants so that this module needs no
 /// Windows crate.
@@ -62,15 +65,29 @@ impl fmt::Display for Stray {
     }
 }
 
-/// A name as it can be typed into regedit, on one line: [`text_from_utf16`], with every control
-/// character escaped. Text that is not valid UTF-16 comes escaped already, and is not escaped again.
-fn shown_name(name: &[u16]) -> String {
-    let text = text_from_utf16(name);
-    if text.chars().any(char::is_control) {
-        text.escape_debug().to_string()
-    } else {
-        text
+/// A name as it can be typed into regedit, on one line, to sit inside double quotes: every control
+/// character and every `"` is escaped and a backslash is not, whatever else the name holds. A name
+/// that is not valid UTF-16 is shown between `(not valid UTF-16: ` and `)`, each unpaired surrogate
+/// as `\u{XXXX}`.
+pub(crate) fn shown_name(name: &[u16]) -> String {
+    let decoded: Vec<_> = char::decode_utf16(name.iter().copied()).collect();
+    let valid = decoded.iter().all(|c| c.is_ok());
+    let mut shown = String::new();
+    if !valid {
+        shown.push_str("(not valid UTF-16: ");
     }
+    for c in decoded {
+        match c {
+            Ok('"') => shown.push_str(r#"\""#),
+            Ok(c) if c.is_control() => shown.extend(c.escape_debug()),
+            Ok(c) => shown.push(c),
+            Err(e) => shown.push_str(&format!(r"\u{{{:04X}}}", e.unpaired_surrogate())),
+        }
+    }
+    if !valid {
+        shown.push(')');
+    }
+    shown
 }
 
 /// The contents of a `Parameters` key.
@@ -114,11 +131,14 @@ enum Entry {
 }
 
 /// A value is a field when its name spells one of goetia's four in any case and it holds one string
-/// of text in any string type. Anything else under a field's name is a stray, so a hand edit never
+/// of text in any string type, except that a `Marker` stored other than as goetia stores it is a
+/// field only when its text is goetia's marker: a third-party service may hold a `Marker` of its
+/// own, and must stay foreign. Anything else under a field's name is a stray, so a hand edit never
 /// reads as equal to what goetia wants.
 fn classify_value(name: Vec<u16>, vtype: u32, data: &[u8]) -> Entry {
     if let Some(field) = field_named_utf16(&name)
         && let Some((text, exact)) = string_text(vtype, data)
+        && (exact || field != FIELD_MARKER || text == blob::MARKER)
     {
         let layout = (!exact).then_some(Stray::Layout { name: field, vtype });
         return Entry::Field {
