@@ -617,7 +617,7 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
-    let mut spec = base_spec(
+    let installed_spec = base_spec(
         &id,
         vec![
             support::current_exe_str(),
@@ -625,12 +625,14 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded() {
             listener.port().to_string(),
         ],
     );
-    let _guard = Guard::install(&mgr, &spec);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    let _guard = Guard::install(&mgr, &installed_spec);
+    mgr.start(&installed_spec.id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     let installed = std::fs::read_to_string(staging_path(&id)).unwrap();
 
-    spec.env.insert("GOETIA_TEST_REVISION".to_string(), "2".to_string());
+    let mut fields = installed_spec.into_fields();
+    fields.env.insert("GOETIA_TEST_REVISION".to_string(), "2".to_string());
+    let spec = DaemonSpec::new(fields).unwrap();
     let refused = mgr
         .install(&spec, false)
         .expect_err("a changed spec over a loaded job must be refused");
