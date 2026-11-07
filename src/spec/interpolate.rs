@@ -129,6 +129,25 @@ pub(crate) fn would_substitution_change(s: &str) -> bool {
     s.contains('$')
 }
 
+/// Whether the text a shape-phase judgement is handed may still hold `${...}` references.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Substitution {
+    /// As authored (the base pass and the all-backends sweep). A value with a `$` may become
+    /// something else, so it is judged only after substitution.
+    Pending,
+    /// Substituted (the native pass). A `$` left is ordinary text (a `$$` escape, or one a `.env`
+    /// value carried), so every value is judged as it stands.
+    Done,
+}
+
+impl Substitution {
+    /// Whether a judgement of `s` waits for a later pass: only while [`Pending`](Self::Pending),
+    /// and only for a value [`would_substitution_change`] flags.
+    pub(super) fn defers(self, s: &str) -> bool {
+        self == Substitution::Pending && would_substitution_change(s)
+    }
+}
+
 /// Scan the body of a `${...}` construct, with `${` already consumed.
 /// `chars` is positioned just after the `{`.
 fn scan_braced(

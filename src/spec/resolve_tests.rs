@@ -276,25 +276,47 @@ fn a_resolved_path_the_field_rules_would_refuse_is_attributed_to_the_resolution(
     // A drive-relative `cwd: C:` resolves through the per-drive directory to a value the authored
     // rules never saw; the message must say so rather than blame the text the user wrote.
     let id = Id::try_from("frpc").unwrap();
-    let err = check_resolved(&id, "cwd", "C:", Path::new("/a\u{FFFE}"), false).unwrap_err();
+    let err = check_resolved(&id, "cwd", "C:", Path::new("/a\u{FFFE}"), false, Substitution::Pending).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("field `cwd` is `C:`, which resolves to `/a\u{FFFE}`, which contains U+FFFE"),
         "{msg}"
     );
-    check_resolved(&id, "cwd", "C:", Path::new("/ordinary"), false).expect("an ordinary value passes");
+    check_resolved(&id, "cwd", "C:", Path::new("/ordinary"), false, Substitution::Pending)
+        .expect("an ordinary value passes");
 }
 
 #[skuld::test]
 fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
     let id = Id::try_from("frpc").unwrap();
-    let msg = check_resolved(&id, "cwd", "bin", Path::new("/a\u{FFFE}/bin"), true)
-        .unwrap_err()
-        .to_string();
+    let msg = check_resolved(
+        &id,
+        "cwd",
+        "bin",
+        Path::new("/a\u{FFFE}/bin"),
+        true,
+        Substitution::Pending,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
         msg.contains("field `cwd` is `bin`, which resolves under the manifest directory to `/a\u{FFFE}/bin`, which contains U+FFFE"),
         "{msg}"
     );
+}
+
+#[skuld::test]
+fn a_resolved_path_defect_is_attributed_to_env_unless_the_directory_added_it() {
+    let id = Id::try_from("frpc").unwrap();
+    let path = Path::new("/a\u{FFFE}/bin");
+    let attribution = |under_manifest_dir, substitution| {
+        check_resolved(&id, "cwd", "bin", path, under_manifest_dir, substitution)
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(attribution(false, Substitution::Done).contains("after substituting from .env: field `cwd`"));
+    assert!(!attribution(true, Substitution::Done).contains("substituting"));
+    assert!(!attribution(false, Substitution::Pending).contains("substituting"));
 }
 
 // A substituted path is judged as it is -------------------------------------------------------------------------------
@@ -346,6 +368,43 @@ fn a_manifest_directory_defect_is_not_blamed_on_the_env_file() {
     .unwrap_err()
     .to_string();
     assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+}
+
+/// `type: simple$$` substitutes to `simple$`, which holds a `$` and no reference: the shape phase
+/// judges it, with `command`, rather than leaving it to completeness.
+#[skuld::test]
+fn a_substituted_enum_with_a_dollar_left_is_judged_in_the_shape_phase() {
+    let msg = resolve_yaml(
+        "id: frpc
+type: 'simple$$'
+",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        msg.contains("after substituting from .env: field `type` is `simple$`"),
+        "an absent `command` is completeness's to report, after the shape phase: {msg}"
+    );
+}
+
+/// A pass that leaves a value to a later one has nothing to say about it: it neither resolves it
+/// nor warns about how it resolves.
+#[cfg(windows)]
+#[skuld::test]
+fn a_pending_value_with_a_dollar_raises_nothing() {
+    let id = Id::try_from("frpc").unwrap();
+    let mut warnings = Vec::new();
+    let resolved = resolve_path_string(
+        &id,
+        "cwd",
+        "C:bin/$x",
+        &base_dir(),
+        Substitution::Pending,
+        &mut warnings,
+    )
+    .unwrap();
+    assert_eq!(resolved, "C:bin/$x");
+    assert!(warnings.is_empty(), "{warnings:?}");
 }
 
 // What the directory alone cannot refuse ------------------------------------------------------------------------------
