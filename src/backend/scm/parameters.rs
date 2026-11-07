@@ -195,6 +195,7 @@ fn string_text(vtype: u32, data: &[u8]) -> Option<(String, bool)> {
 
 /// `units` as text, exactly. Units that are not valid UTF-16 show as text that says so, with each
 /// unpaired surrogate, control character and `=` escaped: no such text can equal a `NAME=value` line.
+#[cfg(any(windows, test))]
 pub(crate) fn text_from_utf16(units: &[u16]) -> String {
     String::from_utf16(units).unwrap_or_else(|_| decode_utf16(units, |c| c == '=' || c.is_control()))
 }
