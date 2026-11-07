@@ -259,18 +259,19 @@ fn await_scm_released_unbounded<T: KillTarget>(target: &mut T, pid: u32) -> io::
 }
 
 /// [`hold_service_process`] for a caller that only wants the process to wait on: the process if it
-/// can be held, and `None` for a service with no process and for one whose process SCM vouches for
-/// but cannot be opened (a right removed by policy). The caller goes on without it; what that
-/// process runs is still found by its image. A failure to read SCM is still an error, and so is an
-/// expiry: neither says anything about the process.
+/// can be held, and `None` for a service with no process, for one whose process SCM vouches for
+/// but cannot be opened (a right removed by policy), and for one whose process is gone but whom SCM
+/// still reports when `deadline` runs out (there is nothing left to wait on). The caller goes on
+/// without it; what that process runs is still found by its image. A failure to read SCM is still
+/// an error: it says nothing about the process.
 pub(crate) fn hold_if_possible<T: KillTarget>(
     target: &mut T,
     deadline: Deadline,
 ) -> std::result::Result<Option<T::Process>, HoldError> {
     match hold_service_process(target, deadline) {
         Ok(held) => Ok(held.map(|(_pid, process)| process)),
-        Err(HoldError::Refused(_)) => Ok(None),
-        Err(e) => Err(e),
+        Err(HoldError::Refused(_) | HoldError::Expired { .. }) => Ok(None),
+        Err(e @ HoldError::Read(_)) => Err(e),
     }
 }
 

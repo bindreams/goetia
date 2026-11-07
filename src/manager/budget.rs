@@ -111,12 +111,11 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
     }
 }
 
-/// The [`crate::Error::ProcessWaitTimeout`] constructor: a `stop` that ran out of `budget` on the
-/// service's process `pid`. `stopped` is whether SCM had confirmed `STOPPED` (the process then had
-/// not exited) or the hold of the process before the stop ran out first (nothing was sent).
+/// The [`crate::Error::ProcessWaitTimeout`] constructor: a `stop` that SCM confirmed ran out of
+/// `budget` waiting for the service's process `pid` to exit.
 ///
 /// Takes the `Budget` for the reasons [`timed_out`] does.
-pub fn process_timed_out(id: &str, pid: u32, stopped: bool, budget: Budget) -> crate::Error {
+pub fn process_timed_out(id: &str, pid: u32, budget: Budget) -> crate::Error {
     debug_assert!(
         matches!(budget, Budget::Bounded(d) if d > Duration::ZERO),
         "only a non-zero Bounded budget can expire, got {budget:?}"
@@ -124,22 +123,15 @@ pub fn process_timed_out(id: &str, pid: u32, stopped: bool, budget: Budget) -> c
     crate::Error::ProcessWaitTimeout {
         id: id.to_string(),
         pid,
-        stopped,
         waited: match budget {
             Budget::Bounded(d) => d,
             Budget::Immediate | Budget::Unbounded => Duration::ZERO,
         },
-        recovery: if stopped {
-            format!(
-                "goetia stopped waiting. The stop was not undone; until the process exits, the files it runs \
-                 stay in use. `goetia daemon status {id}` shows the manager's current view. Allow longer with \
-                 `--timeout <duration>`, or wait indefinitely with `--no-timeout`."
-            )
-        } else {
-            "goetia sent no stop, so nothing changed. Run `stop` again, allowing longer with \
-             `--timeout <duration>` or `--no-timeout`."
-                .to_string()
-        },
+        recovery: format!(
+            "goetia stopped waiting. The stop was not undone; until the process exits, the files it runs \
+             stay in use. `goetia daemon status {id}` shows the manager's current view. Allow longer with \
+             `--timeout <duration>`, or wait indefinitely with `--no-timeout`."
+        ),
     }
 }
 

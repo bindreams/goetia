@@ -166,7 +166,7 @@ fn timed_out_refuses_a_zero_length_budget() {
 /// the message says which wait ran out.
 #[skuld::test]
 fn a_process_that_outlives_the_budget_after_a_confirmed_stop_says_so() {
-    let e = process_timed_out("frpc", 4242, true, Budget::Bounded(Duration::from_secs(1)));
+    let e = process_timed_out("frpc", 4242, Budget::Bounded(Duration::from_secs(1)));
 
     assert_eq!(
         e.to_string(),
@@ -178,23 +178,10 @@ fn a_process_that_outlives_the_budget_after_a_confirmed_stop_says_so() {
     assert!(e.is_indeterminate());
 }
 
-/// A hold that ran out before any stop was sent: the service was not stopped.
-#[skuld::test]
-fn a_hold_that_outlives_the_budget_says_nothing_was_stopped() {
-    let e = process_timed_out("frpc", 4242, false, Budget::Bounded(Duration::from_secs(1)));
-
-    assert_eq!(
-        e.to_string(),
-        "`frpc` was NOT stopped: SCM had not released its process (pid 4242) within 1s: goetia sent no stop, so \
-         nothing changed. Run `stop` again, allowing longer with `--timeout <duration>` or `--no-timeout`."
-    );
-    assert!(e.is_indeterminate());
-}
-
 #[skuld::test]
 #[should_panic(expected = "only a non-zero Bounded budget can expire")]
 fn process_timed_out_refuses_a_budget_that_cannot_expire() {
-    let _ = process_timed_out("frpc", 4242, true, Budget::Unbounded);
+    let _ = process_timed_out("frpc", 4242, Budget::Unbounded);
 }
 
 // Deadline ============================================================================================================

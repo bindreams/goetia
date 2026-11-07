@@ -113,8 +113,8 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use super::wait::{StopAndAwaitExitOutcome, Waited};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
+use crate::backend::scm::kill::hold_if_possible;
 use crate::backend::scm::kill::system::Held;
-use crate::backend::scm::kill::{HoldError, hold_if_possible};
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
@@ -435,7 +435,6 @@ impl Backend for Scm {
         let held = match host {
             Some(_) => hold_process(
                 &id,
-                Budget::Unbounded,
                 Budget::Unbounded.start(),
                 &format!("`{id}` was NOT deleted and is unchanged"),
             )?,
@@ -514,17 +513,23 @@ impl Backend for Scm {
             return super::wait::request_stop(&mut actor).map_err(|e| Error::os(format!("stop `{id}`"), e));
         }
         // Before the STOP: SCM reports `STOPPED` before the process exits, and no pid after it.
-        let held = hold_process(&id, budget, deadline, &format!("`{id}` was NOT stopped"))?;
-        // No notice: the shim exits just after it reports `STOPPED`, so a wait is the usual case.
+        let held = hold_process(&id, deadline, &format!("`{id}` was NOT stopped"))?;
+        // A bounded wait says nothing: the shim exits just after it reports `STOPPED`, so a wait is
+        // the usual case. An unbounded one has no end that says why it is still blocked.
+        let unbounded = deadline.at().is_none();
         let outcome = super::wait::stop_and_await_exit(&mut actor, deadline, held.as_ref(), |held, deadline| {
-            held.wait_for_exit(deadline, || {})
+            held.wait_for_exit(deadline, || {
+                if unbounded {
+                    held.notice(id.as_str());
+                }
+            })
         })
         .map_err(|e| Error::os(format!("stop `{id}`"), e))?;
         match outcome {
             StopAndAwaitExitOutcome::Stopped => Ok(()),
             StopAndAwaitExitOutcome::ServiceExpired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
             StopAndAwaitExitOutcome::ProcessExpired(held) => {
-                Err(budget::process_timed_out(id.as_str(), held.pid(), true, budget))
+                Err(budget::process_timed_out(id.as_str(), held.pid(), budget))
             }
         }
     }
@@ -1026,9 +1031,10 @@ fn registered_shim(snapshot: &ScmSnapshot) -> Option<PathBuf> {
 /// [`hold_if_possible`]): the caller goes on, and what that process runs stays referenced by its
 /// image until it exits. A failure to read SCM is an error, with nothing changed, led by `not_done`,
 /// what the caller did not do. The wait for SCM to let go of a pid whose process is gone ends at
-/// `deadline`, and is then [`budget::process_timed_out`] for `budget`, which says the same. The
-/// service handle the hold used is closed before this returns, or the service could not be deleted.
-fn hold_process(id: &Id, budget: Budget, deadline: Deadline, not_done: &str) -> Result<Option<Held>> {
+/// `deadline`, and holds nothing: the process is gone, so the caller has nothing to wait on and
+/// goes on, which a `stop` must do to send its STOP. The service handle the hold used is closed
+/// before this returns, or the service could not be deleted.
+fn hold_process(id: &Id, deadline: Deadline, not_done: &str) -> Result<Option<Held>> {
     let not_done = |e: Error| Error::Step {
         what: not_done.to_string(),
         source: Box::new(e),
@@ -1040,12 +1046,11 @@ fn hold_process(id: &Id, budget: Budget, deadline: Deadline, not_done: &str) -> 
         Err(e) => return Err(not_done(e)),
     };
     let mut target = super::kill::SystemKillTarget::observing(service, id.as_str().to_string());
-    hold_if_possible(&mut target, deadline).map_err(|e| match e {
-        HoldError::Expired { pid } => budget::process_timed_out(id.as_str(), pid, false, budget),
-        e => not_done(Error::os(
+    hold_if_possible(&mut target, deadline).map_err(|e| {
+        not_done(Error::os(
             format!("hold `{id}`'s process to wait for its exit"),
             std::io::Error::from(e),
-        )),
+        ))
     })
 }
 

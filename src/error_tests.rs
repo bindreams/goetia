@@ -22,7 +22,6 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::ProcessWaitTimeout {
             id: id(),
             pid: 1,
-            stopped: true,
             waited: Duration::ZERO,
             recovery: String::new(),
         },

@@ -330,15 +330,15 @@ fn an_arm_that_expires_expires_the_hold_with_nothing_to_cancel() {
     assert_eq!(target.log(), steps(["service_pid", "open 100", "arm_release"]));
 }
 
-/// An expiry is not a process that could not be opened: `hold_if_possible` lets go of the refusal
-/// only, and the stop reports the expiry.
+/// An expired hold is a process that is gone, whatever SCM still reports: there is nothing to wait
+/// on, so `hold_if_possible` holds nothing and the stop goes on to send its STOP.
 #[skuld::test]
-fn an_expired_hold_is_not_let_go_by_hold_if_possible() {
-    let mut target = Scripted::new([Some(100), Some(100)], [Open::Gone], []).expiring_release();
+fn an_expired_hold_holds_nothing_for_hold_if_possible() {
+    let mut release = Scripted::new([Some(100), Some(100)], [Open::Gone], []).expiring_release();
+    let mut arm = Scripted::new([Some(100)], [Open::Gone], []).expiring_arm();
 
-    let error = hold_if_possible(&mut target, unbounded()).err().expect("an expiry");
-
-    assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
+    assert!(hold_if_possible(&mut release, unbounded()).unwrap().is_none());
+    assert!(hold_if_possible(&mut arm, unbounded()).unwrap().is_none());
 }
 
 /// `uninstall` waits for the process only if it can hold it: a process it cannot open (a right
@@ -359,7 +359,7 @@ fn a_process_that_can_be_opened_is_held_by_hold_if_possible() {
     assert!(hold_if_possible(&mut target, unbounded()).unwrap().is_some());
 }
 
-/// Only the refusal is let go. A failed read of SCM is not a process that cannot be opened: the
+/// Only the refusal and the expiry are let go. A failed read of SCM is not a process that cannot be opened: the
 /// uninstall fails with nothing changed, whether the read was the first or the one after a refusal.
 #[skuld::test]
 fn a_failed_read_of_scm_is_not_let_go_by_hold_if_possible() {

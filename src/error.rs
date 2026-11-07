@@ -432,17 +432,18 @@ pub enum Error {
     /// A `stop` of `id` ran out of budget waiting on the service's process, not on SCM's answer.
     /// Produced only through [`crate::manager::budget::process_timed_out`].
     ///
-    /// `stopped` says how far the stop got. When it is set SCM confirmed `STOPPED`, and the process
-    /// had not exited: the service is stopped, and a file the process runs stays in use until it
-    /// does. When it is not, the stop was never sent: SCM still reported the service's process
-    /// (`pid`, already gone) when the budget ran out, and nothing was changed.
+    /// The stop was sent and SCM confirmed `STOPPED`; the process (`pid`) had not exited: the
+    /// service is stopped, and a file the process runs stays in use until it does.
     ///
-    /// Exit `4` (indeterminate), like [`WaitTimeout`](Error::WaitTimeout).
-    #[error("`{id}` {}: {recovery}", process_wait_summary(*stopped, *pid, *waited))]
+    /// Exit `4` (indeterminate), like [`WaitTimeout`](Error::WaitTimeout): the stop is not
+    /// finished, though not failed.
+    #[error(
+        "`{id}` is stopped, but its process (pid {pid}) had not exited within {waited}: {recovery}",
+        waited = humantime::format_duration(*waited)
+    )]
     ProcessWaitTimeout {
         id: String,
         pid: u32,
-        stopped: bool,
         waited: std::time::Duration,
         recovery: String,
     },
@@ -611,16 +612,6 @@ pub enum Error {
     /// operations should produce.
     #[error("{path} already exists (this should never happen)", path = path.display())]
     AlreadyExists { path: PathBuf },
-}
-
-/// What [`Error::ProcessWaitTimeout`] says before its recovery.
-fn process_wait_summary(stopped: bool, pid: u32, waited: std::time::Duration) -> String {
-    let waited = humantime::format_duration(waited);
-    if stopped {
-        format!("is stopped, but its process (pid {pid}) had not exited within {waited}")
-    } else {
-        format!("was NOT stopped: SCM had not released its process (pid {pid}) within {waited}")
-    }
 }
 
 impl Error {
