@@ -242,10 +242,9 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
         // The SCM generator's warning (a too-large `restart-delay`) fires at
         // resolve time, from `BackendKind::Scm.warn`, before this runs.
         let _ = err;
-        // The real shim path is an open packaging question — this placeholder
-        // is only ever shown in a preview, never installed.
-        let shim_path = PathBuf::from("goetia-shim.exe");
-        let registration = crate::backend::scm::generate::registration(spec, &identity, &shim_path)?;
+        // The real shim path, so the preview refuses a path the install would.
+        let shim_path = crate::backend::scm::manager::shim_path();
+        let registration = crate::backend::scm::generate::install_registration(spec, &identity, &shim_path)?;
         Ok(registration.to_string())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

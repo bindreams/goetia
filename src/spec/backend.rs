@@ -32,10 +32,10 @@
 //! honour is its generator's to refuse at install (`restart: always` on `scm`).
 //!
 //! [`BackendKind::refuse`] runs for the native backend too, on the same spec, for a value its generator would
-//! refuse at install anyway (systemd's `env` names), so the refusal comes at resolve.
+//! refuse at install anyway (what [`systemd_defect`] lists), so the refusal comes at resolve.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -45,7 +45,7 @@ use super::interpolate::Substitution;
 use super::overrides::Supplied;
 use super::resolve::{Refused, invalid};
 use super::vars::is_valid_name;
-use super::{AccountId, Id, Kind, Restart, User, Warning};
+use super::{AccountId, DaemonSpec, Id, Kind, Restart, User, Warning};
 use crate::error::Error;
 
 /// One of the three service-manager backends a `backend-specific:` entry
@@ -176,14 +176,28 @@ impl BackendKind {
 
     /// What this backend's native install cannot carry, judged on the substituted merged spec, base
     /// values included: the install would refuse it anyway, so the refusal comes before it, at
-    /// resolve. Called for the native backend only. systemd drops an `env` key outside
-    /// `[A-Za-z_][A-Za-z0-9_]*` with only a log line; its generator refuses it too ([`systemd_env_key_defect`]).
-    pub(super) fn refuse(self, spec: &ShapedSpec) -> Result<(), Refused> {
+    /// resolve. Called for the native backend only. `base_dir` is the manifest directory.
+    ///
+    /// systemd: every value of the manifest that [`systemd_defect`] lists, which its generator
+    /// refuses too.
+    pub(super) fn refuse(self, spec: &ShapedSpec, base_dir: &Path) -> Result<(), Refused> {
         match self {
-            BackendKind::Systemd => match systemd_env_key_defect(&spec.env) {
-                Some((key, defect)) => Err(Refused::at(Field::EnvKey(key.into()), invalid(&spec.id, &defect))),
-                None => Ok(()),
-            },
+            BackendKind::Systemd => {
+                if let Some(refused) = systemd_parent_dir_from(spec, base_dir) {
+                    return Err(refused);
+                }
+                let defect = systemd_defect_at(
+                    &spec.name,
+                    spec.command.as_deref(),
+                    spec.cwd.as_deref(),
+                    spec.logs.as_deref(),
+                    &spec.env,
+                );
+                match defect {
+                    Some((field, defect)) => Err(Refused::at(field, invalid(&spec.id, &defect))),
+                    None => Ok(()),
+                }
+            }
             BackendKind::Launchd | BackendKind::Scm => Ok(()),
         }
     }
@@ -223,18 +237,153 @@ impl BackendKind {
     }
 }
 
-/// The first `env` key systemd would drop, with why, or `None` when it carries them all.
-/// systemd logs "Invalid environment assignment, ignoring" for any `Environment=` name outside
-/// `[A-Za-z_][A-Za-z0-9_]*` and starts the unit without it (measured on 242 and 255), so the
-/// daemon would never see the variable.
-pub(crate) fn systemd_env_key_defect(env: &BTreeMap<String, String>) -> Option<(&str, String)> {
-    let key = env.keys().find(|key| !is_valid_name(key))?;
-    let defect = format!(
-        "`env` key {key:?} is not a name systemd accepts in Environment=: it must match \
-        [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the \
-        daemon would never see it"
-    );
-    Some((key, defect))
+// systemd's refusals ==================================================================================================
+//
+// What no encoding can carry, so the manifest's value is refused: at resolve ([`BackendKind::refuse`]) and
+// by the generator, which a `DaemonSpec` from a blob reaches without resolve. One predicate per rule,
+// measured on 242 and 255.
+
+/// The first value of the manifest that systemd cannot carry, with the field it belongs to and why.
+/// `command` is `None` while a native override may still supply it.
+///
+/// - `command[0]`: see [`systemd_executable_defect`].
+/// - An `env` key outside `[A-Za-z_][A-Za-z0-9_]*`: systemd logs "Invalid environment assignment,
+///   ignoring" and drops it, and the unit still loads and starts.
+/// - `name`, `cwd` and `logs`: see [`systemd_raw_value_defect`], and for a path
+///   [`systemd_path_defect`].
+fn systemd_defect_at(
+    name: &str,
+    command: Option<&[String]>,
+    cwd: Option<&Path>,
+    logs: Option<&Path>,
+    env: &BTreeMap<String, String>,
+) -> Option<(Field, String)> {
+    if let Some(defect) = command
+        .and_then(<[String]>::first)
+        .and_then(|e| systemd_executable_defect(e))
+    {
+        return Some((Field::Command(0), defect));
+    }
+    if let Some(key) = env.keys().find(|key| !is_valid_name(key)) {
+        let defect = format!(
+            "`env` key {key:?} is not a name systemd accepts in Environment=: it must match \
+            [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the \
+            daemon would never see it"
+        );
+        return Some((Field::EnvKey(key.as_str().into()), defect));
+    }
+    if let Some(defect) = systemd_raw_value_defect("Description=", name) {
+        return Some((Field::Name, defect));
+    }
+    let paths = [
+        (Field::Cwd, SYSTEMD_WORKING_DIRECTORY, cwd),
+        (Field::Logs, SYSTEMD_LOG_PATH, logs),
+    ];
+    for (field, directive, path) in paths {
+        if let Some(defect) = path.and_then(|path| systemd_path_defect(&field.path(), directive, path)) {
+            return Some((field, defect));
+        }
+    }
+    None
+}
+
+/// [`systemd_defect_at`] for a finished daemon, without the field: the generator's check.
+pub(crate) fn systemd_defect(spec: &DaemonSpec) -> Option<String> {
+    systemd_defect_at(
+        &spec.name,
+        Some(&spec.command),
+        spec.cwd.as_deref(),
+        spec.logs.as_deref(),
+        &spec.env,
+    )
+    .map(|(_, defect)| defect)
+}
+
+/// `WorkingDirectory=`, as a message names it.
+const SYSTEMD_WORKING_DIRECTORY: &str = "WorkingDirectory=";
+/// The `append:` path of `StandardOutput=` and `StandardError=`, as a message names it.
+const SYSTEMD_LOG_PATH: &str = "StandardOutput=/StandardError= append:";
+
+/// The characters systemd's line reader strips from both ends of a raw value: space, tab, LF, CR.
+/// VT, FF and Unicode whitespace survive.
+const STRIPPED_BY_SYSTEMD: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// Why systemd cannot run the executable path of `ExecStart=` (`command[0]`), or `None`.
+///
+/// - A backslash, `"` or `'` (after unquoting and specifiers): systemd refuses the whole unit with
+///   "Executable name contains special characters", however the word was quoted. Later arguments
+///   take all three.
+/// - A trailing space: systemd 255 keeps the path but the service exits with 203/EXEC (242 runs it;
+///   both are refused). Interior spaces, other trailing whitespace and later arguments are fine.
+fn systemd_executable_defect(executable: &str) -> Option<String> {
+    if executable.contains(['\\', '"', '\'']) {
+        return Some(format!(
+            "the executable path {executable:?} (`command[0]`) holds a backslash, double quote or apostrophe, \
+             which systemd refuses to load in an executable path"
+        ));
+    }
+    executable.ends_with(' ').then(|| {
+        format!(
+            "the executable path {executable:?} (`command[0]`) ends in whitespace, which systemd does not run \
+             (the service exits with 203/EXEC)"
+        )
+    })
+}
+
+/// Why `value` cannot be a raw directive value (`Description=`, `User=`, `WorkingDirectory=`, the
+/// `append:` path), or `None`: systemd strips [`STRIPPED_BY_SYSTEMD`] from both ends, and no quote,
+/// C escape or line continuation keeps them.
+pub(crate) fn systemd_raw_value_defect(directive: &str, value: &str) -> Option<String> {
+    (value.starts_with(STRIPPED_BY_SYSTEMD) || value.ends_with(STRIPPED_BY_SYSTEMD)).then(|| {
+        format!(
+            "{directive} value {value:?} starts or ends with whitespace, which systemd strips from this \
+             directive; no quoting or escape keeps it"
+        )
+    })
+}
+
+/// Why systemd cannot carry the path `field` (`cwd` or `logs`) written to `directive`, or `None`: a
+/// `..` component (systemd refuses a non-normalized path in `WorkingDirectory=` and
+/// `StandardOutput=append:` on 242; on 255 it silently ignores the `append:` one), or
+/// [`systemd_raw_value_defect`].
+fn systemd_path_defect(field: &str, directive: &str, path: &Path) -> Option<String> {
+    if has_parent_dir(path) {
+        return Some(format!(
+            "`{field}` {path:?} holds a `..`, and systemd refuses a non-normalized path in {directive}: write \
+             the path without it"
+        ));
+    }
+    systemd_raw_value_defect(directive, &path.display().to_string())
+}
+
+fn has_parent_dir(path: &Path) -> bool {
+    path.components().any(|c| c == Component::ParentDir)
+}
+
+/// The refusal for a `cwd` or `logs` whose `..` is all the manifest directory's (`-f`), which no
+/// field wrote; `None` for any other path. It carries no field, like every defect of the directory.
+fn systemd_parent_dir_from(spec: &ShapedSpec, base_dir: &Path) -> Option<Refused> {
+    if !has_parent_dir(base_dir) {
+        return None;
+    }
+    let paths = [
+        (Field::Cwd, SYSTEMD_WORKING_DIRECTORY, spec.cwd.as_deref()),
+        (Field::Logs, SYSTEMD_LOG_PATH, spec.logs.as_deref()),
+    ];
+    paths.into_iter().find_map(|(field, directive, path)| {
+        let path = path?;
+        path.strip_prefix(base_dir).ok().filter(|rest| !has_parent_dir(rest))?;
+        let message = format!(
+            "`{}` resolves to {path:?}, whose `..` comes from the manifest directory `-f {}`, and systemd \
+             refuses a non-normalized path in {directive}: pass `-f` without `..`",
+            field.path(),
+            base_dir.display()
+        );
+        Some(Refused {
+            field: None,
+            err: invalid(&spec.id, &message),
+        })
+    })
 }
 
 /// `type: managed` on Windows has no working-directory or stdout-capture

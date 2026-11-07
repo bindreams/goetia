@@ -721,7 +721,7 @@ fn resolve_parses_each_restart_policy() {
         ("on-failure", Restart::OnFailure),
         ("always", Restart::Always),
     ] {
-        let yaml = format!("id: frpc\ncommand: [bin/frpc]\nrestart: {raw}\n");
+        let yaml = format!("id: frpc\ncommand: [C:/bin/frpc]\nrestart: {raw}\n");
         let (spec, _) = resolve_yaml_as(BackendKind::Systemd, &yaml)
             .unwrap_or_else(|e| panic!("`restart: {raw}` should resolve: {e}"));
         assert_eq!(spec.restart, expected, "restart: {raw}");
@@ -827,7 +827,7 @@ type: simple
 fn an_scm_override_of_on_failure_applies_only_where_scm_is_native() {
     let yaml = r#"
 id: svc
-command: [bin/svc.exe]
+command: [C:/bin/svc.exe]
 restart: always
 backend-specific:
   scm: { restart: on-failure }
@@ -848,7 +848,7 @@ backend-specific:
 fn an_scm_override_that_writes_always_resolves_on_every_native_backend() {
     let yaml = r#"
 id: svc
-command: [bin/svc.exe]
+command: [C:/bin/svc.exe]
 backend-specific:
   scm: { restart: always }
 "#;
@@ -867,7 +867,7 @@ backend-specific:
 fn a_templated_always_resolves_on_every_native_backend(#[fixture(temp_dir)] dir: &Path) {
     let yaml = r#"
 id: svc
-command: [/bin/svc]
+command: [C:/bin/svc]
 restart: ${R}
 "#;
     write_fixture(dir, yaml, Some("R=always\n"));
@@ -1130,7 +1130,8 @@ fn normalize_preserves_parent_dir_components() {
     // deliberate exception to this rule lives in
     // `drive_relative_resolution_collapses_dot_dot_the_windows_way` below.
     let yaml = "id: frpc\ncommand: [bin/frpc]\ncwd: ../sibling\n";
-    let (spec, _) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
+    // As a host whose service manager keeps `..`: systemd refuses it.
+    let (spec, _) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     let cwd = spec.cwd.as_deref().expect("cwd is set");
 
     assert!(
@@ -1535,14 +1536,14 @@ fn an_unreadable_env_file_fails_only_a_manifest_whose_native_spec_needs_it(#[fix
     // An unreadable `.env` fails a manifest only when the native spec needs it.
     write_fixture(dir, "", None);
     std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
-    let overridden = "id: frpc\ncommand: [/bin/frpc]\nrestart-delay: ${DELAY}\n\
+    let overridden = "id: frpc\ncommand: [C:/bin/frpc]\nrestart-delay: ${DELAY}\n\
                       backend-specific:\n  systemd:\n    restart-delay: 1s\n";
     let (spec, warnings) = resolve_as(parse_manifest(overridden), dir, Some(BackendKind::Systemd))
         .expect("an unreadable `.env` must not fail a manifest whose native spec has no `$`");
     assert_eq!(spec.restart_delay, Some(Duration::from_secs(1)));
     assert!(warnings.is_empty(), "{warnings:?}");
 
-    let bare = "id: frpc\ncommand: [/bin/frpc]\nrestart-delay: ${DELAY}\n";
+    let bare = "id: frpc\ncommand: [C:/bin/frpc]\nrestart-delay: ${DELAY}\n";
     let err = resolve_as(parse_manifest(bare), dir, Some(BackendKind::Systemd)).unwrap_err();
     assert!(matches!(err, Error::Os { .. }), "expected Os, got: {err:?}");
 }
@@ -2435,7 +2436,7 @@ fn base_restart_always_resolves_on_every_native_backend() {
     // Whether a backend can honour `always` is its generator's verdict, at install and preview: the
     // base spec is nobody's override, so resolution accepts it.
     let yaml = "id: svc
-command: [/bin/svc]
+command: [C:/bin/svc]
 restart: always
 ";
     for native in BackendKind::ALL {
@@ -2449,7 +2450,7 @@ fn a_host_warns_only_about_its_native_backend() {
     // One manifest that trips every advisory: `type: managed` with a `cwd` (SCM divergence), `on-failure` with
     // a delay that is neither whole seconds (launchd) nor whole milliseconds (SCM).
     let yaml = "id: frpc
-command: [/bin/frpc]
+command: [C:/bin/frpc]
 type: managed
 cwd: .
 restart: on-failure
@@ -2510,7 +2511,7 @@ backend-specific:
 #[skuld::test]
 fn only_a_systemd_host_refuses_an_env_key_systemd_would_drop() {
     let yaml = "id: frpc
-command: [/bin/frpc]
+command: [C:/bin/frpc]
 env:
   MY-VAR: x
 ";
@@ -2527,7 +2528,7 @@ env:
 
 #[skuld::test]
 fn an_env_key_systemd_accepts_draws_no_complaint_on_any_host() {
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\nenv:\n  MY_VAR: x\n";
+    let yaml = "id: frpc\ncommand: [C:/bin/frpc]\nenv:\n  MY_VAR: x\n";
     for native in BackendKind::ALL {
         let (_spec, warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("{native}: {e}"));
         assert!(warnings.is_empty(), "{native}: {warnings:?}");
@@ -2537,7 +2538,7 @@ fn an_env_key_systemd_accepts_draws_no_complaint_on_any_host() {
 #[skuld::test]
 fn a_systemd_refusal_names_the_override_only_when_the_override_wrote_the_value() {
     let yaml = "id: frpc
-command: [/bin/frpc]
+command: [C:/bin/frpc]
 backend-specific:
   systemd:
     env: {MY-VAR: x}
@@ -2547,7 +2548,7 @@ backend-specific:
 
     // The same value in the base, and an override that wrote something else: not the override's.
     let yaml = "id: frpc
-command: [/bin/frpc]
+command: [C:/bin/frpc]
 env: {MY-VAR: x}
 backend-specific:
   systemd:
@@ -2559,12 +2560,113 @@ backend-specific:
 
 #[skuld::test]
 fn an_override_that_wrote_a_different_env_key_does_not_take_the_blame_for_a_base_key() {
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\nenv: {MY-VAR: x}\nbackend-specific:\n  systemd:\n    env: {OTHER: y}\n";
+    let yaml =
+        "id: frpc\ncommand: [C:/bin/frpc]\nenv: {MY-VAR: x}\nbackend-specific:\n  systemd:\n    env: {OTHER: y}\n";
     let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
     assert!(msg.contains("\"MY-VAR\"") && !msg.contains("backend-specific"), "{msg}");
 
     let yaml =
-        "id: frpc\ncommand: [/bin/frpc]\nenv: {MY-VAR: x}\nbackend-specific:\n  systemd:\n    env: {MY-VAR: y}\n";
+        "id: frpc\ncommand: [C:/bin/frpc]\nenv: {MY-VAR: x}\nbackend-specific:\n  systemd:\n    env: {MY-VAR: y}\n";
     let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
     assert!(msg.contains("backend-specific.systemd: "), "{msg}");
+}
+
+// What systemd cannot carry, refused at resolve =======================================================================
+
+/// A `command[0]` that carries no backslash on any host (absolute on Windows, joined to the manifest
+/// directory elsewhere), as a systemd host requires; `abs` writes backslashes on Windows.
+const SLASH_PROGRAM: &str = "C:/bin/frpc";
+
+/// [`abs`], with forward slashes only.
+fn slash_abs(p: &str) -> String {
+    abs(p).to_string_lossy().replace('\\', "/")
+}
+
+/// A manifest of `SLASH_PROGRAM` with `extra` lines (and `command` unless `extra` sets it).
+fn systemd_manifest(extra: &str) -> String {
+    let command = if extra.contains("command:") {
+        String::new()
+    } else {
+        format!("command: ['{SLASH_PROGRAM}']\n")
+    };
+    format!("id: frpc\n{command}{extra}\n")
+}
+
+#[skuld::test]
+fn a_systemd_host_refuses_at_resolve_every_value_its_generator_refuses() {
+    let opt = slash_abs("opt/x");
+    let cases = [
+        (format!("command: ['{SLASH_PROGRAM}\\y']"), "`command[0]`"),
+        (format!("command: ['{SLASH_PROGRAM}\"y']"), "`command[0]`"),
+        (format!("command: ['{SLASH_PROGRAM}''y']"), "`command[0]`"),
+        (format!("command: ['{SLASH_PROGRAM} ']"), "`command[0]`"),
+        ("name: ' a'".to_string(), "Description="),
+        ("name: 'a '".to_string(), "Description="),
+        (format!("cwd: '{opt} '"), "WorkingDirectory="),
+        (format!("logs: '{opt} '"), "StandardOutput="),
+        (format!("cwd: '{opt}/../y'"), "`cwd`"),
+        (format!("logs: '{opt}/../y'"), "`logs`"),
+    ];
+    for (extra, needle) in cases {
+        let yaml = systemd_manifest(&extra);
+        let msg = resolve_yaml_as(BackendKind::Systemd, &yaml)
+            .expect_err(&format!("systemd: {extra}"))
+            .to_string();
+        assert!(msg.contains(needle), "{extra}: {msg}");
+        for native in [BackendKind::Launchd, BackendKind::Scm] {
+            resolve_yaml_as(native, &yaml).unwrap_or_else(|e| panic!("{native}: {extra}: {e}"));
+        }
+    }
+}
+
+#[skuld::test]
+fn a_systemd_refusal_at_resolve_of_a_path_value_follows_the_same_attribution_as_an_env_key() {
+    let opt = slash_abs("opt/x");
+    // The override wrote the `..`.
+    let yaml = systemd_manifest(&format!("backend-specific:\n  systemd:\n    cwd: '{opt}/../y'"));
+    let msg = resolve_yaml_as(BackendKind::Systemd, &yaml).unwrap_err().to_string();
+    assert!(
+        msg.contains("backend-specific.systemd: ") && msg.contains("`cwd`"),
+        "{msg}"
+    );
+
+    // The base wrote it, and the override wrote something else.
+    let yaml = systemd_manifest(&format!(
+        "cwd: '{opt}/../y'\nbackend-specific:\n  systemd:\n    name: other"
+    ));
+    let msg = resolve_yaml_as(BackendKind::Systemd, &yaml).unwrap_err().to_string();
+    assert!(msg.contains("`cwd`") && !msg.contains("backend-specific"), "{msg}");
+}
+
+#[skuld::test]
+fn a_parent_dir_the_manifest_directory_adds_is_attributed_to_dash_f() {
+    let dir = base_dir().join("..").join("x");
+    for field in ["cwd", "logs"] {
+        let yaml = systemd_manifest(&format!("{field}: sub"));
+        let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+            .expect_err(field)
+            .to_string();
+        assert!(
+            msg.contains("`-f`") && msg.contains("`..`") && msg.contains(&format!("`{field}`")),
+            "{field}: {msg}"
+        );
+        resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Scm)).unwrap_or_else(|e| panic!("{field}: {e}"));
+    }
+
+    // A `..` the field wrote is the field's, even under a clean `-f`, and so is one beside the
+    // manifest directory's.
+    for dir in [base_dir(), dir] {
+        let yaml = systemd_manifest("cwd: ../y");
+        let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("`cwd`") && !msg.contains("`-f`"), "{msg}");
+    }
+}
+
+#[skuld::test]
+fn a_parent_dir_in_command_zero_is_accepted_by_a_systemd_host() {
+    // systemd runs `/bin/../bin/frpc`.
+    let yaml = systemd_manifest(&format!("command: ['{}/../bin/frpc']", slash_abs("opt")));
+    resolve_yaml_as(BackendKind::Systemd, &yaml).expect("resolves");
 }

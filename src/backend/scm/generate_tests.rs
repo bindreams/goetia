@@ -906,9 +906,7 @@ fn managed_refuses_an_executable_the_writer_would_mangle() {
     }
 }
 
-/// The refusal says which character the writer acted on, not always "a space". A `command[0]`
-/// cannot hold a tab, newline or vertical tab (control characters are refused earlier); a shim
-/// path can.
+/// The message names the triggering character, not always "a space" (a shim path can hold a tab).
 #[cfg(windows)]
 #[skuld::test]
 fn the_refusal_names_the_character_that_forced_the_quoting() {
@@ -975,10 +973,8 @@ fn executable_refusal_matches_what_the_writer_loses() {
     }
 }
 
-/// The shim path goes through the same writer, so it is held to the same rule. The refusal is the
-/// install's and `diff`'s (`install_registration`), not the rendering's: the path is the host's, so a
-/// bad one must not make every `type: simple` daemon read as having an unusable embedded spec in
-/// `list` and `status`, which render each one.
+/// The shim path goes through the same writer, so the install and `diff` refuse a bad one
+/// (`install_registration`).
 #[skuld::test]
 fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     let shim = PathBuf::from(r"C:\Program Files\Goetia\");

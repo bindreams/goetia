@@ -569,6 +569,25 @@ fn install_and_preview_install_refuse_restart_always() {
     }
 }
 
+/// The shim path is the host's, not the daemon's: `render` (which `list` and `status` use for every
+/// daemon) accepts a path the writer would mangle, and `render_for_install` (`install`, `diff`) does not.
+#[skuld::test]
+fn render_for_install_refuses_a_bad_shim_path_and_render_does_not() {
+    let mgr = Scm::with_shim(PathBuf::from(r"C:\Program Files\Goetia\"));
+    // The shim only runs a `type: simple` daemon.
+    let spec = DaemonSpec::new(DaemonFields {
+        kind: Kind::Simple,
+        ..daemon_spec(Restart::Never).into_fields()
+    })
+    .unwrap();
+
+    mgr.render(&spec).expect("`render` does not judge the shim path");
+    let err = mgr
+        .render_for_install(&spec)
+        .expect_err("the writer would register another path");
+    assert!(err.to_string().contains("goetia-shim path"), "{err}");
+}
+
 // uninstall's failures ================================================================================================
 
 fn uninstall_failure(state: &UninstallFailure) -> String {

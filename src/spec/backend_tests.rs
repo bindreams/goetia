@@ -366,9 +366,11 @@ fn a_sid_is_rejected_under_a_posix_backend() {
 
 // systemd's `Environment=` names ======================================================================================
 
-/// A spec whose `env` holds `key`.
+/// A spec whose `env` holds `key`. Its `command[0]` has no backslash, which a Windows `abs` would write
+/// and a systemd host refuses.
 fn shaped_with_env_key(key: &str) -> ShapedSpec {
     let mut spec = shaped_spec();
+    spec.command = Some(vec!["/bin/frpc".to_string()]);
     spec.env.insert(key.to_string(), "v".to_string());
     spec
 }
@@ -378,14 +380,14 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
         let spec = shaped_with_env_key(key);
         let refused = BackendKind::Systemd
-            .refuse(&spec)
+            .refuse(&spec, &abs("base"))
             .expect_err(&format!("{key:?} must be refused"));
         assert_eq!(refused.field, Some(Field::EnvKey(key.into())));
         let message = Error::from(refused).to_string();
         assert!(message.contains(&format!("{key:?}")), "{message}");
         assert!(message.contains("Environment="), "{message}");
-        assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{key:?}");
-        assert!(BackendKind::Scm.refuse(&spec).is_ok(), "{key:?}");
+        assert!(BackendKind::Launchd.refuse(&spec, &abs("base")).is_ok(), "{key:?}");
+        assert!(BackendKind::Scm.refuse(&spec, &abs("base")).is_ok(), "{key:?}");
 
         let mut warnings = Vec::new();
         BackendKind::Systemd.warn(&spec, &mut warnings);
@@ -396,7 +398,9 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     }
     for key in ["PATH", "_x", "a1_B"] {
         assert!(
-            BackendKind::Systemd.refuse(&shaped_with_env_key(key)).is_ok(),
+            BackendKind::Systemd
+                .refuse(&shaped_with_env_key(key), &abs("base"))
+                .is_ok(),
             "{key:?}"
         );
     }

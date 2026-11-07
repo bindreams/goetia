@@ -388,10 +388,7 @@ fn argv_dollar_sign_is_doubled() {
 
 #[skuld::test]
 fn an_executable_path_with_a_dollar_is_written_literally_and_argv0_separately() {
-    // systemd takes the executable path as written, but runs `$FOO`/`${FOO}` substitution and the
-    // `$$` collapse over argv[0] (measured on 242 and 255). So the path is written undoubled
-    // behind `@`, which makes the next word argv[0], and that word is dollar-doubled. Later
-    // arguments keep the doubling (`argv_dollar_sign_is_doubled`).
+    // `$` in the path: written as `@path argv0` (see `render_exec_start`).
     for (suffix, written) in [
         ("a$b", "@{p}a$b {p}a$$b $$X"),
         ("a${b}", "@{p}a${b} {p}a$${b} $$X"),
@@ -422,8 +419,7 @@ fn an_executable_path_without_a_dollar_gets_no_separate_argv0() {
 
 #[skuld::test]
 fn a_prefix_character_inside_the_executable_is_written_unchanged() {
-    // Only a leading one is a command prefix, and `DaemonSpec::new` guarantees `command[0]` is an
-    // absolute path, so it never leads.
+    // Only a leading one is a command prefix.
     let spec = with_fields(|f| f.command = vec![format!("{PROGRAM}-b@c:d+e!f")]);
     let text = unit(&spec, &minimal_identity()).unwrap();
     assert_eq!(line_of(&text, "ExecStart="), format!("ExecStart={PROGRAM}-b@c:d+e!f"));
@@ -475,10 +471,6 @@ fn percent_is_doubled_in_every_value() {
 }
 
 // Backslashes =========================================================================================================
-//
-// Every expectation below was measured against systemd 242 and 255: a line-ending backslash continues the
-// line, and the reader drops trailing whitespace, so a raw value gets one trailing space; a
-// quoted word reads `\\` as one backslash and needs no guard.
 
 fn with_fields(change: impl FnOnce(&mut DaemonFields)) -> DaemonSpec {
     let mut fields = minimal_spec().into_fields();
@@ -647,8 +639,7 @@ fn no_directive_ends_in_a_line_continuation_and_the_unit_stays_in_order() {
 
 #[skuld::test]
 fn an_executable_path_with_a_backslash_or_quote_is_refused_because_systemd_refuses_to_load_it() {
-    // systemd 255 rejects the unit with "Executable name contains special characters" however the
-    // path is quoted or escaped; there is no encoding to write it in.
+    // Refused: no encoding carries it (see `refuse_unrepresentable`).
     for suffix in [r"\y", r"\", r"\\", "\"y", "'y"] {
         let executable = format!("{PROGRAM}{suffix}");
         let spec = with_fields(|f| f.command = vec![executable.clone()]);
@@ -680,10 +671,6 @@ fn a_later_argument_may_hold_a_backslash_or_quote() {
 }
 
 // Environment names ===================================================================================================
-//
-// Measured on systemd 242 and 255: an `Environment=` assignment whose name is not
-// `[A-Za-z_][A-Za-z0-9_]*` is logged "Invalid environment assignment, ignoring" and dropped, while
-// the unit still loads and starts. Quoting the word does not change that.
 
 #[skuld::test]
 fn an_environment_name_systemd_would_drop_is_refused() {
@@ -733,11 +720,6 @@ fn an_environment_name_systemd_accepts_is_written_and_read_back() {
 }
 
 // Leading and trailing whitespace =====================================================================================
-//
-// Measured against systemd 255: `Description=`, `User=`, `WorkingDirectory=` and the `append:` path
-// are read raw and stripped of leading and trailing space, tab, LF and CR; no quoting, C escape
-// or continuation keeps it. Other whitespace (U+00A0, U+3000, VT, FF) survives. A quoted word keeps
-// all of it, except that an executable path ending in whitespace is not run.
 
 /// `unit` must refuse with a message that names `what` and says systemd strips the whitespace.
 fn assert_refused_as_stripped(result: Result<String, Error>, what: &str, value: &str) {
@@ -816,6 +798,19 @@ fn whitespace_systemd_keeps_is_written_unchanged() {
         f.command = vec![format!("{PROGRAM} b")];
     });
     assert!(unit(&spec, &minimal_identity()).is_ok());
+
+    // An executable path is refused only for a trailing space: other trailing whitespace is written
+    // quoted. (A tab never gets here: it is a control character.)
+    for tail in ["\u{a0}", "\u{3000}"] {
+        let executable = format!("{PROGRAM}{tail}");
+        let spec = with_fields(|f| f.command = vec![executable.clone()]);
+        let text = unit(&spec, &minimal_identity()).unwrap();
+        assert_eq!(
+            line_of(&text, "ExecStart="),
+            format!("ExecStart=\"{executable}\""),
+            "{executable:?}"
+        );
+    }
 }
 
 #[skuld::test]
@@ -840,6 +835,29 @@ fn an_argument_and_an_environment_value_with_edge_whitespace_are_quoted_whole() 
     );
     let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("Environment=")).collect();
     assert_eq!(lines, [r#"Environment="K= v ""#, r#"Environment="L=v ""#]);
+}
+
+// Non-normalized paths ================================================================================================
+
+#[skuld::test]
+fn a_parent_dir_in_a_working_directory_or_log_path_is_refused_because_systemd_refuses_it() {
+    let with_parent = |p: &str| PathBuf::from(format!("{}/../x", abs(p).display()));
+    let cases = [
+        ("`cwd`", with_fields(|f| f.cwd = Some(with_parent("opt/x")))),
+        ("`logs`", with_fields(|f| f.logs = Some(with_parent("var/log")))),
+    ];
+    for (field, spec) in cases {
+        let err = unit(&spec, &minimal_identity()).unwrap_err();
+        let Error::Invalid { daemon, message, .. } = &err else {
+            panic!("{field}: expected Error::Invalid, got {err:?}");
+        };
+        assert_eq!(daemon, "frpc");
+        assert!(message.contains(field), "{field}: {message}");
+        assert!(
+            message.contains("`..`") && message.contains("systemd"),
+            "{field}: {message}"
+        );
+    }
 }
 
 // StartLimitIntervalSec ===============================================================================================

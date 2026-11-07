@@ -93,11 +93,17 @@ impl<'de> Deserialize<'de> for OverrideEntry {
 }
 
 /// Which fields a backend's override actually supplied: provenance the merged spec cannot
-/// carry, so a verdict for one backend (`BackendKind::error`, and the `env` names `BackendKind::refuse`
-/// judges) is not laid on an override that never wrote the value. Only `user` and the `env` names are read.
+/// carry, so a verdict for one backend (`BackendKind::error`, and what `BackendKind::refuse`
+/// judges) is not laid on an override that never wrote the value. Only the fields a verdict can be
+/// about are recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Supplied {
     pub user: bool,
+    pub name: bool,
+    /// `command` as a whole: an override replaces it, never one element.
+    pub command: bool,
+    pub cwd: bool,
+    pub logs: bool,
     /// The `env` names the override wrote.
     pub env: BTreeSet<String>,
 }
@@ -106,6 +112,10 @@ impl Supplied {
     /// No override at all: every field is a base value.
     pub const NONE: Supplied = Supplied {
         user: false,
+        name: false,
+        command: false,
+        cwd: false,
+        logs: false,
         env: BTreeSet::new(),
     };
 
@@ -114,15 +124,13 @@ impl Supplied {
     pub fn supplies(&self, field: &Field) -> bool {
         match field {
             Field::User => self.user,
+            Field::Name => self.name,
+            Field::Command(_) => self.command,
+            Field::Cwd => self.cwd,
+            Field::Logs => self.logs,
             Field::EnvKey(key) => self.env.contains(&**key),
             Field::EnvValue(key) => self.env.contains(key),
-            Field::Name
-            | Field::Command(_)
-            | Field::Cwd
-            | Field::Logs
-            | Field::Restart
-            | Field::RestartDelay
-            | Field::Kind => false,
+            Field::Restart | Field::RestartDelay | Field::Kind => false,
         }
     }
 }
@@ -132,6 +140,10 @@ impl RawOverride {
     pub fn supplied(&self) -> Supplied {
         Supplied {
             user: self.user.is_some(),
+            name: self.name.is_some(),
+            command: self.command.is_some(),
+            cwd: self.cwd.is_some(),
+            logs: self.logs.is_some(),
             env: self.env.iter().flat_map(|env| env.keys().cloned()).collect(),
         }
     }

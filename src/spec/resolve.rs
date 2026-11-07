@@ -162,7 +162,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
             let err = refused.attributed(&from_env);
             if by_override { attribute_to(err, b) } else { err }
         };
-        b.refuse(&shaped).map_err(blame)?;
+        b.refuse(&shaped, base_dir).map_err(blame)?;
         b.warn(&shaped, &mut daemon_warnings);
     }
 
@@ -250,7 +250,7 @@ pub(super) struct Refused {
     /// The field the error is about. `None` for a defect no field's text is to blame for: the
     /// manifest directory's.
     pub(super) field: Option<Field>,
-    err: Error,
+    pub(super) err: Error,
 }
 
 impl Refused {
@@ -1019,7 +1019,7 @@ fn path_defect(path: &Path) -> Option<String> {
 /// The gate every user-supplied string passes before it can be emitted into any artifact. A
 /// control character (above all a newline) can end one systemd directive and start another, and
 /// XML 1.0 cannot represent most C0 control characters at all, so one would make the launchd
-/// plist unparseable. Each defect it catches would be silent if no gate did.
+/// plist unparseable.
 fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     match control_defect(value) {
         Some(defect) => Err(invalid(id, &format!("field `{field}` {defect}"))),

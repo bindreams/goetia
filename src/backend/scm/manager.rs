@@ -121,15 +121,25 @@ use crate::spec::{DaemonSpec, Id, Kind};
 
 // Scm =================================================================================================================
 
-/// The Windows service manager. Holds no state of its own —
-/// every operation opens exactly the SCM/registry handles it needs and
-/// closes them again.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Scm;
+/// The Windows service manager. Every operation opens exactly the SCM/registry handles it needs and
+/// closes them again; the only state is where the shim is, when it is not where [`shim_path`] looks.
+#[derive(Debug, Default, Clone)]
+pub struct Scm {
+    shim: Option<PathBuf>,
+}
 
 impl Scm {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// An `Scm` that registers the shim at `shim`, not at [`shim_path`].
+    pub fn with_shim(shim: PathBuf) -> Self {
+        Self { shim: Some(shim) }
+    }
+
+    fn shim(&self) -> PathBuf {
+        self.shim.clone().unwrap_or_else(shim_path)
     }
 }
 
@@ -218,13 +228,13 @@ impl Backend for Scm {
 
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.user)?;
-        generate::registration(spec, &identity, &shim_path())
+        generate::registration(spec, &identity, &self.shim())
     }
 
     /// The shim path is read once, for the check and the registration alike.
     fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.user)?;
-        generate::install_registration(spec, &identity, &shim_path())
+        generate::install_registration(spec, &identity, &self.shim())
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
@@ -472,7 +482,7 @@ fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Arc<Error>>) -> E
 /// `tests/shim_integration.rs`'s own `main` sets it once, before any test
 /// runs — see that file's doc comment for why a plain `current_exe()`-based
 /// guess cannot find the shim binary from inside a test crate.
-fn shim_path() -> PathBuf {
+pub(crate) fn shim_path() -> PathBuf {
     if let Some(overridden) = std::env::var_os("GOETIA_SHIM_PATH") {
         return PathBuf::from(overridden);
     }

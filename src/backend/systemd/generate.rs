@@ -20,7 +20,7 @@
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Restart, systemd_env_key_defect};
+use crate::spec::{DaemonSpec, Restart, systemd_defect, systemd_raw_value_defect};
 
 // Generation ==========================================================================================================
 
@@ -100,72 +100,25 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
     Ok(out)
 }
 
-/// Refuse the values listed below, each with the measured reason. The list is what is refused,
-/// not everything systemd cannot carry.
-///
-/// - The executable path of `ExecStart=` (after unquoting and specifiers) holding a backslash,
-///   `"` or `'`: systemd refuses the whole unit with "Executable name contains special
-///   characters", however the word was quoted. Later arguments take all three.
-/// - An executable path ending in a space: systemd 255 keeps the path but the service exits with
-///   203/EXEC (242 runs it; both are refused). Interior spaces, other trailing whitespace and
-///   later arguments are fine.
-/// - An `env` key outside `[A-Za-z_][A-Za-z0-9_]*`: systemd logs "Invalid environment
-///   assignment, ignoring" and drops it, and the unit still loads and starts.
-/// - A raw directive (`Description=`, `User=`, `WorkingDirectory=`, the `append:` path) with
-///   leading or trailing whitespace: systemd strips it, and no quote, C escape or line
-///   continuation keeps it. `cwd` and `logs` are absolute, so only their end can be affected.
+/// Refuse what no encoding can carry: the manifest's values ([`systemd_defect`], which lists each rule
+/// with its measurement, and which `resolve` runs too, since a `DaemonSpec` can come from a blob that
+/// never passed it) and the `User=` identity. The list is what is refused, not everything systemd
+/// cannot carry.
 fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error> {
-    let invalid = |message: String| Error::Invalid {
-        daemon: spec.id.to_string(),
-        message,
-        source: None,
-    };
-
-    let executable = &spec.command[0];
-    if executable.contains(['\\', '"', '\'']) {
-        return Err(invalid(format!(
-            "the executable path {executable:?} (`command[0]`) \
-             holds a backslash, double quote or apostrophe, which systemd refuses to load in an \
-             executable path"
-        )));
+    let defect = systemd_defect(spec).or_else(|| systemd_raw_value_defect("User=", &id.user));
+    match defect {
+        Some(message) => Err(Error::Invalid {
+            daemon: spec.id.to_string(),
+            message,
+            source: None,
+        }),
+        None => Ok(()),
     }
-    if executable.ends_with(' ') {
-        return Err(invalid(format!(
-            "the executable path {executable:?} (`command[0]`) \
-             ends in whitespace, which systemd does not run (the service exits with 203/EXEC)"
-        )));
-    }
-    if let Some((_, defect)) = systemd_env_key_defect(&spec.env) {
-        return Err(invalid(defect));
-    }
-
-    let cwd = spec.cwd.as_ref().map(|p| p.display().to_string());
-    let logs = spec.logs.as_ref().map(|p| p.display().to_string());
-    let raw_values = [
-        ("Description=", Some(spec.name.as_str())),
-        ("User=", Some(id.user.as_str())),
-        ("WorkingDirectory=", cwd.as_deref()),
-        ("StandardOutput=/StandardError= append:", logs.as_deref()),
-    ];
-    for (directive, value) in raw_values {
-        let Some(value) = value else { continue };
-        if value.starts_with(STRIPPED_BY_SYSTEMD) || value.ends_with(STRIPPED_BY_SYSTEMD) {
-            return Err(invalid(format!(
-                "{directive} value {value:?} starts or ends with whitespace, which systemd strips from \
-                 this directive; no quoting or escape keeps it"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// The characters systemd reads as a prefix of `ExecStart=`'s first word, after unquoting, and
 /// which quoting does not make literal (measured on 242 and 255).
 const COMMAND_PREFIXES: [char; 5] = ['-', '@', ':', '+', '!'];
-
-/// The characters systemd's line reader strips from both ends of a raw value: space, tab, LF, CR.
-/// VT, FF and Unicode whitespace survive.
-const STRIPPED_BY_SYSTEMD: [char; 4] = [' ', '\t', '\n', '\r'];
 
 /// systemd's `Restart=` vocabulary.
 fn render_restart(restart: Restart) -> &'static str {
@@ -181,8 +134,8 @@ fn render_restart(restart: Restart) -> &'static str {
 /// or wherever an unquoted word would take on a meaning of its own: a bare `;` (systemd's
 /// command-line separator).
 ///
-/// `command[0]` never starts with a command-prefix character (`-@:+!`), which quoting would not
-/// make literal: `DaemonSpec::new` guarantees it is an absolute path, and a Unix one starts with `/`.
+/// `command[0]` is an absolute path (`DaemonSpec::new`), so it never starts with a command-prefix
+/// character (`-@:+!`), which quoting would not make literal.
 ///
 /// Arguments are also dollar-doubled, since systemd substitutes `$FOO`/`${FOO}` and collapses
 /// `$$` there. The executable path is not: systemd takes it as written. But it substitutes in
