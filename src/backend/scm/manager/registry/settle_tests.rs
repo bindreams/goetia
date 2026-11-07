@@ -108,35 +108,29 @@ fn absent_with_the_service_standing_is_its_value() {
     ));
 }
 
-/// The name came from the enumeration of `Services`: a gone service leaves at most a stale row that
-/// the user's own concurrent uninstall explains, so no second open is spent on it.
+/// Something other than a lookup vouches for the name: the enumeration of `Services` listed it (a
+/// gone service leaves at most a stale row, which the user's own concurrent uninstall explains), or
+/// the caller holds an open handle to it (a deleted service is only marked, and its key stays until
+/// the handle closes). No second open is spent on it.
 #[skuld::test]
-fn absent_under_a_listed_name_is_its_value_without_asking_whether_the_service_stands() {
+fn absent_under_a_vouched_name_is_its_value_without_asking_whether_the_service_stands() {
     assert!(matches!(
-        settle(Stop::Absent(7), Origin::Listed, never),
-        Settled::Value(7)
-    ));
-}
-
-/// The caller holds an open handle to the service: a deleted service is only marked, and its key
-/// stays until the handle closes, so a missing optional key cannot mean the service is gone.
-#[skuld::test]
-fn absent_under_a_held_service_is_its_value_without_asking_whether_the_service_stands() {
-    assert!(matches!(
-        settle(Stop::Absent(7), Origin::Held, never),
+        settle(Stop::Absent(7), Origin::Vouched, never),
         Settled::Value(7)
     ));
 }
 
 #[skuld::test]
-fn a_vanish_under_a_listed_name_still_asks_whether_the_service_stands() {
+fn a_vanish_under_a_vouched_name_still_asks_whether_the_service_stands() {
     assert!(matches!(
-        settle(Stop::<i32>::Vanished(failure(KEY_DELETED)), Origin::Listed, || Ok(
+        settle(Stop::<i32>::Vanished(failure(KEY_DELETED)), Origin::Vouched, || Ok(
             false
         )),
         Settled::Gone
     ));
-    match settle(Stop::<i32>::Vanished(failure(KEY_DELETED)), Origin::Listed, || Ok(true)) {
+    match settle(Stop::<i32>::Vanished(failure(KEY_DELETED)), Origin::Vouched, || {
+        Ok(true)
+    }) {
         Settled::Failed(f) => assert_eq!(code_of(&f), Some(KEY_DELETED)),
         other => panic!("expected Failed, got {other:?}"),
     }

@@ -14,13 +14,16 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Wdk::Foundation::{NtClose, OBJECT_ATTRIBUTES};
 use windows_sys::Wdk::System::Registry::{
-    KeyBasicInformation, NtCreateKey, NtDeleteKey, NtDeleteValueKey, NtEnumerateKey, NtOpenKey,
+    KeyBasicInformation, KeyFlagsInformation, NtCreateKey, NtDeleteKey, NtDeleteValueKey, NtEnumerateKey, NtOpenKey,
+    NtQueryKey,
 };
 use windows_sys::Win32::Foundation::{
     HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_OPENLINK, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::System::Registry::{KEY_ENUMERATE_SUB_KEYS, REG_OPTION_NON_VOLATILE};
 use winreg::RegKey;
+
+use super::settle::is_gone;
 
 /// The access right to delete a key (`winnt.h`).
 const DELETE: u32 = 0x0001_0000;
@@ -56,15 +59,55 @@ pub(super) fn delete_value(key: &RegKey, name: &[u16]) -> io::Result<()> {
 ///
 /// A child is opened as the key it is: a registry link is deleted itself, never followed, so what
 /// it points at is neither entered nor removed. The walk is through `ntdll` alone, so a name at
-/// any depth keeps a NUL. `NotFound` is the top-level subkey not being there; one that vanishes
-/// below it, between the listing of its parent and its open, is gone already and not an error.
+/// any depth keeps a NUL. A key that is not there, or is deleted, at its open, its listing or its
+/// delete, at any depth, is gone already, which is what this wants: not an error.
 pub(super) fn delete_subkey(key: &RegKey, name: &[u16]) -> io::Result<()> {
-    delete_tree(open_raw(key.raw_handle(), name, CHILD_ACCESS)?)
+    match open_raw(key.raw_handle(), name, CHILD_ACCESS) {
+        Ok(child) => delete_tree(child),
+        Err(e) => gone_is_done(Err(e)),
+    }
 }
 
-/// Opens the subkey of `key` named `name` as the key it is, a registry link included.
-pub(super) fn open_child(key: &RegKey, name: &[u16], access: u32) -> io::Result<RegKey> {
-    Ok(open_raw(key.raw_handle(), name, access)?.into_key())
+/// `result`, except that a key not found or deleted is done: the goal of a delete is absent.
+fn gone_is_done(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if is_gone(&e) => Ok(()),
+        other => other,
+    }
+}
+
+/// Opens the subkey of the key `parent` named `name`, which may be a path of names, as the last of
+/// them is: a registry link included. `parent` is an open key, whose own access is not asked.
+pub(super) fn open_child(parent: HANDLE, name: &[u16], access: u32) -> io::Result<RegKey> {
+    Ok(open_raw(parent, name, access)?.into_key())
+}
+
+/// `REG_FLAG_LINK` (`ntregapi.h`): the key is a registry link.
+const REG_FLAG_LINK: u32 = 0x0002;
+
+/// Whether `key`, opened with `KEY_QUERY_VALUE`, is a registry link, by its own flags: not by a
+/// value it may hold, which a key can hold without being a link and a link can lack.
+pub(super) fn is_link(key: &RegKey) -> io::Result<bool> {
+    // `KEY_FLAGS_INFORMATION`: the Wow64 flags, the key's flags, the control flags.
+    let mut flags = [0u32; 3];
+    let mut written = 0u32;
+    // SAFETY: `key` holds an open handle; `flags` is 12 writable bytes; `written` is a valid
+    // out-param.
+    checked(unsafe {
+        NtQueryKey(
+            key.raw_handle(),
+            KeyFlagsInformation,
+            flags.as_mut_ptr().cast(),
+            size_of_val(&flags) as u32,
+            &mut written,
+        )
+    })?;
+    Ok(link_flag(flags))
+}
+
+/// The decision of [`is_link`], from the flags `NtQueryKey` wrote.
+fn link_flag(flags: [u32; 3]) -> bool {
+    flags[1] & REG_FLAG_LINK != 0
 }
 
 /// Creates the subkey of `key` named `name`, or opens it if it exists, as the key it is: an
@@ -134,18 +177,21 @@ fn open_raw(parent: HANDLE, name: &[u16], access: u32) -> io::Result<Opened> {
     Ok(Opened(handle))
 }
 
-/// Deletes the open `child`, everything under it first. Its values go with it.
+/// Deletes the open `child`, everything under it first. Its values go with it. A key that is gone
+/// by then, at its listing, below it or at its delete, is done.
 fn delete_tree(child: Opened) -> io::Result<()> {
-    for grandchild in child_names(child.0)? {
+    let names = match child_names(child.0) {
+        Ok(names) => names,
+        Err(e) => return gone_is_done(Err(e)),
+    };
+    for grandchild in names {
         match open_raw(child.0, &grandchild, CHILD_ACCESS) {
             Ok(grandchild) => delete_tree(grandchild)?,
-            // Gone since the listing: what this wanted.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(e) => gone_is_done(Err(e))?,
         }
     }
     // SAFETY: `child` holds an open handle with `DELETE`.
-    checked(unsafe { NtDeleteKey(child.0) })
+    gone_is_done(checked(unsafe { NtDeleteKey(child.0) }))
 }
 
 /// The name of every subkey of the open `key`, by counted name.

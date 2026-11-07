@@ -59,3 +59,31 @@ fn a_key_name_read_back_keeps_a_nul_and_what_follows_it() {
 
     assert_eq!(basic_name(&basic_information(&name)), name);
 }
+
+const REG_FLAG_VOLATILE: u32 = 0x0001;
+const ERROR_KEY_DELETED: i32 = 1018;
+const ERROR_ACCESS_DENIED: i32 = 5;
+
+/// `KEY_FLAGS_INFORMATION`: the Wow64 flags, the key's flags, the control flags.
+#[skuld::test]
+fn a_key_is_a_link_when_its_own_flags_say_so_whatever_else_is_set() {
+    assert!(link_flag([0, REG_FLAG_LINK, 0]));
+    assert!(link_flag([7, REG_FLAG_LINK | REG_FLAG_VOLATILE, 7]));
+}
+
+/// A link is told from its flag alone: a key that merely holds a value named `SymbolicLinkValue`
+/// has no such flag, and a link that holds no such value still has it.
+#[skuld::test]
+fn a_key_without_the_link_flag_is_not_a_link() {
+    assert!(!link_flag([0, 0, 0]));
+    assert!(!link_flag([REG_FLAG_LINK, REG_FLAG_VOLATILE, REG_FLAG_LINK]));
+}
+
+#[skuld::test]
+fn a_key_gone_or_deleted_is_done_and_any_other_failure_is_not() {
+    assert!(gone_is_done(Ok(())).is_ok());
+    assert!(gone_is_done(Err(io::Error::from_raw_os_error(2))).is_ok());
+    assert!(gone_is_done(Err(io::Error::from_raw_os_error(ERROR_KEY_DELETED))).is_ok());
+    let denied = gone_is_done(Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED))).unwrap_err();
+    assert_eq!(denied.raw_os_error(), Some(ERROR_ACCESS_DENIED));
+}

@@ -25,8 +25,8 @@ impl Failure {
 /// Why one pass of a read did not complete.
 #[derive(Debug)]
 pub(super) enum Stop<T> {
-    /// The key a service may lack was not found at open. `T` is what that reads as for a service
-    /// that stands without it.
+    /// The key a service may lack was not found at open, which does not say whether the service
+    /// key above it is there. `T` is what that reads as for a service that stands without it.
     Absent(T),
     /// A key was not found or marked deleted, where a service that stands has it. The failure is
     /// what the read reports if the service stands.
@@ -72,7 +72,7 @@ pub(super) enum Settled<T> {
 }
 
 /// Whether `e` says the key is not there: not found, or deleted and held open by another process.
-fn is_gone(e: &io::Error) -> bool {
+pub(super) fn is_gone(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(ERROR_KEY_DELETED as i32)
 }
 
@@ -88,23 +88,21 @@ pub(super) fn stands(opened: io::Result<()>) -> io::Result<bool> {
 }
 
 /// What vouches that the service stands, for a read that finds an optional key missing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     /// No enumeration vouches for the name: the service was looked up by name, so a missing
     /// optional key may mean it is gone, and the read asks.
     Opened,
-    /// The name came from the enumeration of `Services`. A missing optional key is then taken as the
-    /// service standing without it: a service that is gone leaves at most a stale row, which the
-    /// user's own concurrent uninstall explains.
-    Listed,
-    /// The caller holds an open handle to the service. A deleted service is only marked, and its key
-    /// stays until the handle closes, so a missing optional key is the service standing without it.
-    /// Not [`Origin::Listed`]: that one's reason is a stale row, this one's is the handle.
-    Held,
+    /// Something other than a lookup vouches for the name: the enumeration of `Services` listed it,
+    /// or the caller holds an open handle to the service. A missing optional key, or a service key
+    /// that is gone, is then taken as the service standing without it: a service that is gone
+    /// leaves at most a stale row, which the user's own concurrent uninstall explains, and a
+    /// deleted service that is held is only marked, its key staying until the handle closes.
+    Vouched,
 }
 
 /// Resolves `stop`; `service_stands` runs for `Vanished`, and for `Absent` unless the name is
-/// [`Origin::Listed`] or [`Origin::Held`].
+/// [`Origin::Vouched`].
 pub(super) fn settle<T>(
     stop: Stop<T>,
     origin: Origin,
@@ -112,7 +110,7 @@ pub(super) fn settle<T>(
 ) -> Settled<T> {
     let (stands, on_standing) = match stop {
         Stop::Other(failure) => return Settled::Failed(failure),
-        Stop::Absent(value) if matches!(origin, Origin::Listed | Origin::Held) => return Settled::Value(value),
+        Stop::Absent(value) if origin == Origin::Vouched => return Settled::Value(value),
         Stop::Absent(value) => (service_stands(), Settled::Value(value)),
         Stop::Vanished(failure) => (service_stands(), Settled::Failed(failure)),
     };

@@ -1,5 +1,6 @@
 use super::*;
 
+use winreg::enums::{KEY_CREATE_SUB_KEY, KEY_SET_VALUE};
 use winreg::types::ToRegValue as _;
 
 #[skuld::test]
@@ -16,6 +17,24 @@ fn parameters_key_path_is_the_service_key_plus_parameters() {
         parameters_key_path("goetia-test"),
         r"SYSTEM\CurrentControlSet\Services\goetia-test\Parameters"
     );
+}
+
+/// The access right to delete a key (`winnt.h`).
+const DELETE_ACCESS: u32 = 0x0001_0000;
+
+/// A read opens `Parameters` in one open, relative to `Services`, and asks nothing of the service
+/// key it passes through, which a service that is not goetia's may deny to the reader.
+#[skuld::test]
+fn parameters_are_opened_in_one_step_below_services_for_reading_only() {
+    assert_eq!(
+        parameters_relative_name("goetia-test"),
+        utf16(r"goetia-test\Parameters")
+    );
+    assert_eq!(
+        PARAMETERS_READ_ACCESS & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE_ACCESS),
+        0
+    );
+    assert_eq!(PARAMETERS_READ_ACCESS, KEY_READ);
 }
 
 fn utf16(s: &str) -> Vec<u16> {
@@ -62,21 +81,6 @@ fn a_field_is_named_as_the_enumeration_stored_it() {
 #[skuld::test]
 fn a_field_the_enumeration_missed_is_named_as_goetia_spells_it() {
     assert_eq!(stored_name(&[entry("Stray")], "Spec"), utf16("Spec"));
-}
-
-/// A link key opened as itself holds the `REG_LINK` value `SymbolicLinkValue`; a key that does not,
-/// or holds a value of that name of another type, is a key.
-#[skuld::test]
-fn a_key_is_a_link_when_it_holds_a_reg_link_symbolic_link_value() {
-    assert!(is_link(Ok(REG_LINK)).unwrap());
-    assert!(!is_link(Ok(1)).unwrap());
-    assert!(!is_link(Err(std::io::Error::from(std::io::ErrorKind::NotFound))).unwrap());
-}
-
-#[skuld::test]
-fn a_failed_look_for_the_symbolic_link_value_is_that_failure_not_a_key() {
-    let e = is_link(Err(std::io::Error::from_raw_os_error(5))).unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(5));
 }
 
 const NOT_FOUND: i32 = 2;
@@ -339,7 +343,7 @@ fn a_parameters_read_that_did_not_complete_is_undetermined() {
 fn the_services_key_enumerates_and_finishes() {
     let mut names = Vec::new();
 
-    let incomplete = scan_services(|name| names.push(name));
+    let incomplete = scan_services(|name, _| names.push(name));
 
     assert!(!names.is_empty(), "every Windows host runs services: {names:?}");
     assert!(
@@ -355,7 +359,7 @@ fn the_services_key_enumerates_and_finishes() {
 fn a_services_key_that_does_not_exist_is_an_empty_settled_scan() {
     let mut names = Vec::new();
 
-    let incomplete = scan_names_under(&format!(r"{SERVICES_KEY}\goetia-no-such-key-b6f0a1c2"), |name| {
+    let incomplete = scan_names_under(&format!(r"{SERVICES_KEY}\goetia-no-such-key-b6f0a1c2"), |name, _| {
         names.push(name)
     });
 
@@ -391,7 +395,7 @@ fn a_services_key_that_will_not_open_leaves_the_pass_unfinished() {
     );
     let mut names = Vec::new();
 
-    let incomplete = scan_names_under("SECURITY", |name| names.push(name));
+    let incomplete = scan_names_under("SECURITY", |name, _| names.push(name));
 
     assert!(names.is_empty(), "{names:?}");
     match incomplete {

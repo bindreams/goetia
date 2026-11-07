@@ -14,7 +14,7 @@ use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User}
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows_sys::Wdk::System::Registry::{NtCreateKey, NtSetValueKey};
+use windows_sys::Wdk::System::Registry::{KeyFlagsInformation, NtCreateKey, NtQueryKey, NtSetValueKey};
 use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, OBJ_OPENLINK, UNICODE_STRING};
 use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
 
@@ -899,6 +899,27 @@ fn create_raw_key(parent: &winreg::RegKey, name: &[u16], options: u32) -> winreg
     winreg::RegKey::predef(handle)
 }
 
+/// Whether `key`, opened as itself, is a registry link: `REG_FLAG_LINK` in the key's own flags
+/// (`KEY_FLAGS_INFORMATION`: Wow64 flags, key flags, control flags).
+fn is_registry_link(key: &winreg::RegKey) -> bool {
+    const REG_FLAG_LINK: u32 = 0x0002;
+    let mut flags = [0u32; 3];
+    let mut written = 0u32;
+    // SAFETY: `key` holds an open handle; `flags` is 12 writable bytes; `written` is a valid
+    // out-param.
+    let status = unsafe {
+        NtQueryKey(
+            key.raw_handle(),
+            KeyFlagsInformation,
+            flags.as_mut_ptr().cast(),
+            size_of_val(&flags) as u32,
+            &mut written,
+        )
+    };
+    assert!(status >= 0, "query a key's flags: NTSTATUS {status:#x}");
+    flags[1] & REG_FLAG_LINK != 0
+}
+
 /// A key under `HKLM\SOFTWARE` removed on drop, for a registry link to point at.
 struct LinkTarget {
     path: String,
@@ -976,7 +997,6 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
     let _guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, &id);
     let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
-    let sz = |text: &str| -> Vec<u8> { units(text).into_iter().chain([0]).flat_map(u16::to_le_bytes).collect() };
     let (target, target_key) = LinkTarget::create(&id);
     target_key.set_value("Keep", &"x").expect("write Keep");
     target_key.set_value("Marker", &"not goetia's").expect("write Marker");
@@ -989,7 +1009,11 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
     let service = service_key(&id, KEY_READ | KEY_WRITE);
     service.delete_subkey_all("Parameters").expect("remove Parameters");
     let link = create_raw_key(&service, &units("Parameters"), REG_OPTION_CREATE_LINK);
-    let link_value = sz(&target.nt_path());
+    // No closing NUL, which is how a link's target is stored, so that the link resolves.
+    let link_value: Vec<u8> = units(&target.nt_path())
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
     set_raw_value(&link, &units("SymbolicLinkValue"), REG_LINK, &link_value);
     for (name, value) in fields {
         set_raw_value(&link, &units(&name), value.vtype as u32, &value.bytes);
@@ -1004,11 +1028,14 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
         target_key.get_value::<String, _>("Marker").expect("read Marker"),
         "not goetia's"
     );
-    let parameters = parameters_key(&id, KEY_READ);
-    assert!(
-        parameters.get_value::<String, _>("Marker").is_ok(),
-        "a real Parameters holds goetia's Marker"
-    );
+    // Opened as itself, which `parameters_key` does not: it would follow a link.
+    let service = service_key(&id, KEY_READ | KEY_WRITE);
+    let parameters = create_raw_key(&service, &units("Parameters"), 0);
+    assert!(!is_registry_link(&parameters), "Parameters is still a link");
+    let marker: String = parameters
+        .get_value("Marker")
+        .expect("a real Parameters holds a Marker");
+    assert_ne!(marker, "not goetia's", "Parameters holds goetia's Marker");
 }
 
 /// `RegDeleteTreeW` below the top level stops at a NUL, so a stray subkey holding a child named

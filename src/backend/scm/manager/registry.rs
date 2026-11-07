@@ -11,8 +11,8 @@
 use std::collections::BTreeMap;
 use std::os::windows::ffi::OsStrExt as _;
 
-use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
-use windows_sys::Win32::System::Registry::{REG_LINK, REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
+use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 
@@ -29,8 +29,8 @@ use settle::{Failure, Settled, Stop, settle, stands};
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
 const PARAMETERS_KEY: &str = "Parameters";
-/// The value a registry link holds, naming its target.
-const LINK_VALUE: &str = "SymbolicLinkValue";
+/// The access `Parameters` is opened with for a read.
+const PARAMETERS_READ_ACCESS: u32 = KEY_READ;
 
 fn service_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}")
@@ -43,6 +43,16 @@ fn parameters_key_path(name: &str) -> String {
 fn parameters_key_name() -> Vec<u16> {
     PARAMETERS_KEY.encode_utf16().collect()
 }
+
+/// `Parameters` of `name` as a path below `Services`, for one open that passes the service key
+/// without opening it.
+fn parameters_relative_name(name: &str) -> Vec<u16> {
+    format!(r"{name}\{PARAMETERS_KEY}").encode_utf16().collect()
+}
+
+/// An open `Services` key, which a read opens one service's `Parameters` below. Valid for as long as
+/// the key it was made from is open.
+pub struct ServicesRoot(HANDLE);
 
 /// What did not complete, as facts, with no claim about any id attached. Every registry failure
 /// is built here — single-id reads, [`registry_undetermined`] and the `list` scan — so one
@@ -116,9 +126,11 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///
 /// - A service with no `Parameters` key reads as empty `Parameters`, so `generate::extract` finds
 ///   no marker and the service is `Ownership::Foreign`. This covers a service goetia never touched
-///   and one whose install crashed between `CreateServiceW` and the metadata write. Unless `origin`
-///   vouches for it, the service key is opened to check that it stands: gone, the read is
-///   [`RegistryReadOutcome::ServiceGone`].
+///   and one whose install crashed between `CreateServiceW` and the metadata write. `Parameters` is
+///   opened in one step below `Services`, so the service key is never opened, and a service whose
+///   own key denies the reader is read as any other. A key not found does not say whether the
+///   service key is there: unless `origin` vouches for it, that key is opened to check that it
+///   stands, and gone, the read is [`RegistryReadOutcome::ServiceGone`].
 /// - [`RegistryReadOutcome::ServiceGone`] when the service key is gone, whether the read found it
 ///   so at the start or lost the `Parameters` key under it.
 /// - [`registry_undetermined`] for every other failure, among them a key that vanishes or is marked
@@ -130,18 +142,25 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 /// no `Parameters`, and reads it as Foreign. A concurrent uninstall can leave this window open;
 /// goetia does not guard against it (owner, 2026-11-03).
 pub fn read_parameters(name: &str, origin: Origin) -> Result<RegistryReadOutcome<Parameters>> {
-    let service_path = service_key_path(name);
+    let services = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(SERVICES_KEY, KEY_READ)
+        .map_err(|e| registry_undetermined(name, "open", SERVICES_KEY, e))?;
+    read_parameters_in(&ServicesRoot(services.raw_handle()), name, origin)
+}
+
+/// [`read_parameters`] below a `Services` key that is already open, as a scan holds one.
+pub fn read_parameters_in(
+    services: &ServicesRoot,
+    name: &str,
+    origin: Origin,
+) -> Result<RegistryReadOutcome<Parameters>> {
     let path = parameters_key_path(name);
     read_settled(
         origin,
         || service_stands(name),
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
-            // Not found here is the service gone, not the key a service may lack.
-            let service = RegKey::predef(HKEY_LOCAL_MACHINE)
-                .open_subkey_with_flags(&service_path, KEY_READ)
-                .map_err(|e| Stop::at_open(failure("open", &service_path, e), None))?;
-            let key = counted::open_child(&service, &parameters_key_name(), KEY_READ)
+            let key = counted::open_child(services.0, &parameters_relative_name(name), PARAMETERS_READ_ACCESS)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), Some(Parameters::default())))?;
             let mut parameters = Parameters::default();
             // The names as stored, for a field found not to be a string.
@@ -293,7 +312,7 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
         .collect::<std::io::Result<_>>()
         .map_err(|e| registry_error("enumerate subkeys of", &path, e))?;
     for subkey in &subkeys {
-        tolerate_not_found(counted::delete_subkey(&key, subkey))
+        counted::delete_subkey(&key, subkey)
             .map_err(|e| registry_error(&format!("delete subkey \"{}\" under", shown_name(subkey)), &path, e))?;
     }
     Ok(())
@@ -313,22 +332,12 @@ fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
     let name = parameters_key_name();
     let access = KEY_READ | KEY_WRITE;
     let key = counted::create_child(service, &name, access)?;
-    if !is_link(query_raw_value(&key, LINK_VALUE, &mut Vec::new()))? {
+    if !counted::is_link(&key)? {
         return Ok(key);
     }
     drop(key);
-    tolerate_not_found(counted::delete_subkey(service, &name))?;
+    counted::delete_subkey(service, &name)?;
     counted::create_child(service, &name, access)
-}
-
-/// Whether a key is a registry link, from the type of its `SymbolicLinkValue`: a link holds that
-/// value as `REG_LINK`, and a key holds none, or one of another type.
-fn is_link(link_value_type: std::io::Result<u32>) -> std::io::Result<bool> {
-    match link_value_type {
-        Ok(vtype) => Ok(vtype == REG_LINK),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
 }
 
 /// NotFound is success: the goal state is absent.
@@ -460,19 +469,23 @@ pub fn write_environment(name: &str, lines: &[String]) -> Result<()> {
 
 /// Hands every service currently registered with SCM to `keep`, and returns the entry for what the
 /// pass did not reach, if anything (see [`flow::scan`]).
-pub fn scan_services(keep: impl FnMut(String)) -> Option<Installed> {
+pub fn scan_services(keep: impl FnMut(String, &ServicesRoot)) -> Option<Installed> {
     scan_names_under(SERVICES_KEY, keep)
 }
 
 /// [`scan_services`] over another key: `Services` opens on every host that boots, so another key
 /// is the only way a test reaches an open that fails, or finds nothing.
-fn scan_names_under(path: &str, keep: impl FnMut(String)) -> Option<Installed> {
+fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot)) -> Option<Installed> {
     flow::scan(
         path,
         RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(path, KEY_READ),
-        |key| Box::new(key.enum_keys()),
+        |key| {
+            // Each name carries the handle of the key it was listed under, open until the scan ends.
+            let handle = key.raw_handle();
+            Box::new(key.enum_keys().map(move |name| name.map(|name| (name, handle))))
+        },
         |op, source| registry_error(op, path, source),
-        keep,
+        |(name, handle)| keep(name, &ServicesRoot(handle)),
     )
 }
 

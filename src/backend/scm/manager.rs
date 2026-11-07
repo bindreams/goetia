@@ -230,7 +230,7 @@ impl Backend for Scm {
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), e)),
         };
         // `service` is open: the service key outlives it, so no second open asks whether it stands.
-        Ok(match registry::read_parameters(id.as_str(), Origin::Held)? {
+        Ok(match registry::read_parameters(id.as_str(), Origin::Vouched)? {
             RegistryReadOutcome::ServiceGone => ReadOutcome::Absent,
             RegistryReadOutcome::Read(parameters) => read_marker(parameters, Some(service)).named(id, ScmSnapshot::new),
         })
@@ -280,14 +280,14 @@ impl Backend for Scm {
     fn scan(&self) -> Scan<ScmSnapshot> {
         let mut entries = Vec::new();
         let mut unreadable: Vec<Unreadable> = Vec::new();
-        let incomplete = registry::scan_services(|name| {
+        let incomplete = registry::scan_services(|name, services| {
             // A registry read failure for one unrelated service (e.g. a driver whose `Parameters`
             // key carries a restrictive ACL) must not take `list` down for every other daemon. It
             // leaves us unable to tell whether `name` carries goetia's marker at all, so it is
             // neither omitted nor claimed: collected whole here, reported by
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
-            match registry::read_parameters(&name, Origin::Listed) {
+            match registry::read_parameters_in(services, &name, Origin::Vouched) {
                 // Gone since `scan_services` listed it: not there to list.
                 Ok(RegistryReadOutcome::ServiceGone) => {}
                 Ok(RegistryReadOutcome::Read(params)) => {
