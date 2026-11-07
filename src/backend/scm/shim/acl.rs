@@ -298,7 +298,9 @@ mod system {
     use std::path::{Component, Path, PathBuf};
 
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
+    };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid,
         GetSecurityDescriptorControl, IsValidSid, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
@@ -538,85 +540,98 @@ mod system {
             .open(path)
     }
 
-    /// The owner and DACL of an object on a volume that keeps ACLs ([`require_acls`]).
-    pub(crate) fn read_object(file: &File, path: PathBuf) -> Result<ObjectSecurity> {
-        let handle = file.as_raw_handle() as HANDLE;
+    /// What `GetSecurityInfo` returned for one object: the owner, and the DACL when it was asked for,
+    /// which point into a descriptor the call allocated and this frees on drop. Read them only while
+    /// it is live.
+    struct SecurityInfo {
+        owner: PSID,
+        dacl: *mut ACL,
+        descriptor: *mut c_void,
+    }
 
-        let mut owner: PSID = std::ptr::null_mut();
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut descriptor: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `handle` is open, with `READ_CONTROL`, for as long as `file` is borrowed; the
-        // out-pointers are valid lvalues. On success `descriptor` owns the memory `owner` and
-        // `dacl` point into, and is freed below.
+    impl Drop for SecurityInfo {
+        fn drop(&mut self) {
+            // SAFETY: `descriptor` is null (a failed call allocated nothing, and `LocalFree` ignores
+            // null) or was allocated by `GetSecurityInfo`, and is freed once, here, after the last read
+            // of what points into it.
+            unsafe {
+                LocalFree(self.descriptor);
+            }
+        }
+    }
+
+    /// The owner, and the DACL if `information` includes it, of `handle`, an open object of `kind`
+    /// with `READ_CONTROL`. `what` and `label` stand for the call and the object in an error.
+    fn security_info(
+        handle: HANDLE,
+        kind: SE_OBJECT_TYPE,
+        information: u32,
+        what: &str,
+        label: &Path,
+    ) -> Result<SecurityInfo> {
+        let mut info = SecurityInfo {
+            owner: std::ptr::null_mut(),
+            dacl: std::ptr::null_mut(),
+            descriptor: std::ptr::null_mut(),
+        };
+        let wants_dacl = information & DACL_SECURITY_INFORMATION != 0;
+        // SAFETY: `handle` is open with `READ_CONTROL` for the call; the out-pointers are valid
+        // lvalues of `info`, which frees the descriptor `descriptor` receives, and the DACL's is null
+        // when none was asked for.
         let status = unsafe {
             GetSecurityInfo(
                 handle,
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner,
+                kind,
+                information,
+                &mut info.owner,
                 std::ptr::null_mut(),
-                &mut dacl,
+                if wants_dacl {
+                    &mut info.dacl
+                } else {
+                    std::ptr::null_mut()
+                },
                 std::ptr::null_mut(),
-                &mut descriptor,
+                &mut info.descriptor,
             )
         };
         if status != ERROR_SUCCESS {
-            return Err(Error::os_at(
-                "read the permissions of",
-                path,
-                io::Error::from_raw_os_error(status as i32),
-            ));
+            return Err(Error::os_at(what, label, io::Error::from_raw_os_error(status as i32)));
         }
+        Ok(info)
+    }
+
+    /// The owner and DACL of an object on a volume that keeps ACLs ([`require_acls`]).
+    pub(crate) fn read_object(file: &File, path: PathBuf) -> Result<ObjectSecurity> {
+        let handle = file.as_raw_handle() as HANDLE;
+        let info = security_info(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            "read the permissions of",
+            &path,
+        )?;
         let directory = file.metadata().map(|metadata| {
             std::os::windows::fs::MetadataExt::file_attributes(&metadata) & FILE_ATTRIBUTE_DIRECTORY != 0
         });
-        // SAFETY: `owner` and `dacl` point into `descriptor`, which is live until the free below.
-        let object = match directory {
-            Ok(directory) => unsafe { describe(descriptor, owner, dacl, path, directory) },
+        match directory {
+            // SAFETY: `owner` and `dacl` point into `descriptor`, which `info` keeps live.
+            Ok(directory) => unsafe { describe(info.descriptor, info.owner, info.dacl, path, directory) },
             Err(e) => Err(Error::os_at("read the type of", path, e)),
-        };
-        // SAFETY: `descriptor` was allocated by `GetSecurityInfo` and is freed once, after the
-        // last read of what points into it.
-        unsafe {
-            LocalFree(descriptor);
         }
-        object
     }
 
     /// The owner of the kernel object `handle` (a mutex, say), which must be open with
     /// `READ_CONTROL`. `name` stands for the object in an error.
     pub(crate) fn kernel_object_owner(handle: HANDLE, name: &Path) -> Result<Sid> {
-        let mut owner: PSID = std::ptr::null_mut();
-        let mut descriptor: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `handle` is open with `READ_CONTROL` for the call; the out-pointers are valid
-        // lvalues. On success `descriptor` owns the memory `owner` points into, freed below.
-        let status = unsafe {
-            GetSecurityInfo(
-                handle,
-                SE_KERNEL_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                &mut owner,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(Error::os_at(
-                "read the owner of",
-                name,
-                io::Error::from_raw_os_error(status as i32),
-            ));
-        }
-        // SAFETY: `owner` points into `descriptor`, which is live until the free below.
-        let copied = unsafe { copy_sid(owner, name) };
-        // SAFETY: `descriptor` was allocated by `GetSecurityInfo` and is freed once, after the last
-        // read of what points into it.
-        unsafe {
-            LocalFree(descriptor);
-        }
-        copied
+        let info = security_info(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            "read the owner of",
+            name,
+        )?;
+        // SAFETY: `owner` points into `descriptor`, which `info` keeps live.
+        unsafe { copy_sid(info.owner, name) }
     }
 
     /// Copies the owner, the DACL and whether it is protected out of a security descriptor of a
