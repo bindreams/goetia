@@ -129,7 +129,15 @@ mod stock {
         /// path of `referenced` names, and removes `dir` when that leaves it empty and it is the
         /// default folder; see [`sweep_folder`].
         fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
-            sweep_folder(absolute(&self.dir()?)?, referenced, default_dir)
+            match &self.dir {
+                Some(dir) => sweep_folder(absolute(dir)?, referenced, default_dir),
+                // The folder is the default one: the lookup that found it is the answer to the
+                // question of where the default folder is.
+                None => {
+                    let dir = default_dir()?;
+                    sweep_folder(&dir, referenced, || Ok(dir.clone()))
+                }
+            }
         }
     }
 
