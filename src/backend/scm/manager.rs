@@ -541,7 +541,7 @@ impl Backend for Scm {
             &mut actor,
             deadline,
             held,
-            |held| held.terminate().map_err(|e| terminate_failed(held.pid(), e)),
+            |held| held.terminate(),
             |held, deadline| {
                 held.wait_for_exit(deadline, || {
                     if unbounded {
@@ -1095,15 +1095,6 @@ fn holding<R>(
     hold(&mut target).map_err(|e| not_done(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)))
 }
 
-/// The error of a terminate of the process `pid` that failed after SCM had recorded the service
-/// `STOPPED`: the service is stopped, and the error must not read as a failed stop.
-fn terminate_failed(pid: u32, e: std::io::Error) -> std::io::Error {
-    crate::error::within(
-        format!("the service is stopped, but terminating its process {pid} failed"),
-        e,
-    )
-}
-
 /// The error of a `stop` whose hold expired and whose STOP was sent with nothing held: the
 /// [`WaitTimeout`](Error::WaitTimeout) of a stop SCM did not confirm, led by what makes it so.
 fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
@@ -1169,11 +1160,9 @@ impl Scm {
         };
         if let Some(held) = held {
             // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
-            // ended, through the handle held since before the stop.
-            if let Err(e) = held.terminate() {
-                failures.push(Error::os(format!("terminate `{id}`'s process {}", held.pid()), e).into());
-                return finish(failures);
-            }
+            // ended, through the handle held since before the stop. A terminate that fails is not
+            // an error, as for `stop`: the process is on its way out by itself, and the wait decides.
+            let _ = held.terminate();
             match held.wait_for_exit(Budget::Unbounded.start(), || held.notice(id.as_str())) {
                 Ok(Waited::Confirmed) => {}
                 Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),

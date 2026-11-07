@@ -634,21 +634,38 @@ fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
     assert_eq!(outcome.unwrap_err().to_string(), "wait failed");
 }
 
-/// A terminate that fails is the stop's error, and the process is not waited for: nothing says it
-/// is on its way out.
+/// SCM has confirmed `STOPPED`, so a terminate that fails is not a failed stop: the shim exits on
+/// its own just after it reports `STOPPED`, and the wait for the process decides, whatever it says.
 #[skuld::test]
-fn stop_and_await_exit_reports_a_failed_terminate_and_does_not_wait() {
-    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+fn stop_and_await_exit_goes_on_to_wait_after_a_failed_terminate() {
+    let terminate_fails = |_: &u32| Err(io::Error::other("terminate failed"));
 
+    for (waited, expected) in [
+        (Ok(Waited::Confirmed), StopAndAwaitExitOutcome::Stopped),
+        (Ok(Waited::Expired), StopAndAwaitExitOutcome::ProcessExpired(7)),
+    ] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+
+        let outcome = stop_and_await_exit(
+            &mut fake,
+            unbounded(),
+            HoldOutcome::Held(7u32),
+            terminate_fails,
+            |_, _| waited,
+        );
+
+        assert_eq!(outcome.unwrap(), expected);
+    }
+
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
     let outcome = stop_and_await_exit(
         &mut fake,
         unbounded(),
         HoldOutcome::Held(7u32),
-        |_| Err(io::Error::other("terminate failed")),
-        |_, _| panic!("a process that could not be terminated is not waited for"),
+        terminate_fails,
+        |_, _| Err(io::Error::other("wait failed")),
     );
-
-    assert_eq!(outcome.unwrap_err().to_string(), "terminate failed");
+    assert_eq!(outcome.unwrap_err().to_string(), "wait failed");
 }
 
 /// A hold that expired is sent the STOP all the same, and the stop is not confirmed, even when SCM

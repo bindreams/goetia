@@ -206,8 +206,9 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 /// ends the process, as the documentation of `SetServiceStatus` allows once `SERVICE_STOPPED` is
 /// reported, and `exit` then waits for its exit under the same `deadline` and says whether it did; a
 /// process that outlasts the deadline is [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired),
-/// not an unconfirmed stop. A `terminate` that finds the process already exited is success. No process
-/// held (none reported, or none that could be opened) is the stop alone.
+/// not an unconfirmed stop. A `terminate` that finds the process already exited is success, and one
+/// that fails is not an error: SCM has confirmed the stop, and the wait that follows decides. No
+/// process held (none reported, or none that could be opened) is the stop alone.
 ///
 /// An expired hold is sent the STOP all the same, and it ends there, whatever SCM answers: the held
 /// process died (a crash), SCM may have a recovery restart pending, and a restarted process may have
@@ -237,7 +238,9 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     let Some(process) = held else {
         return Ok(StopAndAwaitExitOutcome::Stopped);
     };
-    terminate(&process)?;
+    // SCM has confirmed `STOPPED`, so a terminate that fails is not a failed stop: the process is
+    // on its way out by itself, and the wait for it decides.
+    let _ = terminate(&process);
     Ok(match exit(&process, deadline)? {
         Waited::Confirmed => StopAndAwaitExitOutcome::Stopped,
         Waited::Expired => StopAndAwaitExitOutcome::ProcessExpired(process),
