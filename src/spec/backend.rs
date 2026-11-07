@@ -43,7 +43,7 @@ use serde::Deserialize;
 use super::field::Field;
 use super::interpolate::Substitution;
 use super::overrides::Supplied;
-use super::resolve::{DirJoin, FieldValues, Refused, dir_join, invalid};
+use super::resolve::{FieldValues, Refused, dir_join, directory_is_to_blame, invalid};
 use super::vars::is_valid_name;
 use super::{AccountId, DaemonSpec, Id, Kind, Restart, User, Warning};
 use crate::error::Error;
@@ -291,18 +291,9 @@ fn systemd_refusal(spec: &ShapedSpec) -> Result<(), Refused> {
 /// The refusal for a joined path under the native systemd backend, or `Ok`: the first defect of
 /// `joined` ([`systemd_path_field_defects`]).
 ///
-/// A joined path may carry a defect the manifest directory (`-f`) put there. There are three cases
-/// ([`DirJoin`]):
-/// - `written` is joined to the whole directory ([`DirJoin::Whole`]) and does not have the defect
-///   itself: it is blamed on `-f` and carries no field.
-/// - `written` is root-relative (`/bin/frpc` on Windows) and keeps only the directory's drive or
-///   share ([`DirJoin::PrefixOnly`]): `-f` is not blamed, since the separators in the result are
-///   the host's, put there by `normalize`. systemd is never native on Windows, so this arises in
-///   tests only.
-/// - `written` is not joined (an absolute path, or a drive-relative one such as `C:bin`): the
-///   defect is the field's.
-///
-/// A defect `written` has is the field's, whatever `-f` holds.
+/// A joined path may carry a defect the manifest directory (`-f`) put there; whose it is
+/// [`directory_is_to_blame`] decides, by how `written` joined the directory
+/// ([`DirJoin`](super::resolve::DirJoin)). `-f` is blamed and no field carries it, or else the field is.
 pub(super) fn systemd_path_refusal(
     id: &Id,
     field: &Field,
@@ -314,9 +305,12 @@ pub(super) fn systemd_path_refusal(
         return Ok(());
     };
     let described = defect.describe(field, joined);
-    let from_directory = dir_join(Path::new(written)) == DirJoin::Whole
-        && !systemd_path_field_defects(field, written).any(|d| d == defect);
-    if from_directory {
+    let has_defect = |p: &Path| {
+        p.to_str()
+            .is_some_and(|text| systemd_path_field_defects(field, text).any(|d| d == defect))
+    };
+    let written = Path::new(written);
+    if directory_is_to_blame(dir_join(written), written, Path::new(joined), has_defect) {
         let message = format!(
             "`{}` resolves to `{joined}`, which systemd cannot carry, and the manifest directory `-f {}` is \
              to blame: {described}. Pass `-f` a path that does not cause it",

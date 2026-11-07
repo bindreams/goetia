@@ -606,6 +606,56 @@ fn a_root_relative_path_carries_a_defect_of_the_directorys_share_to_the_director
     assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
 }
 
+/// A share's defect is put there by `-f`, not by `.env`; a defect beside it is the field's.
+#[cfg(windows)]
+#[skuld::test]
+fn a_share_defect_a_root_relative_path_keeps_is_not_blamed_on_env_but_one_beside_it_is() {
+    let id = Id::try_from("frpc").unwrap();
+    let from_env = BTreeSet::from([Field::Cwd]);
+    let refused = |resolved: &str| {
+        check_resolved(&id, PathField::Cwd, r"\data", Path::new(resolved), DirJoin::PrefixOnly).unwrap_err()
+    };
+
+    let msg = refused("\\\\server\\sh\u{FFFE}re\\data")
+        .attributed(&from_env)
+        .to_string();
+    assert!(msg.contains("the manifest directory's drive or share"), "{msg}");
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+
+    let msg = refused("C:\\da\u{7}ta").attributed(&from_env).to_string();
+    assert!(msg.contains("after substituting from .env: "), "{msg}");
+}
+
+#[skuld::test]
+fn the_directory_is_blamed_only_for_a_defect_it_put_in_the_joined_path() {
+    let bang = |p: &Path| p.to_string_lossy().contains('!');
+    let blamed = |join, written, joined| directory_is_to_blame(join, Path::new(written), Path::new(joined), bang);
+
+    assert!(blamed(DirJoin::Whole, "bin", "/a!/bin"));
+    assert!(!blamed(DirJoin::Whole, "b!in", "/a!/b!in"), "the field wrote it too");
+    assert!(!blamed(DirJoin::Whole, "bin", "/a/bin"), "no defect");
+    assert!(
+        !blamed(DirJoin::Not, "/a!/bin", "/a!/bin"),
+        "nothing of the directory is in the result"
+    );
+    assert!(
+        !blamed(DirJoin::PrefixOnly, "/bin", "/a!/bin"),
+        "no prefix to hold the defect"
+    );
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn only_a_defect_in_the_prefix_a_root_relative_path_keeps_is_the_directorys() {
+    let bang = |p: &Path| p.to_string_lossy().contains('!');
+    let blamed =
+        |written, joined| directory_is_to_blame(DirJoin::PrefixOnly, Path::new(written), Path::new(joined), bang);
+
+    assert!(blamed(r"\data", r"\\server\sh!re\data"));
+    assert!(!blamed(r"\data", r"C:\da!ta"), "the defect is outside the prefix");
+    assert!(!blamed(r"\d!ata", r"\\server\sh!re\d!ata"), "the field wrote it too");
+}
+
 #[skuld::test]
 fn a_manifest_directory_is_joined_whole_to_a_relative_path_only() {
     assert_eq!(dir_join(Path::new("bin/x")), DirJoin::Whole);
@@ -2813,6 +2863,21 @@ fn a_backslash_the_field_wrote_in_a_relative_command_zero_is_the_fields() {
     let msg = resolve_as(parse_manifest(&yaml), &abs("base"), Some(BackendKind::Systemd))
         .unwrap_err()
         .to_string();
+    assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
+}
+
+/// A root-relative `command[0]` keeps only the directory's drive or share, so only a defect in that
+/// is `-f`'s: the backslashes of a joined path are the host's separators, not the directory's.
+#[cfg(windows)]
+#[skuld::test]
+fn a_root_relative_command_zero_blames_dash_f_only_for_a_defect_in_the_share_it_keeps() {
+    let yaml = systemd_manifest("command: ['/bin/frpc']");
+    let resolve = |dir: &str| resolve_as(parse_manifest(&yaml), Path::new(dir), Some(BackendKind::Systemd));
+
+    let msg = resolve(r"\\server\o'brien\app").unwrap_err().to_string();
+    assert!(msg.contains("`-f ") && msg.contains("apostrophe"), "{msg}");
+
+    let msg = resolve(r"C:\app").unwrap_err().to_string();
     assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
 }
 

@@ -662,30 +662,46 @@ pub(super) fn dir_join(p: &Path) -> DirJoin {
     }
 }
 
-/// The field rules for a resolved path, which is what an artifact would carry. `raw` has passed
-/// them already, so the defect is one the user did not write. It is the manifest directory's
-/// (`-f`) when `join` is [`DirJoin::Whole`], and when it is [`DirJoin::PrefixOnly`] and the defect
-/// is in the prefix (a control character, noncharacter or non-UTF-8 in the drive or share);
-/// otherwise it is the field's, which for a drive-relative path is the per-drive current
-/// directory's. The message says the field *resolved* to the bad value and names the source. The
-/// directory's defect is no field's: it carries none.
-fn check_resolved(id: &Id, field: PathField, raw: &str, resolved: &Path, join: DirJoin) -> Result<(), Refused> {
+/// Whether the manifest directory (`-f`) is to blame for a defect of `joined`, the path `written`
+/// resolved to: `joined` has the defect, `written` does not, and the part of `joined` that came from
+/// the directory has it. That part is all of `joined` for [`DirJoin::Whole`], its prefix (drive or
+/// UNC share) for [`DirJoin::PrefixOnly`], and none of it for [`DirJoin::Not`]. Otherwise the defect
+/// is the field's. `has_defect` is the rule that finds the defect.
+pub(super) fn directory_is_to_blame(
+    join: DirJoin,
+    written: &Path,
+    joined: &Path,
+    has_defect: impl Fn(&Path) -> bool,
+) -> bool {
     use std::path::Component;
+    if !has_defect(joined) || has_defect(written) {
+        return false;
+    }
+    match join {
+        DirJoin::Whole => true,
+        DirJoin::PrefixOnly => match joined.components().next() {
+            Some(Component::Prefix(prefix)) => has_defect(Path::new(prefix.as_os_str())),
+            _ => false,
+        },
+        DirJoin::Not => false,
+    }
+}
+
+/// The field rules for a resolved path, which is what an artifact would carry. `raw` has passed
+/// them already, so the defect is one the user did not write. Whose it is: see
+/// [`directory_is_to_blame`], else the field's, which for a drive-relative path is the per-drive
+/// current directory's. The message says the field *resolved* to the bad value and names the source.
+/// The directory's defect is no field's: it carries none.
+fn check_resolved(id: &Id, field: PathField, raw: &str, resolved: &Path, join: DirJoin) -> Result<(), Refused> {
     let name = field.name();
     let Some(defect) = path_defect(resolved) else {
         return Ok(());
     };
-    let prefix_defective = match resolved.components().next() {
-        Some(Component::Prefix(prefix)) => path_defect(Path::new(prefix.as_os_str())).is_some(),
-        _ => false,
-    };
-    let (resolves, from_directory) = match join {
-        DirJoin::Whole => ("resolves under the manifest directory to", true),
-        DirJoin::PrefixOnly if prefix_defective => (
-            "resolves, keeping only the manifest directory's drive or share, to",
-            true,
-        ),
-        _ => ("resolves to", false),
+    let from_directory = directory_is_to_blame(join, Path::new(raw), resolved, |p| path_defect(p).is_some());
+    let resolves = match (from_directory, join) {
+        (true, DirJoin::PrefixOnly) => "resolves, keeping only the manifest directory's drive or share, to",
+        (true, _) => "resolves under the manifest directory to",
+        (false, _) => "resolves to",
     };
     let err = invalid(
         id,

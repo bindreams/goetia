@@ -192,14 +192,13 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
 
 // --dry-run preview ===================================================================================================
 //
-// --dry-run never touches a manager or writes anything. It still reads the manifest and `.env`
-// (resolving the spec), and it canonicalizes the process's current directory when `-f` is
-// relative. A drive-relative path (`C:bin`) in the manifest is resolved against the process's
-// per-drive current directory, which `std::path::absolute` reads. The preview step itself, on Windows, reads the process's own environment and
-// executable path, to name the shim (`shim_path`); it reads no account or file. A real install
-// resolves `spec.user` to a platform account name (see `backend::Identity`) with an effectful
-// lookup (a Windows SID needs `LookupAccountSid`; a launchd numeric UID needs one too); a preview
-// does not, so this is a literal, lookup-free rendering that may differ from a real install's
+// --dry-run never touches a manager or writes anything. It still reads the manifest and `.env` (resolving the spec),
+// and it canonicalizes the process's current directory when `-f` is relative. A drive-relative path (`C:bin`) in the
+// manifest is resolved against the process's per-drive current directory, which `std::path::absolute` reads. The
+// preview step itself, on Windows, reads the process's own environment and executable path, to name the shim
+// (`shim_path`); it reads no account or file. A real install resolves `spec.user` to a platform account name (see
+// `backend::Identity`) with an effectful lookup (a Windows SID needs `LookupAccountSid`; a launchd numeric UID needs
+// one too); a preview does not, so this is a literal, lookup-free rendering that may differ from a real install's
 // artifact in some cases.
 
 fn preview_identity(user: &User) -> Identity {
