@@ -120,7 +120,9 @@ use crate::backend::scm::shim::embedded::{ShimFile, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
 use crate::backend::scm::shim::provider::ShimProvider;
-use crate::backend::scm::shim::sweep::{normalise, referenced_hosts, same_path, sweep_folder};
+use crate::backend::scm::shim::sweep::{
+    left_behind_text, normalise, referenced_hosts, same_path, sweep_folder, undeleted,
+};
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
@@ -1026,21 +1028,26 @@ impl Scm {
     /// for a later sweep. Then sweeps the provider's folder and the folder `host` was in, which is
     /// another when the service was installed by another goetia version or provider.
     ///
-    /// A failure here leaves the service deleted, and says so, with the retry: `uninstall` of the id
-    /// that is no longer installed sweeps again.
+    /// A failure here leaves the service deleted, and says so, naming each file that remains and
+    /// what removes it: see [`left_behind_text`].
     fn finish_uninstall(&self, id: &Id, host: &Path, held: Option<Held>) -> Result<()> {
-        let left_behind = |source: Error| Error::Step {
-            what: format!(
-                "`{id}` was deleted, but the shim files it used were not cleaned up. Re-run \
-                 `goetia daemon uninstall {id}` to retry"
-            ),
-            source: Box::new(source),
+        let host = normalise(host);
+        let provider_folder = self
+            .shim
+            .as_ref()
+            .and_then(|shim| shim.preview().ok())
+            .and_then(|command| command.exe.parent().map(normalise));
+        let left_behind = |source: Error| {
+            let files: Vec<PathBuf> = undeleted(&source).iter().map(|file| normalise(file)).collect();
+            Error::Step {
+                what: left_behind_text(id, provider_folder.as_deref(), host.parent(), &files),
+                source: Box::new(source),
+            }
         };
         if let Some(held) = held {
             held.wait_for_exit(id.as_str())
                 .map_err(|e| left_behind(Error::os(format!("wait for `{id}`'s process to exit"), e)))?;
         }
-        let host = normalise(host);
         // After the wait: the held process has exited and no longer references its file. Any other
         // process running `host` still does, and keeps the file for a later sweep.
         let referenced = referenced_hosts().map_err(left_behind)?;
@@ -1048,13 +1055,10 @@ impl Scm {
         if let Some(shim) = &self.shim {
             failures.extend(shim.sweep(&referenced).err());
         }
-        let provider_folder = self
-            .shim
-            .as_ref()
-            .and_then(|shim| shim.preview().ok())
-            .and_then(|command| command.exe.parent().map(normalise));
         if let Some(folder) = host.parent()
-            && !provider_folder.is_some_and(|provider| same_path(&provider, folder))
+            && !provider_folder
+                .as_deref()
+                .is_some_and(|provider| same_path(provider, folder))
         {
             failures.extend(sweep_folder(folder, &referenced).err());
         }

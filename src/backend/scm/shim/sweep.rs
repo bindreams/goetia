@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use super::embedded::shim_file;
+use crate::error::Error;
 
 /// The files of `files` that are shim files (see [`shim_file`]) and that none of `referenced`
 /// names, in the order given. Paths are compared without regard to case, and are expected
@@ -116,6 +117,86 @@ fn name_key(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// What a failed delete is called in an `Os` error: [`undeleted`] reads it back.
+const DELETE: &str = "delete";
+
+/// The paths `error` names as not deleted (an `Os` error for a delete, however deep in `Step` and
+/// `Both` it is), in the order the failures were met.
+pub(crate) fn undeleted(error: &Error) -> Vec<PathBuf> {
+    match error {
+        Error::Both { first, then } => undeleted(first).into_iter().chain(undeleted(then)).collect(),
+        Error::Step { source, .. } => undeleted(source),
+        Error::Os {
+            what, path: Some(path), ..
+        } if what == DELETE => vec![path.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// What an uninstall says when it deleted the service `id` but could not clean up: which shim files
+/// remain, and what removes them. `files` are those the failure names (none when it failed before
+/// it tried to delete any, and then any file the service used may remain, in `host_folder`).
+///
+/// The retry, `uninstall` of an id that is no longer installed, sweeps `provider_folder` alone: a
+/// file in another folder is removed by the next install or uninstall of a manager whose provider
+/// uses that folder, and with no provider nothing is retried at all.
+pub(crate) fn left_behind_text(
+    id: impl std::fmt::Display,
+    provider_folder: Option<&Path>,
+    host_folder: Option<&Path>,
+    files: &[PathBuf],
+) -> String {
+    let in_providers = |folder: &Path| provider_folder.is_some_and(|provider| same_path(provider, folder));
+    let retry = format!("Re-run `goetia daemon uninstall {id}` to retry");
+    let elsewhere = "the next install or uninstall of a manager whose provider uses that folder removes";
+    let list = |paths: &[&Path]| {
+        paths
+            .iter()
+            .map(|path| format!("`{}`", path.display()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if files.is_empty() {
+        let mut said = format!("`{id}` was deleted, but the shim files it used were not cleaned up.");
+        if provider_folder.is_some() {
+            said.push_str(&format!(
+                " {retry} what is in the folder this program's shim provider uses."
+            ));
+        }
+        if let Some(folder) = host_folder.filter(|folder| !in_providers(folder)) {
+            said.push_str(&format!(
+                " What is in `{}` is not retried by that command: {elsewhere} it.",
+                folder.display()
+            ));
+        }
+        return said;
+    }
+    let (inside, outside): (Vec<&Path>, Vec<&Path>) = files
+        .iter()
+        .map(PathBuf::as_path)
+        .partition(|file| in_providers(file) || file.parent().is_some_and(in_providers));
+    let mut said = format!(
+        "`{id}` was deleted, but {} could not be removed.",
+        list(&files.iter().map(PathBuf::as_path).collect::<Vec<_>>())
+    );
+    if !inside.is_empty() {
+        said.push_str(&format!(" {retry} {}.", list(&inside)));
+    }
+    if !outside.is_empty() {
+        let (is, them) = if outside.len() == 1 {
+            ("is", "it")
+        } else {
+            ("are", "them")
+        };
+        said.push_str(&format!(
+            " {} {is} not in the folder this program's shim provider uses, so that command does not retry              {them}: {elsewhere} {them}.",
+            list(&outside)
+        ));
+    }
+    said
+}
+
 #[cfg(windows)]
 pub(crate) use system::{normalise, referenced_hosts, sweep_folder};
 
@@ -132,7 +213,7 @@ mod system {
     use super::super::acl::{display_path, lexical};
     use super::super::embedded::default_dir;
     use super::super::processes::running_images;
-    use super::{image_references, same_path, unreferenced};
+    use super::{DELETE, image_references, same_path, unreferenced};
     use crate::backend::scm::manager::registry;
     use crate::error::{Error, Reason, Result};
     use crate::manager::Installed;
@@ -266,7 +347,7 @@ mod system {
         }
         match fs::remove_dir(dir) {
             Err(e) if !matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty) => {
-                Err(Error::os_at("delete", dir, e))
+                Err(Error::os_at(DELETE, dir, e))
             }
             _ => Ok(()),
         }
@@ -306,7 +387,7 @@ mod system {
                 fs::remove_file(&path)
             };
             match removed {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => failures.push(Error::os_at("delete", path, e)),
+                Err(e) if e.kind() != io::ErrorKind::NotFound => failures.push(Error::os_at(DELETE, path, e)),
                 _ => {}
             }
         }

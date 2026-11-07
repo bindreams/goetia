@@ -1,7 +1,7 @@
 //! `unreferenced` on every host, over stated paths. The Windows-only tests read temp directories
 //! the test made and nothing else.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -156,6 +156,107 @@ fn only_shim_file_names_are_referenced_by_name() {
         .filter(|reference| !reference.contains('\\'))
         .count(),
         0
+    );
+}
+
+// What an uninstall says it left behind ---------------------------------------------------------------------------
+
+fn failed_delete(path: &str) -> Error {
+    Error::os_at("delete", path, std::io::Error::other("in use"))
+}
+
+#[skuld::test]
+fn undeleted_names_each_file_a_sweep_failed_to_delete_in_order() {
+    let error = Error::Step {
+        what: "clean up".to_string(),
+        source: Box::new(
+            Error::both_all([
+                failed_delete("/p/a.exe"),
+                Error::os_at("read", "/p", std::io::Error::other("denied")),
+                Error::Step {
+                    what: "sweep".to_string(),
+                    source: Box::new(failed_delete("/q/b.exe")),
+                },
+            ])
+            .unwrap(),
+        ),
+    };
+
+    assert_eq!(
+        undeleted(&error),
+        vec![PathBuf::from("/p/a.exe"), PathBuf::from("/q/b.exe")]
+    );
+}
+
+#[skuld::test]
+fn a_failure_that_names_no_file_names_none() {
+    assert!(undeleted(&Error::os("wait for a process", std::io::Error::other("x"))).is_empty());
+}
+
+const RETRY: &str = "Re-run `goetia daemon uninstall frpc`";
+const NEXT: &str = "the next install or uninstall of a manager whose provider uses that folder";
+
+fn text(provider: Option<&str>, host_folder: &str, files: &[&str]) -> String {
+    let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    left_behind_text("frpc", provider.map(Path::new), Some(Path::new(host_folder)), &files)
+}
+
+#[skuld::test]
+fn a_file_in_the_providers_folder_is_retried_by_running_uninstall_again() {
+    let said = text(Some("/p/Goetia"), "/p/Goetia", &["/P/goetia/a.exe"]);
+
+    assert!(said.contains("/P/goetia/a.exe"), "{said}");
+    assert!(said.contains(RETRY), "{said}");
+    assert!(!said.contains(NEXT), "{said}");
+}
+
+#[skuld::test]
+fn a_file_outside_the_providers_folder_is_not_promised_a_retry() {
+    let said = text(Some("/p/Goetia"), "/q/Other", &["/q/Other/b.exe"]);
+
+    assert!(said.contains("/q/Other/b.exe"), "{said}");
+    assert!(said.contains(NEXT), "{said}");
+    assert!(!said.contains(RETRY), "{said}");
+}
+
+#[skuld::test]
+fn files_in_both_get_each_their_own_advice() {
+    let said = text(Some("/p/Goetia"), "/q/Other", &["/p/Goetia/a.exe", "/q/Other/b.exe"]);
+
+    assert!(said.contains(RETRY) && said.contains(NEXT), "{said}");
+}
+
+#[skuld::test]
+fn with_no_provider_nothing_is_retried() {
+    let said = text(None, "/q/Other", &["/q/Other/b.exe"]);
+
+    assert!(said.contains(NEXT), "{said}");
+    assert!(!said.contains(RETRY), "{said}");
+}
+
+/// The default folder itself, which is what a failed removal of it names, is the provider's.
+#[skuld::test]
+fn the_providers_folder_itself_is_in_it() {
+    let said = text(Some("/p/Goetia"), "/p/Goetia", &["/p/Goetia"]);
+
+    assert!(said.contains(RETRY), "{said}");
+}
+
+#[skuld::test]
+fn a_failure_that_names_no_file_says_where_the_files_may_be() {
+    let same = text(Some("/p/Goetia"), "/p/Goetia", &[]);
+    assert!(same.contains(RETRY) && !same.contains(NEXT), "{same}");
+
+    let other = text(Some("/p/Goetia"), "/q/Other", &[]);
+    assert!(
+        other.contains(RETRY) && other.contains(NEXT) && other.contains("/q/Other"),
+        "{other}"
+    );
+
+    let none = text(None, "/q/Other", &[]);
+    assert!(
+        !none.contains(RETRY) && none.contains(NEXT) && none.contains("/q/Other"),
+        "{none}"
     );
 }
 
