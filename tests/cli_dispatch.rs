@@ -17,7 +17,7 @@ use clap::error::ErrorKind;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
 use goetia::manager::{Budget, Installed, Sequence, ServiceManager, State, Status, Step};
-use goetia::spec::{DaemonSpec, Id, Kind, Restart};
+use goetia::spec::{DaemonFields, DaemonSpec, Id, Kind, Restart};
 
 #[path = "support/mod.rs"]
 mod support;
@@ -29,11 +29,15 @@ fn main() {
 // Fixtures ============================================================================================================
 
 fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         kind: Kind::Simple,
-        ..support::spec(id, vec!["daemon".to_owned()])
-    }
+        ..support::spec(
+            id,
+            vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
+        )
+    })
+    .unwrap()
 }
 
 fn write_manifest(dir: &Path, yaml: &str) -> PathBuf {
@@ -57,8 +61,9 @@ fn absent_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
 /// change with no hand-edit.
 fn update_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
     let fake = Fake::new();
-    let mut old = mk(id);
+    let mut old = mk(id).into_fields();
     old.restart = Restart::Never;
+    let old = DaemonSpec::new(old).unwrap();
     fake.install(&old, false).unwrap();
     let manifest = write_manifest(dir, &format!("id: {id}\ncommand: [daemon]\nrestart: on-failure\n"));
     (fake, manifest)
@@ -1503,8 +1508,9 @@ fn list_reaches_the_manager() {
 #[skuld::test]
 fn a_service_installed_with_restart_always_stays_operable() {
     let fake = Fake::new();
-    let mut spec = mk("frpc");
+    let mut spec = mk("frpc").into_fields();
     spec.restart = Restart::Always;
+    let spec = DaemonSpec::new(spec).unwrap();
     fake.install(&spec, false).unwrap();
 
     for verb in ["status", "list"] {

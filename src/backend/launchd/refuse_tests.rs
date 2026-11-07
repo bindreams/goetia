@@ -1,14 +1,16 @@
 use super::*;
 use crate::backend::Identity;
-use crate::spec::{DaemonSpec, Kind, Restart};
+use crate::spec::test_support::{plain_fields, program};
+use crate::spec::{DaemonFields, DaemonSpec, Kind, Restart};
 
 fn spec_fixture() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_owned(),
         restart: Restart::Always,
         kind: Kind::Simple,
-        ..DaemonSpec::for_test("frpc", vec!["frpc".to_owned()])
-    }
+        ..plain_fields("frpc", vec![program("frpc")])
+    })
+    .unwrap()
 }
 
 fn identity(user: &str) -> Identity {
@@ -21,17 +23,18 @@ fn rendered(spec: &DaemonSpec, user: &str) -> String {
 }
 
 fn changed(spec: &DaemonSpec) -> DaemonSpec {
-    let mut changed = spec.clone();
+    let mut changed = spec.clone().into_fields();
     changed.command.push("--verbose".to_owned());
-    changed
+    DaemonSpec::new(changed).unwrap()
 }
 
 /// A spec change the plist does not render: `name` is in the embedded blob only.
 fn renamed(spec: &DaemonSpec) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "another name".to_owned(),
-        ..spec.clone()
-    }
+        ..spec.clone().into_fields()
+    })
+    .unwrap()
 }
 
 // changes_loaded_job ==================================================================================================

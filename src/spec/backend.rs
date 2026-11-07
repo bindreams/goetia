@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::interpolate;
+use super::interpolate::Substitution;
 use super::overrides::Supplied;
 use super::resolve::invalid;
 use super::{AccountId, Id, Kind, Restart, User, Warning};
@@ -110,12 +110,12 @@ impl std::fmt::Display for BackendKind {
 /// before substitution.
 #[derive(Debug)]
 pub(crate) enum Shaped<T> {
-    /// The authored text carried no `$` and parsed.
+    /// The text was judged as it stood, and parsed.
     Parsed(T),
     /// The authored text carries a `$`, so substitution would change it
-    /// and parsing it now would parse the wrong string. Held verbatim
-    /// until the completion phase, which sees the substituted text.
-    Deferred(String),
+    /// and parsing it now would parse the wrong string. Only a pass
+    /// before substitution produces it, and its result is never completed.
+    Deferred,
     /// The manifest did not set the field. The default is applied in the
     /// completion phase, in one place.
     Absent,
@@ -128,15 +128,15 @@ impl<T: Copy> Shaped<T> {
     pub(crate) fn parsed(&self) -> Option<T> {
         match self {
             Shaped::Parsed(value) => Some(*value),
-            Shaped::Deferred(_) | Shaped::Absent => None,
+            Shaped::Deferred | Shaped::Absent => None,
         }
     }
 }
 
 /// A spec whose every value has passed the shape gate, but which may
-/// still be missing a required field and whose `$`-bearing enum/duration
-/// fields are still unparsed. Only the backend being installed is
-/// required to be complete.
+/// still be missing a required field and, before substitution, whose
+/// `$`-bearing enum/duration fields are still unparsed. Only the backend
+/// being installed is required to be complete.
 #[derive(Debug)]
 pub(crate) struct ShapedSpec {
     pub(crate) id: Id,
@@ -171,7 +171,8 @@ impl BackendKind {
 
     /// Values that are wrong for this backend by construction, on any
     /// host. Reads **only** the fields `supplied` marks. See `Supplied`.
-    pub(super) fn error(self, spec: &ShapedSpec, supplied: Supplied) -> Result<(), Error> {
+    /// While `substitution` is pending, a value a substitution may change is not judged.
+    pub(super) fn error(self, spec: &ShapedSpec, supplied: Supplied, substitution: Substitution) -> Result<(), Error> {
         if !supplied.user {
             return Ok(());
         }
@@ -193,14 +194,10 @@ impl BackendKind {
                     ),
                 )),
                 // A `$`-bearing name cannot be classified before substitution; do not guess.
-                User::Name(name)
-                    if !interpolate::would_substitution_change(name) && windows_only_account(name).is_some() =>
-                {
-                    Err(invalid(
-                        &spec.id,
-                        &format!("`{name}` is a Windows built-in account, which is never a POSIX one"),
-                    ))
-                }
+                User::Name(name) if !substitution.defers(name) && windows_only_account(name).is_some() => Err(invalid(
+                    &spec.id,
+                    &format!("`{name}` is a Windows built-in account, which is never a POSIX one"),
+                )),
                 _ => Ok(()),
             },
         }
