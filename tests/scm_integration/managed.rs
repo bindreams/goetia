@@ -24,7 +24,10 @@ use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 /// Held by every test that denies an elevated reader something under
 /// `HKLM\SYSTEM\CurrentControlSet\Services`, and by every test that runs a real
-/// `daemon list` over it, so they take turns rather than race.
+/// `daemon list` over it, so they take turns rather than race. A denied-`Parameters` test
+/// denies a service's `Parameters` read, and two concurrent unreadable services make `list`
+/// report one nameless aggregate instead of a named entry, so each test's lookup by its own
+/// name fails.
 ///
 /// Named for systemd's unit directory rather than for SCM's service tree
 /// deliberately: skuld coordinates serialization across processes by label
@@ -1186,22 +1189,16 @@ fn install_refuses_an_always_blob_as_unusable() {
 // A read that did not complete: the aggregate, and the two objects that produce it ====================================
 
 /// An elevated reader decodes the marker of a service it installed, so the service is listed as
-/// goetia's own. Another service's unreadable `Parameters` is not this test's to assert about.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+/// goetia's own. Another service's unreadable `Parameters` is not this test's to assert about, and
+/// it takes turns with the tests that deny one (see `UNIT_DIR_EXCLUSIVE`).
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn an_elevated_list_reads_the_marker_of_its_own_install() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     install_plain(&mgr, guard.id());
 
-    let listed = mgr.list().expect("list");
-
-    assert!(
-        listed
-            .iter()
-            .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
-        "the installed daemon must actually appear: {listed:?}"
-    );
+    support::assert_own(&mgr.list().expect("list"), &[id.as_str()]);
 }
 
 /// The `Parameters` boundary. A service whose metadata key denies reading is a service whose marker

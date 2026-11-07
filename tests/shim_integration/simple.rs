@@ -21,9 +21,10 @@ use crate::support::{self, ELEVATED};
 
 /// The same cross-process lock `tests/scm_integration/managed.rs` declares,
 /// shared with it by label *name*: both binaries drive the one SCM on the host,
-/// and a denied `Parameters` read is visible to every reader of it. A negative
-/// assertion here is unsound while any test anywhere denies one, so they take
-/// turns rather than race.
+/// and a denied `Parameters` read is visible to every reader of it. A denied-`Parameters`
+/// test denies a service's `Parameters` read, and two concurrent unreadable services make `list`
+/// report one nameless aggregate instead of a named entry, so each test's lookup by its own name
+/// fails; every `list` reader takes turns with them.
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
 

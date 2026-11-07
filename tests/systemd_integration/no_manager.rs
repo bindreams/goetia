@@ -11,7 +11,9 @@ use goetia::backend::systemd::manager::Systemd;
 use goetia::manager::{Budget, ServiceManager};
 use goetia::spec::Id;
 
-use crate::linux::{active_state_and_job, main_pid, mk, unit_path, wants_symlink, world_readable_manifest};
+use crate::linux::{
+    UNIT_DIR_EXCLUSIVE, active_state_and_job, main_pid, mk, unit_path, wants_symlink, world_readable_manifest,
+};
 use crate::support::{self, ELEVATED, ServiceGuard};
 
 /// How a host shows that no systemd manager can be asked, each the way goetia must find it out.
@@ -333,7 +335,10 @@ fn an_uninstall_where_no_manager_can_be_asked_removes_nothing() {
 /// daemon, and `list`, which reads each daemon's — and so `show`, which renders what `list` finds.
 /// An empty answer from a `systemctl` that asked no manager once read as "unknown, not enabled"
 /// for a daemon that was running and enabled.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+///
+/// `UNIT_DIR_EXCLUSIVE`: `status` for every daemon and `list` scan the host's unit directory before
+/// they are refused.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_live_state_read_where_no_manager_can_be_asked_is_refused() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);

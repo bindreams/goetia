@@ -284,7 +284,7 @@ fn launchd_passes_conformance() {
 
 // Round trips and drift ===============================================================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_round_trips_without_a_source_file() {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -327,7 +327,7 @@ fn hand_edit_is_detected_as_conflict() {
 /// The plist directories of a default macOS volume are case-insensitive, so a request for `ID`
 /// reaches the plist installed as `id`. Neither `install` (forced or not) nor `preview_install`
 /// may write over it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -675,7 +675,7 @@ fn uninstall_leaves_nothing() {
     assert!(!is_loaded(&id), "job must not still be loaded after uninstall");
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_plists() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -819,12 +819,7 @@ fn list_omits_a_non_utf8_plist_as_foreign() {
         "bytes that are not goetia's format leave the id neither claimed nor undetermined: \
          {listed:?}"
     );
-    assert!(
-        listed
-            .iter()
-            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.id == readable.id)),
-        "every other daemon is still listed: {listed:?}"
-    );
+    support::assert_own(&listed, &[readable.id.as_str()]);
 }
 
 /// The macOS-wide regression the binary-plist rule prevents. `/Library/

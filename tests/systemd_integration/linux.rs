@@ -27,7 +27,7 @@ use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 /// has a FIFO there, a concurrent reader that opens it hangs the suite; serialising makes a FIFO
 /// regression fail that one test, which guards its read, instead.
 #[skuld::label]
-const UNIT_DIR_EXCLUSIVE: skuld::Label;
+pub(crate) const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 // Fixtures ============================================================================================================
 
@@ -330,7 +330,7 @@ fn systemd_passes_conformance() {
 
 // Step 2: scenarios for each correctness property =====================================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_then_show_round_trips_without_the_source_file() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1782,7 +1782,7 @@ fn a_top_level_service_d_dropin_is_not_this_ids_conflict() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_units() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -2191,10 +2191,7 @@ fn list_omits_a_non_utf8_unit_as_foreign_instead_of_reporting_it() {
         "bytes that are not the UTF-8 goetia writes are foreign, so the id is neither claimed nor \
          left undetermined: {listed:?}"
     );
-    assert!(
-        find_ours(listed, readable_guard.id()).is_some(),
-        "every other daemon is still listed"
-    );
+    support::assert_own(&listed, &[readable_guard.id()]);
 
     // The same file through `status`, so the two cannot describe one machine differently. `Foreign`
     // and not `NotInstalled`: something is demonstrably there.

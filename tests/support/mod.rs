@@ -1,7 +1,7 @@
 //! Shared support for the integration suites.
 //!
 //! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only
-//! `daemon_spec` depends on the `goetia` crate; the marker-inertness probe uses
+//! `daemon_spec` and `list_json` depend on the `goetia` crate; the marker-inertness probe uses
 //! the rest, which runs before any backend exists.
 
 #![allow(dead_code, unused_imports)]
@@ -31,7 +31,7 @@ use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
 pub use daemon_spec::spec;
-pub use list_json::{ListJson, list_json};
+pub use list_json::{ListJson, assert_own, list_json};
 pub use service_guard::ServiceGuard;
 
 // Artifact locations --------------------------------------------------------------------------------------------------

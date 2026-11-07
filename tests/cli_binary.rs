@@ -10,7 +10,7 @@
 //! in-process against the fake.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 #[path = "support/mod.rs"]
 mod support;
@@ -23,12 +23,16 @@ fn goetia_bin() -> &'static str {
     env!("CARGO_BIN_EXE_goetia")
 }
 
-fn run_cli(args: &[&str], cwd: &Path) -> (i32, String, String) {
-    let output = Command::new(goetia_bin())
+fn spawn_cli(args: &[&str], cwd: &Path) -> Output {
+    Command::new(goetia_bin())
         .args(args)
         .current_dir(cwd)
         .output()
-        .unwrap_or_else(|e| panic!("spawn goetia {args:?}: {e}"));
+        .unwrap_or_else(|e| panic!("spawn goetia {args:?}: {e}"))
+}
+
+fn run_cli(args: &[&str], cwd: &Path) -> (i32, String, String) {
+    let output = spawn_cli(args, cwd);
     let code = output
         .status
         .code()
@@ -75,9 +79,8 @@ stderr:
 /// `unavailable` at exit `1` — the fake would also answer cleanly here, so
 /// this rules out exactly the one wrong wiring this module exists to catch.
 /// Labelled `UNIT_DIR_EXCLUSIVE`: this runs a real `daemon list` over the
-/// host's own artifact directories, where a concurrent FIFO test would hang
-/// it. The label is the same cross-process lock the systemd and launchd
-/// integration tests take for that reason.
+/// host's own artifact directories, so it takes turns with the tests that make
+/// them hostile (see the label).
 ///
 /// `support::list_json` ties the exit code to the `--json` document: `errors`
 /// empty, and `4` exactly when `undetermined` is not.
@@ -86,19 +89,18 @@ stderr:
 fn native_backend_answers_list_unelevated() {
     let dir = tempfile::tempdir().unwrap();
 
-    support::list_json(|args| {
-        Command::new(goetia_bin())
-            .args(args)
-            .current_dir(dir.path())
-            .output()
-            .expect("spawn goetia daemon list")
-    });
+    support::list_json(|args| spawn_cli(args, dir.path()));
 }
 
-/// Shared with the systemd and launchd integration binaries: any test that
-/// reads or writes the host's real artifact directories takes this, because a
-/// FIFO test makes them hostile to a concurrent unguarded reader, and a FIFO
-/// regression would then hang the suite instead of failing the one guarded test.
+/// Shared with the systemd, launchd, SCM and shim integration binaries: any
+/// test that reads or writes the host's real artifact directories takes this.
+/// On Linux and macOS a FIFO test makes them hostile to a concurrent unguarded
+/// reader, and a FIFO regression would then hang the suite instead of failing
+/// the one guarded test. On Windows the denied-`Parameters` tests deny a
+/// service's `Parameters` read, and two concurrent unreadable services make
+/// `list` report one nameless aggregate instead of a named entry, so each
+/// test's lookup by its own name fails; every `list` reader there takes turns
+/// with them.
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
