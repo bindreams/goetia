@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use super::{Leg, SPENT, abandoned_before_start, after_start_failed, leg, restart_until, stop_leg};
 use crate::error::Error;
+use crate::manager::budget::process_timed_out;
 use crate::manager::fake::Fake;
 use crate::manager::fake::fake_tests::mk;
 use crate::manager::{Budget, ServiceManager};
@@ -135,6 +136,35 @@ fn a_leg_in_doubt_stays_in_doubt_under_every_budget() {
             );
         }
     }
+}
+
+/// A stop leg that SCM confirmed, whose process outlived the leg's budget: the restart says it was
+/// abandoned with no start issued, that the daemon is stopped, and how to bring it back; it reports
+/// the `--timeout` as given, not the leg's remainder; and the variant stays, so the exit is `4`.
+#[skuld::test]
+fn a_stop_leg_whose_process_outlasted_the_budget_abandons_the_restart_under_the_given_timeout() {
+    let id = Id::try_from("frpc").unwrap();
+    let leg_budget = Budget::Bounded(Duration::from_secs(5));
+    let e = abandoned_before_start(&id, process_timed_out("frpc", 4242, leg_budget), THIRTY);
+
+    assert!(e.is_indeterminate(), "{e:?}");
+    let Error::ProcessWaitTimeout {
+        pid, waited, recovery, ..
+    } = &e
+    else {
+        panic!("the variant is kept: {e:?}");
+    };
+    assert_eq!(*pid, 4242);
+    assert_eq!(
+        *waited,
+        Duration::from_secs(30),
+        "the user's --timeout, not the leg's remainder"
+    );
+    assert!(recovery.contains("the restart was abandoned"), "{recovery}");
+    assert!(recovery.contains("no start was issued"), "{recovery}");
+    assert!(recovery.contains("`goetia daemon start frpc`"), "{recovery}");
+    assert!(!recovery.contains("may or may not have reached stopped"), "{recovery}");
+    assert!(e.to_string().contains("is stopped, but its process (pid 4242)"), "{e}");
 }
 
 /// What the stop leg established is said ahead of the cause, and the cause stays the typed source.

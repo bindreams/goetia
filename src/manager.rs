@@ -154,7 +154,9 @@ pub trait ServiceManager {
     ///
     /// `Ok(())` means the service manager reports the service as stopped, on
     /// the same terms as [`Self::start`]; `budget` bounds only the wait, as
-    /// there; and an expiry is [`Error::WaitTimeout`] on the same terms too.
+    /// there; and an expiry is [`Error::WaitTimeout`] on the same terms too. A backend whose service
+    /// can report stopped before its process has exited (SCM) also waits for that exit, under the
+    /// same `budget`; its expiry is [`Error::ProcessWaitTimeout`], the service being stopped.
     ///
     /// **Where a platform offers no request-only form,
     /// [`Budget::Immediate`] still performs the full blocking call.**
@@ -168,6 +170,7 @@ pub trait ServiceManager {
     /// implementation papers over that difference itself.
     ///
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
+    /// [`Error::ProcessWaitTimeout`]: crate::Error::ProcessWaitTimeout
     fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
 
     /// End the service's running process as a failure, and return once that is delivered. Does not
