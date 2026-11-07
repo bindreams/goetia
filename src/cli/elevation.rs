@@ -11,18 +11,8 @@ pub fn is_elevated() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// Whether the current process has root/Administrator privileges.
-///
-/// Probes the capability rather than the token: opening SCM with
-/// `ALL_ACCESS` is exactly what a mutating subcommand needs and exactly
-/// what a filtered (non-elevated) admin token refuses. The same technique
-/// `tests/support/mod.rs`'s `elevated()` precondition already uses.
 #[cfg(windows)]
-pub fn is_elevated() -> bool {
-    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-
-    ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::ALL_ACCESS).is_ok()
-}
+pub use crate::elevation::is_elevated;
 
 #[cfg(not(any(unix, windows)))]
 pub fn is_elevated() -> bool {

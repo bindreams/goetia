@@ -958,10 +958,9 @@ fn lock_is_for_system_and_administrators_only() {
     });
 }
 
-/// A mutex of the lock's name that an account other than SYSTEM, Administrators and TrustedInstaller
-/// owns (here, the user the test runs as) is refused before any wait, naming that account.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_lock_someone_else_created_first_is_refused() {
+/// The lock's name, made now as the user the test runs as, owned by that user, with a DACL of
+/// `dacl` (SDDL ACEs). It closes when the handle drops, which is when the name goes.
+fn lock_made_by_this_user(dacl: &str) -> OwnedHandle {
     let whoami = support::cmd::run("whoami", &["/user", "/fo", "csv", "/nh"]).expect_ok();
     let sid = whoami
         .stdout
@@ -970,7 +969,7 @@ fn a_lock_someone_else_created_first_is_refused() {
         .nth(1)
         .unwrap_or_else(|| panic!("no SID in {whoami}"))
         .to_string();
-    let sddl = support::wide_null(&format!("O:{sid}D:(A;;GA;;;WD)"));
+    let sddl = support::wide_null(&format!("O:{sid}D:{dacl}"));
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated; `descriptor` is a valid out-pointer, freed below.
     let converted = unsafe {
@@ -1003,10 +1002,14 @@ fn a_lock_someone_else_created_first_is_refused() {
         (last == ERROR_ALREADY_EXISTS, created)
     };
     assert!(!raw.is_null(), "create the lock as {sid}: {created}");
-    // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns. It closes at the end
-    // of the test, which is when the name goes.
-    let _foreign = unsafe { OwnedHandle::from_raw_handle(raw) };
     assert!(!existed, "`{LOCK_NAME}` existed before this test made it");
+    // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns.
+    unsafe { OwnedHandle::from_raw_handle(raw) }
+}
+
+/// The account an install names when it refuses the lock this user made with `dacl`.
+fn account_of_refused_lock(dacl: &str) -> String {
+    let _foreign = lock_made_by_this_user(dacl);
 
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -1015,14 +1018,32 @@ fn a_lock_someone_else_created_first_is_refused() {
     let mgr = embedded_manager(Some(folder), CheckPermissions::Disable);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
-    let refused = mgr.install(&spec, false);
-
-    match refused {
-        Err(Error::ShimLockForeign { account }) => {
-            assert!(!account.is_empty(), "the refusal names the owner");
-        }
+    match mgr.install(&spec, false) {
+        Err(Error::ShimLockForeign { account }) => account,
         other => panic!("expected the foreign lock to be refused: {other:?}"),
     }
+}
+
+/// A mutex of the lock's name that an account other than SYSTEM, Administrators and TrustedInstaller
+/// owns (here, the user the test runs as) is refused before any wait, naming that account.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_lock_someone_else_created_first_is_refused() {
+    let account = account_of_refused_lock("(A;;GA;;;WD)");
+
+    assert!(!account.is_empty(), "the refusal names the owner");
+}
+
+/// A lock whose DACL admits SYSTEM alone shuts an elevated caller out of the open: that is a
+/// foreign lock, not a need for elevation, and the owner is read through `READ_CONTROL`, which an
+/// owner always has.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_lock_that_shuts_administrators_out_is_refused_as_foreign() {
+    let account = account_of_refused_lock("(A;;GA;;;SY)");
+
+    assert!(
+        !account.is_empty() && !account.contains("could not be read"),
+        "the refusal names the owner: {account}"
+    );
 }
 
 // The sweep at install ================================================================================================

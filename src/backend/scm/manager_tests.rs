@@ -10,8 +10,8 @@ use super::*;
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, FolderCheck, HostCommand, ShimProvider, SweepFailure};
 use crate::spec::Restart;
-use crate::spec::{AccountId, DaemonFields, User};
 use crate::spec::test_support::{plain_fields, program};
+use crate::spec::{AccountId, DaemonFields, User};
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     ScmRegistration {

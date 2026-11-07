@@ -7,6 +7,8 @@ pub mod blob;
 pub mod cli;
 pub mod decide;
 pub mod diff;
+#[cfg(windows)]
+mod elevation;
 pub mod error;
 pub mod manager;
 pub mod shim;

@@ -281,8 +281,9 @@ pub enum Error {
 
     /// The machine-wide install lock exists and belongs to an account that is not SYSTEM,
     /// Administrators or TrustedInstaller, so what holds it cannot be trusted to serialise installs.
-    /// `account` is its name, or its SID when it has none. The lock lives while any process has a
-    /// handle to it, not only the one that holds it.
+    /// `account` is its name, its SID when it has none, or a note that it could not be read (a lock
+    /// whose DACL shuts out Administrators may shut out the read too). The lock lives while any
+    /// process has a handle to it, not only the one that holds it.
     #[error(
         "the install lock `Global\\goetia-shim` is owned by {account}, which is not an account goetia trusts (SYSTEM, \
          Administrators, TrustedInstaller), so it cannot be trusted to serialise installs: close every handle to it, by \
@@ -572,7 +573,7 @@ pub enum Error {
 
     /// A mutating CLI subcommand was invoked without the elevation
     /// (root/Administrator) it requires, or, for a library caller on Windows, the install lock
-    /// could not be created for want of it. `what` is the noun phrase that needs it, as the
+    /// could not be created or opened for want of it. `what` is the noun phrase that needs it, as the
     /// message starts with it: the subcommand in backticks, or the action as a gerund. Never
     /// returned for `list`, `status`, `show`, `diff`, or `install --dry-run`.
     #[error("{what} requires elevation (root/Administrator): re-run as root or Administrator")]
