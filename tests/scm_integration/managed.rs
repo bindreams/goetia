@@ -936,11 +936,13 @@ fn force_install_deletes_a_stray_registry_link_and_leaves_its_target() {
         .expect("the target's own subkey survived");
 }
 
-/// `Parameters` itself may be a registry link. goetia reads it as the link (its target is not
-/// consulted) and `--force` deletes it and writes a real key: the target keeps what it held, a
-/// `Marker` of its own included.
+/// `Parameters` itself may be a registry link. A link key cannot hold goetia's values (a write of
+/// any value but `SymbolicLinkValue` to it is denied), and goetia reads it as itself, never through
+/// its target: so a service whose `Parameters` was replaced by a link to a key holding goetia's four
+/// values is no longer goetia's. `list` omits it, `status` and `install`, forced or not, refuse it as
+/// foreign, and the target and the link are as they were.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_target() {
+fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_target_and_link_alone() {
     const REG_LINK: u32 = 6;
     const REG_OPTION_CREATE_LINK: u32 = 2;
     let mgr = Scm::new();
@@ -948,30 +950,25 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
     let _guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, &id);
     let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+
+    // The target holds goetia's four values, copied from the installed `Parameters`, and a `Keep`.
+    let parameters = parameters_key(&id, KEY_READ);
+    let fields: Vec<(String, winreg::RegValue)> = parameters.enum_values().map(|v| v.expect("enumerate")).collect();
+    drop(parameters);
     let target = ScratchKey::new(&format!("link-target-{id}"));
     let target_key = target.create();
     target_key.set_value("Keep", &"x").expect("write Keep");
-    target_key.set_value("Marker", &"not goetia's").expect("write Marker");
+    for (name, value) in &fields {
+        target_key
+            .set_raw_value(name, value)
+            .expect("copy a value to the target");
+    }
 
-    // goetia's four values, copied into the link key itself: the service stays marked, so the read
-    // reaches the comparison, which a target holding no marker would not.
-    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
-    let fields: Vec<(String, winreg::RegValue)> = parameters.enum_values().map(|v| v.expect("enumerate")).collect();
-    drop(parameters);
-    let goetia_marker = fields
-        .iter()
-        .find(|(name, _)| name == "Marker")
-        .map(|(_, value)| value.bytes.clone())
-        .expect("an installed service holds goetia's Marker");
+    // `Parameters` becomes a link to it. No closing NUL, which is how a link's target is stored, so
+    // that the link resolves.
     let service = service_key(&id, KEY_READ | KEY_WRITE);
     service.delete_subkey_all("Parameters").expect("remove Parameters");
     let link = create_raw_key(&service, &units("Parameters"), REG_OPTION_CREATE_LINK);
-    // Before the target: once `SymbolicLinkValue` is set, a write through the link key's handle is
-    // denied (STATUS_ACCESS_DENIED on CI).
-    for (name, value) in fields {
-        set_raw_value(&link, &units(&name), value.vtype as u32, &value.bytes);
-    }
-    // No closing NUL, which is how a link's target is stored, so that the link resolves.
     let link_value: Vec<u8> = units(&target.nt_path())
         .into_iter()
         .flat_map(u16::to_le_bytes)
@@ -979,33 +976,40 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
     set_raw_value(&link, &units("SymbolicLinkValue"), REG_LINK, &link_value);
     drop(link);
 
-    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
-
-    assert!(diff.contains("SymbolicLinkValue"), "{diff}");
-    assert_eq!(target_key.get_value::<String, _>("Keep").expect("read Keep"), "x");
-    assert_eq!(
-        target_key.get_value::<String, _>("Marker").expect("read Marker"),
-        "not goetia's"
+    let listed = mgr.list().expect("list");
+    assert!(
+        !listed.iter().any(|entry| match entry {
+            Installed::Ours { spec, .. } => spec.id.as_str() == id,
+            Installed::OursUnusable { name, .. } => name == &id,
+            Installed::Undetermined { name, .. } => name.as_deref() == Some(id.as_str()),
+        }),
+        "a service whose Parameters is a link is not goetia's, and omitted: {listed:?}"
     );
-    // A link is told by what opening it does, not by how it is stored: opened as itself
-    // (`create_raw_key`) and opened the way every other reader does (`parameters_key`, which follows
-    // a link), a real key is the same key, and a link is the target's.
-    let service = service_key(&id, KEY_READ | KEY_WRITE);
-    let as_itself = create_raw_key(&service, &units("Parameters"), 0);
-    let followed = parameters_key(&id, KEY_READ);
-    for (opened, key) in [("as itself", &as_itself), ("followed", &followed)] {
-        let marker = key
-            .get_raw_value("Marker")
-            .unwrap_or_else(|e| panic!("Parameters {opened} holds no Marker: {e}"));
-        assert_eq!(
-            marker.bytes, goetia_marker,
-            "Parameters {opened} holds goetia's own Marker"
-        );
+    let status = mgr.status(&spec.id).expect_err("status of a foreign service");
+    assert!(matches!(status.cause(), goetia::Error::Foreign { .. }), "{status:?}");
+    for force in [false, true] {
+        let outcome = mgr.install(&spec, force).expect("install");
         assert!(
-            key.get_value::<String, _>("Keep")
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
-            "Parameters {opened} shows the link target's `Keep`"
+            matches!(outcome, Outcome::RefuseForeign { .. }),
+            "force={force}: {outcome:?}"
         );
+    }
+
+    // The target is as it was, and the link still points at it: opened as itself it holds its
+    // `SymbolicLinkValue`, and opened as every other reader does it is the target.
+    assert_eq!(target_key.get_value::<String, _>("Keep").expect("read Keep"), "x");
+    let as_itself = create_raw_key(&service, &units("Parameters"), 0);
+    let held = as_itself
+        .get_raw_value("SymbolicLinkValue")
+        .expect("Parameters is still a link");
+    assert_eq!(held.bytes, link_value);
+    let followed = parameters_key(&id, KEY_READ);
+    for (name, value) in &fields {
+        let seen = followed
+            .get_raw_value(name)
+            .unwrap_or_else(|e| panic!("the target lost {name}: {e}"));
+        assert_eq!(seen.bytes, value.bytes, "{name} through the link");
+        assert_eq!(seen.vtype, value.vtype, "{name} through the link");
     }
 }
 

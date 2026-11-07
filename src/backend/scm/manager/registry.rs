@@ -125,9 +125,9 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 /// What `Services\<name>\Parameters` holds: goetia's four fields, each read by its name, and every
 /// other value and subkey as a stray (see [`Parameters`]). A stray is drift that `install --force`
 /// removes. `Parameters` is opened as the key it is: one that is a registry link reads as the link
-/// (its `SymbolicLinkValue` is a stray, and a marker in its target is not goetia's proof), and the
-/// write of an install or update replaces it. `origin` says what vouches for `name` (see [`Origin`]); the
-/// result classifies the id:
+/// (a link key holds no value but its `SymbolicLinkValue`, so it holds no marker, and a marker in
+/// its target is not goetia's proof): the service reads as not goetia's. `origin` says what vouches
+/// for `name` (see [`Origin`]); the result classifies the id:
 ///
 /// - A service with no `Parameters` key reads as empty `Parameters`, so `generate::extract` finds
 ///   no marker and the service is `Ownership::Foreign`. This covers a service goetia never touched
@@ -146,8 +146,8 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///   ownership a `type: managed` service has.
 ///
 /// goetia's own writes remove `Parameters` only when it is a registry link (see
-/// [`write_parameters`]), which a read already classifies as drift; SCM's delete of the service
-/// removes it, before the service key: a read between the two steps sees a standing service with
+/// [`write_parameters`]), which a read classifies as not goetia's, so a write meets one only when
+/// it appeared after the read; SCM's delete of the service removes it, before the service key: a read between the two steps sees a standing service with
 /// no `Parameters`, and reads it as Foreign. A concurrent uninstall can leave this window open;
 /// goetia does not guard against it (owner, 2026-11-03).
 pub fn read_parameters(name: &str, origin: Origin) -> Result<RegistryReadOutcome<Parameters>> {
@@ -286,7 +286,9 @@ fn enum_values(key: &RegKey) -> std::io::Result<Vec<RawEntry>> {
 /// the service key is gone, rather than creating it.
 ///
 /// The one exception is a `Parameters` that is a registry link: it is deleted itself, never entered,
-/// and a real key takes its place, so its target is left as it was.
+/// and a real key takes its place, so its target is left as it was. A service whose `Parameters` was
+/// a link at the read is not goetia's (see [`read_parameters`]) and is never written, so this is
+/// reached only by a link that appeared between that read and this write.
 ///
 /// goetia owns `Parameters` whole: a stray left behind would keep `read_parameters` from ever
 /// equalling `desired`, so `--force` could not converge. Names compare case-insensitively, as the
@@ -337,7 +339,9 @@ fn strays<'a>(present: &'a [RawEntry], wanted: &BTreeMap<String, String>) -> imp
 }
 
 /// `Parameters` under `service`, created if absent, as the key it is. A link is deleted and a real
-/// key created in its place: writing through it would change a key goetia does not own.
+/// key created in its place: writing through it would change a key goetia does not own. A link is
+/// met only if it appeared after the read that cleared the write (see [`write_parameters`]); this
+/// is the guard against writing through it.
 fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
     let name = parameters_key_name();
     let access = KEY_READ | KEY_WRITE;
