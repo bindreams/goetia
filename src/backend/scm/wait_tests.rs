@@ -705,7 +705,11 @@ fn stop_and_await_exit_after_an_expired_hold_is_unconfirmed_whichever_way_the_st
             |_, _| panic!("no process is held to wait for"),
         );
 
-        assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Unconfirmed { pid: 9 }, "{name}");
+        assert_eq!(
+            outcome.unwrap(),
+            StopAndAwaitExitOutcome::Unconfirmed { pid: 9 },
+            "{name}"
+        );
         assert_eq!(fake.log, log, "{name}");
     }
 }

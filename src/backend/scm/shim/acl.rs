@@ -127,7 +127,7 @@ fn system() -> Sid {
     sid_from_parts(5, &[18])
 }
 
-fn administrators() -> Sid {
+pub(crate) fn administrators() -> Sid {
     sid_from_parts(5, &[32, 544])
 }
 

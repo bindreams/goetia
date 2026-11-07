@@ -281,15 +281,21 @@ pub enum Error {
 
     /// The machine-wide install lock exists and belongs to an account that is not SYSTEM,
     /// Administrators or TrustedInstaller, so what holds it cannot be trusted to serialise installs.
-    /// `account` is its name, its SID when it has none, or a note that it could not be read (a lock
-    /// whose DACL shuts out Administrators may shut out the read too). The lock lives while any
-    /// process has a handle to it, not only the one that holds it.
+    /// `account` is its name, or its SID when it has none. The lock lives while any process has a
+    /// handle to it, not only the one that holds it.
     #[error(
         "the install lock `Global\\goetia-shim` is owned by {account}, which is not an account goetia trusts (SYSTEM, \
          Administrators, TrustedInstaller), so it cannot be trusted to serialise installs: close every handle to it, by \
          ending that account's processes that have it open"
     )]
     ShimLockForeign { account: String },
+
+    /// The machine-wide install lock exists, and its permissions shut Administrators out, so a
+    /// caller whose token has Administrators enabled cannot open it. `owner` is its owner's name (or
+    /// SID), or `None` when it could not be read (the permissions that refused the open may refuse
+    /// that too). Nothing says whether the owner is trusted: it was not read to decide that.
+    #[error("{}", shim_lock_denied(owner))]
+    ShimLockDenied { owner: Option<String> },
 
     /// The `ImagePath` of the service `name` could be read neither from its registry key nor
     /// through SCM, which the chain holds, so what it references is unknown. A remedy, which follows
@@ -666,6 +672,7 @@ impl Error {
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
             | Error::ShimLockForeign { .. }
+            | Error::ShimLockDenied { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -824,6 +831,7 @@ impl Error {
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
             | Error::ShimLockForeign { .. }
+            | Error::ShimLockDenied { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -1058,6 +1066,21 @@ fn why(diagnostic: &Option<String>) -> String {
     match diagnostic {
         Some(diagnostic) => format!(": {diagnostic}"),
         None => " and said nothing about why".to_string(),
+    }
+}
+
+/// [`Error::ShimLockDenied`]'s message.
+fn shim_lock_denied(owner: &Option<String>) -> String {
+    const REMEDY: &str = "close every handle to it, by ending the processes that have it open";
+    match owner {
+        Some(owner) => format!(
+            "the install lock `Global\\goetia-shim` is owned by {owner} and its permissions shut Administrators out, so \
+             this process cannot open it: {REMEDY}"
+        ),
+        None => format!(
+            "the install lock `Global\\goetia-shim` has permissions that shut Administrators out, so this process \
+             cannot open it, and its owner could not be read: {REMEDY}"
+        ),
     }
 }
 

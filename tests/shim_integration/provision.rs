@@ -1007,8 +1007,8 @@ fn lock_made_by_this_user(dacl: &str) -> OwnedHandle {
     unsafe { OwnedHandle::from_raw_handle(raw) }
 }
 
-/// The account an install names when it refuses the lock this user made with `dacl`.
-fn account_of_refused_lock(dacl: &str) -> String {
+/// The error an install ends with when the lock this user made with `dacl` is there.
+fn error_of_refused_lock(dacl: &str) -> Error {
     let _foreign = lock_made_by_this_user(dacl);
 
     let (_root, folder) = temp_shim_folder();
@@ -1018,32 +1018,32 @@ fn account_of_refused_lock(dacl: &str) -> String {
     let mgr = embedded_manager(Some(folder), CheckPermissions::Disable);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
-    match mgr.install(&spec, false) {
-        Err(Error::ShimLockForeign { account }) => account,
-        other => panic!("expected the foreign lock to be refused: {other:?}"),
-    }
+    mgr.install(&spec, false)
+        .expect_err("the lock someone else made is refused")
 }
 
 /// A mutex of the lock's name that an account other than SYSTEM, Administrators and TrustedInstaller
 /// owns (here, the user the test runs as) is refused before any wait, naming that account.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_lock_someone_else_created_first_is_refused() {
-    let account = account_of_refused_lock("(A;;GA;;;WD)");
-
-    assert!(!account.is_empty(), "the refusal names the owner");
+    match error_of_refused_lock("(A;;GA;;;WD)") {
+        Error::ShimLockForeign { account } => assert!(!account.is_empty(), "the refusal names the owner"),
+        other => panic!("expected the foreign lock to be refused: {other:?}"),
+    }
 }
 
-/// A lock whose DACL admits SYSTEM alone shuts an elevated caller out of the open: that is a
-/// foreign lock, not a need for elevation, and the owner is read through `READ_CONTROL`, which an
-/// owner always has.
+/// A lock whose DACL admits SYSTEM alone shuts an elevated caller out of the open: the refusal says
+/// the permissions did it, not that the owner is untrusted, and the owner is read through
+/// `READ_CONTROL`, which an owner always has.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_lock_that_shuts_administrators_out_is_refused_as_foreign() {
-    let account = account_of_refused_lock("(A;;GA;;;SY)");
-
-    assert!(
-        !account.is_empty() && !account.contains("could not be read"),
-        "the refusal names the owner: {account}"
-    );
+fn a_lock_that_shuts_administrators_out_is_refused_as_inaccessible() {
+    match error_of_refused_lock("(A;;GA;;;SY)") {
+        Error::ShimLockDenied { owner } => assert!(
+            owner.as_deref().is_some_and(|owner| !owner.is_empty()),
+            "the refusal names the owner: {owner:?}"
+        ),
+        other => panic!("expected the lock that shuts Administrators out to be refused: {other:?}"),
+    }
 }
 
 // The sweep at install ================================================================================================
