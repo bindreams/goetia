@@ -13,6 +13,7 @@ pub mod cmd;
 pub mod connect_back;
 pub mod daemon_spec;
 pub mod kill;
+pub mod list_json;
 #[cfg(windows)]
 pub mod registry;
 pub mod sentinel;
@@ -30,6 +31,7 @@ use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
 pub use daemon_spec::spec;
+pub use list_json::{ListJson, list_json};
 pub use service_guard::ServiceGuard;
 
 // Artifact locations --------------------------------------------------------------------------------------------------

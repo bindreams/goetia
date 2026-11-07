@@ -765,7 +765,7 @@ fn unelevated_list_works() {
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
-    let listed = unelevated_list_json();
+    let listed = support::list_json(run_unelevated);
 
     let id = Some(spec.id.as_str().to_string());
     assert!(
@@ -807,7 +807,7 @@ fn unelevated_list_reports_a_root_only_plist_as_undetermined() {
     std::fs::set_permissions(staging_path(spec.id.as_str()), std::fs::Permissions::from_mode(0o600))
         .expect("chmod 0600");
 
-    let listed = unelevated_list_json();
+    let listed = support::list_json(run_unelevated);
 
     // Root opens this plist, decodes its marker and lists it under `daemons` at exit `0`, so a run
     // whose reader was not in fact unprivileged fails here instead of passing vacuously.
@@ -1020,20 +1020,6 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
         .expect("spawn goetia as `nobody`")
 }
 
-/// [`run_unelevated`] for `daemon list --json`, parsed.
-fn unelevated_list_json() -> ListJson {
-    let output = run_unelevated(&["daemon", "list", "--json"]);
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
-    let doc = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {context}"));
-    ListJson {
-        doc,
-        code: output.status.code(),
-        context,
-    }
-}
-
 /// `dir`'s mode, restored when this value drops.
 ///
 /// Held by the one test that has to make a plist directory unsearchable to an unprivileged reader.
@@ -1064,29 +1050,6 @@ impl ModeGuard {
 impl Drop for ModeGuard {
     fn drop(&mut self) {
         let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(self.mode));
-    }
-}
-
-/// The one document `--json` promises, plus the raw streams for a failure
-/// message.
-struct ListJson {
-    doc: serde_json::Value,
-    code: Option<i32>,
-    context: String,
-}
-
-impl ListJson {
-    fn ids(&self, key: &str) -> Vec<Option<String>> {
-        self.doc[key]
-            .as_array()
-            .unwrap_or_else(|| panic!("`{key}` must always be present, as an array: {}", self.context))
-            .iter()
-            .map(|entry| match &entry[if key == "daemons" { "id" } else { "name" }] {
-                serde_json::Value::Null => None,
-                serde_json::Value::String(name) => Some(name.clone()),
-                other => panic!("a name must be a string or null: {other}"),
-            })
-            .collect()
     }
 }
 

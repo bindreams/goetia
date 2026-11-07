@@ -223,41 +223,6 @@ fn without_blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send 
     })
 }
 
-/// The one document `--json` promises, plus the raw streams for a failure message.
-struct ListJson {
-    doc: serde_json::Value,
-    code: Option<i32>,
-    context: String,
-}
-
-impl ListJson {
-    fn ids(&self, key: &str) -> Vec<Option<String>> {
-        self.doc[key]
-            .as_array()
-            .unwrap_or_else(|| panic!("`{key}` must always be present, as an array: {}", self.context))
-            .iter()
-            .map(|entry| match &entry[if key == "daemons" { "id" } else { "name" }] {
-                serde_json::Value::Null => None,
-                serde_json::Value::String(name) => Some(name.clone()),
-                other => panic!("a name must be a string or null: {other}"),
-            })
-            .collect()
-    }
-}
-
-fn list_json() -> ListJson {
-    let output = run_unelevated(&["daemon", "list", "--json"]);
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
-    let doc = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {context}"));
-    ListJson {
-        doc,
-        code: output.status.code(),
-        context,
-    }
-}
-
 /// The numeric uid of a real local account, looked up rather than hardcoded — `nobody`'s uid is
 /// traditionally 65534 but is not guaranteed.
 fn uid_of(account: &str) -> u32 {
@@ -1842,7 +1807,7 @@ fn unelevated_list_works() {
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let listed = list_json();
+    let listed = support::list_json(run_unelevated);
 
     assert!(
         listed.ids("daemons").contains(&Some(id.clone())),
@@ -1985,7 +1950,7 @@ fn unelevated_list_reports_a_unit_it_cannot_read_as_undetermined() {
     seed_foreign(denied_guard.id());
     fs::set_permissions(unit_path(denied_guard.id()), fs::Permissions::from_mode(0o600)).expect("chmod 0600");
 
-    let listed = list_json();
+    let listed = support::list_json(run_unelevated);
 
     // Root reads this fragment fine and finds no marker, which reports nothing at all and exits `0`
     // — so a run whose reader was not unprivileged fails here instead of passing vacuously.
@@ -2017,7 +1982,7 @@ fn unelevated_list_reports_a_root_only_unit_as_undetermined() {
     Systemd::new().install(&mk(guard.id()), false).expect("install");
     fs::set_permissions(unit_path(guard.id()), fs::Permissions::from_mode(0o600)).expect("chmod 0600");
 
-    let listed = list_json();
+    let listed = support::list_json(run_unelevated);
 
     // Root reads it, decodes the marker and lists it under `daemons` at exit `0`, so this cannot
     // pass vacuously either.
@@ -2152,7 +2117,7 @@ fn unelevated_show_cannot_call_absent_an_id_whose_dropin_it_could_not_read() {
     write_unreadable_dropin(guard.id());
     assert!(!unit_path(guard.id()).exists(), "the fragment must really be absent");
 
-    let listed = list_json();
+    let listed = support::list_json(run_unelevated);
 
     // Root reads this drop-in fine and reports nothing at all at exit `0`, so a run whose reader was
     // not unprivileged fails here instead of passing vacuously.
@@ -2194,7 +2159,7 @@ fn a_named_undetermined_entry_blocks_only_its_own_id() {
 
     // Non-vacuity: the unreadable unit really does reach this reader as a named entry. Without it
     // the assertion below would pass on a host with no `undetermined` entry at all.
-    let listed = list_json();
+    let listed = support::list_json(run_unelevated);
     assert!(
         listed.ids("undetermined").contains(&Some(denied.clone())),
         "{}",
@@ -2229,7 +2194,7 @@ fn unelevated_list_stays_clean_for_a_normal_install() {
     let guard = ServiceGuard::new(&id);
     Systemd::new().install(&mk(guard.id()), false).expect("install");
 
-    let listed = list_json();
+    let listed = support::list_json(run_unelevated);
 
     assert!(listed.ids("daemons").contains(&Some(id.clone())), "{}", listed.context);
     assert!(
