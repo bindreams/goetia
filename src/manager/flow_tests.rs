@@ -77,6 +77,24 @@ fn install_and_preview_refuse_what_only_render_for_install_refuses() {
     assert_eq!(fake.writes(), 0);
 }
 
+/// The definition is rendered, once, before anything the backend holds or writes: a refusal of the
+/// render is the one an install reports, ahead of `begin_install`'s (here an opaque id, which
+/// `begin_install` refuses), so a backend's scope (SCM's lock and provider write) is never taken for
+/// an install that cannot be rendered.
+#[skuld::test]
+fn install_renders_before_it_begins() {
+    let fake = Fake::new();
+    fake.seed_unfit_for_install("host");
+    fake.seed_opaque("frpc");
+
+    let err = fake
+        .install(&mk_as("frpc", "host"), false)
+        .expect_err("the render is refused");
+
+    assert!(err.to_string().contains("unfit for install (seeded)"), "{err}");
+    assert_eq!(fake.writes(), 0);
+}
+
 #[skuld::test]
 fn install_refuses_an_undecodable_blob_with_uninstall_advice() {
     let fake = Fake::new();

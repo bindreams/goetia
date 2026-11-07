@@ -684,7 +684,8 @@ fn managed_begin_install_takes_no_lock_and_calls_no_provider() {
 }
 
 /// Every refusal `render_for_install` makes comes before the lock is taken and before the provider
-/// writes: a refused install leaves no file behind.
+/// writes: a refused install leaves no file behind. The install flow renders before it begins, and
+/// `begin_install` renders nothing.
 #[skuld::test]
 fn a_refused_simple_install_never_reaches_the_provider() {
     let refused = [
@@ -715,7 +716,7 @@ fn a_refused_simple_install_never_reaches_the_provider() {
         let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
         let err = mgr
-            .begin_install(&DaemonSpec::new(fields).unwrap())
+            .install(&DaemonSpec::new(fields).unwrap(), false)
             .map(|_| ())
             .expect_err(what);
 

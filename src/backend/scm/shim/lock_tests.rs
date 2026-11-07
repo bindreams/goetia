@@ -90,7 +90,10 @@ fn a_token_that_cannot_be_asked_reports_both_failures() {
         panic!("expected both failures, got {error:?}");
     };
     assert!(matches!(**first, Error::Os { .. }), "{first:?}");
-    assert!(then.to_string().contains("no token"), "{then}");
+    assert_eq!(
+        then.report().to_string(),
+        "failed to check whether the token has Administrators enabled: no token"
+    );
 }
 
 /// Every other code is the OS's, whoever the caller is.

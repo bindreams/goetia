@@ -727,8 +727,9 @@ fn install_refuses_a_host_with_no_marker() {
         Err(Error::ShimMarkerMissing { path }) => assert_eq!(path, exe),
         other => panic!("a file without the marker is no host, got {other:?}"),
     }
-    // Swept first, then provided and previewed.
-    assert_eq!(*calls.lock().unwrap(), ["sweep", "provide", "preview"]);
+    // Previewed once for the render, before anything is written; then swept, provided, and previewed
+    // again to check that what was provided is what was previewed.
+    assert_eq!(*calls.lock().unwrap(), ["preview", "sweep", "provide", "preview"]);
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]

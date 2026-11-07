@@ -53,7 +53,9 @@ pub(crate) trait Backend {
     // Primitives ------------------------------------------------------------------------------------------------------
 
     /// Everything an install needs before it reads anything, held until it ends: a version gate, a
-    /// lock, the check that a manager can be asked. Fails before anything is read or written.
+    /// lock, the check that a manager can be asked. Fails before anything is read or written. Run
+    /// after [`Self::render_for_install`] has succeeded, so it holds or writes nothing for an
+    /// install that cannot be rendered.
     fn begin_install(&self, spec: &DaemonSpec) -> Result<Self::InstallScope>;
 
     /// Make ready, all or none, what each of `steps` can draw under `budget`, before the first of

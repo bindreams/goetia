@@ -150,9 +150,11 @@ pub(crate) fn reserved<B: Backend>(b: &B, id: &Id, step: Step, budget: Budget) -
 pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
     // `install` has no `--timeout` of its own: its calls are unbounded.
     let mut reservation = reserved(b, &spec.id, Step::Install, Budget::Unbounded)?;
-    let mut scope = b.begin_install(spec)?;
+    // Rendered once, before the scope: what a backend takes or writes in `begin_install` (SCM's
+    // lock and its provider's file) is never taken for an install that cannot be rendered.
     let desired = b.render_for_install(spec)?;
     let desired_text = desired.to_string();
+    let mut scope = b.begin_install(spec)?;
 
     // No cap: `Raced` is a state change the backend detected, not a wait for time to pass.
     loop {
