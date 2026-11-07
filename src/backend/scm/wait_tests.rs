@@ -81,7 +81,8 @@ struct FakeScm {
 #[derive(Debug, Clone, Copy)]
 enum StopReply {
     Ok,
-    /// `ERROR_SERVICE_NOT_ACTIVE`: the service was already `STOPPED` when the STOP arrived.
+    /// `ERROR_SERVICE_NOT_ACTIVE`, which the real actor answers with `Ok(())`: the service was
+    /// already `STOPPED` when the STOP arrived, so nothing is modelled as stopping.
     NotActive,
     Os(i32),
 }
@@ -372,7 +373,7 @@ impl ScmActor for FakeScm {
         }
         Ok(Armed::Registered(status))
     }
-    fn control_stop(&mut self) -> std::io::Result<ControlStopOutcome> {
+    fn control_stop(&mut self) -> std::io::Result<()> {
         self.log.push("control_stop");
         self.shift("control_stop");
         match self.unanswered.take() {
@@ -383,9 +384,9 @@ impl ScmActor for FakeScm {
             StopReply::Ok => {
                 // The STOP is taken: a service not yet modelled is stopping.
                 self.state.get_or_insert(QueriedState::StopPending);
-                Ok(ControlStopOutcome::Delivered)
+                Ok(())
             }
-            StopReply::NotActive => Ok(ControlStopOutcome::NotActive),
+            StopReply::NotActive => Ok(()),
             StopReply::Os(code) => Err(std::io::Error::from_raw_os_error(code)),
         }
     }
@@ -669,23 +670,44 @@ fn stop_and_await_exit_after_an_expired_hold_sends_the_stop_and_is_unconfirmed()
     assert_eq!(fake.log, vec!["control_stop"]);
 }
 
-/// A STOP that finds the service stopped reached no process: SCM had recorded `STOPPED` before the
-/// STOP was sent, so the process it still named when the hold expired is gone, and no STOP can have
-/// reached a restarted one (a restart would not be `STOPPED`). The stop is done.
+/// A STOP that finds the service stopped is not a confirmed stop either: the hold expired because
+/// the held process died, SCM may have a recovery restart pending, and a restarted process may have
+/// reported `STOPPED` and still be exiting. Which error SCM picks for it (`ERROR_SERVICE_NOT_ACTIVE`,
+/// or a refusal, 1061 or 1052, over a `STOPPED` read) does not change the outcome.
 #[skuld::test]
-fn stop_and_await_exit_after_an_expired_hold_is_stopped_when_the_stop_finds_the_service_stopped() {
-    let mut fake = FakeScm::new([]).stop_replies([StopReply::NotActive]);
+fn stop_and_await_exit_after_an_expired_hold_is_unconfirmed_whichever_way_the_stop_finds_the_service_stopped() {
+    for (name, mut fake, log) in [
+        (
+            "ERROR_SERVICE_NOT_ACTIVE",
+            FakeScm::new([]).stop_replies([StopReply::NotActive]),
+            vec!["control_stop"],
+        ),
+        (
+            "1061 over STOPPED",
+            FakeScm::new([])
+                .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+                .queried(QueriedState::Stopped, false),
+            vec!["control_stop", "query_status"],
+        ),
+        (
+            "1052 over STOPPED",
+            FakeScm::new([])
+                .stop_replies([StopReply::Os(ERROR_INVALID_SERVICE_CONTROL)])
+                .queried(QueriedState::Stopped, false),
+            vec!["control_stop", "query_status"],
+        ),
+    ] {
+        let outcome = stop_and_await_exit(
+            &mut fake,
+            spent(),
+            HoldOutcome::<u32>::Expired { pid: 9 },
+            no_terminate,
+            |_, _| panic!("no process is held to wait for"),
+        );
 
-    let outcome = stop_and_await_exit(
-        &mut fake,
-        spent(),
-        HoldOutcome::<u32>::Expired { pid: 9 },
-        no_terminate,
-        |_, _| panic!("no process is held to wait for"),
-    );
-
-    assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped);
-    assert_eq!(fake.log, vec!["control_stop"]);
+        assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Unconfirmed { pid: 9 }, "{name}");
+        assert_eq!(fake.log, log, "{name}");
+    }
 }
 
 /// A STOP that is refused is an error, as for any stop: nothing was sent, so there is no stop to

@@ -96,16 +96,6 @@ pub enum Armed {
     Gone,
 }
 
-/// What `ControlService(STOP)` came to, when it was not refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlStopOutcome {
-    /// SCM took the STOP.
-    Delivered,
-    /// `ERROR_SERVICE_NOT_ACTIVE`: the service was `STOPPED` when the STOP arrived, so the STOP
-    /// reached no process.
-    NotActive,
-}
-
 /// The granular SCM operations `stop_via_notify`/`start_via_notify` need,
 /// isolated so the ordering can be unit-tested with a fake rather than a real
 /// service.
@@ -146,7 +136,7 @@ pub trait ScmActor {
     /// non-looping call into the SCM, so there is no iteration to bound, and
     /// what blocking they do is the SCM's own — not a wait this module
     /// created, and not one it can bound from the client side.
-    fn control_stop(&mut self) -> io::Result<ControlStopOutcome>;
+    fn control_stop(&mut self) -> io::Result<()>;
     /// `StartServiceW`. What an `ERROR_SERVICE_ALREADY_RUNNING` means is not
     /// decided here but by each caller, from the state the follow-up query
     /// reported — see [`StartReply`].
@@ -219,12 +209,13 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 /// not an unconfirmed stop. A `terminate` that finds the process already exited is success. No process
 /// held (none reported, or none that could be opened) is the stop alone.
 ///
-/// An expired hold is sent the STOP all the same, and it ends there: SCM may have restarted the
-/// service since the pid it still reports, so the STOP may have reached a process that nothing
-/// holds, and a `STOPPED` after it says nothing of that one's exit. That is
-/// [`Unconfirmed`](StopAndAwaitExitOutcome::Unconfirmed), and nothing waits. Unless the STOP found
-/// the service stopped ([`ControlStopOutcome::NotActive`]): it reached no process, and the one SCM
-/// named is gone.
+/// An expired hold is sent the STOP all the same, and it ends there, whatever SCM answers: the held
+/// process died (a crash), SCM may have a recovery restart pending, and a restarted process may have
+/// reported `STOPPED` and still be exiting, so the STOP may have reached a process that nothing
+/// holds, or none, and a `STOPPED` after it says nothing of any one's exit. That is
+/// [`Unconfirmed`](StopAndAwaitExitOutcome::Unconfirmed), and nothing waits, for a STOP that finds
+/// the service already stopped (`ERROR_SERVICE_NOT_ACTIVE`, or a refusal over a `STOPPED` read)
+/// as for one that is delivered.
 pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     a: &mut A,
     deadline: Deadline,
@@ -236,14 +227,8 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
         HoldOutcome::Held(process) => Some(process),
         HoldOutcome::NoProcess => None,
         HoldOutcome::Expired { pid } => {
-            return Ok(match control_stop_or_underway(a)? {
-                // SCM answers `ERROR_SERVICE_NOT_ACTIVE` only for a service it has recorded
-                // `STOPPED`, at the moment the STOP arrives, and a service that restarted since the
-                // pid was read is not `STOPPED`: so the pid's process is gone and the STOP reached
-                // no other. Nothing is left to race with.
-                ControlStopOutcome::NotActive => StopAndAwaitExitOutcome::Stopped,
-                ControlStopOutcome::Delivered => StopAndAwaitExitOutcome::Unconfirmed { pid },
-            });
+            control_stop_or_underway(a)?;
+            return Ok(StopAndAwaitExitOutcome::Unconfirmed { pid });
         }
     };
     if stop_via_notify(a, deadline)? == Waited::Expired {
@@ -259,8 +244,7 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     })
 }
 
-/// [`ScmActor::control_stop`], where a stop already under way counts as sent
-/// ([`ControlStopOutcome::Delivered`]).
+/// [`ScmActor::control_stop`], where a stop already under way counts as sent.
 ///
 /// SCM refuses a STOP with 1061 (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) or 1052
 /// (`ERROR_INVALID_SERVICE_CONTROL`). Microsoft documents 1061 for a service that is `STOPPED`,
@@ -282,9 +266,9 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
 ///   fixture) measures this on CI.
 /// - `START_PENDING`: told as [`STARTING`].
 /// - any other state: the OS error.
-fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<ControlStopOutcome> {
+fn control_stop_or_underway<A: ScmActor>(a: &mut A) -> io::Result<()> {
     match a.control_stop() {
-        Err(e) if is_stop_refusal(&e) => decide_refused_stop(a, e, true).map(|()| ControlStopOutcome::Delivered),
+        Err(e) if is_stop_refusal(&e) => decide_refused_stop(a, e, true),
         other => other,
     }
 }
@@ -310,7 +294,7 @@ fn decide_refused_stop<A: ScmActor>(a: &mut A, e: io::Error, may_resend: bool) -
             } else {
                 match a.control_stop() {
                     Err(e) if is_stop_refusal(&e) => decide_refused_stop(a, e, false),
-                    other => other.map(|_| ()),
+                    other => other,
                 }
             }
         }
@@ -438,7 +422,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
                 match a.control_stop() {
-                    Ok(_) => return wait_after_stop(a, deadline, "", StopSeen::Requested),
+                    Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
                         return wait_after_stop(a, deadline, "", StopSeen::Requested);
                     }
@@ -796,7 +780,7 @@ pub(crate) fn request_start_after_stop<A: ScmActor>(a: &mut A) -> io::Result<()>
 
 /// [`request_start`]'s mirror: issue the stop control and return.
 pub(crate) fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
-    control_stop_or_underway(a).map(|_| ())
+    control_stop_or_underway(a)
 }
 
 // handle teardown =====================================================================================================

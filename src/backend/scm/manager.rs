@@ -1112,8 +1112,9 @@ fn terminate_failed(pid: u32, e: std::io::Error) -> std::io::Error {
 fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
     Error::Step {
         what: format!(
-            "SCM still named process {pid} as `{id}`'s when the time ran out, and that process was gone, so the STOP \
-             sent after it may have reached another"
+            "goetia could not hold `{id}`'s process before the time ran out (SCM still named process {pid}, which \
+             was gone), so it cannot confirm that the service's process exited, whether or not SCM reports the \
+             service stopped"
         ),
         source: Box::new(budget::timed_out(id.as_str(), "stopped", budget)),
     }
