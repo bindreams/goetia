@@ -1713,7 +1713,11 @@ fn a_value_that_only_substitution_made_invalid_says_so(#[fixture(temp_dir)] dir:
     // does hold: step 4 shape-checked this same merged spec and passed, so
     // substitution is provably what changed. Pinned here because nothing else
     // would notice if the verdict path stopped carrying this prefix.
-    write_fixture(dir, "id: frpc\ncommand: [/bin/frpc]\nname: ${N}\n", Some("N=\"a\tb\"\n"));
+    write_fixture(
+        dir,
+        "id: frpc\ncommand: [/bin/frpc]\nname: ${N}\n",
+        Some("N=\"a\tb\"\n"),
+    );
     let err = load(&dir.join("goetia.yaml")).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("after substituting from .env"), "{msg}");

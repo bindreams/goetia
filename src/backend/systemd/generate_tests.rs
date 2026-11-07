@@ -323,8 +323,8 @@ fn extract_finds_the_section_when_it_is_not_the_last_in_the_file() {
 
 // Escaping ============================================================================================================
 
-// The rendering tests below call `render_exec_start` on literal words: a word the rules refuse
-// (`+x` as the program) or a Unix path would not survive `DaemonSpec::new` on every host.
+// The rendering tests below call `render_exec_start` on literal words: a Unix path would not survive
+// `DaemonSpec::new` on every host.
 
 fn words(words: &[&str]) -> Vec<String> {
     words.iter().map(|word| word.to_string()).collect()
@@ -349,10 +349,7 @@ fn argv_with_a_backslash_is_quoted_and_doubled() {
 #[skuld::test]
 fn argv_with_spaces_and_quotes_round_trips() {
     let mut spec = minimal_spec().into_fields();
-    spec.command = vec![
-        format!("{PROGRAM} bar"),
-        "--title=say \"hi\"".to_string(),
-    ];
+    spec.command = vec![format!("{PROGRAM} bar"), "--title=say \"hi\"".to_string()];
     let spec = DaemonSpec::new(spec).unwrap();
     let id = minimal_identity();
 
@@ -420,10 +417,7 @@ fn an_executable_path_with_a_dollar_is_written_literally_and_argv0_separately() 
 
 #[skuld::test]
 fn an_executable_path_without_a_dollar_gets_no_separate_argv0() {
-    assert_eq!(
-        render_exec_start(&words(&["/opt/a b/bin", "x"])),
-        "\"/opt/a b/bin\" x"
-    );
+    assert_eq!(render_exec_start(&words(&["/opt/a b/bin", "x"])), "\"/opt/a b/bin\" x");
 }
 
 #[skuld::test]
@@ -449,10 +443,7 @@ fn percent_is_doubled_in_every_value() {
     let spec = DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "100% Uptime".to_string(),
-        command: vec![
-            format!("{PROGRAM}%1"),
-            "arg%2 with space".to_string(),
-        ],
+        command: vec![format!("{PROGRAM}%1"), "arg%2 with space".to_string()],
         cwd: Some(abs("opt/a%b")),
         env: BTreeMap::from([("KEY".to_string(), "v%alue".to_string())]),
         user: User::Name("ignored-by-generate".to_string()),
@@ -848,7 +839,10 @@ fn an_argument_and_an_environment_value_with_edge_whitespace_are_quoted_whole() 
         ]);
     });
     let text = unit(&spec, &minimal_identity()).unwrap();
-    assert_eq!(line_of(&text, "ExecStart="), format!(r#"ExecStart={PROGRAM} " a" "a " " a " " ""#));
+    assert_eq!(
+        line_of(&text, "ExecStart="),
+        format!(r#"ExecStart={PROGRAM} " a" "a " " a " " ""#)
+    );
     let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("Environment=")).collect();
     assert_eq!(lines, [r#"Environment="K= v ""#, r#"Environment="L=v ""#]);
 }

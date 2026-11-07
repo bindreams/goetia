@@ -858,11 +858,7 @@ fn registration_refuses_restart_always() {
 
 #[cfg(windows)]
 fn managed_with_executable(executable: &str) -> DaemonSpec {
-    DaemonSpec::new(plain_fields(
-        "frpc",
-        vec![executable.to_string(), "arg".to_string()],
-    ))
-    .unwrap()
+    DaemonSpec::new(plain_fields("frpc", vec![executable.to_string(), "arg".to_string()])).unwrap()
 }
 
 /// Executables whose argv[0] the writer reads back exactly, and ones it does not.
@@ -986,10 +982,10 @@ fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     let err = registration(&simple_spec(), &identity(), &shim).expect_err("a mangled shim path must be refused");
     let text = err.to_string();
     assert!(text.contains("service registration"), "{text}");
-    // No manifest sets the shim path: the message names it, its source and its forcing character,
-    // and does not blame `command[0]` or send the user to an install location.
+    // No manifest sets the shim path: the message names it and its forcing character, and does
+    // not blame `command[0]`, name where the path came from, or send the user to an install location.
     assert!(text.contains("goetia-shim path"), "{text}");
-    assert!(text.contains("`GOETIA_SHIM_PATH`"), "{text}");
+    assert!(!text.contains("GOETIA_SHIM_PATH"), "{text}");
     assert!(!text.contains("installed"), "{text}");
     assert!(text.contains(&format!("{:?}", shim.display().to_string())), "{text}");
     assert!(text.contains("space"), "{text}");

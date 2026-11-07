@@ -11,8 +11,7 @@
 //! further doubles `$` in its arguments (systemd performs `$FOO`/`${FOO}` environment
 //! substitution there, but not in the executable path; it does in argv[0], so a path holding `$`
 //! is written `@<path> <argv[0]>`), and quotes a bare `;` argument (systemd's
-//! command-line separator). A `command[0]` starting with one of systemd's command-prefix
-//! characters (`-@:+!`) is refused: quoting does not make the character literal.
+//! command-line separator).
 //!
 //! Backslashes are never refused: a quoted word doubles each, and a raw value ending in an odd
 //! run of them gets a trailing space (see [`raw_value`]). The values no encoding can carry are
@@ -106,9 +105,6 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
 /// - The executable path of `ExecStart=` (after unquoting and specifiers) holding a backslash,
 ///   `"` or `'`: systemd refuses the whole unit with "Executable name contains special
 ///   characters", however the word was quoted. Later arguments take all three.
-/// - An executable path starting with `-`, `@`, `:`, `+` or `!`: systemd reads that character as a
-///   command prefix after unquoting (`+` runs the daemon as root, ignoring `User=`), so quoting
-///   does not make it literal (measured on 242 and 255, all five characters).
 /// - An executable path ending in a space: systemd 255 keeps the path but the service exits with
 ///   203/EXEC (242 runs it; both are refused). Interior spaces, other trailing whitespace and
 ///   later arguments are fine.
@@ -130,13 +126,6 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
             "the executable path {executable:?} (`command[0]`) \
              holds a backslash, double quote or apostrophe, which systemd refuses to load in an \
              executable path"
-        )));
-    }
-    if executable.starts_with(COMMAND_PREFIXES) {
-        return Err(invalid(format!(
-            "the executable path {executable:?} (`command[0]`) \
-             starts with a character systemd reads as a command prefix (`-`, `@`, `:`, `+` or `!`), \
-             even when quoted; `+` would run the daemon as root, ignoring `User=`"
         )));
     }
     if executable.ends_with(' ') {
@@ -173,7 +162,8 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
     Ok(())
 }
 
-/// The characters systemd reads as a prefix of `ExecStart=`'s first word, after unquoting.
+/// The characters systemd reads as a prefix of `ExecStart=`'s first word, after unquoting, and
+/// which quoting does not make literal (measured on 242 and 255).
 const COMMAND_PREFIXES: [char; 5] = ['-', '@', ':', '+', '!'];
 
 /// The characters systemd's line reader strips from both ends of a raw value: space, tab, LF, CR.
@@ -192,8 +182,10 @@ fn render_restart(restart: Restart) -> &'static str {
 /// Render `ExecStart=`'s value: each word percent-doubled, then quoted per systemd's command-line
 /// syntax wherever quoting is needed for readback (whitespace or a quoting-relevant character),
 /// or wherever an unquoted word would take on a meaning of its own: a bare `;` (systemd's
-/// command-line separator). An executable starting with a command-prefix character never gets
-/// here: `refuse_unrepresentable` refuses it.
+/// command-line separator).
+///
+/// `command[0]` never starts with a command-prefix character (`-@:+!`), which quoting would not
+/// make literal: `DaemonSpec::new` guarantees it is an absolute path, and a Unix one starts with `/`.
 ///
 /// Arguments are also dollar-doubled, since systemd substitutes `$FOO`/`${FOO}` and collapses
 /// `$$` there. The executable path is not: systemd takes it as written. But it substitutes in
@@ -201,6 +193,10 @@ fn render_restart(restart: Restart) -> &'static str {
 /// `@` makes the next word argv[0] (measured on 242 and 255). A path without `$` is one word.
 fn render_exec_start(command: &[String]) -> String {
     let (executable, arguments) = command.split_first().expect("a daemon has a command");
+    debug_assert!(
+        !executable.starts_with(COMMAND_PREFIXES),
+        "`command[0]` {executable:?} is not an absolute path, which `DaemonSpec::new` guarantees"
+    );
     let mut words = Vec::with_capacity(command.len() + 1);
     if executable.contains('$') {
         words.push(render_exec_word(&double_percent(&format!("@{executable}"))));
