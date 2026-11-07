@@ -353,25 +353,27 @@ pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Er
     Ok(Some(blob))
 }
 
-/// Look up `field` in `parameters` case-insensitively (ASCII-only: every
-/// field name Goetia itself writes and looks for — `Marker`, `Schema`,
-/// `Version`, `Spec` — is plain ASCII, so no Unicode case-folding is
-/// needed). Deliberately scoped to one field name at a time rather than
-/// folding the whole map: two *unrelated* values under some other
-/// application's own differently-cased keys are none of Goetia's business
-/// unless Goetia is actually trying to interpret one of its own four field
-/// names. More than one key matching `field` case-insensitively is itself
-/// an error rather than a silent pick of whichever `BTreeMap` iteration
-/// visits first — the same "don't silently choose" reasoning as
-/// `spec::raw`'s duplicate-id check.
+/// Goetia's spelling of the field `name` spells in any ASCII case, or `None` for any other name.
+/// ASCII-only: all four field names are plain ASCII, so no Unicode case-folding is needed. The
+/// registry compares value names this way, so a stored `marker` is the `Marker` goetia writes.
+pub(crate) fn field_named(name: &str) -> Option<&'static str> {
+    [FIELD_MARKER, FIELD_SCHEMA, FIELD_VERSION, FIELD_SPEC]
+        .into_iter()
+        .find(|field| field.eq_ignore_ascii_case(name))
+}
+
+/// Look up `field` in `parameters` case-insensitively (see [`field_named`]). Deliberately scoped to
+/// one field name at a time rather than folding the whole map: two *unrelated* values under some
+/// other application's own differently-cased keys are none of Goetia's business unless Goetia is
+/// actually trying to interpret one of its own four field names. More than one key spelling `field`
+/// is itself an error rather than a silent pick of whichever `BTreeMap` iteration visits first, the
+/// same "don't silently choose" reasoning as `spec::raw`'s duplicate-id check.
 fn get_field<'a>(parameters: &'a BTreeMap<String, String>, field: &str) -> Result<Option<&'a str>, Error> {
     let mut found: Option<&str> = None;
     for (key, value) in parameters {
-        if key.eq_ignore_ascii_case(field) {
+        if field_named(key) == Some(field) {
             if found.is_some() {
-                return Err(Error::blob(format!(
-                    "Parameters has more than one value spelled `{field}` case-insensitively"
-                )));
+                return Err(collision_error(field));
             }
             found = Some(value.as_str());
         }
@@ -381,18 +383,23 @@ fn get_field<'a>(parameters: &'a BTreeMap<String, String>, field: &str) -> Resul
 
 /// `parameters` with each name that spells one of Goetia's four fields in another case renamed to
 /// Goetia's spelling. The registry keeps the stored case when a value is set, so a readback
-/// compared with what goetia writes must fold it, as [`extract`] does.
-pub fn canonical_field_names(parameters: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    parameters
-        .iter()
-        .map(|(name, value)| {
-            let canonical = [FIELD_MARKER, FIELD_SCHEMA, FIELD_VERSION, FIELD_SPEC]
-                .into_iter()
-                .find(|field| field.eq_ignore_ascii_case(name))
-                .unwrap_or(name);
-            (canonical.to_string(), value.clone())
-        })
-        .collect()
+/// compared with what goetia writes must fold it, as [`extract`] does. Two names that fold to one
+/// field are an error, as in [`extract`].
+pub fn canonical_field_names(parameters: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>, Error> {
+    let mut folded = BTreeMap::new();
+    for (name, value) in parameters {
+        let canonical = field_named(name).unwrap_or(name);
+        if folded.insert(canonical.to_string(), value.clone()).is_some() {
+            return Err(collision_error(canonical));
+        }
+    }
+    Ok(folded)
+}
+
+fn collision_error(field: &str) -> Error {
+    Error::blob(format!(
+        "Parameters has more than one value spelled `{field}` case-insensitively"
+    ))
 }
 
 fn missing_field_error(field: &str) -> Error {

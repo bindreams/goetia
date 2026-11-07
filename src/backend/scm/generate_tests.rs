@@ -1104,7 +1104,26 @@ fn canonical_field_names_restore_goetias_spelling_and_leave_other_names_alone() 
     let mut expected = reg.parameters;
     expected.insert("Stray".to_string(), "x".to_string());
     expected.insert("sTRAY2".to_string(), "y".to_string());
-    assert_eq!(canonical_field_names(&stored), expected);
+    assert_eq!(canonical_field_names(&stored).unwrap(), expected);
+}
+
+/// Two stored names that fold to one of Goetia's fields are reported, not collapsed into whichever
+/// the map visits last, as [`extract`] reports them.
+#[skuld::test]
+fn canonical_field_names_report_two_names_folding_to_one_field() {
+    let mut stored = build(&managed_spec()).parameters;
+    stored.insert("MARKER".to_string(), "also-goetia".to_string());
+
+    let err = canonical_field_names(&stored).expect_err("two spellings of Marker must be reported");
+    assert!(err.to_string().contains(FIELD_MARKER), "{err}");
+}
+
+#[skuld::test]
+fn field_named_folds_ascii_case_to_goetias_spelling_and_knows_no_other_name() {
+    assert_eq!(field_named("sPeC"), Some(FIELD_SPEC));
+    assert_eq!(field_named("Marker"), Some(FIELD_MARKER));
+    assert_eq!(field_named("Markers"), None);
+    assert_eq!(field_named(""), None);
 }
 
 #[skuld::test]

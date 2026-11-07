@@ -15,7 +15,7 @@
 use std::io;
 use std::ops::ControlFlow;
 
-use crate::backend::scm::exit_status::RecordedExit;
+use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit};
 use crate::manager::budget::Deadline;
 use crate::spec::Kind;
 
@@ -843,8 +843,6 @@ pub(crate) fn marked_for_deletion(state: QueriedState) -> io::Error {
          state waited for"
     ))
 }
-
-pub(crate) use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 
 /// The error for a wait for a state other than `STOPPED` over a service that was deleted meanwhile.
 pub(crate) fn service_gone() -> io::Error {

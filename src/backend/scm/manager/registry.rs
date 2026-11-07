@@ -15,15 +15,18 @@ use windows_sys::Win32::System::Registry::{
     REG_BINARY, REG_DWORD, REG_DWORD_BIG_ENDIAN, REG_EXPAND_SZ, REG_FULL_RESOURCE_DESCRIPTOR, REG_LINK, REG_MULTI_SZ,
     REG_NONE, REG_QWORD, REG_RESOURCE_LIST, REG_RESOURCE_REQUIREMENTS_LIST, REG_SZ, RegQueryValueExW,
 };
-use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::types::FromRegValue as _;
+use winreg::{RegKey, RegValue};
 
+use crate::backend::scm::generate::field_named;
 use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
 
 mod settle;
-use settle::{Failure, Settled, Stop, settle, stands};
+mod watch;
+use settle::{Failure, Settled, Stop, is_gone, settle, stands};
+use watch::ServiceWatch;
 
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
@@ -63,11 +66,19 @@ pub enum RegistryReadOutcome<T> {
 
 /// Runs `pass` until it completes or [`settle`] ends it. `fail` makes the error for a failure that
 /// leaves the read undecided.
+///
+/// A read that must be retried waits for a change under the service key first, rather than reading
+/// again at once: a key marked for deletion stays so while another process holds it open, and reads
+/// until then would spin. The notification is armed before the pass whose failure is waited on, so a
+/// change after that pass began wakes the wait and none is lost. A service key that is already gone
+/// cannot be watched, and the next pass finds it so.
 fn read_settled<T>(
     name: &str,
     fail: impl Fn(Failure) -> Error,
     mut pass: impl FnMut() -> std::result::Result<T, Stop<T>>,
 ) -> Result<RegistryReadOutcome<T>> {
+    let path = service_key_path(name);
+    let mut armed: Option<ServiceWatch> = None;
     loop {
         let stop = match pass() {
             Ok(value) => return Ok(RegistryReadOutcome::Read(value)),
@@ -76,7 +87,18 @@ fn read_settled<T>(
         match settle(stop, || service_stands(name)) {
             Settled::Gone => return Ok(RegistryReadOutcome::ServiceGone),
             Settled::Value(value) => return Ok(RegistryReadOutcome::Read(value)),
-            Settled::Retry => continue,
+            Settled::Retry => {
+                if let Some(watch) = armed.take() {
+                    watch
+                        .wait()
+                        .map_err(|source| fail(failure("wait for a change under", &path, source)))?;
+                }
+                armed = match ServiceWatch::arm(&path) {
+                    Ok(watch) => Some(watch),
+                    Err(source) if is_gone(&source) => None,
+                    Err(source) => return Err(fail(failure("watch", &path, source))),
+                };
+            }
             Settled::Failed(failure) => return Err(fail(failure)),
         }
     }
@@ -101,12 +123,11 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
     }
 }
 
-/// Every string-valued entry under `Services\<name>\Parameters`, keyed
-/// case-preserved (case-insensitive lookup of Goetia's own four fields is
-/// `generate::extract`'s job, not this function's). Values of a non-string
-/// registry type (`REG_DWORD`, `REG_BINARY`, ...) are skipped — they cannot
-/// be one of Goetia's own fields, which are always strings, and are none of
-/// Goetia's business otherwise.
+/// Every entry under `Services\<name>\Parameters`, keyed case-preserved (case-insensitive lookup of
+/// Goetia's own four fields is `generate::extract`'s job, not this function's). A string value is
+/// its text. Anything else goetia does not write is read too, as an entry no field name of Goetia's
+/// can match ([`value_entry`], [`subkey_entry`]): a stray value of another type or a stray subkey
+/// is drift that `install --force` removes, and it must not read as equal to what goetia wants.
 ///
 /// The result classifies the id:
 ///
@@ -125,7 +146,8 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 /// goetia's own writes never remove `Parameters` (see [`write_parameters`]). SCM's delete of the
 /// service does: it removes `Parameters` before the service key, so a read that lands between the
 /// two steps of a concurrent uninstall sees a standing service with no `Parameters`, and reads it
-/// as Foreign.
+/// as Foreign. That window stays open: goetia does not guard against a user's own concurrent runs
+/// (owner, 2026-11-03).
 pub fn read_parameters(name: &str) -> Result<RegistryReadOutcome<BTreeMap<String, String>>> {
     read_parameters_as(name, false)
 }
@@ -151,13 +173,37 @@ fn read_parameters_as(name: &str, listed: bool) -> Result<RegistryReadOutcome<BT
             let mut out = BTreeMap::new();
             for entry in key.enum_values() {
                 let (field, value) = entry.map_err(|e| Stop::mid_read(failure("enumerate", &path, e)))?;
-                if let Ok(s) = String::from_reg_value(&value) {
-                    out.insert(field, s);
-                }
+                let (name, shown) = value_entry(field, &value);
+                out.insert(name, shown);
+            }
+            for entry in key.enum_keys() {
+                let subkey = entry.map_err(|e| Stop::mid_read(failure("enumerate subkeys of", &path, e)))?;
+                let (name, shown) = subkey_entry(&subkey);
+                out.insert(name, shown);
             }
             Ok(out)
         },
     )
+}
+
+/// How one `Parameters` value reads: its text when it is a string, which is all of Goetia's own
+/// fields. Any other type reads as an entry named for the value and its type, so it differs from
+/// every desired entry and still cannot be taken for one of Goetia's fields: a foreign service's
+/// `Marker` of type `REG_DWORD` stays foreign.
+fn value_entry(name: String, value: &RegValue) -> (String, String) {
+    match String::from_reg_value(value) {
+        Ok(text) => (name, text),
+        Err(_) => (
+            format!("{name} ({})", type_name(value.vtype.clone() as u32)),
+            "(value is not a string)".to_string(),
+        ),
+    }
+}
+
+/// How one `Parameters` subkey reads: an entry whose name ends in the backslash a key name cannot
+/// hold, so it is none of Goetia's fields.
+fn subkey_entry(name: &str) -> (String, String) {
+    (format!(r"{name}\"), "(subkey)".to_string())
 }
 
 /// Write `params` as the *entire* contents of `Services\<name>\Parameters`, in place: every value
@@ -172,6 +218,11 @@ fn read_parameters_as(name: &str, listed: bool) -> Result<RegistryReadOutcome<BT
 /// `Conflict`. Names compare case-insensitively, as the registry does: setting `Marker` updates a
 /// stored `marker` and keeps its case, so that value is wanted, not stray.
 pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result<()> {
+    debug_assert!(
+        params.keys().all(|field| field_named(field) == Some(field.as_str())),
+        "Parameters holds only Goetia's own fields, spelled as goetia does: {:?}",
+        params.keys().collect::<Vec<_>>()
+    );
     let service_path = service_key_path(name);
     let path = parameters_key_path(name);
     let service = RegKey::predef(HKEY_LOCAL_MACHINE)
@@ -207,11 +258,12 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
     Ok(())
 }
 
-/// The names in `present` that match no name in `wanted`, compared case-insensitively.
+/// The names in `present` that are none of the fields in `wanted`, which holds only Goetia's own
+/// field names. Compared by [`field_named`]: the registry ignores case.
 fn strays<'a>(present: &'a [String], wanted: &BTreeMap<String, String>) -> impl Iterator<Item = &'a String> {
     present
         .iter()
-        .filter(|field| !wanted.keys().any(|name| name.eq_ignore_ascii_case(field)))
+        .filter(|name| field_named(name).is_none_or(|field| !wanted.contains_key(field)))
 }
 
 /// A delete of something already gone is done.

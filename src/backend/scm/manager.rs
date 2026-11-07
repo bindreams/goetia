@@ -102,13 +102,12 @@ use windows_service::service::{
     ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree,
-};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree};
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
+use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::{
@@ -522,7 +521,7 @@ fn read_live_registration(
             account,
             failure_actions,
             environment,
-            parameters: generate::canonical_field_names(live_params),
+            parameters: generate::canonical_field_names(live_params)?,
         },
         cfg.start_type,
     ))

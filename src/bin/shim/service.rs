@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use cosca::{Containment, Fd, Stdio};
 use goetia::backend::scm::exit_status::{
-    ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, ERROR_SERVICE_DOES_NOT_EXIST,
-    Reported,
+    ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
 };
 use goetia::backend::scm::manager::read_spec_blob;
 use goetia::error::Error;
@@ -85,13 +84,13 @@ fn run_service(id: &str) {
             );
         }
         Err(Error::NotInstalled { .. }) => {
-            log.failure(id, "the service was deleted while the shim was starting");
-            finish(
-                &log,
+            // A non-zero Win32 code would have SCM's recovery restart a shim that fails the same way
+            // every time; only a zero one is never restarted.
+            log.failure(
                 id,
-                status_handle,
-                Reported::shim_failure(Some(ERROR_SERVICE_DOES_NOT_EXIST as i32)),
+                &format!(r"Services\{id} is gone, or this service's record does not name it: no daemon was started"),
             );
+            finish(&log, id, status_handle, Reported::incomplete_stop());
         }
         Err(e) => {
             log.failure(id, &format!("decode metadata blob: {}", e.report()));

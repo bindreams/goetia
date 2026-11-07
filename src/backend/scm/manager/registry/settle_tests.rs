@@ -136,3 +136,10 @@ fn another_failure_fails_without_asking_whether_the_service_stands() {
         other => panic!("expected Failed, got {other:?}"),
     }
 }
+
+#[skuld::test]
+fn a_key_that_is_not_found_or_deleted_is_gone_and_a_denied_one_is_not() {
+    assert!(is_gone(&io::Error::from_raw_os_error(NOT_FOUND)));
+    assert!(is_gone(&io::Error::from_raw_os_error(KEY_DELETED)));
+    assert!(!is_gone(&io::Error::from_raw_os_error(ACCESS_DENIED)));
+}

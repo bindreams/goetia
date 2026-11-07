@@ -1,6 +1,10 @@
 use super::*;
 
+use winreg::RegValue;
+use winreg::enums::RegType;
 use winreg::types::ToRegValue as _;
+
+use crate::backend::scm::generate::field_named;
 
 #[skuld::test]
 fn service_key_path_is_under_current_control_set_services() {
@@ -19,14 +23,56 @@ fn parameters_key_path_is_the_service_key_plus_parameters() {
 }
 
 #[skuld::test]
-fn a_stray_is_a_present_name_that_no_wanted_name_matches_in_any_case() {
+fn a_stray_is_a_present_name_that_is_none_of_the_wanted_fields_in_any_case() {
     let wanted = BTreeMap::from([
         ("Marker".to_string(), "m".to_string()),
         ("Spec".to_string(), "s".to_string()),
     ]);
-    let present: Vec<String> = ["marker", "SPEC", "Stray", "Marker2"].map(String::from).to_vec();
+    // `Schema` is one of Goetia's fields but not wanted here, so it is as stray as `Stray`.
+    let present: Vec<String> = ["marker", "SPEC", "Stray", "Marker2", "schema"]
+        .map(String::from)
+        .to_vec();
     let found: Vec<&String> = strays(&present, &wanted).collect();
-    assert_eq!(found, [&"Stray".to_string(), &"Marker2".to_string()]);
+    assert_eq!(
+        found,
+        [&"Stray".to_string(), &"Marker2".to_string(), &"schema".to_string()]
+    );
+}
+
+fn dword(value: u32) -> RegValue<'static> {
+    RegValue {
+        bytes: std::borrow::Cow::Owned(value.to_le_bytes().to_vec()),
+        vtype: RegType::REG_DWORD,
+    }
+}
+
+#[skuld::test]
+fn a_string_value_reads_as_itself() {
+    let text = "text".to_string();
+    let value = text.to_reg_value();
+    assert_eq!(
+        value_entry("Marker".to_string(), &value),
+        ("Marker".to_string(), "text".to_string())
+    );
+}
+
+/// A value that is not a string is drift in goetia's own key, so it must read as an entry; but never
+/// under a name `extract` would take for one of Goetia's fields, or a foreign service with a
+/// `Marker` DWORD would read as a broken goetia service instead of a foreign one.
+#[skuld::test]
+fn a_value_that_is_not_a_string_reads_as_an_entry_that_is_none_of_goetias_fields() {
+    let (name, shown) = value_entry("Marker".to_string(), &dword(1));
+    assert!(name.contains("Marker") && name.contains("REG_DWORD"), "{name}");
+    assert_eq!(field_named(&name), None);
+    assert!(!shown.is_empty());
+}
+
+#[skuld::test]
+fn a_subkey_reads_as_an_entry_that_is_none_of_goetias_fields() {
+    let (name, shown) = subkey_entry("Marker");
+    assert!(name.contains("Marker"), "{name}");
+    assert_eq!(field_named(&name), None);
+    assert!(!shown.is_empty());
 }
 
 #[skuld::test]

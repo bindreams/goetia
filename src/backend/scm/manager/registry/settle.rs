@@ -78,14 +78,17 @@ pub(super) enum Settled<T> {
     Failed(Failure),
 }
 
+/// Whether `e` says the key is not there: not found, or deleted and held open by another process.
+pub(super) fn is_gone(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(ERROR_KEY_DELETED as i32)
+}
+
 /// Whether the service key opened. A key not found or deleted is gone; a denied open stands,
 /// because resolving the path comes before the access check.
 pub(super) fn stands(opened: io::Result<()>) -> io::Result<bool> {
     match opened {
         Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(ERROR_KEY_DELETED as i32) => {
-            Ok(false)
-        }
+        Err(e) if is_gone(&e) => Ok(false),
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => Ok(true),
         Err(e) => Err(e),
     }

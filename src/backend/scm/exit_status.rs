@@ -16,7 +16,7 @@
 pub const ERROR_BAD_ARGUMENTS: u32 = 160;
 /// The metadata blob is absent or cannot be decoded.
 pub const ERROR_INVALID_DATA: u32 = 13;
-/// The service this shim was started for no longer exists.
+/// SCM's answer to an open of a service that does not exist.
 pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 /// A shim failure that carries no usable OS error.
 pub const ERROR_GEN_FAILURE: u32 = 31;
@@ -42,7 +42,9 @@ pub enum Reported {
     /// The shim failed; holds a Win32 code that is neither 0 nor [`ERROR_SERVICE_SPECIFIC_ERROR`].
     ShimFailure(u32),
     /// The shim could not show that the daemon's tree was terminated, after a stop or a failure,
-    /// or because no Job Object contained it; it may still be running.
+    /// or because no Job Object contained it; it may still be running. Also the report of a shim
+    /// whose service record is gone or names no service: nothing was started, and SCM's recovery
+    /// does not restart it.
     IncompleteStop,
 }
 

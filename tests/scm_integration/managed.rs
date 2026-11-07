@@ -816,6 +816,37 @@ fn force_install_removes_strays_from_parameters_and_keeps_the_service_ours() {
     mgr.status(&spec.id).expect("status: the service still reads as ours");
 }
 
+/// A stray subkey, or a value that is not a string, is the only difference from what goetia wrote:
+/// it is still a `Conflict`, and `install --force` removes it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let (subkey, _) = parameters.create_subkey("Sub").expect("create Sub");
+    subkey.set_value("Nested", &"y").expect("write Nested");
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("Sub"), "{diff}");
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    assert!(
+        matches!(parameters.open_subkey("Sub"), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "the subkey survived"
+    );
+
+    parameters.set_value("Count", &7u32).expect("write a REG_DWORD");
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("Count"), "{diff}");
+    let count = parameters_key(&id, KEY_READ).get_value::<u32, _>("Count");
+    assert!(
+        matches!(&count, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "the REG_DWORD survived: {count:?}"
+    );
+    mgr.status(&spec.id).expect("status: the service still reads as ours");
+}
+
 // Step 7: a real account gets SeServiceLogonRight =====================================================================
 
 struct LocalUserGuard {
