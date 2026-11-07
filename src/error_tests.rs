@@ -86,9 +86,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::NoManager {
             evidence: String::new(),
         },
-        Error::ElevationRequired {
-            what: String::new(),
-        },
+        Error::ElevationRequired { what: String::new() },
         Error::UnsupportedPlatform {
             platform: String::new(),
         },
