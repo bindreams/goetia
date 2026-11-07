@@ -13,14 +13,13 @@ use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows_sys::Wdk::System::Registry::{NtCreateKey, NtSetValueKey};
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, OBJ_CASE_INSENSITIVE, OBJ_OPENLINK, UNICODE_STRING};
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
 
 use crate::common::{self, conformance_mk, fixture_command};
 use crate::deny::Denied;
 use crate::install_helper::INSTALL_AS;
+use crate::support::raw_registry::{create_raw_key, set_raw_value};
 use crate::support::registry::{
     create_parameters_key, parameters_key, service_key, try_parameters_key, try_service_key,
 };
@@ -838,69 +837,6 @@ fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes() {
     mgr.status(&spec.id).expect("status: the service still reads as ours");
 }
 
-/// `name` (UTF-16 units, any, a NUL included) as the counted string `ntdll` takes. It points at
-/// `name`, which must outlive the call it is passed to.
-fn counted(name: &[u16]) -> UNICODE_STRING {
-    // A registry name has at most 16 383 units, so its length in bytes fits.
-    let bytes = u16::try_from(name.len() * 2).expect("a registry name of at most 16 383 units");
-    UNICODE_STRING {
-        Length: bytes,
-        MaximumLength: bytes,
-        Buffer: name.as_ptr().cast_mut(),
-    }
-}
-
-/// A raw `NtSetValueKey` of `name` (UTF-16 units, any, a NUL included) with `vtype` and `data`.
-fn set_raw_value(key: &winreg::RegKey, name: &[u16], vtype: u32, data: &[u8]) {
-    let name = counted(name);
-    // SAFETY: `key` holds an open handle with write access; `name` points at units that outlive the
-    // call, and `data` is `data.len()` readable bytes.
-    let status = unsafe {
-        NtSetValueKey(
-            key.raw_handle(),
-            &name,
-            0,
-            vtype,
-            data.as_ptr().cast(),
-            data.len() as u32,
-        )
-    };
-    assert!(status >= 0, "write a value of type {vtype}: NTSTATUS {status:#x}");
-}
-
-/// A raw `NtCreateKey` of the child `name` (UTF-16 units, any, a NUL included) of `parent`, with
-/// `options` (`REG_OPTION_CREATE_LINK` makes a link). The key is returned open.
-fn create_raw_key(parent: &winreg::RegKey, name: &[u16], options: u32) -> winreg::RegKey {
-    const KEY_ALL_ACCESS: u32 = 0xF003F;
-    let name = counted(name);
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: parent.raw_handle(),
-        ObjectName: &name,
-        Attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENLINK,
-        SecurityDescriptor: std::ptr::null(),
-        SecurityQualityOfService: std::ptr::null(),
-    };
-    let mut handle = std::ptr::null_mut();
-    let mut disposition = 0u32;
-    // SAFETY: `attributes` and the name it points at outlive the call; `handle` and `disposition`
-    // are valid out-params; the class is null, which the API allows.
-    let status = unsafe {
-        NtCreateKey(
-            &mut handle,
-            KEY_ALL_ACCESS,
-            &attributes,
-            0,
-            std::ptr::null(),
-            options,
-            &mut disposition,
-        )
-    };
-    assert!(status >= 0, "create a key: NTSTATUS {status:#x}");
-    // `winreg` closes a handle it holds on drop, which is all this needs from it.
-    winreg::RegKey::predef(handle)
-}
-
 /// `RegDeleteTreeW` follows a registry link: a stray link under `Parameters` would have its target
 /// wiped. `--force` deletes the link itself and leaves the target as it was.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -947,6 +883,8 @@ fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_t
     const REG_OPTION_CREATE_LINK: u32 = 2;
     let mgr = Scm::new();
     let id = support::random_test_id();
+    // Before the service, so that the service and its link go first, while the target is there.
+    let target = ScratchKey::new(&format!("link-target-{id}"));
     let _guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, &id);
     let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
@@ -955,7 +893,6 @@ fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_t
     let parameters = parameters_key(&id, KEY_READ);
     let fields: Vec<(String, winreg::RegValue)> = parameters.enum_values().map(|v| v.expect("enumerate")).collect();
     drop(parameters);
-    let target = ScratchKey::new(&format!("link-target-{id}"));
     let target_key = target.create();
     target_key.set_value("Keep", &"x").expect("write Keep");
     for (name, value) in &fields {
@@ -981,7 +918,8 @@ fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_t
         !listed.iter().any(|entry| match entry {
             Installed::Ours { spec, .. } => spec.id.as_str() == id,
             Installed::OursUnusable { name, .. } => name == &id,
-            Installed::Undetermined { name, .. } => name.as_deref() == Some(id.as_str()),
+            // An aggregate may stand for this id: fail rather than certify what `list` cannot.
+            Installed::Undetermined { name, .. } => name.as_deref().is_none_or(|n| n == id),
         }),
         "a service whose Parameters is a link is not goetia's, and omitted: {listed:?}"
     );
@@ -995,8 +933,9 @@ fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_t
         );
     }
 
-    // The target is as it was, and the link still points at it: opened as itself it holds its
-    // `SymbolicLinkValue`, and opened as every other reader does it is the target.
+    // The refusals wrote nothing through the link. A write through it would have removed `Keep`,
+    // which is a stray to goetia, and the link still points at the target: opened as itself it holds
+    // its `SymbolicLinkValue`, and opened as every other reader does it is the target.
     assert_eq!(target_key.get_value::<String, _>("Keep").expect("read Keep"), "x");
     let as_itself = create_raw_key(&service, &units("Parameters"), 0);
     let held = as_itself

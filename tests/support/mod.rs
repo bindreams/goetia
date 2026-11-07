@@ -15,6 +15,8 @@ pub mod daemon_spec;
 pub mod elevation;
 pub mod kill;
 #[cfg(windows)]
+pub mod raw_registry;
+#[cfg(windows)]
 pub mod registry;
 #[cfg(windows)]
 pub mod scratch;

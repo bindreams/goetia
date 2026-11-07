@@ -147,9 +147,10 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///
 /// goetia's own writes remove `Parameters` only when it is a registry link (see
 /// [`write_parameters`]), which a read classifies as not goetia's, so a write meets one only when
-/// it appeared after the read; SCM's delete of the service removes it, before the service key: a read between the two steps sees a standing service with
-/// no `Parameters`, and reads it as Foreign. A concurrent uninstall can leave this window open;
-/// goetia does not guard against it (owner, 2026-11-03).
+/// it appeared after the read. SCM's delete of the service removes it, before the service key: a
+/// read between the two steps sees a standing service with no `Parameters`, and reads it as
+/// Foreign. A concurrent uninstall can leave this window open; goetia does not guard against it
+/// (owner, 2026-11-03).
 pub fn read_parameters(name: &str, origin: Origin) -> Result<RegistryReadOutcome<Parameters>> {
     let services = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(SERVICES_KEY, KEY_READ)

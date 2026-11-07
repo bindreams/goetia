@@ -3,6 +3,10 @@ use super::*;
 use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
 use winreg::types::ToRegValue as _;
 
+use crate::backend::test_elevation::{ELEVATED, elevated};
+use crate::backend::test_raw_registry::{create_raw_key, set_raw_value};
+use crate::backend::test_scratch::ScratchKey;
+
 #[skuld::test]
 fn service_key_path_is_under_current_control_set_services() {
     assert_eq!(
@@ -424,4 +428,69 @@ fn an_event_message_file_needs_a_system_root() {
         let message = e.to_string();
         assert!(message.contains("SystemRoot"), "{message}");
     }
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. A read classifies a `Parameters` that is a link as not
+/// goetia's, so a write meets one only when it appeared after the read: this drives
+/// `create_parameters_key` directly, with a scratch key for the service key. Writing through the
+/// link is denied (a link key takes no value but its `SymbolicLinkValue`), and would change a key
+/// goetia does not own: the link is deleted, a real key made, and the target left as it was.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_parameters_that_is_a_link_is_replaced_by_a_real_key_and_its_target_is_left_alone() {
+    const REG_LINK: u32 = 6;
+    const REG_OPTION_CREATE_LINK: u32 = 2;
+    let unique = std::process::id();
+    // The target first, so that it is removed last.
+    let target = ScratchKey::new(&format!("parameters-link-target-{unique}"));
+    let service = ScratchKey::new(&format!("parameters-link-service-{unique}"));
+    let target_key = target.create();
+    target_key.set_value("Keep", &"x").expect("write Keep");
+    target_key.set_value("Marker", &"not goetia's").expect("write Marker");
+    let service_key = service.create();
+    let link = create_raw_key(&service_key, &utf16("Parameters"), REG_OPTION_CREATE_LINK);
+    // No closing NUL, which is how a link's target is stored, so that the link resolves.
+    let link_value: Vec<u8> = utf16(&target.nt_path())
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    set_raw_value(&link, &utf16("SymbolicLinkValue"), REG_LINK, &link_value);
+    drop(link);
+
+    let key = create_parameters_key(&service_key).expect("replace the link");
+    key.set_value("Marker", &"goetia's").expect("write through the new key");
+    drop(key);
+
+    // Opened as itself, `Parameters` is a real key: it holds no `SymbolicLinkValue`, and the value
+    // written is in it. Opened as every other reader does, it is the same key, not the target.
+    let as_itself = create_raw_key(&service_key, &utf16("Parameters"), 0);
+    let link_value = as_itself.get_raw_value("SymbolicLinkValue");
+    assert!(
+        link_value
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "Parameters is still a link: {link_value:?}"
+    );
+    assert_eq!(
+        as_itself.get_value::<String, _>("Marker").expect("read Marker"),
+        "goetia's"
+    );
+    let followed = service_key.open_subkey("Parameters").expect("open Parameters");
+    assert_eq!(
+        followed.get_value::<String, _>("Marker").expect("read Marker"),
+        "goetia's"
+    );
+    assert!(
+        followed.get_value::<String, _>("Keep").is_err(),
+        "Parameters shows the target's `Keep`"
+    );
+
+    // The target holds exactly what it did.
+    let mut names: Vec<String> = target_key.enum_values().map(|v| v.expect("enumerate").0).collect();
+    names.sort();
+    assert_eq!(names, ["Keep", "Marker"]);
+    assert_eq!(target_key.get_value::<String, _>("Keep").expect("read Keep"), "x");
+    assert_eq!(
+        target_key.get_value::<String, _>("Marker").expect("read Marker"),
+        "not goetia's"
+    );
 }

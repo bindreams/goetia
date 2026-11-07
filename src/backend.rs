@@ -30,6 +30,11 @@ pub(crate) mod test_cleanup;
 #[cfg(all(test, windows))]
 use test_cleanup as cleanup;
 
+/// The suites' registry calls that `winreg` cannot make.
+#[cfg(all(test, windows))]
+#[path = "../tests/support/raw_registry.rs"]
+pub(crate) mod test_raw_registry;
+
 /// The suites' scratch key under `HKLM\SOFTWARE`.
 #[cfg(all(test, windows))]
 #[path = "../tests/support/scratch.rs"]
