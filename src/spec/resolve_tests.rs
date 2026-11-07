@@ -505,7 +505,7 @@ fn a_defect_in_a_default_followed_by_an_escape_is_not_attributed_to_env(#[fixtur
 
 #[skuld::test]
 fn a_user_name_from_env_is_attributed_to_the_override_and_to_env(#[fixture(temp_dir)] dir: &Path) {
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  systemd:\n    user: ${U}\n";
+    let yaml = "id: frpc\ncommand: [C:/bin/frpc]\nbackend-specific:\n  systemd:\n    user: ${U}\n";
     write_fixture(dir, yaml, Some("U=LocalService\n"));
     let msg = resolve_as(parse_manifest(yaml), dir, Some(BackendKind::Systemd))
         .unwrap_err()
@@ -519,7 +519,7 @@ fn a_user_name_from_env_is_attributed_to_the_override_and_to_env(#[fixture(temp_
 
 #[skuld::test]
 fn a_user_name_written_out_is_attributed_to_the_override_alone() {
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  systemd:\n    user: LocalService\n";
+    let yaml = "id: frpc\ncommand: [C:/bin/frpc]\nbackend-specific:\n  systemd:\n    user: LocalService\n";
     let msg = resolve_as(parse_manifest(yaml), &base_dir(), Some(BackendKind::Systemd))
         .unwrap_err()
         .to_string();
@@ -550,6 +550,7 @@ fn a_pending_value_with_a_dollar_raises_nothing() {
         "C:bin/$x",
         &base_dir(),
         Substitution::Pending,
+        None,
         &mut warnings,
     )
     .unwrap();
@@ -572,7 +573,8 @@ fn a_path_a_substitution_may_make_absolute_is_not_judged_against_the_manifest_di
         format!("command: ['{abs}']\nlogs: ${{D}}"),
     ] {
         let raw = parse_manifest(&format!("id: frpc\n{body}\n"));
-        resolve_shape(&id, raw, &dir, Substitution::Pending).unwrap_or_else(|e| panic!("`{body}`: {}", Error::from(e)));
+        resolve_shape(&id, raw, &dir, Substitution::Pending, None)
+            .unwrap_or_else(|e| panic!("`{body}`: {}", Error::from(e)));
     }
 }
 
@@ -1788,7 +1790,7 @@ fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else(#[fixtur
     // rejects a numeric uid, and `user.id` refuses substitution outright
     // (`interpolate::substitute_user`), so no templated value can ever
     // reach it.
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  systemd:\n    \
+    let yaml = "id: frpc\ncommand: [C:/bin/frpc]\nbackend-specific:\n  systemd:\n    \
                 user: ${ACCT}\n  launchd:\n    user: ${ACCT}\n";
     write_fixture(dir, yaml, Some("ACCT=NT AUTHORITY\\SYSTEM\n"));
 
@@ -1817,7 +1819,7 @@ fn a_native_backend_verdict_names_the_override_that_caused_it() {
     // and this manifest carries no `$` and sits beside no `.env` file.
     for native in BackendKind::ALL {
         let yaml = format!(
-            "id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    user: {}\n",
+            "id: frpc\ncommand: [C:/bin/frpc]\nbackend-specific:\n  {native}:\n    user: {}\n",
             user_rejected_by(native)
         );
         let err = resolve_yaml_as(native, &yaml).unwrap_err();
@@ -2798,4 +2800,41 @@ fn an_absolute_field_that_spells_the_manifest_directorys_prefix_is_the_fields_to
         .unwrap_err()
         .to_string();
     assert!(msg.contains("WorkingDirectory=") && !msg.contains("`-f "), "{msg}");
+}
+
+#[skuld::test]
+fn only_the_defect_the_field_did_not_write_is_dash_fs() {
+    // `-f` holds a backslash; the field wrote only a trailing space.
+    let yaml = systemd_manifest("command: ['bin/frpc ']");
+    let msg = resolve_as(parse_manifest(&yaml), &abs(r"a\b"), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("`command[0]`") && msg.contains("`-f ") && msg.contains("backslash"),
+        "{msg}"
+    );
+    assert_no_run_of_spaces(&msg);
+
+    // `-f` holds a `..`; the field wrote only a leading space.
+    let yaml = systemd_manifest("cwd: ' x'");
+    let msg = resolve_as(parse_manifest(&yaml), Path::new("a/../b"), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("`-f ") && msg.contains("`..`") && msg.contains("`cwd`"),
+        "{msg}"
+    );
+    assert_no_run_of_spaces(&msg);
+}
+
+#[skuld::test]
+fn a_parent_dir_the_field_wrote_says_how_to_fix_it() {
+    let yaml = systemd_manifest(&format!("cwd: '{}/../y'", slash_abs("opt/x")));
+    let msg = resolve_yaml_as(BackendKind::Systemd, &yaml).unwrap_err().to_string();
+    assert!(msg.contains("write the path without `..`"), "{msg}");
+}
+
+/// A message that lost a `\` line continuation shows as a long run of spaces.
+fn assert_no_run_of_spaces(msg: &str) {
+    assert!(!msg.contains("  "), "a run of spaces in {msg:?}");
 }

@@ -50,7 +50,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::backend::{AuthoredPaths, BackendKind, Shaped, ShapedSpec};
+use super::backend::{BackendKind, Shaped, ShapedSpec};
 use super::field::Field;
 use super::interpolate::{self, Substitution};
 use super::overrides::Supplied;
@@ -118,7 +118,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     // on precedence. No `BackendKind` verdict: the base spec is nobody's override.
     let base = raw.without_overrides();
     interpolate::check_spec_grammar(&base)?;
-    resolve_shape(&id, base, base_dir, Substitution::Pending)?;
+    resolve_shape(&id, base, base_dir, Substitution::Pending, None)?;
 
     // Step 4: the all-backends sweep, errors only: every backend's merged spec is checked as
     // authored, and `BackendKind::error` judges the fields its override supplied. A non-native
@@ -131,7 +131,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
         let has_entry = raw.backend_specific.contains_key(&backend);
         let sweep: Result<(), Error> = (|| {
             interpolate::check_spec_grammar(&merged)?;
-            let (shaped, _dropped_warnings) = resolve_shape(&id, merged, base_dir, Substitution::Pending)?;
+            let (shaped, _dropped_warnings) = resolve_shape(&id, merged, base_dir, Substitution::Pending, None)?;
             if Some(backend) == native {
                 return Ok(());
             }
@@ -145,24 +145,27 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     // No `check_spec_grammar`: a substituted `.env` value may legally carry a literal `$`.
     let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
     let from_env = interpolate::spec(&mut native_merged, &vars).map_err(|e| annotate_step5_error(e, native_entry))?;
-    // The one place an error of this pass is attributed to `.env`: by the field it is about.
-    let (shaped, mut daemon_warnings) = resolve_shape(&id, native_merged, base_dir, Substitution::Done)
-        .map_err(|refused| refused.attributed(&from_env))?;
+    // The one place an error of this pass is attributed: to `.env` by the field it is about, and to
+    // the native override when it wrote that field's value.
+    let blame = |refused: Refused| {
+        let by_override = refused
+            .field
+            .as_ref()
+            .is_some_and(|field| native_supplied.supplies(field));
+        let err = refused.attributed(&from_env);
+        match native {
+            Some(b) if by_override => attribute_to(err, b),
+            _ => err,
+        }
+    };
+    let (shaped, mut daemon_warnings) =
+        resolve_shape(&id, native_merged, base_dir, Substitution::Done, native).map_err(blame)?;
     // `error` reads only `native_supplied` fields, and only `user`: it is the backend's verdict on
     // what the override wrote, so it names the backend too, ahead of the `.env` attribution.
     if let Some(b) = native {
         b.error(&shaped, &native_supplied, Substitution::Done)
             .map_err(|e| attribute_to(Refused::at(Field::User, e).attributed(&from_env), b))?;
-        // By the field it is about, as above: the override is named only for a value it wrote.
-        let blame = |refused: Refused| {
-            let by_override = refused
-                .field
-                .as_ref()
-                .is_some_and(|field| native_supplied.supplies(field));
-            let err = refused.attributed(&from_env);
-            if by_override { attribute_to(err, b) } else { err }
-        };
-        b.refuse(&shaped, base_dir).map_err(blame)?;
+        b.refuse(&shaped).map_err(blame)?;
         b.warn(&shaped, &mut daemon_warnings);
     }
 
@@ -298,12 +301,15 @@ impl From<Refused> for Error {
 /// [`require_complete`]'s job.
 ///
 /// `substitution` says whether the values may still hold references, which decides what is judged
-/// now. An error says which field it is about ([`Refused`]); attributing it is the caller's.
+/// now. `native` is the backend whose rules refuse a path as it is joined
+/// ([`BackendKind::refuse_path`]): only the pass whose result is kept names one. An error says which
+/// field it is about ([`Refused`]); attributing it is the caller's.
 fn resolve_shape(
     id: &Id,
     raw: RawSpec,
     base_dir: &Path,
     substitution: Substitution,
+    native: Option<BackendKind>,
 ) -> Result<(ShapedSpec, Vec<Warning>), Refused> {
     debug_assert!(
         raw.backend_specific.is_empty(),
@@ -334,23 +340,18 @@ fn resolve_shape(
     let mut command = raw.command;
     let mut cwd = raw.cwd;
     let mut logs = raw.logs;
-    let mut authored = AuthoredPaths::default();
     for Verdict { resolve, result } in verdicts {
         result?;
         let Some(path_field) = resolve else {
             continue;
         };
-        let (slot, original) = match path_field {
-            PathField::Command => (
-                command.as_mut().and_then(|command| command.first_mut()),
-                &mut authored.command0,
-            ),
-            PathField::Cwd => (cwd.as_mut(), &mut authored.cwd),
-            PathField::Logs => (logs.as_mut(), &mut authored.logs),
+        let slot = match path_field {
+            PathField::Command => command.as_mut().and_then(|command| command.first_mut()),
+            PathField::Cwd => cwd.as_mut(),
+            PathField::Logs => logs.as_mut(),
         };
         if let Some(text) = slot {
-            let resolved = resolve_path_string(id, path_field, text, base_dir, substitution, &mut warnings)?;
-            *original = Some(std::mem::replace(text, resolved));
+            *text = resolve_path_string(id, path_field, text, base_dir, substitution, native, &mut warnings)?;
         }
     }
     let cwd = cwd.map(PathBuf::from);
@@ -379,7 +380,6 @@ fn resolve_shape(
             restart_delay,
             logs,
             kind,
-            authored,
         },
         warnings,
     ))
@@ -418,7 +418,6 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         restart_delay,
         logs,
         kind,
-        authored: _,
     } = shaped;
 
     // Absent and empty share one check, so they cannot diverge in message.
@@ -564,7 +563,9 @@ pub(crate) fn parse_restart_delay(id: &Id, raw: &str) -> Result<Duration, Error>
 /// only through a path that is joined to it and so would carry its defect into an artifact. While
 /// a substitution is [`Pending`](Substitution::Pending), a value it may change is left to a later
 /// pass (`${D}` may be absolute, which no join would touch) and comes back as written. A resolved
-/// path is never converted lossily: one that is not valid UTF-8 is refused.
+/// path is never converted lossily: one that is not valid UTF-8 is refused. The native backend, when
+/// named, refuses what it cannot carry in the result ([`BackendKind::refuse_path`]), here because
+/// the written text and the joined path are both in hand.
 ///
 /// Not a pure function of `(value, base_dir)`: `std::path::absolute`'s drive-relative fallback
 /// reads the per-drive current directory. But every pass `resolve` makes runs in one process
@@ -576,6 +577,7 @@ fn resolve_path_string(
     raw: &str,
     base_dir: &Path,
     substitution: Substitution,
+    native: Option<BackendKind>,
     warnings: &mut Vec<Warning>,
 ) -> Result<String, Refused> {
     let name = field.name();
@@ -626,10 +628,14 @@ fn resolve_path_string(
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
     check_resolved(id, field, raw, &joined, under_manifest_dir)?;
-    Ok(joined
+    let joined = joined
         .into_os_string()
         .into_string()
-        .expect("`check_resolved` refused a path that is not valid UTF-8"))
+        .expect("`check_resolved` refused a path that is not valid UTF-8");
+    if let Some(native) = native {
+        native.refuse_path(id, &field.field(), raw, &joined, base_dir)?;
+    }
+    Ok(joined)
 }
 
 /// Whether `p` is joined to the manifest directory. A path with its own prefix (`C:bin`) replaces
@@ -822,18 +828,7 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// The field rules over a finished daemon, for [`DaemonSpec::new`].
 pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
-    let verdicts = check_field_values(
-        &fields.id,
-        &FieldValues {
-            name: &fields.name,
-            command: Some(&fields.command),
-            cwd: fields.cwd.as_deref(),
-            logs: fields.logs.as_deref(),
-            env: &fields.env,
-            user: &fields.user,
-        },
-        Phase::Final,
-    );
+    let verdicts = check_field_values(&fields.id, &FieldValues::from(fields), Phase::Final);
     for verdict in verdicts {
         verdict.result?;
     }
@@ -851,6 +846,38 @@ pub(super) struct FieldValues<'a> {
     pub(super) logs: Option<&'a Path>,
     pub(super) env: &'a BTreeMap<String, String>,
     pub(super) user: &'a User,
+}
+
+impl<'a> From<&'a DaemonFields> for FieldValues<'a> {
+    fn from(fields: &'a DaemonFields) -> Self {
+        FieldValues {
+            name: &fields.name,
+            command: Some(&fields.command),
+            cwd: fields.cwd.as_deref(),
+            logs: fields.logs.as_deref(),
+            env: &fields.env,
+            user: &fields.user,
+        }
+    }
+}
+
+impl<'a> From<&'a DaemonSpec> for FieldValues<'a> {
+    fn from(spec: &'a DaemonSpec) -> Self {
+        FieldValues::from(&**spec)
+    }
+}
+
+impl<'a> From<&'a ShapedSpec> for FieldValues<'a> {
+    fn from(spec: &'a ShapedSpec) -> Self {
+        FieldValues {
+            name: &spec.name,
+            command: spec.command.as_deref(),
+            cwd: spec.cwd.as_deref(),
+            logs: spec.logs.as_deref(),
+            env: &spec.env,
+            user: &spec.user,
+        }
+    }
 }
 
 impl FieldValues<'_> {

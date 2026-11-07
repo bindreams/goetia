@@ -80,7 +80,6 @@ fn shaped_spec() -> ShapedSpec {
         restart_delay: Shaped::Absent,
         logs: None,
         kind: Shaped::Absent,
-        authored: Default::default(),
     }
 }
 
@@ -381,14 +380,15 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
         let spec = shaped_with_env_key(key);
         let refused = BackendKind::Systemd
-            .refuse(&spec, &abs("base"))
+            .refuse(&spec)
             .expect_err(&format!("{key:?} must be refused"));
         assert_eq!(refused.field, Some(Field::EnvKey(key.into())));
         let message = Error::from(refused).to_string();
         assert!(message.contains(&format!("{key:?}")), "{message}");
         assert!(message.contains("Environment="), "{message}");
-        assert!(BackendKind::Launchd.refuse(&spec, &abs("base")).is_ok(), "{key:?}");
-        assert!(BackendKind::Scm.refuse(&spec, &abs("base")).is_ok(), "{key:?}");
+        assert!(!message.contains("  "), "a run of spaces in {message:?}");
+        assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{key:?}");
+        assert!(BackendKind::Scm.refuse(&spec).is_ok(), "{key:?}");
 
         let mut warnings = Vec::new();
         BackendKind::Systemd.warn(&spec, &mut warnings);
@@ -399,9 +399,7 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     }
     for key in ["PATH", "_x", "a1_B"] {
         assert!(
-            BackendKind::Systemd
-                .refuse(&shaped_with_env_key(key), &abs("base"))
-                .is_ok(),
+            BackendKind::Systemd.refuse(&shaped_with_env_key(key)).is_ok(),
             "{key:?}"
         );
     }
