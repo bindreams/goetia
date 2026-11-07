@@ -55,9 +55,12 @@ mod system {
     const FILE: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;WD)";
     /// [`FILE`], with every entry inherited by files and folders made in it (`OI`, `CI`).
     const FOLDER: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;WD)";
-    /// The install lock: SYSTEM and Administrators have every right (`GA`) and nobody else any, so
-    /// no other account can open it, hold it or release it. No owner is named: the creator is it.
-    const LOCK: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+    /// The install lock: Administrators own it, SYSTEM and Administrators have every right (`GA`)
+    /// and nobody else any, so no other account can open it, hold it or release it. The owner is
+    /// named because the creator's default owner is the user when policy says "Object creator"
+    /// for administrators, and the lock's owner check would then refuse a lock another goetia made.
+    /// Naming `BA` needs it enabled in the creator's token.
+    const LOCK: &str = "O:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
     /// A security descriptor that a file or folder is created with.
     pub(crate) struct Descriptor {
