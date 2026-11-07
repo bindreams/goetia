@@ -1721,13 +1721,7 @@ fn dry_run_reports_a_refused_daemon() {
 #[skuld::test]
 fn dry_run_of_managed_never_calls_host() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(
-        dir.path(),
-        "id: frpc
-command: [frpc]
-type: managed
-",
-    );
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\ntype: managed\n");
 
     let (code, out, err) = dispatch_get_manager(
         &[
@@ -1743,21 +1737,8 @@ type: managed
         &no_host,
     );
 
-    assert_eq!(
-        code, 0,
-        "stdout:
-{out}
-stderr:
-{err}"
-    );
-    assert!(
-        out.contains(
-            "# frpc
-"
-        ),
-        "stdout:
-{out}"
-    );
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("# frpc\n"), "stdout:\n{out}");
 }
 
 /// The Windows preview of a `type: simple` daemon shows the command the host closure supplies, not
@@ -1766,13 +1747,7 @@ stderr:
 #[skuld::test]
 fn dry_run_shows_the_host_preview() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(
-        dir.path(),
-        "id: frpc
-command: [frpc]
-type: simple
-",
-    );
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\ntype: simple\n");
     let host = || -> goetia::Result<HostCommand> {
         Ok(HostCommand {
             exe: PathBuf::from(r"C:\hosts\the-host-under-test.exe"),
@@ -1794,28 +1769,10 @@ type: simple
         &host,
     );
 
-    assert_eq!(
-        code, 0,
-        "stdout:
-{out}
-stderr:
-{err}"
-    );
-    assert!(
-        out.contains("the-host-under-test.exe"),
-        "stdout:
-{out}"
-    );
-    assert!(
-        out.contains("--under-test"),
-        "stdout:
-{out}"
-    );
-    assert!(
-        !out.contains("\"goetia-shim.exe\""),
-        "stdout:
-{out}"
-    );
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("the-host-under-test.exe"), "stdout:\n{out}");
+    assert!(out.contains("--under-test"), "stdout:\n{out}");
+    assert!(!out.contains("\"goetia-shim.exe\""), "stdout:\n{out}");
 }
 
 /// A host the provider cannot name fails the preview with the provider's own message.
@@ -1823,13 +1780,7 @@ stderr:
 #[skuld::test]
 fn dry_run_reports_a_host_error() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(
-        dir.path(),
-        "id: frpc
-command: [frpc]
-type: simple
-",
-    );
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\ntype: simple\n");
     let host = || -> goetia::Result<HostCommand> { Err(goetia::Error::NoShimProvider) };
 
     let (code, out, err) = dispatch_get_manager(
@@ -1846,18 +1797,8 @@ type: simple
         &host,
     );
 
-    assert_eq!(
-        code, 1,
-        "stdout:
-{out}
-stderr:
-{err}"
-    );
-    assert!(
-        err.contains("no shim provider configured"),
-        "stderr:
-{err}"
-    );
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("no shim provider configured"), "stderr:\n{err}");
 }
 
 /// The `list`/`status`/`show`/`diff` partitioning helper must warn about an
