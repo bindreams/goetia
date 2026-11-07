@@ -21,10 +21,11 @@ use crate::support::{self, ELEVATED};
 
 /// The same cross-process lock `tests/scm_integration/managed.rs` declares,
 /// shared with it by label *name*: both binaries drive the one SCM on the host,
-/// and a denied `Parameters` read is visible to every reader of it. A denied-`Parameters`
-/// test denies a service's `Parameters` read, and two concurrent unreadable services make `list`
-/// report one nameless aggregate instead of a named entry, so each test's lookup by its own name
-/// fails; every `list` reader takes turns with them.
+/// and a denied `Parameters` read is visible to every reader of it. Two concurrent
+/// unreadable services make `list` report one nameless `Undetermined` entry instead
+/// of a named one, so a deny test's lookup of its own service by name fails, and a
+/// negative assertion that counts the aggregate (`support::may_account_for`) fails
+/// while any service is denied. A test that checks only its own entry takes no label.
 #[skuld::label]
 pub(crate) const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
@@ -172,17 +173,7 @@ fn uninstall_leaves_nothing() {
 
     let installed = mgr.list().expect("list");
     assert!(
-        installed.iter().all(|entry| match entry {
-            Installed::Ours { spec: s, .. } => s.id.as_str() != id,
-            Installed::OursUnusable { name, .. } => name != &id,
-            Installed::Undetermined { name, .. } => match name {
-                Some(n) => n != &id,
-                // An aggregate may stand for this id, so its absence cannot
-                // be concluded: fail rather than certify what list cannot
-                // establish. See `Installed::Undetermined`.
-                None => false,
-            },
-        }),
+        !support::may_account_for(&installed, &id),
         "uninstalled id must not appear in list"
     );
 }
@@ -197,17 +188,7 @@ fn list_ignores_foreign_services() {
     let mgr = Scm::new();
     let installed = mgr.list().expect("list");
     assert!(
-        installed.iter().all(|entry| match entry {
-            Installed::Ours { spec, .. } => spec.id.as_str() != id,
-            Installed::OursUnusable { name, .. } => name != &id,
-            Installed::Undetermined { name, .. } => match name {
-                Some(n) => n != &id,
-                // An aggregate may stand for this id, so its absence cannot
-                // be concluded: fail rather than certify what list cannot
-                // establish. See `Installed::Undetermined`.
-                None => false,
-            },
-        }),
+        !support::may_account_for(&installed, &id),
         "a foreign service must never appear in list"
     );
 }

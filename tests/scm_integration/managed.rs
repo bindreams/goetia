@@ -23,11 +23,12 @@ use crate::support::registry::{parameters_key, service_key, try_parameters_key};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 /// Held by every test that denies an elevated reader something under
-/// `HKLM\SYSTEM\CurrentControlSet\Services`, and by every test that runs a real
-/// `daemon list` over it, so they take turns rather than race. A denied-`Parameters` test
-/// denies a service's `Parameters` read, and two concurrent unreadable services make `list`
-/// report one nameless aggregate instead of a named entry, so each test's lookup by its own
-/// name fails.
+/// `HKLM\SYSTEM\CurrentControlSet\Services`, and by every test whose assertion reads the
+/// aggregate `list` entry (`support::may_account_for`), so they take turns rather than race.
+/// Two concurrent unreadable services make `list` report one nameless `Undetermined` entry
+/// instead of a named one, so a deny test's lookup of its own service by name fails, and a
+/// negative assertion that counts the aggregate fails while any service is denied. A test that
+/// checks only its own entry cannot fail from another's denial and does not take the label.
 ///
 /// Named for systemd's unit directory rather than for SCM's service tree
 /// deliberately: skuld coordinates serialization across processes by label
@@ -76,8 +77,7 @@ fn hand_edit(id: &str) {
 
 /// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry naming that id in
-/// every concurrent `list()` (a nameless aggregate if another service is unreadable too) — the
-/// listing the other tests in this file read.
+/// every concurrent `list()` (a nameless aggregate if another service is unreadable too).
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn scm_passes_conformance() {
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
@@ -103,7 +103,7 @@ fn scm_passes_conformance() {
 
 // Step 2: round trip, conflict, start/stop/status, uninstall, list ====================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_then_list_round_trips_without_the_source_file() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -138,7 +138,7 @@ fn install_then_list_round_trips_without_the_source_file() {
 
 /// SCM matches service names case-insensitively, so a request for `ID` reaches the service
 /// installed as `id`. Neither `install` (forced or not) nor `preview_install` may write over it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -356,17 +356,7 @@ fn uninstall_leaves_nothing() {
 
     let installed = mgr.list().expect("list");
     assert!(
-        installed.iter().all(|entry| match entry {
-            Installed::Ours { spec: s, .. } => s.id.as_str() != id,
-            Installed::OursUnusable { name, .. } => name != &id,
-            Installed::Undetermined { name, .. } => match name {
-                Some(n) => n != &id,
-                // An aggregate may stand for this id, so its absence cannot
-                // be concluded: fail rather than certify what list cannot
-                // establish. See `Installed::Undetermined`.
-                None => false,
-            },
-        }),
+        !support::may_account_for(&installed, &id),
         "uninstalled id must not appear in list"
     );
 }
@@ -380,17 +370,7 @@ fn list_ignores_foreign_services() {
     let mgr = Scm::new();
     let installed = mgr.list().expect("list");
     assert!(
-        installed.iter().all(|entry| match entry {
-            Installed::Ours { spec, .. } => spec.id.as_str() != id,
-            Installed::OursUnusable { name, .. } => name != &id,
-            Installed::Undetermined { name, .. } => match name {
-                Some(n) => n != &id,
-                // An aggregate may stand for this id, so its absence cannot
-                // be concluded: fail rather than certify what list cannot
-                // establish. See `Installed::Undetermined`.
-                None => false,
-            },
-        }),
+        !support::may_account_for(&installed, &id),
         "a foreign service must never appear in list"
     );
 }
@@ -1065,7 +1045,7 @@ fn a_failed_precondition_leaves_an_installed_service_unchanged() {
 
 // Round-tripping restart: on-failure (the Some(fa) branch of apply_failure_actions/read_failure_actions) ==============
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn restart_on_failure_round_trips_failure_actions() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1099,7 +1079,7 @@ fn restart_on_failure_round_trips_failure_actions() {
 
 // Ownership::OursUnusable: a blob that decodes but whose account can no longer be resolved ============================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn deleted_account_makes_the_service_oursunusable() {
     let suffix = format!("{:08x}", rand::random::<u32>());
     let account = format!("gt{suffix}");
@@ -1189,9 +1169,8 @@ fn install_refuses_an_always_blob_as_unusable() {
 // A read that did not complete: the aggregate, and the two objects that produce it ====================================
 
 /// An elevated reader decodes the marker of a service it installed, so the service is listed as
-/// goetia's own. Another service's unreadable `Parameters` is not this test's to assert about, and
-/// it takes turns with the tests that deny one (see `UNIT_DIR_EXCLUSIVE`).
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+/// goetia's own. Another service's unreadable `Parameters` is not this test's to assert about.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn an_elevated_list_reads_the_marker_of_its_own_install() {
     let mgr = Scm::new();
     let id = support::random_test_id();

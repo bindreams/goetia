@@ -76,9 +76,11 @@ pub fn assert_own(installed: &[Installed], ids: &[&str]) {
     }
 }
 
-/// Runs `daemon list --json` through `run` and parses stdout. Panics if the process died without an
-/// exit code, then unless the exit code agrees with the document: `errors` is empty (a real manager answered) and the code is `4` exactly when
-/// `undetermined` is not, else `0`.
+/// Runs `daemon list --json` through `run` and parses stdout.
+///
+/// Panics if the process was killed by a signal, if `errors` is not empty (a real manager answers
+/// `list` here), or if the exit code disagrees with the document: it must be `4` exactly when
+/// `undetermined` is non-empty, else `0`.
 pub fn list_json(run: impl FnOnce(&[&str]) -> Output) -> ListJson {
     let output = run(&["daemon", "list", "--json"]);
     let code = output

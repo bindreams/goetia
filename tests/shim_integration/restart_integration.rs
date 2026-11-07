@@ -21,7 +21,6 @@ use winreg::enums::{KEY_READ, KEY_WRITE};
 use crate::common::{
     LogDir, ShimGuard, ShimProcess, fixture_command, kill_process, recorded_exit, scm_status, simple_spec,
 };
-use crate::simple::UNIT_DIR_EXCLUSIVE;
 use crate::support::registry::parameters_key;
 use crate::support::{self, ConnectBack, ELEVATED};
 
@@ -462,7 +461,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version() {
 /// service do not regenerate from its blob and the scm generator refuses `always`: started,
 /// restarted, stopped and uninstalled. What does regenerate (`install`, `status`, `list`) reports it
 /// as unusable, since a service that cannot be regenerated cannot be compared or vouched for.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled() {
     let id = support::random_test_id();
     let logs = LogDir::new();

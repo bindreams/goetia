@@ -78,14 +78,18 @@ stderr:
 /// a genuinely unwired manager reports `native()`'s "no backend" there, as
 /// `unavailable` at exit `1` — the fake would also answer cleanly here, so
 /// this rules out exactly the one wrong wiring this module exists to catch.
-/// Labelled `UNIT_DIR_EXCLUSIVE`: this runs a real `daemon list` over the
-/// host's own artifact directories, so it takes turns with the tests that make
-/// them hostile (see the label). On Windows its only reason is that it is a
-/// `list` reader under that rule.
+/// Labelled `UNIT_DIR_EXCLUSIVE` on Linux and macOS: this runs a real `daemon list` over the host's
+/// own artifact directories, so it takes turns with the tests that make them hostile (see the
+/// label). Not on Windows: a concurrent denied `Parameters` read adds an `undetermined` entry, and
+/// the exit code `4` follows from it, so the check below still holds.
 ///
 /// `support::list_json` ties the exit code to the `--json` document: `errors`
 /// empty, and `4` exactly when `undetermined` is not.
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[cfg_attr(
+    not(windows),
+    skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)
+)]
+#[cfg_attr(windows, skuld::test)]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn native_backend_answers_list_unelevated() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,11 +101,11 @@ fn native_backend_answers_list_unelevated() {
 /// test that reads or writes the host's real artifact directories takes this.
 /// On Linux and macOS a FIFO test makes them hostile to a concurrent unguarded
 /// reader, and a FIFO regression would then hang the suite instead of failing
-/// the one guarded test. On Windows the denied-`Parameters` tests deny a
-/// service's `Parameters` read, and two concurrent unreadable services make
-/// `list` report one nameless aggregate instead of a named entry, so each
-/// test's lookup by its own name fails; every `list` reader there takes turns
-/// with them.
+/// the one guarded test. On Windows two tests that deny a service's `Parameters`
+/// read make `list` report one nameless aggregate instead of a named entry, so
+/// each one's lookup of its own denied service fails; and a test whose
+/// assertion reads that aggregate (`support::may_account_for`) fails while any
+/// service is denied. A reader that checks only its own entry takes no label.
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
