@@ -4358,6 +4358,10 @@ fn a_command_stderr_is_escaped_for_a_person_and_exact_in_the_document() {
     assert_eq!(code, 1, "{err}");
     assert_eq!(out, "");
     assert!(
+        err.contains(&format!("`query-live-state` failed ({})", failed_status())),
+        "the command and its status: {err:?}"
+    );
+    assert!(
         err.contains("first\n\tsecond\\u{1b}[31m\\u{202e}\\u{2028}end"),
         "layout kept, the rest escaped: {err:?}"
     );

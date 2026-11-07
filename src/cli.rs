@@ -54,7 +54,7 @@ where
     T: Into<std::ffi::OsString> + Clone,
 {
     Cli::try_parse_from(args).map_err(|e| {
-        // `render` is clap's text without colour: the stream would escape its ESC bytes.
+        // `StyledStr`'s `Display` drops clap's colour, whose ESC bytes the stream would escape.
         let mut stream = EscapedStream::new(if e.use_stderr() { err } else { out });
         let _ = write!(stream, "{}", e.render());
         let _ = stream.flush();
