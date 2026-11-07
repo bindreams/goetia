@@ -309,10 +309,18 @@ mod system {
     pub(crate) fn registered_hosts() -> Result<Vec<PathBuf>> {
         let mut hosts = Vec::new();
         let mut failed = Vec::new();
+        // Opened by the first service whose key cannot be read, and kept for the rest of the scan:
+        // most scans never need it.
+        let mut scm = None;
         let unfinished = registry::scan_services(|name| {
-            match image_of(&name, registry::read_registered_image(&name), || {
-                read_image_through_scm(&name)
-            }) {
+            let through_scm = || {
+                let scm = match &mut scm {
+                    Some(scm) => scm,
+                    empty => empty.insert(open_scm(ServiceManagerAccess::CONNECT)?),
+                };
+                read_image_through_scm(scm, &name)
+            };
+            match image_of(&name, registry::read_registered_image(&name), through_scm) {
                 Ok(Some(image)) => hosts.extend(image_references(&image, &expand_environment(&image)).iter().map(
                     // A bare file name stands for every file of that name: it is not a path to resolve.
                     |reference| match reference.contains(['\\', '/']) {

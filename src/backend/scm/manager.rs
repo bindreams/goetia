@@ -1204,11 +1204,10 @@ fn open_scm_to_classify(id: &str) -> Result<WinServiceManager> {
         .map_err(|e| service_undetermined(id, "open the Service Control Manager", e))
 }
 
-/// The `ImagePath` of the service `name`, read through SCM (`SERVICE_QUERY_CONFIG`) rather than its
+/// The `ImagePath` of the service `name`, read through `scm` (`SERVICE_QUERY_CONFIG`) rather than its
 /// registry key, which may deny reads that SCM does not. `None` when the service is gone or marked
 /// for deletion, which start nothing.
-pub(in crate::backend::scm) fn read_image_through_scm(name: &str) -> Result<Option<String>> {
-    let scm = open_scm(ServiceManagerAccess::CONNECT)?;
+pub(in crate::backend::scm) fn read_image_through_scm(scm: &WinServiceManager, name: &str) -> Result<Option<String>> {
     let service = match scm.open_service(name, ServiceAccess::QUERY_CONFIG) {
         Ok(service) => service,
         Err(e) if is_not_found(&e) => return Ok(None),
