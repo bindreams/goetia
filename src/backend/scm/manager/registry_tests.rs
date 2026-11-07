@@ -1,6 +1,6 @@
 use super::*;
 
-use winreg::enums::{KEY_CREATE_SUB_KEY, KEY_SET_VALUE};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_KEY_DELETED};
 use winreg::types::ToRegValue as _;
 
 #[skuld::test]
@@ -19,22 +19,24 @@ fn parameters_key_path_is_the_service_key_plus_parameters() {
     );
 }
 
-/// The access right to delete a key (`winnt.h`).
-const DELETE_ACCESS: u32 = 0x0001_0000;
-
 /// A read opens `Parameters` in one open, relative to `Services`, and asks nothing of the service
 /// key it passes through, which a service that is not goetia's may deny to the reader.
 #[skuld::test]
-fn parameters_are_opened_in_one_step_below_services_for_reading_only() {
+fn parameters_are_opened_in_one_step_below_services() {
     assert_eq!(
         parameters_relative_name("goetia-test"),
         utf16(r"goetia-test\Parameters")
     );
-    assert_eq!(
-        PARAMETERS_READ_ACCESS & (KEY_SET_VALUE | KEY_CREATE_SUB_KEY | DELETE_ACCESS),
-        0
-    );
-    assert_eq!(PARAMETERS_READ_ACCESS, KEY_READ);
+}
+
+#[skuld::test]
+fn a_key_or_value_gone_or_deleted_is_a_delete_that_is_done_and_any_other_failure_is_not() {
+    let os = |code: u32| std::io::Error::from_raw_os_error(code as i32);
+    assert!(tolerate_not_found(Ok(())).is_ok());
+    assert!(tolerate_not_found(Err(std::io::Error::from(std::io::ErrorKind::NotFound))).is_ok());
+    assert!(tolerate_not_found(Err(os(ERROR_KEY_DELETED))).is_ok());
+    let denied = tolerate_not_found(Err(os(ERROR_ACCESS_DENIED))).unwrap_err();
+    assert_eq!(denied.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
 }
 
 fn utf16(s: &str) -> Vec<u16> {
@@ -84,7 +86,7 @@ fn a_field_the_enumeration_missed_is_named_as_goetia_spells_it() {
 }
 
 const NOT_FOUND: i32 = 2;
-const KEY_DELETED: i32 = 1018;
+const KEY_DELETED: i32 = ERROR_KEY_DELETED as i32;
 
 fn failed_with(code: i32) -> Failure {
     failure("open", "Services", std::io::Error::from_raw_os_error(code))

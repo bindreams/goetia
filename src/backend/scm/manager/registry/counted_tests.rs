@@ -61,29 +61,30 @@ fn a_key_name_read_back_keeps_a_nul_and_what_follows_it() {
 }
 
 const REG_FLAG_VOLATILE: u32 = 0x0001;
-const ERROR_KEY_DELETED: i32 = 1018;
-const ERROR_ACCESS_DENIED: i32 = 5;
 
 /// `KEY_FLAGS_INFORMATION`: the Wow64 flags, the key's flags, the control flags.
 #[skuld::test]
 fn a_key_is_a_link_when_its_own_flags_say_so_whatever_else_is_set() {
-    assert!(link_flag([0, REG_FLAG_LINK, 0]));
-    assert!(link_flag([7, REG_FLAG_LINK | REG_FLAG_VOLATILE, 7]));
+    assert!(link_flag([0, REG_FLAG_LINK, 0], 12).unwrap());
+    assert!(link_flag([7, REG_FLAG_LINK | REG_FLAG_VOLATILE, 7], 12).unwrap());
+    // The key's flags end at byte 8; the control flags after them are not read.
+    assert!(link_flag([0, REG_FLAG_LINK, 0], 8).unwrap());
 }
 
 /// A link is told from its flag alone: a key that merely holds a value named `SymbolicLinkValue`
 /// has no such flag, and a link that holds no such value still has it.
 #[skuld::test]
 fn a_key_without_the_link_flag_is_not_a_link() {
-    assert!(!link_flag([0, 0, 0]));
-    assert!(!link_flag([REG_FLAG_LINK, REG_FLAG_VOLATILE, REG_FLAG_LINK]));
+    assert!(!link_flag([0, 0, 0], 12).unwrap());
+    assert!(!link_flag([REG_FLAG_LINK, REG_FLAG_VOLATILE, REG_FLAG_LINK], 12).unwrap());
 }
 
+/// A reply that does not reach the key's flags leaves the buffer as it was, zeroed: that is no
+/// answer, and reading it as "not a link" would have `--force` write through a link.
 #[skuld::test]
-fn a_key_gone_or_deleted_is_done_and_any_other_failure_is_not() {
-    assert!(gone_is_done(Ok(())).is_ok());
-    assert!(gone_is_done(Err(io::Error::from_raw_os_error(2))).is_ok());
-    assert!(gone_is_done(Err(io::Error::from_raw_os_error(ERROR_KEY_DELETED))).is_ok());
-    let denied = gone_is_done(Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED))).unwrap_err();
-    assert_eq!(denied.raw_os_error(), Some(ERROR_ACCESS_DENIED));
+fn a_reply_too_short_for_the_key_flags_is_an_error_not_a_key_that_is_no_link() {
+    for written in [0, 4, 7] {
+        let e = link_flag([0, 0, 0], written).unwrap_err();
+        assert!(e.to_string().contains(&format!("{written} bytes")), "{e}");
+    }
 }

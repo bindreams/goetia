@@ -55,10 +55,11 @@ fn service_dacl(deny: Option<&str>) -> String {
 /// The registry twin of [`service_dacl`]. `KA` (`KEY_ALL_ACCESS`) subsumes
 /// `DELETE` and `WRITE_DAC`; `KR` (`KEY_READ`) does not, which is why denying
 /// reads still leaves the key rewritable and still leaves it deletable with the
-/// service.
-fn key_dacl(deny: Option<&str>) -> String {
+/// service. `inherit` is the ACE flags of the two allows: `CI` for a key with subkeys that have to
+/// stay as readable as before, because writing a DACL also re-derives what its subkeys inherit.
+fn key_dacl(deny: Option<&str>, inherit: &str) -> String {
     let deny = deny.map(|rights| format!("(D;;{rights};;;WD)")).unwrap_or_default();
-    format!("D:{deny}(A;;KA;;;BA)(A;;KA;;;SY)")
+    format!("D:{deny}(A;{inherit};KA;;;BA)(A;{inherit};KA;;;SY)")
 }
 
 // SetNamedSecurityInfoW ===============================================================================================
@@ -172,7 +173,19 @@ impl Denied {
     /// service has.
     pub fn parameters(id: &str) -> Self {
         let object = format!(r"MACHINE\{}", support::registry::parameters_path(id));
-        Self::seal(object, SE_REGISTRY_KEY, key_dacl(Some("KR")), key_dacl(None))
+        Self::seal(object, SE_REGISTRY_KEY, key_dacl(Some("KR"), ""), key_dacl(None, ""))
+    }
+
+    /// Deny `KEY_READ` on `Services\<id>` itself, as a service whose own key the unelevated reader
+    /// cannot read has it. Its `Parameters` stays as readable as it was: the allows are inherited.
+    pub fn service_key(id: &str) -> Self {
+        let object = format!(r"MACHINE\{}", support::registry::service_path(id));
+        Self::seal(
+            object,
+            SE_REGISTRY_KEY,
+            key_dacl(Some("KR"), "CI"),
+            key_dacl(None, "CI"),
+        )
     }
 
     /// Deny `SERVICE_QUERY_CONFIG` (`CC`) and `SERVICE_QUERY_STATUS` (`LC`) on

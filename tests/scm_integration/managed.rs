@@ -14,14 +14,16 @@ use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User}
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows_sys::Wdk::System::Registry::{KeyFlagsInformation, NtCreateKey, NtQueryKey, NtSetValueKey};
+use windows_sys::Wdk::System::Registry::{NtCreateKey, NtSetValueKey};
 use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, OBJ_OPENLINK, UNICODE_STRING};
 use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
 
 use crate::common::{self, conformance_mk, fixture_command};
 use crate::deny::Denied;
 use crate::install_helper::INSTALL_AS;
-use crate::support::registry::{parameters_key, service_key, try_parameters_key};
+use crate::support::registry::{
+    create_parameters_key, parameters_key, service_key, try_parameters_key, try_service_key,
+};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole
@@ -899,27 +901,6 @@ fn create_raw_key(parent: &winreg::RegKey, name: &[u16], options: u32) -> winreg
     winreg::RegKey::predef(handle)
 }
 
-/// Whether `key`, opened as itself, is a registry link: `REG_FLAG_LINK` in the key's own flags
-/// (`KEY_FLAGS_INFORMATION`: Wow64 flags, key flags, control flags).
-fn is_registry_link(key: &winreg::RegKey) -> bool {
-    const REG_FLAG_LINK: u32 = 0x0002;
-    let mut flags = [0u32; 3];
-    let mut written = 0u32;
-    // SAFETY: `key` holds an open handle; `flags` is 12 writable bytes; `written` is a valid
-    // out-param.
-    let status = unsafe {
-        NtQueryKey(
-            key.raw_handle(),
-            KeyFlagsInformation,
-            flags.as_mut_ptr().cast(),
-            size_of_val(&flags) as u32,
-            &mut written,
-        )
-    };
-    assert!(status >= 0, "query a key's flags: NTSTATUS {status:#x}");
-    flags[1] & REG_FLAG_LINK != 0
-}
-
 /// A key under `HKLM\SOFTWARE` removed on drop, for a registry link to point at.
 struct LinkTarget {
     path: String,
@@ -1006,6 +987,11 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
     let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
     let fields: Vec<(String, winreg::RegValue)> = parameters.enum_values().map(|v| v.expect("enumerate")).collect();
     drop(parameters);
+    let goetia_marker = fields
+        .iter()
+        .find(|(name, _)| name == "Marker")
+        .map(|(_, value)| value.bytes.clone())
+        .expect("an installed service holds goetia's Marker");
     let service = service_key(&id, KEY_READ | KEY_WRITE);
     service.delete_subkey_all("Parameters").expect("remove Parameters");
     let link = create_raw_key(&service, &units("Parameters"), REG_OPTION_CREATE_LINK);
@@ -1028,14 +1014,21 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
         target_key.get_value::<String, _>("Marker").expect("read Marker"),
         "not goetia's"
     );
-    // Opened as itself, which `parameters_key` does not: it would follow a link.
+    // Opened as itself, which `parameters_key` does not: it would follow a link. A link holds a
+    // `SymbolicLinkValue`, which a real key does not.
     let service = service_key(&id, KEY_READ | KEY_WRITE);
     let parameters = create_raw_key(&service, &units("Parameters"), 0);
-    assert!(!is_registry_link(&parameters), "Parameters is still a link");
-    let marker: String = parameters
-        .get_value("Marker")
+    let link_value = parameters.get_raw_value("SymbolicLinkValue");
+    assert!(
+        link_value
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "Parameters is still a link: {link_value:?}"
+    );
+    let marker = parameters
+        .get_raw_value("Marker")
         .expect("a real Parameters holds a Marker");
-    assert_ne!(marker, "not goetia's", "Parameters holds goetia's Marker");
+    assert_eq!(marker.bytes, goetia_marker, "Parameters holds goetia's own Marker");
 }
 
 /// `RegDeleteTreeW` below the top level stops at a NUL, so a stray subkey holding a child named
@@ -1674,6 +1667,53 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
         recovery.contains("re-run as Administrator"),
         "a denial is the one cause elevation fixes: {recovery}"
     );
+}
+
+/// `list` opens `Parameters` in one step below `Services`, and never the service's own key, which
+/// a service that is not goetia's may deny to the unelevated reader. An explicit `Deny` ACE stops
+/// the elevated reader the same way (see `deny.rs`), so this stands in for an unelevated `list`,
+/// which this suite has no way to run. Such a service is a stranger's, not an unreadable one: no
+/// entry claims it or says its read did not complete. Reading the service key first made it
+/// `Undetermined`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn list_reads_a_service_whose_own_key_denies_the_reader_as_a_stranger() {
+    for with_parameters in [false, true] {
+        let mgr = Scm::new();
+        let id = support::random_test_id();
+        let guard = ServiceGuard::new(&id);
+        seed_foreign(guard.id());
+        if with_parameters {
+            // A `Parameters` that holds no marker: readable, and not goetia's.
+            create_parameters_key(&id);
+        }
+
+        let _denied = Denied::service_key(&id);
+
+        // The deny took, as `ERROR_ACCESS_DENIED`: opening the service key to read it fails.
+        let blocked = try_service_key(&id, KEY_READ)
+            .err()
+            .unwrap_or_else(|| panic!("the deny ACE did not apply: `{id}` is still readable"));
+        assert_eq!(blocked.raw_os_error(), Some(5), "{blocked:?}");
+
+        let listed = mgr
+            .list()
+            .expect("a service key denied to the reader must not fail `list`");
+
+        for entry in &listed {
+            match entry {
+                Installed::Ours { spec, .. } if spec.id.as_str() == id => {
+                    panic!("a stranger's service was claimed (with_parameters={with_parameters}): {entry:?}")
+                }
+                Installed::OursUnusable { name, .. } if name == &id => {
+                    panic!("a stranger's service was claimed (with_parameters={with_parameters}): {entry:?}")
+                }
+                Installed::Undetermined { name, reason } if name.as_deref() == Some(id.as_str()) => {
+                    panic!("its read did not complete (with_parameters={with_parameters}): {reason}")
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// The same boundary on the `list` side, and what the entry standing for it is allowed to say. One

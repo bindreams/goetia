@@ -1,11 +1,13 @@
 use std::io;
 
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_KEY_DELETED};
+
 use super::*;
 
 const NOT_FOUND: i32 = 2;
-const ACCESS_DENIED: i32 = 5;
+const ACCESS_DENIED: i32 = ERROR_ACCESS_DENIED as i32;
 const IO_DEVICE: i32 = 1117;
-const KEY_DELETED: i32 = 1018;
+const KEY_DELETED: i32 = ERROR_KEY_DELETED as i32;
 
 fn failure(code: i32) -> Failure {
     Failure {

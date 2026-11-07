@@ -9,6 +9,7 @@
 //! probe already exercises with raw `winreg`.
 
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::os::windows::ffi::OsStrExt as _;
 
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE};
@@ -29,8 +30,6 @@ use settle::{Failure, Settled, Stop, settle, stands};
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
 const PARAMETERS_KEY: &str = "Parameters";
-/// The access `Parameters` is opened with for a read.
-const PARAMETERS_READ_ACCESS: u32 = KEY_READ;
 
 fn service_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}")
@@ -50,9 +49,15 @@ fn parameters_relative_name(name: &str) -> Vec<u16> {
     format!(r"{name}\{PARAMETERS_KEY}").encode_utf16().collect()
 }
 
-/// An open `Services` key, which a read opens one service's `Parameters` below. Valid for as long as
-/// the key it was made from is open.
-pub struct ServicesRoot(HANDLE);
+/// An open `Services` key, which a read opens one service's `Parameters` below. It borrows the key
+/// it is made from, so it cannot outlive the handle.
+pub struct ServicesRoot<'r>(HANDLE, PhantomData<&'r RegKey>);
+
+impl<'r> ServicesRoot<'r> {
+    fn new(key: &'r RegKey) -> Self {
+        Self(key.raw_handle(), PhantomData)
+    }
+}
 
 /// What did not complete, as facts, with no claim about any id attached. Every registry failure
 /// is built here — single-id reads, [`registry_undetermined`] and the `list` scan — so one
@@ -131,8 +136,11 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///   own key denies the reader is read as any other. A key not found does not say whether the
 ///   service key is there: unless `origin` vouches for it, that key is opened to check that it
 ///   stands, and gone, the read is [`RegistryReadOutcome::ServiceGone`].
-/// - [`RegistryReadOutcome::ServiceGone`] when the service key is gone, whether the read found it
-///   so at the start or lost the `Parameters` key under it.
+/// - [`RegistryReadOutcome::ServiceGone`] when the service key is gone: the read found the
+///   `Parameters` key missing and the check above finds the service key missing too, or it lost the
+///   `Parameters` key (marked deleted, or gone mid-read) and the same check finds the service key
+///   gone. A [`Origin::Vouched`] name is not checked for a plain missing `Parameters` key, which
+///   reads as the service standing without it; it is checked only when the key is lost mid-read.
 /// - [`registry_undetermined`] for every other failure, among them a key that vanishes or is marked
 ///   deleted under a service that still stands. Never Foreign: this key holds the only proof of
 ///   ownership a `type: managed` service has.
@@ -145,12 +153,12 @@ pub fn read_parameters(name: &str, origin: Origin) -> Result<RegistryReadOutcome
     let services = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(SERVICES_KEY, KEY_READ)
         .map_err(|e| registry_undetermined(name, "open", SERVICES_KEY, e))?;
-    read_parameters_in(&ServicesRoot(services.raw_handle()), name, origin)
+    read_parameters_in(&ServicesRoot::new(&services), name, origin)
 }
 
 /// [`read_parameters`] below a `Services` key that is already open, as a scan holds one.
 pub fn read_parameters_in(
-    services: &ServicesRoot,
+    services: &ServicesRoot<'_>,
     name: &str,
     origin: Origin,
 ) -> Result<RegistryReadOutcome<Parameters>> {
@@ -160,7 +168,7 @@ pub fn read_parameters_in(
         || service_stands(name),
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
-            let key = counted::open_child(services.0, &parameters_relative_name(name), PARAMETERS_READ_ACCESS)
+            let key = counted::open_child(services.0, &parameters_relative_name(name), KEY_READ)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), Some(Parameters::default())))?;
             let mut parameters = Parameters::default();
             // The names as stored, for a field found not to be a string.
@@ -340,10 +348,11 @@ fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
     counted::create_child(service, &name, access)
 }
 
-/// NotFound is success: the goal state is absent.
+/// A key or value that is gone is success: the goal of a delete is absent. Not found, and a key
+/// deleted while held open, are the same (see [`settle::is_gone`]).
 fn tolerate_not_found(deleted: std::io::Result<()>) -> std::io::Result<()> {
     match deleted {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if settle::is_gone(&e) => Ok(()),
         other => other,
     }
 }
@@ -469,23 +478,31 @@ pub fn write_environment(name: &str, lines: &[String]) -> Result<()> {
 
 /// Hands every service currently registered with SCM to `keep`, and returns the entry for what the
 /// pass did not reach, if anything (see [`flow::scan`]).
-pub fn scan_services(keep: impl FnMut(String, &ServicesRoot)) -> Option<Installed> {
+pub fn scan_services(keep: impl FnMut(String, &ServicesRoot<'_>)) -> Option<Installed> {
     scan_names_under(SERVICES_KEY, keep)
 }
 
 /// [`scan_services`] over another key: `Services` opens on every host that boots, so another key
 /// is the only way a test reaches an open that fails, or finds nothing.
-fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot)) -> Option<Installed> {
+fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>)) -> Option<Installed> {
+    let opened = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(path, KEY_READ);
+    // The scan borrows the key, so that each name carries a root that cannot outlive it.
+    let borrowed = match opened {
+        Ok(ref key) => Ok(key),
+        Err(e) => Err(e),
+    };
     flow::scan(
         path,
-        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(path, KEY_READ),
+        borrowed,
         |key| {
-            // Each name carries the handle of the key it was listed under, open until the scan ends.
-            let handle = key.raw_handle();
-            Box::new(key.enum_keys().map(move |name| name.map(|name| (name, handle))))
+            let key = *key;
+            Box::new(
+                key.enum_keys()
+                    .map(move |name| name.map(|name| (name, ServicesRoot::new(key)))),
+            )
         },
         |op, source| registry_error(op, path, source),
-        |(name, handle)| keep(name, &ServicesRoot(handle)),
+        |(name, root)| keep(name, &root),
     )
 }
 

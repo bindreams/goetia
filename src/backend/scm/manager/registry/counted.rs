@@ -23,7 +23,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Registry::{KEY_ENUMERATE_SUB_KEYS, REG_OPTION_NON_VOLATILE};
 use winreg::RegKey;
 
-use super::settle::is_gone;
+use super::tolerate_not_found;
 
 /// The access right to delete a key (`winnt.h`).
 const DELETE: u32 = 0x0001_0000;
@@ -64,15 +64,7 @@ pub(super) fn delete_value(key: &RegKey, name: &[u16]) -> io::Result<()> {
 pub(super) fn delete_subkey(key: &RegKey, name: &[u16]) -> io::Result<()> {
     match open_raw(key.raw_handle(), name, CHILD_ACCESS) {
         Ok(child) => delete_tree(child),
-        Err(e) => gone_is_done(Err(e)),
-    }
-}
-
-/// `result`, except that a key not found or deleted is done: the goal of a delete is absent.
-fn gone_is_done(result: io::Result<()>) -> io::Result<()> {
-    match result {
-        Err(e) if is_gone(&e) => Ok(()),
-        other => other,
+        Err(e) => tolerate_not_found(Err(e)),
     }
 }
 
@@ -102,12 +94,20 @@ pub(super) fn is_link(key: &RegKey) -> io::Result<bool> {
             &mut written,
         )
     })?;
-    Ok(link_flag(flags))
+    link_flag(flags, written)
 }
 
-/// The decision of [`is_link`], from the flags `NtQueryKey` wrote.
-fn link_flag(flags: [u32; 3]) -> bool {
-    flags[1] & REG_FLAG_LINK != 0
+/// The decision of [`is_link`], from the flags `NtQueryKey` wrote in `written` bytes. A reply too
+/// short to hold the key's flags says nothing about them, and is an error, not "not a link".
+fn link_flag(flags: [u32; 3], written: u32) -> io::Result<bool> {
+    // The key's flags are the second of the words.
+    const FLAGS_END: u32 = 2 * size_of::<u32>() as u32;
+    if written < FLAGS_END {
+        return Err(io::Error::other(format!(
+            "NtQueryKey wrote {written} bytes of the key's flags, which need {FLAGS_END}"
+        )));
+    }
+    Ok(flags[1] & REG_FLAG_LINK != 0)
 }
 
 /// Creates the subkey of `key` named `name`, or opens it if it exists, as the key it is: an
@@ -182,16 +182,16 @@ fn open_raw(parent: HANDLE, name: &[u16], access: u32) -> io::Result<Opened> {
 fn delete_tree(child: Opened) -> io::Result<()> {
     let names = match child_names(child.0) {
         Ok(names) => names,
-        Err(e) => return gone_is_done(Err(e)),
+        Err(e) => return tolerate_not_found(Err(e)),
     };
     for grandchild in names {
         match open_raw(child.0, &grandchild, CHILD_ACCESS) {
             Ok(grandchild) => delete_tree(grandchild)?,
-            Err(e) => gone_is_done(Err(e))?,
+            Err(e) => tolerate_not_found(Err(e))?,
         }
     }
     // SAFETY: `child` holds an open handle with `DELETE`.
-    gone_is_done(checked(unsafe { NtDeleteKey(child.0) }))
+    tolerate_not_found(checked(unsafe { NtDeleteKey(child.0) }))
 }
 
 /// The name of every subkey of the open `key`, by counted name.
