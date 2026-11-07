@@ -736,8 +736,8 @@ Where the bytes come from depends on the build:
 
 `uninstall` of a `type: simple` daemon waits, with no time limit, for the shim
 process to exit, deletes the service, and deletes every `goetia-shim-*.exe`
-that no remaining service references, and the folder when it is then empty. If
-a file cannot be deleted, `uninstall` exits non-zero naming each file that
+that no remaining service references, and the default folder when it is then
+empty. If a file cannot be deleted, `uninstall` exits non-zero naming each file that
 remains: the service is already deleted, and re-running
 `goetia daemon uninstall <id>` sweeps the program's own shim folder again. That
 also holds for an id that is not installed: it sweeps, then reports "nothing to
