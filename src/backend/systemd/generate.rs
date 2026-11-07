@@ -9,7 +9,8 @@
 //! are additionally quoted per systemd's command-line grammar when they
 //! contain whitespace or a quoting-relevant character; `ExecStart=`
 //! further doubles `$` in its arguments (systemd performs `$FOO`/`${FOO}` environment
-//! substitution there, but not in the executable path), quotes a bare `;` argument (systemd's
+//! substitution there, but not in the executable path; it does in argv[0], so a path holding `$`
+//! is written `@<path> <argv[0]>`), quotes a bare `;` argument (systemd's
 //! command-line separator), and quotes `command[0]` if it would otherwise
 //! start with one of systemd's command-prefix characters (`-@:+!`).
 //!
@@ -120,19 +121,17 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
         source: None,
     };
 
-    // `command[0]` was made absolute against the manifest directory, so the path refused here may
-    // hold characters the user never wrote in it.
     let executable = &spec.command[0];
     if executable.contains(['\\', '"', '\'']) {
         return Err(invalid(format!(
-            "the executable path {executable:?} (`command[0]`, made absolute against the manifest directory) \
+            "the executable path {executable:?} (`command[0]`) \
              holds a backslash, double quote or apostrophe, which systemd refuses to load in an \
              executable path"
         )));
     }
     if executable.ends_with(' ') {
         return Err(invalid(format!(
-            "the executable path {executable:?} (`command[0]`, made absolute against the manifest directory) \
+            "the executable path {executable:?} (`command[0]`) \
              ends in whitespace, which systemd does not run (the service exits with 203/EXEC)"
         )));
     }
@@ -177,43 +176,41 @@ fn render_restart(restart: Restart) -> &'static str {
     }
 }
 
-/// Render `ExecStart=`'s value: each argument percent- and dollar-doubled,
-/// then quoted per systemd's command-line syntax wherever quoting is
-/// needed for readback (whitespace or a quoting-relevant character), or
-/// wherever an unquoted word would take on a meaning of its own — a bare
-/// `;` (systemd's command-line separator) or, for `command[0]` only, a
-/// leading `-`/`@`/`:`/`+`/`!` (systemd's command-prefix characters,
-/// e.g. `+` for elevated-privilege execution — a plain executable name
-/// that happens to start with one must not be reinterpreted as that
-/// directive).
+/// Render `ExecStart=`'s value: each word percent-doubled, then quoted per systemd's command-line
+/// syntax wherever quoting is needed for readback (whitespace or a quoting-relevant character),
+/// or wherever an unquoted word would take on a meaning of its own: a bare `;` (systemd's
+/// command-line separator) or, for `command[0]` only, a leading `-`/`@`/`:`/`+`/`!` (systemd's
+/// command-prefix characters, e.g. `+` for elevated-privilege execution).
+///
+/// Arguments are also dollar-doubled, since systemd substitutes `$FOO`/`${FOO}` and collapses
+/// `$$` there. The executable path is not: systemd takes it as written. But it substitutes in
+/// argv[0] too, so a path holding `$` is written as `@<path> <argv[0], dollar-doubled>`, where
+/// `@` makes the next word argv[0] (measured on 242 and 255). A path without `$` is one word.
 fn render_exec_start(command: &[String]) -> String {
-    command
-        .iter()
-        .enumerate()
-        .map(|(index, arg)| render_exec_arg(arg, index == 0))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let (executable, arguments) = command.split_first().expect("a daemon has a command");
+    let mut words = Vec::with_capacity(command.len() + 1);
+    if executable.contains('$') {
+        words.push(render_exec_word(&double_percent(&format!("@{executable}")), false));
+        words.push(render_exec_arg(executable));
+    } else {
+        words.push(render_exec_word(&double_percent(executable), true));
+    }
+    words.extend(arguments.iter().map(|arg| render_exec_arg(arg)));
+    words.join(" ")
 }
 
-fn render_exec_arg(arg: &str, is_executable: bool) -> String {
-    // `ExecStart=` is systemd's "command line" grammar: on top of `%`
-    // specifiers, it performs `$FOO`/`${FOO}` environment-variable
-    // substitution in the arguments, so `$` needs doubling there exactly as `%` does. The
-    // executable path takes no substitution and no `$$` collapse (measured on 242 and 255):
-    // doubling it would name another file.
-    let escaped = if is_executable {
-        double_percent(arg)
-    } else {
-        double_percent(arg).replace('$', "$$")
-    };
+fn render_exec_arg(arg: &str) -> String {
+    render_exec_word(&double_percent(arg).replace('$', "$$"), false)
+}
 
+fn render_exec_word(escaped: &str, is_executable: bool) -> String {
     let is_bare_separator = escaped == ";";
     let is_command_prefix = is_executable && escaped.starts_with(['-', '@', ':', '+', '!']);
 
-    if needs_quoting(&escaped) || is_bare_separator || is_command_prefix {
-        quote(&escaped)
+    if needs_quoting(escaped) || is_bare_separator || is_command_prefix {
+        quote(escaped)
     } else {
-        escaped
+        escaped.to_string()
     }
 }
 

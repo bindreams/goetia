@@ -1965,9 +1965,10 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
     let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    let base = std::env::temp_dir().join(format!("{}-backslashes", guard.id()));
+    // Registered first, so it drops last: the service stops before its directory goes.
+    let base = std::env::temp_dir().join(format!("{id}-backslashes"));
     let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
     let cwd = PathBuf::from(format!("{}/work\\", base.display()));
     let logs = PathBuf::from(format!("{}/log\\\\\\", base.display()));
 
@@ -2029,6 +2030,44 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
             std::ffi::OsString::from("log\\\\\\"),
             std::ffi::OsString::from("work\\")
         ]
+    );
+}
+
+/// systemd takes the executable path as written but substitutes `$FOO`/`${FOO}` and collapses `$$`
+/// in argv[0], so a path holding `$` must run the right file and still hand the daemon its own
+/// path as argv[0].
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_executable_path_with_dollars_runs_with_the_path_as_argv0() {
+    let id = support::random_test_id();
+    let base = std::env::temp_dir().join(format!("{id}-argv0"));
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    let dir = base.join("x${y}$$z$w");
+    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    let executable = dir.join("sh");
+    std::os::unix::fs::symlink("/bin/sh", &executable).expect("symlink");
+    let out = base.join("cmdline");
+
+    let mut spec = mk(guard.id()).into_fields();
+    // The shell lists its own argv, one per line, into the file named by its last argument.
+    spec.command = vec![
+        executable.to_str().unwrap().to_string(),
+        "-c".to_string(),
+        "tr '\\000' '\\n' < /proc/$$/cmdline > \"$1\"".to_string(),
+        "sh".to_string(),
+        out.to_str().unwrap().to_string(),
+    ];
+    let spec = DaemonSpec::new(spec).unwrap();
+
+    Systemd::new().install(&spec, false).expect("install");
+    // Blocks until the shell has exited, so the file is complete.
+    cmd::run("systemctl", &["start", "--wait", &format!("{}.service", guard.id())]).expect_ok();
+
+    let argv = fs::read_to_string(&out).unwrap_or_else(|e| panic!("read {}: {e}", out.display()));
+    assert_eq!(
+        argv.lines().next(),
+        executable.to_str(),
+        "argv[0] of the daemon; all of argv:\n{argv}"
     );
 }
 

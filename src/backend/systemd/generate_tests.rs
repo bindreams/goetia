@@ -386,21 +386,34 @@ fn argv_dollar_sign_is_doubled() {
 }
 
 #[skuld::test]
-fn a_dollar_in_the_executable_path_is_not_doubled() {
-    // systemd takes the executable path as written: no `$FOO` substitution and no `$$` collapse
-    // (measured on 242 and 255), so a doubled `$` would name a different file. Later arguments
-    // keep the doubling (`argv_dollar_sign_is_doubled`).
+fn an_executable_path_with_a_dollar_is_written_literally_and_argv0_separately() {
+    // systemd takes the executable path as written, but runs `$FOO`/`${FOO}` substitution and the
+    // `$$` collapse over argv[0] (measured on 242 and 255). So the path is written undoubled
+    // behind `@`, which makes the next word argv[0], and that word is dollar-doubled. Later
+    // arguments keep the doubling (`argv_dollar_sign_is_doubled`).
     for (executable, written) in [
-        ("/opt/a$b/bin", "ExecStart=/opt/a$b/bin $$X"),
-        ("/opt/a${b}/bin", "ExecStart=/opt/a${b}/bin $$X"),
-        ("/opt/a$$b/bin", "ExecStart=/opt/a$$b/bin $$X"),
-        ("/opt/bin$", "ExecStart=/opt/bin$ $$X"),
+        ("/opt/a$b/bin", "ExecStart=@/opt/a$b/bin /opt/a$$b/bin $$X"),
+        ("/opt/a${b}/bin", "ExecStart=@/opt/a${b}/bin /opt/a$${b}/bin $$X"),
+        ("/opt/a$$b/bin", "ExecStart=@/opt/a$$b/bin /opt/a$$$$b/bin $$X"),
+        ("/opt/bin$", "ExecStart=@/opt/bin$ /opt/bin$$ $$X"),
+        // `%` is doubled in both words; a word that needs quoting is quoted whole, `@` inside.
+        (
+            "/opt/a b$c/bin%x",
+            "ExecStart=\"@/opt/a b$c/bin%%x\" \"/opt/a b$$c/bin%%x\" $$X",
+        ),
     ] {
         let spec = with_fields(|f| f.command = vec![executable.to_string(), "$X".to_string()]);
         let text = unit(&spec, &minimal_identity()).unwrap();
         assert_eq!(line_of(&text, "ExecStart="), written, "{executable:?}");
         assert_eq!(extract(&text).unwrap().unwrap().spec, spec, "{executable:?}");
     }
+}
+
+#[skuld::test]
+fn an_executable_path_without_a_dollar_gets_no_separate_argv0() {
+    let spec = with_fields(|f| f.command = vec!["/opt/a b/bin".to_string(), "x".to_string()]);
+    let text = unit(&spec, &minimal_identity()).unwrap();
+    assert_eq!(line_of(&text, "ExecStart="), "ExecStart=\"/opt/a b/bin\" x");
 }
 
 #[skuld::test]
@@ -662,7 +675,7 @@ fn an_executable_path_with_a_backslash_or_quote_is_refused_because_systemd_refus
             message.contains(&format!("{executable:?}")),
             "{executable:?}: {message}"
         );
-        assert!(message.contains("manifest directory"), "{executable:?}: {message}");
+        assert!(message.contains("`command[0]`"), "{executable:?}: {message}");
         assert!(message.contains("systemd"), "{executable:?}: {message}");
     }
 }
@@ -795,7 +808,7 @@ fn an_executable_path_ending_in_whitespace_is_refused_because_systemd_does_not_r
     };
     assert_eq!(daemon, "frpc");
     assert!(message.contains("\"/bin/x \""), "{message}");
-    assert!(message.contains("manifest directory"), "{message}");
+    assert!(message.contains("`command[0]`"), "{message}");
     assert!(message.contains("whitespace"), "{message}");
     assert!(message.contains("systemd"), "{message}");
 }

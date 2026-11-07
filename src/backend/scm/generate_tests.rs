@@ -985,9 +985,10 @@ fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     let err = registration(&simple_spec(), &identity(), &shim).expect_err("a mangled shim path must be refused");
     let text = err.to_string();
     assert!(text.contains("service registration"), "{text}");
-    // Where goetia is installed is not something the manifest says: the message names the shim
-    // and its path, and does not blame `command[0]`.
-    assert!(text.contains("goetia-shim"), "{text}");
+    // No manifest sets the shim path: the message names it and its forcing character, and does
+    // not blame `command[0]` or send the user to an install location.
+    assert!(text.contains("configured goetia-shim path"), "{text}");
+    assert!(!text.contains("installed"), "{text}");
     assert!(text.contains(&format!("{:?}", shim.display().to_string())), "{text}");
     assert!(text.contains("space"), "{text}");
     assert!(!text.contains("command[0]"), "{text}");

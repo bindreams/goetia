@@ -243,17 +243,16 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
 /// holding a `"`, or ending in any backslashes, registers as another path. An unquoted path is
 /// written as is.
 ///
-/// A `type: managed` executable is `command[0]`, made absolute against the manifest directory; a
-/// `type: simple` one is where goetia installed `goetia-shim.exe`, which no manifest sets, so its
-/// message sends the user to the install location.
+/// A `type: managed` executable is `command[0]`; a `type: simple` one is the shim path, which no
+/// manifest sets, so its message names that path and not `command[0]`.
 fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<(), Error> {
     let text = executable.to_string_lossy();
     let quote_trigger = WRITER_QUOTE_TRIGGERS.iter().find(|(c, _)| text.contains(*c));
     let reason = match quote_trigger {
-        _ if text.contains('"') => "it holds a double quote, which the Windows service registration writer \
-             escapes, and SCM reads the program name up to the next quote with every backslash literal, so SCM \
-             would start a different path"
-            .to_string(),
+        Some(('"', trigger)) => format!(
+            "it holds {trigger}, which the Windows service registration writer escapes, and SCM reads the \
+             program name up to the next quote with every backslash literal, so SCM would start a different path"
+        ),
         // An empty path is quoted too, but it ends in no backslash.
         Some((_, trigger)) if text.ends_with('\\') => format!(
             "it holds {trigger}, so the Windows service registration writer wraps it in quotes and doubles the \
@@ -262,13 +261,9 @@ fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<
         _ => return Ok(()),
     };
     let message = match spec.kind {
-        Kind::Managed => format!(
-            "`command[0]` {text:?} (made absolute against the manifest directory) cannot be written into the \
-             service registration: {reason}"
-        ),
+        Kind::Managed => format!("`command[0]` {text:?} cannot be written into the service registration: {reason}"),
         Kind::Simple => format!(
-            "the path {text:?} of goetia-shim cannot be written into the service registration: {reason}. \
-             This is where goetia is installed, not a setting in the manifest: install goetia in a path without it"
+            "the configured goetia-shim path {text:?} cannot be written into the service registration: {reason}"
         ),
     };
     Err(Error::Invalid {
