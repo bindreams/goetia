@@ -95,8 +95,7 @@ fn managed_kind_renders_its_environment_lines() {
     assert_eq!(reg.environment, ["A=1", "B=2"]);
     assert!(
         reg.to_string().contains("Environment:\n  \"A=1\"\n  \"B=2\"\n"),
-        "the compared text must show each line:\n{}",
-        reg
+        "the compared text must show each line:\n{reg}",
     );
 }
 
@@ -112,8 +111,7 @@ fn simple_kind_renders_no_environment() {
     assert!(reg.environment.is_empty(), "{:?}", reg.environment);
     assert!(
         reg.to_string().contains("Environment:\nParameters:\n"),
-        "an empty environment renders as a bare header:\n{}",
-        reg
+        "an empty environment renders as a bare header:\n{reg}",
     );
 }
 

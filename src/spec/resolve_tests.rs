@@ -1073,10 +1073,10 @@ fn a_dollar_inside_a_substituted_value_survives_resolve_unchanged() {
 
 #[skuld::test]
 fn resolve_substitutes_rather_than_letting_a_reference_through() {
-    // `resolve` is public and takes a public `RawSpec`, so it is
-    // reachable without `load`. Interpolation therefore lives inside it,
-    // not beside it: a literal `${MISSING}` reaching a generated unit would
-    // be expanded by systemd itself, silently, to an empty string.
+    // Interpolation lives inside `resolve`, not beside it in `load`: every
+    // manifest's path to a `DaemonSpec` goes through it, and a literal `${MISSING}`
+    // reaching a generated unit would be expanded by systemd itself,
+    // silently, to an empty string.
     let yaml = "id: frpc\nname: ${ALSO_MISSING}\ncommand: [/bin/frpc, \"--flag=${MISSING}\"]\n";
 
     let err = resolve_yaml(yaml).expect_err("an undefined reference must not resolve");

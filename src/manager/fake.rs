@@ -704,11 +704,11 @@ impl crate::backend::Backend for Fake {
             );
         }
         state.writes += 1;
-        if let Some(left) = state.write_races.get_mut(spec.id.as_str()) {
-            if *left > 0 {
-                *left -= 1;
-                return Ok(WriteOutcome::Raced);
-            }
+        if let Some(left) = state.write_races.get_mut(spec.id.as_str())
+            && *left > 0
+        {
+            *left -= 1;
+            return Ok(WriteOutcome::Raced);
         }
         let current = state.entries.get(spec.id.as_str());
         if current.map(|e| &e.text) != snapshot.map(|s| &s.entry.text) {

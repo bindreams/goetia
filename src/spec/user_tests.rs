@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 use super::{AccountId, RawUser, User, UserWire};
+use crate::spec::raw::RawSpec;
 use crate::spec::resolve::resolve_user;
 
 fn parse(yaml: &str) -> Result<RawUser, yaml_serde::Error> {
@@ -61,13 +62,18 @@ fn an_absent_user_resolves_to_root() {
 
 #[skuld::test]
 fn a_user_that_is_neither_string_nor_mapping_is_refused_in_user_terms() {
-    for yaml in ["[root]\n", "5.5\n", "true\n"] {
-        let err = parse(yaml).unwrap_err().to_string();
-        assert!(
-            err.contains("expected a username string, `root`, or a struct with exactly one of `name` or `id`"),
-            "{yaml:?}: {err}"
-        );
-        assert!(!err.contains("RawUser") && !err.contains("UserWire"), "{yaml:?}: {err}");
+    let expecting = "expected a username string, `root`, or a struct with exactly one of `name` or `id`";
+    for user in ["[root]", "5.5", "true"] {
+        for yaml in [
+            format!("id: x\nuser: {user}\n"),
+            format!("id: x\nbackend-specific:\n  scm:\n    user: {user}\n"),
+        ] {
+            let err = RawSpec::parse(&yaml).unwrap_err().to_string();
+            assert!(err.contains(expecting), "{yaml:?}: {err}");
+            for internal in ["RawUser", "RawSpec", "RawOverride", "Wire"] {
+                assert!(!err.contains(internal), "{yaml:?} leaks `{internal}`: {err}");
+            }
+        }
     }
 }
 
