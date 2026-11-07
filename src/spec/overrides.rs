@@ -32,41 +32,70 @@ use serde::{Deserialize, Deserializer};
 
 use super::BackendKind;
 use super::raw::{EnvVisitor, RawSpec};
-use super::user::RawUser;
+use super::user::{RawUser, deserialize_user};
 
-pub type BackendOverrides = BTreeMap<BackendKind, RawOverride>;
+pub(super) type BackendOverrides = BTreeMap<BackendKind, RawOverride>;
 
 /// One `backend-specific.<backend>` entry: every field optional, since an
 /// override only needs to name the fields it actually overrides. Merging
 /// an override into a base `RawSpec` is [`RawSpec::merged_for`]'s job.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawOverride {
-    #[serde(default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct RawOverride {
     pub name: Option<String>,
-    #[serde(default)]
     pub command: Option<Vec<String>>,
-    #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default, deserialize_with = "no_duplicate_env")]
     pub env: Option<BTreeMap<String, String>>,
-    #[serde(default)]
     pub user: Option<RawUser>,
-    #[serde(default)]
     pub restart: Option<String>,
-    #[serde(rename = "restart-delay", default)]
     pub restart_delay: Option<String>,
-    #[serde(default)]
     pub logs: Option<String>,
-    #[serde(rename = "type", default)]
     pub kind: Option<String>,
+}
+
+/// `RawOverride`'s serde shape; read only under `RawSpec::parse` (see `Wire`).
+#[derive(Deserialize)]
+#[serde(
+    remote = "RawOverride",
+    deny_unknown_fields,
+    expecting = "a mapping of backend-specific overrides"
+)]
+struct OverrideWire {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default, deserialize_with = "no_duplicate_env")]
+    env: Option<BTreeMap<String, String>>,
+    #[serde(default, deserialize_with = "deserialize_user")]
+    user: Option<RawUser>,
+    #[serde(default)]
+    restart: Option<String>,
+    #[serde(rename = "restart-delay", default)]
+    restart_delay: Option<String>,
+    #[serde(default)]
+    logs: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+}
+
+struct OverrideEntry(RawOverride);
+
+impl<'de> Deserialize<'de> for OverrideEntry {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        OverrideWire::deserialize(d).map(OverrideEntry)
+    }
 }
 
 /// Which fields a backend's override actually supplied: provenance the merged spec cannot
 /// carry, so `BackendKind::error` does not reject a base value for a backend the author never
 /// wrote a line for. Only `user` is read today.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Supplied {
+pub(super) struct Supplied {
     pub user: bool,
 }
 
@@ -167,7 +196,7 @@ impl<'de> Visitor<'de> for OverridesVisitor {
             if overrides.contains_key(&backend) {
                 return Err(de::Error::custom(format!("duplicate backend key `{backend}`")));
             }
-            let value: RawOverride = map.next_value()?;
+            let OverrideEntry(value) = map.next_value()?;
             overrides.insert(backend, value);
         }
 
