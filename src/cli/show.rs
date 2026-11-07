@@ -36,13 +36,16 @@
 //! is *any* id `show` cannot find while an aggregate entry — one with no
 //! name — is present, since such an entry may stand for that very id.
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
-use super::support::{load_and_warn, partition_installed, print_undetermined_warnings, print_unusable_warnings};
+use super::support::{
+    load_and_warn, partition_installed, print_error, print_line, print_undetermined_warnings, print_unusable_warnings,
+};
 use crate::error::{Result, escape};
 use crate::manager::ServiceManager;
 use crate::spec::DaemonSpec;
@@ -75,7 +78,7 @@ fn show_from_file(file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Exit
     let spec = match load_and_warn(file, err) {
         Ok(spec) => spec,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -92,14 +95,14 @@ fn show_from_installed(
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
     let installed = match mgr.list() {
         Ok(v) => v,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -138,12 +141,10 @@ fn show_from_installed(
         } else if let Some(entry) = index.undetermined_for(id) {
             // Either the listing could not classify this id, or an aggregate
             // entry may stand for it: absence is unestablished either way.
-            let _ = writeln!(
-                err,
-                "error: daemon `{}`: installation state could not be determined: {}",
-                escape(id),
-                entry.reason
-            );
+            print_line(err, "error", None, |sink| {
+                write!(sink, "daemon `{id}`: installation state could not be determined: ")?;
+                entry.reason.write_to(sink)
+            });
             codes.push(ExitCode::Indeterminate);
         } else {
             let _ = writeln!(err, "error: daemon `{}` is not installed", escape(id));

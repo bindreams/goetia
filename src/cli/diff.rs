@@ -18,9 +18,8 @@ use std::path::PathBuf;
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
-use super::refusal::{Lines, Mood};
-use super::support::load_and_warn;
-use crate::decide::Outcome;
+use super::refusal::{Lines, Mood, NotRefused};
+use super::support::{load_and_warn, print_error};
 use crate::error::Result;
 use crate::manager::ServiceManager;
 
@@ -40,7 +39,7 @@ pub fn run(
     let spec = match load_and_warn(&args.file, err) {
         Ok(spec) => spec,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -48,7 +47,7 @@ pub fn run(
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -56,7 +55,7 @@ pub fn run(
     let outcome = match mgr.preview_install(&spec) {
         Ok(outcome) => outcome,
         Err(e) => {
-            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
+            print_error(err, Some(spec.id.as_str()), "", &e);
             return ExitCode::of(&e);
         }
     };
@@ -64,33 +63,29 @@ pub fn run(
         id: &spec.id,
         mood: Mood::Would,
     };
-    if let Some(code) = lines.refusal(&outcome, out, err) {
-        return code;
-    }
-    match outcome {
-        Outcome::Create => {
+    let settled = match lines.refusal(&outcome, out, err) {
+        Ok(code) => return code,
+        Err(settled) => settled,
+    };
+    match settled {
+        NotRefused::Create => {
             let _ = writeln!(out, "{}: not installed (would be created)", spec.id);
         }
-        Outcome::UpToDate => {
+        NotRefused::UpToDate => {
             let _ = writeln!(out, "{}: up to date", spec.id);
             return ExitCode::Success;
         }
-        Outcome::Update { spec_diff } => {
+        NotRefused::Update { spec_diff } => {
             let _ = writeln!(out, "{}:", spec.id);
             let _ = write!(out, "{spec_diff}");
         }
-        Outcome::Stale { from_version } => {
+        NotRefused::Stale { from_version } => {
             let _ = writeln!(
                 out,
                 "{}: would be regenerated (built by goetia {from_version})",
                 spec.id
             );
         }
-        // Written by `refusal` above.
-        Outcome::Conflict { .. }
-        | Outcome::RefuseForeign { .. }
-        | Outcome::RefuseOtherDaemon { .. }
-        | Outcome::RefuseUnusable { .. } => {}
     }
     ExitCode::Drift
 }

@@ -62,9 +62,9 @@ pub(crate) fn escape(text: &str) -> String {
 /// escaped whole as well.
 ///
 /// A write may end inside a multi-byte character, or on a carriage return that the next byte will
-/// show to be the end of a CRLF, so that tail is held until the next write. Bytes that are not
-/// UTF-8 are written as U+FFFD; a tail still held when the stream is dropped is written as U+FFFD,
-/// or escaped if it is the carriage return.
+/// show to be the end of a CRLF, so that tail is held until the next write, across a flush. Bytes
+/// that are not UTF-8 are written as U+FFFD; a tail still held when the stream is dropped is
+/// written as U+FFFD, or escaped if it is the carriage return.
 #[cfg(feature = "cli")]
 pub(crate) struct EscapedStream<'a> {
     inner: &'a mut dyn io::Write,
@@ -139,13 +139,9 @@ impl io::Write for EscapedStream<'_> {
         Ok(buf.len())
     }
 
-    /// Writes a held carriage return, escaped: a flush says no further byte is due, and a lone one
-    /// is the hazard. Half a character stays held for its other half.
+    /// Flushes the inner stream. A held tail stays held: a flush does not say no byte is due, and
+    /// a CRLF split by one must stay a CRLF.
     fn flush(&mut self) -> io::Result<()> {
-        if self.held == b"\r" {
-            self.held.clear();
-            self.put("\r")?;
-        }
         self.inner.flush()
     }
 }

@@ -305,3 +305,108 @@ fn an_embedded_errors_stderr_keeps_its_layout() {
     assert!(e.to_string().contains(": a\nb), so goetia"), "{e}");
     assert!(e.report_unescaped().to_string().contains(": a\nb), so goetia"));
 }
+
+/// The report as written into a sink whose lines start with `prefix`, as the CLI's `error:` lines do.
+fn under(prefix: &str, e: &Error) -> String {
+    let mut text = String::new();
+    e.write_report(&mut Sink::new(&mut text, true).continuing_with(prefix))
+        .expect("writing to a String cannot fail");
+    text
+}
+
+/// A kept error is handed out as it was: a kept `Both` prints both halves, and a remedy in either.
+#[skuld::test]
+fn a_kept_both_prints_both_halves_and_its_remedies() {
+    let both = || Error::Both {
+        first: Box::new(os("read", "/p", "denied")),
+        then: Box::new(undetermined("re-run as root")),
+    };
+    let expected = both().report().to_string();
+    assert!(expected.contains("; then: "), "{expected}");
+    assert!(expected.ends_with(". re-run as root"), "{expected}");
+    let kept = Error::Kept(Arc::new(both()));
+    assert_eq!(kept.report().to_string(), expected);
+    let twice = Error::Kept(Arc::new(kept));
+    assert_eq!(twice.report().to_string(), expected);
+}
+
+/// After a stderr block, goetia's continuation starts with the prefix the message's first line has,
+/// so a script that keeps the `error:` lines keeps the second failure and the remedy.
+#[skuld::test]
+fn goetias_continuation_after_a_stderr_block_starts_with_the_messages_prefix() {
+    let status = exit_status(1);
+    let block = format!("`systemctl start x` failed ({status}): a\n  b");
+    let prefix = "error: frpc: ";
+
+    let both = Error::Both {
+        first: Box::new(command("a\nb")),
+        then: Box::new(os("read", "/p", "denied")),
+    };
+    assert_eq!(
+        under(prefix, &both),
+        format!("{block}\n{prefix}; then: failed to read /p: denied")
+    );
+
+    let remedied = Error::Both {
+        first: Box::new(undetermined("re-run as root")),
+        then: Box::new(command("a\nb")),
+    };
+    assert!(
+        under(prefix, &remedied).ends_with(&format!("{block}\n{prefix}. re-run as root")),
+        "{}",
+        under(prefix, &remedied)
+    );
+
+    let sourced = Error::StartAsManaged {
+        blob: Arc::new(command("a\nb")),
+        source: Box::new(os("start", "/q", "stopped")),
+    };
+    assert!(
+        under(prefix, &sourced).ends_with(&format!("\n{prefix}): failed to start /q: stopped")),
+        "{}",
+        under(prefix, &sourced)
+    );
+
+    // A line that has no stderr block before it is not a continuation.
+    let plain = os("read", "/p", "denied");
+    assert_eq!(under(prefix, &plain), plain.report().to_string());
+
+    // The unescaped writer keeps the text as it came and adds nothing.
+    let mut raw = String::new();
+    both.write_report(&mut Sink::new(&mut raw, false).continuing_with(prefix))
+        .unwrap();
+    assert_eq!(raw, both.report_unescaped().to_string());
+}
+
+/// A reason around an error is one sentence, written as an error's own sentence is.
+#[skuld::test]
+fn a_reason_around_an_error_continues_under_the_prefix_too() {
+    let around = Reason::around(
+        "while starting: ",
+        Error::Both {
+            first: Box::new(undetermined("re-run as root")),
+            then: Box::new(command("a\nb")),
+        },
+        " (see above)",
+    );
+    let mut text = String::new();
+    around
+        .write_to(&mut Sink::new(&mut text, true).continuing_with("warning: x: "))
+        .unwrap();
+    assert!(
+        text.ends_with("a\n  b\nwarning: x:  (see above). re-run as root"),
+        "{text:?}"
+    );
+}
+
+/// An error's `Display` is its sentence, so the report and `Display` cannot word it differently.
+#[skuld::test]
+fn display_of_a_sentence_variant_is_its_sentence() {
+    let e = Error::LoadedStateInDoubt {
+        id: id(),
+        read_failed: Box::new(os("read", "/p", "denied")),
+        restore_failed: None,
+    };
+    assert_eq!(e.to_string(), e.sentence().unwrap().to_string());
+    assert_eq!(e.report().to_string(), e.to_string());
+}

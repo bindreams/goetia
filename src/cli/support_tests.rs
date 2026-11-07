@@ -123,3 +123,55 @@ fn a_reason_wrapping_a_command_error_keeps_the_stderr_layout_of_the_report() {
         )
     );
 }
+
+/// What goetia writes after a child's stderr block continues on a line that starts with the prefix
+/// the message's first line has, so a script that keeps `warning:` or `error:` lines keeps all of it.
+#[skuld::test]
+fn a_continuation_after_a_stderr_block_keeps_the_prefix_of_every_kind_of_line() {
+    use super::print_error;
+    use crate::error::Error;
+    use crate::error::error_tests::{exit_status, os, undetermined};
+
+    let command = || Error::command("systemctl show x", exit_status(1), b"first\nsecond");
+    let both = || Error::Both {
+        first: Box::new(command()),
+        then: Box::new(os("read", "/p", "denied")),
+    };
+    let remedied = || Error::Both {
+        first: Box::new(undetermined("re-run as root")),
+        then: Box::new(command()),
+    };
+    let block = format!("`systemctl show x` failed ({}): first\n  second", exit_status(1));
+    let written = |write: &dyn Fn(&mut Vec<u8>)| {
+        let mut out: Vec<u8> = Vec::new();
+        write(&mut out);
+        String::from_utf8(out).unwrap()
+    };
+
+    let text = written(&|out| print_error(out, Some("frpc"), "", &both()));
+    assert!(text.starts_with("error: frpc: `systemctl show x`"), "{text:?}");
+    assert!(
+        text.ends_with(&format!("{block}\nerror: frpc: ; then: failed to read /p: denied\n")),
+        "{text:?}"
+    );
+    let text = written(&|out| print_error(out, None, "enable: ", &remedied()));
+    assert!(
+        text.ends_with(&format!("{block}\nerror: . re-run as root\n")),
+        "{text:?}"
+    );
+    assert!(text.starts_with("error: enable: "), "{text:?}");
+
+    let reason = Reason::failed(both());
+    let unusable = std::collections::BTreeMap::from([("x".to_string(), reason.clone())]);
+    let text = written(&|out| print_unusable_warnings(&unusable, out));
+    assert!(
+        text.ends_with(&format!("{block}\nwarning: x: ; then: failed to read /p: denied\n")),
+        "{text:?}"
+    );
+    let entries = [UndeterminedEntry { name: None, reason }];
+    let text = written(&|out| print_undetermined_warnings(&entries, out));
+    assert!(
+        text.ends_with(&format!("{block}\nwarning: ; then: failed to read /p: denied\n")),
+        "{text:?}"
+    );
+}

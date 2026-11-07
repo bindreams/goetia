@@ -1,11 +1,12 @@
 //! Helpers shared by more than one subcommand module.
 
 use std::collections::BTreeMap;
+use std::fmt::{self, Write as _};
 use std::io::Write;
 use std::path::Path;
 
 use super::ExitCode;
-use crate::error::{Error, Reason, Result, escape};
+use crate::error::{Error, Reason, Result, Sink, escape};
 use crate::manager::{Installed, ServiceManager, State};
 use crate::spec::{DaemonSpec, Id, Warning};
 
@@ -18,16 +19,51 @@ pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<DaemonSp
     Ok(spec)
 }
 
+/// `prefix` and then what `body` writes through a [`Sink`], which escapes it and starts every
+/// line goetia continues after a child's stderr with `prefix` again. `prefix` is written as it is.
+pub(super) fn render_line(prefix: &str, body: impl FnOnce(&mut Sink) -> fmt::Result) -> String {
+    let mut line = prefix.to_string();
+    body(&mut Sink::new(&mut line, true).continuing_with(prefix)).expect("writing to a String cannot fail");
+    line
+}
+
+/// Writes one line to `err`: `label: ` and `scope: ` (when there is one), then `body`, which
+/// continues under the same prefix. Every human line of `error:` and `warning:` goes through here,
+/// so none can forget to escape or to keep its prefix on a continuation.
+pub(crate) fn print_line(
+    err: &mut dyn Write,
+    label: &str,
+    scope: Option<&str>,
+    body: impl FnOnce(&mut Sink) -> fmt::Result,
+) {
+    let _ = writeln!(err, "{}", render_line(&line_prefix(label, scope), body));
+}
+
+/// `label: ` and, when there is a `scope`, its escaped text and `: `.
+fn line_prefix(label: &str, scope: Option<&str>) -> String {
+    match scope {
+        Some(scope) => format!("{label}: {}: ", escape(scope)),
+        None => format!("{label}: "),
+    }
+}
+
+/// Writes `error: [id: ]what` and the report of `e`, which says what failed; `what` is goetia's
+/// own words that lead it (`enable: `).
+pub(crate) fn print_error(err: &mut dyn Write, id: Option<&str>, what: &str, e: &Error) {
+    print_line(err, "error", id, |sink| {
+        sink.write_str(what)?;
+        e.write_report(sink)
+    });
+}
+
 /// Renders `warning: <id>: <message>` for a daemon's advisory and
 /// `warning: <message>` for a manifest-level one. Only the drive-relative
 /// `-f` advisory (`spec::resolve`'s `absolutize`) takes the second arm: it
 /// belongs to no daemon.
 pub(crate) fn print_warnings(warnings: &[Warning], err: &mut dyn Write) {
     for warning in warnings {
-        let _ = match &warning.id {
-            Some(id) => writeln!(err, "warning: {id}: {}", escape(&warning.message)),
-            None => writeln!(err, "warning: {}", escape(&warning.message)),
-        };
+        let id = warning.id.as_ref().map(Id::as_str);
+        print_line(err, "warning", id, |sink| sink.write_str(&warning.message));
     }
 }
 
@@ -135,7 +171,9 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
 
 pub(crate) fn print_unusable_warnings(unusable: &BTreeMap<String, Reason>, err: &mut dyn Write) {
     for (name, reason) in unusable {
-        let _ = writeln!(err, "warning: {}: installed but unusable: {}", escape(name), reason);
+        print_line(err, "warning", Some(name), |sink| {
+            reason.installed_but_unusable().write_to(sink)
+        });
     }
 }
 
@@ -143,15 +181,12 @@ pub(crate) fn print_unusable_warnings(unusable: &BTreeMap<String, Reason>, err: 
 /// other. An aggregate's `reason` is a complete sentence and stands alone.
 pub(crate) fn print_undetermined_warnings(undetermined: &[UndeterminedEntry], err: &mut dyn Write) {
     for entry in undetermined {
-        let _ = match &entry.name {
-            Some(name) => writeln!(
-                err,
-                "warning: {}: installation state could not be determined: {}",
-                escape(name),
-                entry.reason
-            ),
-            None => writeln!(err, "warning: {}", entry.reason),
-        };
+        print_line(err, "warning", entry.name.as_deref(), |sink| {
+            if entry.name.is_some() {
+                sink.write_str("installation state could not be determined: ")?;
+            }
+            entry.reason.write_to(sink)
+        });
     }
 }
 
@@ -237,7 +272,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
     let ids = match ids {
         Ok(ids) => ids,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -248,7 +283,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
     let mgr = match (call.get_manager)() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -268,7 +303,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
                 codes.push(ExitCode::Success);
             }
             Err(e) => {
-                let _ = writeln!(err, "error: {id}: {}", e.report());
+                print_error(err, Some(id.as_str()), "", &e);
                 codes.push(ExitCode::of(&e));
             }
         }

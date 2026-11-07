@@ -305,3 +305,33 @@ fn an_errors_message_in_the_document_is_its_unescaped_chain() {
         "step\u{202e}: failed to read /a\nb: x"
     );
 }
+
+/// The three places that say `installed but unusable: ` (the document's message, the `error:` line
+/// and the `warning:` line) take it from the one reason, so they agree, whatever the reason is.
+#[skuld::test]
+fn every_rendering_of_an_unusable_entry_has_the_same_prefix_and_reason() {
+    use crate::cli::support::{partition_installed, print_unusable_warnings};
+    use crate::error::error_tests::os;
+    use crate::manager::Installed;
+
+    let reasons = [
+        Reason::said("damaged"),
+        Reason::failed(os("read", "/p", "denied")),
+        Reason::around("scan (", os("read", "/p", "denied"), ")."),
+    ];
+    for reason in reasons {
+        let index = partition_installed(vec![Installed::OursUnusable {
+            name: "x".to_string(),
+            reason: reason.clone(),
+        }]);
+        let report = from_index(&index);
+        let message = format!("installed but unusable: {}", reason.unescaped());
+        assert_eq!(report.errors[0].message, message);
+
+        let (mut err, mut warn) = (Vec::new(), Vec::new());
+        print_errors(&report, &mut err);
+        print_unusable_warnings(&index.unusable, &mut warn);
+        assert_eq!(String::from_utf8(err).unwrap(), format!("error: x: {message}\n"));
+        assert_eq!(String::from_utf8(warn).unwrap(), format!("warning: x: {message}\n"));
+    }
+}

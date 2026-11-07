@@ -140,9 +140,10 @@ fn an_unusable_refusal_writes_a_childs_stderr_in_the_layout() {
         let (_, out, err) = reported(mood, |lines, out, err| {
             lines.unusable(&reason, Some("uninstall it"), out, err)
         });
-        let line = format!("frpc: {}: {shown}\n. uninstall it\n", refused(mood));
-        assert_eq!(out, line, "{mood:?}");
-        assert_eq!(err, format!("error: {line}"), "{mood:?}");
+        // After the block, goetia's words continue under the prefix of the stream's own line.
+        let line = |prefix: &str| format!("{prefix}{}: {shown}\n{prefix}. uninstall it\n", refused(mood));
+        assert_eq!(out, line("frpc: "), "{mood:?}");
+        assert_eq!(err, line("error: frpc: "), "{mood:?}");
     }
 }
 
@@ -154,18 +155,30 @@ fn only_a_conflict_or_a_refusal_is_a_refusal() {
         id: &id,
         mood: Mood::Done,
     };
-    for outcome in [
-        Outcome::Create,
-        Outcome::UpToDate,
-        Outcome::Update {
-            spec_diff: String::new(),
-        },
-        Outcome::Stale {
-            from_version: "0".to_string(),
-        },
-    ] {
-        assert_eq!(lines.refusal(&outcome, &mut out, &mut err), None, "{outcome:?}");
-    }
+    let create = Outcome::Create;
+    assert!(matches!(
+        lines.refusal(&create, &mut out, &mut err),
+        Err(NotRefused::Create)
+    ));
+    let up_to_date = Outcome::UpToDate;
+    assert!(matches!(
+        lines.refusal(&up_to_date, &mut out, &mut err),
+        Err(NotRefused::UpToDate)
+    ));
+    let update = Outcome::Update {
+        spec_diff: "d".to_string(),
+    };
+    assert!(matches!(
+        lines.refusal(&update, &mut out, &mut err),
+        Err(NotRefused::Update { spec_diff: "d" })
+    ));
+    let stale = Outcome::Stale {
+        from_version: "0".to_string(),
+    };
+    assert!(matches!(
+        lines.refusal(&stale, &mut out, &mut err),
+        Err(NotRefused::Stale { from_version: "0" })
+    ));
     assert!(out.is_empty() && err.is_empty());
     for (outcome, code) in [
         (
@@ -195,6 +208,9 @@ fn only_a_conflict_or_a_refusal_is_a_refusal() {
             ExitCode::Error,
         ),
     ] {
-        assert_eq!(lines.refusal(&outcome, &mut out, &mut err), Some(code), "{outcome:?}");
+        assert!(
+            matches!(lines.refusal(&outcome, &mut out, &mut err), Ok(c) if c == code),
+            "{outcome:?}"
+        );
     }
 }

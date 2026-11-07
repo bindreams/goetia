@@ -1,5 +1,6 @@
 //! Crate-wide error type.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -397,7 +398,7 @@ pub enum Error {
     /// when it failed, and says what is on disk.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", loaded_in_doubt(id, None, restore_failed.is_some()))]
+    #[error("{}", loaded_job_in_doubt(id, restore_failed.is_some()))]
     LoadedJobInDoubt {
         id: String,
         #[source]
@@ -411,7 +412,7 @@ pub enum Error {
     /// launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", loaded_in_doubt(id, Some(read_failed), restore_failed.is_some()))]
+    #[error("{}", self.sentence().expect("`LoadedStateInDoubt` is a sentence"))]
     LoadedStateInDoubt {
         id: String,
         read_failed: Box<Error>,
@@ -472,7 +473,7 @@ pub enum Error {
     /// A `start` was judged as a `type: managed` service's, because the service's spec blob could not
     /// be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
     /// `source` is the failed start.
-    #[error("{}", start_as_managed_message(blob))]
+    #[error("{}", self.sentence().expect("`StartAsManaged` is a sentence"))]
     StartAsManaged {
         blob: Arc<Error>,
         #[source]
@@ -607,7 +608,7 @@ impl Error {
                 id,
                 read_failed,
                 restore_failed,
-            } => Some(loaded_in_doubt(id, Some(read_failed), restore_failed.is_some())),
+            } => Some(loaded_state_in_doubt(id, read_failed, restore_failed.is_some())),
             Error::StartAsManaged { blob, .. } => Some(start_as_managed_message(blob)),
             Error::Kept(kept) => kept.sentence(),
             Error::Os { .. }
@@ -672,6 +673,21 @@ impl Error {
         Report {
             error: self,
             escaped: false,
+        }
+    }
+
+    /// Writes [`report`](Error::report) into `out`, which decides how it is escaped and what
+    /// starts the lines goetia continues after a child's stderr.
+    #[cfg(feature = "cli")]
+    pub(crate) fn write_report(&self, out: &mut Sink) -> fmt::Result {
+        report::write_report(self, out)
+    }
+
+    /// This error, or the error it hands out if it is a [`Kept`](Error::Kept) one.
+    pub(crate) fn unkept(&self) -> &Error {
+        match self {
+            Error::Kept(kept) => kept.unkept(),
+            other => other,
         }
     }
 
@@ -901,46 +917,50 @@ fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
 }
 
 /// A message with an error set inside it: `before`, the error, `after`. `Display` writes the
-/// error as [`Chain`] does; [`Error::report`] writes it as it writes any error (see
-/// [`Error::sentence`]).
+/// error as [`Chain`] does; [`Error::report`] and [`Reason`] write it as they write any error
+/// (see [`Error::sentence`]).
 pub(crate) struct Sentence<'a> {
-    pub(crate) before: String,
-    pub(crate) error: Option<&'a Error>,
-    pub(crate) after: String,
+    pub(crate) before: Cow<'a, str>,
+    pub(crate) error: &'a Error,
+    pub(crate) after: Cow<'a, str>,
 }
 
 impl fmt::Display for Sentence<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.before)?;
-        if let Some(error) = self.error {
-            write!(f, "{}", Chain(error))?;
-        }
-        f.write_str(&self.after)
+        write!(f, "{}{}{}", self.before, Chain(self.error), self.after)
     }
 }
 
 /// The message of [`Error::StartAsManaged`]: `blob` is the unreadable blob's error.
 fn start_as_managed_message(blob: &Error) -> Sentence<'_> {
     Sentence {
-        before: "its spec blob could not be read, so the start was judged as a `type: managed` service's (".to_string(),
-        error: Some(blob),
-        after: ")".to_string(),
+        before: "its spec blob could not be read, so the start was judged as a `type: managed` service's (".into(),
+        error: blob,
+        after: ")".into(),
     }
 }
 
-/// The message of both in-doubt variants. `read_failed` is the failed read (second variant only);
-/// `restore_failed` is whether the put-back of the plist failed, whose error is the variant's source.
-fn loaded_in_doubt<'a>(id: &str, read_failed: Option<&'a Error>, restore_failed: bool) -> Sentence<'a> {
-    let (cause, read_failed) = match read_failed {
-        None => (
-            format!("`{id}` was loaded in launchd while its plist was written"),
-            None,
-        ),
-        Some(read) => (
-            format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read ("),
-            Some(read),
-        ),
-    };
+/// The message of [`Error::LoadedJobInDoubt`].
+fn loaded_job_in_doubt(id: &str, restore_failed: bool) -> String {
+    format!(
+        "`{id}` was loaded in launchd while its plist was written{}",
+        loaded_in_doubt_tail(id, restore_failed)
+    )
+}
+
+/// The message of [`Error::LoadedStateInDoubt`]; `read_failed` is the failed read.
+fn loaded_state_in_doubt<'a>(id: &str, read_failed: &'a Error, restore_failed: bool) -> Sentence<'a> {
+    Sentence {
+        before: format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read (")
+            .into(),
+        error: read_failed,
+        after: format!("){}", loaded_in_doubt_tail(id, restore_failed)).into(),
+    }
+}
+
+/// What both in-doubt messages end with. `restore_failed` is whether the put-back of the plist
+/// failed, whose error is the variant's source.
+fn loaded_in_doubt_tail(id: &str, restore_failed: bool) -> String {
     let remedy = if restore_failed {
         format!(
             "Check what is on disk, then run `goetia daemon stop {id}`, re-run install, then `goetia daemon start {id}`. The plist could not be put back as it was before this install"
@@ -950,14 +970,7 @@ fn loaded_in_doubt<'a>(id: &str, read_failed: Option<&'a Error>, restore_failed:
             "The plist is back as it was before this install, so the change is not installed: run `goetia daemon stop {id}`, re-run install, then `goetia daemon start {id}`"
         )
     };
-    let close = if read_failed.is_some() { ")" } else { "" };
-    Sentence {
-        before: cause,
-        error: read_failed,
-        after: format!(
-            "{close}, so goetia cannot tell whether a loaded job holds the old definition or the new one. {remedy}"
-        ),
-    }
+    format!(", so goetia cannot tell whether a loaded job holds the old definition or the new one. {remedy}")
 }
 
 /// This crate's `Result` alias, used throughout [`crate::manager`] and

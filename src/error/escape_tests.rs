@@ -173,27 +173,37 @@ impl std::io::Write for Probe {
     }
 }
 
-/// A flush is the stream's last chance to write a lone carriage return, which a terminal would
-/// act on: it is written escaped. A character that is only half there stays held for its other half.
+/// A flush only flushes the inner stream: it does not say that no byte is due, so a tail held for
+/// the next write stays held, and a CRLF split by a flush is still a CRLF. The drop writes it.
 #[cfg(feature = "cli")]
 #[skuld::test]
-fn a_flush_writes_a_held_carriage_return_escaped_and_keeps_half_a_character() {
+fn a_flush_keeps_a_held_tail_and_a_crlf_split_by_it_stays_whole() {
     let probe = Probe::default();
     let mut inner = probe.clone();
-    let mut stream = EscapedStream::new(&mut inner);
-    std::io::Write::write_all(&mut stream, b"a\r").unwrap();
-    assert_eq!(probe.0.borrow().0, b"a", "held until the next byte or a flush");
-    std::io::Write::flush(&mut stream).unwrap();
-    assert_eq!(probe.0.borrow().0, br"a\u{d}");
-    assert_eq!(probe.0.borrow().1, 1, "the inner stream is flushed");
-
-    let probe = Probe::default();
-    let mut inner = probe.clone();
-    let mut stream = EscapedStream::new(&mut inner);
-    std::io::Write::write_all(&mut stream, b"b\xe2\x80").unwrap();
-    std::io::Write::flush(&mut stream).unwrap();
-    assert_eq!(probe.0.borrow().0, b"b", "half a character is not written");
-    assert_eq!(probe.0.borrow().1, 1);
-    std::io::Write::write_all(&mut stream, b"\xa8").unwrap();
-    assert_eq!(probe.0.borrow().0, br"b\u{2028}", "its other half completes it");
+    {
+        let mut stream = EscapedStream::new(&mut inner);
+        std::io::Write::write_all(&mut stream, b"a\r").unwrap();
+        std::io::Write::flush(&mut stream).unwrap();
+        assert_eq!(probe.0.borrow().0, b"a", "the carriage return is still held");
+        assert_eq!(probe.0.borrow().1, 1, "the inner stream is flushed");
+        std::io::Write::write_all(&mut stream, b"\nb\xe2\x80").unwrap();
+        std::io::Write::flush(&mut stream).unwrap();
+        assert_eq!(
+            probe.0.borrow().0,
+            b"a\r\nb",
+            "the CRLF is kept, half a character is held"
+        );
+        std::io::Write::write_all(&mut stream, b"\xa8\r").unwrap();
+        std::io::Write::flush(&mut stream).unwrap();
+        assert_eq!(
+            probe.0.borrow().0,
+            concat!("a\r\nb", r"\u{2028}").as_bytes(),
+            "the last return is held again"
+        );
+    }
+    assert_eq!(
+        probe.0.borrow().0,
+        concat!("a\r\nb", r"\u{2028}\u{d}").as_bytes(),
+        "dropped, the held return is escaped"
+    );
 }

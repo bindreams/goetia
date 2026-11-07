@@ -3,8 +3,8 @@
 use std::fmt::{self, Write as _};
 use std::sync::Arc;
 
-use super::Error;
-use super::report::{Sink, write_chain, write_remedies};
+use super::report::{Sink, write_chain, write_remedies, write_sentence};
+use super::{Error, Sentence};
 
 /// Why goetia says what it does about an id it cannot use or classify: a refused install, or a
 /// `list` entry. It is cheap to clone, and two reasons are equal when they read the same.
@@ -77,18 +77,33 @@ impl Reason {
     /// `Display`, written into `out`, so what a caller writes next is placed after a stderr this
     /// ends on as the report places it.
     pub(crate) fn write_to(&self, out: &mut Sink) -> fmt::Result {
-        let (before, error, after) = match self {
-            Reason::Said(text) => ("", None, text.as_str()),
-            Reason::Failed(error) => ("", Some(error), ""),
-            Reason::Around { before, error, after } => (before.as_str(), Some(error), after.as_str()),
-        };
         let mut remedies = Vec::new();
-        out.write_str(before)?;
-        if let Some(error) = error {
-            write_chain(error.as_ref(), out, &mut remedies)?;
+        match self {
+            Reason::Said(text) => out.write_str(text)?,
+            Reason::Failed(error) => write_chain(error.as_ref(), out, &mut remedies)?,
+            Reason::Around { before, error, after } => {
+                let sentence = Sentence {
+                    before: before.as_str().into(),
+                    error,
+                    after: after.as_str().into(),
+                };
+                write_sentence(sentence, out, &mut remedies)?;
+            }
         }
-        out.write_str(after)?;
         write_remedies(out, &remedies)
+    }
+
+    /// This reason said after `installed but unusable: `: what `list` and `status` say of an
+    /// installed daemon goetia cannot use.
+    pub(crate) fn installed_but_unusable(&self) -> Reason {
+        const PREFIX: &str = "installed but unusable: ";
+        match self {
+            Reason::Said(text) => Reason::Said(format!("{PREFIX}{text}")),
+            Reason::Failed(error) => Reason::around(PREFIX, Arc::clone(error), ""),
+            Reason::Around { before, error, after } => {
+                Reason::around(format!("{PREFIX}{before}"), Arc::clone(error), after.as_str())
+            }
+        }
     }
 }
 

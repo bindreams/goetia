@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
-use super::refusal::{Lines, Mood};
-use super::support::{load_and_warn, require_elevation};
+use super::refusal::{Lines, Mood, NotRefused};
+use super::support::{load_and_warn, print_error, require_elevation};
 use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::Outcome;
@@ -54,7 +54,7 @@ pub fn run(
     let spec = match load_and_warn(&args.file, err) {
         Ok(spec) => spec,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -67,7 +67,7 @@ pub fn run(
                 ExitCode::Success
             }
             Err(e) => {
-                let _ = writeln!(err, "error: {}", e.report());
+                print_error(err, None, "", &e);
                 ExitCode::Error
             }
         };
@@ -79,7 +79,7 @@ pub fn run(
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -95,7 +95,7 @@ pub fn run(
     {
         Ok(sequence) => sequence,
         Err(e) => {
-            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
+            print_error(err, Some(spec.id.as_str()), "", &e);
             return ExitCode::of(&e);
         }
     };
@@ -113,18 +113,18 @@ pub fn run(
             if args.enable
                 && let Err(e) = mgr.enable(&spec.id)
             {
-                let _ = writeln!(err, "error: {}: enable: {}", spec.id, e.report());
+                print_error(err, Some(spec.id.as_str()), "enable: ", &e);
                 codes.push(ExitCode::of(&e));
             }
             if let Some(sequence) = sequence.as_mut()
                 && let Err(e) = sequence.start(&spec.id, args.wait.budget())
             {
-                let _ = writeln!(err, "error: {}: start: {}", spec.id, e.report());
+                print_error(err, Some(spec.id.as_str()), "start: ", &e);
                 codes.push(ExitCode::of(&e));
             }
         }
         Err(e) => {
-            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
+            print_error(err, Some(spec.id.as_str()), "", &e);
             codes.push(ExitCode::of(&e));
         }
     }
@@ -137,28 +137,24 @@ pub fn run(
 /// captures stderr for errors still learns that an exit-1/5 run had one.
 fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let lines = Lines { id, mood: Mood::Done };
-    if let Some(code) = lines.refusal(outcome, out, err) {
-        return code;
-    }
-    match outcome {
-        Outcome::Create => {
+    let settled = match lines.refusal(outcome, out, err) {
+        Ok(code) => return code,
+        Err(settled) => settled,
+    };
+    match settled {
+        NotRefused::Create => {
             let _ = writeln!(out, "{id}: created");
         }
-        Outcome::UpToDate => {
+        NotRefused::UpToDate => {
             let _ = writeln!(out, "{id}: up to date");
         }
-        Outcome::Update { spec_diff } => {
+        NotRefused::Update { spec_diff } => {
             let _ = writeln!(out, "{id}: updated");
             let _ = write!(out, "{spec_diff}");
         }
-        Outcome::Stale { from_version } => {
+        NotRefused::Stale { from_version } => {
             let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
         }
-        // Written by `refusal` above.
-        Outcome::Conflict { .. }
-        | Outcome::RefuseForeign { .. }
-        | Outcome::RefuseOtherDaemon { .. }
-        | Outcome::RefuseUnusable { .. } => {}
     }
     ExitCode::Success
 }

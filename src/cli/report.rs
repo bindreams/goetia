@@ -29,8 +29,8 @@ use std::fmt;
 use std::io::Write;
 
 use super::ExitCode;
-use super::support::{InstalledIndex, state_str};
-use crate::error::{Error, Reason, escape};
+use super::support::{InstalledIndex, print_line, state_str};
+use crate::error::{Error, Reason, Sink};
 use crate::manager::Status;
 
 // Wire format =========================================================================================================
@@ -83,8 +83,8 @@ enum Origin {
     Words,
     /// The error failed on, which [`Error::report`] writes.
     Error(Error),
-    /// An installed daemon goetia cannot use: `installed but unusable: ` and the reason.
-    Unusable(Reason),
+    /// A [`Reason`], which `Display` writes as the report does.
+    Reason(Reason),
 }
 
 impl ErrorReport {
@@ -109,20 +109,14 @@ impl ErrorReport {
         }
     }
 
-    /// `message` for a person, as the report writes it (see [`Error::report`]).
-    fn shown(&self) -> impl fmt::Display + '_ {
-        Shown(self)
-    }
-}
+    /// Writes `message` for a person, as the report writes it (see [`Error::report`]).
+    fn write_shown(&self, out: &mut Sink) -> fmt::Result {
+        use std::fmt::Write as _;
 
-struct Shown<'a>(&'a ErrorReport);
-
-impl fmt::Display for Shown<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0.origin {
-            Origin::Words => f.write_str(&escape(&self.0.message)),
-            Origin::Error(e) => write!(f, "{}", e.report()),
-            Origin::Unusable(reason) => write!(f, "installed but unusable: {reason}"),
+        match &self.origin {
+            Origin::Words => out.write_str(&self.message),
+            Origin::Error(e) => e.write_report(out),
+            Origin::Reason(reason) => reason.write_to(out),
         }
     }
 }
@@ -247,11 +241,15 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
         errors: index
             .unusable
             .iter()
-            .map(|(name, reason)| ErrorReport {
-                id: Some(name.clone()),
-                kind: Kind::Unusable,
-                message: format!("installed but unusable: {}", reason.unescaped()),
-                origin: Origin::Unusable(reason.clone()),
+            .map(|(name, reason)| {
+                let reason = reason.installed_but_unusable();
+                let message = reason.unescaped().to_string();
+                ErrorReport {
+                    id: Some(name.clone()),
+                    kind: Kind::Unusable,
+                    message,
+                    origin: Origin::Reason(reason),
+                }
             })
             .collect(),
         // Already ordered: `partition_installed` sorts as it builds, so the
@@ -351,14 +349,7 @@ pub(crate) fn unsupported(subcommand: &str) -> Report {
 /// Writes the entries of `report.errors` as `error:` lines, each under its id when it has one.
 pub(crate) fn print_errors(report: &Report, err: &mut dyn Write) {
     for error in &report.errors {
-        match &error.id {
-            Some(id) => {
-                let _ = writeln!(err, "error: {}: {}", escape(id), error.shown());
-            }
-            None => {
-                let _ = writeln!(err, "error: {}", error.shown());
-            }
-        }
+        print_line(err, "error", error.id.as_deref(), |sink| error.write_shown(sink));
     }
 }
 
