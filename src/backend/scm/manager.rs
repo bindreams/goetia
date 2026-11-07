@@ -113,12 +113,13 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
-use crate::backend::scm::kill::hold_if_possible;
-use crate::backend::scm::kill::system::Held;
+use crate::backend::scm::kill::system::{Held, wait_exit};
+use crate::backend::scm::kill::{KillTarget as _, hold_if_possible};
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
+use crate::backend::scm::shim::processes::unowned_on;
 use crate::backend::scm::shim::provider::ShimProvider;
 use crate::backend::scm::shim::sweep::{
     left_behind_text, normalise, referenced_hosts, same_path, sweep_folder, undeleted,
@@ -1023,10 +1024,12 @@ fn hold_host_process(id: &Id) -> Result<Option<Held>> {
 impl Scm {
     /// What an uninstall does once `id` is stopped and deleted, for a service whose host was the shim
     /// file `host`: waits, with no bound, for the process that was held (it is on its way out: SCM
-    /// recorded `STOPPED` before it exits), and for no other: a healthy service that was updated to
-    /// another file and not restarted still runs `host`, and its process keeps the file referenced
-    /// for a later sweep. Then sweeps the provider's folder and the folder `host` was in, which is
-    /// another when the service was installed by another goetia version or provider.
+    /// recorded `STOPPED` before it exits) and for every other process running `host` that no live
+    /// service reports as its own: the process of a service stopped before the uninstall began, which
+    /// could not be held, is on its way out too. A healthy service that was updated to another file
+    /// and not restarted still runs `host`, and its process is not waited for: it keeps the file
+    /// referenced for a later sweep. Then sweeps the provider's folder and the folder `host` was in,
+    /// which is another when the service was installed by another goetia version or provider.
     ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`].
@@ -1048,8 +1051,19 @@ impl Scm {
             held.wait_for_exit(id.as_str())
                 .map_err(|e| left_behind(Error::os(format!("wait for `{id}`'s process to exit"), e)))?;
         }
-        // After the wait: the held process has exited and no longer references its file. Any other
-        // process running `host` still does, and keeps the file for a later sweep.
+        // The process of a service that stopped before it was held (SCM recorded `STOPPED`, with no
+        // pid, while it was still exiting) is found by its image: it is no live service's.
+        for process in unowned_on(&host).map_err(left_behind)? {
+            let waiting = || eprintln!("{id}: waiting for a process running {} to exit", host.display());
+            wait_exit(&process, waiting).map_err(|e| {
+                left_behind(Error::os(
+                    format!("wait for a process running {} to exit", host.display()),
+                    e,
+                ))
+            })?;
+        }
+        // After the waits: what has exited no longer references its file. A process a live service
+        // reports still does, and keeps the file for a later sweep.
         let referenced = referenced_hosts().map_err(left_behind)?;
         let mut failures = Vec::new();
         if let Some(shim) = &self.shim {
@@ -1164,7 +1178,7 @@ fn previous_start_type(id: &Id, previous: Option<ServiceStartType>) -> String {
 
 // shared helpers ======================================================================================================
 
-fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
+pub(in crate::backend::scm) fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, access).map_err(|e| to_error("open the Service Control Manager", e))
 }
 
@@ -1206,6 +1220,19 @@ pub(in crate::backend::scm) fn read_image_through_scm(name: &str) -> Result<Opti
         Err(e) if is_marked_for_delete(&e) => Ok(None),
         Err(e) => Err(to_error(&format!("query configuration for `{name}`"), e)),
     }
+}
+
+/// The pid SCM reports for the service `name`: `None` when it has no process and when it is gone
+/// since it was listed.
+pub(in crate::backend::scm) fn read_service_pid(scm: &WinServiceManager, name: &str) -> Result<Option<u32>> {
+    let service = match scm.open_service(name, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => service,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(to_error(&format!("open service `{name}` to read its process"), e)),
+    };
+    super::kill::SystemKillTarget::observing(service, name.to_string())
+        .service_pid()
+        .map_err(|e| Error::os(format!("read the process of service `{name}`"), e))
 }
 
 fn is_not_found(e: &windows_service::Error) -> bool {

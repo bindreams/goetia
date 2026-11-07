@@ -159,6 +159,72 @@ fn only_shim_file_names_are_referenced_by_name() {
     );
 }
 
+// Which processes an uninstall waits for ------------------------------------------------------------------------
+
+fn running(pid: u32, image: &str) -> (u32, PathBuf) {
+    (pid, PathBuf::from(image))
+}
+
+fn reports(service: &str, pid: u32) -> (String, u32) {
+    (service.to_string(), pid)
+}
+
+const HOST: &str = "/p/Goetia/goetia-shim-aa.exe";
+
+/// The stopped service's own process: SCM reports `STOPPED` with no pid, so no service has it.
+#[skuld::test]
+fn a_process_on_the_host_that_no_service_reports_is_waited_for() {
+    let waited = unowned_processes(Path::new(HOST), &[running(7, HOST)], &[reports("b", 0)]);
+
+    assert_eq!(waited, vec![7]);
+}
+
+/// A healthy service updated to another file and not restarted still runs the host.
+#[skuld::test]
+fn a_process_a_live_service_reports_is_that_services_and_is_not_waited_for() {
+    let waited = unowned_processes(
+        Path::new(HOST),
+        &[running(7, HOST), running(9, HOST)],
+        &[reports("a", 0), reports("b", 9)],
+    );
+
+    assert_eq!(waited, vec![7]);
+}
+
+#[skuld::test]
+fn a_process_on_another_image_is_not_waited_for_whatever_services_report() {
+    let waited = unowned_processes(
+        Path::new(HOST),
+        &[running(7, "/p/Goetia/goetia-shim-bb.exe"), running(8, "/other/x.exe")],
+        &[],
+    );
+
+    assert!(waited.is_empty(), "{waited:?}");
+}
+
+#[skuld::test]
+fn the_image_is_compared_without_regard_to_case() {
+    let waited = unowned_processes(Path::new(HOST), &[running(7, "/P/GOETIA/GOETIA-SHIM-AA.EXE")], &[]);
+
+    assert_eq!(waited, vec![7]);
+}
+
+#[skuld::test]
+fn processes_are_waited_for_in_the_order_given() {
+    let waited = unowned_processes(
+        Path::new(HOST),
+        &[running(30, HOST), running(10, HOST), running(20, HOST)],
+        &[reports("b", 10)],
+    );
+
+    assert_eq!(waited, vec![30, 20]);
+}
+
+#[skuld::test]
+fn no_process_and_no_service_wait_for_nothing() {
+    assert!(unowned_processes(Path::new(HOST), &[], &[]).is_empty());
+}
+
 // An image path whose registry key cannot be read ------------------------------------------------------------------
 
 fn denied(what: &str) -> Error {
