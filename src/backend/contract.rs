@@ -68,7 +68,7 @@ pub(crate) trait Backend {
     /// `list` regenerate from a stored spec. A backend whose rendering depends on something that
     /// outlives the install (SCM's service host, which a provider may place elsewhere later) keeps
     /// that part from what is installed, so the comparison is of the spec alone. `install` and
-    /// `preview_install` still `render` the desired definition. What it reads of the installed
+    /// `preview_install` still render the desired definition, with [`Self::render_for_install`]. What it reads of the installed
     /// service must be no more than `live_status` reads, so `status` and `list` gain no failure
     /// mode; `judge` calls [`Self::installed`] first, so a failed read is never taken for a bad spec.
     /// A failed read of what is installed is [`Error::InstalledUnreadable`], which `status` and `list`

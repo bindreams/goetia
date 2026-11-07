@@ -271,8 +271,8 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
 /// holding a `"`, or ending in any backslashes, registers as another path. An unquoted path is
 /// written as is.
 ///
-/// A `type: managed` executable is `command[0]`; a `type: simple` one is the shim path, which no
-/// manifest sets, so its message names that path and not `command[0]`.
+/// A `type: managed` executable is `command[0]`; a `type: simple` one is the service host's path,
+/// which no manifest sets, so its message names that path and not `command[0]`.
 fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<(), Error> {
     let text = executable.to_string_lossy();
     // A `"` is refused whatever else quotes the path. An empty path is quoted too, but it ends in no
@@ -295,7 +295,7 @@ fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<
     let message = match spec.kind {
         Kind::Managed => format!("`command[0]` {text:?} cannot be written into the service registration: {reason}"),
         Kind::Simple => {
-            format!("the goetia-shim path {text:?} cannot be written into the service registration: {reason}")
+            format!("the service host path {text:?} cannot be written into the service registration: {reason}")
         }
     };
     Err(Error::Invalid {

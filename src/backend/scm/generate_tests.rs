@@ -1012,13 +1012,18 @@ fn simple_refuses_a_shim_path_the_writer_would_mangle() {
         .expect_err("a mangled shim path must be refused");
     let text = err.to_string();
     assert!(text.contains("service registration"), "{text}");
-    // No manifest sets the shim path: the message names it and its forcing character, and does
-    // not blame `command[0]`, name where the path came from, or send the user to an install location.
-    assert!(text.contains("goetia-shim path"), "{text}");
-    assert!(!text.contains("GOETIA_SHIM_PATH"), "{text}");
-    assert!(!text.contains("installed"), "{text}");
-    assert!(text.contains(&format!("{:?}", shim.display().to_string())), "{text}");
-    assert!(text.contains("space"), "{text}");
+    // No manifest sets the host path, and any provider's host reaches here: the message names it
+    // as the service host, with its forcing character, and does not blame `command[0]`.
+    assert!(
+        text.contains(&format!(
+            "the service host path {:?} cannot be written into the service registration: it holds a space, so \
+             the Windows service registration writer wraps it in quotes and doubles the backslashes it ends in, \
+             which SCM reads literally, so SCM would start a different path",
+            shim.display().to_string()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("goetia-shim"), "{text}");
     assert!(!text.contains("command[0]"), "{text}");
 
     install_registration(&simple_spec(), &identity(), Some(&host())).unwrap();
