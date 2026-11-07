@@ -9,8 +9,8 @@ use crate::spec::{Id, Kind, User};
 
 // Fixtures ============================================================================================================
 //
-// `DaemonSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds one
-// for the host.
+// `DaemonSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds the
+// `cwd` and `logs` for the host, and `PROGRAM` is the `command[0]`.
 
 /// The program every fixture runs. Forward slashes keep a Windows path free of the backslashes that
 /// make `ExecStart=` quote the word, so the expected unit spells it as is.
@@ -334,6 +334,14 @@ fn argv_with_spaces_and_quotes_is_quoted() {
     assert_eq!(
         render_exec_start(&words(&["/usr/bin/foo bar", "--title=say \"hi\""])),
         "\"/usr/bin/foo bar\" \"--title=say \\\"hi\\\"\""
+    );
+}
+
+#[skuld::test]
+fn argv_with_a_backslash_is_quoted_and_doubled() {
+    assert_eq!(
+        render_exec_start(&words(&["/usr/bin/grep", r"--re=a\b"])),
+        r#"/usr/bin/grep "--re=a\\b""#
     );
 }
 

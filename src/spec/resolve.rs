@@ -429,7 +429,15 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
 /// A defect of this crate, not of any manifest: something an earlier step ruled out happened. An
 /// error rather than a `debug_assert!`, which would abort the path that reports it.
 fn contract_violation(id: &Id, message: &str) -> Error {
-    invalid(id, &format!("internal error: {message}; this is a bug in goetia"))
+    invalid(id, &contract_violation_text(message, None))
+}
+
+/// The one wording of a contract violation, with the refusing rule's message when it has one.
+fn contract_violation_text(message: &str, rule: Option<&str>) -> String {
+    match rule {
+        Some(rule) => format!("internal error: {message}: {rule}; this is a bug in goetia"),
+        None => format!("internal error: {message}; this is a bug in goetia"),
+    }
 }
 
 /// [`contract_violation`] for a field rule that refused what an earlier step should have let
@@ -440,14 +448,10 @@ fn contract_violation_from(id: &Id, message: &str, cause: Error) -> Error {
             message: rule, source, ..
         } => Error::Invalid {
             daemon: id.as_str().to_string(),
-            message: format!("internal error: {message}: {rule}; this is a bug in goetia"),
+            message: contract_violation_text(message, Some(&rule)),
             source,
         },
-        other => invalid_from(
-            id,
-            &format!("internal error: {message}; this is a bug in goetia"),
-            other,
-        ),
+        other => invalid_from(id, &contract_violation_text(message, None), other),
     }
 }
 

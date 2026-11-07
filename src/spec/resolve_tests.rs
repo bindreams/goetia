@@ -5,20 +5,15 @@ use skuld::temp_dir;
 
 use super::*;
 use crate::spec::interpolate;
-use crate::spec::test_support::{plain_fields, program};
+use crate::spec::test_support::{abs, plain_fields, program};
 use crate::spec::vars::Vars;
 
 // `Path::new("/opt/rt").is_absolute()` is `false` on Windows, and
 // `PathBuf::from(r"C:\base").join("/opt/rt")` yields `C:/opt/rt` — so every
 // test below that exercises absolute-path resolution needs a base dir the
 // host platform actually considers absolute.
-#[cfg(windows)]
 fn base_dir() -> PathBuf {
-    PathBuf::from(r"C:\base")
-}
-#[cfg(not(windows))]
-fn base_dir() -> PathBuf {
-    PathBuf::from("/base")
+    abs("base")
 }
 
 fn parse_manifest(yaml: &str) -> RawSpec {
@@ -605,9 +600,7 @@ fn a_drive_root_manifest_directory_joins_cleanly() {
 fn a_contract_violation_names_the_daemon_once() {
     let id = Id::try_from("frpc").unwrap();
     let cause = DaemonSpec::new(DaemonFields {
-        name: "a
-b"
-        .to_string(),
+        name: "a\nb".to_string(),
         ..plain_fields("frpc", vec![program("frpc")])
     })
     .expect_err("a newline in `name` is refused");
@@ -618,7 +611,30 @@ b"
 
     assert_eq!(printed.matches("daemon `frpc`").count(), 1, "{printed}");
     assert!(printed.contains("internal error"), "{printed}");
-    assert!(printed.contains("name"), "the cause's field is kept: {printed}");
+    assert!(printed.contains("field `name`"), "the cause's field is kept: {printed}");
+}
+
+#[skuld::test]
+fn a_contract_violation_from_a_non_rule_error_keeps_it_as_the_source() {
+    let id = Id::try_from("frpc").unwrap();
+    let cause = Error::os("read a file", std::io::Error::other("gone"));
+
+    let err = contract_violation_from(&id, "the resolved daemon failed its own field rules", cause);
+
+    let Error::Invalid {
+        daemon,
+        message,
+        source,
+    } = &err
+    else {
+        panic!("a contract violation is `Invalid`: {err:?}");
+    };
+    assert_eq!(daemon, "frpc");
+    assert_eq!(
+        message,
+        "internal error: the resolved daemon failed its own field rules; this is a bug in goetia"
+    );
+    assert!(source.is_some(), "the cause is kept as the source");
 }
 
 // Resolution ==========================================================================================================

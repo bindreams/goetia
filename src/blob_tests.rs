@@ -155,8 +155,24 @@ fn blob_wire_names_are_pinned() {
 
 #[skuld::test]
 fn the_blob_alphabet_is_standard_and_padded() {
-    // `+`, `/` and `=` tell STANDARD from the URL-safe and unpadded variants.
-    assert_eq!(BASE64.encode([0xfb, 0xff]), "+/8=");
+    // `+`, `/` and `=` tell STANDARD from the URL-safe and unpadded variants. U+0FFF is the bytes
+    // `E0 BF BF`, which encode to `+/` when they start a 3-byte group. The program path's length
+    // (host-defined) moves that alignment, so the name holds the character at three offsets and
+    // three lengths are encoded to reach every padding.
+    let encoded: Vec<String> = (0..3)
+        .map(|extra| {
+            let spec = DaemonSpec::new(DaemonFields {
+                name: format!("\u{0FFF}a\u{0FFF}a\u{0FFF}{}", "z".repeat(extra)),
+                ..minimal_spec().into_fields()
+            })
+            .unwrap();
+            encode(&spec)
+        })
+        .collect();
+    assert!(encoded.iter().any(|blob| blob.contains('+')), "{encoded:?}");
+    assert!(encoded.iter().any(|blob| blob.contains('/')), "{encoded:?}");
+    assert!(encoded.iter().any(|blob| blob.ends_with('=')), "{encoded:?}");
+    assert!(encoded.iter().all(|blob| !blob.contains(['-', '_'])), "{encoded:?}");
 }
 
 // Schema and invariant re-validation ==================================================================================

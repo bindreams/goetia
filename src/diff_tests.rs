@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::spec::DaemonFields;
-use crate::spec::test_support::{plain_fields, program};
+use crate::spec::test_support::{abs, plain_fields, program};
 use crate::spec::{Kind, Restart};
 
 // The paths are absolute because `DaemonSpec::new` requires it; no assertion reads them, so their
@@ -11,10 +11,10 @@ use crate::spec::{Kind, Restart};
 fn spec_fixture() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_owned(),
-        cwd: Some(std::env::temp_dir().join("app")),
+        cwd: Some(abs("app")),
         env: BTreeMap::from([("FRP_LOG_LEVEL".to_owned(), "info".to_owned())]),
         restart: Restart::OnFailure,
-        logs: Some(std::env::temp_dir().join("frpc.log")),
+        logs: Some(abs("frpc.log")),
         kind: Kind::Simple,
         ..plain_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()])
     })
