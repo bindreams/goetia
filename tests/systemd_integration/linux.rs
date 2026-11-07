@@ -17,7 +17,7 @@ use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
-use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
+use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
@@ -34,11 +34,12 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 /// A minimal, real, long-running daemon: `sleep infinity` exists on every coreutils Ubuntu ships.
 pub(crate) fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         kind: Kind::Simple,
         ..support::spec(id, vec!["/bin/sleep".to_string(), "infinity".to_string()])
-    }
+    })
+    .unwrap()
 }
 
 /// Bytes goetia never writes: `generate::unit` emits UTF-8 ini and nothing else, so a fragment that
@@ -509,14 +510,14 @@ fn start_stop_status_reflect_reality() {
 
 /// The test binary as a daemon that reports in on every start, under `restart`.
 fn reporting(id: &str, restart: Restart, listener: &support::ConnectBack) -> DaemonSpec {
-    let mut spec = mk(id);
+    let mut spec = mk(id).into_fields();
     spec.command = vec![
         support::current_exe_str(),
         support::sentinel::RUN_UNTIL_KILLED.to_string(),
         listener.port().to_string(),
     ];
     spec.restart = restart;
-    spec
+    DaemonSpec::new(spec).unwrap()
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -640,13 +641,13 @@ fn a_stop_with_no_budget_reaches_systemd() {
 /// A daemon that can never stop: it ignores `SIGTERM`, and a drop-in removes the `SIGKILL` systemd
 /// would otherwise escalate to. [`Unstoppable`]'s `Drop` is what ends it.
 fn unstoppable(id: &str) -> DaemonSpec {
-    let mut spec = mk(id);
+    let mut spec = mk(id).into_fields();
     spec.command = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
         "trap '' TERM; exec /bin/sleep infinity".to_string(),
     ];
-    spec
+    DaemonSpec::new(spec).unwrap()
 }
 
 /// Ends an [`unstoppable`] unit: `SIGKILL` lets the stop job it is stuck in complete, a blocking
@@ -1323,9 +1324,10 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
 fn a_unit_whose_executable_does_not_exist_fails_start() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let mut spec = mk(guard.id());
+    let mut spec = mk(guard.id()).into_fields();
     spec.command = vec!["/nonexistent/goetia-test-executable".to_string()];
     spec.restart = Restart::Always;
+    let spec = DaemonSpec::new(spec).unwrap();
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
@@ -1465,8 +1467,9 @@ fn status_of_residue_names_the_leftover_paths() {
 fn list_reports_a_sid_account_as_ours_unusable() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let mut spec = mk(guard.id());
+    let mut spec = mk(guard.id()).into_fields();
     spec.user = User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string()));
+    let spec = DaemonSpec::new(spec).unwrap();
     let text = generate::unit(&spec, &Identity { user: "0".to_string() });
     fs::write(unit_path(guard.id()), text).expect("seed a unit whose spec names a SID");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
@@ -1861,10 +1864,11 @@ fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user() {
     let logs = base.join("logs").join("out.log");
     let _rm = DirGuard::new(base.clone());
 
-    let mut spec = mk(guard.id());
+    let mut spec = mk(guard.id()).into_fields();
     spec.user = User::Name("nobody".to_string());
     spec.cwd = Some(cwd.clone());
     spec.logs = Some(logs.clone());
+    let spec = DaemonSpec::new(spec).unwrap();
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -1891,10 +1895,11 @@ fn install_accepts_preexisting_dirs_the_target_account_cannot_write() {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     }
 
-    let mut spec = mk(guard.id());
+    let mut spec = mk(guard.id()).into_fields();
     spec.user = User::Name("nobody".to_string());
     spec.cwd = Some(cwd.clone());
     spec.logs = Some(log_dir.join("out.log"));
+    let spec = DaemonSpec::new(spec).unwrap();
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -1924,9 +1929,10 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
     let base_meta_before = fs::metadata(&base).expect("stat base before");
 
     let cwd = base.join("work");
-    let mut spec = mk(guard.id());
+    let mut spec = mk(guard.id()).into_fields();
     spec.user = User::Name("nobody".to_string());
     spec.cwd = Some(cwd.clone());
+    let spec = DaemonSpec::new(spec).unwrap();
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");

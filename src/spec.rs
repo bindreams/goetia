@@ -2,16 +2,16 @@
 //! gate.
 //!
 //! `RawSpec -> DaemonSpec` (see `resolve`) is the crate's parse-don't-validate
-//! boundary: every `DaemonSpec` that [`load`] returns has already passed every
-//! check, so nothing downstream needs to re-derive them. There is no separate
-//! `validate()`. `DaemonSpec`'s fields are public, so a `DaemonSpec` built as
-//! a literal outside this module is not validated.
+//! boundary. A [`DaemonSpec`] has passed every field rule, so nothing
+//! downstream re-derives them; only [`DaemonSpec::new`] makes one, from the
+//! plain-data [`DaemonFields`]. [`load`] and `blob::decode` go through it.
 //!
 //! A daemon may also carry a `backend-specific:` block overriding its
 //! fields per [`BackendKind`]; see `overrides`'s module doc for the
 //! manifest-facing reference.
 
 mod backend;
+mod field;
 mod interpolate;
 mod no_null;
 mod overrides;
@@ -20,16 +20,13 @@ mod resolve;
 mod user;
 mod vars;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use backend::BackendKind;
 pub use resolve::load;
 pub use user::{AccountId, User};
 
-// Re-exported so `blob::decode` re-runs the same injection-gate checks `resolve` uses, against a
-// spec deserialized from an untrusted artifact.
-pub(crate) use resolve::{
-    reject_blank, reject_empty, reject_empty_command, reject_env_key_with_equals, reject_relative_path,
-    reject_unemittable,
-};
 // Read by `crate::backend::scm::generate`, which cannot see through the private `mod backend;`.
 // `windows_only_account` stays out of this line: only `BackendKind::error` reads it, inside
 // `spec::backend`.
@@ -114,11 +111,11 @@ impl std::str::FromStr for Id {
 
 // DaemonSpec ==========================================================================================================
 
-/// A fully resolved daemon: every relative path made absolute, every
-/// default materialized, every user-supplied string checked for the
-/// characters that would let it break out of a generated directive.
+/// What a daemon is, before goetia checks it: plain data a consumer fills in and passes to
+/// [`DaemonSpec::new`]. It has no methods, so nothing reaches a [`DaemonSpec`] through `Deref`
+/// that is not a field.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DaemonSpec {
+pub struct DaemonFields {
     pub id: Id,
     pub name: String,
     pub command: Vec<String>,
@@ -131,27 +128,38 @@ pub struct DaemonSpec {
     pub kind: Kind,
 }
 
-#[cfg(test)]
+/// A daemon goetia has checked: it passed every field rule. Only [`DaemonSpec::new`] makes one;
+/// fields read through `Deref`, there is no `DerefMut`.
+///
+/// A generator may rely on all of these:
+/// - `command` is non-empty and `command[0]` is an absolute path;
+/// - `cwd` and `logs`, when set, are absolute paths;
+/// - no emitted field (`name`, `command`, `cwd`, `logs`, `env` keys and values, `user`) holds a
+///   control character or an XML noncharacter;
+/// - `cwd` and `logs` are valid UTF-8;
+/// - every `env` key is non-empty and has no `=`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonSpec(DaemonFields);
+
 impl DaemonSpec {
-    /// A plain, valid `DaemonSpec` named `id`: root, `restart: never`, `type: managed`, everything
-    /// else unset. Panics if `id` is not a valid [`Id`]. Mirrors `tests/support/daemon_spec.rs`
-    /// (integration tests cannot reach `#[cfg(test)]` code).
-    ///
-    /// Vary fields with struct-update syntax: `DaemonSpec { restart, ..DaemonSpec::for_test("frpc", command) }`.
-    /// Built literally, never through `resolve`, so paths render the same on every platform.
-    pub(crate) fn for_test(id: &str, command: Vec<String>) -> DaemonSpec {
-        DaemonSpec {
-            id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),
-            name: id.to_string(),
-            command,
-            cwd: None,
-            env: BTreeMap::new(),
-            user: User::Root,
-            restart: Restart::Never,
-            restart_delay: None,
-            logs: None,
-            kind: Kind::Managed,
-        }
+    /// Check `fields` against the field rules and wrap them. Fails with [`Error::Invalid`] naming
+    /// the field.
+    pub fn new(fields: DaemonFields) -> Result<DaemonSpec, Error> {
+        resolve::check_fields(&fields)?;
+        Ok(DaemonSpec(fields))
+    }
+
+    /// Give the fields back, to build a variant and check it with [`DaemonSpec::new`].
+    pub fn into_fields(self) -> DaemonFields {
+        self.0
+    }
+}
+
+impl std::ops::Deref for DaemonSpec {
+    type Target = DaemonFields;
+
+    fn deref(&self) -> &DaemonFields {
+        &self.0
     }
 }
 
@@ -196,3 +204,7 @@ pub struct Warning {
     pub id: Option<Id>,
     pub message: String,
 }
+
+#[cfg(test)]
+#[path = "spec_tests.rs"]
+mod spec_tests;

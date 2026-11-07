@@ -8,7 +8,7 @@ use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
 use goetia::backend::scm::wait::{QueriedState, SystemScmActor, Waited, WantState, wait_until};
 use goetia::manager::Budget;
-use goetia::spec::{DaemonSpec, Kind};
+use goetia::spec::{DaemonFields, DaemonSpec, Kind};
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
@@ -150,11 +150,12 @@ impl LogDir {
 /// [`support::spec`] with `type: simple`, logging to a path in `logs` (a dir the test owns) rather
 /// than the `%ProgramData%` default.
 pub fn simple_spec(id: &str, command: Vec<String>, logs: &LogDir) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
         logs: Some(logs.path_for(id)),
         ..support::spec(id, command)
-    }
+    })
+    .unwrap()
 }
 
 /// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid `type: simple` spec for any
