@@ -9,6 +9,7 @@ use super::*;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
 use crate::spec::Restart;
+use crate::spec::test_support::{plain_fields, program};
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     ScmRegistration {
@@ -473,7 +474,7 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
 fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         restart,
-        ..DaemonSpec::for_test("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+        ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
     })
     .unwrap()
 }
@@ -486,7 +487,7 @@ fn blob_of(kind: Kind) -> Blob {
         version: "0.1.0".to_string(),
         spec: DaemonSpec::new(DaemonFields {
             kind,
-            ..DaemonSpec::for_test("frpc", vec!["frpc".to_string()])
+            ..plain_fields("frpc", vec![program("frpc")])
         })
         .unwrap(),
     }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::backend::Identity;
+use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{DaemonFields, DaemonSpec, Kind, Restart};
 
 fn spec_fixture() -> DaemonSpec {
@@ -7,7 +8,7 @@ fn spec_fixture() -> DaemonSpec {
         name: "FRP tunnel client".to_owned(),
         restart: Restart::Always,
         kind: Kind::Simple,
-        ..DaemonSpec::for_test("frpc", vec!["frpc".to_owned()])
+        ..plain_fields("frpc", vec![program("frpc")])
     })
     .unwrap()
 }

@@ -20,6 +20,7 @@ use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
 use crate::spec::DaemonFields;
 use crate::spec::Kind;
+use crate::spec::test_support::plain_fields;
 
 use crate::backend::test_cleanup::{DirGuard, FileGuard, remove_or_warn};
 
@@ -77,7 +78,7 @@ impl Drop for QuarantineSweep {
 fn mk(id: &str) -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
-        ..DaemonSpec::for_test(id, vec!["/bin/true".to_string()])
+        ..plain_fields(id, vec!["/bin/true".to_string()])
     })
     .unwrap()
 }

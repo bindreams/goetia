@@ -5,13 +5,13 @@
 //! boundary. A [`DaemonSpec`] has passed every field rule, so nothing
 //! downstream re-derives them; only [`DaemonSpec::new`] makes one, from the
 //! plain-data [`DaemonFields`]. [`load`] and `blob::decode` go through it.
-//! There is no separate `validate()`.
 //!
 //! A daemon may also carry a `backend-specific:` block overriding its
 //! fields per [`BackendKind`]; see `overrides`'s module doc for the
 //! manifest-facing reference.
 
 mod backend;
+mod field;
 mod interpolate;
 mod no_null;
 mod overrides;
@@ -19,6 +19,9 @@ mod raw;
 mod resolve;
 mod user;
 mod vars;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use backend::BackendKind;
 pub use resolve::load;
@@ -127,21 +130,22 @@ pub struct DaemonFields {
     pub kind: Kind,
 }
 
-/// A daemon goetia has checked: every field passed the injection gate (no control character),
-/// `command` is non-empty, `cwd` and `logs` are absolute, no `env` key holds `=`, and no value
-/// that must not be empty is. Only [`DaemonSpec::new`] makes one; fields read through `Deref`, and
-/// there is no `DerefMut`, so a spec never changes after the check. To vary one, take
-/// [`into_fields`](Self::into_fields) and build another.
+/// A daemon goetia has checked: it passed every field rule. Only [`DaemonSpec::new`] makes one;
+/// fields read through `Deref`, there is no `DerefMut`.
 ///
-/// A hand-written newtype rather than the `nutype` crate: it is one type, and `nutype` would add
-/// a proc-macro dependency for it.
+/// A generator may rely on all of these:
+/// - `command` is non-empty and `command[0]` is an absolute path;
+/// - `cwd` and `logs`, when set, are absolute paths;
+/// - no emitted field (`name`, `command`, `cwd`, `logs`, `env` keys and values, `user`) holds a
+///   control character or an XML noncharacter;
+/// - `cwd` and `logs` are valid UTF-8;
+/// - every `env` key is non-empty and has no `=`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonSpec(DaemonFields);
 
 impl DaemonSpec {
-    /// Check `fields` against the field rules and wrap them. The one place the rules run for a
-    /// value that becomes a `DaemonSpec`; `resolve` runs the same rules over every backend's
-    /// merged manifest in its shape phase. Fails with [`Error::Invalid`] naming the field.
+    /// Check `fields` against the field rules and wrap them. Fails with [`Error::Invalid`] naming
+    /// the field.
     pub fn new(fields: DaemonFields) -> Result<DaemonSpec, Error> {
         resolve::check_fields(&fields)?;
         Ok(DaemonSpec(fields))
@@ -158,52 +162,6 @@ impl std::ops::Deref for DaemonSpec {
 
     fn deref(&self) -> &DaemonFields {
         &self.0
-    }
-}
-
-#[cfg(test)]
-impl DaemonSpec {
-    /// The fields of a plain, valid daemon named `id`: root, `restart: never`, `type: managed`,
-    /// everything else unset. Panics if `id` is not a valid [`Id`]. Mirrors
-    /// `tests/support/daemon_spec.rs` (integration tests cannot reach `#[cfg(test)]` code).
-    ///
-    /// Returns [`DaemonFields`] so a test varies fields with struct-update syntax and checks the
-    /// result: `DaemonSpec::new(DaemonFields { restart, ..DaemonSpec::for_test("frpc", command) })`.
-    /// `command` is taken as given, so a test passes the paths it wants rendered the same on
-    /// every platform.
-    pub(crate) fn for_test(id: &str, command: Vec<String>) -> DaemonFields {
-        DaemonFields {
-            id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),
-            name: id.to_string(),
-            command,
-            cwd: None,
-            env: BTreeMap::new(),
-            user: User::Root,
-            restart: Restart::Never,
-            restart_delay: None,
-            logs: None,
-            kind: Kind::Managed,
-        }
-    }
-
-    /// An absolute path that is not valid UTF-8, for the rule that refuses one.
-    #[cfg(windows)]
-    pub(crate) fn non_utf8_path_for_test() -> PathBuf {
-        // A lone UTF-16 surrogate, which `OsString` holds on Windows.
-        use std::os::windows::ffi::OsStringExt as _;
-        PathBuf::from(std::ffi::OsString::from_wide(&[
-            u16::from(b'C'),
-            u16::from(b':'),
-            u16::from(b'\\'),
-            0xD800,
-        ]))
-    }
-
-    /// An absolute path that is not valid UTF-8, for the rule that refuses one.
-    #[cfg(unix)]
-    pub(crate) fn non_utf8_path_for_test() -> PathBuf {
-        use std::os::unix::ffi::OsStringExt as _;
-        PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xFF, 0xFE]))
     }
 }
 

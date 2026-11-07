@@ -1,23 +1,22 @@
+use crate::spec::test_support::abs;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
 use crate::spec::DaemonFields;
+use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{Id, Kind, User};
 
 // Fixtures ============================================================================================================
 //
-// Every `DaemonSpec` here is built through `DaemonSpec::new`, never `spec::resolve()`, and `new`
-// requires `cwd`/`logs` to be absolute, which is platform-defined (`Path::is_absolute()` is `false`
-// for a bare `/opt/frpc` on Windows). `abs` builds a path that is absolute on the host running the
-// test.
+// `DaemonSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds one
+// for the host.
 
 fn full_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
-        command: vec!["frpc".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+        command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
         cwd: Some(abs("opt/frpc")),
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
@@ -38,19 +37,10 @@ fn full_identity() -> Identity {
     }
 }
 
-#[cfg(windows)]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!(r"C:\{p}"))
-}
-#[cfg(not(windows))]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!("/{p}"))
-}
-
 fn minimal_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
-        ..DaemonSpec::for_test("frpc", vec!["frpc".to_string()])
+        ..plain_fields("frpc", vec![program("frpc")])
     })
     .unwrap()
 }
@@ -97,7 +87,7 @@ fn plist_snapshot_minimal() {
          \t<string>frpc</string>\n\
          \t<key>ProgramArguments</key>\n\
          \t<array>\n\
-         \t\t<string>frpc</string>\n\
+         \t\t<string>{program}</string>\n\
          \t</array>\n\
          \t<key>UserName</key>\n\
          \t<string>root</string>\n\
@@ -105,6 +95,7 @@ fn plist_snapshot_minimal() {
          </plist>\n",
         version = crate::version(),
         blob = blob::encode(&spec),
+        program = program("frpc"),
     );
 
     assert_eq!(text, expected);
@@ -130,7 +121,7 @@ fn plist_snapshot_full() {
          \t<string>frpc</string>\n\
          \t<key>ProgramArguments</key>\n\
          \t<array>\n\
-         \t\t<string>frpc</string>\n\
+         \t\t<string>{program}</string>\n\
          \t\t<string>-c</string>\n\
          \t\t<string>frpc.toml</string>\n\
          \t</array>\n\
@@ -159,6 +150,7 @@ fn plist_snapshot_full() {
          </plist>\n",
         version = crate::version(),
         blob = blob::encode(&spec),
+        program = program("frpc"),
         cwd = abs("opt/frpc").display(),
         logs = abs("var/log/frpc.log").display(),
     );
@@ -354,7 +346,7 @@ fn extract_tolerates_crlf_line_endings_in_the_metadata_comment() {
 #[skuld::test]
 fn xml_special_characters_are_escaped() {
     let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["frpc".to_string(), "a&b<c>d".to_string()];
+    spec.command = vec![program("frpc"), "a&b<c>d".to_string()];
     spec.env = BTreeMap::from([("K&L<M>N".to_string(), "x&y<z>w".to_string())]);
     spec.cwd = Some(abs("opt/a&b<c>d"));
     spec.logs = Some(abs("var/log/a&b<c>d"));
@@ -610,7 +602,7 @@ fn without_metadata_keeps_what_launchd_reads() {
     );
     let other_command = plist(
         &DaemonSpec::new(DaemonFields {
-            command: vec!["frpc".to_string(), "--verbose".to_string()],
+            command: vec![program("frpc"), "--verbose".to_string()],
             ..minimal_spec().into_fields()
         })
         .unwrap(),

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::blob::{self, Blob};
+use crate::spec::test_support::{abs, plain_fields, program};
 use crate::spec::{DaemonFields, DaemonSpec, Kind, Restart};
 
 // Fixtures ============================================================================================================
@@ -25,11 +26,11 @@ fn unclearable() -> ExternalConfig {
 fn spec_fixture() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_owned(),
-        cwd: Some(std::env::temp_dir().join("app")),
+        cwd: Some(abs("app")),
         restart: Restart::OnFailure,
-        logs: Some(std::env::temp_dir().join("frpc.log")),
+        logs: Some(abs("frpc.log")),
         kind: Kind::Simple,
-        ..DaemonSpec::for_test("frpc", vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()])
+        ..plain_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()])
     })
     .unwrap()
 }

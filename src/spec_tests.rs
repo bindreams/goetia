@@ -1,12 +1,5 @@
+use super::test_support::{abs, non_utf8_absolute_path, plain_fields};
 use super::*;
-
-fn abs(p: &str) -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from(format!(r"C:\{p}"))
-    } else {
-        PathBuf::from(format!("/{p}"))
-    }
-}
 
 fn fields() -> DaemonFields {
     DaemonFields {
@@ -14,7 +7,7 @@ fn fields() -> DaemonFields {
         logs: Some(abs("var/log/frpc.log")),
         env: BTreeMap::from([("RUST_LOG".to_string(), "info".to_string())]),
         user: User::Name("svc-frpc".to_string()),
-        ..DaemonSpec::for_test("frpc", vec![abs("bin/frpc").to_string_lossy().into_owned()])
+        ..plain_fields("frpc", vec![abs("bin/frpc").to_string_lossy().into_owned()])
     }
 }
 
@@ -71,6 +64,22 @@ fn new_refuses_an_empty_command_program() {
 }
 
 #[skuld::test]
+fn new_refuses_a_relative_command_program_and_accepts_a_relative_argument() {
+    let msg = message(DaemonFields {
+        command: vec!["bin/frpc".to_string()],
+        ..fields()
+    });
+    assert_eq!(msg, "field `command[0]` must be an absolute path, got `bin/frpc`");
+
+    let program = abs("bin/frpc").to_string_lossy().into_owned();
+    DaemonSpec::new(DaemonFields {
+        command: vec![program, "conf/frpc.toml".to_string()],
+        ..fields()
+    })
+    .expect("only the program must be absolute");
+}
+
+#[skuld::test]
 fn new_refuses_a_relative_cwd_and_logs() {
     let msg = message(DaemonFields {
         cwd: Some(PathBuf::from("relative")),
@@ -87,7 +96,7 @@ fn new_refuses_a_relative_cwd_and_logs() {
 
 #[skuld::test]
 fn new_refuses_a_cwd_and_logs_that_are_not_valid_utf8() {
-    let bad = DaemonSpec::non_utf8_path_for_test();
+    let bad = non_utf8_absolute_path();
     let msg = message(DaemonFields {
         cwd: Some(bad.clone()),
         ..fields()
@@ -135,18 +144,90 @@ fn new_refuses_a_blank_user_name() {
 }
 
 #[skuld::test]
-fn new_refuses_xml_noncharacters() {
+fn new_refuses_xml_noncharacters_in_every_emitted_field() {
     for c in ['\u{FFFF}', '\u{FDD0}'] {
-        let msg = message(DaemonFields {
-            command: vec!["frpc".to_string(), format!("bad{c}arg")],
-            ..fields()
-        });
-        assert_eq!(
-            msg,
-            format!(
-                "field `command` contains U+{:04X}, a Unicode noncharacter that XML cannot represent",
-                c as u32
-            )
-        );
+        let cases = [
+            (
+                "name",
+                DaemonFields {
+                    name: format!("bad{c}name"),
+                    ..fields()
+                },
+            ),
+            (
+                "command",
+                DaemonFields {
+                    command: vec!["frpc".to_string(), format!("bad{c}arg")],
+                    ..fields()
+                },
+            ),
+            (
+                "env key",
+                DaemonFields {
+                    env: BTreeMap::from([(format!("BAD{c}"), "v".to_string())]),
+                    ..fields()
+                },
+            ),
+            (
+                "env[A]",
+                DaemonFields {
+                    env: BTreeMap::from([("A".to_string(), format!("bad{c}value"))]),
+                    ..fields()
+                },
+            ),
+            (
+                "cwd",
+                DaemonFields {
+                    cwd: Some(abs(&format!("bad{c}dir"))),
+                    ..fields()
+                },
+            ),
+            (
+                "logs",
+                DaemonFields {
+                    logs: Some(abs(&format!("bad{c}log"))),
+                    ..fields()
+                },
+            ),
+            (
+                "user.name",
+                DaemonFields {
+                    user: User::Name(format!("bad{c}name")),
+                    ..fields()
+                },
+            ),
+            (
+                "user.id",
+                DaemonFields {
+                    user: User::Id(AccountId::Sid(format!("bad{c}sid"))),
+                    ..fields()
+                },
+            ),
+        ];
+        for (field, bad) in cases {
+            assert_eq!(
+                message(bad),
+                format!(
+                    "field `{field}` contains U+{:04X}, a Unicode noncharacter that XML cannot represent",
+                    c as u32
+                ),
+                "{field}"
+            );
+        }
     }
+}
+
+#[skuld::test]
+fn new_accepts_a_dollar_as_ordinary_text() {
+    // A finished daemon holds no references: a `$` an env key or a SID carries, or an argument
+    // like `${X}`, is what the daemon is told, so only a manifest's text is held to the grammar.
+    let spec = DaemonSpec::new(DaemonFields {
+        command: vec![abs("bin/frpc").to_string_lossy().into_owned(), "${X}".to_string()],
+        env: BTreeMap::from([("A$B".to_string(), "$C".to_string())]),
+        user: User::Id(AccountId::Sid("S-1-5-$".to_string())),
+        ..fields()
+    })
+    .expect("`$` is ordinary text in a finished daemon");
+    let decoded = crate::blob::decode(&crate::blob::encode(&spec)).expect("a valid spec round-trips");
+    assert_eq!(decoded.spec, spec);
 }

@@ -1,26 +1,19 @@
 use super::*;
 use crate::spec::DaemonFields;
+use crate::spec::test_support::abs;
+use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{Builtin, MAX_SC_ACTION_DELAY};
 
 // Fixtures ============================================================================================================
-
-#[cfg(windows)]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!(r"C:\{p}"))
-}
-#[cfg(not(windows))]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!("/{p}"))
-}
 
 fn managed_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_string(),
         restart: Restart::OnFailure,
         restart_delay: Some(Duration::from_secs(5)),
-        ..DaemonSpec::for_test(
+        ..plain_fields(
             "frpc",
-            vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+            vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
         )
     })
     .unwrap()
@@ -35,9 +28,9 @@ fn simple_spec() -> DaemonSpec {
         // asserts `frpc-agent` is absent from `arguments`, which would be
         // vacuously true if it happened to equal the id (also `frpc`, and
         // always present as the shim's sole argument).
-        ..DaemonSpec::for_test(
+        ..plain_fields(
             "frpc",
-            vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+            vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
         )
     })
     .unwrap()
@@ -95,8 +88,7 @@ fn managed_kind_renders_its_environment_lines() {
     assert_eq!(reg.environment, ["A=1", "B=2"]);
     assert!(
         reg.to_string().contains("Environment:\n  \"A=1\"\n  \"B=2\"\n"),
-        "the compared text must show each line:\n{}",
-        reg
+        "the compared text must show each line:\n{reg}",
     );
 }
 
@@ -112,8 +104,7 @@ fn simple_kind_renders_no_environment() {
     assert!(reg.environment.is_empty(), "{:?}", reg.environment);
     assert!(
         reg.to_string().contains("Environment:\nParameters:\n"),
-        "an empty environment renders as a bare header:\n{}",
-        reg
+        "an empty environment renders as a bare header:\n{reg}",
     );
 }
 
@@ -863,30 +854,37 @@ fn registration_refuses_restart_always() {
 
 // The executable must survive the `windows-service` writer ============================================================
 
+// These executables are Windows paths, which `DaemonSpec::new` accepts only on a Windows host.
+
+#[cfg(windows)]
 fn managed_with_executable(executable: &str) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        ..DaemonSpec::for_test("frpc", vec![executable.to_string(), "arg".to_string()])
-    })
+    DaemonSpec::new(plain_fields(
+        "frpc",
+        vec![executable.to_string(), "arg".to_string()],
+    ))
     .unwrap()
 }
 
 /// Executables whose argv[0] the writer reads back exactly, and ones it does not.
+#[cfg(windows)]
 const EXECUTABLES_THE_WRITER_KEEPS: &[&str] = &[
-    "frpc",
+    r"C:\frpc",
     r"C:\no\spaces\here",
     r"C:\no\spaces\here\",
     r"C:\no\spaces\here\\",
     r"C:\some dir\x",
     r"C:\some\back\slashes dir\x\y",
 ];
+#[cfg(windows)]
 const EXECUTABLES_THE_WRITER_MANGLES: &[&str] = &[
     r"C:\some dir\x\",
     r"C:\some dir\x\\",
     r"C:\some dir\x\\\",
     r#"C:\some"dir\x"#,
-    r#"a"b"#,
+    r#"C:\a"b"#,
 ];
 
+#[cfg(windows)]
 #[skuld::test]
 fn managed_refuses_an_executable_the_writer_would_mangle() {
     for executable in EXECUTABLES_THE_WRITER_MANGLES {
@@ -915,10 +913,11 @@ fn managed_refuses_an_executable_the_writer_would_mangle() {
 /// The refusal says which character the writer acted on, not always "a space". A `command[0]`
 /// cannot hold a tab, newline or vertical tab (control characters are refused earlier); a shim
 /// path can.
+#[cfg(windows)]
 #[skuld::test]
 fn the_refusal_names_the_character_that_forced_the_quoting() {
     let cases = [
-        (r#"a"b"#, "double quote", "space"),
+        (r#"C:\a"b"#, "double quote", "space"),
         (r#"C:\a b"c"#, "double quote", "space"),
         (r"C:\a b\", "space", "double quote"),
     ];
@@ -951,6 +950,7 @@ fn the_refusal_names_the_character_that_forced_the_quoting() {
     }
 }
 
+#[cfg(windows)]
 #[skuld::test]
 fn managed_accepts_an_executable_the_writer_keeps() {
     for executable in EXECUTABLES_THE_WRITER_KEEPS {
@@ -961,6 +961,7 @@ fn managed_accepts_an_executable_the_writer_keeps() {
 
 /// The refusal is exactly the set the writer does not round-trip, for the argv[0] rule the real
 /// `CommandLineToArgvW` applies (`windows_style_split_matches_real_command_line_to_argv_w`).
+#[cfg(windows)]
 #[skuld::test]
 fn executable_refusal_matches_what_the_writer_loses() {
     for executable in EXECUTABLES_THE_WRITER_KEEPS

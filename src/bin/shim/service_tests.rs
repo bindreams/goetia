@@ -39,11 +39,15 @@ fn run_daemon(spec: &DaemonSpec, supervisor: &Supervisor, on_running: impl FnOnc
 /// Where [`spec`]'s daemon logs. The `Fake` opens nothing there.
 const DAEMON_LOG: &str = r"C:\goetia-shim-test\daemon.log";
 
+/// The program of [`spec`]'s command, absolute as `DaemonSpec::new` requires. Forward slashes, so the
+/// `Debug` text of the command that the expected messages below spell out has no escapes.
+const POWERSHELL: &str = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+
 /// A `type: simple` daemon. Nothing runs it: the `Fake` states what happens to it, and opens its
 /// log, and takes the shim's failure lines, without touching the file system.
 fn spec() -> DaemonSpec {
     let command = [
-        "powershell",
+        POWERSHELL,
         "-NoProfile",
         "-NonInteractive",
         "-Command",
@@ -62,20 +66,20 @@ fn spec() -> DaemonSpec {
 /// The line logged when no thread can be made to wait on the daemon.
 fn no_thread_failure() -> String {
     format!(
-        r#"make the thread that waits on ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {NO_THREAD}; it was not spawned, so nothing of this daemon is running"#
+        r#"make the thread that waits on ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {NO_THREAD}; it was not spawned, so nothing of this daemon is running"#
     )
 }
 
 /// The line logged when the spawn is refused with [`not_found`].
 fn spawn_failure() -> String {
     format!(
-        r#"spawn ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}"#,
+        r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}"#,
         not_found()
     )
 }
 
 /// The line logged when the daemon is not job-contained, whatever the kill then does.
-const NOT_JOB_CONTAINED: &str = r#"the daemon ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
+const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
 
 /// The line logged when the daemon's tree cannot be terminated after the daemon ended.
 const EXITED_TREE_UNKILLED: &str = "kill_tree after the daemon ended: the kill was refused (fake); its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";

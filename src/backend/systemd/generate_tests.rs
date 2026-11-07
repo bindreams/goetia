@@ -1,3 +1,4 @@
+use crate::spec::test_support::abs;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,25 +10,18 @@ use crate::spec::{Id, Kind, User};
 
 // Fixtures ============================================================================================================
 //
-// Every `DaemonSpec` here is built through `DaemonSpec::new`, never `spec::resolve()`, and `new`
-// requires `cwd`/`logs` to be absolute, which is platform-defined (`Path::is_absolute()` is `false`
-// for a bare `/opt/frpc` on Windows). `abs` builds a path that is absolute on the host running the
-// test, matching the pattern `blob_tests.rs` established.
+// `DaemonSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds the
+// `cwd` and `logs` for the host, and `PROGRAM` is the `command[0]`.
 
-#[cfg(windows)]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!(r"C:\{p}"))
-}
-#[cfg(not(windows))]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!("/{p}"))
-}
+/// The program every fixture runs. Forward slashes keep a Windows path free of the backslashes that
+/// make `ExecStart=` quote the word, so the expected unit spells it as is.
+const PROGRAM: &str = if cfg!(windows) { "C:/bin/frpc" } else { "/bin/frpc" };
 
 fn full_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "Frpc Tunnel".to_string(),
-        command: vec!["frpc".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+        command: vec![PROGRAM.to_string(), "-c".to_string(), "frpc.toml".to_string()],
         cwd: Some(abs("opt/frpc")),
         env: BTreeMap::from([
             ("RUST_LOG".to_string(), "info".to_string()),
@@ -52,7 +46,7 @@ fn minimal_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "frpc".to_string(),
-        command: vec!["frpc".to_string()],
+        command: vec![PROGRAM.to_string()],
         cwd: None,
         env: BTreeMap::new(),
         user: User::Root,
@@ -82,7 +76,7 @@ fn unit_snapshot_full() {
          \n\
          [Service]\n\
          Type=exec\n\
-         ExecStart=frpc -c frpc.toml\n\
+         ExecStart={exec} -c frpc.toml\n\
          WorkingDirectory={cwd}\n\
          Environment=RUST_LOG=info\n\
          Environment=URL=http://x/a%%20b\n\
@@ -100,6 +94,7 @@ fn unit_snapshot_full() {
          Schema=1\n\
          Version={version}\n\
          Spec={spec_b64}\n",
+        exec = PROGRAM,
         cwd = abs("opt/frpc").display(),
         logs = abs("var/log/frpc.log").display(),
         version = crate::version(),
@@ -120,7 +115,7 @@ fn unit_snapshot_minimal() {
          \n\
          [Service]\n\
          Type=exec\n\
-         ExecStart=frpc\n\
+         ExecStart={exec}\n\
          User=0\n\
          Restart=no\n\
          \n\
@@ -132,6 +127,7 @@ fn unit_snapshot_minimal() {
          Schema=1\n\
          Version={version}\n\
          Spec={spec_b64}\n",
+        exec = PROGRAM,
         version = crate::version(),
         spec_b64 = blob::encode(&spec),
     );
@@ -327,20 +323,40 @@ fn extract_finds_the_section_when_it_is_not_the_last_in_the_file() {
 
 // Escaping ============================================================================================================
 
+// The rendering tests below call `render_exec_start` on literal words: a word the rules refuse
+// (`+x` as the program) or a Unix path would not survive `DaemonSpec::new` on every host.
+
+fn words(words: &[&str]) -> Vec<String> {
+    words.iter().map(|word| word.to_string()).collect()
+}
+
+#[skuld::test]
+fn argv_with_spaces_and_quotes_is_quoted() {
+    assert_eq!(
+        render_exec_start(&words(&["/usr/bin/foo bar", "--title=say \"hi\""])),
+        "\"/usr/bin/foo bar\" \"--title=say \\\"hi\\\"\""
+    );
+}
+
+#[skuld::test]
+fn argv_with_a_backslash_is_quoted_and_doubled() {
+    assert_eq!(
+        render_exec_start(&words(&["/usr/bin/grep", r"--re=a\b"])),
+        r#"/usr/bin/grep "--re=a\\b""#
+    );
+}
+
 #[skuld::test]
 fn argv_with_spaces_and_quotes_round_trips() {
     let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["/usr/bin/foo bar".to_string(), "--title=say \"hi\"".to_string()];
+    spec.command = vec![
+        format!("{PROGRAM} bar"),
+        "--title=say \"hi\"".to_string(),
+    ];
     let spec = DaemonSpec::new(spec).unwrap();
     let id = minimal_identity();
 
     let text = unit(&spec, &id).unwrap();
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(
-        exec_start_line,
-        "ExecStart=\"/usr/bin/foo bar\" \"--title=say \\\"hi\\\"\""
-    );
 
     // The escaping is purely for systemd's own command-line parser; the
     // blob carries the real argv independently, so it must round-trip
@@ -355,14 +371,10 @@ fn argv_lone_semicolon_is_quoted() {
     // (systemd.service(5)): "An argument solely consisting of ';' must
     // be escaped". Left unquoted, `find ... ;` would have everything
     // after the `;` parsed as a second command line.
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["/usr/bin/find".to_string(), "-exec".to_string(), ";".to_string()];
-    let spec = DaemonSpec::new(spec).unwrap();
-
-    let text = unit(&spec, &minimal_identity()).unwrap();
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(exec_start_line, "ExecStart=/usr/bin/find -exec \";\"");
+    assert_eq!(
+        render_exec_start(&words(&["/usr/bin/find", "-exec", ";"])),
+        "/usr/bin/find -exec \";\""
+    );
 }
 
 #[skuld::test]
@@ -371,18 +383,10 @@ fn argv_dollar_sign_is_doubled() {
     // substitution (systemd.service(5), "Command Lines"); an
     // unescaped `$` in a literal argument would be expanded or, if the
     // variable is unset, deleted from argv entirely.
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec![
-        "/usr/bin/report".to_string(),
-        "--home=${HOME}".to_string(),
-        "$ARGS".to_string(),
-    ];
-    let spec = DaemonSpec::new(spec).unwrap();
-
-    let text = unit(&spec, &minimal_identity()).unwrap();
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(exec_start_line, "ExecStart=/usr/bin/report --home=$${HOME} $$ARGS");
+    assert_eq!(
+        render_exec_start(&words(&["/usr/bin/report", "--home=${HOME}", "$ARGS"])),
+        "/usr/bin/report --home=$${HOME} $$ARGS"
+    );
 }
 
 #[skuld::test]
@@ -391,57 +395,44 @@ fn an_executable_path_with_a_dollar_is_written_literally_and_argv0_separately() 
     // `$$` collapse over argv[0] (measured on 242 and 255). So the path is written undoubled
     // behind `@`, which makes the next word argv[0], and that word is dollar-doubled. Later
     // arguments keep the doubling (`argv_dollar_sign_is_doubled`).
-    for (executable, written) in [
-        ("/opt/a$b/bin", "ExecStart=@/opt/a$b/bin /opt/a$$b/bin $$X"),
-        ("/opt/a${b}/bin", "ExecStart=@/opt/a${b}/bin /opt/a$${b}/bin $$X"),
-        ("/opt/a$$b/bin", "ExecStart=@/opt/a$$b/bin /opt/a$$$$b/bin $$X"),
-        ("/opt/bin$", "ExecStart=@/opt/bin$ /opt/bin$$ $$X"),
-        // `%` is doubled in both words; a word that needs quoting is quoted whole, `@` inside.
-        (
-            "/opt/a b$c/bin%x",
-            "ExecStart=\"@/opt/a b$c/bin%%x\" \"/opt/a b$$c/bin%%x\" $$X",
-        ),
+    for (suffix, written) in [
+        ("a$b", "@{p}a$b {p}a$$b $$X"),
+        ("a${b}", "@{p}a${b} {p}a$${b} $$X"),
+        ("a$$b", "@{p}a$$b {p}a$$$$b $$X"),
+        ("$", "@{p}$ {p}$$ $$X"),
     ] {
-        let spec = with_fields(|f| f.command = vec![executable.to_string(), "$X".to_string()]);
+        let executable = format!("{PROGRAM}{suffix}");
+        let spec = with_fields(|f| f.command = vec![executable.clone(), "$X".to_string()]);
         let text = unit(&spec, &minimal_identity()).unwrap();
-        assert_eq!(line_of(&text, "ExecStart="), written, "{executable:?}");
+        assert_eq!(
+            line_of(&text, "ExecStart="),
+            format!("ExecStart={}", written.replace("{p}", PROGRAM)),
+            "{executable:?}"
+        );
         assert_eq!(extract(&text).unwrap().unwrap().spec, spec, "{executable:?}");
     }
+    // `%` is doubled in both words; a word that needs quoting is quoted whole, `@` inside.
+    assert_eq!(
+        render_exec_start(&words(&["/opt/a b$c/bin%x", "$X"])),
+        "\"@/opt/a b$c/bin%%x\" \"/opt/a b$$c/bin%%x\" $$X"
+    );
 }
 
 #[skuld::test]
 fn an_executable_path_without_a_dollar_gets_no_separate_argv0() {
-    let spec = with_fields(|f| f.command = vec!["/opt/a b/bin".to_string(), "x".to_string()]);
+    assert_eq!(
+        render_exec_start(&words(&["/opt/a b/bin", "x"])),
+        "\"/opt/a b/bin\" x"
+    );
+}
+
+#[skuld::test]
+fn a_prefix_character_inside_the_executable_is_written_unchanged() {
+    // Only a leading one is a command prefix, and `DaemonSpec::new` guarantees `command[0]` is an
+    // absolute path, so it never leads.
+    let spec = with_fields(|f| f.command = vec![format!("{PROGRAM}-b@c:d+e!f")]);
     let text = unit(&spec, &minimal_identity()).unwrap();
-    assert_eq!(line_of(&text, "ExecStart="), "ExecStart=\"/opt/a b/bin\" x");
-}
-
-#[skuld::test]
-fn a_command_prefix_character_on_the_executable_is_refused_because_quoting_does_not_neutralise_it() {
-    // systemd reads a leading `-`/`@`/`:`/`+`/`!` of the first word as a command prefix after
-    // unquoting (measured on 242 and 255: `ExecStart="+/x"` still runs as root, ignoring `User=`),
-    // so no encoding writes such an executable literally.
-    for executable in ["+svc", "+svc$x", "-svc", "@svc", ":svc", "!svc"] {
-        let spec = with_fields(|f| f.command = vec![executable.to_string()]);
-        let err = unit(&spec, &minimal_identity()).unwrap_err();
-        let Error::Invalid { daemon, message, .. } = &err else {
-            panic!("{executable:?}: expected Error::Invalid, got {err:?}");
-        };
-        assert_eq!(daemon, "frpc");
-        assert!(
-            message.contains(&format!("{executable:?}")),
-            "{executable:?}: {message}"
-        );
-        assert!(message.contains("`command[0]`"), "{executable:?}: {message}");
-        assert!(message.contains("command prefix"), "{executable:?}: {message}");
-        assert!(message.contains("systemd"), "{executable:?}: {message}");
-    }
-}
-
-#[skuld::test]
-fn a_prefix_character_inside_the_executable_is_not_refused() {
-    let spec = with_fields(|f| f.command = vec!["/opt/a-b@c:d+e!f/bin".to_string()]);
-    assert!(unit(&spec, &minimal_identity()).is_ok());
+    assert_eq!(line_of(&text, "ExecStart="), format!("ExecStart={PROGRAM}-b@c:d+e!f"));
 }
 
 #[skuld::test]
@@ -450,14 +441,7 @@ fn argv_command_prefix_character_on_a_later_argument_is_not_quoted() {
     // (the executable); a later argument starting with `-` is an
     // ordinary flag and must not be quoted just because it starts with
     // one of these characters.
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["/usr/bin/foo".to_string(), "-v".to_string()];
-    let spec = DaemonSpec::new(spec).unwrap();
-
-    let text = unit(&spec, &minimal_identity()).unwrap();
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(exec_start_line, "ExecStart=/usr/bin/foo -v");
+    assert_eq!(render_exec_start(&words(&["/usr/bin/foo", "-v"])), "/usr/bin/foo -v");
 }
 
 #[skuld::test]
@@ -465,7 +449,10 @@ fn percent_is_doubled_in_every_value() {
     let spec = DaemonSpec::new(DaemonFields {
         id: Id::try_from("frpc").unwrap(),
         name: "100% Uptime".to_string(),
-        command: vec!["cmd%1".to_string(), "arg%2 with space".to_string()],
+        command: vec![
+            format!("{PROGRAM}%1"),
+            "arg%2 with space".to_string(),
+        ],
         cwd: Some(abs("opt/a%b")),
         env: BTreeMap::from([("KEY".to_string(), "v%alue".to_string())]),
         user: User::Name("ignored-by-generate".to_string()),
@@ -585,7 +572,7 @@ fn a_user_ending_in_backslashes_is_written_so_systemd_reads_it_back() {
 fn an_argument_with_backslashes_is_quoted_with_each_backslash_doubled() {
     let spec = with_fields(|f| {
         f.command = vec![
-            "/bin/x".to_string(),
+            PROGRAM.to_string(),
             r"C:\".to_string(),
             r"C:\\".to_string(),
             r"C:\\\".to_string(),
@@ -596,7 +583,7 @@ fn an_argument_with_backslashes_is_quoted_with_each_backslash_doubled() {
     let text = unit(&spec, &minimal_identity()).unwrap();
     assert_eq!(
         line_of(&text, "ExecStart="),
-        r#"ExecStart=/bin/x "C:\\" "C:\\\\" "C:\\\\\\" "a\\b" "\\""#
+        format!(r#"ExecStart={PROGRAM} "C:\\" "C:\\\\" "C:\\\\\\" "a\\b" "\\""#)
     );
 }
 
@@ -630,7 +617,7 @@ fn no_directive_ends_in_a_line_continuation_and_the_unit_stays_in_order() {
     for tail in [r"\", r"\\", r"\\\", r"\\\\"] {
         let spec = with_fields(|f| {
             f.name = format!("n{tail}");
-            f.command = vec!["/bin/x".to_string(), format!("a{tail}")];
+            f.command = vec![PROGRAM.to_string(), format!("a{tail}")];
             f.cwd = Some(PathBuf::from(format!("{}{tail}", abs("opt/x").display())));
             f.logs = Some(PathBuf::from(format!("{}{tail}", abs("var/log/x").display())));
             f.env = BTreeMap::from([("K".to_string(), format!("v{tail}"))]);
@@ -676,8 +663,9 @@ fn no_directive_ends_in_a_line_continuation_and_the_unit_stays_in_order() {
 fn an_executable_path_with_a_backslash_or_quote_is_refused_because_systemd_refuses_to_load_it() {
     // systemd 255 rejects the unit with "Executable name contains special characters" however the
     // path is quoted or escaped; there is no encoding to write it in.
-    for executable in [r"/bin/x\y", r"/bin/x\", r"/bin/x\\", "/bin/x\"y", "/bin/x'y"] {
-        let spec = with_fields(|f| f.command = vec![executable.to_string()]);
+    for suffix in [r"\y", r"\", r"\\", "\"y", "'y"] {
+        let executable = format!("{PROGRAM}{suffix}");
+        let spec = with_fields(|f| f.command = vec![executable.clone()]);
         let err = unit(&spec, &minimal_identity()).unwrap_err();
         let Error::Invalid { daemon, message, .. } = &err else {
             panic!("{executable:?}: expected Error::Invalid, got {err:?}");
@@ -696,7 +684,7 @@ fn an_executable_path_with_a_backslash_or_quote_is_refused_because_systemd_refus
 fn a_later_argument_may_hold_a_backslash_or_quote() {
     let spec = with_fields(|f| {
         f.command = vec![
-            "/bin/x".to_string(),
+            PROGRAM.to_string(),
             r"a\b".to_string(),
             "a\"b".to_string(),
             "a'b".to_string(),
@@ -813,13 +801,13 @@ fn a_log_path_ending_in_whitespace_is_refused() {
 
 #[skuld::test]
 fn an_executable_path_ending_in_whitespace_is_refused_because_systemd_does_not_run_it() {
-    let spec = with_fields(|f| f.command = vec!["/bin/x ".to_string()]);
+    let spec = with_fields(|f| f.command = vec![format!("{PROGRAM} ")]);
     let err = unit(&spec, &minimal_identity()).unwrap_err();
     let Error::Invalid { daemon, message, .. } = &err else {
         panic!("expected Error::Invalid, got {err:?}");
     };
     assert_eq!(daemon, "frpc");
-    assert!(message.contains("\"/bin/x \""), "{message}");
+    assert!(message.contains(&format!("\"{PROGRAM} \"")), "{message}");
     assert!(message.contains("`command[0]`"), "{message}");
     assert!(message.contains("whitespace"), "{message}");
     assert!(message.contains("systemd"), "{message}");
@@ -839,7 +827,7 @@ fn whitespace_systemd_keeps_is_written_unchanged() {
     }
     let spec = with_fields(|f| {
         f.cwd = Some(PathBuf::from(format!("{}/a b/c", abs("opt/x").display())));
-        f.command = vec!["/bin/a b".to_string()];
+        f.command = vec![format!("{PROGRAM} b")];
     });
     assert!(unit(&spec, &minimal_identity()).is_ok());
 }
@@ -848,7 +836,7 @@ fn whitespace_systemd_keeps_is_written_unchanged() {
 fn an_argument_and_an_environment_value_with_edge_whitespace_are_quoted_whole() {
     let spec = with_fields(|f| {
         f.command = vec![
-            "/bin/x".to_string(),
+            PROGRAM.to_string(),
             " a".to_string(),
             "a ".to_string(),
             " a ".to_string(),
@@ -860,7 +848,7 @@ fn an_argument_and_an_environment_value_with_edge_whitespace_are_quoted_whole() 
         ]);
     });
     let text = unit(&spec, &minimal_identity()).unwrap();
-    assert_eq!(line_of(&text, "ExecStart="), r#"ExecStart=/bin/x " a" "a " " a " " ""#);
+    assert_eq!(line_of(&text, "ExecStart="), format!(r#"ExecStart={PROGRAM} " a" "a " " a " " ""#));
     let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("Environment=")).collect();
     assert_eq!(lines, [r#"Environment="K= v ""#, r#"Environment="L=v ""#]);
 }
@@ -907,7 +895,7 @@ fn manifest_dollar_escape_survives_into_exec_start() {
 
     // On a Windows host `resolve` makes `command[0]` a `C:\...` path, which systemd cannot load.
     let mut fields = spec.into_fields();
-    fields.command[0] = "/bin/frpc".to_string();
+    fields.command[0] = PROGRAM.to_string();
     let spec = DaemonSpec::new(fields).unwrap();
 
     let text = unit(&spec, &minimal_identity()).unwrap();

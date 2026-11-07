@@ -230,7 +230,13 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     let cwd = dir.join(CWD_LEAF);
     std::fs::create_dir(&cwd).expect("the daemon's working directory");
     let logs = dir.join("daemon.log");
-    let command = ["cmd", "/c", "echo %CD%& echo %GOETIA_TEST_VAR%& echo to-stderr>&2"];
+    // `DaemonSpec::new` wants an absolute program; `ComSpec` is the path of `cmd.exe`.
+    let comspec = std::env::var("ComSpec").expect("ComSpec names cmd.exe");
+    let command = [
+        comspec.as_str(),
+        "/c",
+        "echo %CD%& echo %GOETIA_TEST_VAR%& echo to-stderr>&2",
+    ];
     let spec = DaemonSpec::new(DaemonFields {
         cwd: Some(cwd.clone()),
         env: BTreeMap::from([("GOETIA_TEST_VAR".to_string(), "from-spec".to_string())]),

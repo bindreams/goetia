@@ -9,9 +9,7 @@ fn parse(yaml: &str) -> Result<RawSpec, yaml_serde::Error> {
     RawSpec::parse(yaml)
 }
 
-/// The nine overridable field names, byte-exact with `OverrideWire`'s serde
-/// names — shared by every table-driven test below so no field can be
-/// added later without a row.
+/// The nine overridable field names, byte-exact with `OverrideWire`'s serde names.
 const OVERRIDABLE_FIELDS: [&str; 9] = [
     "name",
     "command",

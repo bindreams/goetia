@@ -23,14 +23,34 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Every job except the `stable` test leg builds with `Cargo.toml`'s `rust-version`, so the declared
+  # floor is the one checked. Read with `tomllib`: the toolchain install needs the version before that toolchain exists.
+  rust-version:
+    name: Rust version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.rust.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Read the Rust version
+        id: rust
+        run: python3 -I -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
+
+  # The `stable` leg tests the compiler the release workflows build with. Its checks are not required on `main`,
+  # and it skips clippy: Draft Release gates on this workflow, and a lint new in stable must not block a release.
   test:
-    name: Test (${{ matrix.os }})
+    name: Test${{ matrix.toolchain == 'stable' && ' stable' || '' }} (${{ matrix.os }})
+    needs: rust-version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        toolchain: [floor, stable]
 
     steps:
       - name: Checkout
@@ -40,6 +60,7 @@ jobs:
       # unconditional proc.kill() backstop) faked against subprocess.run --
       # touches no real process, so it runs on every OS in this matrix.
       - name: Test run-with-timeout.py (unit)
+        if: matrix.toolchain != 'stable'
         shell: bash
         run: cd .github/scripts && python3 -B -m unittest run-with-timeout-unit-tests -v
 
@@ -47,7 +68,7 @@ jobs:
       # `getsid`, whose behaviour differs between Linux and macOS, so it needs
       # both to cover it; this matrix is the only job that runs on both.
       - name: Test run-with-timeout.py (POSIX)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.toolchain != 'stable'
         shell: bash
         run: bash .github/scripts/run-with-timeout-tests.sh
 
@@ -55,19 +76,21 @@ jobs:
       # actual Windows host and taskkill to exercise; the unit step above
       # only fakes both.
       - name: Test run-with-timeout.py (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.toolchain != 'stable'
         shell: bash
         run: python3 .github/scripts/run-with-timeout-windows-tests.py
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          components: clippy
+          toolchain: ${{ matrix.toolchain == 'stable' && 'stable' || needs.rust-version.outputs.version }}
+          components: ${{ matrix.toolchain != 'stable' && 'clippy' || '' }}
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Clippy
+        if: matrix.toolchain != 'stable'
         run: cargo clippy --all-targets --locked -- -D warnings
 
       # A plain `cargo test` leaves every elevation-gated test reported by
@@ -151,12 +174,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: probe-results-${{ matrix.os }}
+          name: probe-results-${{ matrix.toolchain }}-${{ matrix.os }}
           path: probe-results/
           if-no-files-found: ignore
 
   lint:
     name: Lint
+    needs: rust-version
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -164,8 +188,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
           components: rustfmt
 
       - name: Cache cargo artifacts
@@ -178,7 +203,7 @@ jobs:
 
       - name: Install prek
         # renovate: datasource=pypi depName=prek
-        run: uv tool install prek==0.5.7
+        run: uv tool install prek==0.5.9
 
       # cargo-clippy is skipped here because it already runs per-platform in
       # the `test` job above (the `#[cfg]` halves differ per platform, so a
@@ -201,6 +226,7 @@ jobs:
   # internally and the three backends have disjoint dependency sets.
   package:
     name: Package (${{ matrix.os }})
+    needs: rust-version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     permissions:
@@ -215,7 +241,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
