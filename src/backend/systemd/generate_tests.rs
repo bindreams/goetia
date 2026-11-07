@@ -658,6 +658,112 @@ fn a_later_argument_may_hold_a_backslash_or_quote() {
     assert!(unit(&spec, &minimal_identity()).is_ok());
 }
 
+// Leading and trailing whitespace =====================================================================================
+//
+// Measured against systemd 255: `Description=`, `User=`, `WorkingDirectory=` and the `append:` path
+// are read raw and stripped of leading and trailing space, tab, LF and CR; no quoting, C escape
+// or continuation keeps it. Other whitespace (U+00A0, U+3000, VT, FF) survives. A quoted word keeps
+// all of it, except that an executable path ending in whitespace is not run.
+
+/// `unit` must refuse with a message that names `what` and says systemd strips the whitespace.
+fn assert_refused_as_stripped(result: Result<String, Error>, what: &str, value: &str) {
+    let err = result.expect_err(&format!("{what} {value:?} would read back stripped"));
+    let Error::Invalid { daemon, message, .. } = &err else {
+        panic!("{what} {value:?}: expected Error::Invalid, got {err:?}");
+    };
+    assert_eq!(daemon, "frpc");
+    assert!(message.contains(what), "{what} {value:?}: {message}");
+    assert!(message.contains("systemd"), "{what} {value:?}: {message}");
+    assert!(message.contains("whitespace"), "{what} {value:?}: {message}");
+}
+
+#[skuld::test]
+fn a_description_with_leading_or_trailing_whitespace_is_refused() {
+    for name in [" a", "a ", " a ", "  a", "a  ", " "] {
+        let spec = with_fields(|f| f.name = name.to_string());
+        assert_refused_as_stripped(unit(&spec, &minimal_identity()), "Description=", name);
+    }
+}
+
+#[skuld::test]
+fn a_user_with_leading_or_trailing_whitespace_is_refused() {
+    for user in [" a", "a ", "a\t", "\ta", "a\n", "a\r"] {
+        let result = unit(&minimal_spec(), &Identity { user: user.to_string() });
+        assert_refused_as_stripped(result, "User=", user);
+    }
+}
+
+#[skuld::test]
+fn a_working_directory_ending_in_whitespace_is_refused() {
+    for tail in [" ", "  ", r"\ "] {
+        let cwd = format!("{}{tail}", abs("opt/x").display());
+        let spec = with_fields(|f| f.cwd = Some(PathBuf::from(&cwd)));
+        assert_refused_as_stripped(unit(&spec, &minimal_identity()), "WorkingDirectory=", &cwd);
+    }
+}
+
+#[skuld::test]
+fn a_log_path_ending_in_whitespace_is_refused() {
+    for tail in [" ", "  ", r"\ "] {
+        let logs = format!("{}{tail}", abs("var/log/x").display());
+        let spec = with_fields(|f| f.logs = Some(PathBuf::from(&logs)));
+        assert_refused_as_stripped(unit(&spec, &minimal_identity()), "StandardOutput=", &logs);
+    }
+}
+
+#[skuld::test]
+fn an_executable_path_ending_in_whitespace_is_refused_because_systemd_does_not_run_it() {
+    let spec = with_fields(|f| f.command = vec!["/bin/x ".to_string()]);
+    let err = unit(&spec, &minimal_identity()).unwrap_err();
+    let Error::Invalid { daemon, message, .. } = &err else {
+        panic!("expected Error::Invalid, got {err:?}");
+    };
+    assert_eq!(daemon, "frpc");
+    assert!(message.contains("command[0]"), "{message}");
+    assert!(message.contains("whitespace"), "{message}");
+    assert!(message.contains("systemd"), "{message}");
+}
+
+#[skuld::test]
+fn whitespace_systemd_keeps_is_written_unchanged() {
+    // Interior whitespace, and edge whitespace systemd does not strip, in every raw directive.
+    for value in ["a b", "a  b", "a\u{a0}", "\u{3000}a", "a\u{2003}"] {
+        let spec = with_fields(|f| f.name = value.to_string());
+        let text = unit(&spec, &minimal_identity()).unwrap();
+        assert_eq!(
+            line_of(&text, "Description="),
+            format!("Description={value}"),
+            "{value:?}"
+        );
+    }
+    let spec = with_fields(|f| {
+        f.cwd = Some(PathBuf::from(format!("{}/a b/c", abs("opt/x").display())));
+        f.command = vec!["/bin/a b".to_string()];
+    });
+    assert!(unit(&spec, &minimal_identity()).is_ok());
+}
+
+#[skuld::test]
+fn an_argument_and_an_environment_value_with_edge_whitespace_are_quoted_whole() {
+    let spec = with_fields(|f| {
+        f.command = vec![
+            "/bin/x".to_string(),
+            " a".to_string(),
+            "a ".to_string(),
+            " a ".to_string(),
+            " ".to_string(),
+        ];
+        f.env = BTreeMap::from([
+            ("K".to_string(), " v ".to_string()),
+            ("L".to_string(), "v ".to_string()),
+        ]);
+    });
+    let text = unit(&spec, &minimal_identity()).unwrap();
+    assert_eq!(line_of(&text, "ExecStart="), r#"ExecStart=/bin/x " a" "a " " a " " ""#);
+    let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("Environment=")).collect();
+    assert_eq!(lines, [r#"Environment="K= v ""#, r#"Environment="L=v ""#]);
+}
+
 // StartLimitIntervalSec ===============================================================================================
 
 #[skuld::test]

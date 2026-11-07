@@ -35,9 +35,9 @@
 //! `windows_style_split_matches_real_command_line_to_argv_w` (which pins the
 //! argv[0] rule against the real Win32 API) and
 //! `executable_trailing_backslash_does_not_round_trip_through_argv0` (which
-//! documents the residual gap rather than hiding it). `executable` is `shim_path`
-//! or, for a `type: managed` daemon, `command[0]`, which no gate stops from
-//! ending in a backslash.
+//! documents the writer's behaviour). `executable` is `shim_path` or, for a `type: managed`
+//! daemon, `command[0]`; [`registration`] refuses one the writer would rewrite, see
+//! [`refuse_unwritable_executable`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -155,6 +155,8 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
         }
     };
 
+    refuse_unwritable_executable(spec, &executable)?;
+
     // SCM does every restart, for both kinds: the shim spawns the daemon once and reports its exit.
     let failure_actions = match spec.restart {
         Restart::Never => None,
@@ -221,6 +223,30 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
         environment,
         parameters,
     })
+}
+
+/// Refuse an `executable` that `windows-service` would write as a different path.
+///
+/// Its writer wraps the path in quotes when it is empty or holds a quote, space, newline, tab or
+/// vertical tab. Inside those quotes it escapes a `"` with a backslash and doubles a trailing
+/// backslash run. argv[0] is read literally up to the next `"`, so neither undoes: a quoted path
+/// holding a `"`, or ending in any backslashes, registers as another path. An unquoted path is
+/// written as is.
+fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<(), Error> {
+    let text = executable.to_string_lossy();
+    let quoted = text.is_empty() || text.contains(['"', ' ', '\n', '\t', '\u{000B}']);
+    if text.contains('"') || (quoted && text.ends_with('\\')) {
+        return Err(Error::Invalid {
+            daemon: spec.id.to_string(),
+            message: format!(
+                "the executable path {text:?} cannot be written into the service registration: the Windows \
+                 service registration writer rewrites a quote in it, or the backslashes it ends in when the \
+                 path needs quoting (it holds a space), so SCM would start a different path"
+            ),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 /// `env` as the `REG_MULTI_SZ` lines `Services\<name>\Environment` needs: the format SCM reads

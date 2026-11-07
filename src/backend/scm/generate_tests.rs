@@ -862,6 +862,87 @@ fn registration_refuses_restart_always() {
     }
 }
 
+// The executable must survive the `windows-service` writer ============================================================
+
+fn managed_with_executable(executable: &str) -> DaemonSpec {
+    DaemonSpec::new(DaemonFields {
+        ..DaemonSpec::for_test("frpc", vec![executable.to_string(), "arg".to_string()])
+    })
+    .unwrap()
+}
+
+/// Executables whose argv[0] the writer reads back exactly, and ones it does not.
+const EXECUTABLES_THE_WRITER_KEEPS: &[&str] = &[
+    "frpc",
+    r"C:\no\spaces\here",
+    r"C:\no\spaces\here\",
+    r"C:\no\spaces\here\\",
+    r"C:\some dir\x",
+    r"C:\some\back\slashes dir\x\y",
+];
+const EXECUTABLES_THE_WRITER_MANGLES: &[&str] = &[
+    r"C:\some dir\x\",
+    r"C:\some dir\x\\",
+    r"C:\some dir\x\\\",
+    r#"C:\some"dir\x"#,
+    r#"a"b"#,
+];
+
+#[skuld::test]
+fn managed_refuses_an_executable_the_writer_would_mangle() {
+    for executable in EXECUTABLES_THE_WRITER_MANGLES {
+        let spec = managed_with_executable(executable);
+        let err = registration(&spec, &identity(), &shim_path()).expect_err(&format!(
+            "{executable:?} is rewritten by the writer and must be refused"
+        ));
+
+        assert!(
+            matches!(&err, Error::Invalid { daemon, .. } if daemon.as_str() == "frpc"),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("service registration"), "the reason is missing: {text}");
+        assert!(!text.contains("systemd"), "wrong backend named: {text}");
+    }
+}
+
+#[skuld::test]
+fn managed_accepts_an_executable_the_writer_keeps() {
+    for executable in EXECUTABLES_THE_WRITER_KEEPS {
+        let spec = managed_with_executable(executable);
+        registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{executable:?}: {e}"));
+    }
+}
+
+/// The refusal is exactly the set the writer does not round-trip, for the argv[0] rule the real
+/// `CommandLineToArgvW` applies (`windows_style_split_matches_real_command_line_to_argv_w`).
+#[skuld::test]
+fn executable_refusal_matches_what_the_writer_loses() {
+    for executable in EXECUTABLES_THE_WRITER_KEEPS
+        .iter()
+        .chain(EXECUTABLES_THE_WRITER_MANGLES)
+    {
+        let read_back = windows_style_split(&windows_style_command_line(executable, &["arg"]));
+        let refused = registration(&managed_with_executable(executable), &identity(), &shim_path()).is_err();
+        assert_eq!(
+            refused,
+            read_back[0] != *executable,
+            "{executable:?} reads back as {:?}",
+            read_back[0]
+        );
+    }
+}
+
+/// The shim path goes through the same writer, so it is held to the same rule.
+#[skuld::test]
+fn simple_refuses_a_shim_path_the_writer_would_mangle() {
+    let shim = PathBuf::from(r"C:\Program Files\Goetia\");
+    let err = registration(&simple_spec(), &identity(), &shim).expect_err("a mangled shim path must be refused");
+    assert!(err.to_string().contains("service registration"), "{err}");
+
+    registration(&simple_spec(), &identity(), &shim_path()).unwrap();
+}
+
 #[skuld::test]
 fn registration_accepts_never_and_on_failure() {
     for restart in [Restart::Never, Restart::OnFailure] {

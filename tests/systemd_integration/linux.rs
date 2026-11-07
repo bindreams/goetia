@@ -1978,10 +1978,14 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
         "infinity".to_string(),
         "C:\\".to_string(),
         "a\\\\b".to_string(),
+        " a ".to_string(),
     ];
     spec.cwd = Some(cwd.clone());
     spec.logs = Some(logs);
-    spec.env = std::collections::BTreeMap::from([("K".to_string(), "C:\\".to_string())]);
+    spec.env = std::collections::BTreeMap::from([
+        ("K".to_string(), "C:\\".to_string()),
+        ("L".to_string(), " v ".to_string()),
+    ]);
     let spec = DaemonSpec::new(spec).unwrap();
 
     Systemd::new().install(&spec, false).expect("install");
@@ -1997,9 +2001,10 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
     assert_eq!(show("Description"), "Backslash name\\");
     assert_eq!(show("WorkingDirectory"), cwd.to_str().unwrap());
     // `show` prints the environment re-quoted, with each backslash doubled.
-    assert_eq!(show("Environment"), "\"K=C:\\\\\"");
+    // A quoted word keeps its edge whitespace; `show` joins the arguments with one space.
+    assert_eq!(show("Environment"), "\"K=C:\\\\\" \"L= v \"");
     assert!(
-        show("ExecStart").contains("argv[]=/bin/sleep infinity C:\\ a\\\\b ;"),
+        show("ExecStart").contains("argv[]=/bin/sleep infinity C:\\ a\\\\b  a  ;"),
         "{}",
         show("ExecStart")
     );

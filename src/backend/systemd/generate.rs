@@ -14,8 +14,8 @@
 //! start with one of systemd's command-prefix characters (`-@:+!`).
 //!
 //! Backslashes are never refused: a quoted word doubles each, and a raw value ending in an odd
-//! run of them gets a trailing space (see [`raw_value`]). The one value no encoding can carry is
-//! an executable path (`command[0]`) holding a backslash, `"` or `'`, which [`unit`] refuses.
+//! run of them gets a trailing space (see [`raw_value`]). The values no encoding can carry are
+//! refused by [`unit`]: see [`refuse_unrepresentable`].
 
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
@@ -35,7 +35,7 @@ use crate::spec::{DaemonSpec, Restart};
 /// `unit(&extract(&unit(spec, id)).unwrap().unwrap().spec, id)` must be
 /// byte-identical to `unit(spec, id)`.
 ///
-/// Fails with [`Error::Invalid`] only for an executable path systemd refuses to load.
+/// Fails with [`Error::Invalid`] only for a value systemd cannot carry; see [`refuse_unrepresentable`].
 ///
 /// Emits `Type=exec` (requires systemd 240+, 2018): `systemd.service(5)` recommends it for
 /// long-running services "as it ensures that process setup errors (e.g. errors such as a missing
@@ -51,7 +51,7 @@ use crate::spec::{DaemonSpec, Restart};
 /// silently" from "conflict, demand `--force`" apart, and it runs before either `desired` or
 /// `regenerated` is even compared.
 pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
-    refuse_unloadable_executable(spec)?;
+    refuse_unrepresentable(spec, id)?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
@@ -100,23 +100,60 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
     Ok(out)
 }
 
-/// systemd checks the executable path of `ExecStart=` (after unquoting and specifiers) and
-/// refuses the whole unit with "Executable name contains special characters" if it holds a
-/// backslash, `"` or `'`, however the word was quoted. Later arguments take all three.
-fn refuse_unloadable_executable(spec: &DaemonSpec) -> Result<(), Error> {
+/// Refuse what no encoding carries through systemd, with the measured reason.
+///
+/// - The executable path of `ExecStart=` (after unquoting and specifiers) holding a backslash,
+///   `"` or `'`: systemd refuses the whole unit with "Executable name contains special
+///   characters", however the word was quoted. Later arguments take all three.
+/// - An executable path ending in a space: systemd keeps the path but the service exits with
+///   203/EXEC. Interior spaces, other trailing whitespace and later arguments are fine.
+/// - A raw directive (`Description=`, `User=`, `WorkingDirectory=`, the `append:` path) with
+///   leading or trailing whitespace: systemd strips it, and no quote, C escape or line
+///   continuation keeps it. `cwd` and `logs` are absolute, so only their end can be affected.
+fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error> {
+    let invalid = |message: String| Error::Invalid {
+        daemon: spec.id.to_string(),
+        message,
+        source: None,
+    };
+
     let executable = &spec.command[0];
     if executable.contains(['\\', '"', '\'']) {
-        return Err(Error::Invalid {
-            daemon: spec.id.to_string(),
-            message: format!(
-                "`command[0]` {executable:?} holds a backslash, double quote or apostrophe, which systemd \
-                 refuses to load in an executable path"
-            ),
-            source: None,
-        });
+        return Err(invalid(format!(
+            "`command[0]` {executable:?} holds a backslash, double quote or apostrophe, which systemd \
+             refuses to load in an executable path"
+        )));
+    }
+    if executable.ends_with(' ') {
+        return Err(invalid(format!(
+            "`command[0]` {executable:?} ends in whitespace, which systemd does not run (the service \
+             exits with 203/EXEC)"
+        )));
+    }
+
+    let cwd = spec.cwd.as_ref().map(|p| p.display().to_string());
+    let logs = spec.logs.as_ref().map(|p| p.display().to_string());
+    let raw_values = [
+        ("Description=", Some(spec.name.as_str())),
+        ("User=", Some(id.user.as_str())),
+        ("WorkingDirectory=", cwd.as_deref()),
+        ("StandardOutput=/StandardError= append:", logs.as_deref()),
+    ];
+    for (directive, value) in raw_values {
+        let Some(value) = value else { continue };
+        if value.starts_with(STRIPPED_BY_SYSTEMD) || value.ends_with(STRIPPED_BY_SYSTEMD) {
+            return Err(invalid(format!(
+                "{directive} value {value:?} starts or ends with whitespace, which systemd strips from \
+                 this directive; no quoting or escape keeps it"
+            )));
+        }
     }
     Ok(())
 }
+
+/// The characters systemd's line reader strips from both ends of a raw value: space, tab, LF, CR.
+/// VT, FF and Unicode whitespace survive.
+const STRIPPED_BY_SYSTEMD: [char; 4] = [' ', '\t', '\n', '\r'];
 
 /// systemd's `Restart=` vocabulary.
 fn render_restart(restart: Restart) -> &'static str {
