@@ -23,7 +23,9 @@ use std::path::PathBuf;
 #[cfg(windows)]
 pub(crate) use protected::{Descriptor, is_as_wanted};
 #[cfg(windows)]
-pub(crate) use system::{is_unreadable, read_object, require_acls_under};
+pub(crate) use system::{
+    display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, require_acls_under,
+};
 
 #[cfg(windows)]
 use std::path::Path;
@@ -152,8 +154,6 @@ pub(crate) fn sid_string(sid: &[u8]) -> String {
 /// Judges `chain` (the target first, then outward to the volume root) by the rules in the module
 /// documentation.
 pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsafe> {
-    let trusted = [system(), administrators(), trusted_installer()];
-    let is_trusted = |sid: &Sid| trusted.contains(sid);
     for object in chain {
         let refuse = |account: &Sid, right: &'static str| Unsafe {
             path: object.path.clone(),
@@ -177,6 +177,12 @@ pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsaf
         }
     }
     Ok(())
+}
+
+/// Whether `sid` is one of the accounts nobody else can be told from: SYSTEM, Administrators and
+/// TrustedInstaller. What may own or change a shim folder, and own the install lock.
+pub(crate) fn is_trusted(sid: &Sid) -> bool {
+    [system(), administrators(), trusted_installer()].contains(sid)
 }
 
 /// `mask` with each generic right replaced by the file rights it stands for.
@@ -235,13 +241,18 @@ impl FolderCheck {
 impl Unsafe {
     /// The error for this refusal. An account with no name (a deleted one) is written as its SID.
     fn into_error(self) -> Error {
-        let account = identity::account_name_of_sid(&self.account).unwrap_or_else(|_| sid_string(&self.account));
         Error::ShimFolderUnsafe {
+            account: account_name(&self.account),
             path: self.path,
-            account,
             right: self.right,
         }
     }
+}
+
+/// The name of the account `sid` is, or the SID's text when no account has it (a deleted one).
+#[cfg(windows)]
+pub(crate) fn account_name(sid: &Sid) -> String {
+    identity::account_name_of_sid(sid).unwrap_or_else(|_| sid_string(sid))
 }
 
 // The filesystem ======================================================================================================
@@ -257,7 +268,7 @@ mod system {
     use std::path::{Component, Path, PathBuf};
 
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT};
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid,
         GetSecurityDescriptorControl, IsValidSid, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
@@ -301,7 +312,7 @@ mod system {
     /// `path` as it is shown and compared: a final path's `\\?\C:\` is `C:\` and its `\\?\UNC\` is
     /// `\\`, so it equals the path it was given as. Any other verbatim path (`\\?\Volume{..}\`) is
     /// kept, since without its prefix it would name something else. Only a label: open the path.
-    pub(super) fn display_path(path: &Path) -> PathBuf {
+    pub(crate) fn display_path(path: &Path) -> PathBuf {
         const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
         const UNC: [u16; 4] = [b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
         let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -475,7 +486,7 @@ mod system {
     }
 
     /// `path` with its `.` and `..` components applied lexically.
-    fn normalise(path: &Path) -> PathBuf {
+    pub(crate) fn normalise(path: &Path) -> PathBuf {
         let mut resolved = PathBuf::new();
         for component in path.components() {
             match component {
@@ -534,6 +545,42 @@ mod system {
             LocalFree(descriptor);
         }
         object
+    }
+
+    /// The owner of the kernel object `handle` (a mutex, say), which must be open with
+    /// `READ_CONTROL`. `name` stands for the object in an error.
+    pub(crate) fn kernel_object_owner(handle: HANDLE, name: &Path) -> Result<Sid> {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `handle` is open with `READ_CONTROL` for the call; the out-pointers are valid
+        // lvalues. On success `descriptor` owns the memory `owner` points into, freed below.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(Error::os_at(
+                "read the owner of",
+                name,
+                io::Error::from_raw_os_error(status as i32),
+            ));
+        }
+        // SAFETY: `owner` points into `descriptor`, which is live until the free below.
+        let copied = unsafe { copy_sid(owner, name) };
+        // SAFETY: `descriptor` was allocated by `GetSecurityInfo` and is freed once, after the last
+        // read of what points into it.
+        unsafe {
+            LocalFree(descriptor);
+        }
+        copied
     }
 
     /// Copies the owner, the DACL and whether it is protected out of a security descriptor.
@@ -702,4 +749,4 @@ mod system {
 
 #[cfg(test)]
 #[path = "acl_tests.rs"]
-mod acl_tests;
+pub(in crate::backend::scm::shim) mod acl_tests;

@@ -5,10 +5,19 @@
 //! not the test's to control.
 
 use std::cell::Cell;
+use std::io;
+use std::os::windows::io::OwnedHandle;
 use std::process::{Child, Command, Stdio};
 
+use windows_sys::Win32::System::Threading::{PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+
 use super::Termination;
-use super::system::{open_process, terminate_process};
+use super::system::{open_process_with, terminate_process};
+
+/// `pid` opened with the rights `kill` holds a service's process with.
+fn open_process(pid: u32) -> io::Result<Option<OwnedHandle>> {
+    open_process_with(pid, PROCESS_TERMINATE | PROCESS_SYNCHRONIZE)
+}
 
 /// A child that is killed and reaped on drop, so a failing assert leaves nothing running.
 struct Spawned(Child);

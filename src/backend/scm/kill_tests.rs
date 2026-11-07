@@ -202,6 +202,60 @@ fn steps<const N: usize>(steps: [&str; N]) -> Vec<String> {
     steps.iter().map(|s| s.to_string()).collect()
 }
 
+/// What `uninstall` holds before it stops a service: the same open, the same confirmation, and no
+/// termination.
+#[skuld::test]
+fn holding_a_service_with_no_process_holds_nothing() {
+    let mut target = Scripted::new([None], [], []);
+
+    assert!(hold_service_process(&mut target).unwrap().is_none());
+    assert_eq!(target.log(), steps(["service_pid"]));
+}
+
+#[skuld::test]
+fn holding_keeps_the_process_once_scm_confirms_its_pid() {
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found], []);
+
+    let (pid, process) = hold_service_process(&mut target).unwrap().expect("a held process");
+
+    assert_eq!(pid, 100);
+    assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+    drop(process);
+    assert_eq!(target.log().last().map(String::as_str), Some("close 100"));
+}
+
+#[skuld::test]
+fn holding_follows_the_service_when_it_restarts_between_the_open_and_the_confirmation() {
+    let mut target = Scripted::new([Some(100), Some(200), Some(200)], [Open::Found, Open::Found], []);
+
+    let (pid, _process) = hold_service_process(&mut target).unwrap().expect("a held process");
+
+    assert_eq!(pid, 200);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "close 100",
+            "service_pid",
+            "open 200",
+            "service_pid",
+        ])
+    );
+}
+
+/// A pid that cannot be opened is the caller's to see only while SCM still says it is the service's.
+#[skuld::test]
+fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
+
+    let error = hold_service_process(&mut target).err().expect("a refused open");
+
+    assert_eq!(error.to_string(), "access denied");
+    assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
 #[skuld::test]
 fn a_service_with_no_process_has_nothing_to_kill() {
     let mut target = Scripted::new([None], [], []);

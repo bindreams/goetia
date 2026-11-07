@@ -130,6 +130,8 @@ struct Store {
     /// `render` fails for want of a shim provider — see [`Fake::seed_no_provider`].
     no_provider: bool,
     installed_fails: BTreeMap<String, Failure>,
+    /// What `uninstall_absent` fails with, if seeded — see [`Fake::seed_absent_cleanup_fails`].
+    absent_cleanup_fails: Option<Failure>,
     live_status_fails: BTreeMap<String, Failure>,
     write_races: BTreeMap<String, usize>,
     /// Ids whose service is gone by the time it is regenerated against or its live state is queried.
@@ -462,6 +464,14 @@ impl Fake {
     pub fn seed_installed_fails(&self, id: &str, error: impl Fn() -> Error + Send + Sync + 'static) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.installed_fails.insert(id.to_string(), Failure(Arc::new(error)));
+    }
+
+    /// Test-only seeding: what `uninstall` of an id that is not installed cleans up (see
+    /// `Backend::uninstall_absent`) fails with what `error` makes, as a backend's sweep does for a file
+    /// it cannot delete.
+    pub fn seed_absent_cleanup_fails(&self, error: impl Fn() -> Error + Send + Sync + 'static) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.absent_cleanup_fails = Some(Failure(Arc::new(error)));
     }
 
     /// Test-only seeding: the live state of `id` cannot be queried, failing with what `error` makes
@@ -829,6 +839,16 @@ impl crate::backend::Backend for Fake {
         state.confirm(&snapshot)?;
         state.entries.remove(snapshot.id().as_str());
         Ok(())
+    }
+
+    /// Recorded as `uninstall_absent`, and fails where [`Fake::seed_absent_cleanup_fails`] says.
+    fn uninstall_absent(&self, id: &Id) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("uninstall_absent", id.as_str().to_string()));
+        match &state.absent_cleanup_fails {
+            Some(failure) => Err(failure.0()),
+            None => Ok(()),
+        }
     }
 
     fn enable(&self, snapshot: Artifact) -> Result<()> {

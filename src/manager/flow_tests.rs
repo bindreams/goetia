@@ -471,7 +471,8 @@ fn owned_maps_absent_foreign_and_marked() {
 }
 
 /// A verb takes the snapshot the gate yields, so the blanket impl alone gates every verb: on an id
-/// that is not goetia's each says why, and the backend is never asked to act.
+/// that is not goetia's each says why, and the backend is never asked to act. The one thing it is
+/// asked is the cleanup `uninstall` of an absent id offers it, which acts on nothing of the id's.
 #[skuld::test]
 fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
     let fake = Fake::new();
@@ -509,7 +510,11 @@ fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
         );
     }
 
-    assert_eq!(fake.calls(), [], "no verb reached the backend");
+    assert_eq!(
+        fake.calls(),
+        [("uninstall_absent", "nobody".to_string())],
+        "no verb reached the backend but the absent id's cleanup, once"
+    );
     assert_eq!(fake.prepared(), [], "no verb reserved anything before the gate passed");
     assert_eq!(fake.writes(), 0);
     let after = fake.preview_install(&mk("stranger")).unwrap();

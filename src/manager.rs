@@ -53,6 +53,13 @@ pub trait ServiceManager {
 
     /// Stop the service if running, remove the artifact, and reload the
     /// manager. Operates by id alone, so it works without the original manifest.
+    ///
+    /// On Windows a `type: simple` service leaves shim files behind (see
+    /// [`EmbeddedStockShim`](crate::shim::EmbeddedStockShim)), and this removes the ones no other
+    /// service or process uses once its own host has exited. If that cleanup fails the service is
+    /// still deleted and the error says so: re-run `uninstall` to retry it. `uninstall` of an id that
+    /// is not installed is the same retry, and reports [`Error::NotInstalled`](crate::Error::NotInstalled)
+    /// when it has nothing left to do.
     fn uninstall(&self, id: &Id) -> Result<()>;
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if

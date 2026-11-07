@@ -142,7 +142,6 @@ mod windows {
                 other => panic!("a missing sibling must name its path, got {other:?}"),
             }
         }
-        SiblingStockShim::new().sweep(&[]).unwrap();
     }
 
     #[skuld::test]

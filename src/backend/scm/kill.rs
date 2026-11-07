@@ -94,14 +94,39 @@ pub trait KillTarget {
 /// Terminate the service's process, or report that it has none.
 ///
 /// Loops only when the service's state changed under it: the process was gone before it could be
-/// opened or terminated, or SCM no longer vouches for the pid it was opened by. Each round re-reads
-/// SCM, which settles on the new process or on none, so the loop follows the service rather than a
-/// count. Only a termination that was delivered is [`Killed::Terminated`], and only once SCM has
-/// recorded the exit: the process has exited and SCM no longer reports its pid.
+/// terminated. Each round holds the process again through [`hold_service_process`], which settles
+/// on the new process or on none, so the loop follows the service rather than a count. Only a
+/// termination that was delivered is [`Killed::Terminated`], and only once SCM has recorded the
+/// exit: the process has exited and SCM no longer reports its pid.
 pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
     loop {
-        let Some(pid) = target.service_pid()? else {
+        let Some((pid, process)) = hold_service_process(target)? else {
             return Ok(Killed::NotRunning);
+        };
+        match target.terminate(&process)? {
+            Termination::Terminated => {
+                target.await_exit(&process).map_err(|e| terminated_but(pid, e))?;
+                await_scm_released(target, pid).map_err(|e| terminated_but(pid, e))?;
+                return Ok(Killed::Terminated);
+            }
+            // The process was gone, and SCM has not yet recorded it; wait for SCM to move off the pid.
+            Termination::AlreadyExited => await_scm_released(target, pid)?,
+        }
+    }
+}
+
+/// The service's process and its pid, opened and held, or `None` when SCM reports none: what
+/// everything that acts on a service's process starts from (`kill` terminates it, `uninstall` waits
+/// for it). The held handle is the proof: SCM is asked again after the open, so a pid it still
+/// vouches for is the process held, never a stranger that took the number.
+///
+/// Loops only when the service's state changed under it: the process was gone before it could be
+/// opened, or SCM no longer vouches for the pid it was opened by. Each round re-reads SCM, which
+/// settles on the new process or on none.
+pub(crate) fn hold_service_process<T: KillTarget>(target: &mut T) -> io::Result<Option<(u32, T::Process)>> {
+    loop {
+        let Some(pid) = target.service_pid()? else {
+            return Ok(None);
         };
         let process = match target.open(pid) {
             Ok(Some(process)) => process,
@@ -122,17 +147,8 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
                 }
             },
         };
-        if target.service_pid()? != Some(pid) {
-            continue;
-        }
-        match target.terminate(&process)? {
-            Termination::Terminated => {
-                target.await_exit(&process).map_err(|e| terminated_but(pid, e))?;
-                await_scm_released(target, pid).map_err(|e| terminated_but(pid, e))?;
-                return Ok(Killed::Terminated);
-            }
-            // As for `Ok(None)` above: gone, and not yet recorded by SCM.
-            Termination::AlreadyExited => await_scm_released(target, pid)?,
+        if target.service_pid()? == Some(pid) {
+            return Ok(Some((pid, process)));
         }
     }
 }
@@ -194,7 +210,7 @@ mod privilege;
 pub use system::SystemKillTarget;
 
 #[cfg(windows)]
-mod system {
+pub(in crate::backend::scm) mod system {
     use std::io;
     use std::mem::size_of;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -203,7 +219,8 @@ mod system {
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Services::{QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS};
     use windows_sys::Win32::System::Threading::{
-        INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        TerminateProcess, WaitForSingleObject,
     };
 
     use crate::backend::scm::wait::{Armed, QueriedState, ScmActor, SystemScmActor, WantState, marked_for_deletion};
@@ -221,19 +238,33 @@ mod system {
         /// Opened by the first [`KillTarget::arm_release`], as a kill that finds SCM already
         /// released never needs it, and dropped by [`KillTarget::cancel_release`].
         notifier: Option<SystemScmActor>,
+        /// The rights the service's process is opened with.
+        access: u32,
     }
 
     impl SystemKillTarget {
+        /// A target whose process is opened with the rights to terminate it and to wait for its exit.
         pub fn new(service: Service, id: String) -> Self {
             Self {
                 service,
                 id,
                 notifier: None,
+                access: PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+            }
+        }
+
+        /// A target whose process is opened with the rights to wait for its exit and to read its
+        /// image, and no more: for a caller that never terminates it, which should not be refused for
+        /// lacking a right it does not use.
+        pub(in crate::backend::scm) fn observing(service: Service, id: String) -> Self {
+            Self {
+                access: PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                ..Self::new(service, id)
             }
         }
 
         fn notice(&self, process: &Held) {
-            eprintln!("{}: waiting for process {} to exit", self.id, process.pid);
+            process.notice(&self.id);
         }
 
         fn notifier(&mut self) -> io::Result<&mut SystemScmActor> {
@@ -250,10 +281,23 @@ mod system {
         pid: u32,
     }
 
+    impl Held {
+        fn notice(&self, id: &str) {
+            eprintln!("{id}: waiting for process {} to exit", self.pid);
+        }
+
+        /// Blocks, with no bound, until the process has exited, saying why nothing returns when it
+        /// has not yet. The wait [`KillTarget::await_exit`] makes, for a caller that no longer holds
+        /// the target: its service handle must be closed before the service can go.
+        pub(in crate::backend::scm) fn wait_for_exit(&self, id: &str) -> io::Result<()> {
+            wait_exit(&self.handle, || self.notice(id))
+        }
+    }
+
     /// The pid in `status`, in any state that has a process. `windows-service`'s `query_status`
     /// reports one only in `Running`, which hides the process of a service stuck starting or stopping,
     /// the case `kill` is for; SCM reports `0` when there is none.
-    pub(super) fn process_of(status: &SERVICE_STATUS_PROCESS) -> Option<u32> {
+    pub(in crate::backend::scm) fn process_of(status: &SERVICE_STATUS_PROCESS) -> Option<u32> {
         Some(status.dwProcessId).filter(|&pid| pid != 0)
     }
 
@@ -282,7 +326,7 @@ mod system {
         }
 
         fn open(&mut self, pid: u32) -> io::Result<Option<Held>> {
-            Ok(open_process(pid)?.map(|handle| Held { handle, pid }))
+            Ok(open_process_with(pid, self.access)?.map(|handle| Held { handle, pid }))
         }
 
         fn terminate(&mut self, process: &Held) -> io::Result<Termination> {
@@ -327,13 +371,12 @@ mod system {
         }
     }
 
-    /// Open `pid` with the rights to terminate it and to wait for its exit, with the caller's
-    /// `SeDebugPrivilege` enabled for the open, as without it a `LocalService` service's process is
-    /// refused. `None` if no process has that pid.
-    pub(super) fn open_process(pid: u32) -> io::Result<Option<OwnedHandle>> {
+    /// Open `pid` with `access`, with the caller's `SeDebugPrivilege` enabled for the open, as
+    /// without it a `LocalService` service's process is refused. `None` if no process has that pid.
+    pub(in crate::backend::scm) fn open_process_with(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {
         let debug = DebugPrivilege::enable();
         // SAFETY: no pointers; a null return is the failure.
-        let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+        let handle = unsafe { OpenProcess(access, 0, pid) };
         if handle.is_null() {
             let e = io::Error::last_os_error();
             return if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
@@ -346,7 +389,7 @@ mod system {
         Ok(Some(unsafe { OwnedHandle::from_raw_handle(handle) }))
     }
 
-    /// Terminate the process behind `process`, an [`open_process`] handle.
+    /// Terminate the process behind `process`, an [`open_process_with`] handle with `PROCESS_TERMINATE`.
     ///
     /// `on_wait` runs once, just before blocking on a process that is terminating but has not yet
     /// exited, so a caller can tell a human why nothing returns.
@@ -366,16 +409,23 @@ mod system {
         wait_exit(process, on_wait).map(|()| Termination::AlreadyExited)
     }
 
-    /// Block until the process behind `process`, an [`open_process`] handle, has exited.
-    ///
-    /// `on_wait` runs once, just before blocking on a process that has not yet exited.
-    pub(super) fn wait_exit(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<()> {
-        // A zero-timeout poll reads the state; it is not a wait. Already signalled: nothing to wait for.
+    /// Whether the process behind `process`, held with `SYNCHRONIZE`, has exited. A zero-timeout
+    /// poll reads the state; it is not a wait.
+    pub(in crate::backend::scm) fn has_exited(process: &OwnedHandle) -> io::Result<bool> {
         // SAFETY: `process` is a live handle with `PROCESS_SYNCHRONIZE`.
         match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
-            WAIT_OBJECT_0 => return Ok(()),
-            WAIT_TIMEOUT => {}
-            _ => return Err(io::Error::last_os_error()),
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// Block until the process behind `process`, an [`open_process_with`] handle, has exited.
+    ///
+    /// `on_wait` runs once, just before blocking on a process that has not yet exited.
+    pub(in crate::backend::scm) fn wait_exit(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<()> {
+        if has_exited(process)? {
+            return Ok(());
         }
         // Unbounded on purpose: the process's exit is the event, and there is no outcome to report
         // before it. A process wedged in a driver request is never signalled, so say why this blocks.

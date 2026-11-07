@@ -112,6 +112,15 @@ pub(crate) trait Backend {
     /// See [`ServiceManager::uninstall`].
     fn uninstall(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<()>;
 
+    /// What `uninstall` of an `id` that is not installed does before it says so: a backend that keeps
+    /// something of its own beyond the service itself (SCM's shim files, which an uninstall that
+    /// failed to sweep leaves behind) cleans it up. A failure replaces [`Error::NotInstalled`], which
+    /// the CLI renders as success, so that re-running `uninstall` is how a failed cleanup is retried.
+    /// Never called for an id that is foreign or whose state is undetermined.
+    fn uninstall_absent(&self, _id: &Id) -> Result<()> {
+        Ok(())
+    }
+
     /// See [`ServiceManager::enable`].
     fn enable(&self, snapshot: Self::Snapshot) -> Result<()>;
 
@@ -241,7 +250,12 @@ impl<B: Backend> ServiceManager for B {
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
-        let snapshot = flow::owned(self, id)?;
+        let snapshot = match flow::owned(self, id) {
+            Err(absent @ Error::NotInstalled { .. }) => {
+                return Err(Backend::uninstall_absent(self, id).err().unwrap_or(absent));
+            }
+            owned => owned?,
+        };
         // `uninstall` has no `--timeout` of its own: its stop is unbounded.
         let mut reservation = flow::reserved(self, id, Step::Uninstall, Budget::Unbounded)?;
         Backend::uninstall(self, snapshot, &mut reservation)

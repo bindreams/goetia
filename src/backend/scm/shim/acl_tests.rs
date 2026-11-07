@@ -303,7 +303,7 @@ fn bytes_that_are_not_a_sid_are_written_as_such_not_panicked_on() {
 }
 
 #[cfg(windows)]
-mod windows {
+pub(in crate::backend::scm::shim) mod windows {
     use super::system::{display_path, identity_of, is_unreadable, parse, read_chain, resolve_target};
     use super::*;
     use crate::error::Error;
@@ -346,7 +346,7 @@ mod windows {
     }
 
     /// A junction (no privilege needed, unlike a symlink) at `link` to the existing `target`.
-    fn junction(link: &Path, target: &Path) {
+    pub(in crate::backend::scm::shim) fn junction(link: &Path, target: &Path) {
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(link)

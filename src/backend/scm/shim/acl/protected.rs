@@ -55,6 +55,9 @@ mod system {
     const FILE: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;WD)";
     /// [`FILE`], with every entry inherited by files and folders made in it (`OI`, `CI`).
     const FOLDER: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;WD)";
+    /// The install lock: SYSTEM and Administrators have every right (`GA`) and nobody else any, so
+    /// no other account can open it, hold it or release it. No owner is named: the creator is it.
+    const LOCK: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
     /// A security descriptor that a file or folder is created with.
     pub(crate) struct Descriptor {
@@ -70,6 +73,11 @@ mod system {
         /// The permissions of a folder made to hold the stock shim.
         pub(crate) fn for_folder() -> Result<Self> {
             Self::from_sddl(FOLDER)
+        }
+
+        /// The permissions of the install lock.
+        pub(crate) fn for_lock() -> Result<Self> {
+            Self::from_sddl(LOCK)
         }
 
         fn from_sddl(sddl: &str) -> Result<Self> {
@@ -153,8 +161,8 @@ mod system {
             Ok(())
         }
 
-        /// Valid while `self` is.
-        fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        /// The attributes an object is created with to have this descriptor. Valid while `self` is.
+        pub(crate) fn attributes(&self) -> SECURITY_ATTRIBUTES {
             SECURITY_ATTRIBUTES {
                 nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: self.raw,

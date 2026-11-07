@@ -30,8 +30,10 @@ pub trait ShimProvider: Send + Sync {
     /// refuses. Idempotent. A provider that writes checks its folder with `folders` first.
     fn provide(&self, folders: &FolderCheck) -> Result<HostCommand>;
 
-    /// After an uninstall, with every path a remaining service still references. Removes what
-    /// this provider wrote and nothing references.
+    /// Under the install lock, before an install provides and after an uninstall, and for an
+    /// uninstall of an id that is not installed. `referenced` is every file a registered service
+    /// or a running process names, as a path that has been normalised. Removes what this provider
+    /// wrote and nothing references, tries every file, and reports every failure after the last.
     fn sweep(&self, referenced: &[PathBuf]) -> Result<()>;
 }
 

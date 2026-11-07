@@ -14,7 +14,6 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 /// What a file name in a shim folder says about the file.
-#[allow(dead_code, reason = "the sweep after an uninstall matches names with it")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShimFile {
     /// `goetia-shim-<hex>.exe`: a shim in place.
@@ -25,7 +24,6 @@ pub(crate) enum ShimFile {
 
 /// Which kind of shim file `name` is, matched without regard to case, or `None` for any other name:
 /// the hash is exactly 64 hexadecimal digits and the random part is not empty.
-#[allow(dead_code, reason = "the sweep after an uninstall matches names with it")]
 pub(crate) fn shim_file(name: &str) -> Option<ShimFile> {
     let lower = name.to_ascii_lowercase();
     let rest = lower.strip_prefix("goetia-shim-")?;
@@ -44,6 +42,8 @@ pub(crate) fn shim_file(name: &str) -> Option<ShimFile> {
 pub use stock::EmbeddedStockShim;
 #[cfg(windows)]
 pub(crate) use stock::SiblingStockShim;
+#[cfg(windows)]
+pub(in crate::backend::scm::shim) use stock::default_dir;
 
 #[cfg(windows)]
 mod stock {
@@ -64,6 +64,7 @@ mod stock {
     };
     use super::super::marker::read_retrying;
     use super::super::provider::ShimProvider;
+    use super::super::sweep::sweep_folder;
     use crate::error::{Error, Result};
     use crate::shim::HostCommand;
 
@@ -115,9 +116,11 @@ mod stock {
             provide_in(&self.dir()?, &image, folders)
         }
 
-        /// Removes nothing.
-        fn sweep(&self, _referenced: &[PathBuf]) -> Result<()> {
-            Ok(())
+        /// Deletes the shim files in `dir`, and what a repair or a crash left beside them, that no
+        /// path of `referenced` names, and removes `dir` when that leaves it empty and it is the
+        /// default folder; see [`sweep_folder`].
+        fn sweep(&self, referenced: &[PathBuf]) -> Result<()> {
+            sweep_folder(absolute(&self.dir()?)?, referenced)
         }
     }
 
@@ -152,9 +155,9 @@ mod stock {
             provide_in(&default_dir()?, &Image::new(&bytes), folders)
         }
 
-        /// Removes nothing.
-        fn sweep(&self, _referenced: &[PathBuf]) -> Result<()> {
-            Ok(())
+        /// As [`EmbeddedStockShim`]'s, over the default folder, and whether or not the sibling is there.
+        fn sweep(&self, referenced: &[PathBuf]) -> Result<()> {
+            sweep_folder(&default_dir()?, referenced)
         }
     }
 
@@ -208,7 +211,7 @@ mod stock {
     // Where it goes ===================================================================================================
 
     /// `%ProgramFiles%\Goetia`.
-    pub(super) fn default_dir() -> Result<PathBuf> {
+    pub(in crate::backend::scm::shim) fn default_dir() -> Result<PathBuf> {
         let mut path: *mut u16 = std::ptr::null_mut();
         // SAFETY: the folder ID is a static; `KF_FLAG_DEFAULT` and no token ask for the machine's
         // folder; `path` is a valid out-pointer.

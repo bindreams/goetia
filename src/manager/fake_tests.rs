@@ -136,6 +136,43 @@ fn operations_on_an_unknown_id_error() {
     assert!(fake.status(&id).is_err());
 }
 
+/// A backend that keeps something of its own per id (SCM's shim files) can clean it up when the id is
+/// gone, so `uninstall` of an absent id offers it the chance, then still says nothing was installed.
+#[skuld::test]
+fn uninstall_of_absent_id_still_sweeps() {
+    let fake = Fake::new();
+    let id = Id::try_from("never-installed").unwrap();
+
+    let result = fake.uninstall(&id);
+
+    assert!(matches!(result, Err(Error::NotInstalled { .. })), "{result:?}");
+    assert_eq!(fake.calls(), vec![("uninstall_absent", "never-installed".to_string())]);
+}
+
+/// Re-running `uninstall` is how a failed sweep is retried, so its failure is what the caller sees,
+/// not `NotInstalled`, which the CLI renders as success.
+#[skuld::test]
+fn a_failed_sweep_of_an_absent_id_replaces_not_installed() {
+    let fake = Fake::new();
+    fake.seed_absent_cleanup_fails(|| Error::os("delete", std::io::Error::other("held")));
+    let id = Id::try_from("never-installed").unwrap();
+
+    let result = fake.uninstall(&id);
+
+    assert!(matches!(result, Err(Error::Os { .. })), "{result:?}");
+}
+
+/// Nothing is swept for an id that is something else's or is undetermined: only an id that is absent.
+#[skuld::test]
+fn uninstall_of_a_foreign_id_sweeps_nothing() {
+    let fake = Fake::new();
+    fake.seed_foreign("stranger", "not a goetia artifact at all\n");
+    let id = Id::try_from("stranger").unwrap();
+
+    assert!(matches!(fake.uninstall(&id), Err(Error::Foreign { .. })));
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
 /// A foreign entry (present, but not Goetia's) must be refused by every
 /// verb, not just `install` — "goetia never touches a service it did not
 /// create" is not an install-only rule. Regression coverage: every verb,

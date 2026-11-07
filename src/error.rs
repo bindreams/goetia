@@ -66,8 +66,10 @@ pub enum Error {
     #[error(transparent)]
     Kept(Arc<Error>),
 
-    /// A step failed, and so did the one after it. `report()` prints both, `first` then `then`.
-    #[error("a step failed, and so did the one after it")]
+    /// Several steps failed, each after the ones before it: `first` is what failed earlier, `then`
+    /// the failure after it. Any number nest to the left (`Both { Both { a, b }, c }`), built by
+    /// [`Error::both_all`]; `report()` prints them in order.
+    #[error("several steps failed")]
     Both {
         #[source]
         first: Box<Error>,
@@ -265,6 +267,15 @@ pub enum Error {
         path.display()
     )]
     SiblingShimMissing { path: PathBuf },
+
+    /// The machine-wide install lock exists and belongs to an account that is neither SYSTEM nor
+    /// Administrators, so what holds it cannot be trusted to serialise installs. `account` is its
+    /// name, or its SID when it has none.
+    #[error(
+        "the install lock `Global\\goetia-shim` is owned by {account}, which is not SYSTEM or Administrators, so it \
+         cannot be trusted to serialise installs: end that account's processes that hold it"
+    )]
+    ShimLockForeign { account: String },
 
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
@@ -605,6 +616,7 @@ impl Error {
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
+            | Error::ShimLockForeign { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -664,6 +676,20 @@ impl Error {
         Ok((Box::new(read), recovery))
     }
 
+    /// The failures of `errors` in one error: `None` for none, the error itself for one, and for
+    /// more nested [`Both`](Error::Both)s in the order given. How every caller that tries each of
+    /// several things and reports what failed folds them.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos")),
+        allow(dead_code, reason = "the SCM and launchd backends fold their failures with it")
+    )]
+    pub(crate) fn both_all(errors: impl IntoIterator<Item = Error>) -> Option<Error> {
+        errors.into_iter().reduce(|first, then| Error::Both {
+            first: Box::new(first),
+            then: Box::new(then),
+        })
+    }
+
     /// What would clear this failure, when it is written to follow the failure's cause: a remedy
     /// says "that read", so it cannot lead. [`report`](Error::report) prints it after the whole
     /// chain, and this variant's [`Display`](fmt::Display) leaves it out.
@@ -716,6 +742,7 @@ impl Error {
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
+            | Error::ShimLockForeign { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)

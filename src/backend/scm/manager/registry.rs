@@ -24,6 +24,9 @@ use crate::manager::{Installed, flow};
 
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
+const IMAGE_PATH_VALUE: &str = "ImagePath";
+/// Set by SCM on a service whose deletion waits for its last handle to close.
+const DELETE_FLAG_VALUE: &str = "DeleteFlag";
 
 fn service_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}")
@@ -301,6 +304,30 @@ fn scan_names_under(path: &str, keep: impl FnMut(String)) -> Option<Installed> {
         |op, source| registry_error(op, path, source),
         keep,
     )
+}
+
+/// The `ImagePath` of the service `name`: the command line SCM starts for it. `None` when the
+/// service is marked for deletion (its record outlives it until the last handle closes, but it
+/// starts nothing), when it has no `ImagePath` or none that is a string, and when it was removed
+/// since it was listed. Any other failure to read is an error: what the service runs is then unknown.
+pub fn read_registered_image(name: &str) -> Result<Option<String>> {
+    let path = service_key_path(name);
+    let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_READ) {
+        Ok(key) => key,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(registry_error("open", &path, e)),
+    };
+    match key.get_value::<u32, _>(DELETE_FLAG_VALUE) {
+        Ok(0) => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(registry_error(&format!("read {DELETE_FLAG_VALUE} under"), &path, e)),
+    }
+    match key.get_raw_value(IMAGE_PATH_VALUE) {
+        Ok(raw) => Ok(String::from_reg_value(&raw).ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(registry_error(&format!("read {IMAGE_PATH_VALUE} under"), &path, e)),
+    }
 }
 
 #[cfg(test)]

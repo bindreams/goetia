@@ -1348,7 +1348,7 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
         // Each location is read, because `/Library/LaunchDaemons` holds every vendor's daemons: a
         // stem found in both is goetia's only if one of the two carries the marker.
         let mut found = Vec::new();
-        let mut unestablished = None;
+        let mut unestablished = Vec::new();
         for location in locations {
             match read_at(&id, location) {
                 Ok(found_here) => found.push(found_here),
@@ -1362,17 +1362,11 @@ fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
                         Ok((read, _recovery)) => *read,
                         Err(e) => e,
                     };
-                    unestablished = Some(match unestablished {
-                        None => failed,
-                        Some(first) => Error::Both {
-                            first: Box::new(first),
-                            then: Box::new(failed),
-                        },
-                    });
+                    unestablished.push(failed);
                 }
             }
         }
-        if let Some(failed) = unestablished {
+        if let Some(failed) = Error::both_all(unestablished) {
             reported.push(Installed::Undetermined {
                 name: Some(id),
                 reason: Reason::failed(failed),

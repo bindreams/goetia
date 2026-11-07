@@ -46,6 +46,18 @@ pub fn shim_bytes() -> &'static [u8] {
     })
 }
 
+/// [`shim_bytes`] with a few bytes after the executable, which Windows ignores: another file under
+/// another hash that is the same host, carrying the marker once. What a second goetia build of
+/// the stock shim looks like to the sweep.
+pub fn other_shim_bytes() -> &'static [u8] {
+    static BYTES: OnceLock<&'static [u8]> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        let mut bytes = shim_bytes().to_vec();
+        bytes.extend_from_slice(b"another build");
+        Box::leak(bytes.into_boxed_slice())
+    })
+}
+
 /// The provider a program built with the stock shim has: the shim of [`shim_bytes`], placed in
 /// `dir`, or in `%ProgramFiles%\Goetia` for `None`.
 pub fn embedded_shim(dir: Option<PathBuf>) -> EmbeddedStockShim {
@@ -329,6 +341,12 @@ impl ShimProcess {
 
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Whether the shim process has exited, read without waiting: a state read, not a wait.
+    pub fn has_exited(&self) -> bool {
+        // SAFETY: `process` is a live handle with SYNCHRONIZE access.
+        unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 0) == WAIT_OBJECT_0 }
     }
 
     /// Blocks until the shim process has exited. No bound: a shim that never exits is a hung test,

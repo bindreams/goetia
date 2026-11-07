@@ -657,51 +657,10 @@ fn managed_begin_install_takes_no_lock_and_calls_no_provider() {
     let (provider, calls) = Recording::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
-    mgr.begin_install(&daemon_spec(Restart::Never)).unwrap();
+    let scope = mgr.begin_install(&daemon_spec(Restart::Never)).unwrap();
 
+    assert!(scope.is_none(), "a managed install holds no lock");
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());
-}
-
-#[skuld::test]
-fn begin_install_refuses_a_provider_that_disagrees() {
-    let dir = tempfile::tempdir().unwrap();
-    let (previewed, provided) = (dir.path().join("previewed.exe"), dir.path().join("provided.exe"));
-    let (provider, _) = Recording::new(command(&previewed), command(&provided));
-    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
-
-    match mgr.begin_install(&simple_daemon()) {
-        Err(Error::ShimProviderDisagrees {
-            previewed: said,
-            provided: gave,
-        }) => assert_eq!((said, gave), (command(previewed), command(provided))),
-        other => panic!("a provider that provides what it did not preview must be refused, got {other:?}"),
-    }
-}
-
-#[skuld::test]
-fn begin_install_refuses_a_host_with_no_marker() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = dir.path().join("host.exe");
-    std::fs::write(&exe, b"not a goetia host").unwrap();
-    let (provider, calls) = Recording::new(command(&exe), command(&exe));
-    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
-
-    match mgr.begin_install(&simple_daemon()) {
-        Err(Error::ShimMarkerMissing { path }) => assert_eq!(path, exe),
-        other => panic!("a file without the marker is no host, got {other:?}"),
-    }
-    assert_eq!(*calls.lock().unwrap(), ["provide", "preview"]);
-}
-
-#[skuld::test]
-fn begin_install_refuses_a_host_named_by_a_relative_path() {
-    let (provider, _) = Recording::new(command(r"bin\host.exe"), command(r"bin\host.exe"));
-    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
-
-    match mgr.begin_install(&simple_daemon()) {
-        Err(Error::ShimPathRelative { path }) => assert_eq!(path, PathBuf::from(r"bin\host.exe")),
-        other => panic!("a relative host must be refused, got {other:?}"),
-    }
 }
 
 /// A snapshot that has never opened a service, with `config` already queried: any further SCM

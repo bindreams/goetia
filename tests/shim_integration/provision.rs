@@ -6,25 +6,29 @@
 //! `%ProgramFiles%\Goetia` for their length: each empties it first and removes it after, and
 //! `UNIT_DIR_EXCLUSIVE` keeps them from running beside each other.
 
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, mpsc};
 
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::error::Error;
 use goetia::manager::{Budget, ServiceManager as _, State};
-use goetia::shim::{CheckPermissions, ShimProvider as _, StandaloneShim};
+use goetia::shim::{CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim};
 use goetia::spec::{DaemonSpec, User};
-use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Foundation::{LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, SYNCHRONIZE};
+use windows_sys::Win32::System::Threading::{OpenMutexW, ReleaseMutex, WaitForSingleObject};
 
 use crate::common::{
-    LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, embedded_manager, embedded_shim, fixture_command, fixture_command_with_exe,
-    shim_bytes, simple_spec,
+    LogDir, ShimGuard, ShimProcess, UNIT_DIR_EXCLUSIVE, embedded_manager, embedded_shim, fixture_command,
+    fixture_command_with_exe, other_shim_bytes, shim_bytes, simple_spec,
 };
 use crate::install_helper::INSTALL_AS;
 use crate::support::cleanup::{self, DirGuard};
@@ -418,7 +422,10 @@ fn install_repairs_tampered_shim() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_refuses_doctored_folder() {
     let (folder, _folder_guard) = default_folder();
+    // Not empty: the sweep every install begins with removes an empty default folder.
+    let placeholder = folder.join("placeholder.txt");
     std::fs::create_dir_all(&folder).expect("create the default folder");
+    std::fs::write(&placeholder, b"keeps the folder").expect("fill the folder");
     let _doctored = Doctored::new(&folder);
     let logs = LogDir::new();
     let id = support::random_test_id();
@@ -436,10 +443,12 @@ fn install_refuses_doctored_folder() {
 
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "nothing may be registered:\n{query}");
-    assert!(
-        std::fs::read_dir(&folder).unwrap().next().is_none(),
-        "nothing may be written to the folder"
-    );
+    let written: Vec<_> = std::fs::read_dir(&folder)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(written, [placeholder], "nothing may be written to the folder");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
@@ -470,7 +479,9 @@ fn install_checks_the_folder_before_the_marker() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn disable_skips_the_folder_check() {
     let (folder, _folder_guard) = default_folder();
+    // Not empty: the sweep every install begins with removes an empty default folder.
     std::fs::create_dir_all(&folder).expect("create the default folder");
+    std::fs::write(folder.join("placeholder.txt"), b"keeps the folder").expect("fill the folder");
     let _doctored = Doctored::new(&folder);
     let logs = LogDir::new();
     let id = support::random_test_id();
@@ -552,4 +563,433 @@ fn every_account_type_runs_the_shim() {
             String::from_utf8_lossy(&output.stderr)
         );
     });
+}
+
+// What `begin_install` checks of a provider ===========================================================================
+
+/// A provider that records the calls it gets and answers with the commands it was given.
+struct Recording {
+    calls: Arc<Mutex<Vec<&'static str>>>,
+    preview: HostCommand,
+    provide: HostCommand,
+}
+
+impl Recording {
+    fn new(preview: HostCommand, provide: HostCommand) -> (Self, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::default();
+        let provider = Self {
+            calls: Arc::clone(&calls),
+            preview,
+            provide,
+        };
+        (provider, calls)
+    }
+}
+
+impl ShimProvider for Recording {
+    fn preview(&self) -> goetia::error::Result<HostCommand> {
+        self.calls.lock().unwrap().push("preview");
+        Ok(self.preview.clone())
+    }
+
+    fn provide(&self, _folders: &FolderCheck) -> goetia::error::Result<HostCommand> {
+        self.calls.lock().unwrap().push("provide");
+        Ok(self.provide.clone())
+    }
+
+    fn sweep(&self, _referenced: &[PathBuf]) -> goetia::error::Result<()> {
+        self.calls.lock().unwrap().push("sweep");
+        Ok(())
+    }
+}
+
+fn command(exe: impl Into<PathBuf>) -> HostCommand {
+    HostCommand {
+        exe: exe.into(),
+        args: vec![],
+    }
+}
+
+/// These installs fail before anything is registered, so nothing needs a guard but the temp dir.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn install_refuses_a_provider_that_disagrees() {
+    let dir = DirGuard::new(tempfile::tempdir().expect("tempdir").keep());
+    let logs = LogDir::new();
+    let spec = simple_spec(&support::random_test_id(), fixture_command("report", &["1"]), &logs);
+    let (previewed, provided) = (dir.path().join("previewed.exe"), dir.path().join("provided.exe"));
+    let (provider, _) = Recording::new(command(&previewed), command(&provided));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    match mgr.install(&spec, false) {
+        Err(Error::ShimProviderDisagrees {
+            previewed: said,
+            provided: gave,
+        }) => assert_eq!((said, gave), (command(previewed), command(provided))),
+        other => panic!("a provider that provides what it did not preview must be refused, got {other:?}"),
+    }
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn install_refuses_a_host_with_no_marker() {
+    let dir = DirGuard::new(tempfile::tempdir().expect("tempdir").keep());
+    let logs = LogDir::new();
+    let spec = simple_spec(&support::random_test_id(), fixture_command("report", &["1"]), &logs);
+    let exe = dir.path().join("host.exe");
+    std::fs::write(&exe, b"not a goetia host").unwrap();
+    let (provider, calls) = Recording::new(command(&exe), command(&exe));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    match mgr.install(&spec, false) {
+        Err(Error::ShimMarkerMissing { path }) => assert_eq!(path, exe),
+        other => panic!("a file without the marker is no host, got {other:?}"),
+    }
+    // Swept first, then provided and previewed.
+    assert_eq!(*calls.lock().unwrap(), ["sweep", "provide", "preview"]);
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn install_refuses_a_host_named_by_a_relative_path() {
+    let logs = LogDir::new();
+    let spec = simple_spec(&support::random_test_id(), fixture_command("report", &["1"]), &logs);
+    let (provider, _) = Recording::new(command(r"bin\host.exe"), command(r"bin\host.exe"));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    match mgr.install(&spec, false) {
+        Err(Error::ShimPathRelative { path }) => assert_eq!(path, PathBuf::from(r"bin\host.exe")),
+        other => panic!("a relative host must be refused, got {other:?}"),
+    }
+}
+
+// The install lock ====================================================================================================
+
+/// What an install running on its own thread reports to the test.
+enum Event {
+    /// The provider is inside `provide`, so the install holds the lock.
+    Provided,
+    Installed(goetia::error::Result<Outcome>),
+}
+
+/// The stock shim of this crate through `StandaloneShim`, held in `provide` until the test lets it
+/// go.
+struct Gated {
+    inner: StandaloneShim,
+    events: Mutex<mpsc::Sender<Event>>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl ShimProvider for Gated {
+    fn preview(&self) -> goetia::error::Result<HostCommand> {
+        self.inner.preview()
+    }
+
+    fn provide(&self, folders: &FolderCheck) -> goetia::error::Result<HostCommand> {
+        self.events
+            .lock()
+            .unwrap()
+            .send(Event::Provided)
+            .expect("the test is listening");
+        self.release
+            .lock()
+            .unwrap()
+            .recv()
+            .expect("the test lets the provider go");
+        self.inner.provide(folders)
+    }
+
+    fn sweep(&self, referenced: &[PathBuf]) -> goetia::error::Result<()> {
+        self.inner.sweep(referenced)
+    }
+}
+
+/// `Global\goetia-shim`, opened to read its permissions and to wait on it.
+fn open_lock() -> OwnedHandle {
+    let name = support::wide_null(r"Global\goetia-shim");
+    // SAFETY: `name` is NUL-terminated; the handle is checked, then owned.
+    let raw = unsafe { OpenMutexW(SYNCHRONIZE | READ_CONTROL, 0, name.as_ptr()) };
+    assert!(
+        !raw.is_null(),
+        "open the install lock: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: a valid handle `OpenMutexW` just returned and nothing else owns.
+    unsafe { OwnedHandle::from_raw_handle(raw) }
+}
+
+/// Runs an install of a `type: simple` service on its own thread, which stops inside the
+/// provider's `provide`, where the lock is held, and calls `probe` with the lock opened then. The
+/// install is then let go and must succeed. Returns the lock, opened.
+fn probing_the_lock_during_an_install(probe: impl FnOnce(&OwnedHandle)) -> OwnedHandle {
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let (events, happened) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let provider = Gated {
+        inner: StandaloneShim::new(PathBuf::from(env!("CARGO_BIN_EXE_goetia-shim")), vec![]),
+        events: Mutex::new(events.clone()),
+        release: Mutex::new(released),
+    };
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let installed = mgr.install(&spec, false);
+            let _ = events.send(Event::Installed(installed));
+        });
+        match happened.recv().expect("the install reports") {
+            Event::Provided => {}
+            Event::Installed(result) => panic!("the install ended before `provide`: {result:?}"),
+        }
+        let lock = open_lock();
+        probe(&lock);
+        release.send(()).expect("the provider is waiting");
+        match happened.recv().expect("the install reports") {
+            Event::Installed(result) => {
+                result.unwrap_or_else(|e| panic!("install: {}", e.report()));
+            }
+            Event::Provided => panic!("`provide` ran twice"),
+        }
+        lock
+    })
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn lock_is_exclusive() {
+    let lock = probing_the_lock_during_an_install(|lock| {
+        // A zero-timeout wait reads whether the mutex is held and waits for nothing.
+        // SAFETY: `lock` is a live handle with `SYNCHRONIZE`.
+        let held = unsafe { WaitForSingleObject(lock.as_raw_handle(), 0) };
+        assert_eq!(held, WAIT_TIMEOUT, "an install in `provide` must hold the lock");
+    });
+
+    // The install has ended, so the lock is free. This thread takes it, and gives it back.
+    // SAFETY: as above.
+    let free = unsafe { WaitForSingleObject(lock.as_raw_handle(), 0) };
+    assert_eq!(free, WAIT_OBJECT_0, "a finished install must release the lock");
+    // SAFETY: taken by this thread just above.
+    assert_ne!(unsafe { ReleaseMutex(lock.as_raw_handle()) }, 0);
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn lock_is_for_system_and_administrators_only() {
+    probing_the_lock_during_an_install(|lock| {
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `lock` is open with `READ_CONTROL`; the descriptor out-pointer is valid, and the
+        // others are not asked for.
+        let status = unsafe {
+            GetSecurityInfo(
+                lock.as_raw_handle(),
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0, "read the permissions of the lock: error {status}");
+        let sddl = sddl_of(descriptor);
+        // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last read.
+        unsafe { LocalFree(descriptor) };
+        assert!(
+            sddl.contains("D:P(A;;GA;;;SY)(A;;GA;;;BA)"),
+            "the lock is for SYSTEM and Administrators alone, and protected: {sddl}"
+        );
+    });
+}
+
+// The sweep at install ================================================================================================
+
+/// What a shim file of another build is named: a valid name nothing is registered under.
+fn stray_shim_in(folder: &Path) -> PathBuf {
+    let stray = folder.join(format!("goetia-shim-{}.exe", "ab".repeat(32)));
+    std::fs::create_dir_all(folder).expect("create the folder");
+    std::fs::write(&stray, b"left behind").expect("write the stray file");
+    stray
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn install_sweeps_what_nothing_references() {
+    let (_root, folder) = temp_shim_folder();
+    let stray = stray_shim_in(&folder);
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let mgr = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+
+    mgr.install(&spec, false).expect("install");
+
+    assert!(!stray.exists(), "a shim file nothing references is swept");
+    assert!(shim_in(&folder).is_file());
+}
+
+/// Service B runs a file other than the one the next install provides, as one installed by another
+/// goetia version does: the install keeps it, and the two services run side by side.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn other_versions_shim_is_kept() {
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let (b_id, a_id) = (support::random_test_id(), support::random_test_id());
+    let (_b_guard, _a_guard) = (ShimGuard::new(&b_id), ShimGuard::new(&a_id));
+    let (b_started, a_started) = (ConnectBack::listen(), ConnectBack::listen());
+    let mgr = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
+    let b_spec = simple_spec(
+        &b_id,
+        fixture_command("report", &[&b_started.port().to_string()]),
+        &logs,
+    );
+    mgr.install(&b_spec, false).expect("install B");
+    // B's file is another valid name for the same host: what another version's build is.
+    let theirs = folder.join(format!("goetia-shim-{}.exe", "cd".repeat(32)));
+    std::fs::copy(shim_in(&folder), &theirs).expect("copy the shim to a second name");
+    support::cmd::run(
+        "sc.exe",
+        &["config", &b_id, "binPath=", &format!("\"{}\"", theirs.display())],
+    )
+    .expect_ok();
+
+    let a_spec = simple_spec(
+        &a_id,
+        fixture_command("report", &[&a_started.port().to_string()]),
+        &logs,
+    );
+    mgr.install(&a_spec, false).expect("install A");
+
+    assert!(theirs.is_file(), "the file a registered service runs is not swept");
+    mgr.start(&b_spec.id, Budget::DEFAULT).expect("start B");
+    mgr.start(&a_spec.id, Budget::DEFAULT).expect("start A");
+    b_started.accept("B to report in from the other file");
+    a_started.accept("A to report in from the file the install provided");
+    // B's host is not the one this goetia provides, so installing it again changes it back.
+    let again = mgr.install(&b_spec, false).expect("install B again");
+    assert!(matches!(again, Outcome::Update { .. }), "{again:?}");
+}
+
+// Uninstall ===========================================================================================================
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_leaves_nothing() {
+    let (folder, _folder_guard) = default_folder();
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let started = ConnectBack::listen();
+    let mgr = embedded_manager(None, CheckPermissions::Enable);
+    let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the daemon to report in under the shim in Program Files");
+
+    // The shim is running its own file, which cannot be deleted while it does.
+    mgr.uninstall(&spec.id).expect("uninstall");
+
+    assert!(
+        !folder.exists(),
+        "no shim file and no default folder is left: {:?}",
+        std::fs::read_dir(&folder).map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+    );
+    assert!(matches!(mgr.status(&spec.id), Err(Error::NotInstalled { .. })));
+}
+
+/// A re-provided service still runs the file it started from. Another service's uninstall leaves
+/// that file alone, and its own waits for its process and then takes both files.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_keeps_a_running_old_shim() {
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let (a_id, b_id) = (support::random_test_id(), support::random_test_id());
+    let (_a_guard, _b_guard) = (ShimGuard::new(&a_id), ShimGuard::new(&b_id));
+    let started = ConnectBack::listen();
+    let first = Scm::with_shim(embedded_shim(Some(folder.clone())), CheckPermissions::Disable);
+    let second = Scm::with_shim(
+        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())),
+        CheckPermissions::Disable,
+    );
+    let a_spec = simple_spec(&a_id, fixture_command("report", &[&started.port().to_string()]), &logs);
+    first.install(&a_spec, false).expect("install A on the first file");
+    let old = shim_in(&folder);
+    first.start(&a_spec.id, Budget::DEFAULT).expect("start A");
+    started.accept("A to report in");
+    let running = ShimProcess::attach(&a_id);
+
+    // A moves to the second file and keeps running the first.
+    let moved = second.install(&a_spec, false).expect("install A on the second file");
+    assert!(matches!(moved, Outcome::Update { .. }), "{moved:?}");
+    let new = EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone()))
+        .preview()
+        .expect("preview")
+        .exe;
+    assert!(old.is_file() && new.is_file(), "both files exist: {old:?} {new:?}");
+    let b_spec = simple_spec(&b_id, fixture_command("report", &["1"]), &logs);
+    second.install(&b_spec, false).expect("install B on the second file");
+
+    second.uninstall(&b_spec.id).expect("uninstall B");
+
+    assert!(old.is_file(), "the file A's process runs is kept");
+    assert!(new.is_file(), "the file A is registered with is kept");
+    second.uninstall(&a_spec.id).expect("uninstall A");
+    assert!(running.has_exited(), "uninstall returns once A's process is gone");
+    assert!(!old.exists() && !new.exists(), "nothing references either file now");
+}
+
+/// Two services on one file: uninstalling one returns without waiting for the other, whose process
+/// runs the file, and leaves the file and the process alone.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_of_one_of_two_on_a_file_returns() {
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let (a_id, b_id) = (support::random_test_id(), support::random_test_id());
+    let (_a_guard, _b_guard) = (ShimGuard::new(&a_id), ShimGuard::new(&b_id));
+    let started = ConnectBack::listen();
+    let mgr = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
+    let a_spec = simple_spec(&a_id, fixture_command("report", &["1"]), &logs);
+    let b_spec = simple_spec(&b_id, fixture_command("report", &[&started.port().to_string()]), &logs);
+    mgr.install(&a_spec, false).expect("install A");
+    mgr.install(&b_spec, false).expect("install B");
+    mgr.start(&b_spec.id, Budget::DEFAULT).expect("start B");
+    started.accept("B to report in");
+    let running = ShimProcess::attach(&b_id);
+
+    mgr.uninstall(&a_spec.id)
+        .expect("uninstall A, which does not wait for B");
+
+    assert!(shim_in(&folder).is_file(), "B still runs the file");
+    assert!(!running.has_exited(), "B keeps running");
+    assert_eq!(mgr.status(&b_spec.id).expect("status").state, State::Running);
+}
+
+/// A service registered under another folder than the manager's: its uninstall sweeps that one too.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_sweeps_the_other_folder() {
+    let (_default, _default_guard) = default_folder();
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let theirs = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
+    let ours = embedded_manager(None, CheckPermissions::Enable);
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+    theirs.install(&spec, false).expect("install under the other folder");
+    assert!(shim_in(&folder).is_file());
+
+    ours.uninstall(&spec.id).expect("uninstall");
+
+    assert!(!shim_in(&folder).exists(), "the service's own folder is swept too");
+}
+
+/// `uninstall` of an id that is not installed is the retry of a sweep that failed.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_retry_sweeps() {
+    let (_root, folder) = temp_shim_folder();
+    let stray = stray_shim_in(&folder);
+    let mgr = embedded_manager(Some(folder), CheckPermissions::Disable);
+    let id = goetia::spec::Id::try_from(support::random_test_id().as_str()).expect("a test id is an Id");
+
+    let result = mgr.uninstall(&id);
+
+    assert!(matches!(result, Err(Error::NotInstalled { .. })), "{result:?}");
+    assert!(!stray.exists(), "the retry sweeps");
 }

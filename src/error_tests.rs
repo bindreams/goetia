@@ -233,6 +233,39 @@ fn report_prints_both_halves() {
 }
 
 #[skuld::test]
+fn both_all_folds_in_order() {
+    assert!(Error::both_all([]).is_none());
+
+    let one = Error::both_all([os("remove", "/a", "boom")]).unwrap();
+    assert!(matches!(one, Error::Os { .. }), "{one:?}");
+
+    let three = Error::both_all([
+        os("remove", "/a", "one"),
+        os("remove", "/b", "two"),
+        os("remove", "/c", "three"),
+    ])
+    .unwrap();
+    assert_eq!(
+        three.report().to_string(),
+        "failed to remove /a: one; then: failed to remove /b: two; then: failed to remove /c: three"
+    );
+}
+
+#[skuld::test]
+fn a_shim_lock_owned_by_another_account_names_it() {
+    let e = Error::ShimLockForeign {
+        account: r"EVE\eve".to_string(),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "the install lock `Global\\goetia-shim` is owned by EVE\\eve, which is not SYSTEM or Administrators, so it \
+         cannot be trusted to serialise installs: end that account's processes that hold it"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+    assert!(!e.is_indeterminate());
+}
+
+#[skuld::test]
 fn report_prints_a_both_under_a_step_once() {
     let e = Error::Step {
         what: "uninstall".to_string(),
