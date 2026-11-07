@@ -9,7 +9,7 @@
 //!
 //! `mode` (default `plain`):
 //! - `plain` — connect to `start-port` with no payload, then wait for
-//!   `SERVICE_CONTROL_STOP`, report `STOPPED`, connect to `stop-port`.
+//!   `SERVICE_CONTROL_STOP`, connect to `stop-port`, report `STOPPED`.
 //! - `env:<VAR>` — like `plain`, but writes `<VAR>`'s value read from this
 //!   process's own environment (or `\0MISSING` if unset) to the
 //!   `start-port` connection instead of just connecting — see
@@ -76,6 +76,5 @@ fn service_main(_scm_arguments: Vec<OsString>) {
     // A real rendezvous with the control handler thread: this returns when
     // SCM delivers the stop, and not before.
     stop_rx.recv().expect("stop control");
-    service_ctrl::report_stopped(status_handle);
-    connect(stop_port);
+    service_ctrl::report_stopped_after(status_handle, || connect(stop_port));
 }

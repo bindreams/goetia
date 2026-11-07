@@ -45,8 +45,11 @@ pub fn report_running(handle: StatusHandle, accept_stop: bool) {
     );
 }
 
-/// Report `STOPPED` with exit code 0.
-pub fn report_stopped(handle: StatusHandle) {
+/// Run `signal`, then report `STOPPED` with exit code 0. The dispatcher returns, and the process
+/// may exit, once every service is `STOPPED`, so anything the host must still do (the stop signal
+/// the test waits for) goes in `signal`, before the report.
+pub fn report_stopped_after(handle: StatusHandle, signal: impl FnOnce()) {
+    signal();
     report(handle, SERVICE_STOPPED, 0);
 }
 

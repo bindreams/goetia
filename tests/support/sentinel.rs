@@ -70,9 +70,12 @@ pub fn run_if_requested() -> bool {
 
 /// Reporting in is best-effort: a failure to connect is indistinguishable to
 /// this process from never having been started, and it is the test — which
-/// holds the listener — that decides what that means.
+/// holds the listener — that decides what that means. The failure is logged to
+/// stderr, the fixture's only trace.
 pub fn connect(port: u16) {
-    drop(TcpStream::connect((Ipv4Addr::LOCALHOST, port)));
+    if let Err(e) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
+        eprintln!("connect to 127.0.0.1:{port} failed: {e}");
+    }
 }
 
 /// [`connect`], then send `value` as the payload.
@@ -123,7 +126,6 @@ mod windows {
         // A real rendezvous with the control handler thread: the recv returns
         // when SCM delivers the stop, and not before.
         stop_rx.recv().expect("stop control");
-        service_ctrl::report_stopped(status_handle);
-        super::connect(stop_port);
+        service_ctrl::report_stopped_after(status_handle, || super::connect(stop_port));
     }
 }
