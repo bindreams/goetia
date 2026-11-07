@@ -8,15 +8,19 @@
 //! refuse to load the unit outright. `ExecStart=`/`Environment=` values
 //! are additionally quoted per systemd's command-line grammar when they
 //! contain whitespace or a quoting-relevant character; `ExecStart=`
-//! further doubles `$` (systemd performs `$FOO`/`${FOO}` environment
-//! substitution there), quotes a bare `;` argument (systemd's
-//! command-line separator), and quotes `command[0]` if it would otherwise
-//! start with one of systemd's command-prefix characters (`-@:+!`).
+//! further doubles `$` in its arguments (systemd performs `$FOO`/`${FOO}` environment
+//! substitution there, but not in the executable path; it does in argv[0], so a path holding `$`
+//! is written `@<path> <argv[0]>`), and quotes a bare `;` argument (systemd's
+//! command-line separator).
+//!
+//! Backslashes are never refused: a quoted word doubles each, and a raw value ending in an odd
+//! run of them gets a trailing space (see [`raw_value`]). The values no encoding can carry are
+//! refused by [`unit`]: see [`refuse_unrepresentable`].
 
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Restart};
+use crate::spec::{DaemonSpec, Restart, systemd_defect, systemd_raw_value_defect};
 
 // Generation ==========================================================================================================
 
@@ -31,6 +35,8 @@ use crate::spec::{DaemonSpec, Restart};
 /// `unit(&extract(&unit(spec, id)).unwrap().unwrap().spec, id)` must be
 /// byte-identical to `unit(spec, id)`.
 ///
+/// Fails with [`Error::Invalid`] for the values [`refuse_unrepresentable`] lists.
+///
 /// Emits `Type=exec` (requires systemd 240+, 2018): `systemd.service(5)` recommends it for
 /// long-running services "as it ensures that process setup errors (e.g. errors such as a missing
 /// service executable, or missing user) are properly tracked", which `Type=simple` does not —
@@ -44,11 +50,12 @@ use crate::spec::{DaemonSpec, Restart};
 /// hand-edited: `decide`'s version-mismatch check (`src/decide.rs`) is what tells "stale, regenerate
 /// silently" from "conflict, demand `--force`" apart, and it runs before either `desired` or
 /// `regenerated` is even compared.
-pub fn unit(spec: &DaemonSpec, id: &Identity) -> String {
+pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
+    refuse_unrepresentable(spec, id)?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
-    out.push_str(&format!("Description={}\n", double_percent(&spec.name)));
+    out.push_str(&format!("Description={}\n", raw_value(&spec.name)));
     if spec.restart != Restart::Never {
         // systemd's defaults (`DefaultStartLimitIntervalSec=10s`,
         // `StartLimitBurst=5`) put a unit permanently into `failed` after
@@ -63,21 +70,18 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> String {
     out.push_str("Type=exec\n");
     out.push_str(&format!("ExecStart={}\n", render_exec_start(&spec.command)));
     if let Some(cwd) = &spec.cwd {
-        out.push_str(&format!(
-            "WorkingDirectory={}\n",
-            double_percent(&cwd.display().to_string())
-        ));
+        out.push_str(&format!("WorkingDirectory={}\n", raw_value(&cwd.display().to_string())));
     }
     for (key, value) in &spec.env {
         out.push_str(&format!("Environment={}\n", render_environment(key, value)));
     }
-    out.push_str(&format!("User={}\n", double_percent(&id.user)));
+    out.push_str(&format!("User={}\n", raw_value(&id.user)));
     out.push_str(&format!("Restart={}\n", render_restart(spec.restart)));
     if let Some(delay) = spec.restart_delay {
         out.push_str(&format!("RestartSec={}\n", delay.as_secs_f64()));
     }
     if let Some(logs) = &spec.logs {
-        let target = format!("append:{}", double_percent(&logs.display().to_string()));
+        let target = format!("append:{}", raw_value(&logs.display().to_string()));
         out.push_str(&format!("StandardOutput={target}\n"));
         out.push_str(&format!("StandardError={target}\n"));
     }
@@ -93,8 +97,28 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> String {
     out.push_str(&format!("Version={}\n", crate::version()));
     out.push_str(&format!("Spec={}\n", blob::encode(spec)));
 
-    out
+    Ok(out)
 }
+
+/// Refuse what no encoding can carry: the manifest's values ([`systemd_defect`], which lists each rule
+/// with its measurement, and which `resolve` runs too, since a `DaemonSpec` can come from a blob that
+/// never passed it) and the `User=` identity. The list is what is refused, not everything systemd
+/// cannot carry.
+fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error> {
+    let defect = systemd_defect(spec).or_else(|| systemd_raw_value_defect("User=", &id.user));
+    match defect {
+        Some(message) => Err(Error::Invalid {
+            daemon: spec.id.to_string(),
+            message,
+            source: None,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The characters systemd reads as a prefix of `ExecStart=`'s first word, after unquoting, and
+/// which quoting does not make literal (measured on 242 and 255).
+const COMMAND_PREFIXES: [char; 5] = ['-', '@', ':', '+', '!'];
 
 /// systemd's `Restart=` vocabulary.
 fn render_restart(restart: Restart) -> &'static str {
@@ -105,37 +129,46 @@ fn render_restart(restart: Restart) -> &'static str {
     }
 }
 
-/// Render `ExecStart=`'s value: each argument percent- and dollar-doubled,
-/// then quoted per systemd's command-line syntax wherever quoting is
-/// needed for readback (whitespace or a quoting-relevant character), or
-/// wherever an unquoted word would take on a meaning of its own — a bare
-/// `;` (systemd's command-line separator) or, for `command[0]` only, a
-/// leading `-`/`@`/`:`/`+`/`!` (systemd's command-prefix characters,
-/// e.g. `+` for elevated-privilege execution — a plain executable name
-/// that happens to start with one must not be reinterpreted as that
-/// directive).
+/// Render `ExecStart=`'s value: each word percent-doubled, then quoted per systemd's command-line
+/// syntax wherever quoting is needed for readback (whitespace or a quoting-relevant character),
+/// or wherever an unquoted word would take on a meaning of its own: a bare `;` (systemd's
+/// command-line separator).
+///
+/// `command[0]` is an absolute path (`DaemonSpec::new`), so it never starts with a command-prefix
+/// character (`-@:+!`), which quoting would not make literal.
+///
+/// Arguments are also dollar-doubled, since systemd substitutes `$FOO`/`${FOO}` and collapses
+/// `$$` there. The executable path is not: systemd takes it as written. But it substitutes in
+/// argv[0] too, so a path holding `$` is written as `@<path> <argv[0], dollar-doubled>`, where
+/// `@` makes the next word argv[0] (measured on 242 and 255). A path without `$` is one word.
 fn render_exec_start(command: &[String]) -> String {
-    command
-        .iter()
-        .enumerate()
-        .map(|(index, arg)| render_exec_arg(arg, index == 0))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let (executable, arguments) = command.split_first().expect("a daemon has a command");
+    debug_assert!(
+        !executable.starts_with(COMMAND_PREFIXES),
+        "`command[0]` {executable:?} is not an absolute path, which `DaemonSpec::new` guarantees"
+    );
+    let mut words = Vec::with_capacity(command.len() + 1);
+    if executable.contains('$') {
+        words.push(render_exec_word(&double_percent(&format!("@{executable}"))));
+        words.push(render_exec_arg(executable));
+    } else {
+        words.push(render_exec_word(&double_percent(executable)));
+    }
+    words.extend(arguments.iter().map(|arg| render_exec_arg(arg)));
+    words.join(" ")
 }
 
-fn render_exec_arg(arg: &str, is_executable: bool) -> String {
-    // `ExecStart=` is systemd's "command line" grammar: on top of `%`
-    // specifiers, it performs `$FOO`/`${FOO}` environment-variable
-    // substitution, so `$` needs doubling here exactly as `%` does.
-    let escaped = double_percent(arg).replace('$', "$$");
+fn render_exec_arg(arg: &str) -> String {
+    render_exec_word(&double_percent(arg).replace('$', "$$"))
+}
 
+fn render_exec_word(escaped: &str) -> String {
     let is_bare_separator = escaped == ";";
-    let is_command_prefix = is_executable && escaped.starts_with(['-', '@', ':', '+', '!']);
 
-    if needs_quoting(&escaped) || is_bare_separator || is_command_prefix {
-        quote(&escaped)
+    if needs_quoting(escaped) || is_bare_separator {
+        quote(escaped)
     } else {
-        escaped
+        escaped.to_string()
     }
 }
 
@@ -143,7 +176,7 @@ fn render_exec_arg(arg: &str, is_executable: bool) -> String {
 /// quoted as a single token so an embedded space cannot split it into two
 /// assignments. `Environment=` is not systemd's command-line grammar, so
 /// unlike `ExecStart=` it gets neither `$`-doubling nor the
-/// separator/prefix-character treatment.
+/// separator treatment.
 fn render_environment(key: &str, value: &str) -> String {
     let escaped = double_percent(&format!("{key}={value}"));
     if needs_quoting(&escaped) {
@@ -156,6 +189,26 @@ fn render_environment(key: &str, value: &str) -> String {
 /// Double every `%` in `s` — see the module doc for why.
 fn double_percent(s: &str) -> String {
     s.replace('%', "%%")
+}
+
+/// A directive's value as systemd reads it verbatim: `Description=`, `WorkingDirectory=`,
+/// `User=` and the `append:` log path take no unquoting, only specifiers.
+///
+/// A line ending in a backslash continues onto the next line, which would swallow the directive
+/// after it (`User=` among them). systemd drops trailing whitespace after that check, so a
+/// space behind an odd run of trailing backslashes ends the line and leaves the value intact; an
+/// even run does not continue and is written as is.
+fn raw_value(s: &str) -> String {
+    let mut out = double_percent(s);
+    if trailing_backslash_run(&out) % 2 == 1 {
+        out.push(' ');
+    }
+    out
+}
+
+/// How many backslashes end `s`.
+fn trailing_backslash_run(s: &str) -> usize {
+    s.len() - s.trim_end_matches('\\').len()
 }
 
 /// Whether `s` needs systemd command-line quoting: it is empty, or

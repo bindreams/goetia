@@ -404,8 +404,7 @@ fn account_needs_password_is_true_for_a_real_account() {
 /// one this function itself appends at the end) so the quote can't be
 /// swallowed by the backslashes ahead of it.
 fn windows_style_escape(s: &str) -> String {
-    const ESCAPE_CHARS: [char; 5] = ['"', ' ', '\n', '\t', '\u{000B}'];
-    if !s.is_empty() && !s.chars().any(|c| ESCAPE_CHARS.contains(&c)) {
+    if !s.is_empty() && !s.chars().any(|c| WRITER_QUOTE_TRIGGERS.iter().any(|(t, _)| *t == c)) {
         return s.to_string();
     }
 
@@ -851,6 +850,171 @@ fn registration_refuses_restart_always() {
         assert!(text.contains("restart: always"), "{text}");
         assert!(text.contains("backend-specific: scm"), "the remedy is missing: {text}");
     }
+}
+
+// The executable must survive the `windows-service` writer ============================================================
+
+// These executables are Windows paths, which `DaemonSpec::new` accepts only on a Windows host.
+
+#[cfg(windows)]
+fn managed_with_executable(executable: &str) -> DaemonSpec {
+    DaemonSpec::new(plain_fields("frpc", vec![executable.to_string(), "arg".to_string()])).unwrap()
+}
+
+/// Executables whose argv[0] the writer reads back exactly, and ones it does not.
+#[cfg(windows)]
+const EXECUTABLES_THE_WRITER_KEEPS: &[&str] = &[
+    r"C:\frpc",
+    r"C:\no\spaces\here",
+    r"C:\no\spaces\here\",
+    r"C:\no\spaces\here\\",
+    r"C:\some dir\x",
+    r"C:\some\back\slashes dir\x\y",
+];
+#[cfg(windows)]
+const EXECUTABLES_THE_WRITER_MANGLES: &[&str] = &[
+    r"C:\some dir\x\",
+    r"C:\some dir\x\\",
+    r"C:\some dir\x\\\",
+    r#"C:\some"dir\x"#,
+    r#"C:\a"b"#,
+];
+
+#[cfg(windows)]
+#[skuld::test]
+fn managed_refuses_an_executable_the_writer_would_mangle() {
+    for executable in EXECUTABLES_THE_WRITER_MANGLES {
+        let spec = managed_with_executable(executable);
+        let err = registration(&spec, &identity(), &shim_path()).expect_err(&format!(
+            "{executable:?} is rewritten by the writer and must be refused"
+        ));
+
+        assert!(
+            matches!(&err, Error::Invalid { daemon, .. } if daemon.as_str() == "frpc"),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("service registration"), "the reason is missing: {text}");
+        assert!(!text.contains("systemd"), "wrong backend named: {text}");
+        // The user wrote `command[0]`; the message names it and the path it became.
+        assert!(text.contains("`command[0]`"), "{executable:?}: {text}");
+        assert!(text.contains(&format!("{executable:?}")), "{executable:?}: {text}");
+        assert!(
+            !text.contains("shim"),
+            "{executable:?}: a spec error is not the shim's: {text}"
+        );
+    }
+}
+
+/// The message names the triggering character, not always "a space" (a shim path can hold a tab).
+#[cfg(windows)]
+#[skuld::test]
+fn the_refusal_names_the_character_that_forced_the_quoting() {
+    let cases = [
+        (r#"C:\a"b"#, "double quote", "space"),
+        (r#"C:\a b"c"#, "double quote", "space"),
+        (r"C:\a b\", "space", "double quote"),
+    ];
+    for (executable, named, not_named) in cases {
+        let err = registration(&managed_with_executable(executable), &identity(), &shim_path())
+            .expect_err(&format!("{executable:?} must be refused"));
+        let text = err.to_string();
+        assert!(text.contains(named), "{executable:?} should name a {named}: {text}");
+        assert!(
+            !text.contains(not_named),
+            "{executable:?} must not name a {not_named}: {text}"
+        );
+    }
+
+    let shim_cases = [
+        (r#"C:\a"b\x"#, "double quote", "tab"),
+        ("C:\\a\tb\\", "tab", "space"),
+        ("C:\\a\nb\\", "newline", "space"),
+        ("C:\\a\u{b}b\\", "vertical tab", "space"),
+    ];
+    for (shim, named, not_named) in shim_cases {
+        let err = install_registration(&simple_spec(), &identity(), Path::new(shim))
+            .expect_err(&format!("{shim:?} must be refused"));
+        let text = err.to_string();
+        assert!(text.contains(named), "{shim:?} should name a {named}: {text}");
+        assert!(
+            !text.contains(not_named),
+            "{shim:?} must not name a {not_named}: {text}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn managed_accepts_an_executable_the_writer_keeps() {
+    for executable in EXECUTABLES_THE_WRITER_KEEPS {
+        let spec = managed_with_executable(executable);
+        registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{executable:?}: {e}"));
+    }
+}
+
+/// The refusal is exactly the set the writer does not round-trip, for the argv[0] rule the real
+/// `CommandLineToArgvW` applies (`windows_style_split_matches_real_command_line_to_argv_w`).
+#[cfg(windows)]
+#[skuld::test]
+fn executable_refusal_matches_what_the_writer_loses() {
+    for executable in EXECUTABLES_THE_WRITER_KEEPS
+        .iter()
+        .chain(EXECUTABLES_THE_WRITER_MANGLES)
+    {
+        let read_back = windows_style_split(&windows_style_command_line(executable, &["arg"]));
+        let refused = registration(&managed_with_executable(executable), &identity(), &shim_path()).is_err();
+        assert_eq!(
+            refused,
+            read_back[0] != *executable,
+            "{executable:?} reads back as {:?}",
+            read_back[0]
+        );
+    }
+}
+
+/// The shim path goes through the same writer, so the install and `diff` refuse a bad one
+/// (`install_registration`).
+#[skuld::test]
+fn simple_refuses_a_shim_path_the_writer_would_mangle() {
+    let shim = PathBuf::from(r"C:\Program Files\Goetia\");
+    let err =
+        install_registration(&simple_spec(), &identity(), &shim).expect_err("a mangled shim path must be refused");
+    let text = err.to_string();
+    assert!(text.contains("service registration"), "{text}");
+    // No manifest sets the shim path: the message names it and its forcing character, and does
+    // not blame `command[0]`, name where the path came from, or send the user to an install location.
+    assert!(text.contains("goetia-shim path"), "{text}");
+    assert!(!text.contains("GOETIA_SHIM_PATH"), "{text}");
+    assert!(!text.contains("installed"), "{text}");
+    assert!(text.contains(&format!("{:?}", shim.display().to_string())), "{text}");
+    assert!(text.contains("space"), "{text}");
+    assert!(!text.contains("command[0]"), "{text}");
+
+    install_registration(&simple_spec(), &identity(), &shim_path()).unwrap();
+}
+
+/// Rendering a `type: simple` daemon never fails for the shim path, whatever it is.
+#[skuld::test]
+fn rendering_a_simple_daemon_does_not_judge_the_shim_path() {
+    for shim in [r"C:\Program Files\Goetia\", r#"C:\a"b\x"#] {
+        registration(&simple_spec(), &identity(), Path::new(shim)).unwrap_or_else(|e| panic!("{shim:?}: {e}"));
+    }
+}
+
+/// What install writes and `diff` shows is the registration, once the shim path is accepted.
+#[skuld::test]
+fn an_accepted_shim_path_gives_the_registration_itself() {
+    let shim = shim_path();
+    let installed = install_registration(&simple_spec(), &identity(), &shim).unwrap();
+    let rendered = registration(&simple_spec(), &identity(), &shim).unwrap();
+    assert_eq!(installed.to_string(), rendered.to_string());
+}
+
+/// A `type: managed` daemon has no shim: its own `command[0]` is what is judged, at rendering.
+#[skuld::test]
+fn a_managed_daemon_is_not_held_to_the_shim_path() {
+    install_registration(&managed_spec(), &identity(), Path::new(r"C:\Program Files\Goetia\")).unwrap();
 }
 
 #[skuld::test]

@@ -1,6 +1,8 @@
 //! RAII cleanup for the real system services the probes register.
 //!
-//! A guard exists before the write it cleans up.
+//! A guard exists before the write it cleans up. Each guard is declared where the thing it
+//! removes is created, in creation order: locals drop in reverse, so a thing is removed only
+//! after everything that uses it.
 //!
 //! On macOS it boots the job out and removes only
 //! `/Library/LaunchDaemons/<id>.plist`, not goetia's staging directory. A

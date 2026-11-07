@@ -205,7 +205,8 @@ impl Backend for Scm {
     type InstallScope = ();
     type Reservation = ();
 
-    /// SCM has nothing to hold across an install: its preconditions are `apply`'s, before any write.
+    /// SCM has nothing to hold across an install: its preconditions are `render_for_install`'s and
+    /// `apply`'s, before any write.
     fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
         Ok(())
     }
@@ -218,6 +219,12 @@ impl Backend for Scm {
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.user)?;
         generate::registration(spec, &identity, &shim_path())
+    }
+
+    /// The shim path is read once, for the check and the registration alike.
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+        let identity = identity::resolve(&spec.user)?;
+        generate::install_registration(spec, &identity, &shim_path())
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
@@ -465,7 +472,7 @@ fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Arc<Error>>) -> E
 /// `tests/shim_integration.rs`'s own `main` sets it once, before any test
 /// runs — see that file's doc comment for why a plain `current_exe()`-based
 /// guess cannot find the shim binary from inside a test crate.
-fn shim_path() -> PathBuf {
+pub(crate) fn shim_path() -> PathBuf {
     if let Some(overridden) = std::env::var_os("GOETIA_SHIM_PATH") {
         return PathBuf::from(overridden);
     }

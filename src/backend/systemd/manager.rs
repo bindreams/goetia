@@ -144,7 +144,7 @@ impl Backend for Systemd {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
-        Ok(generate::unit(spec, &identity_for(&spec.user)?))
+        generate::unit(spec, &identity_for(&spec.user)?)
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Fragment>> {
