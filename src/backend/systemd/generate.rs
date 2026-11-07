@@ -8,8 +8,8 @@
 //! refuse to load the unit outright. `ExecStart=`/`Environment=` values
 //! are additionally quoted per systemd's command-line grammar when they
 //! contain whitespace or a quoting-relevant character; `ExecStart=`
-//! further doubles `$` (systemd performs `$FOO`/`${FOO}` environment
-//! substitution there), quotes a bare `;` argument (systemd's
+//! further doubles `$` in its arguments (systemd performs `$FOO`/`${FOO}` environment
+//! substitution there, but not in the executable path), quotes a bare `;` argument (systemd's
 //! command-line separator), and quotes `command[0]` if it would otherwise
 //! start with one of systemd's command-prefix characters (`-@:+!`).
 //!
@@ -20,7 +20,7 @@
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Restart};
+use crate::spec::{DaemonSpec, Restart, is_valid_name};
 
 // Generation ==========================================================================================================
 
@@ -105,8 +105,11 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
 /// - The executable path of `ExecStart=` (after unquoting and specifiers) holding a backslash,
 ///   `"` or `'`: systemd refuses the whole unit with "Executable name contains special
 ///   characters", however the word was quoted. Later arguments take all three.
-/// - An executable path ending in a space: systemd keeps the path but the service exits with
-///   203/EXEC. Interior spaces, other trailing whitespace and later arguments are fine.
+/// - An executable path ending in a space: systemd 255 keeps the path but the service exits with
+///   203/EXEC (242 runs it; both are refused). Interior spaces, other trailing whitespace and
+///   later arguments are fine.
+/// - An `env` key outside `[A-Za-z_][A-Za-z0-9_]*`: systemd logs "Invalid environment
+///   assignment, ignoring" and drops it, and the unit still loads and starts.
 /// - A raw directive (`Description=`, `User=`, `WorkingDirectory=`, the `append:` path) with
 ///   leading or trailing whitespace: systemd strips it, and no quote, C escape or line
 ///   continuation keeps it. `cwd` and `logs` are absolute, so only their end can be affected.
@@ -117,17 +120,27 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
         source: None,
     };
 
+    // `command[0]` was made absolute against the manifest directory, so the path refused here may
+    // hold characters the user never wrote in it.
     let executable = &spec.command[0];
     if executable.contains(['\\', '"', '\'']) {
         return Err(invalid(format!(
-            "`command[0]` {executable:?} holds a backslash, double quote or apostrophe, which systemd \
-             refuses to load in an executable path"
+            "the executable path {executable:?} (`command[0]`, made absolute against the manifest directory) \
+             holds a backslash, double quote or apostrophe, which systemd refuses to load in an \
+             executable path"
         )));
     }
     if executable.ends_with(' ') {
         return Err(invalid(format!(
-            "`command[0]` {executable:?} ends in whitespace, which systemd does not run (the service \
-             exits with 203/EXEC)"
+            "the executable path {executable:?} (`command[0]`, made absolute against the manifest directory) \
+             ends in whitespace, which systemd does not run (the service exits with 203/EXEC)"
+        )));
+    }
+    if let Some(key) = spec.env.keys().find(|key| !is_valid_name(key)) {
+        return Err(invalid(format!(
+            "`env` key {key:?} is not a name systemd accepts in Environment=: it must match \
+             [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the \
+             daemon would never see it"
         )));
     }
 
@@ -185,8 +198,14 @@ fn render_exec_start(command: &[String]) -> String {
 fn render_exec_arg(arg: &str, is_executable: bool) -> String {
     // `ExecStart=` is systemd's "command line" grammar: on top of `%`
     // specifiers, it performs `$FOO`/`${FOO}` environment-variable
-    // substitution, so `$` needs doubling here exactly as `%` does.
-    let escaped = double_percent(arg).replace('$', "$$");
+    // substitution in the arguments, so `$` needs doubling there exactly as `%` does. The
+    // executable path takes no substitution and no `$$` collapse (measured on 242 and 255):
+    // doubling it would name another file.
+    let escaped = if is_executable {
+        double_percent(arg)
+    } else {
+        double_percent(arg).replace('$', "$$")
+    };
 
     let is_bare_separator = escaped == ";";
     let is_command_prefix = is_executable && escaped.starts_with(['-', '@', ':', '+', '!']);

@@ -219,7 +219,8 @@ fn preview_root_account() -> String {
     "root".to_string()
 }
 
-/// The generated artifact for `spec`, or the generator's refusal of it (scm refuses `restart: always`).
+/// The generated artifact for `spec`, or the generator's refusal of it: scm refuses `restart: always` and
+/// an executable path its registration writer rewrites; systemd refuses a value no unit-file encoding carries.
 ///
 /// `err` is threaded through on every platform so a generator warning cannot
 /// be dropped; no generator produces a [`crate::spec::Warning`] here today.

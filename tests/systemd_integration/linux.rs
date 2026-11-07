@@ -1973,9 +1973,11 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
 
     let mut spec = mk(guard.id()).into_fields();
     spec.name = "Backslash name\\".to_string();
+    // The shell ignores the arguments after the script, so the unit starts and stays up.
     spec.command = vec![
-        "/bin/sleep".to_string(),
-        "infinity".to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "exec sleep infinity".to_string(),
         "C:\\".to_string(),
         "a\\\\b".to_string(),
         " a ".to_string(),
@@ -1988,7 +1990,8 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
     ]);
     let spec = DaemonSpec::new(spec).unwrap();
 
-    Systemd::new().install(&spec, false).expect("install");
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
 
     let unit = format!("{}.service", guard.id());
     let show = |property: &str| {
@@ -2004,12 +2007,29 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
     // A quoted word keeps its edge whitespace; `show` joins the arguments with one space.
     assert_eq!(show("Environment"), "\"K=C:\\\\\" \"L= v \"");
     assert!(
-        show("ExecStart").contains("argv[]=/bin/sleep infinity C:\\ a\\\\b  a  ;"),
+        show("ExecStart").contains("argv[]=/bin/sh -c exec sleep infinity C:\\ a\\\\b  a  ;"),
         "{}",
         show("ExecStart")
     );
     // The line after the description and the working directory was not swallowed.
     assert_eq!(show("User"), "0");
+
+    // `show` does not print the `append:` path, so start the unit: systemd creates the file at
+    // exactly that path before it execs, in the working directory it could enter only if it read
+    // that one back exactly too.
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    let mut entries: Vec<_> = fs::read_dir(&base)
+        .unwrap_or_else(|e| panic!("read {}: {e}", base.display()))
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        [
+            std::ffi::OsString::from("log\\\\\\"),
+            std::ffi::OsString::from("work\\")
+        ]
+    );
 }
 
 // A unit `list` could not read is reported, never omitted =============================================================

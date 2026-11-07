@@ -413,8 +413,7 @@ fn account_needs_password_is_true_for_a_real_account() {
 /// one this function itself appends at the end) so the quote can't be
 /// swallowed by the backslashes ahead of it.
 fn windows_style_escape(s: &str) -> String {
-    const ESCAPE_CHARS: [char; 5] = ['"', ' ', '\n', '\t', '\u{000B}'];
-    if !s.is_empty() && !s.chars().any(|c| ESCAPE_CHARS.contains(&c)) {
+    if !s.is_empty() && !s.chars().any(|c| WRITER_QUOTE_TRIGGERS.iter().any(|(t, _)| *t == c)) {
         return s.to_string();
     }
 
@@ -903,6 +902,52 @@ fn managed_refuses_an_executable_the_writer_would_mangle() {
         let text = err.to_string();
         assert!(text.contains("service registration"), "the reason is missing: {text}");
         assert!(!text.contains("systemd"), "wrong backend named: {text}");
+        // The user wrote `command[0]`; the message names it and the path it became.
+        assert!(text.contains("`command[0]`"), "{executable:?}: {text}");
+        assert!(text.contains(&format!("{executable:?}")), "{executable:?}: {text}");
+        assert!(
+            !text.contains("shim"),
+            "{executable:?}: a spec error is not the shim's: {text}"
+        );
+    }
+}
+
+/// The refusal says which character the writer acted on, not always "a space". A `command[0]`
+/// cannot hold a tab, newline or vertical tab (control characters are refused earlier); a shim
+/// path can.
+#[skuld::test]
+fn the_refusal_names_the_character_that_forced_the_quoting() {
+    let cases = [
+        (r#"a"b"#, "double quote", "space"),
+        (r#"C:\a b"c"#, "double quote", "space"),
+        (r"C:\a b\", "space", "double quote"),
+    ];
+    for (executable, named, not_named) in cases {
+        let err = registration(&managed_with_executable(executable), &identity(), &shim_path())
+            .expect_err(&format!("{executable:?} must be refused"));
+        let text = err.to_string();
+        assert!(text.contains(named), "{executable:?} should name a {named}: {text}");
+        assert!(
+            !text.contains(not_named),
+            "{executable:?} must not name a {not_named}: {text}"
+        );
+    }
+
+    let shim_cases = [
+        (r#"C:\a"b\x"#, "double quote", "tab"),
+        ("C:\\a\tb\\", "tab", "space"),
+        ("C:\\a\nb\\", "newline", "space"),
+        ("C:\\a\u{b}b\\", "vertical tab", "space"),
+    ];
+    for (shim, named, not_named) in shim_cases {
+        let err =
+            registration(&simple_spec(), &identity(), Path::new(shim)).expect_err(&format!("{shim:?} must be refused"));
+        let text = err.to_string();
+        assert!(text.contains(named), "{shim:?} should name a {named}: {text}");
+        assert!(
+            !text.contains(not_named),
+            "{shim:?} must not name a {not_named}: {text}"
+        );
     }
 }
 
@@ -938,7 +983,14 @@ fn executable_refusal_matches_what_the_writer_loses() {
 fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     let shim = PathBuf::from(r"C:\Program Files\Goetia\");
     let err = registration(&simple_spec(), &identity(), &shim).expect_err("a mangled shim path must be refused");
-    assert!(err.to_string().contains("service registration"), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("service registration"), "{text}");
+    // Where goetia is installed is not something the manifest says: the message names the shim
+    // and its path, and does not blame `command[0]`.
+    assert!(text.contains("goetia-shim"), "{text}");
+    assert!(text.contains(&format!("{:?}", shim.display().to_string())), "{text}");
+    assert!(text.contains("space"), "{text}");
+    assert!(!text.contains("command[0]"), "{text}");
 
     registration(&simple_spec(), &identity(), &shim_path()).unwrap();
 }

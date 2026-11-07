@@ -386,6 +386,24 @@ fn argv_dollar_sign_is_doubled() {
 }
 
 #[skuld::test]
+fn a_dollar_in_the_executable_path_is_not_doubled() {
+    // systemd takes the executable path as written: no `$FOO` substitution and no `$$` collapse
+    // (measured on 242 and 255), so a doubled `$` would name a different file. Later arguments
+    // keep the doubling (`argv_dollar_sign_is_doubled`).
+    for (executable, written) in [
+        ("/opt/a$b/bin", "ExecStart=/opt/a$b/bin $$X"),
+        ("/opt/a${b}/bin", "ExecStart=/opt/a${b}/bin $$X"),
+        ("/opt/a$$b/bin", "ExecStart=/opt/a$$b/bin $$X"),
+        ("/opt/bin$", "ExecStart=/opt/bin$ $$X"),
+    ] {
+        let spec = with_fields(|f| f.command = vec![executable.to_string(), "$X".to_string()]);
+        let text = unit(&spec, &minimal_identity()).unwrap();
+        assert_eq!(line_of(&text, "ExecStart="), written, "{executable:?}");
+        assert_eq!(extract(&text).unwrap().unwrap().spec, spec, "{executable:?}");
+    }
+}
+
+#[skuld::test]
 fn argv_command_prefix_character_on_the_executable_is_quoted() {
     // A leading `-`/`@`/`:`/`+`/`!` on ExecStart='s first word is a
     // systemd command-prefix directive (e.g. `+` runs with elevated
@@ -424,7 +442,7 @@ fn percent_is_doubled_in_every_value() {
         name: "100% Uptime".to_string(),
         command: vec!["cmd%1".to_string(), "arg%2 with space".to_string()],
         cwd: Some(abs("opt/a%b")),
-        env: BTreeMap::from([("K%EY".to_string(), "v%alue".to_string())]),
+        env: BTreeMap::from([("KEY".to_string(), "v%alue".to_string())]),
         user: User::Name("ignored-by-generate".to_string()),
         restart: Restart::OnFailure,
         restart_delay: None,
@@ -455,7 +473,7 @@ fn percent_is_doubled_in_every_value() {
 
 // Backslashes =========================================================================================================
 //
-// Every expectation below was measured against systemd 255: a line-ending backslash continues the
+// Every expectation below was measured against systemd 242 and 255: a line-ending backslash continues the
 // line, and the reader drops trailing whitespace, so a raw value gets one trailing space; a
 // quoted word reads `\\` as one backslash and needs no guard.
 
@@ -640,7 +658,11 @@ fn an_executable_path_with_a_backslash_or_quote_is_refused_because_systemd_refus
             panic!("{executable:?}: expected Error::Invalid, got {err:?}");
         };
         assert_eq!(daemon, "frpc");
-        assert!(message.contains("command[0]"), "{executable:?}: {message}");
+        assert!(
+            message.contains(&format!("{executable:?}")),
+            "{executable:?}: {message}"
+        );
+        assert!(message.contains("manifest directory"), "{executable:?}: {message}");
         assert!(message.contains("systemd"), "{executable:?}: {message}");
     }
 }
@@ -656,6 +678,59 @@ fn a_later_argument_may_hold_a_backslash_or_quote() {
         ]
     });
     assert!(unit(&spec, &minimal_identity()).is_ok());
+}
+
+// Environment names ===================================================================================================
+//
+// Measured on systemd 242 and 255: an `Environment=` assignment whose name is not
+// `[A-Za-z_][A-Za-z0-9_]*` is logged "Invalid environment assignment, ignoring" and dropped, while
+// the unit still loads and starts. Quoting the word does not change that.
+
+#[skuld::test]
+fn an_environment_name_systemd_would_drop_is_refused() {
+    for key in [
+        r"K\",
+        r"K\\",
+        r"\",
+        r"K\x",
+        "1K",
+        "K-1",
+        "K.1",
+        "K:1",
+        "K b",
+        "K\"1",
+        "K'1",
+        "K$1",
+        "K%1",
+        "K;1",
+        "K\u{e9}",
+        "\u{43a}\u{43b}\u{44e}\u{447}",
+        "-K",
+    ] {
+        let spec = with_fields(|f| f.env = BTreeMap::from([(key.to_string(), "v".to_string())]));
+        let err = unit(&spec, &minimal_identity()).unwrap_err();
+        let Error::Invalid { daemon, message, .. } = &err else {
+            panic!("{key:?}: expected Error::Invalid, got {err:?}");
+        };
+        assert_eq!(daemon, "frpc");
+        assert!(message.contains(&format!("{key:?}")), "{key:?}: {message}");
+        assert!(message.contains("Environment="), "{key:?}: {message}");
+        assert!(message.contains("systemd"), "{key:?}: {message}");
+    }
+}
+
+#[skuld::test]
+fn an_environment_name_systemd_accepts_is_written_and_read_back() {
+    for key in ["K", "k", "_K", "K1", "K_1", "_", "__COSCA_X", "kEy_9"] {
+        let spec = with_fields(|f| f.env = BTreeMap::from([(key.to_string(), "v".to_string())]));
+        let text = unit(&spec, &minimal_identity()).unwrap();
+        assert_eq!(
+            line_of(&text, "Environment="),
+            format!("Environment={key}=v"),
+            "{key:?}"
+        );
+        assert_eq!(extract(&text).unwrap().unwrap().spec, spec, "{key:?}");
+    }
 }
 
 // Leading and trailing whitespace =====================================================================================
@@ -719,7 +794,8 @@ fn an_executable_path_ending_in_whitespace_is_refused_because_systemd_does_not_r
         panic!("expected Error::Invalid, got {err:?}");
     };
     assert_eq!(daemon, "frpc");
-    assert!(message.contains("command[0]"), "{message}");
+    assert!(message.contains("\"/bin/x \""), "{message}");
+    assert!(message.contains("manifest directory"), "{message}");
     assert!(message.contains("whitespace"), "{message}");
     assert!(message.contains("systemd"), "{message}");
 }

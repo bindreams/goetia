@@ -27,8 +27,8 @@
 //! `CommandLineToArgvW` parses argv[0] (the program name) under different rules
 //! than every later argument: a backslash is always literal there, never doubled
 //! or halved the way `windows-service`'s escaping and every later argument's
-//! parsing treat it. So an `executable` that both needs quoting (contains a
-//! space) *and* ends in a backslash cannot be losslessly recovered from
+//! parsing treat it. So an `executable` that both needs quoting (holds a
+//! space, tab, newline or vertical tab) *and* ends in a backslash cannot be losslessly recovered from
 //! `lpBinaryPathName` — `windows-service` writes a doubled trailing backslash to
 //! protect its closing quote, and argv[0] parsing has no rule that undoes that
 //! doubling. See `generate_tests.rs`'s
@@ -225,28 +225,57 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
     })
 }
 
+/// What makes `windows-service` wrap an argument in quotes (an empty one is wrapped too), each with
+/// the name a message uses for it.
+const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
+    ('"', "a double quote"),
+    (' ', "a space"),
+    ('\n', "a newline"),
+    ('\t', "a tab"),
+    ('\u{000B}', "a vertical tab"),
+];
+
 /// Refuse an `executable` that `windows-service` would write as a different path.
 ///
-/// Its writer wraps the path in quotes when it is empty or holds a quote, space, newline, tab or
-/// vertical tab. Inside those quotes it escapes a `"` with a backslash and doubles a trailing
+/// Its writer wraps the path in quotes when it is empty or holds a [`WRITER_QUOTE_TRIGGERS`]
+/// character. Inside those quotes it escapes a `"` with a backslash and doubles a trailing
 /// backslash run. argv[0] is read literally up to the next `"`, so neither undoes: a quoted path
 /// holding a `"`, or ending in any backslashes, registers as another path. An unquoted path is
 /// written as is.
+///
+/// A `type: managed` executable is `command[0]`, made absolute against the manifest directory; a
+/// `type: simple` one is where goetia installed `goetia-shim.exe`, which no manifest sets, so its
+/// message sends the user to the install location.
 fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<(), Error> {
     let text = executable.to_string_lossy();
-    let quoted = text.is_empty() || text.contains(['"', ' ', '\n', '\t', '\u{000B}']);
-    if text.contains('"') || (quoted && text.ends_with('\\')) {
-        return Err(Error::Invalid {
-            daemon: spec.id.to_string(),
-            message: format!(
-                "the executable path {text:?} cannot be written into the service registration: the Windows \
-                 service registration writer rewrites a quote in it, or the backslashes it ends in when the \
-                 path needs quoting (it holds a space), so SCM would start a different path"
-            ),
-            source: None,
-        });
-    }
-    Ok(())
+    let quote_trigger = WRITER_QUOTE_TRIGGERS.iter().find(|(c, _)| text.contains(*c));
+    let reason = match quote_trigger {
+        _ if text.contains('"') => "it holds a double quote, which the Windows service registration writer \
+             escapes, and SCM reads the program name up to the next quote with every backslash literal, so SCM \
+             would start a different path"
+            .to_string(),
+        // An empty path is quoted too, but it ends in no backslash.
+        Some((_, trigger)) if text.ends_with('\\') => format!(
+            "it holds {trigger}, so the Windows service registration writer wraps it in quotes and doubles the \
+             backslashes it ends in, which SCM reads literally, so SCM would start a different path"
+        ),
+        _ => return Ok(()),
+    };
+    let message = match spec.kind {
+        Kind::Managed => format!(
+            "`command[0]` {text:?} (made absolute against the manifest directory) cannot be written into the \
+             service registration: {reason}"
+        ),
+        Kind::Simple => format!(
+            "the path {text:?} of goetia-shim cannot be written into the service registration: {reason}. \
+             This is where goetia is installed, not a setting in the manifest: install goetia in a path without it"
+        ),
+    };
+    Err(Error::Invalid {
+        daemon: spec.id.to_string(),
+        message,
+        source: None,
+    })
 }
 
 /// `env` as the `REG_MULTI_SZ` lines `Services\<name>\Environment` needs: the format SCM reads
