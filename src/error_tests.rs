@@ -805,3 +805,66 @@ fn an_undetermined_step_chain_gives_up_its_read_and_recovery() {
     let back = other.into_undetermined().expect_err("not an Undetermined");
     assert_eq!(back.report().to_string(), "check: daemon `x` is not installed");
 }
+
+// The OS error an error carries ---------------------------------------------------------------------------------------
+
+fn os_code(code: i32) -> Error {
+    Error::Os {
+        what: "read".to_string(),
+        path: None,
+        source: std::io::Error::from_raw_os_error(code).into(),
+    }
+}
+
+#[skuld::test]
+fn the_os_error_is_found_through_every_wrapper() {
+    let step = |source: Error| Error::Step {
+        what: "step".to_string(),
+        source: Box::new(source),
+    };
+    let undetermined = Error::Undetermined {
+        id: "x".to_string(),
+        reason: Box::new(step(os_code(5))),
+        recovery: String::new(),
+    };
+    assert_eq!(os_code(5).raw_os_error(), Some(5));
+    assert_eq!(step(undetermined).raw_os_error(), Some(5));
+    assert_eq!(Error::Kept(Arc::new(step(os_code(6)))).raw_os_error(), Some(6));
+    assert_eq!(step(not_installed()).raw_os_error(), None);
+    assert_eq!(os("read", "/p", "no code").raw_os_error(), None);
+}
+
+/// Neither half of a `Both` is its `source`; the first with an OS error wins.
+#[skuld::test]
+fn the_os_error_of_a_both_is_the_first_halfs_else_the_seconds() {
+    let both = |first: Error, then: Error| Error::Both {
+        first: Box::new(first),
+        then: Box::new(then),
+    };
+    let nested = Error::Step {
+        what: "outer".to_string(),
+        source: Box::new(both(not_installed(), os_code(7))),
+    };
+
+    assert_eq!(both(os_code(5), os_code(7)).raw_os_error(), Some(5));
+    assert_eq!(both(not_installed(), os_code(7)).raw_os_error(), Some(7));
+    assert_eq!(nested.raw_os_error(), Some(7));
+    assert_eq!(both(not_installed(), not_installed()).raw_os_error(), None);
+}
+
+/// An error a variant writes into its own text is not its `source`.
+#[skuld::test]
+fn the_os_error_of_an_embedded_error_is_found() {
+    let embedded = Error::LoadedStateInDoubt {
+        id: "x".to_string(),
+        read_failed: Box::new(os_code(8)),
+        restore_failed: None,
+    };
+    let blob_unreadable = Error::StartAsManaged {
+        blob: Arc::new(os_code(9)),
+        source: Box::new(not_installed()),
+    };
+
+    assert_eq!(embedded.raw_os_error(), Some(8));
+    assert_eq!(blob_unreadable.raw_os_error(), Some(9));
+}

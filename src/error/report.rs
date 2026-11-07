@@ -63,6 +63,29 @@ pub(super) fn write_chain<'a>(
     Ok(())
 }
 
+/// The first OS error code in `e`: its own, then its source's, then that of what it embeds. A
+/// [`Both`](Error::Both) is searched first half first; [`Error::Kept`] is searched as the error it
+/// holds.
+pub(super) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    if let Some(code) = e
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+    {
+        return Some(code);
+    }
+    let ours = e
+        .downcast_ref::<Error>()
+        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b));
+    match ours {
+        Some(Error::Both { first, then }) => return os_error_in(first.as_ref()).or_else(|| os_error_in(then.as_ref())),
+        Some(Error::Kept(kept)) => return os_error_in(kept.as_ref()),
+        _ => {}
+    }
+    e.source()
+        .and_then(os_error_in)
+        .or_else(|| ours.and_then(Error::embedded).and_then(|inner| os_error_in(inner)))
+}
+
 /// Writes each of `remedies` as `. remedy`.
 pub(super) fn write_remedies(out: &mut dyn fmt::Write, remedies: &[&str]) -> fmt::Result {
     for remedy in remedies {

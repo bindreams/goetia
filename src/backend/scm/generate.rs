@@ -301,22 +301,18 @@ pub fn account_needs_password(account: Option<&str>) -> bool {
 /// Recover the embedded metadata blob from a service's `Parameters` values.
 ///
 /// Returns `Ok(None)` only when `Marker` is absent — an ordinary foreign
-/// service, not one Goetia manages. Once `Marker` is present, `Marker` and
-/// `Spec` must check out completely: a wrong `Marker`, a missing `Spec` or an
-/// undecodable one is `Err`, not partially trusted. `Schema` and `Version` are
-/// plain-text copies for a human reading the registry and are not read.
+/// service, not one Goetia manages. A `Marker` in `parameters` is goetia's:
+/// `parameters::Parameters` admits one only when its text is goetia's marker,
+/// the one place ownership is decided. Then `Spec` must check out completely:
+/// a missing or undecodable one is `Err`, not partially trusted. `Schema` and
+/// `Version` are plain-text copies for a human reading the registry and are
+/// not read.
 ///
 /// `parameters` holds the fields under goetia's spelling of their names (see
 /// `parameters::Parameters`, which folds the case the registry ignores).
 pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Error> {
-    let Some(marker) = parameters.get(FIELD_MARKER) else {
+    if !parameters.contains_key(FIELD_MARKER) {
         return Ok(None);
-    };
-    if marker != blob::MARKER {
-        return Err(Error::blob(format!(
-            "Parameters\\{FIELD_MARKER} is `{marker}`, not `{expected}`",
-            expected = blob::MARKER
-        )));
     }
 
     let spec_text = parameters

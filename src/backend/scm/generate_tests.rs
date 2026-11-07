@@ -1000,16 +1000,6 @@ fn extract_errors_on_corrupt_blob() {
     extract(&parameters).expect_err("a corrupt Spec value must not decode");
 }
 
-#[skuld::test]
-fn extract_errors_on_marker_value_mismatch() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
-    parameters.insert(FIELD_MARKER.to_string(), "not-goetia".to_string());
-
-    let err = extract(&parameters).expect_err("a Marker present with the wrong value must not be treated as ours");
-    assert!(err.to_string().contains(FIELD_MARKER));
-}
-
 /// `Schema` and `Version` are copies for a person reading the registry; `Spec` is the only value
 /// read for meaning, so any state of the copies leaves the decoded blob unchanged.
 #[skuld::test]

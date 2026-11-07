@@ -962,6 +962,32 @@ fn a_read_that_did_not_complete_is_a_restartable_failure_naming_the_read() {
     assert!(!stop.message.contains("decode"), "{}", stop.message);
 }
 
+/// Refusal is by cause, not by whether the read is in doubt: a definite error that is none of the
+/// three causes (here an OS error from a read that failed outright) is still restartable, and
+/// carries the real OS error.
+#[skuld::test]
+fn a_definite_os_error_is_a_restartable_failure_carrying_it() {
+    let read = Err(Error::Step {
+        what: "read the spec".to_string(),
+        source: Box::new(Error::Os {
+            what: r"read HKLM\SYSTEM\CurrentControlSet\Services\x\Parameters".to_string(),
+            path: None,
+            source: Box::new(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+        }),
+    });
+
+    let stop = spec_read(ID, read)
+        .map(|_| ())
+        .expect_err("a failed read stops the shim");
+
+    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_ACCESS_DENIED as i32)));
+    assert!(
+        stop.message.starts_with("read the metadata under Services"),
+        "{}",
+        stop.message
+    );
+}
+
 /// With no OS error to carry, the failure still restarts: `ERROR_INVALID_DATA`.
 #[skuld::test]
 fn an_incomplete_read_with_no_os_error_fails_with_invalid_data() {

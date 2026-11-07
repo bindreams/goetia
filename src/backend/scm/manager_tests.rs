@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::backend::scm::parameters::Stray;
+use crate::backend::scm::test_support::{multi_sz, sz};
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
 use crate::spec::Restart;
@@ -469,24 +470,14 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
         ReadOutcome::Foreign { recovery: None }
     ));
     // Another service's own `Marker`, in any string type or layout, is not goetia's.
-    let units = |text: &str| -> Vec<u8> {
-        text.encode_utf16()
-            .chain([0, 0])
-            .flat_map(|unit| unit.to_le_bytes())
-            .collect()
-    };
     let mut theirs = Parameters::default();
-    theirs.add_value("Marker".encode_utf16().collect(), 7, &units("theirs"));
+    theirs.add_value("Marker".encode_utf16().collect(), 7, &multi_sz("theirs"));
     assert!(matches!(
         read_marker(theirs, None),
         ReadOutcome::Foreign { recovery: None }
     ));
     let mut theirs_exact = Parameters::default();
-    theirs_exact.add_value(
-        "Marker".encode_utf16().collect(),
-        1,
-        &units("theirs")[..2 * ("theirs".len() + 1)],
-    );
+    theirs_exact.add_value("Marker".encode_utf16().collect(), 1, &sz("theirs"));
     assert!(theirs_exact.fields.is_empty());
     assert!(matches!(
         read_marker(theirs_exact, None),
@@ -494,9 +485,14 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
     ));
     // goetia's marker text in another string type is still goetia's, and the layout is drift.
     let mut rewritten = Parameters::default();
-    rewritten.add_value("Marker".encode_utf16().collect(), 7, &units(crate::blob::MARKER));
+    rewritten.add_value("Marker".encode_utf16().collect(), 7, &multi_sz(crate::blob::MARKER));
     assert_eq!(rewritten.strays.len(), 1);
     assert!(matches!(read_marker(rewritten, None), ReadOutcome::Marked(_)));
+    // so is that text in another case, whose case is drift too.
+    let mut recased = Parameters::default();
+    recased.add_value("Marker".encode_utf16().collect(), 1, &sz("Goetia"));
+    assert_eq!(recased.strays.len(), 1);
+    assert!(matches!(read_marker(recased, None), ReadOutcome::Marked(_)));
     match read_marker(ours.clone(), None).named(&id, ScmSnapshot::new) {
         ReadOutcome::Marked(snapshot) => {
             assert_eq!(snapshot.id().as_str(), "frpc");

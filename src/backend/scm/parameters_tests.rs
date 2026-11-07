@@ -1,17 +1,9 @@
 use super::*;
+use crate::backend::scm::test_support::{sz, units_bytes};
 use crate::blob;
 
 fn utf16(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
-}
-
-/// The bytes goetia stores for a string value: UTF-16LE and one closing NUL.
-fn sz(text: &str) -> Vec<u8> {
-    units_bytes(&[utf16(text), vec![0]].concat())
-}
-
-fn units_bytes(units: &[u16]) -> Vec<u8> {
-    units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
 }
 
 fn parameters_of(name: Vec<u16>, vtype: u32, data: &[u8]) -> Parameters {
@@ -102,6 +94,32 @@ fn a_goetia_field_in_another_string_layout_is_a_field_and_a_layout_stray() {
             );
             assert_eq!(parameters.strays, [layout_stray(field, vtype)], "{what}, {name}");
         }
+    }
+}
+
+/// goetia's marker in another case is still goetia's, whatever the layout: the field holds goetia's
+/// own text, and the case is drift that `install --force` rewrites.
+#[skuld::test]
+fn a_marker_in_another_case_is_goetias_field_and_a_layout_stray() {
+    let units = utf16("Goetia");
+    let layouts: [(&str, u32, Vec<u8>); 3] = [
+        ("REG_SZ", vtype::REG_SZ, sz("Goetia")),
+        (
+            "REG_MULTI_SZ",
+            vtype::REG_MULTI_SZ,
+            units_bytes(&[units.clone(), vec![0, 0]].concat()),
+        ),
+        ("REG_SZ with no NUL", vtype::REG_SZ, units_bytes(&units)),
+    ];
+    for (what, vtype, data) in layouts {
+        let parameters = parameters_of(utf16("marker"), vtype, &data);
+
+        assert_eq!(
+            parameters.fields,
+            BTreeMap::from([("Marker".to_string(), blob::MARKER.to_string())]),
+            "{what}"
+        );
+        assert_eq!(parameters.strays, [layout_stray("Marker", vtype)], "{what}");
     }
 }
 
@@ -270,7 +288,7 @@ fn a_stray_renders_its_name_as_it_is_stored_and_its_type() {
     assert_eq!(Stray::Subkey { name: utf16("Sub") }.to_string(), r#"subkey "Sub""#);
     assert_eq!(
         layout_stray("Spec", vtype::REG_MULTI_SZ).to_string(),
-        r#"value "Spec" stored as REG_MULTI_SZ, not as REG_SZ with one closing NUL"#
+        r#"value "Spec" stored as REG_MULTI_SZ, not exactly as goetia writes it"#
     );
 }
 
@@ -322,7 +340,17 @@ fn a_stray_name_that_is_not_valid_utf16_renders_without_losing_the_unit() {
 
 #[skuld::test]
 fn text_from_utf16_is_the_text_when_valid() {
-    assert_eq!(text_from_utf16(&utf16("A=\u{1F600}")), "A=\u{1F600}");
+    assert_eq!(text_from_utf16(&utf16("A=\u{1F600}\n")), "A=\u{1F600}\n");
+}
+
+/// Invalid text is escaped by one rule: every unpaired surrogate, control character and `=`, and
+/// nothing else, a backslash and a quote included.
+#[skuld::test]
+fn text_from_utf16_escapes_what_it_escapes_by_one_rule_when_invalid() {
+    let mut units = utf16("A=b\n\\\"");
+    units.push(0xD800);
+
+    assert_eq!(text_from_utf16(&units), r#"(not valid UTF-16: A\u{3D}b\n\"\u{D800})"#);
 }
 
 #[skuld::test]

@@ -7,7 +7,8 @@
 //! holds a string is read as that field whatever its string type and terminators, so a service a
 //! tool rewrote is still goetia's; a layout other than what goetia writes is a [`Stray::Layout`],
 //! which `install --force` rewrites. The exception is a `Marker`, which is goetia's only when its
-//! text is goetia's marker, in any layout: another service may hold a `Marker` of its own.
+//! text is goetia's marker string in any case and layout: another service may hold a `Marker` of
+//! its own.
 //! Everything else is a [`Stray`]: kept apart from the four so that no stray can be mistaken for
 //! one of them, and so that a stray the registry API refuses to describe (a name that is not
 //! UTF-16 text, a type no API knows) is still reported, and removable.
@@ -42,8 +43,9 @@ pub enum Stray {
     /// number, that is not one of goetia's fields: another name, or a field that holds no one
     /// string of text.
     Value { name: Vec<u16>, vtype: u32 },
-    /// One of goetia's fields whose text reads, stored in a layout goetia does not write: another
-    /// string type, or a terminator other than one NUL. The field is in [`Parameters::fields`].
+    /// One of goetia's fields whose text reads, stored other than as goetia writes it: another
+    /// string type, a terminator other than one NUL, or (a `Marker`) another case. The field is in
+    /// [`Parameters::fields`].
     Layout { name: &'static str, vtype: u32 },
     /// A subkey, by its name as UTF-16.
     Subkey { name: Vec<u16> },
@@ -57,7 +59,7 @@ impl fmt::Display for Stray {
             }
             Stray::Layout { name, vtype } => write!(
                 out,
-                "value \"{name}\" stored as {}, not as REG_SZ with one closing NUL",
+                "value \"{name}\" stored as {}, not exactly as goetia writes it",
                 type_name(*vtype)
             ),
             Stray::Subkey { name } => write!(out, "subkey \"{}\"", shown_name(name)),
@@ -70,7 +72,14 @@ impl fmt::Display for Stray {
 /// that is not valid UTF-16 is shown between `(not valid UTF-16: ` and `)`, each unpaired surrogate
 /// as `\u{XXXX}`.
 pub(crate) fn shown_name(name: &[u16]) -> String {
-    let decoded: Vec<_> = char::decode_utf16(name.iter().copied()).collect();
+    decode_utf16(name, |c| c == '"' || c.is_control())
+}
+
+/// `units` as text, with each char `escaped` names shown as an escape sequence and no other char
+/// changed. Units that are not valid UTF-16 make the result `(not valid UTF-16: ` and `)` around
+/// the text, each unpaired surrogate as `\u{XXXX}`. The one place that decodes units for display.
+fn decode_utf16(units: &[u16], escaped: impl Fn(char) -> bool) -> String {
+    let decoded: Vec<_> = char::decode_utf16(units.iter().copied()).collect();
     let valid = decoded.iter().all(|c| c.is_ok());
     let mut shown = String::new();
     if !valid {
@@ -78,8 +87,15 @@ pub(crate) fn shown_name(name: &[u16]) -> String {
     }
     for c in decoded {
         match c {
-            Ok('"') => shown.push_str(r#"\""#),
-            Ok(c) if c.is_control() => shown.extend(c.escape_debug()),
+            Ok(c) if escaped(c) => {
+                let escape: String = c.escape_debug().collect();
+                if escape.chars().eq([c]) {
+                    // `escape_debug` leaves a printable char as it is.
+                    shown.push_str(&format!(r"\u{{{:X}}}", u32::from(c)));
+                } else {
+                    shown.push_str(&escape);
+                }
+            }
             Ok(c) => shown.push(c),
             Err(e) => shown.push_str(&format!(r"\u{{{:04X}}}", e.unpaired_surrogate())),
         }
@@ -131,15 +147,23 @@ enum Entry {
 }
 
 /// A value is a field when its name spells one of goetia's four in any case and it holds one string
-/// of text in any string type, except that a `Marker` is a field only when its text is goetia's
-/// marker, in any layout: a third-party service may hold a `Marker` of its own, and must stay
-/// foreign. Anything else under a field's name is a stray, so a hand edit never
-/// reads as equal to what goetia wants.
+/// of text in any string type. A `Marker` is goetia's only when its text, less its closing NULs, is
+/// goetia's marker string in any case, in any layout; it is then the field `Marker` with goetia's
+/// own text, so ownership is decided here and nowhere else. A third-party service may hold a
+/// `Marker` of its own, and must stay foreign. Anything else under a field's name is a stray, so a
+/// hand edit never reads as equal to what goetia wants. A field not stored exactly as goetia writes
+/// it, in layout or (a `Marker`) in case, comes with a [`Stray::Layout`].
 fn classify_value(name: Vec<u16>, vtype: u32, data: &[u8]) -> Entry {
     if let Some(field) = field_named_utf16(&name)
         && let Some((text, exact)) = string_text(vtype, data)
-        && (field != FIELD_MARKER || text == blob::MARKER)
+        && (field != FIELD_MARKER || text.eq_ignore_ascii_case(blob::MARKER))
     {
+        let (text, exact) = if field == FIELD_MARKER {
+            let exact = exact && text == blob::MARKER;
+            (blob::MARKER.to_string(), exact)
+        } else {
+            (text, exact)
+        };
         let layout = (!exact).then_some(Stray::Layout { name: field, vtype });
         return Entry::Field {
             name: field,
@@ -178,22 +202,9 @@ fn string_text(vtype: u32, data: &[u8]) -> Option<(String, bool)> {
 }
 
 /// `units` as text, exactly. Units that are not valid UTF-16 show as text that says so, with each
-/// unpaired surrogate and every `=` escaped.
+/// unpaired surrogate, control character and `=` escaped: no such text can equal a `NAME=value` line.
 pub(crate) fn text_from_utf16(units: &[u16]) -> String {
-    let decoded: Vec<_> = char::decode_utf16(units.iter().copied()).collect();
-    if decoded.iter().all(|c| c.is_ok()) {
-        return decoded.into_iter().flatten().collect();
-    }
-    let mut shown = String::from("(not valid UTF-16: ");
-    for c in decoded {
-        match c {
-            Ok('=') => shown.push_str(r"\x3D"),
-            Ok(c) => shown.extend(c.escape_debug()),
-            Err(e) => shown.push_str(&format!(r"\u{{{:04X}}}", e.unpaired_surrogate())),
-        }
-    }
-    shown.push(')');
-    shown
+    String::from_utf16(units).unwrap_or_else(|_| decode_utf16(units, |c| c == '=' || c.is_control()))
 }
 
 /// The registry's own name for a value type, or its number when it has none.
