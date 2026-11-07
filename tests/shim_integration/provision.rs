@@ -1166,10 +1166,11 @@ fn uninstall_right_after_stop_reports_the_file_its_exiting_process_runs_or_leave
 }
 
 /// A service B that was updated to another file and not restarted still runs the first. Uninstalling
-/// A, the last service registered with the first file, returns without waiting for B's process, and
-/// leaves the file and the process alone: B's image keeps the file referenced.
+/// A, the last service registered with the first file, does not wait for B's process and leaves it
+/// alone; the file is kept, as B's image references it, and reported by name: no registered service
+/// names it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file() {
+fn uninstall_reports_the_old_file_an_updated_service_still_runs_without_waiting_for_it() {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
     let (a_id, b_id) = (support::random_test_id(), support::random_test_id());
@@ -1191,10 +1192,14 @@ fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file() {
     let moved = second.install(&b_spec, false).expect("install B on the second file");
     assert!(matches!(moved, Outcome::Update { .. }), "{moved:?}");
 
-    second
+    let err = second
         .uninstall(&a_spec.id)
-        .expect("uninstall A, which does not wait for B");
+        .expect_err("uninstall A, which reports the file B still runs");
 
+    let report = err.report().to_string();
+    let name = old.file_name().expect("the shim has a name").to_string_lossy();
+    assert!(report.contains(&*name), "the file is named: {report}");
+    assert!(report.contains("was deleted"), "A is deleted: {report}");
     assert!(old.is_file(), "B's process still runs the first file");
     assert!(!running.has_exited(), "B keeps running");
 }
