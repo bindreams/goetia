@@ -59,6 +59,25 @@ fn install_refuses_an_unresolvable_account_with_uninstall_advice() {
 }
 
 #[skuld::test]
+fn install_and_preview_refuse_what_only_render_for_install_refuses() {
+    use crate::backend::Backend;
+
+    let fake = Fake::new();
+    fake.seed_unfit_for_install("host");
+    let spec = mk_as("frpc", "host");
+    fake.render(&spec).expect("`render` does not judge the host");
+
+    for result in [
+        fake.install(&spec, false).map(|_| ()),
+        fake.preview_install(&spec).map(|_| ()),
+    ] {
+        let err = result.expect_err("the host cannot carry the definition");
+        assert!(err.to_string().contains("unfit for install (seeded)"), "{err}");
+    }
+    assert_eq!(fake.writes(), 0);
+}
+
+#[skuld::test]
 fn install_refuses_an_undecodable_blob_with_uninstall_advice() {
     let fake = Fake::new();
     fake.seed_unusable("frpc");

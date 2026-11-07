@@ -857,6 +857,7 @@ impl Error {
     /// A [`RequestInDoubt`](Error::RequestInDoubt) with `context` said ahead of any note it
     /// already has: what the caller that holds it knows of the request. Any other error is returned
     /// as it is.
+    #[cfg(any(feature = "cli", target_os = "linux", test))]
     pub(crate) fn in_doubt_context(self, context: String) -> Self {
         match self {
             Error::RequestInDoubt {

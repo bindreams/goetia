@@ -1,9 +1,11 @@
 use std::time::Duration;
 
 use super::{BackendKind, Builtin, MAX_SC_ACTION_DELAY, Shaped, ShapedSpec, windows_builtin, windows_only_account};
+use crate::error::Error;
+use crate::spec::field::Field;
 use crate::spec::interpolate::Substitution;
 use crate::spec::overrides::Supplied;
-use crate::spec::test_support::abs;
+use crate::spec::test_support::{abs, assert_no_run_of_spaces};
 use crate::spec::{AccountId, Id, Kind, Restart, User};
 
 fn parse(yaml: &str) -> Result<BackendKind, yaml_serde::Error> {
@@ -293,12 +295,15 @@ fn a_spelling_that_is_not_in_the_table_is_an_ordinary_account() {
 #[skuld::test]
 fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
     let mut spec = shaped_spec();
-    let supplied = Supplied { user: true };
+    let supplied = Supplied {
+        user: true,
+        ..Supplied::NONE
+    };
 
     spec.user = User::Name("${ACCT}".to_string());
     assert!(
         BackendKind::Systemd
-            .error(&spec, supplied, Substitution::Pending)
+            .error(&spec, &supplied, Substitution::Pending)
             .is_ok(),
         "a `$`-bearing name cannot be classified from this host and must not be guessed at"
     );
@@ -306,14 +311,14 @@ fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
     spec.user = User::Name("LocalService".to_string());
     assert!(
         BackendKind::Systemd
-            .error(&spec, supplied, Substitution::Pending)
+            .error(&spec, &supplied, Substitution::Pending)
             .is_err(),
         "the rule still fires for a value that needs no resolution"
     );
 
     assert!(
         BackendKind::Systemd
-            .error(&spec, Supplied::NONE, Substitution::Pending)
+            .error(&spec, &Supplied::NONE, Substitution::Pending)
             .is_ok(),
         "`Supplied::NONE` means this value came from the base spec, not the override, and must not be rejected"
     );
@@ -323,11 +328,14 @@ fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
 fn a_numeric_uid_is_rejected_under_scm() {
     let mut spec = shaped_spec();
     spec.user = User::Id(AccountId::Uid(1000));
-    let supplied = Supplied { user: true };
-    assert!(BackendKind::Scm.error(&spec, supplied, Substitution::Pending).is_err());
+    let supplied = Supplied {
+        user: true,
+        ..Supplied::NONE
+    };
+    assert!(BackendKind::Scm.error(&spec, &supplied, Substitution::Pending).is_err());
     assert!(
         BackendKind::Scm
-            .error(&spec, Supplied::NONE, Substitution::Pending)
+            .error(&spec, &Supplied::NONE, Substitution::Pending)
             .is_ok()
     );
 }
@@ -336,19 +344,63 @@ fn a_numeric_uid_is_rejected_under_scm() {
 fn a_sid_is_rejected_under_a_posix_backend() {
     let mut spec = shaped_spec();
     spec.user = User::Id(AccountId::Sid("S-1-5-19".to_string()));
-    let supplied = Supplied { user: true };
+    let supplied = Supplied {
+        user: true,
+        ..Supplied::NONE
+    };
     assert!(
         BackendKind::Systemd
-            .error(&spec, supplied, Substitution::Pending)
+            .error(&spec, &supplied, Substitution::Pending)
             .is_err()
     );
     assert!(
         BackendKind::Launchd
-            .error(&spec, supplied, Substitution::Pending)
+            .error(&spec, &supplied, Substitution::Pending)
             .is_err()
     );
     assert!(
-        BackendKind::Scm.error(&spec, supplied, Substitution::Pending).is_ok(),
+        BackendKind::Scm.error(&spec, &supplied, Substitution::Pending).is_ok(),
         "a SID is a Windows account"
     );
+}
+
+// systemd's `Environment=` names ======================================================================================
+
+/// A spec whose `env` holds `key`. Its `command[0]` has no backslash, which a Windows `abs` would write
+/// and a systemd host refuses.
+fn shaped_with_env_key(key: &str) -> ShapedSpec {
+    let mut spec = shaped_spec();
+    spec.command = Some(vec!["/bin/frpc".to_string()]);
+    spec.env.insert(key.to_string(), "v".to_string());
+    spec
+}
+
+#[skuld::test]
+fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
+    for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
+        let spec = shaped_with_env_key(key);
+        let refused = BackendKind::Systemd
+            .refuse(&spec)
+            .expect_err(&format!("{key:?} must be refused"));
+        assert_eq!(refused.field, Some(Field::EnvKey(key.into())));
+        let message = Error::from(refused).to_string();
+        assert!(message.contains(&format!("{key:?}")), "{message}");
+        assert!(message.contains("Environment="), "{message}");
+        assert_no_run_of_spaces(&message);
+        assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{key:?}");
+        assert!(BackendKind::Scm.refuse(&spec).is_ok(), "{key:?}");
+
+        let mut warnings = Vec::new();
+        BackendKind::Systemd.warn(&spec, &mut warnings);
+        assert!(
+            warnings.is_empty(),
+            "the refusal is systemd's whole answer: {warnings:?}"
+        );
+    }
+    for key in ["PATH", "_x", "a1_B"] {
+        assert!(
+            BackendKind::Systemd.refuse(&shaped_with_env_key(key)).is_ok(),
+            "{key:?}"
+        );
+    }
 }

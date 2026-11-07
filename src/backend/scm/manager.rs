@@ -170,6 +170,15 @@ impl Scm {
     fn provider(&self) -> Result<&dyn ShimProvider> {
         self.shim.as_deref().ok_or(Error::NoShimProvider)
     }
+
+    /// The host `spec` would be installed with, as the provider previews it: `Some` for `type: simple`
+    /// only, which has a host.
+    fn host_of(&self, spec: &DaemonSpec) -> Result<Option<HostCommand>> {
+        match spec.kind {
+            Kind::Simple => Ok(Some(self.provider()?.preview()?)),
+            Kind::Managed => Ok(None),
+        }
+    }
 }
 
 impl Default for Scm {
@@ -317,11 +326,7 @@ impl Backend for Scm {
 
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.user)?;
-        let host = match spec.kind {
-            Kind::Simple => Some(self.provider()?.preview()?),
-            Kind::Managed => None,
-        };
-        generate::registration(spec, &identity, host.as_ref())
+        generate::registration(spec, &identity, self.host_of(spec)?.as_ref())
     }
 
     /// Keeps the host command a `type: simple` service is installed with, so that a host another
@@ -338,6 +343,12 @@ impl Backend for Scm {
         })?;
         let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
         generate::registration(spec, &identity, Some(&HostCommand { exe, args }))
+    }
+
+    /// The host is previewed once, for the check and the registration alike.
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+        let identity = identity::resolve(&spec.user)?;
+        generate::install_registration(spec, &identity, self.host_of(spec)?.as_ref())
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither

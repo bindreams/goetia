@@ -1470,7 +1470,7 @@ fn list_reports_a_sid_account_as_ours_unusable() {
     let mut spec = mk(guard.id()).into_fields();
     spec.user = User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string()));
     let spec = DaemonSpec::new(spec).unwrap();
-    let text = generate::unit(&spec, &Identity { user: "0".to_string() });
+    let text = generate::unit(&spec, &Identity { user: "0".to_string() }).unwrap();
     fs::write(unit_path(guard.id()), text).expect("seed a unit whose spec names a SID");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
 
@@ -1955,6 +1955,123 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
         cwd_meta.uid(),
         uid_of("nobody"),
         "the newly-created leaf must be chowned"
+    );
+}
+
+// Backslashes =========================================================================================================
+
+/// Values that end in backslashes are written so that systemd reads each back exactly, and the
+/// directives after them are not swallowed. Read back from the loaded unit, not from the text.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
+    let id = support::random_test_id();
+    // Creation order: see the module doc of `support::service_guard`.
+    let base = std::env::temp_dir().join(format!("{id}-backslashes"));
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    let cwd = PathBuf::from(format!("{}/work\\", base.display()));
+    let logs = PathBuf::from(format!("{}/log\\\\\\", base.display()));
+
+    let mut spec = mk(guard.id()).into_fields();
+    spec.name = "Backslash name\\".to_string();
+    // The shell ignores the arguments after the script, so the unit starts and stays up.
+    spec.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "exec sleep infinity".to_string(),
+        "C:\\".to_string(),
+        "a\\\\b".to_string(),
+        " a ".to_string(),
+    ];
+    spec.cwd = Some(cwd.clone());
+    spec.logs = Some(logs);
+    spec.env = std::collections::BTreeMap::from([
+        ("K".to_string(), "C:\\".to_string()),
+        ("L".to_string(), " v ".to_string()),
+    ]);
+    let spec = DaemonSpec::new(spec).unwrap();
+
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    let unit = format!("{}.service", guard.id());
+    let show = |property: &str| {
+        cmd::run("systemctl", &["show", "--property", property, "--value", &unit])
+            .expect_ok()
+            .stdout
+            .trim_end_matches('\n')
+            .to_string()
+    };
+    assert_eq!(show("Description"), "Backslash name\\");
+    assert_eq!(show("WorkingDirectory"), cwd.to_str().unwrap());
+    // `show` prints the environment re-quoted, with each backslash doubled.
+    // A quoted word keeps its edge whitespace; `show` joins the arguments with one space.
+    assert_eq!(show("Environment"), "\"K=C:\\\\\" \"L= v \"");
+    assert!(
+        show("ExecStart").contains("argv[]=/bin/sh -c exec sleep infinity C:\\ a\\\\b  a  ;"),
+        "{}",
+        show("ExecStart")
+    );
+    // The line after the description and the working directory was not swallowed.
+    assert_eq!(show("User"), "0");
+
+    // `show` does not print the `append:` path, so start the unit: systemd creates the file at
+    // exactly that path before it execs, in the working directory it could enter only if it read
+    // that one back exactly too.
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    let mut entries: Vec<_> = fs::read_dir(&base)
+        .unwrap_or_else(|e| panic!("read {}: {e}", base.display()))
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        [
+            std::ffi::OsString::from("log\\\\\\"),
+            std::ffi::OsString::from("work\\")
+        ]
+    );
+}
+
+/// systemd takes the executable path as written but substitutes `$FOO`/`${FOO}` and collapses `$$`
+/// in argv[0], so a path holding `$` must run the right file and still hand the daemon its own
+/// path as argv[0]. The directory also holds a space and a `%`, which quote and double the word.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_executable_path_with_dollars_runs_with_the_path_as_argv0() {
+    let id = support::random_test_id();
+    let base = std::env::temp_dir().join(format!("{id}-argv0"));
+    let _rm = DirGuard::new(base.clone());
+    let guard = ServiceGuard::new(&id);
+    let dir = base.join("x${y}$$z$w %q");
+    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    let executable = dir.join("sh");
+    std::os::unix::fs::symlink("/bin/sh", &executable).expect("symlink");
+    let out = base.join("cmdline");
+
+    let mut spec = mk(guard.id()).into_fields();
+    // `mk` restarts on failure: a failing script would restart forever and `start --wait` never return.
+    spec.restart = Restart::Never;
+    // The shell lists its own argv, one per line, into the file named by its last argument. The
+    // trailing `:` stops dash from exec'ing `tr` in the shell's place (it does that to the last
+    // command of `-c`), which would make `/proc/$$/cmdline` read `tr`'s argv.
+    spec.command = vec![
+        executable.to_str().unwrap().to_string(),
+        "-c".to_string(),
+        "tr '\\000' '\\n' < /proc/$$/cmdline > \"$1\"; :".to_string(),
+        "sh".to_string(),
+        out.to_str().unwrap().to_string(),
+    ];
+    let spec = DaemonSpec::new(spec).unwrap();
+
+    Systemd::new().install(&spec, false).expect("install");
+    // Blocks until the shell has exited, so the file is complete.
+    cmd::run("systemctl", &["start", "--wait", &format!("{}.service", guard.id())]).expect_ok();
+
+    let argv = fs::read_to_string(&out).unwrap_or_else(|e| panic!("read {}: {e}", out.display()));
+    assert_eq!(
+        argv.lines().next(),
+        executable.to_str(),
+        "argv[0] of the daemon; all of argv:\n{argv}"
     );
 }
 

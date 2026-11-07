@@ -9,8 +9,8 @@ pub(super) enum Field {
     Command(usize),
     Cwd,
     Logs,
-    /// An `env` name, which substitution never changes ([`super::interpolate::spec`] refuses a `$` in one).
-    EnvKey,
+    /// The `env` name, which substitution never changes ([`super::interpolate::spec`] refuses a `$` in one).
+    EnvKey(Box<str>),
     /// The value of the `env` entry with this name.
     EnvValue(String),
     /// `user` or `user.name`, whichever form was written: both are one field to an error.
@@ -30,7 +30,7 @@ impl Field {
             Field::Cwd => "cwd".to_string(),
             Field::Logs => "logs".to_string(),
             // No substitution error asks for it; the arm only keeps the match total.
-            Field::EnvKey => "env key".to_string(),
+            Field::EnvKey(_) => "env key".to_string(),
             Field::EnvValue(key) => format!("env[{key:?}]"),
             Field::User => "user".to_string(),
             Field::Restart => "restart".to_string(),

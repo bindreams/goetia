@@ -194,11 +194,14 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
 
 // --dry-run preview ===================================================================================================
 //
-// --dry-run never touches a manager or does I/O. A real install resolves
-// `spec.user` to a platform account name (see `backend::Identity`) with an
-// effectful lookup (a Windows SID needs `LookupAccountSid`; a launchd numeric
-// UID needs one too); a preview does not, so this is a literal, lookup-free
-// rendering that may differ from a real install's artifact in some cases.
+// --dry-run never touches a manager or writes anything. It still reads the manifest and `.env` (resolving the spec),
+// and it canonicalizes the process's current directory when `-f` is relative. A drive-relative path (`C:bin`) in the
+// manifest is resolved against the process's per-drive current directory, which `std::path::absolute` reads. The
+// preview step itself, on Windows, asks the shim provider for the host command (`host`) of a `type: simple` daemon,
+// and reads no account or file. A real install resolves `spec.user` to a platform account name (see
+// `backend::Identity`) with an effectful lookup (a Windows SID needs `LookupAccountSid`; a launchd numeric UID needs
+// one too); a preview does not, so this is a literal, lookup-free rendering that may differ from a real install's
+// artifact in some cases.
 
 fn preview_identity(user: &User) -> Identity {
     Identity {
@@ -221,7 +224,10 @@ fn preview_root_account() -> String {
     "root".to_string()
 }
 
-/// The generated artifact for `spec`, or the generator's refusal of it (scm refuses `restart: always`).
+/// The generated artifact for `spec`, or the generator's refusal of it: scm refuses `restart: always` and
+/// an executable path its registration writer rewrites; systemd refuses the values `refuse_unrepresentable` lists.
+///
+/// Writes nothing; on Windows a `type: simple` daemon's preview asks `host` for the host command.
 ///
 /// `err` is threaded through on every platform so a generator warning cannot
 /// be dropped; no generator produces a [`crate::spec::Warning`] here today. `host` is
@@ -232,7 +238,7 @@ fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>, e
     #[cfg(target_os = "linux")]
     {
         let _ = (err, host);
-        Ok(crate::backend::systemd::generate::unit(spec, &identity))
+        crate::backend::systemd::generate::unit(spec, &identity)
     }
     #[cfg(target_os = "macos")]
     {
@@ -245,12 +251,13 @@ fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>, e
         // resolve time, from `BackendKind::Scm.warn`, before this runs.
         let _ = err;
         // Asked only for a `type: simple` daemon: a managed one runs no host, and a provider that
-        // cannot name one must not fail its preview.
+        // cannot name one must not fail its preview. The real host, so the preview refuses a path
+        // the install would.
         let command = match spec.kind {
             crate::spec::Kind::Simple => Some(host()?),
             crate::spec::Kind::Managed => None,
         };
-        let registration = crate::backend::scm::generate::registration(spec, &identity, command.as_ref())?;
+        let registration = crate::backend::scm::generate::install_registration(spec, &identity, command.as_ref())?;
         Ok(registration.to_string())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

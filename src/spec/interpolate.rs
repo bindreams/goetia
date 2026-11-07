@@ -10,9 +10,8 @@
 //!
 //! Substitution has to happen on the typed raw manifest, strictly before
 //! `resolve_shape` runs, never on a resolved `DaemonSpec`: `resolve_shape`
-//! routes every user-supplied string through
-//! `reject_unemittable`/`reject_control_chars`, the only gate between a string
-//! and a generated artifact. Substituting after it would let a `.env` value
+//! routes every user-supplied string through `reject_control_chars`, the only gate between a
+//! string and a generated artifact. Substituting after it would let a `.env` value
 //! carry a newline straight into a systemd unit or launchd plist. No field is
 //! exempt, and the call order is all that holds this up.
 //!

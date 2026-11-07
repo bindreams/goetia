@@ -151,7 +151,7 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
     // `install` has no `--timeout` of its own: its calls are unbounded.
     let mut reservation = reserved(b, &spec.id, Step::Install, Budget::Unbounded)?;
     let mut scope = b.begin_install(spec)?;
-    let desired = b.render(spec)?;
+    let desired = b.render_for_install(spec)?;
     let desired_text = desired.to_string();
 
     // No cap: `Raced` is a state change the backend detected, not a wait for time to pass.
@@ -191,7 +191,7 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
 /// Always as if `force` were `false`: the forced outcome would hide the conflict `--force` exists
 /// to let a user decide about.
 pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
-    let desired = b.render(spec)?.to_string();
+    let desired = b.render_for_install(spec)?.to_string();
     let found = classify(b, b.read(&spec.id)?);
     Ok(decide::decide(
         &found.ownership,
