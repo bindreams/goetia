@@ -1718,11 +1718,12 @@ fn list_reads_a_service_whose_own_key_denies_the_reader_by_its_parameters_alone(
             .list()
             .expect("a service key denied to the reader must not fail `list`");
 
-        // An elevated `list` leaves nothing undetermined (`UNIT_DIR_EXCLUSIVE` keeps it so).
+        // No entry says this service's read did not complete. Another service on the host may be
+        // unreadable, so entries naming other ids are not looked at.
         assert!(
-            !listed
-                .iter()
-                .any(|entry| matches!(entry, Installed::Undetermined { .. })),
+            !listed.iter().any(
+                |entry| matches!(entry, Installed::Undetermined { name, .. } if name.as_deref() == Some(id.as_str()))
+            ),
             "{seed:?}: {listed:?}"
         );
         let ours = listed

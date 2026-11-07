@@ -24,9 +24,10 @@ use windows_sys::Win32::System::Registry::{KEY_ENUMERATE_SUB_KEYS, REG_OPTION_NO
 use winreg::RegKey;
 
 use super::settle::gone_is_done;
+use super::tolerate_not_found;
 
 /// The access right to delete a key (`winnt.h`).
-pub(super) const DELETE: u32 = 0x0001_0000;
+const DELETE: u32 = 0x0001_0000;
 
 /// `name` as the counted string `ntdll` takes: its length is stated, and no unit ends it.
 fn counted(name: &[u16]) -> UNICODE_STRING {
@@ -59,12 +60,14 @@ pub(super) fn delete_value(key: &RegKey, name: &[u16]) -> io::Result<()> {
 ///
 /// A child is opened as the key it is: a registry link is deleted itself, never followed, so what
 /// it points at is neither entered nor removed. The walk is through `ntdll` alone, so a name at
-/// any depth keeps a NUL. A key that is not there, or is deleted, at its open, its listing or its
-/// delete, at any depth, is gone already, which is what this wants: not an error.
+/// any depth keeps a NUL. A key that is not there, or is deleted, at its listing or its delete, or
+/// at its open below `name`, is gone already, which is what this wants: not an error. At the open
+/// of `name` itself only NotFound is: KEY_DELETED there says that `key`, the held parent, was
+/// marked deleted, not that the child is gone.
 pub(super) fn delete_subkey(key: &RegKey, name: &[u16]) -> io::Result<()> {
     match open_raw(key.raw_handle(), name, CHILD_ACCESS) {
         Ok(child) => delete_tree(child),
-        Err(e) => gone_is_done(Err(e)),
+        Err(e) => tolerate_not_found(Err(e)),
     }
 }
 

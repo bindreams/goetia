@@ -145,8 +145,9 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///   deleted under a service that still stands. Never Foreign: this key holds the only proof of
 ///   ownership a `type: managed` service has.
 ///
-/// goetia's own writes never remove `Parameters` (see [`write_parameters`]), but SCM's delete of the
-/// service does, before the service key: a read between the two steps sees a standing service with
+/// goetia's own writes remove `Parameters` only when it is a registry link (see
+/// [`write_parameters`]), which a read already classifies as drift; SCM's delete of the service
+/// removes it, before the service key: a read between the two steps sees a standing service with
 /// no `Parameters`, and reads it as Foreign. A concurrent uninstall can leave this window open;
 /// goetia does not guard against it (owner, 2026-11-03).
 pub fn read_parameters(name: &str, origin: Origin) -> Result<RegistryReadOutcome<Parameters>> {
@@ -349,8 +350,12 @@ fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
     counted::create_child(service, &name, access)
 }
 
-/// NotFound is success: the goal state is absent. For a value; a key is deleted with
-/// [`settle::gone_is_done`], which also takes a key marked deleted.
+/// NotFound is success: the goal state is absent. For a value, and for a key opened relative to a
+/// held parent. KEY_DELETED is an error here: the key holding the value, or the parent, was marked
+/// deleted, so what the write targets is gone and the write was lost.
+///
+/// For a key below the one opened, [`settle::gone_is_done`] applies instead, which also takes a key
+/// marked deleted: that key is part of what is being deleted.
 fn tolerate_not_found(deleted: std::io::Result<()>) -> std::io::Result<()> {
     match deleted {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

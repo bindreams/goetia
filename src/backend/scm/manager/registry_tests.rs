@@ -1,8 +1,6 @@
 use super::*;
 
-use super::counted::DELETE;
 use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
-use windows_sys::Win32::System::Registry::{KEY_CREATE_LINK, KEY_CREATE_SUB_KEY, KEY_SET_VALUE};
 use winreg::types::ToRegValue as _;
 
 #[skuld::test]
@@ -28,17 +26,14 @@ fn parameters_are_opened_in_one_step_below_services_for_reading_only() {
     let (name, access) = parameters_read_request("goetia-test");
 
     assert_eq!(name, utf16(r"goetia-test\Parameters"));
-    assert_ne!(access & KEY_READ, 0);
-    for right in [KEY_SET_VALUE, KEY_CREATE_SUB_KEY, KEY_CREATE_LINK, DELETE] {
-        assert_eq!(access & right, 0, "a read asks for {right:#x}");
-    }
+    assert_eq!(access, KEY_READ);
 }
 
 #[skuld::test]
 fn a_value_not_found_is_a_delete_that_is_done_and_any_other_failure_is_not() {
     assert!(tolerate_not_found(Ok(())).is_ok());
     assert!(tolerate_not_found(Err(std::io::Error::from(std::io::ErrorKind::NotFound))).is_ok());
-    // A value has no "marked deleted": that code is a key's.
+    // The key holding the value was marked deleted: the write was lost, which is not done.
     let deleted = std::io::Error::from_raw_os_error(ERROR_KEY_DELETED as i32);
     assert!(tolerate_not_found(Err(deleted)).is_err());
 }
