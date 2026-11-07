@@ -303,12 +303,12 @@ pub(super) fn systemd_path_refusal(
     joined: &str,
     base_dir: &Path,
 ) -> Result<(), Refused> {
-    let Some(&defect) = systemd_path_field_defects(field, joined).first() else {
+    let Some(defect) = systemd_path_field_defects(field, joined).next() else {
         return Ok(());
     };
     let described = defect.describe(field, joined);
     let from_directory =
-        is_under_manifest_dir(Path::new(written)) && !systemd_path_field_defects(field, written).contains(&defect);
+        is_under_manifest_dir(Path::new(written)) && !systemd_path_field_defects(field, written).any(|d| d == defect);
     if from_directory {
         let message = format!(
             "`{}` resolves to `{joined}`, which systemd cannot carry, and the manifest directory `-f {}` is \
@@ -384,33 +384,27 @@ fn path_directive(field: &Field) -> &'static str {
 /// - `command[0]`: [`PathDefect::SpecialChars`], [`PathDefect::TrailingSpace`].
 /// - `cwd` (`WorkingDirectory=`) and `logs` (the `append:` path of `StandardOutput=` and
 ///   `StandardError=`): [`PathDefect::ParentDir`], [`PathDefect::EdgeWhitespace`].
-fn systemd_path_field_defects(field: &Field, text: &str) -> Vec<PathDefect> {
-    let mut defects = Vec::new();
-    match field {
-        Field::Command(0) => {
-            if text.contains(['\\', '"', '\'']) {
-                defects.push(PathDefect::SpecialChars);
-            }
-            if text.ends_with(' ') {
-                defects.push(PathDefect::TrailingSpace);
-            }
-        }
-        Field::Cwd | Field::Logs => {
-            if Path::new(text).components().any(|c| c == Component::ParentDir) {
-                defects.push(PathDefect::ParentDir);
-            }
-            if has_edge_whitespace(text) {
-                defects.push(PathDefect::EdgeWhitespace);
-            }
-        }
-        _ => {}
-    }
-    defects
+fn systemd_path_field_defects(field: &Field, text: &str) -> impl Iterator<Item = PathDefect> {
+    let (first, second) = match field {
+        Field::Command(0) => (
+            text.contains(['\\', '"', '\'']).then_some(PathDefect::SpecialChars),
+            text.ends_with(' ').then_some(PathDefect::TrailingSpace),
+        ),
+        Field::Cwd | Field::Logs => (
+            Path::new(text)
+                .components()
+                .any(|c| c == Component::ParentDir)
+                .then_some(PathDefect::ParentDir),
+            has_edge_whitespace(text).then_some(PathDefect::EdgeWhitespace),
+        ),
+        _ => (None, None),
+    };
+    [first, second].into_iter().flatten()
 }
 
 /// [`systemd_path_field_defects`], the first one worded.
 fn systemd_path_field_defect(field: &Field, text: &str) -> Option<String> {
-    let defect = *systemd_path_field_defects(field, text).first()?;
+    let defect = systemd_path_field_defects(field, text).next()?;
     Some(defect.describe(field, text))
 }
 

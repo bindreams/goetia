@@ -5,7 +5,7 @@ use skuld::temp_dir;
 
 use super::*;
 use crate::spec::interpolate;
-use crate::spec::test_support::{abs, plain_fields, program};
+use crate::spec::test_support::{abs, assert_no_run_of_spaces, plain_fields, program};
 use crate::spec::vars::Vars;
 
 // `Path::new("/opt/rt").is_absolute()` is `false` on Windows, and
@@ -1779,6 +1779,22 @@ fn a_value_that_only_substitution_made_invalid_says_so(#[fixture(temp_dir)] dir:
 }
 
 #[skuld::test]
+fn a_shape_error_on_a_field_the_native_override_supplied_carries_the_override_then_env(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  launchd:\n    name: ${N}\n";
+    write_fixture(dir, yaml, Some("N=\"a\tb\"\n"));
+    let msg = resolve_as(parse_manifest(yaml), dir, Some(BackendKind::Launchd))
+        .unwrap_err()
+        .to_string();
+    let prefix = "daemon `frpc`: backend-specific.launchd: after substituting from .env: ";
+    let rest = msg
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("no `{prefix}` at the start of {msg}"));
+    assert!(rest.contains("control character"), "{msg}");
+}
+
+#[skuld::test]
 fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else(#[fixture(temp_dir)] dir: &Path) {
     // `spec::backend`'s module doc, made executable. Substitution runs for
     // the native backend only, so `${ACCT}` is unresolvable — and therefore
@@ -2827,14 +2843,21 @@ fn only_the_defect_the_field_did_not_write_is_dash_fs() {
     assert_no_run_of_spaces(&msg);
 }
 
+/// `/bin/frpc` is absolute on Unix. On Windows it has a root and no prefix, so it joins to the
+/// manifest directory's drive only; its backslashes are the host's separators, not `-f`'s.
+#[cfg(windows)]
+#[skuld::test]
+fn a_root_relative_path_is_not_under_the_manifest_directory() {
+    let yaml = systemd_manifest("command: ['/bin/frpc']");
+    let msg = resolve_as(parse_manifest(&yaml), &abs("base"), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
+}
+
 #[skuld::test]
 fn a_parent_dir_the_field_wrote_says_how_to_fix_it() {
     let yaml = systemd_manifest(&format!("cwd: '{}/../y'", slash_abs("opt/x")));
     let msg = resolve_yaml_as(BackendKind::Systemd, &yaml).unwrap_err().to_string();
     assert!(msg.contains("write the path without `..`"), "{msg}");
-}
-
-/// A message that lost a `\` line continuation shows as a long run of spaces.
-fn assert_no_run_of_spaces(msg: &str) {
-    assert!(!msg.contains("  "), "a run of spaces in {msg:?}");
 }

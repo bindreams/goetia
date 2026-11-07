@@ -5,7 +5,7 @@ use crate::error::Error;
 use crate::spec::field::Field;
 use crate::spec::interpolate::Substitution;
 use crate::spec::overrides::Supplied;
-use crate::spec::test_support::abs;
+use crate::spec::test_support::{abs, assert_no_run_of_spaces};
 use crate::spec::{AccountId, Id, Kind, Restart, User};
 
 fn parse(yaml: &str) -> Result<BackendKind, yaml_serde::Error> {
@@ -386,7 +386,7 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
         let message = Error::from(refused).to_string();
         assert!(message.contains(&format!("{key:?}")), "{message}");
         assert!(message.contains("Environment="), "{message}");
-        assert!(!message.contains("  "), "a run of spaces in {message:?}");
+        assert_no_run_of_spaces(&message);
         assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{key:?}");
         assert!(BackendKind::Scm.refuse(&spec).is_ok(), "{key:?}");
 

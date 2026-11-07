@@ -639,9 +639,10 @@ fn resolve_path_string(
 }
 
 /// Whether `p` is joined to the manifest directory. A path with its own prefix (`C:bin`) replaces
-/// `base_dir` in the join, so it is not under it.
+/// `base_dir` in the join, and a root-relative one (`/bin`, `\bin` on Windows) keeps only the
+/// drive of `base_dir`, so neither is under it.
 pub(super) fn is_under_manifest_dir(p: &Path) -> bool {
-    !p.is_absolute() && !matches!(p.components().next(), Some(std::path::Component::Prefix(_)))
+    !p.has_root() && !matches!(p.components().next(), Some(std::path::Component::Prefix(_)))
 }
 
 /// The field rules for a resolved path, which is what an artifact would carry. `raw` has passed
