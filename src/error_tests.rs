@@ -357,6 +357,19 @@ fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
     assert!(step("a", inner()).sentence().map(|s| s.error).is_none());
 }
 
+/// A kept error answers `stderr` as the error it holds, however deep.
+#[skuld::test]
+fn a_kept_commands_stderr_is_the_commands() {
+    let command = Error::Command {
+        command: "systemctl start x".to_string(),
+        status: exit_status(1),
+        stderr: "Access denied".to_string(),
+    };
+    let kept = Error::Kept(Arc::new(Error::Kept(Arc::new(command))));
+    assert_eq!(kept.stderr(), Some("Access denied"));
+    assert_eq!(Error::Kept(Arc::new(not_installed())).stderr(), None);
+}
+
 #[skuld::test]
 fn both_is_indeterminate_only_when_both_halves_are() {
     let both = |first: Error, then: Error| Error::Both {

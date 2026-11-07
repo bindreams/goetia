@@ -196,9 +196,34 @@ fn an_embedded_errors_stderr_keeps_its_layout() {
         )),
         "{text:?}"
     );
-    // `Display` and the report for JSON keep it as it came.
-    assert!(e.to_string().contains(": a\nb), so goetia"), "{e}");
+    // The report for JSON keeps it as it came.
     assert!(e.report_unescaped().to_string().contains(": a\nb), so goetia"));
+}
+
+/// Only the report writes a child's stderr: a sentence variant's `Display` leaves out the stderr
+/// of the error inside it, as a failed command's own `Display` does.
+#[skuld::test]
+fn display_of_a_sentence_variant_leaves_out_the_embedded_errors_stderr() {
+    let status = exit_status(1);
+    let blob = Error::StartAsManaged {
+        blob: Arc::new(command("secret\ndiagnostic")),
+        source: Box::new(os("start", "/q", "stopped")),
+    };
+    let loaded = Error::LoadedStateInDoubt {
+        id: id(),
+        read_failed: Box::new(command("secret\ndiagnostic")),
+        restore_failed: None,
+    };
+    for e in [&blob, &loaded] {
+        assert!(
+            e.to_string()
+                .contains(&format!("`systemctl start x` failed ({status})")),
+            "{e}"
+        );
+        assert!(!e.to_string().contains("secret"), "{e}");
+        assert!(e.report().to_string().contains("secret\ndiagnostic"));
+    }
+    assert!(!Chain(&command("secret")).to_string().contains("secret"));
 }
 
 /// A kept error is handed out as it was: a kept `Both` prints both halves, and a remedy in either.
@@ -217,14 +242,32 @@ fn a_kept_both_prints_both_halves_and_its_remedies() {
     assert_eq!(twice.report().to_string(), expected);
 }
 
-/// An error's `Display` is its sentence, so the report and `Display` cannot word it differently.
+/// The report and `Display` word a sentence variant alike: they differ only by the embedded
+/// error's stderr, which only the report writes.
 #[skuld::test]
-fn display_of_a_sentence_variant_is_its_sentence() {
-    let e = Error::LoadedStateInDoubt {
+fn display_of_a_sentence_variant_and_its_report_agree_on_the_words() {
+    let blob = Error::StartAsManaged {
+        blob: Arc::new(os("read", "/p", "denied")),
+        source: Box::new(os("start", "/q", "stopped")),
+    };
+    let loaded = Error::LoadedStateInDoubt {
         id: id(),
         read_failed: Box::new(os("read", "/p", "denied")),
         restore_failed: None,
     };
-    assert_eq!(e.to_string(), e.sentence().unwrap().to_string());
-    assert_eq!(e.report().to_string(), e.to_string());
+    for e in [&blob, &loaded] {
+        // No stderr and no source in the first: the report is `Display`, then the source if any.
+        let report = e.report().to_string();
+        assert!(report.starts_with(&e.to_string()), "{report}");
+    }
+    assert_eq!(loaded.report().to_string(), loaded.to_string());
+
+    // With stderr in the embedded error, the report is `Display` with the stderr put in.
+    let loaded = Error::LoadedStateInDoubt {
+        id: id(),
+        read_failed: Box::new(command("diagnostic")),
+        restore_failed: None,
+    };
+    let (display, report) = (loaded.to_string(), loaded.report().to_string());
+    assert_eq!(report.replacen(": diagnostic", "", 1), display);
 }

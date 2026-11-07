@@ -27,15 +27,30 @@ pub(super) fn write_report(e: &Error, out: &mut Sink) -> fmt::Result {
 /// Where error text goes. The one place it is written for a person is [`write_chain`], so the one
 /// place it is escaped: `escaped` is whether this destination is one. The text goes through
 /// [`fmt::Write`], which escapes it whole; a child's stderr is written with
-/// [`write_layout`](Sink::write_layout), which keeps its line feeds and tabs.
+/// [`write_layout`](Sink::write_layout), which keeps its line feeds and tabs. A sink writes a
+/// child's stderr only if it was made to: [`Chain`] makes one that does not.
 pub(crate) struct Sink<'a> {
     out: &'a mut dyn fmt::Write,
     escaped: bool,
+    stderr: bool,
 }
 
 impl<'a> Sink<'a> {
     pub(crate) fn new(out: &'a mut dyn fmt::Write, escaped: bool) -> Self {
-        Sink { out, escaped }
+        Sink {
+            out,
+            escaped,
+            stderr: true,
+        }
+    }
+
+    /// A sink that writes text as it is and leaves out a child's stderr.
+    fn without_stderr(out: &'a mut dyn fmt::Write) -> Self {
+        Sink {
+            out,
+            escaped: false,
+            stderr: false,
+        }
     }
 
     /// Writes `text`, a child's diagnostic, as it is laid out: for a person its line feeds, tabs
@@ -59,8 +74,9 @@ impl fmt::Write for Sink<'_> {
     }
 }
 
-/// An error and its causes, without the remedies [`Report`] prints after them: how an error that
-/// sits inside another's sentence is written to `Display`.
+/// An error and its causes, without the remedies [`Report`] prints after them and without a failed
+/// command's stderr, as [`Error::Command`]'s own `Display` leaves it out: how an error that sits
+/// inside another's sentence is written to `Display`.
 ///
 /// Not escaped: the text lands in an error's `Display`, which the sink that prints it escapes. The
 /// report does not print a [`Sentence`](super::Sentence) through this, but writes the embedded error
@@ -72,7 +88,7 @@ pub(crate) struct Chain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
 impl fmt::Display for Chain<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_chain(self.0, &mut Sink::new(f, false), &mut Vec::new())
+        write_chain(self.0, &mut Sink::without_stderr(f), &mut Vec::new())
     }
 }
 
@@ -87,9 +103,9 @@ pub(super) fn write_chain<'a>(
     // A `#[source]` of type `Box<Error>` reaches here as the box.
     let ours = e
         .downcast_ref::<Error>()
-        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b))
-        .map(Error::unkept);
-    if let Some(Error::Both { first, then }) = ours {
+        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b));
+    // The one place a `Kept` is looked through by hand: a kept `Both` is a `Both`.
+    if let Some(Error::Both { first, then }) = ours.map(Error::unkept) {
         write_chain(first.as_ref(), out, remedies)?;
         out.write_str("; then: ")?;
         return write_chain(then.as_ref(), out, remedies);
@@ -103,7 +119,9 @@ pub(super) fn write_chain<'a>(
         Some(sentence) => write_sentence(sentence, out, remedies)?,
         None => write!(out, "{e}")?,
     }
-    if let Some(stderr) = ours.and_then(Error::stderr).filter(|stderr| !stderr.is_empty()) {
+    if out.stderr
+        && let Some(stderr) = ours.and_then(Error::stderr).filter(|stderr| !stderr.is_empty())
+    {
         out.write_str(": ")?;
         out.write_layout(stderr)?;
     }

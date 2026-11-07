@@ -412,7 +412,7 @@ pub enum Error {
     /// launchd only.
     ///
     /// Exit `4` (indeterminate).
-    #[error("{}", OwnSentence(self))]
+    #[error("{}", loaded_state_in_doubt(id, read_failed, restore_failed.is_some()))]
     LoadedStateInDoubt {
         id: String,
         read_failed: Box<Error>,
@@ -473,7 +473,7 @@ pub enum Error {
     /// A `start` was judged as a `type: managed` service's, because the service's spec blob could not
     /// be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
     /// `source` is the failed start.
-    #[error("{}", OwnSentence(self))]
+    #[error("{}", start_as_managed_message(blob))]
     StartAsManaged {
         blob: Arc<Error>,
         #[source]
@@ -597,8 +597,8 @@ impl Error {
 
     /// The sentence this error's `Display` is, when it has an error set in it, which is not its
     /// [`source`](std::error::Error::source). [`report`](Error::report) writes that error itself,
-    /// so its remedies print last: a variant that writes an error into its message must build the
-    /// message as a [`Sentence`] and return it here, which its `Display` then writes. A
+    /// so its remedies print last: a variant that writes an error into its message builds the
+    /// message as a [`Sentence`] in one function, which its `Display` and this method both call. A
     /// [`Kept`](Error::Kept) error answers as the error it holds.
     ///
     /// Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
@@ -918,8 +918,8 @@ fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
 }
 
 /// A message with an error set inside it: `before`, the error, `after`. `Display` writes the
-/// error as [`Chain`] does; [`Error::report`] and [`Reason`] write it as they write any error
-/// (see [`Error::sentence`]).
+/// error as [`Chain`] does, without its stderr; [`Error::report`] and [`Reason`] write it as they
+/// write any error (see [`Error::sentence`]).
 pub(crate) struct Sentence<'a> {
     pub(crate) before: Cow<'a, str>,
     pub(crate) error: &'a Error,
@@ -929,21 +929,6 @@ pub(crate) struct Sentence<'a> {
 impl fmt::Display for Sentence<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}{}{}", self.before, Chain(self.error), self.after)
-    }
-}
-
-/// The `Display` of the variants that write an error into their message: [`Error::sentence`] is
-/// their one mapping from fields to message.
-struct OwnSentence<'a>(&'a Error);
-
-impl fmt::Display for OwnSentence<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let sentence = self.0.sentence();
-        debug_assert!(sentence.is_some(), "{:?} has no sentence", self.0);
-        match sentence {
-            Some(sentence) => sentence.fmt(f),
-            None => Ok(()),
-        }
     }
 }
 
