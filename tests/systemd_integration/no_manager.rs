@@ -4,7 +4,7 @@
 //! untouched.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
 use goetia::backend::systemd::manager::Systemd;
@@ -116,16 +116,6 @@ impl NoManager {
         assert_eq!(output.status.code(), Some(1), "{context}");
         assert!(stderr.contains(&format!("{REFUSAL}{}", self.evidence())), "{context}");
         stderr.into_owned()
-    }
-}
-
-/// RAII removal of the boot-enablement link a test's own `enable` made: declared after the
-/// `ServiceGuard`, so it drops first, and the guard's `daemon-reload` sees it gone.
-struct RmLink(PathBuf);
-
-impl Drop for RmLink {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -305,7 +295,6 @@ fn a_start_stop_or_restart_where_no_manager_can_be_asked_sends_nothing() {
 fn enable_or_disable_where_no_manager_can_be_asked_leaves_the_link_alone() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let _link = RmLink(wants_symlink(guard.id()));
     let mgr = Systemd::new();
     let daemon = installed(&guard);
 
@@ -348,7 +337,6 @@ fn an_uninstall_where_no_manager_can_be_asked_removes_nothing() {
 fn a_live_state_read_where_no_manager_can_be_asked_is_refused() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let _link = RmLink(wants_symlink(guard.id()));
     let mgr = Systemd::new();
     let daemon = installed(&guard);
     mgr.enable(&daemon).expect("enable online");

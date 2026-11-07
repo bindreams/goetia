@@ -1,5 +1,11 @@
 //! RAII cleanup for the real system services the probes register.
 //!
+//! A guard exists before the write it cleans up.
+//!
+//! On macOS it boots the job out and removes only
+//! `/Library/LaunchDaemons/<id>.plist`, not goetia's staging directory. A
+//! goetia-installed launchd id is guarded with the launchd suite's `Guard`.
+//!
 //! `Drop` cannot return a `Result`, so every failure other than "not found" is
 //! logged to stderr naming the id and the error. A cleanup failure that
 //! reports nothing surfaces later only as a mysterious straggler in
@@ -29,7 +35,9 @@ impl Drop for ServiceGuard {
     }
 }
 
-fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
+/// Removes a file, or a directory tree when `dir`; "not found" is success, any other failure is
+/// returned as a message for the caller to log.
+pub fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
     let result = if dir {
         std::fs::remove_dir_all(path)
     } else {
@@ -42,9 +50,9 @@ fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
     }
 }
 
-/// These probes never `systemctl enable`, so there is no `.wants` symlink to
-/// undo; a drop-in directory is removed anyway because a leftover one would
-/// poison the next install of the same id.
+/// Removes the fragment, its drop-in directory (a leftover one would poison the
+/// next install of the same id) and the `multi-user.target.wants` symlink a
+/// test that enabled the unit leaves.
 #[cfg(target_os = "linux")]
 fn cleanup(id: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -58,6 +66,10 @@ fn cleanup(id: &str) -> Vec<String> {
     }
     problems.extend(remove_path(&path, false));
     problems.extend(remove_path(&path.with_file_name(format!("{unit}.d")), true));
+    let wants = std::path::PathBuf::from(SYSTEMD_UNIT_DIR)
+        .join("multi-user.target.wants")
+        .join(&unit);
+    problems.extend(remove_path(&wants, false));
     let reload = cmd::run("systemctl", &["daemon-reload"]);
     if !reload.ok() {
         problems.push(reload.to_string());
@@ -88,14 +100,16 @@ fn cleanup(id: &str) -> Vec<String> {
 fn cleanup(id: &str) -> Vec<String> {
     let mut problems = Vec::new();
 
-    // `sc.exe` exits with the Win32 error: 1060 is ERROR_SERVICE_DOES_NOT_EXIST
-    // and 1062 is ERROR_SERVICE_NOT_ACTIVE.
+    // `sc.exe` exits with the Win32 error: 1060 is ERROR_SERVICE_DOES_NOT_EXIST,
+    // 1062 is ERROR_SERVICE_NOT_ACTIVE and 1072 is ERROR_SERVICE_MARKED_FOR_DELETE.
     let stop = cmd::run("sc.exe", &["stop", id]);
-    if !stop.ok() && !matches!(stop.code, Some(1060 | 1062)) {
+    if !stop.ok() && !matches!(stop.code, Some(1060 | 1062 | 1072)) {
         problems.push(stop.to_string());
     }
+    // 1072: `uninstall` may return while the record is only marked for deletion;
+    // SCM drops it once its last handle closes. Nothing is left to delete.
     let delete = cmd::run("sc.exe", &["delete", id]);
-    if !delete.ok() && delete.code != Some(1060) {
+    if !delete.ok() && !matches!(delete.code, Some(1060 | 1072)) {
         problems.push(delete.to_string());
     }
     problems
