@@ -681,7 +681,11 @@ impl ShimProvider for Recording {
         Ok(self.provide.clone())
     }
 
-    fn sweep(&self, _referenced: &[PathBuf]) -> Result<(), SweepFailure> {
+    fn sweep(
+        &self,
+        _referenced: &[PathBuf],
+        _default_folder: &dyn Fn() -> goetia::error::Result<PathBuf>,
+    ) -> Result<(), SweepFailure> {
         self.calls.lock().unwrap().push("sweep");
         Ok(())
     }
@@ -777,8 +781,12 @@ impl ShimProvider for Gated {
         self.inner.provide(folders)
     }
 
-    fn sweep(&self, referenced: &[PathBuf]) -> Result<(), SweepFailure> {
-        self.inner.sweep(referenced)
+    fn sweep(
+        &self,
+        referenced: &[PathBuf],
+        default_folder: &dyn Fn() -> goetia::error::Result<PathBuf>,
+    ) -> Result<(), SweepFailure> {
+        self.inner.sweep(referenced, default_folder)
     }
 }
 

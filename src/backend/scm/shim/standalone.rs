@@ -40,7 +40,11 @@ impl ShimProvider for StandaloneShim {
         Ok(command)
     }
 
-    fn sweep(&self, _referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+    fn sweep(
+        &self,
+        _referenced: &[PathBuf],
+        _default_folder: &dyn Fn() -> Result<PathBuf>,
+    ) -> std::result::Result<(), SweepFailure> {
         Ok(())
     }
 }

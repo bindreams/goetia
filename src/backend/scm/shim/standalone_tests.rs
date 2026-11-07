@@ -56,7 +56,9 @@ fn standalone_sweep_removes_nothing() {
     let exe = dir.path().join("host.exe");
     std::fs::write(&exe, b"host").unwrap();
 
-    StandaloneShim::new(exe.clone(), vec![]).sweep(&[]).unwrap();
+    StandaloneShim::new(exe.clone(), vec![])
+        .sweep(&[], &|| unreachable!("it sweeps nothing, so it asks nothing"))
+        .unwrap();
 
     assert!(exe.exists());
 }
