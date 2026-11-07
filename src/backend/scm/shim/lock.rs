@@ -15,7 +15,7 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_INVALID_OWNER, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_OWNER, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject};
 
@@ -76,10 +76,15 @@ impl InstallLock {
 }
 
 /// The error for a failed `CreateMutexW`. The lock's owner is Administrators, which a token that
-/// does not have it enabled cannot give an object: that is `ERROR_INVALID_OWNER`, and it is the
-/// caller's lack of elevation ([`Error::ElevationRequired`]), not an OS failure.
+/// does not have it enabled cannot give an object (`ERROR_INVALID_OWNER`), and its DACL admits only
+/// SYSTEM and Administrators, so that token cannot open one that exists either
+/// (`ERROR_ACCESS_DENIED`). Both are the caller's lack of elevation ([`Error::ElevationRequired`]),
+/// not an OS failure.
 fn create_failed(source: io::Error) -> Error {
-    if source.raw_os_error() == Some(ERROR_INVALID_OWNER as i32) {
+    if matches!(
+        source.raw_os_error(),
+        Some(code) if code == ERROR_INVALID_OWNER as i32 || code == ERROR_ACCESS_DENIED as i32
+    ) {
         return Error::ElevationRequired {
             subcommand: format!("create the install lock `{NAME}`"),
         };
