@@ -290,6 +290,19 @@ fn installed_host_unreadable() -> Error {
     }
 }
 
+/// The one place a failed `regenerate` is told apart: `judge`, `status` and `list` all use it.
+#[skuld::test]
+fn a_failed_read_of_the_installed_host_is_told_from_a_spec_that_cannot_be_regenerated() {
+    assert!(matches!(
+        RegenerationFailure::of(installed_host_unreadable()),
+        RegenerationFailure::HostUnreadable(Error::InstalledUnreadable { .. })
+    ));
+    assert!(matches!(
+        RegenerationFailure::of(Error::os("resolve the account", std::io::Error::other("gone"))),
+        RegenerationFailure::SpecUnregenerable(Error::Os { .. })
+    ));
+}
+
 /// A failed read of what is installed is not a spec that cannot be regenerated.
 #[skuld::test]
 fn status_names_a_failed_read_of_the_installed_host_as_that() {
