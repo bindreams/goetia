@@ -3,16 +3,18 @@ use std::time::Duration;
 use super::*;
 use crate::manager::Budget;
 use crate::manager::conformance;
+use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{Id, Kind, Restart};
 
 // Fixtures ============================================================================================================
 
 pub(crate) fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         kind: Kind::Simple,
-        ..DaemonSpec::for_test(id, vec!["daemon".to_owned()])
-    }
+        ..plain_fields(id, vec![program("daemon")])
+    })
+    .unwrap()
 }
 
 // The deliverable =====================================================================================================
@@ -763,10 +765,11 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
         }),
     ];
     let spec = mk("frpc");
-    let other = DaemonSpec {
+    let other = DaemonSpec::new(DaemonFields {
         name: "another artifact".to_string(),
-        ..mk("frpc")
-    };
+        ..mk("frpc").into_fields()
+    })
+    .unwrap();
 
     for stale in ["gone", "foreign", "another artifact of goetia's"] {
         let fake = Fake::new();

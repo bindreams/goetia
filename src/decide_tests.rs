@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::blob::{self, Blob};
-use crate::spec::{DaemonSpec, Kind, Restart};
+use crate::spec::test_support::{abs, plain_fields, program};
+use crate::spec::{DaemonFields, DaemonSpec, Kind, Restart};
 
 // Fixtures ============================================================================================================
 
@@ -19,19 +20,19 @@ fn unclearable() -> ExternalConfig {
     }
 }
 
-// `DaemonSpec` is built literally here, never via `resolve()`: a resolved
-// path renders with `\` on Windows and `/` elsewhere, which would make
-// text-level assertions platform-dependent. Every path below is a single
-// component for the same reason (see `diff_tests.rs`).
+// `DaemonSpec` is built through `DaemonSpec::new`, never `resolve()`. The paths are absolute
+// because `new` requires it; no assertion reads them, so their platform spelling does not matter
+// (see `diff_tests.rs`).
 fn spec_fixture() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_owned(),
-        cwd: Some(PathBuf::from("app")),
+        cwd: Some(abs("app")),
         restart: Restart::OnFailure,
-        logs: Some(PathBuf::from("frpc.log")),
+        logs: Some(abs("frpc.log")),
         kind: Kind::Simple,
-        ..DaemonSpec::for_test("frpc", vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()])
-    }
+        ..plain_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()])
+    })
+    .unwrap()
 }
 
 fn blob_for(spec: &DaemonSpec, version: &str) -> Blob {
@@ -93,8 +94,9 @@ fn identical_is_up_to_date() {
 #[skuld::test]
 fn spec_change_updates() {
     let embedded = spec_fixture();
-    let mut new_spec = spec_fixture();
+    let mut new_spec = spec_fixture().into_fields();
     new_spec.restart = Restart::Always;
+    let new_spec = DaemonSpec::new(new_spec).unwrap();
     let regenerated = "ARTIFACT FROM EMBEDDED SPEC";
     let found = ours(&embedded, RUNNING_VERSION, regenerated, regenerated);
 
@@ -170,8 +172,9 @@ fn hand_edit_with_force_updates() {
 #[skuld::test]
 fn spec_change_with_hand_edit_conflicts() {
     let embedded = spec_fixture();
-    let mut new_spec = spec_fixture();
+    let mut new_spec = spec_fixture().into_fields();
     new_spec.restart = Restart::Always;
+    let new_spec = DaemonSpec::new(new_spec).unwrap();
     let regenerated = "ARTIFACT FROM EMBEDDED SPEC\n";
     // Hand-edited on top of the old (embedded-spec) artifact: differs from
     // both `regenerated` and `desired`.
@@ -202,8 +205,9 @@ fn spec_change_with_hand_edit_conflicts() {
 #[skuld::test]
 fn spec_change_with_hand_edit_and_force_updates() {
     let embedded = spec_fixture();
-    let mut new_spec = spec_fixture();
+    let mut new_spec = spec_fixture().into_fields();
     new_spec.restart = Restart::Always;
+    let new_spec = DaemonSpec::new(new_spec).unwrap();
     let regenerated = "ARTIFACT FROM EMBEDDED SPEC\n";
     let on_disk = "ARTIFACT FROM EMBEDDED SPEC\nMemoryMax=8G\n";
     let found = ours(&embedded, RUNNING_VERSION, regenerated, on_disk);
@@ -249,10 +253,11 @@ fn foreign_refuses_even_with_force() {
 
 #[skuld::test]
 fn other_daemon_refuses_even_with_force() {
-    let spec = DaemonSpec {
+    let spec = DaemonSpec::new(DaemonFields {
         id: Id::try_from("FRPC").unwrap(),
-        ..spec_fixture()
-    };
+        ..spec_fixture().into_fields()
+    })
+    .unwrap();
     let installed = Id::try_from("frpc").unwrap();
 
     for force in [false, true] {

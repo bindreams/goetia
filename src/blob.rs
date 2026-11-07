@@ -21,11 +21,9 @@
 //!   by one byte reports the installed service as stale-and-regeneratable
 //!   (see `decide::Outcome::Stale`) rather than as a user hand-edit.
 //!
-//! `decode` re-runs `DaemonSpec`'s injection-gate validation (`spec::resolve`'s
-//! own checks, reused here rather than duplicated) against
-//! the deserialized content: `DaemonSpec`'s fields are `pub`, and a
-//! tampered or bit-rotted artifact can carry structurally valid JSON that
-//! violates them.
+//! `decode` builds the `DaemonSpec` through `DaemonSpec::new`, so the deserialized
+//! content passes every field rule: a tampered or bit-rotted artifact can
+//! carry structurally valid JSON that violates them.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -37,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::spec::{self, AccountId, DaemonSpec, Id, Kind, Restart, User};
+use crate::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 
 // Constants ===========================================================================================================
 
@@ -280,52 +278,17 @@ impl From<Kind> for WireKind {
     }
 }
 
-/// Rebuild a `DaemonSpec` from wire data, re-running every check
-/// `spec::resolve` would have run on it — see the module doc comment for
-/// why a structurally valid `WireSpec` cannot be trusted as-is.
+/// Rebuild a `DaemonSpec` from wire data. `DaemonSpec::new` re-runs every field rule — see the
+/// module doc comment for why a structurally valid `WireSpec` cannot be trusted as-is.
 fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
     let id = Id::try_from(wire.id)?;
 
-    spec::reject_unemittable(&id, "name", &wire.name)?;
-
-    spec::reject_empty_command(&id, &wire.command)?;
-    for arg in &wire.command {
-        spec::reject_unemittable(&id, "command", arg)?;
-    }
-    spec::reject_empty(&id, "command[0]", &wire.command[0])?;
-
-    let cwd = match wire.cwd {
-        Some(raw) => {
-            spec::reject_unemittable(&id, "cwd", &raw)?;
-            spec::reject_empty(&id, "cwd", &raw)?;
-            let path = PathBuf::from(raw);
-            spec::reject_relative_path(&id, "cwd", &path)?;
-            Some(path)
-        }
-        None => None,
+    let user = match wire.user {
+        WireUser::Root => User::Root,
+        WireUser::Name { name } => User::Name(name),
+        WireUser::Uid { uid } => User::Id(AccountId::Uid(uid)),
+        WireUser::Sid { sid } => User::Id(AccountId::Sid(sid)),
     };
-
-    let logs = match wire.logs {
-        Some(raw) => {
-            spec::reject_unemittable(&id, "logs", &raw)?;
-            spec::reject_empty(&id, "logs", &raw)?;
-            let path = PathBuf::from(raw);
-            spec::reject_relative_path(&id, "logs", &path)?;
-            Some(path)
-        }
-        None => None,
-    };
-
-    let mut env = BTreeMap::new();
-    for (key, value) in wire.env {
-        spec::reject_env_key_with_equals(&id, &key)?;
-        spec::reject_unemittable(&id, "env key", &key)?;
-        spec::reject_empty(&id, "env key", &key)?;
-        spec::reject_unemittable(&id, &format!("env[{key}]"), &value)?;
-        env.insert(key, value);
-    }
-
-    let user = user_from_wire(&id, wire.user)?;
 
     let restart = match wire.restart {
         WireRestart::Never => Restart::Never,
@@ -333,54 +296,37 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
         WireRestart::Always => Restart::Always,
     };
 
-    let restart_delay = match wire.restart_delay {
-        Some(d) => Some(duration_from_wire(&id, d)?),
-        None => None,
-    };
-
     let kind = match wire.kind {
         WireKind::Simple => Kind::Simple,
         WireKind::Managed => Kind::Managed,
     };
 
-    Ok(DaemonSpec {
+    let spec = DaemonSpec::new(DaemonFields {
         id,
         name: wire.name,
         command: wire.command,
-        cwd,
-        env,
+        cwd: wire.cwd.map(PathBuf::from),
+        env: wire.env,
         user,
         restart,
-        restart_delay,
-        logs,
+        restart_delay: wire.restart_delay.as_ref().map(duration_from_wire),
+        logs: wire.logs.map(PathBuf::from),
         kind,
-    })
+    })?;
+    // After the field rules: a blob with several defects reports the first in field order.
+    if let Some(delay) = &wire.restart_delay {
+        check_nanos(&spec.id, delay)?;
+    }
+    Ok(spec)
 }
 
-fn user_from_wire(id: &Id, wire: WireUser) -> Result<User, Error> {
-    Ok(match wire {
-        WireUser::Root => User::Root,
-        WireUser::Name { name } => {
-            spec::reject_unemittable(id, "user.name", &name)?;
-            spec::reject_blank(id, "user.name", &name)?;
-            User::Name(name)
-        }
-        WireUser::Uid { uid } => User::Id(AccountId::Uid(uid)),
-        WireUser::Sid { sid } => {
-            spec::reject_unemittable(id, "user.id", &sid)?;
-            spec::reject_blank(id, "user.id", &sid)?;
-            User::Id(AccountId::Sid(sid))
-        }
-    })
+/// Saturates rather than panic on `nanos >= 1e9`; [`check_nanos`] refuses that value right after.
+fn duration_from_wire(wire: &WireDuration) -> Duration {
+    Duration::from_secs(wire.secs).saturating_add(Duration::from_nanos(wire.nanos.into()))
 }
 
-/// `Duration::new` panics if `nanos >= 1_000_000_000`; a hand-tampered
-/// blob can carry exactly that, so this is checked rather than trusted.
-/// This is a `DaemonSpec`-content invariant on an otherwise cleanly
-/// decoded envelope, so it is `Error::Invalid` like every other check in
-/// `daemon_spec_from_wire` — not `Error::Blob`, which is reserved for a
-/// corrupt envelope (see `error.rs`).
-fn duration_from_wire(id: &Id, wire: WireDuration) -> Result<Duration, Error> {
+/// `nanos >= 1e9` is `Error::Invalid` (content), not `Error::Blob` (envelope).
+fn check_nanos(id: &Id, wire: &WireDuration) -> Result<(), Error> {
     if wire.nanos >= 1_000_000_000 {
         return Err(Error::Invalid {
             daemon: id.as_str().to_string(),
@@ -391,7 +337,7 @@ fn duration_from_wire(id: &Id, wire: WireDuration) -> Result<Duration, Error> {
             source: None,
         });
     }
-    Ok(Duration::new(wire.secs, wire.nanos))
+    Ok(())
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ use crate::error::{Error, Reason, Result};
 use crate::manager::budget;
 use crate::manager::flow;
 use crate::manager::{Budget, Installed, ServiceManager, State, Status, Step};
-use crate::spec::{DaemonSpec, Id, User};
+use crate::spec::{DaemonFields, DaemonSpec, Id, User};
 
 /// The fake's own artifact marker, deliberately not any real backend's
 /// `Marker`/`Schema`/`Version`/`Spec` field names: no real manager reads it.
@@ -250,10 +250,10 @@ impl Fake {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
-        let spec = DaemonSpec {
+        let spec = DaemonSpec::new(DaemonFields {
             id: Id::try_from(id).expect("seed_invalid_content needs a valid id"),
             name: id.to_string(),
-            command: vec!["daemon".to_string()],
+            command: vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
             cwd: None,
             env: std::collections::BTreeMap::new(),
             user: crate::spec::User::Root,
@@ -262,7 +262,8 @@ impl Fake {
             restart_delay: Some(std::time::Duration::from_secs(1)),
             logs: None,
             kind: crate::spec::Kind::Simple,
-        };
+        })
+        .expect("a valid spec");
         let encoded = blob::encode(&spec);
         let bytes = BASE64.decode(&encoded).expect("blob::encode emits valid base64");
         let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("blob::encode emits valid JSON");

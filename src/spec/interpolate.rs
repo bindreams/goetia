@@ -60,6 +60,9 @@
 //! before substitution, parsing the wrong string; deferring unnecessarily
 //! only runs a check slightly later. Do not narrow it.
 
+use std::collections::BTreeSet;
+
+use super::field::Field;
 use super::raw::RawSpec;
 use super::user::{AccountId, RawUser};
 use super::vars::Vars;
@@ -71,15 +74,24 @@ use crate::error::{Error, Result};
 enum Mode<'a> {
     /// Resolve each reference against `.env`.
     Substitute(&'a Vars),
-    /// Check the grammar only. [`resolve_name`] returns `Ok(String::new())`
+    /// Check the grammar only. [`resolve_name`] returns empty text
     /// without touching `vars`, so an undefined name is not an error.
     CheckOnly,
+}
+
+/// A scanned string, and whether `.env` supplied any of it.
+#[derive(Debug)]
+pub(crate) struct Scanned {
+    pub(crate) text: String,
+    /// Some reference was resolved from `.env`. Not a default, and not a `$$`: those are the
+    /// manifest's own text.
+    pub(crate) from_env: bool,
 }
 
 /// Substitute one scalar. `path` is the manifest field path used in
 /// errors, e.g. `env["LOG"]`. See the module doc for the grammar and for why
 /// this must run before `resolve_shape`.
-pub(crate) fn scalar(input: &str, path: &str, vars: &Vars) -> Result<String> {
+pub(crate) fn scalar(input: &str, path: &str, vars: &Vars) -> Result<Scanned> {
     scan(input, path, Mode::Substitute(vars))
 }
 
@@ -91,8 +103,9 @@ pub(crate) fn check_grammar(input: &str, path: &str) -> Result<()> {
     scan(input, path, Mode::CheckOnly).map(drop)
 }
 
-fn scan(input: &str, path: &str, mode: Mode<'_>) -> Result<String> {
+fn scan(input: &str, path: &str, mode: Mode<'_>) -> Result<Scanned> {
     let mut out = String::with_capacity(input.len());
+    let mut from_env = false;
     let mut chars = input.char_indices().peekable();
 
     while let Some((i, c)) = chars.next() {
@@ -105,7 +118,8 @@ fn scan(input: &str, path: &str, mode: Mode<'_>) -> Result<String> {
             Some('{') => {
                 chars.next();
                 let value = scan_braced(&mut chars, path, mode)?;
-                out.push_str(&value);
+                out.push_str(&value.text);
+                from_env |= value.from_env;
             }
             Some('$') => {
                 chars.next();
@@ -120,7 +134,7 @@ fn scan(input: &str, path: &str, mode: Mode<'_>) -> Result<String> {
         }
     }
 
-    Ok(out)
+    Ok(Scanned { text: out, from_env })
 }
 
 /// Whether `s` contains any `$` at all. Deliberately an over-approximation of "substitution
@@ -129,13 +143,32 @@ pub(crate) fn would_substitution_change(s: &str) -> bool {
     s.contains('$')
 }
 
+/// Whether the text a shape-phase judgement is handed may still hold `${...}` references.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Substitution {
+    /// As authored (the base pass and the all-backends sweep). A value with a `$` may become
+    /// something else, so it is judged only after substitution.
+    Pending,
+    /// Substituted (the native pass). A `$` left is ordinary text (a `$$` escape, or one a `.env`
+    /// value carried), so every value is judged as it stands.
+    Done,
+}
+
+impl Substitution {
+    /// Whether a judgement of `s` waits for a later pass: only while [`Pending`](Self::Pending),
+    /// and only for a value [`would_substitution_change`] flags.
+    pub(super) fn defers(self, s: &str) -> bool {
+        self == Substitution::Pending && would_substitution_change(s)
+    }
+}
+
 /// Scan the body of a `${...}` construct, with `${` already consumed.
 /// `chars` is positioned just after the `{`.
 fn scan_braced(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     path: &str,
     mode: Mode<'_>,
-) -> Result<String> {
+) -> Result<Scanned> {
     let mut name = String::new();
 
     loop {
@@ -204,15 +237,27 @@ fn scan_default(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>, path
 
 /// Resolve a fully-scanned `name` (with an optional `default`) against
 /// `mode`.
-fn resolve_name(path: &str, mode: Mode<'_>, name: &str, default: Option<String>) -> Result<String> {
+fn resolve_name(path: &str, mode: Mode<'_>, name: &str, default: Option<String>) -> Result<Scanned> {
     let vars = match mode {
-        Mode::CheckOnly => return Ok(String::new()),
+        Mode::CheckOnly => {
+            return Ok(Scanned {
+                text: String::new(),
+                from_env: false,
+            });
+        }
         Mode::Substitute(vars) => vars,
     };
+    let from_env = |text: &str| Scanned {
+        text: text.to_string(),
+        from_env: true,
+    };
     match (vars.get(name), default) {
-        (Some(value), _) if !value.is_empty() => Ok(value.to_string()),
-        (_, Some(default)) => Ok(default),
-        (Some(value), None) => Ok(value.to_string()),
+        (Some(value), _) if !value.is_empty() => Ok(from_env(value)),
+        (_, Some(default)) => Ok(Scanned {
+            text: default,
+            from_env: false,
+        }),
+        (Some(value), None) => Ok(from_env(value)),
         (None, None) => Err(interpolate_error(
             path,
             format!(
@@ -267,7 +312,10 @@ pub(crate) fn reject_interpolated_id(id: &str) -> Result<()> {
 /// Substitute every `String` leaf of the manifest in place. Runs only on a
 /// spec carrying no overrides: `resolve` calls it on the native backend's
 /// `merged_for` result, which becomes the returned spec.
-pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<()> {
+///
+/// Returns the fields in which some reference was resolved from `.env` ([`Scanned::from_env`]),
+/// so `resolve` can say whose text an error about one is.
+pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
     // Destructured so a field added to `RawSpec` stops compiling here until someone decides
     // whether it interpolates; a skipped field is a literal `${VAR}` in a generated artifact.
     let RawSpec {
@@ -286,28 +334,30 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<()> {
     } = raw;
     debug_assert!(backend_specific.is_empty(), "interpolation runs on merged specs only");
 
-    substitute_option(name, "name", vars)?;
+    let mut from_env = BTreeSet::new();
+
+    substitute_option(name, Field::Name, vars, &mut from_env)?;
     for (index, arg) in command.iter_mut().flatten().enumerate() {
-        *arg = scalar(arg, &format!("command[{index}]"), vars)?;
+        substitute(arg, Field::Command(index), vars, &mut from_env)?;
     }
-    substitute_option(cwd, "cwd", vars)?;
-    substitute_option(logs, "logs", vars)?;
+    substitute_option(cwd, Field::Cwd, vars, &mut from_env)?;
+    substitute_option(logs, Field::Logs, vars, &mut from_env)?;
 
     for (key, value) in env.iter_mut() {
-        let key_path = format!("env[{key:?}]");
+        let field = Field::EnvValue(key.clone());
         if would_substitution_change(key) {
-            return Err(interpolate_error(&key_path, ENV_NAME_MESSAGE.to_string()));
+            return Err(interpolate_error(&field.path(), ENV_NAME_MESSAGE.to_string()));
         }
-        *value = scalar(value, &key_path, vars)?;
+        substitute(value, field, vars, &mut from_env)?;
     }
 
-    substitute_user(user, vars)?;
+    substitute_user(user, vars, &mut from_env)?;
 
-    substitute_option(restart, "restart", vars)?;
-    substitute_option(restart_delay, "restart-delay", vars)?;
-    substitute_option(kind, "type", vars)?;
+    substitute_option(restart, Field::Restart, vars, &mut from_env)?;
+    substitute_option(restart_delay, Field::RestartDelay, vars, &mut from_env)?;
+    substitute_option(kind, Field::Kind, vars, &mut from_env)?;
 
-    Ok(())
+    Ok(from_env)
 }
 
 /// Every substitutable `String` leaf of `raw` passes [`check_grammar`].
@@ -404,7 +454,7 @@ pub(super) fn spec_would_change(raw: &RawSpec) -> bool {
 /// Substitute the authored `user:` text, whichever form it was written in. The `root` rule is
 /// left to `resolve::resolve_user`, which applies it to substituted text as to typed text: `user:
 /// ${U}` with `U=root` means `user: root`, and `{name: ${U}}` means `{name: root}`.
-fn substitute_user(user: &mut Option<RawUser>, vars: &Vars) -> Result<()> {
+fn substitute_user(user: &mut Option<RawUser>, vars: &Vars, from_env: &mut BTreeSet<Field>) -> Result<()> {
     match user {
         // A `Uid` is already a number.
         None | Some(RawUser::Id(AccountId::Uid(_))) => Ok(()),
@@ -414,14 +464,8 @@ fn substitute_user(user: &mut Option<RawUser>, vars: &Vars) -> Result<()> {
             }
             Ok(())
         }
-        Some(RawUser::Scalar(text)) => {
-            *text = scalar(text, "user", vars)?;
-            Ok(())
-        }
-        Some(RawUser::Name(name)) => {
-            *name = scalar(name, "user.name", vars)?;
-            Ok(())
-        }
+        Some(RawUser::Scalar(text)) => substitute(text, Field::User, vars, from_env),
+        Some(RawUser::Name(name)) => substitute_at(name, Field::User, "user.name", vars, from_env),
     }
 }
 
@@ -433,12 +477,41 @@ fn user_would_change(user: &Option<RawUser>) -> bool {
     }
 }
 
-/// Substitute an optional field in place; `None` has nothing to substitute.
-fn substitute_option(field: &mut Option<String>, path: &str, vars: &Vars) -> Result<()> {
-    if let Some(value) = field {
-        *value = scalar(value, path, vars)?;
+/// Substitute `text` in place, noting `field` in `from_env` if `.env` supplied any of it. Errors
+/// name [`Field::path`].
+fn substitute(text: &mut String, field: Field, vars: &Vars, from_env: &mut BTreeSet<Field>) -> Result<()> {
+    let path = field.path();
+    substitute_at(text, field, &path, vars, from_env)
+}
+
+/// [`substitute`] with the error path spelled by the caller: `user.name`, which shares
+/// [`Field::User`] with `user`.
+fn substitute_at(
+    text: &mut String,
+    field: Field,
+    path: &str,
+    vars: &Vars,
+    from_env: &mut BTreeSet<Field>,
+) -> Result<()> {
+    let scanned = scalar(text, path, vars)?;
+    *text = scanned.text;
+    if scanned.from_env {
+        from_env.insert(field);
     }
     Ok(())
+}
+
+/// [`substitute`] for an optional field; `None` has nothing to substitute.
+fn substitute_option(
+    text: &mut Option<String>,
+    field: Field,
+    vars: &Vars,
+    from_env: &mut BTreeSet<Field>,
+) -> Result<()> {
+    match text {
+        Some(text) => substitute(text, field, vars, from_env),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
