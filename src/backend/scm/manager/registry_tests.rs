@@ -31,20 +31,25 @@ fn a_stray_is_a_present_name_that_is_none_of_the_wanted_fields_in_any_case() {
     // `Schema` is one of Goetia's fields but not wanted here, so it is as stray as `Stray`; a name
     // that is not valid UTF-16 is none of the fields.
     let invalid = vec![0x4D, 0xD800];
-    let present: Vec<Vec<u16>> = ["marker", "SPEC", "Stray", "Marker2", "schema"]
-        .map(utf16)
+    let present: Vec<RawEntry> = ["marker", "SPEC", "Stray", "Marker2", "schema"]
+        .map(entry)
         .into_iter()
-        .chain([invalid.clone()])
+        .chain([RawEntry::new(invalid.clone(), 1)])
         .collect();
-    let found: Vec<&Vec<u16>> = strays(&present, &wanted).collect();
+    let found: Vec<&Vec<u16>> = strays(&present, &wanted).map(|entry| &entry.name).collect();
     assert_eq!(found, [&utf16("Stray"), &utf16("Marker2"), &utf16("schema"), &invalid]);
 }
 
 fn entry(name: &str) -> RawEntry {
-    RawEntry {
-        name: utf16(name),
-        vtype: 1,
-    }
+    RawEntry::new(utf16(name), 1)
+}
+
+/// The decode happens once, when the entry is made, and says which field the name spells.
+#[skuld::test]
+fn an_entry_knows_which_field_its_name_spells_in_any_case() {
+    assert_eq!(entry("sPeC").field, Some("Spec"));
+    assert_eq!(entry("Spec\0").field, None);
+    assert_eq!(RawEntry::new(vec![0x4D, 0xD800], 1).field, None);
 }
 
 #[skuld::test]
@@ -57,6 +62,21 @@ fn a_field_is_named_as_the_enumeration_stored_it() {
 #[skuld::test]
 fn a_field_the_enumeration_missed_is_named_as_goetia_spells_it() {
     assert_eq!(stored_name(&[entry("Stray")], "Spec"), utf16("Spec"));
+}
+
+/// A link key opened as itself holds the `REG_LINK` value `SymbolicLinkValue`; a key that does not,
+/// or holds a value of that name of another type, is a key.
+#[skuld::test]
+fn a_key_is_a_link_when_it_holds_a_reg_link_symbolic_link_value() {
+    assert!(is_link(Ok(REG_LINK)).unwrap());
+    assert!(!is_link(Ok(1)).unwrap());
+    assert!(!is_link(Err(std::io::Error::from(std::io::ErrorKind::NotFound))).unwrap());
+}
+
+#[skuld::test]
+fn a_failed_look_for_the_symbolic_link_value_is_that_failure_not_a_key() {
+    let e = is_link(Err(std::io::Error::from_raw_os_error(5))).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(5));
 }
 
 const NOT_FOUND: i32 = 2;
@@ -163,27 +183,25 @@ fn an_absent_environment_value_is_no_lines() {
 }
 
 /// A `REG_MULTI_SZ` made of exactly `units`, with no terminator added.
-fn multi_sz(units: &[u16]) -> RawValue {
-    RawValue {
-        vtype: REG_MULTI_SZ,
-        bytes: units.iter().flat_map(|u| u.to_le_bytes()).collect(),
-    }
+fn multi_sz(units: &[u16]) -> (u32, Vec<u8>) {
+    (REG_MULTI_SZ, units.iter().flat_map(|u| u.to_le_bytes()).collect())
 }
 
 /// The bytes `write_environment` writes for `lines`, through the same `winreg` encoder.
-fn goetia_multi_sz(lines: &[&str]) -> RawValue {
+fn goetia_multi_sz(lines: &[&str]) -> (u32, Vec<u8>) {
     let owned: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     let written = owned.to_reg_value();
-    RawValue {
-        vtype: written.vtype as u32,
-        bytes: written.bytes.into_owned(),
-    }
+    (written.vtype as u32, written.bytes.into_owned())
+}
+
+fn lines_of((vtype, bytes): &(u32, Vec<u8>)) -> Vec<String> {
+    environment_lines(Some((*vtype, bytes)))
 }
 
 /// Only a value byte-identical to what goetia writes may read as the lines it was written from, so
 /// that `decide` calls nothing else `UpToDate`.
-fn assert_not_read_as(what: &str, value: RawValue, desired: &[&str]) {
-    let lines = environment_lines(Some(value));
+fn assert_not_read_as(what: &str, value: (u32, Vec<u8>), desired: &[&str]) {
+    let lines = lines_of(&value);
     assert_ne!(
         lines, desired,
         "{what}: {lines:?} must differ from what goetia would write"
@@ -197,7 +215,7 @@ fn assert_not_read_as(what: &str, value: RawValue, desired: &[&str]) {
 #[skuld::test]
 fn the_bytes_goetia_writes_read_back_as_the_lines() {
     let lines = ["A=1", "B=x y", "C=\u{FFFD}"];
-    assert_eq!(environment_lines(Some(goetia_multi_sz(&lines))), lines);
+    assert_eq!(lines_of(&goetia_multi_sz(&lines)), lines);
 }
 
 /// `winreg` reads an empty `REG_MULTI_SZ` as one empty string, and `write_environment` writes an empty
@@ -223,14 +241,14 @@ fn a_lone_surrogate_is_not_the_replacement_character() {
 fn a_surrogate_pair_is_one_character() {
     let mut units = utf16("A=\u{1F600}");
     units.extend([0, 0]);
-    assert_eq!(environment_lines(Some(multi_sz(&units))), ["A=\u{1F600}"]);
+    assert_eq!(lines_of(&multi_sz(&units)), ["A=\u{1F600}"]);
 }
 
 /// Dropping a trailing odd byte reads `A=1` plus half a unit as `A=1`.
 #[skuld::test]
 fn an_odd_trailing_byte_is_not_dropped() {
     let mut value = goetia_multi_sz(&["A=1"]);
-    value.bytes.push(0x41);
+    value.1.push(0x41);
     assert_not_read_as("an odd byte", value, &["A=1"]);
 }
 
@@ -259,11 +277,7 @@ fn a_nul_layout_other_than_goetias_is_not_read_as_the_lines() {
 #[skuld::test]
 fn an_environment_value_of_another_type_is_one_marker_line_naming_its_type() {
     let written = "A=1".to_reg_value();
-    let value = RawValue {
-        vtype: written.vtype as u32,
-        bytes: written.bytes.into_owned(),
-    };
-    let lines = environment_lines(Some(value));
+    let lines = lines_of(&(written.vtype as u32, written.bytes.into_owned()));
 
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(!lines[0].contains('='), "{lines:?}");
@@ -274,11 +288,7 @@ fn an_environment_value_of_another_type_is_one_marker_line_naming_its_type() {
 #[skuld::test]
 fn an_environment_value_of_an_unknown_type_is_one_marker_line_naming_its_number() {
     for vtype in [12u32, 0xFFFF] {
-        let value = RawValue {
-            vtype,
-            bytes: b"A=1".to_vec(),
-        };
-        let lines = environment_lines(Some(value));
+        let lines = lines_of(&(vtype, b"A=1".to_vec()));
 
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(!lines[0].contains('='), "{lines:?}");

@@ -118,6 +118,16 @@ fn absent_under_a_listed_name_is_its_value_without_asking_whether_the_service_st
     ));
 }
 
+/// The caller holds an open handle to the service: a deleted service is only marked, and its key
+/// stays until the handle closes, so a missing optional key cannot mean the service is gone.
+#[skuld::test]
+fn absent_under_a_held_service_is_its_value_without_asking_whether_the_service_stands() {
+    assert!(matches!(
+        settle(Stop::Absent(7), Origin::Held, never),
+        Settled::Value(7)
+    ));
+}
+
 #[skuld::test]
 fn a_vanish_under_a_listed_name_still_asks_whether_the_service_stands() {
     assert!(matches!(

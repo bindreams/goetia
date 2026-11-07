@@ -836,14 +836,21 @@ fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes() {
     mgr.status(&spec.id).expect("status: the service still reads as ours");
 }
 
-/// A raw `NtSetValueKey` of `name` (UTF-16 units, any, a NUL included) with `vtype` and `data`.
-fn set_raw_value(key: &winreg::RegKey, name: &[u16], vtype: u32, data: &[u8]) {
-    let bytes = u16::try_from(name.len() * 2).expect("a value name of at most 16 383 units");
-    let name = UNICODE_STRING {
+/// `name` (UTF-16 units, any, a NUL included) as the counted string `ntdll` takes. It points at
+/// `name`, which must outlive the call it is passed to.
+fn counted(name: &[u16]) -> UNICODE_STRING {
+    // A registry name has at most 16 383 units, so its length in bytes fits.
+    let bytes = u16::try_from(name.len() * 2).expect("a registry name of at most 16 383 units");
+    UNICODE_STRING {
         Length: bytes,
         MaximumLength: bytes,
         Buffer: name.as_ptr().cast_mut(),
-    };
+    }
+}
+
+/// A raw `NtSetValueKey` of `name` (UTF-16 units, any, a NUL included) with `vtype` and `data`.
+fn set_raw_value(key: &winreg::RegKey, name: &[u16], vtype: u32, data: &[u8]) {
+    let name = counted(name);
     // SAFETY: `key` holds an open handle with write access; `name` points at units that outlive the
     // call, and `data` is `data.len()` readable bytes.
     let status = unsafe {
@@ -863,12 +870,7 @@ fn set_raw_value(key: &winreg::RegKey, name: &[u16], vtype: u32, data: &[u8]) {
 /// `options` (`REG_OPTION_CREATE_LINK` makes a link). The key is returned open.
 fn create_raw_key(parent: &winreg::RegKey, name: &[u16], options: u32) -> winreg::RegKey {
     const KEY_ALL_ACCESS: u32 = 0xF003F;
-    let bytes = u16::try_from(name.len() * 2).expect("a key name of at most 255 units");
-    let name = UNICODE_STRING {
-        Length: bytes,
-        MaximumLength: bytes,
-        Buffer: name.as_ptr().cast_mut(),
-    };
+    let name = counted(name);
     let attributes = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: parent.raw_handle(),
@@ -960,6 +962,53 @@ fn force_install_deletes_a_stray_registry_link_and_leaves_its_target() {
     target_key
         .open_subkey("Child")
         .expect("the target's own subkey survived");
+}
+
+/// `Parameters` itself may be a registry link. goetia reads it as the link (its target is not
+/// consulted) and `--force` deletes it and writes a real key: the target keeps what it held, a
+/// `Marker` of its own included.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_target() {
+    const REG_LINK: u32 = 6;
+    const REG_OPTION_CREATE_LINK: u32 = 2;
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+    let sz = |text: &str| -> Vec<u8> { units(text).into_iter().chain([0]).flat_map(u16::to_le_bytes).collect() };
+    let (target, target_key) = LinkTarget::create(&id);
+    target_key.set_value("Keep", &"x").expect("write Keep");
+    target_key.set_value("Marker", &"not goetia's").expect("write Marker");
+
+    // goetia's four values, copied into the link key itself: the service stays marked, so the read
+    // reaches the comparison, which a target holding no marker would not.
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let fields: Vec<(String, winreg::RegValue)> = parameters.enum_values().map(|v| v.expect("enumerate")).collect();
+    drop(parameters);
+    let service = service_key(&id, KEY_READ | KEY_WRITE);
+    service.delete_subkey_all("Parameters").expect("remove Parameters");
+    let link = create_raw_key(&service, &units("Parameters"), REG_OPTION_CREATE_LINK);
+    let link_value = sz(&target.nt_path());
+    set_raw_value(&link, &units("SymbolicLinkValue"), REG_LINK, &link_value);
+    for (name, value) in fields {
+        set_raw_value(&link, &units(&name), value.vtype as u32, &value.bytes);
+    }
+    drop(link);
+
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+
+    assert!(diff.contains("SymbolicLinkValue"), "{diff}");
+    assert_eq!(target_key.get_value::<String, _>("Keep").expect("read Keep"), "x");
+    assert_eq!(
+        target_key.get_value::<String, _>("Marker").expect("read Marker"),
+        "not goetia's"
+    );
+    let parameters = parameters_key(&id, KEY_READ);
+    assert!(
+        parameters.get_value::<String, _>("Marker").is_ok(),
+        "a real Parameters holds goetia's Marker"
+    );
 }
 
 /// `RegDeleteTreeW` below the top level stops at a NUL, so a stray subkey holding a child named

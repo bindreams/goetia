@@ -87,19 +87,24 @@ pub(super) fn stands(opened: io::Result<()>) -> io::Result<bool> {
     }
 }
 
-/// Where a read got the name of the service.
+/// What vouches that the service stands, for a read that finds an optional key missing.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum Origin {
-    /// The service was opened by name just before.
+pub enum Origin {
+    /// No enumeration vouches for the name: the service was looked up by name, so a missing
+    /// optional key may mean it is gone, and the read asks.
     Opened,
     /// The name came from the enumeration of `Services`. A missing optional key is then taken as the
     /// service standing without it: a service that is gone leaves at most a stale row, which the
     /// user's own concurrent uninstall explains.
     Listed,
+    /// The caller holds an open handle to the service. A deleted service is only marked, and its key
+    /// stays until the handle closes, so a missing optional key is the service standing without it.
+    /// Not [`Origin::Listed`]: that one's reason is a stale row, this one's is the handle.
+    Held,
 }
 
 /// Resolves `stop`; `service_stands` runs for `Vanished`, and for `Absent` unless the name is
-/// [`Origin::Listed`].
+/// [`Origin::Listed`] or [`Origin::Held`].
 pub(super) fn settle<T>(
     stop: Stop<T>,
     origin: Origin,
@@ -107,7 +112,7 @@ pub(super) fn settle<T>(
 ) -> Settled<T> {
     let (stands, on_standing) = match stop {
         Stop::Other(failure) => return Settled::Failed(failure),
-        Stop::Absent(value) if matches!(origin, Origin::Listed) => return Settled::Value(value),
+        Stop::Absent(value) if matches!(origin, Origin::Listed | Origin::Held) => return Settled::Value(value),
         Stop::Absent(value) => (service_stands(), Settled::Value(value)),
         Stop::Vanished(failure) => (service_stands(), Settled::Failed(failure)),
     };

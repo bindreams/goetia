@@ -1,21 +1,25 @@
-//! Removal of a value or subkey by its name's stated length.
+//! Access to a value or subkey by its name's stated length, and to a subkey as the key it is.
 //!
 //! A name read back from a key may hold a NUL, which the Win32 calls (`RegDeleteValueW`,
 //! `RegDeleteTreeW`) take as the end of the name: they would remove goetia's `Marker` for a stray
 //! `Marker\0x`, or report success and leave the stray. These go through `ntdll`'s counted names.
 //! No call that takes a NUL-terminated name is made here, at any depth of a subtree.
+//!
+//! A registry link is a key that points at another. `RegOpenKeyExW` without a flag, and so `winreg`'s
+//! `open_subkey`, enters the target: a write or a delete there would reach a key that is not the
+//! one named. A child is opened here as itself, so that a link is a key to delete, never a path.
 
 use std::io;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Wdk::Foundation::{NtClose, OBJECT_ATTRIBUTES};
 use windows_sys::Wdk::System::Registry::{
-    KeyBasicInformation, NtDeleteKey, NtDeleteValueKey, NtEnumerateKey, NtOpenKey,
+    KeyBasicInformation, NtCreateKey, NtDeleteKey, NtDeleteValueKey, NtEnumerateKey, NtOpenKey,
 };
 use windows_sys::Win32::Foundation::{
     HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_OPENLINK, RtlNtStatusToDosError, UNICODE_STRING,
 };
-use windows_sys::Win32::System::Registry::KEY_ENUMERATE_SUB_KEYS;
+use windows_sys::Win32::System::Registry::{KEY_ENUMERATE_SUB_KEYS, REG_OPTION_NON_VOLATILE};
 use winreg::RegKey;
 
 /// The access right to delete a key (`winnt.h`).
@@ -52,9 +56,38 @@ pub(super) fn delete_value(key: &RegKey, name: &[u16]) -> io::Result<()> {
 ///
 /// A child is opened as the key it is: a registry link is deleted itself, never followed, so what
 /// it points at is neither entered nor removed. The walk is through `ntdll` alone, so a name at
-/// any depth keeps a NUL.
+/// any depth keeps a NUL. `NotFound` is the top-level subkey not being there; one that vanishes
+/// below it, between the listing of its parent and its open, is gone already and not an error.
 pub(super) fn delete_subkey(key: &RegKey, name: &[u16]) -> io::Result<()> {
-    delete_tree(key.raw_handle(), name)
+    delete_tree(open_raw(key.raw_handle(), name, CHILD_ACCESS)?)
+}
+
+/// Opens the subkey of `key` named `name` as the key it is, a registry link included.
+pub(super) fn open_child(key: &RegKey, name: &[u16], access: u32) -> io::Result<RegKey> {
+    Ok(open_raw(key.raw_handle(), name, access)?.into_key())
+}
+
+/// Creates the subkey of `key` named `name`, or opens it if it exists, as the key it is: an
+/// existing link is returned as the link, not its target.
+pub(super) fn create_child(key: &RegKey, name: &[u16], access: u32) -> io::Result<RegKey> {
+    let name = counted(name);
+    let attributes = child_attributes(key.raw_handle(), &name);
+    let mut handle: HANDLE = null_mut();
+    let mut disposition = 0u32;
+    // SAFETY: `attributes` and the name it points at outlive the call; `handle` and `disposition`
+    // are valid out-params; the class is null, which the API allows.
+    checked(unsafe {
+        NtCreateKey(
+            &mut handle,
+            access,
+            &attributes,
+            0,
+            null(),
+            REG_OPTION_NON_VOLATILE,
+            &mut disposition,
+        )
+    })?;
+    Ok(Opened(handle).into_key())
 }
 
 /// What a child needs to be listed, entered and deleted.
@@ -90,18 +123,26 @@ fn basic_name(buffer: &[u8]) -> Vec<u16> {
     units.iter().map(|pair| u16::from_le_bytes(*pair)).collect()
 }
 
-/// Deletes the child `name` of `parent`, everything under it first. Its values go with it.
-fn delete_tree(parent: HANDLE, name: &[u16]) -> io::Result<()> {
+/// Opens the child `name` of `parent` as the key it is, with `access`.
+fn open_raw(parent: HANDLE, name: &[u16], access: u32) -> io::Result<Opened> {
     let name = counted(name);
     let attributes = child_attributes(parent, &name);
     let mut handle: HANDLE = null_mut();
     // SAFETY: `attributes` and the name it points at outlive the call; `handle` is a valid
     // out-param.
-    checked(unsafe { NtOpenKey(&mut handle, CHILD_ACCESS, &attributes) })?;
-    let child = Opened(handle);
+    checked(unsafe { NtOpenKey(&mut handle, access, &attributes) })?;
+    Ok(Opened(handle))
+}
 
+/// Deletes the open `child`, everything under it first. Its values go with it.
+fn delete_tree(child: Opened) -> io::Result<()> {
     for grandchild in child_names(child.0)? {
-        delete_tree(child.0, &grandchild)?;
+        match open_raw(child.0, &grandchild, CHILD_ACCESS) {
+            Ok(grandchild) => delete_tree(grandchild)?,
+            // Gone since the listing: what this wanted.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
     // SAFETY: `child` holds an open handle with `DELETE`.
     checked(unsafe { NtDeleteKey(child.0) })
@@ -139,6 +180,15 @@ fn child_names(key: HANDLE) -> io::Result<Vec<Vec<u16>>> {
 
 /// A key opened through `NtOpenKey`, closed on drop.
 struct Opened(HANDLE);
+
+impl Opened {
+    /// The key as a `RegKey`, which closes the handle on drop.
+    fn into_key(self) -> RegKey {
+        let handle = self.0;
+        std::mem::forget(self);
+        RegKey::predef(handle)
+    }
+}
 
 impl Drop for Opened {
     fn drop(&mut self) {
