@@ -19,14 +19,10 @@ use crate::common::{LogDir, ShimGuard, conformance_mk, fixture_command, simple_s
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED};
 
-/// The lock `tests/scm_integration/managed.rs` declares, shared with it by label *name*: both
-/// binaries drive the one SCM on the host, and a denied `Parameters` read is visible to every
-/// reader of it. Two concurrent unreadable services make `list` report one nameless
-/// `Undetermined` entry instead of a named one, so a deny test's lookup of its own service by name
-/// fails, and a negative assertion that counts the aggregate (`support::may_account_for`) fails
-/// while any service is denied. A test that checks only its own entry takes no label.
+/// The label `tests/scm_integration/managed.rs` declares and documents, shared with it by label
+/// *name*: both binaries drive the one SCM on the host.
 #[skuld::label]
-const PARAMETERS_DENIAL: skuld::Label;
+pub(crate) const SCM_DENIAL: skuld::Label;
 
 fn seed_foreign(id: &str) {
     support::cmd::run(
@@ -56,10 +52,10 @@ fn hand_edit(id: &str) {
 
 // Step 1: conformance =================================================================================================
 
-/// `PARAMETERS_DENIAL`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
+/// `SCM_DENIAL`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry in every concurrent
 /// `list()`.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn simple_passes_conformance() {
     let logs = LogDir::new();
     let mgr = Scm::new();
@@ -156,7 +152,7 @@ fn start_stop_status_reflect_reality() {
     assert_eq!(status.state, State::Stopped);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn uninstall_leaves_nothing() {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -177,7 +173,7 @@ fn uninstall_leaves_nothing() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn list_ignores_foreign_services() {
     let id = support::random_test_id();
     // A foreign service runs no shim, so it needs no `ShimGuard`.

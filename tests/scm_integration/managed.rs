@@ -23,17 +23,26 @@ use crate::support::registry::{parameters_key, service_key, try_parameters_key};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 /// Held by every test that denies an elevated reader something under
-/// `HKLM\SYSTEM\CurrentControlSet\Services`, and by every test whose assertion reads the
-/// aggregate `list` entry (`support::may_account_for`), so they take turns rather than race.
-/// Two concurrent unreadable services make `list` report one nameless `Undetermined` entry
-/// instead of a named one, so a deny test's lookup of its own service by name fails, and a
-/// negative assertion that counts the aggregate fails while any service is denied. A test that
-/// checks only its own entry cannot fail from another's denial and does not take the label.
+/// `HKLM\SYSTEM\CurrentControlSet\Services` (the `Parameters` key or a service object), by every
+/// test whose assertion reads the aggregate `list` entry (`support::may_account_for`), by
+/// `tests/cli_binary.rs`'s `list` test, and by the tests here and in `tests/shim_integration` that
+/// install, rewrite or uninstall a service and read it back through `list`, so they take turns
+/// rather than race. The hazards:
 ///
-/// Shared with `tests/shim_integration` by label *name*: skuld serializes across processes by it,
-/// and both binaries drive the one SCM on the host.
+/// - Two concurrent unreadable services make `list` report one nameless `Undetermined` entry
+///   instead of a named one, so a deny test's lookup of its own service by name fails.
+/// - A negative assertion that counts the aggregate fails while any service is denied.
+/// - A service-object denial makes a concurrent `list` report an error for that service, which
+///   `cli_binary`'s `list_json` refuses.
+/// - An install, rewrite or uninstall racing a deny test's `list` can make that test's own lookup
+///   fail through the nameless aggregate. `write_parameters` deletes and recreates `Parameters`, so
+///   a reader mid-rewrite sees the key vanish. This hazard, and the labels held only for it, go
+///   away with `fix/scm-parameters-in-place`.
+///
+/// Shared with `tests/shim_integration` and `tests/cli_binary.rs` by label *name*: skuld serializes
+/// across processes by it, and all three drive the one SCM on the host.
 #[skuld::label]
-const PARAMETERS_DENIAL: skuld::Label;
+const SCM_DENIAL: skuld::Label;
 
 fn id_of(s: &str) -> Id {
     Id::try_from(s).expect("random_test_id/short local ids are valid Ids")
@@ -72,10 +81,10 @@ fn hand_edit(id: &str) {
 
 // Step 1: conformance =================================================================================================
 
-/// `PARAMETERS_DENIAL`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
+/// `SCM_DENIAL`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry naming that id in
 /// every concurrent `list()` (a nameless aggregate if another service is unreadable too).
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn scm_passes_conformance() {
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(conformance::FOREIGN_ID);
@@ -100,7 +109,7 @@ fn scm_passes_conformance() {
 
 // Step 2: round trip, conflict, start/stop/status, uninstall, list ====================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn install_then_list_round_trips_without_the_source_file() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -135,7 +144,7 @@ fn install_then_list_round_trips_without_the_source_file() {
 
 /// SCM matches service names case-insensitively, so a request for `ID` reaches the service
 /// installed as `id`. Neither `install` (forced or not) nor `preview_install` may write over it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -338,7 +347,7 @@ fn killing_a_stopped_service_is_not_running() {
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn uninstall_leaves_nothing() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -358,7 +367,7 @@ fn uninstall_leaves_nothing() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn list_ignores_foreign_services() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1042,7 +1051,7 @@ fn a_failed_precondition_leaves_an_installed_service_unchanged() {
 
 // Round-tripping restart: on-failure (the Some(fa) branch of apply_failure_actions/read_failure_actions) ==============
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn restart_on_failure_round_trips_failure_actions() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1076,7 +1085,7 @@ fn restart_on_failure_round_trips_failure_actions() {
 
 // Ownership::OursUnusable: a blob that decodes but whose account can no longer be resolved ============================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn deleted_account_makes_the_service_oursunusable() {
     let suffix = format!("{:08x}", rand::random::<u32>());
     let account = format!("gt{suffix}");
@@ -1167,7 +1176,7 @@ fn install_refuses_an_always_blob_as_unusable() {
 
 /// An elevated reader decodes the marker of a service it installed, so the service is listed as
 /// goetia's own. Another service's unreadable `Parameters` is not this test's to assert about.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn an_elevated_list_reads_the_marker_of_its_own_install() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1181,7 +1190,7 @@ fn an_elevated_list_reads_the_marker_of_its_own_install() {
 /// was never read, so goetia established neither that it owns the id nor that it does not — and
 /// `Kind::Unusable` would put goetia's name and `uninstall`'s advice on what may be a stranger's
 /// service.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1220,7 +1229,7 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 /// `registry::read_parameters` built: the key, the operation and the Win32 message. `list` used to
 /// match `Err(_)` and hand the entry a static sentence instead, which says nothing of a real Win32
 /// failure.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1264,7 +1273,7 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
 /// opens the service object first, so a DACL denying `SERVICE_QUERY_CONFIG`/`SERVICE_QUERY_STATUS`
 /// stops goetia before it ever looks at the metadata. Fixing `read_parameters` alone would leave
 /// this path — and therefore `status` and `install` — still claiming ownership it never proved.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
 fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
     let mgr = Scm::new();
     let id = support::random_test_id();

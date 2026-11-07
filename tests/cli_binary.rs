@@ -78,14 +78,15 @@ stderr:
 /// a genuinely unwired manager reports `native()`'s "no backend" there, as
 /// `unavailable` at exit `1` — the fake would also answer cleanly here, so
 /// this rules out exactly the one wrong wiring this module exists to catch.
-/// Holds `UNIT_DIR_EXCLUSIVE`: this runs a real `daemon list` over the host's own artifact
-/// directories, so on Linux and macOS it takes turns with the tests that make them hostile. On
-/// Windows no other test holds the label, and a concurrent denied `Parameters` read only adds an
-/// `undetermined` entry, so the check below still holds.
+/// Holds `UNIT_DIR_EXCLUSIVE` on Linux and macOS: this runs a real `daemon list` over the host's own
+/// artifact directories, so it takes turns with the tests that make them hostile. Holds `SCM_DENIAL`
+/// on Windows: a concurrent service-object denial makes `list` report an `errors` entry, which the
+/// check below refuses. Both are held everywhere; each is inert on the platform with no other
+/// holder.
 ///
 /// `support::list_json` ties the exit code to the `--json` document: `errors`
 /// empty, and `4` exactly when `undetermined` is not.
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE, SCM_DENIAL], serial = UNIT_DIR_EXCLUSIVE | SCM_DENIAL)]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn native_backend_answers_list_unelevated() {
     let dir = tempfile::tempdir().unwrap();
@@ -96,10 +97,14 @@ fn native_backend_answers_list_unelevated() {
 /// Shared with the systemd and launchd integration binaries, by label *name*: any test that reads
 /// or writes the host's real unit or plist directories takes this. A FIFO test makes them hostile
 /// to a concurrent unguarded reader, and a FIFO regression would then hang the suite instead of
-/// failing the one guarded test. Windows has no such hazard; its `Parameters` denial has
-/// `PARAMETERS_DENIAL`.
+/// failing the one guarded test. Windows has no such hazard; its SCM denials have `SCM_DENIAL`.
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
+
+/// Shared with the SCM and shim integration binaries, by label *name*; see its declaration in
+/// `tests/scm_integration/managed.rs`.
+#[skuld::label]
+const SCM_DENIAL: skuld::Label;
 
 // Pure paths: no elevation, no manager ================================================================================
 
