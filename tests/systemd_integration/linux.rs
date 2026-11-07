@@ -20,7 +20,7 @@ use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
-use crate::support::{self, ELEVATED, ServiceGuard, cmd};
+use crate::support::{self, ELEVATED, ServiceGuard, cmd, may_account_for};
 
 /// Held by every test that reads or seeds hostile state in the shared `/etc/systemd/system`, and by
 /// every test that runs `daemon list` over it. While `list_does_not_hang_on_a_fifo_in_the_unit_directory`
@@ -186,18 +186,6 @@ fn find_ours(installed: Vec<Installed>, id: &str) -> Option<DaemonSpec> {
     installed.into_iter().find_map(|entry| match entry {
         Installed::Ours { spec, .. } if spec.id.as_str() == id => Some(spec),
         _ => None,
-    })
-}
-
-/// Whether `listed` leaves `id` possible — the basis for every negative assertion below. An
-/// aggregate `Undetermined` entry counts even though it names nothing: it may stand for `id` itself,
-/// so an assertion that treated it as silence would certify what the listing cannot establish (see
-/// [`Installed::Undetermined`]'s null-name rule).
-fn may_account_for(listed: &[Installed], id: &str) -> bool {
-    listed.iter().any(|entry| match entry {
-        Installed::Ours { spec, .. } => spec.id.as_str() == id,
-        Installed::OursUnusable { name, .. } => name == id,
-        Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id),
     })
 }
 

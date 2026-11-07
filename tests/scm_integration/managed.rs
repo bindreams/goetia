@@ -103,7 +103,7 @@ fn scm_passes_conformance() {
 
 // Step 2: round trip, conflict, start/stop/status, uninstall, list ====================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_then_list_round_trips_without_the_source_file() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -138,7 +138,7 @@ fn install_then_list_round_trips_without_the_source_file() {
 
 /// SCM matches service names case-insensitively, so a request for `ID` reaches the service
 /// installed as `id`. Neither `install` (forced or not) nor `preview_install` may write over it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1065,7 +1065,7 @@ fn a_failed_precondition_leaves_an_installed_service_unchanged() {
 
 // Round-tripping restart: on-failure (the Some(fa) branch of apply_failure_actions/read_failure_actions) ==============
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn restart_on_failure_round_trips_failure_actions() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1099,7 +1099,7 @@ fn restart_on_failure_round_trips_failure_actions() {
 
 // Ownership::OursUnusable: a blob that decodes but whose account can no longer be resolved ============================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn deleted_account_makes_the_service_oursunusable() {
     let suffix = format!("{:08x}", rand::random::<u32>());
     let account = format!("gt{suffix}");

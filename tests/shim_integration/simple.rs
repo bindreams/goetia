@@ -26,7 +26,7 @@ use crate::support::{self, ELEVATED};
 /// report one nameless aggregate instead of a named entry, so each test's lookup by its own name
 /// fails; every `list` reader takes turns with them.
 #[skuld::label]
-const UNIT_DIR_EXCLUSIVE: skuld::Label;
+pub(crate) const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 fn seed_foreign(id: &str) {
     support::cmd::run(

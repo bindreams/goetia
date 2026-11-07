@@ -31,7 +31,7 @@ use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
 pub use daemon_spec::spec;
-pub use list_json::{ListJson, assert_own, list_json};
+pub use list_json::{ListJson, assert_own, list_json, may_account_for};
 pub use service_guard::ServiceGuard;
 
 // Artifact locations --------------------------------------------------------------------------------------------------

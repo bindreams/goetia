@@ -80,7 +80,8 @@ stderr:
 /// this rules out exactly the one wrong wiring this module exists to catch.
 /// Labelled `UNIT_DIR_EXCLUSIVE`: this runs a real `daemon list` over the
 /// host's own artifact directories, so it takes turns with the tests that make
-/// them hostile (see the label).
+/// them hostile (see the label). On Windows its only reason is that it is a
+/// `list` reader under that rule.
 ///
 /// `support::list_json` ties the exit code to the `--json` document: `errors`
 /// empty, and `4` exactly when `undetermined` is not.

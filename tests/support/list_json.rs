@@ -44,6 +44,18 @@ impl ListJson {
     }
 }
 
+/// Whether `listed` leaves `id` possible — the basis for every negative assertion about a `list()`
+/// result. An aggregate `Undetermined` entry counts even though it names nothing: it may stand for
+/// `id` itself, so an assertion that treated it as silence would certify what the listing cannot
+/// establish (see [`Installed::Undetermined`]'s null-name rule).
+pub fn may_account_for(listed: &[Installed], id: &str) -> bool {
+    listed.iter().any(|entry| match entry {
+        Installed::Ours { spec, .. } => spec.id.as_str() == id,
+        Installed::OursUnusable { name, .. } => name == id,
+        Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id),
+    })
+}
+
 /// The in-process counterpart of [`ListJson::assert_own`], for a `list()` result: every id in `ids`
 /// is listed as goetia's own and no `Undetermined` entry names it. Nothing is asserted about any
 /// other daemon on the host.
