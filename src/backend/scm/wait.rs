@@ -428,8 +428,8 @@ pub enum StopSeen {
 /// `STOP_PENDING`), which cancels the settle registration if [`settle_and_stop`] acted on a read and left
 /// it unfired.
 ///
-/// What the first arm reads other than `STOPPED` waits: the STOP may not have taken yet, and a `simple`
-/// service reads `RUNNING` until its shim takes it. Once a notification was delivered, the service had
+/// After [`StopSeen::Requested`], what the first arm reads other than `STOPPED` waits: the STOP may not
+/// have taken yet, and a `simple` service reads `RUNNING` until its shim takes it. Once a notification was delivered, the service had
 /// begun to stop, and a re-arm that reads anything but `STOP_PENDING` means it did not stay stopped: a
 /// failure that races the stop goes `STOPPED (1066)` and SCM restarts the service under its restart
 /// policy (P18a), which can reach `RUNNING` before the re-arm. An error says so, ending in `advice`; it

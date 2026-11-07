@@ -1,8 +1,9 @@
 //! The tests' waits for a service's state, over the product's own notification wait
 //! ([`goetia::backend::scm::wait::wait_until`]). Unbounded, like every wait on a state SCM must
-//! reach; a state it settles in that is not the one waited for fails the test with that state
-//! instead of hanging it. After [`StopSeen::Requested`] a first `RUNNING` keeps waiting: the stop
-//! masks do not deliver `RUNNING`, so one that never leaves it hangs.
+//! reach; a state it settles in after the wait began that is not the one waited for fails the test
+//! with that state instead of hanging it. After [`StopSeen::Requested`] a first read other than
+//! `STOP_PENDING` or `STOPPED` keeps waiting: the stop masks deliver neither `RUNNING` nor `PAUSED`,
+//! so a service that never leaves the state it was in hangs the wait.
 
 use std::ops::ControlFlow;
 
