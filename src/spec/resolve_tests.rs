@@ -314,7 +314,7 @@ fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
     );
 }
 
-// What the directory alone cannot refuse -----------------------------------------------------------------------------
+// What the directory alone cannot refuse ------------------------------------------------------------------------------
 
 #[skuld::test]
 fn a_path_a_substitution_may_make_absolute_is_not_judged_against_the_manifest_directory() {
