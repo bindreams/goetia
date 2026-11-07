@@ -6,6 +6,7 @@
 //! `%ProgramFiles%\Goetia` for their length: each empties it first and removes it after, and
 //! `UNIT_DIR_EXCLUSIVE` keeps them from running beside each other.
 
+use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,14 +18,18 @@ use goetia::error::Error;
 use goetia::manager::{Budget, ServiceManager as _, State};
 use goetia::shim::{CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim};
 use goetia::spec::{DaemonSpec, User};
-use windows_sys::Win32::Foundation::{LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{GENERIC_ALL, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
-use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+};
 use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, SYNCHRONIZE};
-use windows_sys::Win32::System::Threading::{OpenMutexW, ReleaseMutex, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW, ReleaseMutex, WaitForSingleObject};
 
 use crate::common::{
     LogDir, ShimGuard, ShimProcess, UNIT_DIR_EXCLUSIVE, embedded_manager, embedded_shim, fixture_command,
@@ -764,11 +769,8 @@ impl ShimProvider for Gated {
             .unwrap()
             .send(Event::Provided)
             .expect("the test is listening");
-        self.release
-            .lock()
-            .unwrap()
-            .recv()
-            .expect("the test lets the provider go");
+        // A test that ends early drops its sender, which lets the provider go as a send does.
+        let _ = self.release.lock().unwrap().recv();
         self.inner.provide(folders)
     }
 
@@ -797,7 +799,9 @@ fn open_lock() -> OwnedHandle {
 
 /// Runs an install of a `type: simple` service on its own thread, which stops inside the
 /// provider's `provide`, where the lock is held, and calls `probe` with the lock opened then. The
-/// install is then let go and must succeed. Returns the lock, opened.
+/// install is then let go and must succeed. Returns the lock, opened. A probe that panics lets the
+/// install go too (the closure owns `release`, which is dropped as it unwinds, before the scope
+/// waits for the install thread), so the test fails instead of hanging.
 fn probing_the_lock_during_an_install(probe: impl FnOnce(&OwnedHandle)) -> OwnedHandle {
     let logs = LogDir::new();
     let id = support::random_test_id();
@@ -813,6 +817,7 @@ fn probing_the_lock_during_an_install(probe: impl FnOnce(&OwnedHandle)) -> Owned
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
     std::thread::scope(|scope| {
+        let release = release;
         scope.spawn(|| {
             let installed = mgr.install(&spec, false);
             let _ = events.send(Event::Installed(installed));
@@ -851,32 +856,103 @@ fn lock_is_exclusive() {
     assert_ne!(unsafe { ReleaseMutex(lock.as_raw_handle()) }, 0);
 }
 
+/// `ACCESS_ALLOWED_ACE_TYPE`, which `windows-sys` does not export.
+const ACCESS_ALLOWED_ACE_TYPE_VALUE: u8 = 0;
+
+/// The DACL of the kernel object `handle` (open with `READ_CONTROL`), as what it means: whether it
+/// is protected, and each entry as its trustee's SID text, its mask and its type. The kernel stores
+/// a generic right as the object's specific mask, so a text comparison would test the spelling.
+fn dacl_of(handle: HANDLE) -> (bool, Vec<(String, u32, u8)>) {
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `handle` is open with `READ_CONTROL`; the out-pointers are valid lvalues, and the
+    // others are not asked for. The descriptor owns `dacl`'s memory until it is freed below.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    assert_eq!(status, 0, "read the permissions of the lock: error {status}");
+    assert!(
+        !dacl.is_null(),
+        "the lock has a NULL DACL, which grants everyone every right"
+    );
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: `descriptor` is live; the out-pointers are valid lvalues.
+    assert_ne!(
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+        0
+    );
+    let mut entries = Vec::new();
+    // SAFETY: `dacl` points into the live `descriptor`, so its header is readable.
+    let count = unsafe { (*dacl).AceCount };
+    for index in 0..u32::from(count) {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `index` is below the entry count; `ace` is a valid out-pointer.
+        assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+        // SAFETY: `GetAce` returned an entry inside `dacl`; every type read here begins with the
+        // header, the mask and the trustee's SID.
+        let (kind, mask, sid) = unsafe {
+            let body = ace as *const ACCESS_ALLOWED_ACE;
+            (
+                (*(ace as *const ACE_HEADER)).AceType,
+                (*body).Mask,
+                std::ptr::addr_of!((*body).SidStart) as PSID,
+            )
+        };
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `sid` is a valid SID inside the entry; `text` is a valid out-pointer.
+        assert_ne!(unsafe { ConvertSidToStringSidW(sid, &mut text) }, 0);
+        let mut len = 0;
+        // SAFETY: `text` is a NUL-terminated string, live until it is freed below.
+        while unsafe { *text.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: the `len` units before the NUL were just read; `text` is freed once.
+        let sid_text = unsafe {
+            let sid_text = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+            sid_text
+        };
+        entries.push((sid_text, mask, kind));
+    }
+    // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last read.
+    unsafe { LocalFree(descriptor) };
+    (control & SE_DACL_PROTECTED != 0, entries)
+}
+
+/// The lock is for SYSTEM and Administrators alone, each with every right the mutex has, in a DACL
+/// that inherits nothing.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn lock_is_for_system_and_administrators_only() {
     probing_the_lock_during_an_install(|lock| {
-        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: `lock` is open with `READ_CONTROL`; the descriptor out-pointer is valid, and the
-        // others are not asked for.
-        let status = unsafe {
-            GetSecurityInfo(
-                lock.as_raw_handle(),
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        assert_eq!(status, 0, "read the permissions of the lock: error {status}");
-        let sddl = sddl_of(descriptor);
-        // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last read.
-        unsafe { LocalFree(descriptor) };
-        assert!(
-            sddl.contains("D:P(A;;GA;;;SY)(A;;GA;;;BA)"),
-            "the lock is for SYSTEM and Administrators alone, and protected: {sddl}"
+        let (protected, entries) = dacl_of(lock.as_raw_handle());
+
+        assert!(protected, "the lock's DACL must not inherit: {entries:?}");
+        let mut trustees: Vec<&str> = entries.iter().map(|(sid, ..)| sid.as_str()).collect();
+        trustees.sort();
+        assert_eq!(
+            trustees,
+            ["S-1-5-18", "S-1-5-32-544"],
+            "SYSTEM and Administrators alone: {entries:?}"
         );
+        for (sid, mask, kind) in &entries {
+            assert_eq!(*kind, ACCESS_ALLOWED_ACE_TYPE_VALUE, "{sid} is allowed, not denied");
+            // The kernel stores a generic right as the object's own mask: all of the mutex's rights.
+            let full = mask & GENERIC_ALL != 0 || mask & MUTEX_ALL_ACCESS == MUTEX_ALL_ACCESS;
+            assert!(
+                full,
+                "{sid} has {mask:#x}, not every right of the mutex ({MUTEX_ALL_ACCESS:#x})"
+            );
+        }
     });
 }
 
