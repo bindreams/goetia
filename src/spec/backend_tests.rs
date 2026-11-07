@@ -363,30 +363,6 @@ fn shaped_with_env_key(key: &str) -> ShapedSpec {
 }
 
 #[skuld::test]
-fn a_host_that_is_not_systemd_warns_about_an_env_key_systemd_would_refuse() {
-    for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
-        let spec = shaped_with_env_key(key);
-        for backend in [BackendKind::Launchd, BackendKind::Scm] {
-            let mut warnings = Vec::new();
-            backend.warn(&spec, &mut warnings);
-            let [warning] = warnings.as_slice() else {
-                panic!("{backend} {key:?}: expected exactly one warning, got {warnings:?}");
-            };
-            assert!(warning.message.contains(&format!("{key:?}")), "{}", warning.message);
-            assert!(warning.message.contains("systemd"), "{}", warning.message);
-        }
-    }
-    for key in ["PATH", "_x", "a1_B"] {
-        let spec = shaped_with_env_key(key);
-        for backend in [BackendKind::Launchd, BackendKind::Scm] {
-            let mut warnings = Vec::new();
-            backend.warn(&spec, &mut warnings);
-            assert!(warnings.is_empty(), "{backend} {key:?}: {warnings:?}");
-        }
-    }
-}
-
-#[skuld::test]
 fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
         let spec = shaped_with_env_key(key);

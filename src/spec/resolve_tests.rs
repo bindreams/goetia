@@ -2508,18 +2508,20 @@ backend-specific:
 // systemd's `Environment=` names ======================================================================================
 
 #[skuld::test]
-fn a_systemd_host_refuses_an_env_key_systemd_would_drop_and_another_host_warns() {
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\nenv:\n  MY-VAR: x\n";
+fn only_a_systemd_host_refuses_an_env_key_systemd_would_drop() {
+    let yaml = "id: frpc
+command: [/bin/frpc]
+env:
+  MY-VAR: x
+";
 
     let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
     assert!(msg.contains("\"MY-VAR\"") && msg.contains("Environment="), "{msg}");
 
+    // Another host's native backend carries the key; a systemd advisory is not its to give.
     for native in [BackendKind::Launchd, BackendKind::Scm] {
         let (_spec, warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("{native}: {e}"));
-        let [warning] = warnings.as_slice() else {
-            panic!("{native}: expected one warning, got {warnings:?}");
-        };
-        assert!(warning.message.contains("\"MY-VAR\""), "{native}: {}", warning.message);
+        assert!(warnings.is_empty(), "{native}: {warnings:?}");
     }
 }
 

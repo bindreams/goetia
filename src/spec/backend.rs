@@ -32,8 +32,7 @@
 //! honour is its generator's to refuse at install (`restart: always` on `scm`).
 //!
 //! [`BackendKind::refuse`] runs for the native backend too, on the same spec, for a value its generator would
-//! refuse at install anyway (systemd's `env` names), so the refusal comes at resolve. Its advisory twin is the
-//! one cross-backend warning: a host whose own backend carries the value says a systemd host would not.
+//! refuse at install anyway (systemd's `env` names), so the refusal comes at resolve.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -165,16 +164,11 @@ impl BackendKind {
     /// with a value, whichever layer wrote it.
     pub(crate) fn warn(self, spec: &ShapedSpec, out: &mut Vec<Warning>) {
         match self {
-            // Refused instead, by `refuse`.
             BackendKind::Systemd => {}
-            BackendKind::Launchd => {
-                warn_on_sub_second_restart_delay(spec, out);
-                warn_on_env_key_systemd_refuses(spec, out);
-            }
+            BackendKind::Launchd => warn_on_sub_second_restart_delay(spec, out),
             BackendKind::Scm => {
                 warn_on_windows_divergences(spec, out);
                 warn_on_over_long_restart_delay(spec, out);
-                warn_on_env_key_systemd_refuses(spec, out);
             }
         }
     }
@@ -233,7 +227,7 @@ impl BackendKind {
 /// systemd logs "Invalid environment assignment, ignoring" for any `Environment=` name outside
 /// `[A-Za-z_][A-Za-z0-9_]*` and starts the unit without it (measured on 242 and 255), so the
 /// daemon would never see the variable. One predicate for the systemd generator's refusal and
-/// for [`BackendKind::refuse`] and its advisory.
+/// for [`BackendKind::refuse`].
 pub(crate) fn systemd_env_key_defect(env: &BTreeMap<String, String>) -> Option<String> {
     let key = env.keys().find(|key| !is_valid_name(key))?;
     Some(format!(
@@ -241,16 +235,6 @@ pub(crate) fn systemd_env_key_defect(env: &BTreeMap<String, String>) -> Option<S
         [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the \
         daemon would never see it"
     ))
-}
-
-/// The advisory for a host whose own backend carries the key: a systemd host would refuse it.
-fn warn_on_env_key_systemd_refuses(spec: &ShapedSpec, out: &mut Vec<Warning>) {
-    if let Some(defect) = systemd_env_key_defect(&spec.env) {
-        out.push(Warning {
-            id: Some(spec.id.clone()),
-            message: format!("{defect}; goetia refuses to install this manifest on a systemd host"),
-        });
-    }
 }
 
 /// `type: managed` on Windows has no working-directory or stdout-capture
