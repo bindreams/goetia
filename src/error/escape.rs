@@ -6,6 +6,8 @@
 //! report and the CLI's other human sinks escape on the way out.
 
 use std::fmt;
+#[cfg(feature = "cli")]
+use std::io;
 
 /// What is escaped: the controls (Cc: C0, DEL and C1), the line and paragraph separators, and the
 /// bidirectional embeddings, overrides and isolates. The rest of the format characters (ZWNJ, ZWJ,
@@ -45,6 +47,105 @@ pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     write_escaped(&mut out, text).expect("writing to a String cannot fail");
     out
+}
+
+/// An [`io::Write`] that writes everything to `inner` with the set escaped, keeping line feeds and
+/// tabs ([`write_escaped_keeping_layout`]): the stream all of the CLI's output goes through, so a
+/// sink that forgets to escape cannot put a control character on the terminal. A line feed passes,
+/// so a quoted value in a one-line message could still start a line of its own: those messages are
+/// escaped whole as well.
+///
+/// A write may end inside a multi-byte character, so the incomplete tail is held until the next
+/// write. Bytes that are not UTF-8 are written as U+FFFD; so is a tail still held when the stream
+/// is dropped.
+#[cfg(feature = "cli")]
+pub(crate) struct EscapedStream<'a> {
+    inner: &'a mut dyn io::Write,
+    held: Vec<u8>,
+}
+
+#[cfg(feature = "cli")]
+impl<'a> EscapedStream<'a> {
+    pub(crate) fn new(inner: &'a mut dyn io::Write) -> Self {
+        EscapedStream {
+            inner,
+            held: Vec::new(),
+        }
+    }
+
+    fn put(&mut self, text: &str) -> io::Result<()> {
+        let mut out = IoAsFmt {
+            inner: &mut *self.inner,
+            error: None,
+        };
+        write_escaped_keeping_layout(&mut out, text).map_err(|_| {
+            out.error
+                .take()
+                .unwrap_or_else(|| io::Error::other("formatting failed"))
+        })
+    }
+}
+
+#[cfg(feature = "cli")]
+impl io::Write for EscapedStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut bytes = std::mem::take(&mut self.held);
+        bytes.extend_from_slice(buf);
+        let mut rest = bytes.as_slice();
+        while !rest.is_empty() {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    self.put(text)?;
+                    break;
+                }
+                Err(e) => {
+                    let (valid, bad) = rest.split_at(e.valid_up_to());
+                    self.put(std::str::from_utf8(valid).expect("`valid_up_to` is valid UTF-8"))?;
+                    match e.error_len() {
+                        None => {
+                            self.held = bad.to_vec();
+                            break;
+                        }
+                        Some(len) => {
+                            self.put("\u{fffd}")?;
+                            rest = &bad[len..];
+                        }
+                    }
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(feature = "cli")]
+impl Drop for EscapedStream<'_> {
+    fn drop(&mut self) {
+        if !self.held.is_empty() {
+            let _ = self.put("\u{fffd}");
+        }
+    }
+}
+
+/// An [`io::Write`] seen as a [`fmt::Write`], keeping the I/O error `fmt::Error` cannot carry.
+#[cfg(feature = "cli")]
+struct IoAsFmt<'a> {
+    inner: &'a mut dyn io::Write,
+    error: Option<io::Error>,
+}
+
+#[cfg(feature = "cli")]
+impl fmt::Write for IoAsFmt<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.inner.write_all(text.as_bytes()).map_err(|e| {
+            self.error = Some(e);
+            fmt::Error
+        })
+    }
 }
 
 #[cfg(test)]

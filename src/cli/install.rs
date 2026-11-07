@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
+use super::refusal::{self, Mood};
 use super::support::{load_and_warn, require_elevation};
 use super::wait::WaitArgs;
 use crate::backend::Identity;
-use crate::decide::{self, Outcome};
+use crate::decide::Outcome;
 use crate::error::Result;
 use crate::manager::{ServiceManager, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
@@ -132,62 +133,29 @@ pub fn run(
 /// additionally gets a one-line diagnostic on `err`, so a script that only
 /// captures stderr for errors still learns that an exit-1/5 run had one.
 fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    if let Some(code) = refusal::report(id, outcome, Mood::Done, out, err) {
+        return code;
+    }
     match outcome {
         Outcome::Create => {
             let _ = writeln!(out, "{id}: created");
-            ExitCode::Success
         }
         Outcome::UpToDate => {
             let _ = writeln!(out, "{id}: up to date");
-            ExitCode::Success
         }
         Outcome::Update { spec_diff } => {
             let _ = writeln!(out, "{id}: updated");
             let _ = write!(out, "{spec_diff}");
-            ExitCode::Success
         }
         Outcome::Stale { from_version } => {
             let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
-            ExitCode::Success
         }
-        Outcome::Conflict {
-            artifact_diff,
-            unclearable_recovery,
-        } => {
-            // `--force` is offered only where it resolves the conflict. When part
-            // of the cause is outside the directory this backend writes, forcing
-            // leaves that part in place and the next run reports the same
-            // conflict; `decide` says which case this is (see `Outcome::Conflict`).
-            let line = match unclearable_recovery {
-                None => format!("{id}: conflict (re-run with --force to overwrite)"),
-                Some(recovery) => format!("{id}: conflict. {recovery}"),
-            };
-            let _ = writeln!(out, "{line}");
-            let _ = write!(out, "{artifact_diff}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Conflict
-        }
-        Outcome::RefuseForeign { recovery } => {
-            let _ = writeln!(out, "{id}: refused: not a goetia-managed service. {recovery}");
-            let _ = writeln!(err, "error: {id}: refused: not a goetia-managed service. {recovery}");
-            ExitCode::Error
-        }
-        Outcome::RefuseOtherDaemon { installed } => {
-            let line = format!("{id}: refused: {}", decide::other_daemon_refusal(installed.as_str()));
-            let _ = writeln!(out, "{line}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Error
-        }
-        Outcome::RefuseUnusable { reason, recovery } => {
-            let line = match recovery {
-                Some(recovery) => format!("{id}: refused: {reason}. {recovery}"),
-                None => format!("{id}: refused: {reason}"),
-            };
-            let _ = writeln!(out, "{line}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Error
-        }
+        Outcome::Conflict { .. }
+        | Outcome::RefuseForeign { .. }
+        | Outcome::RefuseOtherDaemon { .. }
+        | Outcome::RefuseUnusable { .. } => unreachable!("`refusal::report` wrote {outcome:?}"),
     }
+    ExitCode::Success
 }
 
 // --dry-run preview ===================================================================================================

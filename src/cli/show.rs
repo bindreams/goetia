@@ -20,7 +20,10 @@
 //!    backend, so they still agree.
 //! 2. Neither path ever checks elevation.
 //! 3. `show -f` touches no manager; `show` without `-f` touches no manifest.
-//! 4. Output is YAML, one `# <id>` header per daemon, blank-line separated.
+//! 4. Output is YAML, one `# <id>` header per daemon, blank-line separated. It is for reading, so it
+//!    is not byte-exact when a value holds a control character, U+2028, U+2029 or a bidirectional
+//!    control: `dispatch`'s stream writes each as `\u{XXXX}`. The artifact file keeps the exact
+//!    value.
 //!
 //! A daemon this privilege level *can* see, but whose blob will not decode,
 //! is not "not installed": `show` returns `4` for it, per id and for the
@@ -40,7 +43,7 @@ use clap::Args as ClapArgs;
 
 use super::ExitCode;
 use super::support::{load_and_warn, partition_installed, print_undetermined_warnings, print_unusable_warnings};
-use crate::error::Result;
+use crate::error::{Result, escape};
 use crate::manager::ServiceManager;
 use crate::spec::DaemonSpec;
 
@@ -125,22 +128,25 @@ fn show_from_installed(
 
     let mut specs = Vec::new();
     for id in &wanted {
+        // One-line messages quote the id and the reason, both from outside: written whole through
+        // the strict writer.
         if let Some(entry) = index.ours.get(id) {
             specs.push(entry.spec.clone());
         } else if index.unusable.contains_key(id) {
-            let _ = writeln!(err, "error: daemon `{id}` is installed but unusable");
+            let _ = writeln!(err, "error: daemon `{}` is installed but unusable", escape(id));
             codes.push(ExitCode::Indeterminate);
         } else if let Some(entry) = index.undetermined_for(id) {
             // Either the listing could not classify this id, or an aggregate
             // entry may stand for it: absence is unestablished either way.
             let _ = writeln!(
                 err,
-                "error: daemon `{id}`: installation state could not be determined: {}",
-                entry.reason
+                "error: daemon `{}`: installation state could not be determined: {}",
+                escape(id),
+                escape(&entry.reason)
             );
             codes.push(ExitCode::Indeterminate);
         } else {
-            let _ = writeln!(err, "error: daemon `{id}` is not installed");
+            let _ = writeln!(err, "error: daemon `{}` is not installed", escape(id));
             codes.push(ExitCode::Error);
         }
     }

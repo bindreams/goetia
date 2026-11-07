@@ -69,3 +69,24 @@ fn an_unusable_or_undetermined_entry_is_printed_with_control_and_direction_chara
         )
     );
 }
+
+/// The index feeds `--json`, whose encoder escapes the text itself: it holds a reason as it is, and
+/// the sinks that print it escape.
+#[skuld::test]
+fn the_index_holds_a_reason_as_it_is() {
+    use crate::error::Reason;
+    use crate::manager::Installed;
+
+    let index = super::partition_installed(vec![
+        Installed::OursUnusable {
+            name: "a".to_string(),
+            reason: Reason::said("why\u{1b}[0m"),
+        },
+        Installed::Undetermined {
+            name: None,
+            reason: Reason::said("all\rgone"),
+        },
+    ]);
+    assert_eq!(index.unusable["a"], "why\u{1b}[0m");
+    assert_eq!(index.undetermined[0].reason, "all\rgone");
+}

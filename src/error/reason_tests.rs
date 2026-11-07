@@ -57,3 +57,52 @@ fn two_reasons_are_equal_when_they_read_the_same() {
     assert_ne!(reason(), Reason::said("something else"));
     assert_eq!(Reason::said("failed to read /p: denied"), reason());
 }
+
+const HOSTILE: &str = "/a\nb\u{1b}[31m\u{202e}";
+const HOSTILE_ESCAPED: &str = r"/a\u{a}b\u{1b}[31m\u{202e}";
+
+/// Whatever travels as a `Reason` is printed raw as `{reason}`, so its `Display` is the sink.
+#[skuld::test]
+fn a_reason_escapes_every_part_of_what_it_prints_as_the_report_does() {
+    assert_eq!(
+        Reason::said(format!("path {HOSTILE}")).to_string(),
+        format!("path {HOSTILE_ESCAPED}")
+    );
+    assert_eq!(
+        Reason::failed(os("read", HOSTILE, "denied")).to_string(),
+        format!("failed to read {HOSTILE_ESCAPED}: denied")
+    );
+    assert_eq!(
+        Reason::around(
+            format!("scan of {HOSTILE} failed ("),
+            os("read", HOSTILE, "denied"),
+            format!("). Stopped at {HOSTILE}.")
+        )
+        .to_string(),
+        format!(
+            "scan of {HOSTILE_ESCAPED} failed (failed to read {HOSTILE_ESCAPED}: denied). Stopped at \
+             {HOSTILE_ESCAPED}."
+        )
+    );
+}
+
+/// What `--json` carries: the document's encoder escapes the text itself.
+#[skuld::test]
+fn an_unescaped_reason_carries_every_character_as_it_is() {
+    assert_eq!(Reason::said(HOSTILE).unescaped().to_string(), HOSTILE);
+    assert_eq!(
+        Reason::failed(os("read", HOSTILE, "denied")).unescaped().to_string(),
+        format!("failed to read {HOSTILE}: denied")
+    );
+    assert_eq!(
+        Reason::around(HOSTILE, os("read", HOSTILE, "denied"), HOSTILE)
+            .unescaped()
+            .to_string(),
+        format!("{HOSTILE}failed to read {HOSTILE}: denied{HOSTILE}")
+    );
+}
+
+#[skuld::test]
+fn reasons_that_differ_only_in_what_escaping_hides_are_not_equal() {
+    assert_ne!(Reason::said("a\nb"), Reason::said(r"a\u{a}b"));
+}

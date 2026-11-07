@@ -10,7 +10,7 @@ mod report;
 mod within;
 
 #[cfg(feature = "cli")]
-pub(crate) use escape::escape;
+pub(crate) use escape::{EscapedStream, escape};
 pub use reason::Reason;
 pub(crate) use report::Chain;
 pub(crate) use within::within;

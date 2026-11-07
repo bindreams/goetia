@@ -22,6 +22,7 @@ mod exit;
 pub mod install;
 pub mod kill;
 pub mod list;
+mod refusal;
 mod report;
 pub mod restart;
 pub mod show;
@@ -39,7 +40,7 @@ use clap::{Parser, Subcommand};
 pub use elevation::is_elevated;
 pub use exit::ExitCode;
 
-use crate::error::Result;
+use crate::error::{EscapedStream, Result};
 use crate::manager::ServiceManager;
 
 // Cli =================================================================================================================
@@ -187,7 +188,18 @@ pub fn dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    run(cli, get_manager, is_elevated, out, err).code()
+    // The one place nothing can miss: every subcommand writes through these two. `out` is left
+    // alone under `--json`: the document's encoder escapes what it must, and writes U+2028 and the
+    // direction controls as they are, which is valid JSON where the wrapper's `\u{2028}` is not.
+    let mut err = EscapedStream::new(err);
+    let mut escaped_out;
+    let out: &mut dyn Write = if cli.json {
+        out
+    } else {
+        escaped_out = EscapedStream::new(out);
+        &mut escaped_out
+    };
+    run(cli, get_manager, is_elevated, out, &mut err).code()
 }
 
 fn run(

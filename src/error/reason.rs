@@ -59,26 +59,49 @@ impl Reason {
 }
 
 impl fmt::Display for Reason {
-    /// An [`Around`](Reason::Around) error's remedies print after `after`, as [`Error::report`]
-    /// prints them after a chain.
+    /// As [`Error::report`] prints an error: the control and direction characters of every part
+    /// are written as `\u{XXXX}`. An [`Around`](Reason::Around) error's remedies print after
+    /// `after`, as `report` prints them after a chain.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write(f, true)
+    }
+}
+
+impl Reason {
+    /// `Display` with every character as it is: what `--json` carries, and what two reasons are
+    /// compared by.
+    pub(crate) fn unescaped(&self) -> impl fmt::Display + '_ {
+        Unescaped(self)
+    }
+
+    fn write(&self, f: &mut dyn fmt::Write, escaped: bool) -> fmt::Result {
         let (before, error, after) = match self {
-            Reason::Said(text) => return f.write_str(text),
-            Reason::Failed(error) => ("", error, ""),
-            Reason::Around { before, error, after } => (before.as_str(), error, after.as_str()),
+            Reason::Said(text) => ("", None, text.as_str()),
+            Reason::Failed(error) => ("", Some(error), ""),
+            Reason::Around { before, error, after } => (before.as_str(), Some(error), after.as_str()),
         };
+        let mut out = Sink::new(f, escaped);
         let mut remedies = Vec::new();
-        f.write_str(before)?;
-        let mut out = Sink::new(f, false);
-        write_chain(error.as_ref(), &mut out, &mut remedies)?;
+        out.write_str(before)?;
+        if let Some(error) = error {
+            write_chain(error.as_ref(), &mut out, &mut remedies)?;
+        }
         out.write_str(after)?;
         write_remedies(&mut out, &remedies)
     }
 }
 
+struct Unescaped<'a>(&'a Reason);
+
+impl fmt::Display for Unescaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.write(f, false)
+    }
+}
+
 impl PartialEq for Reason {
     fn eq(&self, other: &Self) -> bool {
-        self.to_string() == other.to_string()
+        self.unescaped().to_string() == other.unescaped().to_string()
     }
 }
 

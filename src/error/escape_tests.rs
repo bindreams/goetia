@@ -57,3 +57,63 @@ fn layout_mode_keeps_a_line_feed_and_a_tab_and_escapes_the_rest_of_the_set() {
         concat!("a\tb\nc", r"\u{d}\u{1b}[0m\u{85}\u{2028}\u{202e}")
     );
 }
+
+#[cfg(feature = "cli")]
+/// What `EscapedStream` writes for `chunks`, each handed to its own `write` call.
+fn streamed(chunks: &[&[u8]]) -> Vec<u8> {
+    let mut sink = Vec::new();
+    {
+        let mut stream = EscapedStream::new(&mut sink);
+        for chunk in chunks {
+            std::io::Write::write_all(&mut stream, chunk).unwrap();
+        }
+    }
+    sink
+}
+
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn a_stream_keeps_layout_and_escapes_the_rest_of_the_set() {
+    assert_eq!(
+        streamed(&[b"a\tb\nc\r\x1b[0m"]),
+        concat!("a\tb\nc", r"\u{d}\u{1b}[0m").as_bytes()
+    );
+}
+
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn a_character_split_across_writes_comes_out_whole() {
+    let text = "d\u{e9}j\u{e0} vu \u{1f469}";
+    for cut in 1..text.len() {
+        if !text.is_char_boundary(cut) {
+            let (head, tail) = text.as_bytes().split_at(cut);
+            assert_eq!(streamed(&[head, tail]), text.as_bytes(), "cut at {cut}");
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn an_escaped_character_split_across_writes_is_escaped_once() {
+    let line_separator = "\u{2028}".as_bytes();
+    for cut in 1..line_separator.len() {
+        let (head, tail) = line_separator.split_at(cut);
+        assert_eq!(streamed(&[head, tail]), br"\u{2028}", "cut at {cut}");
+    }
+    // One byte at a time, around the C1 control U+0085.
+    assert_eq!(streamed(&[b"a", &[0xc2], &[0x85], b"b"]), br"a\u{85}b");
+}
+
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn bytes_that_are_not_utf8_are_written_as_the_replacement_character() {
+    assert_eq!(streamed(&[b"a\xffb\xc3"]), "a\u{fffd}b\u{fffd}".as_bytes());
+    // A lead byte whose continuation never comes, then ASCII.
+    assert_eq!(streamed(&[b"\xe2\x80", b"x"]), "\u{fffd}x".as_bytes());
+}
+
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn an_incomplete_character_at_the_end_of_the_stream_is_not_lost_silently() {
+    assert_eq!(streamed(&[b"ok\xe2\x80"]), "ok\u{fffd}".as_bytes());
+}

@@ -15,8 +15,9 @@ use std::path::PathBuf;
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
+use super::refusal::{self, Mood};
 use super::support::load_and_warn;
-use crate::decide::{self, Outcome};
+use crate::decide::Outcome;
 use crate::error::Result;
 use crate::manager::ServiceManager;
 
@@ -49,77 +50,39 @@ pub fn run(
         }
     };
 
-    match mgr.preview_install(&spec) {
-        Ok(Outcome::Create) => {
+    let outcome = match mgr.preview_install(&spec) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
+            return ExitCode::of(&e);
+        }
+    };
+    if let Some(code) = refusal::report(&spec.id, &outcome, Mood::Would, out, err) {
+        return code;
+    }
+    match outcome {
+        Outcome::Create => {
             let _ = writeln!(out, "{}: not installed (would be created)", spec.id);
-            ExitCode::Drift
         }
-        Ok(Outcome::UpToDate) => {
+        Outcome::UpToDate => {
             let _ = writeln!(out, "{}: up to date", spec.id);
-            ExitCode::Success
+            return ExitCode::Success;
         }
-        Ok(Outcome::Update { spec_diff }) => {
+        Outcome::Update { spec_diff } => {
             let _ = writeln!(out, "{}:", spec.id);
             let _ = write!(out, "{spec_diff}");
-            ExitCode::Drift
         }
-        Ok(Outcome::Stale { from_version }) => {
+        Outcome::Stale { from_version } => {
             let _ = writeln!(
                 out,
                 "{}: would be regenerated (built by goetia {from_version})",
                 spec.id
             );
-            ExitCode::Drift
         }
-        // The same two flavours `install` renders, in the subjunctive:
-        // `--force` is named only where it would actually resolve this.
-        Ok(Outcome::Conflict {
-            artifact_diff,
-            unclearable_recovery,
-        }) => {
-            let line = match &unclearable_recovery {
-                None => format!(
-                    "{}: would conflict (hand-edited outside goetia; `install --force` would overwrite it)",
-                    spec.id
-                ),
-                Some(recovery) => format!("{}: would conflict. {recovery}", spec.id),
-            };
-            let _ = writeln!(out, "{line}");
-            let _ = write!(out, "{artifact_diff}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Conflict
-        }
-        Ok(Outcome::RefuseForeign { recovery }) => {
-            let line = format!(
-                "{}: would be refused: not a goetia-managed service. {recovery}",
-                spec.id
-            );
-            let _ = writeln!(out, "{line}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Error
-        }
-        Ok(Outcome::RefuseOtherDaemon { installed }) => {
-            let line = format!(
-                "{}: would be refused: {}",
-                spec.id,
-                decide::other_daemon_refusal(installed.as_str())
-            );
-            let _ = writeln!(out, "{line}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Error
-        }
-        Ok(Outcome::RefuseUnusable { reason, recovery }) => {
-            let line = match recovery {
-                Some(recovery) => format!("{}: would be refused: {reason}. {recovery}", spec.id),
-                None => format!("{}: would be refused: {reason}", spec.id),
-            };
-            let _ = writeln!(out, "{line}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Indeterminate
-        }
-        Err(e) => {
-            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
-            ExitCode::of(&e)
-        }
+        Outcome::Conflict { .. }
+        | Outcome::RefuseForeign { .. }
+        | Outcome::RefuseOtherDaemon { .. }
+        | Outcome::RefuseUnusable { .. } => unreachable!("`refusal::report` wrote {outcome:?}"),
     }
+    ExitCode::Drift
 }

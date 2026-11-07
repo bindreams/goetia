@@ -4228,3 +4228,100 @@ fn status_by_id_where_no_manager_can_be_asked_answers_every_other_id() {
         "{err}"
     );
 }
+
+// Escaping at the stream ==============================================================================================
+
+/// Text from outside with a line separator, an escape and a direction override in it.
+const HOSTILE: &str = "a\u{2028}b\u{1b}[31m\u{202e}c";
+
+/// Every byte of the human output goes through the stream wrapper, so a sink that writes a value
+/// itself, as `show` writes the YAML, cannot put a terminal control on the screen. The layout stays.
+#[skuld::test]
+fn human_output_is_escaped_as_a_stream_and_keeps_its_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon, \"a\\u2028b\\u202ec\"]\n");
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 0, "{err}");
+    assert!(out.starts_with("# frpc\n"), "{out}");
+    // The YAML writer folds at U+2028, so the value is not on one line: that is why the artifact is
+    // the exact copy.
+    assert!(out.contains(r"a\u{2028}") && out.contains(r"b\u{202e}c"), "{out}");
+    assert!(!out.contains(['\u{2028}', '\u{202e}']), "{out:?}");
+    assert!(out.lines().count() > 2, "the YAML keeps its lines: {out}");
+}
+
+/// `--json` writes its own document: the encoder leaves U+2028 and the direction controls as they
+/// are, which is valid JSON, and `\u{2028}` from the wrapper would not be.
+#[skuld::test]
+fn json_output_is_not_wrapped() {
+    let fake = Fake::new();
+    fake.seed_aggregate_undetermined(HOSTILE);
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(
+        out.contains(['\u{2028}', '\u{202e}']),
+        "the encoder's text is as it is: {out:?}"
+    );
+    assert!(!out.contains(r"\u{"), "{out}");
+    assert_eq!(parse_json(&out)["undetermined"][0]["reason"], HOSTILE, "{out}");
+}
+
+/// Why a refusal and a conflict are escaped whole as well: the stream keeps a line feed, so a
+/// `recovery` or a `reason` with one would start a line of its own on both streams.
+#[skuld::test]
+fn a_refusal_and_a_conflict_with_a_line_feed_in_what_they_quote_stay_one_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
+    let manifest = manifest.to_str().unwrap();
+    let text = "move it\nerror: forged";
+    let escaped = r"move it\u{a}error: forged";
+
+    let conflicted = FlakyManager {
+        unclearable_conflict: Some(text.to_string()),
+        ..Default::default()
+    };
+    let unusable = FlakyManager {
+        recoveryless_unusable: Some(text.to_string()),
+        ..Default::default()
+    };
+
+    for mgr in [&conflicted, &unusable] {
+        let (_, out, err) = dispatch_with(&["goetia", "daemon", "install", "-f", manifest], mgr, &|| true);
+        assert!(err.contains(escaped), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(out.lines().next().unwrap().contains(escaped), "{out}");
+
+        let (_, out, err) = dispatch_with(&["goetia", "daemon", "diff", "-f", manifest], mgr, &never_elevated);
+        assert!(err.contains(escaped), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(out.lines().next().unwrap().contains(escaped), "{out}");
+    }
+}
+
+/// `show` prints a listed reason and the id it was asked for, both from outside, in one-line
+/// messages.
+#[skuld::test]
+fn show_escapes_the_reason_and_the_id_it_quotes() {
+    let fake = Fake::new();
+    fake.seed_aggregate_undetermined("scan stopped\nerror: forged");
+
+    let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "show", "a\nb"], &fake);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(
+        err.contains(
+            r"error: daemon `a\u{a}b`: installation state could not be determined: scan stopped\u{a}error: forged"
+        ),
+        "{err}"
+    );
+    assert!(!err.lines().any(|line| line.starts_with("error: forged")), "{err}");
+
+    let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "show", "a\nb"], &Fake::new());
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(err, "error: daemon `a\\u{a}b` is not installed\n");
+}

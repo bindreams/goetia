@@ -144,11 +144,11 @@ fn the_unescaped_report_carries_every_character_as_it_is() {
     );
 }
 
-/// An error quoted inside another's sentence, and a [`Reason`], are text the sink will write: they
-/// stay as they are until it does.
+/// An error quoted inside another's sentence is text the sink will write: it stays as it is until
+/// it does. A [`Reason`] is a sink of its own, which prints as the report does.
 #[skuld::test]
-fn a_chain_and_a_reason_leave_escaping_to_the_sink() {
+fn a_chain_leaves_escaping_to_the_sink_and_a_reason_is_one() {
     let e = os("read", "/a\nb", "denied");
     assert!(Chain(&e).to_string().contains('\n'));
-    assert!(Reason::failed(e).to_string().contains('\n'));
+    assert!(!Reason::failed(e).to_string().contains('\n'));
 }
