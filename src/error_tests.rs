@@ -19,6 +19,13 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             waited: Duration::ZERO,
             recovery: String::new(),
         },
+        Error::ProcessWaitTimeout {
+            id: id(),
+            pid: 1,
+            stopped: true,
+            waited: Duration::ZERO,
+            recovery: String::new(),
+        },
         Error::Unestablished {
             id: id(),
             refused: Box::new(not_installed()),

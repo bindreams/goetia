@@ -6,8 +6,14 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use super::*;
+use crate::backend::scm::wait::Waited;
+use crate::manager::budget::{Budget, Deadline};
 
 type Log = Rc<RefCell<Vec<String>>>;
+
+fn unbounded() -> Deadline {
+    Budget::Unbounded.start()
+}
 
 /// The kind of a failed `service_pid`: not `Other`, so a test sees whether a kind is kept.
 const READ_FAILED_KIND: io::ErrorKind = io::ErrorKind::TimedOut;
@@ -39,6 +45,9 @@ struct Scripted {
     failing_exit: bool,
     /// Whether `arm_release` fails.
     failing_arm: bool,
+    /// Whether the deadline passes during `arm_release`, or during `await_release`.
+    expiring_arm: bool,
+    expiring_release: bool,
     /// How many times the kill has blocked for SCM to let go.
     releases: usize,
     /// How many `arm_release` calls have been made.
@@ -65,6 +74,8 @@ impl Scripted {
             reads: 0,
             failing_exit: false,
             failing_arm: false,
+            expiring_arm: false,
+            expiring_release: false,
             releases: 0,
             arms: 0,
             unwatchable_from: None,
@@ -88,6 +99,18 @@ impl Scripted {
     /// `arm_release` fails.
     fn failing_arm(mut self) -> Self {
         self.failing_arm = true;
+        self
+    }
+
+    /// The deadline passes while `arm_release` is trying to register.
+    fn expiring_arm(mut self) -> Self {
+        self.expiring_arm = true;
+        self
+    }
+
+    /// The deadline passes while `await_release` blocks: the registration is still outstanding.
+    fn expiring_release(mut self) -> Self {
+        self.expiring_release = true;
         self
     }
 
@@ -160,10 +183,13 @@ impl KillTarget for Scripted {
         Ok(())
     }
 
-    fn arm_release(&mut self) -> io::Result<ReleaseWatch> {
+    fn arm_release(&mut self, _deadline: Deadline) -> io::Result<ReleaseWatch> {
         self.log.borrow_mut().push("arm_release".to_string());
         if self.failing_arm {
             return Err(io::Error::other("notifier could not be opened"));
+        }
+        if self.expiring_arm {
+            return Ok(ReleaseWatch::Expired);
         }
         assert!(
             !self.armed,
@@ -185,16 +211,20 @@ impl KillTarget for Scripted {
         self.armed = false;
     }
 
-    fn await_release(&mut self) -> io::Result<()> {
+    fn await_release(&mut self, _deadline: Deadline) -> io::Result<Waited> {
         self.log.borrow_mut().push("await_release".to_string());
         assert!(self.armed, "await_release with no registration to wake");
+        if self.expiring_release {
+            // Still registered: the caller cancels it.
+            return Ok(Waited::Expired);
+        }
         self.armed = false;
         self.releases += 1;
         assert!(
             self.releases <= 5,
             "the script never released the pid; the wait would not end"
         );
-        Ok(())
+        Ok(Waited::Confirmed)
     }
 }
 
@@ -208,7 +238,7 @@ fn steps<const N: usize>(steps: [&str; N]) -> Vec<String> {
 fn holding_a_service_with_no_process_holds_nothing() {
     let mut target = Scripted::new([None], [], []);
 
-    assert!(hold_service_process(&mut target).unwrap().is_none());
+    assert!(hold_service_process(&mut target, unbounded()).unwrap().is_none());
     assert_eq!(target.log(), steps(["service_pid"]));
 }
 
@@ -216,7 +246,9 @@ fn holding_a_service_with_no_process_holds_nothing() {
 fn holding_keeps_the_process_once_scm_confirms_its_pid() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found], []);
 
-    let (pid, process) = hold_service_process(&mut target).unwrap().expect("a held process");
+    let (pid, process) = hold_service_process(&mut target, unbounded())
+        .unwrap()
+        .expect("a held process");
 
     assert_eq!(pid, 100);
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
@@ -228,7 +260,9 @@ fn holding_keeps_the_process_once_scm_confirms_its_pid() {
 fn holding_follows_the_service_when_it_restarts_between_the_open_and_the_confirmation() {
     let mut target = Scripted::new([Some(100), Some(200), Some(200)], [Open::Found, Open::Found], []);
 
-    let (pid, _process) = hold_service_process(&mut target).unwrap().expect("a held process");
+    let (pid, _process) = hold_service_process(&mut target, unbounded())
+        .unwrap()
+        .expect("a held process");
 
     assert_eq!(pid, 200);
     assert_eq!(
@@ -250,11 +284,61 @@ fn holding_follows_the_service_when_it_restarts_between_the_open_and_the_confirm
 fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
 
-    let error = hold_service_process(&mut target).err().expect("a refused open");
+    let error = hold_service_process(&mut target, unbounded())
+        .err()
+        .expect("a refused open");
 
     assert!(matches!(error, HoldError::Refused(_)), "{error:?}");
     assert_eq!(io::Error::from(error).to_string(), "access denied");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+/// A stop under a budget holds the process first, and the hold waits on SCM's release only until
+/// the stop's deadline: a pid SCM keeps reporting past it is [`HoldError::Expired`], with nothing
+/// held and no registration left outstanding.
+#[skuld::test]
+fn a_release_scm_does_not_make_by_the_deadline_expires_the_hold() {
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Gone], []).expiring_release();
+
+    let error = hold_service_process(&mut target, unbounded())
+        .err()
+        .expect("an expired hold");
+
+    assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "arm_release",
+            "service_pid",
+            "await_release",
+            "cancel_release"
+        ])
+    );
+}
+
+#[skuld::test]
+fn an_arm_that_expires_expires_the_hold_with_nothing_to_cancel() {
+    let mut target = Scripted::new([Some(100)], [Open::Gone], []).expiring_arm();
+
+    let error = hold_service_process(&mut target, unbounded())
+        .err()
+        .expect("an expired hold");
+
+    assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
+    assert_eq!(target.log(), steps(["service_pid", "open 100", "arm_release"]));
+}
+
+/// An expiry is not a process that could not be opened: `hold_if_possible` lets go of the refusal
+/// only, and the stop reports the expiry.
+#[skuld::test]
+fn an_expired_hold_is_not_let_go_by_hold_if_possible() {
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Gone], []).expiring_release();
+
+    let error = hold_if_possible(&mut target, unbounded()).err().expect("an expiry");
+
+    assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
 }
 
 /// `uninstall` waits for the process only if it can hold it: a process it cannot open (a right
@@ -264,7 +348,7 @@ fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
 fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
 
-    assert!(hold_if_possible(&mut target).unwrap().is_none());
+    assert!(hold_if_possible(&mut target, unbounded()).unwrap().is_none());
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -272,7 +356,7 @@ fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
 fn a_process_that_can_be_opened_is_held_by_hold_if_possible() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found], []);
 
-    assert!(hold_if_possible(&mut target).unwrap().is_some());
+    assert!(hold_if_possible(&mut target, unbounded()).unwrap().is_some());
 }
 
 /// Only the refusal is let go. A failed read of SCM is not a process that cannot be opened: the
@@ -283,8 +367,11 @@ fn a_failed_read_of_scm_is_not_let_go_by_hold_if_possible() {
     let mut after_refusal = Scripted::new([Some(100), Some(100)], [Open::Fails], []).failing_read(2);
 
     for target in [&mut first, &mut after_refusal] {
-        let error = hold_if_possible(target).err().expect("an SCM read failure");
-        assert_eq!(error.kind(), READ_FAILED_KIND);
+        let error = hold_if_possible(target, unbounded())
+            .err()
+            .expect("an SCM read failure");
+        assert!(matches!(error, HoldError::Read(_)), "{error:?}");
+        assert_eq!(io::Error::from(error).kind(), READ_FAILED_KIND);
     }
 }
 

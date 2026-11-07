@@ -550,19 +550,20 @@ fn stop_and_await_exit_waits_for_the_held_process_after_stopped() {
         Ok(Waited::Confirmed)
     });
 
-    assert_eq!(outcome.unwrap(), Waited::Confirmed);
+    assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped);
     assert_eq!(fake.log, vec!["control_stop", "arm_stopped", "wait", "got_stopped"]);
     assert_eq!(waited_for, vec![(7, deadline)]);
 }
 
-/// A process that outlasts the deadline is an expired stop, as a service that does.
+/// A process that outlasts the deadline is told apart from a service that does: the service is
+/// stopped, and the process is the one that did not exit.
 #[skuld::test]
-fn stop_and_await_exit_expires_when_the_process_outlasts_the_deadline() {
+fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
 
     let outcome = stop_and_await_exit(&mut fake, unbounded(), Some(&7u32), |_, _| Ok(Waited::Expired));
 
-    assert_eq!(outcome.unwrap(), Waited::Expired);
+    assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::ProcessExpired(&7));
 }
 
 #[skuld::test]
@@ -573,7 +574,7 @@ fn stop_and_await_exit_does_not_wait_for_a_process_when_stopped_was_not_confirme
         panic!("the process is waited for once SCM has confirmed the stop")
     });
 
-    assert_eq!(outcome.unwrap(), Waited::Expired);
+    assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::ServiceExpired);
 }
 
 #[skuld::test]
@@ -584,7 +585,7 @@ fn stop_and_await_exit_without_a_held_process_is_the_stop() {
         panic!("there is no process to wait for")
     });
 
-    assert_eq!(outcome.unwrap(), Waited::Confirmed);
+    assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped);
 }
 
 #[skuld::test]

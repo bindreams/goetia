@@ -19,7 +19,9 @@
 
 use std::io;
 
+use crate::backend::scm::wait::Waited;
 use crate::error::{Chain, within};
+use crate::manager::budget::{Budget, Deadline};
 
 /// What a kill did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,8 @@ pub enum ReleaseWatch {
     /// SCM refuses to watch the service, which is marked for deletion, and the status read in its place
     /// is `STOPPED`: SCM has recorded the exit. Nothing is registered.
     Stopped,
+    /// The deadline ran out before SCM took the registration. Nothing is registered.
+    Expired,
 }
 
 /// The three things [`kill_service`] needs of the world, so its ordering is testable without one.
@@ -81,10 +85,14 @@ pub trait KillTarget {
     /// excludes `STOPPED`); that is [`ReleaseWatch::Stopped`], with nothing registered, as is a service
     /// found deleted. A marked service refused in any other state is an error: nothing will wake the
     /// kill.
-    fn arm_release(&mut self) -> io::Result<ReleaseWatch>;
+    ///
+    /// SCM can keep refusing a registration while it catches up with the notifications already
+    /// delivered, and the arm retries until `deadline`: then it is [`ReleaseWatch::Expired`].
+    fn arm_release(&mut self, deadline: Deadline) -> io::Result<ReleaseWatch>;
 
-    /// Block until the registration [`Self::arm_release`] made wakes. Unbounded.
-    fn await_release(&mut self) -> io::Result<()>;
+    /// Block until the registration [`Self::arm_release`] made wakes, or until `deadline`, when
+    /// the registration is still outstanding: the caller cancels it.
+    fn await_release(&mut self, deadline: Deadline) -> io::Result<Waited>;
 
     /// Cancel the registration [`Self::arm_release`] made, for a caller that no longer needs it
     /// woken.
@@ -100,17 +108,17 @@ pub trait KillTarget {
 /// exit: the process has exited and SCM no longer reports its pid.
 pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
     loop {
-        let Some((pid, process)) = hold_service_process(target)? else {
+        let Some((pid, process)) = hold_service_process(target, Budget::Unbounded.start())? else {
             return Ok(Killed::NotRunning);
         };
         match target.terminate(&process)? {
             Termination::Terminated => {
                 target.await_exit(&process).map_err(|e| terminated_but(pid, e))?;
-                await_scm_released(target, pid).map_err(|e| terminated_but(pid, e))?;
+                await_scm_released_unbounded(target, pid).map_err(|e| terminated_but(pid, e))?;
                 return Ok(Killed::Terminated);
             }
             // The process was gone, and SCM has not yet recorded it; wait for SCM to move off the pid.
-            Termination::AlreadyExited => await_scm_released(target, pid)?,
+            Termination::AlreadyExited => await_scm_released_unbounded(target, pid)?,
         }
     }
 }
@@ -122,9 +130,11 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
 ///
 /// Loops only when the service's state changed under it: the process was gone before it could be
 /// opened, or SCM no longer vouches for the pid it was opened by. Each round re-reads SCM, which
-/// settles on the new process or on none.
+/// settles on the new process or on none. The one wait, for SCM to let go of a pid whose process is
+/// gone, ends at `deadline` as [`HoldError::Expired`].
 pub(crate) fn hold_service_process<T: KillTarget>(
     target: &mut T,
+    deadline: Deadline,
 ) -> std::result::Result<Option<(u32, T::Process)>, HoldError> {
     loop {
         let Some(pid) = target.service_pid().map_err(HoldError::Read)? else {
@@ -133,10 +143,10 @@ pub(crate) fn hold_service_process<T: KillTarget>(
         let process = match target.open(pid) {
             Ok(Some(process)) => process,
             // The process is gone and SCM has not yet recorded it; wait for SCM to move off the pid.
-            Ok(None) => {
-                await_scm_released(target, pid).map_err(HoldError::Read)?;
-                continue;
-            }
+            Ok(None) => match await_scm_released(target, pid, deadline).map_err(HoldError::Read)? {
+                Waited::Confirmed => continue,
+                Waited::Expired => return Err(HoldError::Expired { pid }),
+            },
             // A pid that cannot be opened is a refusal only while SCM still says it is the service's.
             Err(e) => match target.service_pid() {
                 Ok(Some(now)) if now == pid => return Err(HoldError::Refused(e)),
@@ -165,12 +175,18 @@ pub(crate) enum HoldError {
     Refused(io::Error),
     /// SCM could not be read, so what the service runs is not known.
     Read(io::Error),
+    /// SCM still reported `pid`, whose process is gone, when the deadline ran out.
+    Expired { pid: u32 },
 }
 
 impl From<HoldError> for io::Error {
     fn from(error: HoldError) -> Self {
         match error {
             HoldError::Refused(e) | HoldError::Read(e) => e,
+            HoldError::Expired { pid } => io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("SCM still reported process {pid} as the service's when the wait ended"),
+            ),
         }
     }
 }
@@ -206,35 +222,55 @@ struct ReadAfterRefusedOpen {
 /// After a wake the pid is read before anything arms again, and only a pid still shown arms: SCM
 /// refuses to watch a marked service it recorded `STOPPED` (round 8), and the wake was that record. An
 /// arm it does refuse ([`ReleaseWatch::Stopped`]) is the release itself.
-fn await_scm_released<T: KillTarget>(target: &mut T, pid: u32) -> io::Result<()> {
-    if target.arm_release()? == ReleaseWatch::Stopped {
-        return Ok(());
+///
+/// Ends at `deadline` as [`Waited::Expired`], with no registration left outstanding.
+fn await_scm_released<T: KillTarget>(target: &mut T, pid: u32, deadline: Deadline) -> io::Result<Waited> {
+    match target.arm_release(deadline)? {
+        ReleaseWatch::Stopped => return Ok(Waited::Confirmed),
+        ReleaseWatch::Expired => return Ok(Waited::Expired),
+        ReleaseWatch::Armed => {}
     }
     loop {
         if target.service_pid()? != Some(pid) {
             target.cancel_release();
-            return Ok(());
+            return Ok(Waited::Confirmed);
         }
-        target.await_release()?;
+        if target.await_release(deadline)? == Waited::Expired {
+            target.cancel_release();
+            return Ok(Waited::Expired);
+        }
         if target.service_pid()? != Some(pid) {
-            return Ok(());
+            return Ok(Waited::Confirmed);
         }
-        if target.arm_release()? == ReleaseWatch::Stopped {
-            return Ok(());
+        match target.arm_release(deadline)? {
+            ReleaseWatch::Stopped => return Ok(Waited::Confirmed),
+            ReleaseWatch::Expired => return Ok(Waited::Expired),
+            ReleaseWatch::Armed => {}
         }
+    }
+}
+
+/// [`await_scm_released`] with no bound, for the callers that terminate the process.
+fn await_scm_released_unbounded<T: KillTarget>(target: &mut T, pid: u32) -> io::Result<()> {
+    match await_scm_released(target, pid, Budget::Unbounded.start())? {
+        Waited::Confirmed => Ok(()),
+        Waited::Expired => unreachable!("an unbounded deadline does not expire"),
     }
 }
 
 /// [`hold_service_process`] for a caller that only wants the process to wait on: the process if it
 /// can be held, and `None` for a service with no process and for one whose process SCM vouches for
 /// but cannot be opened (a right removed by policy). The caller goes on without it; what that
-/// process runs is still found by its image. A failure to read SCM is still an error: it says
-/// nothing about the process.
-pub(crate) fn hold_if_possible<T: KillTarget>(target: &mut T) -> io::Result<Option<T::Process>> {
-    match hold_service_process(target) {
+/// process runs is still found by its image. A failure to read SCM is still an error, and so is an
+/// expiry: neither says anything about the process.
+pub(crate) fn hold_if_possible<T: KillTarget>(
+    target: &mut T,
+    deadline: Deadline,
+) -> std::result::Result<Option<T::Process>, HoldError> {
+    match hold_service_process(target, deadline) {
         Ok(held) => Ok(held.map(|(_pid, process)| process)),
         Err(HoldError::Refused(_)) => Ok(None),
-        Err(e @ HoldError::Read(_)) => Err(e.into()),
+        Err(e) => Err(e),
     }
 }
 
@@ -319,15 +355,24 @@ pub(in crate::backend::scm) mod system {
     }
 
     impl Held {
-        fn notice(&self, id: &str) {
+        /// Says on stderr why nothing returns while `id`'s process runs.
+        pub(in crate::backend::scm) fn notice(&self, id: &str) {
             eprintln!("{id}: waiting for process {} to exit", self.pid);
         }
 
-        /// Blocks until the process has exited or `deadline` passes, saying why nothing returns when
-        /// it has not yet. [`wait_exit`] for a caller that no longer holds the target: its service
-        /// handle must be closed before the service can go.
-        pub(in crate::backend::scm) fn wait_for_exit(&self, id: &str, deadline: Deadline) -> io::Result<Waited> {
-            wait_exit(&self.handle, deadline, || self.notice(id))
+        pub(in crate::backend::scm) fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        /// Blocks until the process has exited or `deadline` passes. [`wait_exit`] for a caller that
+        /// no longer holds the target: its service handle must be closed before the service can go.
+        /// `on_wait` runs once, just before blocking on a process that has not yet exited.
+        pub(in crate::backend::scm) fn wait_for_exit(
+            &self,
+            deadline: Deadline,
+            on_wait: impl FnOnce(),
+        ) -> io::Result<Waited> {
+            wait_exit(&self.handle, deadline, on_wait)
         }
     }
 
@@ -374,12 +419,8 @@ pub(in crate::backend::scm) mod system {
             wait_exit_unbounded(&process.handle, || self.notice(process))
         }
 
-        fn arm_release(&mut self) -> io::Result<ReleaseWatch> {
-            // Unbounded, so the arm cannot expire.
-            match self
-                .notifier()?
-                .arm(WantState::StoppedOnly, Budget::Unbounded.start())?
-            {
+        fn arm_release(&mut self, deadline: Deadline) -> io::Result<ReleaseWatch> {
+            match self.notifier()?.arm(WantState::StoppedOnly, deadline)? {
                 // The status is not used: `await_scm_released` reads the service's pid after every
                 // arm, which is what decides.
                 Armed::Registered(_) => Ok(ReleaseWatch::Armed),
@@ -389,7 +430,7 @@ pub(in crate::backend::scm) mod system {
                 Armed::Unwatchable(status) if status.state == QueriedState::Stopped => Ok(ReleaseWatch::Stopped),
                 Armed::Gone => Ok(ReleaseWatch::Stopped),
                 Armed::Unwatchable(status) => Err(marked_for_deletion(status.state)),
-                Armed::Expired => unreachable!("an unbounded deadline does not expire"),
+                Armed::Expired => Ok(ReleaseWatch::Expired),
             }
         }
 
@@ -399,12 +440,12 @@ pub(in crate::backend::scm) mod system {
             self.notifier = None;
         }
 
-        fn await_release(&mut self) -> io::Result<()> {
-            match self.notifier()?.wait_callback(Budget::Unbounded.start())? {
+        fn await_release(&mut self, deadline: Deadline) -> io::Result<Waited> {
+            Ok(match self.notifier()?.wait_callback(deadline)? {
                 // Whatever woke it, the caller re-reads SCM.
-                Some(_) => Ok(()),
-                None => unreachable!("an unbounded deadline does not expire"),
-            }
+                Some(_) => Waited::Confirmed,
+                None => Waited::Expired,
+            })
         }
     }
 

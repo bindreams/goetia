@@ -429,6 +429,24 @@ pub enum Error {
         recovery: String,
     },
 
+    /// A `stop` of `id` ran out of budget waiting on the service's process, not on SCM's answer.
+    /// Produced only through [`crate::manager::budget::process_timed_out`].
+    ///
+    /// `stopped` says how far the stop got. When it is set SCM confirmed `STOPPED`, and the process
+    /// had not exited: the service is stopped, and a file the process runs stays in use until it
+    /// does. When it is not, the stop was never sent: SCM still reported the service's process
+    /// (`pid`, already gone) when the budget ran out, and nothing was changed.
+    ///
+    /// Exit `4` (indeterminate), like [`WaitTimeout`](Error::WaitTimeout).
+    #[error("`{id}` {}: {recovery}", process_wait_summary(*stopped, *pid, *waited))]
+    ProcessWaitTimeout {
+        id: String,
+        pid: u32,
+        stopped: bool,
+        waited: std::time::Duration,
+        recovery: String,
+    },
+
     /// `kill` found no process of `id`'s to end: the service is stopped, or between runs. Nothing
     /// was signalled.
     #[error("daemon `{id}` is not running: there is no process to kill")]
@@ -595,6 +613,16 @@ pub enum Error {
     AlreadyExists { path: PathBuf },
 }
 
+/// What [`Error::ProcessWaitTimeout`] says before its recovery.
+fn process_wait_summary(stopped: bool, pid: u32, waited: std::time::Duration) -> String {
+    let waited = humantime::format_duration(waited);
+    if stopped {
+        format!("is stopped, but its process (pid {pid}) had not exited within {waited}")
+    } else {
+        format!("was NOT stopped: SCM had not released its process (pid {pid}) within {waited}")
+    }
+}
+
 impl Error {
     /// Whether this failure left the outcome open: what is at the id, whether a request reached the
     /// manager, or where the daemon ended up. `false` means goetia established that the operation
@@ -605,6 +633,7 @@ impl Error {
         match self {
             Error::Undetermined { .. }
             | Error::WaitTimeout { .. }
+            | Error::ProcessWaitTimeout { .. }
             | Error::Unestablished { .. }
             | Error::RequestInDoubt { .. }
             | Error::LoadedJobInDoubt { .. }
@@ -810,6 +839,7 @@ impl Error {
             | Error::Foreign { .. }
             | Error::Undetermined { .. }
             | Error::WaitTimeout { .. }
+            | Error::ProcessWaitTimeout { .. }
             | Error::NotRunning { .. }
             | Error::Unestablished { .. }
             | Error::RequestInDoubt { .. }

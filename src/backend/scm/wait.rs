@@ -183,22 +183,40 @@ pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
     wait_after_stop(a, deadline, " Run `stop` again.")
 }
 
+/// How [`stop_and_await_exit`] ended.
+#[must_use = "an expiry is not a stop; decide what to report rather than discarding it"]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StopAndAwaitExitOutcome<'a, P> {
+    /// SCM confirmed `STOPPED`, and the held process, if any, has exited.
+    Stopped,
+    /// SCM had not confirmed `STOPPED` when the deadline ran out.
+    ServiceExpired,
+    /// SCM confirmed `STOPPED`, and this held process had not exited when the deadline ran out.
+    ProcessExpired(&'a P),
+}
+
 /// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the exit of `held`, the service's
 /// process as it was before the STOP was sent. SCM records `STOPPED` before the process exits (a shim
 /// reports it and then exits), so `STOPPED` alone leaves a file the process runs in use. `exit` waits
 /// for it under the same `deadline` and says whether it did; a process that outlasts the deadline
-/// is as `Expired` as a service that does. No process held (none reported, or none that could be
-/// opened) is the stop alone.
-pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
+/// is [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired), not an unconfirmed stop. No process
+/// held (none reported, or none that could be opened) is the stop alone.
+pub(crate) fn stop_and_await_exit<'a, A: ScmActor, P>(
     a: &mut A,
     deadline: Deadline,
-    held: Option<&P>,
+    held: Option<&'a P>,
     exit: impl FnOnce(&P, Deadline) -> io::Result<Waited>,
-) -> io::Result<Waited> {
-    match stop_via_notify(a, deadline)? {
-        Waited::Confirmed => held.map_or(Ok(Waited::Confirmed), |process| exit(process, deadline)),
-        Waited::Expired => Ok(Waited::Expired),
+) -> io::Result<StopAndAwaitExitOutcome<'a, P>> {
+    if stop_via_notify(a, deadline)? == Waited::Expired {
+        return Ok(StopAndAwaitExitOutcome::ServiceExpired);
     }
+    Ok(match held {
+        Some(process) => match exit(process, deadline)? {
+            Waited::Confirmed => StopAndAwaitExitOutcome::Stopped,
+            Waited::Expired => StopAndAwaitExitOutcome::ProcessExpired(process),
+        },
+        None => StopAndAwaitExitOutcome::Stopped,
+    })
 }
 
 /// [`ScmActor::control_stop`], where a stop already under way counts as sent.

@@ -111,10 +111,10 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
-use super::wait::Waited;
+use super::wait::{StopAndAwaitExitOutcome, Waited};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
-use crate::backend::scm::kill::hold_if_possible;
 use crate::backend::scm::kill::system::Held;
+use crate::backend::scm::kill::{HoldError, hold_if_possible};
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
@@ -129,7 +129,8 @@ use crate::backend::{
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Reason, Result};
-use crate::manager::{Budget, Installed, State, Status, Step, budget};
+use crate::manager::budget::{self, Deadline};
+use crate::manager::{Budget, Installed, State, Status, Step};
 use crate::shim::HostCommand;
 use crate::spec::{DaemonSpec, Id, Kind};
 
@@ -432,10 +433,12 @@ impl Backend for Scm {
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
         let held = match host {
-            Some(_) => hold_process(&id).map_err(|e| Error::Step {
-                what: format!("`{id}` was NOT deleted and is unchanged"),
-                source: Box::new(e),
-            })?,
+            Some(_) => hold_process(
+                &id,
+                Budget::Unbounded,
+                Budget::Unbounded.start(),
+                &format!("`{id}` was NOT deleted and is unchanged"),
+            )?,
             None => None,
         };
         let scm = open_scm_to_classify(id.as_str())?;
@@ -511,17 +514,18 @@ impl Backend for Scm {
             return super::wait::request_stop(&mut actor).map_err(|e| Error::os(format!("stop `{id}`"), e));
         }
         // Before the STOP: SCM reports `STOPPED` before the process exits, and no pid after it.
-        let held = hold_process(&id).map_err(|e| Error::Step {
-            what: format!("`{id}` was NOT stopped"),
-            source: Box::new(e),
-        })?;
-        let waited = super::wait::stop_and_await_exit(&mut actor, deadline, held.as_ref(), |held, deadline| {
-            held.wait_for_exit(id.as_str(), deadline)
+        let held = hold_process(&id, budget, deadline, &format!("`{id}` was NOT stopped"))?;
+        // No notice: the shim exits just after it reports `STOPPED`, so a wait is the usual case.
+        let outcome = super::wait::stop_and_await_exit(&mut actor, deadline, held.as_ref(), |held, deadline| {
+            held.wait_for_exit(deadline, || {})
         })
         .map_err(|e| Error::os(format!("stop `{id}`"), e))?;
-        match waited {
-            Waited::Confirmed => Ok(()),
-            Waited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
+        match outcome {
+            StopAndAwaitExitOutcome::Stopped => Ok(()),
+            StopAndAwaitExitOutcome::ServiceExpired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
+            StopAndAwaitExitOutcome::ProcessExpired(held) => {
+                Err(budget::process_timed_out(id.as_str(), held.pid(), true, budget))
+            }
         }
     }
 
@@ -1020,17 +1024,29 @@ fn registered_shim(snapshot: &ScmSnapshot) -> Option<PathBuf> {
 /// older file than the one registered (an `Update` it has not restarted into), which no read of the
 /// registry shows. `None` when SCM reports none, and when the process cannot be opened (see
 /// [`hold_if_possible`]): the caller goes on, and what that process runs stays referenced by its
-/// image until it exits. A failure to read SCM is an error, with nothing changed. The service
-/// handle the hold used is closed before this returns, or the service could not be deleted.
-fn hold_process(id: &Id) -> Result<Option<Held>> {
+/// image until it exits. A failure to read SCM is an error, with nothing changed, led by `not_done`,
+/// what the caller did not do. The wait for SCM to let go of a pid whose process is gone ends at
+/// `deadline`, and is then [`budget::process_timed_out`] for `budget`, which says the same. The
+/// service handle the hold used is closed before this returns, or the service could not be deleted.
+fn hold_process(id: &Id, budget: Budget, deadline: Deadline, not_done: &str) -> Result<Option<Held>> {
+    let not_done = |e: Error| Error::Step {
+        what: not_done.to_string(),
+        source: Box::new(e),
+    };
     let (_scm, service) = match open_existing(id, ServiceAccess::QUERY_STATUS) {
         Ok(opened) => opened,
         // Gone since it was read: `uninstall_locked` finds it gone too.
         Err(Error::NotInstalled { .. }) => return Ok(None),
-        Err(e) => return Err(e),
+        Err(e) => return Err(not_done(e)),
     };
     let mut target = super::kill::SystemKillTarget::observing(service, id.as_str().to_string());
-    hold_if_possible(&mut target).map_err(|e| Error::os(format!("hold `{id}`'s process to wait for its exit"), e))
+    hold_if_possible(&mut target, deadline).map_err(|e| match e {
+        HoldError::Expired { pid } => budget::process_timed_out(id.as_str(), pid, false, budget),
+        e => not_done(Error::os(
+            format!("hold `{id}`'s process to wait for its exit"),
+            std::io::Error::from(e),
+        )),
+    })
 }
 
 impl Scm {
@@ -1081,7 +1097,7 @@ impl Scm {
             })
         };
         if let Some(held) = held {
-            match held.wait_for_exit(id.as_str(), Budget::Unbounded.start()) {
+            match held.wait_for_exit(Budget::Unbounded.start(), || held.notice(id.as_str())) {
                 Ok(Waited::Confirmed) => {}
                 Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),
                 Err(e) => {
