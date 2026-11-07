@@ -35,18 +35,18 @@ fn layout_stray(field: &'static str, vtype: u32) -> Stray {
 
 #[skuld::test]
 fn a_goetia_field_stored_as_goetia_stores_it_is_a_field_under_goetias_spelling() {
-    for (name, field) in [
-        ("Marker", "Marker"),
-        ("marker", "Marker"),
-        ("SPEC", "Spec"),
-        ("sChEmA", "Schema"),
-        ("Version", "Version"),
+    for (name, field, text) in [
+        ("Marker", "Marker", blob::MARKER),
+        ("marker", "Marker", blob::MARKER),
+        ("SPEC", "Spec", "text"),
+        ("sChEmA", "Schema", "text"),
+        ("Version", "Version", "text"),
     ] {
-        let parameters = parameters_of(utf16(name), vtype::REG_SZ, &sz("text"));
+        let parameters = parameters_of(utf16(name), vtype::REG_SZ, &sz(text));
 
         assert_eq!(
             parameters.fields,
-            BTreeMap::from([(field.to_string(), "text".to_string())]),
+            BTreeMap::from([(field.to_string(), text.to_string())]),
             "{name}"
         );
         assert!(parameters.strays.is_empty(), "{name}");
@@ -108,9 +108,10 @@ fn a_goetia_field_in_another_string_layout_is_a_field_and_a_layout_stray() {
 /// A third-party service may hold its own `Marker`, in any string type. Only goetia's text makes
 /// it goetia's field, so such a service stays foreign instead of reading as a broken goetia one.
 #[skuld::test]
-fn a_marker_in_another_string_layout_with_other_text_is_a_stray_and_no_field() {
+fn a_marker_with_other_text_is_a_stray_and_no_field_in_any_layout() {
     let units = utf16("theirs");
-    let layouts: [(&str, u32, Vec<u8>); 4] = [
+    let layouts: [(&str, u32, Vec<u8>); 5] = [
+        ("REG_SZ", vtype::REG_SZ, sz("theirs")),
         (
             "REG_MULTI_SZ",
             vtype::REG_MULTI_SZ,
@@ -240,7 +241,7 @@ fn a_subkey_is_a_stray_whatever_its_name_and_never_a_field() {
 #[skuld::test]
 fn strays_of_one_name_and_a_field_of_that_name_coexist() {
     let mut parameters = Parameters::default();
-    parameters.add_value(utf16("Marker"), vtype::REG_SZ, &sz("m"));
+    parameters.add_value(utf16("Marker"), vtype::REG_SZ, &sz(blob::MARKER));
     parameters.add_value(utf16("Marker"), vtype::REG_DWORD, &[1, 0, 0, 0]);
     parameters.add_value(utf16("Marker"), vtype::REG_QWORD, &[1; 8]);
     parameters.add_subkey(utf16("Marker"));

@@ -6,8 +6,8 @@
 //! goetia writes four string values there (see `generate`). A value under one of those names that
 //! holds a string is read as that field whatever its string type and terminators, so a service a
 //! tool rewrote is still goetia's; a layout other than what goetia writes is a [`Stray::Layout`],
-//! which `install --force` rewrites. The exception is a `Marker` in another layout, which is
-//! goetia's only when its text is goetia's marker: another service may hold a `Marker` of its own.
+//! which `install --force` rewrites. The exception is a `Marker`, which is goetia's only when its
+//! text is goetia's marker, in any layout: another service may hold a `Marker` of its own.
 //! Everything else is a [`Stray`]: kept apart from the four so that no stray can be mistaken for
 //! one of them, and so that a stray the registry API refuses to describe (a name that is not
 //! UTF-16 text, a type no API knows) is still reported, and removable.
@@ -131,14 +131,14 @@ enum Entry {
 }
 
 /// A value is a field when its name spells one of goetia's four in any case and it holds one string
-/// of text in any string type, except that a `Marker` stored other than as goetia stores it is a
-/// field only when its text is goetia's marker: a third-party service may hold a `Marker` of its
-/// own, and must stay foreign. Anything else under a field's name is a stray, so a hand edit never
+/// of text in any string type, except that a `Marker` is a field only when its text is goetia's
+/// marker, in any layout: a third-party service may hold a `Marker` of its own, and must stay
+/// foreign. Anything else under a field's name is a stray, so a hand edit never
 /// reads as equal to what goetia wants.
 fn classify_value(name: Vec<u16>, vtype: u32, data: &[u8]) -> Entry {
     if let Some(field) = field_named_utf16(&name)
         && let Some((text, exact)) = string_text(vtype, data)
-        && (exact || field != FIELD_MARKER || text == blob::MARKER)
+        && (field != FIELD_MARKER || text == blob::MARKER)
     {
         let layout = (!exact).then_some(Stray::Layout { name: field, vtype });
         return Entry::Field {

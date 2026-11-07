@@ -468,7 +468,7 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
         read_marker(foreign, None),
         ReadOutcome::Foreign { recovery: None }
     ));
-    // Another service's own `Marker`, in a string type goetia does not write, is not goetia's.
+    // Another service's own `Marker`, in any string type or layout, is not goetia's.
     let units = |text: &str| -> Vec<u8> {
         text.encode_utf16()
             .chain([0, 0])
@@ -479,6 +479,17 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
     theirs.add_value("Marker".encode_utf16().collect(), 7, &units("theirs"));
     assert!(matches!(
         read_marker(theirs, None),
+        ReadOutcome::Foreign { recovery: None }
+    ));
+    let mut theirs_exact = Parameters::default();
+    theirs_exact.add_value(
+        "Marker".encode_utf16().collect(),
+        1,
+        &units("theirs")[..2 * ("theirs".len() + 1)],
+    );
+    assert!(theirs_exact.fields.is_empty());
+    assert!(matches!(
+        read_marker(theirs_exact, None),
         ReadOutcome::Foreign { recovery: None }
     ));
     // goetia's marker text in another string type is still goetia's, and the layout is drift.
