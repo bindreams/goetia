@@ -39,6 +39,7 @@ fn stock_file(path: &str) -> ObjectSecurity {
         path: PathBuf::from(path),
         owner: administrators(),
         protected: true,
+        directory: false,
         dacl: Some(vec![
             allow(system(), FULL, 0),
             allow(administrators(), FULL, 0),

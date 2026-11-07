@@ -290,14 +290,14 @@ impl Backend for Scm {
         if provided != previewed {
             return Err(Error::ShimProviderDisagrees { previewed, provided });
         }
-        let folder = provided
+        provided
             .exe
             .parent()
             .filter(|folder| folder.is_absolute())
             .ok_or_else(|| Error::ShimPathRelative {
                 path: provided.exe.clone(),
             })?;
-        self.folders.check(folder)?;
+        self.folders.check(&provided.exe)?;
         marker::verify(&provided.exe)?;
         Ok(Some(lock))
     }

@@ -1,9 +1,10 @@
-//! The shim folder check: refuses a folder an account other than SYSTEM, Administrators or
-//! TrustedInstaller could tamper with, since the shim runs as `LocalSystem` and whoever can replace
-//! its file owns the machine.
+//! The shim permission check: refuses a folder, or a host file in one, that an account other than
+//! SYSTEM, Administrators or TrustedInstaller could tamper with, since the shim runs as
+//! `LocalSystem` and whoever can replace its file owns the machine.
 //!
-//! The check is a static scan of the owner and DACL of the folder and of every ancestor up to the
-//! volume root, over the folder as given and over its final path (links resolved). [`verdict`]
+//! The check is a static scan of the owner and DACL of the folder (or of the file and its folder)
+//! and of every ancestor up to the volume root, over the path as given and over its final path
+//! (links resolved). [`verdict`]
 //! judges plain data (SIDs as bytes, masks as `u32`) and is unit-tested on every host; reading the
 //! data and [`FolderCheck`] are Windows-only.
 //!
@@ -11,8 +12,11 @@
 //! - an untrusted owner refuses (an owner can always change the DACL);
 //! - a NULL DACL refuses (everyone has every right);
 //! - an allow ACE that applies to the object, granting an untrusted account `WRITE_DAC`,
-//!   `WRITE_OWNER`, `DELETE` or `FILE_DELETE_CHILD`, after generic rights are mapped, refuses.
-//!   Accounts that may only add files are accepted, and inherit-only ACEs grant nothing here;
+//!   `WRITE_OWNER`, `DELETE` or, on a directory, `FILE_DELETE_CHILD`, or, on a file,
+//!   `FILE_WRITE_DATA` or `FILE_APPEND_DATA`, after generic rights are mapped, refuses. A file's
+//!   extended attributes and attributes (`FILE_WRITE_EA`, `FILE_WRITE_ATTRIBUTES`) change neither
+//!   what it runs nor who may change it, so they are accepted. Accounts that may only add files to
+//!   a directory are accepted, and inherit-only ACEs grant nothing here;
 //! - deny ACEs are not credited, wherever they stand.
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -45,6 +49,9 @@ pub(crate) struct ObjectSecurity {
     pub(crate) owner: Sid,
     /// Whether the DACL ignores what its parent would have it inherit.
     pub(crate) protected: bool,
+    /// Whether it is a directory (or a link to one), whose rights mean something other than a
+    /// file's: see [`verdict`].
+    pub(crate) directory: bool,
     /// `None` is a NULL DACL, which grants everyone every right.
     pub(crate) dacl: Option<Vec<Ace>>,
 }
@@ -59,7 +66,7 @@ pub(crate) struct Ace {
     pub(crate) allow: bool,
 }
 
-/// The first reason found to refuse a folder.
+/// The first reason found to refuse a folder or a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Unsafe {
     pub(crate) path: PathBuf,
@@ -75,6 +82,8 @@ const DELETE: u32 = 0x1_0000;
 const WRITE_DAC: u32 = 0x4_0000;
 const WRITE_OWNER: u32 = 0x8_0000;
 const FILE_DELETE_CHILD: u32 = 0x40;
+const FILE_WRITE_DATA: u32 = 0x2;
+const FILE_APPEND_DATA: u32 = 0x4;
 
 // `FILE_GENERIC_MAPPING`'s generic rights, and what each maps to on a file or directory.
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -87,11 +96,20 @@ const FILE_GENERIC_EXECUTE: u32 = 0x12_00A0;
 const FILE_ALL_ACCESS: u32 = 0x1F_01FF;
 
 /// The rights that let an account replace what is in a folder, in the order they are reported.
-const TAMPERING: [(u32, &str); 4] = [
+const DIRECTORY_TAMPERING: [(u32, &str); 4] = [
     (WRITE_DAC, "change permissions of"),
     (WRITE_OWNER, "take ownership of"),
     (DELETE, "delete or rename"),
     (FILE_DELETE_CHILD, "delete or rename entries in"),
+];
+
+/// The rights that let an account change a file's contents, or take it away or hand it over, in the
+/// order they are reported.
+const FILE_TAMPERING: [(u32, &str); 4] = [
+    (FILE_WRITE_DATA | FILE_APPEND_DATA, "write to"),
+    (WRITE_DAC, "change permissions of"),
+    (WRITE_OWNER, "take ownership of"),
+    (DELETE, "delete or rename"),
 ];
 
 // SIDs ================================================================================================================
@@ -152,7 +170,8 @@ pub(crate) fn sid_string(sid: &[u8]) -> String {
 // verdict =============================================================================================================
 
 /// Judges `chain` (the target first, then outward to the volume root) by the rules in the module
-/// documentation.
+/// documentation. Each object is judged by its own kind: a file by [`FILE_TAMPERING`], a directory
+/// by [`DIRECTORY_TAMPERING`].
 pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsafe> {
     for object in chain {
         let refuse = |account: &Sid, right: &'static str| Unsafe {
@@ -166,12 +185,17 @@ pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsaf
         let Some(dacl) = &object.dacl else {
             return Err(refuse(&everyone(), "do anything to"));
         };
+        let tampering = if object.directory {
+            &DIRECTORY_TAMPERING
+        } else {
+            &FILE_TAMPERING
+        };
         let applying = dacl
             .iter()
             .filter(|ace| ace.allow && ace.flags & INHERIT_ONLY_ACE == 0 && !is_trusted(&ace.trustee));
         for ace in applying {
             let mask = map_generic(ace.mask);
-            if let Some((_, right)) = TAMPERING.iter().find(|(bit, _)| mask & bit != 0) {
+            if let Some((_, right)) = tampering.iter().find(|(bit, _)| mask & bit != 0) {
                 return Err(refuse(&ace.trustee, right));
             }
         }
@@ -226,14 +250,17 @@ impl FolderCheck {
     }
 
     /// `Ok` under [`Disable`](CheckPermissions::Disable), without reading anything. Otherwise
-    /// reads `dir`, which need not exist (its first existing ancestor stands for it), and every
-    /// ancestor, and refuses with [`Error::ShimFolderUnsafe`] naming the first object and account
-    /// found to be unsafe. An object that cannot be read is an error, never a pass.
-    pub fn check(&self, dir: &Path) -> Result<()> {
+    /// reads `path`, a folder or a host file, which need not exist (its first existing ancestor
+    /// stands for it), and every ancestor, and refuses with [`Error::ShimFolderUnsafe`] naming the
+    /// first object and account found to be unsafe. A file is refused too when an untrusted account
+    /// can write to it, change its permissions, take it over or delete it; a link at `path` is read
+    /// as itself, and so is what it leads to. An object that cannot be read is an error, never a
+    /// pass.
+    pub fn check(&self, path: &Path) -> Result<()> {
         if self.mode == CheckPermissions::Disable {
             return Ok(());
         }
-        verdict(&system::read_chain(dir)?).map_err(Unsafe::into_error)
+        verdict(&system::read_chain(path)?).map_err(Unsafe::into_error)
     }
 }
 
@@ -274,8 +301,8 @@ mod system {
         GetSecurityDescriptorControl, IsValidSid, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-        FILE_READ_ATTRIBUTES, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_ID_INFO, FILE_READ_ATTRIBUTES, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
         GetVolumeInformationByHandleW, READ_CONTROL,
     };
 
@@ -537,8 +564,14 @@ mod system {
                 io::Error::from_raw_os_error(status as i32),
             ));
         }
+        let directory = file.metadata().map(|metadata| {
+            std::os::windows::fs::MetadataExt::file_attributes(&metadata) & FILE_ATTRIBUTE_DIRECTORY != 0
+        });
         // SAFETY: `owner` and `dacl` point into `descriptor`, which is live until the free below.
-        let object = unsafe { describe(descriptor, owner, dacl, path) };
+        let object = match directory {
+            Ok(directory) => unsafe { describe(descriptor, owner, dacl, path, directory) },
+            Err(e) => Err(Error::os_at("read the type of", path, e)),
+        };
         // SAFETY: `descriptor` was allocated by `GetSecurityInfo` and is freed once, after the
         // last read of what points into it.
         unsafe {
@@ -583,7 +616,8 @@ mod system {
         copied
     }
 
-    /// Copies the owner, the DACL and whether it is protected out of a security descriptor.
+    /// Copies the owner, the DACL and whether it is protected out of a security descriptor of a
+    /// directory or, when `directory` is false, a file.
     ///
     /// # Safety
     /// `descriptor` is a live security descriptor, and `owner` and `dacl` point into it (the DACL
@@ -593,6 +627,7 @@ mod system {
         owner: PSID,
         dacl: *mut ACL,
         path: PathBuf,
+        directory: bool,
     ) -> Result<ObjectSecurity> {
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
@@ -610,6 +645,7 @@ mod system {
             path,
             owner,
             protected: control & SE_DACL_PROTECTED != 0,
+            directory,
             dacl,
         })
     }

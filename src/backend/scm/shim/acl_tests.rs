@@ -11,6 +11,9 @@ const GENERIC_READ_EXECUTE: u32 = 0xA000_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const FILE_ADD_FILE: u32 = 0x2;
+const FILE_WRITE_DATA: u32 = 0x2;
+const FILE_WRITE_EA: u32 = 0x10;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
 const FILE_APPEND_DATA: u32 = 0x4;
 const FILE_DELETE_CHILD: u32 = 0x40;
 const DELETE: u32 = 0x1_0000;
@@ -70,8 +73,37 @@ fn object(path: &str, owner: Sid, dacl: Vec<Ace>) -> ObjectSecurity {
         path: PathBuf::from(path),
         owner,
         protected: false,
+        directory: true,
         dacl: Some(dacl),
     }
+}
+
+/// `object`, as a file.
+fn file(path: &str, owner: Sid, dacl: Vec<Ace>) -> ObjectSecurity {
+    ObjectSecurity {
+        directory: false,
+        ..object(path, owner, dacl)
+    }
+}
+
+/// The stock shim file, as a provider creates it.
+fn stock_file() -> ObjectSecurity {
+    file(
+        r"C:\Program Files\Goetia\goetia-shim.exe",
+        administrators(),
+        vec![
+            allow(system(), FULL, 0),
+            allow(administrators(), FULL, 0),
+            allow(everyone(), READ_EXECUTE, 0),
+        ],
+    )
+}
+
+/// A host file in the stock folder: the file first, then the folder and its ancestors.
+fn stock_host_chain() -> Vec<ObjectSecurity> {
+    let mut chain = vec![stock_file()];
+    chain.extend(stock_chain());
+    chain
 }
 
 /// `C:\` as a stock Windows install has it.
@@ -162,6 +194,93 @@ fn an_untrusted_account_with_only_generic_write_is_accepted() {
         .unwrap()
         .push(allow(users(), GENERIC_WRITE, OI_CI));
     assert!(verdict(&chain).is_ok());
+}
+
+#[skuld::test]
+fn the_stock_host_file_and_its_folders_are_accepted() {
+    assert!(verdict(&stock_host_chain()).is_ok());
+}
+
+#[skuld::test]
+fn each_right_that_changes_a_file_is_refused_with_its_own_wording() {
+    let cases = [
+        (FILE_WRITE_DATA, "write to"),
+        (FILE_APPEND_DATA, "write to"),
+        (GENERIC_WRITE, "write to"),
+        (MODIFY, "write to"),
+        (WRITE_DAC, "change permissions of"),
+        (WRITE_OWNER, "take ownership of"),
+        (DELETE, "delete or rename"),
+    ];
+    for (mask, right) in cases {
+        let mut chain = stock_host_chain();
+        chain[0].dacl.as_mut().unwrap().push(allow(users(), mask, 0));
+        let refusal = refused(&chain);
+        assert_eq!(refusal.right, right, "mask {mask:#x}");
+        assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia\goetia-shim.exe"));
+        assert_eq!(refusal.account, users(), "mask {mask:#x}");
+    }
+}
+
+/// Extended attributes and timestamps are not what a process is made of, and neither changes the
+/// file's contents or who may change them.
+#[skuld::test]
+fn a_file_whose_extended_attributes_and_attributes_alone_can_be_written_is_accepted() {
+    let mut chain = stock_host_chain();
+    chain[0]
+        .dacl
+        .as_mut()
+        .unwrap()
+        .push(allow(users(), FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES, 0));
+    assert!(verdict(&chain).is_ok());
+}
+
+#[skuld::test]
+fn delete_child_means_nothing_on_a_file() {
+    let mut chain = stock_host_chain();
+    chain[0]
+        .dacl
+        .as_mut()
+        .unwrap()
+        .push(allow(users(), FILE_DELETE_CHILD, 0));
+    assert!(verdict(&chain).is_ok());
+}
+
+#[skuld::test]
+fn an_inherit_only_ace_on_a_file_grants_nothing() {
+    let mut chain = stock_host_chain();
+    chain[0].dacl.as_mut().unwrap().push(allow(users(), FULL, OI_CI_IO));
+    assert!(verdict(&chain).is_ok());
+}
+
+#[skuld::test]
+fn a_file_an_untrusted_account_owns_is_refused_as_owned() {
+    let mut chain = stock_host_chain();
+    chain[0].owner = users();
+    let refusal = refused(&chain);
+    assert_eq!(refusal.right, "own");
+    assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia\goetia-shim.exe"));
+}
+
+#[skuld::test]
+fn a_file_with_a_null_dacl_is_refused() {
+    let mut chain = stock_host_chain();
+    chain[0].dacl = None;
+    assert_eq!(refused(&chain).right, "do anything to");
+}
+
+/// A link to a file is judged as a file, and so is the file it leads to; the folders on the way are
+/// judged as folders.
+#[skuld::test]
+fn a_file_the_chain_reaches_through_a_link_is_judged_as_a_file() {
+    let link = file(r"C:\Goetia\host.exe", administrators(), vec![allow(system(), FULL, 0)]);
+    let mut target = stock_file();
+    target.dacl.as_mut().unwrap().push(allow(users(), FILE_WRITE_DATA, 0));
+    let mut chain = vec![link, target];
+    chain.extend(stock_chain());
+    let refusal = refused(&chain);
+    assert_eq!(refusal.right, "write to");
+    assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia\goetia-shim.exe"));
 }
 
 #[skuld::test]
@@ -324,6 +443,34 @@ pub(in crate::backend::scm::shim) mod windows {
     }
 
     #[skuld::test]
+    fn a_disabled_file_check_reads_nothing() {
+        assert!(disabled().check(Path::new(r"Z:\no\such\volume\host.exe")).is_ok());
+    }
+
+    #[skuld::test]
+    fn the_chain_of_a_file_starts_with_the_file_and_only_it_is_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().canonicalize().unwrap().join("host.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let chain = read_chain(&exe).unwrap();
+        assert_eq!(chain[0].path, display_path(&exe));
+        assert!(!chain[0].directory);
+        assert!(chain[1..].iter().all(|object| object.directory), "{chain:?}");
+    }
+
+    #[skuld::test]
+    fn a_file_its_creator_owns_is_refused() {
+        // A temp file belongs to the account running this test, which is not a trusted one.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().canonicalize().unwrap().join("host.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let Err(Error::ShimFolderUnsafe { path, .. }) = enabled().check(&exe) else {
+            panic!("a temp file must be refused");
+        };
+        assert!(display_path(&exe).starts_with(&path), "{path:?}");
+    }
+
+    #[skuld::test]
     fn the_chain_of_a_directory_runs_from_it_to_the_volume_root() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().canonicalize().unwrap();
@@ -331,6 +478,7 @@ pub(in crate::backend::scm::shim) mod windows {
         let paths: Vec<&Path> = chain.iter().map(|o| o.path.as_path()).collect();
         let want: Vec<PathBuf> = target.ancestors().map(display_path).collect();
         assert_eq!(paths, want.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+        assert!(chain.iter().all(|object| object.directory));
         for object in &chain {
             assert!(!object.owner.is_empty(), "{}", object.path.display());
             assert_ne!(sid_string(&object.owner), "an invalid SID", "{}", object.path.display());

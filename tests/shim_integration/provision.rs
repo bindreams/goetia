@@ -73,17 +73,23 @@ fn stale_files(folder: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Grants `Users` the right to change `folder`'s permissions, which the folder check refuses, and
-/// takes the grant back on drop.
+/// Grants `Users` a right on a path that the permission check refuses, and takes the grant back on
+/// drop.
 struct Doctored(PathBuf);
 
 impl Doctored {
     const USERS: &'static str = "*S-1-5-32-545";
 
+    /// The right to change `folder`'s permissions.
     fn new(folder: &Path) -> Self {
-        let doctored = Self(folder.to_path_buf());
-        let path = folder.to_string_lossy();
-        support::cmd::run("icacls", &[&path, "/grant", &format!("{}:(WDAC)", Self::USERS)]).expect_ok();
+        Self::grant(folder, "WDAC")
+    }
+
+    /// `rights` (as `icacls` spells them) on `path`.
+    fn grant(path: &Path, rights: &str) -> Self {
+        let doctored = Self(path.to_path_buf());
+        let path = path.to_string_lossy();
+        support::cmd::run("icacls", &[&path, "/grant", &format!("{}:({rights})", Self::USERS)]).expect_ok();
         doctored
     }
 }
@@ -485,6 +491,44 @@ fn install_refuses_doctored_folder() {
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "nothing may be registered:\n{query}");
     assert_eq!(doctored.contents(), before, "nothing may be written to the folder");
+}
+
+/// A host file `Users` can write to is refused though its folder is goetia's: whoever can write to
+/// it controls what runs as `LocalSystem`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn install_refuses_a_host_file_users_can_write_to() {
+    let logs = LogDir::new();
+    let (folder, _dir) = default_folder();
+    let first_id = support::random_test_id();
+    let _first = ShimGuard::new(&first_id);
+    let first = simple_spec(&first_id, fixture_command("report", &["1"]), &logs);
+    embedded_manager(None, CheckPermissions::Enable)
+        .install(&first, false)
+        .expect("install, which makes the default folder and the file");
+    let host = shim_in(&folder);
+    let _grant = Doctored::grant(&host, "W");
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+    let standalone = |check| Scm::with_shim(StandaloneShim::new(host.clone(), vec![]), check);
+
+    match standalone(CheckPermissions::Enable).install(&spec, false) {
+        Err(Error::ShimFolderUnsafe { path, account, right }) => {
+            assert_eq!(path, host);
+            assert_eq!(right, "write to");
+            assert!(account.ends_with("Users"), "{account}");
+        }
+        other => panic!("a host file Users can write to must be refused, got {other:?}"),
+    }
+    let query = support::cmd::run("sc.exe", &["query", &id]);
+    assert!(
+        !query.ok(),
+        "nothing may be registered:
+{query}"
+    );
+    standalone(CheckPermissions::Disable)
+        .install(&spec, false)
+        .expect("with the check off the same host is accepted");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]

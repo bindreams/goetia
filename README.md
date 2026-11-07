@@ -749,9 +749,10 @@ A program that links goetia and installs `type: simple` daemons through
 provider given to `Scm::with_shim`. `Scm::new()` has none: installing a
 `type: simple` daemon through it fails with "no shim provider configured",
 while `status`, `list`, `type: managed` installs and `uninstall` work.
-`CheckPermissions::Disable` turns off only the folder check; the marker check,
-which requires the file to contain goetia's host code of the same version as
-the library, and the file verification always run.
+`CheckPermissions::Disable` turns off only the permission check, of the host's
+folder and of the host file; the marker check, which requires the file to
+contain goetia's host code of the same version as the library, and the file
+verification always run.
 
 Any program that ships a stock shim adds one file, `src/bin/goetia-shim.rs`:
 

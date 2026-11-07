@@ -121,7 +121,7 @@ mod system {
             }
             // SAFETY: `owner` and `dacl` point into `self.raw`, which is live for the call; the DACL
             // is null only when the descriptor has none, which `describe` reports as a NULL DACL.
-            unsafe { describe(self.raw, owner, dacl, PathBuf::new()) }
+            unsafe { describe(self.raw, owner, dacl, PathBuf::new(), false) }
         }
 
         /// Creates `path`, which must not exist, for writing, with this descriptor. The file is

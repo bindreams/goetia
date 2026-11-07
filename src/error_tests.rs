@@ -634,7 +634,7 @@ fn report_of_an_unsafe_shim_folder_names_the_path_the_account_and_the_right() {
     };
     assert_eq!(
         e.report().to_string(),
-        "refusing to use /p for the shim: Users can change permissions of it, so it could replace the shim; fix the folder's permissions"
+        "refusing to use /p for the shim: Users can change permissions of it, so it could replace the shim; fix its permissions"
     );
     assert!(std::error::Error::source(&e).is_none());
 }
