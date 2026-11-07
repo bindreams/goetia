@@ -87,10 +87,27 @@ pub(super) fn stands(opened: io::Result<()>) -> io::Result<bool> {
     }
 }
 
-/// Resolves `stop`; `service_stands` runs only for `Absent` and `Vanished`.
-pub(super) fn settle<T>(stop: Stop<T>, service_stands: impl FnOnce() -> Result<bool, Failure>) -> Settled<T> {
+/// Where a read got the name of the service.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Origin {
+    /// The service was opened by name just before.
+    Opened,
+    /// The name came from the enumeration of `Services`. A missing optional key is then taken as the
+    /// service standing without it: a service that is gone leaves at most a stale row, which the
+    /// user's own concurrent uninstall explains.
+    Listed,
+}
+
+/// Resolves `stop`; `service_stands` runs for `Vanished`, and for `Absent` unless the name is
+/// [`Origin::Listed`].
+pub(super) fn settle<T>(
+    stop: Stop<T>,
+    origin: Origin,
+    service_stands: impl FnOnce() -> Result<bool, Failure>,
+) -> Settled<T> {
     let (stands, on_standing) = match stop {
         Stop::Other(failure) => return Settled::Failed(failure),
+        Stop::Absent(value) if matches!(origin, Origin::Listed) => return Settled::Value(value),
         Stop::Absent(value) => (service_stands(), Settled::Value(value)),
         Stop::Vanished(failure) => (service_stands(), Settled::Failed(failure)),
     };

@@ -1046,6 +1046,28 @@ fn extract_names_the_type_of_a_spec_that_is_stored_but_not_a_string() {
 }
 
 #[skuld::test]
+fn extract_says_a_spec_of_a_string_type_is_not_valid_text() {
+    for vtype in [1, 2, 7] {
+        let reg = build(&managed_spec());
+        let mut parameters = reg.parameters;
+        parameters.remove(FIELD_SPEC);
+        let strays = [Stray::Value {
+            name: "Spec".encode_utf16().collect(),
+            vtype,
+        }];
+
+        let err = extract(&parameters, &strays).expect_err("a Spec that is not text must not decode");
+
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("{} that is not valid text", type_name(vtype))),
+            "{text}"
+        );
+        assert!(!text.contains("not as a string"), "{text}");
+    }
+}
+
+#[skuld::test]
 fn field_named_folds_ascii_case_to_goetias_spelling_and_knows_no_other_name() {
     assert_eq!(field_named("sPeC"), Some(FIELD_SPEC));
     assert_eq!(field_named("Marker"), Some(FIELD_MARKER));

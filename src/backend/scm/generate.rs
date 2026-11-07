@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::Identity;
-use crate::backend::scm::parameters::{Stray, field_named_utf16, type_name};
+use crate::backend::scm::parameters::{Stray, field_named_utf16, is_string_type, type_name};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::spec::{DaemonSpec, Kind, Restart, User, scm_restart_delay, windows_builtin};
@@ -303,7 +303,8 @@ pub fn account_needs_password(account: Option<&str>) -> bool {
 /// `Marker` (a foreign service). With one, `Spec` must decode: a missing or undecodable one is
 /// `Err`, never partially trusted. `Schema` and `Version` are copies for a human and are not read.
 /// `fields` and `strays` are those of [`Parameters`](crate::backend::scm::parameters::Parameters);
-/// `strays` only lets the error say that a `Spec` is stored as something other than a string.
+/// `strays` only lets the error say that a `Spec` is stored as something other than a string, or as
+/// a string that is not text.
 pub fn extract(fields: &BTreeMap<String, String>, strays: &[Stray]) -> Result<Option<Blob>, Error> {
     if !fields.contains_key(FIELD_MARKER) {
         return Ok(None);
@@ -327,6 +328,11 @@ fn missing_spec_error(strays: &[Stray]) -> Error {
         _ => None,
     });
     let what = match stored {
+        // `string_text` refused it: a NUL inside the text, an odd byte count or invalid UTF-16.
+        Some(vtype) if is_string_type(vtype) => format!(
+            "a {} that is not valid text: a NUL inside the text, an odd byte count or invalid UTF-16",
+            type_name(vtype)
+        ),
         Some(vtype) => format!("stored as {}, not as a string", type_name(vtype)),
         None => "missing".to_string(),
     };

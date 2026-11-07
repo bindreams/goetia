@@ -102,12 +102,42 @@ fn a_service_key_that_fails_otherwise_says_nothing() {
 
 #[skuld::test]
 fn absent_with_the_service_standing_is_its_value() {
-    assert!(matches!(settle(Stop::Absent(7), || Ok(true)), Settled::Value(7)));
+    assert!(matches!(
+        settle(Stop::Absent(7), Origin::Opened, || Ok(true)),
+        Settled::Value(7)
+    ));
+}
+
+/// The name came from the enumeration of `Services`: a gone service leaves at most a stale row that
+/// the user's own concurrent uninstall explains, so no second open is spent on it.
+#[skuld::test]
+fn absent_under_a_listed_name_is_its_value_without_asking_whether_the_service_stands() {
+    assert!(matches!(
+        settle(Stop::Absent(7), Origin::Listed, never),
+        Settled::Value(7)
+    ));
+}
+
+#[skuld::test]
+fn a_vanish_under_a_listed_name_still_asks_whether_the_service_stands() {
+    assert!(matches!(
+        settle(Stop::<i32>::Vanished(failure(KEY_DELETED)), Origin::Listed, || Ok(
+            false
+        )),
+        Settled::Gone
+    ));
+    match settle(Stop::<i32>::Vanished(failure(KEY_DELETED)), Origin::Listed, || Ok(true)) {
+        Settled::Failed(f) => assert_eq!(code_of(&f), Some(KEY_DELETED)),
+        other => panic!("expected Failed, got {other:?}"),
+    }
 }
 
 #[skuld::test]
 fn absent_with_the_service_gone_is_gone() {
-    assert!(matches!(settle(Stop::Absent(7), || Ok(false)), Settled::Gone));
+    assert!(matches!(
+        settle(Stop::Absent(7), Origin::Opened, || Ok(false)),
+        Settled::Gone
+    ));
 }
 
 /// Not read again and not waited on: a key another process took away is undetermined, with what
@@ -115,7 +145,7 @@ fn absent_with_the_service_gone_is_gone() {
 #[skuld::test]
 fn a_vanish_with_the_service_standing_fails_with_its_cause() {
     for code in [NOT_FOUND, KEY_DELETED] {
-        match settle(Stop::<i32>::Vanished(failure(code)), || Ok(true)) {
+        match settle(Stop::<i32>::Vanished(failure(code)), Origin::Opened, || Ok(true)) {
             Settled::Failed(f) => assert_eq!(code_of(&f), Some(code)),
             other => panic!("{code}: expected Failed, got {other:?}"),
         }
@@ -125,7 +155,9 @@ fn a_vanish_with_the_service_standing_fails_with_its_cause() {
 #[skuld::test]
 fn a_vanish_with_the_service_gone_is_gone() {
     assert!(matches!(
-        settle(Stop::<i32>::Vanished(failure(KEY_DELETED)), || Ok(false)),
+        settle(Stop::<i32>::Vanished(failure(KEY_DELETED)), Origin::Opened, || Ok(
+            false
+        )),
         Settled::Gone
     ));
 }
@@ -134,7 +166,7 @@ fn a_vanish_with_the_service_gone_is_gone() {
 fn a_failed_existence_check_fails_every_vanish_with_its_own_cause() {
     let stops: [Stop<i32>; 2] = [Stop::Absent(7), Stop::Vanished(failure(NOT_FOUND))];
     for stop in stops {
-        match settle(stop, || Err(failure(IO_DEVICE))) {
+        match settle(stop, Origin::Opened, || Err(failure(IO_DEVICE))) {
             Settled::Failed(f) => assert_eq!(code_of(&f), Some(IO_DEVICE)),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -143,7 +175,7 @@ fn a_failed_existence_check_fails_every_vanish_with_its_own_cause() {
 
 #[skuld::test]
 fn another_failure_fails_without_asking_whether_the_service_stands() {
-    match settle(Stop::<i32>::Other(failure(ACCESS_DENIED)), never) {
+    match settle(Stop::<i32>::Other(failure(ACCESS_DENIED)), Origin::Opened, never) {
         Settled::Failed(f) => assert_eq!(code_of(&f), Some(ACCESS_DENIED)),
         other => panic!("expected Failed, got {other:?}"),
     }

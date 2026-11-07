@@ -286,7 +286,7 @@ impl Backend for Scm {
             // neither omitted nor claimed: collected whole here, reported by
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
-            match registry::read_parameters(&name) {
+            match registry::read_listed_parameters(&name) {
                 // Gone since `scan_services` listed it: not there to list.
                 Ok(RegistryReadOutcome::ServiceGone) => {}
                 Ok(RegistryReadOutcome::Read(params)) => {

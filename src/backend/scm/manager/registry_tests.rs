@@ -40,6 +40,25 @@ fn a_stray_is_a_present_name_that_is_none_of_the_wanted_fields_in_any_case() {
     assert_eq!(found, [&utf16("Stray"), &utf16("Marker2"), &utf16("schema"), &invalid]);
 }
 
+fn entry(name: &str) -> RawEntry {
+    RawEntry {
+        name: utf16(name),
+        vtype: 1,
+    }
+}
+
+#[skuld::test]
+fn a_field_is_named_as_the_enumeration_stored_it() {
+    let entries = [entry("Stray"), entry("sPeC"), entry("Spec\0")];
+
+    assert_eq!(stored_name(&entries, "Spec"), utf16("sPeC"));
+}
+
+#[skuld::test]
+fn a_field_the_enumeration_missed_is_named_as_goetia_spells_it() {
+    assert_eq!(stored_name(&[entry("Stray")], "Spec"), utf16("Spec"));
+}
+
 const NOT_FOUND: i32 = 2;
 const KEY_DELETED: i32 = 1018;
 
@@ -54,6 +73,7 @@ fn os_code(error: &Error) -> Option<i32> {
 #[skuld::test]
 fn a_read_that_finds_no_optional_key_under_a_service_that_is_gone_is_service_gone() {
     let read = read_settled(
+        Origin::Opened,
         || Ok(false),
         |f| registry_error(&f.op, &f.path, f.source),
         || Err(Stop::at_open(failed_with(NOT_FOUND), Some(7))),
@@ -65,6 +85,7 @@ fn a_read_that_finds_no_optional_key_under_a_service_that_is_gone_is_service_gon
 #[skuld::test]
 fn a_read_that_finds_no_optional_key_under_a_service_that_stands_is_the_empty_value() {
     let read = read_settled(
+        Origin::Opened,
         || Ok(true),
         |f| registry_error(&f.op, &f.path, f.source),
         || Err(Stop::at_open(failed_with(NOT_FOUND), Some(7))),
@@ -76,6 +97,7 @@ fn a_read_that_finds_no_optional_key_under_a_service_that_stands_is_the_empty_va
 #[skuld::test]
 fn a_key_that_vanishes_under_a_service_that_stands_fails_with_the_cause_it_met() {
     let read = read_settled(
+        Origin::Opened,
         || Ok(true),
         |f| registry_error(&f.op, &f.path, f.source),
         || Err::<(), _>(Stop::mid_read(failed_with(KEY_DELETED))),
@@ -87,6 +109,7 @@ fn a_key_that_vanishes_under_a_service_that_stands_fails_with_the_cause_it_met()
 #[skuld::test]
 fn a_pass_that_completes_is_its_value_without_asking_whether_the_service_stands() {
     let read = read_settled(
+        Origin::Opened,
         || panic!("the service's existence is asked only after a pass stops"),
         |f| registry_error(&f.op, &f.path, f.source),
         || Ok(7),

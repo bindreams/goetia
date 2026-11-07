@@ -277,19 +277,6 @@ fn strays_of_one_name_and_a_field_of_that_name_coexist() {
 }
 
 #[skuld::test]
-fn a_field_that_repeats_keeps_the_first_and_the_repeat_is_a_stray() {
-    let mut parameters = Parameters::default();
-    parameters.add_value(utf16("Spec"), vtype::REG_SZ, &sz("first"));
-    parameters.add_value(utf16("spec"), vtype::REG_SZ, &sz("second"));
-
-    assert_eq!(
-        parameters.fields,
-        BTreeMap::from([("Spec".to_string(), "first".to_string())])
-    );
-    assert_eq!(parameters.strays, [value_stray(&utf16("spec"), vtype::REG_SZ)]);
-}
-
-#[skuld::test]
 fn a_marker_that_is_not_goetias_text_is_a_stray_at_the_edges() {
     let cases: [(&str, u32, Vec<u8>); 3] = [
         ("no data", vtype::REG_SZ, vec![]),

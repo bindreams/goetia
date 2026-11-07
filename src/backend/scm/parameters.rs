@@ -108,15 +108,15 @@ pub struct Parameters {
 impl Parameters {
     /// Sort one value, as stored, into [`fields`](Self::fields) or [`strays`](Self::strays).
     pub fn add_value(&mut self, name: Vec<u16>, vtype: u32, data: &[u8]) {
-        let stored = name.clone();
         match classify_value(name, vtype, data) {
-            Entry::Field { name, text, layout } if !self.fields.contains_key(name) => {
+            Entry::Field { name, text, layout } => {
+                debug_assert!(
+                    !self.fields.contains_key(name),
+                    "the registry holds no two value names that fold to one: {name} repeats"
+                );
                 self.fields.insert(name.to_string(), text);
                 self.strays.extend(layout);
             }
-            // The registry holds no two names that fold to one; a repeat is kept as drift, not
-            // overwritten.
-            Entry::Field { .. } => self.strays.push(Stray::Value { name: stored, vtype }),
             Entry::Stray(stray) => self.strays.push(stray),
         }
     }
@@ -172,12 +172,17 @@ pub(crate) fn field_named_utf16(name: &[u16]) -> Option<&'static str> {
     String::from_utf16(name).ok().and_then(|name| field_named(&name))
 }
 
+/// Whether `vtype` is a string type: `REG_SZ`, `REG_EXPAND_SZ` or `REG_MULTI_SZ`.
+pub(crate) fn is_string_type(vtype: u32) -> bool {
+    [vtype::REG_SZ, vtype::REG_EXPAND_SZ, vtype::REG_MULTI_SZ].contains(&vtype)
+}
+
 /// The text of a string value of any string type (`REG_SZ`, `REG_EXPAND_SZ`, `REG_MULTI_SZ`), with
 /// the NULs that close it removed, and whether it is laid out as goetia writes one: a `REG_SZ` with
 /// one closing NUL. `None` for another type, an odd byte count, a NUL inside the text, or text that
 /// is not valid UTF-16.
 fn string_text(vtype: u32, data: &[u8]) -> Option<(String, bool)> {
-    if ![vtype::REG_SZ, vtype::REG_EXPAND_SZ, vtype::REG_MULTI_SZ].contains(&vtype) {
+    if !is_string_type(vtype) {
         return None;
     }
     let (pairs, remainder) = data.as_chunks::<2>();

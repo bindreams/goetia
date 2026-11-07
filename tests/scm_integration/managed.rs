@@ -13,8 +13,9 @@ use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Wdk::System::Registry::NtSetValueKey;
-use windows_sys::Win32::Foundation::UNICODE_STRING;
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::System::Registry::{NtCreateKey, NtSetValueKey};
+use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, OBJ_OPENLINK, UNICODE_STRING};
 use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
 
 use crate::common::{self, conformance_mk, fixture_command};
@@ -856,6 +857,132 @@ fn set_raw_value(key: &winreg::RegKey, name: &[u16], vtype: u32, data: &[u8]) {
         )
     };
     assert!(status >= 0, "write a value of type {vtype}: NTSTATUS {status:#x}");
+}
+
+/// A raw `NtCreateKey` of the child `name` (UTF-16 units, any, a NUL included) of `parent`, with
+/// `options` (`REG_OPTION_CREATE_LINK` makes a link). The key is returned open.
+fn create_raw_key(parent: &winreg::RegKey, name: &[u16], options: u32) -> winreg::RegKey {
+    const KEY_ALL_ACCESS: u32 = 0xF003F;
+    let bytes = u16::try_from(name.len() * 2).expect("a key name of at most 255 units");
+    let name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: name.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.raw_handle(),
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENLINK,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle = std::ptr::null_mut();
+    let mut disposition = 0u32;
+    // SAFETY: `attributes` and the name it points at outlive the call; `handle` and `disposition`
+    // are valid out-params; the class is null, which the API allows.
+    let status = unsafe {
+        NtCreateKey(
+            &mut handle,
+            KEY_ALL_ACCESS,
+            &attributes,
+            0,
+            std::ptr::null(),
+            options,
+            &mut disposition,
+        )
+    };
+    assert!(status >= 0, "create a key: NTSTATUS {status:#x}");
+    // `winreg` closes a handle it holds on drop, which is all this needs from it.
+    winreg::RegKey::predef(handle)
+}
+
+/// A key under `HKLM\SOFTWARE` removed on drop, for a registry link to point at.
+struct LinkTarget {
+    path: String,
+}
+
+impl LinkTarget {
+    fn create(id: &str) -> (Self, winreg::RegKey) {
+        let path = format!(r"SOFTWARE\goetia-link-target-{id}");
+        let (key, _) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+            .create_subkey(&path)
+            .expect("create the link target");
+        (Self { path }, key)
+    }
+
+    /// The target as the kernel names it, which is what a link's value holds.
+    fn nt_path(&self) -> String {
+        format!(r"\Registry\Machine\{}", self.path)
+    }
+}
+
+impl Drop for LinkTarget {
+    fn drop(&mut self) {
+        let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+        if let Err(e) = hklm.delete_subkey_all(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("LinkTarget: could not remove HKLM\\{}: {e}", self.path);
+        }
+    }
+}
+
+/// `RegDeleteTreeW` follows a registry link: a stray link under `Parameters` would have its target
+/// wiped. `--force` deletes the link itself and leaves the target as it was.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_deletes_a_stray_registry_link_and_leaves_its_target() {
+    const REG_LINK: u32 = 6;
+    const REG_OPTION_CREATE_LINK: u32 = 2;
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let (target, target_key) = LinkTarget::create(&id);
+    target_key.set_value("Keep", &"x").expect("write Keep");
+    target_key.create_subkey("Child").expect("create Child");
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+    let link = create_raw_key(&parameters, &units("Link"), REG_OPTION_CREATE_LINK);
+    let link_value: Vec<u8> = units(&target.nt_path())
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    set_raw_value(&link, &units("SymbolicLinkValue"), REG_LINK, &link_value);
+    drop(link);
+
+    assert_conflict_cleared_by_force(&mgr, &spec);
+
+    let parameters = parameters_key(&id, KEY_READ);
+    let names: Vec<String> = parameters.enum_keys().map(|name| name.expect("enumerate")).collect();
+    assert!(names.is_empty(), "the link survived: {names:?}");
+    assert_eq!(target_key.get_value::<String, _>("Keep").expect("read Keep"), "x");
+    target_key
+        .open_subkey("Child")
+        .expect("the target's own subkey survived");
+}
+
+/// `RegDeleteTreeW` below the top level stops at a NUL, so a stray subkey holding a child named
+/// `a\0b` would stay. `--force` removes the whole subtree.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_removes_a_stray_subkey_holding_a_child_whose_name_has_a_nul() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let (sub, _) = parameters.create_subkey("Sub").expect("create Sub");
+    let nul_named: Vec<u16> = "a\0b".encode_utf16().collect();
+    let child = create_raw_key(&sub, &nul_named, 0);
+    child.set_value("Nested", &"y").expect("write Nested");
+    drop(child);
+    drop(sub);
+
+    assert_conflict_cleared_by_force(&mgr, &spec);
+
+    let parameters = parameters_key(&id, KEY_READ);
+    let names: Vec<String> = parameters.enum_keys().map(|name| name.expect("enumerate")).collect();
+    assert!(names.is_empty(), "the subtree survived: {names:?}");
 }
 
 /// What `winreg` cannot enumerate must still be drift that `install --force` removes: a goetia field

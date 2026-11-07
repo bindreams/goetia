@@ -23,7 +23,7 @@ use crate::manager::{Installed, flow};
 
 mod counted;
 mod settle;
-use settle::{Failure, Settled, Stop, settle, stands};
+use settle::{Failure, Origin, Settled, Stop, settle, stands};
 
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
@@ -64,6 +64,7 @@ pub enum RegistryReadOutcome<T> {
 /// Runs `pass` once and settles what it met (see [`settle`]). `service_stands` asks whether the
 /// service is still there; `fail` makes the error for a failure that leaves the read undecided.
 fn read_settled<T>(
+    origin: Origin,
     service_stands: impl FnOnce() -> std::result::Result<bool, Failure>,
     fail: impl Fn(Failure) -> Error,
     pass: impl FnOnce() -> std::result::Result<T, Stop<T>>,
@@ -72,7 +73,7 @@ fn read_settled<T>(
         Ok(value) => return Ok(RegistryReadOutcome::Read(value)),
         Err(stop) => stop,
     };
-    match settle(stop, service_stands) {
+    match settle(stop, origin, service_stands) {
         Settled::Gone => Ok(RegistryReadOutcome::ServiceGone),
         Settled::Value(value) => Ok(RegistryReadOutcome::Read(value)),
         Settled::Failed(failure) => Err(fail(failure)),
@@ -100,11 +101,12 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 
 /// What `Services\<name>\Parameters` holds: goetia's four fields, each read by its name, and every
 /// other value and subkey as a stray (see [`Parameters`]). A stray is drift that `install --force`
-/// removes. The result classifies the id:
+/// removes. For a service opened by name; the result classifies the id:
 ///
 /// - A service with no `Parameters` key reads as empty `Parameters`, so `generate::extract` finds
 ///   no marker and the service is `Ownership::Foreign`. This covers a service goetia never touched
-///   and one whose install crashed between `CreateServiceW` and the metadata write.
+///   and one whose install crashed between `CreateServiceW` and the metadata write. The service
+///   key is opened to check that it stands: gone, the read is [`RegistryReadOutcome::ServiceGone`].
 /// - [`RegistryReadOutcome::ServiceGone`] when the service key is gone, whether the read found it
 ///   so at the start or lost the `Parameters` key under it.
 /// - [`registry_undetermined`] for every other failure, among them a key that vanishes or is marked
@@ -116,8 +118,20 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 /// no `Parameters`, and reads it as Foreign. A concurrent uninstall can leave this window open;
 /// goetia does not guard against it (owner, 2026-11-03).
 pub fn read_parameters(name: &str) -> Result<RegistryReadOutcome<Parameters>> {
+    read_parameters_from(name, Origin::Opened)
+}
+
+/// [`read_parameters`] for a name from the enumeration of `Services`: a missing `Parameters` key is
+/// Foreign without the second open, and only a key that vanishes mid-read asks whether the service
+/// stands.
+pub fn read_listed_parameters(name: &str) -> Result<RegistryReadOutcome<Parameters>> {
+    read_parameters_from(name, Origin::Listed)
+}
+
+fn read_parameters_from(name: &str, origin: Origin) -> Result<RegistryReadOutcome<Parameters>> {
     let path = parameters_key_path(name);
     read_settled(
+        origin,
         || service_stands(name),
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
@@ -125,16 +139,19 @@ pub fn read_parameters(name: &str) -> Result<RegistryReadOutcome<Parameters>> {
                 .open_subkey_with_flags(&path, KEY_READ)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), Some(Parameters::default())))?;
             let mut parameters = Parameters::default();
+            // The names as stored, for a field found not to be a string.
+            let entries = enum_values(&key).map_err(|e| Stop::mid_read(failure("enumerate", &path, e)))?;
+            let mut buffer = Vec::new();
             // By name, not by position: a concurrent write that deletes a stray moves the later
             // values up one place in the enumeration, and a read by position would skip one.
             for field in FIELDS {
-                match query_raw_value(&key, field) {
-                    Ok(value) => parameters.add_value(field.encode_utf16().collect(), value.vtype, &value.bytes),
+                match query_raw_value(&key, field, &mut buffer) {
+                    Ok(vtype) => parameters.add_value(stored_name(&entries, field), vtype, &buffer),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(Stop::mid_read(failure(&format!("read {field} under"), &path, e))),
                 }
             }
-            for entry in enum_values(&key).map_err(|e| Stop::mid_read(failure("enumerate", &path, e)))? {
+            for entry in entries {
                 if field_named_utf16(&entry.name).is_none() {
                     parameters.add_value(entry.name, entry.vtype, &[]);
                 }
@@ -146,6 +163,15 @@ pub fn read_parameters(name: &str) -> Result<RegistryReadOutcome<Parameters>> {
             Ok(parameters)
         },
     )
+}
+
+/// `field`'s name as `entries` hold it, which may differ from goetia's spelling in case; goetia's
+/// spelling when the enumeration did not reach it.
+fn stored_name(entries: &[RawEntry], field: &str) -> Vec<u16> {
+    entries
+        .iter()
+        .find(|entry| field_named_utf16(&entry.name) == Some(field))
+        .map_or_else(|| field.encode_utf16().collect(), |entry| entry.name.clone())
 }
 
 /// A registry value as stored: its type number and bytes, unconverted. `winreg`'s `RegValue` cannot
@@ -160,6 +186,9 @@ struct RawEntry {
     name: Vec<u16>,
     vtype: u32,
 }
+
+/// What [`query_raw_value`] first offers a value, in bytes.
+const INITIAL_VALUE_BYTES: usize = 1024;
 
 /// The longest value name the registry holds, in UTF-16 units.
 const MAX_VALUE_NAME_UNITS: usize = 16_383;
@@ -297,14 +326,16 @@ fn tolerate_not_found(deleted: std::io::Result<()>) -> std::io::Result<()> {
 pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
     let path = service_key_path(name);
     read_settled(
+        Origin::Opened,
         || service_stands(name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
             let key = RegKey::predef(HKEY_LOCAL_MACHINE)
                 .open_subkey_with_flags(&path, KEY_READ)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
-            match query_raw_value(&key, ENVIRONMENT_VALUE) {
-                Ok(value) => Ok(environment_lines(Some(value))),
+            let mut bytes = Vec::new();
+            match query_raw_value(&key, ENVIRONMENT_VALUE, &mut bytes) {
+                Ok(vtype) => Ok(environment_lines(Some(RawValue { vtype, bytes }))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(environment_lines(None)),
                 Err(e) => Err(Stop::mid_read(failure(
                     &format!("read {ENVIRONMENT_VALUE} under"),
@@ -316,11 +347,13 @@ pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> 
     )
 }
 
-/// `RegQueryValueExW` for `name` under `key`, whatever its type.
-fn query_raw_value(key: &RegKey, name: &str) -> std::io::Result<RawValue> {
+/// `RegQueryValueExW` for `name` under `key`, whatever its type: the type, with the data in
+/// `buffer` (its contents are replaced, and its allocation is reused across calls).
+fn query_raw_value(key: &RegKey, name: &str, buffer: &mut Vec<u8>) -> std::io::Result<u32> {
     let wide_name = super::identity::wide_null(name);
-    let mut buffer = vec![0u8; 1024];
-    let (vtype, len) = read_growing(&mut buffer, |data, len, vtype| {
+    buffer.clear();
+    buffer.resize(INITIAL_VALUE_BYTES.max(buffer.capacity()), 0);
+    let (vtype, len) = read_growing(buffer, |data, len, vtype| {
         // SAFETY: `key` holds an open handle; `wide_name` is a NUL-terminated UTF-16 string that
         // outlives the call; `vtype` and `len` are valid out-params, and `data` is `len` writable
         // bytes.
@@ -328,7 +361,7 @@ fn query_raw_value(key: &RegKey, name: &str) -> std::io::Result<RawValue> {
     })
     .map_err(|status| std::io::Error::from_raw_os_error(status as i32))?;
     buffer.truncate(len);
-    Ok(RawValue { vtype, bytes: buffer })
+    Ok(vtype)
 }
 
 /// [`read_environment`]'s parsing, apart from the registry so it is testable without one.
