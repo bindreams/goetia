@@ -276,7 +276,7 @@ fn a_resolved_path_the_field_rules_would_refuse_is_attributed_to_the_resolution(
     // A drive-relative `cwd: C:` resolves through the per-drive directory to a value the authored
     // rules never saw; the message must say so rather than blame the text the user wrote.
     let id = Id::try_from("frpc").unwrap();
-    let err = check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\u{FFFE}"), false).unwrap_err();
+    let err = Error::from(check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\u{FFFE}"), false).unwrap_err());
     let msg = err.to_string();
     assert!(
         msg.contains("field `cwd` is `C:`, which resolves to `/a\u{FFFE}`, which contains U+FFFE"),
@@ -288,8 +288,7 @@ fn a_resolved_path_the_field_rules_would_refuse_is_attributed_to_the_resolution(
 #[skuld::test]
 fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
     let id = Id::try_from("frpc").unwrap();
-    let msg = check_resolved(&id, PathField::Cwd, "bin", Path::new("/a\u{FFFE}/bin"), true)
-        .unwrap_err()
+    let msg = Error::from(check_resolved(&id, PathField::Cwd, "bin", Path::new("/a\u{FFFE}/bin"), true).unwrap_err())
         .to_string();
     assert!(
         msg.contains("field `cwd` is `bin`, which resolves under the manifest directory to `/a\u{FFFE}/bin`, which contains U+FFFE"),
@@ -299,10 +298,10 @@ fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
 
 /// A drive-relative path resolves through the per-drive current directory, which a manifest
 /// cannot touch: a drive with none (`Q:`) resolves to its root, `Q:\`, which a path rule refuses.
-/// That is `.env`'s when a reference wrote the `Q:`, and not when it was typed.
+/// That is `.env`'s when a reference wrote the `Q:`.
 #[cfg(windows)]
 #[skuld::test]
-fn a_defect_in_a_drive_relative_path_is_attributed_to_env_only_when_a_reference_wrote_it() {
+fn a_defect_in_a_drive_relative_path_a_reference_wrote_is_attributed_to_env() {
     let abs = base_dir().join("frpc").to_string_lossy().into_owned();
     let yaml = format!("id: frpc\ncommand: ['{abs}']\ncwd: ${{D}}\n");
     let dir = fixture_dir(&yaml, Some("D=Q:\n"));
@@ -311,11 +310,6 @@ fn a_defect_in_a_drive_relative_path_is_attributed_to_env_only_when_a_reference_
         msg.contains("after substituting from .env: field `cwd` is `Q:`, which resolves to `Q:\\`"),
         "{msg}"
     );
-
-    let typed = format!("id: frpc\ncommand: ['{abs}']\ncwd: 'Q:'\n");
-    let msg = resolve(parse_manifest(&typed), &base_dir()).unwrap_err().to_string();
-    assert!(msg.contains("field `cwd` is `Q:`, which resolves to"), "{msg}");
-    assert!(!msg.contains(".env"), "{msg}");
 }
 
 // A substituted path is judged as it is -------------------------------------------------------------------------------
@@ -409,6 +403,45 @@ fn a_defect_in_a_field_no_reference_touched_is_not_attributed_to_env() {
     assert!(!msg.contains(".env"), "{msg}");
 }
 
+/// A default is the manifest's own text, not `.env`'s.
+#[skuld::test]
+fn a_defect_in_a_default_is_not_attributed_to_env() {
+    let dir = fixture_dir("id: frpc\nrestart: ${R:-sometimes}\n", None);
+    let msg = load(dir.path()).unwrap_err().to_string();
+    assert!(msg.contains("field `restart` is `sometimes`"), "{msg}");
+    assert!(!msg.contains(".env"), "{msg}");
+}
+
+#[skuld::test]
+fn a_defect_in_a_value_that_overrides_a_default_is_attributed_to_env() {
+    let dir = fixture_dir("id: frpc\nrestart: ${R:-never}\n", Some("R=sometimes\n"));
+    let msg = load(dir.path()).unwrap_err().to_string();
+    assert!(
+        msg.contains("after substituting from .env: field `restart` is `sometimes`"),
+        "{msg}"
+    );
+}
+
+/// `.env` supplied the value, whatever it looks like: here it equals the reference that asked for it.
+#[skuld::test]
+fn a_defect_in_a_value_equal_to_its_reference_is_attributed_to_env() {
+    let dir = fixture_dir("id: frpc\ntype: ${T}\n", Some("T=${T}\n"));
+    let msg = load(dir.path()).unwrap_err().to_string();
+    assert!(
+        msg.contains("after substituting from .env: field `type` is `${T}`"),
+        "{msg}"
+    );
+}
+
+/// The `$` is the manifest's `$$` and the rest is a default: no reference read `.env`.
+#[skuld::test]
+fn a_defect_in_a_default_followed_by_an_escape_is_not_attributed_to_env() {
+    let dir = fixture_dir("id: frpc\ntype: '${T:-simple}$$'\n", None);
+    let msg = load(dir.path()).unwrap_err().to_string();
+    assert!(msg.contains("field `type` is `simple$`"), "{msg}");
+    assert!(!msg.contains(".env"), "{msg}");
+}
+
 #[skuld::test]
 fn a_user_name_from_env_is_attributed_to_the_override_and_to_env() {
     let yaml = "id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  systemd:\n    user: ${U}\n";
@@ -416,8 +449,10 @@ fn a_user_name_from_env_is_attributed_to_the_override_and_to_env() {
     let msg = resolve_as(parse_manifest(yaml), dir.path(), Some(BackendKind::Systemd))
         .unwrap_err()
         .to_string();
-    assert!(msg.contains("backend-specific.systemd"), "{msg}");
-    assert!(msg.contains("after substituting from .env"), "{msg}");
+    assert!(
+        msg.contains("backend-specific.systemd: after substituting from .env: "),
+        "{msg}"
+    );
     assert!(msg.contains("Windows built-in"), "{msg}");
 }
 
@@ -433,18 +468,12 @@ fn a_user_name_written_out_is_attributed_to_the_override_alone() {
 
 #[skuld::test]
 fn a_manifest_directory_defect_under_a_substituted_path_is_attributed_to_the_directory() {
-    // The field's text changed (`${D}` became `bin`), but the defect is the directory's.
-    let parent = tempfile::tempdir().expect("tempdir should be creatable");
-    let dir = parent.path().join("a\u{FFFE}b");
-    std::fs::create_dir(&dir).expect("a directory name with U+FFFE should be creatable");
+    // The field's text changed (`${D:-bin}` became `bin`), but the defect is the directory's. The
+    // directory is not created: no file system need accept its name.
+    let dir = base_dir().join("a\u{FFFE}b");
     let abs = base_dir().join("frpc").to_string_lossy().into_owned();
-    std::fs::write(
-        dir.join("goetia.yaml"),
-        format!("id: frpc\ncommand: ['{abs}']\ncwd: ${{D}}\n"),
-    )
-    .expect("fixture manifest should be writable");
-    std::fs::write(dir.join(".env"), "D=bin\n").expect("fixture .env should be writable");
-    let msg = load(&dir).unwrap_err().to_string();
+    let yaml = format!("id: frpc\ncommand: ['{abs}']\ncwd: ${{D:-bin}}\n");
+    let msg = resolve(parse_manifest(&yaml), &dir).unwrap_err().to_string();
     assert!(msg.contains("which resolves under the manifest directory to"), "{msg}");
     assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
 }
@@ -484,7 +513,7 @@ fn a_path_a_substitution_may_make_absolute_is_not_judged_against_the_manifest_di
         format!("command: ['{abs}']\nlogs: ${{D}}"),
     ] {
         let raw = parse_manifest(&format!("id: frpc\n{body}\n"));
-        resolve_shape(&id, raw, &dir, Substitution::Pending).unwrap_or_else(|e| panic!("`{body}`: {e}"));
+        resolve_shape(&id, raw, &dir, Substitution::Pending).unwrap_or_else(|e| panic!("`{body}`: {}", Error::from(e)));
     }
 }
 

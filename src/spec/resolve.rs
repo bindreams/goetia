@@ -144,21 +144,16 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     // injection gate inspects final values here, and its `ShapedSpec` becomes the `DaemonSpec`.
     // No `check_spec_grammar`: a substituted `.env` value may legally carry a literal `$`.
     let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
-    let authored = native_merged.clone();
-    interpolate::spec(&mut native_merged, &vars).map_err(|e| annotate_step5_error(e, native_entry))?;
-    let changed = changed_fields(&authored, &native_merged);
+    let from_env = interpolate::spec(&mut native_merged, &vars).map_err(|e| annotate_step5_error(e, native_entry))?;
     // The one place an error of this pass is attributed to `.env`: by the field it is about.
-    let judged: Result<(ShapedSpec, Vec<Warning>), Refused> = (|| {
-        let (shaped, warnings) = resolve_shape(&id, native_merged, base_dir, Substitution::Done)?;
-        // `error` reads only `native_supplied` fields, and only `user`: it is the backend's verdict
-        // on what the override wrote, so it names the backend too.
-        if let Some(b) = native {
-            b.error(&shaped, native_supplied, Substitution::Done)
-                .map_err(|e| Refused::at(Field::User, attribute_to(e, b)))?;
-        }
-        Ok((shaped, warnings))
-    })();
-    let (shaped, mut daemon_warnings) = judged.map_err(|refused| refused.attributed(&changed))?;
+    let (shaped, mut daemon_warnings) = resolve_shape(&id, native_merged, base_dir, Substitution::Done)
+        .map_err(|refused| refused.attributed(&from_env))?;
+    // `error` reads only `native_supplied` fields, and only `user`: it is the backend's verdict on
+    // what the override wrote, so it names the backend too, ahead of the `.env` attribution.
+    if let Some(b) = native {
+        b.error(&shaped, native_supplied, Substitution::Done)
+            .map_err(|e| attribute_to(Refused::at(Field::User, e).attributed(&from_env), b))?;
+    }
     if let Some(b) = native {
         b.warn(&shaped, &mut daemon_warnings);
     }
@@ -242,7 +237,7 @@ fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error 
 
 /// A value a rule judges, named so an error can say whose text is to blame.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Field {
+pub(super) enum Field {
     Name,
     /// An element of `command`; `Command(0)` is the program.
     Command(usize),
@@ -276,9 +271,9 @@ impl Refused {
         }
     }
 
-    /// The error, prefixed "after substituting from .env" iff a reference changed the text of the
-    /// field it is about, so `changed` ([`changed_fields`]) holds it.
-    fn attributed(self, changed: &BTreeSet<Field>) -> Error {
+    /// The error, prefixed "after substituting from .env" iff `.env` supplied some of the text of
+    /// the field it is about, so `from_env` ([`interpolate::spec`]'s result) holds it.
+    fn attributed(self, from_env: &BTreeSet<Field>) -> Error {
         match (self.field, self.err) {
             (
                 Some(field),
@@ -287,7 +282,7 @@ impl Refused {
                     message,
                     source,
                 },
-            ) if changed.contains(&field) => Error::Invalid {
+            ) if from_env.contains(&field) => Error::Invalid {
                 daemon,
                 message: format!("after substituting from .env: {message}"),
                 source,
@@ -297,78 +292,10 @@ impl Refused {
     }
 }
 
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.err.fmt(f)
-    }
-}
-
 impl From<Refused> for Error {
     fn from(refused: Refused) -> Self {
         refused.err
     }
-}
-
-/// The fields whose text a reference changed: `authored` is the merged spec before step 5's
-/// substitution, `substituted` after it. Computed once, so no later error site decides it.
-fn changed_fields(authored: &RawSpec, substituted: &RawSpec) -> BTreeSet<Field> {
-    // Exhaustive, so a field added to `RawSpec` stops compiling here until someone decides whether
-    // it is attributed.
-    let RawSpec {
-        id: _,
-        name,
-        command,
-        cwd,
-        env,
-        user,
-        restart,
-        restart_delay,
-        logs,
-        kind,
-        backend_specific: _,
-    } = authored;
-    let now = substituted;
-    let text_changed = |before: &Option<String>, after: &Option<String>| match (before, after) {
-        (Some(before), Some(after)) => interpolate::reference_changed(before, after),
-        _ => false,
-    };
-
-    let mut changed = BTreeSet::new();
-    for (field, before, after) in [
-        (Field::Name, name, &now.name),
-        (Field::Cwd, cwd, &now.cwd),
-        (Field::Logs, logs, &now.logs),
-        (Field::Restart, restart, &now.restart),
-        (Field::RestartDelay, restart_delay, &now.restart_delay),
-        (Field::Kind, kind, &now.kind),
-    ] {
-        if text_changed(before, after) {
-            changed.insert(field);
-        }
-    }
-    let args = command.iter().flatten().zip(now.command.iter().flatten());
-    for (index, (before, after)) in args.enumerate() {
-        if interpolate::reference_changed(before, after) {
-            changed.insert(Field::Command(index));
-        }
-    }
-    for (key, before) in env {
-        if now
-            .env
-            .get(key)
-            .is_some_and(|after| interpolate::reference_changed(before, after))
-        {
-            changed.insert(Field::EnvValue(key.clone()));
-        }
-    }
-    let user_text = |user: &Option<RawUser>| match user {
-        Some(RawUser::Scalar(text) | RawUser::Name(text)) => Some(text.clone()),
-        None | Some(RawUser::Id(_)) => None,
-    };
-    if text_changed(&user_text(user), &user_text(&now.user)) {
-        changed.insert(Field::User);
-    }
-    changed
 }
 
 /// Shape only: injection gate, path resolution, the three `$`-aware
@@ -940,11 +867,6 @@ impl PathField {
     }
 }
 
-/// `check_field_values`' error: the rule's, at `field`.
-fn at(field: Field) -> impl FnOnce(Error) -> Refused {
-    move |err| Refused::at(field, err)
-}
-
 /// Every field rule, in the order a manifest's defects are reported: `name`, `command`, `cwd`,
 /// `logs`, each `env` entry, `user`. The one list; [`resolve_shape`] runs it on the authored
 /// values and [`DaemonSpec::new`] on the final ones.
@@ -964,18 +886,18 @@ fn check_field_values(
     phase: Phase,
     mut resolve: impl FnMut(PathField) -> Result<(), Refused>,
 ) -> Result<(), Refused> {
-    reject_unemittable(id, "name", values.name).map_err(at(Field::Name))?;
+    reject_unemittable(id, "name", values.name).map_err(|err| Refused::at(Field::Name, err))?;
 
     if let Some(command) = values.command {
         if phase == Phase::Final {
-            reject_empty_command(id, command).map_err(at(Field::Command(0)))?;
+            reject_empty_command(id, command).map_err(|err| Refused::at(Field::Command(0), err))?;
         }
         // Every element, `command[0]` included. Its emptiness is separate.
         for (index, arg) in command.iter().enumerate() {
-            reject_unemittable(id, "command", arg).map_err(at(Field::Command(index)))?;
+            reject_unemittable(id, "command", arg).map_err(|err| Refused::at(Field::Command(index), err))?;
         }
         if let Some(first) = command.first() {
-            reject_empty(id, "command[0]", first).map_err(at(Field::Command(0)))?;
+            reject_empty(id, "command[0]", first).map_err(|err| Refused::at(Field::Command(0), err))?;
         }
         resolve(PathField::Command)?;
     }
@@ -983,9 +905,9 @@ fn check_field_values(
     for (field, path) in [(PathField::Cwd, values.cwd), (PathField::Logs, values.logs)] {
         let name = field.name();
         if let Some(path) = path {
-            check_path(id, name, path).map_err(at(field.field()))?;
+            check_path(id, name, path).map_err(|err| Refused::at(field.field(), err))?;
             if phase == Phase::Final {
-                reject_relative_path(id, name, path).map_err(at(field.field()))?;
+                reject_relative_path(id, name, path).map_err(|err| Refused::at(field.field(), err))?;
             }
             resolve(field)?;
         }
@@ -997,8 +919,9 @@ fn check_field_values(
         if phase == Phase::Authored && interpolate::would_substitution_change(key) {
             return Err(Refused::at(Field::EnvKey, invalid(id, interpolate::ENV_NAME_MESSAGE)));
         }
-        check_env_key(id, key).map_err(at(Field::EnvKey))?;
-        reject_unemittable(id, &format!("env[{key}]"), value).map_err(at(Field::EnvValue(key.clone())))?;
+        check_env_key(id, key).map_err(|err| Refused::at(Field::EnvKey, err))?;
+        reject_unemittable(id, &format!("env[{key}]"), value)
+            .map_err(|err| Refused::at(Field::EnvValue(key.clone()), err))?;
     }
 
     // Same reason as the `env`-name rule above. `${S}` trims to `${S}`, never empty, so this and
@@ -1009,7 +932,7 @@ fn check_field_values(
     {
         return Err(Refused::at(Field::User, invalid(id, interpolate::USER_ID_MESSAGE)));
     }
-    check_user(id, values.user).map_err(at(Field::User))
+    check_user(id, values.user).map_err(|err| Refused::at(Field::User, err))
 }
 
 /// A `cwd` or `logs`. The message omits the path, as [`reject_control_chars`] omits a value.
