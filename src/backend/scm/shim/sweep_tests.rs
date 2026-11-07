@@ -159,7 +159,7 @@ fn only_shim_file_names_are_referenced_by_name() {
     );
 }
 
-// Which kept files an uninstall reports ---------------------------------------------------------------------------
+// Which kept files an uninstall reports -------------------------------------------------------------------------------
 
 /// The exiting process of a service stopped before the uninstall, or an orphan: no service names the
 /// file, and a process runs it.
@@ -170,9 +170,9 @@ fn a_host_only_a_running_process_names_is_reported() {
     assert!(kept_by_process_alone(
         &host,
         &[current("/p/Goetia", HEX_B)],
-        &[host.clone()]
+        std::slice::from_ref(&host)
     ));
-    assert!(kept_by_process_alone(&host, &[], &[host.clone()]));
+    assert!(kept_by_process_alone(&host, &[], std::slice::from_ref(&host)));
 }
 
 /// In use by a service that is registered with it: the spec skips it without an error.
@@ -180,8 +180,12 @@ fn a_host_only_a_running_process_names_is_reported() {
 fn a_host_a_registered_service_names_is_not_reported_whether_or_not_it_runs() {
     let host = current("/p/Goetia", HEX_A);
 
-    assert!(!kept_by_process_alone(&host, &[host.clone()], &[host.clone()]));
-    assert!(!kept_by_process_alone(&host, &[host.clone()], &[]));
+    assert!(!kept_by_process_alone(
+        &host,
+        std::slice::from_ref(&host),
+        std::slice::from_ref(&host)
+    ));
+    assert!(!kept_by_process_alone(&host, std::slice::from_ref(&host), &[]));
 }
 
 #[skuld::test]
@@ -201,8 +205,12 @@ fn the_names_are_compared_without_regard_to_case() {
     let host = current("/p/Goetia", HEX_A);
     let shouted = PathBuf::from(host.to_string_lossy().to_uppercase());
 
-    assert!(kept_by_process_alone(&host, &[], &[shouted.clone()]));
-    assert!(!kept_by_process_alone(&host, &[shouted.clone()], &[shouted]));
+    assert!(kept_by_process_alone(&host, &[], std::slice::from_ref(&shouted)));
+    assert!(!kept_by_process_alone(
+        &host,
+        std::slice::from_ref(&shouted),
+        std::slice::from_ref(&shouted)
+    ));
 }
 
 /// A process whose image could not be read is its file name alone, and counts as running every file
@@ -212,8 +220,12 @@ fn a_file_name_alone_names_the_host_on_either_side() {
     let host = current("/p/Goetia", HEX_A);
     let bare = PathBuf::from(format!("goetia-shim-{HEX_A}.exe"));
 
-    assert!(kept_by_process_alone(&host, &[], &[bare.clone()]));
-    assert!(!kept_by_process_alone(&host, &[bare.clone()], &[bare]));
+    assert!(kept_by_process_alone(&host, &[], std::slice::from_ref(&bare)));
+    assert!(!kept_by_process_alone(
+        &host,
+        std::slice::from_ref(&bare),
+        std::slice::from_ref(&bare)
+    ));
 }
 
 /// A file that is no shim file is none of the sweep's, so it is none of the uninstall's report.
@@ -221,10 +233,10 @@ fn a_file_name_alone_names_the_host_on_either_side() {
 fn a_file_that_is_no_shim_file_is_not_reported() {
     let other = PathBuf::from("/p/Goetia/frpc.exe");
 
-    assert!(!kept_by_process_alone(&other, &[], &[other.clone()]));
+    assert!(!kept_by_process_alone(&other, &[], std::slice::from_ref(&other)));
 }
 
-// An image path whose registry key cannot be read ------------------------------------------------------------------
+// An image path whose registry key cannot be read ---------------------------------------------------------------------
 
 fn denied(what: &str) -> Error {
     Error::os(what.to_string(), std::io::Error::other("Access is denied."))
@@ -300,7 +312,7 @@ fn the_advice_to_make_the_key_readable_follows_both_causes() {
     );
 }
 
-// What an uninstall says it left behind ---------------------------------------------------------------------------
+// What an uninstall says it left behind -------------------------------------------------------------------------------
 
 fn failure(path: &str) -> SweepFailure {
     SweepFailure {
