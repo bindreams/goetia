@@ -267,7 +267,7 @@ pub(crate) fn reject_interpolated_id(id: &str) -> Result<()> {
 /// Substitute every `String` leaf of the manifest in place. Runs only on a
 /// spec carrying no overrides: `resolve` calls it on the native backend's
 /// `merged_for` result, which becomes the returned spec.
-pub(crate) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<()> {
+pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<()> {
     // Destructured so a field added to `RawSpec` stops compiling here until someone decides
     // whether it interpolates; a skipped field is a literal `${VAR}` in a generated artifact.
     let RawSpec {
@@ -314,7 +314,7 @@ pub(crate) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<()> {
 /// Same walk and field paths as [`spec`], with no [`Vars`], so it can run before any `.env` is
 /// loaded. The daemon id, `env` names and `user.id` need no check here: a `$` in them is
 /// rejected outright (`reject_interpolated_id`, `resolve_shape`).
-pub(crate) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
+pub(super) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
     let RawSpec {
         id: _,
         name,
@@ -377,7 +377,7 @@ fn check_user_grammar(user: &Option<RawUser>) -> Result<()> {
 /// it with its own message, and answering `true` would make `resolve` read `.env` first and
 /// possibly replace that message with an unrelated IO failure. The daemon id is checked earlier
 /// (`resolve`'s step 1).
-pub(crate) fn spec_would_change(raw: &RawSpec) -> bool {
+pub(super) fn spec_would_change(raw: &RawSpec) -> bool {
     // Exhaustive for the same reason as `spec`.
     let RawSpec {
         id: _,

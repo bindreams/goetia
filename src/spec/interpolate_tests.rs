@@ -1,8 +1,10 @@
 use super::{check_spec_grammar, reject_interpolated_id, scalar, spec, spec_would_change, would_substitution_change};
 use crate::error::Error;
+use crate::spec::raw::RawSpec;
 use crate::spec::resolve::resolve_user;
+use crate::spec::user::RawUser;
 use crate::spec::vars::Vars;
-use crate::spec::{AccountId, RawSpec, RawUser, User};
+use crate::spec::{AccountId, User};
 
 /// Substitute `input` against `vars` at a fixed test path.
 fn sub(input: &str, vars: &Vars) -> Result<String, Error> {
@@ -240,7 +242,7 @@ fn check_grammar_rejects_a_bare_dollar() {
 /// Parse a manifest fixture, substitute it, and hand back the mutated
 /// `RawSpec` — the same walk `resolve` does.
 fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawSpec, Error> {
-    let mut raw: RawSpec = yaml_serde::from_str(yaml).expect("fixture yaml should parse");
+    let mut raw: RawSpec = RawSpec::parse(yaml).expect("fixture yaml should parse");
     spec(&mut raw, &Vars::from_pairs(pairs))?;
     Ok(raw)
 }
@@ -383,10 +385,10 @@ fn spec_would_change_is_true_for_an_escaped_dollar_only() {
     // The over-approximation, pinned at spec level: a `$$` escape has no
     // reference to resolve, yet still reports `true`. See the module doc
     // comment — narrowing this is a defect, not an optimisation.
-    let escaped: RawSpec = yaml_serde::from_str("id: frpc\ncommand: [/bin/frpc, $$ARGS]\n").unwrap();
+    let escaped: RawSpec = RawSpec::parse("id: frpc\ncommand: [/bin/frpc, $$ARGS]\n").unwrap();
     assert!(spec_would_change(&escaped));
 
-    let dollarless: RawSpec = yaml_serde::from_str("id: frpc\ncommand: [/bin/frpc, --flag]\n").unwrap();
+    let dollarless: RawSpec = RawSpec::parse("id: frpc\ncommand: [/bin/frpc, --flag]\n").unwrap();
     assert!(!spec_would_change(&dollarless));
 }
 
@@ -394,13 +396,13 @@ fn spec_would_change_is_true_for_an_escaped_dollar_only() {
 
 #[skuld::test]
 fn check_spec_grammar_accepts_a_well_formed_manifest() {
-    let raw: RawSpec = yaml_serde::from_str("id: frpc\nname: ${NAME}\ncommand: [\"${BIN}\"]\nrestart: ${R}\n").unwrap();
+    let raw: RawSpec = RawSpec::parse("id: frpc\nname: ${NAME}\ncommand: [\"${BIN}\"]\nrestart: ${R}\n").unwrap();
     assert!(check_spec_grammar(&raw).is_ok());
 }
 
 #[skuld::test]
 fn check_spec_grammar_rejects_a_bare_dollar_in_name() {
-    let raw: RawSpec = yaml_serde::from_str("id: frpc\nname: a$b\ncommand: [/bin/frpc]\n").unwrap();
+    let raw: RawSpec = RawSpec::parse("id: frpc\nname: a$b\ncommand: [/bin/frpc]\n").unwrap();
     let err = check_spec_grammar(&raw).unwrap_err();
     assert!(
         err.to_string().contains("not part of"),
@@ -413,6 +415,6 @@ fn check_spec_grammar_does_not_require_a_defined_variable() {
     // Grammar only, never resolution — an undefined `${UNDEFINED}` must not
     // fail here; that is `interpolate::spec`'s job, once `.env` is actually
     // consulted.
-    let raw: RawSpec = yaml_serde::from_str("id: frpc\nname: ${UNDEFINED}\ncommand: [/bin/frpc]\n").unwrap();
+    let raw: RawSpec = RawSpec::parse("id: frpc\nname: ${UNDEFINED}\ncommand: [/bin/frpc]\n").unwrap();
     assert!(check_spec_grammar(&raw).is_ok());
 }
