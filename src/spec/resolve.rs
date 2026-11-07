@@ -54,9 +54,10 @@ use std::time::Duration;
 use super::backend::{BackendKind, Shaped, ShapedSpec};
 use super::interpolate;
 use super::overrides::Supplied;
+use super::raw::RawSpec;
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
-use super::{DaemonSpec, Id, Kind, RawSpec, Restart, Warning};
+use super::{DaemonSpec, Id, Kind, Restart, Warning};
 use crate::error::Error;
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
@@ -76,7 +77,7 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 /// `base_dir` and written back absolute. A valid manifest may still produce
 /// `Warning`s for properties that are accepted but cannot be faithfully
 /// honored by the native backend.
-pub fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
+fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
     resolve_as(raw, base_dir, BackendKind::native())
 }
 
@@ -424,7 +425,7 @@ fn missing_command_error(id: &Id, backend: Option<BackendKind>) -> Error {
 /// is the literal account called `root`. Applying it here rather than in `RawUser`'s visitor
 /// makes `user: ${U}` with `U=root` mean what a typed `user: root` means, without `{name: ${U}}`
 /// also collapsing to the superuser; a `User::Name` records no syntax of origin.
-pub(crate) fn resolve_user(raw: Option<RawUser>) -> User {
+pub(super) fn resolve_user(raw: Option<RawUser>) -> User {
     match raw {
         None => User::Root,
         Some(RawUser::Scalar(s)) if s == "root" => User::Root,
