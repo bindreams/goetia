@@ -739,7 +739,7 @@ impl Error {
         match self {
             Error::Undetermined { recovery, .. } => Some(recovery),
             Error::ServiceImageUnreadable { .. } => Some(
-                "An administrator must make that service's registry key readable or let SCM query it \
+                "An administrator must make each named service's registry key readable, or let SCM query it \
                  (`SERVICE_QUERY_CONFIG`)",
             ),
             Error::Kept(kept) => kept.remedy(),

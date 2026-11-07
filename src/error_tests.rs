@@ -198,7 +198,7 @@ fn an_unreadable_service_image_is_indeterminate_when_the_read_is_and_its_advice_
     assert_eq!(
         over(not_installed()).remedy(),
         Some(
-            "An administrator must make that service's registry key readable or let SCM query it \
+            "An administrator must make each named service's registry key readable, or let SCM query it \
              (`SERVICE_QUERY_CONFIG`)"
         )
     );
