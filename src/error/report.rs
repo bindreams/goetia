@@ -1,9 +1,8 @@
 //! Printing an [`Error`]: its chain of causes, then each remedy found along it.
 
-use std::fmt::{self, Write as _};
+use std::fmt;
 
 use super::Error;
-use super::escape::Escaping;
 
 /// What [`Error::report`] returns: the chain, formatted on `Display`.
 pub(super) struct Report<'a>(pub(super) &'a Error);
@@ -53,9 +52,7 @@ pub(super) fn write_chain<'a>(
     {
         remedies.push(remedy);
     }
-    // The one place an error's own text is written, so the one place it is escaped: `Report`,
-    // `Chain` and `Reason` all come through here.
-    write!(Escaping(out), "{e}")?;
+    write!(out, "{e}")?;
     if let Some(inner) = ours.and_then(Error::embedded) {
         write_chain(inner, &mut Discard, remedies)?;
     }

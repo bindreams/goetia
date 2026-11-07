@@ -1,16 +1,13 @@
 //! Crate-wide error type.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod escape;
 mod reason;
 mod report;
 mod within;
 
-#[cfg(feature = "cli")]
-pub(crate) use escape::escape;
 pub use reason::Reason;
 pub(crate) use report::Chain;
 pub(crate) use within::within;
@@ -195,7 +192,7 @@ pub enum Error {
 
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
-    #[error("{}:{line}: {message}", path.display())]
+    #[error("{path}:{line}: {message}", path = path.display())]
     EnvFile {
         path: PathBuf,
         line: usize,
@@ -652,8 +649,7 @@ impl Error {
     /// The error and its causes, joined as `context: cause: cause`, then each [`remedy`](Error::remedy)
     /// found along the chain, outermost first, as `. remedy`; a [`Both`](Error::Both) prints as
     /// `first; then: then`. What the CLI prints and `--json` carries: [`Display`](fmt::Display)
-    /// alone is the outermost context. Control and format characters in what an error quotes are
-    /// written as `\u{XXXX}`; `Display` writes them as they are.
+    /// alone is the outermost context.
     pub fn report(&self) -> impl fmt::Display + '_ {
         Report(self)
     }
@@ -834,12 +830,16 @@ fn unsupported_manager(client: &VersionReading, manager: &VersionReading) -> Str
 }
 
 fn path_suffix(path: &Option<PathBuf>) -> String {
-    path.as_deref().map(|p| format!(" {}", p.display())).unwrap_or_default()
+    path.as_deref()
+        .map(Path::display)
+        .map(|p| format!(" {p}"))
+        .unwrap_or_default()
 }
 
 fn read_at(path: &Option<PathBuf>) -> String {
     path.as_deref()
-        .map(|p| format!(" at {}", p.display()))
+        .map(Path::display)
+        .map(|p| format!(" at {p}"))
         .unwrap_or_default()
 }
 

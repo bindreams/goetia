@@ -71,9 +71,6 @@ serde_json = "1"
 similar = "3"
 tempfile = "3"
 thiserror = "2"
-# `escape`: which characters a message must not carry raw. `char::is_control` is category Cc; the
-# standard library has no test for Cf (format characters, the bidi overrides among them).
-unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 yaml_serde = "0.10.7"
 
 [target.'cfg(unix)'.dependencies]

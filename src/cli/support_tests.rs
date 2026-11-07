@@ -24,17 +24,3 @@ fn a_manifest_level_warning_is_printed_with_no_id() {
     // of this arm is the absence of a prefix.
     assert_eq!(rendered(None), "warning: a message\n");
 }
-
-#[skuld::test]
-fn a_warning_is_printed_with_control_and_format_characters_escaped() {
-    let warnings = [Warning {
-        id: None,
-        message: "manifest directory `-f a\nb\u{202e}`".to_string(),
-    }];
-    let mut out: Vec<u8> = Vec::new();
-    print_warnings(&warnings, &mut out);
-    assert_eq!(
-        String::from_utf8(out).unwrap(),
-        concat!(r"warning: manifest directory `-f a\u{a}b\u{202e}`", "\n")
-    );
-}

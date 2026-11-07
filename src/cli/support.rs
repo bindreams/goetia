@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::ExitCode;
-use crate::error::{Error, Result, escape};
+use crate::error::{Error, Result};
 use crate::manager::{Installed, ServiceManager, State};
 use crate::spec::{DaemonSpec, Id, Warning};
 
@@ -25,8 +25,8 @@ pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<DaemonSp
 pub(crate) fn print_warnings(warnings: &[Warning], err: &mut dyn Write) {
     for warning in warnings {
         let _ = match &warning.id {
-            Some(id) => writeln!(err, "warning: {id}: {}", escape(&warning.message)),
-            None => writeln!(err, "warning: {}", escape(&warning.message)),
+            Some(id) => writeln!(err, "warning: {id}: {}", warning.message),
+            None => writeln!(err, "warning: {}", warning.message),
         };
     }
 }

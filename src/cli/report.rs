@@ -29,7 +29,7 @@ use std::io::Write;
 
 use super::ExitCode;
 use super::support::{InstalledIndex, state_str};
-use crate::error::{Error, escape};
+use crate::error::Error;
 use crate::manager::Status;
 
 // Wire format =========================================================================================================
@@ -259,7 +259,7 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
 /// carry the id already.
 pub(crate) fn invalid_id(id: &str, e: &Error) -> ErrorReport {
     let message = match e {
-        Error::Invalid { message, .. } => escape(message),
+        Error::Invalid { message, .. } => message.clone(),
         other => other.report().to_string(),
     };
     ErrorReport {
