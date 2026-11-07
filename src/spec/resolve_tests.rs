@@ -282,20 +282,23 @@ fn a_resolved_path_the_field_rules_would_refuse_is_attributed_to_the_resolution(
     // A drive-relative `cwd: C:` resolves through the per-drive directory to a value the authored
     // rules never saw; the message must say so rather than blame the text the user wrote.
     let id = Id::try_from("frpc").unwrap();
-    let err = Error::from(check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\u{FFFE}"), false).unwrap_err());
+    let err =
+        Error::from(check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\u{FFFE}"), DirJoin::Not).unwrap_err());
     let msg = err.to_string();
     assert!(
         msg.contains("field `cwd` is `C:`, which resolves to `/a\u{FFFE}`, which contains U+FFFE"),
         "{msg}"
     );
-    check_resolved(&id, PathField::Cwd, "C:", Path::new("/ordinary"), false).expect("an ordinary value passes");
+    check_resolved(&id, PathField::Cwd, "C:", Path::new("/ordinary"), DirJoin::Not).expect("an ordinary value passes");
 }
 
 #[skuld::test]
 fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
     let id = Id::try_from("frpc").unwrap();
-    let msg = Error::from(check_resolved(&id, PathField::Cwd, "bin", Path::new("/a\u{FFFE}/bin"), true).unwrap_err())
-        .to_string();
+    let msg = Error::from(
+        check_resolved(&id, PathField::Cwd, "bin", Path::new("/a\u{FFFE}/bin"), DirJoin::Whole).unwrap_err(),
+    )
+    .to_string();
     assert!(
         msg.contains("field `cwd` is `bin`, which resolves under the manifest directory to `/a\u{FFFE}/bin`, which contains U+FFFE"),
         "{msg}"
@@ -306,11 +309,12 @@ fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
 fn a_directory_defect_is_not_attributed_to_env_when_env_supplied_the_field() {
     let id = Id::try_from("frpc").unwrap();
     let from_env = BTreeSet::from([Field::Cwd]);
-    let directory = check_resolved(&id, PathField::Cwd, "bin", Path::new("/a\u{FFFE}/bin"), true).unwrap_err();
+    let directory =
+        check_resolved(&id, PathField::Cwd, "bin", Path::new("/a\u{FFFE}/bin"), DirJoin::Whole).unwrap_err();
     let msg = directory.attributed(&from_env).to_string();
     assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
 
-    let value = check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\u{FFFE}"), false).unwrap_err();
+    let value = check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\u{FFFE}"), DirJoin::Not).unwrap_err();
     let msg = value.attributed(&from_env).to_string();
     assert!(msg.contains("after substituting from .env: "), "{msg}");
 }
@@ -321,7 +325,7 @@ fn a_directory_defect_is_not_attributed_to_env_when_env_supplied_the_field() {
 fn a_resolved_drive_relative_defect_names_the_resolution_and_blames_env_only_when_env_wrote_it() {
     let id = Id::try_from("frpc").unwrap();
     let resolved = Path::new("/a\u{7}");
-    let refused = || check_resolved(&id, PathField::Cwd, "Q:", resolved, false).unwrap_err();
+    let refused = || check_resolved(&id, PathField::Cwd, "Q:", resolved, DirJoin::Not).unwrap_err();
 
     let typed = refused().attributed(&BTreeSet::new()).to_string();
     assert!(
@@ -586,6 +590,35 @@ fn a_root_relative_path_uses_only_the_directorys_drive() {
     let yaml = "id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: '\\data'\n";
     let (spec, _) = resolve(parse_manifest(yaml), &dir).expect("the directory does not appear in the result");
     assert_eq!(spec.cwd, Some(PathBuf::from(r"C:\data")));
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_root_relative_path_carries_a_defect_of_the_directorys_share_to_the_directory() {
+    // The share `sh<U+FFFE>re` is what the root-relative `\data` keeps; no `.env` text is its cause.
+    let dir = PathBuf::from("\\\\server\\sh\u{FFFE}re\\app");
+    let yaml = "id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: ${D:-\\data}\n";
+    let msg = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Scm))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("the manifest directory's drive or share"), "{msg}");
+    assert!(msg.contains("U+FFFE"), "{msg}");
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+}
+
+#[skuld::test]
+fn a_manifest_directory_is_joined_whole_to_a_relative_path_only() {
+    assert_eq!(dir_join(Path::new("bin/x")), DirJoin::Whole);
+    assert_eq!(dir_join(Path::new("./bin")), DirJoin::Whole);
+    assert_eq!(dir_join(Path::new("")), DirJoin::Whole);
+    assert_eq!(dir_join(&abs("bin")), DirJoin::Not);
+    #[cfg(windows)]
+    {
+        assert_eq!(dir_join(Path::new(r"\data")), DirJoin::PrefixOnly);
+        assert_eq!(dir_join(Path::new("/bin/x")), DirJoin::PrefixOnly);
+        assert_eq!(dir_join(Path::new("C:bin")), DirJoin::Not);
+        assert_eq!(dir_join(Path::new(r"\\s\h\x")), DirJoin::Not);
+    }
 }
 
 #[cfg(windows)]
@@ -2841,18 +2874,6 @@ fn only_the_defect_the_field_did_not_write_is_dash_fs() {
         "{msg}"
     );
     assert_no_run_of_spaces(&msg);
-}
-
-/// `/bin/frpc` is absolute on Unix. On Windows it has a root and no prefix, so it joins to the
-/// manifest directory's drive only; its backslashes are the host's separators, not `-f`'s.
-#[cfg(windows)]
-#[skuld::test]
-fn a_root_relative_path_is_not_under_the_manifest_directory() {
-    let yaml = systemd_manifest("command: ['/bin/frpc']");
-    let msg = resolve_as(parse_manifest(&yaml), &abs("base"), Some(BackendKind::Systemd))
-        .unwrap_err()
-        .to_string();
-    assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
 }
 
 #[skuld::test]

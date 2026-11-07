@@ -586,7 +586,7 @@ fn resolve_path_string(
         return Ok(raw.to_string());
     }
     let p = Path::new(raw);
-    let under_manifest_dir = is_under_manifest_dir(p);
+    let join = dir_join(p);
     let joined = if p.is_absolute() {
         p.to_path_buf()
     } else {
@@ -627,7 +627,7 @@ fn resolve_path_string(
         resolved
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
-    check_resolved(id, field, raw, &joined, under_manifest_dir)?;
+    check_resolved(id, field, raw, &joined, join)?;
     let joined = joined
         .into_os_string()
         .into_string()
@@ -638,33 +638,54 @@ fn resolve_path_string(
     Ok(joined)
 }
 
-/// Whether `p` is joined to the manifest directory. A path with its own prefix (`C:bin`) replaces
-/// `base_dir` in the join, and a root-relative one (`/bin`, `\bin` on Windows) keeps only the
-/// drive of `base_dir`, so neither is under it.
-pub(super) fn is_under_manifest_dir(p: &Path) -> bool {
-    !p.has_root() && !matches!(p.components().next(), Some(std::path::Component::Prefix(_)))
+/// How much of the manifest directory `base_dir` a join with a written path keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DirJoin {
+    /// A relative path (`bin`, `./bin`): the whole directory is in the result.
+    Whole,
+    /// A root-relative path (`\data`, `/bin` on Windows, which has a root and no prefix): only the
+    /// directory's prefix (its drive or UNC share) is in the result.
+    PrefixOnly,
+    /// A path with its own prefix (`C:bin`, `C:\bin`), or an absolute one: nothing of the
+    /// directory is in the result.
+    Not,
+}
+
+/// How a join of `p` with the manifest directory keeps the directory.
+pub(super) fn dir_join(p: &Path) -> DirJoin {
+    use std::path::Component;
+    match p.components().next() {
+        Some(Component::Prefix(_)) => DirJoin::Not,
+        _ if p.is_absolute() => DirJoin::Not,
+        Some(Component::RootDir) => DirJoin::PrefixOnly,
+        _ => DirJoin::Whole,
+    }
 }
 
 /// The field rules for a resolved path, which is what an artifact would carry. `raw` has passed
-/// them already, so the defect is one the user did not write: it came from the manifest directory
-/// (`under_manifest_dir`) or, for a drive-relative path, from the per-drive current directory. The
-/// message says the field *resolved* to the bad value and names its source. The directory's defect
-/// is no field's: it carries none.
-fn check_resolved(
-    id: &Id,
-    field: PathField,
-    raw: &str,
-    resolved: &Path,
-    under_manifest_dir: bool,
-) -> Result<(), Refused> {
+/// them already, so the defect is one the user did not write. It is the manifest directory's
+/// (`-f`) when `join` is [`DirJoin::Whole`], and when it is [`DirJoin::PrefixOnly`] and the defect
+/// is in the prefix (a control character, noncharacter or non-UTF-8 in the drive or share);
+/// otherwise it is the field's, which for a drive-relative path is the per-drive current
+/// directory's. The message says the field *resolved* to the bad value and names the source. The
+/// directory's defect is no field's: it carries none.
+fn check_resolved(id: &Id, field: PathField, raw: &str, resolved: &Path, join: DirJoin) -> Result<(), Refused> {
+    use std::path::Component;
     let name = field.name();
     let Some(defect) = path_defect(resolved) else {
         return Ok(());
     };
-    let resolves = if under_manifest_dir {
-        "resolves under the manifest directory to"
-    } else {
-        "resolves to"
+    let prefix_defective = match resolved.components().next() {
+        Some(Component::Prefix(prefix)) => path_defect(Path::new(prefix.as_os_str())).is_some(),
+        _ => false,
+    };
+    let (resolves, from_directory) = match join {
+        DirJoin::Whole => ("resolves under the manifest directory to", true),
+        DirJoin::PrefixOnly if prefix_defective => (
+            "resolves, keeping only the manifest directory's drive or share, to",
+            true,
+        ),
+        _ => ("resolves to", false),
     };
     let err = invalid(
         id,
@@ -673,7 +694,7 @@ fn check_resolved(
             resolved.display()
         ),
     );
-    Err(if under_manifest_dir {
+    Err(if from_directory {
         Refused::of_manifest_dir(err)
     } else {
         Refused::at(field.field(), err)
