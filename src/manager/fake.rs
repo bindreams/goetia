@@ -125,6 +125,7 @@ struct Store {
     prepare_fails: Option<Step>,
     no_manager: bool,
     unresolvable: BTreeSet<String>,
+    unfit_for_install: BTreeSet<String>,
     installed_fails: BTreeMap<String, Failure>,
     live_status_fails: BTreeMap<String, Failure>,
     write_races: BTreeMap<String, usize>,
@@ -427,6 +428,13 @@ impl Fake {
         state.unresolvable.insert(user.to_string());
     }
 
+    /// Test-only seeding: `render_for_install` fails for a spec whose `user` is `User::Name(user)`,
+    /// where `render` succeeds, as a backend's does for a host that cannot carry the definition.
+    pub fn seed_unfit_for_install(&self, user: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.unfit_for_install.insert(user.to_string());
+    }
+
     /// Test-only seeding: reading back what is installed at `id` fails with what `error` makes, as a
     /// backend's does for a drop-in directory it cannot list.
     pub fn seed_installed_fails(&self, id: &str, error: impl Fn() -> Error + Send + Sync + 'static) {
@@ -658,6 +666,21 @@ impl crate::backend::Backend for Fake {
             }
         }
         Ok(generate(spec))
+    }
+
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<String> {
+        let definition = self.render(spec)?;
+        if let User::Name(user) = &spec.user {
+            let state = self.state.lock().expect("Fake mutex poisoned");
+            if state.unfit_for_install.contains(user) {
+                return Err(Error::Invalid {
+                    daemon: spec.id.to_string(),
+                    message: "unfit for install (seeded)".to_string(),
+                    source: None,
+                });
+            }
+        }
+        Ok(definition)
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Artifact>> {
