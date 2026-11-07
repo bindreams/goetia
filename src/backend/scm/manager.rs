@@ -283,8 +283,11 @@ impl Backend for Scm {
     type InstallScope = Option<InstallLock>;
     type Reservation = ();
 
-    /// For `type: simple`, the lock is taken and the files nothing references are swept, and then
-    /// the host is provided and checked before anything is read: `provide` must return what
+    /// For `type: simple`, what the install would register is rendered first, so that every refusal
+    /// `render_for_install` can make (the previewed host's path, an account, `restart: always`)
+    /// comes before the lock is taken or the provider writes. The lock is then taken and the files
+    /// nothing references are swept, and then the host is provided and checked before anything is
+    /// read: `provide` must return what
     /// `preview` names (which is what `render` registers), an absolute path whose folder passes the
     /// folder check, to a file carrying this library's marker. A sweep that cannot read what is
     /// referenced or cannot delete a file does not fail the install: the file is not what the
@@ -295,6 +298,9 @@ impl Backend for Scm {
             return Ok(None);
         }
         let shim = self.provider()?;
+        // The flow renders again for the definition it writes; `provide` returns the previewed host,
+        // which is checked below, so what is refused here is what that render would refuse.
+        self.render_for_install(spec)?;
         let lock = InstallLock::acquire()?;
         if let Ok(referenced) = referenced_hosts() {
             let _ = shim.sweep(&referenced);

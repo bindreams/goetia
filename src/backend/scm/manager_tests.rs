@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use super::*;
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, FolderCheck, HostCommand, ShimProvider, SweepFailure};
-use crate::spec::DaemonFields;
 use crate::spec::Restart;
+use crate::spec::{AccountId, DaemonFields, User};
 use crate::spec::test_support::{plain_fields, program};
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
@@ -573,12 +573,15 @@ fn install_and_preview_install_refuse_restart_always() {
 
 // The shim provider ---------------------------------------------------------------------------------------------------
 
-fn simple_daemon() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
+fn simple_fields() -> DaemonFields {
+    DaemonFields {
         kind: Kind::Simple,
         ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
-    })
-    .unwrap()
+    }
+}
+
+fn simple_daemon() -> DaemonSpec {
+    DaemonSpec::new(simple_fields()).unwrap()
 }
 
 /// A provider that records the calls it gets and answers with the commands it was given.
@@ -678,6 +681,54 @@ fn managed_begin_install_takes_no_lock_and_calls_no_provider() {
 
     assert!(scope.is_none(), "a managed install holds no lock");
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());
+}
+
+/// Every refusal `render_for_install` makes comes before the lock is taken and before the provider
+/// writes: a refused install leaves no file behind.
+#[skuld::test]
+fn a_refused_simple_install_never_reaches_the_provider() {
+    let refused = [
+        (
+            "restart: always",
+            DaemonFields {
+                restart: Restart::Always,
+                ..simple_fields()
+            },
+            command(r"C:\app\app.exe"),
+        ),
+        (
+            "an account that does not resolve",
+            DaemonFields {
+                user: User::Id(AccountId::Uid(1000)),
+                ..simple_fields()
+            },
+            command(r"C:\app\app.exe"),
+        ),
+        (
+            "a host path the registration writer would mangle",
+            simple_fields(),
+            command(r"C:\Program Files\Goetia\"),
+        ),
+    ];
+    for (what, fields, host) in refused {
+        let (provider, calls) = Recording::new(host.clone(), host);
+        let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+        let err = mgr
+            .begin_install(&DaemonSpec::new(fields).unwrap())
+            .map(|_| ())
+            .expect_err(what);
+
+        assert!(
+            matches!(err, Error::Invalid { .. } | Error::AccountLookup { .. }),
+            "{what}: {err:?}"
+        );
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"provide") && !calls.contains(&"sweep"),
+            "{what}: a refused install wrote through the provider: {calls:?}"
+        );
+    }
 }
 
 /// A snapshot that has never opened a service, with `config` already queried: any further SCM
