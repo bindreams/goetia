@@ -296,11 +296,10 @@ pub fn account_needs_password(account: Option<&str>) -> bool {
 /// Recover the embedded metadata blob from a service's `Parameters` values.
 ///
 /// Returns `Ok(None)` only when `Marker` is absent — an ordinary foreign
-/// service, not one Goetia manages. Once `Marker` is present, every other
-/// defect (a value that doesn't match, a missing field, a `Schema`/`Version`
-/// that disagrees with what `Spec` itself decodes to, an undecodable `Spec`)
-/// is `Err`: a `Parameters` key set that merely *claims* to be ours must
-/// check out completely, not be partially trusted.
+/// service, not one Goetia manages. Once `Marker` is present, `Marker` and
+/// `Spec` must check out completely: a wrong `Marker`, a missing `Spec` or an
+/// undecodable one is `Err`, not partially trusted. `Schema` and `Version` are
+/// plain-text copies for a human reading the registry and are not read.
 ///
 /// Field lookups are case-insensitive — `Services\<name>\Parameters` value
 /// names are, to `RegQueryValueEx`, so a case-sensitive lookup here would
@@ -317,40 +316,8 @@ pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Er
         )));
     }
 
-    let schema_text = get_field(parameters, FIELD_SCHEMA)?.ok_or_else(|| missing_field_error(FIELD_SCHEMA))?;
-    let schema: u32 = schema_text.parse().map_err(|source| {
-        Error::blob_from(
-            format!("Parameters\\{FIELD_SCHEMA} `{schema_text}` is not an integer"),
-            source,
-        )
-    })?;
-
-    let version_text = get_field(parameters, FIELD_VERSION)?.ok_or_else(|| missing_field_error(FIELD_VERSION))?;
-
     let spec_text = get_field(parameters, FIELD_SPEC)?.ok_or_else(|| missing_field_error(FIELD_SPEC))?;
-    let blob = blob::decode(spec_text)?;
-
-    // `Schema`/`Version` are written redundantly with what `Spec` already
-    // carries, purely so a reader doesn't have to base64-decode and parse
-    // JSON to know them — but "redundant" must still mean "consistent".
-    // Accepting a `Parameters` set whose flat `Schema`/`Version` disagree
-    // with the blob sitting beside them would be exactly the "partially
-    // trusted" outcome this function's contract above already rules out.
-    if schema != blob.schema {
-        return Err(Error::blob(format!(
-            "Parameters\\{FIELD_SCHEMA} is `{schema}`, but Parameters\\{FIELD_SPEC} decodes to schema `{actual}`",
-            actual = blob.schema
-        )));
-    }
-    if version_text != blob.version {
-        return Err(Error::blob(format!(
-            "Parameters\\{FIELD_VERSION} is `{version_text}`, but Parameters\\{FIELD_SPEC} decodes to version \
-             `{actual}`",
-            actual = blob.version
-        )));
-    }
-
-    Ok(Some(blob))
+    Ok(Some(blob::decode(spec_text)?))
 }
 
 /// Goetia's spelling of the field `name` spells in any ASCII case, or `None` for any other name.

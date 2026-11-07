@@ -208,8 +208,10 @@ fn subkey_entry(name: &str) -> (String, String) {
 
 /// Write `params` as the *entire* contents of `Services\<name>\Parameters`, in place: every value
 /// is set, then every value that matches no name in `params` and every subkey is deleted. The key
-/// itself is never deleted, so a concurrent reader sees the old values or the new ones and never a
-/// missing key. Fails if the service key is gone, rather than creating it.
+/// itself is never deleted, so a concurrent reader never sees a missing key. Each value is set in
+/// one call, so a reader sees the old or the new value of each, not of the set of four. `Spec` is
+/// the only value read for meaning (`Schema` and `Version` are copies for a human), so a reader
+/// sees the old spec or the new one. Fails if the service key is gone, rather than creating it.
 ///
 /// goetia owns `Parameters` whole. A stray value or subkey added by hand must still be
 /// overwritable by `install --force`: left behind, it would keep `on_disk` (via [`read_parameters`],

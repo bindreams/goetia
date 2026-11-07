@@ -1010,33 +1010,22 @@ fn extract_errors_on_marker_value_mismatch() {
     assert!(err.to_string().contains(FIELD_MARKER));
 }
 
+/// `Schema` and `Version` are copies for a person reading the registry; `Spec` is the only value
+/// read for meaning, so any state of the copies leaves the decoded blob unchanged.
 #[skuld::test]
-fn extract_errors_on_missing_schema_field() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
-    parameters.remove(FIELD_SCHEMA);
-
-    let err = extract(&parameters).expect_err("Marker present without Schema must not silently decode");
-    assert!(err.to_string().contains(FIELD_SCHEMA));
-}
-
-#[skuld::test]
-fn extract_errors_on_non_numeric_schema_field() {
+fn extract_does_not_read_schema_or_version() {
     let reg = build(&managed_spec());
     let mut parameters = reg.parameters;
     parameters.insert(FIELD_SCHEMA.to_string(), "not-a-number".to_string());
+    parameters.insert(FIELD_VERSION.to_string(), "0.0.0-not-the-real-version".to_string());
+    let with_wrong_copies = extract(&parameters).expect("wrong copies").expect("still ours");
 
-    extract(&parameters).expect_err("a non-numeric Schema must be rejected, not silently mis-decoded");
-}
-
-#[skuld::test]
-fn extract_errors_on_missing_version_field() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
+    parameters.remove(FIELD_SCHEMA);
     parameters.remove(FIELD_VERSION);
+    let without_copies = extract(&parameters).expect("no copies").expect("still ours");
 
-    let err = extract(&parameters).expect_err("Marker present without Version must not silently decode");
-    assert!(err.to_string().contains(FIELD_VERSION));
+    assert_eq!(with_wrong_copies.spec, managed_spec());
+    assert_eq!(without_copies.spec, managed_spec());
 }
 
 #[skuld::test]
@@ -1047,30 +1036,6 @@ fn extract_errors_on_missing_spec_field() {
 
     let err = extract(&parameters).expect_err("Marker present without Spec must not silently decode");
     assert!(err.to_string().contains(FIELD_SPEC));
-}
-
-#[skuld::test]
-fn extract_errors_on_schema_mismatch_with_decoded_blob() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
-    // A syntactically valid integer that disagrees with what `Spec` itself
-    // decodes to — `extract_errors_on_non_numeric_schema_field` only
-    // covers the "not even a number" shape, which is a weaker check than
-    // the doc comment's "must check out completely" promise.
-    parameters.insert(FIELD_SCHEMA.to_string(), "999".to_string());
-
-    let err = extract(&parameters).expect_err("a Schema that disagrees with the decoded blob must be rejected");
-    assert!(err.to_string().contains(FIELD_SCHEMA));
-}
-
-#[skuld::test]
-fn extract_errors_on_version_mismatch_with_decoded_blob() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
-    parameters.insert(FIELD_VERSION.to_string(), "0.0.0-not-the-real-version".to_string());
-
-    let err = extract(&parameters).expect_err("a Version that disagrees with the decoded blob must be rejected");
-    assert!(err.to_string().contains(FIELD_VERSION));
 }
 
 #[skuld::test]
