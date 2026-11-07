@@ -15,6 +15,7 @@ mod field;
 mod interpolate;
 mod no_null;
 mod overrides;
+mod parent_dirs;
 mod raw;
 mod resolve;
 mod user;

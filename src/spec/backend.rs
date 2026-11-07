@@ -31,8 +31,9 @@
 //! install does with the value it reads. A base value the native backend cannot
 //! honour is its generator's to refuse at install (`restart: always` on `scm`).
 //!
-//! [`BackendKind::refuse`] runs for the native backend too, on the same spec, for a value its generator would
-//! refuse at install anyway (systemd's `env` names and paths), so the refusal comes at resolve.
+//! [`BackendKind::conform`] and [`BackendKind::refuse`] run for the native backend too, on the same spec, for a
+//! value its generator would refuse at install anyway (systemd's `env` names, program path and `..`), so the refusal
+//! comes at resolve. `conform` first spells what it can (systemd's `..`, where that is exact), `refuse` judges the rest.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -43,6 +44,8 @@ use serde::Deserialize;
 use super::field::Field;
 use super::interpolate::Substitution;
 use super::overrides::Supplied;
+use super::parent_dirs;
+use super::raw::RawSpec;
 use super::resolve::{Refused, invalid};
 use super::vars::is_valid_name;
 use super::{AccountId, Id, Kind, Restart, User, Warning};
@@ -174,34 +177,34 @@ impl BackendKind {
         }
     }
 
+    /// Spell the paths of `spec` the way this backend's native install needs, where that names the same
+    /// directory, and refuse where it cannot. Called for the native backend only, on the substituted merged
+    /// spec, with the manifest directory `spec`'s paths were joined to and `authored`, the text they came from.
+    /// systemd will not load a `..` in a working directory or log path; [`parent_dirs::collapse`] removes each
+    /// one the kernel would resolve the same way and refuses the rest. launchd and SCM carry a `..` as written.
+    pub(super) fn conform(self, spec: &mut ShapedSpec, authored: &RawSpec, manifest_dir: &Path) -> Result<(), Refused> {
+        match self {
+            BackendKind::Systemd => parent_dirs::collapse(spec, authored, manifest_dir),
+            BackendKind::Launchd | BackendKind::Scm => Ok(()),
+        }
+    }
+
     /// What this backend's native install cannot carry, judged on the substituted merged spec, base
     /// values included: the install would refuse it anyway, so the refusal comes before it, at
     /// resolve. Called for the native backend only. systemd drops an `env` key outside
-    /// `[A-Za-z_][A-Za-z0-9_]*` with only a log line, will not load a program path ending in `/` or
-    /// a working-directory or log path with a `..` component, and its generator refuses each too
-    /// ([`systemd_env_key_defect`], [`systemd_command_defect`], [`systemd_path_defect`]).
-    pub(super) fn refuse(self, spec: &ShapedSpec) -> Result<(), Refused> {
+    /// `[A-Za-z_][A-Za-z0-9_]*` with only a log line, and will not load a program path ending in `/`; its
+    /// generator refuses each too ([`systemd_env_key_defect`], [`systemd_command_defect`]). The program path
+    /// is judged as `authored` wrote it: resolving a relative one drops the trailing `/`, which launchd and
+    /// SCM then run as the program the user named.
+    pub(super) fn refuse(self, spec: &ShapedSpec, authored: &RawSpec) -> Result<(), Refused> {
         match self {
             BackendKind::Systemd => {
-                let id = &spec.id;
-                if let Some(defect) = spec
-                    .command
-                    .as_deref()
-                    .and_then(|c| c.first())
-                    .and_then(|c| systemd_command_defect(c))
-                {
-                    return Err(Refused::at(Field::Command(0), invalid(id, &defect)));
-                }
-                for (field, name, path) in [(Field::Cwd, "cwd", &spec.cwd), (Field::Logs, "logs", &spec.logs)] {
-                    let defect = path
-                        .as_deref()
-                        .and_then(|p| systemd_path_defect(&format!("field `{name}`"), p));
-                    if let Some(defect) = defect {
-                        return Err(Refused::at(field, invalid(id, &defect)));
-                    }
+                let program = authored.command.as_deref().and_then(|command| command.first());
+                if let Some(defect) = program.and_then(|program| systemd_command_defect(program)) {
+                    return Err(Refused::at(Field::Command(0), invalid(&spec.id, &defect)));
                 }
                 match systemd_env_key_defect(&spec.env) {
-                    Some((key, defect)) => Err(Refused::at(Field::EnvKey(key.into()), invalid(id, &defect))),
+                    Some((key, defect)) => Err(Refused::at(Field::EnvKey(key.into()), invalid(&spec.id, &defect))),
                     None => Ok(()),
                 }
             }
@@ -212,7 +215,7 @@ impl BackendKind {
     /// Values that are wrong for this backend by construction, on any
     /// host. Reads **only** the fields `supplied` marks. See `Supplied`.
     /// While `substitution` is pending, a value a substitution may change is not judged.
-    pub(super) fn error(self, spec: &ShapedSpec, supplied: Supplied, substitution: Substitution) -> Result<(), Error> {
+    pub(super) fn error(self, spec: &ShapedSpec, supplied: &Supplied, substitution: Substitution) -> Result<(), Error> {
         if !supplied.user {
             return Ok(());
         }
@@ -270,17 +273,16 @@ pub(crate) fn systemd_command_defect(executable: &str) -> Option<String> {
     })
 }
 
-/// Why systemd will not load `path`, as the value `what` names (a directive, or a manifest field)
-/// of a working directory or a log file, or `None`: a `..` component fails the unit to load ("path
-/// is not normalized"), or on 255 drops the log. `.` components, `//` and a trailing `/` load and
-/// resolve. A `..` cannot be collapsed lexically without changing which directory a symlink leads
-/// to, so goetia refuses what systemd refuses.
+/// Why systemd will not load `path`, as the value `what` names (a directive) of a working directory
+/// or a log file, or `None`: a `..` component fails the unit to load ("path is not normalized"), or
+/// on 255 drops the log. `.` components, `//` and a trailing `/` load and resolve. Resolving a
+/// manifest removes each `..` it can ([`BackendKind::conform`]), so one that reaches a generator is
+/// from a spec built another way.
 pub(crate) fn systemd_path_defect(what: &str, path: &Path) -> Option<String> {
     path.components().any(|c| c == Component::ParentDir).then(|| {
         format!(
             "{what} is {path:?}, which has a `..` component that systemd refuses to load (it requires a \
-            normalized path); goetia cannot collapse it lexically without changing which directory a \
-            symlink leads to"
+            normalized path); write the path without `..`"
         )
     })
 }

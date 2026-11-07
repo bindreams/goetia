@@ -17,8 +17,6 @@
 //! run of them gets a trailing space (see [`raw_value`]). The values no encoding can carry are
 //! refused by [`unit`]: see [`refuse_unrepresentable`].
 
-use std::path::Path;
-
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
@@ -150,17 +148,25 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
 
     let cwd = spec.cwd.as_ref().map(|p| p.display().to_string());
     let logs = spec.logs.as_ref().map(|p| p.display().to_string());
-    let raw_values = [
-        ("Description=", false, Some(spec.name.as_str())),
-        ("User=", false, Some(id.user.as_str())),
-        ("WorkingDirectory=", true, cwd.as_deref()),
-        ("StandardOutput=/StandardError= append:", true, logs.as_deref()),
+    let paths = [
+        ("WorkingDirectory=", spec.cwd.as_deref()),
+        ("StandardOutput=/StandardError= append:", spec.logs.as_deref()),
     ];
-    for (directive, is_path, value) in raw_values {
-        let Some(value) = value else { continue };
-        if is_path && let Some(defect) = systemd_path_defect(&format!("{directive} path"), Path::new(value)) {
+    for (directive, path) in paths {
+        if let Some(path) = path
+            && let Some(defect) = systemd_path_defect(&format!("{directive} path"), path)
+        {
             return Err(invalid(defect));
         }
+    }
+    let raw_values = [
+        ("Description=", Some(spec.name.as_str())),
+        ("User=", Some(id.user.as_str())),
+        ("WorkingDirectory=", cwd.as_deref()),
+        ("StandardOutput=/StandardError= append:", logs.as_deref()),
+    ];
+    for (directive, value) in raw_values {
+        let Some(value) = value else { continue };
         if value.starts_with(STRIPPED_BY_SYSTEMD) || value.ends_with(STRIPPED_BY_SYSTEMD) {
             return Err(invalid(format!(
                 "{directive} value {value:?} starts or ends with whitespace, which systemd strips from \

@@ -5,6 +5,7 @@ use crate::error::Error;
 use crate::spec::field::Field;
 use crate::spec::interpolate::Substitution;
 use crate::spec::overrides::Supplied;
+use crate::spec::raw::RawSpec;
 use crate::spec::test_support::abs;
 use crate::spec::{AccountId, Id, Kind, Restart, User};
 
@@ -295,12 +296,15 @@ fn a_spelling_that_is_not_in_the_table_is_an_ordinary_account() {
 #[skuld::test]
 fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
     let mut spec = shaped_spec();
-    let supplied = Supplied { user: true };
+    let supplied = Supplied {
+        user: true,
+        ..Supplied::NONE
+    };
 
     spec.user = User::Name("${ACCT}".to_string());
     assert!(
         BackendKind::Systemd
-            .error(&spec, supplied, Substitution::Pending)
+            .error(&spec, &supplied, Substitution::Pending)
             .is_ok(),
         "a `$`-bearing name cannot be classified from this host and must not be guessed at"
     );
@@ -308,14 +312,14 @@ fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
     spec.user = User::Name("LocalService".to_string());
     assert!(
         BackendKind::Systemd
-            .error(&spec, supplied, Substitution::Pending)
+            .error(&spec, &supplied, Substitution::Pending)
             .is_err(),
         "the rule still fires for a value that needs no resolution"
     );
 
     assert!(
         BackendKind::Systemd
-            .error(&spec, Supplied::NONE, Substitution::Pending)
+            .error(&spec, &Supplied::NONE, Substitution::Pending)
             .is_ok(),
         "`Supplied::NONE` means this value came from the base spec, not the override, and must not be rejected"
     );
@@ -325,11 +329,14 @@ fn a_templated_user_name_is_not_checked_against_the_builtin_table() {
 fn a_numeric_uid_is_rejected_under_scm() {
     let mut spec = shaped_spec();
     spec.user = User::Id(AccountId::Uid(1000));
-    let supplied = Supplied { user: true };
-    assert!(BackendKind::Scm.error(&spec, supplied, Substitution::Pending).is_err());
+    let supplied = Supplied {
+        user: true,
+        ..Supplied::NONE
+    };
+    assert!(BackendKind::Scm.error(&spec, &supplied, Substitution::Pending).is_err());
     assert!(
         BackendKind::Scm
-            .error(&spec, Supplied::NONE, Substitution::Pending)
+            .error(&spec, &Supplied::NONE, Substitution::Pending)
             .is_ok()
     );
 }
@@ -338,19 +345,22 @@ fn a_numeric_uid_is_rejected_under_scm() {
 fn a_sid_is_rejected_under_a_posix_backend() {
     let mut spec = shaped_spec();
     spec.user = User::Id(AccountId::Sid("S-1-5-19".to_string()));
-    let supplied = Supplied { user: true };
+    let supplied = Supplied {
+        user: true,
+        ..Supplied::NONE
+    };
     assert!(
         BackendKind::Systemd
-            .error(&spec, supplied, Substitution::Pending)
+            .error(&spec, &supplied, Substitution::Pending)
             .is_err()
     );
     assert!(
         BackendKind::Launchd
-            .error(&spec, supplied, Substitution::Pending)
+            .error(&spec, &supplied, Substitution::Pending)
             .is_err()
     );
     assert!(
-        BackendKind::Scm.error(&spec, supplied, Substitution::Pending).is_ok(),
+        BackendKind::Scm.error(&spec, &supplied, Substitution::Pending).is_ok(),
         "a SID is a Windows account"
     );
 }
@@ -369,14 +379,17 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
         let spec = shaped_with_env_key(key);
         let refused = BackendKind::Systemd
-            .refuse(&spec)
+            .refuse(&spec, &authored("bin/frpc"))
             .expect_err(&format!("{key:?} must be refused"));
         assert_eq!(refused.field, Some(Field::EnvKey(key.into())));
         let message = Error::from(refused).to_string();
         assert!(message.contains(&format!("{key:?}")), "{message}");
         assert!(message.contains("Environment="), "{message}");
-        assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{key:?}");
-        assert!(BackendKind::Scm.refuse(&spec).is_ok(), "{key:?}");
+        assert!(
+            BackendKind::Launchd.refuse(&spec, &authored("bin/frpc")).is_ok(),
+            "{key:?}"
+        );
+        assert!(BackendKind::Scm.refuse(&spec, &authored("bin/frpc")).is_ok(), "{key:?}");
 
         let mut warnings = Vec::new();
         BackendKind::Systemd.warn(&spec, &mut warnings);
@@ -387,47 +400,50 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     }
     for key in ["PATH", "_x", "a1_B"] {
         assert!(
-            BackendKind::Systemd.refuse(&shaped_with_env_key(key)).is_ok(),
+            BackendKind::Systemd
+                .refuse(&shaped_with_env_key(key), &authored("bin/frpc"))
+                .is_ok(),
             "{key:?}"
         );
     }
 }
 
-// systemd's paths =====================================================================================================
+// systemd's program path ==============================================================================================
+
+/// The manifest text of a program path, which `refuse` judges as written.
+fn authored(command: &str) -> RawSpec {
+    RawSpec::parse(&format!(
+        "id: frpc
+command: ['{command}']
+"
+    ))
+    .expect("fixture yaml should parse")
+}
 
 #[skuld::test]
-fn systemd_refuses_the_paths_it_will_not_load_and_names_the_field() {
-    let cases = [
-        ("command", Field::Command(0), "bin/", "ends in `/`"),
-        ("cwd", Field::Cwd, "/srv/a/../b", "`..` component"),
-        ("logs", Field::Logs, "/var/log/..", "`..` component"),
-    ];
-    for (name, field, value, defect) in cases {
-        let mut spec = shaped_spec();
-        match name {
-            "command" => spec.command = Some(vec![value.to_string()]),
-            "cwd" => spec.cwd = Some(value.into()),
-            _ => spec.logs = Some(value.into()),
-        }
+fn systemd_refuses_a_program_path_ending_in_a_slash_as_the_manifest_wrote_it() {
+    // Resolving a relative path drops the slash, so the shaped spec no longer shows it.
+    let spec = shaped_spec();
+    for command in ["bin/", "./bin//", "/opt/bin/frpc/"] {
         let refused = BackendKind::Systemd
-            .refuse(&spec)
-            .expect_err(&format!("{name}: {value:?} must be refused"));
-        assert_eq!(refused.field, Some(field), "{name}");
+            .refuse(&spec, &authored(command))
+            .expect_err(&format!("{command:?} must be refused"));
+        assert_eq!(refused.field, Some(Field::Command(0)), "{command}");
         let message = Error::from(refused).to_string();
-        assert!(message.contains(defect), "{name}: {message}");
-        if name != "command" {
-            assert!(message.contains(&format!("field `{name}`")), "{message}");
-        }
-        assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{name}");
-        assert!(BackendKind::Scm.refuse(&spec).is_ok(), "{name}");
+        assert!(message.contains("ends in `/`"), "{command}: {message}");
+        assert!(
+            BackendKind::Launchd.refuse(&spec, &authored(command)).is_ok(),
+            "{command}"
+        );
+        assert!(BackendKind::Scm.refuse(&spec, &authored(command)).is_ok(), "{command}");
     }
 }
 
 #[skuld::test]
-fn systemd_loads_the_paths_it_resolves() {
+fn systemd_loads_the_program_paths_it_is_given() {
     let mut spec = shaped_spec();
     spec.command = Some(vec!["/bin/../bin/frpc".to_string(), "../arg/".to_string()]);
-    spec.cwd = Some("/srv/./a//b/".into());
-    spec.logs = Some("/var/log/a..b/..c/d.log".into());
-    BackendKind::Systemd.refuse(&spec).expect("each of these loads");
+    BackendKind::Systemd
+        .refuse(&spec, &authored("/bin/../bin/frpc"))
+        .expect("`..` in a program path loads");
 }

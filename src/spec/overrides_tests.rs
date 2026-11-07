@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use super::{RawOverride, Supplied};
 use crate::spec::BackendKind;
+use crate::spec::field::Field;
 use crate::spec::raw::RawSpec;
 use crate::spec::user::RawUser;
 
@@ -635,22 +636,48 @@ backend-specific:
 }
 
 #[skuld::test]
-fn supplied_records_user_only_when_the_override_wrote_it() {
+fn supplied_records_each_field_only_when_the_override_wrote_it() {
     let yaml = "
 id: frpc
 command: [/bin/frpc]
 user: base-user
+env:
+  BASE: \"1\"
 backend-specific:
   scm:
     user: svc-frpc
   systemd:
     cwd: /opt/frpc
+    logs: /var/log/frpc.log
+    command: [/bin/other]
+    env:
+      OVERRIDE: \"2\"
 ";
     let spec = parse(yaml).expect("valid manifest should parse");
     let (_merged, supplied) = spec.merged_for(BackendKind::Scm);
-    assert_eq!(supplied, Supplied { user: true });
+    assert_eq!(
+        supplied,
+        Supplied {
+            user: true,
+            ..Supplied::NONE
+        }
+    );
     let (_merged, supplied) = spec.merged_for(BackendKind::Systemd);
-    assert_eq!(supplied, Supplied::NONE);
+    assert_eq!(
+        supplied,
+        Supplied {
+            cwd: true,
+            logs: true,
+            command: true,
+            env: ["OVERRIDE".to_string()].into(),
+            ..Supplied::NONE
+        }
+    );
+    assert!(supplied.supplies(&Field::Cwd) && supplied.supplies(&Field::Command(0)));
+    assert!(
+        supplied.supplies(&Field::EnvKey("OVERRIDE".into())) && supplied.supplies(&Field::EnvValue("OVERRIDE".into()))
+    );
+    assert!(!supplied.supplies(&Field::EnvKey("BASE".into())) && !supplied.supplies(&Field::User));
 }
 
 // The direct guard on the defect `Supplied` exists to prevent: without it,

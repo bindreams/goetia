@@ -24,7 +24,7 @@
 //! `restart-delay` and `type` stay authored text so `${VAR}` can be
 //! interpolated before `resolve` parses them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::de::{self, MapAccess, Visitor};
@@ -93,41 +93,66 @@ impl<'de> Deserialize<'de> for OverrideEntry {
 }
 
 /// Which fields a backend's override actually supplied: provenance the merged spec cannot
-/// carry, so `BackendKind::error` does not reject a base value for a backend the author never
-/// wrote a line for. Only `user` is read today.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// carry, so a verdict for one backend (`BackendKind::error`, `BackendKind::refuse`) is not laid on
+/// an override that never wrote the value. An `env` field is supplied per name.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Supplied {
+    pub name: bool,
+    pub command: bool,
+    pub cwd: bool,
+    pub logs: bool,
     pub user: bool,
+    pub restart: bool,
+    pub restart_delay: bool,
+    pub kind: bool,
+    /// The `env` names the override wrote.
+    pub env: BTreeSet<String>,
 }
 
 impl Supplied {
     /// No override at all: every field is a base value.
-    pub const NONE: Supplied = Supplied { user: false };
-}
+    pub const NONE: Supplied = Supplied {
+        name: false,
+        command: false,
+        cwd: false,
+        logs: false,
+        user: false,
+        restart: false,
+        restart_delay: false,
+        kind: false,
+        env: BTreeSet::new(),
+    };
 
-impl RawOverride {
-    /// Which of the recorded fields (see [`Supplied`]) this override sets.
-    pub fn supplied(&self) -> Supplied {
-        Supplied {
-            user: self.user.is_some(),
+    /// Whether the override wrote `field`'s value; for an `env` field, the entry of that name.
+    pub fn supplies(&self, field: &Field) -> bool {
+        match field {
+            Field::Name => self.name,
+            Field::Command(_) => self.command,
+            Field::Cwd => self.cwd,
+            Field::Logs => self.logs,
+            Field::EnvKey(key) => self.env.contains(&**key),
+            Field::EnvValue(key) => self.env.contains(key),
+            Field::User => self.user,
+            Field::Restart => self.restart,
+            Field::RestartDelay => self.restart_delay,
+            Field::Kind => self.kind,
         }
     }
 }
 
 impl RawOverride {
-    /// Whether this override wrote `field`'s value; for an `env` field, the entry of that name.
-    pub fn supplies(&self, field: &Field) -> bool {
-        match field {
-            Field::Name => self.name.is_some(),
-            Field::Command(_) => self.command.is_some(),
-            Field::Cwd => self.cwd.is_some(),
-            Field::Logs => self.logs.is_some(),
-            Field::EnvKey(key) => self.env.as_ref().is_some_and(|env| env.contains_key(&**key)),
-            Field::EnvValue(key) => self.env.as_ref().is_some_and(|env| env.contains_key(key)),
-            Field::User => self.user.is_some(),
-            Field::Restart => self.restart.is_some(),
-            Field::RestartDelay => self.restart_delay.is_some(),
-            Field::Kind => self.kind.is_some(),
+    /// Which fields (see [`Supplied`]) this override sets.
+    pub fn supplied(&self) -> Supplied {
+        Supplied {
+            name: self.name.is_some(),
+            command: self.command.is_some(),
+            cwd: self.cwd.is_some(),
+            logs: self.logs.is_some(),
+            user: self.user.is_some(),
+            restart: self.restart.is_some(),
+            restart_delay: self.restart_delay.is_some(),
+            kind: self.kind.is_some(),
+            env: self.env.iter().flat_map(|env| env.keys().cloned()).collect(),
         }
     }
 }
