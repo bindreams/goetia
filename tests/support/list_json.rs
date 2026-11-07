@@ -1,4 +1,4 @@
-//! `goetia daemon list --json`, parsed, for the suites that run it as an unprivileged user.
+//! `goetia daemon list --json`, parsed, for the suites that run it as a real process.
 
 use std::process::Output;
 
@@ -10,7 +10,7 @@ pub struct ListJson {
 }
 
 impl ListJson {
-    /// The ids of the entries under `key` (`daemons`, `undetermined`, `errors`); `None` for an
+    /// The ids of the entries under `key` (`daemons` or `undetermined`); `None` for an
     /// entry that names no id.
     pub fn ids(&self, key: &str) -> Vec<Option<String>> {
         self.doc[key]
@@ -24,18 +24,48 @@ impl ListJson {
             })
             .collect()
     }
+
+    /// Every id in `ids` is listed as goetia's own and none is `undetermined`. Nothing is asserted
+    /// about any other daemon on the host.
+    pub fn assert_own(&self, ids: &[&str]) {
+        let daemons = self.ids("daemons");
+        let undetermined = self.ids("undetermined");
+        for id in ids {
+            let id = Some((*id).to_string());
+            assert!(daemons.contains(&id), "{id:?} must be listed as ours: {}", self.context);
+            assert!(
+                !undetermined.contains(&id),
+                "{id:?} was readable, so it must not be undetermined: {}",
+                self.context
+            );
+        }
+    }
 }
 
-/// Runs `daemon list --json` through `run` (a suite's unprivileged runner) and parses stdout.
+/// Runs `daemon list --json` through `run` and parses stdout. Panics unless the exit code agrees
+/// with the document: `errors` is empty (a real manager answered) and the code is `4` exactly when
+/// `undetermined` is not, else `0`.
 pub fn list_json(run: impl FnOnce(&[&str]) -> Output) -> ListJson {
     let output = run(&["daemon", "list", "--json"]);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     let doc = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {context}"));
-    ListJson {
+    let listed = ListJson {
         doc,
         code: output.status.code(),
         context,
-    }
+    };
+    assert!(
+        listed.doc["errors"].as_array().is_some_and(|errors| errors.is_empty()),
+        "`errors` must be present and empty, since a real manager answers `list` on this platform: {}",
+        listed.context
+    );
+    assert_eq!(
+        listed.code,
+        Some(if listed.ids("undetermined").is_empty() { 0 } else { 4 }),
+        "exit `4` is exactly what an `undetermined` entry reports, and nothing else here reports it: {}",
+        listed.context
+    );
+    listed
 }

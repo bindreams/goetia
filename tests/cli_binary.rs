@@ -12,6 +12,9 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "support/mod.rs"]
+mod support;
+
 fn main() {
     skuld::run_all();
 }
@@ -72,48 +75,30 @@ stderr:
 /// `unavailable` at exit `1` — the fake would also answer cleanly here, so
 /// this rules out exactly the one wrong wiring this module exists to catch.
 /// Labelled `UNIT_DIR_EXCLUSIVE`: this runs a real `daemon list` over the
-/// host's own artifact directories, and `list`'s exit code is host-wide now,
-/// so a concurrently-running test that seeds an unreadable artifact would
-/// turn this `0` into a `4`. The label is the same cross-process lock the
-/// systemd and launchd integration tests take for that reason.
+/// host's own artifact directories, where a concurrent FIFO test would hang
+/// it. The label is the same cross-process lock the systemd and launchd
+/// integration tests take for that reason.
 ///
-/// `--json` rather than the text form, and the code tied to the document
-/// rather than merely allowed to be `0` or `4`: the exit code is host-wide,
-/// so one vendor artifact this caller cannot read legitimately makes it `4`
-/// — but only *with an entry that accounts for it*. A `4` over an empty
-/// `undetermined` is an exit code nothing in the document explains, which
-/// `matches!(code, 0 | 4)` alone accepted.
+/// `support::list_json` ties the exit code to the `--json` document: `errors`
+/// empty, and `4` exactly when `undetermined` is not.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn native_backend_answers_list_unelevated() {
     let dir = tempfile::tempdir().unwrap();
 
-    let (code, out, err) = run_cli(&["daemon", "list", "--json"], dir.path());
-
-    let context = format!("stdout:\n{out}\nstderr:\n{err}");
-    let doc: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {context}"));
-    let array = |key: &str| {
-        doc[key]
-            .as_array()
-            .unwrap_or_else(|| panic!("`{key}` must always be present, as an array: {context}"))
-    };
-
-    assert!(
-        array("errors").is_empty(),
-        "a real manager answers `list` on this platform: {context}"
-    );
-    assert_eq!(
-        code,
-        if array("undetermined").is_empty() { 0 } else { 4 },
-        "exit `4` is exactly what an `undetermined` entry reports, and nothing else here reports it: {context}"
-    );
+    support::list_json(|args| {
+        Command::new(goetia_bin())
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn goetia daemon list")
+    });
 }
 
 /// Shared with the systemd and launchd integration binaries: any test that
-/// reads or writes the host's real artifact directories takes this, because
-/// `list`'s exit code is host-wide and one unreadable artifact changes it
-/// for every concurrent reader.
+/// reads or writes the host's real artifact directories takes this, because a
+/// FIFO test makes them hostile to a concurrent unguarded reader, and a FIFO
+/// regression would then hang the suite instead of failing the one guarded test.
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
 

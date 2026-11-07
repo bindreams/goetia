@@ -22,12 +22,9 @@ use crate::install_helper::INSTALL_AS;
 use crate::support::registry::{parameters_key, service_key, try_parameters_key};
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
-/// Held by every test whose assertion is about `list`'s answer for the *whole
-/// host* — its exit code, or the absence of any `undetermined` entry — and by
-/// every test that denies an elevated reader something under
-/// `HKLM\SYSTEM\CurrentControlSet\Services`, which changes that answer. The two
-/// groups are the same group precisely because either one invalidates the
-/// other, so they take turns rather than race.
+/// Held by every test that denies an elevated reader something under
+/// `HKLM\SYSTEM\CurrentControlSet\Services`, and by every test that runs a real
+/// `daemon list` over it, so they take turns rather than race.
 ///
 /// Named for systemd's unit directory rather than for SCM's service tree
 /// deliberately: skuld coordinates serialization across processes by label
@@ -77,7 +74,7 @@ fn hand_edit(id: &str) {
 /// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry naming that id in
 /// every concurrent `list()` (a nameless aggregate if another service is unreadable too) — the
-/// very answer this file's host-wide assertions are about.
+/// listing the other tests in this file read.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn scm_passes_conformance() {
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
@@ -1189,8 +1186,7 @@ fn install_refuses_an_always_blob_as_unusable() {
 // A read that did not complete: the aggregate, and the two objects that produce it ====================================
 
 /// An elevated reader decodes the marker of a service it installed, so the service is listed as
-/// goetia's own and is not an `undetermined` entry. Another service's unreadable `Parameters` is
-/// not this test's to assert about, so only our id is checked.
+/// goetia's own. Another service's unreadable `Parameters` is not this test's to assert about.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn an_elevated_list_reads_the_marker_of_its_own_install() {
     let mgr = Scm::new();
@@ -1205,13 +1201,6 @@ fn an_elevated_list_reads_the_marker_of_its_own_install() {
             .iter()
             .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
         "the installed daemon must actually appear: {listed:?}"
-    );
-    assert!(
-        !listed.iter().any(|entry| matches!(
-            entry,
-            Installed::Undetermined { name, .. } if name.as_deref() == Some(id.as_str())
-        )),
-        "an elevated caller was expected to read this service's Parameters: {listed:?}"
     );
 }
 

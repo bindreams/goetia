@@ -22,11 +22,10 @@ use goetia::spec::{AccountId, DaemonSpec, Id, Kind, Restart, User};
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
 use crate::support::{self, ELEVATED, ServiceGuard, cmd};
 
-/// Held by every test whose assertion is about `list`'s answer for the *whole host* — its exit code,
-/// or the absence of any `undetermined` entry — and by every test that seeds an unreadable
-/// `*.service` into the shared `/etc/systemd/system`, which changes that answer. The two groups are
-/// the same group precisely because either one invalidates the other, so they take turns rather than
-/// race.
+/// Held by every test that reads or seeds hostile state in the shared `/etc/systemd/system`, and by
+/// every test that runs `daemon list` over it. While `list_does_not_hang_on_a_fifo_in_the_unit_directory`
+/// has a FIFO there, a concurrent reader that opens it hangs the suite; serialising makes a FIFO
+/// regression fail that one test, which guards its read, instead.
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
@@ -301,8 +300,8 @@ fn uninstall_via_cli(id: &str) -> (ExitCode, String, String) {
 // Step 1: conformance =================================================================================================
 
 /// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen units in the shared
-/// `/etc/systemd/system` for its whole length, which is exactly what the host-wide listing
-/// assertion in `tests/cli_binary.rs`'s real `daemon list` is about.
+/// `/etc/systemd/system` for its whole length, so it takes turns with the tests that list or seed
+/// hostile units there.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn systemd_passes_conformance() {
     let mgr = Systemd::new();
@@ -1796,37 +1795,15 @@ fn list_ignores_foreign_units() {
     );
 }
 
-/// `list` needs no elevation, and an unprivileged run reports our daemon. The exit code is about the
-/// whole host, so only what concerns our id is asserted: any other daemon's `undetermined` entry
-/// may make it `4`, and an `undetermined` entry is exactly what `4` reports.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+/// `list` needs no elevation: an unprivileged run reports an install it can read as ours, not as
+/// `undetermined`. The ids of other daemons on the host are not asserted about.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let spec = mk(guard.id());
-    let mgr = Systemd::new();
-    mgr.install(&spec, false).expect("install");
+    Systemd::new().install(&mk(guard.id()), false).expect("install");
 
-    let listed = support::list_json(run_unelevated);
-
-    assert!(
-        listed.ids("daemons").contains(&Some(id.clone())),
-        "the installed daemon must appear in the unelevated `list` output: {}",
-        listed.context
-    );
-    assert!(
-        matches!(listed.code, Some(0 | 4)),
-        "an unelevated `list` must not fail: {}",
-        listed.context
-    );
-    if !listed.ids("undetermined").is_empty() {
-        assert_eq!(
-            listed.code,
-            Some(4),
-            "an entry goetia could not determine is exactly what exit `4` reports: {}",
-            listed.context
-        );
-    }
+    support::list_json(run_unelevated).assert_own(&[id.as_str()]);
 }
 
 // Parent directories ==================================================================================================
@@ -1952,9 +1929,8 @@ fn unelevated_list_reports_a_unit_it_cannot_read_as_undetermined() {
 
     let listed = support::list_json(run_unelevated);
 
-    // Root reads this fragment fine and finds no marker, which reports nothing at all and exits `0`
-    // — so a run whose reader was not unprivileged fails here instead of passing vacuously.
-    assert_eq!(listed.code, Some(4), "{}", listed.context);
+    // Root reads this fragment fine and finds no marker, which reports nothing at all — so a run
+    // whose reader was not unprivileged fails here instead of passing vacuously.
     assert!(
         listed.ids("undetermined").contains(&Some(denied.clone())),
         "{}",
@@ -1984,9 +1960,8 @@ fn unelevated_list_reports_a_root_only_unit_as_undetermined() {
 
     let listed = support::list_json(run_unelevated);
 
-    // Root reads it, decodes the marker and lists it under `daemons` at exit `0`, so this cannot
-    // pass vacuously either.
-    assert_eq!(listed.code, Some(4), "{}", listed.context);
+    // Root reads it, decodes the marker and lists it under `daemons`, so this cannot pass vacuously
+    // either.
     assert!(
         listed.ids("undetermined").contains(&Some(id.clone())),
         "{}",
@@ -2119,9 +2094,8 @@ fn unelevated_show_cannot_call_absent_an_id_whose_dropin_it_could_not_read() {
 
     let listed = support::list_json(run_unelevated);
 
-    // Root reads this drop-in fine and reports nothing at all at exit `0`, so a run whose reader was
-    // not unprivileged fails here instead of passing vacuously.
-    assert_eq!(listed.code, Some(4), "{}", listed.context);
+    // Root reads this drop-in fine and reports nothing at all, so a run whose reader was not
+    // unprivileged fails here instead of passing vacuously.
     assert!(
         listed.ids("undetermined").contains(&Some(id.clone())),
         "{}",
@@ -2184,26 +2158,6 @@ fn a_named_undetermined_entry_blocks_only_its_own_id() {
         String::from_utf8_lossy(&answerable.stdout),
         String::from_utf8_lossy(&answerable.stderr)
     );
-}
-
-/// The other half of the same boundary, and the one that would catch an over-eager fix: an install
-/// an unprivileged caller *can* read is reported as a daemon, and its id is not in the third key.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn unelevated_list_stays_clean_for_a_normal_install() {
-    let id = support::random_test_id();
-    let guard = ServiceGuard::new(&id);
-    Systemd::new().install(&mk(guard.id()), false).expect("install");
-
-    let listed = support::list_json(run_unelevated);
-
-    assert!(listed.ids("daemons").contains(&Some(id.clone())), "{}", listed.context);
-    assert!(
-        !listed.ids("undetermined").contains(&Some(id.clone())),
-        "a unit goetia read in full determines the id: {}",
-        listed.context
-    );
-    // Not `0`: another daemon's `undetermined` entry on the host makes it `4`.
-    assert!(matches!(listed.code, Some(0 | 4)), "{}", listed.context);
 }
 
 /// One `*.service` whose bytes are not UTF-8 must neither make `list` return `Err` — taking down

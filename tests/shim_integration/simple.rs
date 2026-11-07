@@ -21,9 +21,9 @@ use crate::support::{self, ELEVATED};
 
 /// The same cross-process lock `tests/scm_integration/managed.rs` declares,
 /// shared with it by label *name*: both binaries drive the one SCM on the host,
-/// and one denied `Parameters` changes `list`'s answer for all of it. A
-/// negative assertion here is unsound while any test anywhere denies a
-/// `Parameters` read, so they take turns rather than race.
+/// and a denied `Parameters` read is visible to every reader of it. A negative
+/// assertion here is unsound while any test anywhere denies one, so they take
+/// turns rather than race.
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
@@ -57,7 +57,7 @@ fn hand_edit(id: &str) {
 
 /// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry in every concurrent
-/// `list()` — including the ones `tests/scm_integration/managed.rs` asserts are clean.
+/// `list()`.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn simple_passes_conformance() {
     let logs = LogDir::new();

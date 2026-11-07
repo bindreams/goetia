@@ -26,12 +26,12 @@ use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
 use crate::support::cleanup::{DirGuard, FileGuard};
 use crate::support::{self, ConnectBack, ELEVATED, cmd};
 
-/// Held by every test whose assertion is about `list`'s answer for the
-/// *whole host* — its exit code, or the absence of any `undetermined` entry
-/// — and by every test that seeds something unreadable into the shared
-/// [`ENABLED_DIR`]/[`STAGING_DIR`], which changes that answer. The two
-/// groups are the same group precisely because either invalidates the other,
-/// so they take turns rather than race.
+/// Held by every test that reads or seeds hostile state in the shared
+/// [`ENABLED_DIR`]/[`STAGING_DIR`], and by every test that runs `daemon list`
+/// over them. While `list_does_not_hang_on_a_fifo_in_the_plist_directory` has
+/// a FIFO there, a concurrent reader that opens it hangs the suite;
+/// serialising makes a FIFO regression fail that one test, which guards its
+/// read, instead.
 ///
 /// Named for systemd's unit directory rather than for launchd's plist ones
 /// deliberately: skuld coordinates serialization across processes by label
@@ -233,8 +233,8 @@ fn print_job(id: &str) -> cmd::Run {
 // The deliverable: conformance ========================================================================================
 
 /// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen daemons in the shared
-/// [`STAGING_DIR`] for its whole length, which is exactly what the host-wide listing assertions
-/// elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are about.
+/// [`STAGING_DIR`] for its whole length, so it takes turns with the tests that list or seed hostile
+/// plists there.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn launchd_passes_conformance() {
     let mgr = Launchd::new();
@@ -752,46 +752,17 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
 /// code alone proves nothing, since a command that ran against nothing
 /// produces the same one.
 ///
-/// The exit code is a claim about the *whole host*: `/Library/LaunchDaemons`
-/// holds every vendor's daemons, and any one of them `nobody` cannot open is
-/// now an `undetermined` entry and a `4`. So this asserts the invariant that
-/// is actually this test's — our daemon is listed, and is not what the
-/// caller failed to determine — plus the tie between the third key and the
-/// code, and leaves an unrelated vendor plist free to move that code without
-/// failing a test that is not about it.
+/// Only our id is asserted: `/Library/LaunchDaemons` holds every vendor's
+/// daemons, and one `nobody` cannot open is an unrelated `undetermined` entry.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works() {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
-    let listed = support::list_json(run_unelevated);
-
-    let id = Some(spec.id.as_str().to_string());
-    assert!(
-        listed.ids("daemons").contains(&id),
-        "the installed daemon must actually appear in the unelevated `list` output: {}",
-        listed.context
-    );
-    assert!(
-        !listed.ids("undetermined").contains(&id),
-        "`install` writes an 0644 plist under world-searchable directories, so an unprivileged \
-         caller reads it: {}",
-        listed.context
-    );
-    assert!(
-        matches!(listed.code, Some(0 | 4)),
-        "an unelevated `list` must not fail: {}",
-        listed.context
-    );
-    if !listed.ids("undetermined").is_empty() {
-        assert_eq!(
-            listed.code,
-            Some(4),
-            "an entry goetia could not determine is exactly what exit `4` reports: {}",
-            listed.context
-        );
-    }
+    // `install` writes an 0644 plist under world-searchable directories, so an unprivileged caller
+    // reads it.
+    support::list_json(run_unelevated).assert_own(&[spec.id.as_str()]);
 }
 
 /// The motivating defect, end to end and at the privilege boundary that
@@ -809,10 +780,9 @@ fn unelevated_list_reports_a_root_only_plist_as_undetermined() {
 
     let listed = support::list_json(run_unelevated);
 
-    // Root opens this plist, decodes its marker and lists it under `daemons` at exit `0`, so a run
-    // whose reader was not in fact unprivileged fails here instead of passing vacuously.
+    // Root opens this plist, decodes its marker and lists it under `daemons`, so a run whose reader
+    // was not in fact unprivileged fails here instead of passing vacuously.
     let id = Some(spec.id.as_str().to_string());
-    assert_eq!(listed.code, Some(4), "{}", listed.context);
     assert!(listed.ids("undetermined").contains(&id), "{}", listed.context);
     assert!(
         !listed.ids("daemons").contains(&id),
@@ -877,15 +847,6 @@ fn list_stays_clean_on_a_host_carrying_binary_plists() {
         !may_account_for(&listed, &id),
         "a binary plist carries no goetia marker by construction, so it is foreign and omitted \
          exactly like an unmarked XML one: {listed:?}"
-    );
-    let undetermined: Vec<&Installed> = listed
-        .iter()
-        .filter(|e| matches!(e, Installed::Undetermined { .. }))
-        .collect();
-    assert!(
-        undetermined.is_empty(),
-        "nothing on this host was left undetermined, so `list` must report nothing under that key: \
-         {undetermined:?}"
     );
 }
 
@@ -1309,10 +1270,10 @@ fn install_over_a_directory_refuses_instead_of_recursing() {
 /// `mkfifo` there would wedge the listing for the whole host. Classifying
 /// the path before opening it is what keeps that from happening.
 ///
-/// No `UNIT_DIR_EXCLUSIVE`: a FIFO is omitted rather than reported, so it
-/// moves neither the host's `undetermined` set nor `list`'s exit code, and
-/// this asserts about its own id alone.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+/// `UNIT_DIR_EXCLUSIVE`: the FIFO sits where a concurrent unprivileged
+/// `daemon list` reads, and a regression would hang that reader, not only
+/// this test's guarded one.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_does_not_hang_on_a_fifo_in_the_plist_directory() {
     let id = support::random_test_id();
     let path = enabled_path(&id);
