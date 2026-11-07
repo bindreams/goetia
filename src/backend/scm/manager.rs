@@ -116,12 +116,12 @@ use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, S
 use crate::backend::scm::kill::hold_if_possible;
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
-use crate::backend::scm::shim::embedded::{ShimFile, shim_file};
+use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
 use crate::backend::scm::shim::provider::ShimProvider;
 use crate::backend::scm::shim::sweep::{
-    SweepFailure, left_behind_text, normalise, referenced_hosts, same_path, sweep_folder,
+    SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
@@ -1030,8 +1030,10 @@ impl Scm {
     /// file `host`: waits, with no bound, for the process that was held (it is on its way out: SCM
     /// recorded `STOPPED` before it exits), and for no other: a process it did not hold cannot be tied
     /// to the service it is uninstalling, and waiting for another service's stuck process would hold
-    /// the install lock. Then sweeps the provider's folder and the folder `host` was in, which is
-    /// another when the service was installed by another goetia version or provider.
+    /// the install lock. Then sweeps the provider's folder and, when `host` was in the default folder
+    /// and that is another, that one too (see [`second_folder`]): the service may have been installed
+    /// by another goetia version or provider. A host in any other folder is not swept, since
+    /// that folder is not goetia's.
     ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
@@ -1043,31 +1045,40 @@ impl Scm {
             .as_ref()
             .and_then(|shim| shim.preview().ok())
             .and_then(|command| command.exe.parent().map(normalise));
-        let left_behind = |failure: SweepFailure| {
+        let second = host
+            .parent()
+            .map(|folder| second_folder(folder, provider_folder.as_deref(), || Ok(normalise(&default_dir()?))))
+            .transpose();
+        let left_behind = |failure: SweepFailure, second: Option<&Path>| {
             let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
             Error::Step {
-                what: left_behind_text(id, provider_folder.as_deref(), host.parent(), &files),
+                what: left_behind_text(id, provider_folder.as_deref(), second, &files),
                 source: failure.error,
             }
         };
+        // The default folder is not known, so the host's folder may be it: named, not swept.
+        let second = match second {
+            Ok(second) => second.flatten(),
+            Err(e) => return Err(left_behind(e.into(), host.parent())),
+        };
         if let Some(held) = held {
-            held.wait_for_exit(id.as_str())
-                .map_err(|e| left_behind(Error::os(format!("wait for `{id}`'s process to exit"), e).into()))?;
+            held.wait_for_exit(id.as_str()).map_err(|e| {
+                left_behind(
+                    Error::os(format!("wait for `{id}`'s process to exit"), e).into(),
+                    second,
+                )
+            })?;
         }
         // After the wait: what has exited no longer references its file.
-        let referenced = referenced_hosts().map_err(|e| left_behind(e.into()))?;
+        let referenced = referenced_hosts().map_err(|e| left_behind(e.into(), second))?;
         let mut failures = Vec::new();
         if let Some(shim) = &self.shim {
             failures.extend(shim.sweep(&referenced).err());
         }
-        if let Some(folder) = host.parent()
-            && !provider_folder
-                .as_deref()
-                .is_some_and(|provider| same_path(provider, folder))
-        {
+        if let Some(folder) = second {
             failures.extend(sweep_folder(folder, &referenced).err());
         }
-        SweepFailure::all(failures).map_or(Ok(()), |failure| Err(left_behind(failure)))
+        SweepFailure::all(failures).map_or(Ok(()), |failure| Err(left_behind(failure, second)))
     }
 }
 

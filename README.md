@@ -741,9 +741,10 @@ empty. If a file cannot be deleted, `uninstall` exits non-zero naming each file 
 remains: the service is already deleted, and re-running
 `goetia daemon uninstall <id>` sweeps the program's own shim folder again. That
 also holds for an id that is not installed: it sweeps, then reports "nothing to
-do" (exit `0`) when the sweep succeeded. A file in another folder (the service
-was installed by another provider) is removed by the next install or uninstall
-of a program whose provider uses that folder.
+do" (exit `0`) when the sweep succeeded. Besides the provider's folder,
+`uninstall` sweeps only `%ProgramFiles%\Goetia`, where a service installed by
+another provider may have its shim. A file in any other folder is never swept:
+a program's installer may place a file with a shim's name in its own folder.
 
 ### Shipping the shim from a library
 

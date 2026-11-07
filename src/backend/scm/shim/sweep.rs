@@ -181,9 +181,28 @@ impl From<Error> for SweepFailure {
     }
 }
 
+/// The folder, besides the provider's, that an uninstall sweeps after a service whose host was in
+/// `host_folder`: that folder when it is the default folder and not the provider's, else none.
+/// The provider's own folder is swept by the provider. A folder that is neither is not goetia's
+/// to sweep: a consumer's installer may place a file with a shim file's name in its own folder.
+///
+/// `default_folder` is asked only of a folder that is not the provider's, since where the default
+/// folder is matters for nothing else. Paths are expected `normalise`d.
+pub(crate) fn second_folder<'a>(
+    host_folder: &'a Path,
+    provider_folder: Option<&Path>,
+    default_folder: impl FnOnce() -> Result<PathBuf>,
+) -> Result<Option<&'a Path>> {
+    if provider_folder.is_some_and(|provider| same_path(provider, host_folder)) {
+        return Ok(None);
+    }
+    Ok(same_path(&default_folder()?, host_folder).then_some(host_folder))
+}
+
 /// What an uninstall says when it deleted the service `id` but could not clean up: which shim files
 /// remain, and what removes them. `files` are those the failure names (none when it failed before
-/// it tried to delete any, and then any file the service used may remain, in `host_folder`).
+/// it tried to delete any, and then any file the service used may remain, in `second_folder`, the
+/// folder besides the provider's that the uninstall sweeps: see [`second_folder`]).
 ///
 /// The retry, `uninstall` of an id that is no longer installed, sweeps `provider_folder` alone: a
 /// file in another folder is removed by the next install or uninstall of a manager whose provider
@@ -191,7 +210,7 @@ impl From<Error> for SweepFailure {
 pub(crate) fn left_behind_text(
     id: impl std::fmt::Display,
     provider_folder: Option<&Path>,
-    host_folder: Option<&Path>,
+    second_folder: Option<&Path>,
     files: &[PathBuf],
 ) -> String {
     let in_providers = |folder: &Path| provider_folder.is_some_and(|provider| same_path(provider, folder));
@@ -212,7 +231,7 @@ pub(crate) fn left_behind_text(
                 " {retry} what is in the folder this program's shim provider uses."
             ));
         }
-        if let Some(folder) = host_folder.filter(|folder| !in_providers(folder)) {
+        if let Some(folder) = second_folder.filter(|folder| !in_providers(folder)) {
             said.push_str(&format!(
                 " What is in `{}` is not retried by that command: {elsewhere} it.",
                 folder.display()
@@ -387,8 +406,8 @@ mod system {
     /// the files were tried, each failed delete an `Os { what: "delete", path }` and its path in
     /// [`SweepFailure::not_deleted`]. A `dir` that does not exist has nothing to sweep.
     ///
-    /// The one mechanism behind a provider's `sweep` and the sweep of the folder an uninstalled
-    /// service's host was in.
+    /// The one mechanism behind a provider's `sweep` and the sweep of the default folder an
+    /// uninstalled service's host was in (see [`second_folder`]).
     pub(crate) fn sweep_folder(dir: &Path, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
         let swept = sweep_files(dir, referenced);
         let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_dir()?), &normalise(dir))));

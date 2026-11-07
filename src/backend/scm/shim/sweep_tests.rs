@@ -278,9 +278,9 @@ fn a_failure_from_an_error_names_no_file() {
 const RETRY: &str = "Re-run `goetia daemon uninstall frpc`";
 const NEXT: &str = "the next install or uninstall of a manager whose provider uses that folder";
 
-fn text(provider: Option<&str>, host_folder: &str, files: &[&str]) -> String {
+fn text(provider: Option<&str>, second_folder: &str, files: &[&str]) -> String {
     let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
-    left_behind_text("frpc", provider.map(Path::new), Some(Path::new(host_folder)), &files)
+    left_behind_text("frpc", provider.map(Path::new), Some(Path::new(second_folder)), &files)
 }
 
 #[skuld::test]
@@ -340,6 +340,70 @@ fn a_failure_that_names_no_file_says_where_the_files_may_be() {
         !none.contains(RETRY) && none.contains(NEXT) && none.contains("/q/Other"),
         "{none}"
     );
+}
+
+/// A failure that names no file, for a service whose host folder this uninstall does not sweep:
+/// only the provider's folder is the one to retry.
+#[skuld::test]
+fn a_folder_this_uninstall_does_not_sweep_is_not_named() {
+    let said = left_behind_text("frpc", Some(Path::new("/p/Goetia")), None, &[]);
+
+    assert!(said.contains(RETRY) && !said.contains(NEXT), "{said}");
+}
+
+fn second(host: &str, provider: Option<&str>, default: &str) -> Option<PathBuf> {
+    second_folder(Path::new(host), provider.map(Path::new), || Ok(PathBuf::from(default)))
+        .unwrap()
+        .map(Path::to_path_buf)
+}
+
+#[skuld::test]
+fn the_default_folder_is_swept_as_the_second_when_it_is_not_the_providers() {
+    let default = "C:/Program Files/Goetia";
+
+    assert_eq!(second(default, Some("D:/Other"), default), Some(PathBuf::from(default)));
+    assert_eq!(second(default, None, default), Some(PathBuf::from(default)));
+    assert_eq!(
+        second("c:/program files/GOETIA", Some("D:/Other"), default),
+        Some(PathBuf::from("c:/program files/GOETIA"))
+    );
+}
+
+#[skuld::test]
+fn the_providers_folder_is_never_the_second() {
+    let default = "C:/Program Files/Goetia";
+
+    assert_eq!(second(default, Some("c:/program files/goetia"), default), None);
+    assert_eq!(second("D:/Other", Some("d:/other"), default), None);
+}
+
+/// A consumer's installer may place a file with a stock shim's name in its own folder.
+#[skuld::test]
+fn a_folder_that_is_neither_the_default_nor_the_providers_is_never_swept() {
+    let default = "C:/Program Files/Goetia";
+
+    assert_eq!(second("D:/Installer", Some("E:/Other"), default), None);
+    assert_eq!(second("D:/Installer", None, default), None);
+    assert_eq!(second("D:/Installer", Some("C:/Program Files/Goetia"), default), None);
+}
+
+/// Where the default folder is matters only for a folder that is not the provider's.
+#[skuld::test]
+fn the_default_folder_is_not_resolved_for_the_providers_folder() {
+    let chosen = second_folder(Path::new("D:/Other"), Some(Path::new("D:/Other")), || {
+        Err(Error::os("locate %ProgramFiles%", std::io::Error::other("x")))
+    });
+
+    assert!(matches!(chosen, Ok(None)));
+}
+
+#[skuld::test]
+fn an_unresolvable_default_folder_is_an_error_for_any_other_folder() {
+    let chosen = second_folder(Path::new("D:/Other"), Some(Path::new("E:/P")), || {
+        Err(Error::os("locate %ProgramFiles%", std::io::Error::other("x")))
+    });
+
+    assert!(chosen.is_err());
 }
 
 #[cfg(windows)]

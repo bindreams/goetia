@@ -1192,9 +1192,30 @@ fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file() {
     assert!(!running.has_exited(), "B keeps running");
 }
 
-/// A service registered under another folder than the manager's: its uninstall sweeps that one too.
+/// A service registered in the default folder, by a manager whose provider uses another: its uninstall
+/// sweeps the default folder too.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn uninstall_sweeps_the_other_folder() {
+fn uninstall_sweeps_the_default_folder_when_it_is_not_the_providers() {
+    let (default, _default_guard) = default_folder();
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let theirs = embedded_manager(None, CheckPermissions::Enable);
+    let ours = embedded_manager(Some(folder), CheckPermissions::Disable);
+    let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
+    theirs.install(&spec, false).expect("install in the default folder");
+    assert!(default.is_dir());
+
+    ours.uninstall(&spec.id).expect("uninstall");
+
+    assert!(!default.exists(), "the default folder is swept, and removed once empty");
+}
+
+/// A service registered in a folder that is neither the default nor the provider's, such as a
+/// consumer installer's own: its uninstall leaves the folder alone.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_leaves_a_folder_that_is_neither_the_default_nor_the_providers() {
     let (_default, _default_guard) = default_folder();
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -1204,11 +1225,13 @@ fn uninstall_sweeps_the_other_folder() {
     let ours = embedded_manager(None, CheckPermissions::Enable);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     theirs.install(&spec, false).expect("install under the other folder");
-    assert!(shim_in(&folder).is_file());
 
     ours.uninstall(&spec.id).expect("uninstall");
 
-    assert!(!shim_in(&folder).exists(), "the service's own folder is swept too");
+    assert!(
+        shim_in(&folder).is_file(),
+        "a file in a folder goetia does not own is not swept"
+    );
 }
 
 /// `uninstall` of an id that is not installed is the retry of a sweep that failed.
