@@ -1,7 +1,7 @@
 //! Shared support for the integration suites.
 //!
-//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only
-//! `daemon_spec` depends on the `goetia` crate; the marker-inertness probe uses
+//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only `daemon_spec` and
+//! `stock_shim_manager` depend on the `goetia` crate; the marker-inertness probe uses
 //! the rest, which runs before any backend exists.
 
 #![allow(dead_code, unused_imports)]
