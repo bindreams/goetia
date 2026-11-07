@@ -37,20 +37,38 @@ pub fn wait_for_running(actor: &mut SystemScmActor, id: &str) {
     );
 }
 
-/// Returns once `id` reports `STOPPED`, after a stop was sent. The first reading may still be
-/// `RUNNING`, as a control's own status shows the state it left; once a notification has been
-/// delivered, a settled state other than `STOPPED` (a recovery restart's `RUNNING`) is a panic.
-pub fn wait_for_stopped(actor: &mut SystemScmActor, id: &str) {
+/// What the caller of [`wait_for_stopped`] already knows of the stop.
+#[derive(Clone, Copy)]
+pub enum StopSeen {
+    /// A stop was just sent and nothing has shown yet: the first reading may still be `RUNNING`, as a
+    /// control's own status shows the state it left. After the first notification, a settled state
+    /// other than `STOPPED` (a recovery restart's `RUNNING`) is a panic.
+    Requested,
+    /// `STOP_PENDING` was already seen: a settled `RUNNING` or `PAUSED`, even the first reading, is a
+    /// panic, as waiting on it would hang.
+    Pending,
+}
+
+/// Returns once `id` reports `STOPPED`; `stop` says what the caller has seen of the stop.
+pub fn wait_for_stopped(actor: &mut SystemScmActor, id: &str, stop: StopSeen) {
+    let (first, rearm) = match stop {
+        StopSeen::Requested => (WantState::Stopped, WantState::StoppedOnly),
+        StopSeen::Pending => (WantState::StoppedOnly, WantState::StoppedOnly),
+    };
     let waited = wait_until(
         actor,
-        WantState::Stopped,
-        WantState::StoppedOnly,
+        first,
+        rearm,
         QueriedState::Stopped,
         Budget::Unbounded.start(),
-        |sighting| match sighting.status.state {
-            _ if !sighting.pending_delivered => Ok(ControlFlow::Continue(())),
-            QueriedState::StopPending => Ok(ControlFlow::Continue(())),
-            state => panic!("waiting for STOPPED, {id} reached {state:?}"),
+        |sighting| match (stop, sighting.status.state) {
+            (StopSeen::Requested, _) if !sighting.pending_delivered => Ok(ControlFlow::Continue(())),
+            (_, QueriedState::StopPending) => Ok(ControlFlow::Continue(())),
+            (StopSeen::Requested, state)
+            | (StopSeen::Pending, state @ (QueriedState::Running | QueriedState::Paused)) => {
+                panic!("waiting for STOPPED, {id} reached {state:?}")
+            }
+            (StopSeen::Pending, _) => Ok(ControlFlow::Continue(())),
         },
     )
     .unwrap_or_else(|e| panic!("wait for {id} to reach STOPPED: {e}"));

@@ -253,5 +253,5 @@ fn the_shim_reports_stop_pending_then_stopped() {
         "no control is accepted while stopping"
     );
 
-    support::scm_wait::wait_for_stopped(&mut actor, &id);
+    support::scm_wait::wait_for_stopped(&mut actor, &id, support::scm_wait::StopSeen::Pending);
 }
