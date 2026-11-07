@@ -141,12 +141,8 @@ pub(crate) fn image_of(
     let Err(registry) = from_registry else {
         return from_registry;
     };
-    through_scm().map_err(|scm| Error::Step {
-        what: format!(
-            "read the image path of the service `{name}`, which neither its registry key nor SCM answered. \
-             An administrator must make its registry key readable or let SCM query it \
-             (`SERVICE_QUERY_CONFIG`)"
-        ),
+    through_scm().map_err(|scm| Error::ServiceImageUnreadable {
+        name: name.to_string(),
         source: Box::new(Error::Both {
             first: Box::new(Error::Step {
                 what: "its registry key".to_string(),

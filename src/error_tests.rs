@@ -188,6 +188,25 @@ fn a_failed_read_of_the_installed_host_is_indeterminate_when_the_read_is() {
     assert!(matches!(over(not_installed()).cause(), Error::NotInstalled { .. }));
 }
 
+#[skuld::test]
+fn an_unreadable_service_image_is_indeterminate_when_the_read_is_and_its_advice_is_its_remedy() {
+    let over = |source: Error| Error::ServiceImageUnreadable {
+        name: "x".to_string(),
+        source: Box::new(source),
+    };
+    assert!(over(in_doubt()).is_indeterminate());
+    assert!(!over(not_installed()).is_indeterminate());
+    assert!(over(not_installed()).remedy().is_some());
+    assert_eq!(
+        over(not_installed())
+            .report()
+            .to_string()
+            .matches("administrator")
+            .count(),
+        1
+    );
+}
+
 #[cfg(unix)]
 pub(crate) fn exit_status(code: i32) -> std::process::ExitStatus {
     std::os::unix::process::ExitStatusExt::from_raw(code << 8)

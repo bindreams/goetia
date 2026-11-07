@@ -287,6 +287,19 @@ fn when_both_fail_each_cause_is_labelled_and_either_fix_is_named() {
     assert!(said.contains("SERVICE_QUERY_CONFIG"), "{said}");
 }
 
+/// The advice follows the failures it is about: it is the error's remedy, which `report` prints last.
+#[skuld::test]
+fn the_advice_to_make_the_key_readable_follows_both_causes() {
+    let error = image_of("frpc", Err(denied("open the key")), || Err(denied("query the service"))).unwrap_err();
+
+    assert!(error.remedy().is_some_and(|r| r.contains("administrator")), "{error:?}");
+    let said = error.report().to_string();
+    assert!(
+        said.find("query the service").unwrap() < said.find("administrator").unwrap(),
+        "{said}"
+    );
+}
+
 // What an uninstall says it left behind ---------------------------------------------------------------------------
 
 fn failure(path: &str) -> SweepFailure {

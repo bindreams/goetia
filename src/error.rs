@@ -279,6 +279,16 @@ pub enum Error {
     )]
     SiblingShimMissing { path: PathBuf },
 
+    /// The `ImagePath` of the service `name` could be read neither from its registry key nor
+    /// through SCM, which the chain holds, so what it references is unknown. A remedy, which follows
+    /// the chain: see [`remedy`](Error::remedy).
+    #[error("read the image path of the service `{name}`, which neither its registry key nor SCM answered")]
+    ServiceImageUnreadable {
+        name: String,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A shim file the sweep kept because a running process has it as its image, and no registered
     /// service names it: the exiting process of a service stopped before an uninstall, or an orphan.
     /// It goes with the first sweep after that process exits. No OS call failed.
@@ -598,6 +608,7 @@ impl Error {
             | Error::StartUnconfirmed { .. } => true,
             Error::Step { source, .. }
             | Error::StartAsManaged { source, .. }
+            | Error::ServiceImageUnreadable { source, .. }
             | Error::InstalledUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
@@ -715,6 +726,9 @@ impl Error {
     pub fn remedy(&self) -> Option<&str> {
         match self {
             Error::Undetermined { recovery, .. } => Some(recovery),
+            Error::ServiceImageUnreadable { .. } => Some(
+                "An administrator must make that service's registry key readable or let SCM query it                  (`SERVICE_QUERY_CONFIG`)",
+            ),
             Error::Kept(kept) => kept.remedy(),
             _ => None,
         }
@@ -736,6 +750,7 @@ impl Error {
             | Error::Spawn { .. }
             | Error::Step { .. }
             | Error::InstalledUnreadable { .. }
+            | Error::ServiceImageUnreadable { .. }
             | Error::Both { .. }
             | Error::ConcurrentChange { .. }
             | Error::QuarantineStranded { .. }
