@@ -82,6 +82,7 @@ fn an_unquoted_image_path_names_every_prefix_that_ends_before_a_space_and_the_wh
         host_candidates(r"C:\Program Files\Goetia\a.exe -k x"),
         [
             r"C:\Program",
+            r"C:\Program.exe",
             r"C:\Program Files\Goetia\a.exe",
             r"C:\Program Files\Goetia\a.exe -k",
             r"C:\Program Files\Goetia\a.exe -k x",
@@ -94,6 +95,68 @@ fn an_unquoted_image_path_without_spaces_names_itself() {
     assert_eq!(host_candidates(r"C:\a\b.exe"), [r"C:\a\b.exe"]);
     assert_eq!(host_candidates("  "), Vec::<String>::new());
     assert_eq!(host_candidates(""), Vec::<String>::new());
+}
+
+/// `CreateProcess` appends `.exe` to an executable path with no extension.
+#[skuld::test]
+fn a_candidate_with_no_extension_is_also_named_with_exe() {
+    assert_eq!(
+        host_candidates(r"C:\a\goetia-shim-x"),
+        [r"C:\a\goetia-shim-x", r"C:\a\goetia-shim-x.exe"]
+    );
+    assert_eq!(host_candidates(r"C:\a\b.exe"), [r"C:\a\b.exe"]);
+}
+
+fn shim_name(hex: &str) -> String {
+    format!("goetia-shim-{hex}.exe")
+}
+
+/// A registration with a `%VAR%` in it is also known by its file name, since the expansion here may
+/// not be the one SCM makes, and may have failed.
+#[skuld::test]
+fn an_image_path_with_a_variable_also_references_by_file_name() {
+    let raw = format!(r"%ProgramFiles%\Goetia\{}", shim_name(HEX_A));
+    let expanded = format!(r"C:\Program Files\Goetia\{}", shim_name(HEX_A));
+
+    let references = image_references(&raw, &expanded);
+
+    assert!(references.contains(&expanded), "{references:?}");
+    assert!(references.contains(&shim_name(HEX_A)), "by name: {references:?}");
+}
+
+#[skuld::test]
+fn an_expansion_that_changed_nothing_still_references_by_file_name() {
+    let raw = format!(r"%Unset%\{}", shim_name(HEX_A));
+
+    assert!(image_references(&raw, &raw).contains(&shim_name(HEX_A)));
+}
+
+#[skuld::test]
+fn an_extensionless_image_path_with_a_variable_references_the_name_with_exe() {
+    let raw = format!(r"%ProgramFiles%\Goetia\goetia-shim-{HEX_A}");
+
+    assert!(image_references(&raw, &raw).contains(&shim_name(HEX_A)));
+}
+
+#[skuld::test]
+fn an_image_path_without_a_variable_is_not_a_name() {
+    let path = format!(r"C:\Goetia\{}", shim_name(HEX_A));
+
+    assert_eq!(image_references(&path, &path), [path]);
+}
+
+#[skuld::test]
+fn only_shim_file_names_are_referenced_by_name() {
+    assert_eq!(
+        image_references(
+            r"%SystemRoot%\system32\svchost.exe -k x",
+            r"C:\Windows\system32\svchost.exe -k x"
+        )
+        .iter()
+        .filter(|reference| !reference.contains('\\'))
+        .count(),
+        0
+    );
 }
 
 #[cfg(windows)]
@@ -233,6 +296,20 @@ mod windows {
         sweep_folder(dir.path(), &[]).unwrap();
 
         assert!(!aside.exists());
+    }
+
+    /// A folder that cannot be listed is said so once, not by the sweep of its files and again by
+    /// the check whether it is empty.
+    #[skuld::test]
+    fn a_folder_that_cannot_be_listed_is_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_folder = dir.path().join("file.txt");
+        fs::write(&not_a_folder, b"x").unwrap();
+
+        let error = sweep_folder(&not_a_folder, &[]).expect_err("a file cannot be listed");
+
+        let report = error.report().to_string();
+        assert_eq!(report.matches("file.txt").count(), 1, "{report}");
     }
 
     #[skuld::test]

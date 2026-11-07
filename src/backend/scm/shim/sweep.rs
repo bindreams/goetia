@@ -42,31 +42,62 @@ pub(crate) fn unreferenced(files: &[PathBuf], referenced: &[PathBuf]) -> Vec<Pat
 
 /// Every path SCM may start for the command line `image` (an `ImagePath` with its environment
 /// variables expanded): a quoted one is the quoted part; an unquoted one may end before any space,
-/// since SCM tries each, or run to the end. All of them are named, so a service registered either
-/// way references the file it starts. More paths than SCM starts only keep more files.
+/// since SCM tries each, or run to the end. A path with no extension is also named with `.exe`, as
+/// `CreateProcess` appends it. All of them are named, so a service registered either way references
+/// the file it starts. More paths than SCM starts only keep more files.
 pub(crate) fn host_candidates(image: &str) -> Vec<String> {
     let image = image.trim();
+    let mut paths: Vec<String> = Vec::new();
     if let Some(quoted) = image.strip_prefix('"') {
-        let path = quoted.split('"').next().unwrap_or_default();
-        return if path.is_empty() {
-            vec![]
-        } else {
-            vec![path.to_string()]
-        };
+        paths.push(quoted.split('"').next().unwrap_or_default().to_string());
+    } else {
+        let ends = image
+            .char_indices()
+            .filter(|&(_, c)| c == ' ' || c == '\t')
+            .map(|(at, _)| at)
+            .chain(std::iter::once(image.len()));
+        paths.extend(ends.map(|end| image[..end].trim_end().to_string()));
     }
     let mut candidates: Vec<String> = Vec::new();
-    let ends = image
-        .char_indices()
-        .filter(|&(_, c)| c == ' ' || c == '\t')
-        .map(|(at, _)| at)
-        .chain(std::iter::once(image.len()));
-    for end in ends {
-        let prefix = image[..end].trim_end();
-        if !prefix.is_empty() && candidates.last().is_none_or(|last| last != prefix) {
-            candidates.push(prefix.to_string());
+    for path in paths.into_iter().filter(|path| !path.is_empty()) {
+        let without_extension = Path::new(&path).extension().is_none();
+        for candidate in [Some(path.clone()), without_extension.then(|| format!("{path}.exe"))]
+            .into_iter()
+            .flatten()
+        {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
         }
     }
     candidates
+}
+
+/// What a registered `ImagePath` references: the [`host_candidates`] of its `expanded` form and, when
+/// it has a `%VAR%` in it, of the text as registered; and, for such a registration, every shim file
+/// name among them on its own (a bare file name, which [`unreferenced`] reads as naming every file of
+/// that name). This process expands a variable with its own environment, SCM with the system's, and
+/// an expansion can fail, so the folder is not trusted to be the one SCM starts from; a shim file's
+/// name is a hash of its content, so keeping every file of that name keeps nothing it should not.
+pub(crate) fn image_references(raw: &str, expanded: &str) -> Vec<String> {
+    let mut references = host_candidates(expanded);
+    if raw.contains('%') {
+        references.extend(host_candidates(raw));
+        let names: Vec<String> = references
+            .iter()
+            .filter_map(|path| path.rsplit(['\\', '/']).next())
+            .filter(|name| shim_file(name).is_some())
+            .map(str::to_string)
+            .collect();
+        references.extend(names);
+    }
+    let mut unique = Vec::new();
+    for reference in references {
+        if !unique.contains(&reference) {
+            unique.push(reference);
+        }
+    }
+    unique
 }
 
 /// Whether `a` and `b` are one path, compared without regard to case.
@@ -101,7 +132,7 @@ mod system {
     use super::super::acl::{display_path, lexical};
     use super::super::embedded::default_dir;
     use super::super::processes::running_images;
-    use super::{host_candidates, same_path, unreferenced};
+    use super::{image_references, same_path, unreferenced};
     use crate::backend::scm::manager::registry;
     use crate::error::{Error, Reason, Result};
     use crate::manager::Installed;
@@ -128,11 +159,13 @@ mod system {
         let mut hosts = Vec::new();
         let mut failed = Vec::new();
         let unfinished = registry::scan_services(|name| match registry::read_registered_image(&name) {
-            Ok(Some(image)) => hosts.extend(
-                host_candidates(&expand_environment(&image))
-                    .iter()
-                    .map(|candidate| normalise(Path::new(candidate))),
-            ),
+            Ok(Some(image)) => hosts.extend(image_references(&image, &expand_environment(&image)).iter().map(
+                // A bare file name stands for every file of that name: it is not a path to resolve.
+                |reference| match reference.contains(['\\', '/']) {
+                    true => normalise(Path::new(reference)),
+                    false => PathBuf::from(reference),
+                },
+            )),
             Ok(None) => {}
             Err(e) => failed.push(e),
         });
@@ -216,6 +249,9 @@ mod system {
 
     /// Removes `dir` if it is empty and `is_default` says it is the default folder, which is asked
     /// only of a folder that is empty: where the default folder is matters for nothing else.
+    ///
+    /// A folder that cannot be listed is not known to be empty, and the sweep of its files has said
+    /// why it cannot be listed: it stays, without a second report.
     pub(super) fn remove_if_empty_default(dir: &Path, is_default: impl FnOnce() -> Result<bool>) -> Result<()> {
         match fs::read_dir(dir) {
             Ok(mut listing) => {
@@ -223,8 +259,7 @@ mod system {
                     return Ok(());
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(Error::os_at("read", dir, e)),
+            Err(_) => return Ok(()),
         }
         if !is_default()? {
             return Ok(());

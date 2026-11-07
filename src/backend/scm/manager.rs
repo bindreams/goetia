@@ -427,7 +427,7 @@ impl Backend for Scm {
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
         let held = match host {
-            Some(_) => hold_host_process(&id),
+            Some(_) => hold_host_process(&id)?,
             None => None,
         };
         let scm = open_scm_to_classify(id.as_str())?;
@@ -1002,17 +1002,22 @@ fn registered_shim(snapshot: &ScmSnapshot) -> Option<PathBuf> {
 
 /// The process SCM reports for `id`, held before the service is stopped: it may be running an older
 /// file than the one registered (an `Update` it has not restarted into), which no read of the
-/// registry shows. `None` when SCM reports none, and when the service or its process cannot be
-/// reached (see [`hold_if_possible`]): the uninstall goes on, and what that process runs stays
-/// referenced by its image until it exits. The service handle the hold used is closed before this
-/// returns, or the service could not be deleted.
-fn hold_host_process(id: &Id) -> Option<Held> {
-    // A service gone since it was read, or one that will not open, is `uninstall_locked`'s to find.
-    let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS).ok()?;
-    hold_if_possible(&mut super::kill::SystemKillTarget::observing(
-        service,
-        id.as_str().to_string(),
-    ))
+/// registry shows. `None` when SCM reports none, and when the process cannot be opened (see
+/// [`hold_if_possible`]): the uninstall goes on, and what that process runs stays referenced by its
+/// image until it exits. A failure to read SCM fails the uninstall here, with nothing changed. The
+/// service handle the hold used is closed before this returns, or the service could not be deleted.
+fn hold_host_process(id: &Id) -> Result<Option<Held>> {
+    let (_scm, service) = match open_existing(id, ServiceAccess::QUERY_STATUS) {
+        Ok(opened) => opened,
+        // Gone since it was read: `uninstall_locked` finds it gone too.
+        Err(Error::NotInstalled { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut target = super::kill::SystemKillTarget::observing(service, id.as_str().to_string());
+    hold_if_possible(&mut target).map_err(|e| Error::Step {
+        what: format!("`{id}` was NOT deleted and is unchanged"),
+        source: Box::new(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)),
+    })
 }
 
 impl Scm {

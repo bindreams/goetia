@@ -252,7 +252,8 @@ fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
 
     let error = hold_service_process(&mut target).err().expect("a refused open");
 
-    assert_eq!(error.to_string(), "access denied");
+    assert!(matches!(error, HoldError::Refused(_)), "{error:?}");
+    assert_eq!(io::Error::from(error).to_string(), "access denied");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -263,7 +264,7 @@ fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
 fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
 
-    assert!(hold_if_possible(&mut target).is_none());
+    assert!(hold_if_possible(&mut target).unwrap().is_none());
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -271,7 +272,20 @@ fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
 fn a_process_that_can_be_opened_is_held_by_hold_if_possible() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found], []);
 
-    assert!(hold_if_possible(&mut target).is_some());
+    assert!(hold_if_possible(&mut target).unwrap().is_some());
+}
+
+/// Only the refusal is let go. A failed read of SCM is not a process that cannot be opened: the
+/// uninstall fails with nothing changed, whether the read was the first or the one after a refusal.
+#[skuld::test]
+fn a_failed_read_of_scm_is_not_let_go_by_hold_if_possible() {
+    let mut first = Scripted::new([Some(100)], [], []).failing_read(1);
+    let mut after_refusal = Scripted::new([Some(100), Some(100)], [Open::Fails], []).failing_read(2);
+
+    for target in [&mut first, &mut after_refusal] {
+        let error = hold_if_possible(target).err().expect("an SCM read failure");
+        assert_eq!(error.kind(), READ_FAILED_KIND);
+    }
 }
 
 #[skuld::test]

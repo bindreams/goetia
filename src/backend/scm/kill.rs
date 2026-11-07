@@ -123,32 +123,54 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
 /// Loops only when the service's state changed under it: the process was gone before it could be
 /// opened, or SCM no longer vouches for the pid it was opened by. Each round re-reads SCM, which
 /// settles on the new process or on none.
-pub(crate) fn hold_service_process<T: KillTarget>(target: &mut T) -> io::Result<Option<(u32, T::Process)>> {
+pub(crate) fn hold_service_process<T: KillTarget>(
+    target: &mut T,
+) -> std::result::Result<Option<(u32, T::Process)>, HoldError> {
     loop {
-        let Some(pid) = target.service_pid()? else {
+        let Some(pid) = target.service_pid().map_err(HoldError::Read)? else {
             return Ok(None);
         };
         let process = match target.open(pid) {
             Ok(Some(process)) => process,
             // The process is gone and SCM has not yet recorded it; wait for SCM to move off the pid.
             Ok(None) => {
-                await_scm_released(target, pid)?;
+                await_scm_released(target, pid).map_err(HoldError::Read)?;
                 continue;
             }
             // A pid that cannot be opened is a refusal only while SCM still says it is the service's.
             Err(e) => match target.service_pid() {
-                Ok(Some(now)) if now == pid => return Err(e),
+                Ok(Some(now)) if now == pid => return Err(HoldError::Refused(e)),
                 // SCM has moved on: the pid was a process that exited, or somebody else's, and `e`
                 // is superseded by what the next read finds.
                 Ok(_) => continue,
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
                 Err(read) => {
-                    return Err(io::Error::new(read.kind(), ReadAfterRefusedOpen { read, open: e }));
+                    return Err(HoldError::Read(io::Error::new(
+                        read.kind(),
+                        ReadAfterRefusedOpen { read, open: e },
+                    )));
                 }
             },
         };
-        if target.service_pid()? == Some(pid) {
+        if target.service_pid().map_err(HoldError::Read)? == Some(pid) {
             return Ok(Some((pid, process)));
+        }
+    }
+}
+
+/// Why [`hold_service_process`] could not hold the service's process.
+#[derive(Debug)]
+pub(crate) enum HoldError {
+    /// SCM vouches for the pid, and the process cannot be opened.
+    Refused(io::Error),
+    /// SCM could not be read, so what the service runs is not known.
+    Read(io::Error),
+}
+
+impl From<HoldError> for io::Error {
+    fn from(error: HoldError) -> Self {
+        match error {
+            HoldError::Refused(e) | HoldError::Read(e) => e,
         }
     }
 }
@@ -204,14 +226,16 @@ fn await_scm_released<T: KillTarget>(target: &mut T, pid: u32) -> io::Result<()>
 }
 
 /// [`hold_service_process`] for a caller that only wants the process to wait on: the process if it
-/// can be held, and `None` for a service with no process and for one whose process cannot be opened
-/// (a right removed by policy). The caller goes on without it; what that process runs is still
-/// found by its image.
-pub(crate) fn hold_if_possible<T: KillTarget>(target: &mut T) -> Option<T::Process> {
-    hold_service_process(target)
-        .ok()
-        .flatten()
-        .map(|(_pid, process)| process)
+/// can be held, and `None` for a service with no process and for one whose process SCM vouches for
+/// but cannot be opened (a right removed by policy). The caller goes on without it; what that
+/// process runs is still found by its image. A failure to read SCM is still an error: it says
+/// nothing about the process.
+pub(crate) fn hold_if_possible<T: KillTarget>(target: &mut T) -> io::Result<Option<T::Process>> {
+    match hold_service_process(target) {
+        Ok(held) => Ok(held.map(|(_pid, process)| process)),
+        Err(HoldError::Refused(_)) => Ok(None),
+        Err(e @ HoldError::Read(_)) => Err(e.into()),
+    }
 }
 
 #[cfg(windows)]
