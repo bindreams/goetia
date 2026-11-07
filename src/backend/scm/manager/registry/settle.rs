@@ -1,10 +1,11 @@
-//! What a read under `Services\<name>` makes of a key that is gone.
+//! What a read or a delete under `Services\<name>` makes of a key that is gone.
 //!
-//! goetia writes `Parameters` and `Environment` in place, so its own writes take no key away, but
-//! for a `Parameters` that is a registry link, which every write replaces. A key still goes missing
-//! when the service is uninstalled or another tool deletes it. A service that is gone is then
-//! absent; one that stands with a key that vanished is undetermined, with the cause, and is not
-//! waited on: a key another process took away has no event goetia can rely on.
+//! goetia writes `Parameters` and `Environment` in place, so its own writes take no key away,
+//! except that the write of an install or update replaces a `Parameters` that is a registry link.
+//! A key still goes missing when the service is uninstalled or another tool deletes it. A service
+//! that is gone is then absent; one that stands with a key that vanished is undetermined, with the
+//! cause, and is not waited on: a key another process took away has no event goetia can rely on.
+//! [`tolerate_not_found`] and [`gone_is_done`] say what a delete makes of a key or value gone.
 
 use std::io;
 

@@ -24,7 +24,7 @@ use crate::install_helper::INSTALL_AS;
 use crate::support::registry::{
     create_parameters_key, parameters_key, service_key, try_parameters_key, try_service_key,
 };
-use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
+use crate::support::{self, ConnectBack, ELEVATED, ScratchKey, ServiceGuard};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole
 /// host* — its exit code, or the absence of any `undetermined` entry — and by
@@ -901,37 +901,6 @@ fn create_raw_key(parent: &winreg::RegKey, name: &[u16], options: u32) -> winreg
     winreg::RegKey::predef(handle)
 }
 
-/// A key under `HKLM\SOFTWARE` removed on drop, for a registry link to point at.
-struct LinkTarget {
-    path: String,
-}
-
-impl LinkTarget {
-    fn create(id: &str) -> (Self, winreg::RegKey) {
-        let path = format!(r"SOFTWARE\goetia-link-target-{id}");
-        let (key, _) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
-            .create_subkey(&path)
-            .expect("create the link target");
-        (Self { path }, key)
-    }
-
-    /// The target as the kernel names it, which is what a link's value holds.
-    fn nt_path(&self) -> String {
-        format!(r"\Registry\Machine\{}", self.path)
-    }
-}
-
-impl Drop for LinkTarget {
-    fn drop(&mut self) {
-        let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
-        if let Err(e) = hklm.delete_subkey_all(&self.path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("LinkTarget: could not remove HKLM\\{}: {e}", self.path);
-        }
-    }
-}
-
 /// `RegDeleteTreeW` follows a registry link: a stray link under `Parameters` would have its target
 /// wiped. `--force` deletes the link itself and leaves the target as it was.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -942,7 +911,8 @@ fn force_install_deletes_a_stray_registry_link_and_leaves_its_target() {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, &id);
-    let (target, target_key) = LinkTarget::create(&id);
+    let target = ScratchKey::new(&format!("link-target-{id}"));
+    let target_key = target.create();
     target_key.set_value("Keep", &"x").expect("write Keep");
     target_key.create_subkey("Child").expect("create Child");
     let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
@@ -978,7 +948,8 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
     let _guard = ServiceGuard::new(&id);
     let spec = install_plain(&mgr, &id);
     let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
-    let (target, target_key) = LinkTarget::create(&id);
+    let target = ScratchKey::new(&format!("link-target-{id}"));
+    let target_key = target.create();
     target_key.set_value("Keep", &"x").expect("write Keep");
     target_key.set_value("Marker", &"not goetia's").expect("write Marker");
 
@@ -1608,7 +1579,7 @@ fn install_refuses_an_always_blob_as_unusable() {
 ///
 /// `no_aggregate_entry_is_emitted_for_a_zero_count` already covers the code-only half (an aggregate
 /// emitted unconditionally); what this uniquely pins is the claim about the runner.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial)]
 fn an_elevated_list_leaves_nothing_undetermined() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1681,7 +1652,7 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 /// not claimed, and nothing in `list` says a read did not complete. Reading the service key first
 /// made it `Undetermined`. A goetia service with the same denial is still listed as its own, which
 /// shows that the scan reached it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial)]
 fn list_reads_a_service_whose_own_key_denies_the_reader_by_its_parameters_alone() {
     #[derive(Clone, Copy, Debug)]
     enum Seed {

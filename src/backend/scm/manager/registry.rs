@@ -125,8 +125,8 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 /// What `Services\<name>\Parameters` holds: goetia's four fields, each read by its name, and every
 /// other value and subkey as a stray (see [`Parameters`]). A stray is drift that `install --force`
 /// removes. `Parameters` is opened as the key it is: one that is a registry link reads as the link
-/// (its `SymbolicLinkValue` is a stray, and a marker in its target is not goetia's proof), and
-/// `install --force` replaces it. `origin` says what vouches for `name` (see [`Origin`]); the
+/// (its `SymbolicLinkValue` is a stray, and a marker in its target is not goetia's proof), and the
+/// write of an install or update replaces it. `origin` says what vouches for `name` (see [`Origin`]); the
 /// result classifies the id:
 ///
 /// - A service with no `Parameters` key reads as empty `Parameters`, so `generate::extract` finds

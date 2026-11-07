@@ -5,6 +5,9 @@ use std::io::ErrorKind;
 use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
 use winreg::enums::HKEY_LOCAL_MACHINE;
 
+use crate::backend::test_elevation::{ELEVATED, elevated};
+use crate::backend::test_scratch::ScratchKey;
+
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
 
@@ -94,72 +97,37 @@ fn a_reply_too_short_for_the_key_flags_is_an_error_not_a_key_that_is_no_link() {
 
 // Against the real registry ===========================================================================================
 
-/// Skuld precondition: the scratch keys are under `HKLM\SOFTWARE`, which an unelevated run cannot write.
-fn elevated() -> Result<(), String> {
-    if cosca::elevation::is_elevated() {
-        Ok(())
-    } else {
-        Err(r"writes keys under HKLM\SOFTWARE; re-run elevated".to_string())
-    }
-}
-
-/// A key under `HKLM\SOFTWARE`, with everything under it, removed on drop. Made before the key it
-/// names, so that a failed assertion still removes it.
-struct Scratch {
-    path: String,
-}
-
-impl Scratch {
-    fn new(test: &str) -> Self {
-        Self {
-            path: format!(r"SOFTWARE\goetia-counted-{}-{test}", std::process::id()),
-        }
-    }
-
-    fn create(&self) -> RegKey {
-        let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
-            .create_subkey(&self.path)
-            .expect("create the scratch key");
-        key
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if let Err(e) = RegKey::predef(HKEY_LOCAL_MACHINE).delete_subkey_all(&self.path)
-            && e.kind() != ErrorKind::NotFound
-        {
-            eprintln!(r"Scratch: could not remove HKLM\{}: {e}", self.path);
-        }
-    }
-}
-
 fn units(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
 }
 
-/// KEY_DELETED at the open of `name` itself says that the held parent was marked deleted, which
-/// loses the delete's target: an error. A child that is not found is done.
-#[skuld::test(requires = [elevated])]
+/// Writes keys under `HKLM\SOFTWARE`. KEY_DELETED at the open of `name` itself says that the held
+/// parent was marked deleted, which loses the delete's target: an error. A child that is not found
+/// is done.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_child_of_a_parent_marked_deleted_is_an_error_and_a_child_not_found_is_done() {
-    let scratch = Scratch::new("parent");
+    let scratch = ScratchKey::new(&format!("counted-{}-parent", std::process::id()));
     let parent = scratch.create();
 
     delete_subkey(&parent, &units("Missing")).expect("a child that is not there is done");
 
     // Another handle deletes the parent; this one holds it open, so it is marked deleted.
     RegKey::predef(HKEY_LOCAL_MACHINE)
-        .delete_subkey(&scratch.path)
+        .delete_subkey(scratch.path())
         .expect("delete the parent through another handle");
     let e = delete_subkey(&parent, &units("Child")).expect_err("the parent is marked deleted");
 
     assert_eq!(e.raw_os_error(), Some(ERROR_KEY_DELETED as i32), "{e}");
 }
 
-/// Below the top a key marked deleted is part of what is being deleted: done.
-#[skuld::test(requires = [elevated])]
-fn a_key_marked_deleted_under_the_walk_is_done() {
-    let scratch = Scratch::new("below");
+/// Writes keys under `HKLM\SOFTWARE`. A key marked deleted while the walk holds it is done: its
+/// listing fails with KEY_DELETED, and `gone_is_done` takes that. This covers the listing branch at
+/// the top of `delete_tree`; the branch that opens a grandchild of a key deleted meanwhile needs an
+/// interleaving between the walk's listing and its open, which the real registry cannot be made to
+/// give without a hook in the walk.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_key_marked_deleted_while_the_walk_holds_it_is_done_at_its_listing() {
+    let scratch = ScratchKey::new(&format!("counted-{}-listing", std::process::id()));
     let parent = scratch.create();
     let (top, _) = parent.create_subkey("Top").expect("create Top");
     top.create_subkey("Leaf").expect("create Leaf");

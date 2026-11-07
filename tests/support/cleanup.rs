@@ -2,6 +2,9 @@
 //! holding a file, a process still exiting). Self-contained, so the library's unit tests load it as
 //! `backend::test_cleanup`.
 
+// The library's Windows tests load this for `retrying` and `warn_left_behind` alone.
+#![cfg_attr(windows, allow(dead_code))]
+
 use std::time::{Duration, Instant};
 
 /// The problem a removal of `path` that returned `result` leaves, as a message for the caller to

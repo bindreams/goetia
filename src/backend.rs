@@ -21,11 +21,25 @@ pub mod systemd;
 
 /// The integration suites' removal of what a test created, shared with the library's unit tests;
 /// they reach `tests/` only by path, and each module that included it itself would load it twice.
-/// Only Linux and macOS compile it: its library users are the systemd and launchd tests, and on
-/// other targets everything in it would be dead code.
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+/// Its library users are the systemd and launchd tests, and the scratch registry key on Windows.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 #[path = "../tests/support/cleanup.rs"]
 pub(crate) mod test_cleanup;
+
+// `scratch.rs` reaches `test_cleanup` as `super::cleanup`, which is where `support` keeps it.
+#[cfg(all(test, windows))]
+use test_cleanup as cleanup;
+
+/// The suites' scratch key under `HKLM\SOFTWARE`.
+#[cfg(all(test, windows))]
+#[path = "../tests/support/scratch.rs"]
+pub(crate) mod test_scratch;
+
+/// The `ELEVATED` label and `elevated` precondition of the integration suites, for the library's
+/// unit tests that write real system state. On every target: each has such tests.
+#[cfg(test)]
+#[path = "../tests/support/elevation.rs"]
+pub(crate) mod test_elevation;
 
 pub(crate) use contract::{
     Backend, Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed,
