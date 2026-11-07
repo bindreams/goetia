@@ -908,6 +908,35 @@ fn a_stop_whose_service_restarted_before_the_re_arm_says_so_instead_of_waiting()
     }
 }
 
+/// A caller that has seen `STOP_PENDING` already is not waiting for a stop to begin: it arms for
+/// `STOPPED` alone, and a first read of anything but `STOP_PENDING` or `STOPPED` is the failure.
+#[skuld::test]
+fn a_wait_after_a_seen_stop_pending_fails_on_a_first_read_that_is_neither_pending_nor_stopped() {
+    for (state, said) in [
+        (QueriedState::Running, "is running again"),
+        (QueriedState::Paused, "is paused again"),
+        (QueriedState::StartPending, "is starting again"),
+    ] {
+        let mut fake = FakeScm::new([]).starting_in(state);
+        let err = wait_after_stop(&mut fake, unbounded(), "", StopSeen::Pending)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(said), "{state:?}: {err}");
+        assert_eq!(fake.log, vec!["arm_stopped_only"], "{state:?}");
+    }
+}
+
+/// The confirming path: `STOP_PENDING` read at the arm, then `STOPPED` delivered.
+#[skuld::test]
+fn a_wait_after_a_seen_stop_pending_waits_out_stop_pending_and_confirms_stopped() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
+    assert_eq!(
+        wait_after_stop(&mut fake, unbounded(), "", StopSeen::Pending).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(fake.log, vec!["arm_stopped_only", "wait", "got_stopped"]);
+}
+
 /// The same race when the service has stopped and stayed so: the re-arm reports `STOPPED` at once.
 #[skuld::test]
 fn a_stop_whose_service_stopped_before_the_re_arm_is_confirmed_by_the_read() {

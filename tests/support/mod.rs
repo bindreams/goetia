@@ -1,8 +1,8 @@
 //! Shared support for the integration suites.
 //!
-//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only `daemon_spec` and
-//! `stock_shim_manager` depend on the `goetia` crate; the marker-inertness probe uses
-//! the rest, which runs before any backend exists.
+//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only `daemon_spec`, `kill`, `scm_wait`
+//! and `stock_shim_manager` depend on the `goetia` crate; the marker-inertness probe's
+//! hand-written artifacts use the rest.
 
 #![allow(dead_code, unused_imports)]
 // Each probe module is `#[cfg]`-gated to one platform, so most of this is
@@ -17,6 +17,8 @@ pub mod kill;
 pub mod local_user;
 #[cfg(windows)]
 pub mod registry;
+#[cfg(windows)]
+pub mod scm_wait;
 pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
