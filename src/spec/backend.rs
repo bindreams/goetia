@@ -30,6 +30,10 @@
 //! merged spec, base values included: an advisory describes what the native
 //! install does with the value it reads. A base value the native backend cannot
 //! honour is its generator's to refuse at install (`restart: always` on `scm`).
+//!
+//! [`BackendKind::refuse`] runs for the native backend too, on the same spec, for a value its generator would
+//! refuse at install anyway (systemd's `env` names), so the refusal comes at resolve. Its advisory twin is the
+//! one cross-backend warning: a host whose own backend carries the value says a systemd host would not.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -40,6 +44,7 @@ use serde::Deserialize;
 use super::interpolate::Substitution;
 use super::overrides::Supplied;
 use super::resolve::invalid;
+use super::vars::is_valid_name;
 use super::{AccountId, Id, Kind, Restart, User, Warning};
 use crate::error::Error;
 
@@ -160,12 +165,32 @@ impl BackendKind {
     /// with a value, whichever layer wrote it.
     pub(crate) fn warn(self, spec: &ShapedSpec, out: &mut Vec<Warning>) {
         match self {
+            // Refused instead, by `refuse`.
             BackendKind::Systemd => {}
-            BackendKind::Launchd => warn_on_sub_second_restart_delay(spec, out),
+            BackendKind::Launchd => {
+                warn_on_sub_second_restart_delay(spec, out);
+                warn_on_env_key_systemd_refuses(spec, out);
+            }
             BackendKind::Scm => {
                 warn_on_windows_divergences(spec, out);
                 warn_on_over_long_restart_delay(spec, out);
+                warn_on_env_key_systemd_refuses(spec, out);
             }
+        }
+    }
+
+    /// What this backend's native install cannot carry, judged on the substituted merged spec, base
+    /// values included: the install would refuse it anyway, so the refusal comes before it, at
+    /// resolve. Called for the native backend only. systemd drops an `env` key outside
+    /// `[A-Za-z_][A-Za-z0-9_]*` with only a log line, which is why its generator refuses it too
+    /// ([`systemd_env_key_defect`]).
+    pub(super) fn refuse(self, spec: &ShapedSpec) -> Result<(), Error> {
+        match self {
+            BackendKind::Systemd => match systemd_env_key_defect(&spec.env) {
+                Some(defect) => Err(invalid(&spec.id, &defect)),
+                None => Ok(()),
+            },
+            BackendKind::Launchd | BackendKind::Scm => Ok(()),
         }
     }
 
@@ -201,6 +226,30 @@ impl BackendKind {
                 _ => Ok(()),
             },
         }
+    }
+}
+
+/// Why systemd cannot carry the first `env` key it would drop, or `None` when it carries them all.
+/// systemd logs "Invalid environment assignment, ignoring" for any `Environment=` name outside
+/// `[A-Za-z_][A-Za-z0-9_]*` and starts the unit without it (measured on 242 and 255), so the
+/// daemon would never see the variable. One predicate for the systemd generator's refusal and
+/// for [`BackendKind::refuse`] and its advisory.
+pub(crate) fn systemd_env_key_defect(env: &BTreeMap<String, String>) -> Option<String> {
+    let key = env.keys().find(|key| !is_valid_name(key))?;
+    Some(format!(
+        "`env` key {key:?} is not a name systemd accepts in Environment=: it must match \
+        [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the \
+        daemon would never see it"
+    ))
+}
+
+/// The advisory for a host whose own backend carries the key: a systemd host would refuse it.
+fn warn_on_env_key_systemd_refuses(spec: &ShapedSpec, out: &mut Vec<Warning>) {
+    if let Some(defect) = systemd_env_key_defect(&spec.env) {
+        out.push(Warning {
+            id: Some(spec.id.clone()),
+            message: format!("{defect}; goetia refuses to install this manifest on a systemd host"),
+        });
     }
 }
 

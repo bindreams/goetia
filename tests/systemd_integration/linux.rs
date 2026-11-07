@@ -2049,6 +2049,8 @@ fn an_executable_path_with_dollars_runs_with_the_path_as_argv0() {
     let out = base.join("cmdline");
 
     let mut spec = mk(guard.id()).into_fields();
+    // `mk` restarts on failure: a failing script would restart forever and `start --wait` never return.
+    spec.restart = Restart::Never;
     // The shell lists its own argv, one per line, into the file named by its last argument. The
     // trailing `:` stops dash from exec'ing `tr` in the shell's place (it does that to the last
     // command of `-c`), which would make `/proc/$$/cmdline` read `tr`'s argv.

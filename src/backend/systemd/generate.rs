@@ -20,7 +20,7 @@
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Restart, is_valid_name};
+use crate::spec::{DaemonSpec, Restart, systemd_env_key_defect};
 
 // Generation ==========================================================================================================
 
@@ -108,6 +108,11 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
 /// - An executable path ending in a space: systemd 255 keeps the path but the service exits with
 ///   203/EXEC (242 runs it; both are refused). Interior spaces, other trailing whitespace and
 ///   later arguments are fine.
+/// - A path ending in `/` as the executable of `ExecStart=`: "Executable path specifies a directory",
+///   on 242 and 255. `..` in an executable path loads and runs.
+/// - A `..` component in `WorkingDirectory=` (the unit fails to load, "path is not normalized") or
+///   in the `append:` log path (242 fails to load; 255 loads and drops the log). `.` components,
+///   `//` and a trailing `/` load and resolve, so they are written as given.
 /// - An `env` key outside `[A-Za-z_][A-Za-z0-9_]*`: systemd logs "Invalid environment
 ///   assignment, ignoring" and drops it, and the unit still loads and starts.
 /// - A raw directive (`Description=`, `User=`, `WorkingDirectory=`, the `append:` path) with
@@ -134,24 +139,33 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
              ends in whitespace, which systemd does not run (the service exits with 203/EXEC)"
         )));
     }
-    if let Some(key) = spec.env.keys().find(|key| !is_valid_name(key)) {
+    if executable.ends_with('/') {
         return Err(invalid(format!(
-            "`env` key {key:?} is not a name systemd accepts in Environment=: it must match \
-             [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the \
-             daemon would never see it"
+            "the executable path {executable:?} (`command[0]`) \
+            ends in `/`, a directory, which systemd refuses to load in an executable path"
         )));
+    }
+    if let Some(defect) = systemd_env_key_defect(&spec.env) {
+        return Err(invalid(defect));
     }
 
     let cwd = spec.cwd.as_ref().map(|p| p.display().to_string());
     let logs = spec.logs.as_ref().map(|p| p.display().to_string());
     let raw_values = [
-        ("Description=", Some(spec.name.as_str())),
-        ("User=", Some(id.user.as_str())),
-        ("WorkingDirectory=", cwd.as_deref()),
-        ("StandardOutput=/StandardError= append:", logs.as_deref()),
+        ("Description=", false, Some(spec.name.as_str())),
+        ("User=", false, Some(id.user.as_str())),
+        ("WorkingDirectory=", true, cwd.as_deref()),
+        ("StandardOutput=/StandardError= append:", true, logs.as_deref()),
     ];
-    for (directive, value) in raw_values {
+    for (directive, is_path, value) in raw_values {
         let Some(value) = value else { continue };
+        if is_path && value.split('/').any(|component| component == "..") {
+            return Err(invalid(format!(
+                "{directive} path {value:?} has a `..` component, which systemd refuses to load (it \
+                requires a normalized path); goetia cannot collapse it lexically without changing \
+                which directory a symlink leads to"
+            )));
+        }
         if value.starts_with(STRIPPED_BY_SYSTEMD) || value.ends_with(STRIPPED_BY_SYSTEMD) {
             return Err(invalid(format!(
                 "{directive} value {value:?} starts or ends with whitespace, which systemd strips from \
@@ -250,11 +264,15 @@ fn double_percent(s: &str) -> String {
 /// even run does not continue and is written as is.
 fn raw_value(s: &str) -> String {
     let mut out = double_percent(s);
-    let trailing = out.len() - out.trim_end_matches('\\').len();
-    if trailing % 2 == 1 {
+    if trailing_backslash_run(&out) % 2 == 1 {
         out.push(' ');
     }
     out
+}
+
+/// How many backslashes end `s`.
+fn trailing_backslash_run(s: &str) -> usize {
+    s.len() - s.trim_end_matches('\\').len()
 }
 
 /// Whether `s` needs systemd command-line quoting: it is empty, or

@@ -480,11 +480,6 @@ fn percent_is_doubled_in_every_value() {
 // line, and the reader drops trailing whitespace, so a raw value gets one trailing space; a
 // quoted word reads `\\` as one backslash and needs no guard.
 
-/// How many backslashes end `text`.
-fn trailing_backslashes(text: &str) -> usize {
-    text.len() - text.trim_end_matches('\\').len()
-}
-
 fn with_fields(change: impl FnOnce(&mut DaemonFields)) -> DaemonSpec {
     let mut fields = minimal_spec().into_fields();
     change(&mut fields);
@@ -620,7 +615,7 @@ fn no_directive_ends_in_a_line_continuation_and_the_unit_stays_in_order() {
 
         for line in text.lines() {
             assert_eq!(
-                trailing_backslashes(line) % 2,
+                trailing_backslash_run(line) % 2,
                 0,
                 "{tail:?}: `{line}` continues onto the next line"
             );
@@ -845,6 +840,73 @@ fn an_argument_and_an_environment_value_with_edge_whitespace_are_quoted_whole() 
     );
     let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("Environment=")).collect();
     assert_eq!(lines, [r#"Environment="K= v ""#, r#"Environment="L=v ""#]);
+}
+
+// Non-normalized paths ================================================================================================
+//
+// Measured against systemd 242 and 255: a `..` component in `WorkingDirectory=` makes the unit fail to load
+// ("path is not normalized"), and in the `append:` path it does too on 242 and on 255 loads it and drops the log. `.`
+// components, `//` and a trailing `/` load and resolve in both. An `ExecStart=` path takes `..` too, but one ending in
+// `/` is refused ("Executable path specifies a directory").
+
+#[skuld::test]
+fn a_dot_dot_component_in_a_working_directory_or_log_path_is_refused() {
+    for tail in ["x/../y", "x/..", "../x"] {
+        let path = PathBuf::from(format!("{}/{tail}", abs("opt").display()));
+        for (directive, spec) in [
+            ("WorkingDirectory=", with_fields(|f| f.cwd = Some(path.clone()))),
+            ("StandardOutput=", with_fields(|f| f.logs = Some(path.clone()))),
+        ] {
+            let err = unit(&spec, &minimal_identity()).expect_err(&format!("{directive} {path:?}"));
+            let Error::Invalid { daemon, message, .. } = &err else {
+                panic!("{directive} {path:?}: expected Error::Invalid, got {err:?}");
+            };
+            assert_eq!(daemon, "frpc");
+            assert!(message.contains(directive), "{message}");
+            assert!(message.contains(".."), "{message}");
+            assert!(message.contains("systemd"), "{message}");
+        }
+    }
+}
+
+#[skuld::test]
+fn dots_doubled_and_trailing_slashes_in_paths_are_written_as_given() {
+    // systemd loads and resolves each of these; `a..b` and `..a` are names, not `..` components.
+    let base = abs("opt").display().to_string();
+    for tail in ["x/./y", "x//y", "x/", "x/.", "a..b", "..a", "a../b", ".../b"] {
+        let path = PathBuf::from(format!("{base}/{tail}"));
+        let spec = with_fields(|f| {
+            f.cwd = Some(path.clone());
+            f.logs = Some(path.clone());
+        });
+        let text = unit(&spec, &minimal_identity()).unwrap_or_else(|e| panic!("{tail:?}: {e}"));
+        assert_eq!(
+            line_of(&text, "WorkingDirectory="),
+            format!("WorkingDirectory={}", path.display()),
+            "{tail:?}"
+        );
+        assert_eq!(
+            line_of(&text, "StandardOutput="),
+            format!("StandardOutput=append:{}", path.display()),
+            "{tail:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_executable_path_may_hold_dot_dot_but_not_end_in_a_slash() {
+    let spec = with_fields(|f| f.command = vec![format!("{PROGRAM}/../frpc")]);
+    assert!(unit(&spec, &minimal_identity()).is_ok());
+
+    let spec = with_fields(|f| f.command = vec![format!("{PROGRAM}/")]);
+    let err = unit(&spec, &minimal_identity()).unwrap_err();
+    let Error::Invalid { daemon, message, .. } = &err else {
+        panic!("expected Error::Invalid, got {err:?}");
+    };
+    assert_eq!(daemon, "frpc");
+    assert!(message.contains("`command[0]`"), "{message}");
+    assert!(message.contains("directory"), "{message}");
+    assert!(message.contains("systemd"), "{message}");
 }
 
 // StartLimitIntervalSec ===============================================================================================

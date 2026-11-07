@@ -352,3 +352,64 @@ fn a_sid_is_rejected_under_a_posix_backend() {
         "a SID is a Windows account"
     );
 }
+
+// systemd's `Environment=` names ======================================================================================
+
+/// A spec whose `env` holds `key`.
+fn shaped_with_env_key(key: &str) -> ShapedSpec {
+    let mut spec = shaped_spec();
+    spec.env.insert(key.to_string(), "v".to_string());
+    spec
+}
+
+#[skuld::test]
+fn a_host_that_is_not_systemd_warns_about_an_env_key_systemd_would_refuse() {
+    for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
+        let spec = shaped_with_env_key(key);
+        for backend in [BackendKind::Launchd, BackendKind::Scm] {
+            let mut warnings = Vec::new();
+            backend.warn(&spec, &mut warnings);
+            let [warning] = warnings.as_slice() else {
+                panic!("{backend} {key:?}: expected exactly one warning, got {warnings:?}");
+            };
+            assert!(warning.message.contains(&format!("{key:?}")), "{}", warning.message);
+            assert!(warning.message.contains("systemd"), "{}", warning.message);
+        }
+    }
+    for key in ["PATH", "_x", "a1_B"] {
+        let spec = shaped_with_env_key(key);
+        for backend in [BackendKind::Launchd, BackendKind::Scm] {
+            let mut warnings = Vec::new();
+            backend.warn(&spec, &mut warnings);
+            assert!(warnings.is_empty(), "{backend} {key:?}: {warnings:?}");
+        }
+    }
+}
+
+#[skuld::test]
+fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
+    for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
+        let spec = shaped_with_env_key(key);
+        let err = BackendKind::Systemd
+            .refuse(&spec)
+            .expect_err(&format!("{key:?} must be refused"));
+        let message = err.to_string();
+        assert!(message.contains(&format!("{key:?}")), "{message}");
+        assert!(message.contains("Environment="), "{message}");
+        assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{key:?}");
+        assert!(BackendKind::Scm.refuse(&spec).is_ok(), "{key:?}");
+
+        let mut warnings = Vec::new();
+        BackendKind::Systemd.warn(&spec, &mut warnings);
+        assert!(
+            warnings.is_empty(),
+            "the refusal is systemd's whole answer: {warnings:?}"
+        );
+    }
+    for key in ["PATH", "_x", "a1_B"] {
+        assert!(
+            BackendKind::Systemd.refuse(&shaped_with_env_key(key)).is_ok(),
+            "{key:?}"
+        );
+    }
+}

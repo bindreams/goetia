@@ -153,6 +153,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     if let Some(b) = native {
         b.error(&shaped, native_supplied, Substitution::Done)
             .map_err(|e| attribute_to(Refused::at(Field::User, e).attributed(&from_env), b))?;
+        b.refuse(&shaped)?;
         b.warn(&shaped, &mut daemon_warnings);
     }
 

@@ -315,6 +315,28 @@ fn a_directory_defect_is_not_attributed_to_env_when_env_supplied_the_field() {
     assert!(msg.contains("after substituting from .env: "), "{msg}");
 }
 
+/// A drive-relative `Q:` resolves through the per-drive directory, which no manifest can set, so the
+/// resolution is named and `.env` is blamed only when a reference supplied the `Q:`.
+#[skuld::test]
+fn a_resolved_drive_relative_defect_names_the_resolution_and_blames_env_only_when_env_wrote_it() {
+    let id = Id::try_from("frpc").unwrap();
+    let resolved = Path::new("/a\u{7}");
+    let refused = || check_resolved(&id, PathField::Cwd, "Q:", resolved, false).unwrap_err();
+
+    let typed = refused().attributed(&BTreeSet::new()).to_string();
+    assert!(
+        typed.contains("field `cwd` is `Q:`, which resolves to `/a\u{7}`"),
+        "{typed}"
+    );
+    assert!(!typed.contains(".env") && !typed.contains("substituting"), "{typed}");
+
+    let from_env = refused().attributed(&BTreeSet::from([Field::Cwd])).to_string();
+    assert!(
+        from_env.contains("after substituting from .env: field `cwd` is `Q:`, which resolves to `/a\u{7}`"),
+        "{from_env}"
+    );
+}
+
 /// A drive root is a legitimate working directory: nothing refuses the backslash it ends in,
 /// written out or reached through the manifest directory.
 #[cfg(windows)]
@@ -2482,4 +2504,31 @@ backend-specific:
 ";
     let (_spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+// systemd's `Environment=` names ======================================================================================
+
+#[skuld::test]
+fn a_systemd_host_refuses_an_env_key_systemd_would_drop_and_another_host_warns() {
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nenv:\n  MY-VAR: x\n";
+
+    let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
+    assert!(msg.contains("\"MY-VAR\"") && msg.contains("Environment="), "{msg}");
+
+    for native in [BackendKind::Launchd, BackendKind::Scm] {
+        let (_spec, warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("{native}: {e}"));
+        let [warning] = warnings.as_slice() else {
+            panic!("{native}: expected one warning, got {warnings:?}");
+        };
+        assert!(warning.message.contains("\"MY-VAR\""), "{native}: {}", warning.message);
+    }
+}
+
+#[skuld::test]
+fn an_env_key_systemd_accepts_draws_no_complaint_on_any_host() {
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nenv:\n  MY_VAR: x\n";
+    for native in BackendKind::ALL {
+        let (_spec, warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("{native}: {e}"));
+        assert!(warnings.is_empty(), "{native}: {warnings:?}");
+    }
 }

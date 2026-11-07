@@ -205,9 +205,11 @@ impl Backend for Scm {
     type InstallScope = ();
     type Reservation = ();
 
-    /// SCM has nothing to hold across an install: its preconditions are `apply`'s, before any write.
-    fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
-        Ok(())
+    /// SCM has nothing to hold across an install. Its precondition here is the shim's path, which a
+    /// `type: simple` daemon is registered with and which the registration writer must not rewrite;
+    /// the rest are `apply`'s, before any write.
+    fn begin_install(&self, spec: &DaemonSpec) -> Result<()> {
+        generate::check_shim_path(spec, &shim_path())
     }
 
     /// SCM sends its requests through the OS, with no thread or file of ours to run out.
