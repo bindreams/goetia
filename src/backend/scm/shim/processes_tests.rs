@@ -7,7 +7,7 @@ use cosca::Stdio;
 
 use super::super::sweep::normalise;
 use super::*;
-use crate::backend::scm::kill::system::{has_exited, wait_exit};
+use crate::backend::scm::kill::system::{has_exited, open_process_with, wait_exit};
 
 const HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
@@ -46,29 +46,18 @@ fn running_images_lists_a_running_copy() {
     );
 }
 
-#[skuld::test]
-fn processes_with_image_holds_a_running_copy_until_it_exits() {
-    let running = run_a_copy();
-
-    let held = processes_with_image(&running.exe).expect("find the copy");
-
-    assert_eq!(held.len(), 1);
-    assert!(!has_exited(&held[0]).unwrap());
-    running.child.kill().unwrap();
-    wait_exit(&held[0], || {}).expect("wait for the copy to exit");
-    assert!(has_exited(&held[0]).unwrap());
-}
-
 /// A process that has exited, though a handle to it is still held, references nothing.
 #[skuld::test]
 fn a_process_that_has_exited_is_not_an_image() {
     let running = run_a_copy();
-    let held = processes_with_image(&running.exe).expect("find the copy");
+    let held = open_process_with(running.child.id().pid(), ACCESS)
+        .expect("open the copy")
+        .expect("the copy is running");
     running.child.kill().unwrap();
-    wait_exit(&held[0], || {}).unwrap();
+    wait_exit(&held, || {}).expect("wait for the copy to exit");
+    assert!(has_exited(&held).unwrap());
 
     let images = running_images().expect("list the running images");
 
     assert!(!images.contains(&normalise(&running.exe)));
-    assert!(processes_with_image(&running.exe).unwrap().is_empty());
 }

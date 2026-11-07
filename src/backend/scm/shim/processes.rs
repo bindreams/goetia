@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::embedded::shim_file;
-use super::sweep::{normalise, same_path};
+use super::sweep::normalise;
 use crate::backend::scm::kill::system::{has_exited, open_process_with};
 use crate::error::{Error, Result};
 
@@ -34,8 +34,8 @@ const ACCESS: u32 = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
 
 /// What one process of the list came to.
 enum Seen {
-    /// Running, held, with the image it was started from.
-    Image(OwnedHandle, PathBuf),
+    /// Running, with the image it was started from.
+    Image(PathBuf),
     /// Running, but its image could not be read: the file name the process list gives.
     Unnamed(OsString),
 }
@@ -46,7 +46,7 @@ enum Seen {
 pub(crate) fn running_images() -> Result<Vec<PathBuf>> {
     let mut images = Vec::new();
     each(|seen| match seen {
-        Seen::Image(_, image) => images.push(normalise(&image)),
+        Seen::Image(image) => images.push(normalise(&image)),
         Seen::Unnamed(name) => {
             if name.to_str().and_then(shim_file).is_some() {
                 images.push(PathBuf::from(name));
@@ -54,24 +54,6 @@ pub(crate) fn running_images() -> Result<Vec<PathBuf>> {
         }
     })?;
     Ok(images)
-}
-
-/// A handle, opened with `SYNCHRONIZE`, on every running process whose image is `exe`. The image is
-/// read through the handle after the open, so what is held is the process that runs `exe`, never a
-/// stranger that took a pid. A process whose image cannot be read is not here: it cannot be waited
-/// for as one that runs `exe`, but [`running_images`] still counts it.
-pub(crate) fn processes_with_image(exe: &std::path::Path) -> Result<Vec<OwnedHandle>> {
-    let exe = normalise(exe);
-    let mut held = Vec::new();
-    each(|seen| {
-        if let Seen::Image(handle, image) = seen
-            && image.file_name().is_some_and(|name| Some(name) == exe.file_name())
-            && same_path(&normalise(&image), &exe)
-        {
-            held.push(handle);
-        }
-    })?;
-    Ok(held)
 }
 
 /// Visits every process the list names that was still running when it was opened.
@@ -95,7 +77,7 @@ fn open(pid: u32, name: OsString) -> Option<Seen> {
         Err(_) => return Some(Seen::Unnamed(name)),
     };
     match image_of(&handle) {
-        Ok(image) => Some(Seen::Image(handle, image)),
+        Ok(image) => Some(Seen::Image(image)),
         // An exited process keeps its handles but has no image to read. One that has not exited and
         // cannot be read is unknown.
         Err(_) => match has_exited(&handle) {

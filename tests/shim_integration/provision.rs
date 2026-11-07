@@ -993,6 +993,40 @@ fn uninstall_of_one_of_two_on_a_file_returns() {
     assert_eq!(mgr.status(&b_spec.id).expect("status").state, State::Running);
 }
 
+/// A service B that was updated to another file and not restarted still runs the first. Uninstalling
+/// A, the last service registered with the first file, returns without waiting for B's process, and
+/// leaves the file and the process alone: B's image keeps the file referenced.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file() {
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let (a_id, b_id) = (support::random_test_id(), support::random_test_id());
+    let (_a_guard, _b_guard) = (ShimGuard::new(&a_id), ShimGuard::new(&b_id));
+    let started = ConnectBack::listen();
+    let first = Scm::with_shim(embedded_shim(Some(folder.clone())), CheckPermissions::Disable);
+    let second = Scm::with_shim(
+        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())),
+        CheckPermissions::Disable,
+    );
+    let a_spec = simple_spec(&a_id, fixture_command("report", &["1"]), &logs);
+    let b_spec = simple_spec(&b_id, fixture_command("report", &[&started.port().to_string()]), &logs);
+    first.install(&a_spec, false).expect("install A on the first file");
+    first.install(&b_spec, false).expect("install B on the first file");
+    let old = shim_in(&folder);
+    first.start(&b_spec.id, Budget::DEFAULT).expect("start B");
+    started.accept("B to report in");
+    let running = ShimProcess::attach(&b_id);
+    let moved = second.install(&b_spec, false).expect("install B on the second file");
+    assert!(matches!(moved, Outcome::Update { .. }), "{moved:?}");
+
+    second
+        .uninstall(&a_spec.id)
+        .expect("uninstall A, which does not wait for B");
+
+    assert!(old.is_file(), "B's process still runs the first file");
+    assert!(!running.has_exited(), "B keeps running");
+}
+
 /// A service registered under another folder than the manager's: its uninstall sweeps that one too.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_sweeps_the_other_folder() {

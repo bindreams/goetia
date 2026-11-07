@@ -117,7 +117,7 @@ fn name_key(path: &Path) -> String {
 }
 
 #[cfg(windows)]
-pub(crate) use system::{normalise, referenced_hosts, registered_hosts, sweep_folder};
+pub(crate) use system::{normalise, referenced_hosts, sweep_folder};
 
 #[cfg(windows)]
 mod system {

@@ -114,14 +114,13 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::hold_if_possible;
-use crate::backend::scm::kill::system::{Held, wait_exit};
+use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
-use crate::backend::scm::shim::processes::processes_with_image;
 use crate::backend::scm::shim::provider::ShimProvider;
-use crate::backend::scm::shim::sweep::{normalise, referenced_hosts, registered_hosts, same_path, sweep_folder};
+use crate::backend::scm::shim::sweep::{normalise, referenced_hosts, same_path, sweep_folder};
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
@@ -410,9 +409,8 @@ impl Backend for Scm {
     /// A service that may run a shim file takes the install lock first and keeps it to the end, so
     /// that no install places or sweeps a file between the stop and the sweep. If the service's host
     /// is a shim file by name, its process is held before the stop, and once the service is stopped
-    /// and deleted the uninstall waits for that process and for any other that runs the file, and
-    /// sweeps the folders the files can be in: see [`Scm::finish_uninstall`]. Anything else is
-    /// [`uninstall_locked`] alone.
+    /// and deleted the uninstall waits for that process and sweeps the folders the files can be in:
+    /// see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
     fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
         // A blob that will not decode leaves the kind open: the host's name then decides.
         let may_run_a_shim = snapshot.blob().map_or(true, |blob| blob.spec.kind == Kind::Simple);
@@ -1023,9 +1021,10 @@ fn hold_host_process(id: &Id) -> Result<Option<Held>> {
 impl Scm {
     /// What an uninstall does once `id` is stopped and deleted, for a service whose host was the shim
     /// file `host`: waits, with no bound, for the process that was held (it is on its way out: SCM
-    /// recorded `STOPPED` before it exits), and, unless another service registers `host`, for every
-    /// other process that runs it; then sweeps the provider's folder and the folder `host` was in,
-    /// which is another when the service was installed by another goetia version or provider.
+    /// recorded `STOPPED` before it exits), and for no other: a healthy service that was updated to
+    /// another file and not restarted still runs `host`, and its process keeps the file referenced
+    /// for a later sweep. Then sweeps the provider's folder and the folder `host` was in, which is
+    /// another when the service was installed by another goetia version or provider.
     ///
     /// A failure here leaves the service deleted, and says so, with the retry: `uninstall` of the id
     /// that is no longer installed sweeps again.
@@ -1042,23 +1041,8 @@ impl Scm {
                 .map_err(|e| left_behind(Error::os(format!("wait for `{id}`'s process to exit"), e)))?;
         }
         let host = normalise(host);
-        // Another service on the same file keeps it, and its processes are that service's.
-        let shared = registered_hosts()
-            .map_err(left_behind)?
-            .iter()
-            .any(|registered| same_path(registered, &host));
-        if !shared {
-            for process in processes_with_image(&host).map_err(left_behind)? {
-                let waiting = || eprintln!("{id}: waiting for a process running {} to exit", host.display());
-                wait_exit(&process, waiting).map_err(|e| {
-                    left_behind(Error::os(
-                        format!("wait for a process running {} to exit", host.display()),
-                        e,
-                    ))
-                })?;
-            }
-        }
-        // After the waits: what has exited no longer references its file.
+        // After the wait: the held process has exited and no longer references its file. Any other
+        // process running `host` still does, and keeps the file for a later sweep.
         let referenced = referenced_hosts().map_err(left_behind)?;
         let mut failures = Vec::new();
         if let Some(shim) = &self.shim {
