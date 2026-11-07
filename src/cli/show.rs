@@ -142,7 +142,7 @@ fn show_from_installed(
                 err,
                 "error: daemon `{}`: installation state could not be determined: {}",
                 escape(id),
-                escape(&entry.reason)
+                entry.reason
             );
             codes.push(ExitCode::Indeterminate);
         } else {

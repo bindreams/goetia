@@ -1,4 +1,5 @@
 use super::{UndeterminedEntry, print_undetermined_warnings, print_unusable_warnings, print_warnings};
+use crate::error::Reason;
 use crate::spec::{Id, Warning};
 
 fn rendered(id: Option<Id>) -> String {
@@ -44,16 +45,16 @@ fn a_warning_is_printed_with_control_and_direction_characters_escaped() {
 #[skuld::test]
 fn an_unusable_or_undetermined_entry_is_printed_with_control_and_direction_characters_escaped() {
     let mut out: Vec<u8> = Vec::new();
-    let unusable = std::collections::BTreeMap::from([("a\nb".to_string(), "why\u{1b}[0m".to_string())]);
+    let unusable = std::collections::BTreeMap::from([("a\nb".to_string(), Reason::said("why\u{1b}[0m"))]);
     print_unusable_warnings(&unusable, &mut out);
     let undetermined = [
         UndeterminedEntry {
             name: Some("c\u{202e}d".to_string()),
-            reason: "no\u{2028}pe".to_string(),
+            reason: Reason::said("no\u{2028}pe"),
         },
         UndeterminedEntry {
             name: None,
-            reason: "all\rgone".to_string(),
+            reason: Reason::said("all\rgone"),
         },
     ];
     print_undetermined_warnings(&undetermined, &mut out);
@@ -74,7 +75,6 @@ fn an_unusable_or_undetermined_entry_is_printed_with_control_and_direction_chara
 /// the sinks that print it escape.
 #[skuld::test]
 fn the_index_holds_a_reason_as_it_is() {
-    use crate::error::Reason;
     use crate::manager::Installed;
 
     let index = super::partition_installed(vec![
@@ -87,6 +87,39 @@ fn the_index_holds_a_reason_as_it_is() {
             reason: Reason::said("all\rgone"),
         },
     ]);
-    assert_eq!(index.unusable["a"], "why\u{1b}[0m");
-    assert_eq!(index.undetermined[0].reason, "all\rgone");
+    assert_eq!(index.unusable["a"].unescaped().to_string(), "why\u{1b}[0m");
+    assert_eq!(index.undetermined[0].reason.unescaped().to_string(), "all\rgone");
+}
+
+/// A child's stderr looks the same in `list`, `status` and `show` as in the report: its line
+/// breaks stay, and the lines after the first are indented.
+#[skuld::test]
+fn a_reason_wrapping_a_command_error_keeps_the_stderr_layout_of_the_report() {
+    use crate::error::Error;
+    use crate::error::error_tests::exit_status;
+
+    let command = || Error::command("systemctl show x", exit_status(1), b"first\nerror: forged");
+    let report = command().report().to_string();
+    assert!(report.ends_with(": first\n  error: forged"), "{report:?}");
+
+    let mut out: Vec<u8> = Vec::new();
+    let unusable = std::collections::BTreeMap::from([("x".to_string(), Reason::failed(command()))]);
+    print_unusable_warnings(&unusable, &mut out);
+    let undetermined = [
+        UndeterminedEntry {
+            name: Some("y".to_string()),
+            reason: Reason::failed(command()),
+        },
+        UndeterminedEntry {
+            name: None,
+            reason: Reason::failed(command()),
+        },
+    ];
+    print_undetermined_warnings(&undetermined, &mut out);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!(
+            "warning: x: installed but unusable: {report}\nwarning: y: installation state could not be determined: {report}\nwarning: {report}\n"
+        )
+    );
 }

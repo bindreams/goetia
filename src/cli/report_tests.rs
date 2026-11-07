@@ -5,11 +5,7 @@ fn report(kinds: &[Kind]) -> Report {
         daemons: Vec::new(),
         errors: kinds
             .iter()
-            .map(|kind| ErrorReport {
-                id: None,
-                kind: *kind,
-                message: "why".to_string(),
-            })
+            .map(|kind| ErrorReport::said(None, *kind, "why".to_string()))
             .collect(),
         undetermined: Vec::new(),
     }
@@ -36,11 +32,11 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
             enabled: true,
             pid: Some(1234),
         }],
-        errors: vec![ErrorReport {
-            id: Some("corrupt".to_string()),
-            kind: Kind::Unusable,
-            message: "why".to_string(),
-        }],
+        errors: vec![ErrorReport::said(
+            Some("corrupt".to_string()),
+            Kind::Unusable,
+            "why".to_string(),
+        )],
         undetermined: Vec::new(),
     };
 

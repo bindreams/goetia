@@ -20,6 +20,8 @@ impl fmt::Display for Report<'_> {
     }
 }
 
+const LAYOUT_INDENT: &str = "  ";
+
 /// Where error text goes. The one place it is written for a person is [`write_chain`], so the one
 /// place it is escaped: `escaped` is whether this destination is one. The text goes through
 /// [`fmt::Write`], which escapes it whole; a child's stderr is written with
@@ -34,12 +36,20 @@ impl<'a> Sink<'a> {
         Sink { out, escaped }
     }
 
+    /// Writes `text`, a child's diagnostic. For a person it keeps its line breaks and tabs, and
+    /// indents every line after the first, so that no line of it starts where goetia's own lines do
+    /// (a stderr of `error: ...` is not goetia saying it). A blank line has nothing to indent.
     fn write_layout(&mut self, text: &str) -> fmt::Result {
-        if self.escaped {
-            write_escaped_keeping_layout(self.out, text)
-        } else {
-            self.out.write_str(text)
+        if !self.escaped {
+            return self.out.write_str(text);
         }
+        for (i, line) in text.split_inclusive('\n').enumerate() {
+            if i > 0 && !matches!(line, "\n" | "\r\n") {
+                self.out.write_str(LAYOUT_INDENT)?;
+            }
+            write_escaped_keeping_layout(self.out, line)?;
+        }
+        Ok(())
     }
 }
 

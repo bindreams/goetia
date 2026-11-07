@@ -108,8 +108,8 @@ fn a_report_leaves_a_windows_path_and_a_persian_name_as_written() {
     );
 }
 
-/// A child's diagnostic is multi-line by nature: the report keeps its line feeds and tabs, and the
-/// variant's own text holds none of it.
+/// A child's diagnostic is multi-line by nature: the report keeps its line feeds and tabs, indents
+/// the lines after the first, and the variant's own text holds none of it.
 #[skuld::test]
 fn a_commands_stderr_keeps_its_layout_and_loses_the_rest_of_the_set() {
     let e = command("first\n\tsecond\u{1b}[31m\u{202e}\r");
@@ -122,7 +122,7 @@ fn a_commands_stderr_keeps_its_layout_and_loses_the_rest_of_the_set() {
         format!(
             r"`systemctl start x` failed ({}): first{}{}second\u{{1b}}[31m\u{{202e}}\u{{d}}",
             exit_status(1),
-            "\n",
+            "\n  ",
             "\t"
         )
     );
@@ -151,4 +151,43 @@ fn a_chain_leaves_escaping_to_the_sink_and_a_reason_is_one() {
     let e = os("read", "/a\nb", "denied");
     assert!(Chain(&e).to_string().contains('\n'));
     assert!(!Reason::failed(e).to_string().contains('\n'));
+}
+
+/// sc.exe and other Windows tools write CRLF: each line ends as it was written.
+#[skuld::test]
+fn a_commands_stderr_keeps_a_carriage_return_that_ends_a_line() {
+    let text = command("one\r\ntwo\rthree").report().to_string();
+    assert!(text.ends_with(concat!(": one\r\n  two", r"\u{d}", "three")), "{text:?}");
+}
+
+/// Goetia's own lines start at column 0, so no line of a child's stderr after the first may: a
+/// stderr that says `error: ...` would otherwise read as goetia saying it.
+#[skuld::test]
+fn no_line_of_a_commands_stderr_starts_where_goetias_own_lines_do() {
+    let e = command("first\nerror: forged\n\n\tindented\r\nwarning: forged");
+    let text = e.report().to_string();
+    let lines: Vec<&str> = text.split('\n').collect();
+    assert_eq!(lines.len(), 5, "{text:?}");
+    for line in &lines[1..] {
+        assert!(
+            line.trim_end_matches('\r').is_empty() || line.starts_with("  "),
+            "{line:?} in {text:?}"
+        );
+    }
+    assert!(text.contains("\n  error: forged\n"), "{text:?}");
+    // Written for JSON, the text is as it came.
+    assert!(
+        e.report_unescaped()
+            .to_string()
+            .ends_with("first\nerror: forged\n\n\tindented\r\nwarning: forged")
+    );
+}
+
+/// A [`Reason`] prints as the report does, a child's stderr included.
+#[skuld::test]
+fn a_reason_wrapping_a_command_error_prints_its_stderr_as_the_report_does() {
+    let e = command("first\nsecond");
+    let expected = e.report().to_string();
+    assert!(expected.ends_with(": first\n  second"), "{expected:?}");
+    assert_eq!(Reason::failed(e).to_string(), expected);
 }

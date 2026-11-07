@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::ExitCode;
-use crate::error::{Error, Result, escape};
+use crate::error::{Error, Reason, Result, escape};
 use crate::manager::{Installed, ServiceManager, State};
 use crate::spec::{DaemonSpec, Id, Warning};
 
@@ -50,7 +50,7 @@ pub(crate) struct UndeterminedEntry {
     /// [`Installed::Undetermined`], whose doc comment carries the rule
     /// every caller owes such an entry.
     pub name: Option<String>,
-    pub reason: String,
+    pub reason: Reason,
 }
 
 /// [`ServiceManager::list`]'s entries, indexed by id: spec/state/pid/enabled
@@ -58,7 +58,7 @@ pub(crate) struct UndeterminedEntry {
 /// `list`, `status`, `show` and `diff`.
 pub(crate) struct InstalledIndex {
     pub ours: BTreeMap<String, InstalledEntry>,
-    pub unusable: BTreeMap<String, String>,
+    pub unusable: BTreeMap<String, Reason>,
     /// What goetia could not classify at all: named entries first, sorted
     /// by name, then any aggregate. Not a map: an aggregate carries no name
     /// to key on (see [`Installed::Undetermined`]).
@@ -104,13 +104,10 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
                 );
             }
             Installed::OursUnusable { name, reason } => {
-                unusable.insert(name, reason.unescaped().to_string());
+                unusable.insert(name, reason);
             }
             Installed::Undetermined { name, reason } => {
-                undetermined.push(UndeterminedEntry {
-                    name,
-                    reason: reason.unescaped().to_string(),
-                });
+                undetermined.push(UndeterminedEntry { name, reason });
             }
         }
     }
@@ -136,14 +133,9 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
     }
 }
 
-pub(crate) fn print_unusable_warnings(unusable: &BTreeMap<String, String>, err: &mut dyn Write) {
+pub(crate) fn print_unusable_warnings(unusable: &BTreeMap<String, Reason>, err: &mut dyn Write) {
     for (name, reason) in unusable {
-        let _ = writeln!(
-            err,
-            "warning: {}: installed but unusable: {}",
-            escape(name),
-            escape(reason)
-        );
+        let _ = writeln!(err, "warning: {}: installed but unusable: {}", escape(name), reason);
     }
 }
 
@@ -156,9 +148,9 @@ pub(crate) fn print_undetermined_warnings(undetermined: &[UndeterminedEntry], er
                 err,
                 "warning: {}: installation state could not be determined: {}",
                 escape(name),
-                escape(&entry.reason)
+                entry.reason
             ),
-            None => writeln!(err, "warning: {}", escape(&entry.reason)),
+            None => writeln!(err, "warning: {}", entry.reason),
         };
     }
 }

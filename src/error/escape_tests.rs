@@ -58,6 +58,15 @@ fn layout_mode_keeps_a_line_feed_and_a_tab_and_escapes_the_rest_of_the_set() {
     );
 }
 
+/// A CR that ends a line is part of its layout (sc.exe writes CRLF); one anywhere else moves the
+/// cursor.
+#[skuld::test]
+fn layout_mode_keeps_a_carriage_return_only_before_a_line_feed() {
+    assert_eq!(escaped_keeping_layout("a\r\nb\r"), concat!("a\r\nb", r"\u{d}"));
+    assert_eq!(escaped_keeping_layout("\r\r\n"), concat!(r"\u{d}", "\r\n"));
+    assert_eq!(escaped_keeping_layout("a\rb"), r"a\u{d}b");
+}
+
 #[cfg(feature = "cli")]
 /// What `EscapedStream` writes for `chunks`, each handed to its own `write` call.
 fn streamed(chunks: &[&[u8]]) -> Vec<u8> {
@@ -116,4 +125,32 @@ fn bytes_that_are_not_utf8_are_written_as_the_replacement_character() {
 #[skuld::test]
 fn an_incomplete_character_at_the_end_of_the_stream_is_not_lost_silently() {
     assert_eq!(streamed(&[b"ok\xe2\x80"]), "ok\u{fffd}".as_bytes());
+}
+
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn a_stream_keeps_a_carriage_return_only_before_a_line_feed() {
+    assert_eq!(streamed(&[b"a\r\nb"]), b"a\r\nb");
+    assert_eq!(streamed(&[b"a\rb"]), br"a\u{d}b");
+    assert_eq!(streamed(&[b"\r\r\n"]), concat!(r"\u{d}", "\r\n").as_bytes());
+}
+
+/// The CR at the end of one write waits for the next byte to learn which it is.
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn a_carriage_return_ending_a_write_is_decided_by_the_next_byte() {
+    assert_eq!(streamed(&[b"a\r", b"\nb"]), b"a\r\nb");
+    assert_eq!(streamed(&[b"a\r", b"b"]), br"a\u{d}b");
+    assert_eq!(
+        streamed(&[b"a\r", b"\r", b"\n"]),
+        concat!("a", r"\u{d}", "\r\n").as_bytes()
+    );
+    // A write with nothing in it decides nothing.
+    assert_eq!(streamed(&[b"a\r", b"", b"\n"]), b"a\r\n");
+}
+
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn a_carriage_return_at_the_end_of_the_stream_is_escaped() {
+    assert_eq!(streamed(&[b"ok\r"]), br"ok\u{d}");
 }

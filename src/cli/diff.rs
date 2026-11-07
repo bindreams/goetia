@@ -8,6 +8,9 @@
 //! and never carries the raw on-disk artifact text, so it could not tell
 //! "absent" from "occupied by a stranger's service" or "up to date" from
 //! "hand-edited outside Goetia".
+//!
+//! The artifact diff prints for reading, so it is not byte-exact when a value holds a control
+//! character, U+2028, U+2029 or a bidirectional control: see [`super::show`], guarantee 4.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -15,7 +18,7 @@ use std::path::PathBuf;
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
-use super::refusal::{self, Mood};
+use super::refusal::{Lines, Mood};
 use super::support::load_and_warn;
 use crate::decide::Outcome;
 use crate::error::Result;
@@ -57,9 +60,10 @@ pub fn run(
             return ExitCode::of(&e);
         }
     };
-    if let Some(code) = refusal::report(&spec.id, &outcome, Mood::Would, out, err) {
-        return code;
-    }
+    let lines = Lines {
+        id: &spec.id,
+        mood: Mood::Would,
+    };
     match outcome {
         Outcome::Create => {
             let _ = writeln!(out, "{}: not installed (would be created)", spec.id);
@@ -79,10 +83,15 @@ pub fn run(
                 spec.id
             );
         }
-        Outcome::Conflict { .. }
-        | Outcome::RefuseForeign { .. }
-        | Outcome::RefuseOtherDaemon { .. }
-        | Outcome::RefuseUnusable { .. } => unreachable!("`refusal::report` wrote {outcome:?}"),
+        Outcome::Conflict {
+            artifact_diff,
+            unclearable_recovery,
+        } => return lines.conflict(&artifact_diff, unclearable_recovery.as_deref(), out, err),
+        Outcome::RefuseForeign { recovery } => return lines.foreign(&recovery, out, err),
+        Outcome::RefuseOtherDaemon { installed } => return lines.other_daemon(&installed, out, err),
+        Outcome::RefuseUnusable { reason, recovery } => {
+            return lines.unusable(&reason, recovery.as_deref(), out, err);
+        }
     }
     ExitCode::Drift
 }

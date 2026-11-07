@@ -1,4 +1,7 @@
 //! `goetia daemon install [-f FILE] [--force] [--start] [--enable] [--dry-run]`
+//!
+//! `--dry-run` and the diffs print for reading, so they are not byte-exact when a value holds a
+//! control character, U+2028, U+2029 or a bidirectional control: see [`super::show`], guarantee 4.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -6,7 +9,7 @@ use std::path::PathBuf;
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
-use super::refusal::{self, Mood};
+use super::refusal::{Lines, Mood};
 use super::support::{load_and_warn, require_elevation};
 use super::wait::WaitArgs;
 use crate::backend::Identity;
@@ -133,9 +136,7 @@ pub fn run(
 /// additionally gets a one-line diagnostic on `err`, so a script that only
 /// captures stderr for errors still learns that an exit-1/5 run had one.
 fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    if let Some(code) = refusal::report(id, outcome, Mood::Done, out, err) {
-        return code;
-    }
+    let lines = Lines { id, mood: Mood::Done };
     match outcome {
         Outcome::Create => {
             let _ = writeln!(out, "{id}: created");
@@ -150,10 +151,15 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
         Outcome::Stale { from_version } => {
             let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
         }
-        Outcome::Conflict { .. }
-        | Outcome::RefuseForeign { .. }
-        | Outcome::RefuseOtherDaemon { .. }
-        | Outcome::RefuseUnusable { .. } => unreachable!("`refusal::report` wrote {outcome:?}"),
+        Outcome::Conflict {
+            artifact_diff,
+            unclearable_recovery,
+        } => return lines.conflict(artifact_diff, unclearable_recovery.as_deref(), out, err),
+        Outcome::RefuseForeign { recovery } => return lines.foreign(recovery, out, err),
+        Outcome::RefuseOtherDaemon { installed } => return lines.other_daemon(installed, out, err),
+        Outcome::RefuseUnusable { reason, recovery } => {
+            return lines.unusable(reason, recovery.as_deref(), out, err);
+        }
     }
     ExitCode::Success
 }

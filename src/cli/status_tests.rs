@@ -4,11 +4,11 @@ use crate::cli::report::{ErrorReport, Kind};
 fn rendered(id: Option<&str>, message: &str) -> (String, String) {
     let report = Report {
         daemons: Vec::new(),
-        errors: vec![ErrorReport {
-            id: id.map(str::to_string),
-            kind: Kind::InvalidId,
-            message: message.to_string(),
-        }],
+        errors: vec![ErrorReport::said(
+            id.map(str::to_string),
+            Kind::InvalidId,
+            message.to_string(),
+        )],
         undetermined: Vec::new(),
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -26,4 +26,33 @@ fn an_error_line_is_printed_with_control_and_direction_characters_escaped() {
 
     let (_, err) = rendered(None, "no\u{1b}[2Jpe");
     assert_eq!(err, concat!(r"error: no\u{1b}[2Jpe", "\n"));
+}
+
+/// `status <id>` prints a child's stderr as the report does, and `--json` carries it as it came.
+#[skuld::test]
+fn a_failed_commands_stderr_is_printed_as_the_report_prints_it() {
+    use crate::error::Error;
+    use crate::error::error_tests::exit_status;
+
+    let e = Error::command("systemctl show x", exit_status(1), b"first\nerror: forged\x1b");
+    let report = Report {
+        daemons: Vec::new(),
+        errors: vec![report::status_error("x", &e)],
+        undetermined: Vec::new(),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    print_text(&report, &mut out, &mut err);
+    assert_eq!(String::from_utf8(err).unwrap(), format!("error: x: {}\n", e.report()));
+    assert!(
+        e.report()
+            .to_string()
+            .ends_with(concat!(": first\n  error: forged", r"\u{1b}"))
+    );
+    assert_eq!(
+        report.errors[0].message,
+        format!(
+            "`systemctl show x` failed ({}): first\nerror: forged\x1b",
+            exit_status(1)
+        )
+    );
 }

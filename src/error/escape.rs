@@ -20,25 +20,31 @@ fn is_escaped(c: char) -> bool {
 /// and a letter in a Windows path (`C:\new`) cannot be mistaken for an escaped newline. Backslashes
 /// stay as they are. Escaping twice changes nothing.
 pub(super) fn write_escaped(out: &mut dyn fmt::Write, text: &str) -> fmt::Result {
-    write_keeping(out, text, |_| false)
+    write_keeping(out, text, false)
 }
 
-/// [`write_escaped`], except that a line feed and a tab are written as they are: the layout of text
-/// that is multi-line by nature, a child's diagnostic.
+/// [`write_escaped`], except that a line feed, a tab and a carriage return that ends a line (CRLF,
+/// as Windows tools write it) are written as they are: the layout of text that is multi-line by
+/// nature, a child's diagnostic. A carriage return not followed by a line feed, the last character
+/// of `text` included, is escaped.
 pub(super) fn write_escaped_keeping_layout(out: &mut dyn fmt::Write, text: &str) -> fmt::Result {
-    write_keeping(out, text, |c| matches!(c, '\n' | '\t'))
+    write_keeping(out, text, true)
 }
 
-fn write_keeping(out: &mut dyn fmt::Write, text: &str, keep: fn(char) -> bool) -> fmt::Result {
-    let mut plain = text;
-    while let Some(at) = plain.find(|c| is_escaped(c) && !keep(c)) {
-        let (before, rest) = plain.split_at(at);
-        let c = rest.chars().next().expect("`find` stopped on a character");
-        out.write_str(before)?;
+fn write_keeping(out: &mut dyn fmt::Write, text: &str, keep_layout: bool) -> fmt::Result {
+    let mut written = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let next = chars.peek().map(|&(_, next)| next);
+        let layout = matches!(c, '\n' | '\t') || (c == '\r' && next == Some('\n'));
+        if !is_escaped(c) || (keep_layout && layout) {
+            continue;
+        }
+        out.write_str(&text[written..at])?;
         write!(out, "{}", c.escape_unicode())?;
-        plain = &rest[c.len_utf8()..];
+        written = at + c.len_utf8();
     }
-    out.write_str(plain)
+    out.write_str(&text[written..])
 }
 
 /// `text` as [`write_escaped`] writes it.
@@ -50,14 +56,15 @@ pub(crate) fn escape(text: &str) -> String {
 }
 
 /// An [`io::Write`] that writes everything to `inner` with the set escaped, keeping line feeds and
-/// tabs ([`write_escaped_keeping_layout`]): the stream all of the CLI's output goes through, so a
+/// tabs, and a carriage return before a line feed ([`write_escaped_keeping_layout`]): the stream all of the CLI's output goes through, so a
 /// sink that forgets to escape cannot put a control character on the terminal. A line feed passes,
 /// so a quoted value in a one-line message could still start a line of its own: those messages are
 /// escaped whole as well.
 ///
-/// A write may end inside a multi-byte character, so the incomplete tail is held until the next
-/// write. Bytes that are not UTF-8 are written as U+FFFD; so is a tail still held when the stream
-/// is dropped.
+/// A write may end inside a multi-byte character, or on a carriage return that the next byte will
+/// show to be the end of a CRLF, so that tail is held until the next write. Bytes that are not
+/// UTF-8 are written as U+FFFD; a tail still held when the stream is dropped is written as U+FFFD,
+/// or escaped if it is the carriage return.
 #[cfg(feature = "cli")]
 pub(crate) struct EscapedStream<'a> {
     inner: &'a mut dyn io::Write,
@@ -73,29 +80,18 @@ impl<'a> EscapedStream<'a> {
         }
     }
 
-    fn put(&mut self, text: &str) -> io::Result<()> {
-        let mut out = IoAsFmt {
-            inner: &mut *self.inner,
-            error: None,
-        };
-        write_escaped_keeping_layout(&mut out, text).map_err(|_| {
-            out.error
-                .take()
-                .unwrap_or_else(|| io::Error::other("formatting failed"))
-        })
-    }
-}
-
-#[cfg(feature = "cli")]
-impl io::Write for EscapedStream<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut bytes = std::mem::take(&mut self.held);
-        bytes.extend_from_slice(buf);
-        let mut rest = bytes.as_slice();
+    /// Writes `rest`, holding what only the next write can decide.
+    fn feed(&mut self, mut rest: &[u8]) -> io::Result<()> {
         while !rest.is_empty() {
             match std::str::from_utf8(rest) {
                 Ok(text) => {
-                    self.put(text)?;
+                    match text.strip_suffix('\r') {
+                        Some(text) => {
+                            self.put(text)?;
+                            self.held = b"\r".to_vec();
+                        }
+                        None => self.put(text)?,
+                    }
                     break;
                 }
                 Err(e) => {
@@ -114,6 +110,32 @@ impl io::Write for EscapedStream<'_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn put(&mut self, text: &str) -> io::Result<()> {
+        let mut out = IoAsFmt {
+            inner: &mut *self.inner,
+            error: None,
+        };
+        write_escaped_keeping_layout(&mut out, text).map_err(|_| {
+            out.error
+                .take()
+                .unwrap_or_else(|| io::Error::other("formatting failed"))
+        })
+    }
+}
+
+#[cfg(feature = "cli")]
+impl io::Write for EscapedStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.held.is_empty() {
+            self.feed(buf)?;
+        } else {
+            let mut joined = std::mem::take(&mut self.held);
+            joined.extend_from_slice(buf);
+            self.feed(&joined)?;
+        }
         Ok(buf.len())
     }
 
@@ -126,7 +148,8 @@ impl io::Write for EscapedStream<'_> {
 impl Drop for EscapedStream<'_> {
     fn drop(&mut self) {
         if !self.held.is_empty() {
-            let _ = self.put("\u{fffd}");
+            let tail = if self.held == b"\r" { "\r" } else { "\u{fffd}" };
+            let _ = self.put(tail);
         }
     }
 }

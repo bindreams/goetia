@@ -29,7 +29,7 @@ use std::io::Write;
 
 use super::ExitCode;
 use super::support::{InstalledIndex, state_str};
-use crate::error::Error;
+use crate::error::{Error, escape};
 use crate::manager::Status;
 
 // Wire format =========================================================================================================
@@ -68,7 +68,33 @@ pub(crate) struct ErrorReport {
     /// obtaining the manager or from listing.
     pub id: Option<String>,
     pub kind: Kind,
+    /// Exactly as it is: the document's encoder escapes it.
     pub message: String,
+    /// `message` for a person, as the report writes it (see [`Error::report`]); not in the document.
+    #[serde(skip)]
+    pub shown: String,
+}
+
+impl ErrorReport {
+    /// A report of goetia's own words, which a person reads with the control characters escaped.
+    pub(crate) fn said(id: Option<String>, kind: Kind, message: String) -> Self {
+        ErrorReport {
+            id,
+            kind,
+            shown: escape(&message),
+            message,
+        }
+    }
+
+    /// A report of `e`: its unescaped chain for the document, its report for a person.
+    fn failed(id: Option<String>, kind: Kind, e: &Error) -> Self {
+        ErrorReport {
+            id,
+            kind,
+            message: e.report_unescaped().to_string(),
+            shown: e.report().to_string(),
+        }
+    }
 }
 
 /// Every value [`ErrorReport::kind`] can take.
@@ -194,7 +220,8 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
             .map(|(name, reason)| ErrorReport {
                 id: Some(name.clone()),
                 kind: Kind::Unusable,
-                message: format!("installed but unusable: {reason}"),
+                message: format!("installed but unusable: {}", reason.unescaped()),
+                shown: format!("installed but unusable: {reason}"),
             })
             .collect(),
         // Already ordered: `partition_installed` sorts as it builds, so the
@@ -204,7 +231,7 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
             .iter()
             .map(|entry| UndeterminedReport {
                 name: entry.name.clone(),
-                reason: entry.reason.clone(),
+                reason: entry.reason.unescaped().to_string(),
             })
             .collect(),
     }
@@ -244,11 +271,7 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
         Error::Undetermined { .. } => Kind::Undetermined,
         _ => Kind::Unusable,
     };
-    ErrorReport {
-        id: Some(id.to_string()),
-        kind,
-        message: e.report_unescaped().to_string(),
-    }
+    ErrorReport::failed(Some(id.to_string()), kind, e)
 }
 
 /// A CLI argument `support::parse_id` rejected. Attributable to the id it
@@ -258,14 +281,10 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
 /// which prefixes ``daemon `X`: ``: the `id` field and the text renderer both
 /// carry the id already.
 pub(crate) fn invalid_id(id: &str, e: &Error) -> ErrorReport {
-    let message = match e {
-        Error::Invalid { message, .. } => message.clone(),
-        other => other.report_unescaped().to_string(),
-    };
-    ErrorReport {
-        id: Some(id.to_string()),
-        kind: Kind::InvalidId,
-        message,
+    let id = Some(id.to_string());
+    match e {
+        Error::Invalid { message, .. } => ErrorReport::said(id, Kind::InvalidId, message.clone()),
+        other => ErrorReport::failed(id, Kind::InvalidId, other),
     }
 }
 
@@ -275,11 +294,7 @@ pub(crate) fn invalid_id(id: &str, e: &Error) -> ErrorReport {
 pub(crate) fn unavailable(e: &Error) -> Report {
     Report {
         daemons: Vec::new(),
-        errors: vec![ErrorReport {
-            id: None,
-            kind: Kind::Unavailable,
-            message: e.report_unescaped().to_string(),
-        }],
+        errors: vec![ErrorReport::failed(None, Kind::Unavailable, e)],
         undetermined: Vec::new(),
     }
 }
@@ -290,13 +305,13 @@ pub(crate) fn unavailable(e: &Error) -> Report {
 pub(crate) fn unsupported(subcommand: &str) -> Report {
     Report {
         daemons: Vec::new(),
-        errors: vec![ErrorReport {
-            id: None,
-            kind: Kind::Unsupported,
-            message: format!(
+        errors: vec![ErrorReport::said(
+            None,
+            Kind::Unsupported,
+            format!(
                 "`daemon {subcommand}` does not support --json: drop --json, or use `daemon list` or `daemon status`"
             ),
-        }],
+        )],
         undetermined: Vec::new(),
     }
 }

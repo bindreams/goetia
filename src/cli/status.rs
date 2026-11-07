@@ -105,10 +105,10 @@ fn print_text(report: &Report, out: &mut dyn Write, err: &mut dyn Write) {
     for error in &report.errors {
         match &error.id {
             Some(id) => {
-                let _ = writeln!(err, "error: {}: {}", escape(id), escape(&error.message));
+                let _ = writeln!(err, "error: {}: {}", escape(id), error.shown);
             }
             None => {
-                let _ = writeln!(err, "error: {}", escape(&error.message));
+                let _ = writeln!(err, "error: {}", error.shown);
             }
         }
     }
