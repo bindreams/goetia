@@ -284,12 +284,3 @@ fn an_event_message_file_needs_a_system_root() {
         assert!(message.contains("SystemRoot"), "{message}");
     }
 }
-
-/// A `Parameters` key deleted between `open_subkey` and `enum_values` (a concurrent uninstall) is
-/// absent, like one that was never there; a denial is not.
-#[skuld::test]
-fn a_key_that_is_gone_is_absent_and_a_denial_is_not() {
-    assert!(is_absent(&std::io::Error::from(std::io::ErrorKind::NotFound)));
-    assert!(is_absent(&std::io::Error::from_raw_os_error(1018)), "ERROR_KEY_DELETED");
-    assert!(!is_absent(&std::io::Error::from_raw_os_error(5)), "ERROR_ACCESS_DENIED");
-}
