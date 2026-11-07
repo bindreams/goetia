@@ -521,7 +521,7 @@ fn read_live_registration(
             account,
             failure_actions,
             environment,
-            parameters: generate::canonical_field_names(&live_params.fields),
+            parameters: live_params.fields.clone(),
             stray_parameters: live_params.strays.clone(),
         },
         cfg.start_type,

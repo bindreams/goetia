@@ -80,7 +80,7 @@ pub(super) enum Settled<T> {
 }
 
 /// Whether `e` says the key is not there: not found, or deleted and held open by another process.
-pub(super) fn is_gone(e: &io::Error) -> bool {
+fn is_gone(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(ERROR_KEY_DELETED as i32)
 }
 

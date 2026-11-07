@@ -9,8 +9,11 @@ use std::ffi::{OsString, c_void};
 use std::sync::Arc;
 
 use cosca::{Containment, Fd, Stdio};
-use goetia::backend::scm::exit_status::{ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, Reported};
+use goetia::backend::scm::exit_status::{
+    ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
+};
 use goetia::backend::scm::manager::read_spec_blob;
+use goetia::blob::Blob;
 use goetia::error::Error;
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::{define_windows_service, service_dispatcher};
@@ -66,26 +69,11 @@ fn run_service(id: &str) {
         }
     };
 
-    let blob = match read_spec_blob(id) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            log.failure(
-                id,
-                "no Goetia metadata found under Services\\<id>\\Parameters (Marker absent) — this service was \
-                 not created by `goetia daemon install`",
-            );
-            finish(&log, id, status_handle, Reported::Refused);
-        }
-        Err(Error::NotInstalled { .. }) => {
-            log.failure(
-                id,
-                &format!(r"Services\{id} is gone, or this service's record does not name it: no daemon was started"),
-            );
-            finish(&log, id, status_handle, Reported::Refused);
-        }
-        Err(e) => {
-            log.failure(id, &format!("decode metadata blob: {}", e.report()));
-            finish(&log, id, status_handle, Reported::Refused);
+    let blob = match spec_read(id, read_spec_blob(id)) {
+        Ok(blob) => blob,
+        Err(stop) => {
+            log.failure(id, &stop.message);
+            finish(&log, id, status_handle, stop.reported);
         }
     };
 
@@ -99,6 +87,39 @@ fn run_service(id: &str) {
         || report_stopping(&log, id, status_handle),
     );
     finish(&log, id, status_handle, reported);
+}
+
+/// Why the shim reads no spec to run, and what it tells SCM.
+#[derive(Debug)]
+struct SpecStop {
+    message: String,
+    reported: Reported,
+}
+
+/// What `read` of the spec means for the shim. Only a definite answer is a [`Reported::Refused`],
+/// which SCM never restarts: the service is gone, it has no marker, or its spec cannot be decoded.
+/// A read that did not complete says nothing about the record, so it is a failure SCM restarts.
+fn spec_read(id: &str, read: goetia::error::Result<Option<Blob>>) -> Result<Blob, SpecStop> {
+    let refused = |message: String| SpecStop {
+        message,
+        reported: Reported::Refused,
+    };
+    match read {
+        Ok(Some(blob)) => Ok(blob),
+        Ok(None) => Err(refused(format!(
+            r"no Goetia metadata found under Services\{id}\Parameters (Marker absent): this service was not created by `goetia daemon install`"
+        ))),
+        Err(Error::NotInstalled { .. }) => Err(refused(format!(
+            r"Services\{id} is gone, or this service's record does not name it: no daemon was started"
+        ))),
+        Err(e @ (Error::Blob { .. } | Error::Invalid { .. })) => {
+            Err(refused(format!("decode metadata blob: {}", e.report())))
+        }
+        Err(e) => Err(SpecStop {
+            message: format!(r"read the metadata under Services\{id}\Parameters: {}", e.report()),
+            reported: Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
+        }),
+    }
 }
 
 /// Tell SCM the service stopped, then end the process. SCM restarts the service or not from

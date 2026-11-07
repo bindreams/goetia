@@ -726,21 +726,8 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
     let spec = install_with_environment(&mgr, &id);
 
     let key = service_key(&id, KEY_WRITE);
-    let name = support::wide_null("Environment");
-    let data = INSTALLED_ENVIRONMENT.as_bytes();
-    // SAFETY: `key` holds an open handle with write access; `name` is NUL-terminated and `data` is
-    // `data.len()` readable bytes, both outliving the call.
-    let status = unsafe {
-        RegSetValueExW(
-            key.raw_handle(),
-            name.as_ptr(),
-            0,
-            UNKNOWN_TYPE,
-            data.as_ptr(),
-            data.len() as u32,
-        )
-    };
-    assert_eq!(status, 0, "write an Environment of type {UNKNOWN_TYPE}: error {status}");
+    let name: Vec<u16> = "Environment".encode_utf16().collect();
+    set_raw_value(&key, &name, UNKNOWN_TYPE, INSTALLED_ENVIRONMENT.as_bytes());
 
     let diff = assert_conflict_cleared_by_force(&mgr, &spec);
     assert!(diff.contains(&format!("type {UNKNOWN_TYPE}")), "{diff}");
@@ -881,10 +868,21 @@ fn force_install_removes_strays_that_winreg_cannot_enumerate() {
     // UTF-16LE with the closing NUL, as a string value is stored.
     let sz = |text: &str| -> Vec<u8> { units(text).into_iter().chain([0]).flat_map(u16::to_le_bytes).collect() };
 
-    // `Schema`, not `Marker`: a `Marker` that is not goetia's string leaves the service foreign.
     set_raw_value(&parameters, &units("Schema"), REG_EXPAND_SZ, &sz("1"));
     let diff = assert_conflict_cleared_by_force(&mgr, &spec);
     assert!(diff.contains("Schema") && diff.contains("REG_EXPAND_SZ"), "{diff}");
+
+    // A `Marker` another tool rewrote as another string type is still goetia's: the service stays
+    // ours, and `--force` writes it back as `REG_SZ`.
+    let marker: String = parameters.get_value("Marker").expect("read Marker");
+    set_raw_value(&parameters, &units("Marker"), REG_EXPAND_SZ, &sz(&marker));
+    mgr.status(&spec.id).expect("status: a rewritten Marker is still ours");
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("Marker") && diff.contains("REG_EXPAND_SZ"), "{diff}");
+    assert_eq!(
+        parameters.get_value::<String, _>("Marker").expect("read Marker"),
+        marker
+    );
 
     set_raw_value(&parameters, &units("Custom"), CUSTOM_TYPE, b"bytes");
     let diff = assert_conflict_cleared_by_force(&mgr, &spec);

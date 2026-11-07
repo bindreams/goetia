@@ -28,14 +28,24 @@ fn value_stray(name: &[u16], vtype: u32) -> Stray {
 
 // Fields --------------------------------------------------------------------------------------------------------------
 
+fn layout_stray(field: &'static str, vtype: u32) -> Stray {
+    Stray::Layout { name: field, vtype }
+}
+
 #[skuld::test]
-fn a_goetia_field_stored_as_goetia_stores_it_is_a_field_in_whatever_case() {
-    for name in ["Marker", "marker", "SPEC", "sChEmA", "Version"] {
+fn a_goetia_field_stored_as_goetia_stores_it_is_a_field_under_goetias_spelling() {
+    for (name, field) in [
+        ("Marker", "Marker"),
+        ("marker", "Marker"),
+        ("SPEC", "Spec"),
+        ("sChEmA", "Schema"),
+        ("Version", "Version"),
+    ] {
         let parameters = parameters_of(utf16(name), vtype::REG_SZ, &sz("text"));
 
         assert_eq!(
             parameters.fields,
-            BTreeMap::from([(name.to_string(), "text".to_string())]),
+            BTreeMap::from([(field.to_string(), "text".to_string())]),
             "{name}"
         );
         assert!(parameters.strays.is_empty(), "{name}");
@@ -47,20 +57,73 @@ fn an_empty_field_value_is_a_field() {
     let parameters = parameters_of(utf16("Version"), vtype::REG_SZ, &sz(""));
 
     assert_eq!(parameters.fields.get("Version").map(String::as_str), Some(""));
+    assert!(parameters.strays.is_empty());
 }
 
-// Strays: the value is not what goetia writes -------------------------------------------------------------------------
+// A field a tool rewrote is still ours, and drift ---------------------------------------------------------------------
 
-/// A field of another type is not equal to what goetia wants, and not a field `extract` can take
-/// for a marker: a foreign service's `Marker` of type `REG_DWORD` stays foreign.
+/// A tool that rewrites a value may store it as another string type or with other terminators. The
+/// text is still goetia's, so ownership and the spec read; the layout is drift, which `install
+/// --force` rewrites as the exact `REG_SZ`.
 #[skuld::test]
-fn a_goetia_field_of_another_type_is_a_stray_and_no_field() {
+fn a_goetia_field_in_another_string_layout_is_a_field_and_a_layout_stray() {
+    let text = utf16("text");
+    let spellings: [(&str, u32, Vec<u8>); 7] = [
+        ("REG_EXPAND_SZ", vtype::REG_EXPAND_SZ, sz("text")),
+        (
+            "REG_MULTI_SZ",
+            vtype::REG_MULTI_SZ,
+            units_bytes(&[text.clone(), vec![0, 0]].concat()),
+        ),
+        ("REG_MULTI_SZ with one NUL", vtype::REG_MULTI_SZ, sz("text")),
+        (
+            "REG_SZ with two NULs",
+            vtype::REG_SZ,
+            units_bytes(&[text.clone(), vec![0, 0]].concat()),
+        ),
+        (
+            "REG_SZ with three NULs",
+            vtype::REG_SZ,
+            units_bytes(&[text.clone(), vec![0, 0, 0]].concat()),
+        ),
+        ("REG_SZ with no NUL", vtype::REG_SZ, units_bytes(&text)),
+        ("REG_EXPAND_SZ with no NUL", vtype::REG_EXPAND_SZ, units_bytes(&text)),
+    ];
+    for (what, vtype, data) in spellings {
+        for name in ["Marker", "sPeC"] {
+            let parameters = parameters_of(utf16(name), vtype, &data);
+
+            let field = field_named(name).unwrap();
+            assert_eq!(
+                parameters.fields,
+                BTreeMap::from([(field.to_string(), "text".to_string())]),
+                "{what}, {name}"
+            );
+            assert_eq!(parameters.strays, [layout_stray(field, vtype)], "{what}, {name}");
+        }
+    }
+}
+
+#[skuld::test]
+fn an_empty_field_with_no_data_is_a_field_and_a_layout_stray() {
+    let parameters = parameters_of(utf16("Version"), vtype::REG_SZ, &[]);
+
+    assert_eq!(parameters.fields.get("Version").map(String::as_str), Some(""));
+    assert_eq!(parameters.strays, [layout_stray("Version", vtype::REG_SZ)]);
+}
+
+// Strays: the value cannot be what goetia wrote -----------------------------------------------------------------------
+
+/// A field that is not a string has no text to read: a foreign service's `Marker` of type
+/// `REG_DWORD` stays foreign.
+#[skuld::test]
+fn a_goetia_field_that_is_not_a_string_is_a_stray_and_no_field() {
     for vtype in [
-        vtype::REG_EXPAND_SZ,
-        vtype::REG_MULTI_SZ,
         vtype::REG_DWORD,
         vtype::REG_BINARY,
         vtype::REG_NONE,
+        vtype::REG_QWORD,
+        0x20,
     ] {
         let parameters = parameters_of(utf16("Marker"), vtype, &sz("text"));
 
@@ -69,30 +132,25 @@ fn a_goetia_field_of_another_type_is_a_stray_and_no_field() {
     }
 }
 
-/// A string layout goetia never writes: it must not read as the text it resembles.
+/// Text that cannot be one string of UTF-16 must not read as the text it resembles.
 #[skuld::test]
-fn a_goetia_field_that_is_not_plain_nul_terminated_text_is_a_stray() {
+fn a_goetia_field_without_one_string_of_text_is_a_stray() {
     let text = utf16("text");
-    let layouts: [(&str, Vec<u8>); 6] = [
-        ("no terminator", units_bytes(&text)),
-        ("two terminators", units_bytes(&[text.clone(), vec![0, 0]].concat())),
+    let layouts: [(&str, Vec<u8>); 3] = [
         (
             "a NUL inside",
             units_bytes(&[text.clone(), vec![0], text.clone(), vec![0]].concat()),
         ),
         ("an odd trailing byte", [sz("text"), vec![0x41]].concat()),
         ("a lone surrogate", units_bytes(&[0xD800, 0])),
-        ("no data", Vec::new()),
     ];
-    for (what, data) in layouts {
-        let parameters = parameters_of(utf16("Spec"), vtype::REG_SZ, &data);
+    for vtype in [vtype::REG_SZ, vtype::REG_EXPAND_SZ, vtype::REG_MULTI_SZ] {
+        for (what, data) in &layouts {
+            let parameters = parameters_of(utf16("Spec"), vtype, data);
 
-        assert!(parameters.fields.is_empty(), "{what}: {parameters:?}");
-        assert_eq!(
-            parameters.strays,
-            [value_stray(&utf16("Spec"), vtype::REG_SZ)],
-            "{what}"
-        );
+            assert!(parameters.fields.is_empty(), "{what}: {parameters:?}");
+            assert_eq!(parameters.strays, [value_stray(&utf16("Spec"), vtype)], "{what}");
+        }
     }
 }
 
@@ -174,24 +232,44 @@ fn field_named_utf16_folds_ascii_case_and_knows_no_other_name() {
 }
 
 #[skuld::test]
-fn a_stray_renders_its_name_and_type() {
+fn a_stray_renders_its_name_as_it_is_stored_and_its_type() {
     assert_eq!(
         value_stray(&utf16("Marker"), vtype::REG_EXPAND_SZ).to_string(),
         r#"value "Marker" of type REG_EXPAND_SZ"#
     );
     assert_eq!(value_stray(&utf16("x"), 0x20).to_string(), r#"value "x" of type 32"#);
     assert_eq!(Stray::Subkey { name: utf16("Sub") }.to_string(), r#"subkey "Sub""#);
+    assert_eq!(
+        layout_stray("Spec", vtype::REG_MULTI_SZ).to_string(),
+        r#"value "Spec" stored as REG_MULTI_SZ, not as REG_SZ with one closing NUL"#
+    );
+}
+
+/// The name is shown as it can be typed into regedit: a backslash is not doubled.
+#[skuld::test]
+fn a_stray_name_with_a_backslash_or_quote_is_shown_unescaped() {
+    assert_eq!(
+        value_stray(&utf16(r#"a\b"c"#), vtype::REG_SZ).to_string(),
+        r#"value "a\b"c" of type REG_SZ"#
+    );
+}
+
+/// A name with a line break must not break the line a diff is made of.
+#[skuld::test]
+fn a_stray_name_with_a_control_character_is_escaped_on_one_line() {
+    let shown = Stray::Subkey { name: utf16("a\nb") }.to_string();
+
+    assert_eq!(shown, r#"subkey "a\nb""#);
 }
 
 #[skuld::test]
-fn a_stray_name_that_is_not_valid_utf16_renders_without_losing_the_unit() {
+fn a_stray_name_that_is_not_valid_utf16_renders_without_losing_the_unit_or_escaping_twice() {
     let shown = Stray::Subkey {
         name: vec![0x41, 0xD800, 0x3D],
     }
     .to_string();
 
-    assert!(shown.contains("D800") && shown.contains('A'), "{shown}");
-    assert!(!shown.contains('\u{FFFD}'), "{shown}");
+    assert_eq!(shown, r#"subkey "(not valid UTF-16: A\u{D800}\x3D)""#);
 }
 
 #[skuld::test]

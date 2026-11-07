@@ -1039,59 +1039,11 @@ fn extract_errors_on_missing_spec_field() {
 }
 
 #[skuld::test]
-fn extract_is_case_insensitive_for_field_names() {
-    let reg = build(&managed_spec());
-    // Simulate a `Parameters` set written or hand-repaired with different
-    // casing than goetia's own writer uses — Windows registry value names
-    // are case-insensitive, so this must still be recognized as ours.
-    let differently_cased: BTreeMap<String, String> =
-        reg.parameters.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
-
-    let blob = extract(&differently_cased)
-        .expect("differently-cased field names must still decode")
-        .expect("differently-cased field names must still be recognized as ours");
-    assert_eq!(blob.spec, managed_spec());
-}
-
-/// A stored `marker` is the same value as the `Marker` goetia writes (`set_value("Marker")` updates
-/// it and keeps its case), so the readback that `decide` compares must name it `Marker`.
-#[skuld::test]
-fn canonical_field_names_restore_goetias_spelling_and_leave_other_names_alone() {
-    let reg = build(&managed_spec());
-    let mut stored: BTreeMap<String, String> = reg
-        .parameters
-        .iter()
-        .map(|(k, v)| (k.to_uppercase(), v.clone()))
-        .collect();
-    stored.insert("Stray".to_string(), "x".to_string());
-    stored.insert("sTRAY2".to_string(), "y".to_string());
-
-    let mut expected = reg.parameters;
-    expected.insert("Stray".to_string(), "x".to_string());
-    expected.insert("sTRAY2".to_string(), "y".to_string());
-    assert_eq!(canonical_field_names(&stored), expected);
-}
-
-#[skuld::test]
 fn field_named_folds_ascii_case_to_goetias_spelling_and_knows_no_other_name() {
     assert_eq!(field_named("sPeC"), Some(FIELD_SPEC));
     assert_eq!(field_named("Marker"), Some(FIELD_MARKER));
     assert_eq!(field_named("Markers"), None);
     assert_eq!(field_named(""), None);
-}
-
-#[skuld::test]
-fn extract_errors_on_case_insensitive_field_collision() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
-    // Two keys that name the same registry value case-insensitively, with
-    // different content — a plain `BTreeMap<String, String>` can represent
-    // this even though a real `Services\<name>\Parameters` key never
-    // could, so `extract` must not silently pick one.
-    parameters.insert("marker".to_string(), "also-goetia".to_string());
-
-    let err = extract(&parameters).expect_err("two case-differing spellings of the same field must be rejected");
-    assert!(err.to_string().contains(FIELD_MARKER));
 }
 
 // Display =============================================================================================================

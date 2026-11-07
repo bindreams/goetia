@@ -306,12 +306,10 @@ pub fn account_needs_password(account: Option<&str>) -> bool {
 /// undecodable one is `Err`, not partially trusted. `Schema` and `Version` are
 /// plain-text copies for a human reading the registry and are not read.
 ///
-/// Field lookups are case-insensitive — `Services\<name>\Parameters` value
-/// names are, to `RegQueryValueEx`, so a case-sensitive lookup here would
-/// misclassify a hand-repaired or differently-cased write as foreign. See
-/// `get_field`.
+/// `parameters` holds the fields under goetia's spelling of their names (see
+/// `parameters::Parameters`, which folds the case the registry ignores).
 pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Error> {
-    let Some(marker) = get_field(parameters, FIELD_MARKER)? else {
+    let Some(marker) = parameters.get(FIELD_MARKER) else {
         return Ok(None);
     };
     if marker != blob::MARKER {
@@ -321,7 +319,9 @@ pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Er
         )));
     }
 
-    let spec_text = get_field(parameters, FIELD_SPEC)?.ok_or_else(|| missing_field_error(FIELD_SPEC))?;
+    let spec_text = parameters
+        .get(FIELD_SPEC)
+        .ok_or_else(|| missing_field_error(FIELD_SPEC))?;
     Ok(Some(blob::decode(spec_text)?))
 }
 
@@ -332,48 +332,6 @@ pub(crate) fn field_named(name: &str) -> Option<&'static str> {
     [FIELD_MARKER, FIELD_SCHEMA, FIELD_VERSION, FIELD_SPEC]
         .into_iter()
         .find(|field| field.eq_ignore_ascii_case(name))
-}
-
-/// Look up `field` in `parameters` case-insensitively (see [`field_named`]). Deliberately scoped to
-/// one field name at a time rather than folding the whole map: two *unrelated* values under some
-/// other application's own differently-cased keys are none of Goetia's business unless Goetia is
-/// actually trying to interpret one of its own four field names. More than one key spelling `field`
-/// is itself an error rather than a silent pick of whichever `BTreeMap` iteration visits first, the
-/// same "don't silently choose" reasoning as `spec::raw`'s duplicate-id check.
-fn get_field<'a>(parameters: &'a BTreeMap<String, String>, field: &str) -> Result<Option<&'a str>, Error> {
-    let mut found: Option<&str> = None;
-    for (key, value) in parameters {
-        if field_named(key) == Some(field) {
-            if found.is_some() {
-                return Err(collision_error(field));
-            }
-            found = Some(value.as_str());
-        }
-    }
-    Ok(found)
-}
-
-/// `parameters` with each name that spells one of Goetia's four fields in another case renamed to
-/// Goetia's spelling. The registry keeps the stored case when a value is set, so a readback
-/// compared with what goetia writes must fold it, as [`extract`] does. The registry cannot hold two
-/// names that fold to one, so none collide.
-pub fn canonical_field_names(parameters: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut folded = BTreeMap::new();
-    for (name, value) in parameters {
-        let canonical = field_named(name).unwrap_or(name);
-        let displaced = folded.insert(canonical.to_string(), value.clone());
-        debug_assert!(
-            displaced.is_none(),
-            "the registry holds no two value names that fold to `{canonical}`"
-        );
-    }
-    folded
-}
-
-fn collision_error(field: &str) -> Error {
-    Error::blob(format!(
-        "Parameters has more than one value spelled `{field}` case-insensitively"
-    ))
 }
 
 fn missing_field_error(field: &str) -> Error {

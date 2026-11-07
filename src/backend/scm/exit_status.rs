@@ -14,6 +14,9 @@
 
 /// `argv[1]` (the service id) is missing.
 pub const ERROR_BAD_ARGUMENTS: u32 = 160;
+/// The shim could not read its metadata, and the read says nothing about the record: a failure
+/// SCM restarts, unlike [`Reported::Refused`].
+pub const ERROR_INVALID_DATA: u32 = 13;
 /// SCM's answer to an open of a service that does not exist.
 pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 /// A shim failure that carries no usable OS error.
@@ -112,14 +115,14 @@ pub struct RecordedExit {
 impl RecordedExit {
     /// Whether the shim launched the daemon: [`Reported::Clean`] and [`Reported::DaemonExit`], where
     /// it then ended, and [`Reported::IncompleteStop`], where it may still be running. Any other
-    /// Win32 code is a shim failure before or around the launch, and so is [`Reported::Refused`],
-    /// whose Win32 code is 0.
+    /// Win32 code is a shim failure before or around the launch.
     ///
     /// This reads the Win32 code alone, so it also accepts the record of a host that exits before
     /// connecting to SCM: `(0, 0)` with wait hint 2000 (P25 c/d), the same as a failed SCM start
-    /// (P10). Callers must rule that out first; `start_via_notify` does, see there.
+    /// (P10), and [`Reported::Refused`]'s, whose Win32 code is 0. Callers must rule those out
+    /// first; `start_via_notify` does, see there.
     pub fn daemon_ran(self) -> bool {
-        !self.is_refusal() && (self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR)
+        self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR
     }
 
     /// Whether this is [`Reported::Refused`]'s record: the shim started no daemon.

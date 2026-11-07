@@ -102,10 +102,10 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
     }
 }
 
-/// What `Services\<name>\Parameters` holds: goetia's own fields, by the name as stored, when they
-/// are exactly what goetia writes, and every other value and subkey as a stray (see [`Parameters`]).
-/// Case-insensitive lookup of the fields is `generate::extract`'s job, not this function's. A stray
-/// is drift that `install --force` removes, and it cannot read as equal to what goetia wants.
+/// What `Services\<name>\Parameters` holds: goetia's own fields, under goetia's spelling of their
+/// names, when they hold a string of any string type; every other value and subkey as a stray, and
+/// a field stored other than as goetia writes it as a layout stray (see [`Parameters`]). A stray is
+/// drift that `install --force` removes, and it cannot read as equal to what goetia wants.
 ///
 /// The result classifies the id:
 ///
@@ -148,8 +148,8 @@ fn read_parameters_as(name: &str, listed: bool) -> Result<RegistryReadOutcome<Pa
                 Err(e) => return Err(Stop::at_open(failure("open", &path, e), Some(Parameters::default()))),
             };
             let mut parameters = Parameters::default();
-            for entry in enum_raw_values(&key).map_err(|e| Stop::mid_read(failure("enumerate", &path, e)))? {
-                parameters.add_value(entry.name, entry.vtype, &entry.bytes);
+            for entry in enum_raw_values(&key, true).map_err(|e| Stop::mid_read(failure("enumerate", &path, e)))? {
+                parameters.add_value(entry.name, entry.value.vtype, &entry.value.bytes);
             }
             for entry in key.enum_keys_os_string() {
                 let subkey = entry.map_err(|e| Stop::mid_read(failure("enumerate subkeys of", &path, e)))?;
@@ -160,59 +160,84 @@ fn read_parameters_as(name: &str, listed: bool) -> Result<RegistryReadOutcome<Pa
     )
 }
 
-/// One value of an open key as stored: its name as UTF-16, its type number and its bytes.
-struct RawEntry {
-    name: Vec<u16>,
+/// A registry value as stored: its type number and bytes, unconverted. `winreg`'s `RegValue` cannot
+/// hold a type above `REG_QWORD`, and its `get_raw_value` fails on one.
+struct RawValue {
     vtype: u32,
     bytes: Vec<u8>,
+}
+
+/// One value of an open key as stored: its name as UTF-16 and its value.
+struct RawEntry {
+    name: Vec<u16>,
+    value: RawValue,
 }
 
 /// The longest value name the registry holds, in UTF-16 units.
 const MAX_VALUE_NAME_UNITS: usize = 16_383;
 
-/// Every value of `key`, through `RegEnumValueW` alone. `winreg`'s enumeration fails on a type
-/// above `REG_QWORD` and on a name that is not valid UTF-16, which would make a value goetia could
-/// neither read nor remove.
-fn enum_raw_values(key: &RegKey) -> std::io::Result<Vec<RawEntry>> {
-    let mut entries = Vec::new();
-    let mut name = vec![0u16; MAX_VALUE_NAME_UNITS + 1];
-    let mut bytes = vec![0u8; 256];
-    let mut index = 0u32;
+/// Runs a registry call that fills a value's data until it has all of it, from a buffer of
+/// `capacity` bytes. `call` gets the buffer, its size in bytes, which it lowers to what it wrote,
+/// and the type; it returns the status. `ERROR_MORE_DATA` grows the buffer to the size the call
+/// reported, and a size that did not grow would change nothing, so that status is returned as it
+/// is, as is any other failure.
+fn read_growing(
+    capacity: usize,
+    mut call: impl FnMut(*mut u8, &mut u32, &mut u32) -> u32,
+) -> std::result::Result<RawValue, u32> {
+    let mut bytes = vec![0u8; capacity];
     loop {
-        let mut name_len = name.len() as u32;
         let mut vtype = 0u32;
-        let mut data_len = bytes.len() as u32;
-        // SAFETY: `key` holds an open handle; `name` and `bytes` are writable for the lengths
-        // passed, which the call lowers to what it wrote; `vtype` is a valid out-param; the
-        // reserved parameter is null.
-        let status = unsafe {
-            RegEnumValueW(
-                key.raw_handle(),
-                index,
-                name.as_mut_ptr(),
-                &mut name_len,
-                std::ptr::null(),
-                &mut vtype,
-                bytes.as_mut_ptr(),
-                &mut data_len,
-            )
-        };
-        match status {
+        let mut len = bytes.len() as u32;
+        match call(bytes.as_mut_ptr(), &mut len, &mut vtype) {
             ERROR_SUCCESS => {
-                entries.push(RawEntry {
-                    name: name[..name_len as usize].to_vec(),
-                    vtype,
-                    bytes: bytes[..data_len as usize].to_vec(),
-                });
-                index += 1;
+                bytes.truncate(len as usize);
+                return Ok(RawValue { vtype, bytes });
             }
-            // `data_len` is the size this value needs. A name too long for `name` cannot happen: it
-            // is longer than the registry allows. If the size did not grow, nothing would change.
-            ERROR_MORE_DATA if data_len as usize > bytes.len() => bytes.resize(data_len as usize, 0),
-            ERROR_NO_MORE_ITEMS => return Ok(entries),
-            status => return Err(std::io::Error::from_raw_os_error(status as i32)),
+            ERROR_MORE_DATA if len as usize > bytes.len() => bytes.resize(len as usize, 0),
+            status => return Err(status),
         }
     }
+}
+
+/// Every value of `key`, through `RegEnumValueW` alone. `winreg`'s enumeration fails on a type
+/// above `REG_QWORD` and on a name that is not valid UTF-16, which would make a value goetia could
+/// neither read nor remove. Without `with_data` only the names are read, and every value's bytes
+/// are empty.
+fn enum_raw_values(key: &RegKey, with_data: bool) -> std::io::Result<Vec<RawEntry>> {
+    let mut entries = Vec::new();
+    let mut name = vec![0u16; MAX_VALUE_NAME_UNITS + 1];
+    let mut name_len = 0u32;
+    for index in 0u32.. {
+        let read = read_growing(if with_data { 256 } else { 0 }, |data, data_len, vtype| {
+            name_len = name.len() as u32;
+            // SAFETY: `key` holds an open handle; `name` is writable for `name_len` units, which
+            // the call lowers to what it wrote; `data` is writable for `data_len` bytes, and is
+            // null, which the API allows, when the data is not wanted; `vtype` is a valid
+            // out-param; the reserved parameter is null.
+            unsafe {
+                RegEnumValueW(
+                    key.raw_handle(),
+                    index,
+                    name.as_mut_ptr(),
+                    &mut name_len,
+                    std::ptr::null(),
+                    vtype,
+                    if with_data { data } else { std::ptr::null_mut() },
+                    data_len,
+                )
+            }
+        });
+        match read {
+            Ok(value) => entries.push(RawEntry {
+                name: name[..name_len as usize].to_vec(),
+                value,
+            }),
+            Err(ERROR_NO_MORE_ITEMS) => break,
+            Err(status) => return Err(std::io::Error::from_raw_os_error(status as i32)),
+        }
+    }
+    Ok(entries)
 }
 
 /// Write `params` as the *entire* contents of `Services\<name>\Parameters`, in place: every value
@@ -248,7 +273,7 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
             .map_err(|e| registry_error(&format!("write {field} under"), &path, e))?;
     }
 
-    let present: Vec<Vec<u16>> = enum_raw_values(&key)
+    let present: Vec<Vec<u16>> = enum_raw_values(&key, false)
         .map_err(|e| registry_error("enumerate", &path, e))?
         .into_iter()
         .map(|entry| entry.name)
@@ -289,13 +314,6 @@ fn tolerate_not_found(deleted: std::io::Result<()>) -> std::io::Result<()> {
 
 // Environment =========================================================================================================
 
-/// A registry value as stored: its type number and bytes, unconverted. `winreg`'s `RegValue` cannot
-/// hold a type above `REG_QWORD`, and its `get_raw_value` fails on one.
-struct RawValue {
-    vtype: u32,
-    bytes: Vec<u8>,
-}
-
 /// The lines of `Services\<name>\Environment`; empty when the value is absent. Errs only when the
 /// value cannot be read at all; anything that is not what [`write_environment`] writes reads as the
 /// marker lines [`environment_lines`] describes. [`RegistryReadOutcome::ServiceGone`] when the service
@@ -325,33 +343,13 @@ pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> 
 /// `RegQueryValueExW` for `name` under `key`, whatever its type.
 fn query_raw_value(key: &RegKey, name: &str) -> std::io::Result<RawValue> {
     let wide_name = super::identity::wide_null(name);
-    let mut bytes = vec![0u8; 1024];
-    loop {
-        let mut vtype = 0u32;
-        let mut len = bytes.len() as u32;
+    read_growing(1024, |data, len, vtype| {
         // SAFETY: `key` holds an open handle; `wide_name` is a NUL-terminated UTF-16 string that
-        // outlives the call; `vtype` and `len` are valid out-params, and `bytes` is `len` writable
+        // outlives the call; `vtype` and `len` are valid out-params, and `data` is `len` writable
         // bytes.
-        let status = unsafe {
-            RegQueryValueExW(
-                key.raw_handle(),
-                wide_name.as_ptr(),
-                std::ptr::null(),
-                &mut vtype,
-                bytes.as_mut_ptr(),
-                &mut len,
-            )
-        };
-        match status {
-            ERROR_SUCCESS => {
-                bytes.truncate(len as usize);
-                return Ok(RawValue { vtype, bytes });
-            }
-            // `len` is now the size the value needs; it grows only if the value was rewritten meanwhile.
-            ERROR_MORE_DATA => bytes.resize(len as usize, 0),
-            err => return Err(std::io::Error::from_raw_os_error(err as i32)),
-        }
-    }
+        unsafe { RegQueryValueExW(key.raw_handle(), wide_name.as_ptr(), std::ptr::null(), vtype, data, len) }
+    })
+    .map_err(|status| std::io::Error::from_raw_os_error(status as i32))
 }
 
 /// [`read_environment`]'s parsing, apart from the registry so it is testable without one.
