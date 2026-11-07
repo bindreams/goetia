@@ -9,19 +9,19 @@
 //! probe already exercises with raw `winreg`.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::windows::ffi::OsStrExt as _;
 
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 
-use crate::backend::scm::generate::field_named;
+use crate::backend::scm::generate::{FIELDS, field_named};
 use crate::backend::scm::parameters::{Parameters, field_named_utf16, shown_name, text_from_utf16, type_name};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
 
+mod counted;
 mod settle;
 use settle::{Failure, Settled, Stop, settle, stands};
 
@@ -61,14 +61,10 @@ pub enum RegistryReadOutcome<T> {
     Read(T),
 }
 
-/// Runs `pass` once and settles what it met (see [`settle`]). `fail` makes the error for a failure
-/// that leaves the read undecided.
-///
-/// A key that vanishes under a service that stands is not waited on or read again: goetia's own
-/// writes never take a key away, so it is another process's doing, and one whose end no event
-/// promises.
+/// Runs `pass` once and settles what it met (see [`settle`]). `service_stands` asks whether the
+/// service is still there; `fail` makes the error for a failure that leaves the read undecided.
 fn read_settled<T>(
-    name: &str,
+    service_stands: impl FnOnce() -> std::result::Result<bool, Failure>,
     fail: impl Fn(Failure) -> Error,
     pass: impl FnOnce() -> std::result::Result<T, Stop<T>>,
 ) -> Result<RegistryReadOutcome<T>> {
@@ -76,7 +72,7 @@ fn read_settled<T>(
         Ok(value) => return Ok(RegistryReadOutcome::Read(value)),
         Err(stop) => stop,
     };
-    match settle(stop, || service_stands(name)) {
+    match settle(stop, service_stands) {
         Settled::Gone => Ok(RegistryReadOutcome::ServiceGone),
         Settled::Value(value) => Ok(RegistryReadOutcome::Read(value)),
         Settled::Failed(failure) => Err(fail(failure)),
@@ -102,54 +98,46 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
     }
 }
 
-/// What `Services\<name>\Parameters` holds: goetia's own fields, under goetia's spelling of their
-/// names, when they hold a string of any string type; every other value and subkey as a stray, and
-/// a field stored other than as goetia writes it as a layout stray (see [`Parameters`]). A stray is
-/// drift that `install --force` removes, and it cannot read as equal to what goetia wants.
+/// What `Services\<name>\Parameters` holds: goetia's four fields, each read by its name, and every
+/// other value and subkey as a stray (see [`Parameters`]). A stray is drift that `install --force`
+/// removes. The result classifies the id:
 ///
-/// The result classifies the id:
-///
-/// - A service with no `Parameters` key reads as empty `Parameters`: it has no goetia marker, so
-///   `generate::extract` finds none and the service is `Ownership::Foreign`. This covers a service
-///   goetia never touched and one whose install crashed between `CreateServiceW` and the metadata
-///   write (see the module doc comment on `manager`).
+/// - A service with no `Parameters` key reads as empty `Parameters`, so `generate::extract` finds
+///   no marker and the service is `Ownership::Foreign`. This covers a service goetia never touched
+///   and one whose install crashed between `CreateServiceW` and the metadata write.
 /// - [`RegistryReadOutcome::ServiceGone`] when the service key is gone, whether the read found it
 ///   so at the start or lost the `Parameters` key under it.
 /// - [`registry_undetermined`] for every other failure, among them a key that vanishes or is marked
-///   deleted under a service that still stands: this key holds the only proof of ownership a
-///   `type: managed` service has, so a read of it that did not complete leaves goetia unable to
-///   say even that much. Never Foreign.
+///   deleted under a service that still stands. Never Foreign: this key holds the only proof of
+///   ownership a `type: managed` service has.
 ///
-/// goetia's own writes never remove `Parameters` (see [`write_parameters`]). SCM's delete of the
-/// service does: it removes `Parameters` before the service key, so a read that lands between the
-/// two steps of a concurrent uninstall sees a standing service with no `Parameters`, and reads it
-/// as Foreign. That window stays open: goetia does not guard against a user's own concurrent runs
-/// (owner, 2026-11-03).
+/// goetia's own writes never remove `Parameters` (see [`write_parameters`]), but SCM's delete of the
+/// service does, before the service key: a read between the two steps sees a standing service with
+/// no `Parameters`, and reads it as Foreign. A concurrent uninstall can leave this window open;
+/// goetia does not guard against it (owner, 2026-11-03).
 pub fn read_parameters(name: &str) -> Result<RegistryReadOutcome<Parameters>> {
-    read_parameters_as(name, false)
-}
-
-/// [`read_parameters`] for a `name` that the `list` scan has just read from the `Services`
-/// enumeration: a missing `Parameters` key is then Foreign without asking whether the service
-/// stands. A service deleted since leaves a stale Foreign row, which `list` omits.
-pub fn read_listed_parameters(name: &str) -> Result<RegistryReadOutcome<Parameters>> {
-    read_parameters_as(name, true)
-}
-
-fn read_parameters_as(name: &str, listed: bool) -> Result<RegistryReadOutcome<Parameters>> {
     let path = parameters_key_path(name);
     read_settled(
-        name,
+        || service_stands(name),
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
-            let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_READ) {
-                Ok(key) => key,
-                Err(e) if listed && e.kind() == std::io::ErrorKind::NotFound => return Ok(Parameters::default()),
-                Err(e) => return Err(Stop::at_open(failure("open", &path, e), Some(Parameters::default()))),
-            };
+            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+                .open_subkey_with_flags(&path, KEY_READ)
+                .map_err(|e| Stop::at_open(failure("open", &path, e), Some(Parameters::default())))?;
             let mut parameters = Parameters::default();
-            for entry in enum_raw_values(&key, true).map_err(|e| Stop::mid_read(failure("enumerate", &path, e)))? {
-                parameters.add_value(entry.name, entry.value.vtype, &entry.value.bytes);
+            // By name, not by position: a concurrent write that deletes a stray moves the later
+            // values up one place in the enumeration, and a read by position would skip one.
+            for field in FIELDS {
+                match query_raw_value(&key, field) {
+                    Ok(value) => parameters.add_value(field.encode_utf16().collect(), value.vtype, &value.bytes),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Stop::mid_read(failure(&format!("read {field} under"), &path, e))),
+                }
+            }
+            for entry in enum_values(&key).map_err(|e| Stop::mid_read(failure("enumerate", &path, e)))? {
+                if field_named_utf16(&entry.name).is_none() {
+                    parameters.add_value(entry.name, entry.vtype, &[]);
+                }
             }
             for entry in key.enum_keys_os_string() {
                 let subkey = entry.map_err(|e| Stop::mid_read(failure("enumerate subkeys of", &path, e)))?;
@@ -167,10 +155,10 @@ struct RawValue {
     bytes: Vec<u8>,
 }
 
-/// One value of an open key as stored: its name as UTF-16 and its value.
+/// One value of an open key: its name as UTF-16 and its type number.
 struct RawEntry {
     name: Vec<u16>,
-    value: RawValue,
+    vtype: u32,
 }
 
 /// The longest value name the registry holds, in UTF-16 units.
@@ -180,8 +168,7 @@ const MAX_VALUE_NAME_UNITS: usize = 16_383;
 /// gets the buffer, its size in bytes, which it lowers to what it wrote, and the type; it returns
 /// the status. `ERROR_MORE_DATA` grows `buffer` to the size the call reported, and a size that did
 /// not grow would change nothing, so that status is returned as it is, as is any other failure.
-/// On success the value is the type and the first `len` bytes of `buffer`, which stays as grown so
-/// that one buffer serves a whole enumeration.
+/// On success the value is the type and the first `len` bytes of `buffer`.
 fn read_growing(
     buffer: &mut Vec<u8>,
     mut call: impl FnMut(*mut u8, &mut u32, &mut u32) -> u32,
@@ -197,64 +184,51 @@ fn read_growing(
     }
 }
 
-/// Every value of `key`, through `RegEnumValueW` alone. `winreg`'s enumeration fails on a type
-/// above `REG_QWORD` and on a name that is not valid UTF-16, which would make a value goetia could
-/// neither read nor remove. Without `with_data` only the names are read, and every value's bytes
-/// are empty.
-fn enum_raw_values(key: &RegKey, with_data: bool) -> std::io::Result<Vec<RawEntry>> {
+/// The name and type of every value of `key`, through `RegEnumValueW` alone. `winreg`'s enumeration
+/// fails on a type above `REG_QWORD` and on a name that is not valid UTF-16, which would make a
+/// value goetia could neither report nor remove.
+fn enum_values(key: &RegKey) -> std::io::Result<Vec<RawEntry>> {
     let mut entries = Vec::new();
     let mut name = vec![0u16; MAX_VALUE_NAME_UNITS + 1];
-    let mut name_len = 0u32;
-    let mut buffer = vec![0u8; if with_data { 256 } else { 0 }];
     for index in 0u32.. {
-        let read = read_growing(&mut buffer, |data, data_len, vtype| {
-            name_len = name.len() as u32;
-            // SAFETY: `key` holds an open handle; `name` is writable for `name_len` units, which
-            // the call lowers to what it wrote; `data` is writable for `data_len` bytes, and is
-            // null, which the API allows, when the data is not wanted; `vtype` is a valid
-            // out-param; the reserved parameter is null.
-            unsafe {
-                RegEnumValueW(
-                    key.raw_handle(),
-                    index,
-                    name.as_mut_ptr(),
-                    &mut name_len,
-                    std::ptr::null(),
-                    vtype,
-                    if with_data { data } else { std::ptr::null_mut() },
-                    data_len,
-                )
-            }
-        });
-        match read {
-            Ok((vtype, len)) => entries.push(RawEntry {
+        let mut name_len = name.len() as u32;
+        let mut vtype = 0u32;
+        // SAFETY: `key` holds an open handle; `name` is writable for `name_len` units, which the
+        // call lowers to what it wrote; `vtype` is a valid out-param; the data is not wanted, so
+        // its buffer and size are null, which the API allows; the reserved parameter is null.
+        let status = unsafe {
+            RegEnumValueW(
+                key.raw_handle(),
+                index,
+                name.as_mut_ptr(),
+                &mut name_len,
+                std::ptr::null(),
+                &mut vtype,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        match status {
+            ERROR_SUCCESS => entries.push(RawEntry {
                 name: name[..name_len as usize].to_vec(),
-                value: RawValue {
-                    vtype,
-                    // With no data wanted the call reports a size and fills nothing.
-                    bytes: if with_data { buffer[..len].to_vec() } else { Vec::new() },
-                },
+                vtype,
             }),
-            Err(ERROR_NO_MORE_ITEMS) => break,
-            Err(status) => return Err(std::io::Error::from_raw_os_error(status as i32)),
+            ERROR_NO_MORE_ITEMS => break,
+            status => return Err(std::io::Error::from_raw_os_error(status as i32)),
         }
     }
     Ok(entries)
 }
 
 /// Write `params` as the *entire* contents of `Services\<name>\Parameters`, in place: every value
-/// is set, then every value that matches no name in `params` and every subkey is deleted. The key
-/// itself is never deleted, so a concurrent reader never sees a missing key. Each value is set in
-/// one call, so a reader sees the old or the new value of each, not of the set of four. `Spec` is
-/// the only value read for meaning (`Schema` and `Version` are copies for a human), so a reader
-/// sees the old spec or the new one. Fails if the service key is gone, rather than creating it.
+/// is set, then every other value and every subkey is deleted. The key is never deleted, and each
+/// value is set in one call, so a concurrent reader sees the old or the new value of each. Fails if
+/// the service key is gone, rather than creating it.
 ///
-/// goetia owns `Parameters` whole. A stray value or subkey added by hand must still be
-/// overwritable by `install --force`: left behind, it would keep `on_disk` (via [`read_parameters`],
-/// which reads everything present) from ever converging with `desired`, which has only Goetia's own
-/// four fields, and `--force` would report success while every later `install` still said
-/// `Conflict`. Names compare case-insensitively, as the registry does: setting `Marker` updates a
-/// stored `marker` and keeps its case, so that value is wanted, not stray.
+/// goetia owns `Parameters` whole: a stray left behind would keep `read_parameters` from ever
+/// equalling `desired`, so `--force` could not converge. Names compare case-insensitively, as the
+/// registry does: setting `Marker` updates a stored `marker` and keeps its case, so that value is
+/// wanted, not stray.
 pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result<()> {
     debug_assert!(
         params.keys().all(|field| field_named(field) == Some(field.as_str())),
@@ -275,25 +249,24 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
             .map_err(|e| registry_error(&format!("write {field} under"), &path, e))?;
     }
 
-    let present: Vec<Vec<u16>> = enum_raw_values(&key, false)
+    let present: Vec<Vec<u16>> = enum_values(&key)
         .map_err(|e| registry_error("enumerate", &path, e))?
         .into_iter()
         .map(|entry| entry.name)
         .collect();
-    // The name goes to `RegDeleteValueW` as the UTF-16 units read, which `OsString` carries whole.
     for stray in strays(&present, params) {
-        tolerate_not_found(key.delete_value(OsString::from_wide(stray)))
+        tolerate_not_found(counted::delete_value(&key, stray))
             .map_err(|e| registry_error(&format!("delete value \"{}\" under", shown_name(stray)), &path, e))?;
     }
 
-    let subkeys: Vec<OsString> = key
+    let subkeys: Vec<Vec<u16>> = key
         .enum_keys_os_string()
+        .map(|subkey| subkey.map(|name| name.encode_wide().collect()))
         .collect::<std::io::Result<_>>()
         .map_err(|e| registry_error("enumerate subkeys of", &path, e))?;
     for subkey in &subkeys {
-        let shown = shown_name(&subkey.encode_wide().collect::<Vec<_>>());
-        tolerate_not_found(key.delete_subkey_all(subkey))
-            .map_err(|e| registry_error(&format!("delete subkey \"{shown}\" under"), &path, e))?;
+        tolerate_not_found(counted::delete_subkey(&key, subkey))
+            .map_err(|e| registry_error(&format!("delete subkey \"{}\" under", shown_name(subkey)), &path, e))?;
     }
     Ok(())
 }
@@ -307,7 +280,7 @@ fn strays<'a>(present: &'a [Vec<u16>], wanted: &BTreeMap<String, String>) -> imp
         .filter(|name| field_named_utf16(name).is_none_or(|field| !wanted.contains_key(field)))
 }
 
-/// A delete of something already gone is done.
+/// NotFound is success: the goal state is absent.
 fn tolerate_not_found(deleted: std::io::Result<()>) -> std::io::Result<()> {
     match deleted {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -324,7 +297,7 @@ fn tolerate_not_found(deleted: std::io::Result<()>) -> std::io::Result<()> {
 pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
     let path = service_key_path(name);
     read_settled(
-        name,
+        || service_stands(name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
             let key = RegKey::predef(HKEY_LOCAL_MACHINE)
@@ -420,11 +393,8 @@ pub fn write_environment(name: &str, lines: &[String]) -> Result<()> {
         .open_subkey_with_flags(&path, KEY_READ | KEY_WRITE)
         .map_err(|e| registry_error("open", &path, e))?;
     if lines.is_empty() {
-        match key.delete_value(ENVIRONMENT_VALUE) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(registry_error(&format!("delete {ENVIRONMENT_VALUE} under"), &path, e)),
-        }
+        tolerate_not_found(key.delete_value(ENVIRONMENT_VALUE))
+            .map_err(|e| registry_error(&format!("delete {ENVIRONMENT_VALUE} under"), &path, e))
     } else {
         key.set_value(ENVIRONMENT_VALUE, &lines.to_vec())
             .map_err(|e| registry_error(&format!("write {ENVIRONMENT_VALUE} under"), &path, e))

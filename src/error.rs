@@ -564,9 +564,8 @@ impl Error {
         }
     }
 
-    /// The first OS error code this error carries, anywhere in it: its chain of sources, both
-    /// halves of a [`Both`](Error::Both) (the first half first) and the errors it embeds in its own
-    /// text (see [`embedded`](Error::embedded)).
+    /// The first OS error code this error carries, anywhere in it; the search order is
+    /// `report::os_error_in`'s.
     pub fn raw_os_error(&self) -> Option<i32> {
         report::os_error_in(self)
     }

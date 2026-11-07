@@ -595,10 +595,9 @@ const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be 
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
 /// vocabulary, see [`RecordedExit::daemon_ran`]), except the incomplete-stop record: the daemon may
 /// still be running, so that is a failed start; a shim failure or refusal is a failed start returning
-/// `Err`. A
-/// `type: managed` service speaks SCM itself, and stopping with a service-specific code before
-/// `Running` is how it reports a failed start, so for it any `Stopped` before `Running` is a failed
-/// start. Neither blocks forever.
+/// `Err`. A `type: managed` service speaks SCM itself, and stopping with a service-specific code
+/// before `Running` is how it reports a failed start, so for it any `Stopped` before `Running` is a
+/// failed start. Neither blocks forever.
 ///
 /// Critical ordering: arm `RUNNING` strictly AFTER issuing `start`, and decide on the status the arm
 /// returns and the notifications after it. A registration made before the start would fire at once for

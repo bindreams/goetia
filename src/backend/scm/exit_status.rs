@@ -8,9 +8,7 @@
 //!
 //! Under the failure-actions flag SCM restarts after any `STOPPED` report whose Win32 code is
 //! non-zero, a service-specific code included (it is carried as [`ERROR_SERVICE_SPECIFIC_ERROR`]),
-//! and it does so for a stop it commanded too. A report whose Win32 code is 0 is never restarted,
-//! whatever its service-specific code: SCM stores that pair as reported, which is how an incomplete
-//! stop leaves a record without a restart.
+//! and it does so for a stop it commanded too.
 
 /// `argv[1]` (the service id) is missing.
 pub const ERROR_BAD_ARGUMENTS: u32 = 160;
@@ -49,8 +47,9 @@ pub enum Reported {
     IncompleteStop,
     /// The shim refused before it started any daemon, on a definite answer: its service record is
     /// gone, it holds no goetia marker, or its spec cannot be decoded. A read that did not complete
-    /// is a [`Reported::ShimFailure`] instead. Win32 0, so SCM's recovery does not start the same
-    /// refusal again.
+    /// is a [`Reported::ShimFailure`] instead. Win32 0, which SCM never restarts whatever the
+    /// service-specific code: its recovery would start the same refusal again for as long as the
+    /// record that caused it stands.
     Refused,
 }
 

@@ -8,11 +8,11 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::backend::scm::parameters::Stray;
-use crate::backend::scm::test_support::{multi_sz, sz};
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
 use crate::spec::Restart;
 use crate::spec::test_support::{plain_fields, program};
+use windows_sys::Win32::System::Registry::REG_DWORD;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     ScmRegistration {
@@ -462,37 +462,13 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
         read_marker(Parameters::default(), None),
         ReadOutcome::Foreign { recovery: None }
     ));
-    // A `Marker` stored as anything but goetia's string is a stray and no field: no marker.
+    // A `Marker` that is no goetia string reads as a stray, not a field: no marker.
     let mut foreign = Parameters::default();
-    foreign.add_value("Marker".encode_utf16().collect(), 4, &[1, 0, 0, 0]);
+    foreign.add_value("Marker".encode_utf16().collect(), REG_DWORD, &[1, 0, 0, 0]);
     assert!(matches!(
         read_marker(foreign, None),
         ReadOutcome::Foreign { recovery: None }
     ));
-    // Another service's own `Marker`, in any string type or layout, is not goetia's.
-    let mut theirs = Parameters::default();
-    theirs.add_value("Marker".encode_utf16().collect(), 7, &multi_sz("theirs"));
-    assert!(matches!(
-        read_marker(theirs, None),
-        ReadOutcome::Foreign { recovery: None }
-    ));
-    let mut theirs_exact = Parameters::default();
-    theirs_exact.add_value("Marker".encode_utf16().collect(), 1, &sz("theirs"));
-    assert!(theirs_exact.fields.is_empty());
-    assert!(matches!(
-        read_marker(theirs_exact, None),
-        ReadOutcome::Foreign { recovery: None }
-    ));
-    // goetia's marker text in another string type is still goetia's, and the layout is drift.
-    let mut rewritten = Parameters::default();
-    rewritten.add_value("Marker".encode_utf16().collect(), 7, &multi_sz(crate::blob::MARKER));
-    assert_eq!(rewritten.strays.len(), 1);
-    assert!(matches!(read_marker(rewritten, None), ReadOutcome::Marked(_)));
-    // so is that text in another case, whose case is drift too.
-    let mut recased = Parameters::default();
-    recased.add_value("Marker".encode_utf16().collect(), 1, &sz("Goetia"));
-    assert_eq!(recased.strays.len(), 1);
-    assert!(matches!(read_marker(recased, None), ReadOutcome::Marked(_)));
     match read_marker(ours.clone(), None).named(&id, ScmSnapshot::new) {
         ReadOutcome::Marked(snapshot) => {
             assert_eq!(snapshot.id().as_str(), "frpc");
@@ -581,7 +557,7 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
         ("Spec".to_string(), crate::blob::encode(&spec)),
     ]);
 
-    let blob = generate::extract(&parameters)
+    let blob = generate::extract(&parameters, &[])
         .expect("the blob decodes")
         .expect("the blob is ours");
 

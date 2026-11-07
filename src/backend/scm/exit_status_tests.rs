@@ -85,16 +85,10 @@ fn an_incomplete_stop_reports_win32_zero_and_the_specific_code_1003() {
 
 #[skuld::test]
 fn a_refusal_reports_win32_zero_and_its_own_specific_code() {
-    // Win32 0 is never restarted, whatever the specific code: SCM's recovery would start the same
-    // refusal again for as long as the record that caused it stands.
     let reported = Reported::Refused;
 
     assert_eq!(reported.scm_codes(), (0, SHIM_REFUSED));
     assert_eq!(reported.process_exit_code(), SHIM_REFUSED as i32);
-    assert_ne!(
-        SHIM_REFUSED, ERROR_CAN_NOT_COMPLETE,
-        "a refusal is not an incomplete stop"
-    );
     assert_ne!(reported.scm_codes(), Reported::incomplete_stop().scm_codes());
 }
 
@@ -163,7 +157,7 @@ fn a_recorded_shim_failure_means_the_daemon_never_ran() {
     for reported in [
         Reported::shim_failure(None),
         Reported::shim_failure(Some(2)),
-        Reported::shim_failure(Some(13)),
+        Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
     ] {
         let (win32, specific) = reported.scm_codes();
 

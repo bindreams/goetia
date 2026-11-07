@@ -13,7 +13,8 @@ use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::System::Registry::RegSetValueExW;
+use windows_sys::Wdk::System::Registry::NtSetValueKey;
+use windows_sys::Win32::Foundation::UNICODE_STRING;
 use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
 
 use crate::common::{self, conformance_mk, fixture_command};
@@ -834,22 +835,27 @@ fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes() {
     mgr.status(&spec.id).expect("status: the service still reads as ours");
 }
 
-/// A raw `RegSetValueExW` of `name` (UTF-16 units, any) with `vtype` and `data`.
+/// A raw `NtSetValueKey` of `name` (UTF-16 units, any, a NUL included) with `vtype` and `data`.
 fn set_raw_value(key: &winreg::RegKey, name: &[u16], vtype: u32, data: &[u8]) {
-    let name: Vec<u16> = name.iter().copied().chain(std::iter::once(0)).collect();
-    // SAFETY: `key` holds an open handle with write access; `name` is NUL-terminated and `data` is
-    // `data.len()` readable bytes, both outliving the call.
+    let bytes = u16::try_from(name.len() * 2).expect("a value name of at most 16 383 units");
+    let name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: name.as_ptr().cast_mut(),
+    };
+    // SAFETY: `key` holds an open handle with write access; `name` points at units that outlive the
+    // call, and `data` is `data.len()` readable bytes.
     let status = unsafe {
-        RegSetValueExW(
+        NtSetValueKey(
             key.raw_handle(),
-            name.as_ptr(),
+            &name,
             0,
             vtype,
-            data.as_ptr(),
+            data.as_ptr().cast(),
             data.len() as u32,
         )
     };
-    assert_eq!(status, 0, "write a value of type {vtype}: error {status}");
+    assert!(status >= 0, "write a value of type {vtype}: NTSTATUS {status:#x}");
 }
 
 /// What `winreg` cannot enumerate must still be drift that `install --force` removes: a goetia field
@@ -900,6 +906,58 @@ fn force_install_removes_strays_that_winreg_cannot_enumerate() {
     let diff = assert_conflict_cleared_by_force(&mgr, &spec);
     assert!(diff.contains("D800"), "{diff}");
     mgr.status(&spec.id).expect("status: the service still reads as ours");
+}
+
+/// `RegDeleteValueW` stops at a NUL, so a stray `Marker\0x` would delete goetia's `Marker` or stay.
+/// `--force` removes it by its whole name and leaves goetia's four values as they were.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_removes_a_stray_whose_name_holds_a_nul_and_keeps_marker() {
+    const REG_SZ: u32 = 1;
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let marker: String = parameters.get_value("Marker").expect("read Marker");
+    let units: Vec<u16> = "Marker\0x".encode_utf16().collect();
+    let bytes: Vec<u8> = "x\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+
+    set_raw_value(&parameters, &units, REG_SZ, &bytes);
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+
+    assert!(diff.contains(r"Marker\0x"), "{diff}");
+    assert_eq!(
+        parameters.get_value::<String, _>("Marker").expect("read Marker"),
+        marker
+    );
+    let mut names: Vec<String> = parameters
+        .enum_values()
+        .map(|value| value.expect("enumerate").0)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["Marker", "Schema", "Spec", "Version"]);
+}
+
+/// The key is rewritten, never replaced: a handle opened before `--force` reads the new values after.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_rewrites_parameters_in_place_so_a_handle_held_across_it_still_reads() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let held = parameters_key(&id, KEY_READ | KEY_WRITE);
+    held.set_value("Stray", &"x").expect("write Stray");
+
+    let forced = mgr.install(&spec, true).expect("forced install");
+    assert!(!matches!(forced, Outcome::Conflict { .. }), "{forced:?}");
+
+    held.get_value::<String, _>("Marker")
+        .expect("the handle opened before --force still reads Marker");
+    let stray = held.get_value::<String, _>("Stray");
+    assert!(
+        matches!(&stray, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "--force left the stray behind: {stray:?}"
+    );
 }
 
 // Step 7: a real account gets SeServiceLogonRight =====================================================================

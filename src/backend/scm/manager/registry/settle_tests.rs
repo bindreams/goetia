@@ -24,8 +24,6 @@ fn never<T>() -> Result<T, Failure> {
     panic!("the existence of the service must not be asked here")
 }
 
-// Stop::at_open / Stop::mid_read --------------------------------------------------------------------------------------
-
 #[skuld::test]
 fn an_open_that_finds_no_key_is_absent_when_the_key_is_optional() {
     assert!(matches!(Stop::at_open(failure(NOT_FOUND), Some(7)), Stop::Absent(7)));
@@ -78,8 +76,6 @@ fn any_other_mid_read_failure_is_other() {
     }
 }
 
-// stands --------------------------------------------------------------------------------------------------------------
-
 #[skuld::test]
 fn a_service_key_that_opens_stands() {
     assert!(stands(Ok(())).unwrap());
@@ -103,8 +99,6 @@ fn a_service_key_that_fails_otherwise_says_nothing() {
     let e = stands(Err(io::Error::from_raw_os_error(IO_DEVICE))).unwrap_err();
     assert_eq!(e.raw_os_error(), Some(IO_DEVICE));
 }
-
-// settle --------------------------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn absent_with_the_service_standing_is_its_value() {

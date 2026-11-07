@@ -254,8 +254,6 @@ fn a_subkey_is_a_stray_whatever_its_name_and_never_a_field() {
     );
 }
 
-/// Strays are data beside the fields, not names inside their map: no stray can clash with a field
-/// or with another stray.
 #[skuld::test]
 fn strays_of_one_name_and_a_field_of_that_name_coexist() {
     let mut parameters = Parameters::default();
@@ -264,8 +262,57 @@ fn strays_of_one_name_and_a_field_of_that_name_coexist() {
     parameters.add_value(utf16("Marker"), vtype::REG_QWORD, &[1; 8]);
     parameters.add_subkey(utf16("Marker"));
 
-    assert_eq!(parameters.fields.len(), 1);
-    assert_eq!(parameters.strays.len(), 3);
+    assert_eq!(
+        parameters.fields,
+        BTreeMap::from([("Marker".to_string(), blob::MARKER.to_string())])
+    );
+    assert_eq!(
+        parameters.strays,
+        [
+            value_stray(&utf16("Marker"), vtype::REG_DWORD),
+            value_stray(&utf16("Marker"), vtype::REG_QWORD),
+            Stray::Subkey { name: utf16("Marker") },
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_field_that_repeats_keeps_the_first_and_the_repeat_is_a_stray() {
+    let mut parameters = Parameters::default();
+    parameters.add_value(utf16("Spec"), vtype::REG_SZ, &sz("first"));
+    parameters.add_value(utf16("spec"), vtype::REG_SZ, &sz("second"));
+
+    assert_eq!(
+        parameters.fields,
+        BTreeMap::from([("Spec".to_string(), "first".to_string())])
+    );
+    assert_eq!(parameters.strays, [value_stray(&utf16("spec"), vtype::REG_SZ)]);
+}
+
+#[skuld::test]
+fn a_marker_that_is_not_goetias_text_is_a_stray_at_the_edges() {
+    let cases: [(&str, u32, Vec<u8>); 3] = [
+        ("no data", vtype::REG_SZ, vec![]),
+        ("an empty string", vtype::REG_SZ, sz("")),
+        ("goetia's text and a space", vtype::REG_SZ, sz("goetia ")),
+    ];
+    for (what, vtype, data) in cases {
+        let parameters = parameters_of(utf16("Marker"), vtype, &data);
+
+        assert!(parameters.fields.is_empty(), "{what}: {parameters:?}");
+        assert_eq!(parameters.strays, [value_stray(&utf16("Marker"), vtype)], "{what}");
+    }
+}
+
+#[skuld::test]
+fn a_marker_in_goetias_text_in_capitals_is_the_field_and_a_layout_stray() {
+    let parameters = parameters_of(utf16("Marker"), vtype::REG_SZ, &sz("GOETIA"));
+
+    assert_eq!(
+        parameters.fields,
+        BTreeMap::from([("Marker".to_string(), blob::MARKER.to_string())])
+    );
+    assert_eq!(parameters.strays, [layout_stray("Marker", vtype::REG_SZ)]);
 }
 
 // Names and rendering -------------------------------------------------------------------------------------------------

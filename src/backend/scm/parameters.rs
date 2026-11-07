@@ -1,17 +1,9 @@
-//! What `Services\<name>\Parameters` holds, as data.
-//!
-//! Not `#[cfg]`-gated: the registry reads that fill these types are Windows-only, but the types,
-//! their classification of a raw entry and their rendering compile and test everywhere.
-//!
-//! goetia writes four string values there (see `generate`). A value under one of those names that
-//! holds a string is read as that field whatever its string type and terminators, so a service a
-//! tool rewrote is still goetia's; a layout other than what goetia writes is a [`Stray::Layout`],
-//! which `install --force` rewrites. The exception is a `Marker`, which is goetia's only when its
-//! text is goetia's marker string in any case and layout: another service may hold a `Marker` of
-//! its own.
-//! Everything else is a [`Stray`]: kept apart from the four so that no stray can be mistaken for
-//! one of them, and so that a stray the registry API refuses to describe (a name that is not
-//! UTF-16 text, a type no API knows) is still reported, and removable.
+//! What `Services\<name>\Parameters` holds, as data. Not `#[cfg]`-gated: the registry reads that
+//! fill these types are Windows-only, but the types and their classification compile and test
+//! everywhere. goetia writes four string values there (see `generate`), kept as fields; everything
+//! else, and a field stored other than as goetia writes it, is a [`Stray`], apart from the fields so
+//! that none is mistaken for one, and reported and removable even when the registry API refuses to
+//! describe it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -67,10 +59,8 @@ impl fmt::Display for Stray {
     }
 }
 
-/// A name as it can be typed into regedit, on one line, to sit inside double quotes: every control
-/// character and every `"` is escaped and a backslash is not, whatever else the name holds. A name
-/// that is not valid UTF-16 is shown between `(not valid UTF-16: ` and `)`, each unpaired surrogate
-/// as `\u{XXXX}`.
+/// `name` on one line to sit inside double quotes, with every control character and `"` escaped
+/// (see [`decode_utf16`] for a name that is not valid UTF-16).
 pub(crate) fn shown_name(name: &[u16]) -> String {
     decode_utf16(name, |c| c == '"' || c.is_control())
 }
@@ -109,22 +99,24 @@ fn decode_utf16(units: &[u16], escaped: impl Fn(char) -> bool) -> String {
 /// The contents of a `Parameters` key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Parameters {
-    /// goetia's own fields that hold a string, by goetia's spelling of the name (the registry
-    /// ignores case, so the stored one may differ), with the text read from the data.
+    /// goetia's fields that hold a string, under goetia's spelling of the name, with the text read.
     pub fields: BTreeMap<String, String>,
+    /// Every other value and subkey, and each field stored other than as goetia writes it.
     pub strays: Vec<Stray>,
 }
 
 impl Parameters {
     /// Sort one value, as stored, into [`fields`](Self::fields) or [`strays`](Self::strays).
     pub fn add_value(&mut self, name: Vec<u16>, vtype: u32, data: &[u8]) {
+        let stored = name.clone();
         match classify_value(name, vtype, data) {
-            Entry::Field { name, text, layout } => {
-                // The registry holds no two value names that fold to one.
-                let displaced = self.fields.insert(name.to_string(), text);
-                debug_assert!(displaced.is_none(), "two values named `{name}` in one key");
+            Entry::Field { name, text, layout } if !self.fields.contains_key(name) => {
+                self.fields.insert(name.to_string(), text);
                 self.strays.extend(layout);
             }
+            // The registry holds no two names that fold to one; a repeat is kept as drift, not
+            // overwritten.
+            Entry::Field { .. } => self.strays.push(Stray::Value { name: stored, vtype }),
             Entry::Stray(stray) => self.strays.push(stray),
         }
     }

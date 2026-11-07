@@ -1,17 +1,14 @@
 //! What a read under `Services\<name>` makes of a key that is gone.
 //!
 //! goetia writes `Parameters` and `Environment` in place, so its own writes never take a key away.
-//! A key still goes missing when the service is uninstalled, or another tool deletes it, and a read
-//! that meets that must not guess: a service that is gone is absent, and one that stands with a key
-//! that vanished is undetermined, with the cause. It is never called absent or foreign on the
-//! strength of a read that did not complete, and it is not waited on: a key another process took
-//! away has no event goetia can rely on.
+//! A key still goes missing when the service is uninstalled or another tool deletes it. A service
+//! that is gone is then absent; one that stands with a key that vanished is undetermined, with the
+//! cause, and is not waited on: a key another process took away has no event goetia can rely on.
 
 use std::io;
 
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_KEY_DELETED};
 
-/// A registry failure as facts: the operation, the key and the OS error.
 #[derive(Debug)]
 pub(super) struct Failure {
     pub op: String,
@@ -20,12 +17,8 @@ pub(super) struct Failure {
 }
 
 impl Failure {
-    fn is_deleted(&self) -> bool {
-        self.source.raw_os_error() == Some(ERROR_KEY_DELETED as i32)
-    }
-
-    fn is_not_found(&self) -> bool {
-        self.source.kind() == io::ErrorKind::NotFound
+    fn is_gone(&self) -> bool {
+        is_gone(&self.source)
     }
 }
 
@@ -45,12 +38,11 @@ pub(super) enum Stop<T> {
 impl<T> Stop<T> {
     /// `failure` of an open. `absent` is `Some` for a key a service may lack.
     pub fn at_open(failure: Failure, absent: Option<T>) -> Self {
-        if failure.is_not_found() {
-            match absent {
-                Some(value) => Stop::Absent(value),
-                None => Stop::Vanished(failure),
-            }
-        } else if failure.is_deleted() {
+        if failure.source.kind() == io::ErrorKind::NotFound
+            && let Some(value) = absent
+        {
+            Stop::Absent(value)
+        } else if failure.is_gone() {
             Stop::Vanished(failure)
         } else {
             Stop::Other(failure)
@@ -59,7 +51,7 @@ impl<T> Stop<T> {
 
     /// `failure` of a read of a key already open.
     pub fn mid_read(failure: Failure) -> Self {
-        if failure.is_deleted() || failure.is_not_found() {
+        if failure.is_gone() {
             Stop::Vanished(failure)
         } else {
             Stop::Other(failure)
@@ -95,7 +87,7 @@ pub(super) fn stands(opened: io::Result<()>) -> io::Result<bool> {
     }
 }
 
-/// `stop`, given `service_stands`, which is asked only when the answer depends on it.
+/// Resolves `stop`; `service_stands` runs only for `Absent` and `Vanished`.
 pub(super) fn settle<T>(stop: Stop<T>, service_stands: impl FnOnce() -> Result<bool, Failure>) -> Settled<T> {
     let (stands, on_standing) = match stop {
         Stop::Other(failure) => return Settled::Failed(failure),

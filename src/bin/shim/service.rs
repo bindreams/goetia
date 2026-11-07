@@ -96,11 +96,9 @@ struct SpecStop {
     reported: Reported,
 }
 
-/// What `read` of the spec means for the shim. SCM never restarts a [`Reported::Refused`], so the
-/// shim refuses only for the three causes that say no daemon can run: the service is gone
-/// (`NotInstalled`), it has no goetia marker, or its spec cannot be decoded (`Blob`, `Invalid`).
-/// Every other error, definite or not, is a failure SCM restarts, carrying the OS error the read
-/// met, or `ERROR_INVALID_DATA` when there was none.
+/// The shim refuses ([`Reported::Refused`]) only when the service is gone, has no goetia marker or
+/// has an undecodable spec; every other error is a restartable failure carrying the OS error the
+/// read met, or `ERROR_INVALID_DATA`.
 fn spec_read(id: &str, read: goetia::error::Result<Option<Blob>>) -> Result<Blob, SpecStop> {
     let refused = |message: String| SpecStop {
         message,

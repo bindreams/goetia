@@ -286,7 +286,7 @@ impl Backend for Scm {
             // neither omitted nor claimed: collected whole here, reported by
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
-            match registry::read_listed_parameters(&name) {
+            match registry::read_parameters(&name) {
                 // Gone since `scan_services` listed it: not there to list.
                 Ok(RegistryReadOutcome::ServiceGone) => {}
                 Ok(RegistryReadOutcome::Read(params)) => {
@@ -396,7 +396,7 @@ impl Backend for Scm {
 /// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
 /// has no second proof of ownership.
 fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
-    let blob = match generate::extract(&parameters.fields) {
+    let blob = match generate::extract(&parameters.fields, &parameters.strays) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
         Ok(Some(blob)) => Ok(blob),
         Err(e) => Err(Arc::new(e)),
@@ -418,17 +418,12 @@ fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<
 /// value. `registry` itself stays private — this is the one read the shim
 /// needs, not the whole module.
 ///
-/// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no goetia `Marker` (none at
-/// all, or another service's own, see `parameters`): unreachable in practice (SCM only ever
-/// launches the shim against a service *this backend itself* created with `ImagePath` naming the
-/// shim, and `apply` always writes `Parameters` immediately after), but returned rather than folded
-/// into `Err` so a caller can still tell "no marker" apart from "a marker that fails to decode" —
-/// the shim's own version-skew handling (see `src/bin/shim/logging.rs`) needs exactly that
-/// distinction to phrase its failure message.
+/// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no goetia `Marker` (none, or
+/// another service's own), kept apart from `Err` so callers can tell it from an undecodable spec.
 pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     match registry::read_parameters(id)? {
         RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),
-        RegistryReadOutcome::Read(params) => generate::extract(&params.fields),
+        RegistryReadOutcome::Read(params) => generate::extract(&params.fields, &params.strays),
     }
 }
 

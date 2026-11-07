@@ -861,7 +861,10 @@ fn each_report_maps_to_the_exit_codes_scm_records() {
 
     assert_eq!(codes(Reported::Clean), (0, 0));
     assert_eq!(codes(Reported::DaemonExit(7)), (ERROR_SERVICE_SPECIFIC_ERROR, 7));
-    assert_eq!(codes(Reported::shim_failure(Some(13))), (13, 0));
+    assert_eq!(
+        codes(Reported::shim_failure(Some(ERROR_INVALID_DATA as i32))),
+        (ERROR_INVALID_DATA, 0)
+    );
     assert_ne!(
         codes(Reported::shim_failure(Some(ERROR_SERVICE_SPECIFIC_ERROR as i32))).0,
         ERROR_SERVICE_SPECIFIC_ERROR,
@@ -881,8 +884,7 @@ fn an_incomplete_stop_is_reported_as_win32_zero_with_specific_1003() {
     );
 }
 
-/// A refusal reports Win32 0, which SCM's recovery never restarts, with the code that says no
-/// daemon ran.
+/// A refusal reports Win32 0 with the code that says no daemon ran.
 #[skuld::test]
 fn a_refusal_is_reported_as_win32_zero_with_its_own_specific_code() {
     let status = stopped_status(Reported::Refused);
@@ -903,8 +905,7 @@ fn undetermined(source: Error) -> Error {
     }
 }
 
-/// The refusals are the cases where the registry answered and the answer says no daemon can run:
-/// the service is gone, it has no marker, its spec cannot be decoded. SCM never restarts them.
+/// The refusals are the reads that answered that no daemon can run.
 #[skuld::test]
 fn a_gone_service_a_missing_marker_and_an_undecodable_spec_are_refused() {
     let reads = [
@@ -923,6 +924,9 @@ fn a_gone_service_a_missing_marker_and_an_undecodable_spec_are_refused() {
             what: "read the spec".to_string(),
             source: Box::new(Error::NotInstalled { id: ID.to_string() }),
         }),
+        Err(Error::Kept(std::sync::Arc::new(Error::NotInstalled {
+            id: ID.to_string(),
+        }))),
     ];
 
     for read in reads {
@@ -930,6 +934,19 @@ fn a_gone_service_a_missing_marker_and_an_undecodable_spec_are_refused() {
         let stop = spec_read(ID, read).map(|_| ()).expect_err(&shown);
         assert_eq!(stop.reported, Reported::Refused, "{shown}");
     }
+}
+
+#[skuld::test]
+fn a_spec_that_was_read_is_the_one_to_run() {
+    let blob = goetia::blob::Blob {
+        schema: goetia::blob::SCHEMA,
+        version: goetia::version().to_string(),
+        spec: spec(),
+    };
+
+    let read = spec_read(ID, Ok(Some(blob))).expect("a read spec is run");
+
+    assert_eq!(read.spec, spec());
 }
 
 /// A read that did not complete says nothing about the record, so the shim fails restartably (SCM

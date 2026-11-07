@@ -960,7 +960,7 @@ fn parameters_round_trip_through_extract() {
     let spec = managed_spec();
     let reg = build(&spec);
 
-    let blob = extract(&reg.parameters)
+    let blob = extract(&reg.parameters, &[])
         .expect("a freshly generated registration's parameters must decode")
         .expect("a freshly generated registration's parameters must carry the marker");
     assert_eq!(blob.spec, spec);
@@ -975,7 +975,7 @@ fn display_is_the_generation_invariant() {
     let shim = shim_path();
 
     let original = registration(&spec, &id, &shim).unwrap();
-    let recovered_spec = extract(&original.parameters).unwrap().unwrap().spec;
+    let recovered_spec = extract(&original.parameters, &[]).unwrap().unwrap().spec;
     let regenerated = registration(&recovered_spec, &id, &shim).unwrap();
 
     assert_eq!(
@@ -988,7 +988,7 @@ fn display_is_the_generation_invariant() {
 #[skuld::test]
 fn extract_returns_none_for_foreign_parameters() {
     let parameters = BTreeMap::from([("AppDirectory".to_string(), r"C:\nssm\app".to_string())]);
-    assert_eq!(extract(&parameters).unwrap(), None);
+    assert_eq!(extract(&parameters, &[]).unwrap(), None);
 }
 
 #[skuld::test]
@@ -997,7 +997,7 @@ fn extract_errors_on_corrupt_blob() {
     let mut parameters = reg.parameters;
     parameters.insert(FIELD_SPEC.to_string(), "not valid base64 !!!".to_string());
 
-    extract(&parameters).expect_err("a corrupt Spec value must not decode");
+    extract(&parameters, &[]).expect_err("a corrupt Spec value must not decode");
 }
 
 /// `Schema` and `Version` are copies for a person reading the registry; `Spec` is the only value
@@ -1008,11 +1008,11 @@ fn extract_does_not_read_schema_or_version() {
     let mut parameters = reg.parameters;
     parameters.insert(FIELD_SCHEMA.to_string(), "not-a-number".to_string());
     parameters.insert(FIELD_VERSION.to_string(), "0.0.0-not-the-real-version".to_string());
-    let with_wrong_copies = extract(&parameters).expect("wrong copies").expect("still ours");
+    let with_wrong_copies = extract(&parameters, &[]).expect("wrong copies").expect("still ours");
 
     parameters.remove(FIELD_SCHEMA);
     parameters.remove(FIELD_VERSION);
-    let without_copies = extract(&parameters).expect("no copies").expect("still ours");
+    let without_copies = extract(&parameters, &[]).expect("no copies").expect("still ours");
 
     assert_eq!(with_wrong_copies.spec, managed_spec());
     assert_eq!(without_copies.spec, managed_spec());
@@ -1024,8 +1024,25 @@ fn extract_errors_on_missing_spec_field() {
     let mut parameters = reg.parameters;
     parameters.remove(FIELD_SPEC);
 
-    let err = extract(&parameters).expect_err("Marker present without Spec must not silently decode");
+    let err = extract(&parameters, &[]).expect_err("Marker present without Spec must not silently decode");
     assert!(err.to_string().contains(FIELD_SPEC));
+}
+
+#[skuld::test]
+fn extract_names_the_type_of_a_spec_that_is_stored_but_not_a_string() {
+    let reg = build(&managed_spec());
+    let mut parameters = reg.parameters;
+    parameters.remove(FIELD_SPEC);
+    let strays = [Stray::Value {
+        name: "spec".encode_utf16().collect(),
+        vtype: 4,
+    }];
+
+    let err = extract(&parameters, &strays).expect_err("a Spec that is not a string must not decode");
+
+    let text = err.to_string();
+    assert!(text.contains("REG_DWORD"), "{text}");
+    assert!(!text.contains("missing"), "{text}");
 }
 
 #[skuld::test]

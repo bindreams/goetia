@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::Identity;
-use crate::backend::scm::parameters::Stray;
+use crate::backend::scm::parameters::{Stray, field_named_utf16, type_name};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::spec::{DaemonSpec, Kind, Restart, User, scm_restart_delay, windows_builtin};
@@ -60,6 +60,7 @@ pub(crate) const FIELD_MARKER: &str = "Marker";
 const FIELD_SCHEMA: &str = "Schema";
 const FIELD_VERSION: &str = "Version";
 const FIELD_SPEC: &str = "Spec";
+pub(crate) const FIELDS: [&str; 4] = [FIELD_MARKER, FIELD_SCHEMA, FIELD_VERSION, FIELD_SPEC];
 
 // Constants ===========================================================================================================
 
@@ -107,8 +108,8 @@ pub struct ScmRegistration {
     /// The `Services\<name>\Parameters` values, including the metadata blob
     /// (`Marker`/`Schema`/`Version`/`Spec`).
     pub parameters: BTreeMap<String, String>,
-    /// What else `Parameters` holds. Empty for a registration built from a spec; a readback of
-    /// anything else is drift, which [`Display`](fmt::Display) shows, so `install --force` clears it.
+    /// What else `Parameters` holds: empty for a registration built from a spec, and drift in a
+    /// readback, which [`Display`](fmt::Display) shows and `install --force` clears.
     pub stray_parameters: Vec<Stray>,
 }
 
@@ -298,26 +299,18 @@ pub fn account_needs_password(account: Option<&str>) -> bool {
 
 // Extraction ==========================================================================================================
 
-/// Recover the embedded metadata blob from a service's `Parameters` values.
-///
-/// Returns `Ok(None)` only when `Marker` is absent — an ordinary foreign
-/// service, not one Goetia manages. A `Marker` in `parameters` is goetia's:
-/// `parameters::Parameters` admits one only when its text is goetia's marker,
-/// the one place ownership is decided. Then `Spec` must check out completely:
-/// a missing or undecodable one is `Err`, not partially trusted. `Schema` and
-/// `Version` are plain-text copies for a human reading the registry and are
-/// not read.
-///
-/// `parameters` holds the fields under goetia's spelling of their names (see
-/// `parameters::Parameters`, which folds the case the registry ignores).
-pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Error> {
-    if !parameters.contains_key(FIELD_MARKER) {
+/// Recover the embedded metadata blob from a service's `Parameters`: `Ok(None)` when it holds no
+/// `Marker` (a foreign service). With one, `Spec` must decode: a missing or undecodable one is
+/// `Err`, never partially trusted. `Schema` and `Version` are copies for a human and are not read.
+/// `fields` and `strays` are those of [`Parameters`](crate::backend::scm::parameters::Parameters);
+/// `strays` only lets the error say that a `Spec` is stored as something other than a string.
+pub fn extract(fields: &BTreeMap<String, String>, strays: &[Stray]) -> Result<Option<Blob>, Error> {
+    if !fields.contains_key(FIELD_MARKER) {
         return Ok(None);
     }
-
-    let spec_text = parameters
-        .get(FIELD_SPEC)
-        .ok_or_else(|| missing_field_error(FIELD_SPEC))?;
+    let Some(spec_text) = fields.get(FIELD_SPEC) else {
+        return Err(missing_spec_error(strays));
+    };
     Ok(Some(blob::decode(spec_text)?))
 }
 
@@ -325,14 +318,20 @@ pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Er
 /// ASCII-only: all four field names are plain ASCII, so no Unicode case-folding is needed. The
 /// registry compares value names this way, so a stored `marker` is the `Marker` goetia writes.
 pub(crate) fn field_named(name: &str) -> Option<&'static str> {
-    [FIELD_MARKER, FIELD_SCHEMA, FIELD_VERSION, FIELD_SPEC]
-        .into_iter()
-        .find(|field| field.eq_ignore_ascii_case(name))
+    FIELDS.into_iter().find(|field| field.eq_ignore_ascii_case(name))
 }
 
-fn missing_field_error(field: &str) -> Error {
+fn missing_spec_error(strays: &[Stray]) -> Error {
+    let stored = strays.iter().find_map(|stray| match stray {
+        Stray::Value { name, vtype } if field_named_utf16(name) == Some(FIELD_SPEC) => Some(*vtype),
+        _ => None,
+    });
+    let what = match stored {
+        Some(vtype) => format!("stored as {}, not as a string", type_name(vtype)),
+        None => "missing".to_string(),
+    };
     Error::blob(format!(
-        "Parameters\\{FIELD_MARKER} is present but Parameters\\{field} is missing"
+        "Parameters\\{FIELD_MARKER} is present but Parameters\\{FIELD_SPEC} is {what}"
     ))
 }
 

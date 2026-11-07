@@ -40,6 +40,100 @@ fn a_stray_is_a_present_name_that_is_none_of_the_wanted_fields_in_any_case() {
     assert_eq!(found, [&utf16("Stray"), &utf16("Marker2"), &utf16("schema"), &invalid]);
 }
 
+const NOT_FOUND: i32 = 2;
+const KEY_DELETED: i32 = 1018;
+
+fn failed_with(code: i32) -> Failure {
+    failure("open", "Services", std::io::Error::from_raw_os_error(code))
+}
+
+fn os_code(error: &Error) -> Option<i32> {
+    error.raw_os_error()
+}
+
+#[skuld::test]
+fn a_read_that_finds_no_optional_key_under_a_service_that_is_gone_is_service_gone() {
+    let read = read_settled(
+        || Ok(false),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || Err(Stop::at_open(failed_with(NOT_FOUND), Some(7))),
+    );
+
+    assert!(matches!(read, Ok(RegistryReadOutcome::ServiceGone)));
+}
+
+#[skuld::test]
+fn a_read_that_finds_no_optional_key_under_a_service_that_stands_is_the_empty_value() {
+    let read = read_settled(
+        || Ok(true),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || Err(Stop::at_open(failed_with(NOT_FOUND), Some(7))),
+    );
+
+    assert!(matches!(read, Ok(RegistryReadOutcome::Read(7))));
+}
+
+#[skuld::test]
+fn a_key_that_vanishes_under_a_service_that_stands_fails_with_the_cause_it_met() {
+    let read = read_settled(
+        || Ok(true),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || Err::<(), _>(Stop::mid_read(failed_with(KEY_DELETED))),
+    );
+
+    assert_eq!(read.err().and_then(|e| os_code(&e)), Some(KEY_DELETED));
+}
+
+#[skuld::test]
+fn a_pass_that_completes_is_its_value_without_asking_whether_the_service_stands() {
+    let read = read_settled(
+        || panic!("the service's existence is asked only after a pass stops"),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || Ok(7),
+    );
+
+    assert!(matches!(read, Ok(RegistryReadOutcome::Read(7))));
+}
+
+/// What a scripted call does: sets the size and type it reports, and returns its status.
+fn scripted<const N: usize>(steps: [(u32, u32, u32); N]) -> impl FnMut(*mut u8, &mut u32, &mut u32) -> u32 {
+    let mut steps = steps.into_iter();
+    move |_data, len, vtype| {
+        let (status, size, reported_type) = steps.next().expect("the call ran more often than scripted");
+        *len = size;
+        *vtype = reported_type;
+        status
+    }
+}
+
+#[skuld::test]
+fn a_read_that_reports_more_data_grows_the_buffer_to_the_size_reported_and_asks_again() {
+    let mut buffer = vec![0u8; 4];
+    let mut call = scripted([(ERROR_MORE_DATA, 600, 0), (ERROR_SUCCESS, 10, 1)]);
+
+    let read = read_growing(&mut buffer, &mut call);
+
+    assert_eq!(read, Ok((1, 10)));
+    assert_eq!(buffer.len(), 600);
+}
+
+#[skuld::test]
+fn a_read_that_reports_more_data_without_a_larger_size_returns_that_status() {
+    let mut buffer = vec![0u8; 4];
+    let mut call = scripted([(ERROR_MORE_DATA, 4, 0)]);
+
+    assert_eq!(read_growing(&mut buffer, &mut call), Err(ERROR_MORE_DATA));
+    assert_eq!(buffer.len(), 4);
+}
+
+#[skuld::test]
+fn a_read_that_fails_otherwise_returns_that_status() {
+    let mut buffer = vec![0u8; 4];
+    let mut call = scripted([(5, 0, 0)]);
+
+    assert_eq!(read_growing(&mut buffer, &mut call), Err(5));
+}
+
 #[skuld::test]
 fn an_absent_environment_value_is_no_lines() {
     assert_eq!(environment_lines(None), Vec::<String>::new());
