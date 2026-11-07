@@ -108,17 +108,17 @@ pub fn run(
                     return other;
                 }
             }
-            if args.enable {
-                if let Err(e) = mgr.enable(&spec.id) {
-                    let _ = writeln!(err, "error: {}: enable: {}", spec.id, e.report());
-                    codes.push(ExitCode::of(&e));
-                }
+            if args.enable
+                && let Err(e) = mgr.enable(&spec.id)
+            {
+                let _ = writeln!(err, "error: {}: enable: {}", spec.id, e.report());
+                codes.push(ExitCode::of(&e));
             }
-            if let Some(sequence) = sequence.as_mut() {
-                if let Err(e) = sequence.start(&spec.id, args.wait.budget()) {
-                    let _ = writeln!(err, "error: {}: start: {}", spec.id, e.report());
-                    codes.push(ExitCode::of(&e));
-                }
+            if let Some(sequence) = sequence.as_mut()
+                && let Err(e) = sequence.start(&spec.id, args.wait.budget())
+            {
+                let _ = writeln!(err, "error: {}: start: {}", spec.id, e.report());
+                codes.push(ExitCode::of(&e));
             }
         }
         Err(e) => {

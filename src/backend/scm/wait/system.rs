@@ -11,17 +11,20 @@ use windows_service::service::{Service, ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_NOT_ACTIVE, WAIT_IO_COMPLETION};
 use windows_sys::Win32::System::Services::{
-    ControlService, NotifyServiceStatusChangeW, QueryServiceStatus, SERVICE_ACCEPT_STOP, SERVICE_CONTINUE_PENDING,
-    SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_CONTINUE_PENDING,
-    SERVICE_NOTIFY_PAUSE_PENDING, SERVICE_NOTIFY_PAUSED, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING,
-    SERVICE_NOTIFY_STATUS_CHANGE, SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_PAUSE_PENDING,
-    SERVICE_PAUSED, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    ControlService, NotifyServiceStatusChangeW, QueryServiceStatus, SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_STOP,
+    SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_CONTINUE_PENDING, SERVICE_NOTIFY_PAUSE_PENDING,
+    SERVICE_NOTIFY_PAUSED, SERVICE_NOTIFY_RUNNING, SERVICE_NOTIFY_START_PENDING, SERVICE_NOTIFY_STATUS_CHANGE,
+    SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
 };
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::RecordedExit;
 
-use super::{Armed, Cancelled, Deadline, Observed, QueriedState, QueriedStatus, Registration, StartReply, WantState};
+use super::{
+    Armed, Cancelled, Deadline, Observed, QueriedState, QueriedStatus, Registration, SERVICE_ACCEPT_STOP, StartReply,
+    WantState,
+};
 
 /// `windows-service`'s `Error` does not implement `Into<io::Error>` for
 /// every variant (it also carries parse errors this module never
@@ -153,11 +156,11 @@ fn queried_state_of_raw(raw: u32) -> io::Result<QueriedState> {
 /// notify buffer. The `LastStatus` slot and the `SERVICE_NOTIFY_2W`
 /// buffer are heap-pinned (`Box`) so their addresses stay stable across
 /// `arm` -> `SleepEx` -> callback. Both handles are `Option`s so
-/// [`Self::close_and_drain`] can close them *before* it drains — see
+/// `Self::close_and_drain` can close them *before* it drains — see
 /// there for why that order is the whole point.
 ///
 /// Owning the SCM connection (rather than borrowing the caller's) is what
-/// makes [`super::NotifyRegistrar::reopen`] able to follow `NotifyServiceStatusChangeW`'s
+/// makes `NotifyRegistrar::reopen` able to follow `NotifyServiceStatusChangeW`'s
 /// documented `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` remedy exactly: "close
 /// the handle to the SCM, open a new handle, and call this function
 /// again" — the lag condition is tracked against the SCM connection, not
@@ -177,7 +180,7 @@ pub struct SystemScmActor {
 
 impl SystemScmActor {
     /// Open `name` with `QUERY_STATUS | STOP | START` — everything both
-    /// [`super::stop_via_notify`] and [`super::start_via_notify`] need,
+    /// `stop_via_notify` and `start_via_notify` need,
     /// so one actor serves either wait without reopening.
     pub fn open(name: &str) -> io::Result<Self> {
         let scm = open_scm()?;
@@ -274,7 +277,7 @@ impl super::ScmHandles for SystemScmActor {
 }
 
 /// The handles [`super::cancel_registration`] and the lag remedy open.
-pub struct Fresh {
+pub(crate) struct Fresh {
     scm: WinServiceManager,
     service: Service,
 }
@@ -430,14 +433,14 @@ impl super::ScmActor for SystemScmActor {
         }))
     }
 
-    fn stopped_exit(&self) -> RecordedExit {
+    fn delivered_exit(&self) -> RecordedExit {
         RecordedExit {
             win32: self.status.exit_win32.load(Ordering::Acquire),
             specific: self.status.exit_specific.load(Ordering::Acquire),
         }
     }
 
-    fn stopped_wait_hint(&self) -> u32 {
+    fn delivered_wait_hint(&self) -> u32 {
         self.status.wait_hint.load(Ordering::Acquire)
     }
 
@@ -459,7 +462,7 @@ impl super::ScmActor for SystemScmActor {
         })
     }
 
-    fn accepts_stop(&self) -> bool {
-        self.status.controls_accepted.load(Ordering::Acquire) & SERVICE_ACCEPT_STOP != 0
+    fn delivered_controls_accepted(&self) -> u32 {
+        self.status.controls_accepted.load(Ordering::Acquire)
     }
 }

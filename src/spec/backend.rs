@@ -171,7 +171,7 @@ impl BackendKind {
 
     /// Values that are wrong for this backend by construction, on any
     /// host. Reads **only** the fields `supplied` marks. See `Supplied`.
-    pub(crate) fn error(self, spec: &ShapedSpec, supplied: Supplied) -> Result<(), Error> {
+    pub(super) fn error(self, spec: &ShapedSpec, supplied: Supplied) -> Result<(), Error> {
         if !supplied.user {
             return Ok(());
         }

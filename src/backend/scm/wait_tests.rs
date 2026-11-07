@@ -437,9 +437,6 @@ impl ScmActor for FakeScm {
         self.unanswered = observed.map(|o| (o, self.last_accepts));
         Ok(observed)
     }
-    fn accepts_stop(&self) -> bool {
-        self.last_accepts
-    }
     fn query_status(&mut self) -> std::io::Result<QueriedStatus> {
         self.log.push("query_status");
         // The service's state once a notification has told it, else the scripted answer.
@@ -453,11 +450,15 @@ impl ScmActor for FakeScm {
         };
         Ok(answer.expect("query_status was not scripted"))
     }
-    fn stopped_exit(&self) -> RecordedExit {
+    fn delivered_exit(&self) -> RecordedExit {
         self.recorded
     }
-    fn stopped_wait_hint(&self) -> u32 {
+    fn delivered_wait_hint(&self) -> u32 {
         self.wait_hint
+    }
+    fn delivered_controls_accepted(&self) -> u32 {
+        // `SERVICE_ACCEPT_STOP` is the only control the fake models.
+        if self.last_accepts { SERVICE_ACCEPT_STOP } else { 0 }
     }
 }
 
@@ -1617,6 +1618,158 @@ fn a_pending_stop_callback_rearms_under_the_same_deadline() {
     assert_eq!(fake.arm_count(), 2);
     assert_eq!(fake.arm_deadlines, vec![deadline; 2]);
     assert_eq!(fake.deadlines, vec![deadline; 2]);
+}
+
+/// What `wait_until` hands its closure: each state off the target, with whether a notification of
+/// this wait was already delivered.
+#[skuld::test]
+fn wait_until_tells_the_closure_whether_a_pending_state_was_delivered() {
+    let mut fake = FakeScm::new([Some(Observed::Pending)])
+        .starting_in(QueriedState::Running)
+        .drifting_after(1, QueriedState::Running);
+    let mut seen = vec![];
+    let waited = wait_until(
+        &mut fake,
+        WantState::Stopped,
+        WantState::StoppedOnly,
+        QueriedState::Stopped,
+        unbounded(),
+        |sighting| {
+            seen.push((sighting.status.state, sighting.pending_delivered));
+            Ok(if sighting.pending_delivered {
+                ControlFlow::Break(Waited::Expired)
+            } else {
+                ControlFlow::Continue(())
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(waited, Waited::Expired);
+    assert_eq!(
+        seen,
+        vec![(QueriedState::Running, false), (QueriedState::Running, true)]
+    );
+    assert_eq!(fake.log, vec!["arm_stopped", "wait", "got_pending", "arm_stopped_only"]);
+}
+
+/// A `Stopped` notification off the target carries the status of that notification: its record, wait
+/// hint and controls accepted, which the arm's status (`START_PENDING`, no record) does not.
+#[skuld::test]
+fn wait_until_hands_a_notified_stopped_to_the_closure_with_its_record() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)])
+        .queried(QueriedState::StartPending, false)
+        .stopped_by_scm_with_wait_hint(2000)
+        .accepting([false]);
+    fake.recorded = RecordedExit {
+        win32: 1066,
+        specific: 42,
+    };
+    let mut seen = vec![];
+    let waited = wait_until(
+        &mut fake,
+        WantState::Running,
+        WantState::Running,
+        QueriedState::Running,
+        unbounded(),
+        |sighting| {
+            seen.push(sighting);
+            Ok(match sighting.status.state {
+                QueriedState::Stopped => ControlFlow::Break(Waited::Expired),
+                _ => ControlFlow::Continue(()),
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(waited, Waited::Expired);
+    let stopped = seen.last().copied().unwrap();
+    assert_eq!(
+        stopped.status,
+        QueriedStatus {
+            state: QueriedState::Stopped,
+            accepts_stop: false,
+            exit: RecordedExit {
+                win32: 1066,
+                specific: 42,
+            },
+            wait_hint: 2000,
+        }
+    );
+    assert!(!stopped.pending_delivered);
+}
+
+/// A settled state off the target that the closure lets pass is waited out like a pending one: the
+/// wait re-arms with `rearm`, and the arm's status is decided before the wait.
+#[skuld::test]
+fn wait_until_rearms_with_its_second_mask_after_a_notification_the_closure_lets_pass() {
+    let mut fake =
+        FakeScm::new([Some(Observed::Paused), Some(Observed::Running)]).queried(QueriedState::StartPending, false);
+    let mut seen = vec![];
+    let waited = wait_until(
+        &mut fake,
+        WantState::RunningPausedOrStopped,
+        WantState::Running,
+        QueriedState::Running,
+        unbounded(),
+        |sighting| {
+            seen.push((sighting.status.state, sighting.pending_delivered));
+            Ok(ControlFlow::Continue(()))
+        },
+    )
+    .unwrap();
+    assert_eq!(waited, Waited::Confirmed);
+    assert_eq!(
+        seen,
+        vec![
+            (QueriedState::StartPending, false),
+            (QueriedState::Paused, false),
+            (QueriedState::Paused, true),
+        ]
+    );
+    assert_eq!(
+        fake.log,
+        vec!["arm_settle", "wait", "got_paused", "arm_running", "wait", "got_running"]
+    );
+}
+
+/// Under the start wait's own masks, a notified `Stopped` is off the target `Running`: the closure
+/// lets it pass, and the wait re-arms with `Running` and decides on that arm's status before it waits.
+#[skuld::test]
+fn wait_until_rearms_after_a_notified_state_the_closure_lets_pass_under_the_start_masks() {
+    let mut fake =
+        FakeScm::new([Some(Observed::Stopped), Some(Observed::Running)]).queried(QueriedState::StartPending, false);
+    let mut seen = vec![];
+    let waited = wait_until(
+        &mut fake,
+        WantState::Running,
+        WantState::Running,
+        QueriedState::Running,
+        unbounded(),
+        |sighting| {
+            seen.push((sighting.status.state, sighting.pending_delivered));
+            Ok(ControlFlow::Continue(()))
+        },
+    )
+    .unwrap();
+    assert_eq!(waited, Waited::Confirmed);
+    assert_eq!(
+        seen,
+        vec![
+            (QueriedState::StartPending, false),
+            (QueriedState::Stopped, false),
+            (QueriedState::Stopped, true),
+        ]
+    );
+    assert_eq!(
+        fake.log,
+        vec![
+            "arm_running",
+            "wait",
+            "got_stopped",
+            "arm_running",
+            "wait",
+            "got_running"
+        ]
+    );
 }
 
 #[skuld::test]

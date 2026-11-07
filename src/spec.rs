@@ -2,9 +2,10 @@
 //! gate.
 //!
 //! `RawSpec -> DaemonSpec` (see `resolve`) is the crate's parse-don't-validate
-//! boundary: every `DaemonSpec` that exists has already passed every check,
-//! so nothing downstream needs to re-derive them. There is no separate
-//! `validate()`.
+//! boundary: every `DaemonSpec` that [`load`] returns has already passed every
+//! check, so nothing downstream needs to re-derive them. There is no separate
+//! `validate()`. `DaemonSpec`'s fields are public, so a `DaemonSpec` built as
+//! a literal outside this module is not validated.
 //!
 //! A daemon may also carry a `backend-specific:` block overriding its
 //! fields per [`BackendKind`]; see `overrides`'s module doc for the
@@ -20,10 +21,8 @@ mod user;
 mod vars;
 
 pub use backend::BackendKind;
-pub use overrides::{BackendOverrides, RawOverride, Supplied};
-pub use raw::RawSpec;
-pub use resolve::{load, resolve};
-pub use user::{AccountId, RawUser, User};
+pub use resolve::load;
+pub use user::{AccountId, User};
 
 // Re-exported so `blob::decode` re-runs the same injection-gate checks `resolve` uses, against a
 // spec deserialized from an untrusted artifact.

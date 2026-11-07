@@ -3,8 +3,12 @@
 //! for the `type: managed` analogues these mirror.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
 use goetia::backend::scm::manager::Scm;
+use goetia::backend::scm::wait::{
+    Armed, Observed, QueriedState, ScmActor as _, SystemScmActor, Waited, WantState, wait_until,
+};
 use goetia::decide::Outcome;
 use goetia::error::Error;
 use goetia::manager::conformance;
@@ -12,13 +16,8 @@ use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use goetia::shim::{CheckPermissions, StandaloneShim};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::System::Services::{
-    SERVICE_NOTIFY_STOP_PENDING, SERVICE_NOTIFY_STOPPED, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-};
 
-use crate::common::{
-    LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, arm_and_wait, conformance_mk, fixture_command, manager, simple_spec,
-};
+use crate::common::{LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, conformance_mk, fixture_command, manager, simple_spec};
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED};
 
@@ -311,14 +310,42 @@ fn the_shim_reports_stop_pending_then_stopped() {
         .open_service(&id, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)
         .expect("open the service");
 
-    // Armed on RUNNING, before the stop, so the first delivery is the stop's own first state.
-    let first = arm_and_wait(&id, SERVICE_NOTIFY_STOP_PENDING | SERVICE_NOTIFY_STOPPED)
+    // Armed while RUNNING, which is outside the mask, so the first delivery is the stop's own.
+    let mut actor = SystemScmActor::open(&id).expect("open the service for notifications");
+    let armed = actor
+        .arm(WantState::Stopped, Budget::Unbounded.start())
         .expect("arm the STOP_PENDING notification");
+    assert!(
+        matches!(armed, Armed::Registered(s) if s.state == QueriedState::Running),
+        "the arm: {armed:?}"
+    );
     service.stop().expect("send stop");
-    let (state, controls_accepted) = first();
-    assert_eq!(state, SERVICE_STOP_PENDING, "the first state after a stop");
-    assert_eq!(controls_accepted, 0, "no control is accepted while stopping");
+    let observed = actor
+        .wait_callback(Budget::Unbounded.start())
+        .expect("wait for the first state after a stop");
+    assert_eq!(observed, Some(Observed::Pending), "the first state after a stop");
+    // The shim reports STOP_PENDING with no control accepted; read from the notification, not queried,
+    // as a fresh query can land on STOPPED, which also accepts nothing.
+    assert_eq!(
+        actor.delivered_controls_accepted(),
+        0,
+        "no control is accepted while stopping"
+    );
 
-    let (state, _) = arm_and_wait(&id, SERVICE_NOTIFY_STOPPED).expect("arm the STOPPED notification")();
-    assert_eq!(state, SERVICE_STOPPED);
+    // A settled state other than `STOPPED` fails the test instead of hanging it; `STOP_PENDING` waits.
+    let waited = wait_until(
+        &mut actor,
+        WantState::StoppedOnly,
+        WantState::StoppedOnly,
+        QueriedState::Stopped,
+        Budget::Unbounded.start(),
+        |sighting| match sighting.status.state {
+            QueriedState::Running | QueriedState::Paused => {
+                panic!("waiting for Stopped, the service reached {:?}", sighting.status.state)
+            }
+            _ => Ok(ControlFlow::Continue(())),
+        },
+    )
+    .expect("wait for STOPPED");
+    assert_eq!(waited, Waited::Confirmed, "an unbounded wait for STOPPED expired");
 }
