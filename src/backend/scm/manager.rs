@@ -1,6 +1,7 @@
 //! The effectful SCM backend (`#[cfg(windows)]`).
 //!
-//! Handles both `Kind::Simple` (via `goetia-shim`, `shim::run`) and
+//! Handles both `Kind::Simple` (under the host the manager's
+//! [`ShimProvider`](crate::shim::ShimProvider) supplies, which runs `shim::run`) and
 //! `Kind::Managed`; `generate::registration` builds the `ImagePath`/blob
 //! for both. `Kind::Simple`'s own integration tests live in
 //! `tests/shim_integration.rs`, not `tests/scm_integration.rs`, because they

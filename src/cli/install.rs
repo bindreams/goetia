@@ -12,6 +12,7 @@ use crate::backend::Identity;
 use crate::decide::{self, Outcome};
 use crate::error::Result;
 use crate::manager::{ServiceManager, Step};
+use crate::shim::HostCommand;
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
 #[derive(ClapArgs, Debug)]
@@ -44,6 +45,7 @@ pub fn run(
     args: &Args,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
     is_elevated: &dyn Fn() -> bool,
+    host: &dyn Fn() -> Result<HostCommand>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -57,7 +59,7 @@ pub fn run(
 
     if args.dry_run {
         let _ = writeln!(out, "# {}", spec.id);
-        return match preview_artifact(&spec, err) {
+        return match preview_artifact(&spec, host, err) {
             Ok(artifact) => {
                 let _ = write!(out, "{artifact}");
                 ExitCode::Success
@@ -222,18 +224,19 @@ fn preview_root_account() -> String {
 /// The generated artifact for `spec`, or the generator's refusal of it (scm refuses `restart: always`).
 ///
 /// `err` is threaded through on every platform so a generator warning cannot
-/// be dropped; no generator produces a [`crate::spec::Warning`] here today.
-fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
+/// be dropped; no generator produces a [`crate::spec::Warning`] here today. `host` is
+/// called only by the Windows preview of a `type: simple` daemon, whose artifact names it.
+fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>, err: &mut dyn Write) -> Result<String> {
     let identity = preview_identity(&spec.user);
 
     #[cfg(target_os = "linux")]
     {
-        let _ = err;
+        let _ = (err, host);
         Ok(crate::backend::systemd::generate::unit(spec, &identity))
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = err;
+        let _ = (err, host);
         Ok(crate::backend::launchd::generate::plist(spec, &identity))
     }
     #[cfg(windows)]
@@ -241,17 +244,18 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
         // The SCM generator's warning (a too-large `restart-delay`) fires at
         // resolve time, from `BackendKind::Scm.warn`, before this runs.
         let _ = err;
-        // This placeholder is only ever shown in a preview, never installed.
-        let host = crate::shim::HostCommand {
-            exe: PathBuf::from("goetia-shim.exe"),
-            args: vec![],
+        // Asked only for a `type: simple` daemon: a managed one runs no host, and a provider that
+        // cannot name one must not fail its preview.
+        let command = match spec.kind {
+            crate::spec::Kind::Simple => Some(host()?),
+            crate::spec::Kind::Managed => None,
         };
-        let registration = crate::backend::scm::generate::registration(spec, &identity, Some(&host))?;
+        let registration = crate::backend::scm::generate::registration(spec, &identity, command.as_ref())?;
         Ok(registration.to_string())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
-        let _ = err;
+        let _ = (err, host);
         Ok("# no dry-run preview generator for this platform\n".to_string())
     }
 }

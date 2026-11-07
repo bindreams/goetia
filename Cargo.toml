@@ -32,7 +32,9 @@ required-features = ["cli"]
 # "only on Windows" exit elsewhere), so `CARGO_BIN_EXE_goetia-shim` resolves
 # unconditionally for `tests/shim_integration.rs`. Its code is
 # `backend::scm::shim::run` in the library. No `required-features`: Cargo has
-# no platform-conditional feature.
+# no platform-conditional feature. goetia.exe installs it from beside itself
+# (`cargo install` and `cargo build` lay both binaries out together) unless
+# built with the `goetia-shim` feature, which embeds it instead.
 [[bin]]
 name = "goetia-shim"
 path = "src/bin/goetia-shim.rs"
@@ -50,7 +52,8 @@ default = ["cli"]
 # library dependency (see the design spec's crate table, §1).
 cli = ["dep:clap", "dep:libc"]
 # Set only by a build that embeds the stock shim (`goetia::embed_shim!()` is `Some` under it). The
-# release workflow turns it on for the `goetia` binary; the library never reads it.
+# release workflow turns it on for the `goetia` binary, whose `stock_shim()` then embeds it rather
+# than reading `goetia-shim.exe` beside it; the library never reads it.
 goetia-shim = []
 
 [dependencies]

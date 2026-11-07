@@ -2341,6 +2341,7 @@ fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_call
 fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_starts() {
     use crate::cli::wait::WaitArgs;
     use crate::cli::{ExitCode, diff, install};
+    use crate::shim::HostCommand;
 
     let name = format!("goetia-cli-{:x}", std::process::id());
     let _plists = Plists::new(&name);
@@ -2366,7 +2367,8 @@ fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_s
             wait: WaitArgs::default(),
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = install::run(&args, &manager_over(script), &|| true, &mut out, &mut err);
+        let host = || -> Result<HostCommand> { unreachable!("a launchd install never asks for the host command") };
+        let code = install::run(&args, &manager_over(script), &|| true, &host, &mut out, &mut err);
         (code, String::from_utf8(err).unwrap())
     };
 

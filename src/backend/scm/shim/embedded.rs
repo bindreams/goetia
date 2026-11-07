@@ -43,10 +43,6 @@ pub(crate) fn shim_file(name: &str) -> Option<ShimFile> {
 #[cfg(windows)]
 pub use stock::EmbeddedStockShim;
 #[cfg(windows)]
-#[allow(
-    unused_imports,
-    reason = "the CLI of a build without the stock shim embedded constructs it"
-)]
 pub(crate) use stock::SiblingStockShim;
 
 #[cfg(windows)]
@@ -127,16 +123,8 @@ mod stock {
 
     /// The stock shim from `goetia-shim.exe` beside the running executable, into the default folder.
     /// The file is read and hashed on every call, since it can change between two.
-    #[allow(
-        dead_code,
-        reason = "the CLI of a build without the stock shim embedded constructs it"
-    )]
     pub(crate) struct SiblingStockShim;
 
-    #[allow(
-        dead_code,
-        reason = "the CLI of a build without the stock shim embedded constructs it"
-    )]
     impl SiblingStockShim {
         pub(crate) fn new() -> Self {
             Self

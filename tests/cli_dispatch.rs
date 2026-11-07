@@ -17,6 +17,7 @@ use clap::error::ErrorKind;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
 use goetia::manager::{Budget, Installed, Sequence, ServiceManager, State, Status, Step};
+use goetia::shim::HostCommand;
 use goetia::spec::{DaemonSpec, Id, Kind, Restart};
 
 #[path = "support/mod.rs"]
@@ -107,16 +108,18 @@ fn up_to_date_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
 /// for the paths where obtaining a manager is itself what fails, and for
 /// proving a subcommand never asks for one. `is_elevated` is passed
 /// straight through, so a test can hand in a closure that panics if called
-/// — proof a read-only subcommand never checks elevation.
+/// — proof a read-only subcommand never checks elevation. `host` likewise: `no_host` for a
+/// subcommand that must never ask for the host command, `fixed_host` for a dry-run that may.
 fn dispatch_get_manager(
     args: &[&str],
     get_manager: &dyn Fn() -> goetia::Result<Box<dyn ServiceManager>>,
     is_elevated: &dyn Fn() -> bool,
+    host: &dyn Fn() -> goetia::Result<HostCommand>,
 ) -> (i32, String, String) {
     let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse {args:?}: {e}"));
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let code = cli::dispatch(&cli, get_manager, is_elevated, &mut out, &mut err);
+    let code = cli::dispatch(&cli, get_manager, is_elevated, host, &mut out, &mut err);
     (
         code,
         String::from_utf8(out).expect("stdout is UTF-8"),
@@ -133,7 +136,21 @@ fn dispatch_with<M: ServiceManager + Clone + 'static>(
 ) -> (i32, String, String) {
     let mgr = mgr.clone();
     let get_manager = move || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(mgr.clone())) };
-    dispatch_get_manager(args, &get_manager, is_elevated)
+    dispatch_get_manager(args, &get_manager, is_elevated, &fixed_host)
+}
+
+/// The `host` a subcommand that installs through a manager, or needs no shim, must never call.
+fn no_host() -> goetia::Result<HostCommand> {
+    panic!("only a Windows `install --dry-run` of a `type: simple` daemon asks for the host command")
+}
+
+/// A host command for a dry-run that may ask for one (`dispatch_with` hands it in); on Linux and
+/// macOS nothing reads it.
+fn fixed_host() -> goetia::Result<HostCommand> {
+    Ok(HostCommand {
+        exe: PathBuf::from("a-host-under-test.exe"),
+        args: vec![],
+    })
 }
 
 /// The `is_elevated` a read-only subcommand must never call.
@@ -678,7 +695,7 @@ fn install_dry_run_does_not_check_elevation_or_touch_the_manager() {
     let mut out = Vec::new();
     let mut err = Vec::new();
 
-    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &mut out, &mut err);
+    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &fixed_host, &mut out, &mut err);
 
     assert_eq!(code, 0, "stderr:\n{}", String::from_utf8_lossy(&err));
     assert!(!out.is_empty(), "dry-run should print something");
@@ -1385,6 +1402,7 @@ fn kill_refuses_json_before_running_anything() {
         &["goetia", "--json", "daemon", "kill", "frpc"],
         &|| panic!("a refused --json subcommand must never obtain a manager"),
         &|| panic!("a refused --json subcommand must never check elevation"),
+        &no_host,
     );
 
     assert_eq!(code, 2, "{out}");
@@ -1655,7 +1673,7 @@ fn install_dry_run_prints_generator_warnings() {
     let mut out = Vec::new();
     let mut err = Vec::new();
 
-    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &mut out, &mut err);
+    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &no_host, &mut out, &mut err);
 
     assert_eq!(code, 0);
     let err = String::from_utf8_lossy(&err);
@@ -1682,7 +1700,7 @@ fn dry_run_reports_a_refused_daemon() {
     let mut out = Vec::new();
     let mut err = Vec::new();
 
-    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &mut out, &mut err);
+    let code = cli::dispatch(&cli, &get_manager, &is_elevated, &fixed_host, &mut out, &mut err);
 
     let out = String::from_utf8_lossy(&out);
     let err = String::from_utf8_lossy(&err);
@@ -1697,6 +1715,149 @@ fn dry_run_reports_a_refused_daemon() {
         assert!(out.contains("# frpc\n"), "stdout:\n{out}");
         assert!(!err.contains("error:"), "stderr:\n{err}");
     }
+}
+
+/// A `type: managed` daemon runs no shim, so its preview must not ask for the host command.
+#[skuld::test]
+fn dry_run_of_managed_never_calls_host() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        "id: frpc
+command: [frpc]
+type: managed
+",
+    );
+
+    let (code, out, err) = dispatch_get_manager(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--dry-run",
+            "-f",
+            dir.path().to_str().unwrap(),
+        ],
+        &|| panic!("dry-run must never touch the manager"),
+        &|| panic!("dry-run must never check elevation"),
+        &no_host,
+    );
+
+    assert_eq!(
+        code, 0,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(
+        out.contains(
+            "# frpc
+"
+        ),
+        "stdout:
+{out}"
+    );
+}
+
+/// The Windows preview of a `type: simple` daemon shows the command the host closure supplies, not
+/// a placeholder.
+#[cfg(windows)]
+#[skuld::test]
+fn dry_run_shows_the_host_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        "id: frpc
+command: [frpc]
+type: simple
+",
+    );
+    let host = || -> goetia::Result<HostCommand> {
+        Ok(HostCommand {
+            exe: PathBuf::from(r"C:\hosts\the-host-under-test.exe"),
+            args: vec!["--under-test".to_owned()],
+        })
+    };
+
+    let (code, out, err) = dispatch_get_manager(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--dry-run",
+            "-f",
+            dir.path().to_str().unwrap(),
+        ],
+        &|| panic!("dry-run must never touch the manager"),
+        &|| panic!("dry-run must never check elevation"),
+        &host,
+    );
+
+    assert_eq!(
+        code, 0,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(
+        out.contains("the-host-under-test.exe"),
+        "stdout:
+{out}"
+    );
+    assert!(
+        out.contains("--under-test"),
+        "stdout:
+{out}"
+    );
+    assert!(
+        !out.contains("\"goetia-shim.exe\""),
+        "stdout:
+{out}"
+    );
+}
+
+/// A host the provider cannot name fails the preview with the provider's own message.
+#[cfg(windows)]
+#[skuld::test]
+fn dry_run_reports_a_host_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        "id: frpc
+command: [frpc]
+type: simple
+",
+    );
+    let host = || -> goetia::Result<HostCommand> { Err(goetia::Error::NoShimProvider) };
+
+    let (code, out, err) = dispatch_get_manager(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--dry-run",
+            "-f",
+            dir.path().to_str().unwrap(),
+        ],
+        &|| panic!("dry-run must never touch the manager"),
+        &|| panic!("dry-run must never check elevation"),
+        &host,
+    );
+
+    assert_eq!(
+        code, 1,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(
+        err.contains("no shim provider configured"),
+        "stderr:
+{err}"
+    );
 }
 
 /// The `list`/`status`/`show`/`diff` partitioning helper must warn about an
@@ -2308,6 +2469,7 @@ fn list_json_emits_a_document_when_the_manager_is_unavailable() {
             })
         },
         &never_elevated,
+        &no_host,
     );
 
     assert_eq!(
@@ -2562,6 +2724,7 @@ fn json_on_an_unsupported_subcommand_runs_nothing() {
         &["goetia", "--json", "daemon", "uninstall", "frpc"],
         &|| panic!("a refused --json subcommand must never obtain a manager"),
         &|| panic!("a refused --json subcommand must never check elevation"),
+        &no_host,
     );
 
     assert_eq!(code, 2, "{out}");
@@ -4056,7 +4219,7 @@ fn dispatch_to(args: &[&str], mgr: &Fake, out: &mut dyn std::io::Write) -> (i32,
     let mgr = mgr.clone();
     let get_manager = move || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(mgr.clone())) };
     let mut err = Vec::new();
-    let code = cli::dispatch(&cli, &get_manager, &never_elevated, out, &mut err);
+    let code = cli::dispatch(&cli, &get_manager, &never_elevated, &no_host, out, &mut err);
     (code, String::from_utf8(err).expect("stderr is UTF-8"))
 }
 

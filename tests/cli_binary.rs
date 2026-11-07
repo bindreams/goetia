@@ -130,6 +130,37 @@ fn dry_run_needs_no_elevation() {
     assert!(out.contains("frpc"), "{out}");
 }
 
+/// A `cargo build`/`cargo install` goetia.exe has no stock shim embedded, so its preview of a
+/// `type: simple` daemon names the copy of the `goetia-shim.exe` beside it, under its hash.
+#[cfg(windows)]
+#[skuld::test]
+fn dry_run_names_the_hashed_sibling_shim() {
+    use sha2::{Digest as _, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        "id: frpc
+command: [frpc]
+type: simple
+",
+    );
+    let sibling = Path::new(goetia_bin()).with_file_name("goetia-shim.exe");
+    let bytes = std::fs::read(&sibling).unwrap_or_else(|e| panic!("read {}: {e}", sibling.display()));
+    let hex: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+
+    let (code, out, err) = run_cli(&["daemon", "install", "--dry-run"], dir.path());
+
+    assert_eq!(
+        code, 0,
+        "stdout:
+{out}
+stderr:
+{err}"
+    );
+    assert!(out.contains(&format!("goetia-shim-{hex}.exe")), "{out}");
+}
+
 #[skuld::test]
 fn f_flag_accepts_a_directory() {
     let dir = tempfile::tempdir().unwrap();
