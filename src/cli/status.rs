@@ -10,7 +10,7 @@ use clap::Args as ClapArgs;
 use super::ExitCode;
 use super::report::{self, DaemonReport, Report};
 use super::support::{parse_id, partition_installed, print_undetermined_warnings, print_unusable_warnings};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, escape};
 use crate::manager::ServiceManager;
 
 #[derive(ClapArgs, Debug)]
@@ -105,10 +105,10 @@ fn print_text(report: &Report, out: &mut dyn Write, err: &mut dyn Write) {
     for error in &report.errors {
         match &error.id {
             Some(id) => {
-                let _ = writeln!(err, "error: {id}: {}", error.message);
+                let _ = writeln!(err, "error: {}: {}", escape(id), escape(&error.message));
             }
             None => {
-                let _ = writeln!(err, "error: {}", error.message);
+                let _ = writeln!(err, "error: {}", escape(&error.message));
             }
         }
     }
@@ -131,3 +131,7 @@ fn format_status_line(daemon: &DaemonReport) -> String {
         daemon.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string()),
     )
 }
+
+#[cfg(test)]
+#[path = "status_tests.rs"]
+mod status_tests;

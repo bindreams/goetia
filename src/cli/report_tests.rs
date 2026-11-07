@@ -279,3 +279,33 @@ fn emit_returns_the_reports_own_code_when_the_write_succeeds() {
     assert!(!out.is_empty(), "the document is on stdout");
     assert!(err.is_empty(), "nothing is said about a write that worked");
 }
+
+// The document carries the exact text ---------------------------------------------------------------------------------
+
+/// serde encodes the document, so escaping the text first would encode it twice: the human sinks
+/// escape, the document does not.
+#[skuld::test]
+fn a_refused_id_is_reported_as_the_id_was_given() {
+    let id = "a\nb\u{202e}";
+    let e = crate::spec::Id::try_from(id.to_string()).unwrap_err();
+    assert_eq!(
+        invalid_id(id, &e).message,
+        "id `a\nb\u{202e}` does not match the required pattern ^[A-Za-z0-9._-]{1,80}$"
+    );
+}
+
+#[skuld::test]
+fn an_errors_message_in_the_document_is_its_unescaped_chain() {
+    let e = Error::Step {
+        what: "step\u{202e}".to_string(),
+        source: Box::new(Error::os_at("read", "/a\nb", std::io::Error::other("x"))),
+    };
+    assert_eq!(
+        status_error("frpc", &e).message,
+        "step\u{202e}: failed to read /a\nb: x"
+    );
+    assert_eq!(
+        unavailable(&e).errors[0].message,
+        "step\u{202e}: failed to read /a\nb: x"
+    );
+}

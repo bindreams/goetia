@@ -1,17 +1,55 @@
 //! Printing an [`Error`]: its chain of causes, then each remedy found along it.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use super::Error;
+use super::escape::{write_escaped, write_escaped_keeping_layout};
 
-/// What [`Error::report`] returns: the chain, formatted on `Display`.
-pub(super) struct Report<'a>(pub(super) &'a Error);
+/// What [`Error::report`] and [`Error::report_unescaped`] return: the chain, formatted on `Display`.
+pub(super) struct Report<'a> {
+    pub(super) error: &'a Error,
+    pub(super) escaped: bool,
+}
 
 impl fmt::Display for Report<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = Sink::new(f, self.escaped);
         let mut remedies = Vec::new();
-        write_chain(self.0, f, &mut remedies)?;
-        write_remedies(f, &remedies)
+        write_chain(self.error, &mut out, &mut remedies)?;
+        write_remedies(&mut out, &remedies)
+    }
+}
+
+/// Where error text goes. The one place it is written for a person is [`write_chain`], so the one
+/// place it is escaped: `escaped` is whether this destination is one. The text goes through
+/// [`fmt::Write`], which escapes it whole; a child's stderr is written with
+/// [`write_layout`](Sink::write_layout), which keeps its line feeds and tabs.
+pub(super) struct Sink<'a> {
+    out: &'a mut dyn fmt::Write,
+    escaped: bool,
+}
+
+impl<'a> Sink<'a> {
+    pub(super) fn new(out: &'a mut dyn fmt::Write, escaped: bool) -> Self {
+        Sink { out, escaped }
+    }
+
+    fn write_layout(&mut self, text: &str) -> fmt::Result {
+        if self.escaped {
+            write_escaped_keeping_layout(self.out, text)
+        } else {
+            self.out.write_str(text)
+        }
+    }
+}
+
+impl fmt::Write for Sink<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if self.escaped {
+            write_escaped(self.out, text)
+        } else {
+            self.out.write_str(text)
+        }
     }
 }
 
@@ -22,11 +60,13 @@ impl fmt::Display for Report<'_> {
 /// Only an [`Error`] embeds through [`Error::embedded`]. The other users, `Occupant::Unreadable` and
 /// the SCM kill's `ReadAfterRefusedOpen`, hold `io::Error`s, which carry no remedy: a remedy lives
 /// on [`Error::Undetermined`], and no goetia error is wrapped in an `io::Error`.
+///
+/// Not escaped: the text lands in an error's `Display`, which the sink that prints it escapes.
 pub(crate) struct Chain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
 impl fmt::Display for Chain<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_chain(self.0, f, &mut Vec::new())
+        write_chain(self.0, &mut Sink::new(f, false), &mut Vec::new())
     }
 }
 
@@ -35,7 +75,7 @@ impl fmt::Display for Chain<'_> {
 /// the errors `e` embeds in its own text (see [`embedded`]) are collected too, and not written.
 pub(super) fn write_chain<'a>(
     e: &'a (dyn std::error::Error + 'static),
-    out: &mut dyn fmt::Write,
+    out: &mut Sink,
     remedies: &mut Vec<&'a str>,
 ) -> fmt::Result {
     // A `#[source]` of type `Box<Error>` reaches here as the box.
@@ -53,8 +93,12 @@ pub(super) fn write_chain<'a>(
         remedies.push(remedy);
     }
     write!(out, "{e}")?;
+    if let Some(stderr) = ours.and_then(Error::stderr).filter(|stderr| !stderr.is_empty()) {
+        out.write_str(": ")?;
+        out.write_layout(stderr)?;
+    }
     if let Some(inner) = ours.and_then(Error::embedded) {
-        write_chain(inner, &mut Discard, remedies)?;
+        write_chain(inner, &mut Sink::new(&mut Discard, false), remedies)?;
     }
     if let Some(source) = e.source() {
         out.write_str(": ")?;
@@ -64,7 +108,7 @@ pub(super) fn write_chain<'a>(
 }
 
 /// Writes each of `remedies` as `. remedy`.
-pub(super) fn write_remedies(out: &mut dyn fmt::Write, remedies: &[&str]) -> fmt::Result {
+pub(super) fn write_remedies(out: &mut Sink, remedies: &[&str]) -> fmt::Result {
     for remedy in remedies {
         write!(out, ". {remedy}")?;
     }

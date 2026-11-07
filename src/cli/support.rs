@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::ExitCode;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, escape};
 use crate::manager::{Installed, ServiceManager, State};
 use crate::spec::{DaemonSpec, Id, Warning};
 
@@ -25,8 +25,8 @@ pub(crate) fn load_and_warn(file: &Path, err: &mut dyn Write) -> Result<DaemonSp
 pub(crate) fn print_warnings(warnings: &[Warning], err: &mut dyn Write) {
     for warning in warnings {
         let _ = match &warning.id {
-            Some(id) => writeln!(err, "warning: {id}: {}", warning.message),
-            None => writeln!(err, "warning: {}", warning.message),
+            Some(id) => writeln!(err, "warning: {id}: {}", escape(&warning.message)),
+            None => writeln!(err, "warning: {}", escape(&warning.message)),
         };
     }
 }
@@ -138,7 +138,12 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
 
 pub(crate) fn print_unusable_warnings(unusable: &BTreeMap<String, String>, err: &mut dyn Write) {
     for (name, reason) in unusable {
-        let _ = writeln!(err, "warning: {name}: installed but unusable: {reason}");
+        let _ = writeln!(
+            err,
+            "warning: {}: installed but unusable: {}",
+            escape(name),
+            escape(reason)
+        );
     }
 }
 
@@ -149,10 +154,11 @@ pub(crate) fn print_undetermined_warnings(undetermined: &[UndeterminedEntry], er
         let _ = match &entry.name {
             Some(name) => writeln!(
                 err,
-                "warning: {name}: installation state could not be determined: {}",
-                entry.reason
+                "warning: {}: installation state could not be determined: {}",
+                escape(name),
+                escape(&entry.reason)
             ),
-            None => writeln!(err, "warning: {}", entry.reason),
+            None => writeln!(err, "warning: {}", escape(&entry.reason)),
         };
     }
 }

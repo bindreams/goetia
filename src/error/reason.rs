@@ -1,10 +1,10 @@
 //! [`Reason`]: why goetia says what it does about an id it cannot use or classify.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::sync::Arc;
 
 use super::Error;
-use super::report::{write_chain, write_remedies};
+use super::report::{Sink, write_chain, write_remedies};
 
 /// Why goetia says what it does about an id it cannot use or classify: a refused install, or a
 /// `list` entry. It is cheap to clone, and two reasons are equal when they read the same.
@@ -69,9 +69,10 @@ impl fmt::Display for Reason {
         };
         let mut remedies = Vec::new();
         f.write_str(before)?;
-        write_chain(error.as_ref(), f, &mut remedies)?;
-        f.write_str(after)?;
-        write_remedies(f, &remedies)
+        let mut out = Sink::new(f, false);
+        write_chain(error.as_ref(), &mut out, &mut remedies)?;
+        out.write_str(after)?;
+        write_remedies(&mut out, &remedies)
     }
 }
 

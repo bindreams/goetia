@@ -4,10 +4,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod escape;
 mod reason;
 mod report;
 mod within;
 
+#[cfg(feature = "cli")]
+pub(crate) use escape::escape;
 pub use reason::Reason;
 pub(crate) use report::Chain;
 pub(crate) use within::within;
@@ -36,8 +39,9 @@ pub enum Error {
     },
 
     /// A tool goetia runs (`systemctl`, `launchctl`, `plutil`, `sc.exe`) ran and exited
-    /// unsuccessfully. `stderr` is its own diagnostic, trimmed.
-    #[error("`{command}` failed ({status}){}", stderr_suffix(stderr))]
+    /// unsuccessfully. `stderr` is its own diagnostic, trimmed: [`report`](Error::report) writes it,
+    /// and this variant's `Display` does not, so it holds no layout.
+    #[error("`{command}` failed ({status})")]
     Command {
         command: String,
         status: std::process::ExitStatus,
@@ -648,10 +652,34 @@ impl Error {
 
     /// The error and its causes, joined as `context: cause: cause`, then each [`remedy`](Error::remedy)
     /// found along the chain, outermost first, as `. remedy`; a [`Both`](Error::Both) prints as
-    /// `first; then: then`. What the CLI prints and `--json` carries: [`Display`](fmt::Display)
-    /// alone is the outermost context.
+    /// `first; then: then`. What the CLI prints: [`Display`](fmt::Display) alone is the outermost
+    /// context. The control and direction characters of what an error quotes are written as
+    /// `\u{XXXX}`, as the CLI's other human sinks write them; a child's stderr keeps its line feeds
+    /// and tabs.
     pub fn report(&self) -> impl fmt::Display + '_ {
-        Report(self)
+        Report {
+            error: self,
+            escaped: true,
+        }
+    }
+
+    /// [`report`](Error::report) with every character as it is: what `--json` carries, since the
+    /// document's encoder escapes the text itself.
+    #[cfg(feature = "cli")]
+    pub(crate) fn report_unescaped(&self) -> impl fmt::Display + '_ {
+        Report {
+            error: self,
+            escaped: false,
+        }
+    }
+
+    /// The diagnostic of a failed [`Command`](Error::Command), which `Display` leaves out.
+    pub(crate) fn stderr(&self) -> Option<&str> {
+        match self {
+            Error::Command { stderr, .. } => Some(stderr),
+            Error::Kept(kept) => kept.stderr(),
+            _ => None,
+        }
     }
 
     /// A [`RequestInDoubt`](Error::RequestInDoubt) with `context` said ahead of any note it
@@ -841,14 +869,6 @@ fn read_at(path: &Option<PathBuf>) -> String {
         .map(Path::display)
         .map(|p| format!(" at {p}"))
         .unwrap_or_default()
-}
-
-fn stderr_suffix(stderr: &str) -> String {
-    if stderr.is_empty() {
-        String::new()
-    } else {
-        format!(": {stderr}")
-    }
 }
 
 /// The reason a request announced no job: the client's diagnostic, or that it gave none.

@@ -247,7 +247,7 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
     ErrorReport {
         id: Some(id.to_string()),
         kind,
-        message: e.report().to_string(),
+        message: e.report_unescaped().to_string(),
     }
 }
 
@@ -260,7 +260,7 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
 pub(crate) fn invalid_id(id: &str, e: &Error) -> ErrorReport {
     let message = match e {
         Error::Invalid { message, .. } => message.clone(),
-        other => other.report().to_string(),
+        other => other.report_unescaped().to_string(),
     };
     ErrorReport {
         id: Some(id.to_string()),
@@ -278,7 +278,7 @@ pub(crate) fn unavailable(e: &Error) -> Report {
         errors: vec![ErrorReport {
             id: None,
             kind: Kind::Unavailable,
-            message: e.report().to_string(),
+            message: e.report_unescaped().to_string(),
         }],
         undetermined: Vec::new(),
     }

@@ -2502,3 +2502,14 @@ backend-specific:
     let (_spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     assert!(warnings.is_empty(), "{warnings:?}");
 }
+
+/// The message quotes the resolved path as it is; the sink that prints it escapes it.
+#[skuld::test]
+fn a_refused_resolved_path_is_escaped_where_the_error_is_printed() {
+    let id = Id::try_from("frpc").unwrap();
+    let e = Error::from(check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\nb\u{202e}c"), false).unwrap_err());
+    assert_eq!(
+        e.report().to_string(),
+        r"daemon `frpc`: field `cwd` is `C:`, which resolves to `/a\u{a}b\u{202e}c`, which contains a control character, which is forbidden"
+    );
+}
