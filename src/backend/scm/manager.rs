@@ -91,7 +91,6 @@
 pub(in crate::backend::scm) mod identity;
 mod registry;
 
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;
 use std::path::PathBuf;
@@ -110,6 +109,7 @@ use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
+use crate::backend::scm::parameters::Parameters;
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
@@ -138,7 +138,7 @@ pub(crate) struct ScmSnapshot {
     id: Id,
     blob: Decoded,
     /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
-    parameters: BTreeMap<String, String>,
+    parameters: Parameters,
     /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
     /// a service deleted since then does not turn into an unusable one. `None` for what `scan`
     /// saw, which opens no service.
@@ -146,7 +146,7 @@ pub(crate) struct ScmSnapshot {
 }
 
 /// What `read_marker` hands on of a service: its `Parameters` and the object `read` opened.
-type Opened = (BTreeMap<String, String>, Option<Service>);
+type Opened = (Parameters, Option<Service>);
 
 impl ScmSnapshot {
     fn new(id: Id, blob: Decoded, (parameters, service): Opened) -> Self {
@@ -395,8 +395,8 @@ impl Backend for Scm {
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
 /// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
 /// has no second proof of ownership.
-fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
-    let blob = match generate::extract(&parameters) {
+fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
+    let blob = match generate::extract(&parameters.fields) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
         Ok(Some(blob)) => Ok(blob),
         Err(e) => Err(Arc::new(e)),
@@ -427,7 +427,7 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
 pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     match registry::read_parameters(id)? {
         RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),
-        RegistryReadOutcome::Read(params) => generate::extract(&params),
+        RegistryReadOutcome::Read(params) => generate::extract(&params.fields),
     }
 }
 
@@ -487,7 +487,7 @@ fn shim_path() -> PathBuf {
 fn read_live_registration(
     service: &Service,
     name: &str,
-    live_params: &BTreeMap<String, String>,
+    live_params: &Parameters,
 ) -> Result<(ScmRegistration, ServiceStartType)> {
     let cfg = service
         .query_config()
@@ -521,7 +521,8 @@ fn read_live_registration(
             account,
             failure_actions,
             environment,
-            parameters: generate::canonical_field_names(live_params)?,
+            parameters: generate::canonical_field_names(&live_params.fields),
+            stray_parameters: live_params.strays.clone(),
         },
         cfg.start_type,
     ))

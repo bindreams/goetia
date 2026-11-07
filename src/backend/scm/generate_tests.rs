@@ -1069,18 +1069,7 @@ fn canonical_field_names_restore_goetias_spelling_and_leave_other_names_alone() 
     let mut expected = reg.parameters;
     expected.insert("Stray".to_string(), "x".to_string());
     expected.insert("sTRAY2".to_string(), "y".to_string());
-    assert_eq!(canonical_field_names(&stored).unwrap(), expected);
-}
-
-/// Two stored names that fold to one of Goetia's fields are reported, not collapsed into whichever
-/// the map visits last, as [`extract`] reports them.
-#[skuld::test]
-fn canonical_field_names_report_two_names_folding_to_one_field() {
-    let mut stored = build(&managed_spec()).parameters;
-    stored.insert("MARKER".to_string(), "also-goetia".to_string());
-
-    let err = canonical_field_names(&stored).expect_err("two spellings of Marker must be reported");
-    assert!(err.to_string().contains(FIELD_MARKER), "{err}");
+    assert_eq!(canonical_field_names(&stored), expected);
 }
 
 #[skuld::test]
@@ -1106,6 +1095,40 @@ fn extract_errors_on_case_insensitive_field_collision() {
 }
 
 // Display =============================================================================================================
+
+/// A registration built from a spec has no strays, so the text of a readback that has none is the
+/// text of what goetia wants; one that has any differs, and says which.
+#[skuld::test]
+fn a_stray_parameter_is_drift_the_text_names() {
+    let wanted = build(&managed_spec());
+    assert!(wanted.stray_parameters.is_empty());
+    assert!(!wanted.to_string().contains("Stray"), "{wanted}");
+
+    for stray in [
+        Stray::Value {
+            name: "Marker".encode_utf16().collect(),
+            vtype: 2,
+        },
+        Stray::Value {
+            name: vec![0xD800],
+            vtype: 0x20,
+        },
+        Stray::Subkey {
+            name: "Sub
+key"
+            .encode_utf16()
+            .collect(),
+        },
+    ] {
+        let on_disk = ScmRegistration {
+            stray_parameters: vec![stray.clone()],
+            ..wanted.clone()
+        };
+
+        assert_ne!(on_disk.to_string(), wanted.to_string(), "{stray:?}");
+        assert!(on_disk.to_string().contains(&stray.to_string()), "{stray:?}: {on_disk}");
+    }
+}
 
 #[skuld::test]
 fn display_excludes_boot_enablement() {
@@ -1167,6 +1190,7 @@ fn display_output_format_is_pinned() {
             ("Marker".to_string(), "goetia".to_string()),
             ("Schema".to_string(), "1".to_string()),
         ]),
+        stray_parameters: Vec::new(),
     };
 
     // Every line `Display` itself controls (labels, order, indentation,
@@ -1214,6 +1238,7 @@ fn a_registration_displays_as_its_canonical_text() {
         failure_actions: None,
         environment: vec![],
         parameters: BTreeMap::from([("k".to_string(), "v".to_string())]),
+        stray_parameters: Vec::new(),
     };
 
     assert_eq!(

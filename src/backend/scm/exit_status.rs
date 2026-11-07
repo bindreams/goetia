@@ -14,8 +14,6 @@
 
 /// `argv[1]` (the service id) is missing.
 pub const ERROR_BAD_ARGUMENTS: u32 = 160;
-/// The metadata blob is absent or cannot be decoded.
-pub const ERROR_INVALID_DATA: u32 = 13;
 /// SCM's answer to an open of a service that does not exist.
 pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 /// A shim failure that carries no usable OS error.
@@ -24,6 +22,8 @@ pub const ERROR_GEN_FAILURE: u32 = 31;
 pub const ERROR_CAN_NOT_COMPLETE: u32 = 1003;
 /// The control handler or the dispatcher could not be connected, so nothing is reportable.
 pub const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: u32 = 1063;
+/// The service-specific code of [`Reported::Refused`], beside Win32 0.
+pub const SHIM_REFUSED: u32 = 1;
 /// The Win32 code SCM records alongside any service-specific code.
 pub const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
 
@@ -42,10 +42,12 @@ pub enum Reported {
     /// The shim failed; holds a Win32 code that is neither 0 nor [`ERROR_SERVICE_SPECIFIC_ERROR`].
     ShimFailure(u32),
     /// The shim could not show that the daemon's tree was terminated, after a stop or a failure,
-    /// or because no Job Object contained it; it may still be running. Also the report of a shim
-    /// whose service record is gone or names no service: nothing was started, and SCM's recovery
-    /// does not restart it.
+    /// or because no Job Object contained it; it may still be running.
     IncompleteStop,
+    /// The shim refused before it started any daemon: its service record is gone, names no
+    /// service, carries no goetia metadata or carries metadata that cannot be read. Win32 0, so
+    /// SCM's recovery does not start the same refusal again.
+    Refused,
 }
 
 impl Reported {
@@ -76,12 +78,13 @@ impl Reported {
             Reported::Clean => 0,
             Reported::DaemonExit(code) | Reported::ShimFailure(code) => code as i32,
             Reported::IncompleteStop => ERROR_CAN_NOT_COMPLETE as i32,
+            Reported::Refused => SHIM_REFUSED as i32,
         }
     }
 
     /// `(win32, service_specific)` for the `STOPPED` report. A daemon failure is
     /// `(ERROR_SERVICE_SPECIFIC_ERROR, code)`, which is how SCM records a service-specific code;
-    /// an incomplete stop is `(0, ERROR_CAN_NOT_COMPLETE)`. The pair needs a raw `SetServiceStatus`:
+    /// an incomplete stop is `(0, ERROR_CAN_NOT_COMPLETE)` and a refusal `(0, SHIM_REFUSED)`. The pair needs a raw `SetServiceStatus`:
     /// `windows-service`'s `ServiceExitCode` cannot express a service-specific code beside Win32 0.
     pub fn scm_codes(self) -> (u32, u32) {
         match self {
@@ -89,6 +92,7 @@ impl Reported {
             Reported::DaemonExit(code) => (ERROR_SERVICE_SPECIFIC_ERROR, code),
             Reported::ShimFailure(code) => (code, 0),
             Reported::IncompleteStop => (INCOMPLETE_STOP_WIN32, ERROR_CAN_NOT_COMPLETE),
+            Reported::Refused => (0, SHIM_REFUSED),
         }
     }
 }
@@ -100,20 +104,27 @@ impl Reported {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordedExit {
     pub win32: u32,
-    /// Meaningful when `win32` is [`ERROR_SERVICE_SPECIFIC_ERROR`], and for an incomplete stop.
+    /// Meaningful when `win32` is [`ERROR_SERVICE_SPECIFIC_ERROR`], and for an incomplete stop or a
+    /// refusal.
     pub specific: u32,
 }
 
 impl RecordedExit {
     /// Whether the shim launched the daemon: [`Reported::Clean`] and [`Reported::DaemonExit`], where
     /// it then ended, and [`Reported::IncompleteStop`], where it may still be running. Any other
-    /// Win32 code is a shim failure before or around the launch.
+    /// Win32 code is a shim failure before or around the launch, and so is [`Reported::Refused`],
+    /// whose Win32 code is 0.
     ///
     /// This reads the Win32 code alone, so it also accepts the record of a host that exits before
     /// connecting to SCM: `(0, 0)` with wait hint 2000 (P25 c/d), the same as a failed SCM start
     /// (P10). Callers must rule that out first; `start_via_notify` does, see there.
     pub fn daemon_ran(self) -> bool {
-        self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR
+        !self.is_refusal() && (self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR)
+    }
+
+    /// Whether this is [`Reported::Refused`]'s record: the shim started no daemon.
+    pub fn is_refusal(self) -> bool {
+        (self.win32, self.specific) == Reported::Refused.scm_codes()
     }
 
     /// Whether this is [`Reported::IncompleteStop`]'s record: a daemon the shim launched may still
@@ -128,6 +139,8 @@ impl std::fmt::Display for RecordedExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.win32 == ERROR_SERVICE_SPECIFIC_ERROR {
             write!(f, "service-specific exit code {}", self.specific)
+        } else if self.win32 == 0 && self.specific != 0 {
+            write!(f, "exit code 0 with service-specific code {}", self.specific)
         } else {
             write!(f, "exit code {}", self.win32)
         }

@@ -847,6 +847,58 @@ fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes() {
     mgr.status(&spec.id).expect("status: the service still reads as ours");
 }
 
+/// A raw `RegSetValueExW` of `name` (UTF-16 units, any) with `vtype` and `data`.
+fn set_raw_value(key: &winreg::RegKey, name: &[u16], vtype: u32, data: &[u8]) {
+    let name: Vec<u16> = name.iter().copied().chain(std::iter::once(0)).collect();
+    // SAFETY: `key` holds an open handle with write access; `name` is NUL-terminated and `data` is
+    // `data.len()` readable bytes, both outliving the call.
+    let status = unsafe {
+        RegSetValueExW(
+            key.raw_handle(),
+            name.as_ptr(),
+            0,
+            vtype,
+            data.as_ptr(),
+            data.len() as u32,
+        )
+    };
+    assert_eq!(status, 0, "write a value of type {vtype}: error {status}");
+}
+
+/// What `winreg` cannot enumerate must still be drift that `install --force` removes: a goetia field
+/// stored as `REG_EXPAND_SZ`, a value of a type above `REG_QWORD`, and a name that is not valid UTF-16.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_removes_strays_that_winreg_cannot_enumerate() {
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const CUSTOM_TYPE: u32 = 0x20;
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+    // UTF-16LE with the closing NUL, as a string value is stored.
+    let sz = |text: &str| -> Vec<u8> { units(text).into_iter().chain([0]).flat_map(u16::to_le_bytes).collect() };
+
+    // `Schema`, not `Marker`: a `Marker` that is not goetia's string leaves the service foreign.
+    set_raw_value(&parameters, &units("Schema"), REG_EXPAND_SZ, &sz("1"));
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("Schema") && diff.contains("REG_EXPAND_SZ"), "{diff}");
+
+    set_raw_value(&parameters, &units("Custom"), CUSTOM_TYPE, b"bytes");
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(
+        diff.contains("Custom") && diff.contains(&CUSTOM_TYPE.to_string()),
+        "{diff}"
+    );
+
+    set_raw_value(&parameters, &[0x41, 0xD800], REG_SZ, &sz("x"));
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("D800"), "{diff}");
+    mgr.status(&spec.id).expect("status: the service still reads as ours");
+}
+
 // Step 7: a real account gets SeServiceLogonRight =====================================================================
 
 struct LocalUserGuard {

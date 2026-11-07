@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use cosca::Containment;
 use goetia::backend::scm::exit_status::{
-    ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
+    ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
 use goetia::spec::{Kind, Restart};
 use windows_sys::Win32::Foundation::{
@@ -878,6 +878,18 @@ fn an_incomplete_stop_is_reported_as_win32_zero_with_specific_1003() {
     assert_eq!(
         (status.dwWin32ExitCode, status.dwServiceSpecificExitCode),
         (0, ERROR_CAN_NOT_COMPLETE)
+    );
+}
+
+/// A refusal reports Win32 0, which SCM's recovery never restarts, with the code that says no
+/// daemon ran.
+#[skuld::test]
+fn a_refusal_is_reported_as_win32_zero_with_its_own_specific_code() {
+    let status = stopped_status(Reported::Refused);
+
+    assert_eq!(
+        (status.dwWin32ExitCode, status.dwServiceSpecificExitCode),
+        (0, SHIM_REFUSED)
     );
 }
 

@@ -30,9 +30,6 @@ mod kill;
 #[cfg(windows)]
 #[path = "scm_integration/managed.rs"]
 mod managed;
-#[cfg(windows)]
-#[path = "scm_integration/registry_wake.rs"]
-mod registry_wake;
 
 fn main() {
     // Dispatched before the harness starts, exactly like

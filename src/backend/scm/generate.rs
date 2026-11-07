@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::Identity;
+use crate::backend::scm::parameters::Stray;
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::spec::{DaemonSpec, Kind, Restart, User, scm_restart_delay, windows_builtin};
@@ -106,6 +107,9 @@ pub struct ScmRegistration {
     /// The `Services\<name>\Parameters` values, including the metadata blob
     /// (`Marker`/`Schema`/`Version`/`Spec`).
     pub parameters: BTreeMap<String, String>,
+    /// What else `Parameters` holds. Empty for a registration built from a spec; a readback of
+    /// anything else is drift, which [`Display`](fmt::Display) shows, so `install --force` clears it.
+    pub stray_parameters: Vec<Stray>,
 }
 
 /// SCM recovery-action configuration. Only takes effect together with
@@ -221,6 +225,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
         failure_actions,
         environment,
         parameters,
+        stray_parameters: Vec::new(),
     })
 }
 
@@ -350,17 +355,19 @@ fn get_field<'a>(parameters: &'a BTreeMap<String, String>, field: &str) -> Resul
 
 /// `parameters` with each name that spells one of Goetia's four fields in another case renamed to
 /// Goetia's spelling. The registry keeps the stored case when a value is set, so a readback
-/// compared with what goetia writes must fold it, as [`extract`] does. Two names that fold to one
-/// field are an error, as in [`extract`].
-pub fn canonical_field_names(parameters: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>, Error> {
+/// compared with what goetia writes must fold it, as [`extract`] does. The registry cannot hold two
+/// names that fold to one, so none collide.
+pub fn canonical_field_names(parameters: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut folded = BTreeMap::new();
     for (name, value) in parameters {
         let canonical = field_named(name).unwrap_or(name);
-        if folded.insert(canonical.to_string(), value.clone()).is_some() {
-            return Err(collision_error(canonical));
-        }
+        let displaced = folded.insert(canonical.to_string(), value.clone());
+        debug_assert!(
+            displaced.is_none(),
+            "the registry holds no two value names that fold to `{canonical}`"
+        );
     }
-    Ok(folded)
+    folded
 }
 
 fn collision_error(field: &str) -> Error {
@@ -421,6 +428,12 @@ impl fmt::Display for ScmRegistration {
         writeln!(out, "Parameters:")?;
         for (key, value) in &self.parameters {
             writeln!(out, "  {key}: {value:?}")?;
+        }
+        if !self.stray_parameters.is_empty() {
+            writeln!(out, "Stray parameters:")?;
+            for stray in &self.stray_parameters {
+                writeln!(out, "  {stray}")?;
+            }
         }
         Ok(())
     }

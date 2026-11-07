@@ -33,13 +33,18 @@ fn an_open_that_finds_no_key_is_absent_when_the_key_is_optional() {
 
 #[skuld::test]
 fn an_open_that_finds_no_service_key_is_a_vanish() {
-    assert!(matches!(Stop::<i32>::at_open(failure(NOT_FOUND), None), Stop::Vanished));
+    assert!(matches!(
+        Stop::<i32>::at_open(failure(NOT_FOUND), None),
+        Stop::Vanished(f) if code_of(&f) == Some(NOT_FOUND)
+    ));
 }
 
 #[skuld::test]
 fn an_open_of_a_deleted_key_is_a_vanish_whether_or_not_the_key_is_optional() {
     for absent in [Some(7), None] {
-        assert!(matches!(Stop::at_open(failure(KEY_DELETED), absent), Stop::Vanished));
+        assert!(
+            matches!(Stop::at_open(failure(KEY_DELETED), absent), Stop::Vanished(f) if code_of(&f) == Some(KEY_DELETED))
+        );
     }
 }
 
@@ -56,7 +61,10 @@ fn any_other_open_failure_is_other() {
 #[skuld::test]
 fn a_key_deleted_or_not_found_mid_read_is_a_vanish() {
     for code in [KEY_DELETED, NOT_FOUND] {
-        assert!(matches!(Stop::<i32>::mid_read(failure(code)), Stop::Vanished), "{code}");
+        assert!(
+            matches!(Stop::<i32>::mid_read(failure(code)), Stop::Vanished(f) if code_of(&f) == Some(code)),
+            "{code}"
+        );
     }
 }
 
@@ -108,19 +116,29 @@ fn absent_with_the_service_gone_is_gone() {
     assert!(matches!(settle(Stop::Absent(7), || Ok(false)), Settled::Gone));
 }
 
+/// Not read again and not waited on: a key another process took away is undetermined, with what
+/// the read met.
 #[skuld::test]
-fn a_vanish_with_the_service_standing_is_retried() {
-    assert!(matches!(settle(Stop::<i32>::Vanished, || Ok(true)), Settled::Retry));
+fn a_vanish_with_the_service_standing_fails_with_its_cause() {
+    for code in [NOT_FOUND, KEY_DELETED] {
+        match settle(Stop::<i32>::Vanished(failure(code)), || Ok(true)) {
+            Settled::Failed(f) => assert_eq!(code_of(&f), Some(code)),
+            other => panic!("{code}: expected Failed, got {other:?}"),
+        }
+    }
 }
 
 #[skuld::test]
 fn a_vanish_with_the_service_gone_is_gone() {
-    assert!(matches!(settle(Stop::<i32>::Vanished, || Ok(false)), Settled::Gone));
+    assert!(matches!(
+        settle(Stop::<i32>::Vanished(failure(KEY_DELETED)), || Ok(false)),
+        Settled::Gone
+    ));
 }
 
 #[skuld::test]
 fn a_failed_existence_check_fails_every_vanish_with_its_own_cause() {
-    let stops: [Stop<i32>; 2] = [Stop::Absent(7), Stop::Vanished];
+    let stops: [Stop<i32>; 2] = [Stop::Absent(7), Stop::Vanished(failure(NOT_FOUND))];
     for stop in stops {
         match settle(stop, || Err(failure(IO_DEVICE))) {
             Settled::Failed(f) => assert_eq!(code_of(&f), Some(IO_DEVICE)),

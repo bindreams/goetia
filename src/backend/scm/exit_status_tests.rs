@@ -19,13 +19,13 @@ fn a_daemon_failure_is_service_specific_and_exits_with_the_same_code() {
 }
 
 #[skuld::test]
-fn daemon_code_3_and_decode_failure_are_distinct_reports() {
+fn daemon_code_3_and_a_shim_failure_are_distinct_reports() {
     let daemon = Reported::from_daemon_code(3);
-    let decode = Reported::shim_failure(Some(ERROR_INVALID_DATA as i32));
+    let failure = Reported::shim_failure(Some(3));
 
     assert_eq!(daemon.scm_codes(), (ERROR_SERVICE_SPECIFIC_ERROR, 3));
-    assert_eq!(decode.scm_codes(), (ERROR_INVALID_DATA, 0));
-    assert_ne!(daemon, decode);
+    assert_eq!(failure.scm_codes(), (3, 0));
+    assert_ne!(daemon, failure);
 }
 
 #[skuld::test]
@@ -83,6 +83,21 @@ fn an_incomplete_stop_reports_win32_zero_and_the_specific_code_1003() {
     assert_eq!(reported.process_exit_code(), ERROR_CAN_NOT_COMPLETE as i32);
 }
 
+#[skuld::test]
+fn a_refusal_reports_win32_zero_and_its_own_specific_code() {
+    // Win32 0 is never restarted, whatever the specific code: SCM's recovery would start the same
+    // refusal again for as long as the record that caused it stands.
+    let reported = Reported::Refused;
+
+    assert_eq!(reported.scm_codes(), (0, SHIM_REFUSED));
+    assert_eq!(reported.process_exit_code(), SHIM_REFUSED as i32);
+    assert_ne!(
+        SHIM_REFUSED, ERROR_CAN_NOT_COMPLETE,
+        "a refusal is not an incomplete stop"
+    );
+    assert_ne!(reported.scm_codes(), Reported::incomplete_stop().scm_codes());
+}
+
 // What SCM recorded ---------------------------------------------------------------------------------------------------
 
 #[skuld::test]
@@ -111,9 +126,36 @@ fn only_the_incomplete_stop_report_reads_back_as_an_incomplete_stop() {
         Reported::Clean,
         Reported::from_daemon_code(ERROR_CAN_NOT_COMPLETE as i32),
         Reported::shim_failure(Some(ERROR_CAN_NOT_COMPLETE as i32)),
+        Reported::Refused,
     ] {
         assert!(!record(reported).is_incomplete_stop(), "{reported:?}");
     }
+}
+
+#[skuld::test]
+fn only_the_refusal_report_reads_back_as_a_refusal() {
+    let record = |reported: Reported| {
+        let (win32, specific) = reported.scm_codes();
+        RecordedExit { win32, specific }
+    };
+
+    assert!(record(Reported::Refused).is_refusal());
+    for reported in [
+        Reported::Clean,
+        Reported::incomplete_stop(),
+        Reported::from_daemon_code(SHIM_REFUSED as i32),
+        Reported::shim_failure(Some(SHIM_REFUSED as i32)),
+    ] {
+        assert!(!record(reported).is_refusal(), "{reported:?}");
+    }
+}
+
+/// The shim refused before it launched anything, though the record is Win32 0.
+#[skuld::test]
+fn a_recorded_refusal_means_the_daemon_never_ran() {
+    let (win32, specific) = Reported::Refused.scm_codes();
+
+    assert!(!RecordedExit { win32, specific }.daemon_ran());
 }
 
 #[skuld::test]
@@ -121,7 +163,7 @@ fn a_recorded_shim_failure_means_the_daemon_never_ran() {
     for reported in [
         Reported::shim_failure(None),
         Reported::shim_failure(Some(2)),
-        Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
+        Reported::shim_failure(Some(13)),
     ] {
         let (win32, specific) = reported.scm_codes();
 
@@ -151,4 +193,18 @@ fn a_recorded_exit_is_displayed_as_a_service_specific_code_or_a_win32_one() {
 
     assert_eq!(specific.to_string(), "service-specific exit code 7");
     assert_eq!(win32.to_string(), "exit code 2");
+}
+
+/// Win32 0 beside a service-specific code is the shim's own record, not an exit code 0.
+#[skuld::test]
+fn a_win32_zero_record_with_a_specific_code_names_both() {
+    let refused = RecordedExit {
+        win32: 0,
+        specific: SHIM_REFUSED,
+    };
+
+    assert_eq!(
+        refused.to_string(),
+        format!("exit code 0 with service-specific code {SHIM_REFUSED}")
+    );
 }

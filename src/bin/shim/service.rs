@@ -9,9 +9,7 @@ use std::ffi::{OsString, c_void};
 use std::sync::Arc;
 
 use cosca::{Containment, Fd, Stdio};
-use goetia::backend::scm::exit_status::{
-    ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
-};
+use goetia::backend::scm::exit_status::{ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, Reported};
 use goetia::backend::scm::manager::read_spec_blob;
 use goetia::error::Error;
 use goetia::spec::{DaemonSpec, Restart};
@@ -76,30 +74,18 @@ fn run_service(id: &str) {
                 "no Goetia metadata found under Services\\<id>\\Parameters (Marker absent) — this service was \
                  not created by `goetia daemon install`",
             );
-            finish(
-                &log,
-                id,
-                status_handle,
-                Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
-            );
+            finish(&log, id, status_handle, Reported::Refused);
         }
         Err(Error::NotInstalled { .. }) => {
-            // A non-zero Win32 code would have SCM's recovery restart a shim that fails the same way
-            // every time; only a zero one is never restarted.
             log.failure(
                 id,
                 &format!(r"Services\{id} is gone, or this service's record does not name it: no daemon was started"),
             );
-            finish(&log, id, status_handle, Reported::incomplete_stop());
+            finish(&log, id, status_handle, Reported::Refused);
         }
         Err(e) => {
             log.failure(id, &format!("decode metadata blob: {}", e.report()));
-            finish(
-                &log,
-                id,
-                status_handle,
-                Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
-            );
+            finish(&log, id, status_handle, Reported::Refused);
         }
     };
 

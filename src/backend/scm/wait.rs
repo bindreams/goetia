@@ -15,7 +15,7 @@
 use std::io;
 use std::ops::ControlFlow;
 
-use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit};
+use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, SHIM_REFUSED};
 use crate::manager::budget::Deadline;
 use crate::spec::Kind;
 
@@ -594,7 +594,8 @@ const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be 
 /// A terminal `Stopped` before `Running` is read by `kind`. For `type: simple` it is a start when
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
 /// vocabulary, see [`RecordedExit::daemon_ran`]), except the incomplete-stop record: the daemon may
-/// still be running, so that is a failed start; a shim failure is a failed start returning `Err`. A
+/// still be running, so that is a failed start; a shim failure or refusal is a failed start returning
+/// `Err`. A
 /// `type: managed` service speaks SCM itself, and stopping with a service-specific code before
 /// `Running` is how it reports a failed start, so for it any `Stopped` before `Running` is a failed
 /// start. Neither blocks forever.
@@ -658,6 +659,12 @@ fn stopped_before_running(kind: Kind, joined_a_start: bool, exit: RecordedExit, 
         return Err(io::Error::other(
             "service stopped before reaching Running (failed start): the shim never connected to SCM, so no daemon ran",
         ));
+    }
+    // The shim's `(0, SHIM_REFUSED)` says it started no daemon, though its Win32 code is 0.
+    if kind == Kind::Simple && exit.is_refusal() {
+        return Err(io::Error::other(format!(
+            "service stopped with goetia-shim's refusal record (Win32 0, service-specific {SHIM_REFUSED}; failed start): the shim refused to start the daemon, so no daemon ran; see the shim's log"
+        )));
     }
     // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
     // to confirm. The notification may follow a `RUNNING` the wait never saw.

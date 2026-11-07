@@ -2,8 +2,10 @@
 //!
 //! goetia writes `Parameters` and `Environment` in place, so its own writes never take a key away.
 //! A key still goes missing when the service is uninstalled, or another tool deletes it, and a read
-//! that meets that must not guess: a service that is gone is absent, and one that stands is read
-//! again rather than called absent or foreign on the strength of a read that did not complete.
+//! that meets that must not guess: a service that is gone is absent, and one that stands with a key
+//! that vanished is undetermined, with the cause. It is never called absent or foreign on the
+//! strength of a read that did not complete, and it is not waited on: a key another process took
+//! away has no event goetia can rely on.
 
 use std::io;
 
@@ -33,10 +35,9 @@ pub(super) enum Stop<T> {
     /// The key a service may lack was not found at open. `T` is what that reads as for a service
     /// that stands without it.
     Absent(T),
-    /// A key was not found or marked deleted, where a service that stands has it. A key marked
-    /// deleted stays so while another process holds a handle to it; a fresh open finds the new key,
-    /// or nothing, once the handle closes.
-    Vanished,
+    /// A key was not found or marked deleted, where a service that stands has it. The failure is
+    /// what the read reports if the service stands.
+    Vanished(Failure),
     /// Any other failure.
     Other(Failure),
 }
@@ -47,10 +48,10 @@ impl<T> Stop<T> {
         if failure.is_not_found() {
             match absent {
                 Some(value) => Stop::Absent(value),
-                None => Stop::Vanished,
+                None => Stop::Vanished(failure),
             }
         } else if failure.is_deleted() {
-            Stop::Vanished
+            Stop::Vanished(failure)
         } else {
             Stop::Other(failure)
         }
@@ -59,7 +60,7 @@ impl<T> Stop<T> {
     /// `failure` of a read of a key already open.
     pub fn mid_read(failure: Failure) -> Self {
         if failure.is_deleted() || failure.is_not_found() {
-            Stop::Vanished
+            Stop::Vanished(failure)
         } else {
             Stop::Other(failure)
         }
@@ -73,8 +74,8 @@ pub(super) enum Settled<T> {
     Gone,
     /// The service stands and has no such key: the read's value.
     Value(T),
-    /// The service stands and a key vanished under the read: read again from the start.
-    Retry,
+    /// The read did not complete: another failure, a failed existence check, or a key that vanished
+    /// under a service that stands.
     Failed(Failure),
 }
 
@@ -99,7 +100,7 @@ pub(super) fn settle<T>(stop: Stop<T>, service_stands: impl FnOnce() -> Result<b
     let (stands, on_standing) = match stop {
         Stop::Other(failure) => return Settled::Failed(failure),
         Stop::Absent(value) => (service_stands(), Settled::Value(value)),
-        Stop::Vanished => (service_stands(), Settled::Retry),
+        Stop::Vanished(failure) => (service_stands(), Settled::Failed(failure)),
     };
     match stands {
         Ok(true) => on_standing,
