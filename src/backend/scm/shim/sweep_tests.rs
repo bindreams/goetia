@@ -424,6 +424,14 @@ mod windows {
     const HEX_C: &str = "cc7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     const HEX_F: &str = "ff7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
+    /// A default folder that no folder under test is.
+    fn elsewhere() -> Result<PathBuf> {
+        Ok(PathBuf::from(
+            r"Z:
+o\such\default",
+        ))
+    }
+
     fn shim_in(dir: &Path, hex: &str) -> PathBuf {
         dir.join(format!("goetia-shim-{hex}.exe"))
     }
@@ -504,7 +512,7 @@ mod windows {
         let other = dir.path().join("notes.txt");
         fs::write(&other, b"x").unwrap();
 
-        let failure = sweep_folder(dir.path(), &[]).expect_err("three files cannot be deleted");
+        let failure = sweep_folder(dir.path(), &[], elsewhere).expect_err("three files cannot be deleted");
 
         let held_paths: Vec<PathBuf> = held.iter().map(|(path, _)| path.clone()).collect();
         assert_eq!(
@@ -531,7 +539,7 @@ mod windows {
         fs::write(&swept, b"x").unwrap();
 
         // The reference is spelled another way than the folder: both are normalised.
-        sweep_folder(dir.path(), &[normalise(&short(&kept))]).unwrap();
+        sweep_folder(dir.path(), &[normalise(&short(&kept))], elsewhere).unwrap();
 
         assert!(kept.exists());
         assert!(!swept.exists());
@@ -545,7 +553,7 @@ mod windows {
         fs::create_dir(&aside).unwrap();
         fs::write(aside.join("inside"), b"x").unwrap();
 
-        sweep_folder(dir.path(), &[]).unwrap();
+        sweep_folder(dir.path(), &[], elsewhere).unwrap();
 
         assert!(!aside.exists());
     }
@@ -558,7 +566,7 @@ mod windows {
         let not_a_folder = dir.path().join("file.txt");
         fs::write(&not_a_folder, b"x").unwrap();
 
-        let failure = sweep_folder(&not_a_folder, &[]).expect_err("a file cannot be listed");
+        let failure = sweep_folder(&not_a_folder, &[], elsewhere).expect_err("a file cannot be listed");
 
         let report = failure.error.report().to_string();
         assert_eq!(report.matches("file.txt").count(), 1, "{report}");
@@ -569,7 +577,7 @@ mod windows {
     fn sweep_of_a_folder_that_is_not_there_is_nothing_to_do() {
         let dir = tempfile::tempdir().unwrap();
 
-        sweep_folder(&dir.path().join("missing"), &[]).unwrap();
+        sweep_folder(&dir.path().join("missing"), &[], elsewhere).unwrap();
     }
 
     #[skuld::test]
@@ -589,6 +597,36 @@ mod windows {
         remove_if_empty_default(&folder, || Ok(true)).unwrap();
         assert!(!folder.exists());
         remove_if_empty_default(&folder, || unreachable!("a folder that is gone is not asked about")).unwrap();
+    }
+
+    /// The default folder the caller resolved is the one the sweep removes by, and the one a
+    /// failure to resolve reports: nothing else is asked.
+    #[skuld::test]
+    fn the_sweep_removes_an_empty_folder_by_the_default_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Goetia");
+        fs::create_dir(&folder).unwrap();
+
+        sweep_folder(&folder, &[], elsewhere).unwrap();
+        assert!(folder.is_dir(), "a folder that is not the default stays");
+
+        sweep_folder(&folder, &[], || Ok(folder.clone())).unwrap();
+        assert!(!folder.exists());
+    }
+
+    #[skuld::test]
+    fn the_sweep_reports_a_default_that_could_not_be_resolved_when_the_folder_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let failure = sweep_folder(dir.path(), &[], || {
+            Err(Error::os("locate %ProgramFiles%", std::io::Error::other("no")))
+        })
+        .expect_err("an empty folder needs the answer");
+        assert!(
+            failure.error.report().to_string().contains("locate %ProgramFiles%"),
+            "{}",
+            failure.error.report()
+        );
+        assert!(dir.path().is_dir());
     }
 
     /// Where the default folder is matters only for a folder that is empty: a failure to find it is

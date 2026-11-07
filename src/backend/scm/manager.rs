@@ -1043,6 +1043,9 @@ impl Scm {
     /// by another goetia version or provider. A host in any other folder is not swept, since
     /// that folder is not goetia's.
     ///
+    /// A default folder that cannot be located skips the second folder, as it cannot be told from the
+    /// host's, and is reported with whatever else fails: the wait and the provider's sweep go on.
+    ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
     /// runs it is in use, and is skipped without an error: the next sweep removes it once it is free.
@@ -1053,42 +1056,56 @@ impl Scm {
             .as_ref()
             .and_then(|shim| shim.preview().ok())
             .and_then(|command| command.exe.parent().map(normalise));
-        let second = host
+        // The default folder is asked once, here: a second folder is the host's folder only when it
+        // is the default, and that is what its sweep removes it by. When it cannot be located the
+        // host's folder may be it, so it is named, not swept, and nothing else is skipped.
+        let mut failures: Vec<SweepFailure> = Vec::new();
+        let (second, unswept) = match host
             .parent()
             .map(|folder| second_folder(folder, provider_folder.as_deref(), || Ok(normalise(&default_dir()?))))
-            .transpose();
-        let left_behind = |failure: SweepFailure, second: Option<&Path>| {
-            let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
-            Error::Step {
-                what: left_behind_text(id, provider_folder.as_deref(), second, &files),
-                source: failure.error,
+            .transpose()
+        {
+            Ok(second) => (second.flatten(), second.flatten()),
+            Err(e) => {
+                failures.push(e.into());
+                (None, host.parent())
             }
         };
-        // The default folder is not known, so the host's folder may be it: named, not swept.
-        let second = match second {
-            Ok(second) => second.flatten(),
-            Err(e) => return Err(left_behind(e.into(), host.parent())),
+        let finish = |failures: Vec<SweepFailure>| {
+            SweepFailure::all(failures).map_or(Ok(()), |failure| {
+                let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
+                Err(Error::Step {
+                    what: left_behind_text(id, provider_folder.as_deref(), unswept, &files),
+                    source: failure.error,
+                })
+            })
         };
         if let Some(held) = held {
             match held.wait_for_exit(id.as_str(), Budget::Unbounded.start()) {
                 Ok(Waited::Confirmed) => {}
                 Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),
                 Err(e) => {
-                    let failure = Error::os(format!("wait for `{id}`'s process to exit"), e);
-                    return Err(left_behind(failure.into(), second));
+                    failures.push(Error::os(format!("wait for `{id}`'s process to exit"), e).into());
+                    return finish(failures);
                 }
             }
         }
         // After the wait: what has exited no longer references its file.
-        let referenced = referenced_hosts().map_err(|e| left_behind(e.into(), second))?;
-        let mut failures = Vec::new();
+        let referenced = match referenced_hosts() {
+            Ok(referenced) => referenced,
+            Err(e) => {
+                failures.push(e.into());
+                return finish(failures);
+            }
+        };
         if let Some(shim) = &self.shim {
             failures.extend(shim.sweep(&referenced).err());
         }
         if let Some(folder) = second {
-            failures.extend(sweep_folder(folder, &referenced).err());
+            // It is the default folder, by `second_folder`'s choice.
+            failures.extend(sweep_folder(folder, &referenced, || Ok(folder.to_path_buf())).err());
         }
-        SweepFailure::all(failures).map_or(Ok(()), |failure| Err(left_behind(failure, second)))
+        finish(failures)
     }
 }
 

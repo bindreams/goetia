@@ -279,7 +279,6 @@ mod system {
     use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 
     use super::super::acl::{display_path, lexical};
-    use super::super::embedded::default_dir;
     use super::super::processes::running_images;
     use windows_service::service_manager::ServiceManagerAccess;
 
@@ -407,10 +406,16 @@ mod system {
     /// [`SweepFailure::not_deleted`]. A `dir` that does not exist has nothing to sweep.
     ///
     /// The one mechanism behind a provider's `sweep` and the sweep of the default folder an
-    /// uninstalled service's host was in (see [`second_folder`]).
-    pub(crate) fn sweep_folder(dir: &Path, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+    /// uninstalled service's host was in (see [`second_folder`]). `default_folder` says where the
+    /// default folder is, and is asked only of a folder left empty; a caller that has resolved it
+    /// already passes that answer, so that its decisions and this one cannot differ.
+    pub(crate) fn sweep_folder(
+        dir: &Path,
+        referenced: &[PathBuf],
+        default_folder: impl FnOnce() -> Result<PathBuf>,
+    ) -> std::result::Result<(), SweepFailure> {
         let swept = sweep_files(dir, referenced);
-        let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_dir()?), &normalise(dir))));
+        let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir))));
         SweepFailure::all(swept.err().into_iter().chain(removed.err())).map_or(Ok(()), Err)
     }
 

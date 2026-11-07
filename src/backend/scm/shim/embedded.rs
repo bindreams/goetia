@@ -129,7 +129,7 @@ mod stock {
         /// path of `referenced` names, and removes `dir` when that leaves it empty and it is the
         /// default folder; see [`sweep_folder`].
         fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
-            sweep_folder(absolute(&self.dir()?)?, referenced)
+            sweep_folder(absolute(&self.dir()?)?, referenced, default_dir)
         }
     }
 
@@ -166,7 +166,8 @@ mod stock {
 
         /// As [`EmbeddedStockShim`]'s, over the default folder, and whether or not the sibling is there.
         fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
-            sweep_folder(&default_dir()?, referenced)
+            let dir = default_dir()?;
+            sweep_folder(&dir, referenced, || Ok(dir.clone()))
         }
     }
 
