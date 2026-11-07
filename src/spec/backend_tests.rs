@@ -5,7 +5,6 @@ use crate::error::Error;
 use crate::spec::field::Field;
 use crate::spec::interpolate::Substitution;
 use crate::spec::overrides::Supplied;
-use crate::spec::raw::RawSpec;
 use crate::spec::test_support::abs;
 use crate::spec::{AccountId, Id, Kind, Restart, User};
 
@@ -379,17 +378,14 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
         let spec = shaped_with_env_key(key);
         let refused = BackendKind::Systemd
-            .refuse(&spec, &authored("bin/frpc"))
+            .refuse(&spec)
             .expect_err(&format!("{key:?} must be refused"));
         assert_eq!(refused.field, Some(Field::EnvKey(key.into())));
         let message = Error::from(refused).to_string();
         assert!(message.contains(&format!("{key:?}")), "{message}");
         assert!(message.contains("Environment="), "{message}");
-        assert!(
-            BackendKind::Launchd.refuse(&spec, &authored("bin/frpc")).is_ok(),
-            "{key:?}"
-        );
-        assert!(BackendKind::Scm.refuse(&spec, &authored("bin/frpc")).is_ok(), "{key:?}");
+        assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{key:?}");
+        assert!(BackendKind::Scm.refuse(&spec).is_ok(), "{key:?}");
 
         let mut warnings = Vec::new();
         BackendKind::Systemd.warn(&spec, &mut warnings);
@@ -400,50 +396,8 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     }
     for key in ["PATH", "_x", "a1_B"] {
         assert!(
-            BackendKind::Systemd
-                .refuse(&shaped_with_env_key(key), &authored("bin/frpc"))
-                .is_ok(),
+            BackendKind::Systemd.refuse(&shaped_with_env_key(key)).is_ok(),
             "{key:?}"
         );
     }
-}
-
-// systemd's program path ==============================================================================================
-
-/// The manifest text of a program path, which `refuse` judges as written.
-fn authored(command: &str) -> RawSpec {
-    RawSpec::parse(&format!(
-        "id: frpc
-command: ['{command}']
-"
-    ))
-    .expect("fixture yaml should parse")
-}
-
-#[skuld::test]
-fn systemd_refuses_a_program_path_ending_in_a_slash_as_the_manifest_wrote_it() {
-    // Resolving a relative path drops the slash, so the shaped spec no longer shows it.
-    let spec = shaped_spec();
-    for command in ["bin/", "./bin//", "/opt/bin/frpc/"] {
-        let refused = BackendKind::Systemd
-            .refuse(&spec, &authored(command))
-            .expect_err(&format!("{command:?} must be refused"));
-        assert_eq!(refused.field, Some(Field::Command(0)), "{command}");
-        let message = Error::from(refused).to_string();
-        assert!(message.contains("ends in `/`"), "{command}: {message}");
-        assert!(
-            BackendKind::Launchd.refuse(&spec, &authored(command)).is_ok(),
-            "{command}"
-        );
-        assert!(BackendKind::Scm.refuse(&spec, &authored(command)).is_ok(), "{command}");
-    }
-}
-
-#[skuld::test]
-fn systemd_loads_the_program_paths_it_is_given() {
-    let mut spec = shaped_spec();
-    spec.command = Some(vec!["/bin/../bin/frpc".to_string(), "../arg/".to_string()]);
-    BackendKind::Systemd
-        .refuse(&spec, &authored("/bin/../bin/frpc"))
-        .expect("`..` in a program path loads");
 }

@@ -31,12 +31,11 @@
 //! install does with the value it reads. A base value the native backend cannot
 //! honour is its generator's to refuse at install (`restart: always` on `scm`).
 //!
-//! [`BackendKind::conform`] and [`BackendKind::refuse`] run for the native backend too, on the same spec, for a
-//! value its generator would refuse at install anyway (systemd's `env` names, program path and `..`), so the refusal
-//! comes at resolve. `conform` first spells what it can (systemd's `..`, where that is exact), `refuse` judges the rest.
+//! [`BackendKind::refuse`] runs for the native backend too, on the same spec, for a value its generator would
+//! refuse at install anyway (systemd's `env` names), so the refusal comes at resolve.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -44,8 +43,6 @@ use serde::Deserialize;
 use super::field::Field;
 use super::interpolate::Substitution;
 use super::overrides::Supplied;
-use super::parent_dirs;
-use super::raw::RawSpec;
 use super::resolve::{Refused, invalid};
 use super::vars::is_valid_name;
 use super::{AccountId, Id, Kind, Restart, User, Warning};
@@ -177,37 +174,16 @@ impl BackendKind {
         }
     }
 
-    /// Spell the paths of `spec` the way this backend's native install needs, where that names the same
-    /// directory, and refuse where it cannot. Called for the native backend only, on the substituted merged
-    /// spec, with the manifest directory `spec`'s paths were joined to and `authored`, the text they came from.
-    /// systemd will not load a `..` in a working directory or log path; [`parent_dirs::collapse`] removes each
-    /// one the kernel would resolve the same way and refuses the rest. launchd and SCM carry a `..` as written.
-    pub(super) fn conform(self, spec: &mut ShapedSpec, authored: &RawSpec, manifest_dir: &Path) -> Result<(), Refused> {
-        match self {
-            BackendKind::Systemd => parent_dirs::collapse(spec, authored, manifest_dir),
-            BackendKind::Launchd | BackendKind::Scm => Ok(()),
-        }
-    }
-
     /// What this backend's native install cannot carry, judged on the substituted merged spec, base
     /// values included: the install would refuse it anyway, so the refusal comes before it, at
     /// resolve. Called for the native backend only. systemd drops an `env` key outside
-    /// `[A-Za-z_][A-Za-z0-9_]*` with only a log line, and will not load a program path ending in `/`; its
-    /// generator refuses each too ([`systemd_env_key_defect`], [`systemd_command_defect`]). The program path
-    /// is judged as `authored` wrote it: resolving a relative one drops the trailing `/`, which launchd and
-    /// SCM then run as the program the user named.
-    pub(super) fn refuse(self, spec: &ShapedSpec, authored: &RawSpec) -> Result<(), Refused> {
+    /// `[A-Za-z_][A-Za-z0-9_]*` with only a log line; its generator refuses it too ([`systemd_env_key_defect`]).
+    pub(super) fn refuse(self, spec: &ShapedSpec) -> Result<(), Refused> {
         match self {
-            BackendKind::Systemd => {
-                let program = authored.command.as_deref().and_then(|command| command.first());
-                if let Some(defect) = program.and_then(|program| systemd_command_defect(program)) {
-                    return Err(Refused::at(Field::Command(0), invalid(&spec.id, &defect)));
-                }
-                match systemd_env_key_defect(&spec.env) {
-                    Some((key, defect)) => Err(Refused::at(Field::EnvKey(key.into()), invalid(&spec.id, &defect))),
-                    None => Ok(()),
-                }
-            }
+            BackendKind::Systemd => match systemd_env_key_defect(&spec.env) {
+                Some((key, defect)) => Err(Refused::at(Field::EnvKey(key.into()), invalid(&spec.id, &defect))),
+                None => Ok(()),
+            },
             BackendKind::Launchd | BackendKind::Scm => Ok(()),
         }
     }
@@ -259,32 +235,6 @@ pub(crate) fn systemd_env_key_defect(env: &BTreeMap<String, String>) -> Option<(
         daemon would never see it"
     );
     Some((key, defect))
-}
-
-/// Why systemd will not load `executable` as the program of `ExecStart=`, or `None`: a path ending
-/// in `/` is a directory ("Executable path specifies a directory", on 242 and 255). `..` in a
-/// program path loads and runs.
-pub(crate) fn systemd_command_defect(executable: &str) -> Option<String> {
-    executable.ends_with('/').then(|| {
-        format!(
-            "the executable path {executable:?} (`command[0]`) ends in `/`, a directory, which systemd \
-            refuses to load in an executable path"
-        )
-    })
-}
-
-/// Why systemd will not load `path`, as the value `what` names (a directive) of a working directory
-/// or a log file, or `None`: a `..` component fails the unit to load ("path is not normalized"), or
-/// on 255 drops the log. `.` components, `//` and a trailing `/` load and resolve. Resolving a
-/// manifest removes each `..` it can ([`BackendKind::conform`]), so one that reaches a generator is
-/// from a spec built another way.
-pub(crate) fn systemd_path_defect(what: &str, path: &Path) -> Option<String> {
-    path.components().any(|c| c == Component::ParentDir).then(|| {
-        format!(
-            "{what} is {path:?}, which has a `..` component that systemd refuses to load (it requires a \
-            normalized path); write the path without `..`"
-        )
-    })
 }
 
 /// `type: managed` on Windows has no working-directory or stdout-capture

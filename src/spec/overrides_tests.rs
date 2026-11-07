@@ -636,7 +636,7 @@ backend-specific:
 }
 
 #[skuld::test]
-fn supplied_records_each_field_only_when_the_override_wrote_it() {
+fn supplied_records_user_and_env_names_only_when_the_override_wrote_them() {
     let yaml = "
 id: frpc
 command: [/bin/frpc]
@@ -648,8 +648,6 @@ backend-specific:
     user: svc-frpc
   systemd:
     cwd: /opt/frpc
-    logs: /var/log/frpc.log
-    command: [/bin/other]
     env:
       OVERRIDE: \"2\"
 ";
@@ -666,18 +664,15 @@ backend-specific:
     assert_eq!(
         supplied,
         Supplied {
-            cwd: true,
-            logs: true,
-            command: true,
             env: ["OVERRIDE".to_string()].into(),
             ..Supplied::NONE
         }
     );
-    assert!(supplied.supplies(&Field::Cwd) && supplied.supplies(&Field::Command(0)));
     assert!(
         supplied.supplies(&Field::EnvKey("OVERRIDE".into())) && supplied.supplies(&Field::EnvValue("OVERRIDE".into()))
     );
     assert!(!supplied.supplies(&Field::EnvKey("BASE".into())) && !supplied.supplies(&Field::User));
+    assert!(!supplied.supplies(&Field::Cwd));
 }
 
 // The direct guard on the defect `Supplied` exists to prevent: without it,

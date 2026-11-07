@@ -145,10 +145,8 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     // No `check_spec_grammar`: a substituted `.env` value may legally carry a literal `$`.
     let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
     let from_env = interpolate::spec(&mut native_merged, &vars).map_err(|e| annotate_step5_error(e, native_entry))?;
-    // What the backend's rules read as written: shaping resolves a path and drops a trailing `/`.
-    let authored = native_merged.clone();
     // The one place an error of this pass is attributed to `.env`: by the field it is about.
-    let (mut shaped, mut daemon_warnings) = resolve_shape(&id, native_merged, base_dir, Substitution::Done)
+    let (shaped, mut daemon_warnings) = resolve_shape(&id, native_merged, base_dir, Substitution::Done)
         .map_err(|refused| refused.attributed(&from_env))?;
     // `error` reads only `native_supplied` fields, and only `user`: it is the backend's verdict on
     // what the override wrote, so it names the backend too, ahead of the `.env` attribution.
@@ -164,9 +162,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
             let err = refused.attributed(&from_env);
             if by_override { attribute_to(err, b) } else { err }
         };
-        // The one pass that inspects the file system, so every judgement is of one state.
-        b.conform(&mut shaped, &authored, base_dir).map_err(blame)?;
-        b.refuse(&shaped, &authored).map_err(blame)?;
+        b.refuse(&shaped).map_err(blame)?;
         b.warn(&shaped, &mut daemon_warnings);
     }
 
@@ -263,11 +259,6 @@ impl Refused {
             field: Some(field),
             err,
         }
-    }
-
-    /// A defect of the manifest directory, which no field's text is to blame for.
-    pub(super) fn in_manifest_dir(err: Error) -> Self {
-        Refused { field: None, err }
     }
 
     /// The error, prefixed "after substituting from .env" iff `.env` supplied some of the text of
@@ -631,7 +622,7 @@ fn resolve_path_string(
 
 /// Whether `p` is joined to the manifest directory. A path with its own prefix (`C:bin`) replaces
 /// `base_dir` in the join, so it is not under it.
-pub(super) fn is_under_manifest_dir(p: &Path) -> bool {
+fn is_under_manifest_dir(p: &Path) -> bool {
     !p.is_absolute() && !matches!(p.components().next(), Some(std::path::Component::Prefix(_)))
 }
 
@@ -677,8 +668,7 @@ fn check_resolved(
 /// symlinks, which would bake a symlinked deployment path's target into the
 /// artifact, so a service would stop following a repointed symlink. Hence
 /// `-f .` cannot preserve a symlinked spelling (`getcwd` already resolved
-/// it); pass it explicitly to `-f`. A `..` in `dir` is kept too: a service
-/// follows a repointed symlink after it.
+/// it); pass it explicitly to `-f`.
 ///
 /// The process's own working directory, read below when `dir` is relative,
 /// is the opposite case: nobody typed it and it always exists, so it *is*
@@ -1140,7 +1130,7 @@ pub(super) fn invalid(id: &Id, message: &str) -> Error {
 
 /// [`invalid`], for a rejection that is `source` failing to parse or resolve what the manifest
 /// holds.
-pub(super) fn invalid_from(id: &Id, message: &str, source: impl std::error::Error + Send + Sync + 'static) -> Error {
+fn invalid_from(id: &Id, message: &str, source: impl std::error::Error + Send + Sync + 'static) -> Error {
     Error::Invalid {
         daemon: id.as_str().to_string(),
         message: message.to_string(),

@@ -20,7 +20,7 @@
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Restart, systemd_command_defect, systemd_env_key_defect, systemd_path_defect};
+use crate::spec::{DaemonSpec, Restart, systemd_env_key_defect};
 
 // Generation ==========================================================================================================
 
@@ -108,11 +108,6 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
 /// - An executable path ending in a space: systemd 255 keeps the path but the service exits with
 ///   203/EXEC (242 runs it; both are refused). Interior spaces, other trailing whitespace and
 ///   later arguments are fine.
-/// - A path ending in `/` as the executable of `ExecStart=`: "Executable path specifies a directory",
-///   on 242 and 255. `..` in an executable path loads and runs.
-/// - A `..` component in `WorkingDirectory=` (the unit fails to load, "path is not normalized") or
-///   in the `append:` log path (242 fails to load; 255 loads and drops the log). `.` components,
-///   `//` and a trailing `/` load and resolve, so they are written as given.
 /// - An `env` key outside `[A-Za-z_][A-Za-z0-9_]*`: systemd logs "Invalid environment
 ///   assignment, ignoring" and drops it, and the unit still loads and starts.
 /// - A raw directive (`Description=`, `User=`, `WorkingDirectory=`, the `append:` path) with
@@ -139,26 +134,12 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
              ends in whitespace, which systemd does not run (the service exits with 203/EXEC)"
         )));
     }
-    if let Some(defect) = systemd_command_defect(executable) {
-        return Err(invalid(defect));
-    }
     if let Some((_, defect)) = systemd_env_key_defect(&spec.env) {
         return Err(invalid(defect));
     }
 
     let cwd = spec.cwd.as_ref().map(|p| p.display().to_string());
     let logs = spec.logs.as_ref().map(|p| p.display().to_string());
-    let paths = [
-        ("WorkingDirectory=", spec.cwd.as_deref()),
-        ("StandardOutput=/StandardError= append:", spec.logs.as_deref()),
-    ];
-    for (directive, path) in paths {
-        if let Some(path) = path
-            && let Some(defect) = systemd_path_defect(&format!("{directive} path"), path)
-        {
-            return Err(invalid(defect));
-        }
-    }
     let raw_values = [
         ("Description=", Some(spec.name.as_str())),
         ("User=", Some(id.user.as_str())),
