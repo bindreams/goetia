@@ -78,6 +78,18 @@ pub fn elevated() -> Result<(), String> {
     }
 }
 
+/// A manager whose `type: simple` services run the stock shim this package builds, wherever cargo put
+/// it, through a `StandaloneShim`. The folder check is off: the build directory is the user's, not a
+/// protected one. `Scm::new()` has no provider, so a test that installs a `type: simple` service
+/// without caring where its host comes from uses this.
+#[cfg(windows)]
+pub fn stock_shim_manager() -> goetia::backend::scm::manager::Scm {
+    goetia::backend::scm::manager::Scm::with_shim(
+        goetia::shim::StandaloneShim::new(PathBuf::from(env!("CARGO_BIN_EXE_goetia-shim")), vec![]),
+        goetia::shim::CheckPermissions::Disable,
+    )
+}
+
 /// Fails the test unless `dir`, a directory the system provides (`multi-user.target.wants`,
 /// `/Library/LaunchDaemons`), exists. A test never creates one: every test running concurrently
 /// shares it.

@@ -727,11 +727,15 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
 /// An `UpToDate` install writes nothing, so a second install of either kind must compare equal on
 /// everything the first wrote: failure actions, `Environment`, `Parameters`. A `type: simple`
 /// service's `Environment` is empty on both sides, whatever its spec's `env` says. It is registered
-/// but never started, so no shim binary is needed.
+/// but never started, so the shim is only provided and checked, never run: its manager has a provider,
+/// which `Scm::new()` has not.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn install_twice_is_up_to_date_for_both_kinds() {
-    let mgr = Scm::new();
     for kind in [Kind::Managed, Kind::Simple] {
+        let mgr = match kind {
+            Kind::Managed => Scm::new(),
+            Kind::Simple => support::stock_shim_manager(),
+        };
         let id = support::random_test_id();
         let _guard = ServiceGuard::new(&id);
         let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);

@@ -99,6 +99,50 @@ impl Drop for Doctored {
     }
 }
 
+/// `%ProgramFiles%\Goetia` made by goetia (installing a service of its own into it), and then given
+/// `Users` the right to change its permissions. The folder is goetia's, owned by Administrators, so
+/// the folder check reaches the grant: a folder the test made itself is owned by the runner's
+/// account, which the check refuses as an owner before it reads any grant.
+///
+/// Fields drop in order: the grant is taken back, the service uninstalled (which sweeps the folder
+/// away), and the folder removed if anything is left.
+struct DoctoredFolder {
+    folder: PathBuf,
+    _grant: Doctored,
+    _service: ShimGuard,
+    _dir: DirGuard,
+}
+
+impl DoctoredFolder {
+    fn new(logs: &LogDir) -> Self {
+        let (folder, dir) = default_folder();
+        let id = support::random_test_id();
+        let service = ShimGuard::new(&id);
+        let spec = simple_spec(&id, fixture_command("report", &["1"]), logs);
+        embedded_manager(None, CheckPermissions::Enable)
+            .install(&spec, false)
+            .expect("install, which makes the default folder");
+        let grant = Doctored::new(&folder);
+        Self {
+            folder,
+            _grant: grant,
+            _service: service,
+            _dir: dir,
+        }
+    }
+
+    /// What the folder holds, by path.
+    fn contents(&self) -> Vec<PathBuf> {
+        let mut found: Vec<_> = std::fs::read_dir(&self.folder)
+            .unwrap_or_else(|e| panic!("read {}: {e}", self.folder.display()))
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        found.sort();
+        found
+    }
+}
+
 // Reading permissions =================================================================================================
 
 const FILE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;WD)";
@@ -421,44 +465,35 @@ fn install_repairs_tampered_shim() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_refuses_doctored_folder() {
-    let (folder, _folder_guard) = default_folder();
-    // Not empty: the sweep every install begins with removes an empty default folder.
-    let placeholder = folder.join("placeholder.txt");
-    std::fs::create_dir_all(&folder).expect("create the default folder");
-    std::fs::write(&placeholder, b"keeps the folder").expect("fill the folder");
-    let _doctored = Doctored::new(&folder);
     let logs = LogDir::new();
+    let doctored = DoctoredFolder::new(&logs);
+    let before = doctored.contents();
     let id = support::random_test_id();
     let _guard = ShimGuard::new(&id);
     let mgr = embedded_manager(None, CheckPermissions::Enable);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
 
     match mgr.install(&spec, false) {
-        Err(Error::ShimFolderUnsafe { path, right, .. }) => {
-            assert_eq!(path, folder);
+        Err(Error::ShimFolderUnsafe { path, account, right }) => {
+            assert_eq!(path, doctored.folder);
             assert_eq!(right, "change permissions of");
+            assert!(account.ends_with("Users"), "{account}");
         }
         other => panic!("a folder Users can change the permissions of must be refused, got {other:?}"),
     }
 
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "nothing may be registered:\n{query}");
-    let written: Vec<_> = std::fs::read_dir(&folder)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    assert_eq!(written, [placeholder], "nothing may be written to the folder");
+    assert_eq!(doctored.contents(), before, "nothing may be written to the folder");
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_checks_the_folder_before_the_marker() {
-    let (folder, _folder_guard) = default_folder();
-    std::fs::create_dir_all(&folder).expect("create the default folder");
-    let _doctored = Doctored::new(&folder);
+    let logs = LogDir::new();
+    let doctored = DoctoredFolder::new(&logs);
+    let folder = doctored.folder.clone();
     let host = folder.join("host.exe");
     std::fs::write(&host, b"not a goetia host").expect("write a host with no marker");
-    let logs = LogDir::new();
     let id = support::random_test_id();
     let _guard = ShimGuard::new(&id);
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
@@ -478,12 +513,9 @@ fn install_checks_the_folder_before_the_marker() {
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn disable_skips_the_folder_check() {
-    let (folder, _folder_guard) = default_folder();
-    // Not empty: the sweep every install begins with removes an empty default folder.
-    std::fs::create_dir_all(&folder).expect("create the default folder");
-    std::fs::write(folder.join("placeholder.txt"), b"keeps the folder").expect("fill the folder");
-    let _doctored = Doctored::new(&folder);
     let logs = LogDir::new();
+    let doctored = DoctoredFolder::new(&logs);
+    let folder = doctored.folder.clone();
     let id = support::random_test_id();
     let _guard = ShimGuard::new(&id);
     let mgr = embedded_manager(None, CheckPermissions::Disable);

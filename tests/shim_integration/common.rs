@@ -9,7 +9,7 @@ use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
 use goetia::backend::scm::wait::{QueriedState, SystemScmActor, Waited, WantState, wait_until};
 use goetia::manager::Budget;
-use goetia::shim::{CheckPermissions, EmbeddedStockShim, StandaloneShim};
+use goetia::shim::{CheckPermissions, EmbeddedStockShim};
 use goetia::spec::{DaemonSpec, Kind};
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -26,13 +26,10 @@ use crate::support;
 #[skuld::label]
 pub const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
-/// A manager whose `type: simple` services run the shim this crate builds, wherever cargo put it.
-/// The folder check is off: the build directory is the user's, not a protected one.
+/// A manager whose `type: simple` services run the shim this crate builds: see
+/// [`support::stock_shim_manager`].
 pub fn manager() -> Scm {
-    Scm::with_shim(
-        StandaloneShim::new(PathBuf::from(env!("CARGO_BIN_EXE_goetia-shim")), vec![]),
-        CheckPermissions::Disable,
-    )
+    support::stock_shim_manager()
 }
 
 /// The stock shim this crate builds, read once and leaked: what `EmbeddedStockShim` carries in a
