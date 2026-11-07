@@ -407,8 +407,8 @@ mod system {
     ///
     /// The one mechanism behind a provider's `sweep` and the sweep of the default folder an
     /// uninstalled service's host was in (see [`second_folder`]). `default_folder` says where the
-    /// default folder is, and is asked only of a folder left empty; a caller that has resolved it
-    /// already passes that answer, so that its decisions and this one cannot differ.
+    /// default folder is, and is asked only of a folder left empty; the second-folder sweep passes
+    /// the answer it already has.
     pub(crate) fn sweep_folder(
         dir: &Path,
         referenced: &[PathBuf],

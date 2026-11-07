@@ -94,7 +94,6 @@
 pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
 
-use std::cell::{Cell, OnceCell};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;
@@ -289,7 +288,7 @@ impl Backend for Scm {
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
         if let Ok(referenced) = referenced_hosts() {
-            let _ = shim.sweep(&referenced, &default_dir);
+            let _ = shim.sweep(&referenced);
         }
         let provided = shim.provide(&self.folders)?;
         let previewed = shim.preview()?;
@@ -456,8 +455,7 @@ impl Backend for Scm {
             return Ok(());
         };
         let _lock = InstallLock::acquire()?;
-        shim.sweep(&referenced_hosts()?, &default_dir)
-            .map_err(|failure| *failure.error)
+        shim.sweep(&referenced_hosts()?).map_err(|failure| *failure.error)
     }
 
     fn enable(&self, snapshot: ScmSnapshot) -> Result<()> {
@@ -1063,12 +1061,12 @@ impl Scm {
     /// no other: a process it did not hold cannot be tied to the service it is uninstalling, and
     /// waiting for another service's stuck process would hold the install lock. Then sweeps the
     /// provider's folder and, when `host` was in the default folder and that is another, that one
-    /// too (see [`second_folder`]): the service may have been installed by another goetia version
-    /// or provider. A host in any other folder is not swept, since that folder is not goetia's.
+    /// too (see [`second_folder`]): the service may have been installed by another goetia version or
+    /// provider. A host in any other folder is not swept, since that folder is not goetia's.
     ///
     /// A default folder that cannot be located skips the second folder, as it cannot be told from the
-    /// host's, and is reported once, with whatever else fails: the wait and the provider's sweep go
-    /// on, and the sweep is given that answer (see [`DefaultFolder`]).
+    /// host's, and is reported with whatever else fails: the wait and the provider's sweep go on.
+    /// A provider's sweep that fails on the same lookup reports it too.
     ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
@@ -1080,23 +1078,22 @@ impl Scm {
             .as_ref()
             .and_then(|shim| shim.preview().ok())
             .and_then(|command| command.exe.parent().map(normalise));
-        // The default folder is looked up once, for this and for the provider's sweep: a second
-        // folder is the host's folder only when it is the default, and that is what its sweep
-        // removes it by. When it cannot be located the host's folder may be it, so it is named, not
-        // swept, and nothing else is skipped.
-        let default = DefaultFolder::new(&default_dir);
+        // The default folder is asked once, here: a second folder is the host's folder only when it
+        // is the default, and that is what its sweep removes it by. When it cannot be located the
+        // host's folder may be it, so it is named, not swept, and nothing else is skipped.
         let mut failures: Vec<SweepFailure> = Vec::new();
         let (second, unswept) = match host
             .parent()
-            .map(|folder| second_folder(folder, provider_folder.as_deref(), || Ok(normalise(&default.locate()?))))
+            .map(|folder| second_folder(folder, provider_folder.as_deref(), || Ok(normalise(&default_dir()?))))
             .transpose()
         {
             Ok(second) => (second.flatten(), second.flatten()),
-            Err(_) => (None, host.parent()),
+            Err(e) => {
+                failures.push(e.into());
+                (None, host.parent())
+            }
         };
-        let finish = |mut failures: Vec<SweepFailure>| {
-            // Ahead of the rest, where the lookup was made, unless the provider's sweep said it.
-            failures.splice(0..0, default.unreported().map(SweepFailure::from));
+        let finish = |failures: Vec<SweepFailure>| {
             SweepFailure::all(failures).map_or(Ok(()), |failure| {
                 let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
                 Err(Error::Step {
@@ -1124,62 +1121,13 @@ impl Scm {
             }
         };
         if let Some(shim) = &self.shim {
-            failures.extend(default.sweep_by(shim.as_ref(), &referenced).err());
+            failures.extend(shim.sweep(&referenced).err());
         }
         if let Some(folder) = second {
             // It is the default folder, by `second_folder`'s choice.
             failures.extend(sweep_folder(folder, &referenced, || Ok(folder.to_path_buf())).err());
         }
         finish(failures)
-    }
-}
-
-/// Where the default folder is, for the one uninstall that decides on it and hands it to its
-/// provider's sweep: looked up when first asked and never again, so that a failure to locate it is
-/// one failure, reported once.
-struct DefaultFolder<'a> {
-    /// The lookup: [`default_dir`].
-    lookup: &'a dyn Fn() -> Result<PathBuf>,
-    found: OnceCell<std::result::Result<PathBuf, Arc<Error>>>,
-    /// Whether the provider's sweep was handed a failure to locate it and failed itself, which
-    /// reports it.
-    reported_by_provider: Cell<bool>,
-}
-
-impl<'a> DefaultFolder<'a> {
-    fn new(lookup: &'a dyn Fn() -> Result<PathBuf>) -> Self {
-        Self {
-            lookup,
-            found: OnceCell::new(),
-            reported_by_provider: Cell::new(false),
-        }
-    }
-
-    fn locate(&self) -> Result<PathBuf> {
-        match self.found.get_or_init(|| (self.lookup)().map_err(Arc::new)) {
-            Ok(folder) => Ok(folder.clone()),
-            Err(e) => Err(Error::Kept(Arc::clone(e))),
-        }
-    }
-
-    /// `shim.sweep(referenced)`, answered from this lookup.
-    fn sweep_by(&self, shim: &dyn ShimProvider, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
-        let handed_a_failure = Cell::new(false);
-        let swept = shim.sweep(referenced, &|| {
-            let found = self.locate();
-            handed_a_failure.set(found.is_err());
-            found
-        });
-        self.reported_by_provider.set(handed_a_failure.get() && swept.is_err());
-        swept
-    }
-
-    /// The failure to locate the folder that nothing else has reported, if it failed.
-    fn unreported(&self) -> Option<Error> {
-        match self.found.get()? {
-            Err(e) if !self.reported_by_provider.get() => Some(Error::Kept(Arc::clone(e))),
-            _ => None,
-        }
     }
 }
 

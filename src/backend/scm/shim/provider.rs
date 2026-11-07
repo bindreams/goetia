@@ -37,14 +37,5 @@ pub trait ShimProvider: Send + Sync {
     /// or a running process names, as a path that has been normalised. Removes what this provider
     /// wrote and nothing references, tries every file, and reports every failure after the last,
     /// with the files it could not delete.
-    ///
-    /// `default_folder` says where the default folder is (`%ProgramFiles%\Goetia`), for a provider
-    /// that sweeps it or removes a folder that is it. The caller has asked already, or may, and
-    /// answers once however often this asks: a provider that looks it up itself would report a
-    /// failure the caller reports as well.
-    fn sweep(
-        &self,
-        referenced: &[PathBuf],
-        default_folder: &dyn Fn() -> Result<PathBuf>,
-    ) -> std::result::Result<(), SweepFailure>;
+    fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure>;
 }

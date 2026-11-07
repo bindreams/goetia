@@ -106,43 +106,6 @@ mod windows {
         assert!(matches!(shim_file(&name), Some(ShimFile::StaleAside)), "{name}");
     }
 
-    /// A default-folder provider sweeps the folder its caller names as the default, which the
-    /// caller has resolved already: the provider does not look it up again, so the folder it
-    /// removes when empty and the folder the caller decided on cannot differ.
-    #[skuld::test]
-    fn a_sweep_of_the_default_folder_takes_the_callers_answer_for_where_it_is() {
-        let temp = tempfile::tempdir().unwrap();
-        let default = temp.path().join("Goetia");
-        for provider in [
-            &EmbeddedStockShim::new(Some(b"abc"), None) as &dyn ShimProvider,
-            &SiblingStockShim::new(),
-        ] {
-            std::fs::create_dir(&default).unwrap();
-            let stale = default.join(format!("goetia-shim-{HEX}.x1y2z3{STALE_SUFFIX}"));
-            std::fs::write(&stale, b"half written").unwrap();
-
-            provider.sweep(&[], &|| Ok(default.clone())).unwrap();
-
-            assert!(
-                !default.exists(),
-                "the stale file and the then-empty default folder are removed"
-            );
-        }
-    }
-
-    /// A default folder the caller could not locate is the caller's error, returned as it is.
-    #[skuld::test]
-    fn a_sweep_of_the_default_folder_fails_with_the_callers_lookup_failure() {
-        let provider = EmbeddedStockShim::new(Some(b"abc"), None);
-
-        let failure = provider
-            .sweep(&[], &|| Err(Error::NoShimProvider))
-            .expect_err("no folder to sweep");
-
-        assert!(matches!(*failure.error, Error::NoShimProvider), "{failure:?}");
-        assert!(failure.not_deleted.is_empty());
-    }
-
     #[skuld::test]
     fn embed_shim_is_none_without_the_feature() {
         assert!(crate::embed_shim!().is_none());

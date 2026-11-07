@@ -103,12 +103,7 @@ mod stock {
         }
 
         fn dir(&self) -> Result<PathBuf> {
-            self.dir_in(default_dir)
-        }
-
-        /// The folder: `dir`, or the default folder as `default_folder` says.
-        fn dir_in(&self, default_folder: impl FnOnce() -> Result<PathBuf>) -> Result<PathBuf> {
-            self.dir.clone().map_or_else(default_folder, Ok)
+            self.dir.clone().map_or_else(default_dir, Ok)
         }
     }
 
@@ -133,12 +128,8 @@ mod stock {
         /// Deletes the shim files in `dir`, and what a repair or a crash left beside them, that no
         /// path of `referenced` names, and removes `dir` when that leaves it empty and it is the
         /// default folder; see [`sweep_folder`].
-        fn sweep(
-            &self,
-            referenced: &[PathBuf],
-            default_folder: &dyn Fn() -> Result<PathBuf>,
-        ) -> std::result::Result<(), SweepFailure> {
-            sweep_folder(absolute(&self.dir_in(default_folder)?)?, referenced, default_folder)
+        fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+            sweep_folder(absolute(&self.dir()?)?, referenced, default_dir)
         }
     }
 
@@ -174,12 +165,8 @@ mod stock {
         }
 
         /// As [`EmbeddedStockShim`]'s, over the default folder, and whether or not the sibling is there.
-        fn sweep(
-            &self,
-            referenced: &[PathBuf],
-            default_folder: &dyn Fn() -> Result<PathBuf>,
-        ) -> std::result::Result<(), SweepFailure> {
-            let dir = default_folder()?;
+        fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+            let dir = default_dir()?;
             sweep_folder(&dir, referenced, || Ok(dir.clone()))
         }
     }
