@@ -641,7 +641,9 @@ fn a_contract_violation_from_a_non_rule_error_keeps_it_as_the_source() {
 #[skuld::test]
 fn a_manifest_directory_ending_in_a_backslash_is_accepted() {
     let dir = PathBuf::from("/base/a\\");
-    let (spec, _) = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\ncwd: .\n"), &dir).expect("resolves");
+    // Not as a systemd host: it refuses a backslash in the executable path.
+    let yaml = "id: frpc\ncommand: [bin/frpc]\ncwd: .\n";
+    let (spec, _) = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Launchd)).expect("resolves");
     assert_eq!(spec.cwd, Some(dir));
 }
 
@@ -1213,7 +1215,9 @@ fn accepts_a_whitespace_only_cwd() {
     // does — it simply fails to resolve like any other bad path, so it
     // must not be rejected here.
     let yaml = "id: frpc\ncommand: [/bin/frpc]\ncwd: \"  \"\n";
-    let (spec, _warnings) = resolve_yaml(yaml).expect("a whitespace-only path is not empty and has no unsafe default");
+    // Not as a systemd host: it refuses a path that ends in whitespace.
+    let (spec, _warnings) = resolve_yaml_as(BackendKind::Launchd, yaml)
+        .expect("a whitespace-only path is not empty and has no unsafe default");
     assert_eq!(spec.cwd, Some(base_dir().join("  ")));
 }
 
