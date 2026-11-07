@@ -145,12 +145,19 @@ pub(crate) fn image_of(
     };
     through_scm().map_err(|scm| Error::Step {
         what: format!(
-            "read the image path of the service `{name}`, which neither its registry key nor SCM \
-             answered: an administrator must make the service's key readable"
+            "read the image path of the service `{name}`, which neither its registry key nor SCM answered. \
+             An administrator must make its registry key readable or let SCM query it \
+             (`SERVICE_QUERY_CONFIG`)"
         ),
         source: Box::new(Error::Both {
-            first: Box::new(registry),
-            then: Box::new(scm),
+            first: Box::new(Error::Step {
+                what: "its registry key".to_string(),
+                source: Box::new(registry),
+            }),
+            then: Box::new(Error::Step {
+                what: "SCM".to_string(),
+                source: Box::new(scm),
+            }),
         }),
     })
 }

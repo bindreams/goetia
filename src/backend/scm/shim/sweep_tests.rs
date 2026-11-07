@@ -264,11 +264,28 @@ fn when_both_fail_the_error_names_the_service_and_says_who_can_fix_it() {
 
     let said = error.report().to_string();
     assert!(said.contains("`frpc`"), "{said}");
-    assert!(said.contains("administrator must make"), "{said}");
+    assert!(said.contains("administrator"), "{said}");
     assert!(
         said.contains("open the key") && said.contains("query the service"),
         "{said}"
     );
+}
+
+/// The registry read and the SCM read are told apart, and the advice fits whichever failed: SCM may
+/// have failed for a reason making the key readable does not touch.
+#[skuld::test]
+fn when_both_fail_each_cause_is_labelled_and_either_fix_is_named() {
+    let error = image_of("frpc", Err(denied("open the key")), || Err(denied("query the service"))).unwrap_err();
+
+    let said = error.report().to_string();
+    let key = said.find("its registry key: ").expect("the registry cause is labelled");
+    let scm = said.find("SCM: ").expect("the SCM cause is labelled");
+    assert!(
+        said[key..scm.max(key)].contains("open the key") && said[scm..].contains("query the service"),
+        "{said}"
+    );
+    assert!(said.contains("registry key readable"), "{said}");
+    assert!(said.contains("SERVICE_QUERY_CONFIG"), "{said}");
 }
 
 // What an uninstall says it left behind ---------------------------------------------------------------------------
