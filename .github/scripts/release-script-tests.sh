@@ -632,7 +632,7 @@ assert_archives_rejects "rejects two archives holding identical binaries" 5 \
     "$archive1" "$archive2" "$archive3" "$archive4" "$archive5"
 
 # Reproduces the IFS-joined-string collision directly: a 2-member archive
-# (goetia, and ONE member literally named
+# (goetia and one member literally named
 # "<prefix>/LICENSE.md <prefix>/README.md" with an embedded space) is
 # missing LICENSE.md and README.md as their own members, but its sorted
 # member list joins via "${arr[*]}" to the exact same string as the real
