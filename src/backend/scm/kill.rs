@@ -116,9 +116,9 @@ pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
 }
 
 /// The service's process and its pid, opened and held, or `None` when SCM reports none: what
-/// everything that acts on a service's process starts from (`kill` terminates it, `uninstall` waits
-/// for it). The held handle is the proof: SCM is asked again after the open, so a pid it still
-/// vouches for is the process held, never a stranger that took the number.
+/// everything that acts on a service's process starts from (`kill` terminates it, `stop` and
+/// `uninstall` wait for it). The held handle is the proof: SCM is asked again after the open, so a
+/// pid it still vouches for is the process held, never a stranger that took the number.
 ///
 /// Loops only when the service's state changed under it: the process was gone before it could be
 /// opened, or SCM no longer vouches for the pid it was opened by. Each round re-reads SCM, which
@@ -258,8 +258,10 @@ pub(in crate::backend::scm) mod system {
         TerminateProcess, WaitForSingleObject,
     };
 
-    use crate::backend::scm::wait::{Armed, QueriedState, ScmActor, SystemScmActor, WantState, marked_for_deletion};
-    use crate::manager::budget::Budget;
+    use crate::backend::scm::wait::{
+        Armed, QueriedState, ScmActor, SystemScmActor, Waited, WantState, marked_for_deletion,
+    };
+    use crate::manager::budget::{Budget, Deadline};
 
     use super::privilege::DebugPrivilege;
     use super::{KillTarget, ReleaseWatch, Termination};
@@ -321,11 +323,11 @@ pub(in crate::backend::scm) mod system {
             eprintln!("{id}: waiting for process {} to exit", self.pid);
         }
 
-        /// Blocks, with no bound, until the process has exited, saying why nothing returns when it
-        /// has not yet. The wait [`KillTarget::await_exit`] makes, for a caller that no longer holds
-        /// the target: its service handle must be closed before the service can go.
-        pub(in crate::backend::scm) fn wait_for_exit(&self, id: &str) -> io::Result<()> {
-            wait_exit(&self.handle, || self.notice(id))
+        /// Blocks until the process has exited or `deadline` passes, saying why nothing returns when
+        /// it has not yet. [`wait_exit`] for a caller that no longer holds the target: its service
+        /// handle must be closed before the service can go.
+        pub(in crate::backend::scm) fn wait_for_exit(&self, id: &str, deadline: Deadline) -> io::Result<Waited> {
+            wait_exit(&self.handle, deadline, || self.notice(id))
         }
     }
 
@@ -369,7 +371,7 @@ pub(in crate::backend::scm) mod system {
         }
 
         fn await_exit(&mut self, process: &Held) -> io::Result<()> {
-            wait_exit(&process.handle, || self.notice(process))
+            wait_exit_unbounded(&process.handle, || self.notice(process))
         }
 
         fn arm_release(&mut self) -> io::Result<ReleaseWatch> {
@@ -441,7 +443,7 @@ pub(in crate::backend::scm) mod system {
         if e.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
             return Err(e);
         }
-        wait_exit(process, on_wait).map(|()| Termination::AlreadyExited)
+        wait_exit_unbounded(process, on_wait).map(|()| Termination::AlreadyExited)
     }
 
     /// Whether the process behind `process`, held with `SYNCHRONIZE`, has exited. A zero-timeout
@@ -455,20 +457,46 @@ pub(in crate::backend::scm) mod system {
         }
     }
 
-    /// Block until the process behind `process`, an [`open_process_with`] handle, has exited.
+    /// Block until the process behind `process`, an [`open_process_with`] handle, has exited, or
+    /// until `deadline`: the exit is the event, and a deadline is the caller's own bound, so
+    /// [`Waited::Expired`] says the process was running at it.
     ///
     /// `on_wait` runs once, just before blocking on a process that has not yet exited.
-    pub(in crate::backend::scm) fn wait_exit(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<()> {
+    pub(in crate::backend::scm) fn wait_exit(
+        process: &OwnedHandle,
+        deadline: Deadline,
+        on_wait: impl FnOnce(),
+    ) -> io::Result<Waited> {
         if has_exited(process)? {
-            return Ok(());
+            return Ok(Waited::Confirmed);
         }
-        // Unbounded on purpose: the process's exit is the event, and there is no outcome to report
-        // before it. A process wedged in a driver request is never signalled, so say why this blocks.
+        // A process wedged in a driver request is never signalled, so say why this blocks.
         on_wait();
-        // SAFETY: as above.
-        match unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } {
-            WAIT_OBJECT_0 => Ok(()),
-            _ => Err(io::Error::last_os_error()),
+        let mut failed = None;
+        let exited = deadline.sleep_until_woken(|millis| {
+            // SAFETY: as above.
+            match unsafe { WaitForSingleObject(process.as_raw_handle(), millis.unwrap_or(INFINITE)) } {
+                WAIT_OBJECT_0 => true,
+                WAIT_TIMEOUT => false,
+                // Ends the wait; the failure is returned below.
+                _ => {
+                    failed = Some(io::Error::last_os_error());
+                    true
+                }
+            }
+        });
+        match failed {
+            Some(e) => Err(e),
+            None if exited => Ok(Waited::Confirmed),
+            None => Ok(Waited::Expired),
+        }
+    }
+
+    /// [`wait_exit`] with no bound, for the callers that terminate the process.
+    fn wait_exit_unbounded(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<()> {
+        match wait_exit(process, Budget::Unbounded.start(), on_wait)? {
+            Waited::Confirmed => Ok(()),
+            Waited::Expired => unreachable!("an unbounded deadline does not expire"),
         }
     }
 }

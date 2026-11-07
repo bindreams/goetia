@@ -183,6 +183,24 @@ pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
     wait_after_stop(a, deadline, " Run `stop` again.")
 }
 
+/// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the exit of `held`, the service's
+/// process as it was before the STOP was sent. SCM records `STOPPED` before the process exits (a shim
+/// reports it and then exits), so `STOPPED` alone leaves a file the process runs in use. `exit` waits
+/// for it under the same `deadline` and says whether it did; a process that outlasts the deadline
+/// is as `Expired` as a service that does. No process held (none reported, or none that could be
+/// opened) is the stop alone.
+pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
+    a: &mut A,
+    deadline: Deadline,
+    held: Option<&P>,
+    exit: impl FnOnce(&P, Deadline) -> io::Result<Waited>,
+) -> io::Result<Waited> {
+    match stop_via_notify(a, deadline)? {
+        Waited::Confirmed => held.map_or(Ok(Waited::Confirmed), |process| exit(process, deadline)),
+        Waited::Expired => Ok(Waited::Expired),
+    }
+}
+
 /// [`ScmActor::control_stop`], where a stop already under way counts as sent.
 ///
 /// SCM refuses a STOP with 1061 (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) or 1052

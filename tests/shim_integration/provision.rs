@@ -1186,12 +1186,34 @@ fn uninstall_of_one_of_two_on_a_file_returns() {
     assert_eq!(mgr.status(&b_spec.id).expect("status").state, State::Running);
 }
 
-/// `stop` and then `uninstall` at once: SCM already reports `STOPPED` with no pid, so no process is
-/// held, and the uninstall does not wait for the shim's process, which is still exiting. It succeeds
-/// whether or not the file is still in use; a file the process still ran is the next sweep's, once
-/// the process has exited.
+/// `stop` returns once the service's process has exited, not when SCM first reports `STOPPED`, which
+/// the shim does before it exits.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn uninstall_right_after_stop_succeeds_and_the_next_sweep_takes_the_file() {
+fn stop_returns_after_the_services_process_has_exited() {
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let started = ConnectBack::listen();
+    let mgr = embedded_manager(Some(folder), CheckPermissions::Disable);
+    let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the service to report in");
+    let running = ShimProcess::attach(&id);
+
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+
+    assert!(
+        running.has_exited(),
+        "`stop` returned while the shim's process was still running"
+    );
+}
+
+/// `stop` and then `uninstall`: the process is already gone, so the uninstall finds the file free and
+/// removes it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_right_after_stop_leaves_no_file() {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
     let id = support::random_test_id();
@@ -1202,16 +1224,15 @@ fn uninstall_right_after_stop_succeeds_and_the_next_sweep_takes_the_file() {
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the service to report in");
-    let running = ShimProcess::attach(&id);
     let file = shim_in(&folder);
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
     mgr.uninstall(&spec.id).expect("uninstall");
 
-    running.wait_for_exit();
-    let retry = mgr.uninstall(&spec.id);
-    assert!(matches!(retry, Err(Error::NotInstalled { .. })), "{retry:?}");
-    assert!(!file.exists(), "the sweep after the process exited removes it");
+    assert!(
+        !file.exists(),
+        "nothing runs the file, so the uninstall's sweep removes it"
+    );
 }
 
 /// A service B that was updated to another file and not restarted still runs the first. Uninstalling

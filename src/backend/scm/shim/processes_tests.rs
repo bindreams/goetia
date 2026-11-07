@@ -8,6 +8,8 @@ use cosca::Stdio;
 use super::super::sweep::normalise;
 use super::*;
 use crate::backend::scm::kill::system::{has_exited, open_process_with, wait_exit};
+use crate::backend::scm::wait::Waited;
+use crate::manager::budget::Budget;
 
 const HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
@@ -54,7 +56,8 @@ fn a_process_that_has_exited_is_not_an_image() {
         .expect("open the copy")
         .expect("the copy is running");
     running.child.kill().unwrap();
-    wait_exit(&held, || {}).expect("wait for the copy to exit");
+    let waited = wait_exit(&held, Budget::Unbounded.start(), || {}).expect("wait for the copy to exit");
+    assert_eq!(waited, Waited::Confirmed);
     assert!(has_exited(&held).unwrap());
 
     let images = running_images().expect("list the running images");

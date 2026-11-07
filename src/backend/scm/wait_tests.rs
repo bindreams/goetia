@@ -537,6 +537,67 @@ fn stop_over_a_stop_under_way_still_expires_on_the_deadline() {
     assert_eq!(stop_via_notify(&mut fake, unbounded()).unwrap(), Waited::Expired);
 }
 
+/// SCM records `STOPPED` before the service's process exits, so a stop that held the process waits for
+/// its exit once SCM has confirmed, under the deadline the stop had.
+#[skuld::test]
+fn stop_and_await_exit_waits_for_the_held_process_after_stopped() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+    let deadline = Budget::Bounded(std::time::Duration::from_secs(3600)).start();
+    let mut waited_for = vec![];
+
+    let outcome = stop_and_await_exit(&mut fake, deadline, Some(&7u32), |process, by| {
+        waited_for.push((*process, by));
+        Ok(Waited::Confirmed)
+    });
+
+    assert_eq!(outcome.unwrap(), Waited::Confirmed);
+    assert_eq!(fake.log, vec!["control_stop", "arm_stopped", "wait", "got_stopped"]);
+    assert_eq!(waited_for, vec![(7, deadline)]);
+}
+
+/// A process that outlasts the deadline is an expired stop, as a service that does.
+#[skuld::test]
+fn stop_and_await_exit_expires_when_the_process_outlasts_the_deadline() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), Some(&7u32), |_, _| Ok(Waited::Expired));
+
+    assert_eq!(outcome.unwrap(), Waited::Expired);
+}
+
+#[skuld::test]
+fn stop_and_await_exit_does_not_wait_for_a_process_when_stopped_was_not_confirmed() {
+    let mut fake = FakeScm::new([None]);
+
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), Some(&7u32), |_, _| {
+        panic!("the process is waited for once SCM has confirmed the stop")
+    });
+
+    assert_eq!(outcome.unwrap(), Waited::Expired);
+}
+
+#[skuld::test]
+fn stop_and_await_exit_without_a_held_process_is_the_stop() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), None::<&u32>, |_, _| {
+        panic!("there is no process to wait for")
+    });
+
+    assert_eq!(outcome.unwrap(), Waited::Confirmed);
+}
+
+#[skuld::test]
+fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), Some(&7u32), |_, _| {
+        Err(io::Error::other("wait failed"))
+    });
+
+    assert_eq!(outcome.unwrap_err().to_string(), "wait failed");
+}
+
 #[skuld::test]
 fn a_stop_request_over_a_stop_under_way_is_accepted() {
     let mut fake = FakeScm::new([])

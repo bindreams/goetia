@@ -432,7 +432,10 @@ impl Backend for Scm {
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
         let held = match host {
-            Some(_) => hold_host_process(&id)?,
+            Some(_) => hold_process(&id).map_err(|e| Error::Step {
+                what: format!("`{id}` was NOT deleted and is unchanged"),
+                source: Box::new(e),
+            })?,
             None => None,
         };
         let scm = open_scm_to_classify(id.as_str())?;
@@ -507,8 +510,15 @@ impl Backend for Scm {
         if !budget.waits() {
             return super::wait::request_stop(&mut actor).map_err(|e| Error::os(format!("stop `{id}`"), e));
         }
-        let waited =
-            super::wait::stop_via_notify(&mut actor, deadline).map_err(|e| Error::os(format!("stop `{id}`"), e))?;
+        // Before the STOP: SCM reports `STOPPED` before the process exits, and no pid after it.
+        let held = hold_process(&id).map_err(|e| Error::Step {
+            what: format!("`{id}` was NOT stopped"),
+            source: Box::new(e),
+        })?;
+        let waited = super::wait::stop_and_await_exit(&mut actor, deadline, held.as_ref(), |held, deadline| {
+            held.wait_for_exit(id.as_str(), deadline)
+        })
+        .map_err(|e| Error::os(format!("stop `{id}`"), e))?;
         match waited {
             Waited::Confirmed => Ok(()),
             Waited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
@@ -1005,13 +1015,14 @@ fn registered_shim(snapshot: &ScmSnapshot) -> Option<PathBuf> {
     is_shim.then_some(exe)
 }
 
-/// The process SCM reports for `id`, held before the service is stopped: it may be running an older
-/// file than the one registered (an `Update` it has not restarted into), which no read of the
+/// The process SCM reports for `id`, held before the service is stopped: SCM records `STOPPED`
+/// before the process exits, and reports no pid after it. For an uninstall it may be running an
+/// older file than the one registered (an `Update` it has not restarted into), which no read of the
 /// registry shows. `None` when SCM reports none, and when the process cannot be opened (see
-/// [`hold_if_possible`]): the uninstall goes on, and what that process runs stays referenced by its
-/// image until it exits. A failure to read SCM fails the uninstall here, with nothing changed. The
-/// service handle the hold used is closed before this returns, or the service could not be deleted.
-fn hold_host_process(id: &Id) -> Result<Option<Held>> {
+/// [`hold_if_possible`]): the caller goes on, and what that process runs stays referenced by its
+/// image until it exits. A failure to read SCM is an error, with nothing changed. The service
+/// handle the hold used is closed before this returns, or the service could not be deleted.
+fn hold_process(id: &Id) -> Result<Option<Held>> {
     let (_scm, service) = match open_existing(id, ServiceAccess::QUERY_STATUS) {
         Ok(opened) => opened,
         // Gone since it was read: `uninstall_locked` finds it gone too.
@@ -1019,18 +1030,15 @@ fn hold_host_process(id: &Id) -> Result<Option<Held>> {
         Err(e) => return Err(e),
     };
     let mut target = super::kill::SystemKillTarget::observing(service, id.as_str().to_string());
-    hold_if_possible(&mut target).map_err(|e| Error::Step {
-        what: format!("`{id}` was NOT deleted and is unchanged"),
-        source: Box::new(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)),
-    })
+    hold_if_possible(&mut target).map_err(|e| Error::os(format!("hold `{id}`'s process to wait for its exit"), e))
 }
 
 impl Scm {
     /// What an uninstall does once `id` is stopped and deleted, for a service whose host was the shim
     /// file `host`: waits, with no bound, for the process that was held (it is on its way out: SCM
-    /// recorded `STOPPED` before it exits), and for no other: a process it did not hold cannot be tied
-    /// to the service it is uninstalling, and waiting for another service's stuck process would hold
-    /// the install lock. Then sweeps the provider's folder and, when `host` was in the default folder
+    /// recorded `STOPPED` before it exits, and a `stop` that waited has left none to hold), and for
+    /// no other: a process it did not hold cannot be tied to the service it is uninstalling, and
+    /// waiting for another service's stuck process would hold the install lock. Then sweeps the provider's folder and, when `host` was in the default folder
     /// and that is another, that one too (see [`second_folder`]): the service may have been installed
     /// by another goetia version or provider. A host in any other folder is not swept, since
     /// that folder is not goetia's.
@@ -1062,12 +1070,14 @@ impl Scm {
             Err(e) => return Err(left_behind(e.into(), host.parent())),
         };
         if let Some(held) = held {
-            held.wait_for_exit(id.as_str()).map_err(|e| {
-                left_behind(
-                    Error::os(format!("wait for `{id}`'s process to exit"), e).into(),
-                    second,
-                )
-            })?;
+            match held.wait_for_exit(id.as_str(), Budget::Unbounded.start()) {
+                Ok(Waited::Confirmed) => {}
+                Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),
+                Err(e) => {
+                    let failure = Error::os(format!("wait for `{id}`'s process to exit"), e);
+                    return Err(left_behind(failure.into(), second));
+                }
+            }
         }
         // After the wait: what has exited no longer references its file.
         let referenced = referenced_hosts().map_err(|e| left_behind(e.into(), second))?;

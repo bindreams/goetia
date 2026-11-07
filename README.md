@@ -734,6 +734,10 @@ Where the bytes come from depends on the build:
   `goetia.exe` reads the one beside it. If that file is missing, `install` and
   `install --dry-run` fail naming its path.
 
+`stop` of any Windows daemon waits, within its `--timeout`, for the service's
+process to exit as well as for SCM to report `STOPPED`, which it does first.
+A `stop` and then an `uninstall` therefore finds the shim file free.
+
 `uninstall` of a `type: simple` daemon waits, with no time limit, for the shim
 process to exit, deletes the service, and deletes every `goetia-shim-*.exe`
 that no remaining service references, and the default folder when it is then
