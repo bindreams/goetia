@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::{ERROR_KEY_DELETED, ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
     REG_BINARY, REG_DWORD, REG_DWORD_BIG_ENDIAN, REG_EXPAND_SZ, REG_FULL_RESOURCE_DESCRIPTOR, REG_LINK, REG_MULTI_SZ,
     REG_NONE, REG_QWORD, REG_RESOURCE_LIST, REG_RESOURCE_REQUIREMENTS_LIST, REG_SZ, RegQueryValueExW,
@@ -49,6 +49,13 @@ fn registry_undetermined(name: &str, op: &str, path: &str, source: std::io::Erro
     super::undetermined(name, registry_error(op, path, source), access_denied)
 }
 
+/// Whether a registry failure says the key is not there: never created, or deleted while it was
+/// being read. The second is a concurrent uninstall, so the service is going away and is absent,
+/// not undetermined.
+fn is_absent(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(ERROR_KEY_DELETED as i32)
+}
+
 // Parameters (the metadata blob) ======================================================================================
 
 /// Every string-valued entry under `Services\<name>\Parameters`, keyed
@@ -58,7 +65,8 @@ fn registry_undetermined(name: &str, op: &str, path: &str, source: std::io::Erro
 /// be one of Goetia's own fields, which are always strings, and are none of
 /// Goetia's business otherwise.
 ///
-/// An absent `Parameters` subkey — a service that exists but was never
+/// An absent `Parameters` subkey (see [`is_absent`]; a key deleted mid-read counts) — a service
+/// that exists but was never
 /// touched by Goetia's metadata write (including one whose install crashed
 /// between `CreateServiceW` and that write; see the module doc comment on
 /// `manager`) — reads back as an empty map, not an error: to
@@ -72,13 +80,17 @@ pub fn read_parameters(name: &str) -> Result<BTreeMap<String, String>> {
     let path = parameters_key_path(name);
     let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_READ) {
         Ok(k) => k,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) if is_absent(&e) => return Ok(BTreeMap::new()),
         Err(e) => return Err(registry_undetermined(name, "open", &path, e)),
     };
 
     let mut out = BTreeMap::new();
     for entry in key.enum_values() {
-        let (field, value) = entry.map_err(|e| registry_undetermined(name, "enumerate", &path, e))?;
+        let (field, value) = match entry {
+            Ok(pair) => pair,
+            Err(e) if is_absent(&e) => return Ok(BTreeMap::new()),
+            Err(e) => return Err(registry_undetermined(name, "enumerate", &path, e)),
+        };
         if let Ok(s) = String::from_reg_value(&value) {
             out.insert(field, s);
         }
