@@ -1131,11 +1131,11 @@ fn uninstall_of_one_of_two_on_a_file_returns() {
 }
 
 /// `stop` and then `uninstall` at once: SCM already reports `STOPPED` with no pid, so no process is
-/// held, and the uninstall does not wait for the shim's process, which is still exiting. If the
-/// process has gone by the sweep, nothing is left; otherwise the file it runs is reported by name,
-/// and the next sweep, once the process has exited, removes it.
+/// held, and the uninstall does not wait for the shim's process, which is still exiting. It succeeds
+/// whether or not the file is still in use; a file the process still ran is the next sweep's, once
+/// the process has exited.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn uninstall_right_after_stop_reports_the_file_its_exiting_process_runs_or_leaves_nothing() {
+fn uninstall_right_after_stop_succeeds_and_the_next_sweep_takes_the_file() {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
     let id = support::random_test_id();
@@ -1150,27 +1150,19 @@ fn uninstall_right_after_stop_reports_the_file_its_exiting_process_runs_or_leave
     let file = shim_in(&folder);
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
-    match mgr.uninstall(&spec.id) {
-        Ok(()) => assert!(!file.exists(), "the process had gone, so the file is swept"),
-        Err(e) => {
-            let report = e.report().to_string();
-            let name = file.file_name().expect("the shim has a name").to_string_lossy();
-            assert!(report.contains(&*name), "the file is named: {report}");
-            assert!(report.contains("was deleted"), "the service is deleted: {report}");
-            running.wait_for_exit();
-            let retry = mgr.uninstall(&spec.id);
-            assert!(matches!(retry, Err(Error::NotInstalled { .. })), "{retry:?}");
-            assert!(!file.exists(), "the retry sweeps it once the process has exited");
-        }
-    }
+    mgr.uninstall(&spec.id).expect("uninstall");
+
+    running.wait_for_exit();
+    let retry = mgr.uninstall(&spec.id);
+    assert!(matches!(retry, Err(Error::NotInstalled { .. })), "{retry:?}");
+    assert!(!file.exists(), "the sweep after the process exited removes it");
 }
 
 /// A service B that was updated to another file and not restarted still runs the first. Uninstalling
 /// A, the last service registered with the first file, does not wait for B's process and leaves it
-/// alone; the file is kept, as B's image references it, and reported by name: no registered service
-/// names it.
+/// alone; the file is skipped without an error, as B's image references it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn uninstall_reports_the_old_file_an_updated_service_still_runs_without_waiting_for_it() {
+fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file() {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
     let (a_id, b_id) = (support::random_test_id(), support::random_test_id());
@@ -1192,14 +1184,10 @@ fn uninstall_reports_the_old_file_an_updated_service_still_runs_without_waiting_
     let moved = second.install(&b_spec, false).expect("install B on the second file");
     assert!(matches!(moved, Outcome::Update { .. }), "{moved:?}");
 
-    let err = second
+    second
         .uninstall(&a_spec.id)
-        .expect_err("uninstall A, which reports the file B still runs");
+        .expect("uninstall A, which does not wait for B");
 
-    let report = err.report().to_string();
-    let name = old.file_name().expect("the shim has a name").to_string_lossy();
-    assert!(report.contains(&*name), "the file is named: {report}");
-    assert!(report.contains("was deleted"), "A is deleted: {report}");
     assert!(old.is_file(), "B's process still runs the first file");
     assert!(!running.has_exited(), "B keeps running");
 }

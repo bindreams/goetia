@@ -119,11 +119,9 @@ use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
-use crate::backend::scm::shim::processes::running_images;
 use crate::backend::scm::shim::provider::ShimProvider;
 use crate::backend::scm::shim::sweep::{
-    SweepFailure, kept_by_process_alone, left_behind_text, normalise, referenced_hosts, registered_hosts, same_path,
-    sweep_folder,
+    SweepFailure, left_behind_text, normalise, referenced_hosts, same_path, sweep_folder,
 };
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
@@ -1036,10 +1034,8 @@ impl Scm {
     /// another when the service was installed by another goetia version or provider.
     ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
-    /// what removes it: see [`left_behind_text`]. So does `host` kept by a running process that no
-    /// registered service names (the exiting process of a service stopped before the uninstall
-    /// began, or an orphan): the next sweep removes it once the process is gone. `host` kept because
-    /// a registered service names it is in use, and is not reported.
+    /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
+    /// runs it is in use, and is skipped without an error: the next sweep removes it once it is free.
     fn finish_uninstall(&self, id: &Id, host: &Path, held: Option<Held>) -> Result<()> {
         let host = normalise(host);
         let provider_folder = self
@@ -1059,9 +1055,7 @@ impl Scm {
                 .map_err(|e| left_behind(Error::os(format!("wait for `{id}`'s process to exit"), e).into()))?;
         }
         // After the wait: what has exited no longer references its file.
-        let registered = registered_hosts().map_err(|e| left_behind(e.into()))?;
-        let running = running_images().map_err(|e| left_behind(e.into()))?;
-        let referenced = [registered.as_slice(), running.as_slice()].concat();
+        let referenced = referenced_hosts().map_err(|e| left_behind(e.into()))?;
         let mut failures = Vec::new();
         if let Some(shim) = &self.shim {
             failures.extend(shim.sweep(&referenced).err());
@@ -1072,14 +1066,6 @@ impl Scm {
                 .is_some_and(|provider| same_path(provider, folder))
         {
             failures.extend(sweep_folder(folder, &referenced).err());
-        }
-        // Asked after the sweeps, of what they left: a file a process kept and that has exited since
-        // is gone by now or not reported.
-        if kept_by_process_alone(&host, &registered, &running) && host.try_exists().unwrap_or(true) {
-            failures.push(SweepFailure {
-                error: Box::new(Error::ShimInUse { path: host.clone() }),
-                not_deleted: vec![host.clone()],
-            });
         }
         SweepFailure::all(failures).map_or(Ok(()), |failure| Err(left_behind(failure)))
     }

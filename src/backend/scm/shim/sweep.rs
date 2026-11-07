@@ -106,18 +106,6 @@ pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
-/// Whether the shim file `host`, which an uninstall expected to sweep, is kept by a running process
-/// alone: one of `running` (the images of the running processes, [`normalise`]d) names it and none
-/// of `registered` (what the registered services reference) does. SCM marks a service `STOPPED`,
-/// with no pid, before its process has exited, so such a file is the exiting process's of a service
-/// stopped before the uninstall began, or an orphan's; the uninstall waits for neither, and reports
-/// the file instead. A file a registered service names is in use, which the sweep skips without an
-/// error.
-pub(crate) fn kept_by_process_alone(host: &Path, registered: &[PathBuf], running: &[PathBuf]) -> bool {
-    let files = [host.to_path_buf()];
-    unreferenced(&files, running).is_empty() && !unreferenced(&files, registered).is_empty()
-}
-
 /// Whether `path` is a file name with no folder.
 fn is_bare(path: &Path) -> bool {
     path.parent().is_none_or(|folder| folder.as_os_str().is_empty())
@@ -259,7 +247,7 @@ pub(crate) fn left_behind_text(
 }
 
 #[cfg(windows)]
-pub(crate) use system::{normalise, referenced_hosts, registered_hosts, sweep_folder};
+pub(crate) use system::{normalise, referenced_hosts, sweep_folder};
 
 #[cfg(windows)]
 mod system {
@@ -300,7 +288,7 @@ mod system {
     /// read through its registry key or through SCM (see [`image_of`]), or an enumeration that did
     /// not finish, is an error: what the unread entries reference is
     /// unknown, and it must not be taken for nothing.
-    pub(crate) fn registered_hosts() -> Result<Vec<PathBuf>> {
+    fn registered_hosts() -> Result<Vec<PathBuf>> {
         let mut hosts = Vec::new();
         let mut failed = Vec::new();
         // Opened by the first service whose key cannot be read, and kept for the rest of the scan:

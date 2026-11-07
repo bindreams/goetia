@@ -150,7 +150,6 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::ShimMarkerMissing { path: PathBuf::new() },
         Error::ShimNotEmbedded,
         Error::SiblingShimMissing { path: PathBuf::new() },
-        Error::ShimInUse { path: PathBuf::new() },
         Error::ShimMarkerVersion {
             path: PathBuf::new(),
             found: String::new(),
@@ -706,17 +705,6 @@ fn report_of_a_missing_sibling_shim_names_its_path() {
         "the stock shim /b/goetia-shim.exe is missing: goetia looks for goetia-shim.exe beside goetia.exe"
     );
     assert!(std::error::Error::source(&e).is_none());
-}
-
-#[skuld::test]
-fn report_of_a_shim_file_in_use_names_it() {
-    let e = Error::ShimInUse {
-        path: PathBuf::from("/p/goetia-shim-aa.exe"),
-    };
-    assert_eq!(
-        e.report().to_string(),
-        "/p/goetia-shim-aa.exe is the image of a running process, so it was not deleted"
-    );
 }
 
 #[skuld::test]
