@@ -1,6 +1,6 @@
 use super::*;
-use crate::decide;
-use crate::error::Reason;
+use crate::decide::{self, Outcome};
+use crate::error::{Error, Reason};
 
 fn id() -> Id {
     Id::try_from("frpc").expect("`frpc` is a valid id")
@@ -121,5 +121,80 @@ fn what_a_refusal_quotes_is_escaped_so_the_line_stays_one_line() {
                 assert!(!text.contains(['\u{1b}', '\u{202e}']), "{n} {mood:?}: {text}");
             }
         }
+    }
+}
+
+/// A reason holding a command's stderr prints as `list` prints it: the line strict, the stderr in
+/// the layout, and goetia's recovery on a line of its own after it.
+#[skuld::test]
+fn an_unusable_refusal_writes_a_childs_stderr_in_the_layout() {
+    let command = Error::Command {
+        command: "systemctl show x".to_string(),
+        status: crate::error::error_tests::exit_status(1),
+        stderr: "first\nerror: forged\u{1b}[31m".to_string(),
+    };
+    let reason = Reason::failed(command);
+    let shown = reason.to_string();
+    assert!(shown.ends_with("first\n  error: forged\\u{1b}[31m"), "{shown:?}");
+    for mood in [Mood::Done, Mood::Would] {
+        let (_, out, err) = reported(mood, |lines, out, err| {
+            lines.unusable(&reason, Some("uninstall it"), out, err)
+        });
+        let line = format!("frpc: {}: {shown}\n. uninstall it\n", refused(mood));
+        assert_eq!(out, line, "{mood:?}");
+        assert_eq!(err, format!("error: {line}"), "{mood:?}");
+    }
+}
+
+#[skuld::test]
+fn only_a_conflict_or_a_refusal_is_a_refusal() {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let id = id();
+    let lines = Lines {
+        id: &id,
+        mood: Mood::Done,
+    };
+    for outcome in [
+        Outcome::Create,
+        Outcome::UpToDate,
+        Outcome::Update {
+            spec_diff: String::new(),
+        },
+        Outcome::Stale {
+            from_version: "0".to_string(),
+        },
+    ] {
+        assert_eq!(lines.refusal(&outcome, &mut out, &mut err), None, "{outcome:?}");
+    }
+    assert!(out.is_empty() && err.is_empty());
+    for (outcome, code) in [
+        (
+            Outcome::Conflict {
+                artifact_diff: String::new(),
+                unclearable_recovery: None,
+            },
+            ExitCode::Conflict,
+        ),
+        (
+            Outcome::RefuseForeign {
+                recovery: "move it".to_string(),
+            },
+            ExitCode::Error,
+        ),
+        (
+            Outcome::RefuseOtherDaemon {
+                installed: Id::try_from("other").unwrap(),
+            },
+            ExitCode::Error,
+        ),
+        (
+            Outcome::RefuseUnusable {
+                reason: Reason::said("damaged"),
+                recovery: None,
+            },
+            ExitCode::Error,
+        ),
+    ] {
+        assert_eq!(lines.refusal(&outcome, &mut out, &mut err), Some(code), "{outcome:?}");
     }
 }

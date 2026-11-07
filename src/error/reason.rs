@@ -63,7 +63,7 @@ impl fmt::Display for Reason {
     /// are written as `\u{XXXX}`. An [`Around`](Reason::Around) error's remedies print after
     /// `after`, as `report` prints them after a chain.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.write(f, true)
+        self.write_to(&mut Sink::new(f, true))
     }
 }
 
@@ -74,20 +74,21 @@ impl Reason {
         Unescaped(self)
     }
 
-    fn write(&self, f: &mut dyn fmt::Write, escaped: bool) -> fmt::Result {
+    /// `Display`, written into `out`, so what a caller writes next is placed after a stderr this
+    /// ends on as the report places it.
+    pub(crate) fn write_to(&self, out: &mut Sink) -> fmt::Result {
         let (before, error, after) = match self {
             Reason::Said(text) => ("", None, text.as_str()),
             Reason::Failed(error) => ("", Some(error), ""),
             Reason::Around { before, error, after } => (before.as_str(), Some(error), after.as_str()),
         };
-        let mut out = Sink::new(f, escaped);
         let mut remedies = Vec::new();
         out.write_str(before)?;
         if let Some(error) = error {
-            write_chain(error.as_ref(), &mut out, &mut remedies)?;
+            write_chain(error.as_ref(), out, &mut remedies)?;
         }
         out.write_str(after)?;
-        write_remedies(&mut out, &remedies)
+        write_remedies(out, &remedies)
     }
 }
 
@@ -95,7 +96,7 @@ struct Unescaped<'a>(&'a Reason);
 
 impl fmt::Display for Unescaped<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.write(f, false)
+        self.0.write_to(&mut Sink::new(f, false))
     }
 }
 

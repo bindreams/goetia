@@ -142,7 +142,7 @@ fn an_undetermined_error_is_not_reported_as_unusable() {
         recovery: "re-run as root".to_string(),
     };
 
-    let report = status_error("frpc", &e);
+    let report = status_error("frpc", e);
 
     assert_eq!(report.kind, Kind::Undetermined);
     assert_eq!(
@@ -162,7 +162,7 @@ fn a_step_over_not_installed_is_reported_as_not_installed() {
         source: Box::new(Error::NotInstalled { id: "frpc".to_string() }),
     };
 
-    let report = status_error("frpc", &e);
+    let report = status_error("frpc", e);
 
     assert_eq!(report.kind, Kind::NotInstalled);
     assert_eq!(
@@ -285,23 +285,23 @@ fn a_refused_id_is_reported_as_the_id_was_given() {
     let id = "a\nb\u{202e}";
     let e = crate::spec::Id::try_from(id.to_string()).unwrap_err();
     assert_eq!(
-        invalid_id(id, &e).message,
+        invalid_id(id, e).message,
         "id `a\nb\u{202e}` does not match the required pattern ^[A-Za-z0-9._-]{1,80}$"
     );
 }
 
 #[skuld::test]
 fn an_errors_message_in_the_document_is_its_unescaped_chain() {
-    let e = Error::Step {
+    let step = || Error::Step {
         what: "step\u{202e}".to_string(),
         source: Box::new(Error::os_at("read", "/a\nb", std::io::Error::other("x"))),
     };
     assert_eq!(
-        status_error("frpc", &e).message,
+        status_error("frpc", step()).message,
         "step\u{202e}: failed to read /a\nb: x"
     );
     assert_eq!(
-        unavailable(&e).errors[0].message,
+        unavailable(step()).errors[0].message,
         "step\u{202e}: failed to read /a\nb: x"
     );
 }

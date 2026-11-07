@@ -12,7 +12,7 @@ mod within;
 #[cfg(feature = "cli")]
 pub(crate) use escape::{EscapedStream, escape};
 pub use reason::Reason;
-pub(crate) use report::Chain;
+pub(crate) use report::{Chain, Sink};
 pub(crate) use within::within;
 
 use report::Report;
@@ -472,10 +472,7 @@ pub enum Error {
     /// A `start` was judged as a `type: managed` service's, because the service's spec blob could not
     /// be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
     /// `source` is the failed start.
-    #[error(
-        "its spec blob could not be read, so the start was judged as a `type: managed` service's ({})",
-        Chain(&**blob)
-    )]
+    #[error("{}", start_as_managed_message(blob))]
     StartAsManaged {
         blob: Arc<Error>,
         #[source]
@@ -597,17 +594,22 @@ impl Error {
         }
     }
 
-    /// The error this one writes into its own `Display`, which is not its
-    /// [`source`](std::error::Error::source). [`report`](Error::report) collects the remedies of
-    /// what it names, so a variant that writes an error with [`Chain`] must name it here.
+    /// The sentence this error's `Display` is, when it has an error set in it, which is not its
+    /// [`source`](std::error::Error::source). [`report`](Error::report) writes that error itself,
+    /// so its stderr keeps its layout and its remedies print last: a variant that writes an error
+    /// into its message must build the message as a [`Sentence`] and return it here.
     ///
     /// Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
     /// be classified here before it compiles.
-    pub(crate) fn embedded(&self) -> Option<&Error> {
+    pub(crate) fn sentence(&self) -> Option<Sentence<'_>> {
         match self {
-            Error::LoadedStateInDoubt { read_failed, .. } => Some(read_failed),
-            Error::StartAsManaged { blob, .. } => Some(blob),
-            Error::Kept(kept) => kept.embedded(),
+            Error::LoadedStateInDoubt {
+                id,
+                read_failed,
+                restore_failed,
+            } => Some(loaded_in_doubt(id, Some(read_failed), restore_failed.is_some())),
+            Error::StartAsManaged { blob, .. } => Some(start_as_managed_message(blob)),
+            Error::Kept(kept) => kept.sentence(),
             Error::Os { .. }
             | Error::Command { .. }
             | Error::Spawn { .. }
@@ -655,7 +657,7 @@ impl Error {
     /// `first; then: then`. What the CLI prints: [`Display`](fmt::Display) alone is the outermost
     /// context. The control and direction characters of what an error quotes are written as
     /// `\u{XXXX}`, as the CLI's other human sinks write them; a child's stderr keeps its line feeds
-    /// and tabs.
+    /// and tabs, and what follows one of several lines starts a line of its own.
     pub fn report(&self) -> impl fmt::Display + '_ {
         Report {
             error: self,
@@ -898,17 +900,46 @@ fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
     }
 }
 
+/// A message with an error set inside it: `before`, the error, `after`. `Display` writes the
+/// error as [`Chain`] does; [`Error::report`] writes it as it writes any error (see
+/// [`Error::sentence`]).
+pub(crate) struct Sentence<'a> {
+    pub(crate) before: String,
+    pub(crate) error: Option<&'a Error>,
+    pub(crate) after: String,
+}
+
+impl fmt::Display for Sentence<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.before)?;
+        if let Some(error) = self.error {
+            write!(f, "{}", Chain(error))?;
+        }
+        f.write_str(&self.after)
+    }
+}
+
+/// The message of [`Error::StartAsManaged`]: `blob` is the unreadable blob's error.
+fn start_as_managed_message(blob: &Error) -> Sentence<'_> {
+    Sentence {
+        before: "its spec blob could not be read, so the start was judged as a `type: managed` service's (".to_string(),
+        error: Some(blob),
+        after: ")".to_string(),
+    }
+}
+
 /// The message of both in-doubt variants. `read_failed` is the failed read (second variant only);
 /// `restore_failed` is whether the put-back of the plist failed, whose error is the variant's source.
-fn loaded_in_doubt(id: &str, read_failed: Option<&Error>, restore_failed: bool) -> String {
-    let cause = match read_failed {
-        None => format!("`{id}` was loaded in launchd while its plist was written"),
-        Some(read) => {
-            format!(
-                "`{id}`'s plist was written, but whether launchd has its job loaded could not be read ({})",
-                Chain(read)
-            )
-        }
+fn loaded_in_doubt<'a>(id: &str, read_failed: Option<&'a Error>, restore_failed: bool) -> Sentence<'a> {
+    let (cause, read_failed) = match read_failed {
+        None => (
+            format!("`{id}` was loaded in launchd while its plist was written"),
+            None,
+        ),
+        Some(read) => (
+            format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read ("),
+            Some(read),
+        ),
     };
     let remedy = if restore_failed {
         format!(
@@ -919,7 +950,14 @@ fn loaded_in_doubt(id: &str, read_failed: Option<&Error>, restore_failed: bool) 
             "The plist is back as it was before this install, so the change is not installed: run `goetia daemon stop {id}`, re-run install, then `goetia daemon start {id}`"
         )
     };
-    format!("{cause}, so goetia cannot tell whether a loaded job holds the old definition or the new one. {remedy}")
+    let close = if read_failed.is_some() { ")" } else { "" };
+    Sentence {
+        before: cause,
+        error: read_failed,
+        after: format!(
+            "{close}, so goetia cannot tell whether a loaded job holds the old definition or the new one. {remedy}"
+        ),
+    }
 }
 
 /// This crate's `Result` alias, used throughout [`crate::manager`] and

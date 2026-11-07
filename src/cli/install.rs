@@ -137,6 +137,9 @@ pub fn run(
 /// captures stderr for errors still learns that an exit-1/5 run had one.
 fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let lines = Lines { id, mood: Mood::Done };
+    if let Some(code) = lines.refusal(outcome, out, err) {
+        return code;
+    }
     match outcome {
         Outcome::Create => {
             let _ = writeln!(out, "{id}: created");
@@ -151,15 +154,11 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
         Outcome::Stale { from_version } => {
             let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
         }
-        Outcome::Conflict {
-            artifact_diff,
-            unclearable_recovery,
-        } => return lines.conflict(artifact_diff, unclearable_recovery.as_deref(), out, err),
-        Outcome::RefuseForeign { recovery } => return lines.foreign(recovery, out, err),
-        Outcome::RefuseOtherDaemon { installed } => return lines.other_daemon(installed, out, err),
-        Outcome::RefuseUnusable { reason, recovery } => {
-            return lines.unusable(reason, recovery.as_deref(), out, err);
-        }
+        // Written by `refusal` above.
+        Outcome::Conflict { .. }
+        | Outcome::RefuseForeign { .. }
+        | Outcome::RefuseOtherDaemon { .. }
+        | Outcome::RefuseUnusable { .. } => {}
     }
     ExitCode::Success
 }

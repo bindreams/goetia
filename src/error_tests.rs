@@ -331,27 +331,30 @@ fn a_kept_error_reads_as_the_error_it_keeps() {
     assert!(undetermined.is_indeterminate());
 }
 
-/// The errors written into a variant's own `Display` are exactly those `embedded` names, so
+/// The errors written into a variant's own `Display` are exactly those `sentence` names, so
 /// `report` can collect their remedies.
 #[skuld::test]
-fn embedded_names_the_error_a_variant_writes_into_its_own_text() {
+fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
     let inner = || undetermined("re-run as root");
     let loaded = Error::LoadedStateInDoubt {
         id: id(),
         read_failed: Box::new(inner()),
         restore_failed: None,
     };
-    assert!(matches!(loaded.embedded(), Some(Error::Undetermined { .. })));
     assert!(matches!(
-        start_as_managed(not_installed()).embedded(),
+        loaded.sentence().and_then(|s| s.error),
+        Some(Error::Undetermined { .. })
+    ));
+    assert!(matches!(
+        start_as_managed(not_installed()).sentence().and_then(|s| s.error),
         Some(Error::Blob { .. })
     ));
     assert!(matches!(
-        Error::Kept(Arc::new(loaded)).embedded(),
+        Error::Kept(Arc::new(loaded)).sentence().and_then(|s| s.error),
         Some(Error::Undetermined { .. })
     ));
-    assert!(not_installed().embedded().is_none());
-    assert!(step("a", inner()).embedded().is_none());
+    assert!(not_installed().sentence().and_then(|s| s.error).is_none());
+    assert!(step("a", inner()).sentence().and_then(|s| s.error).is_none());
 }
 
 #[skuld::test]

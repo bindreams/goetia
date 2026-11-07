@@ -154,3 +154,46 @@ fn a_carriage_return_ending_a_write_is_decided_by_the_next_byte() {
 fn a_carriage_return_at_the_end_of_the_stream_is_escaped() {
     assert_eq!(streamed(&[b"ok\r"]), br"ok\u{d}");
 }
+
+/// What reached the inner stream, and how often it was flushed, readable while the stream is live.
+#[cfg(feature = "cli")]
+#[derive(Clone, Default)]
+struct Probe(std::rc::Rc<std::cell::RefCell<(Vec<u8>, usize)>>);
+
+#[cfg(feature = "cli")]
+impl std::io::Write for Probe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.borrow_mut().1 += 1;
+        Ok(())
+    }
+}
+
+/// A flush is the stream's last chance to write a lone carriage return, which a terminal would
+/// act on: it is written escaped. A character that is only half there stays held for its other half.
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn a_flush_writes_a_held_carriage_return_escaped_and_keeps_half_a_character() {
+    let probe = Probe::default();
+    let mut inner = probe.clone();
+    let mut stream = EscapedStream::new(&mut inner);
+    std::io::Write::write_all(&mut stream, b"a\r").unwrap();
+    assert_eq!(probe.0.borrow().0, b"a", "held until the next byte or a flush");
+    std::io::Write::flush(&mut stream).unwrap();
+    assert_eq!(probe.0.borrow().0, br"a\u{d}");
+    assert_eq!(probe.0.borrow().1, 1, "the inner stream is flushed");
+
+    let probe = Probe::default();
+    let mut inner = probe.clone();
+    let mut stream = EscapedStream::new(&mut inner);
+    std::io::Write::write_all(&mut stream, b"b\xe2\x80").unwrap();
+    std::io::Write::flush(&mut stream).unwrap();
+    assert_eq!(probe.0.borrow().0, b"b", "half a character is not written");
+    assert_eq!(probe.0.borrow().1, 1);
+    std::io::Write::write_all(&mut stream, b"\xa8").unwrap();
+    assert_eq!(probe.0.borrow().0, br"b\u{2028}", "its other half completes it");
+}

@@ -191,3 +191,117 @@ fn a_reason_wrapping_a_command_error_prints_its_stderr_as_the_report_does() {
     assert!(expected.ends_with(": first\n  second"), "{expected:?}");
     assert_eq!(Reason::failed(e).to_string(), expected);
 }
+
+/// Goetia's own text never continues on a line of a child's stderr: after a multi-line block it
+/// starts a line of its own, whichever part of the report it is.
+#[skuld::test]
+fn goetias_text_after_a_stderr_block_starts_a_new_line() {
+    let status = exit_status(1);
+    let block = format!("`systemctl start x` failed ({status}): a\n  b");
+
+    // A `Both`'s `; then:`.
+    let both = Error::Both {
+        first: Box::new(command("a\nb")),
+        then: Box::new(os("read", "/p", "denied")),
+    };
+    assert_eq!(
+        both.report().to_string(),
+        format!("{block}\n; then: failed to read /p: denied")
+    );
+
+    // A remedy.
+    let remedied = Error::Both {
+        first: Box::new(undetermined("re-run as root")),
+        then: Box::new(command("a\nb")),
+    };
+    assert!(
+        remedied
+            .report()
+            .to_string()
+            .ends_with(&format!("{block}\n. re-run as root")),
+        "{}",
+        remedied.report()
+    );
+
+    // An `Around` reason's `after`, and then its remedy.
+    let around = Reason::around(
+        "while starting: ",
+        Error::Both {
+            first: Box::new(undetermined("re-run as root")),
+            then: Box::new(command("a\nb")),
+        },
+        " (see above)",
+    );
+    assert!(
+        around
+            .to_string()
+            .ends_with(&format!("{block}\n (see above). re-run as root")),
+        "{around}"
+    );
+
+    // The `: source` chain.
+    let sourced = Error::StartAsManaged {
+        blob: Arc::new(command("a\nb")),
+        source: Box::new(os("start", "/q", "stopped")),
+    };
+    assert!(
+        sourced
+            .report()
+            .to_string()
+            .ends_with("\n): failed to start /q: stopped"),
+        "{}",
+        sourced.report()
+    );
+}
+
+/// A one-line stderr has no indented line, so what follows it stays on its line; a block that
+/// already ends in a line feed needs no second one.
+#[skuld::test]
+fn only_a_block_that_does_not_end_the_line_breaks_it() {
+    let status = exit_status(1);
+    let both = |stderr| Error::Both {
+        first: Box::new(command(stderr)),
+        then: Box::new(os("read", "/p", "denied")),
+    };
+    assert_eq!(
+        both("a").report().to_string(),
+        format!("`systemctl start x` failed ({status}): a; then: failed to read /p: denied")
+    );
+    assert_eq!(
+        both("a\nb\n").report().to_string(),
+        format!("`systemctl start x` failed ({status}): a\n  b\n; then: failed to read /p: denied")
+    );
+}
+
+/// An error set inside another's sentence is written as the report writes any error: its stderr
+/// keeps its layout, and the rest of the sentence starts a line of its own.
+#[skuld::test]
+fn an_embedded_errors_stderr_keeps_its_layout() {
+    let status = exit_status(1);
+    let e = Error::StartAsManaged {
+        blob: Arc::new(command("a\nerror: forged")),
+        source: Box::new(os("start", "/q", "stopped")),
+    };
+    let text = e.report().to_string();
+    assert!(
+        text.contains(&format!(
+            "judged as a `type: managed` service's (`systemctl start x` failed ({status}): a\n  error: forged\n): "
+        )),
+        "{text:?}"
+    );
+    let e = Error::LoadedStateInDoubt {
+        id: "x".to_string(),
+        read_failed: Box::new(command("a\nb")),
+        restore_failed: None,
+    };
+    let text = e.report().to_string();
+    assert!(
+        text.contains(&format!(
+            "(`systemctl start x` failed ({status}): a\n  b\n), so goetia cannot tell"
+        )),
+        "{text:?}"
+    );
+    // `Display` and the report for JSON keep it as it came.
+    assert!(e.to_string().contains(": a\nb), so goetia"), "{e}");
+    assert!(e.report_unescaped().to_string().contains(": a\nb), so goetia"));
+}

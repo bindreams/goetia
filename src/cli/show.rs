@@ -128,8 +128,8 @@ fn show_from_installed(
 
     let mut specs = Vec::new();
     for id in &wanted {
-        // One-line messages quote the id and the reason, both from outside: written whole through
-        // the strict writer.
+        // The id comes from outside, so these one-line messages write it through the strict writer.
+        // A reason prints as the report does: a child's stderr in it keeps its layout.
         if let Some(entry) = index.ours.get(id) {
             specs.push(entry.spec.clone());
         } else if index.unusable.contains_key(id) {

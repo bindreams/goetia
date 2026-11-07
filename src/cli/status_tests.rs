@@ -34,10 +34,11 @@ fn a_failed_commands_stderr_is_printed_as_the_report_prints_it() {
     use crate::error::Error;
     use crate::error::error_tests::exit_status;
 
-    let e = Error::command("systemctl show x", exit_status(1), b"first\nerror: forged\x1b");
+    let failed = || Error::command("systemctl show x", exit_status(1), b"first\nerror: forged\x1b");
+    let e = failed();
     let report = Report {
         daemons: Vec::new(),
-        errors: vec![report::status_error("x", &e)],
+        errors: vec![report::status_error("x", failed())],
         undetermined: Vec::new(),
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());

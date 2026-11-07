@@ -64,6 +64,9 @@ pub fn run(
         id: &spec.id,
         mood: Mood::Would,
     };
+    if let Some(code) = lines.refusal(&outcome, out, err) {
+        return code;
+    }
     match outcome {
         Outcome::Create => {
             let _ = writeln!(out, "{}: not installed (would be created)", spec.id);
@@ -83,15 +86,11 @@ pub fn run(
                 spec.id
             );
         }
-        Outcome::Conflict {
-            artifact_diff,
-            unclearable_recovery,
-        } => return lines.conflict(&artifact_diff, unclearable_recovery.as_deref(), out, err),
-        Outcome::RefuseForeign { recovery } => return lines.foreign(&recovery, out, err),
-        Outcome::RefuseOtherDaemon { installed } => return lines.other_daemon(&installed, out, err),
-        Outcome::RefuseUnusable { reason, recovery } => {
-            return lines.unusable(&reason, recovery.as_deref(), out, err);
-        }
+        // Written by `refusal` above.
+        Outcome::Conflict { .. }
+        | Outcome::RefuseForeign { .. }
+        | Outcome::RefuseOtherDaemon { .. }
+        | Outcome::RefuseUnusable { .. } => {}
     }
     ExitCode::Drift
 }

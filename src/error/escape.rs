@@ -139,7 +139,13 @@ impl io::Write for EscapedStream<'_> {
         Ok(buf.len())
     }
 
+    /// Writes a held carriage return, escaped: a flush says no further byte is due, and a lone one
+    /// is the hazard. Half a character stays held for its other half.
     fn flush(&mut self) -> io::Result<()> {
+        if self.held == b"\r" {
+            self.held.clear();
+            self.put("\r")?;
+        }
         self.inner.flush()
     }
 }
