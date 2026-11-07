@@ -78,18 +78,14 @@ stderr:
 /// a genuinely unwired manager reports `native()`'s "no backend" there, as
 /// `unavailable` at exit `1` — the fake would also answer cleanly here, so
 /// this rules out exactly the one wrong wiring this module exists to catch.
-/// Labelled `UNIT_DIR_EXCLUSIVE` on Linux and macOS: this runs a real `daemon list` over the host's
-/// own artifact directories, so it takes turns with the tests that make them hostile (see the
-/// label). Not on Windows: a concurrent denied `Parameters` read adds an `undetermined` entry, and
-/// the exit code `4` follows from it, so the check below still holds.
+/// Holds `UNIT_DIR_EXCLUSIVE`: this runs a real `daemon list` over the host's own artifact
+/// directories, so on Linux and macOS it takes turns with the tests that make them hostile. On
+/// Windows no other test holds the label, and a concurrent denied `Parameters` read only adds an
+/// `undetermined` entry, so the check below still holds.
 ///
 /// `support::list_json` ties the exit code to the `--json` document: `errors`
 /// empty, and `4` exactly when `undetermined` is not.
-#[cfg_attr(
-    not(windows),
-    skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)
-)]
-#[cfg_attr(windows, skuld::test)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn native_backend_answers_list_unelevated() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,15 +93,11 @@ fn native_backend_answers_list_unelevated() {
     support::list_json(|args| spawn_cli(args, dir.path()));
 }
 
-/// Shared with the systemd, launchd, SCM and shim integration binaries: any
-/// test that reads or writes the host's real artifact directories takes this.
-/// On Linux and macOS a FIFO test makes them hostile to a concurrent unguarded
-/// reader, and a FIFO regression would then hang the suite instead of failing
-/// the one guarded test. On Windows two tests that deny a service's `Parameters`
-/// read make `list` report one nameless aggregate instead of a named entry, so
-/// each one's lookup of its own denied service fails; and a test whose
-/// assertion reads that aggregate (`support::may_account_for`) fails while any
-/// service is denied. A reader that checks only its own entry takes no label.
+/// Shared with the systemd and launchd integration binaries, by label *name*: any test that reads
+/// or writes the host's real unit or plist directories takes this. A FIFO test makes them hostile
+/// to a concurrent unguarded reader, and a FIFO regression would then hang the suite instead of
+/// failing the one guarded test. Windows has no such hazard; its `Parameters` denial has
+/// `PARAMETERS_DENIAL`.
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
 

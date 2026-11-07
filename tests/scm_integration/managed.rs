@@ -30,13 +30,10 @@ use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 /// negative assertion that counts the aggregate fails while any service is denied. A test that
 /// checks only its own entry cannot fail from another's denial and does not take the label.
 ///
-/// Named for systemd's unit directory rather than for SCM's service tree
-/// deliberately: skuld coordinates serialization across processes by label
-/// *name*, and `tests/cli_binary.rs::native_backend_answers_list_unelevated`
-/// runs a real `daemon list` — on Windows, through this backend — holding that
-/// same name.
+/// Shared with `tests/shim_integration` by label *name*: skuld serializes across processes by it,
+/// and both binaries drive the one SCM on the host.
 #[skuld::label]
-const UNIT_DIR_EXCLUSIVE: skuld::Label;
+const PARAMETERS_DENIAL: skuld::Label;
 
 fn id_of(s: &str) -> Id {
     Id::try_from(s).expect("random_test_id/short local ids are valid Ids")
@@ -75,10 +72,10 @@ fn hand_edit(id: &str) {
 
 // Step 1: conformance =================================================================================================
 
-/// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
+/// `PARAMETERS_DENIAL`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry naming that id in
 /// every concurrent `list()` (a nameless aggregate if another service is unreadable too).
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
 fn scm_passes_conformance() {
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(conformance::FOREIGN_ID);
@@ -341,7 +338,7 @@ fn killing_a_stopped_service_is_not_running() {
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
 fn uninstall_leaves_nothing() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -361,7 +358,7 @@ fn uninstall_leaves_nothing() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
 fn list_ignores_foreign_services() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1184,7 +1181,7 @@ fn an_elevated_list_reads_the_marker_of_its_own_install() {
 /// was never read, so goetia established neither that it owns the id nor that it does not — and
 /// `Kind::Unusable` would put goetia's name and `uninstall`'s advice on what may be a stranger's
 /// service.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
 fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1223,7 +1220,7 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 /// `registry::read_parameters` built: the key, the operation and the Win32 message. `list` used to
 /// match `Err(_)` and hand the entry a static sentence instead, which says nothing of a real Win32
 /// failure.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, PARAMETERS_DENIAL], serial = PARAMETERS_DENIAL)]
 fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1267,7 +1264,7 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
 /// opens the service object first, so a DACL denying `SERVICE_QUERY_CONFIG`/`SERVICE_QUERY_STATUS`
 /// stops goetia before it ever looks at the metadata. Fixing `read_parameters` alone would leave
 /// this path — and therefore `status` and `install` — still claiming ownership it never proved.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
     let mgr = Scm::new();
     let id = support::random_test_id();
