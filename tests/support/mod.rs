@@ -70,6 +70,14 @@ pub fn elevated() -> Result<(), String> {
     }
 }
 
+/// Fails the test unless `dir`, a directory the system provides (`multi-user.target.wants`,
+/// `/Library/LaunchDaemons`), exists. A test never creates one: every test running concurrently
+/// shares it.
+#[cfg(unix)]
+pub fn require_system_dir(dir: &std::path::Path) {
+    assert!(dir.is_dir(), "the system directory {} is missing", dir.display());
+}
+
 /// Test ids are `goetia-test-<random>`. Random rather than derived from the
 /// pid so a straggler from a crashed run can never collide with a live one.
 pub fn random_test_id() -> String {
