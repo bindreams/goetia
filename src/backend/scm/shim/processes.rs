@@ -14,7 +14,7 @@ use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::embedded::shim_file;
-use super::sweep::{name_key, normalise, service_processes, unowned_processes};
+use super::sweep::normalise;
 use crate::backend::scm::kill::system::{has_exited, open_process_with};
 use crate::error::{Error, Result};
 
@@ -34,8 +34,8 @@ const ACCESS: u32 = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
 
 /// What one process of the list came to.
 enum Seen {
-    /// Running, held, with the pid it was opened by and the image it was started from.
-    Image(OwnedHandle, u32, PathBuf),
+    /// Running, with the image it was started from.
+    Image(PathBuf),
     /// Running, but its image could not be read: the file name the process list gives.
     Unnamed(OsString),
 }
@@ -46,7 +46,7 @@ enum Seen {
 pub(crate) fn running_images() -> Result<Vec<PathBuf>> {
     let mut images = Vec::new();
     each(|seen| match seen {
-        Seen::Image(_, _, image) => images.push(normalise(&image)),
+        Seen::Image(image) => images.push(normalise(&image)),
         Seen::Unnamed(name) => {
             if name.to_str().and_then(shim_file).is_some() {
                 images.push(PathBuf::from(name));
@@ -54,33 +54,6 @@ pub(crate) fn running_images() -> Result<Vec<PathBuf>> {
         }
     })?;
     Ok(images)
-}
-
-/// A handle, opened with `SYNCHRONIZE`, on every running process that runs `host` and that no live
-/// service reports as its own (see [`unowned_processes`]): the processes an uninstall of the
-/// service that ran `host` waits for. The processes are listed before the services are read, and
-/// each is held from the list on, so the pid a service reports cannot have passed to another
-/// process meanwhile. The image is read through the handle, so what is held runs `host`, never a
-/// stranger that took a pid. A process whose image cannot be read is not here: it cannot be waited
-/// for as one that runs `host`, but [`running_images`] still counts it.
-pub(crate) fn unowned_on(host: &Path) -> Result<Vec<OwnedHandle>> {
-    let host = normalise(host);
-    let mut held = Vec::new();
-    each(|seen| {
-        if let Seen::Image(handle, pid, image) = seen
-            && name_key(&image) == name_key(&host)
-        {
-            held.push((pid, normalise(&image), handle));
-        }
-    })?;
-    let services = service_processes()?;
-    let images: Vec<(u32, PathBuf)> = held.iter().map(|(pid, image, _)| (*pid, image.clone())).collect();
-    let unowned = unowned_processes(&host, &images, &services);
-    Ok(held
-        .into_iter()
-        .filter(|(pid, ..)| unowned.contains(pid))
-        .map(|(.., handle)| handle)
-        .collect())
 }
 
 /// Visits every process the list names that was still running when it was opened.
@@ -104,7 +77,7 @@ fn open(pid: u32, name: OsString) -> Option<Seen> {
         Err(_) => return Some(Seen::Unnamed(name)),
     };
     match image_of(&handle) {
-        Ok(image) => Some(Seen::Image(handle, pid, image)),
+        Ok(image) => Some(Seen::Image(image)),
         // An exited process keeps its handles but has no image to read. One that has not exited and
         // cannot be read is unknown.
         Err(_) => match has_exited(&handle) {

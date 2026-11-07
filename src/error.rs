@@ -279,6 +279,12 @@ pub enum Error {
     )]
     SiblingShimMissing { path: PathBuf },
 
+    /// A shim file the sweep kept because a running process has it as its image, and no registered
+    /// service names it: the exiting process of a service stopped before an uninstall, or an orphan.
+    /// It goes with the first sweep after that process exits. No OS call failed.
+    #[error("{} is the image of a running process, so it was not deleted", path.display())]
+    ShimInUse { path: PathBuf },
+
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
     #[error("{path}:{line}: {message}", path = path.display())]
@@ -620,6 +626,7 @@ impl Error {
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
+            | Error::ShimInUse { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -753,6 +760,7 @@ impl Error {
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
+            | Error::ShimInUse { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)

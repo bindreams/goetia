@@ -106,18 +106,16 @@ pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
-/// The pids of `processes` (pid and image, [`normalise`]d) whose image is `host` and that no
-/// service of `services` (name and the pid SCM reports for it, `0` for none) reports as its own, in
-/// the order given: what an uninstall waits for after it deleted the service that ran `host`. SCM
-/// marks that service `STOPPED`, with no pid, before its process has exited, so the process is no
-/// live service's; a process some live service reports is that service's (one updated to another
-/// file and not restarted still runs `host`) and is none of the uninstall's.
-pub(crate) fn unowned_processes(host: &Path, processes: &[(u32, PathBuf)], services: &[(String, u32)]) -> Vec<u32> {
-    processes
-        .iter()
-        .filter(|(pid, image)| same_path(image, host) && !services.iter().any(|(_, owned)| owned == pid))
-        .map(|&(pid, _)| pid)
-        .collect()
+/// Whether the shim file `host`, which an uninstall expected to sweep, is kept by a running process
+/// alone: one of `running` (the images of the running processes, [`normalise`]d) names it and none
+/// of `registered` (what the registered services reference) does. SCM marks a service `STOPPED`,
+/// with no pid, before its process has exited, so such a file is the exiting process's of a service
+/// stopped before the uninstall began, or an orphan's; the uninstall waits for neither, and reports
+/// the file instead. A file a registered service names is in use, which the sweep skips without an
+/// error.
+pub(crate) fn kept_by_process_alone(host: &Path, registered: &[PathBuf], running: &[PathBuf]) -> bool {
+    let files = [host.to_path_buf()];
+    unreferenced(&files, running).is_empty() && !unreferenced(&files, registered).is_empty()
 }
 
 /// Whether `path` is a file name with no folder.
@@ -125,7 +123,7 @@ fn is_bare(path: &Path) -> bool {
     path.parent().is_none_or(|folder| folder.as_os_str().is_empty())
 }
 
-pub(super) fn name_key(path: &Path) -> String {
+fn name_key(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default()
@@ -265,7 +263,7 @@ pub(crate) fn left_behind_text(
 }
 
 #[cfg(windows)]
-pub(crate) use system::{normalise, referenced_hosts, service_processes, sweep_folder};
+pub(crate) use system::{normalise, referenced_hosts, registered_hosts, sweep_folder};
 
 #[cfg(windows)]
 mod system {
@@ -283,7 +281,7 @@ mod system {
     use windows_service::service_manager::ServiceManagerAccess;
 
     use super::{SweepFailure, image_of, image_references, same_path, unreferenced};
-    use crate::backend::scm::manager::{open_scm, read_image_through_scm, read_service_pid, registry};
+    use crate::backend::scm::manager::{open_scm, read_image_through_scm, registry};
     use crate::error::{Error, Reason, Result};
     use crate::manager::Installed;
 
@@ -333,22 +331,6 @@ mod system {
             }
         });
         scan_outcome(hosts, failed, unfinished, "read which services run which host")
-    }
-
-    /// The pid SCM reports for every service, as `(name, pid)`; a service with no process, or one
-    /// that is gone since it was listed, is left out. A service whose process could not be read, or
-    /// an enumeration that did not finish, is an error: a process whose owner is unknown cannot be
-    /// told from an orphan, and an uninstall waits for an orphan with no bound.
-    pub(crate) fn service_processes() -> Result<Vec<(String, u32)>> {
-        let scm = open_scm(ServiceManagerAccess::CONNECT)?;
-        let mut owned = Vec::new();
-        let mut failed = Vec::new();
-        let unfinished = registry::scan_services(|name| match read_service_pid(&scm, &name) {
-            Ok(Some(pid)) => owned.push((name, pid)),
-            Ok(None) => {}
-            Err(e) => failed.push(e),
-        });
-        scan_outcome(owned, failed, unfinished, "read which service runs which process")
     }
 
     /// What a pass over the services found, or, when any read failed or the enumeration did not

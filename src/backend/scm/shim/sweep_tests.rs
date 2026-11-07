@@ -159,70 +159,69 @@ fn only_shim_file_names_are_referenced_by_name() {
     );
 }
 
-// Which processes an uninstall waits for ------------------------------------------------------------------------
+// Which kept files an uninstall reports ---------------------------------------------------------------------------
 
-fn running(pid: u32, image: &str) -> (u32, PathBuf) {
-    (pid, PathBuf::from(image))
-}
-
-fn reports(service: &str, pid: u32) -> (String, u32) {
-    (service.to_string(), pid)
-}
-
-const HOST: &str = "/p/Goetia/goetia-shim-aa.exe";
-
-/// The stopped service's own process: SCM reports `STOPPED` with no pid, so no service has it.
+/// The exiting process of a service stopped before the uninstall, or an orphan: no service names the
+/// file, and a process runs it.
 #[skuld::test]
-fn a_process_on_the_host_that_no_service_reports_is_waited_for() {
-    let waited = unowned_processes(Path::new(HOST), &[running(7, HOST)], &[reports("b", 0)]);
+fn a_host_only_a_running_process_names_is_reported() {
+    let host = current("/p/Goetia", HEX_A);
 
-    assert_eq!(waited, vec![7]);
+    assert!(kept_by_process_alone(
+        &host,
+        &[current("/p/Goetia", HEX_B)],
+        &[host.clone()]
+    ));
+    assert!(kept_by_process_alone(&host, &[], &[host.clone()]));
 }
 
-/// A healthy service updated to another file and not restarted still runs the host.
+/// In use by a service that is registered with it: the spec skips it without an error.
 #[skuld::test]
-fn a_process_a_live_service_reports_is_that_services_and_is_not_waited_for() {
-    let waited = unowned_processes(
-        Path::new(HOST),
-        &[running(7, HOST), running(9, HOST)],
-        &[reports("a", 0), reports("b", 9)],
-    );
+fn a_host_a_registered_service_names_is_not_reported_whether_or_not_it_runs() {
+    let host = current("/p/Goetia", HEX_A);
 
-    assert_eq!(waited, vec![7]);
+    assert!(!kept_by_process_alone(&host, &[host.clone()], &[host.clone()]));
+    assert!(!kept_by_process_alone(&host, &[host.clone()], &[]));
 }
 
 #[skuld::test]
-fn a_process_on_another_image_is_not_waited_for_whatever_services_report() {
-    let waited = unowned_processes(
-        Path::new(HOST),
-        &[running(7, "/p/Goetia/goetia-shim-bb.exe"), running(8, "/other/x.exe")],
-        &[],
-    );
+fn a_host_nothing_names_is_not_reported_because_the_sweep_deleted_it() {
+    let host = current("/p/Goetia", HEX_A);
 
-    assert!(waited.is_empty(), "{waited:?}");
+    assert!(!kept_by_process_alone(&host, &[], &[]));
+    assert!(!kept_by_process_alone(
+        &host,
+        &[current("/p/Goetia", HEX_B)],
+        &[current("/p/Goetia", HEX_B)]
+    ));
 }
 
 #[skuld::test]
-fn the_image_is_compared_without_regard_to_case() {
-    let waited = unowned_processes(Path::new(HOST), &[running(7, "/P/GOETIA/GOETIA-SHIM-AA.EXE")], &[]);
+fn the_names_are_compared_without_regard_to_case() {
+    let host = current("/p/Goetia", HEX_A);
+    let shouted = PathBuf::from(host.to_string_lossy().to_uppercase());
 
-    assert_eq!(waited, vec![7]);
+    assert!(kept_by_process_alone(&host, &[], &[shouted.clone()]));
+    assert!(!kept_by_process_alone(&host, &[shouted.clone()], &[shouted]));
 }
 
+/// A process whose image could not be read is its file name alone, and counts as running every file
+/// of that name; so does a registration that names the file with no folder.
 #[skuld::test]
-fn processes_are_waited_for_in_the_order_given() {
-    let waited = unowned_processes(
-        Path::new(HOST),
-        &[running(30, HOST), running(10, HOST), running(20, HOST)],
-        &[reports("b", 10)],
-    );
+fn a_file_name_alone_names_the_host_on_either_side() {
+    let host = current("/p/Goetia", HEX_A);
+    let bare = PathBuf::from(format!("goetia-shim-{HEX_A}.exe"));
 
-    assert_eq!(waited, vec![30, 20]);
+    assert!(kept_by_process_alone(&host, &[], &[bare.clone()]));
+    assert!(!kept_by_process_alone(&host, &[bare.clone()], &[bare]));
 }
 
+/// A file that is no shim file is none of the sweep's, so it is none of the uninstall's report.
 #[skuld::test]
-fn no_process_and_no_service_wait_for_nothing() {
-    assert!(unowned_processes(Path::new(HOST), &[], &[]).is_empty());
+fn a_file_that_is_no_shim_file_is_not_reported() {
+    let other = PathBuf::from("/p/Goetia/frpc.exe");
+
+    assert!(!kept_by_process_alone(&other, &[], &[other.clone()]));
 }
 
 // An image path whose registry key cannot be read ------------------------------------------------------------------

@@ -113,16 +113,17 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
-use crate::backend::scm::kill::system::{Held, wait_exit};
-use crate::backend::scm::kill::{KillTarget as _, hold_if_possible};
+use crate::backend::scm::kill::hold_if_possible;
+use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
-use crate::backend::scm::shim::processes::unowned_on;
+use crate::backend::scm::shim::processes::running_images;
 use crate::backend::scm::shim::provider::ShimProvider;
 use crate::backend::scm::shim::sweep::{
-    SweepFailure, left_behind_text, normalise, referenced_hosts, same_path, sweep_folder,
+    SweepFailure, kept_by_process_alone, left_behind_text, normalise, referenced_hosts, registered_hosts, same_path,
+    sweep_folder,
 };
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
@@ -1029,15 +1030,16 @@ fn hold_host_process(id: &Id) -> Result<Option<Held>> {
 impl Scm {
     /// What an uninstall does once `id` is stopped and deleted, for a service whose host was the shim
     /// file `host`: waits, with no bound, for the process that was held (it is on its way out: SCM
-    /// recorded `STOPPED` before it exits) and for every other process running `host` that no live
-    /// service reports as its own: the process of a service stopped before the uninstall began, which
-    /// could not be held, is on its way out too. A healthy service that was updated to another file
-    /// and not restarted still runs `host`, and its process is not waited for: it keeps the file
-    /// referenced for a later sweep. Then sweeps the provider's folder and the folder `host` was in,
-    /// which is another when the service was installed by another goetia version or provider.
+    /// recorded `STOPPED` before it exits), and for no other: a process it did not hold cannot be tied
+    /// to the service it is uninstalling, and waiting for another service's stuck process would hold
+    /// the install lock. Then sweeps the provider's folder and the folder `host` was in, which is
+    /// another when the service was installed by another goetia version or provider.
     ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
-    /// what removes it: see [`left_behind_text`].
+    /// what removes it: see [`left_behind_text`]. So does `host` kept by a running process that no
+    /// registered service names (the exiting process of a service stopped before the uninstall
+    /// began, or an orphan): the next sweep removes it once the process is gone. `host` kept because
+    /// a registered service names it is in use, and is not reported.
     fn finish_uninstall(&self, id: &Id, host: &Path, held: Option<Held>) -> Result<()> {
         let host = normalise(host);
         let provider_folder = self
@@ -1056,17 +1058,10 @@ impl Scm {
             held.wait_for_exit(id.as_str())
                 .map_err(|e| left_behind(Error::os(format!("wait for `{id}`'s process to exit"), e).into()))?;
         }
-        // The process of a service that stopped before it was held (SCM recorded `STOPPED`, with no
-        // pid, while it was still exiting) is found by its image: it is no live service's.
-        for process in unowned_on(&host).map_err(|e| left_behind(e.into()))? {
-            let waiting = || eprintln!("{id}: waiting for a process running {} to exit", host.display());
-            wait_exit(&process, waiting).map_err(|e| {
-                left_behind(Error::os(format!("wait for a process running {} to exit", host.display()), e).into())
-            })?;
-        }
-        // After the waits: what has exited no longer references its file. A process a live service
-        // reports still does, and keeps the file for a later sweep.
-        let referenced = referenced_hosts().map_err(|e| left_behind(e.into()))?;
+        // After the wait: what has exited no longer references its file.
+        let registered = registered_hosts().map_err(|e| left_behind(e.into()))?;
+        let running = running_images().map_err(|e| left_behind(e.into()))?;
+        let referenced = [registered.as_slice(), running.as_slice()].concat();
         let mut failures = Vec::new();
         if let Some(shim) = &self.shim {
             failures.extend(shim.sweep(&referenced).err());
@@ -1077,6 +1072,14 @@ impl Scm {
                 .is_some_and(|provider| same_path(provider, folder))
         {
             failures.extend(sweep_folder(folder, &referenced).err());
+        }
+        // Asked after the sweeps, of what they left: a file a process kept and that has exited since
+        // is gone by now or not reported.
+        if kept_by_process_alone(&host, &registered, &running) && host.try_exists().unwrap_or(true) {
+            failures.push(SweepFailure {
+                error: Box::new(Error::ShimInUse { path: host.clone() }),
+                not_deleted: vec![host.clone()],
+            });
         }
         SweepFailure::all(failures).map_or(Ok(()), |failure| Err(left_behind(failure)))
     }
@@ -1221,19 +1224,6 @@ pub(in crate::backend::scm) fn read_image_through_scm(scm: &WinServiceManager, n
         Err(e) if is_marked_for_delete(&e) => Ok(None),
         Err(e) => Err(to_error(&format!("query configuration for `{name}`"), e)),
     }
-}
-
-/// The pid SCM reports for the service `name`: `None` when it has no process and when it is gone
-/// since it was listed.
-pub(in crate::backend::scm) fn read_service_pid(scm: &WinServiceManager, name: &str) -> Result<Option<u32>> {
-    let service = match scm.open_service(name, ServiceAccess::QUERY_STATUS) {
-        Ok(service) => service,
-        Err(e) if is_not_found(&e) => return Ok(None),
-        Err(e) => return Err(to_error(&format!("open service `{name}` to read its process"), e)),
-    };
-    super::kill::SystemKillTarget::observing(service, name.to_string())
-        .service_pid()
-        .map_err(|e| Error::os(format!("read the process of service `{name}`"), e))
 }
 
 fn is_not_found(e: &windows_service::Error) -> bool {

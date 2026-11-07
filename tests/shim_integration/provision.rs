@@ -1131,10 +1131,11 @@ fn uninstall_of_one_of_two_on_a_file_returns() {
 }
 
 /// `stop` and then `uninstall` at once: SCM already reports `STOPPED` with no pid, so no process is
-/// held, but the shim's process is still exiting. Uninstall waits for it by its image, and the file
-/// it ran is swept.
+/// held, and the uninstall does not wait for the shim's process, which is still exiting. If the
+/// process has gone by the sweep, nothing is left; otherwise the file it runs is reported by name,
+/// and the next sweep, once the process has exited, removes it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn uninstall_right_after_stop_waits_for_the_exiting_process_and_sweeps_its_file() {
+fn uninstall_right_after_stop_reports_the_file_its_exiting_process_runs_or_leaves_nothing() {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
     let id = support::random_test_id();
@@ -1146,12 +1147,22 @@ fn uninstall_right_after_stop_waits_for_the_exiting_process_and_sweeps_its_file(
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     started.accept("the service to report in");
     let running = ShimProcess::attach(&id);
+    let file = shim_in(&folder);
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 
-    mgr.uninstall(&spec.id).expect("uninstall");
-
-    assert!(running.has_exited(), "uninstall returns once the process is gone");
-    assert!(!shim_in(&folder).exists(), "the file it ran is swept");
+    match mgr.uninstall(&spec.id) {
+        Ok(()) => assert!(!file.exists(), "the process had gone, so the file is swept"),
+        Err(e) => {
+            let report = e.report().to_string();
+            let name = file.file_name().expect("the shim has a name").to_string_lossy();
+            assert!(report.contains(&*name), "the file is named: {report}");
+            assert!(report.contains("was deleted"), "the service is deleted: {report}");
+            running.wait_for_exit();
+            let retry = mgr.uninstall(&spec.id);
+            assert!(matches!(retry, Err(Error::NotInstalled { .. })), "{retry:?}");
+            assert!(!file.exists(), "the retry sweeps it once the process has exited");
+        }
+    }
 }
 
 /// A service B that was updated to another file and not restarted still runs the first. Uninstalling
