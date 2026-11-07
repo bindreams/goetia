@@ -80,11 +80,9 @@ pub fn connect(port: u16) {
 /// [`connect`], then send `value` as the payload.
 pub fn send_line(port: u16, value: &str) {
     if let Some(mut stream) = open(port) {
-        let written = stream.write_all(value.as_bytes());
-        let ok = written.is_ok();
-        log_failure(port, "write", written);
-        if ok {
-            log_failure(port, "shutdown", stream.shutdown(std::net::Shutdown::Write));
+        match stream.write_all(value.as_bytes()) {
+            Ok(()) => log_failure(port, "shutdown", stream.shutdown(std::net::Shutdown::Write)),
+            Err(e) => log_failure(port, "write", Err(e)),
         }
     }
 }
