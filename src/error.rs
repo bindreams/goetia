@@ -60,6 +60,16 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// A backend that regenerates a spec from what is installed (SCM's service host) could not read
+    /// it, which says nothing about the spec: the read's failure is under it, and
+    /// [`Backend::regenerate`](crate::backend::Backend::regenerate) is where one is made.
+    #[error("read `{id}`'s installed host")]
+    InstalledUnreadable {
+        id: String,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// An error a snapshot kept (its blob's failure), handed out again as it was: its text, source,
     /// remedy and indeterminacy are the kept error's. Neither [`cause`](Error::cause) nor
     /// [`map_cause`](Error::map_cause) goes into it.
@@ -579,7 +589,9 @@ impl Error {
             | Error::LoadedStateInDoubt { .. }
             | Error::StaleJobBootedOut { .. }
             | Error::StartUnconfirmed { .. } => true,
-            Error::Step { source, .. } | Error::StartAsManaged { source, .. } => source.is_indeterminate(),
+            Error::Step { source, .. }
+            | Error::StartAsManaged { source, .. }
+            | Error::InstalledUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
@@ -623,13 +635,16 @@ impl Error {
         }
     }
 
-    /// The error a chain of [`Step`](Error::Step)s and [`StartAsManaged`](Error::StartAsManaged)s
+    /// The error a chain of [`Step`](Error::Step)s, [`StartAsManaged`](Error::StartAsManaged)s and
+    /// [`InstalledUnreadable`](Error::InstalledUnreadable)s
     /// ends in, which classification reads: a step over [`NotInstalled`](Error::NotInstalled) is
     /// still "not installed". [`Both`](Error::Both) has two causes, so it is itself the cause.
     /// [`map_cause`](Error::map_cause) walks the same chain.
     pub fn cause(&self) -> &Error {
         match self {
-            Error::Step { source, .. } | Error::StartAsManaged { source, .. } => source.cause(),
+            Error::Step { source, .. }
+            | Error::StartAsManaged { source, .. }
+            | Error::InstalledUnreadable { source, .. } => source.cause(),
             e => e,
         }
     }
@@ -644,6 +659,10 @@ impl Error {
             },
             Error::StartAsManaged { blob, source } => Error::StartAsManaged {
                 blob,
+                source: Box::new(source.map_cause(f)),
+            },
+            Error::InstalledUnreadable { id, source } => Error::InstalledUnreadable {
+                id,
                 source: Box::new(source.map_cause(f)),
             },
             cause => f(cause),
@@ -708,6 +727,7 @@ impl Error {
             | Error::Command { .. }
             | Error::Spawn { .. }
             | Error::Step { .. }
+            | Error::InstalledUnreadable { .. }
             | Error::Both { .. }
             | Error::ConcurrentChange { .. }
             | Error::QuarantineStranded { .. }

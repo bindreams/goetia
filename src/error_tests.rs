@@ -138,6 +138,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             source: std::io::Error::other("x"),
         },
         Error::NotADirectory { path: PathBuf::new() },
+        Error::InstalledUnreadable {
+            id: id(),
+            source: Box::new(not_installed()),
+        },
         Error::ShimFolderUnsafe {
             path: PathBuf::new(),
             account: String::new(),
@@ -170,6 +174,17 @@ fn a_start_judged_as_managed_is_indeterminate_when_the_failed_start_is() {
     };
     assert!(over(in_doubt()).is_indeterminate());
     assert!(!over(not_installed()).is_indeterminate());
+}
+
+#[skuld::test]
+fn a_failed_read_of_the_installed_host_is_indeterminate_when_the_read_is() {
+    let over = |source: Error| Error::InstalledUnreadable {
+        id: "x".to_string(),
+        source: Box::new(source),
+    };
+    assert!(over(in_doubt()).is_indeterminate());
+    assert!(!over(not_installed()).is_indeterminate());
+    assert!(matches!(over(not_installed()).cause(), Error::NotInstalled { .. }));
 }
 
 #[cfg(unix)]

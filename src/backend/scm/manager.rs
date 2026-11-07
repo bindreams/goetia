@@ -326,8 +326,8 @@ impl Backend for Scm {
             return self.render(spec);
         }
         let identity = identity::resolve(&spec.user)?;
-        let config = snapshot.config().map_err(|e| Error::Step {
-            what: format!("read `{}`'s installed host", snapshot.id()),
+        let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
+            id: snapshot.id().as_str().to_string(),
             source: Box::new(e),
         })?;
         let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());

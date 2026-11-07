@@ -280,6 +280,63 @@ fn status_reports_an_unresolvable_account_as_an_error() {
     }
 }
 
+fn installed_host_unreadable() -> Error {
+    Error::InstalledUnreadable {
+        id: "frpc".to_string(),
+        source: Box::new(Error::os(
+            "query configuration for `frpc`",
+            std::io::Error::other("access denied"),
+        )),
+    }
+}
+
+/// A failed read of what is installed is not a spec that cannot be regenerated.
+#[skuld::test]
+fn status_names_a_failed_read_of_the_installed_host_as_that() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_installed_fails("frpc", installed_host_unreadable);
+
+    let err = fake.status(&Id::try_from("frpc").unwrap()).unwrap_err();
+
+    assert_eq!(
+        err.report().to_string(),
+        "read `frpc`'s installed host: failed to query configuration for `frpc`: access denied"
+    );
+    assert!(matches!(err, Error::InstalledUnreadable { .. }), "{err:?}");
+}
+
+#[skuld::test]
+fn list_names_a_failed_read_of_the_installed_host_as_that() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_installed_fails("frpc", installed_host_unreadable);
+
+    let listed = fake.list().unwrap();
+
+    let [entry @ Installed::OursUnusable { name, .. }] = listed.as_slice() else {
+        panic!("one unusable entry expected, got {listed:?}");
+    };
+    assert_eq!(name, "frpc");
+    assert_eq!(
+        entry.unusable_reason().as_deref(),
+        Some("read `frpc`'s installed host: failed to query configuration for `frpc`: access denied")
+    );
+}
+
+/// The read finding the service gone is absence, however it is labelled.
+#[skuld::test]
+fn list_omits_a_service_whose_installed_host_read_found_it_gone() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_installed_fails("frpc", || Error::InstalledUnreadable {
+        id: "frpc".to_string(),
+        source: Box::new(Error::NotInstalled { id: "frpc".to_string() }),
+    });
+
+    assert!(fake.list().unwrap().is_empty());
+}
+
 #[skuld::test]
 fn list_reports_an_unresolvable_account_as_ours_unusable() {
     let fake = Fake::new();

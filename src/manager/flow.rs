@@ -183,9 +183,13 @@ pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
 pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
     let snapshot = owned(b, id)?;
     let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
-    b.regenerate(&blob.spec, &snapshot).map_err(|e| Error::Step {
-        what: format!("`{id}`'s embedded spec cannot be regenerated"),
-        source: Box::new(e),
+    b.regenerate(&blob.spec, &snapshot).map_err(|e| match e {
+        // Already says what failed, and it is not the spec.
+        read @ Error::InstalledUnreadable { .. } => read,
+        e => Error::Step {
+            what: format!("`{id}`'s embedded spec cannot be regenerated"),
+            source: Box::new(e),
+        },
     })?;
     b.live_status(&snapshot)
 }
@@ -229,10 +233,10 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
             // A backend that reads what is installed to regenerate can find the service gone: as
             // for `live_status`, absence is established and the entry is omitted.
             if !matches!(e.cause(), Error::NotInstalled { .. }) {
-                out.push(unusable(Reason::because(
-                    "marked ours, but its embedded spec cannot be regenerated",
-                    e,
-                )));
+                out.push(unusable(match e {
+                    read @ Error::InstalledUnreadable { .. } => Reason::failed(read),
+                    e => Reason::because("marked ours, but its embedded spec cannot be regenerated", e),
+                }));
             }
             continue;
         }
