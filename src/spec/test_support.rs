@@ -22,6 +22,15 @@ pub(crate) fn plain_fields(id: &str, command: Vec<String>) -> DaemonFields {
     }
 }
 
+/// `p` made absolute on the host running the test, since `Path::is_absolute` is platform-defined.
+pub(crate) fn abs(p: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!(r"C:\{p}"))
+    } else {
+        PathBuf::from(format!("/{p}"))
+    }
+}
+
 /// An absolute path that is not valid UTF-8, for the rule that refuses one.
 #[cfg(windows)]
 pub(crate) fn non_utf8_absolute_path() -> PathBuf {

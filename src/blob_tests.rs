@@ -4,17 +4,9 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::*;
+use crate::spec::test_support::abs;
 
 // Fixtures ============================================================================================================
-
-#[cfg(windows)]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!(r"C:\{p}"))
-}
-#[cfg(not(windows))]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!("/{p}"))
-}
 
 /// The program every fixture runs.
 fn program() -> String {

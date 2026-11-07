@@ -1,13 +1,5 @@
-use super::test_support::{non_utf8_absolute_path, plain_fields};
+use super::test_support::{abs, non_utf8_absolute_path, plain_fields};
 use super::*;
-
-fn abs(p: &str) -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from(format!(r"C:\{p}"))
-    } else {
-        PathBuf::from(format!("/{p}"))
-    }
-}
 
 fn fields() -> DaemonFields {
     DaemonFields {

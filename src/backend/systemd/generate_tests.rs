@@ -1,5 +1,5 @@
+use crate::spec::test_support::abs;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
@@ -11,15 +11,6 @@ use crate::spec::{Id, Kind, User};
 //
 // `DaemonSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds one
 // for the host.
-
-#[cfg(windows)]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!(r"C:\{p}"))
-}
-#[cfg(not(windows))]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!("/{p}"))
-}
 
 /// The program every fixture runs.
 fn program() -> String {

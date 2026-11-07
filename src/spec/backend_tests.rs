@@ -1,9 +1,9 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use super::{BackendKind, Builtin, MAX_SC_ACTION_DELAY, Shaped, ShapedSpec, windows_builtin, windows_only_account};
 use crate::spec::interpolate::Substitution;
 use crate::spec::overrides::Supplied;
+use crate::spec::test_support::abs;
 use crate::spec::{AccountId, Id, Kind, Restart, User};
 
 fn parse(yaml: &str) -> Result<BackendKind, yaml_serde::Error> {
@@ -62,15 +62,6 @@ fn native_backend_agrees_with_the_platforms_that_have_a_service_manager() {
 }
 
 // Fixtures ============================================================================================================
-
-#[cfg(windows)]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!(r"C:\{p}"))
-}
-#[cfg(not(windows))]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!("/{p}"))
-}
 
 /// A `ShapedSpec` with every field at an unremarkable default: `Kind` and
 /// `Restart` absent, no `cwd`/`logs`, no `restart_delay`. Tests override the

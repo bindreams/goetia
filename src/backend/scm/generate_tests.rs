@@ -1,18 +1,10 @@
 use super::*;
 use crate::spec::DaemonFields;
+use crate::spec::test_support::abs;
 use crate::spec::test_support::plain_fields;
 use crate::spec::{Builtin, MAX_SC_ACTION_DELAY};
 
 // Fixtures ============================================================================================================
-
-#[cfg(windows)]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!(r"C:\{p}"))
-}
-#[cfg(not(windows))]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!("/{p}"))
-}
 
 /// The program both fixtures run.
 fn program() -> String {

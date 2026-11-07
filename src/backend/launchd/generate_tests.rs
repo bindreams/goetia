@@ -1,5 +1,5 @@
+use crate::spec::test_support::abs;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
@@ -35,15 +35,6 @@ fn full_identity() -> Identity {
     Identity {
         user: "svc-frpc".to_string(),
     }
-}
-
-#[cfg(windows)]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!(r"C:\{p}"))
-}
-#[cfg(not(windows))]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!("/{p}"))
 }
 
 /// The program every fixture runs.
