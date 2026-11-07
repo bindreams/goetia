@@ -89,7 +89,7 @@ fn simple_passes_conformance() {
 
 // Step 2: round trip, start/stop/status, uninstall, list ==============================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
 fn install_then_list_round_trips_without_the_source_file() {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -115,7 +115,7 @@ fn install_then_list_round_trips_without_the_source_file() {
     assert!(!status.enabled);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
 fn start_stop_status_reflect_reality() {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -206,8 +206,8 @@ fn list_ignores_foreign_services() {
 
 /// A host of another version is refused before anything is registered: the copy of the shim has
 /// every occurrence of this crate's version in it replaced by a different one of the same length.
-// No `UNIT_DIR_EXCLUSIVE`: it creates no service and no `Parameters` key, so it changes no `list`.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+// Labelled but not serial: it takes the install lock, as every `type: simple` install does.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
 fn install_refuses_host_of_another_version() {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -292,7 +292,7 @@ fn status_through_new_keeps_a_standalone_host() {
 /// The shim reports `STOP_PENDING`, accepting no controls, from the moment it takes a stop until it
 /// reports `STOPPED`; SCM would otherwise show the service as `RUNNING` throughout the teardown.
 /// Fails if the shim stops reporting `STOP_PENDING`, or reports it with controls still accepted.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
 fn the_shim_reports_stop_pending_then_stopped() {
     let id = support::random_test_id();
     let logs = LogDir::new();

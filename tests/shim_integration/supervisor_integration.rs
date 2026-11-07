@@ -14,11 +14,13 @@ use goetia::spec::{DaemonFields, DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::KEY_WRITE;
 
-use crate::common::{LogDir, ShimGuard, fixture_command, manager, recorded_exit, scm_status, simple_spec};
+use crate::common::{
+    LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, fixture_command, manager, recorded_exit, scm_status, simple_spec,
+};
 use crate::support::registry::{parameters_key, service_key};
 use crate::support::{self, ConnectBack, ELEVATED};
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
 fn shim_runs_child_with_cwd_and_env() {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -60,7 +62,7 @@ fn shim_runs_child_with_cwd_and_env() {
     assert_eq!(reported_env, "probe-value", "child did not see the configured env var");
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
 fn shim_captures_stdout_to_logs_path() {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -90,7 +92,7 @@ fn shim_captures_stdout_to_logs_path() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
 fn stop_kills_the_whole_process_tree() {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -157,7 +159,7 @@ fn pid_is_alive(pid: &str) -> bool {
     out.ok() && out.stdout.contains(&format!("\"{pid}\""))
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
 fn unreadable_blob_logs_to_fallback_path_and_event_log() {
     let id = support::random_test_id();
     let logs = LogDir::new();
