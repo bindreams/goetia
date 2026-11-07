@@ -653,11 +653,30 @@ impl Error {
     /// still "not installed". [`Both`](Error::Both) has two causes, so it is itself the cause.
     /// [`map_cause`](Error::map_cause) walks the same chain.
     pub fn cause(&self) -> &Error {
+        self.wrapped().map_or(self, Error::cause)
+    }
+
+    /// Whether this error, or what it wraps in a [`Step`](Error::Step), a
+    /// [`StartAsManaged`](Error::StartAsManaged) or a [`Kept`](Error::Kept), is an
+    /// [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
+    /// walks through that variant.
+    pub(crate) fn wraps_unreadable_host(&self) -> bool {
+        match self {
+            Error::InstalledUnreadable { .. } => true,
+            Error::Kept(kept) => kept.wraps_unreadable_host(),
+            e => e.wrapped().is_some_and(Error::wraps_unreadable_host),
+        }
+    }
+
+    /// The one error a wrapper variant adds its operation to. The chain every walk of
+    /// [`cause`](Error::cause)'s kind follows; [`map_cause`](Error::map_cause) owns what it maps, so
+    /// it lists the same variants.
+    fn wrapped(&self) -> Option<&Error> {
         match self {
             Error::Step { source, .. }
             | Error::StartAsManaged { source, .. }
-            | Error::InstalledUnreadable { source, .. } => source.cause(),
-            e => e,
+            | Error::InstalledUnreadable { source, .. } => Some(source),
+            _ => None,
         }
     }
 

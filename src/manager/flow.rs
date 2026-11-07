@@ -54,22 +54,11 @@ impl RegenerationFailure {
     /// Classified by the chain, not the outermost error: a backend may wrap the read's failure in a
     /// `Step` or hand it out `Kept`. The whole error is carried, wrappers included.
     fn of(error: Error) -> Self {
-        if wraps_unreadable_host(&error) {
+        if error.wraps_unreadable_host() {
             Self::HostUnreadable(error)
         } else {
             Self::SpecUnregenerable(error)
         }
-    }
-}
-
-/// Whether `error`, or what it wraps in a `Step`, a `StartAsManaged` or a `Kept`, is an
-/// [`Error::InstalledUnreadable`]. [`Error::cause`] cannot say: it walks through that variant.
-fn wraps_unreadable_host(error: &Error) -> bool {
-    match error {
-        Error::InstalledUnreadable { .. } => true,
-        Error::Step { source, .. } | Error::StartAsManaged { source, .. } => wraps_unreadable_host(source),
-        Error::Kept(kept) => wraps_unreadable_host(kept),
-        _ => false,
     }
 }
 

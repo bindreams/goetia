@@ -951,3 +951,29 @@ fn an_undetermined_step_chain_gives_up_its_read_and_recovery() {
     let back = other.into_undetermined().expect_err("not an Undetermined");
     assert_eq!(back.report().to_string(), "check: daemon `x` is not installed");
 }
+
+#[skuld::test]
+fn a_failed_read_of_the_installed_host_is_found_under_every_wrapper_and_only_there() {
+    let unreadable = || Error::InstalledUnreadable {
+        id: "x".to_string(),
+        source: Box::new(os("read", "/p", "denied")),
+    };
+    let step = |source: Error| Error::Step {
+        what: "regenerate".to_string(),
+        source: Box::new(source),
+    };
+    let start = |source: Error| Error::StartAsManaged {
+        blob: Arc::new(Error::blob(String::new())),
+        source: Box::new(source),
+    };
+
+    assert!(unreadable().wraps_unreadable_host());
+    assert!(step(unreadable()).wraps_unreadable_host());
+    assert!(start(step(unreadable())).wraps_unreadable_host());
+    assert!(Error::Kept(Arc::new(step(unreadable()))).wraps_unreadable_host());
+    assert!(step(Error::Kept(Arc::new(unreadable()))).wraps_unreadable_host());
+
+    assert!(!os("read", "/p", "denied").wraps_unreadable_host());
+    assert!(!step(start(not_installed())).wraps_unreadable_host());
+    assert!(!Error::Kept(Arc::new(step(os("read", "/p", "denied")))).wraps_unreadable_host());
+}
