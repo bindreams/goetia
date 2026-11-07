@@ -192,8 +192,9 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
 
 // --dry-run preview ===================================================================================================
 //
-// --dry-run never touches a manager or does I/O. A real install resolves
-// `spec.user` to a platform account name (see `backend::Identity`) with an
+// --dry-run never touches a manager or writes anything. On Windows it reads the process's own
+// environment and executable path, to name the shim (`shim_path`); it reads no account or file. A
+// real install resolves `spec.user` to a platform account name (see `backend::Identity`) with an
 // effectful lookup (a Windows SID needs `LookupAccountSid`; a launchd numeric
 // UID needs one too); a preview does not, so this is a literal, lookup-free
 // rendering that may differ from a real install's artifact in some cases.
@@ -221,6 +222,8 @@ fn preview_root_account() -> String {
 
 /// The generated artifact for `spec`, or the generator's refusal of it: scm refuses `restart: always` and
 /// an executable path its registration writer rewrites; systemd refuses the values `refuse_unrepresentable` lists.
+///
+/// Writes nothing; on Windows it reads the process's environment and executable path (`shim_path`).
 ///
 /// `err` is threaded through on every platform so a generator warning cannot
 /// be dropped; no generator produces a [`crate::spec::Warning`] here today.

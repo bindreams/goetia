@@ -50,7 +50,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::backend::{BackendKind, Shaped, ShapedSpec};
+use super::backend::{AuthoredPaths, BackendKind, Shaped, ShapedSpec};
 use super::field::Field;
 use super::interpolate::{self, Substitution};
 use super::overrides::Supplied;
@@ -250,7 +250,7 @@ pub(super) struct Refused {
     /// The field the error is about. `None` for a defect no field's text is to blame for: the
     /// manifest directory's.
     pub(super) field: Option<Field>,
-    pub(super) err: Error,
+    err: Error,
 }
 
 impl Refused {
@@ -259,6 +259,11 @@ impl Refused {
             field: Some(field),
             err,
         }
+    }
+
+    /// An error no field's text is to blame for: the manifest directory's (`-f`).
+    pub(super) fn of_manifest_dir(err: Error) -> Self {
+        Refused { field: None, err }
     }
 
     /// The error, prefixed "after substituting from .env" iff `.env` supplied some of the text of
@@ -329,18 +334,23 @@ fn resolve_shape(
     let mut command = raw.command;
     let mut cwd = raw.cwd;
     let mut logs = raw.logs;
+    let mut authored = AuthoredPaths::default();
     for Verdict { resolve, result } in verdicts {
         result?;
         let Some(path_field) = resolve else {
             continue;
         };
-        let slot = match path_field {
-            PathField::Command => command.as_mut().and_then(|command| command.first_mut()),
-            PathField::Cwd => cwd.as_mut(),
-            PathField::Logs => logs.as_mut(),
+        let (slot, original) = match path_field {
+            PathField::Command => (
+                command.as_mut().and_then(|command| command.first_mut()),
+                &mut authored.command0,
+            ),
+            PathField::Cwd => (cwd.as_mut(), &mut authored.cwd),
+            PathField::Logs => (logs.as_mut(), &mut authored.logs),
         };
         if let Some(text) = slot {
-            *text = resolve_path_string(id, path_field, text, base_dir, substitution, &mut warnings)?;
+            let resolved = resolve_path_string(id, path_field, text, base_dir, substitution, &mut warnings)?;
+            *original = Some(std::mem::replace(text, resolved));
         }
     }
     let cwd = cwd.map(PathBuf::from);
@@ -369,6 +379,7 @@ fn resolve_shape(
             restart_delay,
             logs,
             kind,
+            authored,
         },
         warnings,
     ))
@@ -407,6 +418,7 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         restart_delay,
         logs,
         kind,
+        authored: _,
     } = shaped;
 
     // Absent and empty share one check, so they cannot diverge in message.
@@ -622,7 +634,7 @@ fn resolve_path_string(
 
 /// Whether `p` is joined to the manifest directory. A path with its own prefix (`C:bin`) replaces
 /// `base_dir` in the join, so it is not under it.
-fn is_under_manifest_dir(p: &Path) -> bool {
+pub(super) fn is_under_manifest_dir(p: &Path) -> bool {
     !p.is_absolute() && !matches!(p.components().next(), Some(std::path::Component::Prefix(_)))
 }
 
@@ -654,9 +666,10 @@ fn check_resolved(
             resolved.display()
         ),
     );
-    Err(Refused {
-        field: (!under_manifest_dir).then(|| field.field()),
-        err,
+    Err(if under_manifest_dir {
+        Refused::of_manifest_dir(err)
+    } else {
+        Refused::at(field.field(), err)
     })
 }
 
@@ -672,7 +685,9 @@ fn check_resolved(
 ///
 /// The process's own working directory, read below when `dir` is relative,
 /// is the opposite case: nobody typed it and it always exists, so it *is*
-/// canonicalised.
+/// canonicalised. For that reason the leading `..` of a relative `dir` is collapsed against it
+/// (`-f ../app` is the parent of the working directory, however goetia was started), and no other
+/// `..` is: see the loop below.
 fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error> {
     if dir.is_absolute() {
         return Ok(normalize(dir));
@@ -685,8 +700,18 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
             source,
         )
     })?;
-    let cwd = canonicalize_cwd(&cwd)?;
-    let joined = normalize(&cwd.join(dir));
+    let mut anchor = canonicalize_cwd(&cwd)?;
+    // A leading `..` consumes a component of `anchor`, which holds no symlink, so collapsing it is
+    // exact. It is the only `..` that is: a later one follows a component the user named, which
+    // may be a symlink.
+    let mut rest = dir
+        .components()
+        .filter(|c| *c != std::path::Component::CurDir)
+        .peekable();
+    while rest.next_if(|c| *c == std::path::Component::ParentDir).is_some() {
+        anchor.pop();
+    }
+    let joined = normalize(&anchor.join(rest.collect::<PathBuf>()));
     // The fallback below resolves `..` lexically, on this path only: `normalize` leaves `..`
     // alone (wrong with symlinks), but `GetFullPathNameW` collapses it lexically, and goetia must
     // agree with other Windows tools.
@@ -816,15 +841,29 @@ pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
 }
 
 /// The values the field rules read, as the caller holds them: authored text, or a finished
-/// daemon's fields. Paths are [`Path`]s so one function takes both.
-struct FieldValues<'a> {
-    name: &'a str,
+/// daemon's fields. Paths are [`Path`]s so one function takes both. The systemd rules read the same
+/// bundle (`backend`).
+pub(super) struct FieldValues<'a> {
+    pub(super) name: &'a str,
     /// `None` only while authored: the manifest may leave `command` to a native override.
-    command: Option<&'a [String]>,
-    cwd: Option<&'a Path>,
-    logs: Option<&'a Path>,
-    env: &'a BTreeMap<String, String>,
-    user: &'a User,
+    pub(super) command: Option<&'a [String]>,
+    pub(super) cwd: Option<&'a Path>,
+    pub(super) logs: Option<&'a Path>,
+    pub(super) env: &'a BTreeMap<String, String>,
+    pub(super) user: &'a User,
+}
+
+impl FieldValues<'_> {
+    /// The path `field` holds (`command[0]`, `cwd` or `logs`), or `None` for another field or an
+    /// absent value.
+    pub(super) fn path(&self, field: &Field) -> Option<&Path> {
+        match field {
+            Field::Command(0) => self.command?.first().map(Path::new),
+            Field::Cwd => self.cwd,
+            Field::Logs => self.logs,
+            _ => None,
+        }
+    }
 }
 
 /// Which values [`check_field_values`] is reading. Three rules depend on it, each because the

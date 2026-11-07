@@ -1096,6 +1096,32 @@ fn a_relative_manifest_directory_resolves_against_the_canonical_working_director
 }
 
 #[skuld::test]
+fn the_leading_parent_dirs_of_a_relative_manifest_directory_collapse_against_the_working_directory() {
+    let cwd = canonical_cwd();
+    let mut warnings = Vec::new();
+    let one = absolutize(Path::new("../app"), &mut warnings).expect("resolves");
+    assert_eq!(one, cwd.parent().expect("the test runs below a root").join("app"));
+
+    // One component of the working directory per `..`, `.` between them ignored.
+    let two = absolutize(Path::new("../.././app"), &mut warnings).expect("resolves");
+    let grand = cwd
+        .parent()
+        .and_then(Path::parent)
+        .expect("the test runs two below a root");
+    assert_eq!(two, grand.join("app"));
+
+    let bare = absolutize(Path::new(".."), &mut warnings).expect("resolves");
+    assert_eq!(bare, cwd.parent().expect("parent"));
+}
+
+#[skuld::test]
+fn a_parent_dir_after_a_named_component_of_a_manifest_directory_is_kept() {
+    let mut warnings = Vec::new();
+    let resolved = absolutize(Path::new("a/../b"), &mut warnings).expect("resolves");
+    assert_eq!(resolved, canonical_cwd().join("a").join("..").join("b"));
+}
+
+#[skuld::test]
 fn an_authored_base_dir_is_not_canonicalised(#[fixture(temp_dir)] dir: &Path) {
     // The guard on the deduced/authored line: an absolute `-f` pointing
     // through a symlinked directory must resolve to the path as written,
@@ -2673,4 +2699,103 @@ fn a_parent_dir_in_command_zero_is_accepted_by_a_systemd_host() {
     // systemd runs `/bin/../bin/frpc`.
     let yaml = systemd_manifest(&format!("command: ['{}/../bin/frpc']", slash_abs("opt")));
     resolve_yaml_as(BackendKind::Systemd, &yaml).expect("resolves");
+}
+
+// A manifest directory's own defects, on systemd ======================================================================
+
+#[skuld::test]
+fn a_leading_parent_dir_of_a_relative_manifest_directory_is_accepted_by_a_systemd_host() {
+    let yaml = systemd_manifest("cwd: .");
+    let (spec, _) = resolve_as(parse_manifest(&yaml), Path::new("../app"), Some(BackendKind::Systemd))
+        .expect("`-f ../app` resolves without a `..`");
+    let expected = canonical_cwd().parent().expect("parent").join("app");
+    assert_eq!(spec.cwd, Some(expected));
+}
+
+#[skuld::test]
+fn a_parent_dir_after_a_named_component_of_dash_f_is_refused_by_a_systemd_host_naming_dash_f() {
+    let yaml = systemd_manifest("cwd: .");
+    let msg = resolve_as(parse_manifest(&yaml), Path::new("a/../b"), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("`-f") && msg.contains("`cwd`") && msg.contains("`..`"),
+        "{msg}"
+    );
+    resolve_as(parse_manifest(&yaml), Path::new("a/../b"), Some(BackendKind::Scm)).expect("only systemd refuses");
+}
+
+#[skuld::test]
+fn a_backslash_in_dash_f_is_blamed_on_dash_f_when_command_zero_is_relative() {
+    let dir = abs(r"a\b");
+    for yaml in [
+        "id: frpc
+command: [bin/frpc]
+",
+        "id: frpc
+backend-specific:
+  systemd:
+    command: [bin/frpc]
+",
+    ] {
+        let msg = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Systemd))
+            .expect_err(yaml)
+            .to_string();
+        assert!(
+            msg.contains("`command[0]`") && msg.contains("`-f ") && msg.contains("backslash"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("backend-specific"),
+            "the override did not write it: {msg}"
+        );
+    }
+    let yaml = "id: frpc
+command: [bin/frpc]
+";
+    resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Launchd)).expect("only systemd refuses");
+}
+
+#[skuld::test]
+fn a_backslash_the_field_wrote_in_a_relative_command_zero_is_the_fields() {
+    let yaml = systemd_manifest(r"command: ['bin\frpc']");
+    let msg = resolve_as(parse_manifest(&yaml), &abs("base"), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
+}
+
+#[skuld::test]
+fn edge_whitespace_in_dash_f_is_blamed_on_dash_f_for_cwd_and_logs() {
+    let dir = abs("a ");
+    for field in ["cwd", "logs"] {
+        let yaml = systemd_manifest(&format!("{field}: ."));
+        let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+            .expect_err(field)
+            .to_string();
+        assert!(
+            msg.contains("`-f ") && msg.contains(&format!("`{field}`")) && msg.contains("whitespace"),
+            "{field}: {msg}"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_absolute_field_that_spells_the_manifest_directorys_prefix_is_the_fields_to_blame() {
+    // `-f` holds a `..`, and so does the absolute `cwd`, which merely starts with the same text.
+    let dir = base_dir().join("..").join("x");
+    let cwd = slash_abs("base/../x/y");
+    let yaml = systemd_manifest(&format!("cwd: '{cwd}'"));
+    let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("`cwd`") && !msg.contains("`-f "), "{msg}");
+
+    // Absolute with only the directory's prefix, whose whitespace is the directory's text too.
+    let dir = abs("a ");
+    let yaml = systemd_manifest(&format!("cwd: '{}'", slash_abs("a ")));
+    let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("WorkingDirectory=") && !msg.contains("`-f "), "{msg}");
 }

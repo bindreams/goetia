@@ -80,6 +80,7 @@ fn shaped_spec() -> ShapedSpec {
         restart_delay: Shaped::Absent,
         logs: None,
         kind: Shaped::Absent,
+        authored: Default::default(),
     }
 }
 

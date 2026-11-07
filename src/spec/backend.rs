@@ -43,7 +43,7 @@ use serde::Deserialize;
 use super::field::Field;
 use super::interpolate::Substitution;
 use super::overrides::Supplied;
-use super::resolve::{Refused, invalid};
+use super::resolve::{FieldValues, Refused, invalid, is_under_manifest_dir};
 use super::vars::is_valid_name;
 use super::{AccountId, DaemonSpec, Id, Kind, Restart, User, Warning};
 use crate::error::Error;
@@ -154,6 +154,29 @@ pub(crate) struct ShapedSpec {
     pub(crate) restart_delay: Shaped<Duration>,
     pub(crate) logs: Option<PathBuf>,
     pub(crate) kind: Shaped<Kind>,
+    /// The text of `command[0]`, `cwd` and `logs` before they were joined to the manifest directory.
+    pub(crate) authored: AuthoredPaths,
+}
+
+/// The text of the three paths `resolve` joins to the manifest directory, as the manifest wrote them
+/// (after substitution): `None` for a field that is absent. Which defect of a joined path is the
+/// directory's is decided against it.
+#[derive(Debug, Default)]
+pub(crate) struct AuthoredPaths {
+    pub(super) command0: Option<String>,
+    pub(super) cwd: Option<String>,
+    pub(super) logs: Option<String>,
+}
+
+impl AuthoredPaths {
+    fn get(&self, field: &Field) -> Option<&str> {
+        match field {
+            Field::Command(0) => self.command0.as_deref(),
+            Field::Cwd => self.cwd.as_deref(),
+            Field::Logs => self.logs.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 // Advisories and rejections ===========================================================================================
@@ -182,22 +205,7 @@ impl BackendKind {
     /// refuses too.
     pub(super) fn refuse(self, spec: &ShapedSpec, base_dir: &Path) -> Result<(), Refused> {
         match self {
-            BackendKind::Systemd => {
-                if let Some(refused) = systemd_parent_dir_from(spec, base_dir) {
-                    return Err(refused);
-                }
-                let defect = systemd_defect_at(
-                    &spec.name,
-                    spec.command.as_deref(),
-                    spec.cwd.as_deref(),
-                    spec.logs.as_deref(),
-                    &spec.env,
-                );
-                match defect {
-                    Some((field, defect)) => Err(Refused::at(field, invalid(&spec.id, &defect))),
-                    None => Ok(()),
-                }
-            }
+            BackendKind::Systemd => systemd_refusal(spec, base_dir),
             BackendKind::Launchd | BackendKind::Scm => Ok(()),
         }
     }
@@ -243,66 +251,83 @@ impl BackendKind {
 // by the generator, which a `DaemonSpec` from a blob reaches without resolve. One predicate per rule,
 // measured on 242 and 255.
 
-/// The first value of the manifest that systemd cannot carry, with the field it belongs to and why.
-/// `command` is `None` while a native override may still supply it.
+/// The first value of `values` that systemd cannot carry, with the field it belongs to and why.
+/// `values.command` is `None` at resolve while a native override may still supply it: a missing
+/// `command` has no defect here, and `require_complete` reports it once the spec is complete.
 ///
-/// - `command[0]`: see [`systemd_executable_defect`].
+/// - `command[0]`, `cwd` and `logs`: see [`systemd_path_field_defect`].
 /// - An `env` key outside `[A-Za-z_][A-Za-z0-9_]*`: systemd logs "Invalid environment assignment,
 ///   ignoring" and drops it, and the unit still loads and starts.
-/// - `name`, `cwd` and `logs`: see [`systemd_raw_value_defect`], and for a path
-///   [`systemd_path_defect`].
-fn systemd_defect_at(
-    name: &str,
-    command: Option<&[String]>,
-    cwd: Option<&Path>,
-    logs: Option<&Path>,
-    env: &BTreeMap<String, String>,
-) -> Option<(Field, String)> {
-    if let Some(defect) = command
-        .and_then(<[String]>::first)
-        .and_then(|e| systemd_executable_defect(e))
-    {
+/// - `name`: see [`systemd_raw_value_defect`].
+fn systemd_defect_at(values: &FieldValues) -> Option<(Field, String)> {
+    let executable = values.command.and_then(<[String]>::first);
+    if let Some(defect) = executable.and_then(|e| systemd_path_field_defect(&Field::Command(0), e)) {
         return Some((Field::Command(0), defect));
     }
-    if let Some(key) = env.keys().find(|key| !is_valid_name(key)) {
+    if let Some(key) = values.env.keys().find(|key| !is_valid_name(key)) {
         let defect = format!(
-            "`env` key {key:?} is not a name systemd accepts in Environment=: it must match \
-            [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the \
-            daemon would never see it"
+            "`env` key {key:?} is not a name systemd accepts in Environment=: it must match             [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the             daemon would never see it"
         );
         return Some((Field::EnvKey(key.as_str().into()), defect));
     }
-    if let Some(defect) = systemd_raw_value_defect("Description=", name) {
+    if let Some(defect) = systemd_raw_value_defect("Description=", values.name) {
         return Some((Field::Name, defect));
     }
-    let paths = [
-        (Field::Cwd, SYSTEMD_WORKING_DIRECTORY, cwd),
-        (Field::Logs, SYSTEMD_LOG_PATH, logs),
-    ];
-    for (field, directive, path) in paths {
-        if let Some(defect) = path.and_then(|path| systemd_path_defect(&field.path(), directive, path)) {
-            return Some((field, defect));
-        }
-    }
-    None
+    [Field::Cwd, Field::Logs].into_iter().find_map(|field| {
+        let text = values.path(&field)?.to_string_lossy();
+        let defect = systemd_path_field_defect(&field, &text)?;
+        Some((field, defect))
+    })
 }
 
 /// [`systemd_defect_at`] for a finished daemon, without the field: the generator's check.
 pub(crate) fn systemd_defect(spec: &DaemonSpec) -> Option<String> {
-    systemd_defect_at(
-        &spec.name,
-        Some(&spec.command),
-        spec.cwd.as_deref(),
-        spec.logs.as_deref(),
-        &spec.env,
-    )
-    .map(|(_, defect)| defect)
+    let values = FieldValues {
+        name: &spec.name,
+        command: Some(&spec.command),
+        cwd: spec.cwd.as_deref(),
+        logs: spec.logs.as_deref(),
+        env: &spec.env,
+        user: &spec.user,
+    };
+    systemd_defect_at(&values).map(|(_, defect)| defect)
 }
 
-/// `WorkingDirectory=`, as a message names it.
-const SYSTEMD_WORKING_DIRECTORY: &str = "WorkingDirectory=";
-/// The `append:` path of `StandardOutput=` and `StandardError=`, as a message names it.
-const SYSTEMD_LOG_PATH: &str = "StandardOutput=/StandardError= append:";
+/// The refusal for the native systemd backend, or `Ok`: the first value [`systemd_defect_at`] finds
+/// in `spec`.
+///
+/// A defect of a joined path that the authored text of its field does not have alone is the
+/// manifest directory's (`-f`), not the field's: it is blamed on `-f` and carries no field.
+/// Provenance is the authoring, never a prefix: an absolute field that spells the same text as
+/// the directory wrote it, so it is the field's. A drive-relative path (`C:bin`) is not joined to
+/// the directory ([`is_under_manifest_dir`]), so its defect is the field's too.
+fn systemd_refusal(spec: &ShapedSpec, base_dir: &Path) -> Result<(), Refused> {
+    let values = FieldValues {
+        name: &spec.name,
+        command: spec.command.as_deref(),
+        cwd: spec.cwd.as_deref(),
+        logs: spec.logs.as_deref(),
+        env: &spec.env,
+        user: &spec.user,
+    };
+    let Some((field, defect)) = systemd_defect_at(&values) else {
+        return Ok(());
+    };
+    let from_directory = spec.authored.get(&field).is_some_and(|text| {
+        is_under_manifest_dir(Path::new(text)) && systemd_path_field_defect(&field, text).is_none()
+    });
+    if !from_directory {
+        return Err(Refused::at(field, invalid(&spec.id, &defect)));
+    }
+    let resolved = values.path(&field).map(|path| path.display().to_string());
+    let message = format!(
+        "`{}` resolves to `{}`, which systemd cannot carry, and the manifest directory `-f {}` is to blame:          {defect}. Pass `-f` a path that does not cause it",
+        field.path(),
+        resolved.unwrap_or_default(),
+        base_dir.display(),
+    );
+    Err(Refused::of_manifest_dir(invalid(&spec.id, &message)))
+}
 
 /// The characters systemd's line reader strips from both ends of a raw value: space, tab, LF, CR.
 /// VT, FF and Unicode whitespace survive.
@@ -342,48 +367,28 @@ pub(crate) fn systemd_raw_value_defect(directive: &str, value: &str) -> Option<S
     })
 }
 
-/// Why systemd cannot carry the path `field` (`cwd` or `logs`) written to `directive`, or `None`: a
-/// `..` component (systemd refuses a non-normalized path in `WorkingDirectory=` and
-/// `StandardOutput=append:` on 242; on 255 it silently ignores the `append:` one), or
-/// [`systemd_raw_value_defect`].
-fn systemd_path_defect(field: &str, directive: &str, path: &Path) -> Option<String> {
-    if has_parent_dir(path) {
+/// Why systemd cannot carry `text` as the path of `field`, or `None`. The one place that names the
+/// directive a field is written to.
+///
+/// - `command[0]`: see [`systemd_executable_defect`].
+/// - `cwd` (`WorkingDirectory=`) and `logs` (the `append:` path of `StandardOutput=` and
+///   `StandardError=`): a `..` component (systemd 242 refuses a non-normalized path in both; 255
+///   silently ignores the `append:` one), or [`systemd_raw_value_defect`].
+/// - Any other field: none.
+fn systemd_path_field_defect(field: &Field, text: &str) -> Option<String> {
+    let directive = match field {
+        Field::Command(0) => return systemd_executable_defect(text),
+        Field::Cwd => "WorkingDirectory=",
+        Field::Logs => "StandardOutput=/StandardError= append:",
+        _ => return None,
+    };
+    if Path::new(text).components().any(|c| c == Component::ParentDir) {
         return Some(format!(
-            "`{field}` {path:?} holds a `..`, and systemd refuses a non-normalized path in {directive}: write \
-             the path without it"
+            "`{}` {text:?} holds a `..`, and systemd refuses a non-normalized path in {directive}",
+            field.path()
         ));
     }
-    systemd_raw_value_defect(directive, &path.display().to_string())
-}
-
-fn has_parent_dir(path: &Path) -> bool {
-    path.components().any(|c| c == Component::ParentDir)
-}
-
-/// The refusal for a `cwd` or `logs` whose `..` is all the manifest directory's (`-f`), which no
-/// field wrote; `None` for any other path. It carries no field, like every defect of the directory.
-fn systemd_parent_dir_from(spec: &ShapedSpec, base_dir: &Path) -> Option<Refused> {
-    if !has_parent_dir(base_dir) {
-        return None;
-    }
-    let paths = [
-        (Field::Cwd, SYSTEMD_WORKING_DIRECTORY, spec.cwd.as_deref()),
-        (Field::Logs, SYSTEMD_LOG_PATH, spec.logs.as_deref()),
-    ];
-    paths.into_iter().find_map(|(field, directive, path)| {
-        let path = path?;
-        path.strip_prefix(base_dir).ok().filter(|rest| !has_parent_dir(rest))?;
-        let message = format!(
-            "`{}` resolves to {path:?}, whose `..` comes from the manifest directory `-f {}`, and systemd \
-             refuses a non-normalized path in {directive}: pass `-f` without `..`",
-            field.path(),
-            base_dir.display()
-        );
-        Some(Refused {
-            field: None,
-            err: invalid(&spec.id, &message),
-        })
-    })
+    systemd_raw_value_defect(directive, text)
 }
 
 /// `type: managed` on Windows has no working-directory or stdout-capture
