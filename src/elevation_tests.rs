@@ -90,6 +90,7 @@ fn the_process_token_answers_as_its_copy_does() {
 }
 
 /// Opening SCM with `ALL_ACCESS` needs Administrators enabled, so a process that can has them.
+#[cfg(feature = "cli")]
 #[skuld::test]
 fn a_process_that_opens_scm_with_all_access_has_administrators_enabled() {
     if is_elevated() {

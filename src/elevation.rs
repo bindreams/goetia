@@ -1,8 +1,8 @@
-//! What the library asks of the caller's authority on Windows, which it needs as well as the CLI:
-//! it is not behind the `cli` feature. Two questions, which an unelevated administrator answers
-//! the same way and which differ for other tokens:
-//! - [`is_elevated`], a capability: can this process open SCM with every right.
-//! - [`token_has_administrators`], a fact about the token: is Administrators enabled in it.
+//! What goetia asks of the caller's authority on Windows. Two questions, which an unelevated
+//! administrator answers the same way and which differ for other tokens:
+//! - `is_elevated`, a capability the CLI asks: can this process open SCM with every right.
+//! - [`token_has_administrators`], a fact about the token that the library needs, `cli` feature or
+//!   not: is Administrators enabled in it.
 
 use std::io;
 
@@ -19,7 +19,8 @@ use crate::backend::scm::shim::acl::administrators;
 /// `tests/support/mod.rs`'s `elevated()` precondition already uses. What a
 /// token that has Administrators enabled but is refused SCM (a policy,
 /// a different SCM security descriptor) is told is that it is not elevated;
-/// whether the token has Administrators is [`token_has_administrators`].
+/// whether the token has Administrators is [`token_has_administrators`]. Only the CLI asks.
+#[cfg(feature = "cli")]
 pub fn is_elevated() -> bool {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 

@@ -140,6 +140,7 @@ mod windows {
         );
     }
 
+    #[cfg(feature = "cli")]
     #[skuld::test]
     fn sibling_missing_names_the_path() {
         let beside = std::env::current_exe().unwrap().with_file_name("goetia-shim.exe");

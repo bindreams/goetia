@@ -40,7 +40,7 @@ pub(crate) fn shim_file(name: &str) -> Option<ShimFile> {
 
 #[cfg(windows)]
 pub use stock::EmbeddedStockShim;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "cli"))]
 pub(crate) use stock::SiblingStockShim;
 #[cfg(windows)]
 pub(in crate::backend::scm) use stock::default_dir;
@@ -142,9 +142,12 @@ mod stock {
     }
 
     /// The stock shim from `goetia-shim.exe` beside the running executable, into the default folder.
-    /// The file is read and hashed on every call, since it can change between two.
+    /// The file is read and hashed on every call, since it can change between two. Only the CLI
+    /// provides it.
+    #[cfg(feature = "cli")]
     pub(crate) struct SiblingStockShim;
 
+    #[cfg(feature = "cli")]
     impl SiblingStockShim {
         pub(crate) fn new() -> Self {
             Self
@@ -161,6 +164,7 @@ mod stock {
         }
     }
 
+    #[cfg(feature = "cli")]
     impl ShimProvider for SiblingStockShim {
         fn preview(&self) -> Result<HostCommand> {
             let bytes = self.read()?;
