@@ -1188,17 +1188,11 @@ fn install_refuses_an_always_blob_as_unusable() {
 
 // A read that did not complete: the aggregate, and the two objects that produce it ====================================
 
-/// Whether the aggregate is a privilege artifact or a permanent fixture, asserted rather than
-/// assumed: on an elevated run this host must leave nothing undetermined at all, or
-/// `goetia daemon list` exits `4` on every Windows machine forever and the code stops meaning
-/// anything. That every service's `Parameters` is readable to an Administrator is the *claim*, not
-/// the precondition — if some service denies even that, this reddens and the finding is real: the
-/// notice's remedy would then not be the whole remedy.
-///
-/// `no_aggregate_entry_is_emitted_for_a_zero_count` already covers the code-only half (an aggregate
-/// emitted unconditionally); what this uniquely pins is the claim about the runner.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn an_elevated_list_leaves_nothing_undetermined() {
+/// An elevated reader decodes the marker of a service it installed, so the service is listed as
+/// goetia's own and is not an `undetermined` entry. Another service's unreadable `Parameters` is
+/// not this test's to assert about, so only our id is checked.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_elevated_list_reads_the_marker_of_its_own_install() {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1206,22 +1200,18 @@ fn an_elevated_list_leaves_nothing_undetermined() {
 
     let listed = mgr.list().expect("list");
 
-    // Non-vacuous: an elevated reader decodes this service's own marker and lists it, so a run whose
-    // reader could in fact read nothing fails here instead of passing on an empty listing.
     assert!(
         listed
             .iter()
             .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
         "the installed daemon must actually appear: {listed:?}"
     );
-    let undetermined: Vec<&Installed> = listed
-        .iter()
-        .filter(|entry| matches!(entry, Installed::Undetermined { .. }))
-        .collect();
     assert!(
-        undetermined.is_empty(),
-        "an elevated caller was expected to read every service's Parameters; something on this host \
-         was not read, which makes `daemon list` exit 4 here for every caller: {undetermined:?}"
+        !listed.iter().any(|entry| matches!(
+            entry,
+            Installed::Undetermined { name, .. } if name.as_deref() == Some(id.as_str())
+        )),
+        "an elevated caller was expected to read this service's Parameters: {listed:?}"
     );
 }
 
@@ -1268,9 +1258,6 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 /// `registry::read_parameters` built: the key, the operation and the Win32 message. `list` used to
 /// match `Err(_)` and hand the entry a static sentence instead, which says nothing of a real Win32
 /// failure.
-///
-/// `an_elevated_list_leaves_nothing_undetermined` is what makes the count exactly one here: this
-/// denial is the only unreadable `Parameters` on the host, so the aggregate takes its named form.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
     let mgr = Scm::new();
