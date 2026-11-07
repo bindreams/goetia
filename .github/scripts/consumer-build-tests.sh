@@ -217,8 +217,6 @@ goetia_routes() {
     install_root="$work/inst"
 
     cd "$repo"
-    cargo fetch --locked
-    export CARGO_NET_OFFLINE=true
 
     # The two-stage build.
     cargo build --bin goetia-shim --locked
@@ -234,5 +232,11 @@ goetia_routes() {
 }
 
 mkdir -p "$work"
+
+# goetia's own dependencies, fetched while the network is still on: `consumer_routes` goes offline
+# and the setting persists into `goetia_routes`.
+cd "$repo"
+cargo fetch --locked
+
 consumer_routes
 goetia_routes

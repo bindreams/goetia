@@ -709,6 +709,119 @@ it. If the plist is taken or removed after `install` has read launchd's state
 but before it has sent anything, `install` exits `1`: no plist was written and
 nothing was sent, and a rerun starts afresh.
 
+## The service host on Windows
+
+On Windows a `type: simple` daemon runs under a service host, goetia's shim
+(`goetia-shim`), which hands itself to SCM and runs your command. A
+`type: managed` daemon speaks to SCM itself and never touches the shim.
+
+`install` places the shim at `%ProgramFiles%\Goetia\goetia-shim-<sha256>.exe`,
+named by the SHA-256 of its contents, and registers that path. The file is
+created with a protected DACL: SYSTEM and Administrators have full control,
+Everyone read and execute. `install` refuses, before writing anything, if
+an account other than SYSTEM, Administrators or TrustedInstaller owns the folder
+or any ancestor, or can change its permissions or owner, rename it, or delete
+files in it. Every `type: simple` install verifies the file against its
+name and repairs it, also when the service is already up to date. Goetia
+versions on one machine each register their own file, and none deletes a file
+another service still uses.
+
+Where the bytes come from depends on the build:
+
+- The `goetia.exe` of a release embeds the shim, and the archive ships
+  `goetia.exe` alone: a lone copy installs `type: simple` daemons.
+- `cargo install goetia` installs `goetia.exe` and `goetia-shim.exe`, and
+  `goetia.exe` reads the one beside it. If that file is missing, `install` and
+  `install --dry-run` fail naming its path.
+
+`uninstall` of a `type: simple` daemon waits, with no time limit, for the shim
+process to exit, deletes the service, and deletes every `goetia-shim-*.exe`
+that no remaining service references, and the folder when it is then empty. If
+a file cannot be deleted, `uninstall` exits non-zero naming each failure: the
+service is already deleted, and re-running `goetia daemon uninstall <id>`
+sweeps again. That also holds for an id that is not installed: it sweeps, then
+reports "nothing to do" (exit `0`) when the sweep succeeded.
+
+### Shipping the shim from a library
+
+A program that links goetia and installs `type: simple` daemons through
+`goetia::backend::scm::manager::Scm` supplies the host itself, through a
+provider given to `Scm::with_shim`. `Scm::new()` has none: installing a
+`type: simple` daemon through it fails with "no shim provider configured",
+while `status`, `list`, `type: managed` installs and `uninstall` work.
+`CheckPermissions::Disable` turns off only the folder check; the marker check,
+which requires the file to contain goetia's host code of the same version as
+the library, and the file verification always run.
+
+Any program that ships a stock shim adds one file, `src/bin/goetia-shim.rs`:
+
+```rust
+goetia::stock_shim!();
+```
+
+and chooses how it reaches the machine.
+
+**Installer places the file.** The installer puts `goetia-shim.exe` in the
+product folder, and the program points goetia at it:
+
+```rust
+Scm::with_shim(
+    StandaloneShim::new(product_dir.join("goetia-shim.exe"), vec![]),
+    CheckPermissions::Enable,
+)
+```
+
+**A single executable.** The program embeds the shim and goetia places it under
+Program Files (`EmbeddedStockShim::new(bytes, Some(dir))` picks another
+folder). In `Cargo.toml`, declare the feature:
+
+```toml
+[features]
+goetia-shim = []
+```
+
+then build in two stages: the shim, then the program with the feature on and
+`GOETIA_SHIM_EXE` the **absolute** path of the built shim (`include_bytes!`
+resolves a relative one against the source file). Stage 2 builds the program
+target alone:
+
+```sh
+cargo build --release --bin goetia-shim
+GOETIA_SHIM_EXE=/abs/path/target/release/goetia-shim.exe \
+    cargo build --release --bin app --features goetia-shim
+```
+
+```rust
+Scm::with_shim(
+    EmbeddedStockShim::new(goetia::embed_shim!(), None),
+    CheckPermissions::Enable,
+)
+```
+
+Expand `embed_shim!()` in the binary crate, never in a library the shim binary
+links. Without the feature the program still builds and type-checks with no
+variable set, and installing a `type: simple` daemon fails with "built without
+a stock shim". With the feature on and the variable unset, the build fails.
+
+**The program is the service.** The program's own `main` hands over to the shim
+when it is started as the host:
+
+```rust
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--service-host") {
+        goetia::shim::main()
+    }
+    // ...
+}
+
+Scm::with_shim(
+    StandaloneShim::new(std::env::current_exe()?, vec!["--service-host".into()]),
+    CheckPermissions::Enable,
+)
+```
+
+Any other source of the shim implements `goetia::shim::ShimProvider`.
+
 ## Waiting for a start or stop
 
 `daemon start`, `daemon stop`, `daemon restart` and `daemon install --start`
@@ -792,6 +905,11 @@ shim existed have no recovery actions until then, so the new shim runs them but
 SCM does not restart them. On every start, the shim logs one warning when it
 starts under a service that a different goetia version registered and
 `restart` is not `never`.
+
+A `type: simple` daemon installed by goetia 0.2.x runs the `goetia-shim.exe`
+that sat beside `goetia.exe`, not the shim under `%ProgramFiles%\Goetia`
+([above](#the-service-host-on-windows)). Run `goetia daemon uninstall <id>` and
+then `goetia daemon install` for each.
 
 The shim writes its own failures and warnings to the daemon's log once it has
 read the daemon's config, so they appear among the daemon's output. Before
