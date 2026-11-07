@@ -417,19 +417,31 @@ fn an_executable_path_without_a_dollar_gets_no_separate_argv0() {
 }
 
 #[skuld::test]
-fn argv_command_prefix_character_on_the_executable_is_quoted() {
-    // A leading `-`/`@`/`:`/`+`/`!` on ExecStart='s first word is a
-    // systemd command-prefix directive (e.g. `+` runs with elevated
-    // privileges, bypassing `User=`) — a plain executable path that
-    // happens to start with one must not be reinterpreted as it.
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec!["+not-a-privilege-directive".to_string()];
-    let spec = DaemonSpec::new(spec).unwrap();
+fn a_command_prefix_character_on_the_executable_is_refused_because_quoting_does_not_neutralise_it() {
+    // systemd reads a leading `-`/`@`/`:`/`+`/`!` of the first word as a command prefix after
+    // unquoting (measured on 242 and 255: `ExecStart="+/x"` still runs as root, ignoring `User=`),
+    // so no encoding writes such an executable literally.
+    for executable in ["+svc", "+svc$x", "-svc", "@svc", ":svc", "!svc"] {
+        let spec = with_fields(|f| f.command = vec![executable.to_string()]);
+        let err = unit(&spec, &minimal_identity()).unwrap_err();
+        let Error::Invalid { daemon, message, .. } = &err else {
+            panic!("{executable:?}: expected Error::Invalid, got {err:?}");
+        };
+        assert_eq!(daemon, "frpc");
+        assert!(
+            message.contains(&format!("{executable:?}")),
+            "{executable:?}: {message}"
+        );
+        assert!(message.contains("`command[0]`"), "{executable:?}: {message}");
+        assert!(message.contains("command prefix"), "{executable:?}: {message}");
+        assert!(message.contains("systemd"), "{executable:?}: {message}");
+    }
+}
 
-    let text = unit(&spec, &minimal_identity()).unwrap();
-
-    let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
-    assert_eq!(exec_start_line, "ExecStart=\"+not-a-privilege-directive\"");
+#[skuld::test]
+fn a_prefix_character_inside_the_executable_is_not_refused() {
+    let spec = with_fields(|f| f.command = vec!["/opt/a-b@c:d+e!f/bin".to_string()]);
+    assert!(unit(&spec, &minimal_identity()).is_ok());
 }
 
 #[skuld::test]

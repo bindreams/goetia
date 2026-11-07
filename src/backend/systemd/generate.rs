@@ -10,9 +10,9 @@
 //! contain whitespace or a quoting-relevant character; `ExecStart=`
 //! further doubles `$` in its arguments (systemd performs `$FOO`/`${FOO}` environment
 //! substitution there, but not in the executable path; it does in argv[0], so a path holding `$`
-//! is written `@<path> <argv[0]>`), quotes a bare `;` argument (systemd's
-//! command-line separator), and quotes `command[0]` if it would otherwise
-//! start with one of systemd's command-prefix characters (`-@:+!`).
+//! is written `@<path> <argv[0]>`), and quotes a bare `;` argument (systemd's
+//! command-line separator). A `command[0]` starting with one of systemd's command-prefix
+//! characters (`-@:+!`) is refused: quoting does not make the character literal.
 //!
 //! Backslashes are never refused: a quoted word doubles each, and a raw value ending in an odd
 //! run of them gets a trailing space (see [`raw_value`]). The values no encoding can carry are
@@ -106,6 +106,9 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
 /// - The executable path of `ExecStart=` (after unquoting and specifiers) holding a backslash,
 ///   `"` or `'`: systemd refuses the whole unit with "Executable name contains special
 ///   characters", however the word was quoted. Later arguments take all three.
+/// - An executable path starting with `-`, `@`, `:`, `+` or `!`: systemd reads that character as a
+///   command prefix after unquoting (`+` runs the daemon as root, ignoring `User=`), so quoting
+///   does not make it literal (measured on 242 and 255, all five characters).
 /// - An executable path ending in a space: systemd 255 keeps the path but the service exits with
 ///   203/EXEC (242 runs it; both are refused). Interior spaces, other trailing whitespace and
 ///   later arguments are fine.
@@ -127,6 +130,13 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
             "the executable path {executable:?} (`command[0]`) \
              holds a backslash, double quote or apostrophe, which systemd refuses to load in an \
              executable path"
+        )));
+    }
+    if executable.starts_with(COMMAND_PREFIXES) {
+        return Err(invalid(format!(
+            "the executable path {executable:?} (`command[0]`) \
+             starts with a character systemd reads as a command prefix (`-`, `@`, `:`, `+` or `!`), \
+             even when quoted; `+` would run the daemon as root, ignoring `User=`"
         )));
     }
     if executable.ends_with(' ') {
@@ -163,6 +173,9 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
     Ok(())
 }
 
+/// The characters systemd reads as a prefix of `ExecStart=`'s first word, after unquoting.
+const COMMAND_PREFIXES: [char; 5] = ['-', '@', ':', '+', '!'];
+
 /// The characters systemd's line reader strips from both ends of a raw value: space, tab, LF, CR.
 /// VT, FF and Unicode whitespace survive.
 const STRIPPED_BY_SYSTEMD: [char; 4] = [' ', '\t', '\n', '\r'];
@@ -179,8 +192,8 @@ fn render_restart(restart: Restart) -> &'static str {
 /// Render `ExecStart=`'s value: each word percent-doubled, then quoted per systemd's command-line
 /// syntax wherever quoting is needed for readback (whitespace or a quoting-relevant character),
 /// or wherever an unquoted word would take on a meaning of its own: a bare `;` (systemd's
-/// command-line separator) or, for `command[0]` only, a leading `-`/`@`/`:`/`+`/`!` (systemd's
-/// command-prefix characters, e.g. `+` for elevated-privilege execution).
+/// command-line separator). An executable starting with a command-prefix character never gets
+/// here: `refuse_unrepresentable` refuses it.
 ///
 /// Arguments are also dollar-doubled, since systemd substitutes `$FOO`/`${FOO}` and collapses
 /// `$$` there. The executable path is not: systemd takes it as written. But it substitutes in
@@ -190,24 +203,23 @@ fn render_exec_start(command: &[String]) -> String {
     let (executable, arguments) = command.split_first().expect("a daemon has a command");
     let mut words = Vec::with_capacity(command.len() + 1);
     if executable.contains('$') {
-        words.push(render_exec_word(&double_percent(&format!("@{executable}")), false));
+        words.push(render_exec_word(&double_percent(&format!("@{executable}"))));
         words.push(render_exec_arg(executable));
     } else {
-        words.push(render_exec_word(&double_percent(executable), true));
+        words.push(render_exec_word(&double_percent(executable)));
     }
     words.extend(arguments.iter().map(|arg| render_exec_arg(arg)));
     words.join(" ")
 }
 
 fn render_exec_arg(arg: &str) -> String {
-    render_exec_word(&double_percent(arg).replace('$', "$$"), false)
+    render_exec_word(&double_percent(arg).replace('$', "$$"))
 }
 
-fn render_exec_word(escaped: &str, is_executable: bool) -> String {
+fn render_exec_word(escaped: &str) -> String {
     let is_bare_separator = escaped == ";";
-    let is_command_prefix = is_executable && escaped.starts_with(['-', '@', ':', '+', '!']);
 
-    if needs_quoting(escaped) || is_bare_separator || is_command_prefix {
+    if needs_quoting(escaped) || is_bare_separator {
         quote(escaped)
     } else {
         escaped.to_string()
@@ -218,7 +230,7 @@ fn render_exec_word(escaped: &str, is_executable: bool) -> String {
 /// quoted as a single token so an embedded space cannot split it into two
 /// assignments. `Environment=` is not systemd's command-line grammar, so
 /// unlike `ExecStart=` it gets neither `$`-doubling nor the
-/// separator/prefix-character treatment.
+/// separator treatment.
 fn render_environment(key: &str, value: &str) -> String {
     let escaped = double_percent(&format!("{key}={value}"));
     if needs_quoting(&escaped) {

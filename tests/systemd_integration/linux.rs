@@ -1965,7 +1965,7 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
     let id = support::random_test_id();
-    // Registered first, so it drops last: the service stops before its directory goes.
+    // Creation order: see the module doc of `support::service_guard`.
     let base = std::env::temp_dir().join(format!("{id}-backslashes"));
     let _rm = DirGuard::new(base.clone());
     let guard = ServiceGuard::new(&id);
@@ -2035,25 +2035,27 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
 
 /// systemd takes the executable path as written but substitutes `$FOO`/`${FOO}` and collapses `$$`
 /// in argv[0], so a path holding `$` must run the right file and still hand the daemon its own
-/// path as argv[0].
+/// path as argv[0]. The directory also holds a space and a `%`, which quote and double the word.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn an_executable_path_with_dollars_runs_with_the_path_as_argv0() {
     let id = support::random_test_id();
     let base = std::env::temp_dir().join(format!("{id}-argv0"));
     let _rm = DirGuard::new(base.clone());
     let guard = ServiceGuard::new(&id);
-    let dir = base.join("x${y}$$z$w");
+    let dir = base.join("x${y}$$z$w %q");
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
     let executable = dir.join("sh");
     std::os::unix::fs::symlink("/bin/sh", &executable).expect("symlink");
     let out = base.join("cmdline");
 
     let mut spec = mk(guard.id()).into_fields();
-    // The shell lists its own argv, one per line, into the file named by its last argument.
+    // The shell lists its own argv, one per line, into the file named by its last argument. The
+    // trailing `:` stops dash from exec'ing `tr` in the shell's place (it does that to the last
+    // command of `-c`), which would make `/proc/$$/cmdline` read `tr`'s argv.
     spec.command = vec![
         executable.to_str().unwrap().to_string(),
         "-c".to_string(),
-        "tr '\\000' '\\n' < /proc/$$/cmdline > \"$1\"".to_string(),
+        "tr '\\000' '\\n' < /proc/$$/cmdline > \"$1\"; :".to_string(),
         "sh".to_string(),
         out.to_str().unwrap().to_string(),
     ];

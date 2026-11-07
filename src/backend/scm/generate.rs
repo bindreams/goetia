@@ -244,15 +244,17 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
 /// written as is.
 ///
 /// A `type: managed` executable is `command[0]`; a `type: simple` one is the shim path, which no
-/// manifest sets, so its message names that path and not `command[0]`.
+/// manifest sets, so its message names that path and not `command[0]`. Only `GOETIA_SHIM_PATH` can
+/// make the shim path one the writer rewrites: the default, next to the goetia executable, ends in
+/// `goetia-shim.exe` and NTFS forbids `"`, so the message names that variable.
 fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<(), Error> {
     let text = executable.to_string_lossy();
-    let quote_trigger = WRITER_QUOTE_TRIGGERS.iter().find(|(c, _)| text.contains(*c));
-    let reason = match quote_trigger {
-        Some(('"', trigger)) => format!(
-            "it holds {trigger}, which the Windows service registration writer escapes, and SCM reads the \
-             program name up to the next quote with every backslash literal, so SCM would start a different path"
-        ),
+    let reason = match WRITER_QUOTE_TRIGGERS.iter().find(|(c, _)| text.contains(*c)) {
+        // A `"` is refused whatever else quotes the path, whatever the table's order.
+        _ if text.contains('"') => "it holds a double quote, which the Windows service registration writer escapes, \
+             and SCM reads the program name up to the next quote with every backslash literal, so SCM would \
+             start a different path"
+            .to_string(),
         // An empty path is quoted too, but it ends in no backslash.
         Some((_, trigger)) if text.ends_with('\\') => format!(
             "it holds {trigger}, so the Windows service registration writer wraps it in quotes and doubles the \
@@ -263,7 +265,8 @@ fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<
     let message = match spec.kind {
         Kind::Managed => format!("`command[0]` {text:?} cannot be written into the service registration: {reason}"),
         Kind::Simple => format!(
-            "the configured goetia-shim path {text:?} cannot be written into the service registration: {reason}"
+            "the goetia-shim path {text:?}, set by `GOETIA_SHIM_PATH`, cannot be written into the service \
+             registration: {reason}"
         ),
     };
     Err(Error::Invalid {

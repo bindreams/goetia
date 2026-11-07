@@ -129,7 +129,8 @@ impl Drop for LeftoverLog {
 /// failure lines join once they have read the spec.
 ///
 /// Removed on drop by a [`support::cleanup::DirGuard`]: a daemon may still hold its log while its
-/// service stops. Declare it before the test's [`ShimGuard`]s.
+/// service stops. Declared in creation order, before the [`ShimGuard`]s that use it (see the
+/// module doc of `support::service_guard`).
 pub struct LogDir(support::cleanup::DirGuard);
 
 impl LogDir {
