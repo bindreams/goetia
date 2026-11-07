@@ -32,6 +32,17 @@ const FALLBACK: Names = Names {
     spec: "GoetiaSpec",
 };
 
+/// Returns once `sc query` shows `id` as STOPPED. Each pass re-queries the real state; the process
+/// spawn is the pacing, and nothing bounds the wait.
+fn wait_until_stopped(id: &str) {
+    while !cmd::run("sc.exe", &["query", id])
+        .expect_ok()
+        .stdout
+        .lines()
+        .any(|line| line.trim_start().starts_with("STATE") && line.contains("STOPPED"))
+    {}
+}
+
 // Probe ===============================================================================================================
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -109,6 +120,9 @@ fn scm_parameters_values_survive() {
     started.accept("the probe service to report SERVICE_RUNNING");
     cmd::run("sc.exe", &["stop", guard.id()]).expect_ok();
     stopped.accept("the probe service to handle SERVICE_CONTROL_STOP");
+    // The sentinel reports in before it reports STOPPED, and `sc stop` returns once the control is
+    // accepted: the cycle is over only when SCM itself says so.
+    wait_until_stopped(guard.id());
     check("a start/stop cycle");
 
     // Control: the readback has to be able to come out negative. Without this,

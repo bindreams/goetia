@@ -76,5 +76,5 @@ fn service_main(_scm_arguments: Vec<OsString>) {
     // A real rendezvous with the control handler thread: this returns when
     // SCM delivers the stop, and not before.
     stop_rx.recv().expect("stop control");
-    service_ctrl::report_stopped_after(status_handle, || connect(stop_port));
+    service_ctrl::report_stopped(status_handle, stop_port);
 }

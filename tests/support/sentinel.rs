@@ -70,8 +70,9 @@ pub fn run_if_requested() -> bool {
 
 /// Reporting in is best-effort: a failure to connect is indistinguishable to
 /// this process from never having been started, and it is the test — which
-/// holds the listener — that decides what that means. The failure is logged to
-/// stderr, the fixture's only trace.
+/// holds the listener — that decides what that means. A failure is logged to
+/// stderr, which reaches anyone only where the launcher captures it (an
+/// SCM-launched process, or a launchd job without `StandardErrorPath`, has none).
 pub fn connect(port: u16) {
     drop(open(port));
 }
@@ -79,8 +80,12 @@ pub fn connect(port: u16) {
 /// [`connect`], then send `value` as the payload.
 pub fn send_line(port: u16, value: &str) {
     if let Some(mut stream) = open(port) {
-        log_failure(port, "write", stream.write_all(value.as_bytes()));
-        log_failure(port, "shutdown", stream.shutdown(std::net::Shutdown::Write));
+        let written = stream.write_all(value.as_bytes());
+        let ok = written.is_ok();
+        log_failure(port, "write", written);
+        if ok {
+            log_failure(port, "shutdown", stream.shutdown(std::net::Shutdown::Write));
+        }
     }
 }
 
@@ -94,7 +99,7 @@ fn report_uid(port: u16) {
 }
 
 /// Connect to the test's listener, logging a failure to stderr.
-fn open(port: u16) -> Option<TcpStream> {
+pub fn open(port: u16) -> Option<TcpStream> {
     match TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
         Ok(stream) => Some(stream),
         Err(e) => {
@@ -141,6 +146,6 @@ mod windows {
         // A real rendezvous with the control handler thread: the recv returns
         // when SCM delivers the stop, and not before.
         stop_rx.recv().expect("stop control");
-        service_ctrl::report_stopped_after(status_handle, || super::connect(stop_port));
+        service_ctrl::report_stopped(status_handle, stop_port);
     }
 }

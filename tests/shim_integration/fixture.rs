@@ -32,10 +32,9 @@
 //!   first. A failed connect exits 2.
 
 use std::io::{Read as _, Write as _};
-use std::net::{Ipv4Addr, TcpStream};
 use std::sync::mpsc;
 
-use crate::support::sentinel::{connect, send_line};
+use crate::support::sentinel::{connect, open, send_line};
 
 pub const FIXTURE: &str = "--goetia-shim-fixture";
 
@@ -99,7 +98,7 @@ pub fn run_if_requested() -> bool {
         "exit-on-close" => {
             let port: u16 = args[3].parse().expect("port");
             let code: i32 = args[4].parse().expect("code");
-            let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
+            let Some(mut stream) = open(port) else {
                 std::process::exit(2);
             };
             let mut buf = [0u8; 64];
