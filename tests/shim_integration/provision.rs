@@ -1235,6 +1235,34 @@ fn uninstall_right_after_stop_leaves_no_file() {
     );
 }
 
+/// `stop` that does not wait, then `uninstall` at once: the service may report `STOPPED` with no pid
+/// while its process is still exiting, and then the uninstall holds no process and does not wait for
+/// it. It succeeds whether or not the file is still in use; a file the process still ran is the next
+/// sweep's, once the process has exited.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_right_after_an_unwaited_stop_succeeds_and_the_next_sweep_takes_the_file() {
+    let (_root, folder) = temp_shim_folder();
+    let logs = LogDir::new();
+    let id = support::random_test_id();
+    let _guard = ShimGuard::new(&id);
+    let started = ConnectBack::listen();
+    let mgr = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
+    let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    started.accept("the service to report in");
+    let running = ShimProcess::attach(&id);
+    let file = shim_in(&folder);
+    mgr.stop(&spec.id, Budget::Immediate).expect("request the stop");
+
+    mgr.uninstall(&spec.id).expect("uninstall");
+
+    running.wait_for_exit();
+    let retry = mgr.uninstall(&spec.id);
+    assert!(matches!(retry, Err(Error::NotInstalled { .. })), "{retry:?}");
+    assert!(!file.exists(), "the sweep after the process exited removes it");
+}
+
 /// A service B that was updated to another file and not restarted still runs the first. Uninstalling
 /// A, the last service registered with the first file, does not wait for B's process and leaves it
 /// alone; the file is skipped without an error, as B's image references it.
