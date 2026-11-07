@@ -18,6 +18,8 @@
 #[cfg(windows)]
 mod logging;
 #[cfg(windows)]
+mod os;
+#[cfg(windows)]
 mod service;
 #[cfg(windows)]
 mod stop_bus;

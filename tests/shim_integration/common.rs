@@ -113,7 +113,7 @@ impl Drop for LeftoverLog {
                 Ok(true) => Some(format!("left {}: {why}", self.path.display())),
                 Err(e) => Some(format!("left {}, if it exists ({e}): {why}", self.path.display())),
             },
-            Fate::Remove => support::service_guard::remove_path_retrying(&self.path, false),
+            Fate::Remove => support::cleanup::remove_path_retrying(&self.path, false),
         };
         if let Some(problem) = problem {
             eprintln!("ShimGuard[{}]: {problem}", self.id);
@@ -124,32 +124,25 @@ impl Drop for LeftoverLog {
 /// A temp dir the test owns, for everything its daemons write: their logs, which the shims' own
 /// failure lines join once they have read the spec.
 ///
-/// Removed on drop, retried for [`support::service_guard::CLEANUP_BOUND`] and then let go with a
-/// warning: a daemon may still hold its log while its service stops. Declare it before the test's
-/// [`ShimGuard`]s.
-pub struct LogDir(PathBuf);
+/// Removed on drop by a [`support::cleanup::DirGuard`]: a daemon may still hold its log while its
+/// service stops. Declare it before the test's [`ShimGuard`]s.
+pub struct LogDir(support::cleanup::DirGuard);
 
 impl LogDir {
     pub fn new() -> Self {
-        // `keep` hands the removal to the `Drop` below, which does not ignore a failure.
-        Self(tempfile::tempdir().expect("tempdir for the daemons' logs").keep())
+        // `keep` hands the removal to the `DirGuard`, which does not ignore a failure.
+        Self(support::cleanup::DirGuard::new(
+            tempfile::tempdir().expect("tempdir for the daemons' logs").keep(),
+        ))
     }
 
     pub fn path(&self) -> &Path {
-        &self.0
+        self.0.path()
     }
 
     /// Where the daemon `id` logs: `<dir>/<id>.log`.
     pub fn path_for(&self, id: &str) -> PathBuf {
-        self.0.join(format!("{id}.log"))
-    }
-}
-
-impl Drop for LogDir {
-    fn drop(&mut self) {
-        if let Some(problem) = support::service_guard::remove_path_retrying(&self.0, true) {
-            eprintln!("LogDir: {problem}");
-        }
+        self.0.path().join(format!("{id}.log"))
     }
 }
 
