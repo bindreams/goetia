@@ -64,6 +64,13 @@ pub(crate) trait Backend {
     /// does not resolve).
     fn render(&self, spec: &DaemonSpec) -> Result<Self::Definition>;
 
+    /// [`Self::render`], for the definition an install writes and `diff` previews: also fails where
+    /// the host, not the daemon, cannot carry it. `list` and `status` render every daemon with
+    /// [`Self::render`], which must not fail for the host.
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<Self::Definition> {
+        self.render(spec)
+    }
+
     /// What is at `id`. `Err` where the read did not complete: neither absence nor ownership is
     /// established.
     fn read(&self, id: &Id) -> Result<ReadOutcome<Self::Snapshot>>;
