@@ -8,7 +8,7 @@
 //! judges plain data (SIDs as bytes, masks as `u32`) and is unit-tested on every host; reading the
 //! data and [`FolderCheck`] are Windows-only.
 //!
-//! What is judged, per object, nearest the target first:
+//! What is judged, per object, folders before files and each nearest the target first:
 //! - an untrusted owner refuses (an owner can always change the DACL);
 //! - a NULL DACL refuses (everyone has every right);
 //! - an allow ACE that applies to the object, granting an untrusted account `WRITE_DAC`,
@@ -171,9 +171,12 @@ pub(crate) fn sid_string(sid: &[u8]) -> String {
 
 /// Judges `chain` (the target first, then outward to the volume root) by the rules in the module
 /// documentation. Each object is judged by its own kind: a file by [`FILE_TAMPERING`], a directory
-/// by [`DIRECTORY_TAMPERING`].
+/// by [`DIRECTORY_TAMPERING`]. The folders are judged before any file, since a file inherits what
+/// its folder grants and the folder is what to fix; each kind in the order of `chain`.
 pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsafe> {
-    for object in chain {
+    let folders = chain.iter().filter(|object| object.directory);
+    let files = chain.iter().filter(|object| !object.directory);
+    for object in folders.chain(files) {
         let refuse = |account: &Sid, right: &'static str| Unsafe {
             path: object.path.clone(),
             account: account.clone(),

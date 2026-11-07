@@ -269,6 +269,28 @@ fn a_file_with_a_null_dacl_is_refused() {
     assert_eq!(refused(&chain).right, "do anything to");
 }
 
+/// A file inherits what a doctored folder grants, so both are unsafe for one cause: the folder is
+/// the one to fix, and is what is named.
+#[skuld::test]
+fn an_unsafe_folder_is_reported_before_the_host_file_in_it() {
+    let mut chain = stock_host_chain();
+    chain[0].dacl.as_mut().unwrap().push(allow(users(), FILE_WRITE_DATA, 0));
+    chain[1].dacl.as_mut().unwrap().push(allow(users(), WRITE_DAC, 0));
+    let refusal = refused(&chain);
+    assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia"));
+    assert_eq!(refusal.right, "change permissions of");
+}
+
+#[skuld::test]
+fn a_host_file_is_reported_when_every_folder_is_safe() {
+    let mut chain = stock_host_chain();
+    chain[0].dacl.as_mut().unwrap().push(allow(users(), FILE_WRITE_DATA, 0));
+    assert_eq!(
+        refused(&chain).path,
+        PathBuf::from(r"C:\Program Files\Goetia\goetia-shim.exe")
+    );
+}
+
 /// A link to a file is judged as a file, and so is the file it leads to; the folders on the way are
 /// judged as folders.
 #[skuld::test]
