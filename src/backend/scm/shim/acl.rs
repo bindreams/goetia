@@ -152,9 +152,9 @@ pub(crate) fn sid_text(sid: &[u8]) -> Option<String> {
     } else {
         format!("S-1-{authority:#x}")
     };
-    for sub in sid[8..].chunks_exact(4) {
+    for &sub in sid[8..].as_chunks::<4>().0 {
         text.push('-');
-        text.push_str(&u32::from_le_bytes([sub[0], sub[1], sub[2], sub[3]]).to_string());
+        text.push_str(&u32::from_le_bytes(sub).to_string());
     }
     Some(text)
 }
