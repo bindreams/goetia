@@ -16,6 +16,7 @@ use winreg::RegKey;
 use winreg::enums::{KEY_READ, KEY_WRITE};
 
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard, cmd, registry};
+use goetia::backend::scm::wait::StopSeen;
 
 /// Byte-exact field names; renaming one changes every installed artifact.
 const PRIMARY: Names = Names {
@@ -109,6 +110,13 @@ fn scm_parameters_values_survive() {
     started.accept("the probe service to report SERVICE_RUNNING");
     cmd::run("sc.exe", &["stop", guard.id()]).expect_ok();
     stopped.accept("the probe service to handle SERVICE_CONTROL_STOP");
+    // The sentinel reports in before it reports STOPPED, and `sc stop` returns once the control is
+    // accepted: the cycle is over only when SCM itself says so.
+    support::scm_wait::wait_for_stopped(
+        &mut support::scm_wait::open(guard.id()),
+        guard.id(),
+        StopSeen::Requested,
+    );
     check("a start/stop cycle");
 
     // Control: the readback has to be able to come out negative. Without this,
