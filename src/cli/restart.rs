@@ -9,9 +9,9 @@
 //!
 //! **One budget covers the whole restart, not each leg.** The user invoked a
 //! single operation, and taking twice the time it named because the
-//! operation happens to have two steps would be wrong — so [`restart`]
-//! derives one deadline and hands both legs a budget from it. Per id, not
-//! per invocation: `run_id_verb` calls this once per id, so
+//! operation happens to have two steps would be wrong — so [`restart`] starts
+//! one deadline and hands both legs a budget from it. Per id, not
+//! per invocation: [`run`] calls [`restart`] once per id, so
 //! `restart a b c --timeout 30s` promises each of the three 30s rather than
 //! leaving `c` whatever `a` and `b` did not spend.
 
@@ -44,26 +44,6 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    run_with(args, get_manager, is_elevated, &Budget::start, out, err)
-}
-
-/// [`run`] with the clock injected, so the module's two budget rules can be
-/// tested by counting deadlines rather than by timing them.
-///
-/// Both rules are statements about how many deadlines a run derives and
-/// when — one per [`restart`], one per id — and neither is observable
-/// downstream: `Fake` consumes no wall-clock time, so a budget shared
-/// across both legs and a fresh one per leg hand the manager
-/// indistinguishable values. Counting the derivations decides it exactly,
-/// and reads no clock at all.
-fn run_with(
-    args: &Args,
-    get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
-    is_elevated: &dyn Fn() -> bool,
-    start_clock: &dyn Fn(Budget) -> Deadline,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
     let budget = args.wait.budget();
     run_id_verb(
         IdVerbCall {
@@ -71,7 +51,7 @@ fn run_with(
             ids: &args.ids,
             get_manager,
             is_elevated,
-            verb: &|mgr, id| restart(mgr, id, budget, start_clock),
+            verb: &|mgr, id| restart(mgr, id, budget),
             verb_past_tense: wait::reported(budget, "restarted", "restart requested"),
             absent_is_success: false,
         },
@@ -80,7 +60,12 @@ fn run_with(
     )
 }
 
-/// One daemon's restart, spending `budget` across both legs.
+/// One daemon's restart, under one deadline started here.
+fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget) -> Result<()> {
+    restart_until(mgr, id, budget, budget.start())
+}
+
+/// [`restart`], under a `deadline` that may already be spent.
 ///
 /// Under a budget that waits the legs need nothing between them: the stop
 /// leg is only ever handed a budget that waits (see [`stop_leg`]), so a
@@ -90,8 +75,7 @@ fn run_with(
 /// nothing is read — "don't wait, just do the steps", as one request where
 /// the manager has one. Either way no state is queried between the two,
 /// which is what keeps the exit code from being a stopwatch question.
-fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn Fn(Budget) -> Deadline) -> Result<()> {
-    let deadline = start_clock(budget);
+fn restart_until(mgr: &dyn ServiceManager, id: &Id, budget: Budget, deadline: Deadline) -> Result<()> {
     // Before either leg sends anything, so that nothing either leg needs can
     // run out between the stop and the start and leave the daemon stopped.
     let mut sequence = mgr.prepare(&[Step::Stop, Step::Start], budget)?;
@@ -120,7 +104,7 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget, start_clock: &dyn 
 
 // the abandonment rule ================================================================================================
 
-/// The budget a leg of [`restart`] runs under, given the budget the user
+/// The budget a leg of [`restart_until`] runs under, given the budget the user
 /// named and what is left of it.
 #[derive(Debug, PartialEq, Eq)]
 enum Leg {
