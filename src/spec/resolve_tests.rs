@@ -183,7 +183,7 @@ fn a_manifest_with_two_defects_reports_the_earlier_field_first() {
 
 #[cfg(unix)]
 #[skuld::test]
-fn a_manifest_directory_that_is_not_valid_utf8_is_refused_by_name() {
+fn a_manifest_directory_that_is_not_valid_utf8_is_refused_by_the_field_joined_to_it() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -191,20 +191,90 @@ fn a_manifest_directory_that_is_not_valid_utf8_is_refused_by_name() {
     let msg = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\n"), &dir)
         .unwrap_err()
         .to_string();
-    assert!(msg.contains("manifest directory"), "{msg}");
-    assert!(msg.contains("not valid UTF-8"), "{msg}");
+    assert!(msg.contains("field `command`: the manifest directory"), "{msg}");
+    assert!(msg.contains("is not valid UTF-8"), "{msg}");
 }
 
 #[cfg(unix)]
 #[skuld::test]
-fn a_manifest_directory_with_a_newline_is_refused_by_name() {
-    let dir = PathBuf::from("/base/a\nb");
-    let msg = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\n"), &dir)
-        .unwrap_err()
-        .to_string();
-    assert!(msg.contains("manifest directory"), "{msg}");
-    assert!(msg.contains("control character"), "{msg}");
-    assert!(!msg.contains("field `"), "{msg}");
+fn a_non_utf8_manifest_directory_is_fine_when_every_path_is_absolute() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = PathBuf::from(OsStr::from_bytes(b"/srv/caf\xe9/"));
+    let yaml = "id: frpc\ncommand: [/opt/frpc]\ncwd: /opt\nlogs: /var/log/frpc.log\n";
+    let (spec, _) = resolve(parse_manifest(yaml), &dir).expect("no field is joined to the directory");
+    assert_eq!(spec.cwd, Some(PathBuf::from("/opt")));
+}
+
+#[skuld::test]
+fn a_manifest_directory_with_a_newline_is_refused_by_the_field_joined_to_it() {
+    let dir = base_dir().join("a\nb");
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    for (extra, field) in [
+        ("command: [bin/frpc]".to_string(), "command"),
+        (format!("command: ['{abs}']\ncwd: data"), "cwd"),
+        (format!("command: ['{abs}']\nlogs: data"), "logs"),
+    ] {
+        let msg = resolve(parse_manifest(&format!("id: frpc\n{extra}\n")), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(&format!("field `{field}`: the manifest directory")),
+            "{msg}"
+        );
+        assert!(msg.contains("control character"), "{msg}");
+    }
+}
+
+#[skuld::test]
+fn a_resolution_error_is_reported_in_field_order() {
+    // The directory is bad, so each relative path fails to resolve. The first in field order is
+    // reported, though a later defect (an `env` key, a `logs` control character) is also present.
+    let dir = base_dir().join("a\nb");
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let cases = [
+        (
+            "command: [bin/frpc]\nlogs: data\nenv: {\"A=B\": x}".to_string(),
+            "command",
+        ),
+        (format!("command: ['{abs}']\ncwd: data\nenv: {{\"A=B\": x}}"), "cwd"),
+        (format!("command: ['{abs}']\ncwd: data\nlogs: \"a\\nb\""), "cwd"),
+    ];
+    for (body, field) in cases {
+        let msg = resolve(parse_manifest(&format!("id: frpc\n{body}\n")), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(&format!("field `{field}`: the manifest directory")),
+            "`{body}`: {msg}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_bad_id_is_reported_before_a_bad_manifest_directory() {
+    let dir = base_dir().join("a\nb");
+    for id in ["${X}", "\"a\nb\""] {
+        let msg = resolve(parse_manifest(&format!("id: {id}\ncommand: [bin/frpc]\n")), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(!msg.contains("manifest directory"), "id {id}: {msg}");
+    }
+}
+
+#[skuld::test]
+fn a_resolved_path_the_field_rules_would_refuse_is_attributed_to_the_resolution() {
+    // A drive-relative `cwd: C:` resolves through the per-drive directory to a value the authored
+    // rules never saw; the message must say so rather than blame the text the user wrote.
+    let id = Id::try_from("frpc").unwrap();
+    let err = check_resolved(&id, "cwd", "C:", Path::new("/a\u{FFFE}")).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("field `cwd` is `C:`, which resolves to `/a\u{FFFE}`, which contains U+FFFE"),
+        "{msg}"
+    );
+    check_resolved(&id, "cwd", "C:", Path::new("/ordinary")).expect("an ordinary value passes");
 }
 
 // Resolution ==========================================================================================================

@@ -94,7 +94,6 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     // place that makes the guarantee.
     let base_dir = absolutize(base_dir, &mut warnings)?;
     let base_dir = base_dir.as_path();
-    check_base_dir(&raw.id, base_dir)?;
 
     // Step 1: the id. Before `Id::try_from`, whose charset excludes `$` and would answer first
     // with a generic message.
@@ -260,12 +259,17 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
     let name = raw.name.unwrap_or_else(|| id.as_str().to_string());
     let user = resolve_user(raw.user);
 
-    // The field rules run first, on the authored values, before any join or resolution: the
-    // same function `DaemonSpec::new` runs on the final ones. Every backend's merged spec passes
-    // through this, including the non-native ones that never become a `DaemonSpec`: a newline in
-    // `scm`'s env must be caught from Linux too. An absent or empty `command` is incomplete, not
-    // invalid: a native override may supply it, and `require_complete` reports the miss with the
-    // backend named.
+    // The field rules run on the authored values: the same function `DaemonSpec::new` runs on
+    // the final ones. Every backend's merged spec passes through this, including the non-native
+    // ones that never become a `DaemonSpec`: a newline in `scm`'s env must be caught from Linux
+    // too. An absent or empty `command` is incomplete, not invalid: a native override may supply
+    // it, and `require_complete` reports the miss with the backend named.
+    //
+    // Each path is resolved right after its own checks, so a resolution error falls in field
+    // order, and the id is already valid when one names it.
+    let mut command0 = None;
+    let mut cwd = None;
+    let mut logs = None;
     check_field_values(
         id,
         &FieldValues {
@@ -277,14 +281,28 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
             user: &user,
         },
         Phase::Authored,
+        |field| {
+            match field {
+                PathField::Command => {
+                    if let Some(first) = raw.command.as_ref().and_then(|c| c.first()) {
+                        command0 = Some(resolve_path_string(id, "command", first, base_dir, &mut warnings)?);
+                    }
+                }
+                PathField::Cwd => {
+                    cwd = resolve_optional_path(id, "cwd", raw.cwd.as_deref(), base_dir, &mut warnings)?;
+                }
+                PathField::Logs => {
+                    logs = resolve_optional_path(id, "logs", raw.logs.as_deref(), base_dir, &mut warnings)?;
+                }
+            }
+            Ok(())
+        },
     )?;
 
     let mut command = raw.command;
-    if let Some(first) = command.as_mut().and_then(|c| c.first_mut()) {
-        *first = resolve_path_string(id, "command", first, base_dir, &mut warnings)?;
+    if let Some((first, resolved)) = command.as_mut().and_then(|c| c.first_mut()).zip(command0) {
+        *first = resolved;
     }
-    let cwd = resolve_optional_path(id, "cwd", raw.cwd, base_dir, &mut warnings)?;
-    let logs = resolve_optional_path(id, "logs", raw.logs, base_dir, &mut warnings)?;
     let env = raw.env;
 
     let restart = shape(id, raw.restart, parse_restart)?;
@@ -366,9 +384,8 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         Shaped::Absent => Kind::Simple,
     };
 
-    // `resolve_shape` ran the field rules on the authored values and `resolve_as` checked the
-    // manifest directory, so this refuses nothing a manifest can cause; it is what makes the
-    // result a `DaemonSpec`.
+    // `resolve_shape` ran the field rules on the authored values and on every path it resolved, so
+    // this refuses nothing a manifest can cause; it is what makes the result a `DaemonSpec`.
     DaemonSpec::new(DaemonFields {
         id,
         name,
@@ -453,16 +470,19 @@ pub(crate) fn parse_restart_delay(id: &Id, raw: &str) -> Result<Duration, Error>
 fn resolve_optional_path(
     id: &Id,
     field: &str,
-    raw: Option<String>,
+    raw: Option<&str>,
     base_dir: &Path,
     warnings: &mut Vec<Warning>,
 ) -> Result<Option<PathBuf>, Error> {
-    raw.map(|s| resolve_path_string(id, field, &s, base_dir, warnings).map(PathBuf::from))
+    raw.map(|s| resolve_path_string(id, field, s, base_dir, warnings).map(PathBuf::from))
         .transpose()
 }
 
 /// Join a relative path against `base_dir`; leave an absolute path as-is.
 /// Uses `Path::is_absolute`, not a string prefix check, since POSIX and Windows differ.
+///
+/// `base_dir` is checked (see [`check_base_dir`]) only when a path is joined to it, so a manifest
+/// directory that no field uses is never refused. The result is checked too ([`check_resolved`]).
 ///
 /// Not a pure function of `(value, base_dir)`: `std::path::absolute`'s drive-relative fallback
 /// reads the per-drive current directory. But every pass `resolve` makes runs in one process
@@ -479,6 +499,10 @@ fn resolve_path_string(
     let joined = if p.is_absolute() {
         p.to_path_buf()
     } else {
+        // A path with its own prefix (`C:bin`) replaces `base_dir` in the join, so it is not used.
+        if !matches!(p.components().next(), Some(std::path::Component::Prefix(_))) {
+            check_base_dir(id, field, base_dir)?;
+        }
         normalize(&base_dir.join(p))
     };
     // With an absolute `base_dir` a join stays relative only for a Windows drive-relative path
@@ -513,17 +537,29 @@ fn resolve_path_string(
         resolved
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
-    // `base_dir` and `raw` are UTF-8, so this fails only for a drive-relative path anchored to
-    // a per-drive current directory that is not.
-    joined.to_str().map(str::to_string).ok_or_else(|| {
-        invalid(
+    check_resolved(id, field, raw, &joined)?;
+    Ok(joined.to_string_lossy().into_owned())
+}
+
+/// The field rules for a resolved path. `base_dir` and `raw` have passed them, so only a
+/// drive-relative path can fail here, anchored to a per-drive current directory that carries a
+/// defect the authored text does not. The message says the field *resolved* to the bad value, since
+/// the user did not write it.
+fn check_resolved(id: &Id, field: &str, raw: &str, resolved: &Path) -> Result<(), Error> {
+    let defect = match resolved.to_str() {
+        None => Some("is not valid UTF-8".to_string()),
+        Some(text) => unemittable_defect(text),
+    };
+    match defect {
+        None => Ok(()),
+        Some(defect) => Err(invalid(
             id,
             &format!(
-                "field `{field}` is `{raw}`, which resolves to `{}`, which is not valid UTF-8",
-                joined.display()
+                "field `{field}` is `{raw}`, which resolves to `{}`, which {defect}",
+                resolved.display()
             ),
-        )
-    })
+        )),
+    }
 }
 
 /// Make `dir` absolute against the process's working directory.
@@ -583,29 +619,26 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     Ok(joined)
 }
 
-/// The manifest directory, once, so a path joined to it cannot carry a defect the field rules
-/// would blame on a field the manifest wrote cleanly: it must be valid UTF-8, hold no control
-/// character, and not end in a backslash.
+/// The manifest directory, for the field `field` that is joined to it, so the join cannot carry a
+/// defect the field rules would blame on text the manifest wrote cleanly: it must be valid UTF-8,
+/// hold no control character, and not end in a backslash. The error is attributed to `field`, so
+/// it falls in field order.
 ///
 /// The backslash rule is the field rule unchanged, which is an open owner question: it refuses a
 /// Windows drive or UNC root (`C:\`, `\\srv\share\`), the only form `normalize` leaves ending
-/// in one. `daemon` is the authored `id`, unvalidated, used only to label the error.
-fn check_base_dir(daemon: &str, dir: &Path) -> Result<(), Error> {
-    let invalid = |defect: &str| Error::Invalid {
-        daemon: daemon.to_string(),
-        message: format!("the manifest directory {dir:?} {defect}"),
-        source: None,
+/// in one.
+fn check_base_dir(id: &Id, field: &str, dir: &Path) -> Result<(), Error> {
+    let defect = match dir.to_str() {
+        None => Some("is not valid UTF-8".to_string()),
+        Some(text) => unemittable_defect(text),
     };
-    let Some(text) = dir.to_str() else {
-        return Err(invalid("is not valid UTF-8"));
-    };
-    if let Some(defect) = control_defect(text) {
-        return Err(invalid(&defect));
+    match defect {
+        None => Ok(()),
+        Some(defect) => Err(invalid(
+            id,
+            &format!("field `{field}`: the manifest directory {} {defect}", dir.display()),
+        )),
     }
-    if let Some(defect) = trailing_backslash_defect(text) {
-        return Err(invalid(defect));
-    }
-    Ok(())
 }
 
 /// Canonicalise the process's current working directory; see [`absolutize`] for why this value,
@@ -701,6 +734,7 @@ pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
             user: &fields.user,
         },
         Phase::Final,
+        |_| Ok(()),
     )
 }
 
@@ -720,23 +754,51 @@ struct FieldValues<'a> {
 /// other phase cannot hold the value it tests.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// What the manifest wrote, before any substitution, join or resolution. May carry `${...}`
-    /// references, a relative path, or no `command`.
+    /// What the manifest wrote, or what `.env` substitution made of it (step 5 runs this phase on
+    /// the substituted values), before any join or path resolution. Before substitution it may
+    /// carry `${...}` references; either way it may hold a relative path or no `command`.
     Authored,
     /// A finished daemon's fields, after substitution and resolution: `command` is non-empty and
     /// the paths are absolute, and `$` is ordinary text.
     Final,
 }
 
+/// A field that [`resolve_shape`] resolves to an absolute path.
+#[derive(Clone, Copy)]
+enum PathField {
+    Command,
+    Cwd,
+    Logs,
+}
+
+impl PathField {
+    fn name(self) -> &'static str {
+        match self {
+            PathField::Command => "command",
+            PathField::Cwd => "cwd",
+            PathField::Logs => "logs",
+        }
+    }
+}
+
 /// Every field rule, in the order a manifest's defects are reported: `name`, `command`, `cwd`,
 /// `logs`, each `env` entry, `user`. The one list; [`resolve_shape`] runs it on the authored
 /// values and [`DaemonSpec::new`] on the final ones.
+///
+/// `resolve` is called once for each of `command`, `cwd` and `logs` after that field's own rules
+/// pass (for `command`, only if it is present), and an error from it stops the walk. It lets the
+/// caller resolve a path at its place in the order.
 ///
 /// Beyond the rules both phases share, [`Phase::Authored`] refuses a `${...}` reference where
 /// substitution must not produce one (an `env` key, a `user.id`), and [`Phase::Final`] refuses an
 /// empty `command` and a relative `cwd` or `logs`. A path is checked as text; a non-UTF-8 one is
 /// refused first, so the message is exact.
-fn check_field_values(id: &Id, values: &FieldValues, phase: Phase) -> Result<(), Error> {
+fn check_field_values(
+    id: &Id,
+    values: &FieldValues,
+    phase: Phase,
+    mut resolve: impl FnMut(PathField) -> Result<(), Error>,
+) -> Result<(), Error> {
     check_name(id, values.name)?;
 
     if let Some(command) = values.command {
@@ -747,23 +809,26 @@ fn check_field_values(id: &Id, values: &FieldValues, phase: Phase) -> Result<(),
         if let Some(first) = command.first() {
             reject_empty(id, "command[0]", first)?;
         }
+        resolve(PathField::Command)?;
     }
 
-    for (field, path) in [("cwd", values.cwd), ("logs", values.logs)] {
+    for (field, path) in [(PathField::Cwd, values.cwd), (PathField::Logs, values.logs)] {
+        let name = field.name();
         if let Some(path) = path {
             let Some(text) = path.to_str() else {
                 return Err(invalid(
                     id,
                     &format!(
-                        "field `{field}` is `{}`, which is not valid UTF-8",
+                        "field `{name}` is `{}`, which is not valid UTF-8",
                         path.to_string_lossy()
                     ),
                 ));
             };
-            check_path_text(id, field, text)?;
+            check_path_text(id, name, text)?;
             if phase == Phase::Final {
-                reject_relative_path(id, field, path)?;
+                reject_relative_path(id, name, path)?;
             }
+            resolve(field)?;
         }
     }
 
@@ -839,6 +904,13 @@ fn reject_unemittable(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     reject_control_chars(id, field, value)?;
     reject_trailing_backslash(id, field, value)?;
     Ok(())
+}
+
+/// How `value` breaks [`reject_unemittable`], as a predicate to follow the name of what was
+/// checked; `None` if it does not. For a caller that names the value differently (a directory, a
+/// resolved path).
+fn unemittable_defect(value: &str) -> Option<String> {
+    control_defect(value).or_else(|| trailing_backslash_defect(value).map(str::to_string))
 }
 
 fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
