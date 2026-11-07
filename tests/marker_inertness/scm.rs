@@ -11,10 +11,7 @@
 //! measured alongside, since `sc config` rewrites exactly that key.
 
 use std::collections::BTreeMap;
-use std::ops::ControlFlow;
 
-use goetia::backend::scm::wait::{QueriedState, SystemScmActor, Waited, WantState, wait_until};
-use goetia::manager::Budget;
 use winreg::RegKey;
 use winreg::enums::{KEY_READ, KEY_WRITE};
 
@@ -114,22 +111,7 @@ fn scm_parameters_values_survive() {
     stopped.accept("the probe service to handle SERVICE_CONTROL_STOP");
     // The sentinel reports in before it reports STOPPED, and `sc stop` returns once the control is
     // accepted: the cycle is over only when SCM itself says so.
-    let mut actor = SystemScmActor::open(guard.id()).unwrap_or_else(|e| panic!("open {id} to wait for STOPPED: {e}"));
-    let waited = wait_until(
-        &mut actor,
-        WantState::Stopped,
-        WantState::StoppedOnly,
-        QueriedState::Stopped,
-        Budget::Unbounded.start(),
-        |sighting| match sighting.status.state {
-            // The arm reads the state the control left, `RUNNING`: the stop has not begun to show.
-            _ if !sighting.pending_delivered => Ok(ControlFlow::Continue(())),
-            QueriedState::StopPending => Ok(ControlFlow::Continue(())),
-            state => panic!("waiting for Stopped, {id} reached {state:?}"),
-        },
-    )
-    .unwrap_or_else(|e| panic!("wait for {id} to reach STOPPED: {e}"));
-    assert_eq!(waited, Waited::Confirmed, "an unbounded wait for {id} to stop expired");
+    support::scm_wait::wait_for_stopped(&mut support::scm_wait::open(guard.id()), guard.id());
     check("a start/stop cycle");
 
     // Control: the readback has to be able to come out negative. Without this,

@@ -15,6 +15,8 @@ pub mod daemon_spec;
 pub mod kill;
 #[cfg(windows)]
 pub mod registry;
+#[cfg(windows)]
+pub mod scm_wait;
 pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
