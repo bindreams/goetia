@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::spec::test_support::plain_fields;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
 use crate::spec::Restart;
@@ -473,7 +474,7 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
 fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         restart,
-        ..DaemonSpec::for_test("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+        ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
     })
     .unwrap()
 }
@@ -486,7 +487,7 @@ fn blob_of(kind: Kind) -> Blob {
         version: "0.1.0".to_string(),
         spec: DaemonSpec::new(DaemonFields {
             kind,
-            ..DaemonSpec::for_test("frpc", vec!["frpc".to_string()])
+            ..plain_fields("frpc", vec!["frpc".to_string()])
         })
         .unwrap(),
     }

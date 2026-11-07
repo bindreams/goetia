@@ -1,8 +1,7 @@
 //! `RawSpec -> DaemonSpec`: defaults, absolute-path resolution, and the
 //! injection validation gate.
 //!
-//! This is the crate's parse-don't-validate boundary — there is no
-//! separate `validate()`. systemd's `Description=` and `Environment=` have
+//! This is the crate's parse-don't-validate boundary. systemd's `Description=` and `Environment=` have
 //! no escaping and a newline terminates a directive, so an unvalidated
 //! `name` could inject a second `ExecStart=`; XML 1.0 cannot represent
 //! most C0 control characters at all, not even as entities. Every user-supplied
@@ -52,6 +51,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::backend::{BackendKind, Shaped, ShapedSpec};
+use super::field::Field;
 use super::interpolate::{self, Substitution};
 use super::overrides::Supplied;
 use super::raw::RawSpec;
@@ -153,8 +153,6 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     if let Some(b) = native {
         b.error(&shaped, native_supplied, Substitution::Done)
             .map_err(|e| attribute_to(Refused::at(Field::User, e).attributed(&from_env), b))?;
-    }
-    if let Some(b) = native {
         b.warn(&shaped, &mut daemon_warnings);
     }
 
@@ -235,24 +233,6 @@ fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error 
     }
 }
 
-/// A value a rule judges, named so an error can say whose text is to blame.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Field {
-    Name,
-    /// An element of `command`; `Command(0)` is the program.
-    Command(usize),
-    Cwd,
-    Logs,
-    /// An `env` name, which substitution never changes ([`interpolate::spec`] refuses a `$` in one).
-    EnvKey,
-    /// The value of the `env` entry with this name.
-    EnvValue(String),
-    User,
-    Restart,
-    RestartDelay,
-    Kind,
-}
-
 /// An error about one field's value. In step 5 it is attributed to `.env` by [`Refused::attributed`],
 /// the one place that happens.
 #[derive(Debug)]
@@ -320,18 +300,11 @@ fn resolve_shape(
     let name = raw.name.unwrap_or_else(|| id.as_str().to_string());
     let user = resolve_user(raw.user);
 
-    // The field rules run on the authored values: the same function `DaemonSpec::new` runs on
-    // the final ones. Every backend's merged spec passes through this, including the non-native
-    // ones that never become a `DaemonSpec`: a newline in `scm`'s env must be caught from Linux
-    // too. An absent or empty `command` is incomplete, not invalid: a native override may supply
-    // it, and `require_complete` reports the miss with the backend named.
-    //
-    // Each path is resolved right after its own checks, so a resolution error falls in field
-    // order, and the id is already valid when one names it.
-    let mut command0 = None;
-    let mut cwd = None;
-    let mut logs = None;
-    check_field_values(
+    // The rules run on every backend's merged spec, the non-native ones that never become a
+    // `DaemonSpec` included: a newline in `scm`'s env must be caught from Linux too. An absent or
+    // empty `command` is incomplete, not invalid: a native override may supply it, and
+    // `require_complete` reports the miss with the backend named.
+    let verdicts = check_field_values(
         id,
         &FieldValues {
             name: &name,
@@ -342,29 +315,26 @@ fn resolve_shape(
             user: &user,
         },
         Phase::Authored,
-        |field| {
-            let text = match field {
-                PathField::Command => raw.command.as_ref().and_then(|c| c.first()).map(String::as_str),
-                PathField::Cwd => raw.cwd.as_deref(),
-                PathField::Logs => raw.logs.as_deref(),
-            };
-            let Some(text) = text else {
-                return Ok(());
-            };
-            let resolved = resolve_path_string(id, field, text, base_dir, substitution, &mut warnings)?;
-            match field {
-                PathField::Command => command0 = Some(resolved),
-                PathField::Cwd => cwd = Some(PathBuf::from(resolved)),
-                PathField::Logs => logs = Some(PathBuf::from(resolved)),
-            }
-            Ok(())
-        },
-    )?;
-
+    );
     let mut command = raw.command;
-    if let Some((first, resolved)) = command.as_mut().and_then(|c| c.first_mut()).zip(command0) {
-        *first = resolved;
+    let mut cwd = raw.cwd;
+    let mut logs = raw.logs;
+    for Verdict { resolve, result } in verdicts {
+        result?;
+        let Some(path_field) = resolve else {
+            continue;
+        };
+        let slot = match path_field {
+            PathField::Command => command.as_mut().and_then(|command| command.first_mut()),
+            PathField::Cwd => cwd.as_mut(),
+            PathField::Logs => logs.as_mut(),
+        };
+        if let Some(text) = slot {
+            *text = resolve_path_string(id, path_field, text, base_dir, substitution, &mut warnings)?;
+        }
     }
+    let cwd = cwd.map(PathBuf::from);
+    let logs = logs.map(PathBuf::from);
     let env = raw.env;
 
     let restart = shape(id, Field::Restart, raw.restart, substitution, parse_restart)?;
@@ -445,8 +415,9 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
     let restart_delay = settled(&id, "restart-delay", restart_delay)?;
     let kind = settled(&id, "type", kind)?.unwrap_or(Kind::Simple);
 
-    // `resolve_shape` ran the field rules on the authored values and on every path it resolved, so
-    // this refuses nothing a manifest can cause; it is what makes the result a `DaemonSpec`.
+    // The rules already ran on these values and on every path resolved, so `new` is what makes the
+    // result a `DaemonSpec`, not a check: it cannot refuse a manifest.
+    let daemon = id.clone();
     DaemonSpec::new(DaemonFields {
         id,
         name,
@@ -459,22 +430,25 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         logs,
         kind,
     })
+    .map_err(|err| contract_violation(&daemon, &format!("the resolved daemon failed its own field rules: {err}")))
+}
+
+/// A defect of this crate, not of any manifest: something an earlier step ruled out happened. An
+/// error rather than a `debug_assert!`, which would abort the path that reports it.
+fn contract_violation(id: &Id, message: &str) -> Error {
+    invalid(id, &format!("internal error: {message}; this is a bug in goetia"))
 }
 
 /// What a substituted pass leaves of a [`Shaped`] value: it defers nothing, so the value is parsed
-/// or absent. A deferred one is a defect of this crate, reported as an error rather than a panic,
-/// since `load` is public.
+/// or absent.
 fn settled<T>(id: &Id, field: &str, shaped: Shaped<T>) -> Result<Option<T>, Error> {
     match shaped {
         Shaped::Parsed(value) => Ok(Some(value)),
         Shaped::Absent => Ok(None),
-        Shaped::Deferred => {
-            debug_assert!(false, "a substituted pass defers nothing, yet `{field}` is deferred");
-            Err(invalid(
-                id,
-                &format!("internal error: field `{field}` was left to a substitution that has already run"),
-            ))
-        }
+        Shaped::Deferred => Err(contract_violation(
+            id,
+            &format!("field `{field}` was left to a substitution that has already run"),
+        )),
     }
 }
 
@@ -795,11 +769,9 @@ fn normalize(path: &Path) -> PathBuf {
     }
 }
 
-/// The field rules over a finished daemon: the one place they run for a value that becomes a
-/// `DaemonSpec`, called by [`DaemonSpec::new`]. [`resolve_shape`] runs the same rules, through
-/// [`check_field_values`], on the authored values.
+/// The field rules over a finished daemon, for [`DaemonSpec::new`].
 pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
-    check_field_values(
+    let verdicts = check_field_values(
         &fields.id,
         &FieldValues {
             name: &fields.name,
@@ -810,9 +782,11 @@ pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
             user: &fields.user,
         },
         Phase::Final,
-        |_| Ok(()),
-    )
-    .map_err(Error::from)
+    );
+    for verdict in verdicts {
+        verdict.result?;
+    }
+    Ok(())
 }
 
 /// The values the field rules read, as the caller holds them: authored text, or a finished
@@ -867,53 +841,86 @@ impl PathField {
     }
 }
 
-/// Every field rule, in the order a manifest's defects are reported: `name`, `command`, `cwd`,
-/// `logs`, each `env` entry, `user`. The one list; [`resolve_shape`] runs it on the authored
-/// values and [`DaemonSpec::new`] on the final ones.
-///
-/// `resolve` is called once for each of `command`, `cwd` and `logs` that is present, after that
-/// field's own rules pass, and an error from it stops the walk. It lets the caller resolve a path
-/// at its place in the order.
+/// What the rules say of one field, and where its path is resolved.
+struct Verdict {
+    /// The path to resolve once `result` is `Ok`, before the next verdict is read: a resolution
+    /// error falls at its field's place in the order.
+    resolve: Option<PathField>,
+    result: Result<(), Refused>,
+}
+
+/// The one place the field rules run: one [`Verdict`] per field present, in the order a manifest's
+/// defects are reported (`name`, `command`, `cwd`, `logs`, each `env` entry, `user`). The caller
+/// reads them in order and stops at the first error: [`check_fields`] on a finished daemon's
+/// fields, [`resolve_shape`] on the authored values. A rule never resolves a path.
 ///
 /// Beyond the rules both phases share, [`Phase::Authored`] refuses a `${...}` reference where
 /// substitution must not produce one (an `env` key, a `user.id`), and [`Phase::Final`] refuses an
 /// empty `command` and a relative `cwd` or `logs`.
 ///
-/// Every error says which [`Field`] it is about ([`Refused`]); `resolve` may fail the same way.
-fn check_field_values(
-    id: &Id,
-    values: &FieldValues,
-    phase: Phase,
-    mut resolve: impl FnMut(PathField) -> Result<(), Refused>,
-) -> Result<(), Refused> {
-    reject_unemittable(id, "name", values.name).map_err(|err| Refused::at(Field::Name, err))?;
+/// Every error says which [`Field`] it is about ([`Refused`]).
+fn check_field_values(id: &Id, values: &FieldValues, phase: Phase) -> Vec<Verdict> {
+    let name = Verdict {
+        resolve: None,
+        result: reject_unemittable(id, "name", values.name).map_err(|err| Refused::at(Field::Name, err)),
+    };
+    let command = values.command.map(|command| Verdict {
+        resolve: Some(PathField::Command),
+        result: check_command(id, command, phase),
+    });
+    let path = |field: PathField, path: Option<&Path>| {
+        path.map(|path| Verdict {
+            resolve: Some(field),
+            result: check_path_field(id, field, path, phase),
+        })
+    };
+    let env = Verdict {
+        resolve: None,
+        result: check_env(id, values.env, phase),
+    };
+    let user = Verdict {
+        resolve: None,
+        result: check_user_field(id, values.user, phase),
+    };
 
-    if let Some(command) = values.command {
-        if phase == Phase::Final {
-            reject_empty_command(id, command).map_err(|err| Refused::at(Field::Command(0), err))?;
-        }
-        // Every element, `command[0]` included. Its emptiness is separate.
-        for (index, arg) in command.iter().enumerate() {
-            reject_unemittable(id, "command", arg).map_err(|err| Refused::at(Field::Command(index), err))?;
-        }
-        if let Some(first) = command.first() {
-            reject_empty(id, "command[0]", first).map_err(|err| Refused::at(Field::Command(0), err))?;
-        }
-        resolve(PathField::Command)?;
+    [
+        Some(name),
+        command,
+        path(PathField::Cwd, values.cwd),
+        path(PathField::Logs, values.logs),
+        Some(env),
+        Some(user),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn check_command(id: &Id, command: &[String], phase: Phase) -> Result<(), Refused> {
+    if phase == Phase::Final {
+        reject_empty_command(id, command).map_err(|err| Refused::at(Field::Command(0), err))?;
     }
-
-    for (field, path) in [(PathField::Cwd, values.cwd), (PathField::Logs, values.logs)] {
-        let name = field.name();
-        if let Some(path) = path {
-            check_path(id, name, path).map_err(|err| Refused::at(field.field(), err))?;
-            if phase == Phase::Final {
-                reject_relative_path(id, name, path).map_err(|err| Refused::at(field.field(), err))?;
-            }
-            resolve(field)?;
-        }
+    // Every element, `command[0]` included. Its emptiness is separate.
+    for (index, arg) in command.iter().enumerate() {
+        reject_unemittable(id, "command", arg).map_err(|err| Refused::at(Field::Command(index), err))?;
     }
+    if let Some(first) = command.first() {
+        reject_empty(id, "command[0]", first).map_err(|err| Refused::at(Field::Command(0), err))?;
+    }
+    Ok(())
+}
 
-    for (key, value) in values.env {
+fn check_path_field(id: &Id, field: PathField, path: &Path, phase: Phase) -> Result<(), Refused> {
+    let name = field.name();
+    check_path(id, name, path).map_err(|err| Refused::at(field.field(), err))?;
+    if phase == Phase::Final {
+        reject_relative_path(id, name, path).map_err(|err| Refused::at(field.field(), err))?;
+    }
+    Ok(())
+}
+
+fn check_env(id: &Id, env: &BTreeMap<String, String>, phase: Phase) -> Result<(), Refused> {
+    for (key, value) in env {
         // Checked for every backend: `scm: {env: {"${K}": v}}` must be caught from Linux too.
         // `interpolate::spec` keeps its own copy, so it does not depend on this running first.
         if phase == Phase::Authored && interpolate::would_substitution_change(key) {
@@ -923,16 +930,19 @@ fn check_field_values(
         reject_unemittable(id, &format!("env[{key}]"), value)
             .map_err(|err| Refused::at(Field::EnvValue(key.clone()), err))?;
     }
+    Ok(())
+}
 
-    // Same reason as the `env`-name rule above. `${S}` trims to `${S}`, never empty, so this and
-    // `check_user`'s blank check can never both fire on one value.
+fn check_user_field(id: &Id, user: &User, phase: Phase) -> Result<(), Refused> {
+    // Same reason as the `env`-name rule. `${S}` trims to itself, never empty, so this and
+    // `check_user`'s blank check cannot both fire.
     if phase == Phase::Authored
-        && let User::Id(AccountId::Sid(s)) = values.user
+        && let User::Id(AccountId::Sid(s)) = user
         && interpolate::would_substitution_change(s)
     {
         return Err(Refused::at(Field::User, invalid(id, interpolate::USER_ID_MESSAGE)));
     }
-    check_user(id, values.user).map_err(|err| Refused::at(Field::User, err))
+    check_user(id, user).map_err(|err| Refused::at(Field::User, err))
 }
 
 /// A `cwd` or `logs`. The message omits the path, as [`reject_control_chars`] omits a value.

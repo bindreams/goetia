@@ -8,6 +8,7 @@
 //! `tests/launchd_integration.rs` instead.
 
 use super::*;
+use crate::spec::test_support::plain_fields;
 use crate::backend::client::fake::{Entry, Fake, RoleKind, Waited, exited, fail, reply};
 use crate::backend::client::{Client, ClientError, Real};
 use crate::manager::ServiceManager;
@@ -24,7 +25,7 @@ fn sample_plist_restarting(id: &str, restart: Restart) -> String {
     let spec = DaemonSpec::new(DaemonFields {
         restart,
         kind: Kind::Simple,
-        ..DaemonSpec::for_test(id, vec!["/bin/true".to_string()])
+        ..plain_fields(id, vec!["/bin/true".to_string()])
     })
     .unwrap();
     generate::plist(
@@ -1481,7 +1482,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation() {
     let spec = DaemonSpec::new(DaemonFields {
         restart: Restart::Always,
         kind: Kind::Simple,
-        ..DaemonSpec::for_test(&name, vec!["/bin/sleep".to_string(), "300".to_string()])
+        ..plain_fields(&name, vec!["/bin/sleep".to_string(), "300".to_string()])
     })
     .unwrap();
     let exhausted = |reservation: &Reservation| {
@@ -1757,7 +1758,7 @@ fn a_changed_spec_is_refused_while_the_job_is_loaded() {
 fn spec_named(name: &str) -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
-        ..DaemonSpec::for_test(name, vec!["/bin/sleep".to_string(), "300".to_string()])
+        ..plain_fields(name, vec!["/bin/sleep".to_string(), "300".to_string()])
     })
     .unwrap()
 }

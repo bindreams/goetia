@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::*;
+use crate::spec::test_support::plain_fields;
 use crate::spec::DaemonFields;
 use crate::spec::{Kind, Restart};
 
@@ -15,7 +16,7 @@ fn spec_fixture() -> DaemonSpec {
         restart: Restart::OnFailure,
         logs: Some(std::env::temp_dir().join("frpc.log")),
         kind: Kind::Simple,
-        ..DaemonSpec::for_test("frpc", vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()])
+        ..plain_fields("frpc", vec!["frpc".to_owned(), "-c".to_owned(), "frpc.toml".to_owned()])
     })
     .unwrap()
 }

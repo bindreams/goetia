@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::*;
+use crate::spec::test_support::plain_fields;
 use crate::manager::Budget;
 use crate::manager::conformance;
 use crate::spec::{Id, Kind, Restart};
@@ -11,7 +12,7 @@ pub(crate) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         kind: Kind::Simple,
-        ..DaemonSpec::for_test(id, vec!["daemon".to_owned()])
+        ..plain_fields(id, vec!["daemon".to_owned()])
     })
     .unwrap()
 }

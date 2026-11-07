@@ -1,7 +1,7 @@
 use super::{check_spec_grammar, reject_interpolated_id, scalar, spec, spec_would_change, would_substitution_change};
 use crate::error::Error;
 use crate::spec::raw::RawSpec;
-use crate::spec::resolve::Field;
+use crate::spec::field::Field;
 use crate::spec::resolve::resolve_user;
 use crate::spec::user::RawUser;
 use crate::spec::vars::Vars;

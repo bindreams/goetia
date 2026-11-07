@@ -1,4 +1,5 @@
 use super::*;
+use super::test_support::{non_utf8_absolute_path, plain_fields};
 
 fn abs(p: &str) -> PathBuf {
     if cfg!(windows) {
@@ -14,7 +15,7 @@ fn fields() -> DaemonFields {
         logs: Some(abs("var/log/frpc.log")),
         env: BTreeMap::from([("RUST_LOG".to_string(), "info".to_string())]),
         user: User::Name("svc-frpc".to_string()),
-        ..DaemonSpec::for_test("frpc", vec![abs("bin/frpc").to_string_lossy().into_owned()])
+        ..plain_fields("frpc", vec![abs("bin/frpc").to_string_lossy().into_owned()])
     }
 }
 
@@ -86,7 +87,7 @@ fn new_refuses_a_relative_cwd_and_logs() {
 
 #[skuld::test]
 fn new_refuses_a_cwd_and_logs_that_are_not_valid_utf8() {
-    let bad = DaemonSpec::non_utf8_path_for_test();
+    let bad = non_utf8_absolute_path();
     let msg = message(DaemonFields {
         cwd: Some(bad.clone()),
         ..fields()

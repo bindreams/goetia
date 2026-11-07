@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
+use crate::spec::test_support::plain_fields;
 use crate::spec::DaemonFields;
 use crate::spec::{Id, Kind, User};
 
@@ -50,7 +51,7 @@ fn abs(p: &str) -> PathBuf {
 fn minimal_spec() -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
-        ..DaemonSpec::for_test("frpc", vec!["frpc".to_string()])
+        ..plain_fields("frpc", vec!["frpc".to_string()])
     })
     .unwrap()
 }

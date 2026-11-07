@@ -62,8 +62,8 @@
 
 use std::collections::BTreeSet;
 
+use super::field::Field;
 use super::raw::RawSpec;
-use super::resolve::Field;
 use super::user::{AccountId, RawUser};
 use super::vars::Vars;
 use crate::error::{Error, Result};
@@ -336,32 +336,26 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
 
     let mut from_env = BTreeSet::new();
 
-    substitute_option(name, Field::Name, "name", vars, &mut from_env)?;
+    substitute_option(name, Field::Name, vars, &mut from_env)?;
     for (index, arg) in command.iter_mut().flatten().enumerate() {
-        let path = format!("command[{index}]");
-        substitute(arg, Field::Command(index), &path, vars, &mut from_env)?;
+        substitute(arg, Field::Command(index), vars, &mut from_env)?;
     }
-    substitute_option(cwd, Field::Cwd, "cwd", vars, &mut from_env)?;
-    substitute_option(logs, Field::Logs, "logs", vars, &mut from_env)?;
+    substitute_option(cwd, Field::Cwd, vars, &mut from_env)?;
+    substitute_option(logs, Field::Logs, vars, &mut from_env)?;
 
     for (key, value) in env.iter_mut() {
-        let key_path = format!("env[{key:?}]");
+        let field = Field::EnvValue(key.clone());
         if would_substitution_change(key) {
-            return Err(interpolate_error(&key_path, ENV_NAME_MESSAGE.to_string()));
+            return Err(interpolate_error(&field.path(), ENV_NAME_MESSAGE.to_string()));
         }
-        // Built only when `.env` supplied some of the value.
-        let scanned = scalar(value, &key_path, vars)?;
-        *value = scanned.text;
-        if scanned.from_env {
-            from_env.insert(Field::EnvValue(key.clone()));
-        }
+        substitute(value, field, vars, &mut from_env)?;
     }
 
     substitute_user(user, vars, &mut from_env)?;
 
-    substitute_option(restart, Field::Restart, "restart", vars, &mut from_env)?;
-    substitute_option(restart_delay, Field::RestartDelay, "restart-delay", vars, &mut from_env)?;
-    substitute_option(kind, Field::Kind, "type", vars, &mut from_env)?;
+    substitute_option(restart, Field::Restart, vars, &mut from_env)?;
+    substitute_option(restart_delay, Field::RestartDelay, vars, &mut from_env)?;
+    substitute_option(kind, Field::Kind, vars, &mut from_env)?;
 
     Ok(from_env)
 }
@@ -470,8 +464,8 @@ fn substitute_user(user: &mut Option<RawUser>, vars: &Vars, from_env: &mut BTree
             }
             Ok(())
         }
-        Some(RawUser::Scalar(text)) => substitute(text, Field::User, "user", vars, from_env),
-        Some(RawUser::Name(name)) => substitute(name, Field::User, "user.name", vars, from_env),
+        Some(RawUser::Scalar(text)) => substitute(text, Field::User, vars, from_env),
+        Some(RawUser::Name(name)) => substitute_at(name, Field::User, "user.name", vars, from_env),
     }
 }
 
@@ -483,8 +477,22 @@ fn user_would_change(user: &Option<RawUser>) -> bool {
     }
 }
 
-/// Substitute `text` in place, noting `field` in `from_env` if `.env` supplied any of it.
-fn substitute(text: &mut String, field: Field, path: &str, vars: &Vars, from_env: &mut BTreeSet<Field>) -> Result<()> {
+/// Substitute `text` in place, noting `field` in `from_env` if `.env` supplied any of it. Errors
+/// name [`Field::path`].
+fn substitute(text: &mut String, field: Field, vars: &Vars, from_env: &mut BTreeSet<Field>) -> Result<()> {
+    let path = field.path();
+    substitute_at(text, field, &path, vars, from_env)
+}
+
+/// [`substitute`] with the error path spelled by the caller: `user.name`, which shares
+/// [`Field::User`] with `user`.
+fn substitute_at(
+    text: &mut String,
+    field: Field,
+    path: &str,
+    vars: &Vars,
+    from_env: &mut BTreeSet<Field>,
+) -> Result<()> {
     let scanned = scalar(text, path, vars)?;
     *text = scanned.text;
     if scanned.from_env {
@@ -494,15 +502,9 @@ fn substitute(text: &mut String, field: Field, path: &str, vars: &Vars, from_env
 }
 
 /// [`substitute`] for an optional field; `None` has nothing to substitute.
-fn substitute_option(
-    text: &mut Option<String>,
-    field: Field,
-    path: &str,
-    vars: &Vars,
-    from_env: &mut BTreeSet<Field>,
-) -> Result<()> {
+fn substitute_option(text: &mut Option<String>, field: Field, vars: &Vars, from_env: &mut BTreeSet<Field>) -> Result<()> {
     match text {
-        Some(text) => substitute(text, field, path, vars, from_env),
+        Some(text) => substitute(text, field, vars, from_env),
         None => Ok(()),
     }
 }
