@@ -145,7 +145,8 @@ pub(crate) fn image_of(
     };
     through_scm().map_err(|scm| Error::Step {
         what: format!(
-            "read the image path of the service `{name}`, which neither its registry key nor SCM              answered: an administrator must make the service's key readable"
+            "read the image path of the service `{name}`, which neither its registry key nor SCM \
+             answered: an administrator must make the service's key readable"
         ),
         source: Box::new(Error::Both {
             first: Box::new(registry),
@@ -227,7 +228,8 @@ pub(crate) fn left_behind_text(
             ("are", "them")
         };
         said.push_str(&format!(
-            " {} {is} not in the folder this program's shim provider uses, so that command does not retry              {them}: {elsewhere} {them}.",
+            " {} {is} not in the folder this program's shim provider uses, so that command does not retry \
+             {them}: {elsewhere} {them}.",
             list(&outside)
         ));
     }

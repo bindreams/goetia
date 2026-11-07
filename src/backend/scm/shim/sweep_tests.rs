@@ -305,6 +305,20 @@ fn a_failure_that_names_no_file_names_none() {
     assert!(undeleted(&Error::os("wait for a process", std::io::Error::other("x"))).is_empty());
 }
 
+/// A `\` line continuation that is lost leaves the indentation of the next line inside the text.
+#[skuld::test]
+fn the_messages_have_no_run_of_spaces() {
+    let both_failed = image_of("frpc", Err(denied("open the key")), || Err(denied("query the service")))
+        .unwrap_err()
+        .to_string();
+    let outside = text(Some("/p/Goetia"), "/q", &["/q/a.exe", "/q/b.exe"]);
+    let one_outside = text(Some("/p/Goetia"), "/q", &["/q/a.exe"]);
+
+    for said in [both_failed, outside, one_outside] {
+        assert!(!said.contains("  "), "{said}");
+    }
+}
+
 const RETRY: &str = "Re-run `goetia daemon uninstall frpc`";
 const NEXT: &str = "the next install or uninstall of a manager whose provider uses that folder";
 

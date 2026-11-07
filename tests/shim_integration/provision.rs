@@ -526,11 +526,7 @@ fn install_refuses_a_host_file_users_can_write_to() {
         other => panic!("a host file Users can write to must be refused, got {other:?}"),
     }
     let query = support::cmd::run("sc.exe", &["query", &id]);
-    assert!(
-        !query.ok(),
-        "nothing may be registered:
-{query}"
-    );
+    assert!(!query.ok(), "nothing may be registered:\n{query}");
     standalone(CheckPermissions::Disable)
         .install(&spec, false)
         .expect("with the check off the same host is accepted");
