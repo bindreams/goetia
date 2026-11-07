@@ -2641,7 +2641,8 @@ backend-specific:
 #[skuld::test]
 fn a_refused_resolved_path_is_escaped_where_the_error_is_printed() {
     let id = Id::try_from("frpc").unwrap();
-    let e = Error::from(check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\nb\u{202e}c"), DirJoin::Not).unwrap_err());
+    let e =
+        Error::from(check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\nb\u{202e}c"), DirJoin::Not).unwrap_err());
     assert_eq!(
         e.report().to_string(),
         r"daemon `frpc`: field `cwd` is `C:`, which resolves to `/a\u{a}b\u{202e}c`, which contains a control character, which is forbidden"
