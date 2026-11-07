@@ -20,11 +20,9 @@
 //!   substituted. A backend's own override is validated on every host,
 //!   but only the native one is completed and installed.
 //!
-//! Every field here is copied from `RawSpec` (`raw.rs`), not from
-//! `DaemonSpec`: `user`, `restart`, `restart-delay` and `type` stay the
-//! authored-text types (`RawUser`, `String`) so that `${VAR}` can still be
-//! interpolated into them before `resolve` parses the result — see
-//! `RawSpec`'s own field comments.
+//! Fields mirror `RawSpec` (`raw.rs`), not `DaemonSpec`: `user`, `restart`,
+//! `restart-delay` and `type` stay authored text so `${VAR}` can be
+//! interpolated before `resolve` parses them.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -46,7 +44,6 @@ pub type BackendOverrides = BTreeMap<BackendKind, RawOverride>;
 pub struct RawOverride {
     #[serde(default)]
     pub name: Option<String>,
-    // Same shape as `RawSpec::command`, now that both are optional.
     #[serde(default)]
     pub command: Option<Vec<String>>,
     #[serde(default)]
@@ -65,11 +62,9 @@ pub struct RawOverride {
     pub kind: Option<String>,
 }
 
-/// Which fields a backend's override actually supplied.
-/// Provenance the merged spec cannot carry: after the merge a `user`
-/// value is just a value, and `BackendKind::error` must not reject a base
-/// value for a backend the author never wrote a line for. Only `user` is
-/// read today.
+/// Which fields a backend's override actually supplied: provenance the merged spec cannot
+/// carry, so `BackendKind::error` does not reject a base value for a backend the author never
+/// wrote a line for. Only `user` is read today.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Supplied {
     pub user: bool,
@@ -96,9 +91,8 @@ impl RawSpec {
     /// A scalar/vector field wholesale-replaces when the override sets it;
     /// `env` unions instead, the override winning per key. On a backend
     /// with no override entry this is exactly `self.without_overrides()`,
-    /// paired with `Supplied::NONE` — see the module-level guard this
-    /// exists to hold: a per-backend rejection may only ever be applied to
-    /// a field the returned `Supplied` marks `true`.
+    /// paired with `Supplied::NONE`. A per-backend rejection may only be
+    /// applied to a field the returned `Supplied` marks `true`.
     pub fn merged_for(&self, backend: BackendKind) -> (RawSpec, Supplied) {
         let Some(ovr) = self.backend_specific.get(&backend) else {
             return (self.without_overrides(), Supplied::NONE);
@@ -144,10 +138,9 @@ impl RawSpec {
     }
 }
 
-/// `RawSpec::backend_specific`: a hand-written `Visitor` over `MapAccess`,
-/// in the shape of `raw.rs`'s `EnvVisitor` — a plain
+/// `RawSpec::backend_specific`, like `raw.rs`'s `EnvVisitor`: a plain
 /// `BTreeMap<BackendKind, RawOverride>` would silently keep the last of two
-/// `scm:` blocks rather than rejecting the duplicate.
+/// `scm:` blocks.
 pub(super) fn deserialize_overrides<'de, D>(d: D) -> Result<BackendOverrides, D::Error>
 where
     D: Deserializer<'de>,
@@ -182,11 +175,9 @@ impl<'de> Visitor<'de> for OverridesVisitor {
     }
 }
 
-/// `RawOverride::env`, checked for a duplicate key by the same visitor
-/// `RawSpec::env` uses, so base and override cannot disagree about what a
-/// duplicate is. The `Option` is always `Some` here: a missing key never
-/// reaches this function, and a `null` one is a type error the map visitor
-/// raises, exactly as it does for the base field.
+/// `RawOverride::env`, checked by the same visitor as `RawSpec::env`, so base and override agree
+/// on what a duplicate is. Always `Some`: a missing key never reaches this function, and a `null`
+/// is a type error from the visitor.
 fn no_duplicate_env<'de, D>(d: D) -> Result<Option<BTreeMap<String, String>>, D::Error>
 where
     D: Deserializer<'de>,

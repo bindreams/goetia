@@ -2,70 +2,49 @@
 //! injection validation gate.
 //!
 //! This is the crate's parse-don't-validate boundary — there is no
-//! separate `validate()` anywhere. systemd's `Description=` and
-//! `Environment=` have no escaping and a literal newline terminates a
-//! directive, so an unvalidated `name` could inject a second `ExecStart=`
-//! using systemd's own reset-then-reassign idiom; XML 1.0 separately
-//! cannot represent control characters at all, not even as entities. Every
-//! user-supplied string that ends up in a generated artifact — `name`,
-//! `command`, `cwd`, `logs`, every `env` key and value, and `user`'s
-//! `name`/`id` — is rejected here if it contains one.
+//! separate `validate()`. systemd's `Description=` and `Environment=` have
+//! no escaping and a newline terminates a directive, so an unvalidated
+//! `name` could inject a second `ExecStart=`; XML 1.0 cannot represent
+//! most C0 control characters at all, not even as entities. Every user-supplied
+//! string that ends up in a generated artifact — `name`, `command`, `cwd`,
+//! `logs`, every `env` key and value, and `user`'s `name`/`id` — is
+//! rejected here if it contains one.
 //!
 //! **Why `command[0]` is absolutized here and `command[1..]` is not.**
-//! `execve`, `posix_spawn` and `CreateProcess` all take an argument vector
-//! as opaque bytes — no launcher on any platform resolves a path *inside*
-//! an argument. A relative path in `command[1..]` is therefore resolved by
-//! the program being launched, against whatever working directory that
-//! program sees at the time; goetia has no say in it, and this is not a
-//! goetia policy to begin with.
+//! No launcher resolves a path *inside* an argument, so a relative path in
+//! `command[1..]` is the launched program's to resolve, against its working
+//! directory. `command[0]` has a defined role, and systemd, launchd and
+//! Windows services disagree about a relative value (systemd rejects
+//! `bin/frpc`; launchd silently resolves it against the job's working
+//! directory, the default one when `cwd` is unset; Windows against
+//! `System32`). Absolutizing it against the manifest's directory before
+//! any backend sees it gives one rule that does not depend on where the
+//! daemon starts.
 //!
-//! `command[0]` is different because, unlike an argument, it is a field
-//! with a defined role, and the three platforms disagree about that role
-//! for a relative value. systemd requires "either an absolute path to an
-//! executable or a simple file name without any slashes", resolving a bare
-//! name against a fixed compile-time search path and **never** against
-//! `WorkingDirectory=` — so a manifest's `bin/frpc` (a name with a slash
-//! that is not absolute) is rejected outright there. A Windows service has
-//! no working directory of its own at all, and resolves a relative binary
-//! against `System32`. launchd does neither: it resolves
-//! `ProgramArguments[0]` against the job's working directory, which
-//! `generate` emits only when `cwd` is set, so a relative binary there
-//! silently resolves against the default rather than being refused.
-//! Absolutizing `command[0]` against the manifest's directory before any
-//! backend sees it collapses those three disagreeing rules into one that
-//! always holds — and it is the only one of the three that does not depend
-//! on where the daemon happens to start.
-//!
-//! **The dragon is in the default.** Because only `command[0]` is
-//! absolutized, a manifest that passes a relative path as an *argument* —
-//! `command: ["bin/frpc", "-c", "host/frpc.toml"]` — and does not set
-//! `cwd` inherits whatever working directory the platform defaults to.
-//! systemd documents that default, for system instances, as the **root
-//! directory**: `-c host/frpc.toml` then resolves against `/`, and the
-//! daemon starts, cannot find its own config, and exits with no
-//! indication that a working directory was ever the problem. Set `cwd`, or
-//! write the argument absolute.
+//! **The dragon is in the default.** A relative path passed as an
+//! *argument* (`command: ["bin/frpc", "-c", "host/frpc.toml"]`) with no
+//! `cwd` resolves against the platform's default working directory; for a
+//! systemd system instance that is `/`, so the daemon cannot find its
+//! config and exits with no hint that the working directory was the problem.
+//! Set `cwd`, or write the argument absolute.
 //!
 //! # Why the grammar check exists, and why it is not just `scalar` with an
 //! empty `Vars`
 //!
-//! `interpolate::scalar` rejects a `$` that is not part of `${...}` or `$$`,
-//! rejects an unterminated `${`, an empty name, an invalid name character,
-//! and a `$` inside a `:-` default. Every one of those is `str` grammar over
-//! authored text — no `.env`, no substitution, no target machine — which is
-//! shape. But `interpolate::spec` **never runs on a non-native override**,
-//! so without a separate check `scm: {name: "$HOME"}` would resolve cleanly
-//! on Linux and fail only at install on Windows, and a bad `$` in a base
-//! value that the native override replaces would never be diagnosed at all.
-//! Running `scalar` with `Vars::empty()` is not the check: it would fail on
-//! `${VAR}` for the missing variable, which is precisely the thing a
-//! non-native backend is not entitled to decide. `interpolate::check_grammar`/
-//! `check_spec_grammar` are that separate check.
+//! `interpolate::scalar` rejects a `$` outside `${...}` or `$$`, an
+//! unterminated `${`, an empty or invalid name, and a `$` inside a `:-`
+//! default. All of that is grammar over authored text, which is shape. But
+//! `interpolate::spec` **never runs on a non-native override**, so without a
+//! separate check `scm: {name: "$HOME"}` would resolve cleanly on Linux and
+//! fail only at install on Windows, and a bad `$` in a base value that the
+//! native override replaces would never be diagnosed. `scalar` with
+//! `Vars::empty()` is not the check: it fails on `${VAR}` for a missing
+//! variable, which a non-native backend is not entitled to decide.
+//! `interpolate::check_grammar`/`check_spec_grammar` are the separate check.
 //!
-//! `check_spec_grammar` runs on authored text only: a `.env` value
-//! carrying a literal `$` (`SECRET=abc$def`) is legal, survives
-//! substitution, and would fail a grammar check applied to substituted
-//! text.
+//! `check_spec_grammar` runs on authored text only: a `.env` value with a
+//! literal `$` (`SECRET=abc$def`) is legal and would fail a grammar check
+//! applied to substituted text.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -84,16 +63,10 @@ const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 
 /// Turn a parsed manifest into a resolved daemon spec.
 ///
-/// Substitution happens inside `resolve`, on the merged native spec — see
-/// step 5 below. That is what lets `resolve` promise that no `${VAR}`
-/// survives into a returned spec: were it a separate step a caller had to
-/// remember, a manifest reaching this one directly would resolve with its
-/// references intact, and systemd applies its *own* `${...}` expansion to
-/// `ExecStart=` — turning an unsubstituted reference into an empty string
-/// inside a privileged unit. That guarantee holds of every spec `resolve`
-/// *returns*; it does not hold of a non-native backend's override, which is
-/// validated as written (uninterpolated) and then discarded — the best any
-/// host can honestly do for a backend it cannot install.
+/// Substitution happens inside `resolve`, on the merged native spec (step 5), so no `${VAR}`
+/// survives into a returned spec; systemd would apply its *own* `${...}` expansion to
+/// `ExecStart=` and turn an unsubstituted reference into an empty string in a privileged unit.
+/// A non-native backend's override is validated as written (uninterpolated) and then discarded.
 ///
 /// A host judges a non-native backend only by what the manifest wrote under
 /// that backend's own `backend-specific:` key (steps 3-4), and warns only
@@ -109,39 +82,27 @@ pub fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning
 
 /// [`resolve`], with the native backend named rather than detected.
 ///
-/// Production has exactly one caller, [`resolve`], which passes
-/// [`BackendKind::native`]. Tests pass any of the three, because the native arm
-/// of steps 4 and 5 — the skip, the verdict, the advisory — is otherwise
-/// only reachable from the one platform that runs it. A test that names a
-/// non-native backend as `native` exercises the same code an install on
-/// that platform would.
+/// Production's only caller is [`resolve`], with [`BackendKind::native`]. Tests pass any of the
+/// three, since the native arm of steps 4 and 5 is otherwise reachable only from one platform.
 fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Result<(DaemonSpec, Vec<Warning>), Error> {
-    // Declared before `absolutize` runs, not after: `absolutize` itself can
-    // push a manifest-level advisory (a drive-relative `-f`), and the
-    // spec's own advisories are appended to it after.
+    // Before `absolutize`, which can push a manifest-level advisory (a drive-relative `-f`).
     let mut warnings = Vec::new();
 
-    // `DaemonSpec` documents every path as absolute and `blob::decode`
-    // enforces it, so a relative `base_dir` would produce an artifact whose
-    // own embedded blob cannot be decoded — breaking the drift invariant for
-    // the entirely ordinary `goetia daemon install -f .`. Anchor it here, at
-    // the one place that makes the guarantee, rather than trusting every
-    // caller to pass an absolute path.
+    // `blob::decode` requires absolute paths, so a relative `base_dir` (`goetia daemon install
+    // -f .`) would produce an artifact whose own blob cannot be decoded. Anchor it here, the one
+    // place that makes the guarantee.
     let base_dir = absolutize(base_dir, &mut warnings)?;
     let base_dir = base_dir.as_path();
 
-    // Step 1: the id. Must run before `Id::try_from`, or the id-pattern check
-    // (whose charset already excludes `$`) answers first with its generic
-    // message. The id is not overridable, so this runs once.
+    // Step 1: the id. Before `Id::try_from`, whose charset excludes `$` and would answer first
+    // with a generic message.
     interpolate::reject_interpolated_id(&raw.id)?;
     let id = Id::try_from(raw.id.clone())?;
 
-    // Step 2: the `.env` gate, computed from the spec substitution will
-    // actually run on: the merged native spec of step 5. Reading it from
-    // anything else either misses a `${VAR}` written only in the native
-    // override (it would fail "no value for X" while `.env` defines it) or
-    // lets an unrelated/unreadable `.env` break a host whose native backend
-    // has no `$` anywhere.
+    // Step 2: the `.env` gate, computed from the merged native spec of step 5, the one
+    // substitution runs on. Anything else either misses a `${VAR}` written only in the native
+    // override, or lets an unrelated or unreadable `.env` break a host whose native backend has
+    // no `$`.
     let (mut native_merged, native_supplied) = match native {
         Some(b) => raw.merged_for(b),
         None => (raw.without_overrides(), Supplied::NONE),
@@ -152,25 +113,18 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
         Vars::empty()
     };
 
-    // Step 3: the base pass. Reported verbatim — no backend
-    // attribution, because a base-spec error is not any backend's
-    // fault, and base errors therefore always win on precedence. No
-    // `BackendKind` verdict runs here: the base spec is nobody's
-    // override.
+    // Step 3: the base pass. Reported verbatim with no backend attribution, so base errors win
+    // on precedence. No `BackendKind` verdict: the base spec is nobody's override.
     let base = raw.without_overrides();
     interpolate::check_spec_grammar(&base)?;
     resolve_shape(&id, base, base_dir)?;
 
-    // Step 4: the all-backends sweep, and errors only: every backend's
-    // merged spec is checked as authored, and `BackendKind::error` judges
-    // the fields its override supplied. A non-native backend's advisories
-    // are not this host's to give, so the shape pass's warnings are
-    // dropped. The native arm runs the grammar and
-    // shape checks and no verdict: `error` runs in step 5 instead, on
-    // the substituted text it is entitled to. This pass is not redundant
-    // even so: it is what makes step 5's failures provably substitution's
-    // fault, and it is where a *literal* control character in the native
-    // override is caught and attributed here.
+    // Step 4: the all-backends sweep, errors only: every backend's merged spec is checked as
+    // authored, and `BackendKind::error` judges the fields its override supplied. A non-native
+    // backend's advisories are not this host's to give, so its shape warnings are dropped. The
+    // native arm runs the grammar and shape checks but no verdict (step 5 runs `error` on
+    // substituted text). It is still needed: it makes step 5's failures provably substitution's
+    // fault, and catches a *literal* control character in the native override.
     for backend in BackendKind::ALL {
         let (merged, supplied) = raw.merged_for(backend);
         let has_entry = raw.backend_specific.contains_key(&backend);
@@ -185,11 +139,9 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
         sweep.map_err(|e| annotate_sweep_error(e, backend, has_entry))?;
     }
 
-    // Step 5: the native pass, and the substitution whose result is
-    // kept. Authoritative: it is where the injection gate inspects
-    // final values, and its `ShapedSpec` is the one that becomes a
-    // `DaemonSpec`. No `check_spec_grammar` here — the text is
-    // substituted, and a `.env` value may legally carry a literal `$`.
+    // Step 5: the native pass, the substitution whose result is kept. Authoritative: the
+    // injection gate inspects final values here, and its `ShapedSpec` becomes the `DaemonSpec`.
+    // No `check_spec_grammar`: a substituted `.env` value may legally carry a literal `$`.
     let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
     let substituted: Result<(ShapedSpec, Vec<Warning>), Error> = (|| {
         interpolate::spec(&mut native_merged, &vars)?;
@@ -224,25 +176,17 @@ pub fn load(path: &Path) -> Result<(DaemonSpec, Vec<Warning>), Error> {
     };
 
     let text = fs::read_to_string(&file_path).map_err(|source| Error::os_at("read", &file_path, source))?;
-    // The one and only place a manifest is read: every diagnostic a
-    // manifest can produce — line, column, `null`, duplicate key, unknown
-    // field — comes from here, on the file exactly as written. `resolve`
-    // interpolates after it, on the typed result, so a `${VAR}` cannot move
-    // a position or change a message.
+    // The only place a manifest is read, so every positioned diagnostic comes from the file as
+    // written; `resolve` interpolates after, on the typed result.
     let raw = RawSpec::parse(&text)?;
 
     resolve(raw, &base_dir)
 }
 
-/// Backend annotation for step 4. `Error::Invalid` (from `resolve_shape` or
-/// `BackendKind::error`) always gains the `backend-specific.<backend>: `
-/// message prefix: this pass's spec is `merged_for(backend)`, and the base
-/// pass (step 3) already validated the value's base form, so a failure here
-/// can only be attributable to this backend's override — `has_entry` is
-/// true whenever this actually fires. `Error::Interpolate` (from
-/// `check_spec_grammar`) gets a path suffix instead, gated on `has_entry`
-/// explicitly rather than relying on that same reasoning to make the
-/// ungated case unreachable.
+/// Backend annotation for step 4. `Error::Invalid` always gains the `backend-specific.<backend>: `
+/// prefix: the base pass already validated the base form, so a failure here is attributable to
+/// this backend's override. `Error::Interpolate` gets a path suffix instead, gated explicitly on
+/// `has_entry`.
 fn annotate_sweep_error(err: Error, backend: BackendKind, has_entry: bool) -> Error {
     match err {
         Error::Interpolate { path, message } if has_entry => Error::Interpolate {
@@ -253,9 +197,8 @@ fn annotate_sweep_error(err: Error, backend: BackendKind, has_entry: bool) -> Er
     }
 }
 
-/// `backend-specific.<backend>: ` on an `Error::Invalid`, and nothing on any
-/// other variant. Shared by step 4's sweep and step 5's native verdict so
-/// the two spell one attribution one way.
+/// `backend-specific.<backend>: ` on an `Error::Invalid`, and nothing on any other variant.
+/// Shared by step 4's sweep and step 5's native verdict.
 fn attribute_to(err: Error, backend: BackendKind) -> Error {
     match err {
         Error::Invalid {
@@ -271,25 +214,14 @@ fn attribute_to(err: Error, backend: BackendKind) -> Error {
     }
 }
 
-/// Backend annotation for step 5. `Error::Interpolate` (from
-/// `interpolate::spec`'s substitution) gains a "merged with" path suffix,
-/// gated on `native_entry` — `Supplied` answers "which fields did this
-/// override write" and gates `BackendKind::error`; `native_entry` (`raw`'s
-/// `backend_specific.contains_key`) answers "was this backend mentioned at
-/// all" and gates this annotation; the two are not interchangeable, since
-/// `scm: {}` is an entry that sets no field and its `Supplied` is
-/// byte-identical to a missing entry's. `Error::Invalid` (from
-/// `resolve_shape`'s injection gate) gains an "after substituting from .env"
-/// message prefix instead: the uninterpolated pass over the same merged spec
-/// (step 4's native arm) already ran `resolve_shape` and passed, so the only
-/// thing that changed is substitution, and the error must say so rather than
-/// pointing a reader at the manifest line that merely referenced the
-/// variable.
+/// Backend annotation for step 5. `Error::Interpolate` gains a "merged with" path suffix, gated
+/// on `native_entry` (was this backend mentioned at all), not on `Supplied` (which fields did it
+/// write): `scm: {}` is an entry whose `Supplied` equals a missing entry's. `Error::Invalid`
+/// gains an "after substituting from .env" prefix: step 4's native arm already passed
+/// `resolve_shape` on the uninterpolated spec, so substitution is what changed.
 ///
-/// Applied to the substitution and shape half of step 5 only. The native
-/// `BackendKind::error` verdict is annotated by `attribute_to` at its own call
-/// site: step 4 never ran it, so the premise this prefix rests on does not
-/// hold for it.
+/// Applied to the substitution and shape half of step 5 only; the native `BackendKind::error`
+/// verdict is annotated by `attribute_to` at its call site, since step 4 never ran it.
 fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error {
     match err {
         Error::Interpolate { path, message } => {
@@ -342,11 +274,9 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
 
     let mut env = BTreeMap::new();
     for (key, value) in raw.env {
-        // The `$`-in-a-key rule, checked here so it runs for every backend,
-        // not just the native merged spec: `scm: {env: {"${K}": v}}` must be
-        // caught from Linux too. Comment deliberately duplicated with
-        // `interpolate.rs`'s copy — see `USER_ID_MESSAGE`'s note on
-        // `reject_blank` for why this is not a duplicate to be collapsed.
+        // Checked here so it runs for every backend: `scm: {env: {"${K}": v}}` must be caught
+        // from Linux too. Steps 3 and 4 run this before `interpolate::spec` sees the spec, which
+        // keeps its own copy so that it does not depend on that order.
         if interpolate::would_substitution_change(&key) {
             return Err(invalid(id, interpolate::ENV_NAME_MESSAGE));
         }
@@ -365,10 +295,9 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
             reject_blank(id, "user.name", n)?;
         }
         User::Id(AccountId::Sid(s)) => {
-            // The `user.id` `$` rule, checked here for the same reason as
-            // the `env`-name one above. Ordering against `reject_blank` below
-            // does not matter: `${S}` trims to `${S}`, never empty, so the
-            // two can never both fire on one value.
+            // Same reason as the `env`-name rule above, and `interpolate::spec` likewise keeps its
+            // own copy. Ordering against `reject_blank` below does not matter:
+            // `${S}` trims to `${S}`, never empty, so the two can never both fire on one value.
             if interpolate::would_substitution_change(s) {
                 return Err(invalid(id, interpolate::USER_ID_MESSAGE));
             }
@@ -382,13 +311,9 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
     let restart_delay = shape(id, raw.restart_delay, parse_restart_delay)?;
     let kind = shape(id, raw.kind, parse_kind)?;
 
-    // The absoluteness guarantee has exactly one other runtime enforcement
-    // point, inside `blob::decode` — which only fires when re-reading an
-    // artifact that was already written. On the direct resolve -> generate
-    // path that `install`/`show` take, a regression here would be baked into
-    // a unit file before anything noticed. Catch it at the source instead.
-    // The `command[0]` half of this guarantee moved to `require_complete`,
-    // the first point at which a `command` is known to exist at all.
+    // `blob::decode` enforces absoluteness only when re-reading an artifact; on the direct
+    // resolve -> generate path of `install`/`show` a regression would be baked into a unit file
+    // unnoticed. `command[0]` is checked in `require_complete`, where a `command` first exists.
     debug_assert!(
         cwd.as_deref().is_none_or(Path::is_absolute) && logs.as_deref().is_none_or(Path::is_absolute),
         "resolve_shape must return absolute paths; got cwd={cwd:?} logs={logs:?}",
@@ -411,13 +336,9 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
     ))
 }
 
-/// Keep the parse in the shape phase, and skip exactly the values a
-/// substitution would change. Not `contains("${")`: `would_substitution_change`
-/// is deliberately `contains('$')`, so a `$$` escape is deferred too, even
-/// though it needed no `.env` — see that function's doc comment. Deferring
-/// a value that didn't strictly need deferring costs one check running
-/// slightly later; parsing text that substitution is about to change
-/// parses the wrong string outright.
+/// Keep the parse in the shape phase, deferring exactly the values a substitution would change.
+/// `would_substitution_change` is deliberately `contains('$')`, so a `$$` escape is deferred
+/// too; see its doc.
 fn shape<T>(id: &Id, raw: Option<String>, parse: fn(&Id, &str) -> Result<T, Error>) -> Result<Shaped<T>, Error> {
     match raw {
         None => Ok(Shaped::Absent),
@@ -445,16 +366,11 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         kind,
     } = shaped;
 
-    // Both "absent" and "present but empty" go through the one
-    // `reject_empty_command` check, so the two spellings of "no command"
-    // cannot diverge and produce one message each.
+    // Absent and empty share one check, so they cannot diverge in message.
     let command = command.unwrap_or_default();
     reject_empty_command(&id, &command).map_err(|_| missing_command_error(&id, backend))?;
 
-    // The `command[0]` half of the absoluteness guarantee — see
-    // `resolve_shape`'s matching comment. This is the first point at which
-    // a `command` is known to exist; indexing `command[0]` any earlier is
-    // exactly the assumption `Option<Vec<String>>` exists to remove.
+    // See `resolve_shape`'s matching comment.
     debug_assert!(
         Path::new(&command[0]).is_absolute(),
         "resolve must return an absolute command[0]; got {:?}",
@@ -504,15 +420,10 @@ fn missing_command_error(id: &Id, backend: Option<BackendKind>) -> Error {
 /// Apply the `root` reserved word to an authored [`RawUser`], and default
 /// an absent `user:` to [`User::Root`].
 ///
-/// The rule is the bare string form's alone: `user: root` is the
-/// superuser, while `{name: root}` is the literal account called `root`,
-/// which is that form's whole purpose. Applying it here rather than in
-/// `RawUser`'s visitor is what lets `user: ${U}` with `U=root` mean
-/// exactly what a typed `user: root` means, without `{name: ${U}}` also
-/// collapsing to the superuser — a `User::Name` carries no record of
-/// which syntax produced it, so a post-substitution re-normalisation
-/// cannot tell the two apart. Same reasoning as [`parse_restart`], on the
-/// one field whose *deserialization* was value-dependent.
+/// The rule is the bare string form's alone: `user: root` is the superuser, while `{name: root}`
+/// is the literal account called `root`. Applying it here rather than in `RawUser`'s visitor
+/// makes `user: ${U}` with `U=root` mean what a typed `user: root` means, without `{name: ${U}}`
+/// also collapsing to the superuser; a `User::Name` records no syntax of origin.
 pub(crate) fn resolve_user(raw: Option<RawUser>) -> User {
     match raw {
         None => User::Root,
@@ -523,16 +434,9 @@ pub(crate) fn resolve_user(raw: Option<RawUser>) -> User {
     }
 }
 
-/// Parse an authored `restart:` string into a [`Restart`]. `pub(crate)`
-/// rather than private: the backend-specific-override item's two-phase
-/// resolution needs to call this from whichever phase can honestly run it,
-/// once a field can also arrive from a per-backend override rather than
-/// only from here.
-///
-/// A `String` field parsed here, rather than a derived `Deserialize` on
-/// `Restart` itself, is what lets `restart: ${R}` be interpolated before
-/// this ever runs — a derived `Deserialize` would reject `${R}` as an
-/// unknown variant at YAML-parse time, before interpolation gets a chance.
+/// Parse an authored `restart:` string into a [`Restart`]. `pub(crate)` because two-phase
+/// resolution calls it from whichever phase can run it. Parsed from a `String`, not a derived
+/// `Deserialize`, so `restart: ${R}` is interpolated first.
 pub(crate) fn parse_restart(id: &Id, raw: &str) -> Result<Restart, Error> {
     match raw {
         "never" => Ok(Restart::Never),
@@ -558,10 +462,8 @@ pub(crate) fn parse_kind(id: &Id, raw: &str) -> Result<Kind, Error> {
     }
 }
 
-/// Parse an authored `restart-delay:` string into a [`Duration`], replacing
-/// `humantime_serde`'s serde-time parse (accepted syntax is unchanged:
-/// `humantime_serde` was itself a thin wrapper over
-/// `humantime::parse_duration`). `pub(crate)`: see [`parse_restart`].
+/// Parse an authored `restart-delay:` string into a [`Duration`] with `humantime`.
+/// `pub(crate)`: see [`parse_restart`].
 pub(crate) fn parse_restart_delay(id: &Id, raw: &str) -> Result<Duration, Error> {
     humantime::parse_duration(raw).map_err(|source| {
         invalid_from(
@@ -592,17 +494,12 @@ fn resolve_optional_path(
 }
 
 /// Join a relative path against `base_dir`; leave an absolute path as-is.
-/// `Path::is_absolute` (not a string prefix check) so this behaves
-/// correctly on both a POSIX host (`/opt/rt`) and a Windows host
-/// (`C:\base`), whose absoluteness rules differ.
+/// Uses `Path::is_absolute`, not a string prefix check, since POSIX and Windows differ.
 ///
-/// Every check here is deterministic given `(value, base_dir, process
-/// state)` — `std::path::absolute`'s drive-relative fallback reads the
-/// per-drive current directory, so this is not a pure function of `(value,
-/// base_dir)` alone — but every pass `resolve` makes runs in one
-/// process against one unchanging process state, so identical values get
-/// identical verdicts across passes. That is what makes "the base pass
-/// passed, therefore this failure is the override's" sound.
+/// Not a pure function of `(value, base_dir)`: `std::path::absolute`'s drive-relative fallback
+/// reads the per-drive current directory. But every pass `resolve` makes runs in one process
+/// against one unchanging process state, so identical values get identical verdicts, which makes
+/// "the base pass passed, so this failure is the override's" sound.
 fn resolve_path_string(
     id: &Id,
     field: &str,
@@ -616,22 +513,15 @@ fn resolve_path_string(
     } else {
         normalize(&base_dir.join(p))
     };
-    // `base_dir` is absolute, so a join can fail to yield an absolute result
-    // only in one shape: a Windows drive-relative path (`C:bin/frpc.exe`),
-    // which carries a prefix but no root. `PathBuf::push` replaces the
-    // buffer whenever the pushed path carries a prefix, so
-    // `base_dir.join("C:bin")` silently discards `base_dir` and yields
-    // `C:bin` — still relative. Every currently-accepted input resolves
-    // above and never reaches here.
+    // With an absolute `base_dir` a join stays relative only for a Windows drive-relative path
+    // (`C:bin/frpc.exe`): `PathBuf::push` replaces the buffer when the pushed path carries a
+    // prefix, so `base_dir.join("C:bin")` yields `C:bin`.
     let joined = if joined.is_absolute() {
         joined
     } else {
-        // `std::path::absolute` — not the still-unstable `Path::absolute`
-        // method, and not `fs::canonicalize`, which requires the path to
-        // exist, resolves symlinks, and returns a verbatim `\\?\` path on
-        // Windows — resolves the drive-relative case the way
-        // `GetFullPathNameW` does: against the per-drive current directory
-        // of *this* process.
+        // `std::path::absolute`, not `fs::canonicalize` (which needs the path to exist, resolves
+        // symlinks and returns a `\\?\` path on Windows): resolves the way `GetFullPathNameW`
+        // does, against the per-drive current directory of *this* process.
         let resolved = std::path::absolute(&joined).map_err(|source| {
             invalid_from(
                 id,
@@ -640,12 +530,8 @@ fn resolve_path_string(
             )
         })?;
         if resolved.is_absolute() {
-            // `GetFullPathNameW` resolves against process state — the
-            // current directory on that drive in whichever process ran
-            // goetia — not against the manifest. An `install` run from one
-            // directory and a `diff` run from another can resolve this
-            // differently and disagree, reporting drift on an artifact
-            // nobody touched.
+            // Resolved against process state, so `install` and `diff` run from different
+            // directories can disagree and report drift on an untouched artifact.
             warnings.push(Warning {
                 id: Some(id.clone()),
                 message: format!(
@@ -658,8 +544,6 @@ fn resolve_path_string(
         }
         resolved
     };
-    // `std::path::absolute` returns an absolute path or an error, and a verbatim prefix is already
-    // absolute above, so no input reaches here with a relative path.
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
     Ok(joined.to_string_lossy().into_owned())
 }
@@ -668,26 +552,21 @@ fn resolve_path_string(
 ///
 /// **Deduced values may be canonicalised; authored ones are honoured as
 /// written.** `dir` is the manifest directory the user passed to `-f`, so it
-/// is deliberately not `canonicalize()`d: that requires the path to exist
-/// (a manifest may name a `cwd`/`logs` directory the installer is about to
-/// create) and resolves symlinks, which would bake a deliberately
-/// symlinked deployment path's target into the artifact instead of the path
-/// the user wrote, so a service would stop following a repointed symlink.
-/// One consequence: `-f .` cannot preserve a symlinked spelling — `getcwd`
-/// already resolved it before goetia ever saw it, so there is nothing left
-/// to honour. Anyone who wants a symlinked deployment path kept must pass it
-/// explicitly to `-f`.
+/// is not `canonicalize()`d: that requires the path to exist and resolves
+/// symlinks, which would bake a symlinked deployment path's target into the
+/// artifact, so a service would stop following a repointed symlink. Hence
+/// `-f .` cannot preserve a symlinked spelling (`getcwd` already resolved
+/// it); pass it explicitly to `-f`.
 ///
 /// The process's own working directory, read below when `dir` is relative,
-/// is the opposite case: nobody typed it, so it carries no intent to
-/// preserve, and it always exists, so it *is* canonicalised.
+/// is the opposite case: nobody typed it and it always exists, so it *is*
+/// canonicalised.
 fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error> {
     if dir.is_absolute() {
         return Ok(normalize(dir));
     }
-    // Not an `Error::Os` at `dir`: nothing was read from `dir` here, and naming it would send
-    // someone chasing permissions on a directory that is fine, when the real fault is the process's
-    // own cwd being gone.
+    // Not an `Error::Os` at `dir`: nothing was read from it, and naming it would misdirect a
+    // reader when the process's own cwd is what is gone.
     let cwd = std::env::current_dir().map_err(|source| {
         Error::os(
             format!("read the current directory while resolving `{}`", dir.display()),
@@ -696,12 +575,9 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     })?;
     let cwd = canonicalize_cwd(&cwd)?;
     let joined = normalize(&cwd.join(dir));
-    // The fallback below resolves `..` lexically, on this path only.
-    // `normalize` leaves `..` alone everywhere else — removing it lexically
-    // is wrong in the presence of symlinks — but `GetFullPathNameW`
-    // collapses `..` lexically before the filesystem ever sees the path, so
-    // a drive-relative path goetia resolved differently from every other
-    // Windows tool would be the bug, not the other way around.
+    // The fallback below resolves `..` lexically, on this path only: `normalize` leaves `..`
+    // alone (wrong with symlinks), but `GetFullPathNameW` collapses it lexically, and goetia must
+    // agree with other Windows tools.
     let joined = if joined.is_absolute() {
         joined
     } else {
@@ -729,43 +605,21 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     Ok(joined)
 }
 
-/// Canonicalise the process's current working directory. **Deduced values
-/// may be canonicalised; authored ones are honoured as written** — see
-/// [`absolutize`]'s doc comment for the other half of that line. The
-/// working directory is the one value in the chain nobody typed, so it
-/// carries no intent to preserve, and it always exists, so
-/// `canonicalize`'s existence requirement is satisfied by construction.
+/// Canonicalise the process's current working directory; see [`absolutize`] for why this value,
+/// unlike an authored one, may be.
 ///
-/// What this buys, per platform: on Unix, nearly nothing — `getcwd`
-/// already returns a symlink-free path. On Windows it gains canonical
-/// capitalisation, which fixes phantom drift at its source: installing from
-/// `C:\App` and diffing from `C:\app` would otherwise store two different
-/// strings for one directory and report drift on an artifact nobody
-/// touched.
+/// On Unix this gains almost nothing. On Windows it gains canonical capitalisation, so
+/// installing from `C:\App` and diffing from `C:\app` do not report phantom drift.
 ///
-/// When this fails, every subcommand that loads a manifest by a relative
-/// `-f` — including the default `-f .` — fails from that directory. That is
-/// an **accepted limitation**, decided by the owner: the reachable causes
-/// are narrow, and a fallback to the uncanonicalised directory would trade a
-/// loud refusal for silent phantom drift on exactly the platform this
-/// function exists to protect. Revisit if one of them shows up in use.
+/// When this fails, every subcommand that loads a manifest by a relative `-f` (including the
+/// default `-f .`) fails from that directory. That is an accepted limitation, decided by the
+/// owner: the reachable causes are narrow, and a fallback to the uncanonicalised directory would
+/// trade a loud refusal for silent phantom drift on Windows. Revisit if one of them shows up in use.
 ///
-/// The reachable causes, measured rather than assumed:
-///
-/// - **Unix:** a path component the process cannot traverse (`EACCES`) —
-///   the cwd is under a directory whose permissions changed after the
-///   process entered it, or which it inherited and cannot re-walk.
-/// - **Windows:** `canonicalize` is `CreateFileW` with
-///   `FILE_FLAG_BACKUP_SEMANTICS` followed by `GetFinalPathNameByHandleW`
-///   with `VOLUME_NAME_DOS`, so it fails when the open is refused (access
-///   denied, sharing violation) *and* when the volume has no drive letter or
-///   mount point for a DOS path to name — a volume mounted only under a GUID
-///   path, or a VSS snapshot. Filesystem drivers that do not implement the
-///   information classes that call needs fail here too.
-///
-/// A **deleted** working directory is not among them, despite being the
-/// intuitive guess: it fails earlier, in `std::env::current_dir`, and never
-/// reaches this function. Do not put it back in the message below.
+/// The failure causes (an unreadable path component on Unix; a refused open or a volume with no
+/// DOS path on Windows) are the ones the message names. A
+/// **deleted** working directory is not among them: it fails earlier, in
+/// `std::env::current_dir`, so do not put it in the message below.
 fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, Error> {
     let canonical = fs::canonicalize(cwd).map_err(|source| Error::Step {
         what: "the current directory could not be canonicalised; it may be unreadable, or on a volume with no drive \
@@ -778,14 +632,11 @@ fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf, Error> {
 
 /// Strip Windows' `\\?\` verbatim prefix from a `canonicalize`d path, so it
 /// compares equal to every other spelling goetia or SCM produces for the
-/// same directory. `canonicalize` only ever returns the two shapes matched
-/// below; any other prefix is left untouched. Stripped unconditionally, even
-/// past `MAX_PATH` (260): keeping the verbatim prefix instead would put a
-/// `\\?\` string into the metadata blob — a spelling nothing else in the
-/// system produces — guaranteeing permanent phantom drift, which is worse
-/// than the length limit that already applies to every authored absolute
-/// path. A no-op on every other platform, where `canonicalize` never
-/// produces a `Prefix` component to begin with.
+/// same directory. `canonicalize` only returns the two shapes matched below;
+/// any other prefix is left untouched. Stripped unconditionally, even past
+/// `MAX_PATH` (260): a `\\?\` string in the metadata blob would cause
+/// permanent phantom drift, worse than the length limit that already applies
+/// to every authored absolute path. A no-op on other platforms.
 #[cfg(windows)]
 fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     use std::path::{Component, Prefix};
@@ -796,9 +647,7 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
                 out.extend(path.components().skip(1));
                 out
             }
-            // Not `UNC\server\share` — building the drive form by simply
-            // dropping the leading `\\?\` would produce exactly that trap
-            // for this variant.
+            // Not `UNC\server\share`, which dropping the leading `\\?\` would produce.
             Prefix::VerbatimUNC(server, share) => {
                 let mut out = PathBuf::from(format!("\\\\{}\\{}", server.to_string_lossy(), share.to_string_lossy()));
                 out.extend(path.components().skip(1));
@@ -834,24 +683,17 @@ fn normalize(path: &Path) -> PathBuf {
     }
 }
 
-/// systemd's `Description=`/`Environment=`, launchd's `UserName`, and every
-/// other emitted directive have no escaping, and a literal control
-/// character — most importantly a newline — can terminate one directive
-/// and start another. XML 1.0 cannot represent a control character at all,
-/// not even as an entity, so this same check also keeps the launchd
-/// generator from emitting an unparseable plist.
+/// Every gate a user-supplied string must pass before it can be emitted into any artifact. One
+/// entry point, so a field added later cannot pick up half the checks. Each defect they catch
+/// would be silent if no gate did.
 ///
-/// `pub(crate)`: also called by `blob::decode`, which must re-run this
-/// same check against a spec deserialized from an untrusted artifact
-/// rather than trust that `DaemonSpec`'s `pub` fields still satisfy it.
-/// Every gate a user-supplied string must pass before it can be emitted
-/// into any artifact. One entry point rather than two, so a field added
-/// later cannot pick up half the checks: each of these was a real defect
-/// found in review, and both are silent when they fail.
+/// systemd's `Description=`/`Environment=`, launchd's `UserName` and every other emitted
+/// directive have no escaping, and a control character (above all a newline) can terminate one
+/// directive and start another. XML 1.0 cannot represent most C0 control characters at all, so
+/// this also keeps the launchd generator from emitting an unparseable plist.
 ///
-/// `pub(crate)`: also called by `blob::decode`, which re-runs these against
-/// a spec deserialized from an untrusted artifact rather than trusting that
-/// `DaemonSpec`'s `pub` fields still satisfy them.
+/// `pub(crate)`: also called by `blob::decode`, which re-runs these against a spec deserialized
+/// from an untrusted artifact rather than trusting `DaemonSpec`'s `pub` fields.
 pub(crate) fn reject_unemittable(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     reject_control_chars(id, field, value)?;
     reject_trailing_backslash(id, field, value)?;
@@ -866,10 +708,8 @@ pub(crate) fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<
         ));
     }
     if let Some(c) = value.chars().find(|c| is_xml_noncharacter(*c)) {
-        // Not control characters, so `char::is_control()` misses them, but
-        // XML 1.0 cannot represent a noncharacter at all — not even as a
-        // numeric entity — so one reaching the launchd generator produces an
-        // unparseable plist and a daemon that refuses to load.
+        // `char::is_control()` misses these, but XML 1.0 cannot represent a noncharacter even as
+        // a numeric entity, so one would make the launchd plist unparseable.
         return Err(invalid(
             id,
             &format!(
@@ -889,12 +729,10 @@ fn is_xml_noncharacter(c: char) -> bool {
 }
 
 /// A value ending in a backslash is a line continuation to systemd, which
-/// merges its directive with the following line. That is not a formatting
-/// nuisance but a privilege boundary: a `name` ending in `\` swallows
-/// whatever comes next, which can be the `[Service]` section header or the
-/// `User=` directive — and a swallowed `User=` silently runs the daemon as
-/// root instead of the requested account. Interior backslashes are fine and
-/// must stay allowed, or ordinary Windows paths become unexpressible.
+/// merges its directive with the following line. That is a privilege
+/// boundary: a `name` ending in `\` can swallow the `User=` directive and
+/// silently run the daemon as root. Interior backslashes must stay allowed,
+/// or ordinary Windows paths become unexpressible.
 ///
 /// `pub(crate)`: see `reject_control_chars`.
 pub(crate) fn reject_trailing_backslash(id: &Id, field: &str, value: &str) -> Result<(), Error> {
@@ -920,16 +758,11 @@ pub(crate) fn reject_empty_command(id: &Id, command: &[String]) -> Result<(), Er
 /// Fields where the empty string is never meaningful and is silently
 /// dangerous. `pub(crate)`: also called by `blob::decode`.
 ///
-/// Applied to `command[0]`, `cwd` when present, `logs` when present, and
-/// every `env` key — an empty one of these has no dangerous default, it
-/// simply fails to resolve or, for `command[0]`, would silently resolve to
-/// the manifest directory. `user.name` and `user.id` are *not* checked
-/// here: an account identifier needs the stronger [`reject_blank`], since
-/// a value that is empty only after trimming is exactly as dangerous as
-/// one that is empty outright. Deliberately **not** applied to `name` (an
-/// empty systemd `Description=` is harmless), to `env` values (`FOO=` is a
-/// normal assignment), or to `command[1..]` (an empty argv element is
-/// legitimate on POSIX and every generator quotes it).
+/// Applied to `command[0]`, `cwd` and `logs` when present, and every `env` key: an empty one
+/// fails to resolve or, for `command[0]`, would silently resolve to the manifest directory.
+/// `user.name` and `user.id` need the stronger [`reject_blank`]. Deliberately **not** applied
+/// to `name` (an empty `Description=` is harmless), `env` values (`FOO=` is a normal assignment)
+/// or `command[1..]` (an empty argv element is legitimate and every generator quotes it).
 pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     if value.is_empty() {
         return Err(invalid(id, &format!("field `{field}` must not be empty")));
@@ -937,44 +770,24 @@ pub(crate) fn reject_empty(id: &Id, field: &str, value: &str) -> Result<(), Erro
     Ok(())
 }
 
-/// Like [`reject_empty`], but also rejects a value that is nothing but
-/// whitespace. Applied only to `user.name` and `user.id` (the `Sid` arm) —
-/// never to a path or an `env` key, and that asymmetry is deliberate, not
-/// an oversight to "complete":
+/// Like [`reject_empty`], but also rejects a value that is nothing but whitespace. Applied only
+/// to `user.name` and `user.id` (the `Sid` arm), never to a path or an `env` key. The asymmetry
+/// is deliberate:
 ///
-/// - An account identifier has a dangerous default on every backend if the
-///   whitespace is trimmed away downstream: `User=` (a bare space or
-///   several) verifies and starts cleanly under `systemd-analyze verify`
-///   on every platform tested, exactly like `User=` with nothing after
-///   it — systemd does not reject either, so goetia is the only gate. A
-///   whitespace-only value is therefore either the same reset-to-root
-///   silently reached through a value [`reject_empty`] does not catch, or
-///   it names an account that cannot exist (a loud start failure) — both
-///   outcomes this task exists to close off.
-/// - A path has no such default: a file literally named `" "` is legal on
-///   Unix, so refusing it would be defending goetia's own implementation
-///   rather than serving the user, and an all-whitespace `cwd`/`logs`/
-///   `command[0]` simply fails to resolve like any other bad path — it
-///   does not fall back to anything.
-/// - An `env` key made of whitespace is a distinct, broader question
-///   (whether an environment-variable name may contain a space at all)
-///   that this task does not own; only its *emptiness* does, via
-///   [`reject_empty`].
+/// - systemd rejects neither a whitespace-only `User=` nor an empty one (`systemd-analyze verify`
+///   accepts both alike), so goetia is the only gate. An empty `User=` resets to root; a
+///   whitespace-only value reaching the unit either does the same or names an account that
+///   cannot exist.
+/// - A path has no such default: a file named `" "` is legal on Unix, and an all-whitespace
+///   `cwd`/`logs`/`command[0]` simply fails to resolve.
+/// - Whether an `env` key may contain a space at all is a separate question; only its
+///   *emptiness* is checked, via [`reject_empty`].
 ///
-/// `pub(crate)`: also called by `blob::decode`.
+/// `pub(crate)`: also called by `blob::decode`. An installed artifact whose blob carries an empty
+/// or whitespace-only `user.name` decodes as `Installed::OursUnusable`, not silently as root.
 ///
-/// An already-installed artifact whose blob carries an empty or
-/// whitespace-only `user.name` decodes as `Installed::OursUnusable`
-/// rather than silently as root — the correct disclosure, and goetia has
-/// no release yet whose compatibility that would break.
-///
-/// A second, independent rejection of an empty `user.name` and empty
-/// `user.id` SID lives in the per-backend-override validation
-/// (`resolve_shape`): it found that `canonical_account("")` maps an empty
-/// authored name to `LocalSystem` on Windows by a different route, and
-/// stays scoped to the `User::Root` path it was written for. The two
-/// checks have different reachability and neither is redundant with the
-/// other — do not remove one as a "duplicate" of the other.
+/// This is the only gate between an authored empty name and `canonical_account("")`, which maps
+/// it to `LocalSystem` on Windows; `windows_builtin`'s `""` row is the other half (see there).
 pub(crate) fn reject_blank(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     if value.trim().is_empty() {
         return Err(invalid(id, &format!("field `{field}` must not be empty")));
@@ -992,10 +805,8 @@ pub(crate) fn reject_env_key_with_equals(id: &Id, key: &str) -> Result<(), Error
     Ok(())
 }
 
-/// `cwd` and `logs` are always resolved to absolute paths here (joined
-/// against `base_dir` when relative), so a `DaemonSpec` field carrying a
-/// relative path can only be an already-corrupt one. `pub(crate)`: see
-/// `reject_control_chars`.
+/// `cwd` and `logs` are always resolved to absolute paths here, so a relative one in a
+/// `DaemonSpec` is already corrupt. `pub(crate)`: see `reject_control_chars`.
 pub(crate) fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<(), Error> {
     if !path.is_absolute() {
         return Err(invalid(
@@ -1006,10 +817,7 @@ pub(crate) fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<
     Ok(())
 }
 
-/// `pub(super)`: `spec::backend` (a sibling module, not a descendant of
-/// `resolve`) constructs the same `Error::Invalid` shape for its own
-/// rejections (`BackendKind::error`), and this is the one place that shape is
-/// spelled.
+/// `pub(super)`: `spec::backend` builds the same `Error::Invalid` for `BackendKind::error`.
 pub(super) fn invalid(id: &Id, message: &str) -> Error {
     Error::Invalid {
         daemon: id.as_str().to_string(),

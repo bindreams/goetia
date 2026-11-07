@@ -6,12 +6,10 @@
 //! why that is a separate walk of the same text, and why it goes second).
 //!
 //! `env` gets a `deserialize_with`: a typed `BTreeMap` field cannot detect
-//! a duplicate YAML key, because serde's map deserializer inserts and
-//! overwrites and `yaml_serde`'s own duplicate-key check lives only in its
-//! `Mapping` deserializer, which a typed map never reaches. So this module
-//! walks the mapping's key/value pairs itself, one entry at a time, and
-//! rejects a repeat, or a collision that differs only in case, before it
-//! ever reaches a `BTreeMap`.
+//! a duplicate YAML key, because serde's map deserializer overwrites and
+//! `yaml_serde`'s duplicate-key check lives only in its `Mapping`
+//! deserializer. So this module walks the entries itself and rejects a
+//! repeat, or a collision differing only in case, before the `BTreeMap`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -29,17 +27,12 @@ use super::user::RawUser;
 ///
 /// **Construct one with [`RawSpec::parse`], not with `Deserialize`.**
 /// The null rule is enforced by a second walk that `parse` runs over the
-/// same text, because it needs that text to report a position — a
-/// `Deserializer` no longer has one by the time a field could object. So
+/// same text, because it needs that text to report a position. So
 /// `yaml_serde::from_str::<RawSpec>` compiles, and silently accepts every
-/// explicit `null` this module exists to refuse.
-///
-/// That is a real gap in the public surface, not a theoretical one: this
-/// type is exported, so a library consumer can reach the unguarded path.
-/// It is stated here rather than left to be discovered. Narrowing it means
-/// deciding whether [`resolve`](super::resolve) — the only reason this type
-/// is public at all — belongs in the public API beside
-/// [`load`](super::load), which takes a path and is always safe.
+/// explicit `null` this module exists to refuse. The type is exported, so a
+/// library consumer can reach that unguarded path; [`load`](super::load) is
+/// always safe. Narrowing it means deciding whether [`resolve`](super::resolve)
+/// belongs in the public API beside `load`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSpec {
@@ -48,9 +41,8 @@ pub struct RawSpec {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    // `Option`, not `Vec`: a missing `command` is legal at parse time, and
-    // becomes one backend's problem instead of the document's — see
-    // `overrides.rs` and `require_complete`'s `reject_empty_command` call.
+    // `Option`, not `Vec`: a missing `command` is legal at parse time and is caught per backend
+    // (see `overrides.rs`, `require_complete`).
     #[serde(default)]
     pub command: Option<Vec<String>>,
     #[serde(default)]
@@ -77,11 +69,9 @@ pub struct RawSpec {
 
 impl RawSpec {
     /// A manifest's parse entry point, and the only one. The typed parse
-    /// runs first and owns every structural diagnostic — unknown field,
-    /// duplicate key, wrong type — and `reject_nulls` then walks the same
-    /// unmodified text for the one thing that parse cannot refuse with a
-    /// position of its own: an explicit `null`. See `no_null` for both
-    /// halves of that split.
+    /// runs first and owns every structural diagnostic (unknown field,
+    /// duplicate key, wrong type); `reject_nulls` then walks the same text
+    /// for explicit `null`s. See `no_null` for the split.
     pub fn parse(yaml: &str) -> Result<Self, yaml_serde::Error> {
         let spec = yaml_serde::from_str(yaml)?;
         reject_nulls(yaml)?;
@@ -90,9 +80,8 @@ impl RawSpec {
 }
 
 /// `RawSpec::env`, walked one entry at a time for the reason in the module
-/// doc. These values become a privileged service's environment, so a
-/// key lost that way means the daemon runs with an environment the author
-/// never wrote and cannot see they lost.
+/// doc. A key silently lost would give a privileged service an environment
+/// the author never wrote.
 fn no_duplicate_env<'de, D>(d: D) -> Result<BTreeMap<String, String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -114,9 +103,7 @@ impl<'de> Visitor<'de> for EnvVisitor {
         A: MapAccess<'de>,
     {
         let mut env = BTreeMap::new();
-        // Folded key -> the original-case key it was first seen as, so an
-        // exact repeat and a differently-cased collision get distinct
-        // messages.
+        // Folded key -> first-seen original case, so a repeat and a case collision differ in message.
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
 
         while let Some(key) = map.next_key::<String>()? {
