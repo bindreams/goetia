@@ -332,9 +332,10 @@ pub(in crate::backend::scm) mod system {
         /// Opened by the first [`KillTarget::arm_release`], as a kill that finds SCM already
         /// released never needs it, and dropped by [`KillTarget::cancel_release`].
         notifier: Option<SystemScmActor>,
-        /// The rights the service's process is opened with.
-        access: u32,
     }
+
+    /// The rights the service's process is opened with: to terminate it and to wait for its exit.
+    const PROCESS_ACCESS: u32 = PROCESS_TERMINATE | PROCESS_SYNCHRONIZE;
 
     impl SystemKillTarget {
         /// A target whose process is opened with the rights to terminate it and to wait for its exit.
@@ -343,7 +344,6 @@ pub(in crate::backend::scm) mod system {
                 service,
                 id,
                 notifier: None,
-                access: PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
             }
         }
 
@@ -425,7 +425,7 @@ pub(in crate::backend::scm) mod system {
         }
 
         fn open(&mut self, pid: u32) -> io::Result<Option<Held>> {
-            Ok(open_process_with(pid, self.access)?.map(|handle| Held { handle, pid }))
+            Ok(open_process_with(pid, PROCESS_ACCESS)?.map(|handle| Held { handle, pid }))
         }
 
         fn terminate(&mut self, process: &Held) -> io::Result<Termination> {
