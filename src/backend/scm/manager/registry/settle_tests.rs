@@ -79,6 +79,16 @@ fn any_other_mid_read_failure_is_other() {
 }
 
 #[skuld::test]
+fn a_key_gone_or_deleted_is_a_delete_that_is_done_and_any_other_failure_is_not() {
+    assert!(gone_is_done(Ok(())).is_ok());
+    for code in [NOT_FOUND, KEY_DELETED] {
+        assert!(gone_is_done(Err(io::Error::from_raw_os_error(code))).is_ok(), "{code}");
+    }
+    let denied = gone_is_done(Err(io::Error::from_raw_os_error(ACCESS_DENIED))).unwrap_err();
+    assert_eq!(denied.raw_os_error(), Some(ACCESS_DENIED));
+}
+
+#[skuld::test]
 fn a_service_key_that_opens_stands() {
     assert!(stands(Ok(())).unwrap());
 }

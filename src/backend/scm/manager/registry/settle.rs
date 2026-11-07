@@ -76,6 +76,14 @@ pub(super) fn is_gone(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(ERROR_KEY_DELETED as i32)
 }
 
+/// `result`, except that a key not found or deleted is done: the goal of a delete is absent.
+pub(super) fn gone_is_done(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if is_gone(&e) => Ok(()),
+        other => other,
+    }
+}
+
 /// Whether the service key opened. A key not found or deleted is gone; a denied open stands,
 /// because resolving the path comes before the access check.
 pub(super) fn stands(opened: io::Result<()>) -> io::Result<bool> {

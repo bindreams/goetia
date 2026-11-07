@@ -289,8 +289,9 @@ impl Backend for Scm {
             // out to be the only one.
             match registry::read_parameters_in(services, &name, Origin::Vouched) {
                 // Gone since `scan_services` listed it: not there to list. Only a `Parameters` key
-                // lost mid-read reaches this for a name `scan_services` listed; a plain missing key
-                // reads as a service that stands without it, a stale row at worst.
+                // lost (marked deleted at open, or gone mid-read) reaches this, with the service
+                // key gone too; a plain missing key reads as a service that stands without it, a
+                // stale row at worst.
                 Ok(RegistryReadOutcome::ServiceGone) => {}
                 Ok(RegistryReadOutcome::Read(params)) => {
                     let entry = ScanEntry::of(&name, read_marker(params, None), ScmSnapshot::new);

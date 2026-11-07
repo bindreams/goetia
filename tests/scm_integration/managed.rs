@@ -15,7 +15,7 @@ use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::System::Registry::{NtCreateKey, NtSetValueKey};
-use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, OBJ_OPENLINK, UNICODE_STRING};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, OBJ_CASE_INSENSITIVE, OBJ_OPENLINK, UNICODE_STRING};
 use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
 
 use crate::common::{self, conformance_mk, fixture_command};
@@ -1014,21 +1014,26 @@ fn force_install_replaces_a_parameters_that_is_a_registry_link_and_leaves_its_ta
         target_key.get_value::<String, _>("Marker").expect("read Marker"),
         "not goetia's"
     );
-    // Opened as itself, which `parameters_key` does not: it would follow a link. A link holds a
-    // `SymbolicLinkValue`, which a real key does not.
+    // A link is told by what opening it does, not by how it is stored: opened as itself
+    // (`create_raw_key`) and opened the way every other reader does (`parameters_key`, which follows
+    // a link), a real key is the same key, and a link is the target's.
     let service = service_key(&id, KEY_READ | KEY_WRITE);
-    let parameters = create_raw_key(&service, &units("Parameters"), 0);
-    let link_value = parameters.get_raw_value("SymbolicLinkValue");
-    assert!(
-        link_value
-            .as_ref()
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
-        "Parameters is still a link: {link_value:?}"
-    );
-    let marker = parameters
-        .get_raw_value("Marker")
-        .expect("a real Parameters holds a Marker");
-    assert_eq!(marker.bytes, goetia_marker, "Parameters holds goetia's own Marker");
+    let as_itself = create_raw_key(&service, &units("Parameters"), 0);
+    let followed = parameters_key(&id, KEY_READ);
+    for (opened, key) in [("as itself", &as_itself), ("followed", &followed)] {
+        let marker = key
+            .get_raw_value("Marker")
+            .unwrap_or_else(|e| panic!("Parameters {opened} holds no Marker: {e}"));
+        assert_eq!(
+            marker.bytes, goetia_marker,
+            "Parameters {opened} holds goetia's own Marker"
+        );
+        assert!(
+            key.get_value::<String, _>("Keep")
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "Parameters {opened} shows the link target's `Keep`"
+        );
+    }
 }
 
 /// `RegDeleteTreeW` below the top level stops at a NUL, so a stray subkey holding a child named
@@ -1672,19 +1677,33 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 /// `list` opens `Parameters` in one step below `Services`, and never the service's own key, which
 /// a service that is not goetia's may deny to the unelevated reader. An explicit `Deny` ACE stops
 /// the elevated reader the same way (see `deny.rs`), so this stands in for an unelevated `list`,
-/// which this suite has no way to run. Such a service is a stranger's, not an unreadable one: no
-/// entry claims it or says its read did not complete. Reading the service key first made it
-/// `Undetermined`.
+/// which this suite has no way to run. Such a service is a stranger's, not an unreadable one: it is
+/// not claimed, and nothing in `list` says a read did not complete. Reading the service key first
+/// made it `Undetermined`. A goetia service with the same denial is still listed as its own, which
+/// shows that the scan reached it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn list_reads_a_service_whose_own_key_denies_the_reader_as_a_stranger() {
-    for with_parameters in [false, true] {
+fn list_reads_a_service_whose_own_key_denies_the_reader_by_its_parameters_alone() {
+    #[derive(Clone, Copy, Debug)]
+    enum Seed {
+        /// No `Parameters` key.
+        ForeignBare,
+        /// A `Parameters` that holds no marker: readable, and not goetia's.
+        ForeignWithParameters,
+        Goetias,
+    }
+    for seed in [Seed::ForeignBare, Seed::ForeignWithParameters, Seed::Goetias] {
         let mgr = Scm::new();
         let id = support::random_test_id();
         let guard = ServiceGuard::new(&id);
-        seed_foreign(guard.id());
-        if with_parameters {
-            // A `Parameters` that holds no marker: readable, and not goetia's.
-            create_parameters_key(&id);
+        match seed {
+            Seed::ForeignBare => seed_foreign(guard.id()),
+            Seed::ForeignWithParameters => {
+                seed_foreign(guard.id());
+                create_parameters_key(&id);
+            }
+            Seed::Goetias => {
+                install_plain(&mgr, guard.id());
+            }
         }
 
         let _denied = Denied::service_key(&id);
@@ -1693,25 +1712,32 @@ fn list_reads_a_service_whose_own_key_denies_the_reader_as_a_stranger() {
         let blocked = try_service_key(&id, KEY_READ)
             .err()
             .unwrap_or_else(|| panic!("the deny ACE did not apply: `{id}` is still readable"));
-        assert_eq!(blocked.raw_os_error(), Some(5), "{blocked:?}");
+        assert_eq!(blocked.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "{blocked:?}");
 
         let listed = mgr
             .list()
             .expect("a service key denied to the reader must not fail `list`");
 
-        for entry in &listed {
-            match entry {
-                Installed::Ours { spec, .. } if spec.id.as_str() == id => {
-                    panic!("a stranger's service was claimed (with_parameters={with_parameters}): {entry:?}")
-                }
-                Installed::OursUnusable { name, .. } if name == &id => {
-                    panic!("a stranger's service was claimed (with_parameters={with_parameters}): {entry:?}")
-                }
-                Installed::Undetermined { name, reason } if name.as_deref() == Some(id.as_str()) => {
-                    panic!("its read did not complete (with_parameters={with_parameters}): {reason}")
-                }
-                _ => {}
-            }
+        // An elevated `list` leaves nothing undetermined (`UNIT_DIR_EXCLUSIVE` keeps it so).
+        assert!(
+            !listed
+                .iter()
+                .any(|entry| matches!(entry, Installed::Undetermined { .. })),
+            "{seed:?}: {listed:?}"
+        );
+        let ours = listed
+            .iter()
+            .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id));
+        let named = listed.iter().any(|entry| match entry {
+            Installed::OursUnusable { name, .. } => name == &id,
+            _ => false,
+        });
+        match seed {
+            Seed::Goetias => assert!(ours, "the scan did not reach a service it must list: {listed:?}"),
+            _ => assert!(
+                !ours && !named,
+                "{seed:?}: a stranger's service was claimed: {listed:?}"
+            ),
         }
     }
 }

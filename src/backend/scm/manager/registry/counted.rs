@@ -23,10 +23,10 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Registry::{KEY_ENUMERATE_SUB_KEYS, REG_OPTION_NON_VOLATILE};
 use winreg::RegKey;
 
-use super::tolerate_not_found;
+use super::settle::gone_is_done;
 
 /// The access right to delete a key (`winnt.h`).
-const DELETE: u32 = 0x0001_0000;
+pub(super) const DELETE: u32 = 0x0001_0000;
 
 /// `name` as the counted string `ntdll` takes: its length is stated, and no unit ends it.
 fn counted(name: &[u16]) -> UNICODE_STRING {
@@ -64,7 +64,7 @@ pub(super) fn delete_value(key: &RegKey, name: &[u16]) -> io::Result<()> {
 pub(super) fn delete_subkey(key: &RegKey, name: &[u16]) -> io::Result<()> {
     match open_raw(key.raw_handle(), name, CHILD_ACCESS) {
         Ok(child) => delete_tree(child),
-        Err(e) => tolerate_not_found(Err(e)),
+        Err(e) => gone_is_done(Err(e)),
     }
 }
 
@@ -182,16 +182,16 @@ fn open_raw(parent: HANDLE, name: &[u16], access: u32) -> io::Result<Opened> {
 fn delete_tree(child: Opened) -> io::Result<()> {
     let names = match child_names(child.0) {
         Ok(names) => names,
-        Err(e) => return tolerate_not_found(Err(e)),
+        Err(e) => return gone_is_done(Err(e)),
     };
     for grandchild in names {
         match open_raw(child.0, &grandchild, CHILD_ACCESS) {
             Ok(grandchild) => delete_tree(grandchild)?,
-            Err(e) => tolerate_not_found(Err(e))?,
+            Err(e) => gone_is_done(Err(e))?,
         }
     }
     // SAFETY: `child` holds an open handle with `DELETE`.
-    tolerate_not_found(checked(unsafe { NtDeleteKey(child.0) }))
+    gone_is_done(checked(unsafe { NtDeleteKey(child.0) }))
 }
 
 /// The name of every subkey of the open `key`, by counted name.

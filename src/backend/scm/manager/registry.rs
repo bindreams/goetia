@@ -43,10 +43,10 @@ fn parameters_key_name() -> Vec<u16> {
     PARAMETERS_KEY.encode_utf16().collect()
 }
 
-/// `Parameters` of `name` as a path below `Services`, for one open that passes the service key
-/// without opening it.
-fn parameters_relative_name(name: &str) -> Vec<u16> {
-    format!(r"{name}\{PARAMETERS_KEY}").encode_utf16().collect()
+/// What a read asks `Services` for: `Parameters` of `name` as a path below it, for one open that
+/// passes the service key without opening it, and the access to open it with, which is a read's.
+fn parameters_read_request(name: &str) -> (Vec<u16>, u32) {
+    (format!(r"{name}\{PARAMETERS_KEY}").encode_utf16().collect(), KEY_READ)
 }
 
 /// An open `Services` key, which a read opens one service's `Parameters` below. It borrows the key
@@ -168,7 +168,8 @@ pub fn read_parameters_in(
         || service_stands(name),
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
-            let key = counted::open_child(services.0, &parameters_relative_name(name), KEY_READ)
+            let (relative, access) = parameters_read_request(name);
+            let key = counted::open_child(services.0, &relative, access)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), Some(Parameters::default())))?;
             let mut parameters = Parameters::default();
             // The names as stored, for a field found not to be a string.
@@ -348,11 +349,11 @@ fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
     counted::create_child(service, &name, access)
 }
 
-/// A key or value that is gone is success: the goal of a delete is absent. Not found, and a key
-/// deleted while held open, are the same (see [`settle::is_gone`]).
+/// NotFound is success: the goal state is absent. For a value; a key is deleted with
+/// [`settle::gone_is_done`], which also takes a key marked deleted.
 fn tolerate_not_found(deleted: std::io::Result<()>) -> std::io::Result<()> {
     match deleted {
-        Err(e) if settle::is_gone(&e) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
 }
