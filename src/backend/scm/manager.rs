@@ -113,14 +113,14 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
-use crate::backend::scm::kill::hold_service_process;
+use crate::backend::scm::kill::hold_if_possible;
 use crate::backend::scm::kill::system::{Held, wait_exit};
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
 use crate::backend::scm::shim::processes::processes_with_image;
-use crate::backend::scm::shim::provider::{NoShim, ShimProvider};
+use crate::backend::scm::shim::provider::ShimProvider;
 use crate::backend::scm::shim::sweep::{normalise, referenced_hosts, registered_hosts, same_path, sweep_folder};
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
@@ -138,7 +138,8 @@ use crate::spec::{DaemonSpec, Id, Kind};
 /// SCM/registry handles it needs and closes them again — only the source of `type: simple`
 /// services' host and the check on the folder it lives in.
 pub struct Scm {
-    shim: Box<dyn ShimProvider>,
+    /// `None` for [`Scm::new`]: no host to provide, and no files of the manager's own to sweep.
+    shim: Option<Box<dyn ShimProvider>>,
     folders: FolderCheck,
 }
 
@@ -147,7 +148,10 @@ impl Scm {
     /// be installed or previewed ([`Error::NoShimProvider`]), and `status` and `list` judge what is
     /// installed without one.
     pub fn new() -> Self {
-        Self::with_shim(NoShim, CheckPermissions::Enable)
+        Self {
+            shim: None,
+            folders: FolderCheck::new(CheckPermissions::Enable),
+        }
     }
 
     /// A manager whose `type: simple` services run the host `provider` supplies. `check` says
@@ -155,9 +159,14 @@ impl Scm {
     /// another account replace it.
     pub fn with_shim(provider: impl ShimProvider + 'static, check: CheckPermissions) -> Self {
         Self {
-            shim: Box::new(provider),
+            shim: Some(Box::new(provider)),
             folders: FolderCheck::new(check),
         }
+    }
+
+    /// The provider, or [`Error::NoShimProvider`] for a manager built without one.
+    fn provider(&self) -> Result<&dyn ShimProvider> {
+        self.shim.as_deref().ok_or(Error::NoShimProvider)
     }
 }
 
@@ -274,10 +283,11 @@ impl Backend for Scm {
         if spec.kind != Kind::Simple {
             return Ok(None);
         }
+        let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
-        let _ = referenced_hosts().and_then(|referenced| self.shim.sweep(&referenced));
-        let provided = self.shim.provide(&self.folders)?;
-        let previewed = self.shim.preview()?;
+        let _ = referenced_hosts().and_then(|referenced| shim.sweep(&referenced));
+        let provided = shim.provide(&self.folders)?;
+        let previewed = shim.preview()?;
         if provided != previewed {
             return Err(Error::ShimProviderDisagrees { previewed, provided });
         }
@@ -301,7 +311,7 @@ impl Backend for Scm {
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.user)?;
         let host = match spec.kind {
-            Kind::Simple => Some(self.shim.preview()?),
+            Kind::Simple => Some(self.provider()?.preview()?),
             Kind::Managed => None,
         };
         generate::registration(spec, &identity, host.as_ref())
@@ -417,7 +427,7 @@ impl Backend for Scm {
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
         let held = match host {
-            Some(_) => hold_host_process(&id)?,
+            Some(_) => hold_host_process(&id),
             None => None,
         };
         let scm = open_scm_to_classify(id.as_str())?;
@@ -428,10 +438,14 @@ impl Backend for Scm {
     }
 
     /// Under the lock, the sweep an `install` makes before it provides, which is how an `uninstall`
-    /// that stopped short of its own sweep is retried: by running it again.
+    /// that stopped short of its own sweep is retried: by running it again. A manager with no
+    /// provider has nothing of its own to sweep, and takes no lock and reads nothing.
     fn uninstall_absent(&self, _id: &Id) -> Result<()> {
+        let Some(shim) = &self.shim else {
+            return Ok(());
+        };
         let _lock = InstallLock::acquire()?;
-        referenced_hosts().and_then(|referenced| self.shim.sweep(&referenced))
+        referenced_hosts().and_then(|referenced| shim.sweep(&referenced))
     }
 
     fn enable(&self, snapshot: ScmSnapshot) -> Result<()> {
@@ -988,26 +1002,17 @@ fn registered_shim(snapshot: &ScmSnapshot) -> Option<PathBuf> {
 
 /// The process SCM reports for `id`, held before the service is stopped: it may be running an older
 /// file than the one registered (an `Update` it has not restarted into), which no read of the
-/// registry shows. `None` when SCM reports none. The service handle the hold used is closed before
-/// this returns, or the service could not be deleted.
-///
-/// A process that cannot be opened fails the uninstall here, with nothing changed: going on would
-/// leave the file for a sweep that cannot tell that process is gone.
-fn hold_host_process(id: &Id) -> Result<Option<Held>> {
-    let (_scm, service) = match open_existing(id, ServiceAccess::QUERY_STATUS) {
-        Ok(opened) => opened,
-        // Gone since it was read: `uninstall_locked` finds it gone too.
-        Err(Error::NotInstalled { .. }) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut target = super::kill::SystemKillTarget::observing(service, id.as_str().to_string());
-    match hold_service_process(&mut target) {
-        Ok(held) => Ok(held.map(|(_pid, held)| held)),
-        Err(e) => Err(Error::Step {
-            what: format!("`{id}` was NOT deleted and is unchanged"),
-            source: Box::new(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)),
-        }),
-    }
+/// registry shows. `None` when SCM reports none, and when the service or its process cannot be
+/// reached (see [`hold_if_possible`]): the uninstall goes on, and what that process runs stays
+/// referenced by its image until it exits. The service handle the hold used is closed before this
+/// returns, or the service could not be deleted.
+fn hold_host_process(id: &Id) -> Option<Held> {
+    // A service gone since it was read, or one that will not open, is `uninstall_locked`'s to find.
+    let (_scm, service) = open_existing(id, ServiceAccess::QUERY_STATUS).ok()?;
+    hold_if_possible(&mut super::kill::SystemKillTarget::observing(
+        service,
+        id.as_str().to_string(),
+    ))
 }
 
 impl Scm {
@@ -1051,11 +1056,13 @@ impl Scm {
         // After the waits: what has exited no longer references its file.
         let referenced = referenced_hosts().map_err(left_behind)?;
         let mut failures = Vec::new();
-        failures.extend(self.shim.sweep(&referenced).err());
+        if let Some(shim) = &self.shim {
+            failures.extend(shim.sweep(&referenced).err());
+        }
         let provider_folder = self
             .shim
-            .preview()
-            .ok()
+            .as_ref()
+            .and_then(|shim| shim.preview().ok())
             .and_then(|command| command.exe.parent().map(normalise));
         if let Some(folder) = host.parent()
             && !provider_folder.is_some_and(|provider| same_path(&provider, folder))

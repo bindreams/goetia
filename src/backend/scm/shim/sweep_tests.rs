@@ -61,6 +61,41 @@ fn unreferenced_keeps_every_file_of_a_referenced_bare_name() {
     assert_eq!(unreferenced(&files, &referenced), vec![current("/a", HEX_B)]);
 }
 
+/// What SCM starts for `"C:\Program Files\Goetia\a.exe" -k x` is the quoted part alone.
+#[skuld::test]
+fn a_quoted_image_path_names_its_quoted_part() {
+    assert_eq!(
+        host_candidates(r#""C:\Program Files\Goetia\a.exe" -k x"#),
+        [r"C:\Program Files\Goetia\a.exe"]
+    );
+    assert_eq!(
+        host_candidates(r#""C:\a b\c.exe"#),
+        [r"C:\a b\c.exe"],
+        "an unterminated quote runs to the end"
+    );
+}
+
+/// SCM tries each space as the end of the path, so an unquoted path with spaces may be any of these.
+#[skuld::test]
+fn an_unquoted_image_path_names_every_prefix_that_ends_before_a_space_and_the_whole() {
+    assert_eq!(
+        host_candidates(r"C:\Program Files\Goetia\a.exe -k x"),
+        [
+            r"C:\Program",
+            r"C:\Program Files\Goetia\a.exe",
+            r"C:\Program Files\Goetia\a.exe -k",
+            r"C:\Program Files\Goetia\a.exe -k x",
+        ]
+    );
+}
+
+#[skuld::test]
+fn an_unquoted_image_path_without_spaces_names_itself() {
+    assert_eq!(host_candidates(r"C:\a\b.exe"), [r"C:\a\b.exe"]);
+    assert_eq!(host_candidates("  "), Vec::<String>::new());
+    assert_eq!(host_candidates(""), Vec::<String>::new());
+}
+
 #[cfg(windows)]
 mod windows {
     use std::ffi::OsString;
@@ -71,9 +106,10 @@ mod windows {
 
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE, GetShortPathNameW};
 
-    use super::system::sweep_dir;
+    use super::system::{expand_environment, remove_if_empty_default};
     use super::*;
     use crate::backend::scm::shim::acl::acl_tests::windows::junction;
+    use crate::error::Error;
 
     const HEX_C: &str = "cc7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     const HEX_F: &str = "ff7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -207,21 +243,53 @@ mod windows {
     }
 
     #[skuld::test]
-    fn sweep_dir_removes_the_folder_only_when_empty_and_asked() {
+    fn an_empty_folder_is_removed_only_when_it_is_the_default() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("Goetia");
         fs::create_dir(&folder).unwrap();
-        fs::write(shim_in(&folder, HEX_A), b"x").unwrap();
         fs::write(folder.join("notes.txt"), b"x").unwrap();
 
-        sweep_dir(&folder, &[], true).unwrap();
-        assert!(folder.is_dir(), "a folder that holds anything else stays");
+        remove_if_empty_default(&folder, || Ok(true)).unwrap();
+        assert!(folder.is_dir(), "a folder that holds anything stays");
 
         fs::remove_file(folder.join("notes.txt")).unwrap();
-        sweep_dir(&folder, &[], false).unwrap();
+        remove_if_empty_default(&folder, || Ok(false)).unwrap();
         assert!(folder.is_dir(), "a folder that is not the default stays");
 
-        sweep_dir(&folder, &[], true).unwrap();
+        remove_if_empty_default(&folder, || Ok(true)).unwrap();
         assert!(!folder.exists());
+        remove_if_empty_default(&folder, || unreachable!("a folder that is gone is not asked about")).unwrap();
+    }
+
+    /// Where the default folder is matters only for a folder that is empty: a failure to find it is
+    /// not reported for one that is not, and does not fail the sweep of the files.
+    #[skuld::test]
+    fn a_default_folder_that_cannot_be_located_is_reported_only_when_it_matters() {
+        let dir = tempfile::tempdir().unwrap();
+        let unlocated = || Err(Error::os("locate %ProgramFiles%", std::io::Error::other("no")));
+        fs::write(dir.path().join("notes.txt"), b"x").unwrap();
+
+        remove_if_empty_default(dir.path(), unlocated).unwrap();
+
+        fs::remove_file(dir.path().join("notes.txt")).unwrap();
+        let error = remove_if_empty_default(dir.path(), unlocated).expect_err("an empty folder needs the answer");
+        assert!(
+            error.report().to_string().contains("locate %ProgramFiles%"),
+            "{}",
+            error.report()
+        );
+        assert!(dir.path().is_dir());
+    }
+
+    #[skuld::test]
+    fn environment_variables_in_an_image_path_are_expanded() {
+        let root = std::env::var("SystemRoot").expect("SystemRoot");
+
+        assert_eq!(expand_environment(r"%SystemRoot%\x.exe"), format!(r"{root}\x.exe"));
+        assert_eq!(
+            expand_environment(r"%goetia_no_such_variable%\x.exe"),
+            r"%goetia_no_such_variable%\x.exe"
+        );
+        assert_eq!(expand_environment(r"C:\a\b.exe"), r"C:\a\b.exe");
     }
 }

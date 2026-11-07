@@ -40,6 +40,35 @@ pub(crate) fn unreferenced(files: &[PathBuf], referenced: &[PathBuf]) -> Vec<Pat
         .collect()
 }
 
+/// Every path SCM may start for the command line `image` (an `ImagePath` with its environment
+/// variables expanded): a quoted one is the quoted part; an unquoted one may end before any space,
+/// since SCM tries each, or run to the end. All of them are named, so a service registered either
+/// way references the file it starts. More paths than SCM starts only keep more files.
+pub(crate) fn host_candidates(image: &str) -> Vec<String> {
+    let image = image.trim();
+    if let Some(quoted) = image.strip_prefix('"') {
+        let path = quoted.split('"').next().unwrap_or_default();
+        return if path.is_empty() {
+            vec![]
+        } else {
+            vec![path.to_string()]
+        };
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    let ends = image
+        .char_indices()
+        .filter(|&(_, c)| c == ' ' || c == '\t')
+        .map(|(at, _)| at)
+        .chain(std::iter::once(image.len()));
+    for end in ends {
+        let prefix = image[..end].trim_end();
+        if !prefix.is_empty() && candidates.last().is_none_or(|last| last != prefix) {
+            candidates.push(prefix.to_string());
+        }
+    }
+    candidates
+}
+
 /// Whether `a` and `b` are one path, compared without regard to case.
 pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
@@ -61,15 +90,19 @@ pub(crate) use system::{normalise, referenced_hosts, registered_hosts, sweep_fol
 
 #[cfg(windows)]
 mod system {
+    use std::ffi::OsString;
     use std::fs;
     use std::io;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::path::{Path, PathBuf};
+
+    use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 
     use super::super::acl::{display_path, lexical};
     use super::super::embedded::default_dir;
     use super::super::processes::running_images;
-    use super::{same_path, unreferenced};
-    use crate::backend::scm::manager::{registry, split_command_line};
+    use super::{host_candidates, same_path, unreferenced};
+    use crate::backend::scm::manager::registry;
     use crate::error::{Error, Reason, Result};
     use crate::manager::Installed;
 
@@ -85,7 +118,8 @@ mod system {
 
     // What references a file ------------------------------------------------------------------------------------------
 
-    /// The executable of every service's `ImagePath`, [`normalise`]d: what SCM would start. A
+    /// Every executable SCM may start for any service's `ImagePath` (see [`host_candidates`]), with
+    /// its environment variables expanded, [`normalise`]d. A
     /// service marked for deletion references nothing (its record outlives it until a handle
     /// closes), and one with no `ImagePath` has nothing to start. A service whose entry could not be
     /// read, or an enumeration that did not finish, is an error: what the unread entries reference is
@@ -94,7 +128,11 @@ mod system {
         let mut hosts = Vec::new();
         let mut failed = Vec::new();
         let unfinished = registry::scan_services(|name| match registry::read_registered_image(&name) {
-            Ok(Some(image)) => hosts.push(normalise(&split_command_line(&image).0)),
+            Ok(Some(image)) => hosts.extend(
+                host_candidates(&expand_environment(&image))
+                    .iter()
+                    .map(|candidate| normalise(Path::new(candidate))),
+            ),
             Ok(None) => {}
             Err(e) => failed.push(e),
         });
@@ -104,6 +142,30 @@ mod system {
                 what: "read which services run which host".to_string(),
                 source: Box::new(e),
             }),
+        }
+    }
+
+    /// `text` with each `%NAME%` replaced by the variable's value, as the system expands a
+    /// `REG_EXPAND_SZ`; a name that is not set stays as written.
+    pub(super) fn expand_environment(text: &str) -> String {
+        let source: Vec<u16> = std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buf = vec![0u16; 512];
+        loop {
+            // SAFETY: `source` is NUL-terminated and `buf` is `buf.len()` writable units.
+            let needed =
+                unsafe { ExpandEnvironmentStringsW(source.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+            if needed == 0 {
+                // Nothing could be expanded: the text as it was names what it names.
+                return text.to_string();
+            }
+            if needed <= buf.len() {
+                // `needed` counts the NUL.
+                return OsString::from_wide(&buf[..needed - 1]).to_string_lossy().into_owned();
+            }
+            buf.resize(needed, 0);
         }
     }
 
@@ -144,19 +206,39 @@ mod system {
     /// The one mechanism behind a provider's `sweep` and the sweep of the folder an uninstalled
     /// service's host was in.
     pub(crate) fn sweep_folder(dir: &Path, referenced: &[PathBuf]) -> Result<()> {
-        let (is_default, unlocated) = match default_dir() {
-            Ok(default) => (same_path(&normalise(&default), &normalise(dir)), None),
-            Err(e) => (false, Some(e)),
-        };
-        let swept = sweep_dir(dir, referenced, is_default);
-        match Error::both_all(swept.err().into_iter().chain(unlocated)) {
+        let swept = sweep_files(dir, referenced);
+        let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_dir()?), &normalise(dir))));
+        match Error::both_all(swept.err().into_iter().chain(removed.err())) {
             None => Ok(()),
             Some(e) => Err(e),
         }
     }
 
-    /// [`sweep_folder`] with the folder's removal decided by the caller.
-    pub(super) fn sweep_dir(dir: &Path, referenced: &[PathBuf], remove_when_empty: bool) -> Result<()> {
+    /// Removes `dir` if it is empty and `is_default` says it is the default folder, which is asked
+    /// only of a folder that is empty: where the default folder is matters for nothing else.
+    pub(super) fn remove_if_empty_default(dir: &Path, is_default: impl FnOnce() -> Result<bool>) -> Result<()> {
+        match fs::read_dir(dir) {
+            Ok(mut listing) => {
+                if listing.next().is_some() {
+                    return Ok(());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::os_at("read", dir, e)),
+        }
+        if !is_default()? {
+            return Ok(());
+        }
+        match fs::remove_dir(dir) {
+            Err(e) if !matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty) => {
+                Err(Error::os_at("delete", dir, e))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The deletion half of [`sweep_folder`].
+    fn sweep_files(dir: &Path, referenced: &[PathBuf]) -> Result<()> {
         let mut failures = Vec::new();
         let mut entries = Vec::new();
         match fs::read_dir(dir) {
@@ -190,14 +272,6 @@ mod system {
             };
             match removed {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => failures.push(Error::os_at("delete", path, e)),
-                _ => {}
-            }
-        }
-        if remove_when_empty {
-            match fs::remove_dir(dir) {
-                Err(e) if !matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty) => {
-                    failures.push(Error::os_at("delete", dir, e));
-                }
                 _ => {}
             }
         }

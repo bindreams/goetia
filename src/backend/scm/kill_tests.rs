@@ -256,6 +256,24 @@ fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
+/// `uninstall` waits for the process only if it can hold it: a process it cannot open (a right
+/// removed by policy) must not stop the service from being uninstalled, and is left to the sweep,
+/// which finds it by its image.
+#[skuld::test]
+fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
+
+    assert!(hold_if_possible(&mut target).is_none());
+    assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+#[skuld::test]
+fn a_process_that_can_be_opened_is_held_by_hold_if_possible() {
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found], []);
+
+    assert!(hold_if_possible(&mut target).is_some());
+}
+
 #[skuld::test]
 fn a_service_with_no_process_has_nothing_to_kill() {
     let mut target = Scripted::new([None], [], []);

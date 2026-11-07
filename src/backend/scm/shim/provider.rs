@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use super::acl::FolderCheck;
 #[cfg(windows)]
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// The command SCM launches for a `type: simple` service: a host built from `goetia::shim::main()`
 /// and the arguments it is started with. The arguments are `String`s because the registry read
@@ -36,27 +36,3 @@ pub trait ShimProvider: Send + Sync {
     /// wrote and nothing references, tries every file, and reports every failure after the last.
     fn sweep(&self, referenced: &[PathBuf]) -> Result<()>;
 }
-
-/// `Scm::new()`'s provider: it has no host, so a `type: simple` service cannot be installed or
-/// previewed, and there is nothing to sweep.
-#[cfg(windows)]
-pub(crate) struct NoShim;
-
-#[cfg(windows)]
-impl ShimProvider for NoShim {
-    fn preview(&self) -> Result<HostCommand> {
-        Err(Error::NoShimProvider)
-    }
-
-    fn provide(&self, _folders: &FolderCheck) -> Result<HostCommand> {
-        Err(Error::NoShimProvider)
-    }
-
-    fn sweep(&self, _referenced: &[PathBuf]) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(all(windows, test))]
-#[path = "provider_tests.rs"]
-mod provider_tests;

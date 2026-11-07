@@ -4,9 +4,11 @@
 //!
 //! Every process is opened through [`open_process_with`], which enables `SeDebugPrivilege` as `kill`
 //! does, and its image is read through the handle it was opened with, so a pid reused meanwhile
-//! cannot mislead. A process whose image cannot be read, because it refuses the open or the read, is
-//! known only by the file name the process list gives, and counts as running every file of that
-//! name. A process that has exited is skipped, though its handle is still held by someone.
+//! cannot mislead. A process that is still running and whose image cannot be established, because
+//! the open fails for any reason other than the process not existing (a right removed by policy, a
+//! protected process) or the read does, is known only by the file name the process list gives, and
+//! counts as running every file of that name. A process that has exited is skipped, though its handle
+//! is still held by someone.
 use std::ffi::OsString;
 use std::io;
 use std::mem::size_of;

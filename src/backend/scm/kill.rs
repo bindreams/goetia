@@ -203,6 +203,17 @@ fn await_scm_released<T: KillTarget>(target: &mut T, pid: u32) -> io::Result<()>
     }
 }
 
+/// [`hold_service_process`] for a caller that only wants the process to wait on: the process if it
+/// can be held, and `None` for a service with no process and for one whose process cannot be opened
+/// (a right removed by policy). The caller goes on without it; what that process runs is still
+/// found by its image.
+pub(crate) fn hold_if_possible<T: KillTarget>(target: &mut T) -> Option<T::Process> {
+    hold_service_process(target)
+        .ok()
+        .flatten()
+        .map(|(_pid, process)| process)
+}
+
 #[cfg(windows)]
 mod privilege;
 
