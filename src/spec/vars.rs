@@ -78,7 +78,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::error::{Error, Result, escape_control};
+use crate::error::{Error, Result};
 
 /// The file name `Vars::load` looks for beside a manifest.
 pub(crate) const ENV_FILE_NAME: &str = ".env";
@@ -358,8 +358,7 @@ fn env_error(path: &Path, line: usize, message: String) -> Error {
     Error::EnvFile {
         path: path.to_path_buf(),
         line,
-        // The message quotes the file's own text, which may hold a control character.
-        message: escape_control(&message),
+        message,
     }
 }
 

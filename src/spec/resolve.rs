@@ -58,7 +58,7 @@ use super::raw::RawSpec;
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
 use super::{DaemonFields, DaemonSpec, Id, Kind, Restart, Warning};
-use crate::error::{Error, escape_control, escaped_path};
+use crate::error::Error;
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
 
@@ -118,7 +118,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     // on precedence. No `BackendKind` verdict: the base spec is nobody's override.
     let base = raw.without_overrides();
     interpolate::check_spec_grammar(&base)?;
-    resolve_shape(&id, base, base_dir)?;
+    resolve_shape(&id, base, base_dir, Substitution::Pending)?;
 
     // Step 4: the all-backends sweep, errors only: every backend's merged spec is checked as
     // authored, and `BackendKind::error` judges the fields its override supplied. A non-native
@@ -131,7 +131,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
         let has_entry = raw.backend_specific.contains_key(&backend);
         let sweep: Result<(), Error> = (|| {
             interpolate::check_spec_grammar(&merged)?;
-            let (shaped, _dropped_warnings) = resolve_shape(&id, merged, base_dir)?;
+            let (shaped, _dropped_warnings) = resolve_shape(&id, merged, base_dir, Substitution::Pending)?;
             if Some(backend) == native {
                 return Ok(());
             }
@@ -145,10 +145,10 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     // No `check_spec_grammar`: a substituted `.env` value may legally carry a literal `$`.
     let native_entry = native.filter(|b| raw.backend_specific.contains_key(b));
     let substituted: Result<(ShapedSpec, Vec<Warning>), Error> = (|| {
-        interpolate::spec(&mut native_merged, &vars)?;
-        resolve_shape(&id, native_merged, base_dir)
+        interpolate::spec(&mut native_merged, &vars).map_err(|e| annotate_step5_error(e, native_entry))?;
+        resolve_shape(&id, native_merged, base_dir, Substitution::Done)
     })();
-    let (shaped, mut daemon_warnings) = substituted.map_err(|e| annotate_step5_error(e, native_entry))?;
+    let (shaped, mut daemon_warnings) = substituted?;
 
     // `error` reads only `native_supplied` fields, so attribute to the backend, not `.env`.
     if let Some(b) = native {
@@ -215,14 +215,13 @@ fn attribute_to(err: Error, backend: BackendKind) -> Error {
     }
 }
 
-/// Backend annotation for step 5. `Error::Interpolate` gains a "merged with" path suffix, gated
-/// on `native_entry` (was this backend mentioned at all), not on `Supplied` (which fields did it
-/// write): `scm: {}` is an entry whose `Supplied` equals a missing entry's. `Error::Invalid`
-/// gains an "after substituting from .env" prefix: step 4's native arm already passed
-/// `resolve_shape` on the uninterpolated spec, so substitution is what changed.
+/// Annotation for an error of step 5's substitution. `Error::Interpolate` gains a "merged with"
+/// path suffix, gated on `native_entry` (was this backend mentioned at all), not on `Supplied`
+/// (which fields did it write): `scm: {}` is an entry whose `Supplied` equals a missing entry's.
+/// Anything else is [`after_substituting`].
 ///
-/// Applied to the substitution and shape half of step 5 only; the native `BackendKind::error`
-/// verdict is annotated by `attribute_to` at its call site, since step 4 never ran it.
+/// The native `BackendKind::error` verdict is annotated by `attribute_to` at its call site, since
+/// step 4 never ran it.
 fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error {
     match err {
         Error::Interpolate { path, message } => {
@@ -232,6 +231,15 @@ fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error 
             };
             Error::Interpolate { path, message }
         }
+        other => after_substituting(other),
+    }
+}
+
+/// An "after substituting from .env" prefix on an `Error::Invalid`, and nothing on any other
+/// variant: step 4's native arm already passed `resolve_shape` on the uninterpolated spec, so
+/// substitution is what changed.
+fn after_substituting(err: Error) -> Error {
+    match err {
         Error::Invalid {
             daemon,
             message,
@@ -245,10 +253,48 @@ fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error 
     }
 }
 
+/// Whether the text [`resolve_shape`] is handed may still hold `${...}` references.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Substitution {
+    /// Steps 3 and 4: as authored. A value with a `$` may become something else, so it is judged
+    /// only after substitution.
+    Pending,
+    /// Step 5: substituted. A `$` left is ordinary text (a `$$` escape, or one a `.env` value
+    /// carried), so every value is judged as it stands.
+    Done,
+}
+
 /// Shape only: injection gate, path resolution, the three `$`-aware
 /// parses. Requires no particular field to be present — completeness is
 /// [`require_complete`]'s job.
-fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, Vec<Warning>), Error> {
+///
+/// An error of a [`Substitution::Done`] pass is [`after_substituting`], unless the defect is the
+/// manifest directory's: `.env` did not put it there.
+fn resolve_shape(
+    id: &Id,
+    raw: RawSpec,
+    base_dir: &Path,
+    substitution: Substitution,
+) -> Result<(ShapedSpec, Vec<Warning>), Error> {
+    let mut from_directory = false;
+    shape_values(id, raw, base_dir, substitution, &mut from_directory).map_err(|e| {
+        if substitution == Substitution::Done && !from_directory {
+            after_substituting(e)
+        } else {
+            e
+        }
+    })
+}
+
+/// [`resolve_shape`]'s work. `from_directory` is set when the error is a path refused for what
+/// the manifest directory adds to it.
+fn shape_values(
+    id: &Id,
+    raw: RawSpec,
+    base_dir: &Path,
+    substitution: Substitution,
+    from_directory: &mut bool,
+) -> Result<(ShapedSpec, Vec<Warning>), Error> {
     debug_assert!(
         raw.backend_specific.is_empty(),
         "resolve_shape must be handed a merged spec, never one still carrying overrides"
@@ -282,18 +328,20 @@ fn resolve_shape(id: &Id, raw: RawSpec, base_dir: &Path) -> Result<(ShapedSpec, 
         },
         Phase::Authored,
         |field| {
+            let text = match field {
+                PathField::Command => raw.command.as_ref().and_then(|c| c.first()).map(String::as_str),
+                PathField::Cwd => raw.cwd.as_deref(),
+                PathField::Logs => raw.logs.as_deref(),
+            };
+            let Some(text) = text else {
+                return Ok(());
+            };
+            let resolved = resolve_path_string(id, field.name(), text, base_dir, substitution, &mut warnings)
+                .inspect_err(|_| *from_directory = is_under_manifest_dir(Path::new(text)))?;
             match field {
-                PathField::Command => {
-                    if let Some(first) = raw.command.as_ref().and_then(|c| c.first()) {
-                        command0 = Some(resolve_path_string(id, "command", first, base_dir, &mut warnings)?);
-                    }
-                }
-                PathField::Cwd => {
-                    cwd = resolve_optional_path(id, "cwd", raw.cwd.as_deref(), base_dir, &mut warnings)?;
-                }
-                PathField::Logs => {
-                    logs = resolve_optional_path(id, "logs", raw.logs.as_deref(), base_dir, &mut warnings)?;
-                }
+                PathField::Command => command0 = Some(resolved),
+                PathField::Cwd => cwd = Some(PathBuf::from(resolved)),
+                PathField::Logs => logs = Some(PathBuf::from(resolved)),
             }
             Ok(())
         },
@@ -467,24 +515,14 @@ pub(crate) fn parse_restart_delay(id: &Id, raw: &str) -> Result<Duration, Error>
     })
 }
 
-fn resolve_optional_path(
-    id: &Id,
-    field: &str,
-    raw: Option<&str>,
-    base_dir: &Path,
-    warnings: &mut Vec<Warning>,
-) -> Result<Option<PathBuf>, Error> {
-    raw.map(|s| resolve_path_string(id, field, s, base_dir, warnings).map(PathBuf::from))
-        .transpose()
-}
-
 /// Join a relative path against `base_dir`; leave an absolute path as-is.
 /// Uses `Path::is_absolute`, not a string prefix check, since POSIX and Windows differ.
 ///
 /// The result is checked ([`check_resolved`]), not `base_dir` on its own: a directory is refused
-/// only through a path that is joined to it and so would carry its defect into an artifact. A
-/// value a substitution may still change is left to [`DaemonSpec::new`], which judges the final
-/// path: `${D}` may be absolute, which no join would touch.
+/// only through a path that is joined to it and so would carry its defect into an artifact. While
+/// a substitution is [`Pending`](Substitution::Pending), a value it may change is left to a later
+/// pass (`${D}` may be absolute, which no join would touch) and comes back as written. A resolved
+/// path is never converted lossily: one that is not valid UTF-8 is refused.
 ///
 /// Not a pure function of `(value, base_dir)`: `std::path::absolute`'s drive-relative fallback
 /// reads the per-drive current directory. But every pass `resolve` makes runs in one process
@@ -495,12 +533,11 @@ fn resolve_path_string(
     field: &str,
     raw: &str,
     base_dir: &Path,
+    substitution: Substitution,
     warnings: &mut Vec<Warning>,
 ) -> Result<String, Error> {
     let p = Path::new(raw);
-    // A path with its own prefix (`C:bin`) replaces `base_dir` in the join, so it is not under it.
-    let under_manifest_dir =
-        !p.is_absolute() && !matches!(p.components().next(), Some(std::path::Component::Prefix(_)));
+    let under_manifest_dir = is_under_manifest_dir(p);
     let joined = if p.is_absolute() {
         p.to_path_buf()
     } else {
@@ -538,10 +575,20 @@ fn resolve_path_string(
         resolved
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
-    if !interpolate::would_substitution_change(raw) {
-        check_resolved(id, field, raw, &joined, under_manifest_dir)?;
+    if substitution == Substitution::Pending && interpolate::would_substitution_change(raw) {
+        return Ok(raw.to_string());
     }
-    Ok(joined.to_string_lossy().into_owned())
+    check_resolved(id, field, raw, &joined, under_manifest_dir)?;
+    Ok(joined
+        .into_os_string()
+        .into_string()
+        .expect("`check_resolved` refused a path that is not valid UTF-8"))
+}
+
+/// Whether `p` is joined to the manifest directory. A path with its own prefix (`C:bin`) replaces
+/// `base_dir` in the join, so it is not under it.
+fn is_under_manifest_dir(p: &Path) -> bool {
+    !p.is_absolute() && !matches!(p.components().next(), Some(std::path::Component::Prefix(_)))
 }
 
 /// The field rules for a resolved path, which is what an artifact would carry. `raw` has passed
@@ -560,8 +607,8 @@ fn check_resolved(id: &Id, field: &str, raw: &str, resolved: &Path, under_manife
     Err(invalid(
         id,
         &format!(
-            "field `{field}` is `{raw}`, which {resolves} {}, which {defect}",
-            escaped_path(resolved)
+            "field `{field}` is `{raw}`, which {resolves} `{}`, which {defect}",
+            resolved.display()
         ),
     ))
 }
@@ -587,7 +634,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     // reader when the process's own cwd is what is gone.
     let cwd = std::env::current_dir().map_err(|source| {
         Error::os(
-            format!("read the current directory while resolving `{}`", escaped_path(dir)),
+            format!("read the current directory while resolving `{}`", dir.display()),
             source,
         )
     })?;
@@ -601,7 +648,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
     } else {
         let resolved = std::path::absolute(&joined).map_err(|source| {
             Error::os(
-                format!("resolve manifest directory `{}` to an absolute path", escaped_path(dir)),
+                format!("resolve manifest directory `{}` to an absolute path", dir.display()),
                 source,
             )
         })?;
@@ -613,7 +660,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
                      current directory on that drive in whichever process runs goetia, not to a \
                      fixed location. Pass a full path (e.g. `C:\\repo`) or a `.`-relative one to \
                      `-f` instead.",
-                    escaped_path(dir)
+                    dir.display()
                 ),
             });
         }
@@ -990,10 +1037,7 @@ fn reject_blank(id: &Id, field: &str, value: &str) -> Result<(), Error> {
 /// systemd `Environment=` directive ambiguous about where the key ends.
 fn reject_env_key_with_equals(id: &Id, key: &str) -> Result<(), Error> {
     if key.contains('=') {
-        return Err(invalid(
-            id,
-            &format!("env key `{}` must not contain `=`", escape_control(key)),
-        ));
+        return Err(invalid(id, &format!("env key `{key}` must not contain `=`")));
     }
     Ok(())
 }

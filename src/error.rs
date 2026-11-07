@@ -1,13 +1,16 @@
 //! Crate-wide error type.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
+mod escape;
 mod reason;
 mod report;
 mod within;
 
+#[cfg(feature = "cli")]
+pub(crate) use escape::escape;
 pub use reason::Reason;
 pub(crate) use report::Chain;
 pub(crate) use within::within;
@@ -192,7 +195,7 @@ pub enum Error {
 
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
-    #[error("{path}:{line}: {message}", path = escaped_path(path))]
+    #[error("{}:{line}: {message}", path.display())]
     EnvFile {
         path: PathBuf,
         line: usize,
@@ -649,7 +652,8 @@ impl Error {
     /// The error and its causes, joined as `context: cause: cause`, then each [`remedy`](Error::remedy)
     /// found along the chain, outermost first, as `. remedy`; a [`Both`](Error::Both) prints as
     /// `first; then: then`. What the CLI prints and `--json` carries: [`Display`](fmt::Display)
-    /// alone is the outermost context.
+    /// alone is the outermost context. Control and format characters in what an error quotes are
+    /// written as `\u{XXXX}`; `Display` writes them as they are.
     pub fn report(&self) -> impl fmt::Display + '_ {
         Report(self)
     }
@@ -830,37 +834,13 @@ fn unsupported_manager(client: &VersionReading, manager: &VersionReading) -> Str
 }
 
 fn path_suffix(path: &Option<PathBuf>) -> String {
-    path.as_deref()
-        .map(escaped_path)
-        .map(|p| format!(" {p}"))
-        .unwrap_or_default()
+    path.as_deref().map(|p| format!(" {}", p.display())).unwrap_or_default()
 }
 
 fn read_at(path: &Option<PathBuf>) -> String {
     path.as_deref()
-        .map(escaped_path)
-        .map(|p| format!(" at {p}"))
+        .map(|p| format!(" at {}", p.display()))
         .unwrap_or_default()
-}
-
-/// `text` with every control character written as an escape (`\n`, `\u{1b}`), so a refused value
-/// that goes into a message cannot move the cursor or start a line of its own. Everything else is
-/// as written.
-pub(crate) fn escape_control(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if c.is_control() {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// `path` as a message shows it: [`escape_control`], read lossily.
-pub(crate) fn escaped_path(path: &Path) -> String {
-    escape_control(&path.to_string_lossy())
 }
 
 fn stderr_suffix(stderr: &str) -> String {

@@ -1,6 +1,8 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::*;
+use crate::error::Reason;
 use crate::error::error_tests::{id, os, undetermined};
 
 /// The failed read sits inside the sentence of the error that embeds it: its remedy must not
@@ -45,4 +47,51 @@ fn a_chain_is_written_without_remedies() {
         Chain(&e).to_string(),
         "cannot determine whether daemon `x` is installed: failed to read /p: denied"
     );
+}
+
+// The sink ------------------------------------------------------------------------------------------------------------
+
+/// Every error the CLI prints reaches the terminal through the report, so a value that came from a
+/// manifest, an environment file or the command line cannot carry a control or format character
+/// into it: not a newline, an escape sequence or a bidi override.
+#[skuld::test]
+fn a_report_escapes_control_and_format_characters_in_every_link_of_the_chain() {
+    let errors = [
+        Error::Invalid {
+            daemon: "x".to_string(),
+            message: "field `restart` is `a\nb\u{202e}c`".to_string(),
+            source: None,
+        },
+        Error::os_at("read", PathBuf::from("/a\nb\u{202e}c"), std::io::Error::other("x")),
+        os("read", "/p", "cause\u{1b}[0m\u{202e}"),
+        Error::Step {
+            what: "step\r".to_string(),
+            source: Box::new(os("read", "/p", "denied")),
+        },
+    ];
+    for e in &errors {
+        let text = e.report().to_string();
+        assert!(
+            !text.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "a raw control or format character reached the report: {text:?}"
+        );
+        assert!(text.contains(r"\u{"), "{text:?}");
+    }
+    assert!(errors[0].report().to_string().ends_with(r"`a\u{a}b\u{202e}c`"));
+}
+
+#[skuld::test]
+fn a_report_leaves_an_ordinary_windows_path_as_written() {
+    // `\n` and `\u` here are a backslash and a letter, not escapes; they must stay as they are.
+    let path = r"C:\Users\new\u{1b}\notes.txt";
+    let e = Error::os_at("read", PathBuf::from(path), std::io::Error::other("denied"));
+    assert_eq!(e.report().to_string(), format!("failed to read {path}: denied"));
+}
+
+#[skuld::test]
+fn a_chain_and_a_reason_escape_as_a_report_does() {
+    let e = os("read", "/a\nb", "denied");
+    assert!(!Chain(&e).to_string().contains('\n'));
+    let reason = Reason::failed(e);
+    assert!(!reason.to_string().contains('\n'), "{reason}");
 }

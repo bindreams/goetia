@@ -227,7 +227,6 @@ fn a_manifest_directory_with_a_newline_is_refused_by_the_field_joined_to_it() {
             "{msg}"
         );
         assert!(msg.contains("control character"), "{msg}");
-        assert!(!msg.contains('\n'), "the control character must be escaped: {msg:?}");
     }
 }
 
@@ -269,10 +268,6 @@ fn a_bad_id_is_reported_first_whatever_the_manifest_directory() {
             .to_string();
         assert!(msg.contains(expected), "id {id}: {msg}");
         assert!(!msg.contains("manifest directory"), "id {id}: {msg}");
-        assert!(
-            !msg.contains('\n'),
-            "id {id}: the control character must be escaped: {msg:?}"
-        );
     }
 }
 
@@ -284,34 +279,73 @@ fn a_resolved_path_the_field_rules_would_refuse_is_attributed_to_the_resolution(
     let err = check_resolved(&id, "cwd", "C:", Path::new("/a\u{FFFE}"), false).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("field `cwd` is `C:`, which resolves to /a\u{FFFE}, which contains U+FFFE"),
+        msg.contains("field `cwd` is `C:`, which resolves to `/a\u{FFFE}`, which contains U+FFFE"),
         "{msg}"
     );
     check_resolved(&id, "cwd", "C:", Path::new("/ordinary"), false).expect("an ordinary value passes");
 }
 
 #[skuld::test]
-fn a_resolved_path_is_named_escaped() {
+fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
     let id = Id::try_from("frpc").unwrap();
-    for under_manifest_dir in [false, true] {
-        let msg = check_resolved(&id, "cwd", "bin", Path::new("/a\nb\u{1b}"), under_manifest_dir)
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("/a\\nb\\u{1b}"), "{msg:?}");
-        assert!(!msg.contains('\n') && !msg.contains('\u{1b}'), "{msg:?}");
+    let msg = check_resolved(&id, "cwd", "bin", Path::new("/a\u{FFFE}/bin"), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("field `cwd` is `bin`, which resolves under the manifest directory to `/a\u{FFFE}/bin`, which contains U+FFFE"),
+        "{msg}"
+    );
+}
+
+// A substituted path is judged as it is -------------------------------------------------------------------------------
+
+/// A manifest directory whose name is not valid UTF-8.
+fn non_utf8_dir() -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(OsStr::from_bytes(b"/base/\xff"))
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let mut name: Vec<u16> = r"C:\base\".encode_utf16().collect();
+        name.push(0xD800);
+        PathBuf::from(OsString::from_wide(&name))
+    }
+}
+
+/// `$$` is an escape: after step 5 the value is `data/$x`, which holds a `$` and no reference.
+#[skuld::test]
+fn a_path_with_an_escaped_dollar_is_judged_against_the_manifest_directory() {
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    for dir in [non_utf8_dir(), base_dir().join("a\nb")] {
+        let msg = resolve(
+            parse_manifest(&format!("id: frpc\ncommand: ['{abs}']\ncwd: 'data/$$x'\n")),
+            &dir,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("field `cwd` is `data/$x`, which resolves under the manifest directory to "),
+            "{dir:?}: {msg}"
+        );
     }
 }
 
 #[skuld::test]
-fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
-    let id = Id::try_from("frpc").unwrap();
-    let msg = check_resolved(&id, "cwd", "bin", Path::new("/a\nb/bin"), true)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        msg.contains("field `cwd` is `bin`, which resolves under the manifest directory to /a\\nb/bin, which contains a control character"),
-        "{msg}"
-    );
+fn a_manifest_directory_defect_is_not_blamed_on_the_env_file() {
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let dir = base_dir().join("a\nb");
+    let msg = resolve(
+        parse_manifest(&format!("id: frpc\ncommand: ['{abs}']\ncwd: 'data/$$x'\n")),
+        &dir,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
 }
 
 // What the directory alone cannot refuse ------------------------------------------------------------------------------
@@ -329,7 +363,7 @@ fn a_path_a_substitution_may_make_absolute_is_not_judged_against_the_manifest_di
         format!("command: ['{abs}']\nlogs: ${{D}}"),
     ] {
         let raw = parse_manifest(&format!("id: frpc\n{body}\n"));
-        resolve_shape(&id, raw, &dir).unwrap_or_else(|e| panic!("`{body}`: {e}"));
+        resolve_shape(&id, raw, &dir, Substitution::Pending).unwrap_or_else(|e| panic!("`{body}`: {e}"));
     }
 }
 

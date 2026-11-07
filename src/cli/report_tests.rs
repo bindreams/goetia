@@ -279,3 +279,14 @@ fn emit_returns_the_reports_own_code_when_the_write_succeeds() {
     assert!(!out.is_empty(), "the document is on stdout");
     assert!(err.is_empty(), "nothing is said about a write that worked");
 }
+
+#[skuld::test]
+fn a_refused_id_is_reported_with_control_characters_escaped() {
+    let id = "a\nb\u{202e}";
+    let e = crate::spec::Id::try_from(id.to_string()).unwrap_err();
+    let message = invalid_id(id, &e).message;
+    assert_eq!(
+        message,
+        r"id `a\u{a}b\u{202e}` does not match the required pattern ^[A-Za-z0-9._-]{1,80}$"
+    );
+}

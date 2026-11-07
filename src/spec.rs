@@ -40,7 +40,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::error::{Error, escape_control};
+use crate::error::Error;
 
 // Id ==================================================================================================================
 
@@ -81,10 +81,9 @@ impl TryFrom<String> for Id {
         if is_valid_id(&value) {
             Ok(Id(value))
         } else {
-            let shown = escape_control(&value);
             Err(Error::Invalid {
-                daemon: shown.clone(),
-                message: format!("id `{shown}` does not match the required pattern ^[A-Za-z0-9._-]{{1,80}}$"),
+                daemon: value.clone(),
+                message: format!("id `{value}` does not match the required pattern ^[A-Za-z0-9._-]{{1,80}}$"),
                 source: None,
             })
         }
