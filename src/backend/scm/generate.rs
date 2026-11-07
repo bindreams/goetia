@@ -35,10 +35,9 @@
 //! `windows_style_split_matches_real_command_line_to_argv_w` (which pins the
 //! argv[0] rule against the real Win32 API) and
 //! `executable_trailing_backslash_does_not_round_trip_through_argv0` (which
-//! documents the residual gap rather than hiding it). In practice this can only
-//! reach `executable` via `shim_path` — `goetia.yaml`'s `command[0]` cannot end
-//! in a backslash at all as of the injection gate's odd-trailing-backslash
-//! rejection (systemd reads a trailing `\` as a line continuation).
+//! documents the residual gap rather than hiding it). `executable` is `shim_path`
+//! or, for a `type: managed` daemon, `command[0]`, which no gate stops from
+//! ending in a backslash.
 
 use std::collections::BTreeMap;
 use std::fmt;

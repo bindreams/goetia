@@ -125,12 +125,11 @@ pub struct DaemonFields {
     pub kind: Kind,
 }
 
-/// A daemon goetia has checked: every field passed the injection gate (no control character,
-/// no trailing backslash that systemd reads as a line continuation), `command` is non-empty,
-/// `cwd` and `logs` are absolute, no `env` key holds `=`, and no value that must not be empty
-/// is. Only [`DaemonSpec::new`] makes one; fields read through `Deref`, and there is no
-/// `DerefMut`, so a spec never changes after the check. To vary one, take [`into_fields`](Self::into_fields)
-/// and build another.
+/// A daemon goetia has checked: every field passed the injection gate (no control character),
+/// `command` is non-empty, `cwd` and `logs` are absolute, no `env` key holds `=`, and no value
+/// that must not be empty is. Only [`DaemonSpec::new`] makes one; fields read through `Deref`, and
+/// there is no `DerefMut`, so a spec never changes after the check. To vary one, take
+/// [`into_fields`](Self::into_fields) and build another.
 ///
 /// A hand-written newtype rather than the `nutype` crate: it is one type, and `nutype` would add
 /// a proc-macro dependency for it.

@@ -1470,7 +1470,7 @@ fn list_reports_a_sid_account_as_ours_unusable() {
     let mut spec = mk(guard.id()).into_fields();
     spec.user = User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string()));
     let spec = DaemonSpec::new(spec).unwrap();
-    let text = generate::unit(&spec, &Identity { user: "0".to_string() });
+    let text = generate::unit(&spec, &Identity { user: "0".to_string() }).unwrap();
     fs::write(unit_path(guard.id()), text).expect("seed a unit whose spec names a SID");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
 
@@ -1956,6 +1956,55 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
         uid_of("nobody"),
         "the newly-created leaf must be chowned"
     );
+}
+
+// Backslashes =========================================================================================================
+
+/// Values that end in backslashes are written so that systemd reads each back exactly, and the
+/// directives after them are not swallowed. Read back from the loaded unit, not from the text.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let base = std::env::temp_dir().join(format!("{}-backslashes", guard.id()));
+    let _rm = DirGuard::new(base.clone());
+    let cwd = PathBuf::from(format!("{}/work\\", base.display()));
+    let logs = PathBuf::from(format!("{}/log\\\\\\", base.display()));
+
+    let mut spec = mk(guard.id()).into_fields();
+    spec.name = "Backslash name\\".to_string();
+    spec.command = vec![
+        "/bin/sleep".to_string(),
+        "infinity".to_string(),
+        "C:\\".to_string(),
+        "a\\\\b".to_string(),
+    ];
+    spec.cwd = Some(cwd.clone());
+    spec.logs = Some(logs);
+    spec.env = std::collections::BTreeMap::from([("K".to_string(), "C:\\".to_string())]);
+    let spec = DaemonSpec::new(spec).unwrap();
+
+    Systemd::new().install(&spec, false).expect("install");
+
+    let unit = format!("{}.service", guard.id());
+    let show = |property: &str| {
+        cmd::run("systemctl", &["show", "--property", property, "--value", &unit])
+            .expect_ok()
+            .stdout
+            .trim_end_matches('\n')
+            .to_string()
+    };
+    assert_eq!(show("Description"), "Backslash name\\");
+    assert_eq!(show("WorkingDirectory"), cwd.to_str().unwrap());
+    // `show` prints the environment re-quoted, with each backslash doubled.
+    assert_eq!(show("Environment"), "\"K=C:\\\\\"");
+    assert!(
+        show("ExecStart").contains("argv[]=/bin/sleep infinity C:\\ a\\\\b ;"),
+        "{}",
+        show("ExecStart")
+    );
+    // The line after the description and the working directory was not swallowed.
+    assert_eq!(show("User"), "0");
 }
 
 // A unit `list` could not read is reported, never omitted =============================================================

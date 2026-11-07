@@ -229,7 +229,7 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
     #[cfg(target_os = "linux")]
     {
         let _ = err;
-        Ok(crate::backend::systemd::generate::unit(spec, &identity))
+        crate::backend::systemd::generate::unit(spec, &identity)
     }
     #[cfg(target_os = "macos")]
     {

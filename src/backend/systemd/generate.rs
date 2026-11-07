@@ -12,6 +12,10 @@
 //! substitution there), quotes a bare `;` argument (systemd's
 //! command-line separator), and quotes `command[0]` if it would otherwise
 //! start with one of systemd's command-prefix characters (`-@:+!`).
+//!
+//! Backslashes are never refused: a quoted word doubles each, and a raw value ending in an odd
+//! run of them gets a trailing space (see [`raw_value`]). The one value no encoding can carry is
+//! an executable path (`command[0]`) holding a backslash, `"` or `'`, which [`unit`] refuses.
 
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
@@ -31,6 +35,8 @@ use crate::spec::{DaemonSpec, Restart};
 /// `unit(&extract(&unit(spec, id)).unwrap().unwrap().spec, id)` must be
 /// byte-identical to `unit(spec, id)`.
 ///
+/// Fails with [`Error::Invalid`] only for an executable path systemd refuses to load.
+///
 /// Emits `Type=exec` (requires systemd 240+, 2018): `systemd.service(5)` recommends it for
 /// long-running services "as it ensures that process setup errors (e.g. errors such as a missing
 /// service executable, or missing user) are properly tracked", which `Type=simple` does not —
@@ -44,11 +50,12 @@ use crate::spec::{DaemonSpec, Restart};
 /// hand-edited: `decide`'s version-mismatch check (`src/decide.rs`) is what tells "stale, regenerate
 /// silently" from "conflict, demand `--force`" apart, and it runs before either `desired` or
 /// `regenerated` is even compared.
-pub fn unit(spec: &DaemonSpec, id: &Identity) -> String {
+pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
+    refuse_unloadable_executable(spec)?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
-    out.push_str(&format!("Description={}\n", double_percent(&spec.name)));
+    out.push_str(&format!("Description={}\n", raw_value(&spec.name)));
     if spec.restart != Restart::Never {
         // systemd's defaults (`DefaultStartLimitIntervalSec=10s`,
         // `StartLimitBurst=5`) put a unit permanently into `failed` after
@@ -63,21 +70,18 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> String {
     out.push_str("Type=exec\n");
     out.push_str(&format!("ExecStart={}\n", render_exec_start(&spec.command)));
     if let Some(cwd) = &spec.cwd {
-        out.push_str(&format!(
-            "WorkingDirectory={}\n",
-            double_percent(&cwd.display().to_string())
-        ));
+        out.push_str(&format!("WorkingDirectory={}\n", raw_value(&cwd.display().to_string())));
     }
     for (key, value) in &spec.env {
         out.push_str(&format!("Environment={}\n", render_environment(key, value)));
     }
-    out.push_str(&format!("User={}\n", double_percent(&id.user)));
+    out.push_str(&format!("User={}\n", raw_value(&id.user)));
     out.push_str(&format!("Restart={}\n", render_restart(spec.restart)));
     if let Some(delay) = spec.restart_delay {
         out.push_str(&format!("RestartSec={}\n", delay.as_secs_f64()));
     }
     if let Some(logs) = &spec.logs {
-        let target = format!("append:{}", double_percent(&logs.display().to_string()));
+        let target = format!("append:{}", raw_value(&logs.display().to_string()));
         out.push_str(&format!("StandardOutput={target}\n"));
         out.push_str(&format!("StandardError={target}\n"));
     }
@@ -93,7 +97,25 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> String {
     out.push_str(&format!("Version={}\n", crate::version()));
     out.push_str(&format!("Spec={}\n", blob::encode(spec)));
 
-    out
+    Ok(out)
+}
+
+/// systemd checks the executable path of `ExecStart=` (after unquoting and specifiers) and
+/// refuses the whole unit with "Executable name contains special characters" if it holds a
+/// backslash, `"` or `'`, however the word was quoted. Later arguments take all three.
+fn refuse_unloadable_executable(spec: &DaemonSpec) -> Result<(), Error> {
+    let executable = &spec.command[0];
+    if executable.contains(['\\', '"', '\'']) {
+        return Err(Error::Invalid {
+            daemon: spec.id.to_string(),
+            message: format!(
+                "`command[0]` {executable:?} holds a backslash, double quote or apostrophe, which systemd \
+                 refuses to load in an executable path"
+            ),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 /// systemd's `Restart=` vocabulary.
@@ -156,6 +178,22 @@ fn render_environment(key: &str, value: &str) -> String {
 /// Double every `%` in `s` — see the module doc for why.
 fn double_percent(s: &str) -> String {
     s.replace('%', "%%")
+}
+
+/// A directive's value as systemd reads it verbatim: `Description=`, `WorkingDirectory=`,
+/// `User=` and the `append:` log path take no unquoting, only specifiers.
+///
+/// A line ending in a backslash continues onto the next line, which would swallow the directive
+/// after it (`User=` among them). systemd drops trailing whitespace after that check, so a
+/// space behind an odd run of trailing backslashes ends the line and leaves the value intact; an
+/// even run does not continue and is written as is.
+fn raw_value(s: &str) -> String {
+    let mut out = double_percent(s);
+    let trailing = out.len() - out.trim_end_matches('\\').len();
+    if trailing % 2 == 1 {
+        out.push(' ');
+    }
+    out
 }
 
 /// Whether `s` needs systemd command-line quoting: it is empty, or

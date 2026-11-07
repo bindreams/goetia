@@ -43,12 +43,13 @@ fn new_refuses_a_control_character() {
 }
 
 #[skuld::test]
-fn new_refuses_a_trailing_backslash() {
-    let msg = message(DaemonFields {
+fn new_accepts_a_trailing_backslash() {
+    let spec = DaemonSpec::new(DaemonFields {
         name: "frpc\\".to_string(),
         ..fields()
-    });
-    assert!(msg.contains("ends in a backslash"), "{msg}");
+    })
+    .expect("a trailing backslash is a legitimate value");
+    assert_eq!(spec.name, "frpc\\");
 }
 
 #[skuld::test]

@@ -459,7 +459,7 @@ fn unit_text() -> String {
         ..crate::spec::DaemonSpec::for_test("x", vec!["/bin/true".to_string()])
     })
     .unwrap();
-    generate::unit(&spec, &crate::backend::Identity { user: "0".to_string() })
+    generate::unit(&spec, &crate::backend::Identity { user: "0".to_string() }).unwrap()
 }
 
 /// What `classified` makes of a fragment that was read, by what the marker says: no marker is a

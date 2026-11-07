@@ -106,7 +106,7 @@ fn unit_snapshot_full() {
         spec_b64 = blob::encode(&spec),
     );
 
-    assert_eq!(unit(&spec, &id), expected);
+    assert_eq!(unit(&spec, &id).unwrap(), expected);
 }
 
 #[skuld::test]
@@ -136,7 +136,7 @@ fn unit_snapshot_minimal() {
         spec_b64 = blob::encode(&spec),
     );
 
-    assert_eq!(unit(&spec, &id), expected);
+    assert_eq!(unit(&spec, &id).unwrap(), expected);
 }
 
 // The generation invariant ============================================================================================
@@ -149,7 +149,7 @@ fn unit_snapshot_minimal() {
 #[skuld::test]
 fn unit_round_trips_through_extract() {
     for (spec, id) in [(full_spec(), full_identity()), (minimal_spec(), minimal_identity())] {
-        let text = unit(&spec, &id);
+        let text = unit(&spec, &id).unwrap();
         let blob = extract(&text).unwrap().unwrap();
 
         assert_eq!(blob.spec, spec);
@@ -161,9 +161,9 @@ fn unit_round_trips_through_extract() {
 #[skuld::test]
 fn unit_is_the_generation_invariant() {
     for (spec, id) in [(full_spec(), full_identity()), (minimal_spec(), minimal_identity())] {
-        let first = unit(&spec, &id);
+        let first = unit(&spec, &id).unwrap();
         let recovered = extract(&first).unwrap().unwrap().spec;
-        let second = unit(&recovered, &id);
+        let second = unit(&recovered, &id).unwrap();
 
         assert_eq!(first, second);
     }
@@ -179,7 +179,7 @@ fn unit_is_the_generation_invariant() {
 fn a_unit_written_by_an_older_goetia_is_stale_not_a_conflict() {
     let spec = full_spec();
     let id = full_identity();
-    let today = unit(&spec, &id);
+    let today = unit(&spec, &id).unwrap();
 
     // The text an older goetia would have written for the same spec: `Type=simple`, and a blob
     // whose embedded version is `0.0.9` rather than today's.
@@ -197,7 +197,7 @@ fn a_unit_written_by_an_older_goetia_is_stale_not_a_conflict() {
     let blob = extract(&on_disk).unwrap().unwrap();
     assert_eq!(blob.version, "0.0.9");
 
-    let regenerated = unit(&blob.spec, &id);
+    let regenerated = unit(&blob.spec, &id).unwrap();
     let outcome = decide(
         &Ownership::Ours {
             blob,
@@ -239,7 +239,7 @@ fn extract_errors_on_corrupt_blob() {
 #[skuld::test]
 fn extract_errors_on_duplicate_x_goetia_section() {
     let spec = minimal_spec();
-    let one_section = unit(&spec, &minimal_identity());
+    let one_section = unit(&spec, &minimal_identity()).unwrap();
     // Both copies decode individually; duplication alone must still be refused.
     let text = format!("{one_section}\n{one_section}");
 
@@ -334,7 +334,7 @@ fn argv_with_spaces_and_quotes_round_trips() {
     let spec = DaemonSpec::new(spec).unwrap();
     let id = minimal_identity();
 
-    let text = unit(&spec, &id);
+    let text = unit(&spec, &id).unwrap();
 
     let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
     assert_eq!(
@@ -359,7 +359,7 @@ fn argv_lone_semicolon_is_quoted() {
     spec.command = vec!["/usr/bin/find".to_string(), "-exec".to_string(), ";".to_string()];
     let spec = DaemonSpec::new(spec).unwrap();
 
-    let text = unit(&spec, &minimal_identity());
+    let text = unit(&spec, &minimal_identity()).unwrap();
 
     let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
     assert_eq!(exec_start_line, "ExecStart=/usr/bin/find -exec \";\"");
@@ -379,7 +379,7 @@ fn argv_dollar_sign_is_doubled() {
     ];
     let spec = DaemonSpec::new(spec).unwrap();
 
-    let text = unit(&spec, &minimal_identity());
+    let text = unit(&spec, &minimal_identity()).unwrap();
 
     let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
     assert_eq!(exec_start_line, "ExecStart=/usr/bin/report --home=$${HOME} $$ARGS");
@@ -395,7 +395,7 @@ fn argv_command_prefix_character_on_the_executable_is_quoted() {
     spec.command = vec!["+not-a-privilege-directive".to_string()];
     let spec = DaemonSpec::new(spec).unwrap();
 
-    let text = unit(&spec, &minimal_identity());
+    let text = unit(&spec, &minimal_identity()).unwrap();
 
     let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
     assert_eq!(exec_start_line, "ExecStart=\"+not-a-privilege-directive\"");
@@ -411,7 +411,7 @@ fn argv_command_prefix_character_on_a_later_argument_is_not_quoted() {
     spec.command = vec!["/usr/bin/foo".to_string(), "-v".to_string()];
     let spec = DaemonSpec::new(spec).unwrap();
 
-    let text = unit(&spec, &minimal_identity());
+    let text = unit(&spec, &minimal_identity()).unwrap();
 
     let exec_start_line = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
     assert_eq!(exec_start_line, "ExecStart=/usr/bin/foo -v");
@@ -436,7 +436,7 @@ fn percent_is_doubled_in_every_value() {
         user: "u%ser".to_string(),
     };
 
-    let text = unit(&spec, &id);
+    let text = unit(&spec, &id).unwrap();
 
     // One line the doubling must have reached, asserted outright: the loop
     // below checks only what `unit` emitted, so text it stopped emitting
@@ -453,6 +453,211 @@ fn percent_is_doubled_in_every_value() {
     }
 }
 
+// Backslashes =========================================================================================================
+//
+// Every expectation below was measured against systemd 255: a line-ending backslash continues the
+// line, and the reader drops trailing whitespace, so a raw value gets one trailing space; a
+// quoted word reads `\\` as one backslash and needs no guard.
+
+/// How many backslashes end `text`.
+fn trailing_backslashes(text: &str) -> usize {
+    text.len() - text.trim_end_matches('\\').len()
+}
+
+fn with_fields(change: impl FnOnce(&mut DaemonFields)) -> DaemonSpec {
+    let mut fields = minimal_spec().into_fields();
+    change(&mut fields);
+    DaemonSpec::new(fields).unwrap()
+}
+
+/// The first line of `text` that starts with `key`.
+fn line_of<'a>(text: &'a str, key: &str) -> &'a str {
+    text.lines()
+        .find(|l| l.starts_with(key))
+        .unwrap_or_else(|| panic!("no `{key}` line in:\n{text}"))
+}
+
+#[skuld::test]
+fn a_raw_value_ending_in_an_odd_run_of_backslashes_gets_a_trailing_space() {
+    // (value, the line's text after `=`)
+    for (name, emitted) in [
+        (r"a\", r"a\ "),
+        (r"a\\", r"a\\"),
+        (r"a\\\", r"a\\\ "),
+        (r"a\\\\", r"a\\\\"),
+        (r"\", r"\ "),
+        (r"a\b", r"a\b"),
+        (r"a\\b", r"a\\b"),
+        (r"a\nb", r"a\nb"),
+    ] {
+        let spec = with_fields(|f| f.name = name.to_string());
+        let text = unit(&spec, &minimal_identity()).unwrap();
+        assert_eq!(
+            line_of(&text, "Description="),
+            format!("Description={emitted}"),
+            "{name:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_working_directory_ending_in_backslashes_is_written_so_systemd_reads_it_back() {
+    for (suffix, guard) in [(r"\", " "), (r"\\", ""), (r"\\\", " "), (r"\b", ""), (r"\\b", "")] {
+        let cwd = format!("{}{suffix}", abs("opt/x").display());
+        let spec = with_fields(|f| f.cwd = Some(PathBuf::from(&cwd)));
+        let text = unit(&spec, &minimal_identity()).unwrap();
+        assert_eq!(
+            line_of(&text, "WorkingDirectory="),
+            format!("WorkingDirectory={cwd}{guard}"),
+            "{cwd:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_log_path_ending_in_backslashes_is_written_so_systemd_reads_it_back() {
+    for (suffix, guard) in [(r"\", " "), (r"\\", ""), (r"\\\", " "), (r"\b", ""), (r"\\b", "")] {
+        let logs = format!("{}{suffix}", abs("var/log/x").display());
+        let spec = with_fields(|f| f.logs = Some(PathBuf::from(&logs)));
+        let text = unit(&spec, &minimal_identity()).unwrap();
+        for key in ["StandardOutput=", "StandardError="] {
+            assert_eq!(
+                line_of(&text, key),
+                format!("{key}append:{logs}{guard}"),
+                "{key} {logs:?}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn a_user_ending_in_backslashes_is_written_so_systemd_reads_it_back() {
+    for (user, emitted) in [(r"a\", r"a\ "), (r"a\\", r"a\\"), (r"a\\\", r"a\\\ "), (r"a\b", r"a\b")] {
+        let text = unit(&minimal_spec(), &Identity { user: user.to_string() }).unwrap();
+        assert_eq!(line_of(&text, "User="), format!("User={emitted}"), "{user:?}");
+    }
+}
+
+#[skuld::test]
+fn an_argument_with_backslashes_is_quoted_with_each_backslash_doubled() {
+    let spec = with_fields(|f| {
+        f.command = vec![
+            "/bin/x".to_string(),
+            r"C:\".to_string(),
+            r"C:\\".to_string(),
+            r"C:\\\".to_string(),
+            r"a\b".to_string(),
+            r"\".to_string(),
+        ]
+    });
+    let text = unit(&spec, &minimal_identity()).unwrap();
+    assert_eq!(
+        line_of(&text, "ExecStart="),
+        r#"ExecStart=/bin/x "C:\\" "C:\\\\" "C:\\\\\\" "a\\b" "\\""#
+    );
+}
+
+#[skuld::test]
+fn an_environment_value_with_backslashes_is_quoted_with_each_backslash_doubled() {
+    let spec = with_fields(|f| {
+        f.env = BTreeMap::from([
+            ("A".to_string(), r"C:\".to_string()),
+            ("B".to_string(), r"C:\\".to_string()),
+            ("C".to_string(), r"C:\\\".to_string()),
+            ("D".to_string(), r"a\b".to_string()),
+        ])
+    });
+    let text = unit(&spec, &minimal_identity()).unwrap();
+    let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("Environment=")).collect();
+    assert_eq!(
+        lines,
+        [
+            r#"Environment="A=C:\\""#,
+            r#"Environment="B=C:\\\\""#,
+            r#"Environment="C=C:\\\\\\""#,
+            r#"Environment="D=a\\b""#,
+        ]
+    );
+}
+
+#[skuld::test]
+fn no_directive_ends_in_a_line_continuation_and_the_unit_stays_in_order() {
+    // The privilege boundary: a `Description=` that continued onto the next line would swallow
+    // `User=` and run the daemon as root.
+    for tail in [r"\", r"\\", r"\\\", r"\\\\"] {
+        let spec = with_fields(|f| {
+            f.name = format!("n{tail}");
+            f.command = vec!["/bin/x".to_string(), format!("a{tail}")];
+            f.cwd = Some(PathBuf::from(format!("{}{tail}", abs("opt/x").display())));
+            f.logs = Some(PathBuf::from(format!("{}{tail}", abs("var/log/x").display())));
+            f.env = BTreeMap::from([("K".to_string(), format!("v{tail}"))]);
+        });
+        let id = Identity {
+            user: format!("u{tail}"),
+        };
+        let text = unit(&spec, &id).unwrap();
+
+        for line in text.lines() {
+            assert_eq!(
+                trailing_backslashes(line) % 2,
+                0,
+                "{tail:?}: `{line}` continues onto the next line"
+            );
+        }
+        let keys: Vec<&str> = text.lines().filter_map(|l| l.split_once('=').map(|(k, _)| k)).collect();
+        assert_eq!(
+            keys,
+            [
+                "Description",
+                "Type",
+                "ExecStart",
+                "WorkingDirectory",
+                "Environment",
+                "User",
+                "Restart",
+                "StandardOutput",
+                "StandardError",
+                "WantedBy",
+                "Marker",
+                "Schema",
+                "Version",
+                "Spec",
+            ],
+            "{tail:?}"
+        );
+        assert_eq!(extract(&text).unwrap().unwrap().spec, spec, "{tail:?}");
+    }
+}
+
+#[skuld::test]
+fn an_executable_path_with_a_backslash_or_quote_is_refused_because_systemd_refuses_to_load_it() {
+    // systemd 255 rejects the unit with "Executable name contains special characters" however the
+    // path is quoted or escaped; there is no encoding to write it in.
+    for executable in [r"/bin/x\y", r"/bin/x\", r"/bin/x\\", "/bin/x\"y", "/bin/x'y"] {
+        let spec = with_fields(|f| f.command = vec![executable.to_string()]);
+        let err = unit(&spec, &minimal_identity()).unwrap_err();
+        let Error::Invalid { daemon, message, .. } = &err else {
+            panic!("{executable:?}: expected Error::Invalid, got {err:?}");
+        };
+        assert_eq!(daemon, "frpc");
+        assert!(message.contains("command[0]"), "{executable:?}: {message}");
+        assert!(message.contains("systemd"), "{executable:?}: {message}");
+    }
+}
+
+#[skuld::test]
+fn a_later_argument_may_hold_a_backslash_or_quote() {
+    let spec = with_fields(|f| {
+        f.command = vec![
+            "/bin/x".to_string(),
+            r"a\b".to_string(),
+            "a\"b".to_string(),
+            "a'b".to_string(),
+        ]
+    });
+    assert!(unit(&spec, &minimal_identity()).is_ok());
+}
+
 // StartLimitIntervalSec ===============================================================================================
 
 #[skuld::test]
@@ -465,7 +670,7 @@ fn start_limit_disabled_when_restart_enabled() {
         let mut spec = minimal_spec().into_fields();
         spec.restart = restart;
         let spec = DaemonSpec::new(spec).unwrap();
-        let text = unit(&spec, &minimal_identity());
+        let text = unit(&spec, &minimal_identity()).unwrap();
 
         assert_eq!(
             text.lines().any(|l| l == "StartLimitIntervalSec=0"),
@@ -493,7 +698,12 @@ fn manifest_dollar_escape_survives_into_exec_start() {
     let (spec, _warnings) = crate::spec::load(dir.path()).expect("manifest should load");
     assert_eq!(spec.command[1], "$ARGS");
 
-    let text = unit(&spec, &minimal_identity());
+    // On a Windows host `resolve` makes `command[0]` a `C:\...` path, which systemd cannot load.
+    let mut fields = spec.into_fields();
+    fields.command[0] = "/bin/frpc".to_string();
+    let spec = DaemonSpec::new(fields).unwrap();
+
+    let text = unit(&spec, &minimal_identity()).unwrap();
     let exec_start = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
     assert!(
         exec_start.ends_with(" $$ARGS"),

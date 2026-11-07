@@ -585,11 +585,7 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
 
 /// The manifest directory, once, so a path joined to it cannot carry a defect the field rules
 /// would blame on a field the manifest wrote cleanly: it must be valid UTF-8, hold no control
-/// character, and not end in a backslash.
-///
-/// The backslash rule is the field rule unchanged, which is an open owner question: it refuses a
-/// Windows drive or UNC root (`C:\`, `\\srv\share\`), the only form `normalize` leaves ending
-/// in one. `daemon` is the authored `id`, unvalidated, used only to label the error.
+/// character. `daemon` is the authored `id`, unvalidated, used only to label the error.
 fn check_base_dir(daemon: &str, dir: &Path) -> Result<(), Error> {
     let invalid = |defect: &str| Error::Invalid {
         daemon: daemon.to_string(),
@@ -601,9 +597,6 @@ fn check_base_dir(daemon: &str, dir: &Path) -> Result<(), Error> {
     };
     if let Some(defect) = control_defect(text) {
         return Err(invalid(&defect));
-    }
-    if let Some(defect) = trailing_backslash_defect(text) {
-        return Err(invalid(defect));
     }
     Ok(())
 }
@@ -789,58 +782,48 @@ fn check_field_values(id: &Id, values: &FieldValues, phase: Phase) -> Result<(),
 }
 
 fn check_name(id: &Id, name: &str) -> Result<(), Error> {
-    reject_unemittable(id, "name", name)
+    reject_control_chars(id, "name", name)
 }
 
 /// Every `command` element, `command[0]` included. Its emptiness is separate: see [`reject_empty`].
 fn check_command_args(id: &Id, command: &[String]) -> Result<(), Error> {
     for arg in command {
-        reject_unemittable(id, "command", arg)?;
+        reject_control_chars(id, "command", arg)?;
     }
     Ok(())
 }
 
 /// A `cwd` or `logs`, as the text of the path.
 fn check_path_text(id: &Id, field: &str, text: &str) -> Result<(), Error> {
-    reject_unemittable(id, field, text)?;
+    reject_control_chars(id, field, text)?;
     reject_empty(id, field, text)
 }
 
 fn check_env_entry(id: &Id, key: &str, value: &str) -> Result<(), Error> {
     reject_env_key_with_equals(id, key)?;
-    reject_unemittable(id, "env key", key)?;
+    reject_control_chars(id, "env key", key)?;
     reject_empty(id, "env key", key)?;
-    reject_unemittable(id, &format!("env[{key}]"), value)
+    reject_control_chars(id, &format!("env[{key}]"), value)
 }
 
 fn check_user(id: &Id, user: &User) -> Result<(), Error> {
     match user {
         User::Root | User::Id(AccountId::Uid(_)) => Ok(()),
         User::Name(n) => {
-            reject_unemittable(id, "user.name", n)?;
+            reject_control_chars(id, "user.name", n)?;
             reject_blank(id, "user.name", n)
         }
         User::Id(AccountId::Sid(s)) => {
-            reject_unemittable(id, "user.id", s)?;
+            reject_control_chars(id, "user.id", s)?;
             reject_blank(id, "user.id", s)
         }
     }
 }
 
-/// Every gate a user-supplied string must pass before it can be emitted into any artifact. One
-/// entry point, so a field added later cannot pick up half the checks. Each defect they catch
-/// would be silent if no gate did.
-///
-/// systemd's `Description=`/`Environment=`, launchd's `UserName` and every other emitted
-/// directive have no escaping, and a control character (above all a newline) can terminate one
-/// directive and start another. XML 1.0 cannot represent most C0 control characters at all, so
-/// this also keeps the launchd generator from emitting an unparseable plist.
-fn reject_unemittable(id: &Id, field: &str, value: &str) -> Result<(), Error> {
-    reject_control_chars(id, field, value)?;
-    reject_trailing_backslash(id, field, value)?;
-    Ok(())
-}
-
+/// The gate every user-supplied string passes before it can be emitted into any artifact. A
+/// control character (above all a newline) can end one systemd directive and start another, and
+/// XML 1.0 cannot represent most C0 control characters at all, so one would make the launchd
+/// plist unparseable. Each defect it catches would be silent if no gate did.
 fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> {
     match control_defect(value) {
         Some(defect) => Err(invalid(id, &format!("field `{field}` {defect}"))),
@@ -869,25 +852,6 @@ fn control_defect(value: &str) -> Option<String> {
 fn is_xml_noncharacter(c: char) -> bool {
     let n = c as u32;
     (0xFDD0..=0xFDEF).contains(&n) || (n & 0xFFFE) == 0xFFFE
-}
-
-/// A value ending in a backslash is a line continuation to systemd, which
-/// merges its directive with the following line. That is a privilege
-/// boundary: a `name` ending in `\` can swallow the `User=` directive and
-/// silently run the daemon as root. Interior backslashes must stay allowed,
-/// or ordinary Windows paths become unexpressible.
-fn reject_trailing_backslash(id: &Id, field: &str, value: &str) -> Result<(), Error> {
-    match trailing_backslash_defect(value) {
-        Some(defect) => Err(invalid(id, &format!("field `{field}` {defect}"))),
-        None => Ok(()),
-    }
-}
-
-/// How `value` breaks the trailing-backslash rule, as a predicate to follow the name of what was
-/// checked; `None` if it does not.
-fn trailing_backslash_defect(value: &str) -> Option<&'static str> {
-    let trailing = value.len() - value.trim_end_matches('\\').len();
-    (trailing % 2 == 1).then_some("ends in a backslash, which systemd reads as a line continuation")
 }
 
 /// `command` must name at least one argv entry.

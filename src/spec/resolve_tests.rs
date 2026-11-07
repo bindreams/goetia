@@ -133,13 +133,11 @@ fn rejects_control_characters_in_cwd_and_logs() {
 // The rules check what the user wrote ---------------------------------------------------------------------------------
 
 #[skuld::test]
-fn rejects_a_relative_cwd_and_logs_ending_in_a_backslash_on_every_host() {
-    // `normalize` drops a trailing `\` on Windows, so only a check on the authored text refuses
-    // `data\`.
+fn accepts_a_relative_cwd_and_logs_ending_in_a_backslash_on_every_host() {
+    // Whether a backend can write the path is that backend's question, not the field's.
     for field in ["cwd", "logs"] {
         let yaml = format!("id: frpc\ncommand: [bin/frpc]\n{field}: 'data\\'\n");
-        let msg = resolve_yaml(&yaml).unwrap_err().to_string();
-        assert!(msg.contains(&format!("field `{field}` ends in a backslash")), "{msg}");
+        resolve_yaml(&yaml).unwrap_or_else(|e| panic!("`{field}` ending in a backslash: {e}"));
     }
 }
 
@@ -205,6 +203,14 @@ fn a_manifest_directory_with_a_newline_is_refused_by_name() {
     assert!(msg.contains("manifest directory"), "{msg}");
     assert!(msg.contains("control character"), "{msg}");
     assert!(!msg.contains("field `"), "{msg}");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_manifest_directory_ending_in_a_backslash_is_accepted() {
+    let dir = PathBuf::from("/base/a\\");
+    let (spec, _) = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\ncwd: .\n"), &dir).expect("resolves");
+    assert_eq!(spec.cwd, Some(dir));
 }
 
 // Resolution ==========================================================================================================
@@ -549,33 +555,26 @@ fn resolve_with_env_value(value: &str) -> Result<(DaemonSpec, Vec<Warning>), Err
 }
 
 #[skuld::test]
-fn rejects_trailing_backslash_in_name() {
-    // systemd reads a backslash at end of line as a line continuation, so a
-    // `name` ending in one merges `Description=` with whatever follows — which
-    // can be the `[Service]` section header, or the `User=` directive. A
-    // swallowed `User=` silently runs the daemon as root instead of the
-    // requested account, so this is a privilege boundary, not formatting.
-    let err = resolve_with_name("FRP client\\").expect_err("trailing backslash must be rejected");
-    assert!(
-        err.to_string().contains("backslash"),
-        "message should name the cause: {err}"
-    );
+fn accepts_trailing_backslashes_in_name() {
+    // Keeping a line-ending backslash from continuing the line is the systemd generator's job.
+    for name in ["FRP client\\", "FRP client\\\\", "FRP client\\\\\\"] {
+        let (spec, _) = resolve_with_name(name).unwrap_or_else(|e| panic!("{name:?}: {e}"));
+        assert_eq!(spec.name, name);
+    }
 }
 
 #[skuld::test]
-fn rejects_trailing_backslash_in_env_value() {
-    let err = resolve_with_env_value("C:\\opt\\rt\\").expect_err("trailing backslash must be rejected");
-    assert!(
-        err.to_string().contains("backslash"),
-        "message should name the cause: {err}"
-    );
+fn accepts_trailing_backslashes_in_env_value() {
+    for value in ["C:\\opt\\rt\\", "C:\\opt\\rt\\\\"] {
+        let (spec, _) = resolve_with_env_value(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
+        assert_eq!(spec.env["FOO"], value);
+    }
 }
 
 #[skuld::test]
 fn accepts_interior_backslashes() {
-    // Only a *trailing* backslash continues a line. Rejecting interior ones
-    // would make ordinary Windows paths unexpressible.
-    resolve_with_env_value("C:\\opt\\rt").expect("interior backslashes are fine");
+    let (spec, _) = resolve_with_env_value("C:\\opt\\rt").expect("interior backslashes are fine");
+    assert_eq!(spec.env["FOO"], "C:\\opt\\rt");
 }
 
 #[skuld::test]
@@ -591,7 +590,7 @@ fn rejects_xml_noncharacters() {
     let id = Id::try_from("frpc").expect("valid id");
     for bad in ['\u{FFFE}', '\u{FFFF}', '\u{FDD0}', '\u{1FFFE}'] {
         let value = format!("frp{bad}");
-        let err = reject_unemittable(&id, "name", &value).expect_err("noncharacter must be rejected");
+        let err = reject_control_chars(&id, "name", &value).expect_err("noncharacter must be rejected");
         assert!(
             err.to_string().contains("noncharacter"),
             "message should name the cause for U+{:04X}: {err}",
@@ -605,7 +604,7 @@ fn accepts_ordinary_text() {
     // Guards the noncharacter check against over-rejecting: it must not
     // catch ordinary non-ASCII, which is legitimate in a display name.
     let id = Id::try_from("frpc").expect("valid id");
-    reject_unemittable(&id, "name", "FRP — клиент 日本語").expect("ordinary text is fine");
+    reject_control_chars(&id, "name", "FRP — клиент 日本語").expect("ordinary text is fine");
 }
 
 #[skuld::test]
@@ -1290,11 +1289,11 @@ fn a_value_that_only_substitution_made_invalid_says_so() {
     // does hold: step 4 shape-checked this same merged spec and passed, so
     // substitution is provably what changed. Pinned here because nothing else
     // would notice if the verdict path stopped carrying this prefix.
-    let dir = fixture_dir("id: frpc\ncommand: [/bin/frpc]\nname: ${N}\n", Some("N=frpc\\\n"));
+    let dir = fixture_dir("id: frpc\ncommand: [/bin/frpc]\nname: ${N}\n", Some("N=\"a\tb\"\n"));
     let err = load(&dir.path().join("goetia.yaml")).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("after substituting from .env"), "{msg}");
-    assert!(msg.contains("backslash"), "{msg}");
+    assert!(msg.contains("control character"), "{msg}");
 }
 
 #[skuld::test]
@@ -1842,14 +1841,12 @@ fn a_bare_dollar_in_an_env_value_survives_a_substituted_pass() {
 fn a_base_value_must_pass_the_shape_gate_even_when_every_backend_overrides_it() {
     // Deliberate: the base pass shape-checks every authored value, even one
     // no backend ends up using, so a dead value cannot sit in the manifest
-    // as a trap for whoever later deletes an override. `C:\ProgramData\frpc`
-    // names the same directory as `C:\ProgramData\frpc\`, so the remedy is
-    // lossless: write the value under the backends that need it instead.
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\ncwd: \"C:\\\\ProgramData\\\\frpc\\\\\"\n\
+    // as a trap for whoever later deletes an override.
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\ncwd: \"/opt/a\\tb\"\n\
                 backend-specific:\n  launchd:\n    cwd: /var/frpc\n  scm:\n    cwd: /var/frpc\n  \
                 systemd:\n    cwd: /var/frpc\n";
     let err = resolve_yaml(yaml).unwrap_err();
-    assert!(err.to_string().contains("backslash"), "{err}");
+    assert!(err.to_string().contains("control character"), "{err}");
 }
 
 // The `$`-skip rule for `restart`/`type`/`restart-delay` ==============================================================
