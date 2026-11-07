@@ -595,11 +595,9 @@ impl Error {
         }
     }
 
-    /// The sentence this error's `Display` is, when it has an error set in it, which is not its
-    /// [`source`](std::error::Error::source). [`report`](Error::report) writes that error itself,
-    /// so its remedies print last: a variant that writes an error into its message builds the
-    /// message as a [`Sentence`] in one function, which its `Display` and this method both call. A
-    /// [`Kept`](Error::Kept) error answers as the error it holds.
+    /// The sentence `Display` writes around an embedded error that is not the `source`, so `report`
+    /// can write that error with its remedies last; `None` otherwise. A [`Kept`](Error::Kept) error
+    /// answers as the error it holds.
     ///
     /// Exhaustive on purpose, like [`is_indeterminate`](Error::is_indeterminate): a new variant must
     /// be classified here before it compiles.
@@ -667,8 +665,7 @@ impl Error {
         }
     }
 
-    /// [`report`](Error::report) with every character as it is: what `--json` carries, since the
-    /// document's encoder escapes the text itself.
+    /// [`report`](Error::report) with every character as it is: the exact text for `--json`.
     #[cfg(feature = "cli")]
     pub(crate) fn report_unescaped(&self) -> impl fmt::Display + '_ {
         Report {

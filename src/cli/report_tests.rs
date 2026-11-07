@@ -278,8 +278,7 @@ fn emit_returns_the_reports_own_code_when_the_write_succeeds() {
 
 // The document carries the exact text ---------------------------------------------------------------------------------
 
-/// serde encodes the document, so escaping the text first would encode it twice: the human sinks
-/// escape, the document does not.
+/// The exact text for `--json`; the human sinks escape.
 #[skuld::test]
 fn a_refused_id_is_reported_as_the_id_was_given() {
     let id = "a\nb\u{202e}";

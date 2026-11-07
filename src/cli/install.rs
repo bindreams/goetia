@@ -1,8 +1,8 @@
 //! `goetia daemon install [-f FILE] [--force] [--start] [--enable] [--dry-run]`
 //!
-//! `--dry-run` and the diffs print for reading, so they are not byte-exact when a value holds a
-//! control character, U+2028, U+2029 or a bidirectional control: see [`super::show`], guarantee 4.
+//! Values are escaped for reading (see [`super::show`], guarantee 4).
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use clap::Args as ClapArgs;
 
 use super::ExitCode;
 use super::refusal::{Lines, Mood, NotRefused};
-use super::support::{load_and_warn, print_error, require_elevation};
+use super::support::{line_prefix, load_and_warn, print_error, render_line, require_elevation};
 use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::Outcome;
@@ -154,7 +154,10 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
             let _ = write!(out, "{spec_diff}");
         }
         NotRefused::Stale { from_version } => {
-            let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
+            let line = render_line(&line_prefix(None, Some(id.as_str())), |sink| {
+                write!(sink, "regenerated (was built by goetia {from_version})")
+            });
+            let _ = writeln!(out, "{line}");
         }
     }
     ExitCode::Success

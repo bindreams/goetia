@@ -45,6 +45,22 @@ use crate::manager::ServiceManager;
 
 // Cli =================================================================================================================
 
+/// Parses `args` as clap does, except that what clap would print goes through the escaping streams
+/// like all other output: a usage error quotes the argument as typed. `Err` is the exit code, with
+/// the text already written, to `out` for help and version and to `err` otherwise, as clap does.
+pub fn parse<I, T>(args: I, out: &mut dyn Write, err: &mut dyn Write) -> std::result::Result<Cli, i32>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    Cli::try_parse_from(args).map_err(|e| {
+        let mut stream = EscapedStream::new(if e.use_stderr() { err } else { out });
+        let _ = write!(stream, "{}", e.render());
+        let _ = stream.flush();
+        e.exit_code()
+    })
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "goetia",
@@ -174,13 +190,12 @@ pub enum DaemonCommand {
 /// it runs.
 ///
 /// Anything clap short-circuits on is a deliberate carve-out, because it
-/// happens before `dispatch` is ever called: `--help`/`--version` print
+/// happens before `dispatch` is ever called, in [`parse`]: `--help`/`--version` print
 /// their own text and exit `0`, and a usage error (`goetia --json daemon
 /// uninstall`, with `<IDS>` missing) prints clap's message to stderr, leaves
 /// stdout empty, and exits `2`. Rendering those as JSON would mean
-/// pre-scanning `std::env::args()` before parsing, or intercepting
-/// `try_parse` and re-rendering clap's own diagnostics — both worse than the
-/// carve-out.
+/// pre-scanning `std::env::args()` before parsing, or re-rendering clap's own
+/// diagnostics — both worse than the carve-out.
 pub fn dispatch(
     cli: &Cli,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
@@ -188,9 +203,8 @@ pub fn dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    // The one place nothing can miss: every subcommand writes through these two. `out` is left
-    // alone under `--json`: the document's encoder escapes what it must, and writes U+2028 and the
-    // direction controls as they are, which is valid JSON where the wrapper's `\u{2028}` is not.
+    // `out` is left alone under `--json`, which carries the exact text: U+2028 and the direction
+    // controls are valid JSON as they are, where the wrapper's `\u{2028}` is not.
     let mut err = EscapedStream::new(err);
     let mut escaped_out;
     let out: &mut dyn Write = if cli.json {

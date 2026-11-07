@@ -127,7 +127,7 @@ fn a_commands_stderr_keeps_its_layout_and_loses_the_rest_of_the_set() {
     );
 }
 
-/// `--json` carries the exact text: serde encodes it, so escaping first would encode it twice.
+/// The exact text for `--json`.
 #[skuld::test]
 fn the_unescaped_report_carries_every_character_as_it_is() {
     let e = Error::Step {

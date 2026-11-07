@@ -207,3 +207,83 @@ fn a_flush_keeps_a_held_tail_and_a_crlf_split_by_it_stays_whole() {
         "dropped, the held return is escaped"
     );
 }
+
+/// How a text is written must not depend on how it is cut into writes: every byte string the tests
+/// above feed whole, fed one byte per write, gives the same output.
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn a_stream_gives_the_same_output_one_byte_per_write_as_in_one_write() {
+    let texts: &[&[u8]] = &[
+        b"a\tb\nc\r\x1b[0m",
+        b"a\r\nb\r",
+        b"\r\r\n",
+        b"a\rb",
+        b"ok\r",
+        b"a\xffb\xc3",
+        b"\xe2\x80x",
+        b"ok\xe2\x80",
+        "d\u{e9}j\u{e0} vu \u{1f469}".as_bytes(),
+        "a\u{2028}b\u{85}c\u{202e}d\u{2066}e".as_bytes(),
+        "\u{2065}\u{200c}\u{ad}\u{200e}".as_bytes(),
+        br"C:\Users\new\u{1b}\notes.txt",
+    ];
+    for text in texts {
+        let bytes: Vec<&[u8]> = text.chunks(1).collect();
+        assert_eq!(streamed(&bytes), streamed(&[text]), "{text:?}");
+    }
+}
+
+/// A held partial character is dropped for U+FFFD when the next byte cannot continue it, and that
+/// byte is then read for what it is.
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn a_held_partial_character_followed_by_a_byte_that_cannot_continue_it_is_replaced() {
+    // ASCII, a control, a new lead byte, a complete character, and a stray continuation byte.
+    assert_eq!(streamed(&[b"\xe2", b"("]), "\u{fffd}(".as_bytes());
+    assert_eq!(streamed(&[b"\xe2\x80", b"\x1b"]), "\u{fffd}\\u{1b}".as_bytes());
+    assert_eq!(
+        streamed(&[b"\xe2\x80", b"\xe2\x80\xa8"]),
+        "\u{fffd}\\u{2028}".as_bytes()
+    );
+    assert_eq!(streamed(&[b"\xf0\x9f", b"\xc3\xa9"]), "\u{fffd}\u{e9}".as_bytes());
+    assert_eq!(streamed(&[b"\xe2", b"\x80", b"\x28"]), "\u{fffd}(".as_bytes());
+}
+
+/// An inner stream that fails every write and flush with its own error.
+#[cfg(feature = "cli")]
+struct Failing;
+
+#[cfg(feature = "cli")]
+impl std::io::Write for Failing {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the pipe is closed",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::StorageFull, "the disk is full"))
+    }
+}
+
+/// The caller of the document's `write` sees the failure of the stream underneath, not a
+/// formatting error in its place.
+#[cfg(feature = "cli")]
+#[skuld::test]
+fn a_failing_inner_stream_returns_its_own_error_from_write_and_flush() {
+    let mut inner = Failing;
+    let mut stream = EscapedStream::new(&mut inner);
+
+    let e = std::io::Write::write_all(&mut stream, b"text").unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+    assert_eq!(e.to_string(), "the pipe is closed");
+
+    // Escaped text takes the same path.
+    let e = std::io::Write::write_all(&mut stream, b"a\x1bb").unwrap_err();
+    assert_eq!(e.to_string(), "the pipe is closed");
+
+    let e = std::io::Write::flush(&mut stream).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::StorageFull, "{e}");
+    assert_eq!(e.to_string(), "the disk is full");
+}

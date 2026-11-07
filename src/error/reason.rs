@@ -68,8 +68,8 @@ impl fmt::Display for Reason {
 }
 
 impl Reason {
-    /// `Display` with every character as it is: what `--json` carries, and what two reasons are
-    /// compared by.
+    /// `Display` with every character as it is: the exact text for `--json`, and what two reasons
+    /// are compared by.
     pub(crate) fn unescaped(&self) -> impl fmt::Display + '_ {
         Unescaped(self)
     }

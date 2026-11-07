@@ -46,7 +46,7 @@ use super::ExitCode;
 use super::support::{
     load_and_warn, partition_installed, print_error, print_line, print_undetermined_warnings, print_unusable_warnings,
 };
-use crate::error::{Result, escape};
+use crate::error::Result;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonSpec;
 
@@ -136,7 +136,9 @@ fn show_from_installed(
         if let Some(entry) = index.ours.get(id) {
             specs.push(entry.spec.clone());
         } else if index.unusable.contains_key(id) {
-            let _ = writeln!(err, "error: daemon `{}` is installed but unusable", escape(id));
+            print_line(err, "error", None, |sink| {
+                write!(sink, "daemon `{id}` is installed but unusable")
+            });
             codes.push(ExitCode::Indeterminate);
         } else if let Some(entry) = index.undetermined_for(id) {
             // Either the listing could not classify this id, or an aggregate
@@ -147,7 +149,9 @@ fn show_from_installed(
             });
             codes.push(ExitCode::Indeterminate);
         } else {
-            let _ = writeln!(err, "error: daemon `{}` is not installed", escape(id));
+            print_line(err, "error", None, |sink| {
+                write!(sink, "daemon `{id}` is not installed")
+            });
             codes.push(ExitCode::Error);
         }
     }

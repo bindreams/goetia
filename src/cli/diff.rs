@@ -9,9 +9,9 @@
 //! "absent" from "occupied by a stranger's service" or "up to date" from
 //! "hand-edited outside Goetia".
 //!
-//! The artifact diff prints for reading, so it is not byte-exact when a value holds a control
-//! character, U+2028, U+2029 or a bidirectional control: see [`super::show`], guarantee 4.
+//! Values are escaped for reading (see [`super::show`], guarantee 4).
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use clap::Args as ClapArgs;
 
 use super::ExitCode;
 use super::refusal::{Lines, Mood, NotRefused};
-use super::support::{load_and_warn, print_error};
+use super::support::{line_prefix, load_and_warn, print_error, render_line};
 use crate::error::Result;
 use crate::manager::ServiceManager;
 
@@ -81,11 +81,10 @@ pub fn run(
             let _ = write!(out, "{spec_diff}");
         }
         NotRefused::Stale { from_version } => {
-            let _ = writeln!(
-                out,
-                "{}: would be regenerated (built by goetia {from_version})",
-                spec.id
-            );
+            let line = render_line(&line_prefix(None, Some(spec.id.as_str())), |sink| {
+                write!(sink, "would be regenerated (built by goetia {from_version})")
+            });
+            let _ = writeln!(out, "{line}");
         }
     }
     ExitCode::Drift

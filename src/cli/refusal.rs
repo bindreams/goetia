@@ -43,8 +43,7 @@ impl Lines<'_> {
     /// For a conflict or a refusal: writes its line and breaks with the exit code. The line goes
     /// to `out` with the diff under it, and to `err` as `error: <line>`, so a script that only
     /// captures stderr still learns of it. Any other outcome writes nothing and continues with
-    /// what the caller reports. Matches every [`Outcome`], so the compiler checks that none is
-    /// missed.
+    /// what the caller reports.
     pub(super) fn refusal<'o>(
         &self,
         outcome: &'o Outcome,
@@ -73,9 +72,7 @@ impl Lines<'_> {
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> ExitCode {
-        // `--force` is named only where it resolves the conflict. When part of the cause is
-        // outside the directory this backend writes, forcing leaves that part in place and the
-        // next run reports the same conflict; `decide` says which case this is.
+        // `--force` is named only where it resolves the conflict (see `decide`).
         let line = match (unclearable_recovery, self.mood) {
             (None, Mood::Done) => "conflict (re-run with --force to overwrite)".to_string(),
             (None, Mood::Would) => {

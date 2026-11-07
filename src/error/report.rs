@@ -26,9 +26,8 @@ pub(super) fn write_report(e: &Error, out: &mut Sink) -> fmt::Result {
 
 /// Where error text goes. The one place it is written for a person is [`write_chain`], so the one
 /// place it is escaped: `escaped` is whether this destination is one. The text goes through
-/// [`fmt::Write`], which escapes it whole; a child's stderr is written with
-/// [`write_layout`](Sink::write_layout), which keeps its line feeds and tabs. A sink writes a
-/// child's stderr only if it was made to: [`Chain`] makes one that does not.
+/// [`fmt::Write`]; a child's stderr is written with [`write_layout`](Sink::write_layout). A sink
+/// writes a child's stderr only if it was made to: [`Chain`] makes one that does not.
 pub(crate) struct Sink<'a> {
     out: &'a mut dyn fmt::Write,
     escaped: bool,
@@ -80,10 +79,7 @@ impl fmt::Write for Sink<'_> {
 ///
 /// Not escaped: the text lands in an error's `Display`, which the sink that prints it escapes. The
 /// report does not print a [`Sentence`](super::Sentence) through this, but writes the embedded error
-/// itself (see [`write_chain`]), so its remedies print once, last. The other users,
-/// `Occupant::Unreadable` and the SCM kill's `ReadAfterRefusedOpen`, hold `io::Error`s, which carry
-/// no remedy: a remedy lives on [`Error::Undetermined`], and no goetia error is wrapped in an
-/// `io::Error`.
+/// itself (see [`write_chain`]), so its remedies print once, last.
 pub(crate) struct Chain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
 impl fmt::Display for Chain<'_> {

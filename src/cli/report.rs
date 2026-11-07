@@ -25,7 +25,7 @@
 //! with or without `--json`: both build a [`Report`] first and then pick a
 //! renderer, so the exit code cannot depend on the output format.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::Write;
 
 use super::ExitCode;
@@ -69,7 +69,7 @@ pub(crate) struct ErrorReport {
     /// obtaining the manager or from listing.
     pub id: Option<String>,
     pub kind: Kind,
-    /// Exactly as it is: the document's encoder escapes it.
+    /// Exactly as it is, for `--json`: serde encodes it, so escaping first would encode it twice.
     pub message: String,
     /// What `message` was made from, which a person reads written as the report writes it; not in
     /// the document.
@@ -111,8 +111,6 @@ impl ErrorReport {
 
     /// Writes `message` for a person, as the report writes it (see [`Error::report`]).
     fn write_shown(&self, out: &mut Sink) -> fmt::Result {
-        use std::fmt::Write as _;
-
         match &self.origin {
             Origin::Words => out.write_str(&self.message),
             Origin::Error(e) => e.write_report(out),
@@ -380,7 +378,9 @@ pub(crate) fn emit(report: &Report, out: &mut dyn Write, err: &mut dyn Write) ->
     match write(report, out) {
         Ok(()) => exit_code(report),
         Err(e) => {
-            let _ = writeln!(err, "error: failed to write the --json document to stdout: {e}");
+            print_line(err, "error", None, |sink| {
+                write!(sink, "failed to write the --json document to stdout: {e}")
+            });
             ExitCode::Error
         }
     }

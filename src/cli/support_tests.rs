@@ -71,7 +71,7 @@ fn an_unusable_or_undetermined_entry_is_printed_with_control_and_direction_chara
     );
 }
 
-/// The index feeds `--json`, whose encoder escapes the text itself: it holds a reason as it is, and
+/// The index feeds `--json`, which takes the exact text: it holds a reason as it is, and
 /// the sinks that print it escape.
 #[skuld::test]
 fn the_index_holds_a_reason_as_it_is() {

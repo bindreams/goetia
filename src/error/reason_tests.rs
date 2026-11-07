@@ -86,7 +86,7 @@ fn a_reason_escapes_every_part_of_what_it_prints_as_the_report_does() {
     );
 }
 
-/// What `--json` carries: the document's encoder escapes the text itself.
+/// The exact text for `--json`.
 #[skuld::test]
 fn an_unescaped_reason_carries_every_character_as_it_is() {
     assert_eq!(Reason::said(HOSTILE).unescaped().to_string(), HOSTILE);

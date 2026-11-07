@@ -207,13 +207,10 @@ pub(crate) fn require_elevation(
     if is_elevated() {
         return Ok(());
     }
-    let _ = writeln!(
-        err,
-        "error: {}",
-        Error::ElevationRequired {
-            subcommand: subcommand.to_string()
-        }
-    );
+    let e = Error::ElevationRequired {
+        subcommand: subcommand.to_string(),
+    };
+    print_error(err, None, "", &e);
     Err(ExitCode::Error)
 }
 

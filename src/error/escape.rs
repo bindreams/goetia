@@ -55,11 +55,9 @@ pub(crate) fn escape(text: &str) -> String {
     out
 }
 
-/// An [`io::Write`] that writes everything to `inner` with the set escaped, keeping line feeds and
-/// tabs, and a carriage return before a line feed ([`write_escaped_keeping_layout`]): the stream all of the CLI's output goes through, so a
-/// sink that forgets to escape cannot put a control character on the terminal. A line feed passes,
-/// so a quoted value in a one-line message could still start a line of its own: those messages are
-/// escaped whole as well.
+/// An [`io::Write`] that escapes everything written to `inner`, keeping layout as
+/// [`write_escaped_keeping_layout`] does: the backstop for any sink that forgets to escape.
+/// One-line messages still need the strict writer, since a line feed passes.
 ///
 /// A write may end inside a multi-byte character, or on a carriage return that the next byte will
 /// show to be the end of a CRLF, so that tail is held until the next write, across a flush. Bytes
