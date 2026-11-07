@@ -2,6 +2,8 @@
 
 #[cfg(windows)]
 pub use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
+#[cfg(windows)]
+pub use crate::backend::scm::shim::embedded::EmbeddedStockShim;
 pub use crate::backend::scm::shim::provider::HostCommand;
 #[cfg(windows)]
 pub use crate::backend::scm::shim::provider::ShimProvider;
@@ -30,4 +32,28 @@ macro_rules! stock_shim {
             $crate::shim::main()
         }
     };
+}
+
+/// The stock shim's bytes for [`EmbeddedStockShim::new`](crate::shim::EmbeddedStockShim::new): an
+/// `Option<&'static [u8]>` that is `Some(include_bytes!(..))` of the file `GOETIA_SHIM_EXE` names
+/// when the crate it expands in has its own `goetia-shim` feature on, and `None` otherwise.
+///
+/// Expand it in the binary crate, never in a library the shim binary links, with
+/// `GOETIA_SHIM_EXE` the absolute path of the built stock shim (`include_bytes!` would resolve a
+/// relative one against the source file). With the feature on and no variable the build fails.
+#[macro_export]
+macro_rules! embed_shim {
+    () => {{
+        #[cfg(feature = "goetia-shim")]
+        {
+            Some(include_bytes!(env!(
+                "GOETIA_SHIM_EXE",
+                "GOETIA_SHIM_EXE must be the absolute path of the built stock shim when the goetia-shim feature is on"
+            )) as &'static [u8])
+        }
+        #[cfg(not(feature = "goetia-shim"))]
+        {
+            None::<&'static [u8]>
+        }
+    }};
 }

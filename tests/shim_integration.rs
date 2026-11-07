@@ -27,6 +27,12 @@ mod deny;
 #[path = "shim_integration/fixture.rs"]
 mod fixture;
 #[cfg(windows)]
+#[path = "shim_integration/install_helper.rs"]
+mod install_helper;
+#[cfg(windows)]
+#[path = "shim_integration/provision.rs"]
+mod provision;
+#[cfg(windows)]
 #[path = "shim_integration/restart_integration.rs"]
 mod restart_integration;
 #[cfg(windows)]
@@ -39,7 +45,7 @@ mod supervisor_integration;
 fn main() {
     #[cfg(windows)]
     {
-        if fixture::run_if_requested() {
+        if fixture::run_if_requested() || install_helper::run_if_requested() {
             return;
         }
     }

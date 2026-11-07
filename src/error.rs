@@ -254,6 +254,18 @@ pub enum Error {
     #[error("the shim provider named {}, which is not an absolute path", path.display())]
     ShimPathRelative { path: PathBuf },
 
+    /// `EmbeddedStockShim` holds no bytes: the program was built without the stock shim. No OS
+    /// call failed.
+    #[error("built without a stock shim: GOETIA_SHIM_EXE was not set under the goetia-shim feature")]
+    ShimNotEmbedded,
+
+    /// The stock shim `goetia.exe` reads from beside itself is not there. No OS call failed.
+    #[error(
+        "the stock shim {} is missing: goetia looks for goetia-shim.exe beside goetia.exe",
+        path.display()
+    )]
+    SiblingShimMissing { path: PathBuf },
+
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
     #[error("{path}:{line}: {message}", path = path.display())]
@@ -591,6 +603,8 @@ impl Error {
             | Error::NoShimProvider
             | Error::ShimProviderDisagrees { .. }
             | Error::ShimPathRelative { .. }
+            | Error::ShimNotEmbedded
+            | Error::SiblingShimMissing { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -700,6 +714,8 @@ impl Error {
             | Error::NoShimProvider
             | Error::ShimProviderDisagrees { .. }
             | Error::ShimPathRelative { .. }
+            | Error::ShimNotEmbedded
+            | Error::SiblingShimMissing { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)

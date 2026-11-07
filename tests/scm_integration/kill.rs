@@ -19,7 +19,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
-use crate::common::{self, fixture_command_with_exe};
+use crate::common::fixture_command_with_exe;
 use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
 
 /// While alive, the calling thread has `SeDebugPrivilege` disabled (still held, as for an elevated
@@ -101,8 +101,8 @@ fn kill_with_the_privilege_disabled(user: User) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    // LocalService cannot execute the repo's own build tree; see `WorldReadableExe`.
-    let exe = common::WorldReadableExe::new(&id);
+    // LocalService cannot execute the repo's own build tree; see `support::WorldReadableExe`.
+    let exe = support::WorldReadableExe::new(&id);
     let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
     let spec = DaemonSpec {
         user,

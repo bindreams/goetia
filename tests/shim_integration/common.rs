@@ -3,11 +3,12 @@
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
-use goetia::shim::{CheckPermissions, StandaloneShim};
+use goetia::shim::{CheckPermissions, EmbeddedStockShim, StandaloneShim};
 use goetia::spec::{DaemonSpec, Kind};
 use windows_service::service::{Service, ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -37,12 +38,37 @@ pub fn manager() -> Scm {
     )
 }
 
+/// The stock shim this crate builds, read once and leaked: what `EmbeddedStockShim` carries in a
+/// program built with the stock shim.
+pub fn shim_bytes() -> &'static [u8] {
+    static BYTES: OnceLock<&'static [u8]> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        let path = env!("CARGO_BIN_EXE_goetia-shim");
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read the stock shim {path}: {e}"));
+        Box::leak(bytes.into_boxed_slice())
+    })
+}
+
+/// The provider a program built with the stock shim has: the shim of [`shim_bytes`], placed in
+/// `dir`, or in `%ProgramFiles%\Goetia` for `None`.
+pub fn embedded_shim(dir: Option<PathBuf>) -> EmbeddedStockShim {
+    EmbeddedStockShim::new(Some(shim_bytes()), dir)
+}
+
+/// A manager whose `type: simple` services run the stock shim [`embedded_shim`] places, with the
+/// folder check as `check` says.
+pub fn embedded_manager(dir: Option<PathBuf>, check: CheckPermissions) -> Scm {
+    Scm::with_shim(embedded_shim(dir), check)
+}
+
 pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
-    let mut v = vec![
-        support::current_exe_str(),
-        fixture::FIXTURE.to_string(),
-        mode.to_string(),
-    ];
+    fixture_command_with_exe(&support::current_exe_str(), mode, args)
+}
+
+/// [`fixture_command`] with the daemon run from `exe`, a copy of this binary (see
+/// [`support::WorldReadableExe`]) that the account the service runs as can execute.
+pub fn fixture_command_with_exe(exe: &str, mode: &str, args: &[&str]) -> Vec<String> {
+    let mut v = vec![exe.to_string(), fixture::FIXTURE.to_string(), mode.to_string()];
     v.extend(args.iter().map(|s| s.to_string()));
     v
 }
@@ -155,6 +181,19 @@ impl LogDir {
         Self(support::cleanup::DirGuard::new(
             tempfile::tempdir().expect("tempdir for the daemons' logs").keep(),
         ))
+    }
+
+    /// Like [`Self::new`], but under `%ProgramData%` and writable by every account, for a daemon
+    /// whose service account cannot write the runner's `%TEMP%`.
+    pub fn world_writable() -> Self {
+        let path = support::program_data().join(support::random_test_id());
+        let guard = support::cleanup::DirGuard::new(path.clone());
+        std::fs::create_dir(&path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+        let path_str = path
+            .to_str()
+            .unwrap_or_else(|| panic!("{} is not UTF-8", path.display()));
+        support::cmd::run("icacls", &[path_str, "/grant", "*S-1-1-0:(OI)(CI)(M)"]).expect_ok();
+        Self(guard)
     }
 
     pub fn path(&self) -> &Path {

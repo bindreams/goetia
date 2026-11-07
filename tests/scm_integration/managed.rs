@@ -758,31 +758,6 @@ fn install_twice_is_up_to_date_for_both_kinds() {
 
 // Step 7: a real account gets SeServiceLogonRight =====================================================================
 
-struct LocalUserGuard {
-    name: String,
-}
-
-impl LocalUserGuard {
-    fn create(name: &str, password: &str) -> Self {
-        // Built after the add, not before: `/add` is atomic, so on failure nothing
-        // was created and a guard would delete an account this test did not make.
-        support::cmd::run("net.exe", &["user", name, password, "/add"]).expect_ok();
-        Self { name: name.to_string() }
-    }
-}
-
-impl Drop for LocalUserGuard {
-    fn drop(&mut self) {
-        // `net.exe` exits 2 for every error; the message names the Win32 one, and 2221 is
-        // NERR_UserNotFound ("NET HELPMSG 2221"), the account already gone.
-        support::cleanup::warn_left_behind(support::cmd::run_cleanup_unless(
-            "net.exe",
-            &[&["user", &self.name, "/delete"]],
-            |run| run.stderr.contains("2221"),
-        ));
-    }
-}
-
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn real_account_gets_service_logon_right() {
     // Windows local (SAM) account names are capped at 20 characters.
@@ -792,7 +767,7 @@ fn real_account_gets_service_logon_right() {
     // interactively about pre-Windows-2000 compatibility, which hangs
     // waiting on stdin in CI.
     let password = "Goetia!Test12";
-    let _user_guard = LocalUserGuard::create(&account, password);
+    let _user_guard = support::LocalUserGuard::create(&account, password);
 
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -900,7 +875,7 @@ fn a_local_service_daemon_actually_runs() {
     let _guard = ServiceGuard::new(&id);
     // Held past the `install`/`start`/`stop` calls below and dropped (which
     // deletes the copy) only once nothing further needs to launch it.
-    let exe = common::WorldReadableExe::new(&id);
+    let exe = support::WorldReadableExe::new(&id);
     let started = ConnectBack::listen();
     let stopped = ConnectBack::listen();
     let spec = DaemonSpec {
@@ -1107,7 +1082,7 @@ fn deleted_account_makes_the_service_oursunusable() {
     // interactively about pre-Windows-2000 compatibility, which hangs
     // waiting on stdin in CI.
     let password = "Goetia!Test12";
-    let user_guard = LocalUserGuard::create(&account, password);
+    let user_guard = support::LocalUserGuard::create(&account, password);
     let sid = common::sid_string_for_account(&account);
 
     let id = support::random_test_id();

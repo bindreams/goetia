@@ -144,6 +144,8 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             right: "own",
         },
         Error::ShimMarkerMissing { path: PathBuf::new() },
+        Error::ShimNotEmbedded,
+        Error::SiblingShimMissing { path: PathBuf::new() },
         Error::ShimMarkerVersion {
             path: PathBuf::new(),
             found: String::new(),
@@ -628,6 +630,26 @@ fn report_of_a_host_of_another_version_names_both_versions() {
         e.report().to_string(),
         "/h.exe is a goetia service host of version 0.1.0, and this goetia is version 0.2.0: rebuild the host with \
          this version"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_build_without_a_stock_shim_names_the_variable_and_the_feature() {
+    assert_eq!(
+        Error::ShimNotEmbedded.report().to_string(),
+        "built without a stock shim: GOETIA_SHIM_EXE was not set under the goetia-shim feature"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_missing_sibling_shim_names_its_path() {
+    let e = Error::SiblingShimMissing {
+        path: PathBuf::from("/b/goetia-shim.exe"),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "the stock shim /b/goetia-shim.exe is missing: goetia looks for goetia-shim.exe beside goetia.exe"
     );
     assert!(std::error::Error::source(&e).is_none());
 }

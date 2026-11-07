@@ -14,11 +14,15 @@ pub mod connect_back;
 pub mod daemon_spec;
 pub mod kill;
 #[cfg(windows)]
+pub mod local_user;
+#[cfg(windows)]
 pub mod registry;
 pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
 pub mod service_guard;
+#[cfg(windows)]
+pub mod world_readable_exe;
 
 use std::fs;
 use std::path::PathBuf;
@@ -30,7 +34,11 @@ use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
 pub use daemon_spec::spec;
+#[cfg(windows)]
+pub use local_user::LocalUserGuard;
 pub use service_guard::ServiceGuard;
+#[cfg(windows)]
+pub use world_readable_exe::WorldReadableExe;
 
 // Artifact locations --------------------------------------------------------------------------------------------------
 // Shared with `service_guard`, whose cleanup has to reach the very paths

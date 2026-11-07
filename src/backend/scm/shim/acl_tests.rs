@@ -69,6 +69,7 @@ fn object(path: &str, owner: Sid, dacl: Vec<Ace>) -> ObjectSecurity {
     ObjectSecurity {
         path: PathBuf::from(path),
         owner,
+        protected: false,
         dacl: Some(dacl),
     }
 }

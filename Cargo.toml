@@ -2,12 +2,12 @@
 name = "goetia"
 version = "0.2.0"
 edition = "2024"
-# `cosca` uses `std::io::PipeReader`, stable since 1.87. That is already true
-# on Windows, where cosca has been a dependency all along, and the Unix
-# backends' bounded wait (`backend::bounded`) extends the same requirement to
-# Linux and macOS. Not verified end to end: CI pins `dtolnay/rust-toolchain`
+# `cosca` uses `std::io::PipeReader`, stable since 1.87, and the Unix
+# backends' bounded wait (`backend::bounded`) extends that requirement to
+# Linux and macOS; `sha2` 0.11, which hashes the stock shim on Windows,
+# declares 1.88. Not verified end to end: CI pins `dtolnay/rust-toolchain`
 # at `stable` on every job, so nothing checks this floor.
-rust-version = "1.87"
+rust-version = "1.88"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
 readme = "README.md"
@@ -49,6 +49,9 @@ default = ["cli"]
 # `goetia = { version = "0.1", default-features = false }` stays a clean
 # library dependency (see the design spec's crate table, §1).
 cli = ["dep:clap", "dep:libc"]
+# Set only by a build that embeds the stock shim (`goetia::embed_shim!()` is `Some` under it). The
+# release workflow turns it on for the `goetia` binary; the library never reads it.
+goetia-shim = []
 
 [dependencies]
 base64 = "0.23"
@@ -109,6 +112,9 @@ nix = { version = "0.31", features = ["user", "fs"] }
 # on every Windows build regardless of the `cli` feature, since it is part
 # of the core library, not CLI-only output formatting.
 windows-service = "0.8"
+# `EmbeddedStockShim` names the stock shim by the SHA-256 of its bytes and verifies a file
+# of that name against it.
+sha2 = "0.11.1"
 # `Services\<name>\Parameters` (the metadata blob) and `Services\<name>\Environment`
 # (see `manager::registry`) are read and written directly through the
 # registry: `windows-service`'s `ServiceConfig` exposes neither.
@@ -120,7 +126,9 @@ winreg = "0.56"
 # `executable`+`arguments` pre-joined into one command line), and
 # `RegQueryValueExW`, which reads an `Environment` value of any type where
 # `winreg` fails on one above `REG_QWORD` (`manager::registry`), and the owner
-# and DACL reads of the shim folder check (`scm::shim::acl`).
+# and DACL reads of the shim folder check (`scm::shim::acl`), the protected DACL a shim file
+# is created with, and `%ProgramFiles%` (`SHGetKnownFolderPath`, whose string `CoTaskMemFree`
+# releases: `Win32_System_Com`).
 #
 # The shim (`src/backend/scm/shim/run/`) adds `Win32_System_EventLog`, the
 # version-skew/log-path-denied fallback channel — see
@@ -134,6 +142,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_EventLog",
     "Win32_System_Registry",
     "Win32_System_Services",

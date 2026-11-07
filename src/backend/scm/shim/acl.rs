@@ -16,7 +16,14 @@
 //! - deny ACEs are not credited, wherever they stand.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+mod protected;
+
 use std::path::PathBuf;
+
+#[cfg(windows)]
+pub(crate) use protected::{Descriptor, is_as_wanted};
+#[cfg(windows)]
+pub(crate) use system::read_object;
 
 #[cfg(windows)]
 use std::path::Path;
@@ -34,6 +41,8 @@ pub(crate) type Sid = Vec<u8>;
 pub(crate) struct ObjectSecurity {
     pub(crate) path: PathBuf,
     pub(crate) owner: Sid,
+    /// Whether the DACL ignores what its parent would have it inherit.
+    pub(crate) protected: bool,
     /// `None` is a NULL DACL, which grants everyone every right.
     pub(crate) dacl: Option<Vec<Ace>>,
 }
@@ -250,8 +259,8 @@ mod system {
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid, IsValidSid,
-        OWNER_SECURITY_INFORMATION, PSID,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid,
+        GetSecurityDescriptorControl, IsValidSid, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
@@ -489,7 +498,7 @@ mod system {
     }
 
     /// The owner and DACL of an object on a volume that keeps ACLs ([`require_acls`]).
-    fn read_object(file: &File, path: PathBuf) -> Result<ObjectSecurity> {
+    pub(crate) fn read_object(file: &File, path: PathBuf) -> Result<ObjectSecurity> {
         let handle = file.as_raw_handle() as HANDLE;
 
         let mut owner: PSID = std::ptr::null_mut();
@@ -518,14 +527,44 @@ mod system {
             ));
         }
         // SAFETY: `owner` and `dacl` point into `descriptor`, which is live until the free below.
-        let parsed = unsafe { parse(owner, dacl, &path) };
+        let object = unsafe { describe(descriptor, owner, dacl, path) };
         // SAFETY: `descriptor` was allocated by `GetSecurityInfo` and is freed once, after the
         // last read of what points into it.
         unsafe {
             LocalFree(descriptor);
         }
-        let (owner, dacl) = parsed?;
-        Ok(ObjectSecurity { path, owner, dacl })
+        object
+    }
+
+    /// Copies the owner, the DACL and whether it is protected out of a security descriptor.
+    ///
+    /// # Safety
+    /// `descriptor` is a live security descriptor, and `owner` and `dacl` point into it (the DACL
+    /// null for a NULL DACL).
+    pub(super) unsafe fn describe(
+        descriptor: *mut c_void,
+        owner: PSID,
+        dacl: *mut ACL,
+        path: PathBuf,
+    ) -> Result<ObjectSecurity> {
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        // SAFETY: the caller's contract covers `descriptor`; the out-pointers are valid lvalues.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(Error::os_at(
+                "read the permissions of",
+                path,
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: the caller's contract covers `owner` and `dacl`.
+        let (owner, dacl) = unsafe { parse(owner, dacl, &path)? };
+        Ok(ObjectSecurity {
+            path,
+            owner,
+            protected: control & SE_DACL_PROTECTED != 0,
+            dacl,
+        })
     }
 
     /// Refuses a volume that keeps no ACLs, where every account can do anything.

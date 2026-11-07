@@ -1,7 +1,5 @@
 //! Shared `DaemonSpec` construction for the SCM integration tests.
 
-use std::path::PathBuf;
-
 use goetia::spec::DaemonSpec;
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
@@ -11,7 +9,7 @@ use crate::{fixture, support};
 
 /// [`fixture_command`], parameterized on the executable path. Needed by
 /// `a_local_service_daemon_actually_runs` (`managed.rs`), which runs the
-/// fixture from a copy under `%ProgramData%` (see [`WorldReadableExe`])
+/// fixture from a copy under `%ProgramData%` (see [`support::WorldReadableExe`])
 /// rather than the ordinary `target/` one — `LocalService` cannot be
 /// assumed to have execute access to the repo's own build tree.
 pub fn fixture_command_with_exe(exe: &str, id: &str, start_port: u16, stop_port: u16, mode: &str) -> Vec<String> {
@@ -48,46 +46,6 @@ pub fn query_account_name(id: &str) -> Option<String> {
         .query_config()
         .unwrap_or_else(|e| panic!("query config for `{id}`: {e}"));
     cfg.account_name.map(|a| a.to_string_lossy().into_owned())
-}
-
-/// A copy of the current test executable, placed under `%ProgramData%` with
-/// an explicit grant of read+execute to `Everyone` (by well-known SID
-/// `S-1-1-0`, not by localized name), removed again on drop.
-///
-/// `LocalService` cannot be assumed to have execute access to the repo's
-/// own `target/` tree — CI checks that out under an ACL scoped to the
-/// runner's own (interactive/build) account, not to every built-in service
-/// identity. A plain copy is not enough on its own either: it inherits
-/// `%ProgramData%`'s own ACL, which does not grant `Everyone` execute
-/// either, hence the explicit `icacls` grant.
-pub struct WorldReadableExe {
-    path: PathBuf,
-    _remove: support::cleanup::FileGuard,
-}
-
-impl WorldReadableExe {
-    pub fn new(id: &str) -> Self {
-        let path = support::program_data().join(format!("{id}.exe"));
-        let guard = Self {
-            _remove: support::cleanup::FileGuard::new(path.clone()),
-            path,
-        };
-        let exe = std::env::current_exe().expect("locate the test binary");
-        std::fs::copy(&exe, &guard.path)
-            .unwrap_or_else(|e| panic!("copy {} to {}: {e}", exe.display(), guard.path.display()));
-
-        let path_str = guard.path_str();
-        support::cmd::run("icacls", &[&path_str, "/grant", "*S-1-1-0:(RX)"]).expect_ok();
-
-        guard
-    }
-
-    pub fn path_str(&self) -> String {
-        self.path
-            .to_str()
-            .unwrap_or_else(|| panic!("{} is not UTF-8", self.path.display()))
-            .to_string()
-    }
 }
 
 /// The `mk` [`goetia::manager::conformance::run`] needs. Ports are dummy — the

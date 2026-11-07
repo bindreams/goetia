@@ -115,7 +115,7 @@ fn version_after(head: &[u8], mut file: impl Read, keep: usize) -> io::Result<Op
     }
 }
 
-fn read_retrying(file: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_retrying(file: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         match file.read(buf) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
