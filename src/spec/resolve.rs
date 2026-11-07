@@ -841,14 +841,13 @@ fn check_field_values(
         check_env_entry(id, key, value)?;
     }
 
-    if phase == Phase::Authored {
-        if let User::Id(AccountId::Sid(s)) = values.user {
-            // Same reason as the `env`-name rule above. `${S}` trims to `${S}`, never empty, so
-            // this and `check_user`'s blank check can never both fire on one value.
-            if interpolate::would_substitution_change(s) {
-                return Err(invalid(id, interpolate::USER_ID_MESSAGE));
-            }
-        }
+    // Same reason as the `env`-name rule above. `${S}` trims to `${S}`, never empty, so this and
+    // `check_user`'s blank check can never both fire on one value.
+    if phase == Phase::Authored
+        && let User::Id(AccountId::Sid(s)) = values.user
+        && interpolate::would_substitution_change(s)
+    {
+        return Err(invalid(id, interpolate::USER_ID_MESSAGE));
     }
     check_user(id, values.user)
 }
