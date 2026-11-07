@@ -17,10 +17,12 @@
 //! run of them gets a trailing space (see [`raw_value`]). The values no encoding can carry are
 //! refused by [`unit`]: see [`refuse_unrepresentable`].
 
+use std::path::Path;
+
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Restart, systemd_env_key_defect};
+use crate::spec::{DaemonSpec, Restart, systemd_command_defect, systemd_env_key_defect, systemd_path_defect};
 
 // Generation ==========================================================================================================
 
@@ -139,13 +141,10 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
              ends in whitespace, which systemd does not run (the service exits with 203/EXEC)"
         )));
     }
-    if executable.ends_with('/') {
-        return Err(invalid(format!(
-            "the executable path {executable:?} (`command[0]`) \
-            ends in `/`, a directory, which systemd refuses to load in an executable path"
-        )));
+    if let Some(defect) = systemd_command_defect(executable) {
+        return Err(invalid(defect));
     }
-    if let Some(defect) = systemd_env_key_defect(&spec.env) {
+    if let Some((_, defect)) = systemd_env_key_defect(&spec.env) {
         return Err(invalid(defect));
     }
 
@@ -159,12 +158,8 @@ fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error>
     ];
     for (directive, is_path, value) in raw_values {
         let Some(value) = value else { continue };
-        if is_path && value.split('/').any(|component| component == "..") {
-            return Err(invalid(format!(
-                "{directive} path {value:?} has a `..` component, which systemd refuses to load (it \
-                requires a normalized path); goetia cannot collapse it lexically without changing \
-                which directory a symlink leads to"
-            )));
+        if is_path && let Some(defect) = systemd_path_defect(&format!("{directive} path"), Path::new(value)) {
+            return Err(invalid(defect));
         }
         if value.starts_with(STRIPPED_BY_SYSTEMD) || value.ends_with(STRIPPED_BY_SYSTEMD) {
             return Err(invalid(format!(

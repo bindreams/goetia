@@ -205,11 +205,10 @@ impl Backend for Scm {
     type InstallScope = ();
     type Reservation = ();
 
-    /// SCM has nothing to hold across an install. Its precondition here is the shim's path, which a
-    /// `type: simple` daemon is registered with and which the registration writer must not rewrite;
-    /// the rest are `apply`'s, before any write.
-    fn begin_install(&self, spec: &DaemonSpec) -> Result<()> {
-        generate::check_shim_path(spec, &shim_path())
+    /// SCM has nothing to hold across an install: its preconditions are `render_for_install`'s and
+    /// `apply`'s, before any write.
+    fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
+        Ok(())
     }
 
     /// SCM sends its requests through the OS, with no thread or file of ours to run out.
@@ -220,6 +219,12 @@ impl Backend for Scm {
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.user)?;
         generate::registration(spec, &identity, &shim_path())
+    }
+
+    /// The shim path is read once, for the check and the registration alike.
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+        let identity = identity::resolve(&spec.user)?;
+        generate::install_registration(spec, &identity, &shim_path())
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither

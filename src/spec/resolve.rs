@@ -153,7 +153,15 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     if let Some(b) = native {
         b.error(&shaped, native_supplied, Substitution::Done)
             .map_err(|e| attribute_to(Refused::at(Field::User, e).attributed(&from_env), b))?;
-        b.refuse(&shaped)?;
+        // By the field it is about, as above: the override is named only for a value it wrote.
+        b.refuse(&shaped).map_err(|refused| {
+            let by_override = refused
+                .field
+                .as_ref()
+                .is_some_and(|field| raw.backend_specific.get(&b).is_some_and(|ovr| ovr.supplies(field)));
+            let err = refused.attributed(&from_env);
+            if by_override { attribute_to(err, b) } else { err }
+        })?;
         b.warn(&shaped, &mut daemon_warnings);
     }
 
@@ -237,15 +245,15 @@ fn annotate_step5_error(err: Error, native_entry: Option<BackendKind>) -> Error 
 /// An error about one field's value. In step 5 it is attributed to `.env` by [`Refused::attributed`],
 /// the one place that happens.
 #[derive(Debug)]
-struct Refused {
+pub(super) struct Refused {
     /// The field the error is about. `None` for a defect no field's text is to blame for: the
     /// manifest directory's.
-    field: Option<Field>,
+    pub(super) field: Option<Field>,
     err: Error,
 }
 
 impl Refused {
-    fn at(field: Field, err: Error) -> Self {
+    pub(super) fn at(field: Field, err: Error) -> Self {
         Refused {
             field: Some(field),
             err,
@@ -567,7 +575,16 @@ fn resolve_path_string(
     let joined = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        normalize(&base_dir.join(p))
+        join_to_manifest_dir(base_dir, p).map_err(|source| {
+            Refused::at(
+                field.field(),
+                invalid_from(
+                    id,
+                    &format!("field `{name}` is `{raw}`, which cannot be resolved against the manifest directory"),
+                    source,
+                ),
+            )
+        })?
     };
     // With an absolute `base_dir` a join stays relative only for a Windows drive-relative path
     // (`C:bin/frpc.exe`): `PathBuf::push` replaces the buffer when the pushed path carries a
@@ -605,10 +622,43 @@ fn resolve_path_string(
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
     check_resolved(id, field, raw, &joined, under_manifest_dir)?;
-    Ok(joined
+    let mut resolved = joined
         .into_os_string()
         .into_string()
-        .expect("`check_resolved` refused a path that is not valid UTF-8"))
+        .expect("`check_resolved` refused a path that is not valid UTF-8");
+    // `normalize` drops a trailing `/`, which makes a program path a directory's. Kept as written
+    // for `command[0]`, so the backend that cannot run a directory refuses what the user wrote.
+    if field == PathField::Command && under_manifest_dir && raw.ends_with('/') {
+        resolved.push('/');
+    }
+    Ok(resolved)
+}
+
+/// `p`, relative, joined to `base_dir`.
+///
+/// A leading run of `..` is collapsed against `base_dir` canonicalised, which is exact: the
+/// parent of the directory a symlinked `base_dir` leads to is what the user means, and systemd
+/// refuses a path that keeps the `..`. Every other path keeps the spelling of `base_dir`, and a
+/// `..` after a component stays, since collapsing it would change which directory a symlink in
+/// that component leads to. `base_dir` must exist when a field leads with `..`.
+fn join_to_manifest_dir(base_dir: &Path, p: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+    let mut leading = 0;
+    let mut rest = p.components().peekable();
+    while let Some(Component::CurDir | Component::ParentDir) = rest.peek() {
+        if rest.next() == Some(Component::ParentDir) {
+            leading += 1;
+        }
+    }
+    if leading == 0 {
+        return Ok(normalize(&base_dir.join(p)));
+    }
+    let mut parent = strip_verbatim_prefix(fs::canonicalize(base_dir)?);
+    for _ in 0..leading {
+        // A root is its own parent, on Unix and Windows alike.
+        parent.pop();
+    }
+    Ok(normalize(&parent.join(rest.collect::<PathBuf>())))
 }
 
 /// Whether `p` is joined to the manifest directory. A path with its own prefix (`C:bin`) replaces
@@ -659,14 +709,15 @@ fn check_resolved(
 /// symlinks, which would bake a symlinked deployment path's target into the
 /// artifact, so a service would stop following a repointed symlink. Hence
 /// `-f .` cannot preserve a symlinked spelling (`getcwd` already resolved
-/// it); pass it explicitly to `-f`.
+/// it); pass it explicitly to `-f`. The exception is a `dir` with a `..`,
+/// which is resolved through the file system ([`resolve_parent_dirs`]).
 ///
 /// The process's own working directory, read below when `dir` is relative,
 /// is the opposite case: nobody typed it and it always exists, so it *is*
 /// canonicalised.
 fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error> {
     if dir.is_absolute() {
-        return Ok(normalize(dir));
+        return resolve_parent_dirs(normalize(dir));
     }
     // Not an `Error::Os` at `dir`: nothing was read from it, and naming it would misdirect a
     // reader when the process's own cwd is what is gone.
@@ -705,7 +756,25 @@ fn absolutize(dir: &Path, warnings: &mut Vec<Warning>) -> Result<PathBuf, Error>
         resolved
     };
     debug_assert!(joined.is_absolute(), "`std::path::absolute` returned a relative path");
-    Ok(joined)
+    resolve_parent_dirs(joined)
+}
+
+/// `dir` with its `..` components resolved through the file system, and returned as is when it has
+/// none. A `..` cannot be collapsed lexically (wrong through a symlink), and one left in would be in
+/// every path joined to `dir`, which systemd refuses to load.
+fn resolve_parent_dirs(dir: PathBuf) -> Result<PathBuf, Error> {
+    if !dir.components().any(|c| c == std::path::Component::ParentDir) {
+        return Ok(dir);
+    }
+    let canonical = fs::canonicalize(&dir).map_err(|source| Error::Step {
+        what: format!(
+            "the manifest directory `{}` has a `..` component, which is resolved through the file system, and that \
+             failed",
+            dir.display()
+        ),
+        source: Box::new(Error::os_at("canonicalise", &dir, source)),
+    })?;
+    Ok(strip_verbatim_prefix(canonical))
 }
 
 /// Canonicalise the process's current working directory; see [`absolutize`] for why this value,
@@ -832,7 +901,7 @@ enum Phase {
 }
 
 /// A field that [`resolve_shape`] resolves to an absolute path.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PathField {
     Command,
     Cwd,
@@ -945,9 +1014,12 @@ fn check_env(id: &Id, env: &BTreeMap<String, String>, phase: Phase) -> Result<()
         // Checked for every backend: `scm: {env: {"${K}": v}}` must be caught from Linux too.
         // `interpolate::spec` keeps its own copy, so it does not depend on this running first.
         if phase == Phase::Authored && interpolate::would_substitution_change(key) {
-            return Err(Refused::at(Field::EnvKey, invalid(id, interpolate::ENV_NAME_MESSAGE)));
+            return Err(Refused::at(
+                Field::EnvKey(key.as_str().into()),
+                invalid(id, interpolate::ENV_NAME_MESSAGE),
+            ));
         }
-        check_env_key(id, key).map_err(|err| Refused::at(Field::EnvKey, err))?;
+        check_env_key(id, key).map_err(|err| Refused::at(Field::EnvKey(key.as_str().into()), err))?;
         reject_control_chars(id, &format!("env[{key}]"), value)
             .map_err(|err| Refused::at(Field::EnvValue(key.clone()), err))?;
     }

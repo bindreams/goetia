@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 use super::{BackendKind, Builtin, MAX_SC_ACTION_DELAY, Shaped, ShapedSpec, windows_builtin, windows_only_account};
+use crate::error::Error;
+use crate::spec::field::Field;
 use crate::spec::interpolate::Substitution;
 use crate::spec::overrides::Supplied;
 use crate::spec::test_support::abs;
@@ -366,10 +368,11 @@ fn shaped_with_env_key(key: &str) -> ShapedSpec {
 fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
     for key in ["MY-VAR", "1ST", "a.b", "é", "a b"] {
         let spec = shaped_with_env_key(key);
-        let err = BackendKind::Systemd
+        let refused = BackendKind::Systemd
             .refuse(&spec)
             .expect_err(&format!("{key:?} must be refused"));
-        let message = err.to_string();
+        assert_eq!(refused.field, Some(Field::EnvKey(key.into())));
+        let message = Error::from(refused).to_string();
         assert!(message.contains(&format!("{key:?}")), "{message}");
         assert!(message.contains("Environment="), "{message}");
         assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{key:?}");
@@ -388,4 +391,43 @@ fn systemd_refuses_an_env_key_it_would_drop_and_the_others_do_not() {
             "{key:?}"
         );
     }
+}
+
+// systemd's paths =====================================================================================================
+
+#[skuld::test]
+fn systemd_refuses_the_paths_it_will_not_load_and_names_the_field() {
+    let cases = [
+        ("command", Field::Command(0), "bin/", "ends in `/`"),
+        ("cwd", Field::Cwd, "/srv/a/../b", "`..` component"),
+        ("logs", Field::Logs, "/var/log/..", "`..` component"),
+    ];
+    for (name, field, value, defect) in cases {
+        let mut spec = shaped_spec();
+        match name {
+            "command" => spec.command = Some(vec![value.to_string()]),
+            "cwd" => spec.cwd = Some(value.into()),
+            _ => spec.logs = Some(value.into()),
+        }
+        let refused = BackendKind::Systemd
+            .refuse(&spec)
+            .expect_err(&format!("{name}: {value:?} must be refused"));
+        assert_eq!(refused.field, Some(field), "{name}");
+        let message = Error::from(refused).to_string();
+        assert!(message.contains(defect), "{name}: {message}");
+        if name != "command" {
+            assert!(message.contains(&format!("field `{name}`")), "{message}");
+        }
+        assert!(BackendKind::Launchd.refuse(&spec).is_ok(), "{name}");
+        assert!(BackendKind::Scm.refuse(&spec).is_ok(), "{name}");
+    }
+}
+
+#[skuld::test]
+fn systemd_loads_the_paths_it_resolves() {
+    let mut spec = shaped_spec();
+    spec.command = Some(vec!["/bin/../bin/frpc".to_string(), "../arg/".to_string()]);
+    spec.cwd = Some("/srv/./a//b/".into());
+    spec.logs = Some("/var/log/a..b/..c/d.log".into());
+    BackendKind::Systemd.refuse(&spec).expect("each of these loads");
 }

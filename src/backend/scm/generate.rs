@@ -37,7 +37,8 @@
 //! `executable_trailing_backslash_does_not_round_trip_through_argv0` (which
 //! documents the writer's behaviour). `executable` is `shim_path` or, for a `type: managed`
 //! daemon, `command[0]`; one the writer would rewrite is refused, see [`refuse_unwritable_executable`]:
-//! a `command[0]` by [`registration`], and a shim path by [`check_shim_path`], which `install` calls.
+//! a `command[0]` by [`registration`], and a shim path by [`install_registration`], which `install` and
+//! `diff` call.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -135,10 +136,13 @@ pub struct FailureActions {
 /// `id` is the account already resolved by the effectful install path (see
 /// [`Identity`]) — this function does no lookup of its own. `shim_path` is
 /// only used for `Kind::Simple`, where the shim (not the spec's own command)
-/// is what SCM launches, and is not judged here: see [`check_shim_path`].
+/// is what SCM launches, and is not judged here: see [`install_registration`].
 ///
-/// Refuses a `type: managed` `command[0]` the registration writer would rewrite, and `restart: always` with [`Error::Invalid`]: SCM recovery actions never fire after a
-/// clean exit, so the registration could only run on-failure semantics.
+/// Refuses, with [`Error::Invalid`]:
+///
+/// - a `type: managed` `command[0]` the registration writer would rewrite;
+/// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
+///   could only run on-failure semantics.
 pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Result<ScmRegistration, Error> {
     let (executable, arguments) = match spec.kind {
         // SCM only ever launches the shim, with the daemon id as its sole
@@ -227,16 +231,16 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Resul
     })
 }
 
-/// Refuse a `type: simple` daemon's install when the shim path would be written as another path.
-/// The path is the host's, not the daemon's, so this is the install's refusal and not the
-/// rendering's: `list` and `status` render every daemon, and must not report one as having an
-/// unusable embedded spec because of where goetia itself is installed. Nothing to check for a
-/// `type: managed` daemon, which never runs the shim.
-pub fn check_shim_path(spec: &DaemonSpec, shim_path: &Path) -> Result<(), Error> {
-    match spec.kind {
-        Kind::Simple => refuse_unwritable_executable(spec, shim_path),
-        Kind::Managed => Ok(()),
+/// [`registration`], for an install or its preview: also refuses a `type: simple` daemon when the
+/// shim path would be written as another path. The path is the host's, not the daemon's, so this is
+/// the install's refusal and not the rendering's: `list` and `status` render every daemon, and must
+/// not report one as having an unusable embedded spec because of where goetia itself is installed.
+/// A `type: managed` daemon never runs the shim, so its path is not judged.
+pub fn install_registration(spec: &DaemonSpec, id: &Identity, shim_path: &Path) -> Result<ScmRegistration, Error> {
+    if spec.kind == Kind::Simple {
+        refuse_unwritable_executable(spec, shim_path)?;
     }
+    registration(spec, id, shim_path)
 }
 
 /// What makes `windows-service` wrap an argument in quotes (an empty one is wrapped too), each with

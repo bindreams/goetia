@@ -32,17 +32,18 @@
 //! honour is its generator's to refuse at install (`restart: always` on `scm`).
 //!
 //! [`BackendKind::refuse`] runs for the native backend too, on the same spec, for a value its generator would
-//! refuse at install anyway (systemd's `env` names), so the refusal comes at resolve.
+//! refuse at install anyway (systemd's `env` names and paths), so the refusal comes at resolve.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::field::Field;
 use super::interpolate::Substitution;
 use super::overrides::Supplied;
-use super::resolve::invalid;
+use super::resolve::{Refused, invalid};
 use super::vars::is_valid_name;
 use super::{AccountId, Id, Kind, Restart, User, Warning};
 use crate::error::Error;
@@ -176,14 +177,34 @@ impl BackendKind {
     /// What this backend's native install cannot carry, judged on the substituted merged spec, base
     /// values included: the install would refuse it anyway, so the refusal comes before it, at
     /// resolve. Called for the native backend only. systemd drops an `env` key outside
-    /// `[A-Za-z_][A-Za-z0-9_]*` with only a log line, which is why its generator refuses it too
-    /// ([`systemd_env_key_defect`]).
-    pub(super) fn refuse(self, spec: &ShapedSpec) -> Result<(), Error> {
+    /// `[A-Za-z_][A-Za-z0-9_]*` with only a log line, will not load a program path ending in `/` or
+    /// a working-directory or log path with a `..` component, and its generator refuses each too
+    /// ([`systemd_env_key_defect`], [`systemd_command_defect`], [`systemd_path_defect`]).
+    pub(super) fn refuse(self, spec: &ShapedSpec) -> Result<(), Refused> {
         match self {
-            BackendKind::Systemd => match systemd_env_key_defect(&spec.env) {
-                Some(defect) => Err(invalid(&spec.id, &defect)),
-                None => Ok(()),
-            },
+            BackendKind::Systemd => {
+                let id = &spec.id;
+                if let Some(defect) = spec
+                    .command
+                    .as_deref()
+                    .and_then(|c| c.first())
+                    .and_then(|c| systemd_command_defect(c))
+                {
+                    return Err(Refused::at(Field::Command(0), invalid(id, &defect)));
+                }
+                for (field, name, path) in [(Field::Cwd, "cwd", &spec.cwd), (Field::Logs, "logs", &spec.logs)] {
+                    let defect = path
+                        .as_deref()
+                        .and_then(|p| systemd_path_defect(&format!("field `{name}`"), p));
+                    if let Some(defect) = defect {
+                        return Err(Refused::at(field, invalid(id, &defect)));
+                    }
+                }
+                match systemd_env_key_defect(&spec.env) {
+                    Some((key, defect)) => Err(Refused::at(Field::EnvKey(key.into()), invalid(id, &defect))),
+                    None => Ok(()),
+                }
+            }
             BackendKind::Launchd | BackendKind::Scm => Ok(()),
         }
     }
@@ -223,18 +244,45 @@ impl BackendKind {
     }
 }
 
-/// Why systemd cannot carry the first `env` key it would drop, or `None` when it carries them all.
+/// The first `env` key systemd would drop, with why, or `None` when it carries them all.
 /// systemd logs "Invalid environment assignment, ignoring" for any `Environment=` name outside
 /// `[A-Za-z_][A-Za-z0-9_]*` and starts the unit without it (measured on 242 and 255), so the
-/// daemon would never see the variable. One predicate for the systemd generator's refusal and
-/// for [`BackendKind::refuse`].
-pub(crate) fn systemd_env_key_defect(env: &BTreeMap<String, String>) -> Option<String> {
+/// daemon would never see the variable.
+pub(crate) fn systemd_env_key_defect(env: &BTreeMap<String, String>) -> Option<(&str, String)> {
     let key = env.keys().find(|key| !is_valid_name(key))?;
-    Some(format!(
+    let defect = format!(
         "`env` key {key:?} is not a name systemd accepts in Environment=: it must match \
         [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the \
         daemon would never see it"
-    ))
+    );
+    Some((key, defect))
+}
+
+/// Why systemd will not load `executable` as the program of `ExecStart=`, or `None`: a path ending
+/// in `/` is a directory ("Executable path specifies a directory", on 242 and 255). `..` in a
+/// program path loads and runs.
+pub(crate) fn systemd_command_defect(executable: &str) -> Option<String> {
+    executable.ends_with('/').then(|| {
+        format!(
+            "the executable path {executable:?} (`command[0]`) ends in `/`, a directory, which systemd \
+            refuses to load in an executable path"
+        )
+    })
+}
+
+/// Why systemd will not load `path`, as the value `what` names (a directive, or a manifest field)
+/// of a working directory or a log file, or `None`: a `..` component fails the unit to load ("path
+/// is not normalized"), or on 255 drops the log. `.` components, `//` and a trailing `/` load and
+/// resolve. A `..` cannot be collapsed lexically without changing which directory a symlink leads
+/// to, so goetia refuses what systemd refuses.
+pub(crate) fn systemd_path_defect(what: &str, path: &Path) -> Option<String> {
+    path.components().any(|c| c == Component::ParentDir).then(|| {
+        format!(
+            "{what} is {path:?}, which has a `..` component that systemd refuses to load (it requires a \
+            normalized path); goetia cannot collapse it lexically without changing which directory a \
+            symlink leads to"
+        )
+    })
 }
 
 /// `type: managed` on Windows has no working-directory or stdout-capture

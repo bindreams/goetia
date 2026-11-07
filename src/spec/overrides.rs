@@ -31,6 +31,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::BackendKind;
+use super::field::Field;
 use super::raw::{EnvVisitor, RawSpec};
 use super::user::{RawUser, deserialize_user};
 
@@ -109,6 +110,24 @@ impl RawOverride {
     pub fn supplied(&self) -> Supplied {
         Supplied {
             user: self.user.is_some(),
+        }
+    }
+}
+
+impl RawOverride {
+    /// Whether this override wrote `field`'s value; for an `env` field, the entry of that name.
+    pub fn supplies(&self, field: &Field) -> bool {
+        match field {
+            Field::Name => self.name.is_some(),
+            Field::Command(_) => self.command.is_some(),
+            Field::Cwd => self.cwd.is_some(),
+            Field::Logs => self.logs.is_some(),
+            Field::EnvKey(key) => self.env.as_ref().is_some_and(|env| env.contains_key(&**key)),
+            Field::EnvValue(key) => self.env.as_ref().is_some_and(|env| env.contains_key(key)),
+            Field::User => self.user.is_some(),
+            Field::Restart => self.restart.is_some(),
+            Field::RestartDelay => self.restart_delay.is_some(),
+            Field::Kind => self.kind.is_some(),
         }
     }
 }

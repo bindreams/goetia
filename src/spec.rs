@@ -31,7 +31,9 @@ pub use user::{AccountId, User};
 // private `mod backend;`.
 // `windows_only_account` stays out of this line: only `BackendKind::error` reads it, inside
 // `spec::backend`.
-pub(crate) use backend::{scm_restart_delay, systemd_env_key_defect, windows_builtin};
+pub(crate) use backend::{
+    scm_restart_delay, systemd_command_defect, systemd_env_key_defect, systemd_path_defect, windows_builtin,
+};
 // Named from `generate_tests.rs` alone.
 #[cfg(test)]
 pub(crate) use backend::MAX_SC_ACTION_DELAY;

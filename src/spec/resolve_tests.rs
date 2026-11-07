@@ -1121,22 +1121,162 @@ fn an_authored_base_dir_is_not_canonicalised(#[fixture(temp_dir)] dir: &Path) {
     );
 }
 
-#[skuld::test]
-fn normalize_preserves_parent_dir_components() {
-    // `.` is dropped but `..` is deliberately kept: collapsing `..`
-    // lexically is wrong when a component is a symlink, since `a/b/..` is
-    // only `a` if `b` is a real directory. Pin the distinction so a future
-    // "completion" of the match arm cannot quietly change it. The one
-    // deliberate exception to this rule lives in
-    // `drive_relative_resolution_collapses_dot_dot_the_windows_way` below.
-    let yaml = "id: frpc\ncommand: [bin/frpc]\ncwd: ../sibling\n";
-    let (spec, _) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
-    let cwd = spec.cwd.as_deref().expect("cwd is set");
+/// `path` as `fs::canonicalize` and `resolve` spell it.
+fn canonical(path: &Path) -> PathBuf {
+    strip_verbatim_prefix(std::fs::canonicalize(path).expect("path canonicalizes"))
+}
 
-    assert!(
-        cwd.components().any(|c| matches!(c, std::path::Component::ParentDir)),
-        "`..` must survive normalization, got {cwd:?}"
-    );
+/// Make `dir/<name>` for each of `names`, and return `dir` as `resolve` spells a canonical path. The
+/// fixture's own spelling may be verbatim (`\\?\`), where `..` is a name and not a parent.
+fn make_dirs(dir: &Path, names: &[&str]) -> PathBuf {
+    for name in names {
+        std::fs::create_dir_all(dir.join(name)).expect("directory is creatable");
+    }
+    canonical(dir)
+}
+
+fn has_parent_dir(path: &Path) -> bool {
+    path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+#[skuld::test]
+fn a_manifest_directory_with_dot_dot_is_resolved_through_the_file_system(#[fixture(temp_dir)] dir: &Path) {
+    let dir = &make_dirs(dir, &["a", "app"]);
+    let mut warnings = Vec::new();
+    let resolved = absolutize(&dir.join("a").join("..").join("app"), &mut warnings).expect("resolves");
+    assert_eq!(resolved, dir.join("app"));
+
+    // `-f ../<the directory the process runs in>`, a relative spelling of the same shape.
+    let cwd = canonical_cwd();
+    let name = cwd.file_name().expect("the working directory has a name");
+    let resolved = absolutize(&Path::new("..").join(name), &mut warnings).expect("resolves");
+    assert_eq!(resolved, cwd);
+}
+
+#[skuld::test]
+fn a_dot_dot_in_the_manifest_directory_is_in_no_field_so_no_field_is_refused_for_it(#[fixture(temp_dir)] dir: &Path) {
+    let dir = &make_dirs(dir, &["a", "app"]);
+    let base = dir.join("a").join("..").join("app");
+    let yaml = "id: frpc
+command: [bin/frpc]
+cwd: .
+logs: out.log
+";
+    for native in BackendKind::ALL {
+        let (spec, _) =
+            resolve_as(parse_manifest(yaml), &base, Some(native)).unwrap_or_else(|e| panic!("{native}: {e}"));
+        let app = dir.join("app");
+        assert_eq!(spec.cwd.as_deref(), Some(app.as_path()), "{native}");
+        assert_eq!(spec.logs, Some(app.join("out.log")), "{native}");
+        assert!(!has_parent_dir(Path::new(&spec.command[0])), "{native}");
+    }
+}
+
+#[skuld::test]
+fn a_leading_dot_dot_in_a_field_is_collapsed_against_the_canonical_manifest_directory(#[fixture(temp_dir)] dir: &Path) {
+    let dir = &make_dirs(dir, &["real/sub"]);
+    let base = dir.join("real").join("sub");
+    let yaml = "id: frpc
+command: [../bin/frpc]
+cwd: ../data
+logs: ./../../out.log
+";
+    for native in BackendKind::ALL {
+        let (spec, _) =
+            resolve_as(parse_manifest(yaml), &base, Some(native)).unwrap_or_else(|e| panic!("{native}: {e}"));
+        let root = dir.clone();
+        assert_eq!(spec.cwd, Some(root.join("real").join("data")), "{native}");
+        assert_eq!(spec.logs, Some(root.join("out.log")), "{native}");
+        assert_eq!(
+            Path::new(&spec.command[0]),
+            root.join("real").join("bin").join("frpc"),
+            "{native}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_leading_dot_dot_goes_to_the_parent_of_the_directory_a_symlinked_manifest_directory_leads_to(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    let dir = &make_dirs(dir, &["real/sub"]);
+    let link = dir.join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.join("real").join("sub"), &link).expect("symlink should be creatable");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(dir.join("real").join("sub"), &link).expect("symlink should be creatable");
+
+    let yaml = "id: frpc
+command: [/bin/frpc]
+cwd: ../data
+logs: out.log
+";
+    let (spec, _) = resolve_as(parse_manifest(yaml), &link, Some(BackendKind::Systemd)).expect("resolves");
+    // `..` of the link is `real`, not the directory holding the link; `logs` keeps the spelling the user gave.
+    assert_eq!(spec.cwd, Some(dir.join("real").join("data")));
+    assert_eq!(spec.logs, Some(link.join("out.log")));
+}
+
+#[skuld::test]
+fn a_dot_dot_after_a_component_the_user_wrote_stays_and_systemd_refuses_it() {
+    let yaml_for = |field: &str| {
+        format!(
+            "id: frpc
+command: [/bin/frpc]
+{field}
+"
+        )
+    };
+    let beyond = abs("a/../b").to_string_lossy().into_owned();
+    for (field, name) in [
+        ("cwd: a/../b".to_string(), "cwd"),
+        ("logs: x/..".to_string(), "logs"),
+        (format!("cwd: {beyond}"), "cwd"),
+    ] {
+        let msg = resolve_yaml_as(BackendKind::Systemd, &yaml_for(&field))
+            .expect_err(&field)
+            .to_string();
+        assert!(msg.contains(&format!("field `{name}`")), "{field}: {msg}");
+        assert!(
+            msg.contains("`..` component") && msg.contains("normalized"),
+            "{field}: {msg}"
+        );
+
+        for native in [BackendKind::Launchd, BackendKind::Scm] {
+            let (spec, _) = resolve_yaml_as(native, &yaml_for(&field)).unwrap_or_else(|e| panic!("{native}: {e}"));
+            let kept = spec.cwd.iter().chain(spec.logs.iter()).any(|p| has_parent_dir(p));
+            assert!(kept, "{native}: {field}: the `..` the user wrote is kept");
+        }
+    }
+}
+
+#[skuld::test]
+fn only_systemd_refuses_a_command_ending_in_a_slash_whether_or_not_it_is_relative() {
+    let absolute = format!("{}/", abs("bin/frpc").to_string_lossy());
+    for command in ["bin/", "./bin//", absolute.as_str()] {
+        let yaml = format!(
+            "id: frpc
+command: ['{command}']
+"
+        );
+        let msg = resolve_yaml_as(BackendKind::Systemd, &yaml)
+            .expect_err(command)
+            .to_string();
+        assert!(
+            msg.contains("command[0]") && msg.contains("directory"),
+            "{command}: {msg}"
+        );
+        for native in [BackendKind::Launchd, BackendKind::Scm] {
+            resolve_yaml_as(native, &yaml).unwrap_or_else(|e| panic!("{native}: {command}: {e}"));
+        }
+    }
+    resolve_yaml_as(
+        BackendKind::Systemd,
+        "id: frpc
+command: [bin/frpc]
+",
+    )
+    .expect("no trailing slash");
 }
 
 // The emptiness gate ==================================================================================================
@@ -2532,4 +2672,41 @@ fn an_env_key_systemd_accepts_draws_no_complaint_on_any_host() {
         let (_spec, warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("{native}: {e}"));
         assert!(warnings.is_empty(), "{native}: {warnings:?}");
     }
+}
+
+#[skuld::test]
+fn a_systemd_refusal_names_the_override_only_when_the_override_wrote_the_value() {
+    let by_override =
+        |field: &str| format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  systemd:\n    {field}\n");
+    for field in ["env: {MY-VAR: x}", "cwd: a/../b", "logs: a/../b", "command: ['/bin/']"] {
+        let msg = resolve_yaml_as(BackendKind::Systemd, &by_override(field))
+            .expect_err(field)
+            .to_string();
+        assert!(msg.contains("backend-specific.systemd: "), "{field}: {msg}");
+    }
+
+    // The same values in the base, and an override that wrote something else: not the override's.
+    let base = |field: &str| {
+        format!(
+            "id: frpc\ncommand: [/bin/frpc]\n{field}\nbackend-specific:\n  systemd:\n    env: {{OK: x}}\n    name: other\n"
+        )
+    };
+    for field in ["env: {MY-VAR: x}", "cwd: a/../b", "logs: a/../b"] {
+        let msg = resolve_yaml_as(BackendKind::Systemd, &base(field))
+            .expect_err(field)
+            .to_string();
+        assert!(!msg.contains("backend-specific"), "{field}: {msg}");
+    }
+}
+
+#[skuld::test]
+fn an_override_that_wrote_a_different_env_key_does_not_take_the_blame_for_a_base_key() {
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nenv: {MY-VAR: x}\nbackend-specific:\n  systemd:\n    env: {OTHER: y}\n";
+    let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
+    assert!(msg.contains("\"MY-VAR\"") && !msg.contains("backend-specific"), "{msg}");
+
+    let yaml =
+        "id: frpc\ncommand: [/bin/frpc]\nenv: {MY-VAR: x}\nbackend-specific:\n  systemd:\n    env: {MY-VAR: y}\n";
+    let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
+    assert!(msg.contains("backend-specific.systemd: "), "{msg}");
 }

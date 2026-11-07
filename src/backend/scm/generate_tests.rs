@@ -935,7 +935,8 @@ fn the_refusal_names_the_character_that_forced_the_quoting() {
         ("C:\\a\u{b}b\\", "vertical tab", "space"),
     ];
     for (shim, named, not_named) in shim_cases {
-        let err = check_shim_path(&simple_spec(), Path::new(shim)).expect_err(&format!("{shim:?} must be refused"));
+        let err = install_registration(&simple_spec(), &identity(), Path::new(shim))
+            .expect_err(&format!("{shim:?} must be refused"));
         let text = err.to_string();
         assert!(text.contains(named), "{shim:?} should name a {named}: {text}");
         assert!(
@@ -975,13 +976,14 @@ fn executable_refusal_matches_what_the_writer_loses() {
 }
 
 /// The shim path goes through the same writer, so it is held to the same rule. The refusal is the
-/// install's (`Scm::begin_install`), not the rendering's: the path is the host's, so a bad one must
-/// not make every `type: simple` daemon read as having an unusable embedded spec in `list` and
-/// `status`, which render each one.
+/// install's and `diff`'s (`install_registration`), not the rendering's: the path is the host's, so a
+/// bad one must not make every `type: simple` daemon read as having an unusable embedded spec in
+/// `list` and `status`, which render each one.
 #[skuld::test]
 fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     let shim = PathBuf::from(r"C:\Program Files\Goetia\");
-    let err = check_shim_path(&simple_spec(), &shim).expect_err("a mangled shim path must be refused");
+    let err =
+        install_registration(&simple_spec(), &identity(), &shim).expect_err("a mangled shim path must be refused");
     let text = err.to_string();
     assert!(text.contains("service registration"), "{text}");
     // No manifest sets the shim path: the message names it and its forcing character, and does
@@ -993,7 +995,7 @@ fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     assert!(text.contains("space"), "{text}");
     assert!(!text.contains("command[0]"), "{text}");
 
-    check_shim_path(&simple_spec(), &shim_path()).unwrap();
+    install_registration(&simple_spec(), &identity(), &shim_path()).unwrap();
 }
 
 /// Rendering a `type: simple` daemon never fails for the shim path, whatever it is.
@@ -1004,10 +1006,19 @@ fn rendering_a_simple_daemon_does_not_judge_the_shim_path() {
     }
 }
 
+/// What install writes and `diff` shows is the registration, once the shim path is accepted.
+#[skuld::test]
+fn an_accepted_shim_path_gives_the_registration_itself() {
+    let shim = shim_path();
+    let installed = install_registration(&simple_spec(), &identity(), &shim).unwrap();
+    let rendered = registration(&simple_spec(), &identity(), &shim).unwrap();
+    assert_eq!(installed.to_string(), rendered.to_string());
+}
+
 /// A `type: managed` daemon has no shim: its own `command[0]` is what is judged, at rendering.
 #[skuld::test]
 fn a_managed_daemon_is_not_held_to_the_shim_path() {
-    check_shim_path(&managed_spec(), Path::new(r"C:\Program Files\Goetia\")).unwrap();
+    install_registration(&managed_spec(), &identity(), Path::new(r"C:\Program Files\Goetia\")).unwrap();
 }
 
 #[skuld::test]
