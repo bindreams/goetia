@@ -4,8 +4,7 @@
 //! `RawSpec -> DaemonSpec` (see `resolve`) is the crate's parse-don't-validate
 //! boundary: every `DaemonSpec` that [`load`] returns has already passed every
 //! check, so nothing downstream needs to re-derive them. There is no separate
-//! `validate()`. `DaemonSpec`'s fields are public, so a `DaemonSpec` built as
-//! a literal outside this module is not validated.
+//! `validate()`.
 //!
 //! A daemon may also carry a `backend-specific:` block overriding its
 //! fields per [`BackendKind`]; see `overrides`'s module doc for the

@@ -27,9 +27,8 @@ use super::user::{RawUser, deserialize_user};
 ///
 /// **[`RawSpec::parse`] is the only way to get one from text.** The null
 /// rule is enforced by a second walk that `parse` runs over the same text,
-/// because it needs that text to report a position. So `RawSpec` does not
-/// implement `Deserialize`: the derive sits on the private `Wire`, which
-/// only `parse` deserializes into. The type is module-private to `spec` so
+/// because it needs that text to report a position. Hence `RawSpec` has no
+/// `Deserialize`; the derive sits on the private `Wire`. The type is module-private to `spec` so
 /// that library consumers reach a spec only through [`load`](super::load).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RawSpec {
@@ -51,8 +50,7 @@ pub(super) struct RawSpec {
 }
 
 /// `RawSpec`'s serde shape, a remote derive so that `RawSpec` itself has no
-/// `Deserialize` and `parse` is the only reader of YAML into one. Serde
-/// checks the fields against `RawSpec`'s at compile time.
+/// `Deserialize` and `parse` is the only reader of YAML into one.
 ///
 /// `expecting` words the error for a document that is not a mapping, which
 /// would otherwise name `RawSpec`.
