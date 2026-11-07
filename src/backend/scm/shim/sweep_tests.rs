@@ -159,6 +159,52 @@ fn only_shim_file_names_are_referenced_by_name() {
     );
 }
 
+// An image path whose registry key cannot be read ------------------------------------------------------------------
+
+fn denied(what: &str) -> Error {
+    Error::os(what.to_string(), std::io::Error::other("Access is denied."))
+}
+
+#[skuld::test]
+fn an_image_read_from_the_registry_does_not_ask_scm() {
+    let image = image_of("frpc", Ok(Some("C:/a.exe".to_string())), || panic!("SCM was asked"));
+
+    assert_eq!(image.unwrap(), Some("C:/a.exe".to_string()));
+}
+
+#[skuld::test]
+fn a_service_with_no_image_in_the_registry_is_not_asked_of_scm_either() {
+    assert_eq!(image_of("frpc", Ok(None), || panic!("SCM was asked")).unwrap(), None);
+}
+
+#[skuld::test]
+fn a_key_that_cannot_be_read_is_read_through_scm() {
+    let image = image_of("frpc", Err(denied("open the key")), || Ok(Some("C:/b.exe".to_string())));
+
+    assert_eq!(image.unwrap(), Some("C:/b.exe".to_string()));
+}
+
+#[skuld::test]
+fn a_service_scm_has_no_image_for_is_none_when_the_key_cannot_be_read() {
+    assert_eq!(
+        image_of("frpc", Err(denied("open the key")), || Ok(None)).unwrap(),
+        None
+    );
+}
+
+#[skuld::test]
+fn when_both_fail_the_error_names_the_service_and_says_who_can_fix_it() {
+    let error = image_of("frpc", Err(denied("open the key")), || Err(denied("query the service"))).unwrap_err();
+
+    let said = error.report().to_string();
+    assert!(said.contains("`frpc`"), "{said}");
+    assert!(said.contains("administrator must make"), "{said}");
+    assert!(
+        said.contains("open the key") && said.contains("query the service"),
+        "{said}"
+    );
+}
+
 // What an uninstall says it left behind ---------------------------------------------------------------------------
 
 fn failed_delete(path: &str) -> Error {

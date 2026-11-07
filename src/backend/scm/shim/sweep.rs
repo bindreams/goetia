@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use super::embedded::shim_file;
-use crate::error::Error;
+use crate::error::{Error, Result};
 
 /// The files of `files` that are shim files (see [`shim_file`]) and that none of `referenced`
 /// names, in the order given. Paths are compared without regard to case, and are expected
@@ -117,6 +117,29 @@ fn name_key(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The `ImagePath` of the service `name`, from `from_registry` (the read of its key) or, when that
+/// failed, from `through_scm`: a key that denies `KEY_READ` to Administrators still answers SCM,
+/// which reads it as the service control manager. An error only when both failed; it names the
+/// service, since one unreadable service must not fail every uninstall without saying which.
+pub(crate) fn image_of(
+    name: &str,
+    from_registry: Result<Option<String>>,
+    through_scm: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    let Err(registry) = from_registry else {
+        return from_registry;
+    };
+    through_scm().map_err(|scm| Error::Step {
+        what: format!(
+            "read the image path of the service `{name}`, which neither its registry key nor SCM              answered: an administrator must make the service's key readable"
+        ),
+        source: Box::new(Error::Both {
+            first: Box::new(registry),
+            then: Box::new(scm),
+        }),
+    })
+}
+
 /// What a failed delete is called in an `Os` error: [`undeleted`] reads it back.
 const DELETE: &str = "delete";
 
@@ -213,8 +236,8 @@ mod system {
     use super::super::acl::{display_path, lexical};
     use super::super::embedded::default_dir;
     use super::super::processes::running_images;
-    use super::{DELETE, image_references, same_path, unreferenced};
-    use crate::backend::scm::manager::registry;
+    use super::{DELETE, image_of, image_references, same_path, unreferenced};
+    use crate::backend::scm::manager::{read_image_through_scm, registry};
     use crate::error::{Error, Reason, Result};
     use crate::manager::Installed;
 
@@ -234,21 +257,26 @@ mod system {
     /// its environment variables expanded, [`normalise`]d. A
     /// service marked for deletion references nothing (its record outlives it until a handle
     /// closes), and one with no `ImagePath` has nothing to start. A service whose entry could not be
-    /// read, or an enumeration that did not finish, is an error: what the unread entries reference is
+    /// read through its registry key or through SCM (see [`image_of`]), or an enumeration that did
+    /// not finish, is an error: what the unread entries reference is
     /// unknown, and it must not be taken for nothing.
     pub(crate) fn registered_hosts() -> Result<Vec<PathBuf>> {
         let mut hosts = Vec::new();
         let mut failed = Vec::new();
-        let unfinished = registry::scan_services(|name| match registry::read_registered_image(&name) {
-            Ok(Some(image)) => hosts.extend(image_references(&image, &expand_environment(&image)).iter().map(
-                // A bare file name stands for every file of that name: it is not a path to resolve.
-                |reference| match reference.contains(['\\', '/']) {
-                    true => normalise(Path::new(reference)),
-                    false => PathBuf::from(reference),
-                },
-            )),
-            Ok(None) => {}
-            Err(e) => failed.push(e),
+        let unfinished = registry::scan_services(|name| {
+            match image_of(&name, registry::read_registered_image(&name), || {
+                read_image_through_scm(&name)
+            }) {
+                Ok(Some(image)) => hosts.extend(image_references(&image, &expand_environment(&image)).iter().map(
+                    // A bare file name stands for every file of that name: it is not a path to resolve.
+                    |reference| match reference.contains(['\\', '/']) {
+                        true => normalise(Path::new(reference)),
+                        false => PathBuf::from(reference),
+                    },
+                )),
+                Ok(None) => {}
+                Err(e) => failed.push(e),
+            }
         });
         match Error::both_all(failed.into_iter().chain(unfinished.map(why_unfinished))) {
             None => Ok(hosts),
