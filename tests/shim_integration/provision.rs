@@ -777,9 +777,13 @@ impl ShimProvider for Gated {
     }
 }
 
-/// `Global\goetia-shim`, opened to read its permissions and to wait on it.
+/// The lock's name: it is in a private namespace, which a process that holds the lock has the alias
+/// of, so this process can open it while an install on one of its threads holds it.
+const LOCK_NAME: &str = r"goetia-shim\install-lock";
+
+/// The lock, opened to read its permissions and to wait on it.
 fn open_lock() -> OwnedHandle {
-    let name = support::wide_null(r"Global\goetia-shim");
+    let name = support::wide_null(LOCK_NAME);
     // SAFETY: `name` is NUL-terminated; the handle is checked, then owned.
     let raw = unsafe { OpenMutexW(SYNCHRONIZE | READ_CONTROL, 0, name.as_ptr()) };
     assert!(
@@ -873,6 +877,20 @@ fn lock_is_for_system_and_administrators_only() {
             sddl.contains("D:P(A;;GA;;;SY)(A;;GA;;;BA)"),
             "the lock is for SYSTEM and Administrators alone, and protected: {sddl}"
         );
+    });
+}
+
+/// The lock is not a name a service account can take first: nothing of it is in `Global\`, where
+/// every service account holds the privilege to create objects.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn lock_is_not_in_the_global_namespace() {
+    probing_the_lock_during_an_install(|_| {
+        for name in [r"Global\goetia-shim", r"Global\goetia-shim-install-lock"] {
+            let wide = support::wide_null(name);
+            // SAFETY: `wide` is NUL-terminated; a handle, if there is one, is closed below.
+            let raw = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide.as_ptr()) };
+            assert!(raw.is_null(), "`{name}` exists while an install holds the lock");
+        }
     });
 }
 

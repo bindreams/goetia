@@ -631,7 +631,7 @@ fn new_has_no_provider() {
 /// With no provider there is nothing of the manager's own to sweep, so the retry of an uninstall
 /// for an absent id succeeds without taking the machine-wide lock or reading anything: a library
 /// caller that is not elevated keeps getting `NotInstalled` from `uninstall`. (A regression would
-/// try to create `Global\goetia-shim`, which fails unelevated, and this would be an error.)
+/// try to create the install lock's namespace, which fails unelevated, and this would be an error.)
 #[skuld::test]
 fn uninstall_of_an_absent_id_without_a_provider_takes_no_lock() {
     Scm::new()

@@ -252,20 +252,6 @@ fn both_all_folds_in_order() {
 }
 
 #[skuld::test]
-fn a_shim_lock_owned_by_another_account_names_it() {
-    let e = Error::ShimLockForeign {
-        account: r"EVE\eve".to_string(),
-    };
-    assert_eq!(
-        e.report().to_string(),
-        "the install lock `Global\\goetia-shim` is owned by EVE\\eve, which is not SYSTEM or Administrators, so it \
-         cannot be trusted to serialise installs: end that account's processes that hold it"
-    );
-    assert!(std::error::Error::source(&e).is_none());
-    assert!(!e.is_indeterminate());
-}
-
-#[skuld::test]
 fn report_prints_a_both_under_a_step_once() {
     let e = Error::Step {
         what: "uninstall".to_string(),
