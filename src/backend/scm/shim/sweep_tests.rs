@@ -426,10 +426,7 @@ mod windows {
 
     /// A default folder that no folder under test is.
     fn elsewhere() -> Result<PathBuf> {
-        Ok(PathBuf::from(
-            r"Z:
-o\such\default",
-        ))
+        Ok(PathBuf::from(r"Z:\no\such\default"))
     }
 
     fn shim_in(dir: &Path, hex: &str) -> PathBuf {
