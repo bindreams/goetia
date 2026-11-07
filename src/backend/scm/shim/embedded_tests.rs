@@ -67,6 +67,19 @@ mod windows {
         );
     }
 
+    /// The bytes are `'static` and the digest is of them alone, so the first use keeps it for every
+    /// later one.
+    #[skuld::test]
+    fn the_digest_of_the_embedded_bytes_is_computed_once_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = EmbeddedStockShim::new(Some(b"abc"), Some(dir.path().to_path_buf()));
+        assert!(provider.digest.get().is_none(), "nothing is hashed before it is needed");
+
+        provider.preview().unwrap();
+
+        assert_eq!(provider.digest.get(), Some(&Image::new(b"abc").digest()));
+    }
+
     #[skuld::test]
     fn another_content_is_another_name() {
         let dir = tempfile::tempdir().unwrap();

@@ -52,6 +52,7 @@ mod stock {
     use std::io::{self, Read, Write as _};
     use std::os::windows::ffi::OsStringExt as _;
     use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
 
     use sha2::{Digest as _, Sha256};
     use tempfile::Builder;
@@ -78,6 +79,9 @@ mod stock {
     /// the stock shim, `None` in one built without.
     pub struct EmbeddedStockShim {
         bytes: Option<&'static [u8]>,
+        /// The SHA-256 of `bytes`, computed by the first use: the bytes are `'static`, and every
+        /// `preview` and `provide` of one install needs it.
+        pub(super) digest: OnceLock<[u8; 32]>,
         dir: Option<PathBuf>,
     }
 
@@ -86,11 +90,17 @@ mod stock {
         /// `None` for `%ProgramFiles%\Goetia`, which is looked up only when a `type: simple`
         /// install or its preview needs it.
         pub fn new(bytes: Option<&'static [u8]>, dir: Option<PathBuf>) -> Self {
-            Self { bytes, dir }
+            Self {
+                bytes,
+                digest: OnceLock::new(),
+                dir,
+            }
         }
 
         fn image(&self) -> Result<Image<'static>> {
-            self.bytes.map(Image::new).ok_or(Error::ShimNotEmbedded)
+            let bytes = self.bytes.ok_or(Error::ShimNotEmbedded)?;
+            let digest = *self.digest.get_or_init(|| Sha256::digest(bytes).into());
+            Ok(Image { bytes, digest })
         }
 
         fn dir(&self) -> Result<PathBuf> {
