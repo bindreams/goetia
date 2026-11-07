@@ -23,8 +23,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Every job builds with `Cargo.toml`'s `rust-version`, so the declared floor is the one checked.
-  # Read with `tomllib`: the toolchain install needs the version before that toolchain exists.
+  # Every job except the `stable` test leg builds with `Cargo.toml`'s `rust-version`, so the declared
+  # floor is the one checked. Read with `tomllib`: the toolchain install needs the version before that toolchain exists.
   rust-version:
     name: Rust version
     runs-on: ubuntu-latest
@@ -39,9 +39,10 @@ jobs:
         id: rust
         run: python3 -I -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
 
-  # The `stable` leg tests the compiler the release workflows build with. Its checks are not required on `main`.
+  # The `stable` leg tests the compiler the release workflows build with. Its checks are not required on `main`,
+  # and it skips clippy: Draft Release gates on this workflow, and a lint new in stable must not block a release.
   test:
-    name: ${{ matrix.toolchain == 'stable' && format('Test stable ({0})', matrix.os) || format('Test ({0})', matrix.os) }}
+    name: Test${{ matrix.toolchain == 'stable' && ' stable' || '' }} (${{ matrix.os }})
     needs: rust-version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -59,6 +60,7 @@ jobs:
       # unconditional proc.kill() backstop) faked against subprocess.run --
       # touches no real process, so it runs on every OS in this matrix.
       - name: Test run-with-timeout.py (unit)
+        if: matrix.toolchain != 'stable'
         shell: bash
         run: cd .github/scripts && python3 -B -m unittest run-with-timeout-unit-tests -v
 
@@ -66,7 +68,7 @@ jobs:
       # `getsid`, whose behaviour differs between Linux and macOS, so it needs
       # both to cover it; this matrix is the only job that runs on both.
       - name: Test run-with-timeout.py (POSIX)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.toolchain != 'stable'
         shell: bash
         run: bash .github/scripts/run-with-timeout-tests.sh
 
@@ -74,7 +76,7 @@ jobs:
       # actual Windows host and taskkill to exercise; the unit step above
       # only fakes both.
       - name: Test run-with-timeout.py (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.toolchain != 'stable'
         shell: bash
         run: python3 .github/scripts/run-with-timeout-windows-tests.py
 
@@ -86,10 +88,9 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: ${{ matrix.toolchain }}
 
       - name: Clippy
+        if: matrix.toolchain != 'stable'
         run: cargo clippy --all-targets --locked -- -D warnings
 
       # A plain `cargo test` leaves every elevation-gated test reported by
