@@ -279,12 +279,14 @@ pub enum Error {
     )]
     SiblingShimMissing { path: PathBuf },
 
-    /// The machine-wide install lock exists and belongs to an account that is neither SYSTEM nor
-    /// Administrators, so what holds it cannot be trusted to serialise installs. `account` is its
-    /// name, or its SID when it has none.
+    /// The machine-wide install lock exists and belongs to an account that is not SYSTEM,
+    /// Administrators or TrustedInstaller, so what holds it cannot be trusted to serialise installs.
+    /// `account` is its name, or its SID when it has none. The lock lives while any process has a
+    /// handle to it, not only the one that holds it.
     #[error(
-        "the install lock `Global\\goetia-shim` is owned by {account}, which is not SYSTEM or Administrators, so it \
-         cannot be trusted to serialise installs: end that account's processes that hold it"
+        "the install lock `Global\\goetia-shim` is owned by {account}, which is not an account goetia trusts (SYSTEM, \
+         Administrators, TrustedInstaller), so it cannot be trusted to serialise installs: close every handle to it, by \
+         ending that account's processes that have it open"
     )]
     ShimLockForeign { account: String },
 
