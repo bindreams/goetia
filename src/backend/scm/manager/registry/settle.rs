@@ -2,8 +2,8 @@
 //!
 //! goetia writes `Parameters` and `Environment` in place, so its own writes never take a key away.
 //! A key still goes missing when the service is uninstalled, or another tool deletes it, and a read
-//! that meets that must not guess: a service that is gone is absent, and one that stands is
-//! neither absent nor foreign on the strength of a read that did not complete.
+//! that meets that must not guess: a service that is gone is absent, and one that stands is read
+//! again rather than called absent or foreign on the strength of a read that did not complete.
 
 use std::io;
 
@@ -33,10 +33,10 @@ pub(super) enum Stop<T> {
     /// The key a service may lack was not found at open. `T` is what that reads as for a service
     /// that stands without it.
     Absent(T),
-    /// A key was not found at open or deleted after it, where a service that stands has it.
+    /// A key was not found or marked deleted, where a service that stands has it. A key marked
+    /// deleted stays so while another process holds a handle to it; a fresh open finds the new key,
+    /// or nothing, once the handle closes.
     Vanished,
-    /// `ERROR_KEY_DELETED` at open.
-    DeletedAtOpen(Failure),
     /// Any other failure.
     Other(Failure),
 }
@@ -50,7 +50,7 @@ impl<T> Stop<T> {
                 None => Stop::Vanished,
             }
         } else if failure.is_deleted() {
-            Stop::DeletedAtOpen(failure)
+            Stop::Vanished
         } else {
             Stop::Other(failure)
         }
@@ -73,7 +73,7 @@ pub(super) enum Settled<T> {
     Gone,
     /// The service stands and has no such key: the read's value.
     Value(T),
-    /// The service stands and a key was swapped under the read: read again from the start.
+    /// The service stands and a key vanished under the read: read again from the start.
     Retry,
     Failed(Failure),
 }
@@ -92,14 +92,11 @@ pub(super) fn stands(opened: io::Result<()>) -> io::Result<bool> {
 }
 
 /// `stop`, given `service_stands`, which is asked only when the answer depends on it.
-///
-/// A `DeletedAtOpen` on a service that stands is not retried: a fresh open meets the same key.
 pub(super) fn settle<T>(stop: Stop<T>, service_stands: impl FnOnce() -> Result<bool, Failure>) -> Settled<T> {
     let (stands, on_standing) = match stop {
         Stop::Other(failure) => return Settled::Failed(failure),
         Stop::Absent(value) => (service_stands(), Settled::Value(value)),
         Stop::Vanished => (service_stands(), Settled::Retry),
-        Stop::DeletedAtOpen(failure) => (service_stands(), Settled::Failed(failure)),
     };
     match stands {
         Ok(true) => on_standing,

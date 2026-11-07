@@ -844,8 +844,7 @@ pub(crate) fn marked_for_deletion(state: QueriedState) -> io::Error {
     ))
 }
 
-/// `ERROR_SERVICE_DOES_NOT_EXIST`.
-pub(crate) const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+pub(crate) use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 
 /// The error for a wait for a state other than `STOPPED` over a service that was deleted meanwhile.
 pub(crate) fn service_gone() -> io::Error {

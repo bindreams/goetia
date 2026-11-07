@@ -780,6 +780,42 @@ fn install_twice_is_up_to_date_for_both_kinds() {
     }
 }
 
+/// goetia owns `Parameters` whole: `install --force` removes a stray value and a subkey, and a
+/// marker stored in another case is still ours, so the service reads as unchanged afterwards.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_removes_strays_from_parameters_and_keeps_the_service_ours() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let marker: String = parameters.get_value("Marker").expect("read Marker");
+    parameters.delete_value("Marker").expect("delete Marker");
+    parameters.set_value("marker", &marker).expect("write marker");
+    parameters.set_value("Stray", &"x").expect("write Stray");
+    let (subkey, _) = parameters.create_subkey("Sub").expect("create Sub");
+    subkey.set_value("Nested", &"y").expect("write Nested");
+
+    let forced = mgr.install(&spec, true).expect("forced install");
+    assert!(!matches!(forced, Outcome::Conflict { .. }), "{forced:?}");
+
+    let parameters = parameters_key(&id, KEY_READ);
+    let stray = parameters.get_value::<String, _>("Stray");
+    assert!(
+        matches!(&stray, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "the stray value survived: {stray:?}"
+    );
+    let sub = parameters.open_subkey("Sub");
+    assert!(
+        matches!(&sub, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "the subkey survived"
+    );
+    let again = mgr.preview_install(&spec).expect("preview_install after force");
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    mgr.status(&spec.id).expect("status: the service still reads as ours");
+}
+
 // Step 7: a real account gets SeServiceLogonRight =====================================================================
 
 struct LocalUserGuard {

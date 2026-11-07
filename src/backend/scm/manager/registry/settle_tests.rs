@@ -37,10 +37,9 @@ fn an_open_that_finds_no_service_key_is_a_vanish() {
 }
 
 #[skuld::test]
-fn an_open_of_a_deleted_key_keeps_its_cause() {
-    match Stop::<i32>::at_open(failure(KEY_DELETED), Some(7)) {
-        Stop::DeletedAtOpen(f) => assert_eq!(code_of(&f), Some(KEY_DELETED)),
-        other => panic!("expected DeletedAtOpen, got {other:?}"),
+fn an_open_of_a_deleted_key_is_a_vanish_whether_or_not_the_key_is_optional() {
+    for absent in [Some(7), None] {
+        assert!(matches!(Stop::at_open(failure(KEY_DELETED), absent), Stop::Vanished));
     }
 }
 
@@ -119,31 +118,9 @@ fn a_vanish_with_the_service_gone_is_gone() {
     assert!(matches!(settle(Stop::<i32>::Vanished, || Ok(false)), Settled::Gone));
 }
 
-/// A fresh open failing the way the first did would fail the same way again: not retried, and not
-/// Foreign either.
-#[skuld::test]
-fn a_deleted_open_with_the_service_standing_fails_with_its_cause() {
-    match settle(Stop::<i32>::DeletedAtOpen(failure(KEY_DELETED)), || Ok(true)) {
-        Settled::Failed(f) => assert_eq!(code_of(&f), Some(KEY_DELETED)),
-        other => panic!("expected Failed, got {other:?}"),
-    }
-}
-
-#[skuld::test]
-fn a_deleted_open_with_the_service_gone_is_gone() {
-    assert!(matches!(
-        settle(Stop::<i32>::DeletedAtOpen(failure(KEY_DELETED)), || Ok(false)),
-        Settled::Gone
-    ));
-}
-
 #[skuld::test]
 fn a_failed_existence_check_fails_every_vanish_with_its_own_cause() {
-    let stops: [Stop<i32>; 3] = [
-        Stop::Absent(7),
-        Stop::Vanished,
-        Stop::DeletedAtOpen(failure(KEY_DELETED)),
-    ];
+    let stops: [Stop<i32>; 2] = [Stop::Absent(7), Stop::Vanished];
     for stop in stops {
         match settle(stop, || Err(failure(IO_DEVICE))) {
             Settled::Failed(f) => assert_eq!(code_of(&f), Some(IO_DEVICE)),

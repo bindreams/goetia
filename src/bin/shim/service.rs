@@ -10,9 +10,11 @@ use std::sync::Arc;
 
 use cosca::{Containment, Fd, Stdio};
 use goetia::backend::scm::exit_status::{
-    ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
+    ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, ERROR_SERVICE_DOES_NOT_EXIST,
+    Reported,
 };
 use goetia::backend::scm::manager::read_spec_blob;
+use goetia::error::Error;
 use goetia::spec::{DaemonSpec, Restart};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
@@ -80,6 +82,15 @@ fn run_service(id: &str) {
                 id,
                 status_handle,
                 Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
+            );
+        }
+        Err(Error::NotInstalled { .. }) => {
+            log.failure(id, "the service was deleted while the shim was starting");
+            finish(
+                &log,
+                id,
+                status_handle,
+                Reported::shim_failure(Some(ERROR_SERVICE_DOES_NOT_EXIST as i32)),
             );
         }
         Err(e) => {

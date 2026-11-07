@@ -16,6 +16,8 @@
 pub const ERROR_BAD_ARGUMENTS: u32 = 160;
 /// The metadata blob is absent or cannot be decoded.
 pub const ERROR_INVALID_DATA: u32 = 13;
+/// The service this shim was started for no longer exists.
+pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 /// A shim failure that carries no usable OS error.
 pub const ERROR_GEN_FAILURE: u32 = 31;
 /// The shim could not show that the daemon's tree was terminated: the incomplete stop.

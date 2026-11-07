@@ -287,7 +287,7 @@ impl Backend for Scm {
             // neither omitted nor claimed: collected whole here, reported by
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
-            match registry::read_parameters(&name) {
+            match registry::read_listed_parameters(&name) {
                 // Gone since `scan_services` listed it: not there to list.
                 Ok(RegistryReadOutcome::ServiceGone) => {}
                 Ok(RegistryReadOutcome::Read(params)) => {
@@ -419,14 +419,12 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
 /// value. `registry` itself stays private — this is the one read the shim
 /// needs, not the whole module.
 ///
-/// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no `Marker` at all: unreachable in practice (SCM only
-/// ever launches the shim against a service *this backend itself* created
-/// with `ImagePath` naming the shim, and `apply` always writes `Parameters`
-/// immediately after), but returned rather than folded into `Err` so a
-/// caller can still tell "no marker" apart from "a marker that fails to
-/// decode" — the shim's own version-skew handling (see
-/// `src/bin/shim/logging.rs`) needs exactly that distinction to phrase its
-/// failure message.
+/// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no `Marker` at all:
+/// unreachable in practice (SCM only ever launches the shim against a service *this backend itself*
+/// created with `ImagePath` naming the shim, and `apply` always writes `Parameters` immediately
+/// after), but returned rather than folded into `Err` so a caller can still tell "no marker" apart
+/// from "a marker that fails to decode" — the shim's own version-skew handling (see
+/// `src/bin/shim/logging.rs`) needs exactly that distinction to phrase its failure message.
 pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     match registry::read_parameters(id)? {
         RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),
@@ -524,7 +522,7 @@ fn read_live_registration(
             account,
             failure_actions,
             environment,
-            parameters: live_params.clone(),
+            parameters: generate::canonical_field_names(live_params),
         },
         cfg.start_type,
     ))

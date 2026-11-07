@@ -19,6 +19,17 @@ fn parameters_key_path_is_the_service_key_plus_parameters() {
 }
 
 #[skuld::test]
+fn a_stray_is_a_present_name_that_no_wanted_name_matches_in_any_case() {
+    let wanted = BTreeMap::from([
+        ("Marker".to_string(), "m".to_string()),
+        ("Spec".to_string(), "s".to_string()),
+    ]);
+    let present: Vec<String> = ["marker", "SPEC", "Stray", "Marker2"].map(String::from).to_vec();
+    let found: Vec<&String> = strays(&present, &wanted).collect();
+    assert_eq!(found, [&"Stray".to_string(), &"Marker2".to_string()]);
+}
+
+#[skuld::test]
 fn an_absent_environment_value_is_no_lines() {
     assert_eq!(environment_lines(None), Vec::<String>::new());
 }

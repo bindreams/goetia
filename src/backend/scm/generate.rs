@@ -379,6 +379,22 @@ fn get_field<'a>(parameters: &'a BTreeMap<String, String>, field: &str) -> Resul
     Ok(found)
 }
 
+/// `parameters` with each name that spells one of Goetia's four fields in another case renamed to
+/// Goetia's spelling. The registry keeps the stored case when a value is set, so a readback
+/// compared with what goetia writes must fold it, as [`extract`] does.
+pub fn canonical_field_names(parameters: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    parameters
+        .iter()
+        .map(|(name, value)| {
+            let canonical = [FIELD_MARKER, FIELD_SCHEMA, FIELD_VERSION, FIELD_SPEC]
+                .into_iter()
+                .find(|field| field.eq_ignore_ascii_case(name))
+                .unwrap_or(name);
+            (canonical.to_string(), value.clone())
+        })
+        .collect()
+}
+
 fn missing_field_error(field: &str) -> Error {
     Error::blob(format!(
         "Parameters\\{FIELD_MARKER} is present but Parameters\\{field} is missing"

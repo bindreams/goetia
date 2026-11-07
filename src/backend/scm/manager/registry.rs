@@ -90,11 +90,7 @@ fn service_stands(name: &str) -> std::result::Result<bool, Failure> {
             .open_subkey_with_flags(&path, KEY_READ)
             .map(drop),
     )
-    .map_err(|source| Failure {
-        op: "open".to_string(),
-        path,
-        source,
-    })
+    .map_err(|source| failure("open", &path, source))
 }
 
 fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
@@ -119,21 +115,39 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///   goetia never touched and one whose install crashed between `CreateServiceW` and the metadata
 ///   write (see the module doc comment on `manager`).
 /// - [`RegistryReadOutcome::ServiceGone`] when the service key is gone, whether the read found it
-///   so at the start or lost the `Parameters` key under it. A key swapped under a service that still
-///   stands is read again from the start.
-/// - [`registry_undetermined`] for every other failure, including a deleted key at open on a
-///   service that stands: this key holds the only proof of ownership a `type: managed` service
-///   has, so a read of it that did not complete leaves goetia unable to say even that much.
-///   Never Foreign.
+///   so at the start or lost the `Parameters` key under it. A key that vanishes or is marked
+///   deleted under a service that still stands is read again from the start, until the read
+///   completes or the service is gone.
+/// - [`registry_undetermined`] for every other failure: this key holds the only proof of ownership
+///   a `type: managed` service has, so a read of it that did not complete leaves goetia unable to
+///   say even that much. Never Foreign.
+///
+/// goetia's own writes never remove `Parameters` (see [`write_parameters`]). SCM's delete of the
+/// service does: it removes `Parameters` before the service key, so a read that lands between the
+/// two steps of a concurrent uninstall sees a standing service with no `Parameters`, and reads it
+/// as Foreign.
 pub fn read_parameters(name: &str) -> Result<RegistryReadOutcome<BTreeMap<String, String>>> {
+    read_parameters_as(name, false)
+}
+
+/// [`read_parameters`] for a `name` that the `list` scan has just read from the `Services`
+/// enumeration: a missing `Parameters` key is then Foreign without asking whether the service
+/// stands. A service deleted since leaves a stale Foreign row, which `list` omits.
+pub fn read_listed_parameters(name: &str) -> Result<RegistryReadOutcome<BTreeMap<String, String>>> {
+    read_parameters_as(name, true)
+}
+
+fn read_parameters_as(name: &str, listed: bool) -> Result<RegistryReadOutcome<BTreeMap<String, String>>> {
     let path = parameters_key_path(name);
     read_settled(
         name,
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
-            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
-                .open_subkey_with_flags(&path, KEY_READ)
-                .map_err(|e| Stop::at_open(failure("open", &path, e), Some(BTreeMap::new())))?;
+            let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_READ) {
+                Ok(key) => key,
+                Err(e) if listed && e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+                Err(e) => return Err(Stop::at_open(failure("open", &path, e), Some(BTreeMap::new()))),
+            };
             let mut out = BTreeMap::new();
             for entry in key.enum_values() {
                 let (field, value) = entry.map_err(|e| Stop::mid_read(failure("enumerate", &path, e)))?;
@@ -146,39 +160,66 @@ pub fn read_parameters(name: &str) -> Result<RegistryReadOutcome<BTreeMap<String
     )
 }
 
-/// Write `params` under `Services\<name>\Parameters` as the key's *entire* contents, in place: every
-/// value is set and every other value is deleted, and the key itself is never deleted, so a
-/// concurrent reader sees the old values or the new ones and never a missing key. A hand-edit that
-/// adds a stray value under `Parameters` must still be overwritable by `install --force` — leaving
-/// it behind would mean `on_disk` (via [`read_parameters`], which reads
-/// everything present) never converges with `desired`/`regenerated` (which
-/// only ever have Goetia's own four fields), and `--force` would report
-/// success while the very artifact it was asked to fix keeps reporting
-/// `Conflict` on every subsequent `install`. A value whose name differs from a wanted one only in
-/// case is a stray too: the registry keeps the stored case on a set, and `on_disk` compares names
-/// exactly.
+/// Write `params` as the *entire* contents of `Services\<name>\Parameters`, in place: every value
+/// is set, then every value that matches no name in `params` and every subkey is deleted. The key
+/// itself is never deleted, so a concurrent reader sees the old values or the new ones and never a
+/// missing key. Fails if the service key is gone, rather than creating it.
+///
+/// goetia owns `Parameters` whole. A stray value or subkey added by hand must still be
+/// overwritable by `install --force`: left behind, it would keep `on_disk` (via [`read_parameters`],
+/// which reads everything present) from ever converging with `desired`, which has only Goetia's own
+/// four fields, and `--force` would report success while every later `install` still said
+/// `Conflict`. Names compare case-insensitively, as the registry does: setting `Marker` updates a
+/// stored `marker` and keeps its case, so that value is wanted, not stray.
 pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result<()> {
+    let service_path = service_key_path(name);
     let path = parameters_key_path(name);
-    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .create_subkey_with_flags(&path, KEY_READ | KEY_WRITE)
+    let service = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(&service_path, KEY_READ | KEY_WRITE)
+        .map_err(|e| registry_error("open", &service_path, e))?;
+    let (key, _) = service
+        .create_subkey_with_flags("Parameters", KEY_READ | KEY_WRITE)
         .map_err(|e| registry_error("create", &path, e))?;
+
+    for (field, value) in params {
+        key.set_value(field, value)
+            .map_err(|e| registry_error(&format!("write {field} under"), &path, e))?;
+    }
+
     let present: Vec<String> = key
         .enum_values()
         .map(|entry| entry.map(|(field, _)| field))
         .collect::<std::io::Result<_>>()
         .map_err(|e| registry_error("enumerate", &path, e))?;
-    for field in present.iter().filter(|field| !params.contains_key(*field)) {
-        match key.delete_value(field) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(registry_error(&format!("delete {field} under"), &path, e)),
-        }
+    for field in strays(&present, params) {
+        tolerate_not_found(key.delete_value(field))
+            .map_err(|e| registry_error(&format!("delete {field} under"), &path, e))?;
     }
-    for (field, value) in params {
-        key.set_value(field, value)
-            .map_err(|e| registry_error(&format!("write {field} under"), &path, e))?;
+
+    let subkeys: Vec<String> = key
+        .enum_keys()
+        .collect::<std::io::Result<_>>()
+        .map_err(|e| registry_error("enumerate subkeys of", &path, e))?;
+    for subkey in &subkeys {
+        tolerate_not_found(key.delete_subkey_all(subkey))
+            .map_err(|e| registry_error(&format!("delete subkey {subkey} under"), &path, e))?;
     }
     Ok(())
+}
+
+/// The names in `present` that match no name in `wanted`, compared case-insensitively.
+fn strays<'a>(present: &'a [String], wanted: &BTreeMap<String, String>) -> impl Iterator<Item = &'a String> {
+    present
+        .iter()
+        .filter(|field| !wanted.keys().any(|name| name.eq_ignore_ascii_case(field)))
+}
+
+/// A delete of something already gone is done.
+fn tolerate_not_found(deleted: std::io::Result<()>) -> std::io::Result<()> {
+    match deleted {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 // Environment =========================================================================================================

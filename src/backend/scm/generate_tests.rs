@@ -1088,6 +1088,25 @@ fn extract_is_case_insensitive_for_field_names() {
     assert_eq!(blob.spec, managed_spec());
 }
 
+/// A stored `marker` is the same value as the `Marker` goetia writes (`set_value("Marker")` updates
+/// it and keeps its case), so the readback that `decide` compares must name it `Marker`.
+#[skuld::test]
+fn canonical_field_names_restore_goetias_spelling_and_leave_other_names_alone() {
+    let reg = build(&managed_spec());
+    let mut stored: BTreeMap<String, String> = reg
+        .parameters
+        .iter()
+        .map(|(k, v)| (k.to_uppercase(), v.clone()))
+        .collect();
+    stored.insert("Stray".to_string(), "x".to_string());
+    stored.insert("sTRAY2".to_string(), "y".to_string());
+
+    let mut expected = reg.parameters;
+    expected.insert("Stray".to_string(), "x".to_string());
+    expected.insert("sTRAY2".to_string(), "y".to_string());
+    assert_eq!(canonical_field_names(&stored), expected);
+}
+
 #[skuld::test]
 fn extract_errors_on_case_insensitive_field_collision() {
     let reg = build(&managed_spec());
