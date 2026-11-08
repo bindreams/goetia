@@ -311,25 +311,28 @@ fn a_shim_lock_owned_by_another_account_names_it() {
     assert!(!e.is_indeterminate());
 }
 
-/// A lock whose permissions shut an elevated caller out says that, and names the owner when it could
-/// be read. It says nothing of trust: the caller never learned who the owner is, or that they are
-/// untrusted.
+/// A lock that denied a token with Administrators enabled says only that, names the owner when it
+/// could be read, lists the causes it cannot tell apart, and tells the user to end processes only
+/// for the case that the lock is someone else's. It says nothing of trust: the caller never learned
+/// who the owner is, or that they are untrusted.
 #[skuld::test]
-fn a_shim_lock_that_shuts_administrators_out_says_so_and_names_the_owner_when_read() {
+fn a_shim_lock_that_denied_administrators_says_so_and_names_the_owner_when_read() {
     let readable = Error::ShimLockDenied {
         owner: Some(r"EVE\eve".to_string()),
     };
     assert_eq!(
         readable.report().to_string(),
-        "the install lock `Global\\goetia-shim` is owned by EVE\\eve and its permissions shut Administrators out, so \
-         this process cannot open it: close every handle to it, by ending the processes that have it open"
+        "access to the install lock `Global\\goetia-shim`, which is owned by EVE\\eve, was denied to a token with \
+         Administrators enabled: either the lock's permissions or the token's integrity level or privileges refuse \
+         it. If the lock is someone else's, close every handle to it, by ending the processes that have it open"
     );
 
     let unreadable = Error::ShimLockDenied { owner: None };
     assert_eq!(
         unreadable.report().to_string(),
-        "the install lock `Global\\goetia-shim` has permissions that shut Administrators out, so this process cannot \
-         open it, and its owner could not be read: close every handle to it, by ending the processes that have it open"
+        "access to the install lock `Global\\goetia-shim` was denied to a token with Administrators enabled, and its \
+         owner could not be read: either the lock's permissions or the token's integrity level or privileges refuse \
+         it. If the lock is someone else's, close every handle to it, by ending the processes that have it open"
     );
 
     for e in [&readable, &unreadable] {

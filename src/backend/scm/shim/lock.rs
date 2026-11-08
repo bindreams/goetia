@@ -82,9 +82,8 @@ impl InstallLock {
 enum FailureKind {
     /// The caller's token lacks Administrators: [`Error::ElevationRequired`].
     NeedsElevation,
-    /// Someone else made the lock, with a DACL that shuts Administrators out:
-    /// [`Error::ShimLockDenied`].
-    ForeignLock,
+    /// The lock refused a token that has Administrators enabled: [`Error::ShimLockDenied`].
+    Denied,
     /// The OS's failure, as it was.
     Os,
 }
@@ -92,11 +91,12 @@ enum FailureKind {
 /// The lock's owner is Administrators, which a token that does not have it enabled cannot give an
 /// object (`ERROR_INVALID_OWNER`), and its DACL admits only SYSTEM and Administrators, so that token
 /// cannot open one that exists either (`ERROR_ACCESS_DENIED`): both are its lack of elevation. A
-/// token with `administrators` refused by that DACL was shut out by whoever made the lock.
+/// token with `administrators` that is refused has a cause this does not know (the lock's DACL, or
+/// the token's integrity level or privileges).
 fn failure_kind(code: Option<i32>, administrators: bool) -> FailureKind {
     match code {
         Some(code) if code == ERROR_INVALID_OWNER as i32 => FailureKind::NeedsElevation,
-        Some(code) if code == ERROR_ACCESS_DENIED as i32 && administrators => FailureKind::ForeignLock,
+        Some(code) if code == ERROR_ACCESS_DENIED as i32 && administrators => FailureKind::Denied,
         Some(code) if code == ERROR_ACCESS_DENIED as i32 => FailureKind::NeedsElevation,
         _ => FailureKind::Os,
     }
@@ -115,13 +115,14 @@ fn failure(
     administrators: impl FnOnce() -> io::Result<bool>,
     owner: impl FnOnce() -> Option<String>,
 ) -> Error {
+    let create = format!("create the install lock `{NAME}`");
     let code = source.raw_os_error();
     let administrators = if code == Some(ERROR_ACCESS_DENIED as i32) {
         match administrators() {
             Ok(enabled) => enabled,
             Err(asked) => {
                 return Error::Both {
-                    first: Box::new(Error::os(format!("create the install lock `{NAME}`"), source)),
+                    first: Box::new(Error::os(create, source)),
                     then: Box::new(Error::os(
                         "check whether the token has Administrators enabled".to_string(),
                         asked,
@@ -136,8 +137,8 @@ fn failure(
         FailureKind::NeedsElevation => Error::ElevationRequired {
             what: format!("creating or opening the install lock `{NAME}`"),
         },
-        FailureKind::ForeignLock => Error::ShimLockDenied { owner: owner() },
-        FailureKind::Os => Error::os(format!("create the install lock `{NAME}`"), source),
+        FailureKind::Denied => Error::ShimLockDenied { owner: owner() },
+        FailureKind::Os => Error::os(create, source),
     }
 }
 

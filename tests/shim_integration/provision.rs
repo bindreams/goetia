@@ -1078,17 +1078,17 @@ fn a_lock_someone_else_created_first_is_refused() {
     }
 }
 
-/// A lock whose DACL admits SYSTEM alone shuts an elevated caller out of the open: the refusal says
-/// the permissions did it, not that the owner is untrusted, and the owner is read through
-/// `READ_CONTROL`, which an owner always has.
+/// A lock whose DACL admits SYSTEM alone denies an elevated caller the open: the refusal says access
+/// was denied to a token with Administrators enabled, not that the owner is untrusted, and the owner
+/// is read through `READ_CONTROL`, which an owner always has.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_lock_that_shuts_administrators_out_is_refused_as_inaccessible() {
+fn a_lock_that_denies_administrators_is_refused_as_inaccessible() {
     match error_of_refused_lock("(A;;GA;;;SY)") {
         Error::ShimLockDenied { owner } => assert!(
             owner.as_deref().is_some_and(|owner| !owner.is_empty()),
             "the refusal names the owner: {owner:?}"
         ),
-        other => panic!("expected the lock that shuts Administrators out to be refused: {other:?}"),
+        other => panic!("expected the lock that denies Administrators to be refused: {other:?}"),
     }
 }
 

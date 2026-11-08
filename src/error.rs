@@ -291,10 +291,11 @@ pub enum Error {
     )]
     ShimLockForeign { account: String },
 
-    /// The machine-wide install lock exists, and its permissions shut Administrators out, so a
-    /// caller whose token has Administrators enabled cannot open it. `owner` is its owner's name (or
-    /// SID), or `None` when it could not be read (the permissions that refused the open may refuse
-    /// that too). Nothing says whether the owner is trusted: it was not read to decide that.
+    /// Access to the machine-wide install lock was denied to a token with Administrators enabled.
+    /// Its permissions, or the token's integrity level or privileges, may be the cause; goetia does
+    /// not know which. `owner` is the lock's owner's name (or SID), or `None` when it could not be
+    /// read (the permissions that refused the open may refuse that too). Nothing says whether the
+    /// owner is trusted: it was not read to decide that.
     #[error("{}", shim_lock_denied(owner))]
     ShimLockDenied { owner: Option<String> },
 
@@ -1077,15 +1078,17 @@ fn why(diagnostic: &Option<String>) -> String {
 
 /// [`Error::ShimLockDenied`]'s message.
 fn shim_lock_denied(owner: &Option<String>) -> String {
-    const REMEDY: &str = "close every handle to it, by ending the processes that have it open";
+    const CAUSES: &str = "either the lock's permissions or the token's integrity level or privileges refuse it. If \
+                          the lock is someone else's, close every handle to it, by ending the processes that have \
+                          it open";
     match owner {
         Some(owner) => format!(
-            "the install lock `Global\\goetia-shim` is owned by {owner} and its permissions shut Administrators out, so \
-             this process cannot open it: {REMEDY}"
+            "access to the install lock `Global\\goetia-shim`, which is owned by {owner}, was denied to a token with \
+             Administrators enabled: {CAUSES}"
         ),
         None => format!(
-            "the install lock `Global\\goetia-shim` has permissions that shut Administrators out, so this process \
-             cannot open it, and its owner could not be read: {REMEDY}"
+            "access to the install lock `Global\\goetia-shim` was denied to a token with Administrators enabled, and \
+             its owner could not be read: {CAUSES}"
         ),
     }
 }

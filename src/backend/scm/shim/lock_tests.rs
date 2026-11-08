@@ -21,20 +21,19 @@ fn a_lock_the_token_cannot_own_is_a_need_for_elevation() {
 
 /// A caller whose token lacks Administrators that opens a lock an elevated process made is refused
 /// by its DACL, which admits only SYSTEM and Administrators. A caller whose token has them, refused,
-/// was shut out by whoever made the lock.
+/// is denied, for a cause the code does not say.
 #[skuld::test]
 fn access_denied_is_a_need_for_elevation_only_for_a_token_without_administrators() {
     let denied = Some(ERROR_ACCESS_DENIED as i32);
 
     assert_eq!(failure_kind(denied, false), FailureKind::NeedsElevation);
-    assert_eq!(failure_kind(denied, true), FailureKind::ForeignLock);
+    assert_eq!(failure_kind(denied, true), FailureKind::Denied);
 }
 
-/// A denial for a token with Administrators enabled is the lock's permissions shutting them out,
-/// whoever owns it: the sentence says that and names the owner when it was read, and says nothing of
-/// trust.
+/// A denial for a token with Administrators enabled is told as that, with the owner when it was
+/// read: the lock's permissions are one cause, not the established one.
 #[skuld::test]
-fn a_denied_administrator_is_told_the_locks_permissions_shut_them_out() {
+fn a_denied_administrator_is_told_only_what_is_known() {
     let denied = || io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
 
     let readable = failure(denied(), || Ok(true), || Some(r"EVE\eve".to_string()));
@@ -42,13 +41,15 @@ fn a_denied_administrator_is_told_the_locks_permissions_shut_them_out() {
 
     assert_eq!(
         readable.to_string(),
-        "the install lock `Global\\goetia-shim` is owned by EVE\\eve and its permissions shut Administrators out, so \
-         this process cannot open it: close every handle to it, by ending the processes that have it open"
+        "access to the install lock `Global\\goetia-shim`, which is owned by EVE\\eve, was denied to a token with \
+         Administrators enabled: either the lock's permissions or the token's integrity level or privileges refuse \
+         it. If the lock is someone else's, close every handle to it, by ending the processes that have it open"
     );
     assert_eq!(
         unreadable.to_string(),
-        "the install lock `Global\\goetia-shim` has permissions that shut Administrators out, so this process cannot \
-         open it, and its owner could not be read: close every handle to it, by ending the processes that have it open"
+        "access to the install lock `Global\\goetia-shim` was denied to a token with Administrators enabled, and its \
+         owner could not be read: either the lock's permissions or the token's integrity level or privileges refuse \
+         it. If the lock is someone else's, close every handle to it, by ending the processes that have it open"
     );
 }
 
