@@ -6,7 +6,6 @@
 
 use std::io;
 
-use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Security::CheckTokenMembership;
 
 use crate::backend::scm::shim::acl::administrators;
@@ -31,21 +30,19 @@ pub fn is_elevated() -> bool {
 /// Administrators enabled, which is what an object owned by Administrators needs of its creator.
 /// A filtered administrator's token has the group disabled.
 pub(crate) fn token_has_administrators() -> io::Result<bool> {
-    has_administrators_in(std::ptr::null_mut())
-}
-
-/// [`token_has_administrators`] for `token`, an impersonation token, or the thread's own for NULL.
-fn has_administrators_in(token: HANDLE) -> io::Result<bool> {
     let mut sid = administrators();
     let mut member = 0;
     // SAFETY: `sid` is a valid binary SID that lives for the call; `member` is a valid out-pointer;
-    // `token` is NULL or a live impersonation token handle.
-    let ok = unsafe { CheckTokenMembership(token, sid.as_mut_ptr().cast(), &mut member) };
+    // a NULL token is the calling thread's.
+    let ok = unsafe { CheckTokenMembership(std::ptr::null_mut(), sid.as_mut_ptr().cast(), &mut member) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(member != 0)
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "elevation_tests.rs"]
