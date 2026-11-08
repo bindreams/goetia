@@ -211,20 +211,43 @@ pub(crate) fn second_folder<'a>(
     Ok(same_path(&default_folder()?, host_folder).then_some(host_folder))
 }
 
+/// What an uninstall knows of the folder its shim provider sweeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderFolder {
+    /// The manager has no provider: nothing is retried.
+    None,
+    /// It has one, and which folder it uses is not known (its `preview` failed): its sweep is still
+    /// what the retry runs.
+    Unknown,
+    At(PathBuf),
+}
+
+impl ProviderFolder {
+    /// The folder, when it is known.
+    pub(crate) fn path(&self) -> Option<&Path> {
+        match self {
+            Self::At(folder) => Some(folder),
+            Self::None | Self::Unknown => None,
+        }
+    }
+}
+
 /// What an uninstall says when it deleted the service `id` but could not clean up: which shim files
 /// remain, and what removes them. `files` are those the failure names (none when it failed before
 /// it tried to delete any, and then any file the service used may remain, in `second_folder`, the
 /// folder besides the provider's that the uninstall sweeps: see [`second_folder`]).
 ///
-/// The retry, `uninstall` of an id that is no longer installed, sweeps `provider_folder` alone: a
-/// file in another folder is removed by the next install or uninstall of a manager whose provider
-/// uses that folder, and with no provider nothing is retried at all.
+/// The retry, `uninstall` of an id that is no longer installed, sweeps the provider's folder alone:
+/// a file in another folder is removed by the next install or uninstall of a manager whose provider
+/// uses that folder, and with no provider nothing is retried at all. For a provider whose folder is
+/// [`Unknown`](ProviderFolder::Unknown) the text says only that the retry runs its sweep.
 pub(crate) fn left_behind_text(
     id: impl std::fmt::Display,
-    provider_folder: Option<&Path>,
+    provider: &ProviderFolder,
     second_folder: Option<&Path>,
     files: &[PathBuf],
 ) -> String {
+    let provider_folder = provider.path();
     let in_providers = |folder: &Path| provider_folder.is_some_and(|provider| same_path(provider, folder));
     let retry = format!("Re-run `goetia daemon uninstall {id}` to retry");
     let elsewhere = "the next install or uninstall of a manager whose provider uses that folder removes";
@@ -238,12 +261,14 @@ pub(crate) fn left_behind_text(
 
     if files.is_empty() {
         let mut said = format!("`{id}` was deleted, but the shim files it used were not cleaned up.");
-        if provider_folder.is_some() {
+        if *provider != ProviderFolder::None {
             said.push_str(&format!(
                 " {retry} what is in the folder this program's shim provider uses."
             ));
         }
-        if let Some(folder) = second_folder.filter(|folder| !in_providers(folder)) {
+        if let Some(folder) = second_folder.filter(|folder| !in_providers(folder))
+            && *provider != ProviderFolder::Unknown
+        {
             said.push_str(&format!(
                 " What is in `{}` is not retried by that command: {elsewhere} it.",
                 folder.display()
@@ -251,14 +276,17 @@ pub(crate) fn left_behind_text(
         }
         return said;
     }
-    let (inside, outside): (Vec<&Path>, Vec<&Path>) = files
-        .iter()
-        .map(PathBuf::as_path)
+    let all: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+    let mut said = format!("`{id}` was deleted, but {} could not be removed.", list(&all));
+    if *provider == ProviderFolder::Unknown {
+        said.push_str(&format!(
+            " {retry} those in the folder this program's shim provider uses, which is not known."
+        ));
+        return said;
+    }
+    let (inside, outside): (Vec<&Path>, Vec<&Path>) = all
+        .into_iter()
         .partition(|file| in_providers(file) || file.parent().is_some_and(in_providers));
-    let mut said = format!(
-        "`{id}` was deleted, but {} could not be removed.",
-        list(&files.iter().map(PathBuf::as_path).collect::<Vec<_>>())
-    );
     if !inside.is_empty() {
         said.push_str(&format!(" {retry} {}.", list(&inside)));
     }

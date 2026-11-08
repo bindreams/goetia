@@ -333,7 +333,24 @@ const NEXT: &str = "the next install or uninstall of a manager whose provider us
 
 fn text(provider: Option<&str>, second_folder: &str, files: &[&str]) -> String {
     let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
-    left_behind_text("frpc", provider.map(Path::new), Some(Path::new(second_folder)), &files)
+    let provider = provider.map_or(ProviderFolder::None, |folder| ProviderFolder::At(PathBuf::from(folder)));
+    left_behind_text("frpc", &provider, Some(Path::new(second_folder)), &files)
+}
+
+/// A provider whose `preview` failed is not the absence of one: its sweep is what the retry runs, so
+/// the text says that, and claims neither that its folder is the retried one nor that it is not.
+#[skuld::test]
+fn a_provider_whose_folder_is_not_known_is_still_retried() {
+    for files in [vec![], vec![PathBuf::from("/q/Other/b.exe")]] {
+        let said = left_behind_text("frpc", &ProviderFolder::Unknown, Some(Path::new("/q/Other")), &files);
+
+        assert!(said.contains(RETRY), "{said}");
+        assert!(
+            !said.contains("not retried") && !said.contains("does not retry"),
+            "{said}"
+        );
+        assert!(!said.contains(NEXT), "{said}");
+    }
 }
 
 #[skuld::test]
@@ -399,7 +416,7 @@ fn a_failure_that_names_no_file_says_where_the_files_may_be() {
 /// only the provider's folder is the one to retry.
 #[skuld::test]
 fn a_folder_this_uninstall_does_not_sweep_is_not_named() {
-    let said = left_behind_text("frpc", Some(Path::new("/p/Goetia")), None, &[]);
+    let said = left_behind_text("frpc", &ProviderFolder::At(PathBuf::from("/p/Goetia")), None, &[]);
 
     assert!(said.contains(RETRY) && !said.contains(NEXT), "{said}");
 }

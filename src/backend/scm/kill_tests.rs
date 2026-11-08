@@ -340,14 +340,18 @@ fn an_expired_hold_is_not_let_go_by_hold_if_possible() {
 
 /// `uninstall` waits for the process only if it can hold it: a process it cannot open (a right
 /// removed by policy) must not stop the service from being uninstalled, and is left to the sweep,
-/// which finds it by its image.
+/// which finds it by its image. The outcome carries why it is not held, so the caller can say that no
+/// wait for it was possible.
 #[skuld::test]
 fn a_process_that_cannot_be_opened_is_not_held_and_not_an_error() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
 
     let outcome = hold_if_possible(&mut target, unbounded()).unwrap();
 
-    assert!(matches!(outcome, HoldOutcome::NoProcess), "{outcome:?}");
+    let HoldOutcome::Refused(reason) = outcome else {
+        panic!("expected the refusal, got {outcome:?}");
+    };
+    assert_eq!(reason.to_string(), "access denied");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -367,19 +371,6 @@ fn a_process_that_can_be_opened_is_held_by_hold_if_possible() {
     let outcome = hold_if_possible(&mut target, unbounded()).unwrap();
 
     assert!(matches!(outcome, HoldOutcome::Held(_)), "{outcome:?}");
-}
-
-/// The hold of a caller that waits without a bound answers with the process or none: its type has
-/// no expiry to handle.
-#[skuld::test]
-fn the_unbounded_hold_answers_with_the_process_or_none() {
-    let mut held = Scripted::new([Some(100), Some(100)], [Open::Found], []);
-    let mut refused = Scripted::new([Some(100), Some(100)], [Open::Fails], []);
-    let mut none = Scripted::new([None], [], []);
-
-    assert!(hold_if_possible_unbounded(&mut held).unwrap().is_some());
-    assert!(hold_if_possible_unbounded(&mut refused).unwrap().is_none());
-    assert!(hold_if_possible_unbounded(&mut none).unwrap().is_none());
 }
 
 /// Only the refusal is let go. A failed read of SCM is not a process that cannot be opened: the

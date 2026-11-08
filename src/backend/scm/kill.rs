@@ -259,14 +259,16 @@ fn await_scm_released_unbounded<T: KillTarget>(target: &mut T, pid: u32) -> io::
 }
 
 /// How [`hold_if_possible`] ended, when SCM could be read.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum HoldOutcome<P> {
     /// The service's process, held.
     Held(P),
-    /// A service with no process, or one whose process SCM vouches for but cannot be opened (a right
-    /// removed by policy): the caller goes on without it, and what that process runs is still found
-    /// by its image.
+    /// A service with no process.
     NoProcess,
+    /// SCM vouches for the service's process and it cannot be opened (a right removed by policy),
+    /// for the reason given: the caller goes on without it, since what that process runs is still
+    /// found by its image, and says that no wait for it was possible.
+    Refused(io::Error),
     /// SCM still reported `pid`, whose process is gone, when the deadline ran out. There is nothing
     /// to wait on, and what that means is the caller's.
     Expired { pid: u32 },
@@ -280,19 +282,10 @@ pub(crate) fn hold_if_possible<T: KillTarget>(
 ) -> io::Result<HoldOutcome<T::Process>> {
     match hold_service_process(target, deadline) {
         Ok(Some((_pid, process))) => Ok(HoldOutcome::Held(process)),
-        Ok(None) | Err(HoldError::Refused(_)) => Ok(HoldOutcome::NoProcess),
+        Ok(None) => Ok(HoldOutcome::NoProcess),
+        Err(HoldError::Refused(e)) => Ok(HoldOutcome::Refused(e)),
         Err(HoldError::Expired { pid }) => Ok(HoldOutcome::Expired { pid }),
         Err(HoldError::Read(e)) => Err(e),
-    }
-}
-
-/// [`hold_if_possible`] with no bound, for the callers that wait without one: the process, or `None`
-/// for a service with none or one that cannot be opened.
-pub(crate) fn hold_if_possible_unbounded<T: KillTarget>(target: &mut T) -> io::Result<Option<T::Process>> {
-    match hold_if_possible(target, Budget::Unbounded.start())? {
-        HoldOutcome::Held(process) => Ok(Some(process)),
-        HoldOutcome::NoProcess => Ok(None),
-        HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline does not expire"),
     }
 }
 

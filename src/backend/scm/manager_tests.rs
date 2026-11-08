@@ -734,6 +734,86 @@ fn a_provided_host_that_is_not_the_rendered_one_is_a_mismatch() {
     assert_eq!((*said, *gave), (rendered, provided));
 }
 
+const SHIM_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+/// A registered host is the shim by its file name alone, quoted or not, with or without arguments.
+#[skuld::test]
+fn a_registered_host_is_a_shim_by_its_file_name() {
+    let shim = format!(r"C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe");
+
+    assert_eq!(
+        shim_host(&format!(r#""{shim}" --service-host"#)),
+        Some(PathBuf::from(&shim))
+    );
+    assert_eq!(shim_host(r"C:\bin\frpc.exe"), None);
+    assert_eq!(
+        shim_host(&format!(
+            r"C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.k3j9.stale.exe"
+        )),
+        None,
+        "a file set aside is not a service's host"
+    );
+}
+
+/// Only a service that is gone or marked for deletion refuses the read of its host as a matter of
+/// course; any other failure is not "no shim", and is reported.
+#[skuld::test]
+fn only_a_gone_or_marked_service_is_an_expected_refusal_to_read_its_host() {
+    let os = |code: u32| Error::os("query configuration", std::io::Error::from_raw_os_error(code as i32));
+
+    assert!(is_gone_or_marked(&Error::NotInstalled { id: "x".to_string() }));
+    assert!(is_gone_or_marked(&os(ERROR_SERVICE_MARKED_FOR_DELETE)));
+    assert!(is_gone_or_marked(&os(ERROR_SERVICE_DOES_NOT_EXIST)));
+    assert!(!is_gone_or_marked(&os(ERROR_ACCESS_DENIED)));
+}
+
+/// The provider's folder, as an uninstall tells it: none without a provider, the folder of the
+/// previewed host, and unknown (with the failure) for a provider whose `preview` fails, which is not
+/// the absence of one.
+#[skuld::test]
+fn the_providers_folder_is_none_known_or_unknown() {
+    let (folder, failed) = Scm::new().provider_folder();
+    assert_eq!((folder, failed.is_none()), (ProviderFolder::None, true));
+
+    let known = Scm::with_shim(
+        crate::shim::StandaloneShim::new(PathBuf::from(r"C:\app\host.exe"), vec![]),
+        CheckPermissions::Disable,
+    );
+    let (folder, failed) = known.provider_folder();
+    assert_eq!(
+        (folder, failed.is_none()),
+        (ProviderFolder::At(PathBuf::from(r"C:\app")), true)
+    );
+
+    let relative = Scm::with_shim(
+        crate::shim::StandaloneShim::new(PathBuf::from("host.exe"), vec![]),
+        CheckPermissions::Disable,
+    );
+    let (folder, failed) = relative.provider_folder();
+    assert_eq!(folder, ProviderFolder::Unknown);
+    assert!(
+        matches!(&failed, Some(Error::Step { source, .. }) if matches!(**source, Error::ShimPathRelative { .. })),
+        "{failed:?}"
+    );
+}
+
+/// A `stop` whose process could not be opened says so in the error that follows, led by it, and the
+/// error under it keeps its class: a timeout is still indeterminate.
+#[skuld::test]
+fn a_stop_error_says_when_the_process_could_not_be_waited_for() {
+    let id = Id::try_from("frpc").unwrap();
+    let timeout = budget::timed_out("frpc", "stopped", Budget::Bounded(std::time::Duration::from_secs(1)));
+    let error = unwaited(&id, std::io::Error::other("access denied"), timeout);
+
+    assert!(error.is_indeterminate(), "{error:?}");
+    let said = error.report().to_string();
+    assert!(
+        said.contains("`frpc`'s process") && said.contains("access denied"),
+        "{said}"
+    );
+    assert!(said.contains("goetia stopped waiting"), "{said}");
+}
+
 /// The sweep before a provide runs in the host's folder only when it exists and passes the check: a
 /// folder that is missing has nothing to sweep and could be made by someone else before the sweep,
 /// and one that fails the check is not goetia's to delete in (the provide refuses it, with the

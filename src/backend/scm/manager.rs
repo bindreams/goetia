@@ -113,7 +113,7 @@ use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_process};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
-use crate::backend::scm::kill::{HoldOutcome, hold_if_possible, hold_if_possible_unbounded};
+use crate::backend::scm::kill::{HoldOutcome, hold_if_possible};
 use crate::backend::scm::parameters::Parameters;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
@@ -121,14 +121,14 @@ use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
 use crate::backend::scm::shim::provider::ShimProvider;
 use crate::backend::scm::shim::sweep::{
-    SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
+    ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Reason, Result};
+use crate::error::{Chain, Error, Reason, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, Installed, State, Status, Step};
 use crate::shim::HostCommand;
@@ -453,15 +453,25 @@ impl Backend for Scm {
         let host = if lock.is_some() {
             registered_shim(&snapshot)
         } else {
-            None
+            Ok(None)
+        };
+        // A host that could not be read is not "no shim": the uninstall goes on, since the service
+        // is deleted either way, and says that the cleanup was skipped, and why, if it succeeds.
+        let (host, unread) = match host {
+            Ok(host) => (host, None),
+            Err(e) => (None, Some(e)),
         };
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
         let scm = open_scm_to_classify(id.as_str())?;
-        match (uninstall_locked(&scm, &id, host.is_some())?, host) {
-            (Uninstalled::Deleted { held }, Some(host)) => self.finish_uninstall(&id, &host, held),
-            _ => Ok(()),
+        match uninstall_locked(&scm, &id, host.is_some())? {
+            Uninstalled::Deleted { process } => match (host, unread) {
+                (Some(host), _) => self.finish_uninstall(&id, &host, process),
+                (None, Some(unread)) => Err(self.cleanup_skipped(&id, unread)),
+                (None, None) => Ok(()),
+            },
+            Uninstalled::Left => Ok(()),
         }
     }
 
@@ -525,6 +535,9 @@ impl Backend for Scm {
     /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
     /// runs is free when `stop` returns.
     ///
+    /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
+    /// say so; one that fails leads its error with it (see [`unwaited`]).
+    ///
     /// The gap: if the held process crashes and Windows' recovery restarts the service before the
     /// STOP is sent, the STOP reaches the new process, which goetia does not hold. `stop` can then
     /// return while that process is still exiting, and an `uninstall` right after may leave the shim
@@ -542,11 +555,17 @@ impl Backend for Scm {
         // Before the STOP: SCM reports `STOPPED` before the process exits, and no pid after it. An
         // expired hold is sent the STOP all the same, and is not a stop: see `stop_and_await_exit`.
         let held = hold_process(&id, deadline, &format!("`{id}` was NOT stopped"))?;
-        let outcome = super::wait::stop_and_await_exit(&mut actor, deadline, held, |held, deadline| {
+        // A process that cannot be opened is not waited for, and a `stop` that succeeds has no
+        // channel to say so: the reason leads the error of one that fails.
+        let (held, unopened) = match held {
+            HoldOutcome::Refused(reason) => (HoldOutcome::NoProcess, Some(reason)),
+            other => (other, None),
+        };
+        let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, held, |held, deadline| {
             end_held(&id, held, deadline)
         })
-        .map_err(|e| Error::os(format!("stop `{id}`"), e))?;
-        match outcome {
+        .map_err(|e| Error::os(format!("stop `{id}`"), e))
+        .and_then(|outcome| match outcome {
             StopAndAwaitExitOutcome::Stopped => Ok(()),
             // The STOP was sent and its effect is not confirmed, as when SCM does not answer in time.
             StopAndAwaitExitOutcome::ServiceExpired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
@@ -560,7 +579,11 @@ impl Backend for Scm {
                 budget,
                 terminate_failed,
             )),
-        }
+        });
+        stopped.map_err(|error| match unopened {
+            Some(reason) => unwaited(&id, reason, error),
+            None => error,
+        })
     }
 
     /// See [`super::kill::kill_service`] for how the process is chosen safely. Exit code `1`
@@ -1026,15 +1049,17 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, hold: bool) -> Result<Unin
     // Taken here and not before the disable: a start in flight at the disable, or a recovery
     // restart, replaces the process, and a disabled service cannot be started again. Taken again for
     // each STOP the loop sends, so the one kept is the process that STOP is for.
-    let mut held = None;
+    let mut process = HoldOutcome::NoProcess;
     let mut hold_failed = None;
     let settled = super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start(), |_| {
         if !hold {
             return Ok(());
         }
-        match hold_process_unbounded(id, &format!("`{id}`'s process could not be held before its STOP")) {
-            Ok(process) => {
-                held = process;
+        let not_done = format!("`{id}`'s process could not be held before its STOP");
+        match hold_process(id, Budget::Unbounded.start(), &not_done) {
+            Ok(HoldOutcome::Expired { .. }) => unreachable!("an unbounded deadline does not expire"),
+            Ok(held) => {
+                process = held;
                 Ok(())
             }
             Err(e) => {
@@ -1069,12 +1094,12 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, hold: bool) -> Result<Unin
     };
     let service = match scm.open_service(id.as_str(), ServiceAccess::DELETE) {
         Ok(service) => service,
-        Err(e) if is_not_found(&e) => return Ok(Uninstalled::Deleted { held }),
+        Err(e) if is_not_found(&e) => return Ok(Uninstalled::Deleted { process }),
         Err(e) => return Err(not_deleted(format!("open `{id}` to delete it"), e)),
     };
     match service.delete() {
-        Ok(()) => Ok(Uninstalled::Deleted { held }),
-        Err(e) if is_not_found(&e) || is_marked_for_delete(&e) => Ok(Uninstalled::Deleted { held }),
+        Ok(()) => Ok(Uninstalled::Deleted { process }),
+        Err(e) if is_not_found(&e) || is_marked_for_delete(&e) => Ok(Uninstalled::Deleted { process }),
         Err(e) => Err(not_deleted(format!("delete service `{id}`"), e)),
     }
 }
@@ -1082,9 +1107,9 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, hold: bool) -> Result<Unin
 /// How far a successful [`uninstall_locked`] got.
 enum Uninstalled {
     /// The service was stopped and is deleted, or is about to be when a handle closes: nothing it
-    /// ran is running or will start again, once the process SCM reported has exited. `held` is
-    /// that process, when it was held.
-    Deleted { held: Option<Held> },
+    /// ran is running or will start again, once the process SCM reported has exited. `process` is
+    /// what holding it came to: never an expiry, since the hold has no bound.
+    Deleted { process: HoldOutcome<Held> },
     /// Nothing of this call's is left to wait for: the service was already gone (1060), or someone
     /// else had marked it for deletion, so it was stopped but not deleted by this call. What it ran
     /// is left for the next sweep.
@@ -1094,36 +1119,59 @@ enum Uninstalled {
 // A shim host ---------------------------------------------------------------------------------------------------------
 
 /// The host `snapshot`'s service is registered with, when its file name is that of a shim file
-/// placed by a provider (`goetia-shim-<hex>.exe`): the one case whose file an uninstall may sweep. A
-/// service whose configuration cannot be read has no host known, and its uninstall goes on without
-/// one (a service already marked for deletion refuses the read, and `uninstall_locked` still
-/// finishes it).
-fn registered_shim(snapshot: &ScmSnapshot) -> Option<PathBuf> {
-    let config = snapshot.config().ok()?;
-    let (exe, _) = split_command_line(&config.executable_path.to_string_lossy());
+/// placed by a provider (`goetia-shim-<hex>.exe`): the one case whose file an uninstall may sweep.
+/// `None` for another host, and for a service already marked for deletion or gone, which refuses the
+/// read as a matter of course (`uninstall_locked` still finishes it). Any other failure to read the
+/// configuration is an error: the host is not known, which is not "no shim".
+fn registered_shim(snapshot: &ScmSnapshot) -> Result<Option<PathBuf>> {
+    match snapshot.config() {
+        Ok(config) => Ok(shim_host(&config.executable_path.to_string_lossy())),
+        Err(e) if is_gone_or_marked(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The host the command line `image` starts, when its file name is that of a shim file placed by a
+/// provider.
+fn shim_host(image: &str) -> Option<PathBuf> {
+    let (exe, _) = split_command_line(image);
     let is_shim = exe.file_name()?.to_str().and_then(shim_file) == Some(ShimFile::Current);
     is_shim.then_some(exe)
+}
+
+/// Whether `error`, from reading a service's configuration, says the service is gone or marked for
+/// deletion.
+fn is_gone_or_marked(error: &Error) -> bool {
+    matches!(error, Error::NotInstalled { .. })
+        || matches!(
+            error.raw_os_error(),
+            Some(code) if code == ERROR_SERVICE_MARKED_FOR_DELETE as i32 || code == ERROR_SERVICE_DOES_NOT_EXIST as i32
+        )
 }
 
 /// The process SCM reports for `id`, held before the service is stopped: SCM records `STOPPED`
 /// before the process exits, and reports no pid after it. For an uninstall it may be running an
 /// older file than the one registered (an `Update` it has not restarted into), which no read of the
-/// registry shows. `None` when SCM reports none, and when the process cannot be opened (see
-/// [`hold_if_possible`]): the caller goes on, and what that process runs stays referenced by its
-/// image until it exits. A failure to read SCM is an error, led by `not_done`, what the caller did
-/// not do. The wait for SCM to let go of a pid whose process is gone ends at `deadline`, and is
-/// [`HoldOutcome::Expired`]: a `stop` sends its STOP all the same. The service handle the hold used
-/// is closed before this returns, or the service could not be deleted.
+/// registry shows. [`HoldOutcome::NoProcess`] when SCM reports none, and [`HoldOutcome::Refused`],
+/// with why, when the process cannot be opened (see [`hold_if_possible`]): the caller goes on, and
+/// what that process runs stays referenced by its image until it exits. A failure to read SCM is an
+/// error, led by `not_done`, what the caller did not do. The wait for SCM to let go of a pid whose
+/// process is gone ends at `deadline`, and is [`HoldOutcome::Expired`]: a `stop` sends its STOP all
+/// the same. A service gone since it was read has none. The service handle the hold used is closed
+/// before this returns, or the service could not be deleted.
 fn hold_process(id: &Id, deadline: Deadline, not_done: &str) -> Result<HoldOutcome<Held>> {
-    holding(id, not_done, HoldOutcome::NoProcess, |target| {
-        hold_if_possible(target, deadline)
-    })
-}
-
-/// [`hold_process`] with no bound, for an uninstall: its answer is the process, or none, and cannot
-/// be an expiry.
-fn hold_process_unbounded(id: &Id, not_done: &str) -> Result<Option<Held>> {
-    holding(id, not_done, None, hold_if_possible_unbounded)
+    let not_done = |e: Error| Error::Step {
+        what: not_done.to_string(),
+        source: Box::new(e),
+    };
+    let (_scm, service) = match open_existing(id, ServiceAccess::QUERY_STATUS) {
+        Ok(opened) => opened,
+        Err(Error::NotInstalled { .. }) => return Ok(HoldOutcome::NoProcess),
+        Err(e) => return Err(not_done(e)),
+    };
+    let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
+    hold_if_possible(&mut target, deadline)
+        .map_err(|e| not_done(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)))
 }
 
 /// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]
@@ -1140,27 +1188,16 @@ fn end_held(id: &Id, held: Held, deadline: Deadline) -> std::io::Result<EndProce
     })
 }
 
-/// What [`hold_process`] and [`hold_process_unbounded`] share: `hold` run on a target for `id` whose
-/// process is opened with the rights to terminate it and to wait for its exit, with a failure to read
-/// SCM led by `not_done`, and `gone` when `id` is gone since it was read (`uninstall_locked` finds it
-/// gone too).
-fn holding<R>(
-    id: &Id,
-    not_done: &str,
-    gone: R,
-    hold: impl FnOnce(&mut super::kill::SystemKillTarget) -> std::io::Result<R>,
-) -> Result<R> {
-    let not_done = |e: Error| Error::Step {
-        what: not_done.to_string(),
-        source: Box::new(e),
-    };
-    let (_scm, service) = match open_existing(id, ServiceAccess::QUERY_STATUS) {
-        Ok(opened) => opened,
-        Err(Error::NotInstalled { .. }) => return Ok(gone),
-        Err(e) => return Err(not_done(e)),
-    };
-    let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
-    hold(&mut target).map_err(|e| not_done(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)))
+/// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not open, for
+/// `reason`: led by what that left undone, with the class of `error`.
+fn unwaited(id: &Id, reason: std::io::Error, error: Error) -> Error {
+    Error::Step {
+        what: format!(
+            "goetia could not open `{id}`'s process ({}), so it could not wait for the process to exit",
+            Chain(&reason)
+        ),
+        source: Box::new(error),
+    }
 }
 
 /// The error of a `stop` whose hold expired and whose STOP was sent with nothing held: the
@@ -1177,6 +1214,52 @@ fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
 }
 
 impl Scm {
+    /// The folder of the provider, as an uninstall tells it: [`ProviderFolder::None`] without a
+    /// provider, the normalised folder of the host its `preview` names, and
+    /// [`ProviderFolder::Unknown`] when the `preview` fails, which is not the absence of a provider:
+    /// the failure comes with it, for the uninstall to report.
+    fn provider_folder(&self) -> (ProviderFolder, Option<Error>) {
+        let Some(shim) = &self.shim else {
+            return (ProviderFolder::None, None);
+        };
+        match shim.preview() {
+            Ok(command) => match command.exe.parent() {
+                Some(folder) => (ProviderFolder::At(normalise(folder)), None),
+                None => (ProviderFolder::Unknown, None),
+            },
+            Err(e) => (
+                ProviderFolder::Unknown,
+                Some(Error::Step {
+                    what: "the folder of this program's shim provider could not be determined".to_string(),
+                    source: Box::new(e),
+                }),
+            ),
+        }
+    }
+
+    /// The error of an uninstall that deleted `id` but did not clean up its shim files, because the
+    /// read of its registered host failed with `unread`: the host is not known, so nothing was
+    /// waited for or swept. Told as [`finish_uninstall`](Self::finish_uninstall) tells a cleanup that
+    /// failed, with the retry that applies.
+    fn cleanup_skipped(&self, id: &Id, unread: Error) -> Error {
+        let (provider, unknown) = self.provider_folder();
+        let skipped = Error::Step {
+            what: format!("`{id}`'s host could not be read, so no shim file of it was waited for or swept"),
+            source: Box::new(unread),
+        };
+        let cause = match unknown {
+            Some(unknown) => Error::Both {
+                first: Box::new(skipped),
+                then: Box::new(unknown),
+            },
+            None => skipped,
+        };
+        Error::Step {
+            what: left_behind_text(id, &provider, None, &[]),
+            source: Box::new(cause),
+        }
+    }
+
     /// What an uninstall does once `id` is stopped and deleted, for a service whose host was the shim
     /// file `host`: ends the process that was held, as the documentation of `SetServiceStatus`
     /// allows once `SERVICE_STOPPED` is reported, and waits, with no bound, for it to exit (SCM
@@ -1194,21 +1277,17 @@ impl Scm {
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
     /// runs it is in use, and is skipped without an error: the next sweep removes it once it is free.
-    fn finish_uninstall(&self, id: &Id, host: &Path, held: Option<Held>) -> Result<()> {
+    fn finish_uninstall(&self, id: &Id, host: &Path, process: HoldOutcome<Held>) -> Result<()> {
         let host = normalise(host);
-        let provider_folder = self
-            .shim
-            .as_ref()
-            .and_then(|shim| shim.preview().ok())
-            .and_then(|command| command.exe.parent().map(normalise));
+        let (provider, unknown) = self.provider_folder();
         // A second folder is the host's folder only when it is the default, and that is what its
         // sweep removes it by. The provider asks where the default folder is too, so a lookup that
         // fails can be reported twice. When it cannot be located the host's folder may be it, so it
         // is named, not swept, and nothing else is skipped.
-        let mut failures: Vec<SweepFailure> = Vec::new();
+        let mut failures: Vec<SweepFailure> = unknown.map(SweepFailure::from).into_iter().collect();
         let (second, unswept) = match host
             .parent()
-            .map(|folder| second_folder(folder, provider_folder.as_deref(), || Ok(normalise(&default_dir()?))))
+            .map(|folder| second_folder(folder, provider.path(), || Ok(normalise(&default_dir()?))))
             .transpose()
         {
             Ok(second) => (second.flatten(), second.flatten()),
@@ -1221,24 +1300,31 @@ impl Scm {
             SweepFailure::all(failures).map_or(Ok(()), |failure| {
                 let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
                 Err(Error::Step {
-                    what: left_behind_text(id, provider_folder.as_deref(), unswept, &files),
+                    what: left_behind_text(id, &provider, unswept, &files),
                     source: failure.error,
                 })
             })
         };
-        if let Some(held) = held {
+        match process {
             // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
             // ended, through the handle held since before the stop, and waited for as `stop` waits
             // for it (see [`end_held`]), with no bound: the shim exits by itself after it reports
             // `STOPPED`, and the terminate is a backstop.
-            match end_held(id, held, Budget::Unbounded.start()) {
+            HoldOutcome::Held(held) => match end_held(id, held, Budget::Unbounded.start()) {
                 Ok(EndProcessOutcome::Exited) => {}
                 Ok(EndProcessOutcome::Lingers { .. }) => unreachable!("an unbounded deadline never expires"),
                 Err(e) => {
                     failures.push(Error::os(format!("wait for `{id}`'s process to exit"), e).into());
                     return finish(failures);
                 }
+            },
+            HoldOutcome::NoProcess => {}
+            // Not waited for, and said so: the file it runs stays until it exits, and the sweep below
+            // keeps it by its image.
+            HoldOutcome::Refused(reason) => {
+                failures.push(Error::os(format!("open `{id}`'s process to wait for its exit"), reason).into())
             }
+            HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
         }
         // After the wait: what has exited no longer references its file.
         let referenced = match referenced_hosts() {

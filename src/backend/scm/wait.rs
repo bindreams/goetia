@@ -268,7 +268,8 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
 ) -> io::Result<StopAndAwaitExitOutcome<P>> {
     let held = match held {
         HoldOutcome::Held(process) => Some(process),
-        HoldOutcome::NoProcess => None,
+        // Why a refused process is not held is the caller's to report: it knows where.
+        HoldOutcome::NoProcess | HoldOutcome::Refused(_) => None,
         HoldOutcome::Expired { pid } => {
             control_stop_or_underway(a)?;
             return Ok(StopAndAwaitExitOutcome::Unconfirmed { pid });
