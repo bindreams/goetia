@@ -83,9 +83,16 @@ fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning>), 
 
 /// [`resolve`], with the native backend named rather than detected.
 ///
-/// Production's only caller is [`resolve`], with [`BackendKind::native`]. Tests pass any of the
-/// three, since the native arm of steps 4 and 5 is otherwise reachable only from one platform.
+/// Production's only caller is [`resolve`], with [`BackendKind::native`]. Resolution reads the
+/// host's path style from `std::path`, so a named backend's path style must be the host's
+/// (systemd and launchd on Unix, the SCM on Windows); a test simulates only such a backend, or none.
 fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Result<(DaemonSpec, Vec<Warning>), Error> {
+    #[cfg(test)]
+    debug_assert!(
+        native.is_none_or(|b| crate::spec::test_support::HOST_BACKENDS.contains(&b)),
+        "`{native:?}` does not share this host's path style"
+    );
+
     // Before `absolutize`, which can push a manifest-level advisory (a drive-relative `-f`).
     let mut warnings = Vec::new();
 
