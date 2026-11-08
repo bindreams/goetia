@@ -43,6 +43,8 @@ mod windows {
     use std::io::{self, Cursor, Read, Write as _};
     use std::path::{Path, PathBuf};
 
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
+
     use super::stock::*;
     use super::*;
     use crate::backend::scm::shim::acl::{CheckPermissions, Descriptor, FolderCheck};
@@ -219,6 +221,59 @@ mod windows {
             assert_eq!(streamed, whole, "step {step}");
         }
         assert_eq!(hash_reader(Cursor::new(Vec::new())).unwrap(), Image::new(b"").digest());
+    }
+
+    #[skuld::test]
+    fn the_folders_to_create_are_those_below_the_first_that_exists_outermost_first() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            root.path().join("a"),
+            root.path().join("a").join("b"),
+            root.path().join("a").join("b").join("c"),
+        );
+
+        assert_eq!(missing_components(&c).unwrap(), [a.clone(), b.clone(), c.clone()]);
+        std::fs::create_dir(&a).unwrap();
+        assert_eq!(missing_components(&c).unwrap(), [b, c]);
+        assert!(missing_components(&a).unwrap().is_empty());
+    }
+
+    /// A folder found missing that exists when it is created was made by someone else in between,
+    /// which goetia cannot tell from a hostile one: it is refused, not adopted.
+    #[skuld::test]
+    fn a_folder_that_appeared_after_it_was_found_missing_is_refused() {
+        let path = Path::new(r"C:\Goetia");
+
+        let refused = created(path, io::Error::from_raw_os_error(ERROR_ALREADY_EXISTS as i32));
+        let failed = created(path, io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+
+        let Error::Step { what, source } = &refused else {
+            panic!("expected a refusal, got {refused:?}");
+        };
+        assert!(what.contains(r"C:\Goetia") && what.contains("appeared"), "{what}");
+        assert!(matches!(**source, Error::AlreadyExists { .. }), "{source:?}");
+        assert!(matches!(failed, Error::Os { .. }), "{failed:?}");
+    }
+
+    /// The race itself needs a folder to appear between the two steps, which no test can arrange
+    /// without a seam: the folder that "appeared" is one already in the list.
+    #[skuld::test(requires = [elevated], labels = [ELEVATED])]
+    fn creating_stops_at_a_folder_that_exists_and_leaves_it_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let (made, taken, after) = (
+            root.path().join("made"),
+            root.path().join("taken"),
+            root.path().join("after"),
+        );
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::write(taken.join("theirs"), b"x").unwrap();
+
+        let refused = create_each(&[made.clone(), taken.clone(), after.clone()]).unwrap_err();
+
+        assert!(matches!(refused, Error::Step { .. }), "{refused:?}");
+        assert!(made.is_dir(), "what came before is goetia's own");
+        assert!(!after.exists(), "nothing is created past the refusal");
+        assert!(taken.join("theirs").is_file(), "the folder that was there is untouched");
     }
 
     /// What `inspect` says of `path`, as the provider asks it, for the image of `b"abc"`.

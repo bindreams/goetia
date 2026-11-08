@@ -297,9 +297,15 @@ mod stock {
     /// The core of every `provide`: the file for `image` in `dir`, checked, written or repaired.
     fn provide_in(dir: &Path, image: &Image<'_>, folders: &FolderCheck) -> Result<HostCommand> {
         let command = preview_in(dir, image)?;
+        // Before anything is created, so that a folder under an unsafe ancestor is refused without
+        // a trace. For a folder that does not exist this judges its first existing ancestor alone.
         folders.check(dir)?;
         require_acls_under(dir)?;
         create_missing(dir)?;
+        // After: the folder itself, which a non-administrator could have made just before this
+        // process did (`create_missing` refuses that) or been left with its ancestor's permissions.
+        // Nothing reads, writes, renames or deletes in `dir` before this.
+        folders.check(dir)?;
         let file = Descriptor::for_file()?;
         match inspect(&command.exe, image, &file.wanted()?)? {
             Existing::Good => {}
@@ -315,22 +321,54 @@ mod stock {
     /// Creates the folders of `dir` that do not exist, outermost first, with the permissions of a
     /// shim folder.
     fn create_missing(dir: &Path) -> Result<()> {
+        create_each(&missing_components(dir)?)
+    }
+
+    /// The folders of `dir` that do not exist, outermost first: those below its first existing
+    /// ancestor.
+    pub(super) fn missing_components(dir: &Path) -> Result<Vec<PathBuf>> {
         let mut missing = Vec::new();
         for ancestor in dir.ancestors() {
             match fs::symlink_metadata(ancestor) {
                 Ok(_) => break,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(ancestor),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(ancestor.to_path_buf()),
                 Err(e) => return Err(Error::os_at("read the type of", ancestor, e)),
             }
         }
-        if missing.is_empty() {
+        missing.reverse();
+        Ok(missing)
+    }
+
+    /// Creates each of `paths` in order, as a shim folder, each one with a call that fails when it
+    /// exists, so that goetia never adopts a folder it did not make: see [`created`].
+    pub(super) fn create_each(paths: &[PathBuf]) -> Result<()> {
+        if paths.is_empty() {
             return Ok(());
         }
         let folder = Descriptor::for_folder()?;
-        for path in missing.into_iter().rev() {
-            folder.create_dir(path).map_err(|e| Error::os_at("create", path, e))?;
+        for path in paths {
+            folder.create_dir(path).map_err(|e| created(path, e))?;
         }
         Ok(())
+    }
+
+    /// The error for `error`, from creating `path`, which was found missing. A folder that exists
+    /// now was made by someone else since, and goetia cannot tell a hostile one from another's (a
+    /// non-administrator can add folders under `C:\`, and could leave a link): it is refused.
+    pub(super) fn created(path: &Path, error: io::Error) -> Error {
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Error::os_at("create", path, error);
+        }
+        Error::Step {
+            what: format!(
+                "refusing `{}` for the shim: it appeared after goetia found it missing, so goetia did not make it \
+                 and cannot vouch for it",
+                path.display()
+            ),
+            source: Box::new(Error::AlreadyExists {
+                path: path.to_path_buf(),
+            }),
+        }
     }
 
     /// What `inspect` found at the file's path.

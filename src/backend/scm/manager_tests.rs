@@ -734,6 +734,30 @@ fn a_provided_host_that_is_not_the_rendered_one_is_a_mismatch() {
     assert_eq!((*said, *gave), (rendered, provided));
 }
 
+/// The sweep before a provide runs in the host's folder only when it exists and passes the check: a
+/// folder that is missing has nothing to sweep and could be made by someone else before the sweep,
+/// and one that fails the check is not goetia's to delete in (the provide refuses it, with the
+/// reason).
+#[skuld::test]
+fn the_sweep_before_a_provide_is_of_a_folder_that_exists_and_passes_the_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let (off, on) = (
+        FolderCheck::new(CheckPermissions::Disable),
+        FolderCheck::new(CheckPermissions::Enable),
+    );
+
+    assert!(sweepable(&off, &dir.path().join("host.exe")));
+    assert!(!sweepable(&off, &dir.path().join("missing").join("host.exe")));
+    assert!(
+        !sweepable(&off, Path::new("host.exe")),
+        "a host with no folder has none to sweep"
+    );
+    assert!(
+        !sweepable(&on, &dir.path().join("host.exe")),
+        "a folder in the temp directory gives its owner's account rights over it"
+    );
+}
+
 /// Every refusal `render_for_install` makes comes before the lock is taken and before the provider
 /// writes: a refused install leaves no file behind. The install flow renders before it begins, and
 /// `begin_install` renders nothing.
