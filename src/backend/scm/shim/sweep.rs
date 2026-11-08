@@ -312,7 +312,7 @@ mod system {
         // Opened by the first service whose key cannot be read, and kept for the rest of the scan:
         // most scans never need it.
         let mut scm = None;
-        let unfinished = registry::scan_services(|name| {
+        let unfinished = registry::scan_services(|name, _services| {
             let through_scm = || {
                 let scm = match &mut scm {
                     Some(scm) => scm,

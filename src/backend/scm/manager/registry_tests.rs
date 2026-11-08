@@ -1,6 +1,11 @@
 use super::*;
 
+use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
 use winreg::types::ToRegValue as _;
+
+use crate::backend::test_elevation::{ELEVATED, elevated};
+use crate::backend::test_raw_registry::{create_link, create_raw_key};
+use crate::backend::test_scratch::ScratchKey;
 
 #[skuld::test]
 fn service_key_path_is_under_current_control_set_services() {
@@ -18,37 +23,185 @@ fn parameters_key_path_is_the_service_key_plus_parameters() {
     );
 }
 
+/// A read opens `Parameters` in one open, relative to `Services`, and asks nothing of the service
+/// key it passes through, which a service that is not goetia's may deny to the reader.
 #[skuld::test]
-fn an_absent_environment_value_is_no_lines() {
-    assert_eq!(environment_lines(None), Vec::<String>::new());
-}
+fn parameters_are_opened_in_one_step_below_services_for_reading_only() {
+    let (name, access) = parameters_read_request("goetia-test");
 
-/// A `REG_MULTI_SZ` made of exactly `units`, with no terminator added.
-fn multi_sz(units: &[u16]) -> RawValue {
-    RawValue {
-        vtype: REG_MULTI_SZ,
-        bytes: units.iter().flat_map(|u| u.to_le_bytes()).collect(),
-    }
+    assert_eq!(name, utf16(r"goetia-test\Parameters"));
+    assert_eq!(access, KEY_READ);
 }
 
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
+#[skuld::test]
+fn a_stray_is_a_present_name_that_is_none_of_the_wanted_fields_in_any_case() {
+    let wanted = BTreeMap::from([
+        ("Marker".to_string(), "m".to_string()),
+        ("Spec".to_string(), "s".to_string()),
+    ]);
+    // `Schema` is one of Goetia's fields but not wanted here, so it is as stray as `Stray`; a name
+    // that is not valid UTF-16 is none of the fields.
+    let invalid = vec![0x4D, 0xD800];
+    let present: Vec<RawEntry> = ["marker", "SPEC", "Stray", "Marker2", "schema"]
+        .map(entry)
+        .into_iter()
+        .chain([RawEntry::new(invalid.clone(), 1)])
+        .collect();
+    let found: Vec<&Vec<u16>> = strays(&present, &wanted).map(|entry| &entry.name).collect();
+    assert_eq!(found, [&utf16("Stray"), &utf16("Marker2"), &utf16("schema"), &invalid]);
+}
+
+fn entry(name: &str) -> RawEntry {
+    RawEntry::new(utf16(name), 1)
+}
+
+/// The decode happens once, when the entry is made, and says which field the name spells.
+#[skuld::test]
+fn an_entry_knows_which_field_its_name_spells_in_any_case() {
+    assert_eq!(entry("sPeC").field, Some("Spec"));
+    assert_eq!(entry("Spec\0").field, None);
+    assert_eq!(RawEntry::new(vec![0x4D, 0xD800], 1).field, None);
+}
+
+#[skuld::test]
+fn a_field_is_named_as_the_enumeration_stored_it() {
+    let entries = [entry("Stray"), entry("sPeC"), entry("Spec\0")];
+
+    assert_eq!(stored_name(&entries, "Spec"), utf16("sPeC"));
+}
+
+#[skuld::test]
+fn a_field_the_enumeration_missed_is_named_as_goetia_spells_it() {
+    assert_eq!(stored_name(&[entry("Stray")], "Spec"), utf16("Spec"));
+}
+
+const NOT_FOUND: i32 = 2;
+const KEY_DELETED: i32 = ERROR_KEY_DELETED as i32;
+
+fn failed_with(code: i32) -> Failure {
+    failure("open", "Services", std::io::Error::from_raw_os_error(code))
+}
+
+fn os_code(error: &Error) -> Option<i32> {
+    error.raw_os_error()
+}
+
+#[skuld::test]
+fn a_read_that_finds_no_optional_key_under_a_service_that_is_gone_is_service_gone() {
+    let read = read_settled(
+        Origin::Opened,
+        || Ok(false),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || Err(Stop::at_open(failed_with(NOT_FOUND), Some(7))),
+    );
+
+    assert!(matches!(read, Ok(RegistryReadOutcome::ServiceGone)));
+}
+
+#[skuld::test]
+fn a_read_that_finds_no_optional_key_under_a_service_that_stands_is_the_empty_value() {
+    let read = read_settled(
+        Origin::Opened,
+        || Ok(true),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || Err(Stop::at_open(failed_with(NOT_FOUND), Some(7))),
+    );
+
+    assert!(matches!(read, Ok(RegistryReadOutcome::Read(7))));
+}
+
+#[skuld::test]
+fn a_key_that_vanishes_under_a_service_that_stands_fails_with_the_cause_it_met() {
+    let read = read_settled(
+        Origin::Opened,
+        || Ok(true),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || Err::<(), _>(Stop::mid_read(failed_with(KEY_DELETED))),
+    );
+
+    assert_eq!(read.err().and_then(|e| os_code(&e)), Some(KEY_DELETED));
+}
+
+#[skuld::test]
+fn a_pass_that_completes_is_its_value_without_asking_whether_the_service_stands() {
+    let read = read_settled(
+        Origin::Opened,
+        || panic!("the service's existence is asked only after a pass stops"),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || Ok(7),
+    );
+
+    assert!(matches!(read, Ok(RegistryReadOutcome::Read(7))));
+}
+
+/// What a scripted call does: sets the size and type it reports, and returns its status.
+fn scripted<const N: usize>(steps: [(u32, u32, u32); N]) -> impl FnMut(*mut u8, &mut u32, &mut u32) -> u32 {
+    let mut steps = steps.into_iter();
+    move |_data, len, vtype| {
+        let (status, size, reported_type) = steps.next().expect("the call ran more often than scripted");
+        *len = size;
+        *vtype = reported_type;
+        status
+    }
+}
+
+#[skuld::test]
+fn a_read_that_reports_more_data_grows_the_buffer_to_the_size_reported_and_asks_again() {
+    let mut buffer = vec![0u8; 4];
+    let mut call = scripted([(ERROR_MORE_DATA, 600, 0), (ERROR_SUCCESS, 10, 1)]);
+
+    let read = read_growing(&mut buffer, &mut call);
+
+    assert_eq!(read, Ok((1, 10)));
+    assert_eq!(buffer.len(), 600);
+}
+
+#[skuld::test]
+fn a_read_that_reports_more_data_without_a_larger_size_returns_that_status() {
+    let mut buffer = vec![0u8; 4];
+    let mut call = scripted([(ERROR_MORE_DATA, 4, 0)]);
+
+    assert_eq!(read_growing(&mut buffer, &mut call), Err(ERROR_MORE_DATA));
+    assert_eq!(buffer.len(), 4);
+}
+
+#[skuld::test]
+fn a_read_that_fails_otherwise_returns_that_status() {
+    let mut buffer = vec![0u8; 4];
+    let mut call = scripted([(5, 0, 0)]);
+
+    assert_eq!(read_growing(&mut buffer, &mut call), Err(5));
+}
+
+#[skuld::test]
+fn an_absent_environment_value_is_no_lines() {
+    assert_eq!(environment_lines(None), Vec::<String>::new());
+}
+
+/// A `REG_MULTI_SZ` made of exactly `units`, with no terminator added.
+fn multi_sz(units: &[u16]) -> (u32, Vec<u8>) {
+    (REG_MULTI_SZ, units.iter().flat_map(|u| u.to_le_bytes()).collect())
+}
+
 /// The bytes `write_environment` writes for `lines`, through the same `winreg` encoder.
-fn goetia_multi_sz(lines: &[&str]) -> RawValue {
+fn goetia_multi_sz(lines: &[&str]) -> (u32, Vec<u8>) {
     let owned: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     let written = owned.to_reg_value();
-    RawValue {
-        vtype: written.vtype as u32,
-        bytes: written.bytes.into_owned(),
-    }
+    (written.vtype as u32, written.bytes.into_owned())
+}
+
+fn lines_of((vtype, bytes): &(u32, Vec<u8>)) -> Vec<String> {
+    environment_lines(Some((*vtype, bytes)))
 }
 
 /// Only a value byte-identical to what goetia writes may read as the lines it was written from, so
 /// that `decide` calls nothing else `UpToDate`.
-fn assert_not_read_as(what: &str, value: RawValue, desired: &[&str]) {
-    let lines = environment_lines(Some(value));
+fn assert_not_read_as(what: &str, value: (u32, Vec<u8>), desired: &[&str]) {
+    let lines = lines_of(&value);
     assert_ne!(
         lines, desired,
         "{what}: {lines:?} must differ from what goetia would write"
@@ -62,7 +215,7 @@ fn assert_not_read_as(what: &str, value: RawValue, desired: &[&str]) {
 #[skuld::test]
 fn the_bytes_goetia_writes_read_back_as_the_lines() {
     let lines = ["A=1", "B=x y", "C=\u{FFFD}"];
-    assert_eq!(environment_lines(Some(goetia_multi_sz(&lines))), lines);
+    assert_eq!(lines_of(&goetia_multi_sz(&lines)), lines);
 }
 
 /// `winreg` reads an empty `REG_MULTI_SZ` as one empty string, and `write_environment` writes an empty
@@ -88,14 +241,14 @@ fn a_lone_surrogate_is_not_the_replacement_character() {
 fn a_surrogate_pair_is_one_character() {
     let mut units = utf16("A=\u{1F600}");
     units.extend([0, 0]);
-    assert_eq!(environment_lines(Some(multi_sz(&units))), ["A=\u{1F600}"]);
+    assert_eq!(lines_of(&multi_sz(&units)), ["A=\u{1F600}"]);
 }
 
 /// Dropping a trailing odd byte reads `A=1` plus half a unit as `A=1`.
 #[skuld::test]
 fn an_odd_trailing_byte_is_not_dropped() {
     let mut value = goetia_multi_sz(&["A=1"]);
-    value.bytes.push(0x41);
+    value.1.push(0x41);
     assert_not_read_as("an odd byte", value, &["A=1"]);
 }
 
@@ -124,11 +277,7 @@ fn a_nul_layout_other_than_goetias_is_not_read_as_the_lines() {
 #[skuld::test]
 fn an_environment_value_of_another_type_is_one_marker_line_naming_its_type() {
     let written = "A=1".to_reg_value();
-    let value = RawValue {
-        vtype: written.vtype as u32,
-        bytes: written.bytes.into_owned(),
-    };
-    let lines = environment_lines(Some(value));
+    let lines = lines_of(&(written.vtype as u32, written.bytes.into_owned()));
 
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(!lines[0].contains('='), "{lines:?}");
@@ -139,11 +288,7 @@ fn an_environment_value_of_another_type_is_one_marker_line_naming_its_type() {
 #[skuld::test]
 fn an_environment_value_of_an_unknown_type_is_one_marker_line_naming_its_number() {
     for vtype in [12u32, 0xFFFF] {
-        let value = RawValue {
-            vtype,
-            bytes: b"A=1".to_vec(),
-        };
-        let lines = environment_lines(Some(value));
+        let lines = lines_of(&(vtype, b"A=1".to_vec()));
 
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(!lines[0].contains('='), "{lines:?}");
@@ -194,7 +339,7 @@ fn a_parameters_read_that_did_not_complete_is_undetermined() {
 fn the_services_key_enumerates_and_finishes() {
     let mut names = Vec::new();
 
-    let incomplete = scan_services(|name| names.push(name));
+    let incomplete = scan_services(|name, _| names.push(name));
 
     assert!(!names.is_empty(), "every Windows host runs services: {names:?}");
     assert!(
@@ -210,7 +355,7 @@ fn the_services_key_enumerates_and_finishes() {
 fn a_services_key_that_does_not_exist_is_an_empty_settled_scan() {
     let mut names = Vec::new();
 
-    let incomplete = scan_names_under(&format!(r"{SERVICES_KEY}\goetia-no-such-key-b6f0a1c2"), |name| {
+    let incomplete = scan_names_under(&format!(r"{SERVICES_KEY}\goetia-no-such-key-b6f0a1c2"), |name, _| {
         names.push(name)
     });
 
@@ -246,7 +391,7 @@ fn a_services_key_that_will_not_open_leaves_the_pass_unfinished() {
     );
     let mut names = Vec::new();
 
-    let incomplete = scan_names_under("SECURITY", |name| names.push(name));
+    let incomplete = scan_names_under("SECURITY", |name, _| names.push(name));
 
     assert!(names.is_empty(), "{names:?}");
     match incomplete {
@@ -283,4 +428,60 @@ fn an_event_message_file_needs_a_system_root() {
         let message = e.to_string();
         assert!(message.contains("SystemRoot"), "{message}");
     }
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. A read classifies a `Parameters` that is a link as not
+/// goetia's, so a write meets one only when it appeared after the read: this drives
+/// `create_parameters_key` directly, with a scratch key for the service key. Writing through the
+/// link is denied (a link key takes no value but its `SymbolicLinkValue`), and would change a key
+/// goetia does not own: the link is deleted, a real key made, and the target left as it was.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_parameters_that_is_a_link_is_replaced_by_a_real_key_and_its_target_is_left_alone() {
+    let unique = std::process::id();
+    // The target first, so that it is removed last.
+    let target = ScratchKey::new(&format!("parameters-link-target-{unique}"));
+    let service = ScratchKey::new(&format!("parameters-link-service-{unique}"));
+    let target_key = target.create();
+    target_key.set_value("Keep", &"x").expect("write Keep");
+    target_key.set_value("Marker", &"not goetia's").expect("write Marker");
+    let service_key = service.create();
+    let _link = create_link(&service_key, "Parameters", &target.nt_path());
+
+    let key = create_parameters_key(&service_key).expect("replace the link");
+    key.set_value("Marker", &"goetia's").expect("write through the new key");
+    drop(key);
+
+    // Opened as itself, `Parameters` is a real key: it holds no `SymbolicLinkValue`, and the value
+    // written is in it. Opened as every other reader does, it is the same key, not the target.
+    let as_itself = create_raw_key(&service_key, &utf16("Parameters"), 0);
+    let link_value = as_itself.get_raw_value("SymbolicLinkValue");
+    assert!(
+        link_value
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "Parameters is still a link: {link_value:?}"
+    );
+    assert_eq!(
+        as_itself.get_value::<String, _>("Marker").expect("read Marker"),
+        "goetia's"
+    );
+    let followed = service_key.open_subkey("Parameters").expect("open Parameters");
+    assert_eq!(
+        followed.get_value::<String, _>("Marker").expect("read Marker"),
+        "goetia's"
+    );
+    assert!(
+        followed.get_value::<String, _>("Keep").is_err(),
+        "Parameters shows the target's `Keep`"
+    );
+
+    // The target holds exactly what it did.
+    let mut names: Vec<String> = target_key.enum_values().map(|v| v.expect("enumerate").0).collect();
+    names.sort();
+    assert_eq!(names, ["Keep", "Marker"]);
+    assert_eq!(target_key.get_value::<String, _>("Keep").expect("read Keep"), "x");
+    assert_eq!(
+        target_key.get_value::<String, _>("Marker").expect("read Marker"),
+        "not goetia's"
+    );
 }

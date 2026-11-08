@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use goetia::backend::scm::exit_status::{ERROR_INVALID_DATA, RecordedExit};
+use goetia::backend::scm::exit_status::{RecordedExit, SHIM_REFUSED};
 use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonFields, DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
@@ -185,12 +185,15 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log() {
         "the start failure does not say the blob could not be read: {text}"
     );
 
-    // The shim's own failure, in the Win32 space: it cannot read as a daemon's exit code.
+    // The shim's refusal: Win32 0, which SCM's recovery never restarts, and its own specific code.
     let status = scm_status(&id);
     assert_eq!(
-        status.exit_code,
-        ServiceExitCode::Win32(ERROR_INVALID_DATA),
-        "an undecodable blob is a shim failure: {status:?}"
+        recorded_exit(&id),
+        RecordedExit {
+            win32: 0,
+            specific: SHIM_REFUSED
+        },
+        "an undecodable blob is a refusal: {status:?}"
     );
 
     let fallback_log = support::shim_default_log(logs.path(), &id);

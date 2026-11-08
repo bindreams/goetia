@@ -124,11 +124,12 @@ winreg = "0.56"
 # checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
 # (`manager::identity`), `CommandLineToArgvW` for readback (SCM stores
 # `executable`+`arguments` pre-joined into one command line), and
-# `RegQueryValueExW`, which reads an `Environment` value of any type where
-# `winreg` fails on one above `REG_QWORD` (`manager::registry`), and the owner
-# and DACL reads of the shim folder check (`scm::shim::acl`), the protected DACL a shim file
-# is created with, and `%ProgramFiles%` (`SHGetKnownFolderPath`, whose string `CoTaskMemFree`
-# releases: `Win32_System_Com`).
+# `RegQueryValueExW` and `RegEnumValueW`, which read an `Environment` or `Parameters` value of any
+# type where `winreg` fails on one above `REG_QWORD`, and `NtDeleteValueKey` and `NtOpenKey`, which
+# remove a name that holds a NUL by its stated length where `RegDeleteValueW` would stop at it
+# (`manager::registry`); the owner and DACL reads of the shim folder check (`scm::shim::acl`), the
+# protected DACL a shim file is created with, and `%ProgramFiles%` (`SHGetKnownFolderPath`, whose
+# string `CoTaskMemFree` releases: `Win32_System_Com`).
 #
 # The shim (`src/backend/scm/shim/run/`) adds `Win32_System_EventLog`, the
 # version-skew/log-path-denied fallback channel — see
@@ -150,6 +151,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    "Wdk_Foundation",
+    "Wdk_System_Registry",
 ] }
 
 [dev-dependencies]

@@ -94,7 +94,6 @@
 pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
 
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
@@ -105,16 +104,17 @@ use windows_service::service::{
     ServiceInfo, ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree,
-};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree};
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
+use self::registry::{Origin, RegistryReadOutcome};
+use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{StopAndAwaitExitOutcome, Waited};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HoldOutcome, hold_if_possible, hold_if_possible_unbounded};
+use crate::backend::scm::parameters::Parameters;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
@@ -192,7 +192,7 @@ pub(crate) struct ScmSnapshot {
     id: Id,
     blob: Decoded,
     /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
-    parameters: BTreeMap<String, String>,
+    parameters: Parameters,
     /// The one object every query of this snapshot asks, so that a service deleted and recreated
     /// meanwhile cannot answer part of them: the one `read` opened to classify it, or, for what
     /// `scan` saw (which opens no service), the one [`Self::service`] opens on first use.
@@ -204,7 +204,7 @@ pub(crate) struct ScmSnapshot {
 }
 
 /// What `read_marker` hands on of a service: its `Parameters` and the object `read` opened.
-type Opened = (BTreeMap<String, String>, Option<Service>);
+type Opened = (Parameters, Option<Service>);
 
 impl ScmSnapshot {
     fn new(id: Id, blob: Decoded, (parameters, opened): Opened) -> Self {
@@ -367,7 +367,11 @@ impl Backend for Scm {
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), e)),
         };
-        Ok(read_marker(registry::read_parameters(id.as_str())?, Some(service)).named(id, ScmSnapshot::new))
+        // `service` is open: the service key outlives it, so no second open asks whether it stands.
+        Ok(match registry::read_parameters(id.as_str(), Origin::Vouched)? {
+            RegistryReadOutcome::ServiceGone => ReadOutcome::Absent,
+            RegistryReadOutcome::Read(parameters) => read_marker(parameters, Some(service)).named(id, ScmSnapshot::new),
+        })
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
@@ -408,15 +412,20 @@ impl Backend for Scm {
     fn scan(&self) -> Scan<ScmSnapshot> {
         let mut entries = Vec::new();
         let mut unreadable: Vec<Unreadable> = Vec::new();
-        let incomplete = registry::scan_services(|name| {
+        let incomplete = registry::scan_services(|name, services| {
             // A registry read failure for one unrelated service (e.g. a driver whose `Parameters`
             // key carries a restrictive ACL) must not take `list` down for every other daemon. It
             // leaves us unable to tell whether `name` carries goetia's marker at all, so it is
             // neither omitted nor claimed: collected whole here, reported by
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
-            match registry::read_parameters(&name) {
-                Ok(params) => {
+            match registry::read_parameters_in(services, &name, Origin::Vouched) {
+                // Gone since `scan_services` listed it: not there to list. Only a `Parameters` key
+                // lost (marked deleted at open, or gone mid-read) reaches this, with the service
+                // key gone too; a plain missing key reads as a service that stands without it, a
+                // stale row at worst.
+                Ok(RegistryReadOutcome::ServiceGone) => {}
+                Ok(RegistryReadOutcome::Read(params)) => {
                     let entry = ScanEntry::of(&name, read_marker(params, None), ScmSnapshot::new);
                     entries.push((name, entry));
                 }
@@ -592,8 +601,8 @@ impl Backend for Scm {
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
 /// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
 /// has no second proof of ownership.
-fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
-    let blob = match generate::extract(&parameters) {
+fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
+    let blob = match generate::extract(&parameters.fields, &parameters.strays) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
         Ok(Some(blob)) => Ok(blob),
         Err(e) => Err(Arc::new(e)),
@@ -611,17 +620,13 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
 /// name, not a `DaemonSpec` to hand to `render`, and must not pull in
 /// `ServiceManager`'s effectful install path just to read one value.
 ///
-/// `Ok(None)` means no `Marker` at all: unreachable in practice (SCM only
-/// ever launches the shim against a service *this backend itself* created
-/// with `ImagePath` naming the shim, and `apply` always writes `Parameters`
-/// immediately after), but returned rather than folded into `Err` so a
-/// caller can still tell "no marker" apart from "a marker that fails to
-/// decode" — the shim's own version-skew handling (see
-/// `shim::run::logging`) needs exactly that distinction to phrase its
-/// failure message.
+/// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no goetia `Marker` (none, or
+/// another service's own), kept apart from `Err` so callers can tell it from an undecodable spec.
 pub(crate) fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
-    let params = registry::read_parameters(id)?;
-    generate::extract(&params)
+    match registry::read_parameters(id, Origin::Opened)? {
+        RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),
+        RegistryReadOutcome::Read(params) => generate::extract(&params.fields, &params.strays),
+    }
 }
 
 /// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not
@@ -657,7 +662,7 @@ fn read_live_registration(
     cfg: &ServiceConfig,
     service: &Service,
     name: &str,
-    live_params: &BTreeMap<String, String>,
+    live_params: &Parameters,
 ) -> Result<ScmRegistration> {
     let cmdline = cfg.executable_path.to_string_lossy().into_owned();
     let (executable, arguments) = split_command_line(&cmdline);
@@ -675,7 +680,10 @@ fn read_live_registration(
         // one-off `LocalSystem`-only filter.
         .and_then(|a| generate::canonical_account(&a));
     let failure_actions = read_failure_actions(service, name)?;
-    let environment = registry::read_environment(name)?;
+    let environment = match registry::read_environment(name)? {
+        RegistryReadOutcome::ServiceGone => return Err(Error::NotInstalled { id: name.to_string() }),
+        RegistryReadOutcome::Read(lines) => lines,
+    };
 
     Ok(ScmRegistration {
         name: name.to_string(),
@@ -685,7 +693,8 @@ fn read_live_registration(
         account,
         failure_actions,
         environment,
-        parameters: live_params.clone(),
+        parameters: live_params.fields.clone(),
+        stray_parameters: live_params.strays.clone(),
     })
 }
 

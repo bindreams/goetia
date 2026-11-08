@@ -5,7 +5,10 @@ pub mod generate;
 pub(crate) mod kill;
 #[cfg(windows)]
 pub mod manager;
+pub mod parameters;
 pub(crate) mod shim;
+#[cfg(test)]
+pub(crate) mod test_support;
 // `pub` on Windows for the shim integration tests and the marker-inertness probe
 // (through `tests/support/scm_wait.rs`); crate-private elsewhere. Declared last because
 // `cargo fmt` sorts these alphabetically and would move a comment placed above `manager` onto it.

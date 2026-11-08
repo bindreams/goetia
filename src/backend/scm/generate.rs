@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backend::Identity;
+use crate::backend::scm::parameters::{Stray, field_named_utf16, is_string_type, type_name};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
@@ -56,10 +57,11 @@ use crate::spec::{DaemonSpec, Kind, Restart, User, scm_restart_delay, windows_bu
 /// Byte-exact per the Global Constraints: the same four names every embed
 /// site (systemd's `[X-Goetia]`, launchd's comment block, SCM's
 /// `Parameters`) uses.
-const FIELD_MARKER: &str = "Marker";
+pub(crate) const FIELD_MARKER: &str = "Marker";
 const FIELD_SCHEMA: &str = "Schema";
 const FIELD_VERSION: &str = "Version";
 const FIELD_SPEC: &str = "Spec";
+pub(crate) const FIELDS: [&str; 4] = [FIELD_MARKER, FIELD_SCHEMA, FIELD_VERSION, FIELD_SPEC];
 
 // Constants ===========================================================================================================
 
@@ -107,6 +109,9 @@ pub struct ScmRegistration {
     /// The `Services\<name>\Parameters` values, including the metadata blob
     /// (`Marker`/`Schema`/`Version`/`Spec`).
     pub parameters: BTreeMap<String, String>,
+    /// What else `Parameters` holds: empty for a registration built from a spec, and drift in a
+    /// readback, which [`Display`](fmt::Display) shows and `install --force` clears.
+    pub stray_parameters: Vec<Stray>,
 }
 
 /// SCM recovery-action configuration. Only takes effect together with
@@ -232,6 +237,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>
         failure_actions,
         environment,
         parameters,
+        stray_parameters: Vec::new(),
     })
 }
 
@@ -374,95 +380,45 @@ pub fn account_needs_password(account: Option<&str>) -> bool {
 
 // Extraction ==========================================================================================================
 
-/// Recover the embedded metadata blob from a service's `Parameters` values.
-///
-/// Returns `Ok(None)` only when `Marker` is absent — an ordinary foreign
-/// service, not one Goetia manages. Once `Marker` is present, every other
-/// defect (a value that doesn't match, a missing field, a `Schema`/`Version`
-/// that disagrees with what `Spec` itself decodes to, an undecodable `Spec`)
-/// is `Err`: a `Parameters` key set that merely *claims* to be ours must
-/// check out completely, not be partially trusted.
-///
-/// Field lookups are case-insensitive — `Services\<name>\Parameters` value
-/// names are, to `RegQueryValueEx`, so a case-sensitive lookup here would
-/// misclassify a hand-repaired or differently-cased write as foreign. See
-/// `get_field`.
-pub fn extract(parameters: &BTreeMap<String, String>) -> Result<Option<Blob>, Error> {
-    let Some(marker) = get_field(parameters, FIELD_MARKER)? else {
+/// Recover the embedded metadata blob from a service's `Parameters`: `Ok(None)` when it holds no
+/// `Marker` (a foreign service). With one, `Spec` must decode: a missing or undecodable one is
+/// `Err`, never partially trusted. `Schema` and `Version` are copies for a human and are not read.
+/// `fields` and `strays` are those of [`Parameters`](crate::backend::scm::parameters::Parameters);
+/// `strays` only lets the error say that a `Spec` is stored as something other than a string, or as
+/// a string that is not text.
+pub fn extract(fields: &BTreeMap<String, String>, strays: &[Stray]) -> Result<Option<Blob>, Error> {
+    if !fields.contains_key(FIELD_MARKER) {
         return Ok(None);
+    }
+    let Some(spec_text) = fields.get(FIELD_SPEC) else {
+        return Err(missing_spec_error(strays));
     };
-    if marker != blob::MARKER {
-        return Err(Error::blob(format!(
-            "Parameters\\{FIELD_MARKER} is `{marker}`, not `{expected}`",
-            expected = blob::MARKER
-        )));
-    }
-
-    let schema_text = get_field(parameters, FIELD_SCHEMA)?.ok_or_else(|| missing_field_error(FIELD_SCHEMA))?;
-    let schema: u32 = schema_text.parse().map_err(|source| {
-        Error::blob_from(
-            format!("Parameters\\{FIELD_SCHEMA} `{schema_text}` is not an integer"),
-            source,
-        )
-    })?;
-
-    let version_text = get_field(parameters, FIELD_VERSION)?.ok_or_else(|| missing_field_error(FIELD_VERSION))?;
-
-    let spec_text = get_field(parameters, FIELD_SPEC)?.ok_or_else(|| missing_field_error(FIELD_SPEC))?;
-    let blob = blob::decode(spec_text)?;
-
-    // `Schema`/`Version` are written redundantly with what `Spec` already
-    // carries, purely so a reader doesn't have to base64-decode and parse
-    // JSON to know them — but "redundant" must still mean "consistent".
-    // Accepting a `Parameters` set whose flat `Schema`/`Version` disagree
-    // with the blob sitting beside them would be exactly the "partially
-    // trusted" outcome this function's contract above already rules out.
-    if schema != blob.schema {
-        return Err(Error::blob(format!(
-            "Parameters\\{FIELD_SCHEMA} is `{schema}`, but Parameters\\{FIELD_SPEC} decodes to schema `{actual}`",
-            actual = blob.schema
-        )));
-    }
-    if version_text != blob.version {
-        return Err(Error::blob(format!(
-            "Parameters\\{FIELD_VERSION} is `{version_text}`, but Parameters\\{FIELD_SPEC} decodes to version \
-             `{actual}`",
-            actual = blob.version
-        )));
-    }
-
-    Ok(Some(blob))
+    Ok(Some(blob::decode(spec_text)?))
 }
 
-/// Look up `field` in `parameters` case-insensitively (ASCII-only: every
-/// field name Goetia itself writes and looks for — `Marker`, `Schema`,
-/// `Version`, `Spec` — is plain ASCII, so no Unicode case-folding is
-/// needed). Deliberately scoped to one field name at a time rather than
-/// folding the whole map: two *unrelated* values under some other
-/// application's own differently-cased keys are none of Goetia's business
-/// unless Goetia is actually trying to interpret one of its own four field
-/// names. More than one key matching `field` case-insensitively is itself
-/// an error rather than a silent pick of whichever `BTreeMap` iteration
-/// visits first — the same "don't silently choose" reasoning as
-/// `spec::raw`'s duplicate-id check.
-fn get_field<'a>(parameters: &'a BTreeMap<String, String>, field: &str) -> Result<Option<&'a str>, Error> {
-    let mut found: Option<&str> = None;
-    for (key, value) in parameters {
-        if key.eq_ignore_ascii_case(field) {
-            if found.is_some() {
-                return Err(Error::blob(format!(
-                    "Parameters has more than one value spelled `{field}` case-insensitively"
-                )));
-            }
-            found = Some(value.as_str());
-        }
-    }
-    Ok(found)
+/// Goetia's spelling of the field `name` spells in any ASCII case, or `None` for any other name.
+/// ASCII-only: all four field names are plain ASCII, so no Unicode case-folding is needed. The
+/// registry compares value names this way, so a stored `marker` is the `Marker` goetia writes.
+pub(crate) fn field_named(name: &str) -> Option<&'static str> {
+    FIELDS.into_iter().find(|field| field.eq_ignore_ascii_case(name))
 }
 
-fn missing_field_error(field: &str) -> Error {
+fn missing_spec_error(strays: &[Stray]) -> Error {
+    let stored = strays.iter().find_map(|stray| match stray {
+        Stray::Value { name, vtype } if field_named_utf16(name) == Some(FIELD_SPEC) => Some(*vtype),
+        _ => None,
+    });
+    let what = match stored {
+        // `string_text` refused it: a NUL inside the text, an odd byte count or invalid UTF-16.
+        Some(vtype) if is_string_type(vtype) => format!(
+            "a {} that is not valid text: a NUL inside the text, an odd byte count or invalid UTF-16",
+            type_name(vtype)
+        ),
+        Some(vtype) => format!("stored as {}, not as a string", type_name(vtype)),
+        None => "missing".to_string(),
+    };
     Error::blob(format!(
-        "Parameters\\{FIELD_MARKER} is present but Parameters\\{field} is missing"
+        "Parameters\\{FIELD_MARKER} is present but Parameters\\{FIELD_SPEC} is {what}"
     ))
 }
 
@@ -512,6 +468,12 @@ impl fmt::Display for ScmRegistration {
         writeln!(out, "Parameters:")?;
         for (key, value) in &self.parameters {
             writeln!(out, "  {key}: {value:?}")?;
+        }
+        if !self.stray_parameters.is_empty() {
+            writeln!(out, "Stray parameters:")?;
+            for stray in &self.stray_parameters {
+                writeln!(out, "  {stray}")?;
+            }
         }
         Ok(())
     }

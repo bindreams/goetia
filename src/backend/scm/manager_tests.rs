@@ -3,15 +3,18 @@
 //! (everything that actually talks to SCM) is covered by
 //! `tests/scm_integration.rs` instead.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use super::*;
+use crate::backend::scm::parameters::Stray;
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, FolderCheck, HostCommand, ShimProvider, SweepFailure};
 use crate::spec::Restart;
 use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{AccountId, DaemonFields, User};
+use windows_sys::Win32::System::Registry::REG_DWORD;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     ScmRegistration {
@@ -23,6 +26,7 @@ fn dummy_reg(account: Option<&str>) -> ScmRegistration {
         failure_actions: None,
         environment: vec![],
         parameters: BTreeMap::new(),
+        stray_parameters: Vec::new(),
     }
 }
 
@@ -441,17 +445,30 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
 #[skuld::test]
 fn read_marker_sorts_parameters_into_foreign_and_marked() {
     let spec = blob_of(Kind::Managed).spec;
-    let ours = BTreeMap::from([
-        ("Marker".to_string(), crate::blob::MARKER.to_string()),
-        ("Schema".to_string(), crate::blob::SCHEMA.to_string()),
-        ("Version".to_string(), crate::version().to_string()),
-        ("Spec".to_string(), crate::blob::encode(&spec)),
-    ]);
-    let torn = BTreeMap::from([("Marker".to_string(), crate::blob::MARKER.to_string())]);
+    let ours = Parameters {
+        fields: BTreeMap::from([
+            ("Marker".to_string(), crate::blob::MARKER.to_string()),
+            ("Schema".to_string(), crate::blob::SCHEMA.to_string()),
+            ("Version".to_string(), crate::version().to_string()),
+            ("Spec".to_string(), crate::blob::encode(&spec)),
+        ]),
+        strays: vec![Stray::Subkey { name: vec![0x41] }],
+    };
+    let torn = Parameters {
+        fields: BTreeMap::from([("Marker".to_string(), crate::blob::MARKER.to_string())]),
+        strays: Vec::new(),
+    };
 
     let id = Id::try_from("frpc").unwrap();
     assert!(matches!(
-        read_marker(BTreeMap::new(), None),
+        read_marker(Parameters::default(), None),
+        ReadOutcome::Foreign { recovery: None }
+    ));
+    // A `Marker` that is no goetia string reads as a stray, not a field: no marker.
+    let mut foreign = Parameters::default();
+    foreign.add_value("Marker".encode_utf16().collect(), REG_DWORD, &[1, 0, 0, 0]);
+    assert!(matches!(
+        read_marker(foreign, None),
         ReadOutcome::Foreign { recovery: None }
     ));
     match read_marker(ours.clone(), None).named(&id, ScmSnapshot::new) {
@@ -542,7 +559,7 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
         ("Spec".to_string(), crate::blob::encode(&spec)),
     ]);
 
-    let blob = generate::extract(&parameters)
+    let blob = generate::extract(&parameters, &[])
         .expect("the blob decodes")
         .expect("the blob is ours");
 
@@ -743,7 +760,7 @@ fn snapshot_with_config(spec: &DaemonSpec, command_line: &str) -> ScmSnapshot {
         version: crate::version().to_string(),
         spec: spec.clone(),
     };
-    let snapshot = ScmSnapshot::new(spec.id.clone(), Ok(blob), (BTreeMap::new(), None));
+    let snapshot = ScmSnapshot::new(spec.id.clone(), Ok(blob), (Parameters::default(), None));
     let config = windows_service::service::ServiceConfig {
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::OnDemand,

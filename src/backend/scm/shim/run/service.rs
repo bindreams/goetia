@@ -12,6 +12,8 @@ use crate::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
 };
 use crate::backend::scm::manager::read_spec_blob;
+use crate::blob::Blob;
+use crate::error::Error;
 use crate::spec::{DaemonSpec, Restart};
 use cosca::{Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
@@ -70,29 +72,11 @@ fn run_service(id: &str) {
         }
     };
 
-    let blob = match read_spec_blob(id) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            log.failure(
-                id,
-                "no Goetia metadata found under Services\\<id>\\Parameters (Marker absent) — this service was \
-                 not created by `goetia daemon install`",
-            );
-            finish(
-                &log,
-                id,
-                status_handle,
-                Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
-            );
-        }
-        Err(e) => {
-            log.failure(id, &format!("decode metadata blob: {}", e.report()));
-            finish(
-                &log,
-                id,
-                status_handle,
-                Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)),
-            );
+    let blob = match spec_read(id, read_spec_blob(id)) {
+        Ok(blob) => blob,
+        Err(stop) => {
+            log.failure(id, &stop.message);
+            finish(&log, id, status_handle, stop.reported);
         }
     };
 
@@ -106,6 +90,46 @@ fn run_service(id: &str) {
         || report_stopping(&log, id, status_handle),
     );
     finish(&log, id, status_handle, reported);
+}
+
+/// Why the shim reads no spec to run, and what it tells SCM.
+#[derive(Debug)]
+struct SpecStop {
+    message: String,
+    reported: Reported,
+}
+
+/// The shim refuses ([`Reported::Refused`]) only when the service is gone, has no goetia marker or
+/// has an undecodable spec; every other error is a restartable failure carrying the OS error the
+/// read met, or `ERROR_INVALID_DATA`.
+fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob, SpecStop> {
+    let refused = |message: String| SpecStop {
+        message,
+        reported: Reported::Refused,
+    };
+    let e = match read {
+        Ok(Some(blob)) => return Ok(blob),
+        Ok(None) => {
+            return Err(refused(format!(
+                r"no Goetia marker found under Services\{id}\Parameters: this service was not created by `goetia daemon install`"
+            )));
+        }
+        Err(e) => e,
+    };
+    let mut cause = e.cause();
+    while let Error::Kept(kept) = cause {
+        cause = kept.cause();
+    }
+    match cause {
+        Error::NotInstalled { .. } => Err(refused(format!(
+            r"Services\{id} is gone, or this service's record does not name it: no daemon was started"
+        ))),
+        Error::Blob { .. } | Error::Invalid { .. } => Err(refused(format!("decode metadata blob: {}", e.report()))),
+        _ => Err(SpecStop {
+            message: format!(r"read the metadata under Services\{id}\Parameters: {}", e.report()),
+            reported: Reported::shim_failure(Some(e.raw_os_error().unwrap_or(ERROR_INVALID_DATA as i32))),
+        }),
+    }
 }
 
 /// Tell SCM the service stopped, then end the process. SCM restarts the service or not from
