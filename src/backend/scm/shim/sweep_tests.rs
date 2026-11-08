@@ -421,6 +421,27 @@ mod windows {
     use crate::backend::scm::shim::acl::acl_tests::windows::junction;
     use crate::error::Error;
 
+    /// What `--json` reports is the exact text of the reason an enumeration stopped; only the
+    /// human report escapes it.
+    #[skuld::test]
+    fn an_enumeration_that_stopped_keeps_the_exact_text_of_its_reason() {
+        let entry = crate::manager::Installed::Undetermined {
+            name: None,
+            reason: crate::error::Reason::said("stopped\u{1b}[31m"),
+        };
+
+        let e = super::system::why_unfinished(entry);
+
+        assert_eq!(
+            e.report_unescaped().to_string(),
+            "failed to enumerate the services: stopped\u{1b}[31m"
+        );
+        assert_eq!(
+            e.report().to_string(),
+            "failed to enumerate the services: stopped\\u{1b}[31m"
+        );
+    }
+
     const HEX_C: &str = "cc7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     const HEX_F: &str = "ff7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 

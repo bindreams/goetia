@@ -238,13 +238,12 @@ pub enum Error {
 
     /// A file that is to be the shim host carries the marker of another goetia version. Hosts and
     /// the program that installs them are built from one checkout, so this is a stale file. `found`
-    /// is the file's own bytes, written escaped, and at most `expected`'s length plus one. No OS
-    /// call failed.
+    /// is the file's own bytes, exactly (the output sink escapes them), and at most `expected`'s
+    /// length plus one. No OS call failed.
     #[error(
         "{} is a goetia service host of version {found}, and this goetia is version {expected}: rebuild the host \
          with this version",
-        path.display(),
-        found = found.escape_debug()
+        path.display()
     )]
     ShimMarkerVersion {
         path: PathBuf,

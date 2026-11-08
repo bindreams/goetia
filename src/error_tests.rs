@@ -790,16 +790,25 @@ fn report_of_a_missing_sibling_shim_names_its_path() {
     assert!(std::error::Error::source(&e).is_none());
 }
 
+/// The error holds the file's exact bytes: the human report escapes them, as it does every quoted
+/// value, and the `--json` report writes them as they are. A backslash is not doubled.
 #[skuld::test]
-fn report_of_a_host_version_writes_the_file_supplied_bytes_escaped() {
+fn report_of_a_host_version_holds_the_file_supplied_bytes_exactly_and_the_sink_escapes() {
     let e = Error::ShimMarkerVersion {
         path: PathBuf::from("/h.exe"),
-        found: "\u{1b}[31m\n".to_string(),
+        found: "\u{1b}[31m\n\\".to_string(),
         expected: "0.2.0".to_string(),
     };
-    let report = e.report().to_string();
-    assert!(report.contains("version \\u{1b}[31m\\n,"), "{report}");
-    assert!(!report.contains('\u{1b}') && !report.contains('\n'), "{report:?}");
+    assert_eq!(
+        e.report().to_string(),
+        "/h.exe is a goetia service host of version \\u{1b}[31m\\u{a}\\, and this goetia is version 0.2.0: rebuild \
+         the host with this version"
+    );
+    assert_eq!(
+        e.report_unescaped().to_string(),
+        "/h.exe is a goetia service host of version \u{1b}[31m\n\\, and this goetia is version 0.2.0: rebuild the \
+         host with this version"
+    );
 }
 
 #[skuld::test]

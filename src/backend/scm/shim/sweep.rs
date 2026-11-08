@@ -373,15 +373,17 @@ mod system {
 
     /// The error that stands for an enumeration that stopped, which `scan_services` reports as the
     /// `list` entry it leaves behind.
-    fn why_unfinished(entry: Installed) -> Error {
+    pub(super) fn why_unfinished(entry: Installed) -> Error {
         match entry {
             Installed::Undetermined {
                 reason: Reason::Around { error, .. } | Reason::Failed(error),
                 ..
             } => Error::Kept(error),
-            Installed::Undetermined { reason, .. } => {
-                Error::os("enumerate the services", io::Error::other(reason.to_string()))
-            }
+            // The exact text: the report escapes it for a person, and `--json` reports it as it is.
+            Installed::Undetermined { reason, .. } => Error::os(
+                "enumerate the services",
+                io::Error::other(reason.unescaped().to_string()),
+            ),
             _ => Error::os(
                 "enumerate the services",
                 io::Error::other("the enumeration did not finish"),
