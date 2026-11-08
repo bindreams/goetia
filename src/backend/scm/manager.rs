@@ -582,24 +582,30 @@ impl Backend for Scm {
 }
 
 /// `provided`, the host `provide` returned, when it is `rendered`, the host the registration names.
-/// When it is not, `preview` is asked once more, which is pure: a `preview` that now names `provided`
-/// says the host changed while the install waited for the lock ([`Error::ShimHostChanged`], run the
-/// install again); any other answer is a provider whose `preview` and `provide` disagree
-/// ([`Error::ShimProviderDisagrees`], which running again would not fix).
+/// When it is not, `preview` is asked once more, which is pure, and only an answer equal to
+/// `rendered` proves a provider whose `preview` and `provide` disagree
+/// ([`Error::ShimProviderDisagrees`], which running again would not fix). Any other answer, a third
+/// host or a failed `preview` (kept as the changed host's cause), is a host that changed while the
+/// install waited for the lock ([`Error::ShimHostChanged`], run the install again).
 fn confirm_provided(shim: &dyn ShimProvider, rendered: HostCommand, provided: HostCommand) -> Result<HostCommand> {
     if provided == rendered {
         return Ok(provided);
     }
-    Err(if shim.preview()? == provided {
-        Error::ShimHostChanged {
-            rendered: Box::new(rendered),
-            provided: Box::new(provided),
-        }
-    } else {
-        Error::ShimProviderDisagrees {
+    Err(match shim.preview() {
+        Ok(again) if again == rendered => Error::ShimProviderDisagrees {
             previewed: Box::new(rendered),
             provided: Box::new(provided),
-        }
+        },
+        Ok(_) => Error::ShimHostChanged {
+            rendered: Box::new(rendered),
+            provided: Box::new(provided),
+            preview_failed: None,
+        },
+        Err(failed) => Error::ShimHostChanged {
+            rendered: Box::new(rendered),
+            provided: Box::new(provided),
+            preview_failed: Some(Box::new(failed)),
+        },
     })
 }
 

@@ -163,6 +163,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
                 exe: PathBuf::new(),
                 args: vec![],
             }),
+            preview_failed: None,
         },
         Error::ShimProviderDisagrees {
             previewed: Box::new(crate::shim::HostCommand {
@@ -830,16 +831,42 @@ fn report_of_a_host_changed_while_the_install_waited_says_what_to_do() {
     let e = Error::ShimHostChanged {
         rendered: Box::new(host("/a/old.exe")),
         provided: Box::new(host("/a/new.exe")),
+        preview_failed: None,
     };
     assert_eq!(
         e.report().to_string(),
         "the service host changed while this install waited for the install lock: it was /a/old.exe \
-         [\"--service-host\"] when the install began and is /a/new.exe [\"--service-host\"] now. Nothing was \
-         registered. Run the install again to use the new one. The file just provided stays; the provider's next \
-         sweep may remove it if nothing references it"
+         [\"--service-host\"] when the install began, and the provider has since provided /a/new.exe \
+         [\"--service-host\"]. Nothing was registered. Run the install again to use the current one. The file \
+         just provided stays; the provider's next sweep may remove it if nothing references it"
     );
     assert!(!e.is_indeterminate());
     assert!(std::error::Error::source(&e).is_none());
+}
+
+/// A changed host whose second `preview` failed writes that failure as it writes any embedded
+/// error, once, inside the sentence; it is not the error's source.
+#[skuld::test]
+fn report_of_a_host_changed_whose_preview_failed_writes_that_failure_once() {
+    let host = |exe: &str| crate::shim::HostCommand {
+        exe: PathBuf::from(exe),
+        args: vec![],
+    };
+    let e = Error::ShimHostChanged {
+        rendered: Box::new(host("/a/old.exe")),
+        provided: Box::new(host("/a/new.exe")),
+        preview_failed: Some(Box::new(os("locate the host", "/a", "denied"))),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "the service host changed while this install waited for the install lock: it was /a/old.exe [] when the \
+         install began, the provider has since provided /a/new.exe [], and asking it which host it names now \
+         failed (failed to locate the host /a: denied). Nothing was registered. Run the install again to use \
+         the current one. The file just provided stays; the provider's next sweep may remove it if nothing \
+         references it"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+    assert!(!e.is_indeterminate());
 }
 
 #[skuld::test]

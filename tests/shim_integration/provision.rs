@@ -735,6 +735,7 @@ fn install_refuses_a_host_that_changed_after_the_render() {
         Err(Error::ShimHostChanged {
             rendered: said,
             provided: gave,
+            preview_failed: None,
         }) => assert_eq!((*said, *gave), (command(rendered), command(upgraded))),
         other => panic!("a host other than the one the registration names must be refused, got {other:?}"),
     }
