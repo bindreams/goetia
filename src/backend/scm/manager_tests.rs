@@ -443,7 +443,7 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
 #[skuld::test]
 fn a_service_scm_holds_whose_registry_key_is_gone_is_undetermined_naming_the_key() {
     let Err(Error::Undetermined { id, reason, .. }) =
-        held_service_parameters("held", registry::RegistryReadOutcome::ServiceGone)
+        held_service("held", registry::RegistryReadOutcome::<Vec<String>>::ServiceGone)
     else {
         panic!("a held service whose key is gone must be undetermined");
     };
@@ -458,7 +458,7 @@ fn a_service_scm_holds_whose_registry_key_is_gone_is_undetermined_naming_the_key
 
 #[skuld::test]
 fn a_service_scm_holds_with_a_registry_read_is_that_read() {
-    let read = held_service_parameters("held", registry::RegistryReadOutcome::Read(Parameters::default()));
+    let read = held_service("held", registry::RegistryReadOutcome::Read(Parameters::default()));
 
     assert!(read.is_ok());
 }

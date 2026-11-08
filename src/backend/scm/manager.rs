@@ -236,7 +236,7 @@ impl Backend for Scm {
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), e)),
         };
-        let parameters = held_service_parameters(id.as_str(), registry::read_parameters(id.as_str())?)?;
+        let parameters = held_service(id.as_str(), registry::read_parameters(id.as_str())?)?;
         Ok(read_marker(parameters, Some(service)).named(id, ScmSnapshot::new))
     }
 
@@ -399,11 +399,11 @@ impl Backend for Scm {
     }
 }
 
-/// `read`, of a service SCM has open: SCM says the service exists, so a registry that finds its key
-/// gone disagrees with SCM, and the read failed. The service is neither absent nor foreign.
-fn held_service_parameters(id: &str, read: RegistryReadOutcome<Parameters>) -> Result<Parameters> {
+/// A registry read of a service SCM has open: SCM says the service exists, so a registry that finds
+/// its key gone disagrees with SCM, and the read failed. The service is neither absent nor foreign.
+fn held_service<T>(id: &str, read: RegistryReadOutcome<T>) -> Result<T> {
     match read {
-        RegistryReadOutcome::Read(parameters) => Ok(parameters),
+        RegistryReadOutcome::Read(value) => Ok(value),
         RegistryReadOutcome::ServiceGone => Err(registry::missing_service_key(id)),
     }
 }
@@ -519,10 +519,7 @@ fn read_live_registration(
         // one-off `LocalSystem`-only filter.
         .and_then(|a| generate::canonical_account(&a));
     let failure_actions = read_failure_actions(service, name)?;
-    let environment = match registry::read_environment(name)? {
-        RegistryReadOutcome::ServiceGone => return Err(Error::NotInstalled { id: name.to_string() }),
-        RegistryReadOutcome::Read(lines) => lines,
-    };
+    let environment = held_service(name, registry::read_environment(name)?)?;
 
     Ok((
         ScmRegistration {

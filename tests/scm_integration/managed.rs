@@ -1705,8 +1705,10 @@ impl Drop for SwappedServiceKey {
     /// Never panics, so a drop that runs while the test unwinds still goes on.
     fn drop(&mut self) {
         let put_back = || -> std::io::Result<()> {
-            let (key, _) = services_key().create_subkey(&self.id)?;
-            self.saved.create().copy_tree("service", &key)
+            let (key, _) = try_services_key()?.create_subkey(&self.id)?;
+            let saved =
+                winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(self.saved.path(), KEY_READ)?;
+            saved.copy_tree("service", &key)
         };
         support::cleanup::warn_left_behind(support::cleanup::retrying(|| {
             put_back()
@@ -1716,10 +1718,12 @@ impl Drop for SwappedServiceKey {
     }
 }
 
+fn try_services_key() -> std::io::Result<winreg::RegKey> {
+    winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(support::SCM_SERVICES_KEY, KEY_READ | KEY_WRITE)
+}
+
 fn services_key() -> winreg::RegKey {
-    winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(support::SCM_SERVICES_KEY, KEY_READ | KEY_WRITE)
-        .expect("open Services")
+    try_services_key().expect("open Services")
 }
 
 /// A service key that is a registry link to a missing key is a key SCM has a service at, but nothing
@@ -1766,6 +1770,52 @@ fn a_service_key_that_is_a_link_to_a_missing_key_is_undetermined_for_list_and_st
     assert!(
         matches!(&err, goetia::Error::Undetermined { id: reported, .. } if reported == &id),
         "{err:?}"
+    );
+}
+
+/// The service key taken out with nothing in its place, while SCM still opens the service: the
+/// registry disagrees with SCM, so `status` is `Undetermined` naming the missing key, neither absent
+/// nor foreign. `list` enumerates `Services`, where the key is not, so it has nothing to report for
+/// the id: it is not listed.
+///
+/// `SCM_DENIAL`: `status` here is `Undetermined`, and the service is a stranger to concurrent
+/// `list()` assertions.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
+fn a_service_scm_holds_whose_key_is_gone_is_undetermined_for_status_and_not_listed() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    seed_foreign(&id);
+    let _swapped = SwappedServiceKey::take_out(&id, ScratchKey::new(&format!("gone-saved-{id}")));
+
+    let scm = WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+    scm.open_service(&id, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)
+        .unwrap_or_else(|e| panic!("SCM must still open a service whose key is gone: {e}"));
+
+    let err = mgr
+        .status(&id_of(&id))
+        .expect_err("a service SCM holds whose key is gone is not absent");
+    let goetia::Error::Undetermined {
+        id: reported, reason, ..
+    } = &err
+    else {
+        panic!("{err:?}");
+    };
+    assert_eq!(reported, &id);
+    let reason = reason.report().to_string();
+    assert!(
+        reason.contains(&support::registry::service_path(&id)),
+        "the reason must name the missing service key: {reason}"
+    );
+
+    let listed = mgr.list().expect("list");
+    assert!(
+        !listed.iter().any(|entry| match entry {
+            Installed::Ours { spec, .. } => spec.id.as_str() == id,
+            Installed::OursUnusable { name, .. } | Installed::Undetermined { name: Some(name), .. } => name == &id,
+            Installed::Undetermined { name: None, .. } => false,
+        }),
+        "a key that is not under Services is not enumerated: {listed:?}"
     );
 }
 
