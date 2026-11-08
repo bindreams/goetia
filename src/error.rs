@@ -313,10 +313,11 @@ pub enum Error {
     #[error("{}", shim_lock_denied(owner))]
     ShimLockDenied { owner: Option<String> },
 
-    /// The `ImagePath` of the service `name` could be read neither from its registry key nor
-    /// through SCM, which the chain holds, so what it references is unknown. A remedy, which follows
-    /// the chain: see [`remedy`](Error::remedy).
-    #[error("read the image path of the service `{name}`, which neither its registry key nor SCM answered")]
+    /// SCM could not give the `ImagePath` of the service `name`, and its registry key gave none (the
+    /// read failed, or said the service is gone, which is not taken as proof), as the chain holds, so
+    /// what it references is unknown. A remedy, which follows the chain: see
+    /// [`remedy`](Error::remedy).
+    #[error("read the image path of the service `{name}`, which SCM could not give and its registry key did not")]
     ServiceImageUnreadable {
         name: String,
         #[source]

@@ -243,6 +243,21 @@ fn when_both_fail_the_error_names_the_service_and_says_who_can_fix_it() {
     );
 }
 
+/// The sentence is true whether the registry key failed or said the service is gone: either way it
+/// gave no image, and SCM could not either.
+#[skuld::test]
+fn the_error_says_neither_scm_nor_the_registry_key_gave_the_image() {
+    let sentence = "read the image path of the service `frpc`, which SCM could not give and its registry key did not";
+    let failed = image_of("frpc", Err(denied("open the key")), || Err(denied("query the service"))).unwrap_err();
+    let gone = image_of("frpc", Ok(RegistryReadOutcome::ServiceGone), || {
+        Err(denied("query the service"))
+    })
+    .unwrap_err();
+
+    assert_eq!(failed.to_string(), sentence);
+    assert_eq!(gone.to_string(), sentence);
+}
+
 /// The registry read and the SCM read are told apart, and the advice fits whichever failed: SCM may
 /// have failed for a reason making the key readable does not touch.
 #[skuld::test]
