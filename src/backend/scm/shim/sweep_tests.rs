@@ -489,7 +489,19 @@ mod windows {
     use super::system::{expand_environment, remove_if_empty_default};
     use super::*;
     use crate::backend::scm::shim::acl::acl_tests::windows::junction;
+    use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
     use crate::error::Error;
+
+    /// No check on the folder.
+    fn off() -> FolderCheck {
+        FolderCheck::new(CheckPermissions::Disable)
+    }
+
+    /// The check a program uses: a folder in the temp directory fails it, since its owner's account
+    /// has rights over it.
+    fn on() -> FolderCheck {
+        FolderCheck::new(CheckPermissions::Enable)
+    }
 
     /// What `--json` reports is the exact text of the reason an enumeration stopped; only the
     /// human report escapes it.
@@ -600,7 +612,7 @@ mod windows {
         let other = dir.path().join("notes.txt");
         fs::write(&other, b"x").unwrap();
 
-        let failure = sweep_folder(dir.path(), &[], elsewhere).expect_err("three files cannot be deleted");
+        let failure = sweep_folder(dir.path(), &[], &off(), elsewhere).expect_err("three files cannot be deleted");
 
         let held_paths: Vec<PathBuf> = held.iter().map(|(path, _)| path.clone()).collect();
         assert_eq!(
@@ -627,7 +639,7 @@ mod windows {
         fs::write(&swept, b"x").unwrap();
 
         // The reference is spelled another way than the folder: both are normalised.
-        sweep_folder(dir.path(), &[normalise(&short(&kept))], elsewhere).unwrap();
+        sweep_folder(dir.path(), &[normalise(&short(&kept))], &off(), elsewhere).unwrap();
 
         assert!(kept.exists());
         assert!(!swept.exists());
@@ -641,7 +653,7 @@ mod windows {
         fs::create_dir(&aside).unwrap();
         fs::write(aside.join("inside"), b"x").unwrap();
 
-        sweep_folder(dir.path(), &[], elsewhere).unwrap();
+        sweep_folder(dir.path(), &[], &off(), elsewhere).unwrap();
 
         assert!(!aside.exists());
     }
@@ -654,18 +666,50 @@ mod windows {
         let not_a_folder = dir.path().join("file.txt");
         fs::write(&not_a_folder, b"x").unwrap();
 
-        let failure = sweep_folder(&not_a_folder, &[], elsewhere).expect_err("a file cannot be listed");
+        let failure = sweep_folder(&not_a_folder, &[], &off(), elsewhere).expect_err("a file cannot be listed");
 
         let report = failure.error.report().to_string();
         assert_eq!(report.matches("file.txt").count(), 1, "{report}");
         assert!(failure.not_deleted.is_empty(), "nothing was tried to be deleted");
     }
 
+    /// A folder that is not there has nothing to sweep, and is not checked: the check would judge
+    /// its first existing ancestor, which a folder made by someone else meanwhile is not.
     #[skuld::test]
-    fn sweep_of_a_folder_that_is_not_there_is_nothing_to_do() {
+    fn sweep_of_a_folder_that_is_not_there_is_skipped_before_the_check() {
         let dir = tempfile::tempdir().unwrap();
 
-        sweep_folder(&dir.path().join("missing"), &[], elsewhere).unwrap();
+        sweep_folder(&dir.path().join("missing"), &[], &on(), elsewhere)
+            .expect("a folder in the temp directory would be refused, if it were checked");
+    }
+
+    /// A folder whose metadata cannot be read is not known to be absent: it is a failure of the
+    /// sweep, with the path, and nothing is swept or removed.
+    #[skuld::test]
+    fn a_folder_whose_metadata_cannot_be_read_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        // `?` is not valid in a name: the answer is not "not found".
+        let unreadable = dir.path().join("what?");
+
+        let failure = sweep_folder(&unreadable, &[], &off(), elsewhere).expect_err("not known to be absent");
+
+        let report = failure.error.report().to_string();
+        assert!(report.contains("what?"), "{report}");
+        assert!(failure.not_deleted.is_empty());
+    }
+
+    /// A folder the check refuses is not swept, and the refusal is the sweep's failure.
+    #[skuld::test]
+    fn a_folder_the_check_refuses_is_not_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = shim_in(dir.path(), HEX_A);
+        fs::write(&file, b"x").unwrap();
+
+        let failure = sweep_folder(dir.path(), &[], &on(), elsewhere)
+            .expect_err("a folder in the temp directory gives its owner's account rights over it");
+
+        assert!(matches!(*failure.error, Error::ShimFolderUnsafe { .. }), "{failure:?}");
+        assert!(file.exists(), "a refused folder is not swept");
     }
 
     #[skuld::test]
@@ -695,17 +739,17 @@ mod windows {
         let folder = dir.path().join("Goetia");
         fs::create_dir(&folder).unwrap();
 
-        sweep_folder(&folder, &[], elsewhere).unwrap();
+        sweep_folder(&folder, &[], &off(), elsewhere).unwrap();
         assert!(folder.is_dir(), "a folder that is not the default stays");
 
-        sweep_folder(&folder, &[], || Ok(folder.clone())).unwrap();
+        sweep_folder(&folder, &[], &off(), || Ok(folder.clone())).unwrap();
         assert!(!folder.exists());
     }
 
     #[skuld::test]
     fn the_sweep_reports_a_default_that_could_not_be_resolved_when_the_folder_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let failure = sweep_folder(dir.path(), &[], || {
+        let failure = sweep_folder(dir.path(), &[], &off(), || {
             Err(Error::os("locate %ProgramFiles%", std::io::Error::other("no")))
         })
         .expect_err("an empty folder needs the answer");

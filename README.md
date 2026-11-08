@@ -764,7 +764,10 @@ while `status`, `list`, `type: managed` installs and `uninstall` work.
 `CheckPermissions::Disable` turns off only the permission check, of the host's
 folder and of the host file; the marker check, which requires the file to
 contain goetia's host code of the same version as the library, and the file
-verification always run.
+verification always run. A sweep checks the folder it deletes in with the
+provider's own check, which `EmbeddedStockShim` takes from
+`EmbeddedStockShim::new(..).with_check(check)`, so a program that disables the
+check passes `Disable` to both.
 
 Any program that ships a stock shim adds one file, `src/bin/goetia-shim.rs`:
 

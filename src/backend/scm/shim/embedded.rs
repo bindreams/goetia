@@ -61,7 +61,8 @@ mod stock {
     use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
 
     use super::super::acl::{
-        Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, read_object, require_acls_under,
+        CheckPermissions, Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, read_object,
+        require_acls_under,
     };
     use super::super::lock::InstallLock;
     use super::super::marker::read_retrying;
@@ -84,18 +85,30 @@ mod stock {
         /// `preview` and `provide` of one install needs the digest.
         pub(super) image: OnceLock<Image<'static>>,
         dir: Option<PathBuf>,
+        /// What `sweep` checks the folder with: `provide` is handed the manager's, but `sweep` is not.
+        folders: FolderCheck,
     }
 
     impl EmbeddedStockShim {
         /// `dir` is where the file goes (an absolute path; a relative one is refused when used), or
         /// `None` for `%ProgramFiles%\Goetia`, which is looked up only when a `type: simple`
-        /// install or its preview needs it.
+        /// install or its preview needs it. `sweep` checks the folder as
+        /// [`CheckPermissions::Enable`] does: [`Self::with_check`] says otherwise.
         pub fn new(bytes: Option<&'static [u8]>, dir: Option<PathBuf>) -> Self {
             Self {
                 bytes,
                 image: OnceLock::new(),
                 dir,
+                folders: FolderCheck::new(CheckPermissions::Enable),
             }
+        }
+
+        /// The check `sweep` makes of the folder before it deletes in it: the one the manager this
+        /// provider is given to is built with (`Scm::with_shim`), since `sweep` is not handed it as
+        /// `provide` is.
+        pub fn with_check(mut self, check: CheckPermissions) -> Self {
+            self.folders = FolderCheck::new(check);
+            self
         }
 
         fn image(&self) -> Result<&Image<'static>> {
@@ -128,16 +141,17 @@ mod stock {
 
         /// Deletes the shim files in `dir`, and what a repair or a crash left beside them, that no
         /// path of `referenced` names, and removes `dir` when that leaves it empty and it is the
-        /// default folder; see [`sweep_folder`]. Takes the install lock itself.
+        /// default folder; see [`sweep_folder`], which also refuses a folder the provider's check
+        /// refuses. Takes the install lock itself.
         fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
             let _lock = InstallLock::acquire()?;
             match &self.dir {
-                Some(dir) => sweep_folder(absolute(dir)?, referenced, default_dir),
+                Some(dir) => sweep_folder(absolute(dir)?, referenced, &self.folders, default_dir),
                 // The folder is the default one: the lookup that found it is the answer to the
                 // question of where the default folder is.
                 None => {
                     let dir = default_dir()?;
-                    sweep_folder(&dir, referenced, || Ok(dir.clone()))
+                    sweep_folder(&dir, referenced, &self.folders, || Ok(dir.clone()))
                 }
             }
         }
@@ -147,12 +161,18 @@ mod stock {
     /// The file is read and hashed on every call, since it can change between two. Only the CLI
     /// provides it.
     #[cfg(feature = "cli")]
-    pub(crate) struct SiblingStockShim;
+    pub(crate) struct SiblingStockShim {
+        /// What `sweep` checks the folder with; the CLI's manager checks with
+        /// [`CheckPermissions::Enable`] too.
+        folders: FolderCheck,
+    }
 
     #[cfg(feature = "cli")]
     impl SiblingStockShim {
         pub(crate) fn new() -> Self {
-            Self
+            Self {
+                folders: FolderCheck::new(CheckPermissions::Enable),
+            }
         }
 
         /// The sibling's bytes, or [`Error::SiblingShimMissing`] naming where it should be.
@@ -182,7 +202,7 @@ mod stock {
         fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
             let _lock = InstallLock::acquire()?;
             let dir = default_dir()?;
-            sweep_folder(&dir, referenced, || Ok(dir.clone()))
+            sweep_folder(&dir, referenced, &self.folders, || Ok(dir.clone()))
         }
     }
 

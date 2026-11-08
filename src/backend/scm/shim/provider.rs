@@ -37,6 +37,8 @@ pub trait ShimProvider: Send + Sync {
     /// the install lock, which a caller that holds it already can take again. `referenced` is
     /// every file a registered service or a running process names, as a path that has been
     /// normalised. Removes what this provider wrote and nothing references, tries every file, and
-    /// reports every failure after the last, with the files it could not delete.
+    /// reports every failure after the last, with the files it could not delete. It deletes only in
+    /// a folder that passes the check `provide` is handed, which is the manager's, so the provider
+    /// is built with the same one: a folder that fails it is a failure, not swept.
     fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure>;
 }

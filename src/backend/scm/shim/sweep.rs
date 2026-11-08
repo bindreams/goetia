@@ -318,7 +318,7 @@ mod system {
 
     use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 
-    use super::super::acl::{display_path, lexical};
+    use super::super::acl::{FolderCheck, display_path, lexical};
     use super::super::processes::running_images;
     use windows_service::service_manager::ServiceManagerAccess;
 
@@ -445,7 +445,12 @@ mod system {
     /// of `referenced` names, and removes `dir` when that leaves it empty and it is the default
     /// folder. Every file is tried: the failures come back together after the last, in the order
     /// the files were tried, each failed delete an `Os { what: "delete", path }` and its path in
-    /// [`SweepFailure::not_deleted`]. A `dir` that does not exist has nothing to sweep.
+    /// [`SweepFailure::not_deleted`].
+    ///
+    /// Nothing is deleted in a folder `folders` refuses: the refusal is the failure. A `dir` that
+    /// does not exist (and only that: any other failure to read its metadata is a failure) has
+    /// nothing to sweep, and is not checked, since the check judges the first ancestor that exists,
+    /// which a folder made by someone else meanwhile is not.
     ///
     /// The one mechanism behind a provider's `sweep` and the sweep of the default folder an
     /// uninstalled service's host was in (see [`second_folder`]). `default_folder` says where the
@@ -454,8 +459,15 @@ mod system {
     pub(crate) fn sweep_folder(
         dir: &Path,
         referenced: &[PathBuf],
+        folders: &FolderCheck,
         default_folder: impl FnOnce() -> Result<PathBuf>,
     ) -> std::result::Result<(), SweepFailure> {
+        match fs::symlink_metadata(dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::os_at("read", dir, e).into()),
+        }
+        folders.check(dir)?;
         let swept = sweep_files(dir, referenced);
         let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir))));
         SweepFailure::all(swept.err().into_iter().chain(removed.err())).map_or(Ok(()), Err)

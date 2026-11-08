@@ -1163,9 +1163,9 @@ fn uninstall_keeps_a_running_old_shim() {
     let (a_id, b_id) = (support::random_test_id(), support::random_test_id());
     let (_a_guard, _b_guard) = (ShimGuard::new(&a_id), ShimGuard::new(&b_id));
     let started = ConnectBack::listen();
-    let first = Scm::with_shim(embedded_shim(Some(folder.clone())), CheckPermissions::Disable);
+    let first = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
     let second = Scm::with_shim(
-        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())),
+        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())).with_check(CheckPermissions::Disable),
         CheckPermissions::Disable,
     );
     let a_spec = simple_spec(&a_id, fixture_command("report", &[&started.port().to_string()]), &logs);
@@ -1308,9 +1308,9 @@ fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file() {
     let (a_id, b_id) = (support::random_test_id(), support::random_test_id());
     let (_a_guard, _b_guard) = (ShimGuard::new(&a_id), ShimGuard::new(&b_id));
     let started = ConnectBack::listen();
-    let first = Scm::with_shim(embedded_shim(Some(folder.clone())), CheckPermissions::Disable);
+    let first = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
     let second = Scm::with_shim(
-        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())),
+        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())).with_check(CheckPermissions::Disable),
         CheckPermissions::Disable,
     );
     let a_spec = simple_spec(&a_id, fixture_command("report", &["1"]), &logs);

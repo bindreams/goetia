@@ -286,8 +286,8 @@ impl Backend for Scm {
     /// For `type: simple`: the install flow has rendered the definition already, so every refusal
     /// `render_for_install` can make (the previewed host's path, an account, `restart: always`)
     /// has come before the lock is taken or the provider writes. The lock is taken and the files
-    /// nothing references are swept (in a folder that exists and passes the check: see [`sweepable`]),
-    /// and then the host is provided and checked before anything is
+    /// nothing references are swept (by the provider, in a folder that exists and passes its check: see
+    /// [`sweep_folder`]), and then the host is provided and checked before anything is
     /// read: `provide` must return the host `desired` registers (the flow's render, from the
     /// provider's `preview`: a sibling shim upgraded while the install waited on the lock
     /// would otherwise register a file that was never placed), an absolute path whose folder passes
@@ -301,9 +301,7 @@ impl Backend for Scm {
         }
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
-        if sweepable(&self.folders, &desired.executable)
-            && let Ok(referenced) = referenced_hosts()
-        {
+        if let Ok(referenced) = referenced_hosts() {
             let _ = shim.sweep(&referenced);
         }
         let provided = shim.provide(&self.folders)?;
@@ -601,16 +599,6 @@ impl Backend for Scm {
             }),
         }
     }
-}
-
-/// Whether the sweep before a provide may run in the folder of `host`, the host the registration
-/// names: it exists, and passes `folders`. The check is made on a folder known to exist, so that
-/// one made by someone else since a check of its ancestor is judged as itself; a folder that does not
-/// exist has nothing to sweep. A refused folder is left for the provide to refuse, with its reason.
-fn sweepable(folders: &FolderCheck, host: &Path) -> bool {
-    host.parent()
-        .filter(|folder| folder.is_absolute() && std::fs::symlink_metadata(folder).is_ok())
-        .is_some_and(|folder| folders.check(folder).is_ok())
 }
 
 /// `provided`, the host `provide` returned, when it is `rendered`, the host the registration names;
@@ -1336,7 +1324,7 @@ impl Scm {
         }
         if let Some(folder) = second {
             // It is the default folder, by `second_folder`'s choice.
-            failures.extend(sweep_folder(folder, &referenced, || Ok(folder.to_path_buf())).err());
+            failures.extend(sweep_folder(folder, &referenced, &self.folders, || Ok(folder.to_path_buf())).err());
         }
         finish(failures)
     }

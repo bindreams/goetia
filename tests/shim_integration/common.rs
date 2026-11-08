@@ -58,9 +58,9 @@ pub fn embedded_shim(dir: Option<PathBuf>) -> EmbeddedStockShim {
 }
 
 /// A manager whose `type: simple` services run the stock shim [`embedded_shim`] places, with the
-/// folder check as `check` says.
+/// folder check as `check` says, for the provider's sweep as for the manager's.
 pub fn embedded_manager(dir: Option<PathBuf>, check: CheckPermissions) -> Scm {
-    Scm::with_shim(embedded_shim(dir), check)
+    Scm::with_shim(embedded_shim(dir).with_check(check), check)
 }
 
 pub fn fixture_command(mode: &str, args: &[&str]) -> Vec<String> {
