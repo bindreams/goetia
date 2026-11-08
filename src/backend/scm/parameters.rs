@@ -3,7 +3,7 @@
 //! everywhere. goetia writes four string values there (see `generate`), kept as fields; everything
 //! else, and a field stored other than as goetia writes it, is a [`Stray`], apart from the fields so
 //! that none is mistaken for one, and reported and removable even when the registry API refuses to
-//! describe it.
+//! describe it. [`RegistryReadOutcome`] is what a read of a service's registry values returns.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -94,6 +94,15 @@ fn decode_utf16(units: &[u16], escaped: impl Fn(char) -> bool) -> String {
         shown.push(')');
     }
     shown
+}
+
+/// What a read of a service's registry values found.
+pub enum RegistryReadOutcome<T> {
+    /// The registry says the service no longer exists. That is its word, not proof: a service key
+    /// that is a link to a missing target reads as gone while SCM has the service, so a caller that
+    /// must not take a live service for gone asks SCM too (the sweep does).
+    ServiceGone,
+    Read(T),
 }
 
 /// The contents of a `Parameters` key.

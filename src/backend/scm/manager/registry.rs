@@ -20,6 +20,7 @@ use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::types::FromRegValue as _;
 
 use crate::backend::scm::generate::{FIELDS, field_named};
+pub use crate::backend::scm::parameters::RegistryReadOutcome;
 use crate::backend::scm::parameters::{Parameters, field_named_utf16, shown_name, text_from_utf16, type_name};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
@@ -81,13 +82,6 @@ fn registry_undetermined(name: &str, op: &str, path: &str, source: std::io::Erro
 }
 
 // Parameters (the metadata blob) ======================================================================================
-
-/// What a read of a service's registry values found.
-pub enum RegistryReadOutcome<T> {
-    /// The service no longer exists.
-    ServiceGone,
-    Read(T),
-}
 
 /// Runs `pass` once and settles what it met (see [`settle`]). `service_stands` asks whether the
 /// service is still there; `fail` makes the error for a failure that leaves the read undecided.
