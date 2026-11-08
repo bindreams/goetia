@@ -23,17 +23,7 @@ use crate::spec::Kind;
 use crate::spec::test_support::plain_fields;
 
 use crate::backend::test_cleanup::{DirGuard, FileGuard, remove_or_warn};
-
-#[skuld::label]
-const ELEVATED: skuld::Label;
-
-fn elevated() -> std::result::Result<(), String> {
-    if unsafe { libc::geteuid() } == 0 {
-        Ok(())
-    } else {
-        Err("writes real files under /etc/systemd/system; re-run under sudo".to_string())
-    }
-}
+use crate::backend::test_elevation::{ELEVATED, elevated};
 
 /// On drop, removes every `unique_quarantine_path(id)` file the test's scenario left behind.
 /// Production deliberately leaves one on an unrecoverable double-race so a human can find it, and a

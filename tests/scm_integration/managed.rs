@@ -13,14 +13,17 @@ use goetia::manager::{Budget, Installed, ServiceManager as _, State};
 use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::System::Registry::RegSetValueExW;
-use winreg::enums::{KEY_READ, KEY_WRITE};
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
 
 use crate::common::{self, conformance_mk, fixture_command};
 use crate::deny::Denied;
 use crate::install_helper::INSTALL_AS;
-use crate::support::registry::{parameters_key, service_key, try_parameters_key};
-use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
+use crate::support::raw_registry::{create_link, create_raw_key, set_raw_value};
+use crate::support::registry::{
+    create_parameters_key, parameters_key, service_key, try_parameters_key, try_service_key,
+};
+use crate::support::{self, ConnectBack, ELEVATED, ScratchKey, ServiceGuard};
 
 /// Held by every test whose assertion is about `list`'s answer for the *whole
 /// host* — its exit code, or the absence of any `undetermined` entry — and by
@@ -726,21 +729,8 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
     let spec = install_with_environment(&mgr, &id);
 
     let key = service_key(&id, KEY_WRITE);
-    let name = support::wide_null("Environment");
-    let data = INSTALLED_ENVIRONMENT.as_bytes();
-    // SAFETY: `key` holds an open handle with write access; `name` is NUL-terminated and `data` is
-    // `data.len()` readable bytes, both outliving the call.
-    let status = unsafe {
-        RegSetValueExW(
-            key.raw_handle(),
-            name.as_ptr(),
-            0,
-            UNKNOWN_TYPE,
-            data.as_ptr(),
-            data.len() as u32,
-        )
-    };
-    assert_eq!(status, 0, "write an Environment of type {UNKNOWN_TYPE}: error {status}");
+    let name: Vec<u16> = "Environment".encode_utf16().collect();
+    set_raw_value(&key, &name, UNKNOWN_TYPE, INSTALLED_ENVIRONMENT.as_bytes());
 
     let diff = assert_conflict_cleared_by_force(&mgr, &spec);
     assert!(diff.contains(&format!("type {UNKNOWN_TYPE}")), "{diff}");
@@ -778,6 +768,300 @@ fn install_twice_is_up_to_date_for_both_kinds() {
         };
         assert_eq!(environment_of(&id), expected, "{kind:?}");
     }
+}
+
+/// goetia owns `Parameters` whole: `install --force` removes a stray value and a subkey, and a
+/// marker stored in another case is still ours, so the service reads as unchanged afterwards.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_removes_strays_from_parameters_and_keeps_the_service_ours() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let marker: String = parameters.get_value("Marker").expect("read Marker");
+    parameters.delete_value("Marker").expect("delete Marker");
+    parameters.set_value("marker", &marker).expect("write marker");
+    parameters.set_value("Stray", &"x").expect("write Stray");
+    let (subkey, _) = parameters.create_subkey("Sub").expect("create Sub");
+    subkey.set_value("Nested", &"y").expect("write Nested");
+
+    let forced = mgr.install(&spec, true).expect("forced install");
+    assert!(!matches!(forced, Outcome::Conflict { .. }), "{forced:?}");
+
+    let parameters = parameters_key(&id, KEY_READ);
+    let stray = parameters.get_value::<String, _>("Stray");
+    assert!(
+        matches!(&stray, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "the stray value survived: {stray:?}"
+    );
+    let sub = parameters.open_subkey("Sub");
+    assert!(
+        matches!(&sub, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "the subkey survived"
+    );
+    let again = mgr.preview_install(&spec).expect("preview_install after force");
+    assert!(matches!(again, Outcome::UpToDate), "{again:?}");
+    mgr.status(&spec.id).expect("status: the service still reads as ours");
+}
+
+/// A stray subkey, or a value that is not a string, is the only difference from what goetia wrote:
+/// it is still a `Conflict`, and `install --force` removes it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let (subkey, _) = parameters.create_subkey("Sub").expect("create Sub");
+    subkey.set_value("Nested", &"y").expect("write Nested");
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("Sub"), "{diff}");
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    assert!(
+        matches!(parameters.open_subkey("Sub"), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "the subkey survived"
+    );
+
+    parameters.set_value("Count", &7u32).expect("write a REG_DWORD");
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("Count"), "{diff}");
+    let count = parameters_key(&id, KEY_READ).get_value::<u32, _>("Count");
+    assert!(
+        matches!(&count, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "the REG_DWORD survived: {count:?}"
+    );
+    mgr.status(&spec.id).expect("status: the service still reads as ours");
+}
+
+/// `RegDeleteTreeW` follows a registry link: a stray link under `Parameters` would have its target
+/// wiped. `--force` deletes the link itself and leaves the target as it was.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_deletes_a_stray_registry_link_and_leaves_its_target() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    // Declared first, so that it is removed last.
+    let target = ScratchKey::new(&format!("link-target-{id}"));
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let target_key = target.create();
+    target_key.set_value("Keep", &"x").expect("write Keep");
+    target_key.create_subkey("Child").expect("create Child");
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let _link = create_link(&parameters, "Link", &target.nt_path());
+
+    assert_conflict_cleared_by_force(&mgr, &spec);
+
+    let parameters = parameters_key(&id, KEY_READ);
+    let names: Vec<String> = parameters.enum_keys().map(|name| name.expect("enumerate")).collect();
+    assert!(names.is_empty(), "the link survived: {names:?}");
+    assert_eq!(target_key.get_value::<String, _>("Keep").expect("read Keep"), "x");
+    target_key
+        .open_subkey("Child")
+        .expect("the target's own subkey survived");
+}
+
+/// `Parameters` itself may be a registry link. A link key cannot hold goetia's values (a write of
+/// any value but `SymbolicLinkValue` to it is denied), and goetia reads it as itself, never through
+/// its target: so a service whose `Parameters` was replaced by a link to a key holding goetia's four
+/// values is no longer goetia's. `list` omits it, `status` and `install`, forced or not, refuse it as
+/// foreign, and the target and the link are as they were.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_target_and_link_alone() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    // Declared first, so that it is removed last.
+    let target = ScratchKey::new(&format!("link-target-{id}"));
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+
+    // The target holds goetia's four values, copied from the installed `Parameters`, and a `Keep`.
+    let parameters = parameters_key(&id, KEY_READ);
+    let fields: Vec<(String, winreg::RegValue)> = parameters.enum_values().map(|v| v.expect("enumerate")).collect();
+    drop(parameters);
+    let target_key = target.create();
+    target_key.set_value("Keep", &"x").expect("write Keep");
+    for (name, value) in &fields {
+        target_key
+            .set_raw_value(name, value)
+            .expect("copy a value to the target");
+    }
+
+    // `Parameters` becomes a link to it.
+    let service = service_key(&id, KEY_READ | KEY_WRITE);
+    service.delete_subkey_all("Parameters").expect("remove Parameters");
+    let _link = create_link(&service, "Parameters", &target.nt_path());
+
+    let listed = mgr.list().expect("list");
+    assert!(
+        !listed.iter().any(|entry| match entry {
+            Installed::Ours { spec, .. } => spec.id.as_str() == id,
+            Installed::OursUnusable { name, .. } => name == &id,
+            // An aggregate may stand for this id: fail rather than certify what `list` cannot.
+            Installed::Undetermined { name, .. } => name.as_deref().is_none_or(|n| n == id),
+        }),
+        "a service whose Parameters is a link is not goetia's, and omitted: {listed:?}"
+    );
+    let status = mgr.status(&spec.id).expect_err("status of a foreign service");
+    assert!(matches!(status.cause(), goetia::Error::Foreign { .. }), "{status:?}");
+    for force in [false, true] {
+        let outcome = mgr.install(&spec, force).expect("install");
+        assert!(
+            matches!(outcome, Outcome::RefuseForeign { .. }),
+            "force={force}: {outcome:?}"
+        );
+    }
+
+    // The refusals wrote nothing through the link. A write through it would have removed `Keep`,
+    // which is a stray to goetia, and the link still points at the target: opened as itself it holds
+    // its `SymbolicLinkValue`, and opened as every other reader does it is the target.
+    assert_eq!(target_key.get_value::<String, _>("Keep").expect("read Keep"), "x");
+    let as_itself = create_raw_key(&service, &units("Parameters"), 0);
+    let held = as_itself
+        .get_raw_value("SymbolicLinkValue")
+        .expect("Parameters is still a link");
+    let link_value: Vec<u8> = units(&target.nt_path())
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    assert_eq!(held.bytes, link_value);
+    let followed = parameters_key(&id, KEY_READ);
+    for (name, value) in &fields {
+        let seen = followed
+            .get_raw_value(name)
+            .unwrap_or_else(|e| panic!("the target lost {name}: {e}"));
+        assert_eq!(seen.bytes, value.bytes, "{name} through the link");
+        assert_eq!(seen.vtype, value.vtype, "{name} through the link");
+    }
+}
+
+/// `RegDeleteTreeW` below the top level stops at a NUL, so a stray subkey holding a child named
+/// `a\0b` would stay. `--force` removes the whole subtree.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_removes_a_stray_subkey_holding_a_child_whose_name_has_a_nul() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let (sub, _) = parameters.create_subkey("Sub").expect("create Sub");
+    let nul_named: Vec<u16> = "a\0b".encode_utf16().collect();
+    let child = create_raw_key(&sub, &nul_named, 0);
+    child.set_value("Nested", &"y").expect("write Nested");
+    drop(child);
+    drop(sub);
+
+    assert_conflict_cleared_by_force(&mgr, &spec);
+
+    let parameters = parameters_key(&id, KEY_READ);
+    let names: Vec<String> = parameters.enum_keys().map(|name| name.expect("enumerate")).collect();
+    assert!(names.is_empty(), "the subtree survived: {names:?}");
+}
+
+/// What `winreg` cannot enumerate must still be drift that `install --force` removes: a goetia field
+/// stored as `REG_EXPAND_SZ`, a value of a type above `REG_QWORD`, and a name that is not valid UTF-16.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_removes_strays_that_winreg_cannot_enumerate() {
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const CUSTOM_TYPE: u32 = 0x20;
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+    // UTF-16LE with the closing NUL, as a string value is stored.
+    let sz = |text: &str| -> Vec<u8> { units(text).into_iter().chain([0]).flat_map(u16::to_le_bytes).collect() };
+
+    set_raw_value(&parameters, &units("Schema"), REG_EXPAND_SZ, &sz("1"));
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("Schema") && diff.contains("REG_EXPAND_SZ"), "{diff}");
+
+    // A `Marker` another tool rewrote as another string type is still goetia's: the service stays
+    // ours, and `--force` writes it back as `REG_SZ`.
+    let marker: String = parameters.get_value("Marker").expect("read Marker");
+    set_raw_value(&parameters, &units("Marker"), REG_EXPAND_SZ, &sz(&marker));
+    mgr.status(&spec.id).expect("status: a rewritten Marker is still ours");
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("Marker") && diff.contains("REG_EXPAND_SZ"), "{diff}");
+    assert_eq!(
+        parameters.get_value::<String, _>("Marker").expect("read Marker"),
+        marker
+    );
+    assert_eq!(
+        parameters.get_raw_value("Marker").expect("read Marker raw").vtype,
+        RegType::REG_SZ,
+        "--force writes Marker back as REG_SZ"
+    );
+
+    set_raw_value(&parameters, &units("Custom"), CUSTOM_TYPE, b"bytes");
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(
+        diff.contains("Custom") && diff.contains(&CUSTOM_TYPE.to_string()),
+        "{diff}"
+    );
+
+    set_raw_value(&parameters, &[0x41, 0xD800], REG_SZ, &sz("x"));
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+    assert!(diff.contains("D800"), "{diff}");
+    mgr.status(&spec.id).expect("status: the service still reads as ours");
+}
+
+/// `RegDeleteValueW` stops at a NUL, so a stray `Marker\0x` would delete goetia's `Marker` or stay.
+/// `--force` removes it by its whole name and leaves goetia's four values as they were.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_removes_a_stray_whose_name_holds_a_nul_and_keeps_marker() {
+    const REG_SZ: u32 = 1;
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
+    let marker: String = parameters.get_value("Marker").expect("read Marker");
+    let units: Vec<u16> = "Marker\0x".encode_utf16().collect();
+    let bytes: Vec<u8> = "x\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+
+    set_raw_value(&parameters, &units, REG_SZ, &bytes);
+    let diff = assert_conflict_cleared_by_force(&mgr, &spec);
+
+    assert!(diff.contains(r"Marker\0x"), "{diff}");
+    assert_eq!(
+        parameters.get_value::<String, _>("Marker").expect("read Marker"),
+        marker
+    );
+    let mut names: Vec<String> = parameters
+        .enum_values()
+        .map(|value| value.expect("enumerate").0)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["Marker", "Schema", "Spec", "Version"]);
+}
+
+/// The key is rewritten, never replaced: a handle opened before `--force` reads the new values after.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn force_install_rewrites_parameters_in_place_so_a_handle_held_across_it_still_reads() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, &id);
+    let held = parameters_key(&id, KEY_READ | KEY_WRITE);
+    held.set_value("Stray", &"x").expect("write Stray");
+
+    let forced = mgr.install(&spec, true).expect("forced install");
+    assert!(!matches!(forced, Outcome::Conflict { .. }), "{forced:?}");
+
+    held.get_value::<String, _>("Marker")
+        .expect("the handle opened before --force still reads Marker");
+    let stray = held.get_value::<String, _>("Stray");
+    assert!(
+        matches!(&stray, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "--force left the stray behind: {stray:?}"
+    );
 }
 
 // Step 7: a real account gets SeServiceLogonRight =====================================================================
@@ -1227,7 +1511,7 @@ fn install_refuses_an_always_blob_as_unusable() {
 ///
 /// `no_aggregate_entry_is_emitted_for_a_zero_count` already covers the code-only half (an aggregate
 /// emitted unconditionally); what this uniquely pins is the claim about the runner.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial)]
 fn an_elevated_list_leaves_nothing_undetermined() {
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1291,6 +1575,80 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
         recovery.contains("re-run as Administrator"),
         "a denial is the one cause elevation fixes: {recovery}"
     );
+}
+
+/// `list` opens `Parameters` in one step below `Services`, and never the service's own key, which
+/// a service that is not goetia's may deny to the unelevated reader. An explicit `Deny` ACE stops
+/// the elevated reader the same way (see `deny.rs`), so this stands in for an unelevated `list`,
+/// which this suite has no way to run. Such a service is a stranger's, not an unreadable one: it is
+/// not claimed, and nothing in `list` says a read did not complete. Reading the service key first
+/// made it `Undetermined`. A goetia service with the same denial is still listed as its own, which
+/// shows that the scan reached it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial)]
+fn list_reads_a_service_whose_own_key_denies_the_reader_by_its_parameters_alone() {
+    #[derive(Clone, Copy, Debug)]
+    enum Seed {
+        /// No `Parameters` key.
+        ForeignBare,
+        /// A `Parameters` that holds no marker: readable, and not goetia's.
+        ForeignWithParameters,
+        Goetias,
+    }
+    for seed in [Seed::ForeignBare, Seed::ForeignWithParameters, Seed::Goetias] {
+        let mgr = Scm::new();
+        let id = support::random_test_id();
+        let guard = ServiceGuard::new(&id);
+        match seed {
+            Seed::ForeignBare => seed_foreign(guard.id()),
+            Seed::ForeignWithParameters => {
+                seed_foreign(guard.id());
+                create_parameters_key(&id);
+            }
+            Seed::Goetias => {
+                install_plain(&mgr, guard.id());
+            }
+        }
+
+        // What the host's `list` says is undetermined before the denial: other services may be
+        // unreadable, and two of them aggregate into one entry with no name.
+        let undetermined = |listed: &[Installed]| -> Vec<String> {
+            listed
+                .iter()
+                .filter(|entry| matches!(entry, Installed::Undetermined { .. }))
+                .map(|entry| format!("{entry:?}"))
+                .collect()
+        };
+        let baseline = undetermined(&mgr.list().expect("list before the denial"));
+
+        let _denied = Denied::service_key(&id);
+
+        // The deny took, as `ERROR_ACCESS_DENIED`: opening the service key to read it fails.
+        let blocked = try_service_key(&id, KEY_READ)
+            .err()
+            .unwrap_or_else(|| panic!("the deny ACE did not apply: `{id}` is still readable"));
+        assert_eq!(blocked.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "{blocked:?}");
+
+        let listed = mgr
+            .list()
+            .expect("a service key denied to the reader must not fail `list`");
+
+        // The denial adds nothing undetermined: the same entries as before it, whatever they carry.
+        assert_eq!(undetermined(&listed), baseline, "{seed:?}: {listed:?}");
+        let ours = listed
+            .iter()
+            .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id));
+        let named = listed.iter().any(|entry| match entry {
+            Installed::OursUnusable { name, .. } => name == &id,
+            _ => false,
+        });
+        match seed {
+            Seed::Goetias => assert!(ours, "the scan did not reach a service it must list: {listed:?}"),
+            _ => assert!(
+                !ours && !named,
+                "{seed:?}: a stranger's service was claimed: {listed:?}"
+            ),
+        }
+    }
 }
 
 /// The same boundary on the `list` side, and what the entry standing for it is allowed to say. One
