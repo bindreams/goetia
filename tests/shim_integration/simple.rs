@@ -91,7 +91,7 @@ fn simple_passes_conformance() {
 
 // Step 2: round trip, start/stop/status, uninstall, list ==============================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn install_then_list_round_trips_without_the_source_file() {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -237,7 +237,7 @@ fn install_refuses_host_of_another_version() {
 
 /// A manager with no provider judges a service another provider's host runs: `status` and `list`
 /// regenerate from the installed registration, whose host and arguments stay as they were.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn status_through_new_keeps_a_standalone_host() {
     let id = support::random_test_id();
     let logs = LogDir::new();
