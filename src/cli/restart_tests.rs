@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{Leg, SPENT, abandoned_before_start, after_start_failed, leg, restart_until, stop_leg};
@@ -160,7 +161,7 @@ fn a_stop_leg_whose_process_outlasted_the_budget_abandons_the_restart_under_the_
         Duration::from_secs(30),
         "the user's --timeout, not the leg's remainder"
     );
-    assert!(recovery.contains("the restart was abandoned"), "{recovery}");
+    assert!(recovery.contains("The restart was abandoned"), "{recovery}");
     assert!(recovery.contains("no start was issued"), "{recovery}");
     assert!(recovery.contains("`goetia daemon start frpc`"), "{recovery}");
     assert!(!recovery.contains("may or may not have reached stopped"), "{recovery}");
@@ -172,14 +173,22 @@ fn a_stop_leg_whose_process_outlasted_the_budget_abandons_the_restart_under_the_
 fn an_abandoned_restart_keeps_the_failed_terminate_of_the_process() {
     let id = Id::try_from("frpc").unwrap();
     let leg_budget = Budget::Bounded(Duration::from_secs(5));
-    let timed_out = process_timed_out("frpc", 4242, leg_budget, Some("access denied".to_string()));
+    let failed = Arc::new(std::io::Error::other("The handle is invalid. (os error 6)"));
+    let timed_out = process_timed_out("frpc", 4242, leg_budget, Some(failed));
 
     let e = abandoned_before_start(&id, timed_out, THIRTY);
 
+    let report = e.report().to_string();
     assert!(
-        e.to_string()
-            .contains("had not exited within 30s (terminating it failed: access denied): the restart was abandoned"),
-        "{e}"
+        report.contains(
+            "had not exited within 30s, and terminating it failed: The handle is invalid. (os error 6). The \
+             restart was abandoned"
+        ),
+        "{report}"
+    );
+    assert!(
+        std::error::Error::source(&e).is_some(),
+        "the failed terminate stays the source"
     );
 }
 

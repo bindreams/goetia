@@ -937,8 +937,12 @@ fn the_waiting_notice_names_the_process() {
 #[skuld::test]
 fn the_waiting_notice_names_a_failed_terminate() {
     assert_eq!(
-        waiting_notice("frpc", 4242, Some(&io::Error::other("access denied"))),
-        "frpc: waiting for process 4242 to exit (terminating it failed: access denied)"
+        waiting_notice(
+            "frpc",
+            4242,
+            Some(&io::Error::other("The handle is invalid. (os error 6)"))
+        ),
+        "frpc: waiting for process 4242 to exit, and terminating it failed: The handle is invalid. (os error 6)"
     );
 }
 

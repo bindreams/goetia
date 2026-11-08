@@ -27,6 +27,10 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// cheap to share inside the `Arc<Error>` a snapshot keeps.
 pub type SharedError = Arc<dyn std::error::Error + Send + Sync>;
 
+/// The clause that says ending a process failed, which the failure's own text follows: written once,
+/// for [`Error::ProcessWaitTimeout`] and the notice of a wait for the process.
+pub(crate) const TERMINATE_FAILED_CLAUSE: &str = ", and terminating it failed";
+
 /// Every goetia error. A variant is named for the layer that raised it, and its `Display` is its
 /// own context only, never its source's text: print the whole chain with [`Error::report`].
 #[derive(Debug, thiserror::Error)]
@@ -453,19 +457,21 @@ pub enum Error {
     ///
     /// Exit `4` (indeterminate), like [`WaitTimeout`](Error::WaitTimeout): the stop is not
     /// finished, though not failed.
+    ///
+    /// `terminate_failed` is the source: its text follows [`TERMINATE_FAILED_CLAUSE`] in
+    /// [`report`](Error::report), and `recovery` is the remedy, which follows it.
     #[error(
-        "`{id}` is stopped, but its process (pid {pid}) had not exited within {waited}{terminated}: {recovery}",
-        waited = humantime::format_duration(*waited),
-        terminated = terminate_failed
-            .as_ref()
-            .map_or_else(String::new, |e| format!(" (terminating it failed: {e})"))
+        "`{id}` is stopped, but its process (pid {pid}) had not exited within {waited}{}",
+        terminate_failed.as_ref().map_or("", |_| TERMINATE_FAILED_CLAUSE),
+        waited = humantime::format_duration(*waited)
     )]
     ProcessWaitTimeout {
         id: String,
         pid: u32,
         waited: std::time::Duration,
         /// Why goetia's attempt to end the process failed, if it did.
-        terminate_failed: Option<String>,
+        #[source]
+        terminate_failed: Option<Arc<std::io::Error>>,
         recovery: String,
     },
 
@@ -796,7 +802,7 @@ impl Error {
     /// A variant with no source keeps its remedy in its `Display`, where nothing follows it.
     pub fn remedy(&self) -> Option<&str> {
         match self {
-            Error::Undetermined { recovery, .. } => Some(recovery),
+            Error::Undetermined { recovery, .. } | Error::ProcessWaitTimeout { recovery, .. } => Some(recovery),
             Error::ServiceImageUnreadable { .. } => Some(
                 "An administrator must make each named service's registry key readable, or let SCM query it \
                  (`SERVICE_QUERY_CONFIG`)",

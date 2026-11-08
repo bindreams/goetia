@@ -177,7 +177,7 @@ fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
             terminate_failed,
             waited: as_given(budget, waited),
             recovery: format!(
-                "the restart was abandoned: no start was issued, so `{id}` is left stopped, while its \
+                "The restart was abandoned: no start was issued, so `{id}` is left stopped, while its \
                  process keeps the files it runs in use until it exits. `goetia daemon status {id}` shows \
                  the manager's current view, and `goetia daemon start {id}` brings it back up. Allow \
                  longer with `--timeout <duration>`, or wait indefinitely with `--no-timeout`."

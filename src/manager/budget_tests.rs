@@ -169,32 +169,38 @@ fn a_process_that_outlives_the_budget_after_a_confirmed_stop_says_so() {
     let e = process_timed_out("frpc", 4242, Budget::Bounded(Duration::from_secs(1)), None);
 
     assert_eq!(
-        e.to_string(),
-        "`frpc` is stopped, but its process (pid 4242) had not exited within 1s: goetia stopped waiting. The stop \
+        e.report().to_string(),
+        "`frpc` is stopped, but its process (pid 4242) had not exited within 1s. goetia stopped waiting. The stop \
          was not undone; until the process exits, the files it runs stay in use. `goetia daemon status frpc` shows \
          the manager's current view. Allow longer with `--timeout <duration>`, or wait indefinitely with \
          `--no-timeout`."
     );
+    assert!(std::error::Error::source(&e).is_none());
     assert!(e.is_indeterminate());
 }
 
-/// The process goetia could not end is the likely reason it outlived the budget, so the text says so.
+/// The process goetia could not end is the likely reason it outlived the budget, so the report says
+/// so, once, and the failure stays the error's typed source.
 #[skuld::test]
 fn a_process_that_could_not_be_terminated_says_so_when_it_outlives_the_budget() {
+    let terminate_failed = std::sync::Arc::new(std::io::Error::other("The handle is invalid. (os error 6)"));
     let e = process_timed_out(
         "frpc",
         4242,
         Budget::Bounded(Duration::from_secs(1)),
-        Some("Access is denied. (os error 5)".to_string()),
+        Some(terminate_failed.clone()),
     );
 
     assert_eq!(
-        e.to_string(),
-        "`frpc` is stopped, but its process (pid 4242) had not exited within 1s (terminating it failed: Access is \
-         denied. (os error 5)): goetia stopped waiting. The stop was not undone; until the process exits, the files \
-         it runs stay in use. `goetia daemon status frpc` shows the manager's current view. Allow longer with \
-         `--timeout <duration>`, or wait indefinitely with `--no-timeout`."
+        e.report().to_string(),
+        "`frpc` is stopped, but its process (pid 4242) had not exited within 1s, and terminating it failed: The \
+         handle is invalid. (os error 6). goetia stopped waiting. The stop was not undone; until the process \
+         exits, the files it runs stay in use. `goetia daemon status frpc` shows the manager's current view. Allow \
+         longer with `--timeout <duration>`, or wait indefinitely with `--no-timeout`."
     );
+    let source = std::error::Error::source(&e).expect("the failed terminate is the source");
+    assert_eq!(source.to_string(), terminate_failed.to_string());
+    assert_eq!(e.report().to_string().matches("The handle is invalid").count(), 1);
 }
 
 #[skuld::test]

@@ -14,6 +14,7 @@
 
 use std::io;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, SHIM_REFUSED};
 use crate::backend::scm::kill::HoldOutcome;
@@ -184,9 +185,50 @@ pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
     wait_after_stop(a, deadline, " Run `stop` again.", StopSeen::Requested)
 }
 
+/// How [`end_process`] ended.
+#[must_use = "a process that outlasted the deadline is not gone; decide what to report rather than discarding it"]
+#[derive(Debug)]
+pub(crate) enum EndProcessOutcome<P> {
+    /// The process has exited.
+    Exited,
+    /// The process had not exited when the deadline ran out. `terminate_failed` is why the attempt
+    /// to end it failed, if it did.
+    Lingers {
+        process: P,
+        terminate_failed: Option<Arc<io::Error>>,
+    },
+}
+
+/// Ends `process`, the service's process held before its STOP, once SCM has confirmed `STOPPED`: the
+/// one end of a held process, for `stop` and `uninstall` alike. SCM records `STOPPED` before the
+/// process exits (a shim reports it and then exits), so `STOPPED` alone leaves a file the process
+/// runs in use.
+///
+/// `terminate` ends the process, as the documentation of `SetServiceStatus` allows once
+/// `SERVICE_STOPPED` is reported, and `exit` then waits for its exit under `deadline` and says whether
+/// it did. Whatever `terminate` returns, the wait follows: SCM has confirmed the stop, so a failure
+/// to end the process is no failure of the end, and the process may be on its way out by itself. The
+/// failure is kept: `exit` is handed it for its notice, and [`Lingers`](EndProcessOutcome::Lingers)
+/// carries it. An `exit` that fails is the error.
+pub(crate) fn end_process<P>(
+    process: P,
+    deadline: Deadline,
+    terminate: impl FnOnce(&P) -> io::Result<()>,
+    exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
+) -> io::Result<EndProcessOutcome<P>> {
+    let terminate_failed = terminate(&process).err().map(Arc::new);
+    Ok(match exit(&process, deadline, terminate_failed.as_deref())? {
+        Waited::Confirmed => EndProcessOutcome::Exited,
+        Waited::Expired => EndProcessOutcome::Lingers {
+            process,
+            terminate_failed,
+        },
+    })
+}
+
 /// How [`stop_and_await_exit`] ended.
 #[must_use = "an expiry is not a stop; decide what to report rather than discarding it"]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum StopAndAwaitExitOutcome<P> {
     /// SCM confirmed `STOPPED`, and the process held before the STOP, if any, has exited.
     Stopped,
@@ -196,7 +238,7 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
     /// `terminate_failed` is why the attempt to end it failed, if it did.
     ProcessExpired {
         process: P,
-        terminate_failed: Option<String>,
+        terminate_failed: Option<Arc<io::Error>>,
     },
     /// The hold expired, with SCM still naming process `pid`, which was gone, so the STOP was sent with
     /// no process held, and nothing says that it took effect or which process it reached: not a stop,
@@ -205,15 +247,11 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 }
 
 /// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the end of `held`, the service's
-/// process as it was before the STOP was sent. SCM records `STOPPED` before the process exits (a shim
-/// reports it and then exits), so `STOPPED` alone leaves a file the process runs in use. `terminate`
-/// ends the process, as the documentation of `SetServiceStatus` allows once `SERVICE_STOPPED` is
-/// reported, and `exit` then waits for its exit under the same `deadline` and says whether it did; a
-/// process that outlasts the deadline is [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired),
-/// not an unconfirmed stop. A `terminate` that finds the process already exited is success, and one
-/// that fails is not an error: SCM has confirmed the stop, and the wait that follows decides. The
-/// failure is kept: `exit` is handed it for its notice, and `ProcessExpired` carries its text. No
-/// process held (none reported, or none that could be opened) is the stop alone.
+/// process as it was before the STOP was sent. `end` is [`end_process`] over the real process, under
+/// the same `deadline`; a process that outlasts it is
+/// [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired), not an unconfirmed stop, and carries
+/// the failed terminate, if any. No process held (none reported, or none that could be opened) is the
+/// stop alone.
 ///
 /// An expired hold is sent the STOP all the same, and it ends there, whatever SCM answers: the held
 /// process died (a crash), SCM may have a recovery restart pending, and a restarted process may have
@@ -226,8 +264,7 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     a: &mut A,
     deadline: Deadline,
     held: HoldOutcome<P>,
-    terminate: impl FnOnce(&P) -> io::Result<()>,
-    exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
+    end: impl FnOnce(P, Deadline) -> io::Result<EndProcessOutcome<P>>,
 ) -> io::Result<StopAndAwaitExitOutcome<P>> {
     let held = match held {
         HoldOutcome::Held(process) => Some(process),
@@ -243,14 +280,14 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     let Some(process) = held else {
         return Ok(StopAndAwaitExitOutcome::Stopped);
     };
-    // SCM has confirmed `STOPPED`, so a terminate that fails is not a failed stop: the process is
-    // on its way out by itself, and the wait for it decides.
-    let terminate_failed = terminate(&process).err();
-    Ok(match exit(&process, deadline, terminate_failed.as_ref())? {
-        Waited::Confirmed => StopAndAwaitExitOutcome::Stopped,
-        Waited::Expired => StopAndAwaitExitOutcome::ProcessExpired {
+    Ok(match end(process, deadline)? {
+        EndProcessOutcome::Exited => StopAndAwaitExitOutcome::Stopped,
+        EndProcessOutcome::Lingers {
             process,
-            terminate_failed: terminate_failed.map(|e| e.to_string()),
+            terminate_failed,
+        } => StopAndAwaitExitOutcome::ProcessExpired {
+            process,
+            terminate_failed,
         },
     })
 }

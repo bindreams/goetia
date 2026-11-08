@@ -115,8 +115,13 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
 /// `budget` waiting for the service's process `pid` to exit.
 ///
 /// Takes the `Budget` for the reasons [`timed_out`] does. `terminate_failed` is why ending the
-/// process failed, if it did.
-pub fn process_timed_out(id: &str, pid: u32, budget: Budget, terminate_failed: Option<String>) -> crate::Error {
+/// process failed, if it did; the error keeps it as its source.
+pub fn process_timed_out(
+    id: &str,
+    pid: u32,
+    budget: Budget,
+    terminate_failed: Option<std::sync::Arc<std::io::Error>>,
+) -> crate::Error {
     debug_assert!(
         matches!(budget, Budget::Bounded(d) if d > Duration::ZERO),
         "only a non-zero Bounded budget can expire, got {budget:?}"

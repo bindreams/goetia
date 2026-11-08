@@ -110,7 +110,7 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::{Origin, RegistryReadOutcome};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
-use super::wait::{StopAndAwaitExitOutcome, Waited};
+use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_process};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HoldOutcome, hold_if_possible, hold_if_possible_unbounded};
@@ -547,22 +547,9 @@ impl Backend for Scm {
         // Before the STOP: SCM reports `STOPPED` before the process exits, and no pid after it. An
         // expired hold is sent the STOP all the same, and is not a stop: see `stop_and_await_exit`.
         let held = hold_process(&id, deadline, &format!("`{id}` was NOT stopped"))?;
-        // A bounded wait says nothing: the shim exits just after it reports `STOPPED`, so a wait is
-        // the usual case. An unbounded one has no end that says why it is still blocked.
-        let unbounded = deadline.at().is_none();
-        let outcome = super::wait::stop_and_await_exit(
-            &mut actor,
-            deadline,
-            held,
-            |held| held.terminate(),
-            |held, deadline, terminate_failed| {
-                held.wait_for_exit(deadline, || {
-                    if unbounded {
-                        held.notice(id.as_str(), terminate_failed);
-                    }
-                })
-            },
-        )
+        let outcome = super::wait::stop_and_await_exit(&mut actor, deadline, held, |held, deadline| {
+            end_held(&id, held, deadline)
+        })
         .map_err(|e| Error::os(format!("stop `{id}`"), e))?;
         match outcome {
             StopAndAwaitExitOutcome::Stopped => Ok(()),
@@ -1092,9 +1079,24 @@ fn hold_process_unbounded(id: &Id, not_done: &str) -> Result<Option<Held>> {
     holding(id, not_done, None, hold_if_possible_unbounded)
 }
 
+/// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]
+/// over the real process, for `stop` and `uninstall` alike. A wait with no end says on stderr why it
+/// is blocked; a bounded one is the usual case (the shim exits just after it reports `STOPPED`) and
+/// says nothing.
+fn end_held(id: &Id, held: Held, deadline: Deadline) -> std::io::Result<EndProcessOutcome<Held>> {
+    end_process(held, deadline, Held::terminate, |held, deadline, terminate_failed| {
+        held.wait_for_exit(deadline, || {
+            if deadline.at().is_none() {
+                held.notice(id.as_str(), terminate_failed);
+            }
+        })
+    })
+}
+
 /// What [`hold_process`] and [`hold_process_unbounded`] share: `hold` run on a target for `id` whose
-/// process is opened with the rights to terminate it and to wait for its exit, with a failure to read SCM led by `not_done`, and `gone` when `id` is gone since it was read
-/// (`uninstall_locked` finds it gone too).
+/// process is opened with the rights to terminate it and to wait for its exit, with a failure to read
+/// SCM led by `not_done`, and `gone` when `id` is gone since it was read (`uninstall_locked` finds it
+/// gone too).
 fn holding<R>(
     id: &Id,
     not_done: &str,
@@ -1179,16 +1181,12 @@ impl Scm {
         };
         if let Some(held) = held {
             // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
-            // ended, through the handle held since before the stop. A process that cannot be ended
-            // is not waited for: the wait has no bound, and the service is already deleted. Its
-            // file stays for the next sweep.
-            if let Err(e) = held.terminate() {
-                failures.push(Error::os(format!("terminate `{id}`'s process {}", held.pid()), e).into());
-                return finish(failures);
-            }
-            match held.wait_for_exit(Budget::Unbounded.start(), || held.notice(id.as_str(), None)) {
-                Ok(Waited::Confirmed) => {}
-                Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),
+            // ended, through the handle held since before the stop, and waited for as `stop` waits
+            // for it (see [`end_held`]), with no bound: the shim exits by itself after it reports
+            // `STOPPED`, and the terminate is a backstop.
+            match end_held(id, held, Budget::Unbounded.start()) {
+                Ok(EndProcessOutcome::Exited) => {}
+                Ok(EndProcessOutcome::Lingers { .. }) => unreachable!("an unbounded deadline never expires"),
                 Err(e) => {
                     failures.push(Error::os(format!("wait for `{id}`'s process to exit"), e).into());
                     return finish(failures);
