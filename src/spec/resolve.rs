@@ -88,7 +88,7 @@ fn resolve(raw: RawSpec, base_dir: &Path) -> Result<(DaemonSpec, Vec<Warning>), 
 /// (systemd and launchd on Unix, the SCM on Windows); a test simulates only such a backend, or none.
 fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Result<(DaemonSpec, Vec<Warning>), Error> {
     #[cfg(test)]
-    debug_assert!(
+    assert!(
         native.is_none_or(|b| crate::spec::test_support::HOST_BACKENDS.contains(&b)),
         "`{native:?}` does not share this host's path style"
     );

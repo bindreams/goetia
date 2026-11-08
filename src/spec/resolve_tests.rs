@@ -936,7 +936,7 @@ backend-specific:
 }
 
 #[skuld::test]
-fn an_scm_override_that_writes_always_resolves_on_every_native_backend() {
+fn an_scm_override_that_writes_always_resolves_on_each_host_backend() {
     let yaml = r#"
 id: svc
 command: [/bin/svc.exe]
@@ -955,7 +955,7 @@ backend-specific:
 }
 
 #[skuld::test]
-fn a_templated_always_resolves_on_every_native_backend(#[fixture(temp_dir)] dir: &Path) {
+fn a_templated_always_resolves_on_each_host_backend(#[fixture(temp_dir)] dir: &Path) {
     let yaml = r#"
 id: svc
 command: [/bin/svc]
@@ -1849,8 +1849,8 @@ fn user_rejected_by(backend: BackendKind) -> &'static str {
     }
 }
 
-/// `resolve`, with `native` named rather than detected — the seam that puts
-/// every host's native arm within reach of every other host's test runner.
+/// `resolve`, with `native` named rather than detected. Only a backend in [`HOST_BACKENDS`], whose
+/// path style is this host's, may be named.
 fn resolve_yaml_as(native: BackendKind, yaml: &str) -> Result<(DaemonSpec, Vec<Warning>), Error> {
     resolve_as(parse_manifest(yaml), &base_dir(), Some(native))
 }
@@ -2580,7 +2580,7 @@ fn a_dollar_in_a_user_id_is_rejected_under_every_backend() {
 // A host warns only about its native backend ==========================================================================
 
 #[skuld::test]
-fn base_restart_always_resolves_on_every_native_backend() {
+fn base_restart_always_resolves_on_each_host_backend() {
     // Whether a backend can honour `always` is its generator's verdict, at install and preview: the
     // base spec is nobody's override, so resolution accepts it.
     let yaml = "id: svc
@@ -2657,6 +2657,29 @@ backend-specific:
 ";
     let (_spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+/// Each input the `systemd` module's tests show a systemd host refusing, which an SCM host carries.
+#[cfg(windows)]
+#[skuld::test]
+fn an_scm_host_accepts_every_value_a_systemd_host_refuses() {
+    let opt = abs("opt/x").display().to_string();
+    let base = format!("id: frpc\ncommand: ['{}']\n", program("frpc"));
+    let cases = [
+        ("env: {MY-VAR: x}".to_string(), base_dir()),
+        ("name: ' a'".to_string(), base_dir()),
+        ("name: 'a '".to_string(), base_dir()),
+        (format!("cwd: '{opt} '"), base_dir()),
+        ("cwd: .".to_string(), abs("a ")),
+        (format!("cwd: '{opt}\\..\\y'"), base_dir()),
+        (format!("logs: '{opt}\\..\\y'"), base_dir()),
+        ("cwd: sub".to_string(), base_dir().join("..").join("x")),
+        ("logs: sub".to_string(), base_dir().join("..").join("x")),
+    ];
+    for (extra, dir) in cases {
+        let yaml = format!("{base}{extra}\n");
+        resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Scm)).unwrap_or_else(|e| panic!("{extra}: {e}"));
+    }
 }
 
 /// The message quotes the resolved path as it is; the sink that prints it escapes it.
