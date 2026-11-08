@@ -426,14 +426,11 @@ fn an_event_message_file_needs_a_system_root() {
     }
 }
 
-/// Writes keys under `HKLM\SOFTWARE`. A service key that is a registry link to a missing key is a key
-/// SCM has a service at, but nothing below it can be read: the read, which `list`, `status` and the
-/// shim share, is a failure. It is neither not goetia's (`Parameters` holds the only proof of
-/// ownership a `type: managed` service has, which this read could not see) nor a service that is gone.
+/// Writes keys under `HKLM\SOFTWARE`. A service key that is a link to a missing key reads as an
+/// error: neither Foreign nor gone.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_service_key_that_is_a_link_to_a_missing_key_fails_a_parameters_read() {
     let unique = std::process::id();
-    // The target is never created.
     let root_scratch = ScratchKey::new(&format!("parameters-{unique}-dangling-root"));
     let target = ScratchKey::new(&format!("parameters-{unique}-dangling-target"));
     let root = root_scratch.create();
@@ -448,12 +445,10 @@ fn a_service_key_that_is_a_link_to_a_missing_key_fails_a_parameters_read() {
     );
 }
 
-/// Writes keys under `HKLM\SOFTWARE`. The service-existence check `read_environment` shares with the
-/// `Parameters` read: a service key that is a link to a missing key is an error, not a service gone.
+/// Writes keys under `HKLM\SOFTWARE`. `read_environment` on a dangling-link service key is an error.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_environment_read() {
     let unique = std::process::id();
-    // The target is never created.
     let root_scratch = ScratchKey::new(&format!("environment-{unique}-dangling-root"));
     let target = ScratchKey::new(&format!("environment-{unique}-dangling-target"));
     let root = root_scratch.create();
@@ -462,10 +457,11 @@ fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_environment_read() {
 
     let read = read_environment_in(&services, "dangling");
 
-    assert!(
-        read.is_err(),
-        "a service key whose target is missing is not a service that is gone"
-    );
+    let error = read
+        .err()
+        .expect("a service key whose target is missing is not a service that is gone");
+    assert!(matches!(error, Error::Os { .. }), "{error:?}");
+    assert_eq!(os_code(&error), Some(NOT_FOUND), "{error:?}");
 }
 
 /// Writes keys under `HKLM\SOFTWARE`. A service key that is there with no `Parameters` stands without

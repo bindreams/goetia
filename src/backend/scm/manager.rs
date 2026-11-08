@@ -236,10 +236,8 @@ impl Backend for Scm {
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), e)),
         };
-        Ok(match registry::read_parameters(id.as_str())? {
-            RegistryReadOutcome::ServiceGone => ReadOutcome::Absent,
-            RegistryReadOutcome::Read(parameters) => read_marker(parameters, Some(service)).named(id, ScmSnapshot::new),
-        })
+        let parameters = held_service_parameters(id.as_str(), registry::read_parameters(id.as_str())?)?;
+        Ok(read_marker(parameters, Some(service)).named(id, ScmSnapshot::new))
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
@@ -296,8 +294,7 @@ impl Backend for Scm {
             match registry::read_parameters_in(services, &name) {
                 // Gone since `scan_services` listed it: not there to list. A `Parameters` key not
                 // found, marked deleted or gone mid-read reaches this only if the service key is
-                // gone too. A service key that is a registry link to a missing key is not gone: it
-                // is an error, reported in the unreadable aggregate.
+                // gone too.
                 Ok(RegistryReadOutcome::ServiceGone) => {}
                 Ok(RegistryReadOutcome::Read(params)) => {
                     let entry = ScanEntry::of(&name, read_marker(params, None), ScmSnapshot::new);
@@ -399,6 +396,15 @@ impl Backend for Scm {
                 id: id.as_str().to_string(),
             }),
         }
+    }
+}
+
+/// `read`, of a service SCM has open: SCM says the service exists, so a registry that finds its key
+/// gone disagrees with SCM, and the read failed. The service is neither absent nor foreign.
+fn held_service_parameters(id: &str, read: RegistryReadOutcome<Parameters>) -> Result<Parameters> {
+    match read {
+        RegistryReadOutcome::Read(parameters) => Ok(parameters),
+        RegistryReadOutcome::ServiceGone => Err(registry::missing_service_key(id)),
     }
 }
 

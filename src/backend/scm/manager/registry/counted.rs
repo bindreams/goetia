@@ -76,7 +76,7 @@ pub(super) fn delete_subkey(key: &RegKey, name: &[u16]) -> io::Result<()> {
 pub(super) enum LinkHandling {
     /// The link is the key opened.
     Itself,
-    /// The link's target is the key opened, as for a reader that wants what SCM reads.
+    /// The link's target is the key opened.
     Followed,
 }
 

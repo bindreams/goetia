@@ -14,7 +14,7 @@ use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User}
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
-use winreg::enums::{KEY_READ, KEY_WRITE, RegType};
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, RegType};
 
 use crate::common::{self, conformance_mk, fixture_command};
 use crate::deny::Denied;
@@ -1559,16 +1559,12 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
     );
 }
 
-/// `list` opens `Parameters` in one step below `Services`, so it opens the service's own key only
-/// for a service without `Parameters`, to ask whether it stands, and a denied open counts as
-/// standing. A service that is not goetia's may deny that key to the unelevated reader. An explicit `Deny` ACE stops
-/// the elevated reader the same way (see `deny.rs`), so this stands in for an unelevated `list`,
-/// which this suite has no way to run. Such a service is a stranger's, not an unreadable one: it is
-/// not claimed, and nothing in `list` says a read did not complete. Reading the service key first
-/// made it `Undetermined`. A goetia service with the same denial is still listed as its own, which
-/// shows that the scan reached it.
+/// `list` must not fail on a foreign service whose own key denies the unelevated reader: a denied
+/// open counts as standing. An explicit `Deny` ACE stops the elevated reader the same way (see
+/// `deny.rs`), so this stands in for an unelevated `list`, which this suite has no way to run. A
+/// goetia service with the same denial is still listed as its own, which shows that the scan reached it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial)]
-fn list_reads_a_service_whose_own_key_denies_the_reader_by_its_parameters_alone() {
+fn list_reads_a_service_whose_own_key_denies_the_reader_as_standing() {
     #[derive(Clone, Copy, Debug)]
     enum Seed {
         /// No `Parameters` key.
@@ -1676,6 +1672,100 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
             .iter()
             .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
         "the marker went unread, so ownership may not be claimed: {listed:?}"
+    );
+}
+
+/// A service key under `Services` taken out and replaced by a registry link to a missing key, then
+/// put back on drop. SCM keeps the service in its own database, so it still opens by name.
+///
+/// Declare it after the `ServiceGuard` of the service, so that it is put back before the service is
+/// deleted, and before the link guard made by [`create_link`], so that the link is removed first.
+struct SwappedServiceKey {
+    id: String,
+    /// The service's key as it was, under `saved`'s `service`.
+    saved: ScratchKey,
+}
+
+impl SwappedServiceKey {
+    /// Copies `Services\<id>` aside and deletes it. The guard exists before either.
+    fn take_out(id: &str, saved: ScratchKey) -> Self {
+        let guard = Self {
+            id: id.to_string(),
+            saved,
+        };
+        let (copy, _) = guard.saved.create().create_subkey("service").expect("create the copy");
+        let services = services_key();
+        services.copy_tree(id, &copy).expect("copy the service key aside");
+        services.delete_subkey_all(id).expect("delete the service key");
+        guard
+    }
+}
+
+impl Drop for SwappedServiceKey {
+    /// Never panics, so a drop that runs while the test unwinds still goes on.
+    fn drop(&mut self) {
+        let put_back = || -> std::io::Result<()> {
+            let (key, _) = services_key().create_subkey(&self.id)?;
+            self.saved.create().copy_tree("service", &key)
+        };
+        support::cleanup::warn_left_behind(support::cleanup::retrying(|| {
+            put_back()
+                .err()
+                .map(|e| format!(r"put back the service key of {}: {e}", self.id))
+        }));
+    }
+}
+
+fn services_key() -> winreg::RegKey {
+    winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(support::SCM_SERVICES_KEY, KEY_READ | KEY_WRITE)
+        .expect("open Services")
+}
+
+/// A service key that is a registry link to a missing key is a key SCM has a service at, but nothing
+/// below it can be read: `list` reports it in the unreadable aggregate, `status` is `Undetermined`,
+/// and neither calls it a stranger's or absent. SCM still opens the service by name, so the
+/// `Undetermined` of `status` is the registry read's, not the open's.
+///
+/// `SCM_DENIAL`: the unreadable service puts an `Undetermined` entry naming it in every concurrent
+/// `list()`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
+fn a_service_key_that_is_a_link_to_a_missing_key_is_undetermined_for_list_and_status() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    seed_foreign(&id);
+    let target = ScratchKey::new(&format!("dangling-target-{id}"));
+    let _swapped = SwappedServiceKey::take_out(&id, ScratchKey::new(&format!("dangling-saved-{id}")));
+    let services = services_key();
+    let _link = create_link(&services, &id, &target.nt_path());
+
+    let scm = WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+    scm.open_service(&id, ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)
+        .unwrap_or_else(|e| panic!("SCM must still open a service whose key is a dangling link: {e}"));
+
+    let listed = mgr
+        .list()
+        .expect("one unreadable service must not take down the listing");
+    let reason = listed
+        .iter()
+        .find_map(|entry| match entry {
+            Installed::Undetermined { name, reason } if name.as_deref() == Some(id.as_str()) => Some(reason),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a service whose key cannot be read is neither claimed nor omitted: {listed:?}"))
+        .to_string();
+    assert!(
+        reason.contains(&support::registry::service_path(&id)),
+        "the entry must name the service key: {reason}"
+    );
+
+    let err = mgr
+        .status(&id_of(&id))
+        .expect_err("a service whose key cannot be read settles nothing about the id");
+    assert!(
+        matches!(&err, goetia::Error::Undetermined { id: reported, .. } if reported == &id),
+        "{err:?}"
     );
 }
 

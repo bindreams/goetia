@@ -47,7 +47,7 @@ fn a_child_is_opened_as_the_key_it_is_even_when_it_is_a_link() {
     assert!(std::ptr::eq(attributes.ObjectName, &name));
 }
 
-/// A reader that wants what SCM reads opens as SCM does: a link is entered.
+/// `Followed` enters a link.
 #[skuld::test]
 fn a_child_is_opened_through_a_link_when_asked_to_follow_it() {
     let name = counted(&"Sub".encode_utf16().collect::<Vec<u16>>());

@@ -105,9 +105,7 @@ pub(super) fn gone_is_done(result: io::Result<()>) -> io::Result<()> {
 /// comes before the access check.
 ///
 /// A key gone through the link is gone only if `itself`, asked then, finds it gone as itself too.
-/// If `itself` finds a key there, it is a link whose target is missing, which SCM has a service at
-/// and which is no service gone: that is `through`'s error, the failure of a read that cannot see
-/// through it.
+/// If `itself` finds a key, it is a link with a missing target: `through`'s error stands.
 pub(super) fn stands(through: io::Result<()>, itself: impl FnOnce() -> io::Result<()>) -> io::Result<bool> {
     let denied = |e: &io::Error| e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
     match through {

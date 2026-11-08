@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::os::windows::ffi::OsStrExt as _;
 
-use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE,
+};
 use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
@@ -75,6 +77,12 @@ fn registry_undetermined(name: &str, op: &str, path: &str, source: std::io::Erro
     super::undetermined(name, registry_error(op, path, source), access_denied)
 }
 
+/// The failure for a service SCM has open whose `Services\<name>` key is not there.
+pub fn missing_service_key(name: &str) -> Error {
+    let not_found = std::io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32);
+    registry_undetermined(name, "open", &service_key_path(name), not_found)
+}
+
 // Parameters (the metadata blob) ======================================================================================
 
 /// What a read of a service's registry values found.
@@ -105,9 +113,7 @@ fn read_settled<T>(
 /// Whether `Services\<name>` exists below `services`, an open `Services` key, asked only after a
 /// read met a missing key.
 ///
-/// The key is opened as SCM reads it, through a registry link. A link whose target is missing is a
-/// key SCM has a service at, so the read that met a missing key below it is a failure, not a service
-/// that is gone (see [`stands`]).
+/// The key is opened as SCM reads it, through a registry link (see [`stands`]).
 fn service_stands_in(services: &ServicesRoot<'_>, name: &str) -> std::result::Result<bool, Failure> {
     let wide: Vec<u16> = name.encode_utf16().collect();
     let open = |links| counted::open_child(services.0, &wide, KEY_READ, links).map(drop);
@@ -142,8 +148,8 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///   gone.
 /// - [`registry_undetermined`] for every other failure, among them a key that vanishes or is marked
 ///   deleted under a service that still stands, and a service key that is a registry link to a
-///   missing key (SCM has a service there, but nothing below it can be read). Never Foreign: this
-///   key holds the only proof of ownership a `type: managed` service has.
+///   missing key. Never Foreign: this key holds the only proof of ownership a `type: managed`
+///   service has.
 ///
 /// goetia's own writes remove `Parameters` only when it is a registry link (see
 /// [`write_parameters`]), which a read classifies as not goetia's, so a write meets one only when
@@ -355,8 +361,7 @@ fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
 /// The lines of `Services\<name>\Environment`; empty when the value is absent. Errs only when the
 /// value cannot be read at all; anything that is not what [`write_environment`] writes reads as the
 /// marker lines [`environment_lines`] describes. [`RegistryReadOutcome::ServiceGone`] when the service
-/// is gone, the same classification as [`read_parameters`]'s: a key that vanished under a service
-/// that still stands, a service key that is a registry link to a missing key included, is an error.
+/// is gone, the same classification as [`read_parameters`]'s.
 pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
     let services = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(SERVICES_KEY, KEY_READ)

@@ -152,9 +152,7 @@ fn absent_with_the_service_standing_is_its_value() {
     assert!(matches!(settle(Stop::Absent(7), || Ok(true)), Settled::Value(7)));
 }
 
-/// Whatever the caller knows about the name, a missing optional key asks whether the service
-/// stands: nothing else tells a service that stands without the key from a service key that cannot
-/// be read.
+/// A missing optional key always asks whether the service stands.
 #[skuld::test]
 fn absent_asks_whether_the_service_stands() {
     let asked = std::cell::Cell::new(false);
