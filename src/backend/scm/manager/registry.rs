@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStrExt as _;
 
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE};
@@ -24,7 +25,6 @@ use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
 
 mod counted;
-use counted::LinkHandling;
 mod settle;
 pub use settle::Origin;
 use settle::{Failure, Settled, Stop, settle, stands, tolerate_not_found};
@@ -108,20 +108,15 @@ fn read_settled<T>(
     }
 }
 
-/// Whether `Services\<name>` exists below `services`, an open `Services` key, asked only after a
-/// read met a missing key. `wide` is `name` as UTF-16, which the read has encoded already.
-///
-/// The key is opened as SCM reads it, through a registry link. A link whose target is missing is a
-/// key SCM has a service at, so the read that met a missing key below it is a failure, not a service
-/// that is gone (see [`stands`]).
-fn service_stands_in(services: &ServicesRoot<'_>, name: &str, wide: &[u16]) -> std::result::Result<bool, Failure> {
-    debug_assert!(
-        wide.iter().copied().eq(name.encode_utf16()),
-        "`wide` is `name` in UTF-16"
-    );
-    let open = |links| counted::open_child(services.0, wide, KEY_READ, links).map(drop);
-    stands(open(LinkHandling::Followed), || open(LinkHandling::Itself))
-        .map_err(|source| failure("open", &service_key_path(name), source))
+/// Whether `Services\<name>` exists, asked only after a read met a missing key.
+fn service_stands(name: &str) -> std::result::Result<bool, Failure> {
+    let path = service_key_path(name);
+    stands(
+        RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(&path, KEY_READ)
+            .map(drop),
+    )
+    .map_err(|source| failure("open", &path, source))
 }
 
 fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
@@ -152,10 +147,8 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///   gone. A [`Origin::Vouched`] name is not checked for a plain missing `Parameters` key, which
 ///   reads as the service standing without it; it is checked only when the key is lost mid-read.
 /// - [`registry_undetermined`] for every other failure, among them a key that vanishes or is marked
-///   deleted under a service that still stands, and a service key that is a registry link to a
-///   missing key (SCM has a service there, and the check above finds it standing, but nothing below
-///   it can be read). Never Foreign: this key holds the only proof of ownership a `type: managed`
-///   service has.
+///   deleted under a service that still stands. Never Foreign: this key holds the only proof of
+///   ownership a `type: managed` service has.
 ///
 /// goetia's own writes remove `Parameters` only when it is a registry link (see
 /// [`write_parameters`]), which a read classifies as not goetia's, so a write meets one only when
@@ -179,11 +172,11 @@ pub fn read_parameters_in(
     let path = parameters_key_path(name);
     read_settled(
         origin,
-        || service_stands_in(services, name, &name.encode_utf16().collect::<Vec<_>>()),
+        || service_stands(name),
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
             let (relative, access) = parameters_read_request(name);
-            let key = counted::open_child(services.0, &relative, access, LinkHandling::Itself)
+            let key = counted::open_child(services.0, &relative, access)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), Some(Parameters::default())))?;
             let mut parameters = Parameters::default();
             // The names as stored, for a field found not to be a string.
@@ -372,25 +365,16 @@ fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
 /// The lines of `Services\<name>\Environment`; empty when the value is absent. Errs only when the
 /// value cannot be read at all; anything that is not what [`write_environment`] writes reads as the
 /// marker lines [`environment_lines`] describes. [`RegistryReadOutcome::ServiceGone`] when the service
-/// is gone, the same classification as [`read_parameters`]'s: a key that vanished under a service
-/// that still stands, a service key that is a registry link to a missing key included, is an error.
+/// is gone, the same classification as [`read_parameters`]'s.
 pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
-    let services = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(SERVICES_KEY, KEY_READ)
-        .map_err(|e| registry_error("open", SERVICES_KEY, e))?;
-    read_environment_in(&ServicesRoot::new(&services), name)
-}
-
-/// [`read_environment`] below a `Services` key that is already open.
-fn read_environment_in(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
     let path = service_key_path(name);
-    let wide: Vec<u16> = name.encode_utf16().collect();
     read_settled(
         Origin::Opened,
-        || service_stands_in(services, name, &wide),
+        || service_stands(name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
-            let key = counted::open_child(services.0, &wide, KEY_READ, LinkHandling::Followed)
+            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+                .open_subkey_with_flags(&path, KEY_READ)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
             let mut bytes = Vec::new();
             match query_raw_value(&key, ENVIRONMENT_VALUE, &mut bytes) {
@@ -534,17 +518,19 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
 /// for the name, [`Origin::Vouched`]): the registry's word only, which the sweep does not take
 /// alone. Any other failure to read is an error, a key that vanished under a service that still
 /// stands included: what the service runs is then unknown. A service key that is a registry link is
-/// read through it, as SCM reads it, and one whose target is missing is such a failure: SCM has the
-/// service, and the sweep asks it.
+/// read through it, as SCM reads it; one whose target is missing reads as gone, and SCM may have a
+/// service there, which is why the sweep asks it.
 pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Option<String>>> {
     let path = service_key_path(name);
-    let wide: Vec<u16> = name.encode_utf16().collect();
+    // `services` lends its handle: wrapped so that dropping the key does not close it.
+    let root = ManuallyDrop::new(RegKey::predef(services.0));
     read_settled(
         Origin::Vouched,
-        || service_stands_in(services, name, &wide),
+        || service_stands(name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
-            let key = counted::open_child(services.0, &wide, KEY_READ, LinkHandling::Followed)
+            let key = root
+                .open_subkey_with_flags(name, KEY_READ)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
             match key.get_value::<u32, _>(DELETE_FLAG_VALUE) {
                 Ok(0) => {}

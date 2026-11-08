@@ -7,8 +7,7 @@
 //!
 //! A registry link is a key that points at another. `RegOpenKeyExW` without a flag, and so `winreg`'s
 //! `open_subkey`, enters the target: a write or a delete there would reach a key that is not the
-//! one named. A child is opened here as itself, so that a link is a key to delete, never a path,
-//! unless the caller asks for [`LinkHandling::Followed`]: only a read of what SCM reads does.
+//! one named. A child is opened here as itself, so that a link is a key to delete, never a path.
 
 use std::io;
 use std::ptr::{null, null_mut};
@@ -65,25 +64,16 @@ pub(super) fn delete_value(key: &RegKey, name: &[u16]) -> io::Result<()> {
 /// of `name` itself only NotFound is: KEY_DELETED there says that `key`, the held parent, was
 /// marked deleted, not that the child is gone.
 pub(super) fn delete_subkey(key: &RegKey, name: &[u16]) -> io::Result<()> {
-    match open_raw(key.raw_handle(), name, CHILD_ACCESS, LinkHandling::Itself) {
+    match open_raw(key.raw_handle(), name, CHILD_ACCESS) {
         Ok(child) => delete_tree(child),
         Err(e) => tolerate_not_found(Err(e)),
     }
 }
 
-/// Whether an open stops at a registry link or enters it.
-#[derive(Clone, Copy)]
-pub(super) enum LinkHandling {
-    /// The link is the key opened.
-    Itself,
-    /// The link's target is the key opened, as for a reader that wants what SCM reads.
-    Followed,
-}
-
-/// Opens the subkey of the key `parent` named `name`, which may be a path of names, with `access`.
-/// `parent` is an open key, whose own access is not asked.
-pub(super) fn open_child(parent: HANDLE, name: &[u16], access: u32, links: LinkHandling) -> io::Result<RegKey> {
-    Ok(open_raw(parent, name, access, links)?.into_key())
+/// Opens the subkey of the key `parent` named `name`, which may be a path of names, as the last of
+/// them is: a registry link included. `parent` is an open key, whose own access is not asked.
+pub(super) fn open_child(parent: HANDLE, name: &[u16], access: u32) -> io::Result<RegKey> {
+    Ok(open_raw(parent, name, access)?.into_key())
 }
 
 /// `REG_FLAG_LINK` (`ntregapi.h`): the key is a registry link.
@@ -126,7 +116,7 @@ fn link_flag(flags: [u32; 3], written: u32) -> io::Result<bool> {
 /// existing link is returned as the link, not its target.
 pub(super) fn create_child(key: &RegKey, name: &[u16], access: u32) -> io::Result<RegKey> {
     let name = counted(name);
-    let attributes = child_attributes(key.raw_handle(), &name, LinkHandling::Itself);
+    let attributes = child_attributes(key.raw_handle(), &name);
     let mut handle: HANDLE = null_mut();
     let mut disposition = 0u32;
     // SAFETY: `attributes` and the name it points at outlive the call; `handle` and `disposition`
@@ -159,17 +149,13 @@ const BASIC_INFORMATION_BYTES: usize = 1024;
 const BASIC_NAME_LENGTH_AT: usize = 12;
 const BASIC_NAME_AT: usize = 16;
 
-/// How to open the child `name` of `parent`, a link as `links` says.
-fn child_attributes(parent: HANDLE, name: &UNICODE_STRING, links: LinkHandling) -> OBJECT_ATTRIBUTES {
-    let link = match links {
-        LinkHandling::Itself => OBJ_OPENLINK,
-        LinkHandling::Followed => 0,
-    };
+/// How to open the child `name` of `parent`: itself even when it is a link.
+fn child_attributes(parent: HANDLE, name: &UNICODE_STRING) -> OBJECT_ATTRIBUTES {
     OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: parent,
         ObjectName: name,
-        Attributes: OBJ_CASE_INSENSITIVE | link,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENLINK,
         SecurityDescriptor: null(),
         SecurityQualityOfService: null(),
     }
@@ -182,10 +168,10 @@ fn basic_name(buffer: &[u8]) -> Vec<u16> {
     units.iter().map(|pair| u16::from_le_bytes(*pair)).collect()
 }
 
-/// Opens the child `name` of `parent` with `access`, a link as `links` says.
-fn open_raw(parent: HANDLE, name: &[u16], access: u32, links: LinkHandling) -> io::Result<Opened> {
+/// Opens the child `name` of `parent` as the key it is, with `access`.
+fn open_raw(parent: HANDLE, name: &[u16], access: u32) -> io::Result<Opened> {
     let name = counted(name);
-    let attributes = child_attributes(parent, &name, links);
+    let attributes = child_attributes(parent, &name);
     let mut handle: HANDLE = null_mut();
     // SAFETY: `attributes` and the name it points at outlive the call; `handle` is a valid
     // out-param.
@@ -201,7 +187,7 @@ fn delete_tree(child: Opened) -> io::Result<()> {
         Err(e) => return gone_is_done(Err(e)),
     };
     for grandchild in names {
-        match open_raw(child.0, &grandchild, CHILD_ACCESS, LinkHandling::Itself) {
+        match open_raw(child.0, &grandchild, CHILD_ACCESS) {
             Ok(grandchild) => delete_tree(grandchild)?,
             Err(e) => gone_is_done(Err(e))?,
         }
