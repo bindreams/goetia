@@ -184,6 +184,17 @@ fn a_key_that_cannot_be_read_is_read_through_scm() {
     assert_eq!(image.unwrap(), Some("C:/b.exe".to_string()));
 }
 
+/// A link at the service key whose target is missing reads as the key not found, though SCM has the
+/// service: SCM's answer stands.
+#[skuld::test]
+fn a_key_found_missing_under_a_service_is_read_through_scm() {
+    let not_found = Error::os("open the key", std::io::Error::from(std::io::ErrorKind::NotFound));
+
+    let image = image_of("frpc", Err(not_found), || Ok(Some("C:/b.exe".to_string())));
+
+    assert_eq!(image.unwrap(), Some("C:/b.exe".to_string()));
+}
+
 #[skuld::test]
 fn a_service_scm_has_no_image_for_is_none_when_the_key_cannot_be_read() {
     assert_eq!(

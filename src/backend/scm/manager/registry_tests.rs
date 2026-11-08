@@ -482,6 +482,47 @@ fn a_service_key_that_is_a_link_is_read_through_to_its_target() {
     assert_eq!(read.as_deref(), Some(r"C:\linked\host.exe --x"));
 }
 
+/// Writes keys under `HKLM\SOFTWARE`. A link at a service key whose target is missing is a key SCM
+/// still has a service at, so a read through it that finds nothing is a failure, which the sweep
+/// answers through SCM, and not the service gone: left out of what is referenced, its host would be
+/// deleted.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_to_a_missing_key_is_a_failed_read_not_an_absent_service() {
+    let unique = std::process::id();
+    // The target is never created.
+    let target = ScratchKey::new(&format!("image-{unique}-dangling-target"));
+    let root_scratch = ScratchKey::new(&format!("image-{unique}-dangling-root"));
+    let root = root_scratch.create();
+    let _link = create_link(&root, "dangling", &target.nt_path());
+    let services = ServicesRoot::new(&root);
+
+    let read = read_registered_image(&services, "dangling");
+
+    assert!(
+        read.is_err(),
+        "a service key whose target is missing is not an absent service: {read:?}"
+    );
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. The same link, read for `Parameters` as a service looked up by
+/// name: the service stands without them, which reads as not goetia's, and is not gone.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_to_a_missing_key_stands_for_a_parameters_read() {
+    let unique = std::process::id();
+    let target = ScratchKey::new(&format!("parameters-{unique}-dangling-target"));
+    let root_scratch = ScratchKey::new(&format!("parameters-{unique}-dangling-root"));
+    let root = root_scratch.create();
+    let _link = create_link(&root, "dangling", &target.nt_path());
+    let services = ServicesRoot::new(&root);
+
+    let read = read_parameters_in(&services, "dangling", Origin::Opened).expect("read the linked service");
+
+    assert!(
+        matches!(read, RegistryReadOutcome::Read(_)),
+        "a service key whose target is missing is not a service that is gone"
+    );
+}
+
 /// Writes keys under `HKLM\SOFTWARE`. A `Services` key that is marked deleted while the scan holds
 /// it (another handle deleted it) fails the open of a service below it with KEY_DELETED, which the
 /// read settles as #165's reads do: the service is gone when its own key is, and is not a failure.
@@ -494,7 +535,6 @@ fn a_root_marked_deleted_under_the_scan_reads_the_service_as_gone() {
         .delete_subkey(scratch.path())
         .expect("delete the root through another handle");
 
-    // A name no service of the machine has, so the existence check finds the real key gone too.
     let read = read_registered_image(
         &services,
         &format!("goetia-test-no-such-service-{}", std::process::id()),

@@ -110,11 +110,25 @@ fn read_settled<T>(
 
 /// Whether `Services\<name>` exists, asked only after a read met a missing key.
 fn service_stands(name: &str) -> std::result::Result<bool, Failure> {
+    let services = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(SERVICES_KEY, KEY_READ)
+        .map_err(|source| failure("open", SERVICES_KEY, source))?;
+    service_stands_in(&ServicesRoot::new(&services), name)
+}
+
+/// [`service_stands`] below a `Services` key that is already open. The key is opened as itself: a
+/// registry link at it is a key SCM has a service at, even when the link's target is missing, and
+/// the read that met a missing key below it is then a failure, not a service that is gone.
+fn service_stands_in(services: &ServicesRoot<'_>, name: &str) -> std::result::Result<bool, Failure> {
     let path = service_key_path(name);
     stands(
-        RegKey::predef(HKEY_LOCAL_MACHINE)
-            .open_subkey_with_flags(&path, KEY_READ)
-            .map(drop),
+        counted::open_child(
+            services.0,
+            &name.encode_utf16().collect::<Vec<_>>(),
+            KEY_READ,
+            LinkHandling::Itself,
+        )
+        .map(drop),
     )
     .map_err(|source| failure("open", &path, source))
 }
@@ -172,7 +186,7 @@ pub fn read_parameters_in(
     let path = parameters_key_path(name);
     read_settled(
         origin,
-        || service_stands(name),
+        || service_stands_in(services, name),
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
             let (relative, access) = parameters_read_request(name);
@@ -517,12 +531,13 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
 /// how [`settle`] reads every key that vanishes (the scan vouches for the name, [`Origin::Vouched`]).
 /// Any other failure to read is an error, a key that vanished under a service that still stands
 /// included: what the service runs is then unknown. A service key that is a registry link is read
-/// through it, as SCM reads it.
+/// through it, as SCM reads it, and one whose target is missing is such a failure: SCM has the
+/// service, and the sweep asks it.
 pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<Option<String>> {
     let path = service_key_path(name);
     let read = read_settled(
         Origin::Vouched,
-        || service_stands(name),
+        || service_stands_in(services, name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
             let key = counted::open_child(
