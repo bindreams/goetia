@@ -20,7 +20,10 @@
 //!    backend, so they still agree.
 //! 2. Neither path ever checks elevation.
 //! 3. `show -f` touches no manager; `show` without `-f` touches no manifest.
-//! 4. Output is YAML, one `# <id>` header per daemon, blank-line separated.
+//! 4. Output is YAML, one `# <id>` header per daemon, blank-line separated. It is for reading, so it
+//!    is not byte-exact when a value holds a control character, U+2028, U+2029 or a bidirectional
+//!    control: `dispatch`'s stream writes each as `\u{XXXX}`. The artifact file keeps the exact
+//!    value.
 //!
 //! A daemon this privilege level *can* see, but whose blob will not decode,
 //! is not "not installed": `show` returns `4` for it, per id and for the
@@ -33,13 +36,16 @@
 //! is *any* id `show` cannot find while an aggregate entry — one with no
 //! name — is present, since such an entry may stand for that very id.
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
-use super::support::{load_and_warn, partition_installed, print_undetermined_warnings, print_unusable_warnings};
+use super::support::{
+    load_and_warn, partition_installed, print_error, print_line, print_undetermined_warnings, print_unusable_warnings,
+};
 use crate::error::Result;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonSpec;
@@ -72,7 +78,7 @@ fn show_from_file(file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Exit
     let spec = match load_and_warn(file, err) {
         Ok(spec) => spec,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -89,14 +95,14 @@ fn show_from_installed(
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
     let installed = match mgr.list() {
         Ok(v) => v,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -125,22 +131,27 @@ fn show_from_installed(
 
     let mut specs = Vec::new();
     for id in &wanted {
+        // The id comes from outside, so these one-line messages write it through the strict writer.
+        // A reason prints as the report does: a child's stderr in it keeps its layout.
         if let Some(entry) = index.ours.get(id) {
             specs.push(entry.spec.clone());
         } else if index.unusable.contains_key(id) {
-            let _ = writeln!(err, "error: daemon `{id}` is installed but unusable");
+            print_line(err, Some("error"), None, |sink| {
+                write!(sink, "daemon `{id}` is installed but unusable")
+            });
             codes.push(ExitCode::Indeterminate);
         } else if let Some(entry) = index.undetermined_for(id) {
             // Either the listing could not classify this id, or an aggregate
             // entry may stand for it: absence is unestablished either way.
-            let _ = writeln!(
-                err,
-                "error: daemon `{id}`: installation state could not be determined: {}",
-                entry.reason
-            );
+            print_line(err, Some("error"), None, |sink| {
+                write!(sink, "daemon `{id}`: installation state could not be determined: ")?;
+                entry.reason.write_to(sink)
+            });
             codes.push(ExitCode::Indeterminate);
         } else {
-            let _ = writeln!(err, "error: daemon `{id}` is not installed");
+            print_line(err, Some("error"), None, |sink| {
+                write!(sink, "daemon `{id}` is not installed")
+            });
             codes.push(ExitCode::Error);
         }
     }

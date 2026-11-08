@@ -494,14 +494,11 @@ fn dropin_external_config(id: &str, dirs: &[(PathBuf, String)]) -> ExternalConfi
 /// How to resolve a conflict `--force` cannot. Deliberately parallel to [`residue_recovery`], which
 /// says the same thing about the same directories on the path where the fragment is already gone.
 fn dropin_recovery(unclearable: &[&Path]) -> String {
-    let paths = unclearable
-        .iter()
-        .map(|p| format!("\n  {}", p.display()))
-        .collect::<String>();
+    let paths = list(unclearable);
     format!(
-        "systemd applies configuration goetia did not write, from outside `{UNIT_DIR}`:{paths}\n\
+        "systemd applies configuration goetia did not write, from outside `{UNIT_DIR}`: {paths}. \
          `--force` rewrites `{UNIT_DIR}/<id>.service` and clears only `{UNIT_DIR}`'s own drop-in, so \
-         it cannot resolve this — remove the directories above by hand, run `systemctl \
+         it cannot resolve this — remove those directories by hand, run `systemctl \
          daemon-reload`, and re-run."
     )
 }
@@ -636,19 +633,25 @@ fn residue(id: &str) -> ReadResult<Option<Residue>> {
     Ok(Some(Residue { dropin, links }))
 }
 
+/// `paths` on one line, each in backticks. A recovery holds no layout: a path can hold a line feed
+/// of its own, and layout is the report's to decide.
+fn list(paths: &[&Path]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("`{}`", p.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// How to empty an id whose fragment is gone but whose [`Residue`] is not. Goetia removes none of
 /// it itself: `<id>.service.d` in `/run` or `/usr/lib` — and, for that matter, in `/etc` — is just
 /// as plausibly an administrator's override of a unit *shipped elsewhere* as it is goetia's own
 /// leftover, and there is nothing on disk that distinguishes the two.
 fn residue_recovery(id: &str, residue: &Residue) -> String {
-    let paths = residue
-        .paths()
-        .iter()
-        .map(|p| format!("\n  {}", p.display()))
-        .collect::<String>();
+    let paths = list(&residue.paths());
     format!(
-        "no `{UNIT_DIR}/{id}.service`, but systemd still applies configuration attached to `{id}`:\
-         {paths}\ngoetia cannot tell its own leftovers from an administrator's overrides of a unit \
+        "no `{UNIT_DIR}/{id}.service`, but systemd still applies configuration attached to `{id}`: \
+         {paths}. goetia cannot tell its own leftovers from an administrator's overrides of a unit \
          shipped elsewhere, so it removes neither — `systemctl disable {id}.service` drops the \
          enablement link and a drop-in directory has to go by hand. Then run `systemctl \
          daemon-reload` and re-run."
