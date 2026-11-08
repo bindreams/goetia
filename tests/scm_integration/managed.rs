@@ -37,10 +37,6 @@ use crate::support::{self, ConnectBack, ELEVATED, ScratchKey, ServiceGuard};
 /// - A negative assertion that counts the aggregate fails while any service is denied.
 /// - A service-object denial makes a concurrent `list` report an error for that service, which
 ///   `cli_binary`'s `list_json` refuses.
-/// - An install, rewrite or uninstall racing a deny test's `list` can make that test's own lookup
-///   fail through the nameless aggregate. `write_parameters` deletes and recreates `Parameters`, so
-///   a reader mid-rewrite sees the key vanish. This hazard, and the labels held only for it, go
-///   away with `fix/scm-parameters-in-place`.
 ///
 /// Shared with `tests/shim_integration` and `tests/cli_binary.rs` by label *name*: skuld serializes
 /// across processes by it, and all three drive the one SCM on the host.
