@@ -13,7 +13,9 @@ mod within;
 #[cfg(feature = "cli")]
 pub(crate) use escape::{EscapedStream, escape};
 pub use reason::Reason;
-pub(crate) use report::{Chain, Sink};
+pub(crate) use report::Chain;
+#[cfg(feature = "cli")]
+pub(crate) use report::Sink;
 pub(crate) use within::within;
 
 use report::Report;
