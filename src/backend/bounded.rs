@@ -158,9 +158,10 @@ pub(crate) enum Role {
     AnnouncedRequest(fn(&[u8]) -> bool),
     /// A request that never says when the manager has it. The deadline applies from the spawn, but
     /// an expiry leaves the child running rather than killing it, since a kill could land before
-    /// the request is out, and its [`Reaper`] reaps it once it exits. launchd's alone: on Linux,
-    /// cosca 0.4's cgroup containment kills a detached tree when it drops the leaf, so a
-    /// [`command`] child would not be left running.
+    /// the request is out, and its [`Reaper`] reaps it once it exits. The caller gets the child
+    /// back as a [`Left`] and may kill it once it knows the manager has the request. launchd's
+    /// alone: on Linux, cosca 0.4's cgroup containment kills a detached tree when it drops the
+    /// leaf, so a [`command`] child would not be left running.
     ///
     /// Its output goes to temp files, never pipes: a pipe goetia stopped reading — on expiry, or by
     /// exiting — kills the writer with `SIGPIPE`, and a file does not.
@@ -339,8 +340,10 @@ pub(crate) struct Lost {
 }
 
 /// Block until the child exits or `deadline` expires, under its [`Role`]'s rule for what an expiry
-/// does: kill the child, tear its tree down and reap it — or, for [`Role::Request`], leave it
-/// running for its [`Reaper`]. Nothing here makes a thread or a file: [`spawn`] made them all.
+/// does: kill the child, tear its tree down and reap it ([`Finished::Expired`]) — or, for
+/// [`Role::Request`], leave it running and hand it back as [`Finished::Left`], which releases it to
+/// its [`Reaper`] unless the caller kills it. Nothing here makes a thread or a file: [`spawn`] made
+/// them all.
 pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, Lost> {
     let Spawned {
         child,

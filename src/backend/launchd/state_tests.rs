@@ -116,6 +116,16 @@ fn a_start_is_not_held_on_any_other_reading() {
     assert!(!start_is_held(""));
 }
 
+/// Only a queued start is evidence that cannot be an older instance still running.
+#[skuld::test]
+fn only_a_queued_start_is_queued() {
+    assert!(start_is_queued(&print_body("spawn scheduled", None)));
+    assert!(!start_is_queued(&print_body("running", Some(4242))));
+    assert!(!start_is_queued(&print_body("xpcproxy", Some(39459))));
+    assert!(!start_is_queued(&print_body("not running", None)));
+    assert!(!start_is_queued(""));
+}
+
 // find_field ==========================================================================================================
 
 #[skuld::test]

@@ -29,14 +29,19 @@ pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
     (state, pid)
 }
 
+/// Whether one `launchctl print` body shows a start queued for the job: `spawn scheduled`, which
+/// [`classify`] folds into `Unknown`. The reading that cannot be an instance already running.
+pub(crate) fn start_is_queued(print_body: &str) -> bool {
+    find_field(print_body, "state").map(str::trim) == Some("spawn scheduled")
+}
+
 /// Whether one `launchctl print` body shows launchd holding a start for the job: one queued
-/// (`spawn scheduled`, which [`classify`] folds into `Unknown`) or the job already running.
+/// ([`start_is_queued`]) or the job already running.
 ///
 /// Any other reading, an unrecognised or missing `state` included, is `false`: it is no evidence that
 /// launchd has the request.
 pub(crate) fn start_is_held(print_body: &str) -> bool {
-    classify(print_body).0 == State::Running
-        || find_field(print_body, "state").map(str::trim) == Some("spawn scheduled")
+    start_is_queued(print_body) || classify(print_body).0 == State::Running
 }
 
 /// Extracts the value on the first `key = value` line of a `launchctl print`-style body (one
