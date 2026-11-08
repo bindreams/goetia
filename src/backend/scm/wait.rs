@@ -590,10 +590,10 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
         StartReply::Accepted => Ok(()),
         StartReply::AlreadyRunning(queried) if already_running_is_recoverable(queried) => Ok(()),
         StartReply::AlreadyRunning(QueriedState::StopPending) => Err(io::Error::other(STOPPING)),
-        StartReply::AlreadyRunning(QueriedState::Paused | QueriedState::PausePending) => Err(io::Error::other(PAUSED)),
+        StartReply::AlreadyRunning(QueriedState::Paused) => Err(io::Error::other(PAUSED)),
         StartReply::AlreadyRunning(queried) => Err(io::Error::other(format!(
             "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
-             {queried:?} — neither Running nor StartPending, so nothing is on its way to running"
+             {queried:?}, so nothing is on its way to running"
         ))),
     }
 }
@@ -844,16 +844,16 @@ pub struct QueriedStatus {
     pub wait_hint: u32,
 }
 
-/// Whether 1056 still counts as a start, for the plain `start` verb: `Running`, `StartPending` and
-/// `ContinuePending` are states the service is heading to running from; every other state is not, and
-/// accepting it would report a start that did not happen. A `PausePending` one settles `PAUSED`, which
-/// [`PAUSED`] tells. `restart --timeout 0` never consults it
-/// ([`request_start_after_stop`]).
+/// Whether 1056 still counts as a start, for the plain `start` verb: `Running` and the states that are
+/// not settled and may end in it (`StartPending`, `ContinuePending`, `PausePending`: a failing pause
+/// returns to `Running`) count. Every other state does not, and accepting it would report a start that
+/// did not happen. A wait over a recovered one tells `PAUSED` if it settles there. `restart --timeout 0`
+/// never consults it ([`request_start_after_stop`]).
 #[must_use]
 pub(crate) fn already_running_is_recoverable(queried: QueriedState) -> bool {
     matches!(
         queried,
-        QueriedState::Running | QueriedState::StartPending | QueriedState::ContinuePending
+        QueriedState::Running | QueriedState::StartPending | QueriedState::ContinuePending | QueriedState::PausePending
     )
 }
 

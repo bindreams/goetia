@@ -2082,26 +2082,24 @@ fn a_queried_running_recovers_an_already_running_start() {
 }
 
 #[skuld::test]
-fn a_queried_start_or_continue_pending_recovers_an_already_running_start() {
-    // A service something else started or resumed a moment ago is on its way to
-    // `Running`, and the wait resolves it. Rejecting it failed a start that
-    // was going to succeed — narrowing this predicate back to
-    // `Running`-only fails here.
-    assert!(already_running_is_recoverable(QueriedState::StartPending));
-    assert!(already_running_is_recoverable(QueriedState::ContinuePending));
+fn a_queried_start_continue_or_pause_pending_recovers_an_already_running_start() {
+    // A service something else started, resumed or is pausing is not settled, and the wait resolves
+    // it: a failing pause returns to `Running`. Rejecting it failed a start that was going to
+    // succeed — narrowing this predicate back to `Running`-only fails here.
+    for state in [
+        QueriedState::StartPending,
+        QueriedState::ContinuePending,
+        QueriedState::PausePending,
+    ] {
+        assert!(already_running_is_recoverable(state), "{state:?}");
+    }
 }
 
 #[skuld::test]
 fn no_other_queried_state_recovers_an_already_running_start() {
-    // None of these is on its way to `Running`, so treating 1056 as "the wait
-    // will complete" would report a start that did not happen instead of what
-    // the service is actually doing.
-    for state in [
-        QueriedState::Stopped,
-        QueriedState::StopPending,
-        QueriedState::PausePending,
-        QueriedState::Paused,
-    ] {
+    // None of these is on its way to `Running` or unsettled, so treating 1056 as "the wait will
+    // complete" would report a start that did not happen instead of what the service is actually doing.
+    for state in [QueriedState::Stopped, QueriedState::StopPending, QueriedState::Paused] {
         assert!(
             !already_running_is_recoverable(state),
             "{state:?} must not be recoverable"
@@ -2197,6 +2195,79 @@ fn a_start_is_not_failed_by_a_paused_the_service_left_before_it_was_delivered() 
     );
 }
 
+/// A delivered `PAUSED` whose read finds the service resuming is not decided: the wait re-arms under the
+/// same deadline, and the `RUNNING` that follows confirms.
+#[skuld::test]
+fn a_delivered_paused_whose_read_is_pending_keeps_the_start_waiting() {
+    let deadline = an_hour_out();
+    let mut fake = FakeScm::new([Some(Observed::Running)])
+        .starting_in(QueriedState::Stopped)
+        .shifting_at("start", QueriedState::Paused)
+        .shifting_at("arm", QueriedState::ContinuePending);
+    assert_eq!(
+        start_via_notify(&mut fake, deadline, Kind::Managed).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(
+        fake.log,
+        vec![
+            "start",
+            "arm_settle",
+            "wait",
+            "got_paused",
+            "query_status",
+            "arm_settle",
+            "wait",
+            "got_running"
+        ]
+    );
+    assert_eq!(fake.arm_deadlines, vec![deadline; 2]);
+    assert_eq!(fake.deadlines, vec![deadline; 2]);
+}
+
+/// A delivered `PAUSED` whose read finds the service `STOPPED` is judged as a `STOPPED` is, by `kind`.
+#[skuld::test]
+fn a_delivered_paused_whose_read_is_stopped_is_judged_by_kind() {
+    let mut fake = FakeScm::new([])
+        .starting_in(QueriedState::Stopped)
+        .shifting_at("start", QueriedState::Paused)
+        .shifting_at("arm", QueriedState::ContinuePending)
+        .shifting_at("wait", QueriedState::Stopped)
+        .stopped_after(Reported::from_daemon_code(7));
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap_err();
+    assert!(err.to_string().contains("failed start"), "{err}");
+    assert_eq!(
+        fake.log,
+        vec!["start", "arm_settle", "wait", "got_paused", "query_status"]
+    );
+}
+
+/// A 1056 over a service that is resuming or pausing is on its way to a settled state: the start waits
+/// for it. `RUNNING` confirms, and `PAUSED` is told as paused. The request-only start accepts it, as it
+/// does a starting one.
+#[skuld::test]
+fn a_start_over_a_resuming_or_pausing_service_waits_for_what_it_settles_in() {
+    for queried in [QueriedState::ContinuePending, QueriedState::PausePending] {
+        let mut fake = FakeScm::new([Some(Observed::Running)]).already_running(queried);
+        assert_eq!(
+            start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap(),
+            Waited::Confirmed,
+            "{queried:?}"
+        );
+        assert_eq!(
+            fake.log,
+            vec!["start", "arm_settle", "wait", "got_running"],
+            "{queried:?}"
+        );
+
+        let mut fake = FakeScm::new([Some(Observed::Paused)]).already_running(queried);
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap_err();
+        assert_eq!(err.to_string(), PAUSED, "{queried:?}");
+
+        request_start(&mut FakeScm::new([]).already_running(queried)).unwrap();
+    }
+}
+
 /// A start over a paused service says the same whether the pause came before the start (1056) or
 /// settled after it, and names the state and the way out.
 #[skuld::test]
@@ -2210,19 +2281,17 @@ fn a_start_over_a_paused_service_says_it_is_paused() {
         .unwrap_err()
         .to_string();
     assert_eq!(fake.log, vec!["start", "arm_settle"]);
-    // 1056 over a paused service, or one that is about to be: nothing is waited for.
-    for queried in [QueriedState::Paused, QueriedState::PausePending] {
-        let mut fake = FakeScm::new([]).already_running(queried);
-        let waiting = start_via_notify(&mut fake, unbounded(), Kind::Managed)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(fake.log, vec!["start"], "{queried:?}");
-        let immediate = request_start(&mut FakeScm::new([]).already_running(queried))
-            .unwrap_err()
-            .to_string();
-        assert_eq!(waiting, notified, "{queried:?}");
-        assert_eq!(immediate, notified, "{queried:?}");
-    }
+    // 1056 over a paused service: nothing is waited for.
+    let mut fake = FakeScm::new([]).already_running(QueriedState::Paused);
+    let waiting = start_via_notify(&mut fake, unbounded(), Kind::Managed)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(fake.log, vec!["start"]);
+    let immediate = request_start(&mut FakeScm::new([]).already_running(QueriedState::Paused))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(waiting, notified);
+    assert_eq!(immediate, notified);
     assert!(
         notified.contains("paused, not running") && notified.contains("`sc continue`"),
         "{notified}"
