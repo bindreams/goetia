@@ -29,19 +29,31 @@ pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
     (state, pid)
 }
 
-/// Whether one `launchctl print` body shows a start queued for the job: `spawn scheduled`, which
-/// [`classify`] folds into `Unknown`. The reading that cannot be an instance already running.
-pub(crate) fn start_is_queued(print_body: &str) -> bool {
-    find_field(print_body, "state").map(str::trim) == Some("spawn scheduled")
+/// What a `launchctl print` must show before goetia ends the `kickstart` an expiry left running.
+/// Ended before launchd has the request, the start is lost, so only a reading that cannot be an
+/// older instance of the job counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Evidence {
+    /// `spawn scheduled`: a start queued. Where a `running` could be an older instance, which would
+    /// not hold this request: after a read that was not a clean `Stopped`, and, conservatively,
+    /// after the corrective cycle's `bootout`, where a wrong kill costs the start and leaving it
+    /// costs a `launchctl` running for up to `restart_delay`.
+    Queued,
+    /// A start queued, or the job running (`pid` attached from `xpcproxy` on): after a clean
+    /// `Stopped` read, where a `running` is a fork after it.
+    QueuedOrRunning,
 }
 
-/// Whether one `launchctl print` body shows launchd holding a start for the job: one queued
-/// ([`start_is_queued`]) or the job already running.
-///
-/// Any other reading, an unrecognised or missing `state` included, is `false`: it is no evidence that
-/// launchd has the request.
-pub(crate) fn start_is_held(print_body: &str) -> bool {
-    start_is_queued(print_body) || classify(print_body).0 == State::Running
+impl Evidence {
+    /// Whether one `launchctl print` body shows it. Any other reading, an unrecognised or missing
+    /// `state` included, is no evidence that launchd has the request.
+    pub(crate) fn shown_by(self, print_body: &str) -> bool {
+        let queued = find_field(print_body, "state").map(str::trim) == Some("spawn scheduled");
+        match self {
+            Evidence::Queued => queued,
+            Evidence::QueuedOrRunning => queued || classify(print_body).0 == State::Running,
+        }
+    }
 }
 
 /// Extracts the value on the first `key = value` line of a `launchctl print`-style body (one

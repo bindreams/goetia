@@ -93,37 +93,37 @@ fn the_pid_is_returned_alongside_every_state() {
     );
 }
 
-// start_is_held =======================================================================================================
+// Evidence ============================================================================================================
 
-/// launchd holds a start when it has queued one (`spawn scheduled`) or the job already runs, `pid`
-/// attached from `xpcproxy` on.
 #[skuld::test]
-fn a_start_is_held_when_it_is_queued_or_the_job_runs() {
-    assert!(start_is_held(&print_body("spawn scheduled", None)));
-    assert!(start_is_held(&print_body("running", Some(4242))));
-    assert!(start_is_held(&print_body("xpcproxy", Some(39459))));
+fn queued_or_running_accepts_a_queued_start_and_a_running_job() {
+    let shown = |body: &str| Evidence::QueuedOrRunning.shown_by(body);
+    assert!(shown(&print_body("spawn scheduled", None)));
+    assert!(shown(&print_body("running", Some(4242))));
+    assert!(shown(&print_body("xpcproxy", Some(39459))));
 }
 
-/// Any other reading, an unrecognised or missing `state` included, is no evidence launchd has the
-/// request.
 #[skuld::test]
-fn a_start_is_not_held_on_any_other_reading() {
-    assert!(!start_is_held(&print_body("not running", None)));
-    assert!(!start_is_held(&print_body("exited", None)));
-    assert!(!start_is_held(&print_body("xpcproxy", None)));
-    assert!(!start_is_held(&print_body("someday-new-apple-state", None)));
-    assert!(!start_is_held("system/com.example.daemon = {\n\tactive count = 1\n}\n"));
-    assert!(!start_is_held(""));
+fn no_evidence_accepts_any_other_reading() {
+    for evidence in [Evidence::Queued, Evidence::QueuedOrRunning] {
+        let shown = |body: &str| evidence.shown_by(body);
+        assert!(!shown(&print_body("not running", None)), "{evidence:?}");
+        assert!(!shown(&print_body("exited", None)), "{evidence:?}");
+        assert!(!shown(&print_body("xpcproxy", None)), "{evidence:?}");
+        assert!(!shown(&print_body("someday-new-apple-state", None)), "{evidence:?}");
+        assert!(
+            !shown("system/com.example.daemon = {\n\tactive count = 1\n}\n"),
+            "{evidence:?}"
+        );
+        assert!(!shown(""), "{evidence:?}");
+    }
 }
 
-/// Only a queued start is evidence that cannot be an older instance still running.
 #[skuld::test]
-fn only_a_queued_start_is_queued() {
-    assert!(start_is_queued(&print_body("spawn scheduled", None)));
-    assert!(!start_is_queued(&print_body("running", Some(4242))));
-    assert!(!start_is_queued(&print_body("xpcproxy", Some(39459))));
-    assert!(!start_is_queued(&print_body("not running", None)));
-    assert!(!start_is_queued(""));
+fn queued_accepts_only_a_queued_start() {
+    assert!(Evidence::Queued.shown_by(&print_body("spawn scheduled", None)));
+    assert!(!Evidence::Queued.shown_by(&print_body("running", Some(4242))));
+    assert!(!Evidence::Queued.shown_by(&print_body("xpcproxy", Some(39459))));
 }
 
 // find_field ==========================================================================================================

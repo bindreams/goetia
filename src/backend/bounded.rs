@@ -65,8 +65,7 @@ pub(crate) struct Capture {
 pub(crate) enum Finished {
     /// The child exited on its own, inside the budget.
     Exited { status: ExitStatus, capture: Capture },
-    /// The deadline expired first. The child was killed and reaped. (A [`Role::Request`] is left
-    /// running instead: [`Finished::Left`].)
+    /// The deadline expired first. The child was killed and reaped.
     ///
     /// Carries no capture. Whatever the child had written by then is a
     /// prefix no consumer may treat as whole, and the one thing every
@@ -96,10 +95,10 @@ pub(crate) enum Fate {
 
 /// A [`Role::Request`] the deadline left running, held until its caller decides its [`Fate`].
 ///
-/// goetia cannot tell from `launchctl` whether the request is out, so nothing here kills it
-/// unasked: dropping a `Left` releases the child to its reaper, as an expiry always did. A caller
-/// that learns by other means that the manager has the request may [`kill`](Left::kill) the child,
-/// which then costs the request nothing.
+/// goetia cannot tell from the client whether the request is out, and a kill before it is would
+/// lose it, so nothing here kills unasked: dropping a `Left` releases the child to its reaper. A
+/// caller that learns by other means that the manager has the request may [`kill`](Left::kill) the
+/// child, which then costs the request nothing.
 pub(crate) struct Left(Option<Settle>);
 
 impl Left {
@@ -107,8 +106,8 @@ impl Left {
         Left(Some(Box::new(settle)))
     }
 
-    /// End the child. Best-effort: one that already exited is not an error, and one that cannot be
-    /// signalled runs on, which is what [`Fate::Release`] is. Either way it is reaped.
+    /// End the child. One that already exited is not an error; one that cannot be signalled runs
+    /// on, which is [`Fate::Release`], and says so on stderr.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn kill(mut self) {
         self.settle(Fate::Kill);
@@ -159,9 +158,8 @@ pub(crate) enum Role {
     /// A request that never says when the manager has it. The deadline applies from the spawn, but
     /// an expiry leaves the child running rather than killing it, since a kill could land before
     /// the request is out, and its [`Reaper`] reaps it once it exits. The caller gets the child
-    /// back as a [`Left`] and may kill it once it knows the manager has the request. launchd's
-    /// alone: on Linux, cosca 0.4's cgroup containment kills a detached tree when it drops the
-    /// leaf, so a [`command`] child would not be left running.
+    /// back as a [`Left`]. launchd's alone: on Linux, cosca 0.4's cgroup containment kills a
+    /// detached tree when it drops the leaf, so a [`command`] child would not be left running.
     ///
     /// Its output goes to temp files, never pipes: a pipe goetia stopped reading — on expiry, or by
     /// exiting — kills the writer with `SIGPIPE`, and a file does not.
@@ -390,15 +388,13 @@ fn waited_out(
     let status = match (waited, role) {
         (Some(status), _) => status,
         (None, Role::Request(reaper)) => {
-            // Not killed here: goetia cannot tell whether the request is out yet, and a request
-            // left unsent because goetia ran out of budget is the one answer worse than waiting.
-            // Its output files stay open in it, and a file never breaks under its writer. The
-            // caller may kill it once it knows the manager has the request.
+            // Left to the caller: see `Left`. Its output files stay open in it, and a file never
+            // breaks under its writer.
             return Ok(Finished::Left(Left::new(move |fate| {
-                if fate == Fate::Kill {
-                    // Root only, and before the reap: `kill` is a no-op on a child that already
-                    // exited, so an error leaves it running, which is `Fate::Release`.
-                    let _ = child.kill();
+                if fate == Fate::Kill
+                    && let Err(e) = child.kill()
+                {
+                    eprintln!("warning: could not kill a request left running, which runs on: {e}");
                 }
                 reaper.reap(child);
             })));

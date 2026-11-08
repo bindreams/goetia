@@ -1317,6 +1317,8 @@ const PID: Answer = (0, "4242\n", "");
 /// A `print` that `state::classify` reads as `Unknown`: launchd has decided to start the job and not
 /// yet forked it.
 const SPAWN_SCHEDULED: Answer = (0, "\tstate = spawn scheduled\n", "");
+/// A `print` whose `state` no recognised value names.
+const UNRECOGNISED: Answer = (0, "\tstate = someday-new-apple-state\n", "");
 
 /// `start`'s longest path, every one of its [`START_CALLS`] `launchctl` calls: not loaded; a
 /// `bootstrap` refused, by a concurrent start that loaded it meanwhile; a `kickstart -p` that names
@@ -1572,7 +1574,7 @@ fn launchctl_sends_requests_as_requests_and_reads_as_queries() {
 
     let (launchctl, fake) = done("kickstart");
     launchctl
-        .kickstart(id, Budget::DEFAULT, deadline, state::start_is_held, &mut held)
+        .kickstart(id, Budget::DEFAULT, deadline, Evidence::QueuedOrRunning, &mut held)
         .unwrap();
     assert_eq!(fake.waits(), waited(RoleKind::Request));
 
@@ -1623,7 +1625,7 @@ fn launchctl_calls_that_expire_report_the_expiry() {
         id,
         Budget::DEFAULT,
         deadline,
-        state::start_is_held,
+        Evidence::QueuedOrRunning,
         &mut held,
     );
     assert!(started.expect("an expiry is not a failure").is_none());
@@ -1662,23 +1664,17 @@ fn a_stop_whose_bootout_expires_is_a_wait_timeout() {
 }
 
 /// A waited `start` of a loaded job that reads `NOT_RUNNING`, whose `kickstart` outlasts the budget
-/// and is left running, then `print` answered by `after` (`None`: the call itself fails). The error
-/// the `start` ended with, and how the `kickstart` ended up.
-fn start_whose_kickstart_expires(after: Option<Entry>) -> (Error, Ended) {
+/// and is left running, then `print` answered by `after`.
+fn start_whose_kickstart_expires(after: Entry) -> (Error, Ended) {
     let (e, ended, _fake) = start_whose_kickstart_expires_over(NOT_RUNNING, after);
     (e, ended)
 }
 
-/// [`start_whose_kickstart_expires`] after a read of the job that answered `before`, with the fake
-/// that answered.
-fn start_whose_kickstart_expires_over(before: Answer, after: Option<Entry>) -> (Error, Ended, Fake) {
+/// [`start_whose_kickstart_expires`] after a read of the job that answered `before`.
+fn start_whose_kickstart_expires_over(before: Answer, after: Entry) -> (Error, Ended, Fake) {
     let id = never_installed();
     let (kickstart, ended) = lingering(&["kickstart"]);
-    let fake = Fake::new(
-        [answer("print", DONE), answer("print", before), kickstart]
-            .into_iter()
-            .chain(after),
-    );
+    let fake = Fake::new([answer("print", DONE), answer("print", before), kickstart, after]);
     let mgr = launchd_over(fake.clone());
 
     let e = backend::Backend::start(&mgr, marked_plist(&id), Budget::DEFAULT, &mut reserved(&[Step::Start]))
@@ -1704,28 +1700,23 @@ fn assert_wait_timeout(e: &Error) {
     assert!(matches!(e, Error::WaitTimeout { awaited: "running", .. }), "{e:?}");
 }
 
-/// A `kickstart` the budget ran out on is ended when one `print` shows launchd holding the start,
-/// queued or running: it has the request, so the kill costs nothing. The verb still reports the
-/// timeout.
+/// A `kickstart` the budget ran out on is ended once a `print` shows the start queued or the job running.
 #[skuld::test]
 fn a_kickstart_that_outlasts_the_budget_is_ended_once_launchd_holds_the_start() {
     for held in [SPAWN_SCHEDULED, RUNNING] {
-        let (e, ended) = start_whose_kickstart_expires(Some(answer("print", held)));
+        let (e, ended) = start_whose_kickstart_expires(answer("print", held));
 
         assert_wait_timeout(&e);
         assert_eq!(ended.fate(), Some(Fate::Kill), "{held:?}");
     }
 }
 
-/// Only a clean `Stopped` read before the `kickstart` lets a later `running` end it. After a read
-/// that was `Unknown`, the `running` could be an old instance still tearing down, which nothing
-/// re-checks under `restart: never`, so the `kickstart` is left running; a queued start still ends it.
+/// After a read that was not a clean `Stopped`, only a queued start ends the `kickstart`.
 #[skuld::test]
 fn a_kickstart_after_an_unknown_read_is_ended_only_by_a_queued_start() {
-    const UNRECOGNISED: Answer = (0, "\tstate = someday-new-apple-state\n", "");
     for before in [UNREADABLE, SPAWN_SCHEDULED, UNRECOGNISED] {
         for (shown, fate) in [(RUNNING, Fate::Release), (SPAWN_SCHEDULED, Fate::Kill)] {
-            let (e, ended, _fake) = start_whose_kickstart_expires_over(before, Some(answer("print", shown)));
+            let (e, ended, _fake) = start_whose_kickstart_expires_over(before, answer("print", shown));
 
             assert_wait_timeout(&e);
             assert_eq!(ended.fate(), Some(fate), "{before:?} then {shown:?}");
@@ -1737,7 +1728,7 @@ fn a_kickstart_after_an_unknown_read_is_ended_only_by_a_queued_start() {
 /// `start --timeout` past its timeout without end.
 #[skuld::test]
 fn the_print_after_an_expired_kickstart_is_a_bounded_query() {
-    let (_e, _ended, fake) = start_whose_kickstart_expires_over(NOT_RUNNING, Some(answer("print", SPAWN_SCHEDULED)));
+    let (_e, _ended, fake) = start_whose_kickstart_expires_over(NOT_RUNNING, answer("print", SPAWN_SCHEDULED));
 
     assert_ends_with_a_bounded_query(&fake);
 }
@@ -1746,16 +1737,15 @@ fn the_print_after_an_expired_kickstart_is_a_bounded_query() {
 /// timeout is reported and the `kickstart` is left running.
 #[skuld::test]
 fn a_kickstart_that_outlasts_the_budget_is_left_running_when_the_print_expires() {
-    let (e, ended) = start_whose_kickstart_expires(Some(reply(&["print"], Finished::Expired)));
+    let (e, ended) = start_whose_kickstart_expires(reply(&["print"], Finished::Expired));
 
     assert_wait_timeout(&e);
     assert_eq!(ended.fate(), Some(Fate::Release));
 }
 
-/// `start` of a `restart: always` job down to the corrective cycle's `kickstart`, which expires,
-/// then `print` answered by `after`: [`START_LONGEST`]'s path with its last two calls replaced, so
-/// every call of the verb's worst path is drawn from its reservation. The error the `start` ended
-/// with, how the `kickstart` ended up, and the fake.
+/// `start` of a `restart: always` job down to the corrective cycle's `kickstart`, which expires:
+/// [`START_LONGEST`]'s path with its last two calls replaced, the `print` taking the place of the
+/// verb's last read, so the worst path stays within its reservation.
 fn corrective_start_whose_kickstart_expires(after: Answer) -> (Error, Ended, Fake) {
     let id = never_installed();
     let (kickstart, ended) = lingering(&["kickstart"]);
@@ -1779,9 +1769,7 @@ fn corrective_start_whose_kickstart_expires(after: Answer) -> (Error, Ended, Fak
     (e, ended, fake)
 }
 
-/// After the corrective cycle's `bootout` an older instance of the job may still be tearing down,
-/// and a `running` could be it, so only a queued start ends the `kickstart` there. The same timeout
-/// is reported either way.
+/// After the corrective cycle's `bootout`, only a queued start ends the `kickstart`.
 #[skuld::test]
 fn a_corrective_kickstart_is_ended_only_by_a_queued_start() {
     for (shown, fate) in [(SPAWN_SCHEDULED, Fate::Kill), (RUNNING, Fate::Release)] {
@@ -1797,14 +1785,8 @@ fn a_corrective_kickstart_is_ended_only_by_a_queued_start() {
 /// has the request, the start is lost, so only evidence ends it.
 #[skuld::test]
 fn a_kickstart_that_outlasts_the_budget_is_left_running_when_the_start_is_not_shown_held() {
-    const UNRECOGNISED: Answer = (
-        0,
-        "	state = someday-new-apple-state
-",
-        "",
-    );
     for shown in [NOT_RUNNING, UNRECOGNISED] {
-        let (e, ended) = start_whose_kickstart_expires(Some(answer("print", shown)));
+        let (e, ended) = start_whose_kickstart_expires(answer("print", shown));
 
         assert_wait_timeout(&e);
         assert_eq!(ended.fate(), Some(Fate::Release), "{shown:?}");
@@ -1835,7 +1817,7 @@ fn a_kickstart_that_outlasts_the_budget_is_left_running_when_the_print_fails() {
         ("no launchctl to run", fail(&["print"], not_run())),
     ];
     for (what, entry) in failures {
-        let (e, ended) = start_whose_kickstart_expires(Some(entry));
+        let (e, ended) = start_whose_kickstart_expires(entry);
 
         assert_wait_timeout(&e);
         assert_eq!(ended.fate(), Some(Fate::Release), "{what}");

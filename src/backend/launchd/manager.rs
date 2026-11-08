@@ -20,16 +20,13 @@
 //!   Otherwise the verify and corrective path can give `Ok`,
 //!   `WaitTimeout`, `StartUnconfirmed` or `NotStarted`. `bootstrap` returns at load, before the
 //!   `RunAtLoad` run is forked, so a `start` straight after it may meet no throttle and give any of
-//!   those four. On `WaitTimeout` the request stands. The `launchctl` carrying it is killed only once one
-//!   `launchctl print` shows launchd holding the start (`spawn scheduled`, or the job running; only
-//!   `spawn scheduled` when an instance of the job may be the one running, as after a read that was
-//!   not a clean stop, or after the corrective cycle's `bootout`): killed before launchd has the
-//!   request, the start is lost. Otherwise, and whenever that `print` fails, is not whole or outlasts
-//!   `HELD_READ_BOUND`, it is left running and outlives the verb until the throttle ends: up to
-//!   `restart_delay`. The budget bounds the wait for the pid and nothing else: every `launchctl` call
-//!   that issues the request runs to completion, and the `print` that decides is bounded by
-//!   `HELD_READ_BOUND`, not by the budget. The throttle is keyed to the job, so `bootout` plus
-//!   `bootstrap` does not clear it and there is no remedy to apply.
+//!   those four. On `WaitTimeout` the request stands. Its `launchctl` is ended only once one
+//!   `launchctl print` shows launchd holding the start (`Evidence`): ended before launchd has the
+//!   request, the start is lost. On any doubt, including a `print` that fails, is cut or outlasts
+//!   `HELD_READ_BOUND`, it is left running until the throttle ends: up to `restart_delay`. The budget
+//!   bounds the wait for the pid and nothing else: every `launchctl` call that issues the request
+//!   runs to completion. The throttle is keyed to the job, so `bootout` plus `bootstrap` does not
+//!   clear it and there is no remedy to apply.
 //! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded.
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`] (`/Library/LaunchDaemons`).
 //!   Does not start it.
@@ -58,6 +55,7 @@ use std::{fs, io};
 
 use crate::backend::bounded::{self, Finished, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
+use crate::backend::launchd::state::Evidence;
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
     self, Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
@@ -749,8 +747,7 @@ enum Kickstarted {
 
 /// How long the `print` after an expired `kickstart` may take before it counts as doubt. A failure
 /// bound for an external process that might never exit, never taken as proof of state: expiry only
-/// leaves the `kickstart` running. `print` answers in milliseconds; 5s mirrors the integration
-/// tests' `PRINT_FAILURE_BOUND`.
+/// leaves the `kickstart` running. `print` answers in milliseconds.
 const HELD_READ_BOUND: Duration = Duration::from_secs(5);
 
 /// Exit codes `launchctl` uses for "no such job": 3 ("no such process") and 113 ("could not find
@@ -840,14 +837,14 @@ impl Launchctl {
     /// pid parsed from a successful `-p` is the confirmation and no follow-up `print` is needed. A
     /// budget that does not wait uses the plain form, which only requests the spawn.
     ///
-    /// On an expiry the `kickstart` is left running unless `shows_held` accepts a `print` of the
-    /// job: see [`Self::end_if_held`].
+    /// On an expiry the `kickstart` is left running unless a `print` of the job shows `evidence`: see
+    /// [`Self::end_if_held`].
     fn kickstart(
         &self,
         id: &str,
         budget: Budget,
         deadline: Deadline,
-        shows_held: fn(&str) -> bool,
+        evidence: Evidence,
         reservation: &mut Reservation,
     ) -> Result<Option<Kickstarted>> {
         let target = target(id);
@@ -860,7 +857,7 @@ impl Launchctl {
         let (status, capture) = match self.run(&args, deadline, role, reservation)? {
             Finished::Exited { status, capture } => (status, capture),
             Finished::Left(left) => {
-                self.end_if_held(id, left, shows_held, reservation);
+                self.end_if_held(id, left, evidence, reservation);
                 return Ok(None);
             }
             Finished::Expired => return Ok(None),
@@ -880,24 +877,18 @@ impl Launchctl {
         }))
     }
 
-    /// Ends the `kickstart` that `left` holds, but only once one `launchctl print` shows launchd
-    /// holding the start (`shows_held`, one of [`state::start_is_held`] and
-    /// [`state::start_is_queued`]): killed before launchd has the request, the start is lost. A
-    /// `print` that failed, whose output is not whole, or that outlasts [`HELD_READ_BOUND`] is
-    /// doubt, and doubt leaves the `kickstart` running to deliver the request. Either way the
-    /// caller reports the expiry, so a failed read is not an error of its own.
-    ///
-    /// The read has a bound of its own, since the verb's deadline is spent: a `launchctl` that
-    /// never answers must not hold a `start --timeout` past its timeout without end.
-    fn end_if_held(&self, id: &str, left: Left, shows_held: fn(&str) -> bool, reservation: &mut Reservation) {
+    /// Ends the `kickstart` that `left` holds if one `launchctl print` shows `evidence`. A `print`
+    /// that failed, is not whole or outlasts [`HELD_READ_BOUND`] is doubt, and doubt leaves it running.
+    fn end_if_held(&self, id: &str, left: Left, evidence: Evidence, reservation: &mut Reservation) {
         let target = target(id);
         let args = ["print", target.as_str()];
         let deadline = Budget::Bounded(HELD_READ_BOUND).start();
         let held = match self.run(&args, deadline, Role::Query, reservation) {
             Ok(Finished::Exited { status, capture }) => {
-                status.success() && capture.complete && shows_held(&String::from_utf8_lossy(&capture.stdout))
+                status.success() && capture.complete && evidence.shown_by(&String::from_utf8_lossy(&capture.stdout))
             }
-            Ok(Finished::Left(_) | Finished::Expired) | Err(_) => false,
+            Ok(Finished::Left(_)) => unreachable!("a query is never left running"),
+            Ok(Finished::Expired) | Err(_) => false,
         };
         if held {
             left.kill();
@@ -987,7 +978,7 @@ const KILL_REQUESTS: usize = 1;
 
 /// Most `launchctl` calls per verb, reads included: each draws its role's temp files from the same
 /// reservation. `install` adds two `is_loaded`s; `start` two `is_loaded`s and five `live_state`s. The
-/// `print` after an expired `kickstart` is not counted: the verb ends there, in place of a later read.
+/// post-expiry `print` has its own bound ([`HELD_READ_BOUND`]).
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2;
 const START_CALLS: usize = START_REQUESTS + 7;
 const STOP_CALLS: usize = STOP_REQUESTS;
@@ -1275,20 +1266,17 @@ impl backend::Backend for Launchd {
         // plain `kickstart` leaves a running instance alone, so check first.
         let before = self.launchctl.live_state(id.as_str(), issuing, reservation)?.0;
         if before != State::Running {
-            // Only after a clean `Stopped` may a later `running` end the `kickstart`: it is then a
-            // fork after that read. After an `Unknown` (a read that failed or was cut, an unrecognised
-            // state) it could be an old instance still tearing down, which nothing re-checks under
-            // `restart: never` or `on-failure`, so only a queued start counts.
-            let shows_held = if before == State::Stopped {
-                state::start_is_held
+            // A later `running` ends the `kickstart` only after a clean `Stopped` read: see `Evidence`.
+            let evidence = if before == State::Stopped {
+                Evidence::QueuedOrRunning
             } else {
-                state::start_is_queued
+                Evidence::Queued
             };
             // Bounded by `deadline`: `-p` is the wait for the pid. An expiry leaves the `launchctl`
             // running unless launchd is shown to hold the start, so the request still goes out.
             match self
                 .launchctl
-                .kickstart(id.as_str(), budget, deadline, shows_held, reservation)?
+                .kickstart(id.as_str(), budget, deadline, evidence, reservation)?
                 .ok_or_else(timed_out)?
             {
                 // launchd forked the job and named the pid: the confirmation.
@@ -1336,12 +1324,9 @@ impl backend::Backend for Launchd {
             never_expires(self.launchctl.bootout(id.as_str(), issuing, reservation)?);
             never_expires(self.launchctl.bootstrap(&location.path, issuing, reservation)?);
             if self.launchctl.live_state(id.as_str(), issuing, reservation)?.0 != State::Running {
-                // Only a queued start ends it here, conservatively: a `running` would be the new
-                // instance (see `request_start_after_stop`: a `bootout` ends the instance it
-                // stops), but ending the `kickstart` on a wrong reading loses the start, where
-                // leaving it costs a `launchctl` running for up to `restart_delay`.
+                // Queued only: see `Evidence`.
                 self.launchctl
-                    .kickstart(id.as_str(), budget, deadline, state::start_is_queued, reservation)?
+                    .kickstart(id.as_str(), budget, deadline, Evidence::Queued, reservation)?
                     .ok_or_else(timed_out)?;
             }
             let state = self.launchctl.live_state(id.as_str(), deadline, reservation)?.0;

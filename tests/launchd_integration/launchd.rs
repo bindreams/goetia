@@ -186,8 +186,7 @@ impl Drop for Guard {
 
 /// Kills the `launchctl kickstart -p system/<id>` that a `start` answering `WaitTimeout` leaves
 /// running on purpose when its `print` did not show launchd holding the start, which a long
-/// `ThrottleInterval` would keep alive for an hour. A `start` that did see it held ends the
-/// `kickstart` itself; this is the backstop for the one that did not. Whether the
+/// `ThrottleInterval` would keep alive for an hour. Whether the
 /// `bootout` in `Guard`'s uninstall ends it, or waits on it, is unmeasured, so this kills it first.
 /// Declare it after the [`Guard`], so it drops before the uninstall; launchd keeps the request, and
 /// the `bootout` discards it. `id` is the test's random id, so only this test's process can match.
@@ -195,9 +194,7 @@ struct KickstartGuard(Id);
 
 impl Drop for KickstartGuard {
     fn drop(&mut self) {
-        // Anchored: only the whole command line matches. The id is hex and dashes, so it needs no escaping.
-        let pattern = format!("^launchctl kickstart -p system/{}$", self.0);
-        match Command::new("pkill").args(["-f", &pattern]).output() {
+        match Command::new("pkill").args(["-f", &kickstart_pattern(&self.0)]).output() {
             // 1: no process matched.
             Ok(out) if out.status.success() || out.status.code() == Some(1) => {}
             Ok(out) => eprintln!(
@@ -209,6 +206,31 @@ impl Drop for KickstartGuard {
             Err(e) => eprintln!("KickstartGuard[{}]: cleanup failed: {e}", self.0),
         }
     }
+}
+
+/// The command line of the `launchctl kickstart -p system/<id>` a `start` leaves running. Anchored: only
+/// the whole command line matches. The id is hex and dashes, so it needs no escaping.
+fn kickstart_pattern(id: &Id) -> String {
+    format!("^launchctl kickstart -p system/{id}$")
+}
+
+/// Whether that `launchctl kickstart` is running.
+fn kickstart_is_running(id: &Id) -> bool {
+    let out = Command::new("pgrep")
+        .args(["-f", &kickstart_pattern(id)])
+        .output()
+        .expect("run pgrep");
+    match out.status.code() {
+        Some(0) => true,
+        // No process matched.
+        Some(1) => false,
+        other => panic!("pgrep exited {other:?}: {}", String::from_utf8_lossy(&out.stderr)),
+    }
+}
+
+/// The value on the first `key`-prefixed line of a `launchctl print` body.
+fn print_field<'a>(printed: &'a str, key: &str) -> Option<&'a str> {
+    printed.lines().find_map(|line| line.trim_start().strip_prefix(key))
 }
 
 /// How long a failing `launchctl print` is retried before the test gives up on it. A failure bound
@@ -1213,15 +1235,10 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     // with a pid, so wait for a whole `launchctl print` showing the exit and no pid. Not `status`: it
     // reads a failed `print` as `Unknown` with no pid, which would end the wait early.
     support::kill::until(|| {
-        let printed = print_job(&id);
-        let field = |key: &str| {
-            printed
-                .stdout
-                .lines()
-                .find_map(|line| line.trim_start().strip_prefix(key))
-        };
+        let printed = print_job(&id).stdout;
         // A job that has not exited yet reads `last exit code = (never exited)`.
-        field("last exit code = ").is_some_and(|code| !code.contains("never exited")) && field("pid = ").is_none()
+        print_field(&printed, "last exit code = ").is_some_and(|code| !code.contains("never exited"))
+            && print_field(&printed, "pid = ").is_none()
     });
 
     let err = mgr.start(&spec.id, Budget::DEFAULT).expect_err(
@@ -1233,6 +1250,21 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
         "an unconfirmed bounded start must be WaitTimeout; if it is another error, check whether \
          kickstart -p honoured ThrottleInterval (restart_delay): {err:?}"
     );
+
+    // `start` read `print` as it gave up, and ended its `kickstart` iff launchd showed the start
+    // held. The throttle keeps the job at `spawn scheduled`, so the same reading here means it was
+    // ended, and a reading showing no start held means it was left to deliver the request. A
+    // `running` is not asserted: whether it ends the `kickstart` depends on the read before it.
+    let printed = print_job(&id).stdout;
+    match print_field(&printed, "state = ") {
+        // Killed and reaped by goetia: wait for that, on the process itself.
+        Some("spawn scheduled") => support::kill::until(|| !kickstart_is_running(&spec.id)),
+        Some("running") => {}
+        state => assert!(
+            kickstart_is_running(&spec.id),
+            "start ended its kickstart though `print` showed {state:?}"
+        ),
+    }
 }
 
 /// `Budget::Immediate` leaves the job in launchd's `spawn scheduled` /
