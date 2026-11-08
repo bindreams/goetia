@@ -154,6 +154,16 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         },
         Error::ShimMarkerMissing { path: PathBuf::new() },
         Error::ShimNotEmbedded,
+        Error::ShimHostChanged {
+            rendered: Box::new(crate::shim::HostCommand {
+                exe: PathBuf::new(),
+                args: vec![],
+            }),
+            provided: Box::new(crate::shim::HostCommand {
+                exe: PathBuf::new(),
+                args: vec![],
+            }),
+        },
         Error::SiblingShimMissing { path: PathBuf::new() },
         Error::ShimMarkerVersion {
             path: PathBuf::new(),
@@ -790,6 +800,27 @@ fn report_of_a_host_version_writes_the_file_supplied_bytes_escaped() {
     let report = e.report().to_string();
     assert!(report.contains("version \\u{1b}[31m\\n,"), "{report}");
     assert!(!report.contains('\u{1b}') && !report.contains('\n'), "{report:?}");
+}
+
+#[skuld::test]
+fn report_of_a_host_changed_while_the_install_waited_says_what_to_do() {
+    let host = |exe: &str| crate::shim::HostCommand {
+        exe: PathBuf::from(exe),
+        args: vec!["--service-host".to_string()],
+    };
+    let e = Error::ShimHostChanged {
+        rendered: Box::new(host("/a/old.exe")),
+        provided: Box::new(host("/a/new.exe")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "the service host changed while this install waited for the install lock: it was /a/old.exe \
+         [\"--service-host\"] when the install began and is /a/new.exe [\"--service-host\"] now. Nothing was \
+         registered. Run the install again to use the new one. The file just provided stays, and the next sweep \
+         removes it if nothing references it"
+    );
+    assert!(!e.is_indeterminate());
+    assert!(std::error::Error::source(&e).is_none());
 }
 
 #[skuld::test]

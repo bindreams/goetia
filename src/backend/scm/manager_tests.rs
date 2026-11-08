@@ -602,6 +602,10 @@ fn simple_daemon() -> DaemonSpec {
 }
 
 /// A provider that records the calls it gets and answers with the commands it was given.
+///
+/// The same provider is `Recording` in `tests/shim_integration/provision.rs`, which this module
+/// cannot share (an integration test reaches the library only through its public API, and this is
+/// `cfg(test)` inside it): keep the two identical in behaviour.
 struct Recording {
     calls: Arc<Mutex<Vec<&'static str>>>,
     preview: HostCommand,

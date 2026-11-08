@@ -309,8 +309,8 @@ impl Backend for Scm {
             args: desired.arguments.clone(),
         };
         if provided != rendered {
-            return Err(Error::ShimProviderDisagrees {
-                previewed: Box::new(rendered),
+            return Err(Error::ShimHostChanged {
+                rendered: Box::new(rendered),
                 provided: Box::new(provided),
             });
         }

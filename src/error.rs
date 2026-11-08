@@ -257,19 +257,22 @@ pub enum Error {
     #[error("no shim provider configured")]
     NoShimProvider,
 
-    /// A shim provider's `provide` returned a command other than the one its `preview` named when
-    /// the install rendered, so the registration would name a file that was never placed. No OS call
-    /// failed.
+    /// An install rendered its registration from the service host the provider named, and the
+    /// provider has provided another by the time the install holds the lock (the sibling shim was
+    /// upgraded while it waited), so the registration would name a file that was never placed.
+    /// Nothing was registered, and the file provided stays for the next sweep. No OS call failed.
     #[error(
-        "the shim provider's `provide` returned {} {:?}, but its `preview` named {} {:?}",
+        "the service host changed while this install waited for the install lock: it was {} {:?} when the install \
+         began and is {} {:?} now. Nothing was registered. Run the install again to use the new one. The file just \
+         provided stays, and the next sweep removes it if nothing references it",
+        rendered.exe.display(),
+        rendered.args,
         provided.exe.display(),
-        provided.args,
-        previewed.exe.display(),
-        previewed.args
+        provided.args
     )]
-    ShimProviderDisagrees {
+    ShimHostChanged {
         // Boxed: two inline commands make `Error`, and every `Result` over it, large (`clippy::result_large_err`).
-        previewed: Box<crate::shim::HostCommand>,
+        rendered: Box<crate::shim::HostCommand>,
         provided: Box<crate::shim::HostCommand>,
     },
 
@@ -684,7 +687,7 @@ impl Error {
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
             | Error::NoShimProvider
-            | Error::ShimProviderDisagrees { .. }
+            | Error::ShimHostChanged { .. }
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
@@ -852,7 +855,7 @@ impl Error {
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
             | Error::NoShimProvider
-            | Error::ShimProviderDisagrees { .. }
+            | Error::ShimHostChanged { .. }
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
