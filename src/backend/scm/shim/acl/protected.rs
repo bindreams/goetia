@@ -83,7 +83,8 @@ mod system {
             Self::from_sddl(LOCK)
         }
 
-        fn from_sddl(sddl: &str) -> Result<Self> {
+        /// A descriptor written as SDDL.
+        pub(crate) fn from_sddl(sddl: &str) -> Result<Self> {
             let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
             let mut raw: *mut c_void = std::ptr::null_mut();
             // SAFETY: `wide` is NUL-terminated; `raw` is a valid out-pointer, and the size is not asked for.

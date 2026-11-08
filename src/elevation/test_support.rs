@@ -4,13 +4,16 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
+use windows_sys::Win32::Foundation::ERROR_NO_TOKEN;
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx, SID_AND_ATTRIBUTES, SecurityImpersonation,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_QUERY, TokenImpersonation,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TokenImpersonation,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
+};
 
-use crate::backend::scm::shim::acl::Sid;
+use crate::backend::scm::shim::acl::{Descriptor, Sid};
 
 /// This process's token, opened to be copied.
 fn process_token() -> OwnedHandle {
@@ -26,16 +29,28 @@ fn process_token() -> OwnedHandle {
     unsafe { OwnedHandle::from_raw_handle(process) }
 }
 
-/// An impersonation copy of `source`, opened with `access`.
+/// The permissions of a token copy: every right to Everyone, so to the user the thread impersonates
+/// whatever its groups. A copy made with the source's default permissions grants its own user and
+/// Administrators, and an elevated administrator's default grants Administrators alone; a thread
+/// that impersonates a copy with Administrators denied is then refused the copy it is asked to open
+/// (`CheckTokenMembership` with no token opens the thread's). A copy is a handle in this process,
+/// named nowhere, so it is no wider an opening than the handle itself.
+const TOKEN_COPY: &str = "D:(A;;GA;;;WD)";
+
+/// An impersonation copy of `source`, opened with `access`, that the thread impersonating it can open
+/// on any host (see [`TOKEN_COPY`]).
 fn impersonation_copy(source: &OwnedHandle, access: u32) -> OwnedHandle {
+    let permissions = Descriptor::from_sddl(TOKEN_COPY).expect("the permissions of a token copy");
+    let attributes = permissions.attributes();
     let mut copy = std::ptr::null_mut();
-    // SAFETY: `source` is a live token handle with `TOKEN_DUPLICATE`; `copy` is a local.
+    // SAFETY: `source` is a live token handle with `TOKEN_DUPLICATE`; `attributes` points at
+    // `permissions`, which is live for the call; `copy` is a local.
     assert_ne!(
         unsafe {
             DuplicateTokenEx(
                 source.as_raw_handle(),
                 access,
-                std::ptr::null(),
+                &attributes,
                 SecurityImpersonation,
                 TokenImpersonation,
                 &mut copy,
@@ -102,14 +117,33 @@ pub(crate) fn token_without_privileges() -> OwnedHandle {
     restricted_token_copy(DISABLE_MAX_PRIVILEGE, &mut [], TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY)
 }
 
-/// Removes any impersonation from the calling thread when dropped, so a failing assert leaves the
-/// test thread as it found it (a test thread starts without a token).
-pub(crate) struct ThreadTokenReset;
+/// The calling thread's own token, opened with `access`, if it has one (a test thread starts
+/// without).
+pub(crate) fn open_thread_token(access: u32) -> Option<OwnedHandle> {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: a pointer to a local; a returned token is owned below.
+    let ok = unsafe { OpenThreadToken(GetCurrentThread(), access, 1, &mut token) };
+    if ok != 0 {
+        // SAFETY: a valid handle `OpenThreadToken` just returned and nothing else owns.
+        return Some(unsafe { OwnedHandle::from_raw_handle(token) });
+    }
+    let e = io::Error::last_os_error();
+    assert_eq!(e.raw_os_error(), Some(ERROR_NO_TOKEN as i32), "OpenThreadToken: {e}");
+    None
+}
+
+/// Puts back the token the calling thread impersonated before [`Self::impersonate`], or none, when
+/// dropped, so a failing assert leaves the test thread as it found it.
+pub(crate) struct ThreadTokenReset {
+    /// The thread's token before, which must outlive the impersonation.
+    previous: Option<OwnedHandle>,
+}
 
 impl ThreadTokenReset {
     /// The calling thread impersonates `token`, which needs `TOKEN_IMPERSONATE`, until the guard
     /// drops.
     pub(crate) fn impersonate(token: &OwnedHandle) -> Self {
+        let previous = open_thread_token(TOKEN_IMPERSONATE);
         // SAFETY: a null thread means this one; `token` is a live handle.
         assert_ne!(
             unsafe { SetThreadToken(std::ptr::null(), token.as_raw_handle()) },
@@ -117,13 +151,18 @@ impl ThreadTokenReset {
             "SetThreadToken: {}",
             io::Error::last_os_error()
         );
-        Self
+        Self { previous }
     }
 }
 
 impl Drop for ThreadTokenReset {
     fn drop(&mut self) {
-        // SAFETY: a null thread means this one; a null token ends the impersonation.
-        unsafe { SetThreadToken(std::ptr::null(), std::ptr::null_mut()) };
+        let previous = self
+            .previous
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |p| p.as_raw_handle());
+        // SAFETY: a null thread means this one; `previous` is a live token with `TOKEN_IMPERSONATE`,
+        // or null, which ends the impersonation.
+        unsafe { SetThreadToken(std::ptr::null(), previous) };
     }
 }

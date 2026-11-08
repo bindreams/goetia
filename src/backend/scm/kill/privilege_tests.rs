@@ -4,17 +4,16 @@
 //! `tests/scm_integration` pin the whole path.
 
 use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NO_TOKEN, ERROR_SHARING_VIOLATION, LUID};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, LUID};
 use windows_sys::Win32::Security::{
     GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PRIVILEGE_SET, PrivilegeCheck, SE_DEBUG_NAME,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
 use super::{DebugPrivilege, enable_in, restore_notice};
-use crate::elevation::test_support::{ThreadTokenReset, process_token_copy, token_without_privileges};
+use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
 
 /// Skuld precondition: the process token holds `SeDebugPrivilege`, enabled or not.
 fn holds_debug_privilege() -> Result<(), String> {
@@ -26,18 +25,9 @@ fn holds_debug_privilege() -> Result<(), String> {
     }
 }
 
-/// The calling thread's own token, if it has one.
+/// The calling thread's own token, if it has one, opened to be queried.
 fn open_thread_token() -> Option<OwnedHandle> {
-    let mut token = std::ptr::null_mut();
-    // SAFETY: a pointer to a local; a returned token is owned below.
-    let ok = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
-    if ok != 0 {
-        // SAFETY: a valid handle `OpenThreadToken` just returned.
-        return Some(unsafe { OwnedHandle::from_raw_handle(token) });
-    }
-    let e = io::Error::last_os_error();
-    assert_eq!(e.raw_os_error(), Some(ERROR_NO_TOKEN as i32), "OpenThreadToken: {e}");
-    None
+    test_support::open_thread_token(TOKEN_QUERY)
 }
 
 fn thread_has_token() -> bool {
