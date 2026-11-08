@@ -5,6 +5,19 @@ use super::*;
 use crate::error::Reason;
 use crate::error::error_tests::{exit_status, id, os, undetermined};
 
+/// A remedy is its own sentence: it follows a period the words before it already ended with, and
+/// supplies one when they did not.
+#[skuld::test]
+fn a_remedy_follows_the_closing_period_of_the_words_before_it_without_doubling_it() {
+    for (words, expected) in [("it broke", "it broke. fix it"), ("it broke.", "it broke. fix it")] {
+        let mut text = String::new();
+        let mut sink = Sink::new(&mut text, true);
+        sink.write_str(words).unwrap();
+        sink.write_remedy("fix it").unwrap();
+        assert_eq!(text, expected);
+    }
+}
+
 /// The failed read sits inside the sentence of the error that embeds it: its remedy must not
 /// interrupt that sentence, and still prints once, last.
 #[skuld::test]

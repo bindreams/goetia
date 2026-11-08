@@ -62,7 +62,7 @@ pub fn run(
 
     if args.dry_run {
         let _ = writeln!(out, "# {}", spec.id);
-        return match preview_artifact(&spec, err) {
+        return match preview_artifact(&spec) {
             Ok(artifact) => {
                 let _ = write!(out, "{artifact}");
                 ExitCode::Success
@@ -198,27 +198,21 @@ fn preview_root_account() -> String {
 /// an executable path its registration writer rewrites; systemd refuses the values `refuse_unrepresentable` lists.
 ///
 /// Writes nothing; on Windows it reads the process's environment and executable path (`shim_path`).
-///
-/// `err` is threaded through on every platform so a generator warning cannot
-/// be dropped; no generator produces a [`crate::spec::Warning`] here today.
-fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
+fn preview_artifact(spec: &DaemonSpec) -> Result<String> {
     let identity = preview_identity(&spec.user);
 
     #[cfg(target_os = "linux")]
     {
-        let _ = err;
         crate::backend::systemd::generate::unit(spec, &identity)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = err;
         Ok(crate::backend::launchd::generate::plist(spec, &identity))
     }
     #[cfg(windows)]
     {
         // The SCM generator's warning (a too-large `restart-delay`) fires at
         // resolve time, from `BackendKind::Scm.warn`, before this runs.
-        let _ = err;
         // The real shim path, so the preview refuses a path the install would.
         let shim_path = crate::backend::scm::manager::shim_path();
         let registration = crate::backend::scm::generate::install_registration(spec, &identity, &shim_path)?;
@@ -226,7 +220,6 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
-        let _ = err;
         Ok("# no dry-run preview generator for this platform\n".to_string())
     }
 }
