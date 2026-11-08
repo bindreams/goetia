@@ -562,7 +562,7 @@ fn stop_and_await_exit_terminates_then_waits_for_the_held_process_after_stopped(
             calls.borrow_mut().push(("terminate", *process, None));
             Ok(())
         },
-        |process, by| {
+        |process, by, _| {
             calls.borrow_mut().push(("wait", *process, Some(by)));
             Ok(Waited::Confirmed)
         },
@@ -587,19 +587,29 @@ fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
         unbounded(),
         HoldOutcome::Held(7u32),
         |_| Ok(()),
-        |_, _| Ok(Waited::Expired),
+        |_, _, _| Ok(Waited::Expired),
     );
 
-    assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::ProcessExpired(7));
+    assert_eq!(
+        outcome.unwrap(),
+        StopAndAwaitExitOutcome::ProcessExpired {
+            process: 7,
+            terminate_failed: None
+        }
+    );
 }
 
 #[skuld::test]
 fn stop_and_await_exit_neither_terminates_nor_waits_when_stopped_was_not_confirmed() {
     let mut fake = FakeScm::new([None]);
 
-    let outcome = stop_and_await_exit(&mut fake, unbounded(), HoldOutcome::Held(7u32), no_terminate, |_, _| {
-        panic!("the process is waited for once SCM has confirmed the stop")
-    });
+    let outcome = stop_and_await_exit(
+        &mut fake,
+        unbounded(),
+        HoldOutcome::Held(7u32),
+        no_terminate,
+        |_, _, _| panic!("the process is waited for once SCM has confirmed the stop"),
+    );
 
     assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::ServiceExpired);
 }
@@ -613,7 +623,7 @@ fn stop_and_await_exit_without_a_held_process_is_the_stop() {
         unbounded(),
         HoldOutcome::<u32>::NoProcess,
         no_terminate,
-        |_, _| panic!("there is no process to wait for"),
+        |_, _, _| panic!("there is no process to wait for"),
     );
 
     assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped);
@@ -628,7 +638,7 @@ fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
         unbounded(),
         HoldOutcome::Held(7u32),
         |_| Ok(()),
-        |_, _| Err(io::Error::other("wait failed")),
+        |_, _, _| Err(io::Error::other("wait failed")),
     );
 
     assert_eq!(outcome.unwrap_err().to_string(), "wait failed");
@@ -636,25 +646,38 @@ fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
 
 /// SCM has confirmed `STOPPED`, so a terminate that fails is not a failed stop: the shim exits on
 /// its own just after it reports `STOPPED`, and the wait for the process decides, whatever it says.
+/// The failure is not lost: the wait is told of it (its notice names it), and a process that
+/// outlasts the deadline carries it.
 #[skuld::test]
 fn stop_and_await_exit_goes_on_to_wait_after_a_failed_terminate() {
     let terminate_fails = |_: &u32| Err(io::Error::other("terminate failed"));
 
     for (waited, expected) in [
         (Ok(Waited::Confirmed), StopAndAwaitExitOutcome::Stopped),
-        (Ok(Waited::Expired), StopAndAwaitExitOutcome::ProcessExpired(7)),
+        (
+            Ok(Waited::Expired),
+            StopAndAwaitExitOutcome::ProcessExpired {
+                process: 7,
+                terminate_failed: Some("terminate failed".to_string()),
+            },
+        ),
     ] {
         let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+        let told = std::cell::RefCell::new(None);
 
         let outcome = stop_and_await_exit(
             &mut fake,
             unbounded(),
             HoldOutcome::Held(7u32),
             terminate_fails,
-            |_, _| waited,
+            |_, _, terminate_failed| {
+                *told.borrow_mut() = terminate_failed.map(ToString::to_string);
+                waited
+            },
         );
 
         assert_eq!(outcome.unwrap(), expected);
+        assert_eq!(told.into_inner().as_deref(), Some("terminate failed"));
     }
 
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
@@ -663,7 +686,7 @@ fn stop_and_await_exit_goes_on_to_wait_after_a_failed_terminate() {
         unbounded(),
         HoldOutcome::Held(7u32),
         terminate_fails,
-        |_, _| Err(io::Error::other("wait failed")),
+        |_, _, _| Err(io::Error::other("wait failed")),
     );
     assert_eq!(outcome.unwrap_err().to_string(), "wait failed");
 }
@@ -680,7 +703,7 @@ fn stop_and_await_exit_after_an_expired_hold_sends_the_stop_and_is_unconfirmed()
         spent(),
         HoldOutcome::<u32>::Expired { pid: 9 },
         no_terminate,
-        |_, _| panic!("no process is held to wait for"),
+        |_, _, _| panic!("no process is held to wait for"),
     );
 
     assert_eq!(outcome.unwrap(), StopAndAwaitExitOutcome::Unconfirmed { pid: 9 });
@@ -719,7 +742,7 @@ fn stop_and_await_exit_after_an_expired_hold_is_unconfirmed_whichever_way_the_st
             spent(),
             HoldOutcome::<u32>::Expired { pid: 9 },
             no_terminate,
-            |_, _| panic!("no process is held to wait for"),
+            |_, _, _| panic!("no process is held to wait for"),
         );
 
         assert_eq!(
@@ -744,7 +767,7 @@ fn stop_and_await_exit_after_an_expired_hold_reports_a_refused_stop() {
         spent(),
         HoldOutcome::<u32>::Expired { pid: 9 },
         no_terminate,
-        |_, _| panic!("no process is held to wait for"),
+        |_, _, _| panic!("no process is held to wait for"),
     );
 
     assert!(outcome.is_err());

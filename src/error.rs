@@ -446,13 +446,18 @@ pub enum Error {
     /// Exit `4` (indeterminate), like [`WaitTimeout`](Error::WaitTimeout): the stop is not
     /// finished, though not failed.
     #[error(
-        "`{id}` is stopped, but its process (pid {pid}) had not exited within {waited}: {recovery}",
-        waited = humantime::format_duration(*waited)
+        "`{id}` is stopped, but its process (pid {pid}) had not exited within {waited}{terminated}: {recovery}",
+        waited = humantime::format_duration(*waited),
+        terminated = terminate_failed
+            .as_ref()
+            .map_or_else(String::new, |e| format!(" (terminating it failed: {e})"))
     )]
     ProcessWaitTimeout {
         id: String,
         pid: u32,
         waited: std::time::Duration,
+        /// Why goetia's attempt to end the process failed, if it did.
+        terminate_failed: Option<String>,
         recovery: String,
     },
 

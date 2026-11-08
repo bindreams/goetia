@@ -924,6 +924,24 @@ fn a_failed_termination_is_an_error_not_a_kill() {
     );
 }
 
+// The notice of a wait ------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn the_waiting_notice_names_the_process() {
+    assert_eq!(
+        waiting_notice("frpc", 4242, None),
+        "frpc: waiting for process 4242 to exit"
+    );
+}
+
+#[skuld::test]
+fn the_waiting_notice_names_a_failed_terminate() {
+    assert_eq!(
+        waiting_notice("frpc", 4242, Some(&io::Error::other("access denied"))),
+        "frpc: waiting for process 4242 to exit (terminating it failed: access denied)"
+    );
+}
+
 // The raw status ------------------------------------------------------------------------------------------------------
 
 /// `windows-service`'s `query_status` reports a pid only in `Running`; SCM reports one in every

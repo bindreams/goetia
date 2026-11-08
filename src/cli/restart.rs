@@ -167,7 +167,14 @@ fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
             awaited,
         },
         // SCM confirmed the stop; its process had not exited when the budget ran out.
-        Error::ProcessWaitTimeout { id, pid, waited, .. } => Error::ProcessWaitTimeout {
+        Error::ProcessWaitTimeout {
+            id,
+            pid,
+            waited,
+            terminate_failed,
+            ..
+        } => Error::ProcessWaitTimeout {
+            terminate_failed,
             waited: as_given(budget, waited),
             recovery: format!(
                 "the restart was abandoned: no start was issued, so `{id}` is left stopped, while its \

@@ -145,7 +145,7 @@ fn a_leg_in_doubt_stays_in_doubt_under_every_budget() {
 fn a_stop_leg_whose_process_outlasted_the_budget_abandons_the_restart_under_the_given_timeout() {
     let id = Id::try_from("frpc").unwrap();
     let leg_budget = Budget::Bounded(Duration::from_secs(5));
-    let e = abandoned_before_start(&id, process_timed_out("frpc", 4242, leg_budget), THIRTY);
+    let e = abandoned_before_start(&id, process_timed_out("frpc", 4242, leg_budget, None), THIRTY);
 
     assert!(e.is_indeterminate(), "{e:?}");
     let Error::ProcessWaitTimeout {
@@ -165,6 +165,22 @@ fn a_stop_leg_whose_process_outlasted_the_budget_abandons_the_restart_under_the_
     assert!(recovery.contains("`goetia daemon start frpc`"), "{recovery}");
     assert!(!recovery.contains("may or may not have reached stopped"), "{recovery}");
     assert!(e.to_string().contains("is stopped, but its process (pid 4242)"), "{e}");
+}
+
+/// The abandoned restart re-words the recovery, not the fact that goetia could not end the process.
+#[skuld::test]
+fn an_abandoned_restart_keeps_the_failed_terminate_of_the_process() {
+    let id = Id::try_from("frpc").unwrap();
+    let leg_budget = Budget::Bounded(Duration::from_secs(5));
+    let timed_out = process_timed_out("frpc", 4242, leg_budget, Some("access denied".to_string()));
+
+    let e = abandoned_before_start(&id, timed_out, THIRTY);
+
+    assert!(
+        e.to_string()
+            .contains("had not exited within 30s (terminating it failed: access denied): the restart was abandoned"),
+        "{e}"
+    );
 }
 
 /// What the stop leg established is said ahead of the cause, and the cause stays the typed source.

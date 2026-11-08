@@ -296,6 +296,14 @@ pub(crate) fn hold_if_possible_unbounded<T: KillTarget>(target: &mut T) -> io::R
     }
 }
 
+/// What an unbounded wait for `id`'s process `pid` says it is blocked on.
+fn waiting_notice(id: &str, pid: u32, terminate_failed: Option<&io::Error>) -> String {
+    match terminate_failed {
+        None => format!("{id}: waiting for process {pid} to exit"),
+        Some(e) => format!("{id}: waiting for process {pid} to exit (terminating it failed: {e})"),
+    }
+}
+
 #[cfg(windows)]
 mod privilege;
 
@@ -348,7 +356,7 @@ pub(in crate::backend::scm) mod system {
         }
 
         fn notice(&self, process: &Held) {
-            process.notice(&self.id);
+            process.notice(&self.id, None);
         }
 
         fn notifier(&mut self) -> io::Result<&mut SystemScmActor> {
@@ -366,9 +374,10 @@ pub(in crate::backend::scm) mod system {
     }
 
     impl Held {
-        /// Says on stderr why nothing returns while `id`'s process runs.
-        pub(in crate::backend::scm) fn notice(&self, id: &str) {
-            eprintln!("{id}: waiting for process {} to exit", self.pid);
+        /// Says on stderr why nothing returns while `id`'s process runs, and why it is still
+        /// running if ending it failed.
+        pub(in crate::backend::scm) fn notice(&self, id: &str, terminate_failed: Option<&io::Error>) {
+            eprintln!("{}", super::waiting_notice(id, self.pid, terminate_failed));
         }
 
         pub(in crate::backend::scm) fn pid(&self) -> u32 {

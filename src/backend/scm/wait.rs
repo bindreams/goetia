@@ -193,7 +193,11 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
     /// SCM had not confirmed `STOPPED` when the deadline ran out.
     ServiceExpired,
     /// SCM confirmed `STOPPED`, and this held process had not exited when the deadline ran out.
-    ProcessExpired(P),
+    /// `terminate_failed` is why the attempt to end it failed, if it did.
+    ProcessExpired {
+        process: P,
+        terminate_failed: Option<String>,
+    },
     /// The hold expired, with SCM still naming process `pid`, which was gone, so the STOP was sent with
     /// no process held, and nothing says that it took effect or which process it reached: not a stop,
     /// whatever SCM answers afterwards.
@@ -207,7 +211,8 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 /// reported, and `exit` then waits for its exit under the same `deadline` and says whether it did; a
 /// process that outlasts the deadline is [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired),
 /// not an unconfirmed stop. A `terminate` that finds the process already exited is success, and one
-/// that fails is not an error: SCM has confirmed the stop, and the wait that follows decides. No
+/// that fails is not an error: SCM has confirmed the stop, and the wait that follows decides. The
+/// failure is kept: `exit` is handed it for its notice, and `ProcessExpired` carries its text. No
 /// process held (none reported, or none that could be opened) is the stop alone.
 ///
 /// An expired hold is sent the STOP all the same, and it ends there, whatever SCM answers: the held
@@ -222,7 +227,7 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     deadline: Deadline,
     held: HoldOutcome<P>,
     terminate: impl FnOnce(&P) -> io::Result<()>,
-    exit: impl FnOnce(&P, Deadline) -> io::Result<Waited>,
+    exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
 ) -> io::Result<StopAndAwaitExitOutcome<P>> {
     let held = match held {
         HoldOutcome::Held(process) => Some(process),
@@ -240,10 +245,13 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     };
     // SCM has confirmed `STOPPED`, so a terminate that fails is not a failed stop: the process is
     // on its way out by itself, and the wait for it decides.
-    let _ = terminate(&process);
-    Ok(match exit(&process, deadline)? {
+    let terminate_failed = terminate(&process).err();
+    Ok(match exit(&process, deadline, terminate_failed.as_ref())? {
         Waited::Confirmed => StopAndAwaitExitOutcome::Stopped,
-        Waited::Expired => StopAndAwaitExitOutcome::ProcessExpired(process),
+        Waited::Expired => StopAndAwaitExitOutcome::ProcessExpired {
+            process,
+            terminate_failed: terminate_failed.map(|e| e.to_string()),
+        },
     })
 }
 

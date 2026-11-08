@@ -114,8 +114,9 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
 /// The [`crate::Error::ProcessWaitTimeout`] constructor: a `stop` that SCM confirmed ran out of
 /// `budget` waiting for the service's process `pid` to exit.
 ///
-/// Takes the `Budget` for the reasons [`timed_out`] does.
-pub fn process_timed_out(id: &str, pid: u32, budget: Budget) -> crate::Error {
+/// Takes the `Budget` for the reasons [`timed_out`] does. `terminate_failed` is why ending the
+/// process failed, if it did.
+pub fn process_timed_out(id: &str, pid: u32, budget: Budget, terminate_failed: Option<String>) -> crate::Error {
     debug_assert!(
         matches!(budget, Budget::Bounded(d) if d > Duration::ZERO),
         "only a non-zero Bounded budget can expire, got {budget:?}"
@@ -127,6 +128,7 @@ pub fn process_timed_out(id: &str, pid: u32, budget: Budget) -> crate::Error {
             Budget::Bounded(d) => d,
             Budget::Immediate | Budget::Unbounded => Duration::ZERO,
         },
+        terminate_failed,
         recovery: format!(
             "goetia stopped waiting. The stop was not undone; until the process exits, the files it runs \
              stay in use. `goetia daemon status {id}` shows the manager's current view. Allow longer with \

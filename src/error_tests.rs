@@ -23,6 +23,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             pid: 1,
             waited: Duration::ZERO,
+            terminate_failed: None,
             recovery: String::new(),
         },
         Error::Unestablished {

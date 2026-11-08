@@ -166,7 +166,7 @@ fn timed_out_refuses_a_zero_length_budget() {
 /// the message says which wait ran out.
 #[skuld::test]
 fn a_process_that_outlives_the_budget_after_a_confirmed_stop_says_so() {
-    let e = process_timed_out("frpc", 4242, Budget::Bounded(Duration::from_secs(1)));
+    let e = process_timed_out("frpc", 4242, Budget::Bounded(Duration::from_secs(1)), None);
 
     assert_eq!(
         e.to_string(),
@@ -178,10 +178,29 @@ fn a_process_that_outlives_the_budget_after_a_confirmed_stop_says_so() {
     assert!(e.is_indeterminate());
 }
 
+/// The process goetia could not end is the likely reason it outlived the budget, so the text says so.
+#[skuld::test]
+fn a_process_that_could_not_be_terminated_says_so_when_it_outlives_the_budget() {
+    let e = process_timed_out(
+        "frpc",
+        4242,
+        Budget::Bounded(Duration::from_secs(1)),
+        Some("Access is denied. (os error 5)".to_string()),
+    );
+
+    assert_eq!(
+        e.to_string(),
+        "`frpc` is stopped, but its process (pid 4242) had not exited within 1s (terminating it failed: Access is \
+         denied. (os error 5)): goetia stopped waiting. The stop was not undone; until the process exits, the files \
+         it runs stay in use. `goetia daemon status frpc` shows the manager's current view. Allow longer with \
+         `--timeout <duration>`, or wait indefinitely with `--no-timeout`."
+    );
+}
+
 #[skuld::test]
 #[should_panic(expected = "only a non-zero Bounded budget can expire")]
 fn process_timed_out_refuses_a_budget_that_cannot_expire() {
-    let _ = process_timed_out("frpc", 4242, Budget::Unbounded);
+    let _ = process_timed_out("frpc", 4242, Budget::Unbounded, None);
 }
 
 // Deadline ============================================================================================================

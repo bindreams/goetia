@@ -546,10 +546,10 @@ impl Backend for Scm {
             deadline,
             held,
             |held| held.terminate(),
-            |held, deadline| {
+            |held, deadline, terminate_failed| {
                 held.wait_for_exit(deadline, || {
                     if unbounded {
-                        held.notice(id.as_str());
+                        held.notice(id.as_str(), terminate_failed);
                     }
                 })
             },
@@ -560,9 +560,15 @@ impl Backend for Scm {
             // The STOP was sent and its effect is not confirmed, as when SCM does not answer in time.
             StopAndAwaitExitOutcome::ServiceExpired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
             StopAndAwaitExitOutcome::Unconfirmed { pid } => Err(unconfirmed_stop(&id, pid, budget)),
-            StopAndAwaitExitOutcome::ProcessExpired(held) => {
-                Err(budget::process_timed_out(id.as_str(), held.pid(), budget))
-            }
+            StopAndAwaitExitOutcome::ProcessExpired {
+                process,
+                terminate_failed,
+            } => Err(budget::process_timed_out(
+                id.as_str(),
+                process.pid(),
+                budget,
+                terminate_failed,
+            )),
         }
     }
 
@@ -1171,7 +1177,7 @@ impl Scm {
                 failures.push(Error::os(format!("terminate `{id}`'s process {}", held.pid()), e).into());
                 return finish(failures);
             }
-            match held.wait_for_exit(Budget::Unbounded.start(), || held.notice(id.as_str())) {
+            match held.wait_for_exit(Budget::Unbounded.start(), || held.notice(id.as_str(), None)) {
                 Ok(Waited::Confirmed) => {}
                 Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),
                 Err(e) => {
