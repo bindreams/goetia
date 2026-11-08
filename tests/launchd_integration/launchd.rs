@@ -24,14 +24,14 @@ use goetia::manager::{self, Budget, Installed, ServiceManager, State};
 use goetia::spec::{DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::cleanup::{DirGuard, FileGuard};
-use crate::support::{self, ConnectBack, ELEVATED, cmd};
+use crate::support::{self, ConnectBack, ELEVATED, cmd, may_account_for};
 
-/// Held by every test whose assertion is about `list`'s answer for the
-/// *whole host* — its exit code, or the absence of any `undetermined` entry
-/// — and by every test that seeds something unreadable into the shared
-/// [`ENABLED_DIR`]/[`STAGING_DIR`], which changes that answer. The two
-/// groups are the same group precisely because either invalidates the other,
-/// so they take turns rather than race.
+/// Held by every test that reads or seeds hostile state in the shared
+/// [`ENABLED_DIR`]/[`STAGING_DIR`], and by every test that runs `daemon list`
+/// over them. While `list_does_not_hang_on_a_fifo_in_the_plist_directory` has
+/// a FIFO there, a concurrent reader that opens it hangs the suite;
+/// serialising makes a FIFO regression fail that one test, which guards its
+/// read, instead.
 ///
 /// Named for systemd's unit directory rather than for launchd's plist ones
 /// deliberately: skuld coordinates serialization across processes by label
@@ -146,19 +146,6 @@ fn write_bytes(path: &Path, bytes: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("chmod plist");
 }
 
-/// Whether `listed` leaves `id` possible — the basis for every negative
-/// assertion below. An aggregate `Undetermined` entry counts even though it
-/// names nothing: it may stand for `id` itself, so an assertion that treated
-/// it as silence would certify what the listing cannot establish (see
-/// [`Installed::Undetermined`]'s null-name rule).
-fn may_account_for(listed: &[Installed], id: &str) -> bool {
-    listed.iter().any(|entry| match entry {
-        Installed::Ours { spec, .. } => spec.id.as_str() == id,
-        Installed::OursUnusable { name, .. } => name == id,
-        Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id),
-    })
-}
-
 // Guards ==============================================================================================================
 
 /// Installs `spec` through `mgr` and `uninstall`s it on drop. Covers both
@@ -234,8 +221,8 @@ fn print_job(id: &str) -> cmd::Run {
 // The deliverable: conformance ========================================================================================
 
 /// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen daemons in the shared
-/// [`STAGING_DIR`] for its whole length, which is exactly what the host-wide listing assertions
-/// elsewhere in this file (and `tests/cli_binary.rs`'s real `daemon list`) are about.
+/// [`STAGING_DIR`] for its whole length, so it takes turns with the tests that list or seed hostile
+/// plists there.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn launchd_passes_conformance() {
     let mgr = Launchd::new();
@@ -285,7 +272,7 @@ fn launchd_passes_conformance() {
 
 // Round trips and drift ===============================================================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_round_trips_without_a_source_file() {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -328,7 +315,7 @@ fn hand_edit_is_detected_as_conflict() {
 /// The plist directories of a default macOS volume are case-insensitive, so a request for `ID`
 /// reaches the plist installed as `id`. Neither `install` (forced or not) nor `preview_install`
 /// may write over it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -680,7 +667,7 @@ fn uninstall_leaves_nothing() {
     assert!(!is_loaded(&id), "job must not still be loaded after uninstall");
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_plists() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -758,46 +745,17 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
 /// code alone proves nothing, since a command that ran against nothing
 /// produces the same one.
 ///
-/// The exit code is a claim about the *whole host*: `/Library/LaunchDaemons`
-/// holds every vendor's daemons, and any one of them `nobody` cannot open is
-/// now an `undetermined` entry and a `4`. So this asserts the invariant that
-/// is actually this test's — our daemon is listed, and is not what the
-/// caller failed to determine — plus the tie between the third key and the
-/// code, and leaves an unrelated vendor plist free to move that code without
-/// failing a test that is not about it.
+/// Only our id is asserted: `/Library/LaunchDaemons` holds every vendor's
+/// daemons, and one `nobody` cannot open is an unrelated `undetermined` entry.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works() {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
-    let listed = unelevated_list_json();
-
-    let id = Some(spec.id.as_str().to_string());
-    assert!(
-        listed.ids("daemons").contains(&id),
-        "the installed daemon must actually appear in the unelevated `list` output: {}",
-        listed.context
-    );
-    assert!(
-        !listed.ids("undetermined").contains(&id),
-        "`install` writes an 0644 plist under world-searchable directories, so an unprivileged \
-         caller reads it: {}",
-        listed.context
-    );
-    assert!(
-        matches!(listed.code, Some(0 | 4)),
-        "an unelevated `list` must not fail: {}",
-        listed.context
-    );
-    if !listed.ids("undetermined").is_empty() {
-        assert_eq!(
-            listed.code,
-            Some(4),
-            "an entry goetia could not determine is exactly what exit `4` reports: {}",
-            listed.context
-        );
-    }
+    // `install` writes an 0644 plist under world-searchable directories, so an unprivileged caller
+    // reads it.
+    support::list_json(run_unelevated).assert_own(&[spec.id.as_str()]);
 }
 
 /// The motivating defect, end to end and at the privilege boundary that
@@ -813,12 +771,11 @@ fn unelevated_list_reports_a_root_only_plist_as_undetermined() {
     std::fs::set_permissions(staging_path(spec.id.as_str()), std::fs::Permissions::from_mode(0o600))
         .expect("chmod 0600");
 
-    let listed = unelevated_list_json();
+    let listed = support::list_json(run_unelevated);
 
-    // Root opens this plist, decodes its marker and lists it under `daemons` at exit `0`, so a run
-    // whose reader was not in fact unprivileged fails here instead of passing vacuously.
+    // Root opens this plist, decodes its marker and lists it under `daemons`, so a run whose reader
+    // was not in fact unprivileged fails here instead of passing vacuously.
     let id = Some(spec.id.as_str().to_string());
-    assert_eq!(listed.code, Some(4), "{}", listed.context);
     assert!(listed.ids("undetermined").contains(&id), "{}", listed.context);
     assert!(
         !listed.ids("daemons").contains(&id),
@@ -855,12 +812,7 @@ fn list_omits_a_non_utf8_plist_as_foreign() {
         "bytes that are not goetia's format leave the id neither claimed nor undetermined: \
          {listed:?}"
     );
-    assert!(
-        listed
-            .iter()
-            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.id == readable.id)),
-        "every other daemon is still listed: {listed:?}"
-    );
+    support::assert_own(&listed, &[readable.id.as_str()]);
 }
 
 /// The macOS-wide regression the binary-plist rule prevents. `/Library/
@@ -883,15 +835,6 @@ fn list_stays_clean_on_a_host_carrying_binary_plists() {
         !may_account_for(&listed, &id),
         "a binary plist carries no goetia marker by construction, so it is foreign and omitted \
          exactly like an unmarked XML one: {listed:?}"
-    );
-    let undetermined: Vec<&Installed> = listed
-        .iter()
-        .filter(|e| matches!(e, Installed::Undetermined { .. }))
-        .collect();
-    assert!(
-        undetermined.is_empty(),
-        "nothing on this host was left undetermined, so `list` must report nothing under that key: \
-         {undetermined:?}"
     );
 }
 
@@ -1026,20 +969,6 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
         .expect("spawn goetia as `nobody`")
 }
 
-/// [`run_unelevated`] for `daemon list --json`, parsed.
-fn unelevated_list_json() -> ListJson {
-    let output = run_unelevated(&["daemon", "list", "--json"]);
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
-    let doc = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {context}"));
-    ListJson {
-        doc,
-        code: output.status.code(),
-        context,
-    }
-}
-
 /// `dir`'s mode, restored when this value drops.
 ///
 /// Held by the one test that has to make a plist directory unsearchable to an unprivileged reader.
@@ -1070,29 +999,6 @@ impl ModeGuard {
 impl Drop for ModeGuard {
     fn drop(&mut self) {
         let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(self.mode));
-    }
-}
-
-/// The one document `--json` promises, plus the raw streams for a failure
-/// message.
-struct ListJson {
-    doc: serde_json::Value,
-    code: Option<i32>,
-    context: String,
-}
-
-impl ListJson {
-    fn ids(&self, key: &str) -> Vec<Option<String>> {
-        self.doc[key]
-            .as_array()
-            .unwrap_or_else(|| panic!("`{key}` must always be present, as an array: {}", self.context))
-            .iter()
-            .map(|entry| match &entry[if key == "daemons" { "id" } else { "name" }] {
-                serde_json::Value::Null => None,
-                serde_json::Value::String(name) => Some(name.clone()),
-                other => panic!("a name must be a string or null: {other}"),
-            })
-            .collect()
     }
 }
 
@@ -1356,10 +1262,10 @@ fn install_over_a_directory_refuses_instead_of_recursing() {
 /// `mkfifo` there would wedge the listing for the whole host. Classifying
 /// the path before opening it is what keeps that from happening.
 ///
-/// No `UNIT_DIR_EXCLUSIVE`: a FIFO is omitted rather than reported, so it
-/// moves neither the host's `undetermined` set nor `list`'s exit code, and
-/// this asserts about its own id alone.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+/// `UNIT_DIR_EXCLUSIVE`: the FIFO sits where a concurrent unprivileged
+/// `daemon list` reads, and a regression would hang that reader, not only
+/// this test's guarded one.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_does_not_hang_on_a_fifo_in_the_plist_directory() {
     let id = support::random_test_id();
     let path = enabled_path(&id);
