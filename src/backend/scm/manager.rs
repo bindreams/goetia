@@ -581,9 +581,6 @@ impl Backend for Scm {
     }
 }
 
-/// What the `Parameters` of a service goetia could open say about its ownership. No marker is
-/// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
-/// has no second proof of ownership.
 /// `provided`, the host `provide` returned, when it is `rendered`, the host the registration names.
 /// When it is not, `preview` is asked once more, which is pure: a `preview` that now names `provided`
 /// says the host changed while the install waited for the lock ([`Error::ShimHostChanged`], run the
@@ -606,6 +603,9 @@ fn confirm_provided(shim: &dyn ShimProvider, rendered: HostCommand, provided: Ho
     })
 }
 
+/// What the `Parameters` of a service goetia could open say about its ownership. No marker is
+/// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
+/// has no second proof of ownership.
 fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
     let blob = match generate::extract(&parameters.fields, &parameters.strays) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
