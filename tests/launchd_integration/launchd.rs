@@ -185,7 +185,9 @@ impl Drop for Guard {
 }
 
 /// Kills the `launchctl kickstart -p system/<id>` that a `start` answering `WaitTimeout` leaves
-/// running on purpose, which a long `ThrottleInterval` would keep alive for an hour. Whether the
+/// running on purpose when its `print` did not show launchd holding the start, which a long
+/// `ThrottleInterval` would keep alive for an hour. A `start` that did see it held ends the
+/// `kickstart` itself; this is the backstop for the one that did not. Whether the
 /// `bootout` in `Guard`'s uninstall ends it, or waits on it, is unmeasured, so this kills it first.
 /// Declare it after the [`Guard`], so it drops before the uninstall; launchd keeps the request, and
 /// the `bootout` discards it. `id` is the test's random id, so only this test's process can match.

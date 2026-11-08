@@ -65,8 +65,8 @@ pub(crate) struct Capture {
 pub(crate) enum Finished {
     /// The child exited on its own, inside the budget.
     Exited { status: ExitStatus, capture: Capture },
-    /// The deadline expired first. The child was killed and reaped — or, under
-    /// [`Role::Request`], left running, to be reaped on a thread of its own once it exits.
+    /// The deadline expired first. The child was killed and reaped. (A [`Role::Request`] is left
+    /// running instead: [`Finished::Left`].)
     ///
     /// Carries no capture. Whatever the child had written by then is a
     /// prefix no consumer may treat as whole, and the one thing every
@@ -76,6 +76,61 @@ pub(crate) enum Finished {
     /// expiry identically. A field nothing may read and nothing does read is
     /// surplus.
     Expired,
+    /// The deadline expired first, and the child is a [`Role::Request`] left running: the caller
+    /// may end it ([`Left::kill`]) or, by dropping this, leave it to its [`Reaper`].
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Left(Left),
+}
+
+/// Carries a [`Fate`] out on the child a [`Left`] holds.
+type Settle = Box<dyn FnOnce(Fate) + Send>;
+
+/// How a request left running by an expiry ends up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fate {
+    /// The caller ended the child.
+    Kill,
+    /// The child runs on, and its [`Reaper`] reaps it once it exits.
+    Release,
+}
+
+/// A [`Role::Request`] the deadline left running, held until its caller decides its [`Fate`].
+///
+/// goetia cannot tell from `launchctl` whether the request is out, so nothing here kills it
+/// unasked: dropping a `Left` releases the child to its reaper, as an expiry always did. A caller
+/// that learns by other means that the manager has the request may [`kill`](Left::kill) the child,
+/// which then costs the request nothing.
+pub(crate) struct Left(Option<Settle>);
+
+impl Left {
+    pub(crate) fn new(settle: impl FnOnce(Fate) + Send + 'static) -> Left {
+        Left(Some(Box::new(settle)))
+    }
+
+    /// End the child. Best-effort: one that already exited is not an error, and one that cannot be
+    /// signalled runs on, which is what [`Fate::Release`] is. Either way it is reaped.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn kill(mut self) {
+        self.settle(Fate::Kill);
+    }
+
+    fn settle(&mut self, fate: Fate) {
+        if let Some(settle) = self.0.take() {
+            settle(fate);
+        }
+    }
+}
+
+impl Drop for Left {
+    fn drop(&mut self) {
+        self.settle(Fate::Release);
+    }
+}
+
+impl std::fmt::Debug for Left {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Left")
+    }
 }
 
 /// What the child does for its caller, which decides what the deadline may cut short, and where its
@@ -332,11 +387,18 @@ fn waited_out(
     let status = match (waited, role) {
         (Some(status), _) => status,
         (None, Role::Request(reaper)) => {
-            // Not killed: goetia cannot tell whether the request is out yet, and a request left
-            // unsent because goetia ran out of budget is the one answer worse than waiting. Its
-            // output files stay open in it, and a file never breaks under its writer.
-            reaper.reap(child);
-            return Ok(Finished::Expired);
+            // Not killed here: goetia cannot tell whether the request is out yet, and a request
+            // left unsent because goetia ran out of budget is the one answer worse than waiting.
+            // Its output files stay open in it, and a file never breaks under its writer. The
+            // caller may kill it once it knows the manager has the request.
+            return Ok(Finished::Left(Left::new(move |fate| {
+                if fate == Fate::Kill {
+                    // Root only, and before the reap: `kill` is a no-op on a child that already
+                    // exited, so an error leaves it running, which is `Fate::Release`.
+                    let _ = child.kill();
+                }
+                reaper.reap(child);
+            })));
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
             // The root first, and its `Ok` is what makes the reap below unable to block.

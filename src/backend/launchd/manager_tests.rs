@@ -8,7 +8,8 @@
 //! `tests/launchd_integration.rs` instead.
 
 use super::*;
-use crate::backend::client::fake::{Entry, Fake, RoleKind, Waited, exited, fail, reply};
+use crate::backend::bounded::Fate;
+use crate::backend::client::fake::{Ended, Entry, Fake, RoleKind, Waited, exited, fail, lingering, reply};
 use crate::backend::client::{Client, ClientError, Real};
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
@@ -1652,6 +1653,92 @@ fn a_stop_whose_bootout_expires_is_a_wait_timeout() {
         "{e:?}"
     );
     fake.assert_spent("the bootout was sent");
+}
+
+/// A waited `start` of a loaded job that is not running, whose `kickstart` outlasts the budget and
+/// is left running, then `print` answered by `after` (`None`: the call itself fails). The error the
+/// `start` ended with, and how the `kickstart` ended up.
+fn start_whose_kickstart_expires(after: Option<Entry>) -> (Error, Ended) {
+    let id = never_installed();
+    let (kickstart, ended) = lingering(&["kickstart"]);
+    let fake = Fake::new(
+        [answer("print", DONE), answer("print", NOT_RUNNING), kickstart]
+            .into_iter()
+            .chain(after),
+    );
+    let mgr = launchd_over(fake.clone());
+
+    let e = backend::Backend::start(&mgr, marked_plist(&id), Budget::DEFAULT, &mut reserved(&[Step::Start]))
+        .expect_err("a kickstart that outlasts the budget");
+
+    fake.assert_spent("the start was driven to the expiry and the read after it");
+    (e, ended)
+}
+
+fn assert_wait_timeout(e: &Error) {
+    assert!(matches!(e, Error::WaitTimeout { awaited: "running", .. }), "{e:?}");
+}
+
+/// A `kickstart` the budget ran out on is ended when one `print` shows launchd holding the start,
+/// queued or running: it has the request, so the kill costs nothing. The verb still reports the
+/// timeout.
+#[skuld::test]
+fn a_kickstart_that_outlasts_the_budget_is_ended_once_launchd_holds_the_start() {
+    for held in [SPAWN_SCHEDULED, RUNNING] {
+        let (e, ended) = start_whose_kickstart_expires(Some(answer("print", held)));
+
+        assert_wait_timeout(&e);
+        assert_eq!(ended.fate(), Some(Fate::Kill), "{held:?}");
+    }
+}
+
+/// A `print` that does not show the start held leaves the `kickstart` running: killed before launchd
+/// has the request, the start is lost, so only evidence ends it.
+#[skuld::test]
+fn a_kickstart_that_outlasts_the_budget_is_left_running_when_the_start_is_not_shown_held() {
+    const UNRECOGNISED: Answer = (
+        0,
+        "	state = someday-new-apple-state
+",
+        "",
+    );
+    for shown in [NOT_RUNNING, UNRECOGNISED] {
+        let (e, ended) = start_whose_kickstart_expires(Some(answer("print", shown)));
+
+        assert_wait_timeout(&e);
+        assert_eq!(ended.fate(), Some(Fate::Release), "{shown:?}");
+    }
+}
+
+/// A `print` that failed, or whose output is not whole, is doubt, and doubt never kills: the same
+/// timeout is reported and the `kickstart` is left running.
+#[skuld::test]
+fn a_kickstart_that_outlasts_the_budget_is_left_running_when_the_print_fails() {
+    let cut = Finished::Exited {
+        status: std::os::unix::process::ExitStatusExt::from_raw(0),
+        capture: bounded::Capture {
+            stdout: SPAWN_SCHEDULED.1.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            complete: false,
+        },
+    };
+    let not_run = || ClientError::NotRun(std::io::Error::other("no launchctl").into());
+    let failures = [
+        ("a nonzero exit", answer("print", UNREADABLE)),
+        (
+            "a nonzero exit with a state in its output",
+            answer("print", (5, SPAWN_SCHEDULED.1, "")),
+        ),
+        ("not loaded", answer("print", NOT_LOADED)),
+        ("output that is not whole", reply(&["print"], cut)),
+        ("no launchctl to run", fail(&["print"], not_run())),
+    ];
+    for (what, entry) in failures {
+        let (e, ended) = start_whose_kickstart_expires(Some(entry));
+
+        assert_wait_timeout(&e);
+        assert_eq!(ended.fate(), Some(Fate::Release), "{what}");
+    }
 }
 
 // kill ================================================================================================================
