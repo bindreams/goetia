@@ -1,5 +1,6 @@
 use super::{check_spec_grammar, reject_interpolated_id, scalar, spec, spec_would_change, would_substitution_change};
 use crate::error::Error;
+use crate::spec::field::Field;
 use crate::spec::raw::RawSpec;
 use crate::spec::resolve::resolve_user;
 use crate::spec::user::RawUser;
@@ -8,7 +9,7 @@ use crate::spec::{AccountId, User};
 
 /// Substitute `input` against `vars` at a fixed test path.
 fn sub(input: &str, vars: &Vars) -> Result<String, Error> {
-    scalar(input, "env[\"LOG\"]", vars)
+    scalar(input, "env[\"LOG\"]", vars).map(|scanned| scanned.text)
 }
 
 // Basic substitution ==================================================================================================
@@ -245,6 +246,33 @@ fn interpolate_yaml(yaml: &str, pairs: &[(&str, &str)]) -> Result<RawSpec, Error
     let mut raw: RawSpec = RawSpec::parse(yaml).expect("fixture yaml should parse");
     spec(&mut raw, &Vars::from_pairs(pairs))?;
     Ok(raw)
+}
+
+/// `spec` names the fields in which a reference was resolved from `.env`: not a default, not a `$$`.
+#[skuld::test]
+fn spec_reports_the_fields_a_reference_read_from_env() {
+    let yaml = r#"
+id: frpc
+name: ${N}
+command: ["/bin/frpc", "${A:-x}", "${B:-x}", "$$"]
+cwd: ${NOPE:-/srv}
+env:
+  SET: ${N}
+  DEFAULTED: ${NOPE:-x}
+user: ${U}
+"#;
+    let mut raw = RawSpec::parse(yaml).expect("fixture yaml should parse");
+    let vars = Vars::from_pairs(&[("N", "n"), ("B", "b"), ("U", "u")]);
+    let from_env = spec(&mut raw, &vars).unwrap();
+    assert_eq!(
+        from_env.into_iter().collect::<Vec<_>>(),
+        [
+            Field::Name,
+            Field::Command(2),
+            Field::EnvValue("SET".to_string()),
+            Field::User
+        ]
+    );
 }
 
 #[skuld::test]

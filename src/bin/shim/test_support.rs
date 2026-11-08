@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::os::fake::{Fake, KILL_REFUSED};
 use crate::stop_bus::Supervisor;
 
-// The shim is its own crate and cannot reach `DaemonSpec::for_test`; share the integration suites'
+// The shim is its own crate and cannot reach `spec::test_support::plain_fields`; share the integration suites'
 // constructor.
 #[path = "../../../tests/support/daemon_spec.rs"]
 pub(crate) mod daemon_spec;

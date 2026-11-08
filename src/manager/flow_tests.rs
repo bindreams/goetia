@@ -4,15 +4,16 @@ use crate::error::Error;
 use crate::manager::fake::fake_tests::mk;
 use crate::manager::fake::{Fake, generate};
 use crate::manager::{Budget, Installed, ServiceManager, Step};
-use crate::spec::{DaemonSpec, Id, User};
+use crate::spec::{DaemonFields, DaemonSpec, Id, User};
 
 // Fixtures ============================================================================================================
 
 fn mk_as(id: &str, user: &str) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         user: User::Name(user.to_string()),
-        ..mk(id)
-    }
+        ..mk(id).into_fields()
+    })
+    .unwrap()
 }
 
 /// What `Fake::render` fails with for a seeded unresolvable account.
@@ -55,6 +56,25 @@ fn install_refuses_an_unresolvable_account_with_uninstall_advice() {
             recovery: Some(decide::unusable_recovery("frpc")),
         }
     );
+}
+
+#[skuld::test]
+fn install_and_preview_refuse_what_only_render_for_install_refuses() {
+    use crate::backend::Backend;
+
+    let fake = Fake::new();
+    fake.seed_unfit_for_install("host");
+    let spec = mk_as("frpc", "host");
+    fake.render(&spec).expect("`render` does not judge the host");
+
+    for result in [
+        fake.install(&spec, false).map(|_| ()),
+        fake.preview_install(&spec).map(|_| ()),
+    ] {
+        let err = result.expect_err("the host cannot carry the definition");
+        assert!(err.to_string().contains("unfit for install (seeded)"), "{err}");
+    }
+    assert_eq!(fake.writes(), 0);
 }
 
 #[skuld::test]

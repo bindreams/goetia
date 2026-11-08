@@ -1,21 +1,19 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use skuld::temp_dir;
+
 use super::*;
 use crate::spec::interpolate;
+use crate::spec::test_support::{abs, assert_no_run_of_spaces, plain_fields, program};
 use crate::spec::vars::Vars;
 
 // `Path::new("/opt/rt").is_absolute()` is `false` on Windows, and
 // `PathBuf::from(r"C:\base").join("/opt/rt")` yields `C:/opt/rt` — so every
 // test below that exercises absolute-path resolution needs a base dir the
 // host platform actually considers absolute.
-#[cfg(windows)]
 fn base_dir() -> PathBuf {
-    PathBuf::from(r"C:\base")
-}
-#[cfg(not(windows))]
-fn base_dir() -> PathBuf {
-    PathBuf::from("/base")
+    abs("base")
 }
 
 fn parse_manifest(yaml: &str) -> RawSpec {
@@ -130,6 +128,610 @@ fn rejects_control_characters_in_cwd_and_logs() {
     assert!(logs_err.to_string().contains("logs"));
 }
 
+// The rules check what the user wrote ---------------------------------------------------------------------------------
+
+#[skuld::test]
+fn accepts_a_relative_cwd_and_logs_ending_in_a_backslash_on_every_host() {
+    // Whether a backend can write the path is that backend's question, not the field's.
+    for field in ["cwd", "logs"] {
+        let yaml = format!("id: frpc\ncommand: [bin/frpc]\n{field}: 'data\\'\n");
+        resolve_yaml(&yaml).unwrap_or_else(|e| panic!("`{field}` ending in a backslash: {e}"));
+    }
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_drive_relative_path_with_nul_gets_the_control_character_message() {
+    // `std::path::absolute` fails on the NUL and would print it; the check on the authored text
+    // comes first.
+    let yaml = r#"
+id: frpc
+command: [bin/frpc]
+cwd: "C:x\0y"
+"#;
+    let msg = resolve_yaml(yaml).unwrap_err().to_string();
+    assert!(msg.contains("field `cwd` contains a control character"), "{msg}");
+    assert!(!msg.contains('\0'), "{msg:?}");
+}
+
+#[skuld::test]
+fn a_manifest_with_two_defects_reports_the_earlier_field_first() {
+    let cases = [
+        ("name: \"a\\nb\"\ncwd: \"\"", "field `name`"),
+        ("cwd: \"\"\nlogs: \"a\\nb\"", "field `cwd` must not be empty"),
+        ("cwd: \"a\\nb\"\nlogs: \"c\\nd\"", "field `cwd`"),
+        ("cwd: \"a\\nb\"\nlogs: \"\"", "field `cwd` contains"),
+        ("logs: \"a\\nb\"\nenv: {\"A=B\": x}", "field `logs`"),
+        ("env: {A: \"a\\nb\"}\nuser: {name: \" \"}", "env[A]"),
+    ];
+    for (extra, expected) in cases {
+        let msg = resolve_yaml(&format!("id: frpc\ncommand: [bin/frpc]\n{extra}\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(expected),
+            "`{extra}`: expected `{expected}` first, got: {msg}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_manifest_directory_that_is_not_valid_utf8_is_refused_by_the_field_joined_to_it() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = PathBuf::from(OsStr::from_bytes(b"/base/\xff"));
+    let msg = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc]\n"), &dir)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("field `command` is `bin/frpc`, which resolves under the manifest directory to"),
+        "{msg}"
+    );
+    assert!(msg.contains("is not valid UTF-8"), "{msg}");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_non_utf8_manifest_directory_is_fine_when_every_path_is_absolute() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = PathBuf::from(OsStr::from_bytes(b"/srv/caf\xe9/"));
+    let yaml = "id: frpc\ncommand: [/opt/frpc]\ncwd: /opt\nlogs: /var/log/frpc.log\n";
+    let (spec, _) = resolve(parse_manifest(yaml), &dir).expect("no field is joined to the directory");
+    assert_eq!(spec.cwd, Some(PathBuf::from("/opt")));
+}
+
+#[skuld::test]
+fn a_manifest_directory_with_a_newline_is_refused_by_the_field_joined_to_it() {
+    let dir = base_dir().join("a\nb");
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    for (extra, field) in [
+        ("command: [bin/frpc]".to_string(), "command"),
+        (format!("command: ['{abs}']\ncwd: data"), "cwd"),
+        (format!("command: ['{abs}']\nlogs: data"), "logs"),
+    ] {
+        let msg = resolve(parse_manifest(&format!("id: frpc\n{extra}\n")), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(&format!("field `{field}` is ")) && msg.contains("resolves under the manifest directory to"),
+            "{msg}"
+        );
+        assert!(msg.contains("control character"), "{msg}");
+    }
+}
+
+#[skuld::test]
+fn a_resolution_error_is_reported_in_field_order() {
+    // The directory is bad, so each relative path fails to resolve.
+    let dir = base_dir().join("a\nb");
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let cases = [
+        (
+            "command: [bin/frpc]\nlogs: data\nenv: {\"A=B\": x}".to_string(),
+            "command",
+        ),
+        (format!("command: ['{abs}']\ncwd: data\nenv: {{\"A=B\": x}}"), "cwd"),
+        (format!("command: ['{abs}']\ncwd: data\nlogs: \"a\\nb\""), "cwd"),
+    ];
+    for (body, field) in cases {
+        let msg = resolve(parse_manifest(&format!("id: frpc\n{body}\n")), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains(&format!("field `{field}` is ")) && msg.contains("resolves under the manifest directory to"),
+            "`{body}`: {msg}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_rule_error_is_reported_before_a_later_fields_resolution_error() {
+    let dir = base_dir().join("a\nb");
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let msg = resolve(
+        parse_manifest(&format!("id: frpc\ncommand: ['{abs}']\ncwd: \"c\\nd\"\nlogs: data\n")),
+        &dir,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(msg.contains("field `cwd` contains a control character"), "{msg}");
+}
+
+#[skuld::test]
+fn a_bad_id_is_reported_first_whatever_the_manifest_directory() {
+    // The id is checked before any path is resolved, so the directory's defect never answers first.
+    let dir = base_dir().join("a\nb");
+    for (id, expected) in [
+        ("${X}", "a daemon id cannot be interpolated"),
+        ("\"a\\nb\"", "does not match the required pattern"),
+    ] {
+        let msg = resolve(parse_manifest(&format!("id: {id}\ncommand: [bin/frpc]\n")), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(expected), "id {id}: {msg}");
+        assert!(!msg.contains("manifest directory"), "id {id}: {msg}");
+    }
+}
+
+#[skuld::test]
+fn a_resolved_path_the_field_rules_would_refuse_is_attributed_to_the_resolution() {
+    // A drive-relative `cwd: C:` resolves through the per-drive directory to a value the authored
+    // rules never saw; the message must say so rather than blame the text the user wrote.
+    let id = Id::try_from("frpc").unwrap();
+    let err =
+        Error::from(check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\u{FFFE}"), DirJoin::Not).unwrap_err());
+    let msg = err.to_string();
+    assert!(
+        msg.contains("field `cwd` is `C:`, which resolves to `/a\u{FFFE}`, which contains U+FFFE"),
+        "{msg}"
+    );
+    check_resolved(&id, PathField::Cwd, "C:", Path::new("/ordinary"), DirJoin::Not).expect("an ordinary value passes");
+}
+
+#[skuld::test]
+fn a_defect_only_the_directory_adds_is_attributed_to_the_directory() {
+    let id = Id::try_from("frpc").unwrap();
+    let msg = Error::from(
+        check_resolved(&id, PathField::Cwd, "bin", Path::new("/a\u{FFFE}/bin"), DirJoin::Whole).unwrap_err(),
+    )
+    .to_string();
+    assert!(
+        msg.contains("field `cwd` is `bin`, which resolves under the manifest directory to `/a\u{FFFE}/bin`, which contains U+FFFE"),
+        "{msg}"
+    );
+}
+
+#[skuld::test]
+fn a_directory_defect_is_not_attributed_to_env_when_env_supplied_the_field() {
+    let id = Id::try_from("frpc").unwrap();
+    let from_env = BTreeSet::from([Field::Cwd]);
+    let directory =
+        check_resolved(&id, PathField::Cwd, "bin", Path::new("/a\u{FFFE}/bin"), DirJoin::Whole).unwrap_err();
+    let msg = directory.attributed(&from_env).to_string();
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+
+    let value = check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\u{FFFE}"), DirJoin::Not).unwrap_err();
+    let msg = value.attributed(&from_env).to_string();
+    assert!(msg.contains("after substituting from .env: "), "{msg}");
+}
+
+/// A drive-relative `Q:` resolves through the per-drive directory, which no manifest can set, so the
+/// resolution is named and `.env` is blamed only when a reference supplied the `Q:`.
+#[skuld::test]
+fn a_resolved_drive_relative_defect_names_the_resolution_and_blames_env_only_when_env_wrote_it() {
+    let id = Id::try_from("frpc").unwrap();
+    let resolved = Path::new("/a\u{7}");
+    let refused = || check_resolved(&id, PathField::Cwd, "Q:", resolved, DirJoin::Not).unwrap_err();
+
+    let typed = refused().attributed(&BTreeSet::new()).to_string();
+    assert!(
+        typed.contains("field `cwd` is `Q:`, which resolves to `/a\u{7}`"),
+        "{typed}"
+    );
+    assert!(!typed.contains(".env") && !typed.contains("substituting"), "{typed}");
+
+    let from_env = refused().attributed(&BTreeSet::from([Field::Cwd])).to_string();
+    assert!(
+        from_env.contains("after substituting from .env: field `cwd` is `Q:`, which resolves to `/a\u{7}`"),
+        "{from_env}"
+    );
+}
+
+/// A drive root is a legitimate working directory: nothing refuses the backslash it ends in,
+/// written out or reached through the manifest directory.
+#[cfg(windows)]
+#[skuld::test]
+fn a_drive_root_cwd_resolves() {
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let written = format!("id: frpc\ncommand: ['{abs}']\ncwd: 'C:\\'\n");
+    let (spec, _) = resolve(parse_manifest(&written), &base_dir()).expect("`C:\\` resolves");
+    assert_eq!(spec.cwd, Some(PathBuf::from(r"C:\")));
+
+    let dotted = "id: frpc\ncommand: [bin/frpc.exe]\ncwd: .\n";
+    let (spec, _) = resolve(parse_manifest(dotted), Path::new(r"C:\")).expect("`.` in `C:\\` resolves");
+    assert_eq!(spec.cwd, Some(PathBuf::from(r"C:\")));
+}
+
+// A substituted path is judged as it is -------------------------------------------------------------------------------
+
+/// A manifest directory whose name is not valid UTF-8.
+fn non_utf8_dir() -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(OsStr::from_bytes(b"/base/\xff"))
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let mut name: Vec<u16> = r"C:\base\".encode_utf16().collect();
+        name.push(0xD800);
+        PathBuf::from(OsString::from_wide(&name))
+    }
+}
+
+/// `$$` is an escape: after step 5 the value is `data/$x`, which holds a `$` and no reference.
+#[skuld::test]
+fn a_path_with_an_escaped_dollar_is_judged_against_the_manifest_directory() {
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    for dir in [non_utf8_dir(), base_dir().join("a\nb")] {
+        let msg = resolve(
+            parse_manifest(&format!("id: frpc\ncommand: ['{abs}']\ncwd: 'data/$$x'\n")),
+            &dir,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("field `cwd` is `data/$x`, which resolves under the manifest directory to "),
+            "{dir:?}: {msg}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_manifest_directory_defect_is_not_blamed_on_the_env_file() {
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let dir = base_dir().join("a\nb");
+    let msg = resolve(
+        parse_manifest(&format!("id: frpc\ncommand: ['{abs}']\ncwd: 'data/$$x'\n")),
+        &dir,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+}
+
+/// `type: simple$$` substitutes to `simple$`, which holds a `$` and no reference: the shape phase
+/// judges it, with `command`, rather than leaving it to completeness.
+#[skuld::test]
+fn a_substituted_enum_with_a_dollar_left_is_judged_in_the_shape_phase() {
+    let msg = resolve_yaml(
+        "id: frpc
+type: 'simple$$'
+",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        msg.contains("field `type` is `simple$`"),
+        "an absent `command` is completeness's to report, after the shape phase: {msg}"
+    );
+    assert!(!msg.contains(".env"), "`$$` is not `.env`'s: {msg}");
+}
+
+// Which defects are `.env`'s ------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_defect_in_a_value_a_reference_supplied_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\ntype: ${T}\n", Some("T=simple$\n"));
+    let msg = load(dir).unwrap_err().to_string();
+    assert!(
+        msg.contains("after substituting from .env: field `type` is `simple$`"),
+        "{msg}"
+    );
+}
+
+#[skuld::test]
+fn a_defect_in_a_field_no_reference_touched_is_not_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    // `name` is substituted; the `type` defect is in a field that holds only a `$$` escape.
+    write_fixture(dir, "id: frpc\nname: ${N}\ntype: 'simple$$'\n", Some("N=frpc\n"));
+    let msg = load(dir).unwrap_err().to_string();
+    assert!(msg.contains("field `type` is `simple$`"), "{msg}");
+    assert!(!msg.contains(".env"), "{msg}");
+}
+
+#[skuld::test]
+fn a_defect_in_a_default_is_not_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\nrestart: ${R:-sometimes}\n", None);
+    let msg = load(dir).unwrap_err().to_string();
+    assert!(msg.contains("field `restart` is `sometimes`"), "{msg}");
+    assert!(!msg.contains(".env"), "{msg}");
+}
+
+#[skuld::test]
+fn an_empty_env_value_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    write_fixture(
+        dir,
+        &format!("id: frpc\ncommand: ['{abs}']\ncwd: ${{D}}\n"),
+        Some("D=\n"),
+    );
+    let msg = load(dir).unwrap_err().to_string();
+    assert!(
+        msg.contains("after substituting from .env: field `cwd` must not be empty"),
+        "{msg}"
+    );
+}
+
+#[skuld::test]
+fn a_default_that_replaces_an_empty_env_value_is_not_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\nrestart: ${R:-sometimes}\n", Some("R=\n"));
+    let msg = load(dir).unwrap_err().to_string();
+    assert!(msg.contains("field `restart` is `sometimes`"), "{msg}");
+    assert!(!msg.contains(".env"), "{msg}");
+}
+
+#[skuld::test]
+fn a_defect_in_a_value_that_overrides_a_default_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\nrestart: ${R:-never}\n", Some("R=sometimes\n"));
+    let msg = load(dir).unwrap_err().to_string();
+    assert!(
+        msg.contains("after substituting from .env: field `restart` is `sometimes`"),
+        "{msg}"
+    );
+}
+
+/// `.env` supplied the value, whatever it looks like: here it equals the reference that asked for it.
+#[skuld::test]
+fn a_defect_in_a_value_equal_to_its_reference_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\ntype: ${T}\n", Some("T=${T}\n"));
+    let msg = load(dir).unwrap_err().to_string();
+    assert!(
+        msg.contains("after substituting from .env: field `type` is `${T}`"),
+        "{msg}"
+    );
+}
+
+/// The `$` is the manifest's `$$` and the rest is a default: no reference read `.env`.
+#[skuld::test]
+fn a_defect_in_a_default_followed_by_an_escape_is_not_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\ntype: '${T:-simple}$$'\n", None);
+    let msg = load(dir).unwrap_err().to_string();
+    assert!(msg.contains("field `type` is `simple$`"), "{msg}");
+    assert!(!msg.contains(".env"), "{msg}");
+}
+
+#[skuld::test]
+fn a_user_name_from_env_is_attributed_to_the_override_and_to_env(#[fixture(temp_dir)] dir: &Path) {
+    let yaml = "id: frpc\ncommand: [C:/bin/frpc]\nbackend-specific:\n  systemd:\n    user: ${U}\n";
+    write_fixture(dir, yaml, Some("U=LocalService\n"));
+    let msg = resolve_as(parse_manifest(yaml), dir, Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("backend-specific.systemd: after substituting from .env: "),
+        "{msg}"
+    );
+    assert!(msg.contains("Windows built-in"), "{msg}");
+}
+
+#[skuld::test]
+fn a_user_name_written_out_is_attributed_to_the_override_alone() {
+    let yaml = "id: frpc\ncommand: [C:/bin/frpc]\nbackend-specific:\n  systemd:\n    user: LocalService\n";
+    let msg = resolve_as(parse_manifest(yaml), &base_dir(), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("backend-specific.systemd"), "{msg}");
+    assert!(!msg.contains(".env"), "{msg}");
+}
+
+#[skuld::test]
+fn a_manifest_directory_defect_under_a_substituted_path_is_attributed_to_the_directory() {
+    // The field's text changed (`${D:-bin}` became `bin`), but the defect is the directory's. The
+    // directory is not created: no file system need accept its name.
+    let dir = base_dir().join("a\u{FFFE}b");
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    let yaml = format!("id: frpc\ncommand: ['{abs}']\ncwd: ${{D:-bin}}\n");
+    let msg = resolve(parse_manifest(&yaml), &dir).unwrap_err().to_string();
+    assert!(msg.contains("which resolves under the manifest directory to"), "{msg}");
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_pending_value_with_a_dollar_raises_nothing() {
+    let id = Id::try_from("frpc").unwrap();
+    let mut warnings = Vec::new();
+    let resolved = resolve_path_string(
+        &id,
+        PathField::Cwd,
+        "C:bin/$x",
+        &base_dir(),
+        Substitution::Pending,
+        None,
+        &mut warnings,
+    )
+    .unwrap();
+    assert_eq!(resolved, "C:bin/$x");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+// What the directory alone cannot refuse ------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_path_a_substitution_may_make_absolute_is_not_judged_against_the_manifest_directory() {
+    // `${D}` is absolute if `.env` says so; the shape phase cannot know, and `DaemonSpec::new`
+    // judges the final value.
+    let id = Id::try_from("frpc").unwrap();
+    let dir = base_dir().join("a\nb");
+    let abs = base_dir().join("frpc").to_string_lossy().into_owned();
+    for body in [
+        "command: ['${D}']".to_string(),
+        format!("command: ['{abs}']\ncwd: ${{D}}"),
+        format!("command: ['{abs}']\nlogs: ${{D}}"),
+    ] {
+        let raw = parse_manifest(&format!("id: frpc\n{body}\n"));
+        resolve_shape(&id, raw, &dir, Substitution::Pending, None)
+            .unwrap_or_else(|e| panic!("`{body}`: {}", Error::from(e)));
+    }
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_root_relative_path_uses_only_the_directorys_drive() {
+    // `C:\base\a<newline>b` joined with `\data` is `C:\data`: nothing of the directory survives.
+    let dir = base_dir().join("a\nb");
+    let yaml = "id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: '\\data'\n";
+    let (spec, _) = resolve(parse_manifest(yaml), &dir).expect("the directory does not appear in the result");
+    assert_eq!(spec.cwd, Some(PathBuf::from(r"C:\data")));
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_root_relative_path_carries_a_defect_of_the_directorys_share_to_the_directory() {
+    // The share `sh<U+FFFE>re` is what the root-relative `\data` keeps; no `.env` text is its cause.
+    let dir = PathBuf::from("\\\\server\\sh\u{FFFE}re\\app");
+    let yaml = "id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: ${D:-\\data}\n";
+    let msg = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Scm))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("the manifest directory's drive or share"), "{msg}");
+    assert!(msg.contains("U+FFFE"), "{msg}");
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+}
+
+/// A share's defect is put there by `-f`, not by `.env`; a defect beside it is the field's.
+#[cfg(windows)]
+#[skuld::test]
+fn a_share_defect_a_root_relative_path_keeps_is_not_blamed_on_env_but_one_beside_it_is() {
+    let id = Id::try_from("frpc").unwrap();
+    let from_env = BTreeSet::from([Field::Cwd]);
+    let refused = |resolved: &str| {
+        check_resolved(&id, PathField::Cwd, r"\data", Path::new(resolved), DirJoin::PrefixOnly).unwrap_err()
+    };
+
+    let msg = refused("\\\\server\\sh\u{FFFE}re\\data")
+        .attributed(&from_env)
+        .to_string();
+    assert!(msg.contains("the manifest directory's drive or share"), "{msg}");
+    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
+
+    let msg = refused("C:\\da\u{7}ta").attributed(&from_env).to_string();
+    assert!(msg.contains("after substituting from .env: "), "{msg}");
+}
+
+#[skuld::test]
+fn the_directory_is_blamed_only_for_a_defect_it_put_in_the_joined_path() {
+    let bang = |p: &Path| p.to_string_lossy().contains('!');
+    let blamed = |join, written, joined| directory_is_to_blame(join, Path::new(written), Path::new(joined), bang);
+
+    assert!(blamed(DirJoin::Whole, "bin", "/a!/bin"));
+    assert!(!blamed(DirJoin::Whole, "b!in", "/a!/b!in"), "the field wrote it too");
+    assert!(!blamed(DirJoin::Whole, "bin", "/a/bin"), "no defect");
+    assert!(
+        !blamed(DirJoin::Not, "/a!/bin", "/a!/bin"),
+        "nothing of the directory is in the result"
+    );
+    assert!(
+        !blamed(DirJoin::PrefixOnly, "/bin", "/a!/bin"),
+        "no prefix to hold the defect"
+    );
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn only_a_defect_in_the_prefix_a_root_relative_path_keeps_is_the_directorys() {
+    let bang = |p: &Path| p.to_string_lossy().contains('!');
+    let blamed =
+        |written, joined| directory_is_to_blame(DirJoin::PrefixOnly, Path::new(written), Path::new(joined), bang);
+
+    assert!(blamed(r"\data", r"\\server\sh!re\data"));
+    assert!(!blamed(r"\data", r"C:\da!ta"), "the defect is outside the prefix");
+    assert!(!blamed(r"\d!ata", r"\\server\sh!re\d!ata"), "the field wrote it too");
+}
+
+#[skuld::test]
+fn a_manifest_directory_is_joined_whole_to_a_relative_path_only() {
+    assert_eq!(dir_join(Path::new("bin/x")), DirJoin::Whole);
+    assert_eq!(dir_join(Path::new("./bin")), DirJoin::Whole);
+    assert_eq!(dir_join(Path::new("")), DirJoin::Whole);
+    assert_eq!(dir_join(&abs("bin")), DirJoin::Not);
+    #[cfg(windows)]
+    {
+        assert_eq!(dir_join(Path::new(r"\data")), DirJoin::PrefixOnly);
+        assert_eq!(dir_join(Path::new("/bin/x")), DirJoin::PrefixOnly);
+        assert_eq!(dir_join(Path::new("C:bin")), DirJoin::Not);
+        assert_eq!(dir_join(Path::new(r"\\s\h\x")), DirJoin::Not);
+    }
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn a_drive_root_manifest_directory_joins_cleanly() {
+    let (spec, _) = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc.exe]\n"), Path::new(r"C:\"))
+        .expect("`C:\\` joined with `bin` is `C:\\bin`");
+    assert_eq!(spec.command[0], r"C:\bin\frpc.exe");
+}
+
+// Contract violations =================================================================================================
+
+#[skuld::test]
+fn a_contract_violation_names_the_daemon_once() {
+    let id = Id::try_from("frpc").unwrap();
+    let cause = DaemonSpec::new(DaemonFields {
+        name: "a\nb".to_string(),
+        ..plain_fields("frpc", vec![program("frpc")])
+    })
+    .expect_err("a newline in `name` is refused");
+
+    let printed = contract_violation_from(&id, "the resolved daemon failed its own field rules", cause)
+        .report()
+        .to_string();
+
+    assert_eq!(printed.matches("daemon `frpc`").count(), 1, "{printed}");
+    assert!(printed.contains("internal error"), "{printed}");
+    assert!(printed.contains("field `name`"), "the cause's field is kept: {printed}");
+}
+
+#[skuld::test]
+fn a_contract_violation_from_a_non_rule_error_keeps_it_as_the_source() {
+    let id = Id::try_from("frpc").unwrap();
+    let cause = Error::os("read a file", std::io::Error::other("gone"));
+
+    let err = contract_violation_from(&id, "the resolved daemon failed its own field rules", cause);
+
+    let Error::Invalid {
+        daemon,
+        message,
+        source,
+    } = &err
+    else {
+        panic!("a contract violation is `Invalid`: {err:?}");
+    };
+    assert_eq!(daemon, "frpc");
+    assert_eq!(
+        message,
+        "internal error: the resolved daemon failed its own field rules; this is a bug in goetia"
+    );
+    assert!(source.is_some(), "the cause is kept as the source");
+}
+
+#[cfg(unix)]
+#[skuld::test]
+fn a_manifest_directory_ending_in_a_backslash_is_accepted() {
+    let dir = PathBuf::from("/base/a\\");
+    // Not as a systemd host: it refuses a backslash in the executable path.
+    let yaml = "id: frpc\ncommand: [bin/frpc]\ncwd: .\n";
+    let (spec, _) = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Launchd)).expect("resolves");
+    assert_eq!(spec.cwd, Some(dir));
+}
+
 // Resolution ==========================================================================================================
 
 #[skuld::test]
@@ -206,7 +808,7 @@ fn resolve_parses_each_restart_policy() {
         ("on-failure", Restart::OnFailure),
         ("always", Restart::Always),
     ] {
-        let yaml = format!("id: frpc\ncommand: [bin/frpc]\nrestart: {raw}\n");
+        let yaml = format!("id: frpc\ncommand: [C:/bin/frpc]\nrestart: {raw}\n");
         let (spec, _) = resolve_yaml_as(BackendKind::Systemd, &yaml)
             .unwrap_or_else(|e| panic!("`restart: {raw}` should resolve: {e}"));
         assert_eq!(spec.restart, expected, "restart: {raw}");
@@ -312,7 +914,7 @@ type: simple
 fn an_scm_override_of_on_failure_applies_only_where_scm_is_native() {
     let yaml = r#"
 id: svc
-command: [bin/svc.exe]
+command: [C:/bin/svc.exe]
 restart: always
 backend-specific:
   scm: { restart: on-failure }
@@ -333,7 +935,7 @@ backend-specific:
 fn an_scm_override_that_writes_always_resolves_on_every_native_backend() {
     let yaml = r#"
 id: svc
-command: [bin/svc.exe]
+command: [C:/bin/svc.exe]
 backend-specific:
   scm: { restart: always }
 "#;
@@ -349,16 +951,16 @@ backend-specific:
 }
 
 #[skuld::test]
-fn a_templated_always_resolves_on_every_native_backend() {
+fn a_templated_always_resolves_on_every_native_backend(#[fixture(temp_dir)] dir: &Path) {
     let yaml = r#"
 id: svc
-command: [/bin/svc]
+command: [C:/bin/svc]
 restart: ${R}
 "#;
-    let dir = fixture_dir(yaml, Some("R=always\n"));
+    write_fixture(dir, yaml, Some("R=always\n"));
     for native in BackendKind::ALL {
-        let (spec, _warnings) = resolve_as(parse_manifest(yaml), dir.path(), Some(native))
-            .unwrap_or_else(|e| panic!("native {native}: {e}"));
+        let (spec, _warnings) =
+            resolve_as(parse_manifest(yaml), dir, Some(native)).unwrap_or_else(|e| panic!("native {native}: {e}"));
         assert_eq!(spec.restart, Restart::Always, "native {native}");
     }
 }
@@ -424,32 +1026,29 @@ fn a_whole_second_restart_delay_still_does_not_warn() {
 // load() ==============================================================================================================
 
 #[skuld::test]
-fn load_reads_a_file_path() {
-    let dir = tempfile::tempdir().expect("tempdir should be creatable");
-    let manifest_path = dir.path().join("goetia.yaml");
+fn load_reads_a_file_path(#[fixture(temp_dir)] dir: &Path) {
+    let manifest_path = dir.join("goetia.yaml");
     std::fs::write(&manifest_path, "id: frpc\ncommand: [bin/frpc]\n").unwrap();
 
     let (spec, _warnings) = load(&manifest_path).expect("file path should load");
     assert_eq!(spec.id.as_str(), "frpc");
     // Relative paths resolve against the manifest's own directory, not the
     // process's current directory.
-    let expected = dir.path().join("bin").join("frpc").to_string_lossy().into_owned();
+    let expected = dir.join("bin").join("frpc").to_string_lossy().into_owned();
     assert_eq!(spec.command[0], expected);
 }
 
 #[skuld::test]
-fn load_reads_a_directory_containing_goetia_yaml() {
-    let dir = tempfile::tempdir().expect("tempdir should be creatable");
-    std::fs::write(dir.path().join("goetia.yaml"), "id: frpc\ncommand: [bin/frpc]\n").unwrap();
+fn load_reads_a_directory_containing_goetia_yaml(#[fixture(temp_dir)] dir: &Path) {
+    std::fs::write(dir.join("goetia.yaml"), "id: frpc\ncommand: [bin/frpc]\n").unwrap();
 
-    let (spec, _warnings) = load(dir.path()).expect("directory should load");
+    let (spec, _warnings) = load(dir).expect("directory should load");
     assert_eq!(spec.id.as_str(), "frpc");
 }
 
 #[skuld::test]
-fn load_reports_io_error_for_missing_path() {
-    let dir = tempfile::tempdir().expect("tempdir should be creatable");
-    let missing = dir.path().join("does-not-exist.yaml");
+fn load_reports_io_error_for_missing_path(#[fixture(temp_dir)] dir: &Path) {
+    let missing = dir.join("does-not-exist.yaml");
 
     let err = load(&missing).unwrap_err();
     assert!(matches!(err, Error::Os { .. }), "expected an Os error, got: {err:?}");
@@ -472,33 +1071,26 @@ fn resolve_with_env_value(value: &str) -> Result<(DaemonSpec, Vec<Warning>), Err
 }
 
 #[skuld::test]
-fn rejects_trailing_backslash_in_name() {
-    // systemd reads a backslash at end of line as a line continuation, so a
-    // `name` ending in one merges `Description=` with whatever follows — which
-    // can be the `[Service]` section header, or the `User=` directive. A
-    // swallowed `User=` silently runs the daemon as root instead of the
-    // requested account, so this is a privilege boundary, not formatting.
-    let err = resolve_with_name("FRP client\\").expect_err("trailing backslash must be rejected");
-    assert!(
-        err.to_string().contains("backslash"),
-        "message should name the cause: {err}"
-    );
+fn accepts_trailing_backslashes_in_name() {
+    // Keeping a line-ending backslash from continuing the line is the systemd generator's job.
+    for name in ["FRP client\\", "FRP client\\\\", "FRP client\\\\\\"] {
+        let (spec, _) = resolve_with_name(name).unwrap_or_else(|e| panic!("{name:?}: {e}"));
+        assert_eq!(spec.name, name);
+    }
 }
 
 #[skuld::test]
-fn rejects_trailing_backslash_in_env_value() {
-    let err = resolve_with_env_value("C:\\opt\\rt\\").expect_err("trailing backslash must be rejected");
-    assert!(
-        err.to_string().contains("backslash"),
-        "message should name the cause: {err}"
-    );
+fn accepts_trailing_backslashes_in_env_value() {
+    for value in ["C:\\opt\\rt\\", "C:\\opt\\rt\\\\"] {
+        let (spec, _) = resolve_with_env_value(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
+        assert_eq!(spec.env["FOO"], value);
+    }
 }
 
 #[skuld::test]
 fn accepts_interior_backslashes() {
-    // Only a *trailing* backslash continues a line. Rejecting interior ones
-    // would make ordinary Windows paths unexpressible.
-    resolve_with_env_value("C:\\opt\\rt").expect("interior backslashes are fine");
+    let (spec, _) = resolve_with_env_value("C:\\opt\\rt").expect("interior backslashes are fine");
+    assert_eq!(spec.env["FOO"], "C:\\opt\\rt");
 }
 
 #[skuld::test]
@@ -514,7 +1106,7 @@ fn rejects_xml_noncharacters() {
     let id = Id::try_from("frpc").expect("valid id");
     for bad in ['\u{FFFE}', '\u{FFFF}', '\u{FDD0}', '\u{1FFFE}'] {
         let value = format!("frp{bad}");
-        let err = reject_unemittable(&id, "name", &value).expect_err("noncharacter must be rejected");
+        let err = reject_control_chars(&id, "name", &value).expect_err("noncharacter must be rejected");
         assert!(
             err.to_string().contains("noncharacter"),
             "message should name the cause for U+{:04X}: {err}",
@@ -528,7 +1120,7 @@ fn accepts_ordinary_text() {
     // Guards the noncharacter check against over-rejecting: it must not
     // catch ordinary non-ASCII, which is legitimate in a display name.
     let id = Id::try_from("frpc").expect("valid id");
-    reject_unemittable(&id, "name", "FRP — клиент 日本語").expect("ordinary text is fine");
+    reject_control_chars(&id, "name", "FRP — клиент 日本語").expect("ordinary text is fine");
 }
 
 #[skuld::test]
@@ -589,16 +1181,41 @@ fn a_relative_manifest_directory_resolves_against_the_canonical_working_director
 }
 
 #[skuld::test]
-fn an_authored_base_dir_is_not_canonicalised() {
+fn the_leading_parent_dirs_of_a_relative_manifest_directory_collapse_against_the_working_directory() {
+    let cwd = canonical_cwd();
+    let mut warnings = Vec::new();
+    let one = absolutize(Path::new("../app"), &mut warnings).expect("resolves");
+    assert_eq!(one, cwd.parent().expect("the test runs below a root").join("app"));
+
+    // One component of the working directory per `..`, `.` between them ignored.
+    let two = absolutize(Path::new("../.././app"), &mut warnings).expect("resolves");
+    let grand = cwd
+        .parent()
+        .and_then(Path::parent)
+        .expect("the test runs two below a root");
+    assert_eq!(two, grand.join("app"));
+
+    let bare = absolutize(Path::new(".."), &mut warnings).expect("resolves");
+    assert_eq!(bare, cwd.parent().expect("parent"));
+}
+
+#[skuld::test]
+fn a_parent_dir_after_a_named_component_of_a_manifest_directory_is_kept() {
+    let mut warnings = Vec::new();
+    let resolved = absolutize(Path::new("a/../b"), &mut warnings).expect("resolves");
+    assert_eq!(resolved, canonical_cwd().join("a").join("..").join("b"));
+}
+
+#[skuld::test]
+fn an_authored_base_dir_is_not_canonicalised(#[fixture(temp_dir)] dir: &Path) {
     // The guard on the deduced/authored line: an absolute `-f` pointing
     // through a symlinked directory must resolve to the path as written,
     // not to the link target. No fallback, no conditional assertion — if
     // the symlink cannot be created, this must fail loudly rather than
     // quietly assert something else.
-    let dir = tempfile::tempdir().expect("tempdir should be creatable");
-    let real = dir.path().join("real");
+    let real = dir.join("real");
     std::fs::create_dir(&real).expect("real dir should be creatable");
-    let link = dir.path().join("link");
+    let link = dir.join("link");
 
     #[cfg(unix)]
     std::os::unix::fs::symlink(&real, &link).expect("symlink should be creatable");
@@ -626,7 +1243,8 @@ fn normalize_preserves_parent_dir_components() {
     // deliberate exception to this rule lives in
     // `drive_relative_resolution_collapses_dot_dot_the_windows_way` below.
     let yaml = "id: frpc\ncommand: [bin/frpc]\ncwd: ../sibling\n";
-    let (spec, _) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
+    // As a host whose service manager keeps `..`: systemd refuses it.
+    let (spec, _) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     let cwd = spec.cwd.as_deref().expect("cwd is set");
 
     assert!(
@@ -708,7 +1326,9 @@ fn accepts_a_whitespace_only_cwd() {
     // does — it simply fails to resolve like any other bad path, so it
     // must not be rejected here.
     let yaml = "id: frpc\ncommand: [/bin/frpc]\ncwd: \"  \"\n";
-    let (spec, _warnings) = resolve_yaml(yaml).expect("a whitespace-only path is not empty and has no unsafe default");
+    // Not as a systemd host: it refuses a path that ends in whitespace.
+    let (spec, _warnings) = resolve_yaml_as(BackendKind::Launchd, yaml)
+        .expect("a whitespace-only path is not empty and has no unsafe default");
     assert_eq!(spec.cwd, Some(base_dir().join("  ")));
 }
 
@@ -896,18 +1516,16 @@ command: ['\\?\C:']
 
 // Interpolation =======================================================================================================
 
-/// A fresh directory holding `goetia.yaml`, and `.env` when `env` is given.
-fn fixture_dir(yaml: &str, env: Option<&str>) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("tempdir should be creatable");
-    std::fs::write(dir.path().join("goetia.yaml"), yaml).expect("fixture manifest should be writable");
+/// Write `goetia.yaml` into `dir`, and `.env` when `env` is given.
+fn write_fixture(dir: &Path, yaml: &str, env: Option<&str>) {
+    std::fs::write(dir.join("goetia.yaml"), yaml).expect("fixture manifest should be writable");
     if let Some(env) = env {
-        std::fs::write(dir.path().join(".env"), env).expect("fixture .env should be writable");
+        std::fs::write(dir.join(".env"), env).expect("fixture .env should be writable");
     }
-    dir
 }
 
 #[skuld::test]
-fn a_dollar_inside_a_substituted_value_survives_resolve_unchanged() {
+fn a_dollar_inside_a_substituted_value_survives_resolve_unchanged(#[fixture(temp_dir)] dir: &Path) {
     // A `.env` value is fully literal, so a `$` in one is ordinary content —
     // passwords and connection strings carry them routinely. Substituted
     // text is never rescanned, so that `$` must reach the resolved spec
@@ -915,11 +1533,12 @@ fn a_dollar_inside_a_substituted_value_survives_resolve_unchanged() {
     // bare `$` in *manifest* text: anything that interpolated a second time
     // would turn a legal secret into
     // "`$` at byte N is not part of `${...}`" and fail the whole load.
-    let dir = fixture_dir(
+    write_fixture(
+        dir,
         "id: frpc\ncommand: [/bin/frpc]\nenv:\n  PASSWORD: ${SECRET}\n",
         Some("SECRET=abc$def\n"),
     );
-    let manifest = dir.path().join("goetia.yaml");
+    let manifest = dir.join("goetia.yaml");
     let (spec, _warnings) = load(&manifest).expect("a literal `$` in a .env value is legal");
     assert_eq!(spec.env.get("PASSWORD").map(String::as_str), Some("abc$def"));
 }
@@ -944,60 +1563,67 @@ fn resolve_substitutes_rather_than_letting_a_reference_through() {
 }
 
 #[skuld::test]
-fn resolve_reads_the_env_file_beside_its_base_dir() {
-    let dir = fixture_dir(
+fn resolve_reads_the_env_file_beside_its_base_dir(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
         "id: frpc\nname: ${NAME}\ncommand: [/bin/frpc]\n",
         Some("NAME=Frpc Tunnel\n"),
     );
     let yaml = "id: frpc\nname: ${NAME}\ncommand: [/bin/frpc]\n";
 
-    let (spec, _warnings) = resolve(parse_manifest(yaml), dir.path()).expect("manifest should resolve");
+    let (spec, _warnings) = resolve(parse_manifest(yaml), dir).expect("manifest should resolve");
     assert_eq!(spec.name, "Frpc Tunnel");
 }
 
 #[skuld::test]
-fn resolve_does_not_read_the_env_file_when_the_manifest_has_no_dollar() {
+fn resolve_does_not_read_the_env_file_when_the_manifest_has_no_dollar(#[fixture(temp_dir)] dir: &Path) {
     // The gate moved with the substitution step, so it is `resolve`'s to
     // hold now: a directory at the `.env` path would make `Vars::load` fail
     // with `Io`, and a dollarless manifest resolving anyway proves it was
     // never read.
-    let dir = fixture_dir("id: frpc\ncommand: [/bin/frpc]\n", None);
-    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+    write_fixture(dir, "id: frpc\ncommand: [/bin/frpc]\n", None);
+    std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
     let yaml = "id: frpc\ncommand: [/bin/frpc]\n";
 
-    let (spec, _warnings) = resolve(parse_manifest(yaml), dir.path()).expect("a dollarless manifest should resolve");
+    let (spec, _warnings) = resolve(parse_manifest(yaml), dir).expect("a dollarless manifest should resolve");
     assert_eq!(spec.id.as_str(), "frpc");
 }
 
 #[skuld::test]
-fn load_substitutes_from_the_env_file_beside_the_manifest() {
-    let dir = fixture_dir(
+fn load_substitutes_from_the_env_file_beside_the_manifest(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
         "id: frpc\nname: ${NAME}\ncommand: [/bin/frpc]\n",
         Some("NAME=Frpc Tunnel\n"),
     );
 
-    let (spec, _warnings) = load(&dir.path().join("goetia.yaml")).expect("manifest should load");
+    let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("manifest should load");
     assert_eq!(spec.name, "Frpc Tunnel");
 }
 
 #[skuld::test]
-fn load_substitutes_when_the_path_names_a_directory() {
+fn load_substitutes_when_the_path_names_a_directory(#[fixture(temp_dir)] dir: &Path) {
     // The `.env` is found beside the manifest, not beside the *argument* —
     // the two differ for a directory path.
-    let dir = fixture_dir(
+    write_fixture(
+        dir,
         "id: frpc\nname: ${NAME}\ncommand: [/bin/frpc]\n",
         Some("NAME=Frpc Tunnel\n"),
     );
 
-    let (spec, _warnings) = load(dir.path()).expect("directory should load");
+    let (spec, _warnings) = load(dir).expect("directory should load");
     assert_eq!(spec.name, "Frpc Tunnel");
 }
 
 #[skuld::test]
-fn load_reports_an_unset_variable_naming_it() {
-    let dir = fixture_dir("id: frpc\nname: ${NAME}\ncommand: [/bin/frpc]\n", Some("OTHER=1\n"));
+fn load_reports_an_unset_variable_naming_it(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
+        "id: frpc\nname: ${NAME}\ncommand: [/bin/frpc]\n",
+        Some("OTHER=1\n"),
+    );
 
-    let err = load(dir.path()).unwrap_err();
+    let err = load(dir).unwrap_err();
     assert!(
         matches!(err, Error::Interpolate { .. }),
         "expected Interpolate, got: {err:?}"
@@ -1008,75 +1634,76 @@ fn load_reports_an_unset_variable_naming_it() {
 }
 
 #[skuld::test]
-fn load_does_not_read_the_env_file_when_the_manifest_has_no_dollar() {
+fn load_does_not_read_the_env_file_when_the_manifest_has_no_dollar(#[fixture(temp_dir)] dir: &Path) {
     // A directory at the `.env` path makes `Vars::load` fail with `Io`, so a
     // manifest that loads anyway demonstrably never read it: an unrelated or
     // root-only-readable `.env` cannot break a manifest that references no
     // variable.
-    let dir = fixture_dir("id: frpc\ncommand: [/bin/frpc]\n", None);
-    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+    write_fixture(dir, "id: frpc\ncommand: [/bin/frpc]\n", None);
+    std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
 
-    let (spec, _warnings) = load(dir.path()).expect("a dollarless manifest should not read .env");
+    let (spec, _warnings) = load(dir).expect("a dollarless manifest should not read .env");
     assert_eq!(spec.id.as_str(), "frpc");
 }
 
 #[skuld::test]
-fn an_unreadable_env_file_fails_only_a_manifest_whose_native_spec_needs_it() {
+fn an_unreadable_env_file_fails_only_a_manifest_whose_native_spec_needs_it(#[fixture(temp_dir)] dir: &Path) {
     // An unreadable `.env` fails a manifest only when the native spec needs it.
-    let dir = fixture_dir("", None);
-    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
-    let overridden = "id: frpc\ncommand: [/bin/frpc]\nrestart-delay: ${DELAY}\n\
+    write_fixture(dir, "", None);
+    std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
+    let overridden = "id: frpc\ncommand: [C:/bin/frpc]\nrestart-delay: ${DELAY}\n\
                       backend-specific:\n  systemd:\n    restart-delay: 1s\n";
-    let (spec, warnings) = resolve_as(parse_manifest(overridden), dir.path(), Some(BackendKind::Systemd))
+    let (spec, warnings) = resolve_as(parse_manifest(overridden), dir, Some(BackendKind::Systemd))
         .expect("an unreadable `.env` must not fail a manifest whose native spec has no `$`");
     assert_eq!(spec.restart_delay, Some(Duration::from_secs(1)));
     assert!(warnings.is_empty(), "{warnings:?}");
 
-    let bare = "id: frpc\ncommand: [/bin/frpc]\nrestart-delay: ${DELAY}\n";
-    let err = resolve_as(parse_manifest(bare), dir.path(), Some(BackendKind::Systemd)).unwrap_err();
+    let bare = "id: frpc\ncommand: [C:/bin/frpc]\nrestart-delay: ${DELAY}\n";
+    let err = resolve_as(parse_manifest(bare), dir, Some(BackendKind::Systemd)).unwrap_err();
     assert!(matches!(err, Error::Os { .. }), "expected Os, got: {err:?}");
 }
 
 #[skuld::test]
-fn load_reads_the_env_file_for_an_escaped_dollar_only() {
+fn load_reads_the_env_file_for_an_escaped_dollar_only(#[fixture(temp_dir)] dir: &Path) {
     // The same fixture whose only `$` is a `$$` escape *does* read `.env`,
     // pinning `would_substitution_change`'s over-approximation rather than
     // leaving it to drift: one predicate serves this decision and the
     // shape-phase carve-out, and it must stay the safe, wide one.
-    let dir = fixture_dir("id: frpc\ncommand: [/bin/frpc, $$ARGS]\n", None);
-    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+    write_fixture(dir, "id: frpc\ncommand: [/bin/frpc, $$ARGS]\n", None);
+    std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
 
-    let err = load(dir.path()).unwrap_err();
+    let err = load(dir).unwrap_err();
     assert!(matches!(err, Error::Os { .. }), "expected Os, got: {err:?}");
 }
 
 #[skuld::test]
-fn a_dollar_in_a_comment_is_ignored() {
+fn a_dollar_in_a_comment_is_ignored(#[fixture(temp_dir)] dir: &Path) {
     // The walk runs over the parsed manifest, not the file's text, so a `$`
     // the YAML parser discards never reaches it.
-    let dir = fixture_dir(
+    write_fixture(
+        dir,
         "id: frpc\n# ${NOPE} is a comment, not a reference\ncommand: [/bin/frpc]\n",
         None,
     );
-    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+    std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
 
-    let (spec, _warnings) = load(dir.path()).expect("a commented-out reference should not read .env");
+    let (spec, _warnings) = load(dir).expect("a commented-out reference should not read .env");
     assert_eq!(spec.id.as_str(), "frpc");
 }
 
 #[skuld::test]
-fn load_preserves_authored_scalar_text_alongside_interpolation() {
+fn load_preserves_authored_scalar_text_alongside_interpolation(#[fixture(temp_dir)] dir: &Path) {
     // Every leaf stays the text the user wrote, all the way through
     // interpolation: nothing round-trips through a YAML value, so no scalar
     // is renormalised by a number/bool parse it never asked for.
-    let dir = fixture_dir(
-        "id: frpc\nname: +5\ncommand: [/bin/frpc]\nenv:\n  A: 0.10\n  B: 1e3\n  \
-         C: 0x10\n  D: 0o22\n  E: True\n  F: 1.\n  G: 18446744073709551616\n  1.50: plain\n  \
-         H: ${TOKEN}\n",
-        Some("TOKEN=s3cret\n"),
-    );
+    let yaml = "id: frpc\nname: +5\ncommand: [/bin/frpc]\nenv:\n  A: 0.10\n  B: 1e3\n  \
+                C: 0x10\n  D: 0o22\n  E: True\n  F: 1.\n  G: 18446744073709551616\n  1.50: plain\n  \
+                H: ${TOKEN}\n";
+    write_fixture(dir, yaml, Some("TOKEN=s3cret\n"));
 
-    let (spec, _warnings) = load(dir.path()).expect("manifest should load");
+    // Not as a systemd host: it refuses the key `1.50`, which no systemd unit can carry.
+    let (spec, _warnings) =
+        resolve_as(parse_manifest(yaml), dir, Some(BackendKind::Launchd)).expect("manifest should load");
     let env = &spec.env;
     assert_eq!(spec.name, "+5");
     assert_eq!(env["A"], "0.10");
@@ -1091,18 +1718,28 @@ fn load_preserves_authored_scalar_text_alongside_interpolation() {
 }
 
 #[skuld::test]
-fn load_reports_original_positions() {
+fn load_reports_original_positions(#[fixture(temp_dir)] dir: &Path) {
     // Interpolation runs on the parsed manifest, after the one and only
     // parse, so a syntax or shape diagnostic still points at the file as
     // written — with or without a `${VAR}` in it.
-    let plain = fixture_dir("id: frpc\nname: literal\ncommand: [/bin/frpc]\nbogus: 1\n", None);
-    let interpolated = fixture_dir(
+    let plain = dir.join("plain");
+    let interpolated = dir.join("interpolated");
+    for sub in [&plain, &interpolated] {
+        std::fs::create_dir(sub).expect("fixture directory should be creatable");
+    }
+    write_fixture(
+        &plain,
+        "id: frpc\nname: literal\ncommand: [/bin/frpc]\nbogus: 1\n",
+        None,
+    );
+    write_fixture(
+        &interpolated,
         "id: frpc\nname: ${NAME}\ncommand: [/bin/frpc]\nbogus: 1\n",
         Some("NAME=x\n"),
     );
 
-    let plain_err = load(plain.path()).unwrap_err().to_string();
-    let interpolated_err = load(interpolated.path()).unwrap_err().to_string();
+    let plain_err = load(&plain).unwrap_err().to_string();
+    let interpolated_err = load(&interpolated).unwrap_err().to_string();
 
     assert!(plain_err.contains("bogus"), "should name the field: {plain_err}");
     assert!(plain_err.contains("line 4"), "should name the line: {plain_err}");
@@ -1110,7 +1747,7 @@ fn load_reports_original_positions() {
 }
 
 #[skuld::test]
-fn interpolated_values_pass_through_the_injection_gate() {
+fn interpolated_values_pass_through_the_injection_gate(#[fixture(temp_dir)] dir: &Path) {
     // Substitution happens before `resolve`, so a `.env` value carrying a
     // control character is rejected by the same gate a literal one hits —
     // on every leaf that reaches a generated artifact, not just `name`.
@@ -1133,9 +1770,9 @@ fn interpolated_values_pass_through_the_injection_gate() {
     ];
 
     for (leaf, body) in leaves {
-        let dir = fixture_dir(&format!("id: frpc\n{body}"), Some("EVIL='evil\u{1b}[2Jclear'\n"));
+        write_fixture(dir, &format!("id: frpc\n{body}"), Some("EVIL='evil\u{1b}[2Jclear'\n"));
 
-        let err = load(dir.path()).unwrap_err();
+        let err = load(dir).unwrap_err();
         assert!(
             matches!(err, Error::Invalid { .. }),
             "{leaf}: expected Invalid, got: {err:?}"
@@ -1208,20 +1845,40 @@ fn resolve_yaml_as(native: BackendKind, yaml: &str) -> Result<(DaemonSpec, Vec<W
 }
 
 #[skuld::test]
-fn a_value_that_only_substitution_made_invalid_says_so() {
+fn a_value_that_only_substitution_made_invalid_says_so(#[fixture(temp_dir)] dir: &Path) {
     // The other half of step 5's annotation, and the half whose premise
     // does hold: step 4 shape-checked this same merged spec and passed, so
     // substitution is provably what changed. Pinned here because nothing else
     // would notice if the verdict path stopped carrying this prefix.
-    let dir = fixture_dir("id: frpc\ncommand: [/bin/frpc]\nname: ${N}\n", Some("N=frpc\\\n"));
-    let err = load(&dir.path().join("goetia.yaml")).unwrap_err();
+    write_fixture(
+        dir,
+        "id: frpc\ncommand: [/bin/frpc]\nname: ${N}\n",
+        Some("N=\"a\tb\"\n"),
+    );
+    let err = load(&dir.join("goetia.yaml")).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("after substituting from .env"), "{msg}");
-    assert!(msg.contains("backslash"), "{msg}");
+    assert!(msg.contains("control character"), "{msg}");
 }
 
 #[skuld::test]
-fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else() {
+fn a_shape_error_on_a_field_the_native_override_supplied_carries_the_override_then_env(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  launchd:\n    name: ${N}\n";
+    write_fixture(dir, yaml, Some("N=\"a\tb\"\n"));
+    let msg = resolve_as(parse_manifest(yaml), dir, Some(BackendKind::Launchd))
+        .unwrap_err()
+        .to_string();
+    let prefix = "daemon `frpc`: backend-specific.launchd: after substituting from .env: ";
+    let rest = msg
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("no `{prefix}` at the start of {msg}"));
+    assert!(rest.contains("control character"), "{msg}");
+}
+
+#[skuld::test]
+fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else(#[fixture(temp_dir)] dir: &Path) {
     // `spec::backend`'s module doc, made executable. Substitution runs for
     // the native backend only, so `${ACCT}` is unresolvable — and therefore
     // unchecked — under the other two, while the native one is substituted
@@ -1232,12 +1889,12 @@ fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else() {
     // rejects a numeric uid, and `user.id` refuses substitution outright
     // (`interpolate::substitute_user`), so no templated value can ever
     // reach it.
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  systemd:\n    \
+    let yaml = "id: frpc\ncommand: [C:/bin/frpc]\nbackend-specific:\n  systemd:\n    \
                 user: ${ACCT}\n  launchd:\n    user: ${ACCT}\n";
-    let dir = fixture_dir(yaml, Some("ACCT=NT AUTHORITY\\SYSTEM\n"));
+    write_fixture(dir, yaml, Some("ACCT=NT AUTHORITY\\SYSTEM\n"));
 
     for native in [BackendKind::Systemd, BackendKind::Launchd] {
-        let err = resolve_as(parse_manifest(yaml), dir.path(), Some(native)).unwrap_err();
+        let err = resolve_as(parse_manifest(yaml), dir, Some(native)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Windows built-in"), "native `{native}`: {msg}");
         assert!(
@@ -1249,7 +1906,7 @@ fn a_templated_user_is_judged_under_the_native_backend_and_nowhere_else() {
     // The other direction: with
     // `scm` native, neither `${ACCT}` is substituted, so neither is judged
     // — and `.env` is not read at all.
-    resolve_as(parse_manifest(yaml), dir.path(), Some(BackendKind::Scm))
+    resolve_as(parse_manifest(yaml), dir, Some(BackendKind::Scm))
         .expect("a template under a non-native backend is unresolvable, and so unchecked");
 }
 
@@ -1261,7 +1918,7 @@ fn a_native_backend_verdict_names_the_override_that_caused_it() {
     // and this manifest carries no `$` and sits beside no `.env` file.
     for native in BackendKind::ALL {
         let yaml = format!(
-            "id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    user: {}\n",
+            "id: frpc\ncommand: [C:/bin/frpc]\nbackend-specific:\n  {native}:\n    user: {}\n",
             user_rejected_by(native)
         );
         let err = resolve_yaml_as(native, &yaml).unwrap_err();
@@ -1437,12 +2094,12 @@ fn native_pass_alone_emits_every_native_advisory() {
 }
 
 #[skuld::test]
-fn a_templated_base_field_keeps_the_native_advisories_it_had_as_a_literal() {
+fn a_templated_base_field_keeps_the_native_advisories_it_had_as_a_literal(#[fixture(temp_dir)] dir: &Path) {
     // The native advisories read the substituted native spec, so moving a
     // base `type`/`restart`/`restart-delay` into `.env` must not delete a
     // warning about the value that is installed either way. The two
     // manifests resolve to the same spec, so they owe the same advisories.
-    let dir = fixture_dir("", Some("KIND=managed\nRESTART=on-failure\nDELAY=500500us\n"));
+    write_fixture(dir, "", Some("KIND=managed\nRESTART=on-failure\nDELAY=500500us\n"));
     let fields = |kind: &str, restart: &str, delay: &str| {
         format!(
             "id: frpc\ncommand: [/bin/frpc]\ncwd: .\ntype: {kind}\n\
@@ -1452,13 +2109,13 @@ fn a_templated_base_field_keeps_the_native_advisories_it_had_as_a_literal() {
     for (native, expected) in [(BackendKind::Launchd, 1), (BackendKind::Scm, 2)] {
         let (_spec, from_literal) = resolve_as(
             parse_manifest(&fields("managed", "on-failure", "500500us")),
-            dir.path(),
+            dir,
             Some(native),
         )
         .expect("resolves, with advisories");
         let (_spec, from_env) = resolve_as(
             parse_manifest(&fields("${KIND}", "${RESTART}", "${DELAY}")),
-            dir.path(),
+            dir,
             Some(native),
         )
         .expect("resolves, with advisories");
@@ -1722,9 +2379,9 @@ fn an_over_long_restart_delay_with_no_type_does_not_warn() {
 
 #[cfg(windows)]
 #[skuld::test]
-fn a_templated_drive_relative_path_warns_once_quoting_the_substituted_path() {
-    let dir = fixture_dir("id: frpc\ncommand: [\"C:${SUB}\"]\n", Some("SUB=bin/frpc.exe\n"));
-    let (_spec, warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+fn a_templated_drive_relative_path_warns_once_quoting_the_substituted_path(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\ncommand: [\"C:${SUB}\"]\n", Some("SUB=bin/frpc.exe\n"));
+    let (_spec, warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
         warnings[0].message.contains("C:bin/frpc.exe"),
@@ -1755,9 +2412,13 @@ fn a_base_grammar_error_is_rejected_even_when_every_backend_overrides_the_field(
 }
 
 #[skuld::test]
-fn a_bare_dollar_in_an_env_value_survives_a_substituted_pass() {
-    let dir = fixture_dir("id: frpc\ncommand: [/bin/frpc]\nenv:\n  X: ${S}\n", Some("S=ab$cd\n"));
-    let (spec, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+fn a_bare_dollar_in_an_env_value_survives_a_substituted_pass(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
+        "id: frpc\ncommand: [/bin/frpc]\nenv:\n  X: ${S}\n",
+        Some("S=ab$cd\n"),
+    );
+    let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
     assert_eq!(spec.env["X"], "ab$cd");
 }
 
@@ -1765,48 +2426,51 @@ fn a_bare_dollar_in_an_env_value_survives_a_substituted_pass() {
 fn a_base_value_must_pass_the_shape_gate_even_when_every_backend_overrides_it() {
     // Deliberate: the base pass shape-checks every authored value, even one
     // no backend ends up using, so a dead value cannot sit in the manifest
-    // as a trap for whoever later deletes an override. `C:\ProgramData\frpc`
-    // names the same directory as `C:\ProgramData\frpc\`, so the remedy is
-    // lossless: write the value under the backends that need it instead.
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\ncwd: \"C:\\\\ProgramData\\\\frpc\\\\\"\n\
+    // as a trap for whoever later deletes an override.
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\ncwd: \"/opt/a\\tb\"\n\
                 backend-specific:\n  launchd:\n    cwd: /var/frpc\n  scm:\n    cwd: /var/frpc\n  \
                 systemd:\n    cwd: /var/frpc\n";
     let err = resolve_yaml(yaml).unwrap_err();
-    assert!(err.to_string().contains("backslash"), "{err}");
+    assert!(err.to_string().contains("control character"), "{err}");
 }
 
 // The `$`-skip rule for `restart`/`type`/`restart-delay` ==============================================================
 
 #[skuld::test]
-fn a_templated_restart_resolves() {
-    let dir = fixture_dir(
+fn a_templated_restart_resolves(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
         "id: frpc\ncommand: [/bin/frpc]\nrestart: ${R}\n",
         Some("R=on-failure\n"),
     );
-    let (spec, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+    let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
     assert_eq!(spec.restart, Restart::OnFailure);
 }
 
 #[skuld::test]
-fn a_templated_type_resolves() {
-    let dir = fixture_dir("id: frpc\ncommand: [/bin/frpc]\ntype: ${T}\n", Some("T=managed\n"));
-    let (spec, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+fn a_templated_type_resolves(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\ncommand: [/bin/frpc]\ntype: ${T}\n", Some("T=managed\n"));
+    let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
     assert_eq!(spec.kind, Kind::Managed);
 }
 
 #[skuld::test]
-fn a_templated_restart_delay_resolves() {
-    let dir = fixture_dir("id: frpc\ncommand: [/bin/frpc]\nrestart-delay: ${D}\n", Some("D=2s\n"));
-    let (spec, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+fn a_templated_restart_delay_resolves(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
+        "id: frpc\ncommand: [/bin/frpc]\nrestart-delay: ${D}\n",
+        Some("D=2s\n"),
+    );
+    let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
     assert_eq!(spec.restart_delay, Some(Duration::from_secs(2)));
 }
 
 #[skuld::test]
-fn a_templated_restart_in_the_native_override_resolves() {
+fn a_templated_restart_in_the_native_override_resolves(#[fixture(temp_dir)] dir: &Path) {
     let native = BackendKind::native().expect("native() is Some on every CI platform");
     let yaml = format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    restart: ${{R}}\n");
-    let dir = fixture_dir(&yaml, Some("R=on-failure\n"));
-    let (spec, _warnings) = load(&dir.path().join("goetia.yaml")).expect("resolves");
+    write_fixture(dir, &yaml, Some("R=on-failure\n"));
+    let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
     assert_eq!(spec.restart, Restart::OnFailure);
 }
 
@@ -1840,13 +2504,13 @@ fn an_escaped_dollar_in_an_enum_field_is_deferred_and_then_rejected() {
 }
 
 #[skuld::test]
-fn a_variable_used_only_in_a_non_native_override_does_not_read_the_env_file() {
+fn a_variable_used_only_in_a_non_native_override_does_not_read_the_env_file(#[fixture(temp_dir)] dir: &Path) {
     let backend = non_native_backend();
     let yaml = format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {backend}:\n    restart: ${{R}}\n");
-    let dir = fixture_dir(&yaml, None);
-    std::fs::create_dir(dir.path().join(".env")).expect("fixture directory should be creatable");
+    write_fixture(dir, &yaml, None);
+    std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
     let (spec, _warnings) =
-        load(&dir.path().join("goetia.yaml")).expect("must not read .env for a value it will never substitute");
+        load(&dir.join("goetia.yaml")).expect("must not read .env for a value it will never substitute");
     assert_eq!(spec.id.as_str(), "frpc");
 }
 
@@ -1903,7 +2567,7 @@ fn base_restart_always_resolves_on_every_native_backend() {
     // Whether a backend can honour `always` is its generator's verdict, at install and preview: the
     // base spec is nobody's override, so resolution accepts it.
     let yaml = "id: svc
-command: [/bin/svc]
+command: [C:/bin/svc]
 restart: always
 ";
     for native in BackendKind::ALL {
@@ -1917,7 +2581,7 @@ fn a_host_warns_only_about_its_native_backend() {
     // One manifest that trips every advisory: `type: managed` with a `cwd` (SCM divergence), `on-failure` with
     // a delay that is neither whole seconds (launchd) nor whole milliseconds (SCM).
     let yaml = "id: frpc
-command: [/bin/frpc]
+command: [C:/bin/frpc]
 type: managed
 cwd: .
 restart: on-failure
@@ -1971,4 +2635,327 @@ backend-specific:
 ";
     let (_spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+/// The message quotes the resolved path as it is; the sink that prints it escapes it.
+#[skuld::test]
+fn a_refused_resolved_path_is_escaped_where_the_error_is_printed() {
+    let id = Id::try_from("frpc").unwrap();
+    let e =
+        Error::from(check_resolved(&id, PathField::Cwd, "C:", Path::new("/a\nb\u{202e}c"), DirJoin::Not).unwrap_err());
+    assert_eq!(
+        e.report().to_string(),
+        r"daemon `frpc`: field `cwd` is `C:`, which resolves to `/a\u{a}b\u{202e}c`, which contains a control character, which is forbidden"
+    );
+}
+
+// systemd's `Environment=` names ======================================================================================
+
+#[skuld::test]
+fn only_a_systemd_host_refuses_an_env_key_systemd_would_drop() {
+    let yaml = "id: frpc
+command: [C:/bin/frpc]
+env:
+  MY-VAR: x
+";
+
+    let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
+    assert!(msg.contains("\"MY-VAR\"") && msg.contains("Environment="), "{msg}");
+
+    // Another host's native backend carries the key; a systemd advisory is not its to give.
+    for native in [BackendKind::Launchd, BackendKind::Scm] {
+        let (_spec, warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("{native}: {e}"));
+        assert!(warnings.is_empty(), "{native}: {warnings:?}");
+    }
+}
+
+#[skuld::test]
+fn an_env_key_systemd_accepts_draws_no_complaint_on_any_host() {
+    let yaml = "id: frpc\ncommand: [C:/bin/frpc]\nenv:\n  MY_VAR: x\n";
+    for native in BackendKind::ALL {
+        let (_spec, warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("{native}: {e}"));
+        assert!(warnings.is_empty(), "{native}: {warnings:?}");
+    }
+}
+
+#[skuld::test]
+fn a_systemd_refusal_names_the_override_only_when_the_override_wrote_the_value() {
+    let yaml = "id: frpc
+command: [C:/bin/frpc]
+backend-specific:
+  systemd:
+    env: {MY-VAR: x}
+";
+    let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
+    assert!(msg.contains("backend-specific.systemd: "), "{msg}");
+
+    // The same value in the base, and an override that wrote something else: not the override's.
+    let yaml = "id: frpc
+command: [C:/bin/frpc]
+env: {MY-VAR: x}
+backend-specific:
+  systemd:
+    name: other
+";
+    let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
+    assert!(!msg.contains("backend-specific"), "{msg}");
+}
+
+#[skuld::test]
+fn an_override_that_wrote_a_different_env_key_does_not_take_the_blame_for_a_base_key() {
+    let yaml =
+        "id: frpc\ncommand: [C:/bin/frpc]\nenv: {MY-VAR: x}\nbackend-specific:\n  systemd:\n    env: {OTHER: y}\n";
+    let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
+    assert!(msg.contains("\"MY-VAR\"") && !msg.contains("backend-specific"), "{msg}");
+
+    let yaml =
+        "id: frpc\ncommand: [C:/bin/frpc]\nenv: {MY-VAR: x}\nbackend-specific:\n  systemd:\n    env: {MY-VAR: y}\n";
+    let msg = resolve_yaml_as(BackendKind::Systemd, yaml).unwrap_err().to_string();
+    assert!(msg.contains("backend-specific.systemd: "), "{msg}");
+}
+
+// What systemd cannot carry, refused at resolve =======================================================================
+
+/// A `command[0]` that carries no backslash on any host (absolute on Windows, joined to the manifest
+/// directory elsewhere), as a systemd host requires; `abs` writes backslashes on Windows.
+const SLASH_PROGRAM: &str = "C:/bin/frpc";
+
+/// [`abs`], with forward slashes only.
+fn slash_abs(p: &str) -> String {
+    abs(p).to_string_lossy().replace('\\', "/")
+}
+
+/// A manifest of `SLASH_PROGRAM` with `extra` lines (and `command` unless `extra` sets it).
+fn systemd_manifest(extra: &str) -> String {
+    let command = if extra.contains("command:") {
+        String::new()
+    } else {
+        format!("command: ['{SLASH_PROGRAM}']\n")
+    };
+    format!("id: frpc\n{command}{extra}\n")
+}
+
+#[skuld::test]
+fn a_systemd_host_refuses_at_resolve_every_value_its_generator_refuses() {
+    let opt = slash_abs("opt/x");
+    let cases = [
+        (format!("command: ['{SLASH_PROGRAM}\\y']"), "`command[0]`"),
+        (format!("command: ['{SLASH_PROGRAM}\"y']"), "`command[0]`"),
+        (format!("command: ['{SLASH_PROGRAM}''y']"), "`command[0]`"),
+        (format!("command: ['{SLASH_PROGRAM} ']"), "`command[0]`"),
+        ("name: ' a'".to_string(), "Description="),
+        ("name: 'a '".to_string(), "Description="),
+        (format!("cwd: '{opt} '"), "WorkingDirectory="),
+        (format!("logs: '{opt} '"), "StandardOutput="),
+        (format!("cwd: '{opt}/../y'"), "`cwd`"),
+        (format!("logs: '{opt}/../y'"), "`logs`"),
+    ];
+    for (extra, needle) in cases {
+        let yaml = systemd_manifest(&extra);
+        let msg = resolve_yaml_as(BackendKind::Systemd, &yaml)
+            .expect_err(&format!("systemd: {extra}"))
+            .to_string();
+        assert!(msg.contains(needle), "{extra}: {msg}");
+        for native in [BackendKind::Launchd, BackendKind::Scm] {
+            resolve_yaml_as(native, &yaml).unwrap_or_else(|e| panic!("{native}: {extra}: {e}"));
+        }
+    }
+}
+
+#[skuld::test]
+fn a_systemd_refusal_at_resolve_of_a_path_value_follows_the_same_attribution_as_an_env_key() {
+    let opt = slash_abs("opt/x");
+    // The override wrote the `..`.
+    let yaml = systemd_manifest(&format!("backend-specific:\n  systemd:\n    cwd: '{opt}/../y'"));
+    let msg = resolve_yaml_as(BackendKind::Systemd, &yaml).unwrap_err().to_string();
+    assert!(
+        msg.contains("backend-specific.systemd: ") && msg.contains("`cwd`"),
+        "{msg}"
+    );
+
+    // The base wrote it, and the override wrote something else.
+    let yaml = systemd_manifest(&format!(
+        "cwd: '{opt}/../y'\nbackend-specific:\n  systemd:\n    name: other"
+    ));
+    let msg = resolve_yaml_as(BackendKind::Systemd, &yaml).unwrap_err().to_string();
+    assert!(msg.contains("`cwd`") && !msg.contains("backend-specific"), "{msg}");
+}
+
+#[skuld::test]
+fn a_parent_dir_the_manifest_directory_adds_is_attributed_to_dash_f() {
+    let dir = base_dir().join("..").join("x");
+    for field in ["cwd", "logs"] {
+        let yaml = systemd_manifest(&format!("{field}: sub"));
+        let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+            .expect_err(field)
+            .to_string();
+        assert!(
+            msg.contains("`-f`") && msg.contains("`..`") && msg.contains(&format!("`{field}`")),
+            "{field}: {msg}"
+        );
+        resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Scm)).unwrap_or_else(|e| panic!("{field}: {e}"));
+    }
+
+    // A `..` the field wrote is the field's, even under a clean `-f`, and so is one beside the
+    // manifest directory's.
+    for dir in [base_dir(), dir] {
+        let yaml = systemd_manifest("cwd: ../y");
+        let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("`cwd`") && !msg.contains("`-f`"), "{msg}");
+    }
+}
+
+#[skuld::test]
+fn a_parent_dir_in_command_zero_is_accepted_by_a_systemd_host() {
+    // systemd runs `/bin/../bin/frpc`.
+    let yaml = systemd_manifest(&format!("command: ['{}/../bin/frpc']", slash_abs("opt")));
+    resolve_yaml_as(BackendKind::Systemd, &yaml).expect("resolves");
+}
+
+// A manifest directory's own defects, on systemd ======================================================================
+
+#[skuld::test]
+fn a_leading_parent_dir_of_a_relative_manifest_directory_is_accepted_by_a_systemd_host() {
+    let yaml = systemd_manifest("cwd: .");
+    let (spec, _) = resolve_as(parse_manifest(&yaml), Path::new("../app"), Some(BackendKind::Systemd))
+        .expect("`-f ../app` resolves without a `..`");
+    let expected = canonical_cwd().parent().expect("parent").join("app");
+    assert_eq!(spec.cwd, Some(expected));
+}
+
+#[skuld::test]
+fn a_parent_dir_after_a_named_component_of_dash_f_is_refused_by_a_systemd_host_naming_dash_f() {
+    let yaml = systemd_manifest("cwd: .");
+    let msg = resolve_as(parse_manifest(&yaml), Path::new("a/../b"), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("`-f") && msg.contains("`cwd`") && msg.contains("`..`"),
+        "{msg}"
+    );
+    resolve_as(parse_manifest(&yaml), Path::new("a/../b"), Some(BackendKind::Scm)).expect("only systemd refuses");
+}
+
+#[skuld::test]
+fn a_backslash_in_dash_f_is_blamed_on_dash_f_when_command_zero_is_relative() {
+    let dir = abs(r"a\b");
+    for yaml in [
+        "id: frpc
+command: [bin/frpc]
+",
+        "id: frpc
+backend-specific:
+  systemd:
+    command: [bin/frpc]
+",
+    ] {
+        let msg = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Systemd))
+            .expect_err(yaml)
+            .to_string();
+        assert!(
+            msg.contains("`command[0]`") && msg.contains("`-f ") && msg.contains("backslash"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("backend-specific"),
+            "the override did not write it: {msg}"
+        );
+    }
+    let yaml = "id: frpc
+command: [bin/frpc]
+";
+    resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Launchd)).expect("only systemd refuses");
+}
+
+#[skuld::test]
+fn a_backslash_the_field_wrote_in_a_relative_command_zero_is_the_fields() {
+    let yaml = systemd_manifest(r"command: ['bin\frpc']");
+    let msg = resolve_as(parse_manifest(&yaml), &abs("base"), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
+}
+
+/// A root-relative `command[0]` keeps only the directory's drive or share, so only a defect in that
+/// is `-f`'s: the backslashes of a joined path are the host's separators, not the directory's.
+#[cfg(windows)]
+#[skuld::test]
+fn a_root_relative_command_zero_blames_dash_f_only_for_a_defect_in_the_share_it_keeps() {
+    let yaml = systemd_manifest("command: ['/bin/frpc']");
+    let resolve = |dir: &str| resolve_as(parse_manifest(&yaml), Path::new(dir), Some(BackendKind::Systemd));
+
+    let msg = resolve(r"\\server\o'brien\app").unwrap_err().to_string();
+    assert!(msg.contains("`-f ") && msg.contains("apostrophe"), "{msg}");
+
+    let msg = resolve(r"C:\app").unwrap_err().to_string();
+    assert!(msg.contains("`command[0]`") && !msg.contains("`-f "), "{msg}");
+}
+
+#[skuld::test]
+fn edge_whitespace_in_dash_f_is_blamed_on_dash_f_for_cwd_and_logs() {
+    let dir = abs("a ");
+    for field in ["cwd", "logs"] {
+        let yaml = systemd_manifest(&format!("{field}: ."));
+        let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+            .expect_err(field)
+            .to_string();
+        assert!(
+            msg.contains("`-f ") && msg.contains(&format!("`{field}`")) && msg.contains("whitespace"),
+            "{field}: {msg}"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_absolute_field_that_spells_the_manifest_directorys_prefix_is_the_fields_to_blame() {
+    // `-f` holds a `..`, and so does the absolute `cwd`, which merely starts with the same text.
+    let dir = base_dir().join("..").join("x");
+    let cwd = slash_abs("base/../x/y");
+    let yaml = systemd_manifest(&format!("cwd: '{cwd}'"));
+    let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("`cwd`") && !msg.contains("`-f "), "{msg}");
+
+    // Absolute with only the directory's prefix, whose whitespace is the directory's text too.
+    let dir = abs("a ");
+    let yaml = systemd_manifest(&format!("cwd: '{}'", slash_abs("a ")));
+    let msg = resolve_as(parse_manifest(&yaml), &dir, Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("WorkingDirectory=") && !msg.contains("`-f "), "{msg}");
+}
+
+#[skuld::test]
+fn only_the_defect_the_field_did_not_write_is_dash_fs() {
+    // `-f` holds a backslash; the field wrote only a trailing space.
+    let yaml = systemd_manifest("command: ['bin/frpc ']");
+    let msg = resolve_as(parse_manifest(&yaml), &abs(r"a\b"), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("`command[0]`") && msg.contains("`-f ") && msg.contains("backslash"),
+        "{msg}"
+    );
+    assert_no_run_of_spaces(&msg);
+
+    // `-f` holds a `..`; the field wrote only a leading space.
+    let yaml = systemd_manifest("cwd: ' x'");
+    let msg = resolve_as(parse_manifest(&yaml), Path::new("a/../b"), Some(BackendKind::Systemd))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("`-f ") && msg.contains("`..`") && msg.contains("`cwd`"),
+        "{msg}"
+    );
+    assert_no_run_of_spaces(&msg);
+}
+
+#[skuld::test]
+fn a_parent_dir_the_field_wrote_says_how_to_fix_it() {
+    let yaml = systemd_manifest(&format!("cwd: '{}/../y'", slash_abs("opt/x")));
+    let msg = resolve_yaml_as(BackendKind::Systemd, &yaml).unwrap_err().to_string();
+    assert!(msg.contains("write the path without `..`"), "{msg}");
 }

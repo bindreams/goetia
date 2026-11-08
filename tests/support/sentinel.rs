@@ -70,25 +70,46 @@ pub fn run_if_requested() -> bool {
 
 /// Reporting in is best-effort: a failure to connect is indistinguishable to
 /// this process from never having been started, and it is the test — which
-/// holds the listener — that decides what that means.
+/// holds the listener — that decides what that means. A failure is logged to
+/// stderr, which reaches anyone only where the launcher captures it (an
+/// SCM-launched process, or a launchd job without `StandardErrorPath`, has none).
 pub fn connect(port: u16) {
-    drop(TcpStream::connect((Ipv4Addr::LOCALHOST, port)));
+    drop(open(port));
 }
 
 /// [`connect`], then send `value` as the payload.
 pub fn send_line(port: u16, value: &str) {
-    if let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
-        let _ = stream.write_all(value.as_bytes());
-        let _ = stream.shutdown(std::net::Shutdown::Write);
+    if let Some(mut stream) = open(port) {
+        match stream.write_all(value.as_bytes()) {
+            Ok(()) => log_failure(port, "shutdown", stream.shutdown(std::net::Shutdown::Write)),
+            Err(e) => log_failure(port, "write", Err(e)),
+        }
     }
 }
 
 #[cfg(unix)]
 fn report_uid(port: u16) {
-    if let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
+    if let Some(mut stream) = open(port) {
         // SAFETY: `getuid` takes no arguments, reads no memory, and cannot fail.
         let uid = unsafe { libc::getuid() };
-        let _ = write!(stream, "{uid}");
+        log_failure(port, "write", write!(stream, "{uid}"));
+    }
+}
+
+/// Connect to the test's listener, logging a failure to stderr.
+pub fn open(port: u16) -> Option<TcpStream> {
+    match TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            log_failure(port, "connect", Err(e));
+            None
+        }
+    }
+}
+
+fn log_failure(port: u16, what: &str, result: std::io::Result<()>) {
+    if let Err(e) = result {
+        eprintln!("{what} to 127.0.0.1:{port} failed: {e}");
     }
 }
 
@@ -123,7 +144,6 @@ mod windows {
         // A real rendezvous with the control handler thread: the recv returns
         // when SCM delivers the stop, and not before.
         stop_rx.recv().expect("stop control");
-        service_ctrl::report_stopped(status_handle);
-        super::connect(stop_port);
+        service_ctrl::report_stopped(status_handle, stop_port);
     }
 }

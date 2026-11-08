@@ -1,31 +1,26 @@
 use super::*;
+use crate::spec::DaemonFields;
+use crate::spec::test_support::abs;
+use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{Builtin, MAX_SC_ACTION_DELAY};
 
 // Fixtures ============================================================================================================
 
-#[cfg(windows)]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!(r"C:\{p}"))
-}
-#[cfg(not(windows))]
-fn abs(p: &str) -> PathBuf {
-    PathBuf::from(format!("/{p}"))
-}
-
 fn managed_spec() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_string(),
         restart: Restart::OnFailure,
         restart_delay: Some(Duration::from_secs(5)),
-        ..DaemonSpec::for_test(
+        ..plain_fields(
             "frpc",
-            vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+            vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
         )
-    }
+    })
+    .unwrap()
 }
 
 fn simple_spec() -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "FRP tunnel client".to_string(),
         restart: Restart::OnFailure,
         kind: Kind::Simple,
@@ -33,11 +28,12 @@ fn simple_spec() -> DaemonSpec {
         // asserts `frpc-agent` is absent from `arguments`, which would be
         // vacuously true if it happened to equal the id (also `frpc`, and
         // always present as the shim's sole argument).
-        ..DaemonSpec::for_test(
+        ..plain_fields(
             "frpc",
-            vec!["frpc-agent".to_string(), "-c".to_string(), "frpc.toml".to_string()],
+            vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
         )
-    }
+    })
+    .unwrap()
 }
 
 fn identity() -> Identity {
@@ -83,9 +79,10 @@ fn managed_kind_executable_is_own_command() {
 
 #[skuld::test]
 fn managed_kind_renders_its_environment_lines() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.env.insert("B".to_string(), "2".to_string());
     spec.env.insert("A".to_string(), "1".to_string());
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     assert_eq!(reg.environment, ["A=1", "B=2"]);
@@ -99,8 +96,9 @@ fn managed_kind_renders_its_environment_lines() {
 fn simple_kind_renders_no_environment() {
     // SCM applies `Environment` to the shim, not the daemon (the shim applies `spec.env` itself), so
     // the registration carries none for `Kind::Simple`.
-    let mut spec = simple_spec();
+    let mut spec = simple_spec().into_fields();
     spec.env.insert("A".to_string(), "1".to_string());
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     assert!(reg.environment.is_empty(), "{:?}", reg.environment);
@@ -139,8 +137,9 @@ fn format_environment_lines_preserves_equals_signs_in_the_value() {
 
 #[skuld::test]
 fn root_user_maps_to_local_system() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.user = User::Root;
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     assert_eq!(reg.account, None, "User::Root must map to None (LocalSystem)");
@@ -148,8 +147,9 @@ fn root_user_maps_to_local_system() {
 
 #[skuld::test]
 fn named_user_account_uses_resolved_identity() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.user = User::Name("bindreams".to_string());
+    let spec = DaemonSpec::new(spec).unwrap();
     let id = identity();
     let reg = registration(&spec, &id, &shim_path()).unwrap();
 
@@ -260,8 +260,9 @@ fn every_canonical_builtin_needs_no_password() {
 
 #[skuld::test]
 fn registration_canonicalizes_a_builtin_account() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.user = User::Name("LocalService".to_string());
+    let spec = DaemonSpec::new(spec).unwrap();
     let id = Identity {
         user: "LocalService".to_string(),
     };
@@ -272,8 +273,9 @@ fn registration_canonicalizes_a_builtin_account() {
 
 #[skuld::test]
 fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.user = User::Root;
+    let spec = DaemonSpec::new(spec).unwrap();
     // The value `identity::resolve` actually returns for `User::Root`, not
     // a hand-written non-empty one — `root_user_maps_to_local_system`
     // (above) uses `identity()`'s non-empty fixture and so cannot catch
@@ -402,8 +404,7 @@ fn account_needs_password_is_true_for_a_real_account() {
 /// one this function itself appends at the end) so the quote can't be
 /// swallowed by the backslashes ahead of it.
 fn windows_style_escape(s: &str) -> String {
-    const ESCAPE_CHARS: [char; 5] = ['"', ' ', '\n', '\t', '\u{000B}'];
-    if !s.is_empty() && !s.chars().any(|c| ESCAPE_CHARS.contains(&c)) {
+    if !s.is_empty() && !s.chars().any(|c| WRITER_QUOTE_TRIGGERS.iter().any(|(t, _)| *t == c)) {
         return s.to_string();
     }
 
@@ -725,9 +726,10 @@ fn windows_style_split_matches_real_command_line_to_argv_w() {
 
 #[skuld::test]
 fn simple_kind_maps_restart_to_failure_actions_like_managed() {
-    let mut spec = simple_spec();
+    let mut spec = simple_spec().into_fields();
     spec.restart = Restart::OnFailure;
     spec.restart_delay = Some(Duration::from_secs(42));
+    let spec = DaemonSpec::new(spec).unwrap();
     let fa = build(&spec)
         .failure_actions
         .expect("restart: on-failure must configure recovery actions: SCM does every restart for a simple daemon");
@@ -738,15 +740,20 @@ fn simple_kind_maps_restart_to_failure_actions_like_managed() {
         "without the flag, a clean non-zero report never restarts"
     );
 
-    spec.restart = Restart::Never;
+    let spec = DaemonSpec::new(DaemonFields {
+        restart: Restart::Never,
+        ..spec.into_fields()
+    })
+    .unwrap();
     assert_eq!(build(&spec).failure_actions, None);
 }
 
 #[skuld::test]
 fn simple_kind_default_restart_delay_when_unset() {
-    let mut spec = simple_spec();
+    let mut spec = simple_spec().into_fields();
     spec.restart = Restart::OnFailure;
     spec.restart_delay = None;
+    let spec = DaemonSpec::new(spec).unwrap();
 
     let fa = build(&spec).failure_actions.expect("recovery actions");
     assert_eq!(fa.delay, DEFAULT_RESTART_DELAY);
@@ -756,12 +763,14 @@ fn simple_kind_default_restart_delay_when_unset() {
 fn the_two_kinds_get_the_same_failure_actions_for_every_restart_value() {
     for restart in [Restart::Never, Restart::OnFailure] {
         for restart_delay in [None, Some(Duration::from_secs(42))] {
-            let mut simple = simple_spec();
+            let mut simple = simple_spec().into_fields();
             simple.restart = restart;
             simple.restart_delay = restart_delay;
-            let mut managed = managed_spec();
+            let simple = DaemonSpec::new(simple).unwrap();
+            let mut managed = managed_spec().into_fields();
             managed.restart = restart;
             managed.restart_delay = restart_delay;
+            let managed = DaemonSpec::new(managed).unwrap();
 
             assert_eq!(
                 build(&simple).failure_actions,
@@ -786,8 +795,9 @@ fn managed_kind_sets_on_non_crash_failures() {
 
 #[skuld::test]
 fn managed_kind_maps_restart_delay_to_action_delay() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.restart_delay = Some(Duration::from_secs(42));
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     let fa = reg
@@ -798,8 +808,9 @@ fn managed_kind_maps_restart_delay_to_action_delay() {
 
 #[skuld::test]
 fn managed_kind_default_restart_delay_when_unset() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.restart_delay = None;
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     let fa = reg
@@ -810,8 +821,9 @@ fn managed_kind_default_restart_delay_when_unset() {
 
 #[skuld::test]
 fn managed_kind_with_restart_never_has_no_failure_actions() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.restart = Restart::Never;
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = build(&spec);
 
     assert_eq!(
@@ -823,10 +835,11 @@ fn managed_kind_with_restart_never_has_no_failure_actions() {
 #[skuld::test]
 fn registration_refuses_restart_always() {
     for spec in [managed_spec(), simple_spec()] {
-        let spec = DaemonSpec {
+        let spec = DaemonSpec::new(DaemonFields {
             restart: Restart::Always,
-            ..spec
-        };
+            ..spec.into_fields()
+        })
+        .unwrap();
         let err = registration(&spec, &identity(), &shim_path()).expect_err("`restart: always` must be refused");
 
         assert!(
@@ -839,11 +852,180 @@ fn registration_refuses_restart_always() {
     }
 }
 
+// The executable must survive the `windows-service` writer ============================================================
+
+// These executables are Windows paths, which `DaemonSpec::new` accepts only on a Windows host.
+
+#[cfg(windows)]
+fn managed_with_executable(executable: &str) -> DaemonSpec {
+    DaemonSpec::new(plain_fields("frpc", vec![executable.to_string(), "arg".to_string()])).unwrap()
+}
+
+/// Executables whose argv[0] the writer reads back exactly, and ones it does not.
+#[cfg(windows)]
+const EXECUTABLES_THE_WRITER_KEEPS: &[&str] = &[
+    r"C:\frpc",
+    r"C:\no\spaces\here",
+    r"C:\no\spaces\here\",
+    r"C:\no\spaces\here\\",
+    r"C:\some dir\x",
+    r"C:\some\back\slashes dir\x\y",
+];
+#[cfg(windows)]
+const EXECUTABLES_THE_WRITER_MANGLES: &[&str] = &[
+    r"C:\some dir\x\",
+    r"C:\some dir\x\\",
+    r"C:\some dir\x\\\",
+    r#"C:\some"dir\x"#,
+    r#"C:\a"b"#,
+];
+
+#[cfg(windows)]
+#[skuld::test]
+fn managed_refuses_an_executable_the_writer_would_mangle() {
+    for executable in EXECUTABLES_THE_WRITER_MANGLES {
+        let spec = managed_with_executable(executable);
+        let err = registration(&spec, &identity(), &shim_path()).expect_err(&format!(
+            "{executable:?} is rewritten by the writer and must be refused"
+        ));
+
+        assert!(
+            matches!(&err, Error::Invalid { daemon, .. } if daemon.as_str() == "frpc"),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("service registration"), "the reason is missing: {text}");
+        assert!(!text.contains("systemd"), "wrong backend named: {text}");
+        // The user wrote `command[0]`; the message names it and the path it became.
+        assert!(text.contains("`command[0]`"), "{executable:?}: {text}");
+        assert!(text.contains(&format!("{executable:?}")), "{executable:?}: {text}");
+        assert!(
+            !text.contains("shim"),
+            "{executable:?}: a spec error is not the shim's: {text}"
+        );
+    }
+}
+
+/// The message names the triggering character, not always "a space" (a shim path can hold a tab).
+#[cfg(windows)]
+#[skuld::test]
+fn the_refusal_names_the_character_that_forced_the_quoting() {
+    let cases = [
+        (r#"C:\a"b"#, "double quote", "space"),
+        (r#"C:\a b"c"#, "double quote", "space"),
+        (r"C:\a b\", "space", "double quote"),
+    ];
+    for (executable, named, not_named) in cases {
+        let err = registration(&managed_with_executable(executable), &identity(), &shim_path())
+            .expect_err(&format!("{executable:?} must be refused"));
+        let text = err.to_string();
+        assert!(text.contains(named), "{executable:?} should name a {named}: {text}");
+        assert!(
+            !text.contains(not_named),
+            "{executable:?} must not name a {not_named}: {text}"
+        );
+    }
+
+    let shim_cases = [
+        (r#"C:\a"b\x"#, "double quote", "tab"),
+        ("C:\\a\tb\\", "tab", "space"),
+        ("C:\\a\nb\\", "newline", "space"),
+        ("C:\\a\u{b}b\\", "vertical tab", "space"),
+    ];
+    for (shim, named, not_named) in shim_cases {
+        let err = install_registration(&simple_spec(), &identity(), Path::new(shim))
+            .expect_err(&format!("{shim:?} must be refused"));
+        let text = err.to_string();
+        assert!(text.contains(named), "{shim:?} should name a {named}: {text}");
+        assert!(
+            !text.contains(not_named),
+            "{shim:?} must not name a {not_named}: {text}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn managed_accepts_an_executable_the_writer_keeps() {
+    for executable in EXECUTABLES_THE_WRITER_KEEPS {
+        let spec = managed_with_executable(executable);
+        registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{executable:?}: {e}"));
+    }
+}
+
+/// The refusal is exactly the set the writer does not round-trip, for the argv[0] rule the real
+/// `CommandLineToArgvW` applies (`windows_style_split_matches_real_command_line_to_argv_w`).
+#[cfg(windows)]
+#[skuld::test]
+fn executable_refusal_matches_what_the_writer_loses() {
+    for executable in EXECUTABLES_THE_WRITER_KEEPS
+        .iter()
+        .chain(EXECUTABLES_THE_WRITER_MANGLES)
+    {
+        let read_back = windows_style_split(&windows_style_command_line(executable, &["arg"]));
+        let refused = registration(&managed_with_executable(executable), &identity(), &shim_path()).is_err();
+        assert_eq!(
+            refused,
+            read_back[0] != *executable,
+            "{executable:?} reads back as {:?}",
+            read_back[0]
+        );
+    }
+}
+
+/// The shim path goes through the same writer, so the install and `diff` refuse a bad one
+/// (`install_registration`).
+#[skuld::test]
+fn simple_refuses_a_shim_path_the_writer_would_mangle() {
+    let shim = PathBuf::from(r"C:\Program Files\Goetia\");
+    let err =
+        install_registration(&simple_spec(), &identity(), &shim).expect_err("a mangled shim path must be refused");
+    let text = err.to_string();
+    assert!(text.contains("service registration"), "{text}");
+    // No manifest sets the shim path: the message names it and its forcing character, and does
+    // not blame `command[0]`, name where the path came from, or send the user to an install location.
+    assert!(text.contains("goetia-shim path"), "{text}");
+    assert!(!text.contains("GOETIA_SHIM_PATH"), "{text}");
+    assert!(!text.contains("installed"), "{text}");
+    assert!(text.contains(&format!("{:?}", shim.display().to_string())), "{text}");
+    assert!(text.contains("space"), "{text}");
+    assert!(!text.contains("command[0]"), "{text}");
+
+    install_registration(&simple_spec(), &identity(), &shim_path()).unwrap();
+}
+
+/// Rendering a `type: simple` daemon never fails for the shim path, whatever it is.
+#[skuld::test]
+fn rendering_a_simple_daemon_does_not_judge_the_shim_path() {
+    for shim in [r"C:\Program Files\Goetia\", r#"C:\a"b\x"#] {
+        registration(&simple_spec(), &identity(), Path::new(shim)).unwrap_or_else(|e| panic!("{shim:?}: {e}"));
+    }
+}
+
+/// What install writes and `diff` shows is the registration, once the shim path is accepted.
+#[skuld::test]
+fn an_accepted_shim_path_gives_the_registration_itself() {
+    let shim = shim_path();
+    let installed = install_registration(&simple_spec(), &identity(), &shim).unwrap();
+    let rendered = registration(&simple_spec(), &identity(), &shim).unwrap();
+    assert_eq!(installed.to_string(), rendered.to_string());
+}
+
+/// A `type: managed` daemon has no shim: its own `command[0]` is what is judged, at rendering.
+#[skuld::test]
+fn a_managed_daemon_is_not_held_to_the_shim_path() {
+    install_registration(&managed_spec(), &identity(), Path::new(r"C:\Program Files\Goetia\")).unwrap();
+}
+
 #[skuld::test]
 fn registration_accepts_never_and_on_failure() {
     for restart in [Restart::Never, Restart::OnFailure] {
         for spec in [managed_spec(), simple_spec()] {
-            let spec = DaemonSpec { restart, ..spec };
+            let spec = DaemonSpec::new(DaemonFields {
+                restart,
+                ..spec.into_fields()
+            })
+            .unwrap();
             registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
         }
     }
@@ -851,10 +1033,13 @@ fn registration_accepts_never_and_on_failure() {
 
 #[skuld::test]
 fn managed_kind_clamps_absurdly_long_restart_delay() {
-    let mut spec = managed_spec();
     // One millisecond past what a DWORD of milliseconds (SC_ACTION.Delay)
     // can express.
-    spec.restart_delay = Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
+    let spec = DaemonSpec::new(DaemonFields {
+        restart_delay: Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1)),
+        ..managed_spec().into_fields()
+    })
+    .unwrap();
     let reg = registration(&spec, &identity(), &shim_path()).unwrap();
 
     let fa = reg
@@ -879,8 +1064,9 @@ fn a_sub_millisecond_restart_delay_rounds_up_to_the_whole_millisecond_scm_stores
         (Duration::from_millis(7), 7),
         (Duration::ZERO, 0),
     ] {
-        let mut spec = managed_spec();
+        let mut spec = managed_spec().into_fields();
         spec.restart_delay = Some(delay);
+        let spec = DaemonSpec::new(spec).unwrap();
         let reg = build(&spec);
         let fa = reg.failure_actions.expect("on-failure configures recovery actions");
         assert_eq!(fa.delay, Duration::from_millis(stored_ms), "delay {delay:?}");
@@ -906,8 +1092,9 @@ fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
         MAX_SC_ACTION_DELAY + Duration::from_nanos(1),
         Duration::MAX,
     ] {
-        let mut spec = managed_spec();
+        let mut spec = managed_spec().into_fields();
         spec.restart_delay = Some(delay);
+        let spec = DaemonSpec::new(spec).unwrap();
         let fa = build(&spec).failure_actions.expect("recovery actions");
         assert_eq!(fa.delay, MAX_SC_ACTION_DELAY, "delay {delay:?}");
     }
@@ -915,8 +1102,9 @@ fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
 
 #[skuld::test]
 fn managed_kind_restart_delay_within_bound_does_not_clamp() {
-    let mut spec = managed_spec();
+    let mut spec = managed_spec().into_fields();
     spec.restart_delay = Some(Duration::from_secs(42));
+    let spec = DaemonSpec::new(spec).unwrap();
     let reg = registration(&spec, &identity(), &shim_path()).unwrap();
 
     let fa = reg
@@ -936,7 +1124,7 @@ fn parameters_round_trip_through_extract() {
     let spec = managed_spec();
     let reg = build(&spec);
 
-    let blob = extract(&reg.parameters)
+    let blob = extract(&reg.parameters, &[])
         .expect("a freshly generated registration's parameters must decode")
         .expect("a freshly generated registration's parameters must carry the marker");
     assert_eq!(blob.spec, spec);
@@ -951,7 +1139,7 @@ fn display_is_the_generation_invariant() {
     let shim = shim_path();
 
     let original = registration(&spec, &id, &shim).unwrap();
-    let recovered_spec = extract(&original.parameters).unwrap().unwrap().spec;
+    let recovered_spec = extract(&original.parameters, &[]).unwrap().unwrap().spec;
     let regenerated = registration(&recovered_spec, &id, &shim).unwrap();
 
     assert_eq!(
@@ -964,7 +1152,7 @@ fn display_is_the_generation_invariant() {
 #[skuld::test]
 fn extract_returns_none_for_foreign_parameters() {
     let parameters = BTreeMap::from([("AppDirectory".to_string(), r"C:\nssm\app".to_string())]);
-    assert_eq!(extract(&parameters).unwrap(), None);
+    assert_eq!(extract(&parameters, &[]).unwrap(), None);
 }
 
 #[skuld::test]
@@ -973,46 +1161,25 @@ fn extract_errors_on_corrupt_blob() {
     let mut parameters = reg.parameters;
     parameters.insert(FIELD_SPEC.to_string(), "not valid base64 !!!".to_string());
 
-    extract(&parameters).expect_err("a corrupt Spec value must not decode");
+    extract(&parameters, &[]).expect_err("a corrupt Spec value must not decode");
 }
 
+/// `Schema` and `Version` are copies for a person reading the registry; `Spec` is the only value
+/// read for meaning, so any state of the copies leaves the decoded blob unchanged.
 #[skuld::test]
-fn extract_errors_on_marker_value_mismatch() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
-    parameters.insert(FIELD_MARKER.to_string(), "not-goetia".to_string());
-
-    let err = extract(&parameters).expect_err("a Marker present with the wrong value must not be treated as ours");
-    assert!(err.to_string().contains(FIELD_MARKER));
-}
-
-#[skuld::test]
-fn extract_errors_on_missing_schema_field() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
-    parameters.remove(FIELD_SCHEMA);
-
-    let err = extract(&parameters).expect_err("Marker present without Schema must not silently decode");
-    assert!(err.to_string().contains(FIELD_SCHEMA));
-}
-
-#[skuld::test]
-fn extract_errors_on_non_numeric_schema_field() {
+fn extract_does_not_read_schema_or_version() {
     let reg = build(&managed_spec());
     let mut parameters = reg.parameters;
     parameters.insert(FIELD_SCHEMA.to_string(), "not-a-number".to_string());
+    parameters.insert(FIELD_VERSION.to_string(), "0.0.0-not-the-real-version".to_string());
+    let with_wrong_copies = extract(&parameters, &[]).expect("wrong copies").expect("still ours");
 
-    extract(&parameters).expect_err("a non-numeric Schema must be rejected, not silently mis-decoded");
-}
-
-#[skuld::test]
-fn extract_errors_on_missing_version_field() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
+    parameters.remove(FIELD_SCHEMA);
     parameters.remove(FIELD_VERSION);
+    let without_copies = extract(&parameters, &[]).expect("no copies").expect("still ours");
 
-    let err = extract(&parameters).expect_err("Marker present without Version must not silently decode");
-    assert!(err.to_string().contains(FIELD_VERSION));
+    assert_eq!(with_wrong_copies.spec, managed_spec());
+    assert_eq!(without_copies.spec, managed_spec());
 }
 
 #[skuld::test]
@@ -1021,64 +1188,92 @@ fn extract_errors_on_missing_spec_field() {
     let mut parameters = reg.parameters;
     parameters.remove(FIELD_SPEC);
 
-    let err = extract(&parameters).expect_err("Marker present without Spec must not silently decode");
+    let err = extract(&parameters, &[]).expect_err("Marker present without Spec must not silently decode");
     assert!(err.to_string().contains(FIELD_SPEC));
 }
 
 #[skuld::test]
-fn extract_errors_on_schema_mismatch_with_decoded_blob() {
+fn extract_names_the_type_of_a_spec_that_is_stored_but_not_a_string() {
     let reg = build(&managed_spec());
     let mut parameters = reg.parameters;
-    // A syntactically valid integer that disagrees with what `Spec` itself
-    // decodes to — `extract_errors_on_non_numeric_schema_field` only
-    // covers the "not even a number" shape, which is a weaker check than
-    // the doc comment's "must check out completely" promise.
-    parameters.insert(FIELD_SCHEMA.to_string(), "999".to_string());
+    parameters.remove(FIELD_SPEC);
+    let strays = [Stray::Value {
+        name: "spec".encode_utf16().collect(),
+        vtype: 4,
+    }];
 
-    let err = extract(&parameters).expect_err("a Schema that disagrees with the decoded blob must be rejected");
-    assert!(err.to_string().contains(FIELD_SCHEMA));
+    let err = extract(&parameters, &strays).expect_err("a Spec that is not a string must not decode");
+
+    let text = err.to_string();
+    assert!(text.contains("REG_DWORD"), "{text}");
+    assert!(!text.contains("missing"), "{text}");
 }
 
 #[skuld::test]
-fn extract_errors_on_version_mismatch_with_decoded_blob() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
-    parameters.insert(FIELD_VERSION.to_string(), "0.0.0-not-the-real-version".to_string());
+fn extract_says_a_spec_of_a_string_type_is_not_valid_text() {
+    for vtype in [1, 2, 7] {
+        let reg = build(&managed_spec());
+        let mut parameters = reg.parameters;
+        parameters.remove(FIELD_SPEC);
+        let strays = [Stray::Value {
+            name: "Spec".encode_utf16().collect(),
+            vtype,
+        }];
 
-    let err = extract(&parameters).expect_err("a Version that disagrees with the decoded blob must be rejected");
-    assert!(err.to_string().contains(FIELD_VERSION));
+        let err = extract(&parameters, &strays).expect_err("a Spec that is not text must not decode");
+
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("{} that is not valid text", type_name(vtype))),
+            "{text}"
+        );
+        assert!(!text.contains("not as a string"), "{text}");
+    }
 }
 
 #[skuld::test]
-fn extract_is_case_insensitive_for_field_names() {
-    let reg = build(&managed_spec());
-    // Simulate a `Parameters` set written or hand-repaired with different
-    // casing than goetia's own writer uses — Windows registry value names
-    // are case-insensitive, so this must still be recognized as ours.
-    let differently_cased: BTreeMap<String, String> =
-        reg.parameters.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
-
-    let blob = extract(&differently_cased)
-        .expect("differently-cased field names must still decode")
-        .expect("differently-cased field names must still be recognized as ours");
-    assert_eq!(blob.spec, managed_spec());
-}
-
-#[skuld::test]
-fn extract_errors_on_case_insensitive_field_collision() {
-    let reg = build(&managed_spec());
-    let mut parameters = reg.parameters;
-    // Two keys that name the same registry value case-insensitively, with
-    // different content — a plain `BTreeMap<String, String>` can represent
-    // this even though a real `Services\<name>\Parameters` key never
-    // could, so `extract` must not silently pick one.
-    parameters.insert("marker".to_string(), "also-goetia".to_string());
-
-    let err = extract(&parameters).expect_err("two case-differing spellings of the same field must be rejected");
-    assert!(err.to_string().contains(FIELD_MARKER));
+fn field_named_folds_ascii_case_to_goetias_spelling_and_knows_no_other_name() {
+    assert_eq!(field_named("sPeC"), Some(FIELD_SPEC));
+    assert_eq!(field_named("Marker"), Some(FIELD_MARKER));
+    assert_eq!(field_named("Markers"), None);
+    assert_eq!(field_named(""), None);
 }
 
 // Display =============================================================================================================
+
+/// A registration built from a spec has no strays, so the text of a readback that has none is the
+/// text of what goetia wants; one that has any differs, and says which.
+#[skuld::test]
+fn a_stray_parameter_is_drift_the_text_names() {
+    let wanted = build(&managed_spec());
+    assert!(wanted.stray_parameters.is_empty());
+    assert!(!wanted.to_string().contains("Stray"), "{wanted}");
+
+    for stray in [
+        Stray::Value {
+            name: "Marker".encode_utf16().collect(),
+            vtype: 2,
+        },
+        Stray::Value {
+            name: vec![0xD800],
+            vtype: 0x20,
+        },
+        Stray::Subkey {
+            name: "Sub
+key"
+            .encode_utf16()
+            .collect(),
+        },
+    ] {
+        let on_disk = ScmRegistration {
+            stray_parameters: vec![stray.clone()],
+            ..wanted.clone()
+        };
+
+        assert_ne!(on_disk.to_string(), wanted.to_string(), "{stray:?}");
+        assert!(on_disk.to_string().contains(&stray.to_string()), "{stray:?}: {on_disk}");
+    }
+}
 
 #[skuld::test]
 fn display_excludes_boot_enablement() {
@@ -1140,6 +1335,7 @@ fn display_output_format_is_pinned() {
             ("Marker".to_string(), "goetia".to_string()),
             ("Schema".to_string(), "1".to_string()),
         ]),
+        stray_parameters: Vec::new(),
     };
 
     // Every line `Display` itself controls (labels, order, indentation,
@@ -1187,6 +1383,7 @@ fn a_registration_displays_as_its_canonical_text() {
         failure_actions: None,
         environment: vec![],
         parameters: BTreeMap::from([("k".to_string(), "v".to_string())]),
+        stray_parameters: Vec::new(),
     };
 
     assert_eq!(

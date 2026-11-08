@@ -1,15 +1,20 @@
 //! `goetia daemon install [-f FILE] [--force] [--start] [--enable] [--dry-run]`
+//!
+//! Values are escaped for reading (see [`super::show`], guarantee 4).
 
+use std::fmt::Write as _;
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
-use super::support::{load_and_warn, require_elevation};
+use super::refusal::{Lines, Mood, NotRefused};
+use super::support::{load_and_warn, print_error, print_line, require_elevation};
 use super::wait::WaitArgs;
 use crate::backend::Identity;
-use crate::decide::{self, Outcome};
+use crate::decide::Outcome;
 use crate::error::Result;
 use crate::manager::{ServiceManager, Step};
 use crate::spec::{AccountId, DaemonSpec, Id, User};
@@ -50,7 +55,7 @@ pub fn run(
     let spec = match load_and_warn(&args.file, err) {
         Ok(spec) => spec,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -63,7 +68,7 @@ pub fn run(
                 ExitCode::Success
             }
             Err(e) => {
-                let _ = writeln!(err, "error: {}", e.report());
+                print_error(err, None, "", &e);
                 ExitCode::Error
             }
         };
@@ -75,7 +80,7 @@ pub fn run(
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
+            print_error(err, None, "", &e);
             return ExitCode::Error;
         }
     };
@@ -91,7 +96,7 @@ pub fn run(
     {
         Ok(sequence) => sequence,
         Err(e) => {
-            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
+            print_error(err, Some(spec.id.as_str()), "", &e);
             return ExitCode::of(&e);
         }
     };
@@ -109,18 +114,18 @@ pub fn run(
             if args.enable
                 && let Err(e) = mgr.enable(&spec.id)
             {
-                let _ = writeln!(err, "error: {}: enable: {}", spec.id, e.report());
+                print_error(err, Some(spec.id.as_str()), "enable: ", &e);
                 codes.push(ExitCode::of(&e));
             }
             if let Some(sequence) = sequence.as_mut()
                 && let Err(e) = sequence.start(&spec.id, args.wait.budget())
             {
-                let _ = writeln!(err, "error: {}: start: {}", spec.id, e.report());
+                print_error(err, Some(spec.id.as_str()), "start: ", &e);
                 codes.push(ExitCode::of(&e));
             }
         }
         Err(e) => {
-            let _ = writeln!(err, "error: {}: {}", spec.id, e.report());
+            print_error(err, Some(spec.id.as_str()), "", &e);
             codes.push(ExitCode::of(&e));
         }
     }
@@ -132,71 +137,41 @@ pub fn run(
 /// additionally gets a one-line diagnostic on `err`, so a script that only
 /// captures stderr for errors still learns that an exit-1/5 run had one.
 fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    match outcome {
-        Outcome::Create => {
+    let lines = Lines { id, mood: Mood::Done };
+    let settled = match lines.refusal(outcome, out, err) {
+        ControlFlow::Break(code) => return code,
+        ControlFlow::Continue(settled) => settled,
+    };
+    match settled {
+        NotRefused::Create => {
             let _ = writeln!(out, "{id}: created");
-            ExitCode::Success
         }
-        Outcome::UpToDate => {
+        NotRefused::UpToDate => {
             let _ = writeln!(out, "{id}: up to date");
-            ExitCode::Success
         }
-        Outcome::Update { spec_diff } => {
+        NotRefused::Update { spec_diff } => {
             let _ = writeln!(out, "{id}: updated");
             let _ = write!(out, "{spec_diff}");
-            ExitCode::Success
         }
-        Outcome::Stale { from_version } => {
-            let _ = writeln!(out, "{id}: regenerated (was built by goetia {from_version})");
-            ExitCode::Success
-        }
-        Outcome::Conflict {
-            artifact_diff,
-            unclearable_recovery,
-        } => {
-            // `--force` is offered only where it resolves the conflict. When part
-            // of the cause is outside the directory this backend writes, forcing
-            // leaves that part in place and the next run reports the same
-            // conflict; `decide` says which case this is (see `Outcome::Conflict`).
-            let line = match unclearable_recovery {
-                None => format!("{id}: conflict (re-run with --force to overwrite)"),
-                Some(recovery) => format!("{id}: conflict. {recovery}"),
-            };
-            let _ = writeln!(out, "{line}");
-            let _ = write!(out, "{artifact_diff}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Conflict
-        }
-        Outcome::RefuseForeign { recovery } => {
-            let _ = writeln!(out, "{id}: refused: not a goetia-managed service. {recovery}");
-            let _ = writeln!(err, "error: {id}: refused: not a goetia-managed service. {recovery}");
-            ExitCode::Error
-        }
-        Outcome::RefuseOtherDaemon { installed } => {
-            let line = format!("{id}: refused: {}", decide::other_daemon_refusal(installed.as_str()));
-            let _ = writeln!(out, "{line}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Error
-        }
-        Outcome::RefuseUnusable { reason, recovery } => {
-            let line = match recovery {
-                Some(recovery) => format!("{id}: refused: {reason}. {recovery}"),
-                None => format!("{id}: refused: {reason}"),
-            };
-            let _ = writeln!(out, "{line}");
-            let _ = writeln!(err, "error: {line}");
-            ExitCode::Error
+        NotRefused::Stale { from_version } => {
+            print_line(out, None, Some(id.as_str()), |sink| {
+                write!(sink, "regenerated (was built by goetia {from_version})")
+            });
         }
     }
+    ExitCode::Success
 }
 
 // --dry-run preview ===================================================================================================
 //
-// --dry-run never touches a manager or does I/O. A real install resolves
-// `spec.user` to a platform account name (see `backend::Identity`) with an
-// effectful lookup (a Windows SID needs `LookupAccountSid`; a launchd numeric
-// UID needs one too); a preview does not, so this is a literal, lookup-free
-// rendering that may differ from a real install's artifact in some cases.
+// --dry-run never touches a manager or writes anything. It still reads the manifest and `.env` (resolving the spec),
+// and it canonicalizes the process's current directory when `-f` is relative. A drive-relative path (`C:bin`) in the
+// manifest is resolved against the process's per-drive current directory, which `std::path::absolute` reads. The
+// preview step itself, on Windows, reads the process's own environment and executable path, to name the shim
+// (`shim_path`); it reads no account or file. A real install resolves `spec.user` to a platform account name (see
+// `backend::Identity`) with an effectful lookup (a Windows SID needs `LookupAccountSid`; a launchd numeric UID needs
+// one too); a preview does not, so this is a literal, lookup-free rendering that may differ from a real install's
+// artifact in some cases.
 
 fn preview_identity(user: &User) -> Identity {
     Identity {
@@ -219,7 +194,10 @@ fn preview_root_account() -> String {
     "root".to_string()
 }
 
-/// The generated artifact for `spec`, or the generator's refusal of it (scm refuses `restart: always`).
+/// The generated artifact for `spec`, or the generator's refusal of it: scm refuses `restart: always` and
+/// an executable path its registration writer rewrites; systemd refuses the values `refuse_unrepresentable` lists.
+///
+/// Writes nothing; on Windows it reads the process's environment and executable path (`shim_path`).
 ///
 /// `err` is threaded through on every platform so a generator warning cannot
 /// be dropped; no generator produces a [`crate::spec::Warning`] here today.
@@ -229,7 +207,7 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
     #[cfg(target_os = "linux")]
     {
         let _ = err;
-        Ok(crate::backend::systemd::generate::unit(spec, &identity))
+        crate::backend::systemd::generate::unit(spec, &identity)
     }
     #[cfg(target_os = "macos")]
     {
@@ -241,10 +219,9 @@ fn preview_artifact(spec: &DaemonSpec, err: &mut dyn Write) -> Result<String> {
         // The SCM generator's warning (a too-large `restart-delay`) fires at
         // resolve time, from `BackendKind::Scm.warn`, before this runs.
         let _ = err;
-        // The real shim path is an open packaging question — this placeholder
-        // is only ever shown in a preview, never installed.
-        let shim_path = PathBuf::from("goetia-shim.exe");
-        let registration = crate::backend::scm::generate::registration(spec, &identity, &shim_path)?;
+        // The real shim path, so the preview refuses a path the install would.
+        let shim_path = crate::backend::scm::manager::shim_path();
+        let registration = crate::backend::scm::generate::install_registration(spec, &identity, &shim_path)?;
         Ok(registration.to_string())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

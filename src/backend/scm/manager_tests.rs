@@ -3,11 +3,16 @@
 //! (everything that actually talks to SCM) is covered by
 //! `tests/scm_integration.rs` instead.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::*;
+use crate::backend::scm::parameters::Stray;
 use crate::manager::ServiceManager;
+use crate::spec::DaemonFields;
 use crate::spec::Restart;
+use crate::spec::test_support::{plain_fields, program};
+use windows_sys::Win32::System::Registry::REG_DWORD;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
     ScmRegistration {
@@ -19,6 +24,7 @@ fn dummy_reg(account: Option<&str>) -> ScmRegistration {
         failure_actions: None,
         environment: vec![],
         parameters: BTreeMap::new(),
+        stray_parameters: Vec::new(),
     }
 }
 
@@ -437,17 +443,30 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
 #[skuld::test]
 fn read_marker_sorts_parameters_into_foreign_and_marked() {
     let spec = blob_of(Kind::Managed).spec;
-    let ours = BTreeMap::from([
-        ("Marker".to_string(), crate::blob::MARKER.to_string()),
-        ("Schema".to_string(), crate::blob::SCHEMA.to_string()),
-        ("Version".to_string(), crate::version().to_string()),
-        ("Spec".to_string(), crate::blob::encode(&spec)),
-    ]);
-    let torn = BTreeMap::from([("Marker".to_string(), crate::blob::MARKER.to_string())]);
+    let ours = Parameters {
+        fields: BTreeMap::from([
+            ("Marker".to_string(), crate::blob::MARKER.to_string()),
+            ("Schema".to_string(), crate::blob::SCHEMA.to_string()),
+            ("Version".to_string(), crate::version().to_string()),
+            ("Spec".to_string(), crate::blob::encode(&spec)),
+        ]),
+        strays: vec![Stray::Subkey { name: vec![0x41] }],
+    };
+    let torn = Parameters {
+        fields: BTreeMap::from([("Marker".to_string(), crate::blob::MARKER.to_string())]),
+        strays: Vec::new(),
+    };
 
     let id = Id::try_from("frpc").unwrap();
     assert!(matches!(
-        read_marker(BTreeMap::new(), None),
+        read_marker(Parameters::default(), None),
+        ReadOutcome::Foreign { recovery: None }
+    ));
+    // A `Marker` that is no goetia string reads as a stray, not a field: no marker.
+    let mut foreign = Parameters::default();
+    foreign.add_value("Marker".encode_utf16().collect(), REG_DWORD, &[1, 0, 0, 0]);
+    assert!(matches!(
+        read_marker(foreign, None),
         ReadOutcome::Foreign { recovery: None }
     ));
     match read_marker(ours.clone(), None).named(&id, ScmSnapshot::new) {
@@ -470,10 +489,11 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
 // Install refuses `restart: always` ===================================================================================
 
 fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         restart,
-        ..DaemonSpec::for_test("frpc", vec![r"C:\bin\frpc.exe".to_string()])
-    }
+        ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+    })
+    .unwrap()
 }
 
 // start_kind ----------------------------------------------------------------------------------------------------------
@@ -482,10 +502,11 @@ fn blob_of(kind: Kind) -> Blob {
     Blob {
         schema: 1,
         version: "0.1.0".to_string(),
-        spec: DaemonSpec {
+        spec: DaemonSpec::new(DaemonFields {
             kind,
-            ..DaemonSpec::for_test("frpc", vec!["frpc".to_string()])
-        },
+            ..plain_fields("frpc", vec![program("frpc")])
+        })
+        .unwrap(),
     }
 }
 
@@ -523,10 +544,11 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
 /// any other.
 #[skuld::test]
 fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
-    let spec = DaemonSpec {
+    let spec = DaemonSpec::new(DaemonFields {
         restart: Restart::Always,
-        ..blob_of(Kind::Simple).spec
-    };
+        ..blob_of(Kind::Simple).spec.into_fields()
+    })
+    .unwrap();
     // Hand-write the blob: `registration` refuses `always`.
     let parameters = BTreeMap::from([
         ("Marker".to_string(), crate::blob::MARKER.to_string()),
@@ -535,7 +557,7 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
         ("Spec".to_string(), crate::blob::encode(&spec)),
     ]);
 
-    let blob = generate::extract(&parameters)
+    let blob = generate::extract(&parameters, &[])
         .expect("the blob decodes")
         .expect("the blob is ours");
 

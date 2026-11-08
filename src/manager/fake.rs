@@ -19,7 +19,7 @@ use crate::error::{Error, Reason, Result};
 use crate::manager::budget;
 use crate::manager::flow;
 use crate::manager::{Budget, Installed, ServiceManager, State, Status, Step};
-use crate::spec::{DaemonSpec, Id, User};
+use crate::spec::{DaemonFields, DaemonSpec, Id, User};
 
 /// The fake's own artifact marker, deliberately not any real backend's
 /// `Marker`/`Schema`/`Version`/`Spec` field names: no real manager reads it.
@@ -125,6 +125,7 @@ struct Store {
     prepare_fails: Option<Step>,
     no_manager: bool,
     unresolvable: BTreeSet<String>,
+    unfit_for_install: BTreeSet<String>,
     installed_fails: BTreeMap<String, Failure>,
     live_status_fails: BTreeMap<String, Failure>,
     write_races: BTreeMap<String, usize>,
@@ -250,10 +251,10 @@ impl Fake {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
-        let spec = DaemonSpec {
+        let spec = DaemonSpec::new(DaemonFields {
             id: Id::try_from(id).expect("seed_invalid_content needs a valid id"),
             name: id.to_string(),
-            command: vec!["daemon".to_string()],
+            command: vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
             cwd: None,
             env: std::collections::BTreeMap::new(),
             user: crate::spec::User::Root,
@@ -262,7 +263,8 @@ impl Fake {
             restart_delay: Some(std::time::Duration::from_secs(1)),
             logs: None,
             kind: crate::spec::Kind::Simple,
-        };
+        })
+        .expect("a valid spec");
         let encoded = blob::encode(&spec);
         let bytes = BASE64.decode(&encoded).expect("blob::encode emits valid base64");
         let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("blob::encode emits valid JSON");
@@ -424,6 +426,13 @@ impl Fake {
     pub fn seed_unresolvable_account(&self, user: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.unresolvable.insert(user.to_string());
+    }
+
+    /// Test-only seeding: `render_for_install` fails for a spec whose `user` is `User::Name(user)`,
+    /// where `render` succeeds, as a backend's does for a host that cannot carry the definition.
+    pub fn seed_unfit_for_install(&self, user: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.unfit_for_install.insert(user.to_string());
     }
 
     /// Test-only seeding: reading back what is installed at `id` fails with what `error` makes, as a
@@ -657,6 +666,21 @@ impl crate::backend::Backend for Fake {
             }
         }
         Ok(generate(spec))
+    }
+
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<String> {
+        let definition = self.render(spec)?;
+        if let User::Name(user) = &spec.user {
+            let state = self.state.lock().expect("Fake mutex poisoned");
+            if state.unfit_for_install.contains(user) {
+                return Err(Error::Invalid {
+                    daemon: spec.id.to_string(),
+                    message: "unfit for install (seeded)".to_string(),
+                    source: None,
+                });
+            }
+        }
+        Ok(definition)
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Artifact>> {

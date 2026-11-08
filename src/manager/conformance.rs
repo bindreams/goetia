@@ -188,10 +188,11 @@ fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) ->
     );
 
     // A routine config update must not undo a deliberate enable (or disable).
-    let mut changed = mk(spec.id.as_str());
-    changed
+    let mut fields = mk(spec.id.as_str()).into_fields();
+    fields
         .env
         .insert("GOETIA_CONFORMANCE_CHANGED".to_string(), "1".to_string());
+    let changed = DaemonSpec::new(fields).expect("the conformance spec plus one env var is valid");
     let outcome = mgr.install(&changed, false).expect("reinstall over a changed spec");
     assert!(
         matches!(outcome, crate::decide::Outcome::Update { .. }),

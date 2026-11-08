@@ -1,10 +1,10 @@
 //! [`Reason`]: why goetia says what it does about an id it cannot use or classify.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::sync::Arc;
 
-use super::Error;
-use super::report::{write_chain, write_remedies};
+use super::report::{Sink, write_chain, write_remedies, write_sentence};
+use super::{Error, Sentence};
 
 /// Why goetia says what it does about an id it cannot use or classify: a refused install, or a
 /// `list` entry. It is cheap to clone, and two reasons are equal when they read the same.
@@ -59,25 +59,65 @@ impl Reason {
 }
 
 impl fmt::Display for Reason {
-    /// An [`Around`](Reason::Around) error's remedies print after `after`, as [`Error::report`]
-    /// prints them after a chain.
+    /// As [`Error::report`] prints an error: the control and direction characters of every part
+    /// are written as `\u{XXXX}`. An [`Around`](Reason::Around) error's remedies print after
+    /// `after`, as `report` prints them after a chain.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (before, error, after) = match self {
-            Reason::Said(text) => return f.write_str(text),
-            Reason::Failed(error) => ("", error, ""),
-            Reason::Around { before, error, after } => (before.as_str(), error, after.as_str()),
-        };
+        self.write_to(&mut Sink::new(f, true))
+    }
+}
+
+impl Reason {
+    /// `Display` with every character as it is: the exact text for `--json`, and what two reasons
+    /// are compared by.
+    pub(crate) fn unescaped(&self) -> impl fmt::Display + '_ {
+        Unescaped(self)
+    }
+
+    /// `Display`, written into `out`, which decides how it is escaped: a caller writes what follows
+    /// into the same sink.
+    pub(crate) fn write_to(&self, out: &mut Sink) -> fmt::Result {
         let mut remedies = Vec::new();
-        f.write_str(before)?;
-        write_chain(error.as_ref(), f, &mut remedies)?;
-        f.write_str(after)?;
-        write_remedies(f, &remedies)
+        match self {
+            Reason::Said(text) => out.write_str(text)?,
+            Reason::Failed(error) => write_chain(error.as_ref(), out, &mut remedies)?,
+            Reason::Around { before, error, after } => {
+                let sentence = Sentence {
+                    before: before.as_str().into(),
+                    error,
+                    after: after.as_str().into(),
+                };
+                write_sentence(sentence, out, &mut remedies)?;
+            }
+        }
+        write_remedies(out, &remedies)
+    }
+
+    /// This reason said after `installed but unusable: `: what `list` and `status` say of an
+    /// installed daemon goetia cannot use.
+    pub(crate) fn installed_but_unusable(&self) -> Reason {
+        const PREFIX: &str = "installed but unusable: ";
+        match self {
+            Reason::Said(text) => Reason::Said(format!("{PREFIX}{text}")),
+            Reason::Failed(error) => Reason::around(PREFIX, Arc::clone(error), ""),
+            Reason::Around { before, error, after } => {
+                Reason::around(format!("{PREFIX}{before}"), Arc::clone(error), after.as_str())
+            }
+        }
+    }
+}
+
+struct Unescaped<'a>(&'a Reason);
+
+impl fmt::Display for Unescaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.write_to(&mut Sink::new(f, false))
     }
 }
 
 impl PartialEq for Reason {
     fn eq(&self, other: &Self) -> bool {
-        self.to_string() == other.to_string()
+        self.unescaped().to_string() == other.unescaped().to_string()
     }
 }
 

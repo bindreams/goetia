@@ -3,12 +3,9 @@
 //! for the `type: managed` analogues these mirror.
 
 use std::collections::BTreeMap;
-use std::ops::ControlFlow;
 
 use goetia::backend::scm::manager::Scm;
-use goetia::backend::scm::wait::{
-    Armed, Observed, QueriedState, ScmActor as _, SystemScmActor, Waited, WantState, wait_until,
-};
+use goetia::backend::scm::wait::{Armed, Observed, QueriedState, ScmActor as _, StopSeen, SystemScmActor, WantState};
 use goetia::decide::Outcome;
 use goetia::manager::conformance;
 use goetia::manager::{Budget, Installed, ServiceManager as _, State};
@@ -233,20 +230,5 @@ fn the_shim_reports_stop_pending_then_stopped() {
         "no control is accepted while stopping"
     );
 
-    // A settled state other than `STOPPED` fails the test instead of hanging it; `STOP_PENDING` waits.
-    let waited = wait_until(
-        &mut actor,
-        WantState::StoppedOnly,
-        WantState::StoppedOnly,
-        QueriedState::Stopped,
-        Budget::Unbounded.start(),
-        |sighting| match sighting.status.state {
-            QueriedState::Running | QueriedState::Paused => {
-                panic!("waiting for Stopped, the service reached {:?}", sighting.status.state)
-            }
-            _ => Ok(ControlFlow::Continue(())),
-        },
-    )
-    .expect("wait for STOPPED");
-    assert_eq!(waited, Waited::Confirmed, "an unbounded wait for STOPPED expired");
+    support::scm_wait::wait_for_stopped(&mut actor, &id, StopSeen::Pending);
 }

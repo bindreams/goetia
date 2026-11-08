@@ -331,27 +331,43 @@ fn a_kept_error_reads_as_the_error_it_keeps() {
     assert!(undetermined.is_indeterminate());
 }
 
-/// The errors written into a variant's own `Display` are exactly those `embedded` names, so
+/// The errors written into a variant's own `Display` are exactly those `sentence` names, so
 /// `report` can collect their remedies.
 #[skuld::test]
-fn embedded_names_the_error_a_variant_writes_into_its_own_text() {
+fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
     let inner = || undetermined("re-run as root");
     let loaded = Error::LoadedStateInDoubt {
         id: id(),
         read_failed: Box::new(inner()),
         restore_failed: None,
     };
-    assert!(matches!(loaded.embedded(), Some(Error::Undetermined { .. })));
     assert!(matches!(
-        start_as_managed(not_installed()).embedded(),
+        loaded.sentence().map(|s| s.error),
+        Some(Error::Undetermined { .. })
+    ));
+    assert!(matches!(
+        start_as_managed(not_installed()).sentence().map(|s| s.error),
         Some(Error::Blob { .. })
     ));
     assert!(matches!(
-        Error::Kept(Arc::new(loaded)).embedded(),
+        Error::Kept(Arc::new(loaded)).sentence().map(|s| s.error),
         Some(Error::Undetermined { .. })
     ));
-    assert!(not_installed().embedded().is_none());
-    assert!(step("a", inner()).embedded().is_none());
+    assert!(not_installed().sentence().map(|s| s.error).is_none());
+    assert!(step("a", inner()).sentence().map(|s| s.error).is_none());
+}
+
+/// A kept error answers `stderr` as the error it holds, however deep.
+#[skuld::test]
+fn a_kept_commands_stderr_is_the_commands() {
+    let command = Error::Command {
+        command: "systemctl start x".to_string(),
+        status: exit_status(1),
+        stderr: "Access denied".to_string(),
+    };
+    let kept = Error::Kept(Arc::new(Error::Kept(Arc::new(command))));
+    assert_eq!(kept.stderr(), Some("Access denied"));
+    assert_eq!(Error::Kept(Arc::new(not_installed())).stderr(), None);
 }
 
 #[skuld::test]
@@ -804,4 +820,67 @@ fn an_undetermined_step_chain_gives_up_its_read_and_recovery() {
     };
     let back = other.into_undetermined().expect_err("not an Undetermined");
     assert_eq!(back.report().to_string(), "check: daemon `x` is not installed");
+}
+
+// The OS error an error carries ---------------------------------------------------------------------------------------
+
+fn os_code(code: i32) -> Error {
+    Error::Os {
+        what: "read".to_string(),
+        path: None,
+        source: std::io::Error::from_raw_os_error(code).into(),
+    }
+}
+
+#[skuld::test]
+fn the_os_error_is_found_through_every_wrapper() {
+    let step = |source: Error| Error::Step {
+        what: "step".to_string(),
+        source: Box::new(source),
+    };
+    let undetermined = Error::Undetermined {
+        id: "x".to_string(),
+        reason: Box::new(step(os_code(5))),
+        recovery: String::new(),
+    };
+    assert_eq!(os_code(5).raw_os_error(), Some(5));
+    assert_eq!(step(undetermined).raw_os_error(), Some(5));
+    assert_eq!(Error::Kept(Arc::new(step(os_code(6)))).raw_os_error(), Some(6));
+    assert_eq!(step(not_installed()).raw_os_error(), None);
+    assert_eq!(os("read", "/p", "no code").raw_os_error(), None);
+}
+
+/// Neither half of a `Both` is its `source`; the first with an OS error wins.
+#[skuld::test]
+fn the_os_error_of_a_both_is_the_first_halfs_else_the_seconds() {
+    let both = |first: Error, then: Error| Error::Both {
+        first: Box::new(first),
+        then: Box::new(then),
+    };
+    let nested = Error::Step {
+        what: "outer".to_string(),
+        source: Box::new(both(not_installed(), os_code(7))),
+    };
+
+    assert_eq!(both(os_code(5), os_code(7)).raw_os_error(), Some(5));
+    assert_eq!(both(not_installed(), os_code(7)).raw_os_error(), Some(7));
+    assert_eq!(nested.raw_os_error(), Some(7));
+    assert_eq!(both(not_installed(), not_installed()).raw_os_error(), None);
+}
+
+/// An error a variant writes into its own text is not its `source`.
+#[skuld::test]
+fn the_os_error_of_an_embedded_error_is_found() {
+    let embedded = Error::LoadedStateInDoubt {
+        id: "x".to_string(),
+        read_failed: Box::new(os_code(8)),
+        restore_failed: None,
+    };
+    let blob_unreadable = Error::StartAsManaged {
+        blob: Arc::new(os_code(9)),
+        source: Box::new(not_installed()),
+    };
+
+    assert_eq!(embedded.raw_os_error(), Some(8));
+    assert_eq!(blob_unreadable.raw_os_error(), Some(9));
 }

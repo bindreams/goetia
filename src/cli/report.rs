@@ -25,11 +25,12 @@
 //! with or without `--json`: both build a [`Report`] first and then pick a
 //! renderer, so the exit code cannot depend on the output format.
 
+use std::fmt::{self, Write as _};
 use std::io::Write;
 
 use super::ExitCode;
-use super::support::{InstalledIndex, state_str};
-use crate::error::Error;
+use super::support::{InstalledIndex, print_line, state_str};
+use crate::error::{Error, Reason, Sink};
 use crate::manager::Status;
 
 // Wire format =========================================================================================================
@@ -68,7 +69,54 @@ pub(crate) struct ErrorReport {
     /// obtaining the manager or from listing.
     pub id: Option<String>,
     pub kind: Kind,
+    /// Exactly as it is, for `--json`: serde encodes it, so escaping first would encode it twice.
     pub message: String,
+    /// What `message` was made from, which a person reads written as the report writes it; not in
+    /// the document.
+    #[serde(skip)]
+    origin: Origin,
+}
+
+/// What an [`ErrorReport`]'s `message` was made from.
+enum Origin {
+    /// goetia's own words.
+    Words,
+    /// The error failed on, which [`Error::report`] writes.
+    Error(Error),
+    /// A [`Reason`], which `Display` writes as the report does.
+    Reason(Reason),
+}
+
+impl ErrorReport {
+    /// A report of goetia's own words, which a person reads with the control characters escaped.
+    pub(crate) fn said(id: Option<String>, kind: Kind, message: String) -> Self {
+        ErrorReport {
+            id,
+            kind,
+            message,
+            origin: Origin::Words,
+        }
+    }
+
+    /// A report of `e`: its unescaped chain for the document, its report for a person.
+    fn failed(id: Option<String>, kind: Kind, e: Error) -> Self {
+        let message = e.report_unescaped().to_string();
+        ErrorReport {
+            id,
+            kind,
+            message,
+            origin: Origin::Error(e),
+        }
+    }
+
+    /// Writes `message` for a person, as the report writes it (see [`Error::report`]).
+    fn write_shown(&self, out: &mut Sink) -> fmt::Result {
+        match &self.origin {
+            Origin::Words => out.write_str(&self.message),
+            Origin::Error(e) => e.write_report(out),
+            Origin::Reason(reason) => reason.write_to(out),
+        }
+    }
 }
 
 /// Every value [`ErrorReport::kind`] can take.
@@ -191,10 +239,15 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
         errors: index
             .unusable
             .iter()
-            .map(|(name, reason)| ErrorReport {
-                id: Some(name.clone()),
-                kind: Kind::Unusable,
-                message: format!("installed but unusable: {reason}"),
+            .map(|(name, reason)| {
+                let reason = reason.installed_but_unusable();
+                let message = reason.unescaped().to_string();
+                ErrorReport {
+                    id: Some(name.clone()),
+                    kind: Kind::Unusable,
+                    message,
+                    origin: Origin::Reason(reason),
+                }
             })
             .collect(),
         // Already ordered: `partition_installed` sorts as it builds, so the
@@ -204,7 +257,7 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
             .iter()
             .map(|entry| UndeterminedReport {
                 name: entry.name.clone(),
-                reason: entry.reason.clone(),
+                reason: entry.reason.unescaped().to_string(),
             })
             .collect(),
     }
@@ -236,7 +289,7 @@ pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
 /// [`Error::NoManager`] says nothing about the id: no manager was available to
 /// ask. It is `unavailable` under the id, exit `1`, per id like every verb
 /// given ids.
-pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
+pub(crate) fn status_error(id: &str, e: Error) -> ErrorReport {
     let kind = match e.cause() {
         Error::NoManager { .. } => Kind::Unavailable,
         Error::NotInstalled { .. } => Kind::NotInstalled,
@@ -244,11 +297,7 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
         Error::Undetermined { .. } => Kind::Undetermined,
         _ => Kind::Unusable,
     };
-    ErrorReport {
-        id: Some(id.to_string()),
-        kind,
-        message: e.report().to_string(),
-    }
+    ErrorReport::failed(Some(id.to_string()), kind, e)
 }
 
 /// A CLI argument `support::parse_id` rejected. Attributable to the id it
@@ -257,29 +306,21 @@ pub(crate) fn status_error(id: &str, e: &Error) -> ErrorReport {
 /// Carries [`Error::Invalid`]'s `message` field rather than its `Display`,
 /// which prefixes ``daemon `X`: ``: the `id` field and the text renderer both
 /// carry the id already.
-pub(crate) fn invalid_id(id: &str, e: &Error) -> ErrorReport {
-    let message = match e {
-        Error::Invalid { message, .. } => message.clone(),
-        other => other.report().to_string(),
-    };
-    ErrorReport {
-        id: Some(id.to_string()),
-        kind: Kind::InvalidId,
-        message,
+pub(crate) fn invalid_id(id: &str, e: Error) -> ErrorReport {
+    let id = Some(id.to_string());
+    match e {
+        Error::Invalid { message, .. } => ErrorReport::said(id, Kind::InvalidId, message),
+        other => ErrorReport::failed(id, Kind::InvalidId, other),
     }
 }
 
 /// `get_manager()` or `mgr.list()` failed, so no answer was obtained for any
 /// daemon: the whole report is this one error, attributable to no id.
 /// Without it, stdout would be empty on this path.
-pub(crate) fn unavailable(e: &Error) -> Report {
+pub(crate) fn unavailable(e: Error) -> Report {
     Report {
         daemons: Vec::new(),
-        errors: vec![ErrorReport {
-            id: None,
-            kind: Kind::Unavailable,
-            message: e.report().to_string(),
-        }],
+        errors: vec![ErrorReport::failed(None, Kind::Unavailable, e)],
         undetermined: Vec::new(),
     }
 }
@@ -290,18 +331,25 @@ pub(crate) fn unavailable(e: &Error) -> Report {
 pub(crate) fn unsupported(subcommand: &str) -> Report {
     Report {
         daemons: Vec::new(),
-        errors: vec![ErrorReport {
-            id: None,
-            kind: Kind::Unsupported,
-            message: format!(
+        errors: vec![ErrorReport::said(
+            None,
+            Kind::Unsupported,
+            format!(
                 "`daemon {subcommand}` does not support --json: drop --json, or use `daemon list` or `daemon status`"
             ),
-        }],
+        )],
         undetermined: Vec::new(),
     }
 }
 
 // Rendering ===========================================================================================================
+
+/// Writes the entries of `report.errors` as `error:` lines, each under its id when it has one.
+pub(crate) fn print_errors(report: &Report, err: &mut dyn Write) {
+    for error in &report.errors {
+        print_line(err, Some("error"), error.id.as_deref(), |sink| error.write_shown(sink));
+    }
+}
 
 /// Write `report` as one compact line terminated by a newline, and flush.
 ///
@@ -330,7 +378,9 @@ pub(crate) fn emit(report: &Report, out: &mut dyn Write, err: &mut dyn Write) ->
     match write(report, out) {
         Ok(()) => exit_code(report),
         Err(e) => {
-            let _ = writeln!(err, "error: failed to write the --json document to stdout: {e}");
+            print_line(err, Some("error"), None, |sink| {
+                write!(sink, "failed to write the --json document to stdout: {e}")
+            });
             ExitCode::Error
         }
     }

@@ -30,17 +30,22 @@
 //! merged spec, base values included: an advisory describes what the native
 //! install does with the value it reads. A base value the native backend cannot
 //! honour is its generator's to refuse at install (`restart: always` on `scm`).
+//!
+//! [`BackendKind::refuse`] runs for the native backend too, on the same spec, for a value its generator would
+//! refuse at install anyway (what [`systemd_defect`] lists), so the refusal comes at resolve.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::interpolate;
+use super::field::Field;
+use super::interpolate::Substitution;
 use super::overrides::Supplied;
-use super::resolve::invalid;
-use super::{AccountId, Id, Kind, Restart, User, Warning};
+use super::resolve::{FieldValues, Refused, dir_join, directory_is_to_blame, invalid};
+use super::vars::is_valid_name;
+use super::{AccountId, DaemonSpec, Id, Kind, Restart, User, Warning};
 use crate::error::Error;
 
 /// One of the three service-manager backends a `backend-specific:` entry
@@ -110,12 +115,12 @@ impl std::fmt::Display for BackendKind {
 /// before substitution.
 #[derive(Debug)]
 pub(crate) enum Shaped<T> {
-    /// The authored text carried no `$` and parsed.
+    /// The text was judged as it stood, and parsed.
     Parsed(T),
     /// The authored text carries a `$`, so substitution would change it
-    /// and parsing it now would parse the wrong string. Held verbatim
-    /// until the completion phase, which sees the substituted text.
-    Deferred(String),
+    /// and parsing it now would parse the wrong string. Only a pass
+    /// before substitution produces it, and its result is never completed.
+    Deferred,
     /// The manifest did not set the field. The default is applied in the
     /// completion phase, in one place.
     Absent,
@@ -128,15 +133,15 @@ impl<T: Copy> Shaped<T> {
     pub(crate) fn parsed(&self) -> Option<T> {
         match self {
             Shaped::Parsed(value) => Some(*value),
-            Shaped::Deferred(_) | Shaped::Absent => None,
+            Shaped::Deferred | Shaped::Absent => None,
         }
     }
 }
 
 /// A spec whose every value has passed the shape gate, but which may
-/// still be missing a required field and whose `$`-bearing enum/duration
-/// fields are still unparsed. Only the backend being installed is
-/// required to be complete.
+/// still be missing a required field and, before substitution, whose
+/// `$`-bearing enum/duration fields are still unparsed. Only the backend
+/// being installed is required to be complete.
 #[derive(Debug)]
 pub(crate) struct ShapedSpec {
     pub(crate) id: Id,
@@ -169,9 +174,40 @@ impl BackendKind {
         }
     }
 
+    /// What this backend's native install cannot carry, judged on the substituted merged spec, base
+    /// values included: the install would refuse it anyway, so the refusal comes before it, at
+    /// resolve. Called for the native backend only.
+    ///
+    /// systemd: every value of the manifest that [`systemd_defect`] lists, which its generator
+    /// refuses too, but for the paths ([`BackendKind::refuse_path`]).
+    pub(super) fn refuse(self, spec: &ShapedSpec) -> Result<(), Refused> {
+        match self {
+            BackendKind::Systemd => systemd_refusal(spec),
+            BackendKind::Launchd | BackendKind::Scm => Ok(()),
+        }
+    }
+
+    /// [`BackendKind::refuse`] for one path as it is joined to the manifest directory `base_dir`,
+    /// which is when the directory can be told from the field: `written` is the field's text,
+    /// `joined` what it resolved to. Called for the native backend only.
+    pub(super) fn refuse_path(
+        self,
+        id: &Id,
+        field: &Field,
+        written: &str,
+        joined: &str,
+        base_dir: &Path,
+    ) -> Result<(), Refused> {
+        match self {
+            BackendKind::Systemd => systemd_path_refusal(id, field, written, joined, base_dir),
+            BackendKind::Launchd | BackendKind::Scm => Ok(()),
+        }
+    }
+
     /// Values that are wrong for this backend by construction, on any
     /// host. Reads **only** the fields `supplied` marks. See `Supplied`.
-    pub(super) fn error(self, spec: &ShapedSpec, supplied: Supplied) -> Result<(), Error> {
+    /// While `substitution` is pending, a value a substitution may change is not judged.
+    pub(super) fn error(self, spec: &ShapedSpec, supplied: &Supplied, substitution: Substitution) -> Result<(), Error> {
         if !supplied.user {
             return Ok(());
         }
@@ -193,18 +229,202 @@ impl BackendKind {
                     ),
                 )),
                 // A `$`-bearing name cannot be classified before substitution; do not guess.
-                User::Name(name)
-                    if !interpolate::would_substitution_change(name) && windows_only_account(name).is_some() =>
-                {
-                    Err(invalid(
-                        &spec.id,
-                        &format!("`{name}` is a Windows built-in account, which is never a POSIX one"),
-                    ))
-                }
+                User::Name(name) if !substitution.defers(name) && windows_only_account(name).is_some() => Err(invalid(
+                    &spec.id,
+                    &format!("`{name}` is a Windows built-in account, which is never a POSIX one"),
+                )),
                 _ => Ok(()),
             },
         }
     }
+}
+
+// systemd's refusals ==================================================================================================
+//
+// What no encoding can carry, so the manifest's value is refused: at resolve ([`BackendKind::refuse`]) and
+// by the generator, which a `DaemonSpec` from a blob reaches without resolve. One predicate per rule,
+// measured on 242 and 255.
+
+/// The first value of `spec` that systemd cannot carry, the generator's check.
+///
+/// - `command[0]`, `cwd` and `logs`: see [`systemd_path_field_defect`].
+/// - Then the others: see [`systemd_value_defect`].
+pub(crate) fn systemd_defect(spec: &DaemonSpec) -> Option<String> {
+    let values = FieldValues::from(spec);
+    [Field::Command(0), Field::Cwd, Field::Logs]
+        .iter()
+        .find_map(|field| {
+            let text = values.path(field)?.to_string_lossy();
+            systemd_path_field_defect(field, &text)
+        })
+        .or_else(|| systemd_value_defect(&values).map(|(_, defect)| defect))
+}
+
+/// The first of `values` that systemd cannot carry and that is no path's, with the field it belongs
+/// to and why:
+///
+/// - An `env` key outside `[A-Za-z_][A-Za-z0-9_]*`: systemd logs "Invalid environment assignment,
+///   ignoring" and drops it, and the unit still loads and starts.
+/// - `name`: see [`systemd_raw_value_defect`].
+fn systemd_value_defect(values: &FieldValues) -> Option<(Field, String)> {
+    if let Some(key) = values.env.keys().find(|key| !is_valid_name(key)) {
+        let defect = format!(
+            "`env` key {key:?} is not a name systemd accepts in Environment=: it must match \
+             [A-Za-z_][A-Za-z0-9_]*, and systemd drops any other assignment with only a log line, so the \
+             daemon would never see it"
+        );
+        return Some((Field::EnvKey(key.as_str().into()), defect));
+    }
+    systemd_raw_value_defect("Description=", values.name).map(|defect| (Field::Name, defect))
+}
+
+/// The refusal for the native systemd backend, or `Ok`: the first value of `spec` that
+/// [`systemd_value_defect`] finds. The paths were judged as they were joined
+/// ([`systemd_path_refusal`]).
+fn systemd_refusal(spec: &ShapedSpec) -> Result<(), Refused> {
+    match systemd_value_defect(&FieldValues::from(spec)) {
+        Some((field, defect)) => Err(Refused::at(field, invalid(&spec.id, &defect))),
+        None => Ok(()),
+    }
+}
+
+/// The refusal for a joined path under the native systemd backend, or `Ok`: the first defect of
+/// `joined` ([`systemd_path_field_defects`]).
+///
+/// A joined path may carry a defect the manifest directory (`-f`) put there; whose it is
+/// [`directory_is_to_blame`] decides, by how `written` joined the directory
+/// ([`DirJoin`](super::resolve::DirJoin)). `-f` is blamed and no field carries it, or else the field is.
+pub(super) fn systemd_path_refusal(
+    id: &Id,
+    field: &Field,
+    written: &str,
+    joined: &str,
+    base_dir: &Path,
+) -> Result<(), Refused> {
+    let Some(defect) = systemd_path_field_defects(field, joined).next() else {
+        return Ok(());
+    };
+    let described = defect.describe(field, joined);
+    let has_defect = |p: &Path| {
+        p.to_str()
+            .is_some_and(|text| systemd_path_field_defects(field, text).any(|d| d == defect))
+    };
+    let written = Path::new(written);
+    if directory_is_to_blame(dir_join(written), written, Path::new(joined), has_defect) {
+        let message = format!(
+            "`{}` resolves to `{joined}`, which systemd cannot carry, and the manifest directory `-f {}` is \
+             to blame: {described}. Pass `-f` a path that does not cause it",
+            field.path(),
+            base_dir.display(),
+        );
+        return Err(Refused::of_manifest_dir(invalid(id, &message)));
+    }
+    let message = match defect {
+        PathDefect::ParentDir => format!("{described}; write the path without `..`"),
+        _ => described,
+    };
+    Err(Refused::at(field.clone(), invalid(id, &message)))
+}
+
+/// The characters systemd's line reader strips from both ends of a raw value: space, tab, LF, CR.
+/// VT, FF and Unicode whitespace survive.
+const STRIPPED_BY_SYSTEMD: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// Why systemd cannot carry a path field, kinds so a defect of a joined path can be compared with the
+/// written text's ([`systemd_path_refusal`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathDefect {
+    /// `command[0]` holds a backslash, `"` or `'` (after unquoting and specifiers): systemd refuses
+    /// the whole unit with "Executable name contains special characters", however the word was
+    /// quoted. Later arguments take all three.
+    SpecialChars,
+    /// `command[0]` ends in a space: systemd 255 keeps the path but the service exits with 203/EXEC
+    /// (242 runs it; both are refused). Interior spaces, other trailing whitespace and later
+    /// arguments are fine.
+    TrailingSpace,
+    /// `cwd` or `logs` holds a `..` component: systemd 242 refuses a non-normalized path in both
+    /// `WorkingDirectory=` and the `append:` path; 255 silently ignores the `append:` one.
+    ParentDir,
+    /// `cwd` or `logs` starts or ends with whitespace: see [`systemd_raw_value_defect`].
+    EdgeWhitespace,
+}
+
+impl PathDefect {
+    fn describe(self, field: &Field, text: &str) -> String {
+        match self {
+            PathDefect::SpecialChars => format!(
+                "the executable path {text:?} (`command[0]`) holds a backslash, double quote or apostrophe, \
+                 which systemd refuses to load in an executable path"
+            ),
+            PathDefect::TrailingSpace => format!(
+                "the executable path {text:?} (`command[0]`) ends in whitespace, which systemd does not run \
+                 (the service exits with 203/EXEC)"
+            ),
+            PathDefect::ParentDir => format!(
+                "`{}` {text:?} holds a `..`, and systemd refuses a non-normalized path in {}",
+                field.path(),
+                path_directive(field)
+            ),
+            PathDefect::EdgeWhitespace => raw_value_message(path_directive(field), text),
+        }
+    }
+}
+
+/// The directive a `cwd` or `logs` value is written to.
+fn path_directive(field: &Field) -> &'static str {
+    match field {
+        Field::Logs => "StandardOutput=/StandardError= append:",
+        _ => "WorkingDirectory=",
+    }
+}
+
+/// Why systemd cannot carry `text` as the path of `field`, in the order they are reported; empty for
+/// a path it can, and for a field that is no path. The one place that says which rule a field is
+/// under.
+///
+/// - `command[0]`: [`PathDefect::SpecialChars`], [`PathDefect::TrailingSpace`].
+/// - `cwd` (`WorkingDirectory=`) and `logs` (the `append:` path of `StandardOutput=` and
+///   `StandardError=`): [`PathDefect::ParentDir`], [`PathDefect::EdgeWhitespace`].
+fn systemd_path_field_defects(field: &Field, text: &str) -> impl Iterator<Item = PathDefect> {
+    let (first, second) = match field {
+        Field::Command(0) => (
+            text.contains(['\\', '"', '\'']).then_some(PathDefect::SpecialChars),
+            text.ends_with(' ').then_some(PathDefect::TrailingSpace),
+        ),
+        Field::Cwd | Field::Logs => (
+            Path::new(text)
+                .components()
+                .any(|c| c == Component::ParentDir)
+                .then_some(PathDefect::ParentDir),
+            has_edge_whitespace(text).then_some(PathDefect::EdgeWhitespace),
+        ),
+        _ => (None, None),
+    };
+    [first, second].into_iter().flatten()
+}
+
+/// [`systemd_path_field_defects`], the first one worded.
+fn systemd_path_field_defect(field: &Field, text: &str) -> Option<String> {
+    let defect = systemd_path_field_defects(field, text).next()?;
+    Some(defect.describe(field, text))
+}
+
+fn has_edge_whitespace(value: &str) -> bool {
+    value.starts_with(STRIPPED_BY_SYSTEMD) || value.ends_with(STRIPPED_BY_SYSTEMD)
+}
+
+fn raw_value_message(directive: &str, value: &str) -> String {
+    format!(
+        "{directive} value {value:?} starts or ends with whitespace, which systemd strips from this \
+         directive; no quoting or escape keeps it"
+    )
+}
+
+/// Why `value` cannot be a raw directive value (`Description=`, `User=`, `WorkingDirectory=`, the
+/// `append:` path), or `None`: systemd strips [`STRIPPED_BY_SYSTEMD`] from both ends, and no quote,
+/// C escape or line continuation keeps them.
+pub(crate) fn systemd_raw_value_defect(directive: &str, value: &str) -> Option<String> {
+    has_edge_whitespace(value).then(|| raw_value_message(directive, value))
 }
 
 /// `type: managed` on Windows has no working-directory or stdout-capture

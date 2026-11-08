@@ -21,7 +21,7 @@ use goetia::backend::launchd::generate;
 use goetia::backend::launchd::manager::{ENABLED_DIR, Launchd, STAGING_DIR};
 use goetia::decide::Outcome;
 use goetia::manager::{self, Budget, Installed, ServiceManager, State};
-use goetia::spec::{DaemonSpec, Id, Kind, Restart, User};
+use goetia::spec::{DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::cleanup::{DirGuard, FileGuard};
 use crate::support::{self, ConnectBack, ELEVATED, cmd, may_account_for};
@@ -45,10 +45,11 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 /// [`support::spec`] as a `simple` daemon: every spec this suite installs is one.
 fn base_spec(id: &str, command: Vec<String>) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
         ..support::spec(id, command)
-    }
+    })
+    .unwrap()
 }
 
 /// A long-lived, real, harmless daemon — used everywhere the test only
@@ -328,10 +329,11 @@ fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
         staging_path(&upper).display()
     );
 
-    let requested = DaemonSpec {
+    let requested = DaemonSpec::new(DaemonFields {
         id: Id::try_from(upper.as_str()).unwrap(),
-        ..spec.clone()
-    };
+        ..spec.clone().into_fields()
+    })
+    .unwrap();
     let expected = Outcome::RefuseOtherDaemon {
         installed: spec.id.clone(),
     };
@@ -531,9 +533,10 @@ fn reporting(id: &str, restart: Restart, listener: &ConnectBack) -> DaemonSpec {
             support::sentinel::RUN_UNTIL_KILLED.to_string(),
             listener.port().to_string(),
         ],
-    );
+    )
+    .into_fields();
     spec.restart = restart;
-    spec
+    DaemonSpec::new(spec).unwrap()
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
@@ -601,7 +604,7 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
     let listener = ConnectBack::listen();
-    let mut spec = base_spec(
+    let installed_spec = base_spec(
         &id,
         vec![
             support::current_exe_str(),
@@ -609,12 +612,14 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded() {
             listener.port().to_string(),
         ],
     );
-    let _guard = Guard::install(&mgr, &spec);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    let _guard = Guard::install(&mgr, &installed_spec);
+    mgr.start(&installed_spec.id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     let installed = std::fs::read_to_string(staging_path(&id)).unwrap();
 
-    spec.env.insert("GOETIA_TEST_REVISION".to_string(), "2".to_string());
+    let mut fields = installed_spec.into_fields();
+    fields.env.insert("GOETIA_TEST_REVISION".to_string(), "2".to_string());
+    let spec = DaemonSpec::new(fields).unwrap();
     let refused = mgr
         .install(&spec, false)
         .expect_err("a changed spec over a loaded job must be refused");
@@ -694,8 +699,9 @@ fn list_reports_a_deleted_user_as_ours_unusable() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
     let user = "goetia-no-such-user-xyz";
-    let mut spec = sleepy(&id);
+    let mut spec = sleepy(&id).into_fields();
     spec.user = User::Name(user.to_string());
+    let spec = DaemonSpec::new(spec).unwrap();
     let path = staging_path(&id);
     let _cleanup = FileGuard::new(path.clone());
     ensure_staging_dir();
@@ -1090,9 +1096,11 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
             support::sentinel::CONNECT_BACK.to_string(),
             listener.port().to_string(),
         ],
-    );
+    )
+    .into_fields();
     spec.restart = Restart::Always;
     spec.restart_delay = Some(Duration::from_secs(3600));
+    let spec = DaemonSpec::new(spec).unwrap();
     // Registered before the job is loaded: its `uninstall` boots the job out.
     let _guard = Guard::install(&mgr, &spec);
     // Declared after `_guard`, so the leftover kick is killed before the uninstall's `bootout`.
@@ -1143,8 +1151,9 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
 fn a_start_with_no_budget_is_ok_for_a_restart_always_job() {
     let mgr = Launchd::new();
     let id = support::random_test_id();
-    let mut spec = sleepy(&id);
+    let mut spec = sleepy(&id).into_fields();
     spec.restart = Restart::Always;
+    let spec = DaemonSpec::new(spec).unwrap();
     let _guard = Guard::install(&mgr, &spec);
 
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
@@ -1179,10 +1188,11 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account() {
     let _cleanup_cwd = DirGuard::new(cwd.clone());
     let _cleanup_logs_parent = DirGuard::new(logs.parent().unwrap().to_path_buf());
 
-    let mut spec = base_spec(&id, vec!["/bin/true".to_string()]);
+    let mut spec = base_spec(&id, vec!["/bin/true".to_string()]).into_fields();
     spec.user = User::Name("nobody".to_string());
     spec.cwd = Some(cwd.clone());
     spec.logs = Some(logs.clone());
+    let spec = DaemonSpec::new(spec).unwrap();
     let _guard = Guard::install(&mgr, &spec);
 
     for (dir, what) in [(cwd.as_path(), "cwd"), (logs.parent().unwrap(), "logs' parent")] {
@@ -1314,8 +1324,9 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label() {
     let id = support::random_test_id();
 
     // Ours: `restart: always`, so launchd guarantees it runs once loaded.
-    let mut spec = sleepy(&id);
+    let mut spec = sleepy(&id).into_fields();
     spec.restart = Restart::Always;
+    let spec = DaemonSpec::new(spec).unwrap();
 
     // The decoy takes the label *before* install, which is the real
     // sequence: a predecessor job is still loaded when Goetia installs over

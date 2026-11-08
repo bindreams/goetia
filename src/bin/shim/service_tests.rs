@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use cosca::Containment;
 use goetia::backend::scm::exit_status::{
-    ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
+    ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
 use goetia::spec::{Kind, Restart};
 use windows_sys::Win32::Foundation::{
@@ -27,6 +27,7 @@ use crate::test_support::{
     assert_failures, assert_one_failure, daemon_spec, fallback_refused_failure, not_found, supervisor,
     tree_refused_failure,
 };
+use goetia::spec::DaemonFields;
 
 const ID: &str = "goetia-shim-launch-test";
 
@@ -38,42 +39,47 @@ fn run_daemon(spec: &DaemonSpec, supervisor: &Supervisor, on_running: impl FnOnc
 /// Where [`spec`]'s daemon logs. The `Fake` opens nothing there.
 const DAEMON_LOG: &str = r"C:\goetia-shim-test\daemon.log";
 
+/// The program of [`spec`]'s command, absolute as `DaemonSpec::new` requires. Forward slashes, so the
+/// `Debug` text of the command that the expected messages below spell out has no escapes.
+const POWERSHELL: &str = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+
 /// A `type: simple` daemon. Nothing runs it: the `Fake` states what happens to it, and opens its
 /// log, and takes the shim's failure lines, without touching the file system.
 fn spec() -> DaemonSpec {
     let command = [
-        "powershell",
+        POWERSHELL,
         "-NoProfile",
         "-NonInteractive",
         "-Command",
         "Start-Sleep -Seconds 300",
     ];
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         name: "goetia-shim launch test".to_string(),
         restart: Restart::Always,
         logs: Some(PathBuf::from(DAEMON_LOG)),
         kind: Kind::Simple,
         ..daemon_spec::spec(ID, command.map(str::to_string).to_vec())
-    }
+    })
+    .unwrap()
 }
 
 /// The line logged when no thread can be made to wait on the daemon.
 fn no_thread_failure() -> String {
     format!(
-        r#"make the thread that waits on ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {NO_THREAD}; it was not spawned, so nothing of this daemon is running"#
+        r#"make the thread that waits on ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {NO_THREAD}; it was not spawned, so nothing of this daemon is running"#
     )
 }
 
 /// The line logged when the spawn is refused with [`not_found`].
 fn spawn_failure() -> String {
     format!(
-        r#"spawn ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}"#,
+        r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}"#,
         not_found()
     )
 }
 
 /// The line logged when the daemon is not job-contained, whatever the kill then does.
-const NOT_JOB_CONTAINED: &str = r#"the daemon ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
+const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
 
 /// The line logged when the daemon's tree cannot be terminated after the daemon ended.
 const EXITED_TREE_UNKILLED: &str = "kill_tree after the daemon ended: the kill was refused (fake); its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
@@ -302,11 +308,12 @@ fn a_daemon_that_exits_nonzero_is_one_pass() {
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Ends));
     // The shim ignores the restart policy: no respawn.
-    let daemon = DaemonSpec {
+    let daemon = DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         restart_delay: None,
-        ..spec()
-    };
+        ..spec().into_fields()
+    })
+    .unwrap();
 
     let reported = run_daemon(&daemon, &supervisor(&fake), || {});
 
@@ -854,7 +861,10 @@ fn each_report_maps_to_the_exit_codes_scm_records() {
 
     assert_eq!(codes(Reported::Clean), (0, 0));
     assert_eq!(codes(Reported::DaemonExit(7)), (ERROR_SERVICE_SPECIFIC_ERROR, 7));
-    assert_eq!(codes(Reported::shim_failure(Some(13))), (13, 0));
+    assert_eq!(
+        codes(Reported::shim_failure(Some(ERROR_INVALID_DATA as i32))),
+        (ERROR_INVALID_DATA, 0)
+    );
     assert_ne!(
         codes(Reported::shim_failure(Some(ERROR_SERVICE_SPECIFIC_ERROR as i32))).0,
         ERROR_SERVICE_SPECIFIC_ERROR,
@@ -874,6 +884,142 @@ fn an_incomplete_stop_is_reported_as_win32_zero_with_specific_1003() {
     );
 }
 
+/// A refusal reports Win32 0 with the code that says no daemon ran.
+#[skuld::test]
+fn a_refusal_is_reported_as_win32_zero_with_its_own_specific_code() {
+    let status = stopped_status(Reported::Refused);
+
+    assert_eq!(
+        (status.dwWin32ExitCode, status.dwServiceSpecificExitCode),
+        (0, SHIM_REFUSED)
+    );
+}
+
+// What the shim does with its read of the spec ------------------------------------------------------------------------
+
+fn undetermined(source: Error) -> Error {
+    Error::Undetermined {
+        id: ID.to_string(),
+        reason: Box::new(source),
+        recovery: "resolve that failure and re-run".to_string(),
+    }
+}
+
+/// The refusals are the reads that answered that no daemon can run.
+#[skuld::test]
+fn a_gone_service_a_missing_marker_and_an_undecodable_spec_are_refused() {
+    let reads = [
+        Err(Error::NotInstalled { id: ID.to_string() }),
+        Ok(None),
+        Err(Error::Blob {
+            message: "invalid base64".to_string(),
+            source: None,
+        }),
+        Err(Error::Invalid {
+            daemon: ID.to_string(),
+            message: "id is not valid".to_string(),
+            source: None,
+        }),
+        Err(Error::Step {
+            what: "read the spec".to_string(),
+            source: Box::new(Error::NotInstalled { id: ID.to_string() }),
+        }),
+        Err(Error::Kept(std::sync::Arc::new(Error::NotInstalled {
+            id: ID.to_string(),
+        }))),
+    ];
+
+    for read in reads {
+        let shown = format!("{read:?}");
+        let stop = spec_read(ID, read).map(|_| ()).expect_err(&shown);
+        assert_eq!(stop.reported, Reported::Refused, "{shown}");
+    }
+}
+
+#[skuld::test]
+fn a_spec_that_was_read_is_the_one_to_run() {
+    let blob = goetia::blob::Blob {
+        schema: goetia::blob::SCHEMA,
+        version: goetia::version().to_string(),
+        spec: spec(),
+    };
+
+    let read = spec_read(ID, Ok(Some(blob))).expect("a read spec is run");
+
+    assert_eq!(read.spec, spec());
+}
+
+/// A read that did not complete says nothing about the record, so the shim fails restartably (SCM
+/// retries it) and the message names the registry read, not decoding. The failure carries the OS
+/// error the read met, however deep in the chain.
+#[skuld::test]
+fn a_read_that_did_not_complete_is_a_restartable_failure_naming_the_read() {
+    let io = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+    let read = Err(Error::Step {
+        what: "read the spec".to_string(),
+        source: Box::new(undetermined(Error::Os {
+            what: r"enumerate HKLM\SYSTEM\CurrentControlSet\Services\x\Parameters".to_string(),
+            path: None,
+            source: Box::new(io),
+        })),
+    });
+
+    let stop = spec_read(ID, read)
+        .map(|_| ())
+        .expect_err("an undetermined read stops the shim");
+
+    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_ACCESS_DENIED as i32)));
+    assert_ne!(stop.reported.scm_codes().0, 0, "SCM restarts a non-zero Win32 code");
+    assert!(
+        stop.message.starts_with("read the metadata under Services"),
+        "{}",
+        stop.message
+    );
+    assert!(stop.message.contains("enumerate"), "{}", stop.message);
+    assert!(!stop.message.contains("decode"), "{}", stop.message);
+}
+
+/// Refusal is by cause, not by whether the read is in doubt: a definite error that is none of the
+/// three causes (here an OS error from a read that failed outright) is still restartable, and
+/// carries the real OS error.
+#[skuld::test]
+fn a_definite_os_error_is_a_restartable_failure_carrying_it() {
+    let read = Err(Error::Step {
+        what: "read the spec".to_string(),
+        source: Box::new(Error::Os {
+            what: r"read HKLM\SYSTEM\CurrentControlSet\Services\x\Parameters".to_string(),
+            path: None,
+            source: Box::new(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+        }),
+    });
+
+    let stop = spec_read(ID, read)
+        .map(|_| ())
+        .expect_err("a failed read stops the shim");
+
+    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_ACCESS_DENIED as i32)));
+    assert!(
+        stop.message.starts_with("read the metadata under Services"),
+        "{}",
+        stop.message
+    );
+}
+
+/// With no OS error to carry, the failure still restarts: `ERROR_INVALID_DATA`.
+#[skuld::test]
+fn an_incomplete_read_with_no_os_error_fails_with_invalid_data() {
+    let read = Err(undetermined(Error::Blob {
+        message: "no code here".to_string(),
+        source: None,
+    }));
+
+    let stop = spec_read(ID, read)
+        .map(|_| ())
+        .expect_err("an undetermined read stops the shim");
+
+    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)));
+}
+
 #[skuld::test]
 fn a_stopped_report_is_stopped_and_accepts_no_control() {
     let status = stopped_status(Reported::Clean);
@@ -885,7 +1031,11 @@ fn a_stopped_report_is_stopped_and_accepts_no_control() {
 // Services registered by an earlier version ---------------------------------------------------------------------------
 
 fn spec_restarting(restart: Restart) -> DaemonSpec {
-    DaemonSpec { restart, ..spec() }
+    DaemonSpec::new(DaemonFields {
+        restart,
+        ..spec().into_fields()
+    })
+    .unwrap()
 }
 
 #[skuld::test]

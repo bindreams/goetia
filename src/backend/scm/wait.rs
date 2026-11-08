@@ -15,7 +15,7 @@
 use std::io;
 use std::ops::ControlFlow;
 
-use crate::backend::scm::exit_status::RecordedExit;
+use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, SHIM_REFUSED};
 use crate::manager::budget::Deadline;
 use crate::spec::Kind;
 
@@ -180,7 +180,7 @@ pub trait ScmActor {
 pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     // Issued whatever is left of the budget: only the *waiting* is bounded.
     control_stop_or_underway(a)?;
-    wait_after_stop(a, deadline, " Run `stop` again.")
+    wait_after_stop(a, deadline, " Run `stop` again.", StopSeen::Requested)
 }
 
 /// [`ScmActor::control_stop`], where a stop already under way counts as sent.
@@ -361,9 +361,9 @@ pub(crate) fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
                 match a.control_stop() {
-                    Ok(()) => return wait_after_stop(a, deadline, ""),
+                    Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
-                        return wait_after_stop(a, deadline, "");
+                        return wait_after_stop(a, deadline, "", StopSeen::Requested);
                     }
                     Err(e) if is_stop_refusal(&e) => {
                         refused = e.raw_os_error();
@@ -415,12 +415,21 @@ fn seen_in(status: QueriedStatus) -> Option<Seen> {
     }
 }
 
+/// What the caller of [`wait_after_stop`] has seen of the stop.
+#[derive(Debug, Clone, Copy)]
+pub enum StopSeen {
+    /// The STOP was sent and nothing has shown yet: a first read other than `STOPPED` waits.
+    Requested,
+    /// `STOP_PENDING` was already seen: any first read other than `STOP_PENDING` or `STOPPED` fails.
+    Pending,
+}
+
 /// The wait of a stop once the STOP is accepted or known to be under way: arm for `STOPPED` (and
 /// `STOP_PENDING`), which cancels the settle registration if [`settle_and_stop`] acted on a read and left
 /// it unfired.
 ///
-/// What the first arm reads other than `STOPPED` waits: the STOP may not have taken yet, and a `simple`
-/// service reads `RUNNING` until its shim takes it. Once a notification was delivered, the service had
+/// After [`StopSeen::Requested`], what the first arm reads other than `STOPPED` waits: the STOP may not
+/// have taken yet, and a `simple` service reads `RUNNING` until its shim takes it. Once a notification was delivered, the service had
 /// begun to stop, and a re-arm that reads anything but `STOP_PENDING` means it did not stay stopped: a
 /// failure that races the stop goes `STOPPED (1066)` and SCM restarts the service under its restart
 /// policy (P18a), which can reach `RUNNING` before the re-arm. An error says so, ending in `advice`; it
@@ -429,15 +438,22 @@ fn seen_in(status: QueriedStatus) -> Option<Seen> {
 /// The re-arm is `STOPPED` alone, not the first mask again: after a lag reopen the new handle delivers
 /// the current state at once (P27 c, f), which over an already-reported `STOP_PENDING` would wake the
 /// wait with a state it has seen. [`wait_until`] documents the same reason for `rearm`.
-fn wait_after_stop<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str) -> io::Result<Waited> {
+///
+/// `seen` is what the caller has already seen of the stop: after [`StopSeen::Requested`] the first arm
+/// is `STOPPED` and `STOP_PENDING`, and a first read of anything else waits; after [`StopSeen::Pending`]
+/// the first arm is `STOPPED` alone, and a first read of anything but `STOP_PENDING` or `STOPPED` fails.
+pub fn wait_after_stop<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str, seen: StopSeen) -> io::Result<Waited> {
     wait_until(
         a,
-        WantState::Stopped,
+        match seen {
+            StopSeen::Requested => WantState::Stopped,
+            StopSeen::Pending => WantState::StoppedOnly,
+        },
         WantState::StoppedOnly,
         QueriedState::Stopped,
         deadline,
         |sighting| match sighting.status.state {
-            _ if !sighting.pending_delivered => Ok(ControlFlow::Continue(())),
+            _ if matches!(seen, StopSeen::Requested) && !sighting.pending_delivered => Ok(ControlFlow::Continue(())),
             QueriedState::StopPending => Ok(ControlFlow::Continue(())),
             state => Err(io::Error::other(not_left_stopped(state, advice))),
         },
@@ -594,10 +610,10 @@ const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be 
 /// A terminal `Stopped` before `Running` is read by `kind`. For `type: simple` it is a start when
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
 /// vocabulary, see [`RecordedExit::daemon_ran`]), except the incomplete-stop record: the daemon may
-/// still be running, so that is a failed start; a shim failure is a failed start returning `Err`. A
-/// `type: managed` service speaks SCM itself, and stopping with a service-specific code before
-/// `Running` is how it reports a failed start, so for it any `Stopped` before `Running` is a failed
-/// start. Neither blocks forever.
+/// still be running, so that is a failed start; a shim failure or refusal is a failed start returning
+/// `Err`. A `type: managed` service speaks SCM itself, and stopping with a service-specific code
+/// before `Running` is how it reports a failed start, so for it any `Stopped` before `Running` is a
+/// failed start. Neither blocks forever.
 ///
 /// Critical ordering: arm `RUNNING` strictly AFTER issuing `start`, and decide on the status the arm
 /// returns and the notifications after it. A registration made before the start would fire at once for
@@ -658,6 +674,12 @@ fn stopped_before_running(kind: Kind, joined_a_start: bool, exit: RecordedExit, 
         return Err(io::Error::other(
             "service stopped before reaching Running (failed start): the shim never connected to SCM, so no daemon ran",
         ));
+    }
+    // The shim's `(0, SHIM_REFUSED)` says it started no daemon, though its Win32 code is 0.
+    if kind == Kind::Simple && exit.is_refusal() {
+        return Err(io::Error::other(format!(
+            "service stopped with goetia-shim's refusal record (Win32 0, service-specific {SHIM_REFUSED}; failed start): the shim refused to start the daemon, so no daemon ran; see the shim's log"
+        )));
     }
     // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
     // to confirm. The notification may follow a `RUNNING` the wait never saw.
@@ -843,9 +865,6 @@ pub(crate) fn marked_for_deletion(state: QueriedState) -> io::Error {
          state waited for"
     ))
 }
-
-/// `ERROR_SERVICE_DOES_NOT_EXIST`.
-pub(crate) const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 
 /// The error for a wait for a state other than `STOPPED` over a service that was deleted meanwhile.
 pub(crate) fn service_gone() -> io::Error {

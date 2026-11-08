@@ -91,7 +91,6 @@
 pub(in crate::backend::scm) mod identity;
 mod registry;
 
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;
 use std::path::PathBuf;
@@ -102,14 +101,15 @@ use windows_service::service::{
     ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree,
-};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree};
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
+use self::registry::{Origin, RegistryReadOutcome};
+use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
+use crate::backend::scm::parameters::Parameters;
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
@@ -138,7 +138,7 @@ pub(crate) struct ScmSnapshot {
     id: Id,
     blob: Decoded,
     /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
-    parameters: BTreeMap<String, String>,
+    parameters: Parameters,
     /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
     /// a service deleted since then does not turn into an unusable one. `None` for what `scan`
     /// saw, which opens no service.
@@ -146,7 +146,7 @@ pub(crate) struct ScmSnapshot {
 }
 
 /// What `read_marker` hands on of a service: its `Parameters` and the object `read` opened.
-type Opened = (BTreeMap<String, String>, Option<Service>);
+type Opened = (Parameters, Option<Service>);
 
 impl ScmSnapshot {
     fn new(id: Id, blob: Decoded, (parameters, service): Opened) -> Self {
@@ -205,7 +205,8 @@ impl Backend for Scm {
     type InstallScope = ();
     type Reservation = ();
 
-    /// SCM has nothing to hold across an install: its preconditions are `apply`'s, before any write.
+    /// SCM has nothing to hold across an install: its preconditions are `render_for_install`'s and
+    /// `apply`'s, before any write.
     fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
         Ok(())
     }
@@ -220,6 +221,12 @@ impl Backend for Scm {
         generate::registration(spec, &identity, &shim_path())
     }
 
+    /// The shim path is read once, for the check and the registration alike.
+    fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
+        let identity = identity::resolve(&spec.user)?;
+        generate::install_registration(spec, &identity, &shim_path())
+    }
+
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
     /// absent nor goetia's.
     fn read(&self, id: &Id) -> Result<ReadOutcome<ScmSnapshot>> {
@@ -229,7 +236,11 @@ impl Backend for Scm {
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), e)),
         };
-        Ok(read_marker(registry::read_parameters(id.as_str())?, Some(service)).named(id, ScmSnapshot::new))
+        // `service` is open: the service key outlives it, so no second open asks whether it stands.
+        Ok(match registry::read_parameters(id.as_str(), Origin::Vouched)? {
+            RegistryReadOutcome::ServiceGone => ReadOutcome::Absent,
+            RegistryReadOutcome::Read(parameters) => read_marker(parameters, Some(service)).named(id, ScmSnapshot::new),
+        })
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
@@ -276,15 +287,20 @@ impl Backend for Scm {
     fn scan(&self) -> Scan<ScmSnapshot> {
         let mut entries = Vec::new();
         let mut unreadable: Vec<Unreadable> = Vec::new();
-        let incomplete = registry::scan_services(|name| {
+        let incomplete = registry::scan_services(|name, services| {
             // A registry read failure for one unrelated service (e.g. a driver whose `Parameters`
             // key carries a restrictive ACL) must not take `list` down for every other daemon. It
             // leaves us unable to tell whether `name` carries goetia's marker at all, so it is
             // neither omitted nor claimed: collected whole here, reported by
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
-            match registry::read_parameters(&name) {
-                Ok(params) => {
+            match registry::read_parameters_in(services, &name, Origin::Vouched) {
+                // Gone since `scan_services` listed it: not there to list. Only a `Parameters` key
+                // lost (marked deleted at open, or gone mid-read) reaches this, with the service
+                // key gone too; a plain missing key reads as a service that stands without it, a
+                // stale row at worst.
+                Ok(RegistryReadOutcome::ServiceGone) => {}
+                Ok(RegistryReadOutcome::Read(params)) => {
                     let entry = ScanEntry::of(&name, read_marker(params, None), ScmSnapshot::new);
                     entries.push((name, entry));
                 }
@@ -390,8 +406,8 @@ impl Backend for Scm {
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
 /// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
 /// has no second proof of ownership.
-fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
-    let blob = match generate::extract(&parameters) {
+fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
+    let blob = match generate::extract(&parameters.fields, &parameters.strays) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },
         Ok(Some(blob)) => Ok(blob),
         Err(e) => Err(Arc::new(e)),
@@ -413,17 +429,13 @@ fn read_marker(parameters: BTreeMap<String, String>, service: Option<Service>) -
 /// value. `registry` itself stays private — this is the one read the shim
 /// needs, not the whole module.
 ///
-/// `Ok(None)` means no `Marker` at all: unreachable in practice (SCM only
-/// ever launches the shim against a service *this backend itself* created
-/// with `ImagePath` naming the shim, and `apply` always writes `Parameters`
-/// immediately after), but returned rather than folded into `Err` so a
-/// caller can still tell "no marker" apart from "a marker that fails to
-/// decode" — the shim's own version-skew handling (see
-/// `src/bin/shim/logging.rs`) needs exactly that distinction to phrase its
-/// failure message.
+/// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no goetia `Marker` (none, or
+/// another service's own), kept apart from `Err` so callers can tell it from an undecodable spec.
 pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
-    let params = registry::read_parameters(id)?;
-    generate::extract(&params)
+    match registry::read_parameters(id, Origin::Opened)? {
+        RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),
+        RegistryReadOutcome::Read(params) => generate::extract(&params.fields, &params.strays),
+    }
 }
 
 /// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not
@@ -465,7 +477,7 @@ fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Arc<Error>>) -> E
 /// `tests/shim_integration.rs`'s own `main` sets it once, before any test
 /// runs — see that file's doc comment for why a plain `current_exe()`-based
 /// guess cannot find the shim binary from inside a test crate.
-fn shim_path() -> PathBuf {
+pub(crate) fn shim_path() -> PathBuf {
     if let Some(overridden) = std::env::var_os("GOETIA_SHIM_PATH") {
         return PathBuf::from(overridden);
     }
@@ -482,7 +494,7 @@ fn shim_path() -> PathBuf {
 fn read_live_registration(
     service: &Service,
     name: &str,
-    live_params: &BTreeMap<String, String>,
+    live_params: &Parameters,
 ) -> Result<(ScmRegistration, ServiceStartType)> {
     let cfg = service
         .query_config()
@@ -502,7 +514,10 @@ fn read_live_registration(
         // one-off `LocalSystem`-only filter.
         .and_then(|a| generate::canonical_account(&a));
     let failure_actions = read_failure_actions(service, name)?;
-    let environment = registry::read_environment(name)?;
+    let environment = match registry::read_environment(name)? {
+        RegistryReadOutcome::ServiceGone => return Err(Error::NotInstalled { id: name.to_string() }),
+        RegistryReadOutcome::Read(lines) => lines,
+    };
 
     Ok((
         ScmRegistration {
@@ -513,7 +528,8 @@ fn read_live_registration(
             account,
             failure_actions,
             environment,
-            parameters: live_params.clone(),
+            parameters: live_params.fields.clone(),
+            stray_parameters: live_params.strays.clone(),
         },
         cfg.start_type,
     ))

@@ -13,6 +13,7 @@
 use std::io;
 
 use super::*;
+use crate::spec::test_support::plain_fields;
 
 /// `ENOTDIR`: a regular file where a directory component has to be. Not `NotFound`, not
 /// `PermissionDenied`, and identical for root and everyone else — which is what makes it the right
@@ -454,11 +455,12 @@ fn a_socket_swapped_in_is_classified_not_a_failed_read() {
 // read / installed ----------------------------------------------------------------------------------------------------
 
 fn unit_text() -> String {
-    let spec = crate::spec::DaemonSpec {
+    let spec = crate::spec::DaemonSpec::new(crate::spec::DaemonFields {
         kind: crate::spec::Kind::Simple,
-        ..crate::spec::DaemonSpec::for_test("x", vec!["/bin/true".to_string()])
-    };
-    generate::unit(&spec, &crate::backend::Identity { user: "0".to_string() })
+        ..plain_fields("x", vec!["/bin/true".to_string()])
+    })
+    .unwrap();
+    generate::unit(&spec, &crate::backend::Identity { user: "0".to_string() }).unwrap()
 }
 
 /// What `classified` makes of a fragment that was read, by what the marker says: no marker is a
@@ -508,4 +510,29 @@ fn an_id_with_no_dropin_installs_as_its_fragment_alone() {
 
     assert_eq!(read.definition, text);
     assert!(matches!(read.external, ExternalConfig::Absent));
+}
+
+/// A recovery is one line of text: a path can hold a line feed of its own, so a list laid out with
+/// them could be forged, and layout is the report's to decide.
+#[skuld::test]
+fn a_recovery_names_its_paths_on_one_line() {
+    let paths = [
+        Path::new("/run/systemd/system/x.service.d"),
+        Path::new("/usr/lib/systemd/system/x.service.d"),
+    ];
+    let dropin = dropin_recovery(&paths);
+    let residue = residue_recovery(
+        "x",
+        &Residue {
+            dropin: vec![(paths[0].to_path_buf(), String::new())],
+            links: vec![paths[1].to_path_buf()],
+        },
+    );
+    for recovery in [dropin, residue] {
+        assert!(!recovery.contains('\n'), "{recovery}");
+        assert!(
+            paths.iter().all(|p| recovery.contains(&*p.to_string_lossy())),
+            "{recovery}"
+        );
+    }
 }

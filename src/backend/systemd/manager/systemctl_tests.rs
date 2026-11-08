@@ -37,7 +37,7 @@ fn a_failure_is_reported_with_what_systemctl_wrote_on_stderr() {
         &capture("", "Unit x.service not found.\n", true),
     );
     assert_eq!(
-        e.to_string(),
+        e.report().to_string(),
         "`systemctl start x.service` failed (exit status: 1): Unit x.service not found."
     );
 }
@@ -55,7 +55,7 @@ fn a_failure_that_wrote_only_to_stdout_is_still_reported_with_what_it_wrote() {
         &capture("something on stdout\n", "", true),
     );
     assert_eq!(
-        e.to_string(),
+        e.report().to_string(),
         "`systemctl stop x.service` failed (exit status: 1): something on stdout"
     );
 }
@@ -72,7 +72,7 @@ fn stderr_is_preferred_over_stdout_when_both_carry_something() {
         &capture("noise\n", "the real diagnostic\n", true),
     );
     assert_eq!(
-        e.to_string(),
+        e.report().to_string(),
         "`systemctl start x.service` failed (exit status: 1): the real diagnostic"
     );
 }
@@ -83,7 +83,7 @@ fn stderr_is_preferred_over_stdout_when_both_carry_something() {
 #[skuld::test]
 fn a_truncated_diagnostic_says_it_may_be_only_a_prefix() {
     let e = failed("start", "x.service", exit(1), &capture("", "Unit x.ser", false));
-    let msg = e.to_string();
+    let msg = e.report().to_string();
     assert!(msg.contains("Unit x.ser"), "{msg}");
     assert!(msg.contains("may be only a prefix"), "{msg}");
     assert!(msg.contains("budget expired"), "{msg}");
@@ -94,7 +94,9 @@ fn a_truncated_diagnostic_says_it_may_be_only_a_prefix() {
 #[skuld::test]
 fn an_empty_diagnostic_is_explained_rather_than_trailing_off_after_a_colon() {
     for complete in [true, false] {
-        let msg = failed("start", "x.service", exit(1), &capture("", "", complete)).to_string();
+        let msg = failed("start", "x.service", exit(1), &capture("", "", complete))
+            .report()
+            .to_string();
         assert!(
             !msg.ends_with(": "),
             "an empty diagnostic must not trail off after a colon (complete={complete}): {msg:?}"
@@ -207,7 +209,7 @@ fn enable_and_disable_failures_name_the_verb_the_unit_and_systemd_s_words() {
     for (verb, run) in [("enable", enable_impl as Verb), ("disable", disable_impl as Verb)] {
         let _stand_in = stand_in::set(Some(&gate_passes_then("echo 'Access denied' >&2; exit 1")), booted());
 
-        let msg = run("x").expect_err(verb).to_string();
+        let msg = run("x").expect_err(verb).report().to_string();
 
         assert!(msg.contains(&format!("`systemctl {verb} x.service` failed")), "{msg}");
         assert!(msg.contains("Access denied"), "{msg}");
@@ -519,7 +521,7 @@ fn a_failure_is_reported_without_the_transaction_lines() {
         ),
     );
     assert_eq!(
-        e.to_string(),
+        e.report().to_string(),
         "`systemctl start x.service` failed (exit status: 1): Job for x.service failed because the control process \
          exited with error code."
     );
@@ -540,7 +542,7 @@ fn a_failure_whose_stderr_is_only_protocol_is_reported_with_its_stdout() {
         ),
     );
     assert_eq!(
-        e.to_string(),
+        e.report().to_string(),
         "`systemctl start x.service` failed (exit status: 1): something on stdout"
     );
 }
@@ -570,7 +572,7 @@ fn a_prefixed_transaction_is_still_protocol() {
         );
         let e = failed("start", "x.service", exit(1), &capture("", &stderr, true));
         assert_eq!(
-            e.to_string(),
+            e.report().to_string(),
             format!(
                 "`systemctl start x.service` failed (exit status: 1): {prefix}Job for x.service failed because the control process \
                  exited with error code."
@@ -590,6 +592,7 @@ fn a_truncated_capture_of_only_the_transaction_says_nothing_was_captured() {
         exit(1),
         &capture("", "Enqueued anchor job 7 x.service/start.\n", false),
     )
+    .report()
     .to_string();
     assert!(!msg.contains("Enqueued"), "{msg}");
     assert!(msg.contains("no diagnostic was captured"), "{msg}");
@@ -1560,7 +1563,7 @@ fn kill_of_a_unit_with_no_main_process_is_not_running() {
 fn kill_refused_for_any_other_reason_is_a_plain_failure() {
     let e = kill_with("echo 'Failed to kill unit x.service: Access denied' >&2; exit 1").expect_err("refused");
     assert!(matches!(&e, Error::Command { .. }), "{e:?}");
-    let msg = e.to_string();
+    let msg = e.report().to_string();
     assert!(msg.contains("`systemctl kill x.service` failed"), "{msg}");
     assert!(msg.contains("Access denied"), "{msg}");
 }

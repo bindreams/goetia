@@ -18,20 +18,12 @@ use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_sti
 use super::*;
 use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
+use crate::spec::DaemonFields;
 use crate::spec::Kind;
+use crate::spec::test_support::plain_fields;
 
 use crate::backend::test_cleanup::{DirGuard, FileGuard, remove_or_warn};
-
-#[skuld::label]
-const ELEVATED: skuld::Label;
-
-fn elevated() -> std::result::Result<(), String> {
-    if unsafe { libc::geteuid() } == 0 {
-        Ok(())
-    } else {
-        Err("writes real files under /etc/systemd/system; re-run under sudo".to_string())
-    }
-}
+use crate::backend::test_elevation::{ELEVATED, elevated};
 
 /// On drop, removes every `unique_quarantine_path(id)` file the test's scenario left behind.
 /// Production deliberately leaves one on an unrecoverable double-race so a human can find it, and a
@@ -74,10 +66,11 @@ impl Drop for QuarantineSweep {
 }
 
 fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec {
+    DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
-        ..DaemonSpec::for_test(id, vec!["/bin/true".to_string()])
-    }
+        ..plain_fields(id, vec!["/bin/true".to_string()])
+    })
+    .unwrap()
 }
 
 // create_unit: a create never clobbers ================================================================================

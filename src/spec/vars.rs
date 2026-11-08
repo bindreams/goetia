@@ -256,8 +256,9 @@ fn strip_export_prefix(s: &str) -> &str {
     }
 }
 
-/// `^[A-Za-z_][A-Za-z0-9_]*$`.
-fn is_valid_name(s: &str) -> bool {
+/// `^[A-Za-z_][A-Za-z0-9_]*$`: a `.env` variable's name, and the only `Environment=` name systemd
+/// keeps.
+pub(crate) fn is_valid_name(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
