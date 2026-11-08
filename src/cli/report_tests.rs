@@ -5,11 +5,7 @@ fn report(kinds: &[Kind]) -> Report {
         daemons: Vec::new(),
         errors: kinds
             .iter()
-            .map(|kind| ErrorReport {
-                id: None,
-                kind: *kind,
-                message: "why".to_string(),
-            })
+            .map(|kind| ErrorReport::said(None, *kind, "why".to_string()))
             .collect(),
         undetermined: Vec::new(),
     }
@@ -36,11 +32,11 @@ fn write_emits_one_compact_line_terminated_by_a_newline() {
             enabled: true,
             pid: Some(1234),
         }],
-        errors: vec![ErrorReport {
-            id: Some("corrupt".to_string()),
-            kind: Kind::Unusable,
-            message: "why".to_string(),
-        }],
+        errors: vec![ErrorReport::said(
+            Some("corrupt".to_string()),
+            Kind::Unusable,
+            "why".to_string(),
+        )],
         undetermined: Vec::new(),
     };
 
@@ -146,7 +142,7 @@ fn an_undetermined_error_is_not_reported_as_unusable() {
         recovery: "re-run as root".to_string(),
     };
 
-    let report = status_error("frpc", &e);
+    let report = status_error("frpc", e);
 
     assert_eq!(report.kind, Kind::Undetermined);
     assert_eq!(
@@ -166,7 +162,7 @@ fn a_step_over_not_installed_is_reported_as_not_installed() {
         source: Box::new(Error::NotInstalled { id: "frpc".to_string() }),
     };
 
-    let report = status_error("frpc", &e);
+    let report = status_error("frpc", e);
 
     assert_eq!(report.kind, Kind::NotInstalled);
     assert_eq!(
@@ -278,4 +274,63 @@ fn emit_returns_the_reports_own_code_when_the_write_succeeds() {
     assert_eq!(code, ExitCode::Indeterminate);
     assert!(!out.is_empty(), "the document is on stdout");
     assert!(err.is_empty(), "nothing is said about a write that worked");
+}
+
+// The document carries the exact text ---------------------------------------------------------------------------------
+
+/// The exact text for `--json`; the human sinks escape.
+#[skuld::test]
+fn a_refused_id_is_reported_as_the_id_was_given() {
+    let id = "a\nb\u{202e}";
+    let e = crate::spec::Id::try_from(id.to_string()).unwrap_err();
+    assert_eq!(
+        invalid_id(id, e).message,
+        "id `a\nb\u{202e}` does not match the required pattern ^[A-Za-z0-9._-]{1,80}$"
+    );
+}
+
+#[skuld::test]
+fn an_errors_message_in_the_document_is_its_unescaped_chain() {
+    let step = || Error::Step {
+        what: "step\u{202e}".to_string(),
+        source: Box::new(Error::os_at("read", "/a\nb", std::io::Error::other("x"))),
+    };
+    assert_eq!(
+        status_error("frpc", step()).message,
+        "step\u{202e}: failed to read /a\nb: x"
+    );
+    assert_eq!(
+        unavailable(step()).errors[0].message,
+        "step\u{202e}: failed to read /a\nb: x"
+    );
+}
+
+/// The three places that say `installed but unusable: ` (the document's message, the `error:` line
+/// and the `warning:` line) take it from the one reason, so they agree, whatever the reason is.
+#[skuld::test]
+fn every_rendering_of_an_unusable_entry_has_the_same_prefix_and_reason() {
+    use crate::cli::support::{partition_installed, print_unusable_warnings};
+    use crate::error::error_tests::os;
+    use crate::manager::Installed;
+
+    let reasons = [
+        Reason::said("damaged"),
+        Reason::failed(os("read", "/p", "denied")),
+        Reason::around("scan (", os("read", "/p", "denied"), ")."),
+    ];
+    for reason in reasons {
+        let index = partition_installed(vec![Installed::OursUnusable {
+            name: "x".to_string(),
+            reason: reason.clone(),
+        }]);
+        let report = from_index(&index);
+        let message = format!("installed but unusable: {}", reason.unescaped());
+        assert_eq!(report.errors[0].message, message);
+
+        let (mut err, mut warn) = (Vec::new(), Vec::new());
+        print_errors(&report, &mut err);
+        print_unusable_warnings(&index.unusable, &mut warn);
+        assert_eq!(String::from_utf8(err).unwrap(), format!("error: x: {message}\n"));
+        assert_eq!(String::from_utf8(warn).unwrap(), format!("warning: x: {message}\n"));
+    }
 }

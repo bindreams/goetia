@@ -20,10 +20,12 @@ pub fn run(
 ) -> ExitCode {
     // The `Report` is built in both modes, and both take their exit code
     // from it — see [`report`]'s module doc comment.
-    let index = get_manager().and_then(|mgr| mgr.list()).map(partition_installed);
-    let report = match &index {
-        Ok(index) => report::from_index(index),
-        Err(e) => report::unavailable(e),
+    let (index, report) = match get_manager().and_then(|mgr| mgr.list()).map(partition_installed) {
+        Ok(index) => {
+            let report = report::from_index(&index);
+            (Some(index), report)
+        }
+        Err(e) => (None, report::unavailable(e)),
     };
 
     if json {
@@ -31,10 +33,8 @@ pub fn run(
     }
 
     match &index {
-        Ok(index) => print_text(index, out, err),
-        Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
-        }
+        Some(index) => print_text(index, out, err),
+        None => report::print_errors(&report, err),
     }
 
     report::exit_code(&report)

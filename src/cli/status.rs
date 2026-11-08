@@ -28,7 +28,7 @@ pub fn run(
 ) -> ExitCode {
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
-        Err(e) => return unavailable(&e, json, out, err),
+        Err(e) => return unavailable(e, json, out, err),
     };
 
     if args.ids.is_empty() {
@@ -47,10 +47,10 @@ pub fn run(
     };
     for id_str in &args.ids {
         match parse_id(id_str) {
-            Err(e) => report.errors.push(report::invalid_id(id_str, &e)),
+            Err(e) => report.errors.push(report::invalid_id(id_str, e)),
             Ok(id) => match mgr.status(&id) {
                 Ok(status) => report.daemons.push(report::daemon(id_str, &status)),
-                Err(e) => report.errors.push(report::status_error(id_str, &e)),
+                Err(e) => report.errors.push(report::status_error(id_str, e)),
             },
         }
     }
@@ -65,20 +65,22 @@ pub fn run(
 
 /// `report::unavailable` always maps to exit 1; taken from
 /// `report::exit_code` here so json and text agree.
-fn unavailable(e: &Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+fn unavailable(e: Error, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let report = report::unavailable(e);
     if json {
         return report::emit(&report, out, err);
     }
-    let _ = writeln!(err, "error: {}", e.report());
+    report::print_errors(&report, err);
     report::exit_code(&report)
 }
 
 fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let index = mgr.list().map(partition_installed);
-    let report = match &index {
-        Ok(index) => report::from_index(index),
-        Err(e) => report::unavailable(e),
+    let (index, report) = match mgr.list().map(partition_installed) {
+        Ok(index) => {
+            let report = report::from_index(&index);
+            (Some(index), report)
+        }
+        Err(e) => (None, report::unavailable(e)),
     };
 
     if json {
@@ -86,15 +88,13 @@ fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &m
     }
 
     match &index {
-        Ok(index) => {
+        Some(index) => {
             // An unusable entry is a `warning:` here, not an `error:` line.
             print_unusable_warnings(&index.unusable, err);
             print_undetermined_warnings(&index.undetermined, err);
             print_daemons(&report, out);
         }
-        Err(e) => {
-            let _ = writeln!(err, "error: {}", e.report());
-        }
+        None => report::print_errors(&report, err),
     }
 
     report::exit_code(&report)
@@ -102,16 +102,7 @@ fn status_all(mgr: &dyn ServiceManager, json: bool, out: &mut dyn Write, err: &m
 
 fn print_text(report: &Report, out: &mut dyn Write, err: &mut dyn Write) {
     print_daemons(report, out);
-    for error in &report.errors {
-        match &error.id {
-            Some(id) => {
-                let _ = writeln!(err, "error: {id}: {}", error.message);
-            }
-            None => {
-                let _ = writeln!(err, "error: {}", error.message);
-            }
-        }
-    }
+    report::print_errors(report, err);
 }
 
 fn print_daemons(report: &Report, out: &mut dyn Write) {
@@ -131,3 +122,7 @@ fn format_status_line(daemon: &DaemonReport) -> String {
         daemon.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string()),
     )
 }
+
+#[cfg(test)]
+#[path = "status_tests.rs"]
+mod status_tests;
