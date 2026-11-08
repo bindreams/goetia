@@ -33,11 +33,6 @@ pub enum WantState {
 impl WantState {
     /// The states a registration for `self` fires on: the single definition of the notification
     /// mask, which `system::want_to_mask` folds into bits and the unit tests' model of SCM reads.
-    ///
-    /// A start wait arms [`WantState::RunningPausedOrStopped`]: it is armed after `start()`, when the
-    /// service has entered `StartPending`, so a `StartPending -> Stopped` delivers a real `Stopped` that
-    /// ends the wait with the failed start it is, and a `StartPending -> Paused` a `Paused` that ends it
-    /// with the service not running.
     pub(crate) fn states(self) -> &'static [QueriedState] {
         use QueriedState::{Paused, Running, StopPending, Stopped};
         match self {
@@ -51,11 +46,8 @@ impl WantState {
 
 /// The service state a `wait_callback` observed. Distinct from [`WantState`]:
 /// a callback can report a state that is neither what the caller wants nor
-/// its opposite. `Running`, `Paused` and `Stopped` are settled. The start wait ends on each: `Running`
-/// confirms, `Paused` fails, `Stopped` is read by `kind`. `settle_and_stop` sends STOP on `Running` or
-/// `Paused` (an error if the service does not accept it) and ends on `Stopped`; `stop_via_notify` is
-/// never delivered `Paused`. `Pending` is any intermediate (`StartPending`/`StopPending`) and re-arms
-/// the stop waits.
+/// its opposite. `Running`, `Paused` and `Stopped` are settled; `Pending` is any intermediate
+/// (`StartPending`/`StopPending`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
     Running,
@@ -466,7 +458,8 @@ pub fn wait_after_stop<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str,
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sighting {
     /// After an arm, the status the arm returned. After a notification, the state it reported with the
-    /// actor's buffered exit, wait hint and STOP acceptance for that delivery.
+    /// actor's buffered exit, wait hint and STOP acceptance for that delivery; after one of `PAUSED`,
+    /// the status read in its place.
     pub status: QueriedStatus,
     /// Whether a notification of this wait was already delivered, and the wait re-armed after it.
     /// The first arm reads whatever state the service was in; after a delivery the service is on its
@@ -483,7 +476,9 @@ pub struct Sighting {
 /// that ran out of `deadline` are [`Waited::Expired`]. A service marked for deletion or gone is decided
 /// as `decided_or_status` says. A notification of a pending state re-arms without asking `other`, and
 /// so does one the armed mask excludes: SCM does not deliver a state its mask excludes; if one arrives
-/// it is treated as pending. Every other state, from a status or a notification, goes to
+/// it is treated as pending. A notification of `PAUSED` is replaced by [`ScmActor::query_status`]: the
+/// delivery may report the state at registration, and a paused service may have resumed since. Every
+/// other state, from a status or a notification, goes to
 /// `other` as a [`Sighting`]: `Break` ends the wait with that answer, an error ends it with the error,
 /// and `Continue` keeps waiting (after a notification, by re-arming).
 ///
@@ -512,9 +507,12 @@ pub fn wait_until<A: ScmActor>(
             },
             None => match a.wait_callback(deadline)? {
                 None => return Ok(Waited::Expired),
-                Some(observed) => notified_state(observed)
-                    .filter(|state| mask.states().contains(state))
-                    .map(|state| delivered_status(a, state)),
+                Some(observed) => match notified_state(observed).filter(|state| mask.states().contains(state)) {
+                    // A delivery reports the state at registration, which the service can have left by now.
+                    Some(QueriedState::Paused) => Some(a.query_status()?),
+                    Some(state) => Some(delivered_status(a, state)),
+                    None => None,
+                },
             },
         };
         if let Some(status) = status {
@@ -592,7 +590,7 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
         StartReply::Accepted => Ok(()),
         StartReply::AlreadyRunning(queried) if already_running_is_recoverable(queried) => Ok(()),
         StartReply::AlreadyRunning(QueriedState::StopPending) => Err(io::Error::other(STOPPING)),
-        StartReply::AlreadyRunning(QueriedState::Paused) => Err(io::Error::other(PAUSED)),
+        StartReply::AlreadyRunning(QueriedState::Paused | QueriedState::PausePending) => Err(io::Error::other(PAUSED)),
         StartReply::AlreadyRunning(queried) => Err(io::Error::other(format!(
             "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
              {queried:?} — neither Running nor StartPending, so nothing is on its way to running"
@@ -601,8 +599,7 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
 }
 
 /// What a start is told when the service is `PAUSED` instead of `RUNNING`, whether it settled so after
-/// the start or SCM answered 1056 over it. The caller's error prefix names the service; `sc continue`
-/// takes its name too.
+/// the start or SCM answered 1056 over it.
 const PAUSED: &str = "the service is paused, not running: `sc continue` resumes it";
 
 /// What a start over a `STOP_PENDING` service is told. SCM refuses the start (1056), so reporting it
@@ -610,10 +607,12 @@ const PAUSED: &str = "the service is paused, not running: `sc continue` resumes 
 /// restarted by SCM under the service's restart policy (P18a, P26).
 const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be started yet. SCM may start it again itself under its restart policy. Run the start again once it has stopped";
 
-/// Start the service, gated strictly on a real `RUNNING` callback; under the same `deadline`
-/// throughout, so that a service that stays `START_PENDING` forever ends at the caller's budget
-/// instead of never. The wait ends on `RUNNING` (confirmed), on `STOPPED` (read by `kind`, below) and on
-/// `PAUSED`, which is an error: a paused service is settled and does not reach `RUNNING` by itself.
+/// Start the service and wait for a settled state, from an arm's status or a notification, under the
+/// same `deadline` throughout, so that a service that stays `START_PENDING` forever ends at the caller's
+/// budget instead of never. `RUNNING` confirms, `STOPPED` is read by `kind` (below), and `PAUSED` is an
+/// error: a paused service does not reach `RUNNING` by itself. A notified `PAUSED` is not decided on
+/// alone, as the first arm may queue a delivery of the state at registration, which the service can have
+/// left; the status read decides, and a state that is pending keeps the wait going.
 ///
 /// A terminal `Stopped` before `Running` is read by `kind`. For `type: simple` it is a start when
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
@@ -627,9 +626,9 @@ const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be 
 /// issuing `start`, and decide on the status the arm returns and the notifications after it. A
 /// registration made before the start would fire at once for a `RUNNING` already current, and a run
 /// that then failed would have that stale `RUNNING` confirm a start whose new run has reported
-/// nothing. A service that reached `RUNNING`, `PAUSED` or `STOPPED` before the arm is seen in the
-/// status the arm returns, as a registration is not delivered for a state already current. Every
-/// state the mask delivers ends the wait, so the start never re-arms.
+/// nothing. The status is read after the registration and decides: a service already `RUNNING`,
+/// `PAUSED` or `STOPPED` is seen there. The first arm on a fresh handle may also queue an at-once
+/// delivery of the state at registration (P20, P27), which can be older than that status.
 ///
 /// An `ERROR_SERVICE_ALREADY_RUNNING` over a service the query reports
 /// `Running` is the SCM's own answer that the goal is reached, so it is the
@@ -655,7 +654,6 @@ pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind:
                 let status = sighting.status;
                 stopped_before_running(kind, joined_a_start, status.exit, status.wait_hint).map(ControlFlow::Break)
             }
-            // From a notification or from an arm's status alike.
             QueriedState::Paused => Err(io::Error::other(PAUSED)),
             // Any other state waits: a pending one is what the wait is for.
             _ => Ok(ControlFlow::Continue(())),
@@ -846,13 +844,17 @@ pub struct QueriedStatus {
     pub wait_hint: u32,
 }
 
-/// Whether 1056 still counts as a start, for the plain `start` verb: `Running` and `StartPending`
-/// are states the service is heading to running from; every other state is not, and accepting it
-/// would report a start that did not happen. `restart --timeout 0` never consults it
+/// Whether 1056 still counts as a start, for the plain `start` verb: `Running`, `StartPending` and
+/// `ContinuePending` are states the service is heading to running from; every other state is not, and
+/// accepting it would report a start that did not happen. A `PausePending` one settles `PAUSED`, which
+/// [`PAUSED`] tells. `restart --timeout 0` never consults it
 /// ([`request_start_after_stop`]).
 #[must_use]
 pub(crate) fn already_running_is_recoverable(queried: QueriedState) -> bool {
-    matches!(queried, QueriedState::Running | QueriedState::StartPending)
+    matches!(
+        queried,
+        QueriedState::Running | QueriedState::StartPending | QueriedState::ContinuePending
+    )
 }
 
 /// `NotifyServiceStatusChangeW`'s "you are too far behind" return. Not among
