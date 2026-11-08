@@ -476,8 +476,8 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// Seeding [`UNDETERMINED_ID`] changes `list`'s answer for the whole host, not
 /// only for that id. A caller whose suite also asserts a *clean* host-wide
 /// listing has to serialize the two against each other: the integration suites
-/// share `UNIT_DIR_EXCLUSIVE` by name, and each such test both carries it in
-/// `labels` and declares `serial = UNIT_DIR_EXCLUSIVE`.
+/// share a label by name (`UNIT_DIR_EXCLUSIVE` on Linux and macOS, `SCM_DENIAL` on
+/// Windows), and each such test both carries it in `labels` and declares `serial` on it.
 ///
 /// A backend satisfies the `list` half by naming the id in an
 /// [`Installed::Undetermined`] entry *or* by emitting any aggregate one. The

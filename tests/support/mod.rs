@@ -1,7 +1,7 @@
 //! Shared support for the integration suites.
 //!
 //! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only
-//! `daemon_spec`, `kill` and `scm_wait` depend on the `goetia` crate; the
+//! `daemon_spec`, `kill`, `list_json` and `scm_wait` depend on the `goetia` crate; the
 //! marker-inertness probe's hand-written artifacts use the rest.
 
 #![allow(dead_code, unused_imports)]
@@ -14,6 +14,7 @@ pub mod connect_back;
 pub mod daemon_spec;
 pub mod elevation;
 pub mod kill;
+pub mod list_json;
 #[cfg(windows)]
 pub mod raw_registry;
 #[cfg(windows)]
@@ -38,6 +39,7 @@ use rand::RngExt as _;
 pub use connect_back::ConnectBack;
 pub use daemon_spec::spec;
 pub use elevation::{ELEVATED, elevated};
+pub use list_json::{ListJson, assert_own, list_json, may_account_for};
 #[cfg(windows)]
 pub use scratch::ScratchKey;
 pub use service_guard::ServiceGuard;
