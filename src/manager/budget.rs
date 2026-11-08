@@ -115,7 +115,7 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
 /// `budget` waiting for the service's process `pid` to exit.
 ///
 /// Takes the `Budget` for the reasons [`timed_out`] does. `terminate_failed` is why ending the
-/// process failed, if it did; the error keeps it as its source.
+/// process failed, if it did; the error names it, and does not take it as its source.
 pub fn process_timed_out(
     id: &str,
     pid: u32,

@@ -186,9 +186,10 @@ fn an_abandoned_restart_keeps_the_failed_terminate_of_the_process() {
         ),
         "{report}"
     );
+    assert_eq!(report, e.to_string(), "the whole sentence is the error's text");
     assert!(
-        std::error::Error::source(&e).is_some(),
-        "the failed terminate stays the source"
+        std::error::Error::source(&e).is_none(),
+        "the failed terminate is named in the text, not the source"
     );
 }
 

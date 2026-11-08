@@ -480,11 +480,14 @@ pub enum Error {
     /// Exit `4` (indeterminate), like [`WaitTimeout`](Error::WaitTimeout): the stop is not
     /// finished, though not failed.
     ///
-    /// `terminate_failed` is the source: its text follows [`TERMINATE_FAILED_CLAUSE`] in
-    /// [`report`](Error::report), and `recovery` is the remedy, which follows it.
+    /// `terminate_failed` is not the source: the timeout is not an OS failure, and a source would
+    /// have [`raw_os_error`](Error::raw_os_error) answer with the terminate's code. Its text follows
+    /// [`TERMINATE_FAILED_CLAUSE`] in the `Display`, which ends with `recovery`.
     #[error(
-        "`{id}` is stopped, but its process (pid {pid}) had not exited within {waited}{}",
-        terminate_failed.as_ref().map_or("", |_| TERMINATE_FAILED_CLAUSE),
+        "`{id}` is stopped, but its process (pid {pid}) had not exited within {waited}{}. {recovery}",
+        terminate_failed
+            .as_ref()
+            .map_or_else(String::new, |e| format!("{TERMINATE_FAILED_CLAUSE}: {e}")),
         waited = humantime::format_duration(*waited)
     )]
     ProcessWaitTimeout {
@@ -492,7 +495,6 @@ pub enum Error {
         pid: u32,
         waited: std::time::Duration,
         /// Why goetia's attempt to end the process failed, if it did.
-        #[source]
         terminate_failed: Option<Arc<std::io::Error>>,
         recovery: String,
     },
@@ -825,7 +827,7 @@ impl Error {
     /// A variant with no source keeps its remedy in its `Display`, where nothing follows it.
     pub fn remedy(&self) -> Option<&str> {
         match self {
-            Error::Undetermined { recovery, .. } | Error::ProcessWaitTimeout { recovery, .. } => Some(recovery),
+            Error::Undetermined { recovery, .. } => Some(recovery),
             Error::ServiceImageUnreadable { .. } => Some(
                 "An administrator must make each named service's registry key readable, or let SCM query it \
                  (`SERVICE_QUERY_CONFIG`)",
