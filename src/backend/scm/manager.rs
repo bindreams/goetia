@@ -292,7 +292,7 @@ impl Backend for Scm {
     /// would otherwise register a file that was never placed), an absolute path whose folder passes
     /// the folder check, to a file carrying this library's marker. A sweep that cannot read what is
     /// referenced or cannot delete a file does not fail the install: the file is not what the
-    /// install needs, and the next sweep finds it (owner, 2026-11-02). `type: managed` has no host,
+    /// install needs, and the next sweep finds it. `type: managed` has no host,
     /// so nothing is held or checked: its preconditions are `apply`'s, before any write.
     fn begin_install(&self, spec: &DaemonSpec, desired: &ScmRegistration) -> Result<Option<InstallLock>> {
         if spec.kind != Kind::Simple {

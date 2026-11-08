@@ -490,7 +490,7 @@ fn a_service_key_that_is_a_link_is_read_through_to_its_target() {
 
 /// Writes keys under `HKLM\SOFTWARE`. A `Services` key that is marked deleted while the scan holds
 /// it (another handle deleted it) fails the open of a service below it with KEY_DELETED, which the
-/// read settles as #165's reads do: the service is gone when its own key is, and is not a failure.
+/// read settles the service as gone, not as a failure, as it does when its own key is gone.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn a_root_marked_deleted_under_the_scan_reads_the_service_as_gone() {
     let scratch = ScratchKey::new(&format!("image-{}-deleted-root", std::process::id()));
