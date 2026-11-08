@@ -1276,6 +1276,9 @@ impl Scm {
     /// host's, and is reported with whatever else fails: the wait and the provider's sweep go on.
     /// A provider's sweep that fails on the same lookup reports it too.
     ///
+    /// A provider whose `preview` failed has no folder to name, and sweeps all the same; that is told
+    /// only beside a failure of the cleanup, see [`finished_cleanup`].
+    ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
     /// runs it is in use, and is skipped without an error: the next sweep removes it once it is free.
@@ -1286,7 +1289,7 @@ impl Scm {
         // sweep removes it by. The provider asks where the default folder is too, so a lookup that
         // fails can be reported twice. When it cannot be located the host's folder may be it, so it
         // is named, not swept, and nothing else is skipped.
-        let mut failures: Vec<SweepFailure> = unknown.map(SweepFailure::from).into_iter().collect();
+        let mut failures: Vec<SweepFailure> = Vec::new();
         let (second, unswept) = match host
             .parent()
             .map(|folder| second_folder(folder, provider.path(), || Ok(normalise(&default_dir()?))))
@@ -1298,15 +1301,7 @@ impl Scm {
                 (None, host.parent())
             }
         };
-        let finish = |failures: Vec<SweepFailure>| {
-            SweepFailure::all(failures).map_or(Ok(()), |failure| {
-                let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
-                Err(Error::Step {
-                    what: left_behind_text(id, &provider, unswept, &files),
-                    source: failure.error,
-                })
-            })
-        };
+        let finish = |failures: Vec<SweepFailure>| finished_cleanup(id, &provider, unswept, unknown, failures);
         match process {
             // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
             // ended, through the handle held since before the stop, and waited for as `stop` waits
@@ -1345,6 +1340,33 @@ impl Scm {
         }
         finish(failures)
     }
+}
+
+/// The result of the cleanup of an uninstall that deleted `id`: `Ok` when every sweep succeeded, and
+/// otherwise the failures, led by what remains (see [`left_behind_text`]). `unknown` is why the
+/// provider's folder could not be named. The provider's sweep does not depend on it, so it is no
+/// failure of its own, and is told as context of one that is.
+fn finished_cleanup(
+    id: &Id,
+    provider: &ProviderFolder,
+    unswept: Option<&Path>,
+    unknown: Option<Error>,
+    failures: Vec<SweepFailure>,
+) -> Result<()> {
+    SweepFailure::all(failures).map_or(Ok(()), |failure| {
+        let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
+        let cause = match unknown {
+            Some(unknown) => Box::new(Error::Both {
+                first: failure.error,
+                then: Box::new(unknown),
+            }),
+            None => failure.error,
+        };
+        Err(Error::Step {
+            what: left_behind_text(id, provider, unswept, &files),
+            source: cause,
+        })
+    })
 }
 
 /// What [`disable_before_delete`] did.

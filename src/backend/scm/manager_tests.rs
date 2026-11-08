@@ -797,6 +797,41 @@ fn the_providers_folder_is_none_known_or_unknown() {
     );
 }
 
+/// What an uninstall makes of the failures of its cleanup and of a failed `preview`: the provider's
+/// sweep does not depend on `preview`, so a folder that could not be named is no failure of its own,
+/// and is told only beside one that is.
+#[skuld::test]
+fn a_failed_preview_is_no_failed_cleanup_and_is_context_for_one() {
+    let id = Id::try_from("frpc").unwrap();
+    let unknown = || {
+        Some(Error::Step {
+            what: "the folder of this program's shim provider could not be determined".to_string(),
+            source: Box::new(Error::ShimPathRelative {
+                path: PathBuf::from("host.exe"),
+            }),
+        })
+    };
+
+    finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), vec![])
+        .expect("every sweep succeeded, so the folder is not an error");
+
+    let file = PathBuf::from(r"C:\app\goetia-shim.exe");
+    let failure = SweepFailure {
+        error: Box::new(Error::os_at(
+            "delete",
+            &file,
+            std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32),
+        )),
+        not_deleted: vec![file],
+    };
+    let said = finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), vec![failure])
+        .expect_err("a file could not be deleted")
+        .report()
+        .to_string();
+    assert!(said.contains("could not be removed"), "{said}");
+    assert!(said.contains("could not be determined"), "{said}");
+}
+
 /// A `stop` whose process could not be opened says so in the error that follows, led by it, and the
 /// error under it keeps its class: a timeout is still indeterminate.
 #[skuld::test]
