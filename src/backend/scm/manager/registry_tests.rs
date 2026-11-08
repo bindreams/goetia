@@ -460,6 +460,28 @@ fn a_registered_image_is_read_below_the_root_it_is_given() {
     assert_eq!(read("not-listed-any-more"), None);
 }
 
+/// Writes keys under `HKLM\SOFTWARE`. SCM follows a registry link at `Services\<name>`, and so the
+/// sweep reads the target's `ImagePath`: left out of what is referenced, the host the service starts
+/// would be deleted.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_is_read_through_to_its_target() {
+    let unique = std::process::id();
+    // The target first, so that it is removed last.
+    let target = ScratchKey::new(&format!("image-{unique}-link-target"));
+    let root_scratch = ScratchKey::new(&format!("image-{unique}-link-root"));
+    target
+        .create()
+        .set_raw_value(IMAGE_PATH_VALUE, &r"C:\linked\host.exe --x".to_reg_value())
+        .expect("write ImagePath");
+    let root = root_scratch.create();
+    let _link = create_link(&root, "linked", &target.nt_path());
+    let services = ServicesRoot::new(&root);
+
+    let read = read_registered_image(&services, "linked").expect("read the linked service");
+
+    assert_eq!(read.as_deref(), Some(r"C:\linked\host.exe --x"));
+}
+
 /// Writes keys under `HKLM\SOFTWARE`. A `Services` key that is marked deleted while the scan holds
 /// it (another handle deleted it) fails the open of a service below it with KEY_DELETED, which the
 /// read settles as #165's reads do: the service is gone when its own key is, and is not a failure.

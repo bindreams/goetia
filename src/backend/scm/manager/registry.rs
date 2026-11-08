@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
 
 mod counted;
+use counted::LinkHandling;
 mod settle;
 pub use settle::Origin;
 use settle::{Failure, Settled, Stop, settle, stands, tolerate_not_found};
@@ -175,7 +176,7 @@ pub fn read_parameters_in(
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
             let (relative, access) = parameters_read_request(name);
-            let key = counted::open_child(services.0, &relative, access)
+            let key = counted::open_child(services.0, &relative, access, LinkHandling::Itself)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), Some(Parameters::default())))?;
             let mut parameters = Parameters::default();
             // The names as stored, for a field found not to be a string.
@@ -515,7 +516,8 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
 /// service key was marked deleted at the open or mid-read and the service no longer stands, which is
 /// how [`settle`] reads every key that vanishes (the scan vouches for the name, [`Origin::Vouched`]).
 /// Any other failure to read is an error, a key that vanished under a service that still stands
-/// included: what the service runs is then unknown.
+/// included: what the service runs is then unknown. A service key that is a registry link is read
+/// through it, as SCM reads it.
 pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<Option<String>> {
     let path = service_key_path(name);
     let read = read_settled(
@@ -523,8 +525,13 @@ pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<
         || service_stands(name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
-            let key = counted::open_child(services.0, &name.encode_utf16().collect::<Vec<_>>(), KEY_READ)
-                .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
+            let key = counted::open_child(
+                services.0,
+                &name.encode_utf16().collect::<Vec<_>>(),
+                KEY_READ,
+                LinkHandling::Followed,
+            )
+            .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
             match key.get_value::<u32, _>(DELETE_FLAG_VALUE) {
                 Ok(0) => {}
                 Ok(_) => return Ok(None),
