@@ -698,7 +698,7 @@ fn command(exe: impl Into<PathBuf>) -> HostCommand {
     }
 }
 
-/// The install renders from the first `preview`, so the registration names that host. A provider
+/// The install renders from the `preview`, so the registration names that host. A provider
 /// whose `provide` places another (the sibling shim upgraded while the install waited on the lock,
 /// or a `preview` and `provide` that disagree) provides a file the registration does not name:
 /// refused as a mismatch, with nothing registered. This install fails before anything is

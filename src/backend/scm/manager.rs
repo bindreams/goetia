@@ -288,7 +288,7 @@ impl Backend for Scm {
     /// has come before the lock is taken or the provider writes. The lock is taken and the files
     /// nothing references are swept, and then the host is provided and checked before anything is
     /// read: `provide` must return the host `desired` registers (the flow's render, from the
-    /// provider's first `preview`: a sibling shim upgraded while the install waited on the lock
+    /// provider's `preview`: a sibling shim upgraded while the install waited on the lock
     /// would otherwise register a file that was never placed), an absolute path whose folder passes
     /// the folder check, to a file carrying this library's marker. A sweep that cannot read what is
     /// referenced or cannot delete a file does not fail the install: the file is not what the
