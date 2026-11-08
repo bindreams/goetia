@@ -105,7 +105,7 @@ use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_MARKED_F
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
-use self::registry::{Origin, RegistryReadOutcome};
+use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::Waited;
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
@@ -236,8 +236,7 @@ impl Backend for Scm {
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), e)),
         };
-        // `service` is open: the service key outlives it, so no second open asks whether it stands.
-        Ok(match registry::read_parameters(id.as_str(), Origin::Vouched)? {
+        Ok(match registry::read_parameters(id.as_str())? {
             RegistryReadOutcome::ServiceGone => ReadOutcome::Absent,
             RegistryReadOutcome::Read(parameters) => read_marker(parameters, Some(service)).named(id, ScmSnapshot::new),
         })
@@ -294,11 +293,11 @@ impl Backend for Scm {
             // neither omitted nor claimed: collected whole here, reported by
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
-            match registry::read_parameters_in(services, &name, Origin::Vouched) {
-                // Gone since `scan_services` listed it: not there to list. Only a `Parameters` key
-                // lost (marked deleted at open, or gone mid-read) reaches this, with the service
-                // key gone too; a plain missing key reads as a service that stands without it, a
-                // stale row at worst.
+            match registry::read_parameters_in(services, &name) {
+                // Gone since `scan_services` listed it: not there to list. A `Parameters` key not
+                // found, marked deleted or gone mid-read reaches this only if the service key is
+                // gone too. A service key that is a registry link to a missing key is not gone: it
+                // is an error, reported in the unreadable aggregate.
                 Ok(RegistryReadOutcome::ServiceGone) => {}
                 Ok(RegistryReadOutcome::Read(params)) => {
                     let entry = ScanEntry::of(&name, read_marker(params, None), ScmSnapshot::new);
@@ -432,7 +431,7 @@ fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<
 /// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no goetia `Marker` (none, or
 /// another service's own), kept apart from `Err` so callers can tell it from an undecodable spec.
 pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
-    match registry::read_parameters(id, Origin::Opened)? {
+    match registry::read_parameters(id)? {
         RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),
         RegistryReadOutcome::Read(params) => generate::extract(&params.fields, &params.strays),
     }
