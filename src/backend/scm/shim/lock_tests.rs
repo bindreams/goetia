@@ -1,8 +1,17 @@
 use std::io;
+use std::thread;
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER, ERROR_NOT_ENOUGH_MEMORY};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER, ERROR_NOT_ENOUGH_MEMORY, WAIT_TIMEOUT};
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+use windows_sys::Win32::System::Threading::MUTEX_MODIFY_STATE;
 
 use super::*;
+use crate::backend::test_elevation::{ELEVATED, elevated};
+
+/// Carried by every test that takes the real lock, which wait for each other: one's probe of who
+/// holds it must not see another's hold.
+#[skuld::label]
+const INSTALL_LOCK: skuld::Label;
 
 /// The lock's owner is Administrators, which a token without it enabled (an unelevated one) cannot
 /// give an object: `CreateMutexW` fails with `ERROR_INVALID_OWNER`. That is a need for elevation.
@@ -113,6 +122,48 @@ fn any_other_code_is_the_os_failure() {
         failure_kind(Some(ERROR_INVALID_OWNER as i32), true),
         FailureKind::NeedsElevation
     );
+}
+
+/// Whether some thread holds the real lock right now: a poll of its state from a thread that holds
+/// nothing, which takes the lock and gives it back when it is free.
+fn is_held_by_another_thread() -> bool {
+    thread::spawn(|| {
+        let name = wide_null(NAME);
+        // SAFETY: `name` is NUL-terminated.
+        let raw = unsafe { OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, 0, name.as_ptr()) };
+        assert!(!raw.is_null(), "open the lock: {}", io::Error::last_os_error());
+        // SAFETY: a valid handle `OpenMutexW` just returned and nothing else owns.
+        let mutex = unsafe { OwnedHandle::from_raw_handle(raw) };
+        // SAFETY: `mutex` is a live handle with `SYNCHRONIZE`; a zero wait asks for the state.
+        match unsafe { WaitForSingleObject(mutex.as_raw_handle(), 0) } {
+            WAIT_TIMEOUT => true,
+            WAIT_OBJECT_0 | WAIT_ABANDONED => {
+                // SAFETY: this thread took the mutex just above.
+                assert_ne!(unsafe { ReleaseMutex(mutex.as_raw_handle()) }, 0);
+                false
+            }
+            other => panic!("poll the lock: {other}"),
+        }
+    })
+    .join()
+    .unwrap()
+}
+
+/// A provider's `sweep` takes the lock whoever calls it, including a caller that holds it already
+/// (`Scm` does): a second take succeeds, and the lock is let go only when both are dropped.
+///
+/// What the `sweep` itself holds is not observable from here without a seam in the provider.
+#[skuld::test(requires = [elevated], labels = [ELEVATED, INSTALL_LOCK], serial = INSTALL_LOCK)]
+fn a_lock_taken_again_by_its_holder_is_released_one_level_at_a_time() {
+    let outer = InstallLock::acquire().unwrap();
+    let inner = InstallLock::acquire().unwrap();
+    assert!(is_held_by_another_thread());
+
+    drop(inner);
+    assert!(is_held_by_another_thread(), "the outer hold is still the thread's");
+
+    drop(outer);
+    assert!(!is_held_by_another_thread());
 }
 
 /// Any other failure is the OS's, as it was.

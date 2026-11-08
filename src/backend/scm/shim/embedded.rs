@@ -63,6 +63,7 @@ mod stock {
     use super::super::acl::{
         Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, read_object, require_acls_under,
     };
+    use super::super::lock::InstallLock;
     use super::super::marker::read_retrying;
     use super::super::provider::ShimProvider;
     use super::super::sweep::{SweepFailure, sweep_folder};
@@ -127,8 +128,9 @@ mod stock {
 
         /// Deletes the shim files in `dir`, and what a repair or a crash left beside them, that no
         /// path of `referenced` names, and removes `dir` when that leaves it empty and it is the
-        /// default folder; see [`sweep_folder`].
+        /// default folder; see [`sweep_folder`]. Takes the install lock itself.
         fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+            let _lock = InstallLock::acquire()?;
             match &self.dir {
                 Some(dir) => sweep_folder(absolute(dir)?, referenced, default_dir),
                 // The folder is the default one: the lookup that found it is the answer to the
@@ -178,6 +180,7 @@ mod stock {
 
         /// As [`EmbeddedStockShim`]'s, over the default folder, and whether or not the sibling is there.
         fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+            let _lock = InstallLock::acquire()?;
             let dir = default_dir()?;
             sweep_folder(&dir, referenced, || Ok(dir.clone()))
         }
