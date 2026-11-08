@@ -1596,25 +1596,33 @@ fn launchctl_sends_requests_as_requests_and_reads_as_queries() {
 
 /// A deadline that expired before `launchctl` finished is neither a success nor a failure of the
 /// call: each call says so as `Ok(None)`, and a read of live state as `Unknown`, which the verb
-/// above it turns into a wait timeout or a state it does not know.
+/// above it turns into a wait timeout or a state it does not know. A read expires as
+/// [`Finished::Expired`], a request as [`Finished::Left`]; an expired `kickstart` is followed by
+/// the one `print` that decides whether it is ended (see `end_if_held`).
 #[skuld::test]
 fn launchctl_calls_that_expire_report_the_expiry() {
     let id = never_installed();
     let id = id.as_str();
     let deadline = Budget::DEFAULT.start();
     let path = Path::new("/nonexistent/goetia-expiry.plist");
-    let mut held = reservation(4, 6);
+    let mut held = reservation(4, 7);
     let expired = |verb| launchctl_replying(verb, Finished::Expired).0;
+    let left = |verb| launchctl_replying(verb, Finished::Left(Left::new(|_| {}))).0;
 
     let loaded = expired("print").is_loaded(id, deadline, &mut held);
     assert!(loaded.expect("an expiry is not a failure").is_none());
-    let bootstrapped = expired("bootstrap").bootstrap(path, deadline, &mut held);
+    let bootstrapped = left("bootstrap").bootstrap(path, deadline, &mut held);
     assert!(bootstrapped.expect("an expiry is not a failure").is_none());
-    let started = expired("kickstart").kickstart(id, Budget::DEFAULT, deadline, &mut held);
+    let fake = Fake::new([
+        reply(&["kickstart"], Finished::Left(Left::new(|_| {}))),
+        answer("print", NOT_RUNNING),
+    ]);
+    let started = Launchctl::new(Box::new(fake.clone())).kickstart(id, Budget::DEFAULT, deadline, &mut held);
     assert!(started.expect("an expiry is not a failure").is_none());
-    let booted_out = expired("bootout").bootout(id, deadline, &mut held);
+    fake.assert_spent("an expired kickstart is followed by one print");
+    let booted_out = left("bootout").bootout(id, deadline, &mut held);
     assert!(booted_out.expect("an expiry is not a failure").is_none());
-    let killed = expired("kill").kill_job(id, deadline, &mut held);
+    let killed = left("kill").kill_job(id, deadline, &mut held);
     assert!(killed.expect("an expiry is not a failure").is_none());
 
     for role in [Role::Query, Role::UncountedQuery] {
@@ -1633,7 +1641,7 @@ fn a_stop_whose_bootout_expires_is_a_wait_timeout() {
     use crate::backend::Backend;
 
     let id = never_installed();
-    let fake = Fake::new([reply(&["bootout"], Finished::Expired)]);
+    let fake = Fake::new([reply(&["bootout"], Finished::Left(Left::new(|_| {})))]);
     let mgr = launchd_over(fake.clone());
 
     let e = Backend::stop(&mgr, marked_plist(&id), Budget::DEFAULT, &mut reserved(&[Step::Stop])).expect_err("expired");
