@@ -1164,9 +1164,13 @@ impl Scm {
         };
         if let Some(held) = held {
             // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
-            // ended, through the handle held since before the stop. A terminate that fails is not
-            // an error, as for `stop`: the process is on its way out by itself, and the wait decides.
-            let _ = held.terminate();
+            // ended, through the handle held since before the stop. A process that cannot be ended
+            // is not waited for: the wait has no bound, and the service is already deleted. Its
+            // file stays for the next sweep.
+            if let Err(e) = held.terminate() {
+                failures.push(Error::os(format!("terminate `{id}`'s process {}", held.pid()), e).into());
+                return finish(failures);
+            }
             match held.wait_for_exit(Budget::Unbounded.start(), || held.notice(id.as_str())) {
                 Ok(Waited::Confirmed) => {}
                 Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),
