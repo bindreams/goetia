@@ -441,8 +441,8 @@ impl Backend for Scm {
 
     /// A service that may run a shim file takes the install lock first and keeps it to the end, so
     /// that no install places or sweeps a file between the stop and the sweep. If the service's host
-    /// is a shim file by name, its process is held after the service is disabled and has settled,
-    /// just before the stop (see [`uninstall_locked`]), and once the service is stopped
+    /// is a shim file by name, its process is held after the service is disabled, before the stop or
+    /// the wait for one under way (see [`uninstall_locked`]), and once the service is stopped
     /// and deleted the uninstall waits for that process and sweeps the folders the files can be in:
     /// see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
     fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
@@ -1021,8 +1021,9 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// the record is removed, which is what `uninstall` is for. A second `uninstall` racing the first
 /// can meet 1060 at the first open.
 ///
-/// With `hold`, the service's process is held once it is disabled and settled, just before each STOP,
-/// and handed back in [`Uninstalled::Deleted`] for the caller to wait for: SCM records `STOPPED`
+/// With `hold`, the service's process is held once it is disabled: just before each STOP, once the
+/// state has settled, or at once for a service already `STOP_PENDING`, with no STOP of ours. It is
+/// handed back in [`Uninstalled::Deleted`] for the caller to wait for: SCM records `STOPPED`
 /// before the process exits, and reports no pid after it. It may be running an older file than the
 /// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
 /// process that cannot be opened is none (see [`hold_if_possible`]). The service handle each hold
@@ -1048,14 +1049,15 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, hold: bool) -> Result<Unin
 
     // Taken here and not before the disable: a start in flight at the disable, or a recovery
     // restart, replaces the process, and a disabled service cannot be started again. Taken again for
-    // each STOP the loop sends, so the one kept is the process that STOP is for.
+    // each STOP the loop sends, so the one kept is the process that STOP is for, and once for a
+    // service that is already `STOP_PENDING`, which no STOP of ours is sent to.
     let mut process = HoldOutcome::NoProcess;
     let mut hold_failed = None;
     let settled = super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start(), |_| {
         if !hold {
             return Ok(());
         }
-        let not_done = format!("`{id}`'s process could not be held before its STOP");
+        let not_done = format!("`{id}`'s process could not be held to wait for its exit");
         match hold_process(id, Budget::Unbounded.start(), &not_done) {
             Ok(HoldOutcome::Expired { .. }) => unreachable!("an unbounded deadline does not expire"),
             Ok(held) => {

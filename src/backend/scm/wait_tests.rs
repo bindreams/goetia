@@ -1197,15 +1197,15 @@ fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Wai
     super::settle_and_stop(a, deadline, |_| Ok(()))
 }
 
-/// The `before_stop` of a caller that logs it in the fake's own log, so that its place among the
-/// steps is what the log says.
+/// The `hold` of a caller that logs it in the fake's own log, so that its place among the steps is
+/// what the log says.
 fn holding(fake: &mut FakeScm) -> io::Result<()> {
     fake.log.push("hold");
     Ok(())
 }
 
-/// The caller's `before_stop` runs once the state is settled and before each STOP, not before the
-/// wait: what it holds is the process of the service as it is now. A service that is already
+/// The caller's `hold` runs once the state is settled and before each STOP, not before the wait for
+/// a state to settle: what it holds is the process of the service as it is now. A service that is already
 /// stopped has no STOP and no hold.
 #[skuld::test]
 fn settle_and_stop_runs_the_callers_step_before_each_stop_it_sends() {
@@ -1259,6 +1259,30 @@ fn settle_and_stop_runs_the_callers_step_before_each_stop_it_sends() {
         Waited::Confirmed
     );
     assert_eq!(fake.log, ["arm_settle", "wait", "got_stopped"]);
+}
+
+/// A service found `STOP_PENDING` (stopped by someone else, or by a `stop` whose wait ran out) is
+/// held once, before the wait for its `STOPPED`, with no STOP of ours: the process that is exiting is
+/// the one the caller must wait for.
+#[skuld::test]
+fn settle_and_stop_holds_a_service_found_stop_pending_once_before_waiting() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
+    assert_eq!(
+        super::settle_and_stop(&mut fake, unbounded(), holding).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(fake.log, ["arm_settle", "hold", "wait", "got_stopped"]);
+}
+
+/// A hold that fails ends the settle with its error, as for a STOP.
+#[skuld::test]
+fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_stop_pending_service() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
+
+    let error = super::settle_and_stop(&mut fake, unbounded(), |_| Err(io::Error::other("no hold"))).unwrap_err();
+
+    assert_eq!(error.to_string(), "no hold");
+    assert_eq!(fake.log, ["arm_settle"]);
 }
 
 /// A step that fails ends the settle with its error and no STOP: the service is left as it was.
