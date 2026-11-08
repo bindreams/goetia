@@ -114,8 +114,10 @@ winreg = "0.56"
 # checkpoint/`Sleep` poll), `SeServiceLogonRight` provisioning
 # (`manager::identity`), `CommandLineToArgvW` for readback (SCM stores
 # `executable`+`arguments` pre-joined into one command line), and
-# `RegQueryValueExW`, which reads an `Environment` value of any type where
-# `winreg` fails on one above `REG_QWORD` (`manager::registry`).
+# `RegQueryValueExW` and `RegEnumValueW`, which read an `Environment` or `Parameters` value of any
+# type where `winreg` fails on one above `REG_QWORD`, and `NtDeleteValueKey` and `NtOpenKey`, which
+# remove a name that holds a NUL by its stated length where `RegDeleteValueW` would stop at it
+# (`manager::registry`).
 #
 # The shim (`src/bin/shim/`, same crate/dependency graph — see the
 # `goetia-shim` `[[bin]]` above) adds `Win32_System_EventLog`, the
@@ -134,6 +136,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    "Wdk_Foundation",
+    "Wdk_System_Registry",
 ] }
 
 [dev-dependencies]
