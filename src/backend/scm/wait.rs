@@ -22,7 +22,6 @@ use crate::spec::Kind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WantState {
     Stopped,
-    Running,
     /// A state that is settled: `RUNNING`, `PAUSED` or `STOPPED`, and no pending one. Arming
     /// `START_PENDING` while the service is starting would not fire until the start had settled.
     RunningPausedOrStopped,
@@ -35,14 +34,14 @@ impl WantState {
     /// The states a registration for `self` fires on: the single definition of the notification
     /// mask, which `system::want_to_mask` folds into bits and the unit tests' model of SCM reads.
     ///
-    /// A start wait includes `STOPPED`: it is armed after `start()`, when the service has entered
-    /// `StartPending`, so a `StartPending -> Stopped` delivers a real `Stopped` that ends the wait with
-    /// the failed start it is.
+    /// A start wait arms [`WantState::RunningPausedOrStopped`]: it is armed after `start()`, when the
+    /// service has entered `StartPending`, so a `StartPending -> Stopped` delivers a real `Stopped` that
+    /// ends the wait with the failed start it is, and a `StartPending -> Paused` a `Paused` that ends it
+    /// with the service not running.
     pub(crate) fn states(self) -> &'static [QueriedState] {
-        use QueriedState::{Paused, Running, StartPending, StopPending, Stopped};
+        use QueriedState::{Paused, Running, StopPending, Stopped};
         match self {
             WantState::Stopped => &[Stopped, StopPending],
-            WantState::Running => &[Running, Stopped, StartPending],
             // No `START_PENDING`: a service starting at the arm must not fire it.
             WantState::RunningPausedOrStopped => &[Running, Paused, Stopped],
             WantState::StoppedOnly => &[Stopped],
@@ -52,8 +51,9 @@ impl WantState {
 
 /// The service state a `wait_callback` observed. Distinct from [`WantState`]:
 /// a callback can report a state that is neither what the caller wants nor
-/// its opposite. `Running`/`Stopped` are terminal; `Pending` is any
-/// intermediate (`StartPending`/`StopPending`) and re-arms.
+/// its opposite. `Running`/`Paused`/`Stopped` are terminal for both waits (the stop wait sends or
+/// fails on a `Paused`, the start wait fails on it); `Pending` is any intermediate
+/// (`StartPending`/`StopPending`) and re-arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
     Running,
@@ -597,15 +597,18 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
     }
 }
 
+/// What a start is told when the service settles `PAUSED` instead of `RUNNING`.
+const PAUSED: &str = "the service is paused, not running: `sc continue` resumes it";
+
 /// What a start over a `STOP_PENDING` service is told. SCM refuses the start (1056), so reporting it
 /// as started would be false. What follows the stop is not known here: a failed daemon's teardown is
 /// restarted by SCM under the service's restart policy (P18a, P26).
 const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be started yet. SCM may start it again itself under its restart policy. Run the start again once it has stopped";
 
-/// Start the service, gated strictly on a real `RUNNING` callback; re-arms
-/// after a non-terminal callback, under the same `deadline` throughout —
-/// which is what makes a service that chatters `START_PENDING` forever
-/// terminate at the caller's budget instead of never.
+/// Start the service, gated strictly on a real `RUNNING` callback; under the same `deadline`
+/// throughout, so that a service that stays `START_PENDING` forever ends at the caller's budget
+/// instead of never. The wait ends on `RUNNING` (confirmed), on `STOPPED` (read by `kind`, below) and on
+/// `PAUSED`, which is an error: a paused service is settled and does not reach `RUNNING` by itself.
 ///
 /// A terminal `Stopped` before `Running` is read by `kind`. For `type: simple` it is a start when
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
@@ -637,8 +640,8 @@ pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind:
     let joined_a_start = matches!(reply, StartReply::AlreadyRunning(_));
     wait_until(
         a,
-        WantState::Running,
-        WantState::Running,
+        WantState::RunningPausedOrStopped,
+        WantState::RunningPausedOrStopped,
         QueriedState::Running,
         deadline,
         |sighting| match sighting.status.state {
@@ -646,9 +649,9 @@ pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind:
                 let status = sighting.status;
                 stopped_before_running(kind, joined_a_start, status.exit, status.wait_hint).map(ControlFlow::Break)
             }
-            // Any other state waits. `Paused` reaches here only from an arm's status: the start mask
-            // excludes it, so a notification of it re-arms before the closure. A pending state is what
-            // the wait is for.
+            // From a notification or from an arm's status alike.
+            QueriedState::Paused => Err(io::Error::other(PAUSED)),
+            // Any other state waits: a pending one is what the wait is for.
             _ => Ok(ControlFlow::Continue(())),
         },
     )

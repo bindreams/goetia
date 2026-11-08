@@ -329,7 +329,6 @@ impl ScmActor for FakeScm {
         self.arm_deadlines.push(deadline);
         self.log.push(match want {
             WantState::Stopped => "arm_stopped",
-            WantState::Running => "arm_running",
             WantState::RunningPausedOrStopped => "arm_settle",
             WantState::StoppedOnly => "arm_stopped_only",
         });
@@ -1234,104 +1233,7 @@ fn start_via_notify_starts_then_arms_running_and_gates_on_running() {
         Waited::Confirmed
     );
     // The critical ordering: arm RUNNING strictly AFTER start, so only what follows it decides.
-    assert_eq!(fake.log, vec!["start", "arm_running", "wait", "got_running"]);
-}
-
-#[skuld::test]
-fn start_re_arms_after_a_non_terminal_callback() {
-    // A StartPending/StopPending intermediate (Pending) fires while waiting
-    // for RUNNING, then RUNNING; the non-terminal callback must trigger a
-    // re-arm.
-    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Running)]);
-    assert_eq!(
-        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
-        Waited::Confirmed
-    );
-    assert_eq!(
-        fake.log,
-        vec![
-            "start",
-            "arm_running",
-            "wait",
-            "got_pending",
-            "arm_running", // re-arm: still waiting for RUNNING
-            "wait",
-            "got_running",
-        ]
-    );
-}
-
-/// The service can be RUNNING before the re-arm that follows a pending notification, and a re-arm
-/// is not delivered for a state already current: the read after it confirms the start.
-#[skuld::test]
-fn a_start_whose_service_is_running_before_the_re_arm_is_confirmed_by_the_read() {
-    let mut fake = FakeScm::new([Some(Observed::Pending)]).drifting_after(1, QueriedState::Running);
-    assert_eq!(
-        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
-        Waited::Confirmed
-    );
-    assert_eq!(
-        fake.log,
-        vec!["start", "arm_running", "wait", "got_pending", "arm_running"]
-    );
-}
-
-/// A service that stopped before the re-arm is read like a notified `STOPPED`, with the exit record
-/// and wait hint the read carries.
-#[skuld::test]
-fn a_start_whose_service_stopped_before_the_re_arm_is_judged_like_a_notified_stopped() {
-    type Script = fn(FakeScm) -> FakeScm;
-    let cases: [(&str, Kind, Script, Option<&str>); 5] = [
-        (
-            "daemon ended",
-            Kind::Simple,
-            |f| f.stopped_after(Reported::from_daemon_code(7)),
-            None,
-        ),
-        (
-            "shim failed",
-            Kind::Simple,
-            |f| f.stopped_after(Reported::shim_failure(Some(2))),
-            Some("exit code 2"),
-        ),
-        (
-            "incomplete stop",
-            Kind::Simple,
-            |f| f.stopped_after(Reported::incomplete_stop()),
-            Some("may still be running"),
-        ),
-        (
-            "SCM's failed start, joined",
-            Kind::Simple,
-            |f| {
-                f.already_running(QueriedState::StartPending)
-                    .stopped_by_scm_with_wait_hint(2000)
-            },
-            Some("the shim never connected to SCM"),
-        ),
-        (
-            "managed",
-            Kind::Managed,
-            |f| f.stopped_after(Reported::from_daemon_code(7)),
-            Some("failed start"),
-        ),
-    ];
-    for (name, kind, script, error) in cases {
-        let mut fake = script(FakeScm::new([Some(Observed::Pending)]).drifting_after(1, QueriedState::Stopped));
-        let result = start_via_notify(&mut fake, unbounded(), kind);
-        match error {
-            None => assert_eq!(result.unwrap(), Waited::Confirmed, "{name}"),
-            Some(text) => {
-                let err = result.unwrap_err().to_string();
-                assert!(err.contains("failed start") && err.contains(text), "{name}: {err}");
-            }
-        }
-        assert_eq!(
-            fake.log,
-            vec!["start", "arm_running", "wait", "got_pending", "arm_running"],
-            "{name}"
-        );
-    }
+    assert_eq!(fake.log, vec!["start", "arm_settle", "wait", "got_running"]);
 }
 
 /// A `RUNNING` queued at an arm made before the start is not the start's answer: the run it reported
@@ -1346,18 +1248,7 @@ fn a_start_is_not_confirmed_by_a_running_the_service_left_before_the_start() {
         Waited::Confirmed
     );
     assert_eq!(fake.state, Some(QueriedState::Running), "confirmed on a stale RUNNING");
-    assert_eq!(
-        fake.log,
-        vec![
-            "start",
-            "arm_running",
-            "wait",
-            "got_pending",
-            "arm_running",
-            "wait",
-            "got_running"
-        ]
-    );
+    assert_eq!(fake.log, vec!["start", "arm_settle", "wait", "got_running"]);
 }
 
 /// The arm follows the start, so a service that is `RUNNING` by then is seen in the status the arm
@@ -1369,7 +1260,7 @@ fn a_start_whose_service_is_running_before_the_arm_is_confirmed_by_the_read() {
         start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
         Waited::Confirmed
     );
-    assert_eq!(fake.log, vec!["start", "arm_running"]);
+    assert_eq!(fake.log, vec!["start", "arm_settle"]);
 }
 
 /// A service that stopped before the arm is judged like a notified `STOPPED`, with the exit record
@@ -1388,7 +1279,7 @@ fn a_start_whose_service_stopped_before_the_arm_is_judged_by_the_read() {
         .stopped_after(Reported::shim_failure(Some(2)));
     let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
     assert!(err.to_string().contains("exit code 2"), "{err}");
-    assert_eq!(fake.log, vec!["start", "arm_running"]);
+    assert_eq!(fake.log, vec!["start", "arm_settle"]);
 }
 
 #[skuld::test]
@@ -1396,7 +1287,7 @@ fn a_terminal_stopped_after_start_is_still_an_error_not_an_expiry() {
     // A service that stopped instead of reaching Running is a *failed
     // start*, not a wait that ran out of budget — the caller's remedy
     // differs, so the two must not collapse into one another.
-    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]);
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
     assert!(start_via_notify(&mut fake, unbounded(), Kind::Simple).is_err());
 }
 
@@ -1560,35 +1451,26 @@ fn a_managed_service_that_reaches_running_is_a_started_service() {
     );
 }
 
+/// `PAUSED` is a settled state that is not `RUNNING`: the start fails naming it instead of waiting for a
+/// `RUNNING` that a paused service does not reach. SCM delivers it only if the armed mask includes it.
+#[skuld::test]
+fn a_start_whose_service_settles_paused_fails_naming_the_state() {
+    let mut fake = FakeScm::new([Some(Observed::Paused)]);
+    let err = start_via_notify(&mut fake, unbounded(), Kind::Managed).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("paused, not running") && text.contains("`sc continue`"),
+        "{text}"
+    );
+    assert!(fake.mask.contains(&QueriedState::Paused), "{:?}", fake.mask);
+    assert_eq!(fake.log, vec!["start", "arm_settle", "wait", "got_paused"]);
+}
+
 #[skuld::test]
 fn a_failed_start_names_the_recorded_code() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::shim_failure(Some(2)));
     let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
     assert!(err.to_string().contains("exit code 2"), "{err}");
-}
-
-#[skuld::test]
-fn start_via_notify_rearms_on_pending_not_errs() {
-    // A StartPending/StopPending intermediate (Pending) must RE-ARM, not fail.
-    let mut fake = FakeScm::new([
-        Some(Observed::Pending),
-        Some(Observed::Pending),
-        Some(Observed::Running),
-    ]);
-    assert_eq!(
-        start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
-        Waited::Confirmed
-    );
-    assert_eq!(fake.arm_count(), 3); // initial + 2 re-arms
-}
-
-#[skuld::test]
-fn a_start_wait_whose_deadline_expires_reports_expired() {
-    let mut fake = FakeScm::new([Some(Observed::Pending), None]);
-    assert_eq!(
-        start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
-        Waited::Expired
-    );
 }
 
 #[skuld::test]
@@ -1607,7 +1489,7 @@ fn an_expired_deadline_still_issues_the_start_request() {
         start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
         Waited::Expired
     );
-    assert_eq!(fake.log, vec!["start", "arm_running", "wait", "got_nothing"]);
+    assert_eq!(fake.log, vec!["start", "arm_settle", "wait", "got_nothing"]);
 }
 
 /// A deadline no re-derivation inside the wait can reproduce: an hour out,
@@ -1618,27 +1500,9 @@ fn an_hour_out() -> Deadline {
 }
 
 /// Re-arming must not restart the clock: a service that chatters
-/// START_PENDING forever has to terminate at the caller's budget. Every arm
+/// STOP_PENDING forever has to terminate at the caller's budget. Every arm
 /// — `arm`'s own deadline bounds the lagging-remedy loop — and every wait
 /// gets the caller's deadline, not a fresh one.
-#[skuld::test]
-fn a_pending_callback_rearms_under_the_same_deadline() {
-    let deadline = an_hour_out();
-    let mut fake = FakeScm::new([
-        Some(Observed::Pending),
-        Some(Observed::Pending),
-        Some(Observed::Running),
-    ]);
-    assert_eq!(
-        start_via_notify(&mut fake, deadline, Kind::Simple).unwrap(),
-        Waited::Confirmed
-    );
-    assert_eq!(fake.arm_count(), 3);
-    assert_eq!(fake.arm_deadlines, vec![deadline; 3]);
-    assert_eq!(fake.deadlines, vec![deadline; 3]);
-}
-
-/// [`a_pending_callback_rearms_under_the_same_deadline`]'s stop mirror.
 #[skuld::test]
 fn a_pending_stop_callback_rearms_under_the_same_deadline() {
     let deadline = an_hour_out();
@@ -1647,6 +1511,19 @@ fn a_pending_stop_callback_rearms_under_the_same_deadline() {
     assert_eq!(fake.arm_count(), 2);
     assert_eq!(fake.arm_deadlines, vec![deadline; 2]);
     assert_eq!(fake.deadlines, vec![deadline; 2]);
+}
+
+/// The start's arm and its wait are bounded by the caller's deadline, not a fresh one.
+#[skuld::test]
+fn a_start_arms_and_waits_under_the_callers_deadline() {
+    let deadline = an_hour_out();
+    let mut fake = FakeScm::new([Some(Observed::Running)]);
+    assert_eq!(
+        start_via_notify(&mut fake, deadline, Kind::Simple).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(fake.arm_deadlines, vec![deadline]);
+    assert_eq!(fake.deadlines, vec![deadline]);
 }
 
 /// What `wait_until` hands its closure: each state off the target, with whether a notification of
@@ -1696,8 +1573,8 @@ fn wait_until_hands_a_notified_stopped_to_the_closure_with_its_record() {
     let mut seen = vec![];
     let waited = wait_until(
         &mut fake,
-        WantState::Running,
-        WantState::Running,
+        WantState::RunningPausedOrStopped,
+        WantState::RunningPausedOrStopped,
         QueriedState::Running,
         unbounded(),
         |sighting| {
@@ -1731,13 +1608,13 @@ fn wait_until_hands_a_notified_stopped_to_the_closure_with_its_record() {
 #[skuld::test]
 fn wait_until_rearms_with_its_second_mask_after_a_notification_the_closure_lets_pass() {
     let mut fake =
-        FakeScm::new([Some(Observed::Paused), Some(Observed::Running)]).queried(QueriedState::StartPending, false);
+        FakeScm::new([Some(Observed::Paused), Some(Observed::Stopped)]).queried(QueriedState::StartPending, false);
     let mut seen = vec![];
     let waited = wait_until(
         &mut fake,
         WantState::RunningPausedOrStopped,
-        WantState::Running,
-        QueriedState::Running,
+        WantState::StoppedOnly,
+        QueriedState::Stopped,
         unbounded(),
         |sighting| {
             seen.push((sighting.status.state, sighting.pending_delivered));
@@ -1756,21 +1633,28 @@ fn wait_until_rearms_with_its_second_mask_after_a_notification_the_closure_lets_
     );
     assert_eq!(
         fake.log,
-        vec!["arm_settle", "wait", "got_paused", "arm_running", "wait", "got_running"]
+        vec![
+            "arm_settle",
+            "wait",
+            "got_paused",
+            "arm_stopped_only",
+            "wait",
+            "got_stopped"
+        ]
     );
 }
 
-/// Under the start wait's own masks, a notified `Stopped` is off the target `Running`: the closure
-/// lets it pass, and the wait re-arms with `Running` and decides on that arm's status before it waits.
+/// Under the settled mask, a notified `Stopped` is off the target `Running`: the closure lets it pass,
+/// and the wait re-arms with the same mask and decides on that arm's status before it waits.
 #[skuld::test]
-fn wait_until_rearms_after_a_notified_state_the_closure_lets_pass_under_the_start_masks() {
+fn wait_until_rearms_after_a_notified_state_the_closure_lets_pass_under_the_settled_mask() {
     let mut fake =
         FakeScm::new([Some(Observed::Stopped), Some(Observed::Running)]).queried(QueriedState::StartPending, false);
     let mut seen = vec![];
     let waited = wait_until(
         &mut fake,
-        WantState::Running,
-        WantState::Running,
+        WantState::RunningPausedOrStopped,
+        WantState::RunningPausedOrStopped,
         QueriedState::Running,
         unbounded(),
         |sighting| {
@@ -1790,14 +1674,7 @@ fn wait_until_rearms_after_a_notified_state_the_closure_lets_pass_under_the_star
     );
     assert_eq!(
         fake.log,
-        vec![
-            "arm_running",
-            "wait",
-            "got_stopped",
-            "arm_running",
-            "wait",
-            "got_running"
-        ]
+        vec!["arm_settle", "wait", "got_stopped", "arm_settle", "wait", "got_running"]
     );
 }
 
@@ -1812,7 +1689,7 @@ fn an_arm_that_keeps_lagging_returns_expired_instead_of_looping() {
         start_via_notify(&mut fake, spent(), Kind::Simple).unwrap(),
         Waited::Expired
     );
-    assert_eq!(fake.log, vec!["start", "arm_running"]);
+    assert_eq!(fake.log, vec!["start", "arm_settle"]);
 }
 
 #[skuld::test]
@@ -1945,7 +1822,7 @@ fn a_start_wait_is_confirmed_by_the_running_status_of_an_arm_refused_on_a_marked
         start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
         Waited::Confirmed
     );
-    assert_eq!(fake.log, vec!["start", "arm_running"]);
+    assert_eq!(fake.log, vec!["start", "arm_settle"]);
 }
 
 #[skuld::test]
@@ -1977,7 +1854,7 @@ fn a_stop_wait_reads_a_service_gone_at_an_arm_as_stopped() {
 /// A start is for `RUNNING`: a service that is gone is not that.
 #[skuld::test]
 fn a_start_wait_reads_a_service_gone_at_an_arm_as_an_error() {
-    let mut fake = FakeScm::new([Some(Observed::Pending)]).gone_at_arm(2);
+    let mut fake = FakeScm::new([]).gone_at_arm(1);
     let text = start_via_notify(&mut fake, unbounded(), Kind::Simple)
         .unwrap_err()
         .to_string();
@@ -2137,19 +2014,18 @@ fn a_queried_running_recovers_an_already_running_start() {
 
 #[skuld::test]
 fn a_queried_start_pending_recovers_an_already_running_start() {
-    // `want_to_mask` arms SERVICE_NOTIFY_START_PENDING for
-    // `WantState::Running`, so a service something else started a
-    // moment ago immediate-fires and resolves through the wait. Rejecting it
-    // failed a start that was going to succeed — narrowing this predicate
-    // back to `Running`-only fails here.
+    // A service something else started a moment ago is on its way to
+    // `Running`, and the wait resolves it. Rejecting it failed a start that
+    // was going to succeed — narrowing this predicate back to
+    // `Running`-only fails here.
     assert!(already_running_is_recoverable(QueriedState::StartPending));
 }
 
 #[skuld::test]
 fn no_other_queried_state_recovers_an_already_running_start() {
-    // None of these is a state the RUNNING wait is armed for, so treating
-    // 1056 as "the wait will complete" would block until the deadline
-    // instead of reporting what the service is actually doing.
+    // None of these is on its way to `Running`, so treating 1056 as "the wait
+    // will complete" would report a start that did not happen instead of what
+    // the service is actually doing.
     for state in [
         QueriedState::Stopped,
         QueriedState::StopPending,
