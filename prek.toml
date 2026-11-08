@@ -49,6 +49,15 @@ types = ["rust"]
 pass_filenames = false
 
 [[repos.hooks]]
+id = "cargo-clippy-lib-only"
+name = "cargo clippy (library only)"
+# A library-only build has no CLI callers, so dead code there passed unnoticed.
+entry = "cargo clippy --lib --no-default-features --locked -- -D warnings"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
 id = "format-section-comments"
 name = "format section comments"
 entry = "python scripts/format-section-comments.py"

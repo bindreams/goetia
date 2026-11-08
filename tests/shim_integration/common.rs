@@ -16,11 +16,6 @@ use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCH
 use crate::fixture;
 use crate::support;
 
-/// The same cross-process lock `tests/scm_integration/managed.rs` declares, shared with it by label
-/// *name*: both binaries drive the one SCM on the host, and one denied `Parameters` changes `list`'s
-/// answer for all of it. A negative assertion is unsound while any test anywhere denies a
-/// `Parameters` read, so they take turns rather than race.
-///
 /// Every test that installs or uninstalls a `type: simple` service carries it, which takes the
 /// machine-wide install lock; those that change what the lock or the services look like to the rest
 /// are also `serial = UNIT_DIR_EXCLUSIVE`, and so wait for the labelled tests, and they for it.

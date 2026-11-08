@@ -18,6 +18,11 @@ use crate::common::{LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, conformance_mk, fixtu
 use crate::deny::Denied;
 use crate::support::{self, ELEVATED};
 
+/// The label `tests/scm_integration/managed.rs` declares and documents, shared with it by label
+/// *name*: both binaries drive the one SCM on the host.
+#[skuld::label]
+pub(crate) const SCM_DENIAL: skuld::Label;
+
 fn seed_foreign(id: &str) {
     support::cmd::run(
         "sc.exe",
@@ -43,10 +48,10 @@ fn hand_edit(id: &str) {
 
 // Step 1: conformance =================================================================================================
 
-/// `UNIT_DIR_EXCLUSIVE`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
+/// `SCM_DENIAL`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry in every concurrent
-/// `list()` — including the ones `tests/scm_integration/managed.rs` asserts are clean.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+/// `list()`.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn simple_passes_conformance() {
     let logs = LogDir::new();
     let mgr = manager();
@@ -143,7 +148,7 @@ fn start_stop_status_reflect_reality() {
     assert_eq!(status.state, State::Stopped);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn uninstall_leaves_nothing() {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -159,22 +164,12 @@ fn uninstall_leaves_nothing() {
 
     let installed = mgr.list().expect("list");
     assert!(
-        installed.iter().all(|entry| match entry {
-            Installed::Ours { spec: s, .. } => s.id.as_str() != id,
-            Installed::OursUnusable { name, .. } => name != &id,
-            Installed::Undetermined { name, .. } => match name {
-                Some(n) => n != &id,
-                // An aggregate may stand for this id, so its absence cannot
-                // be concluded: fail rather than certify what list cannot
-                // establish. See `Installed::Undetermined`.
-                None => false,
-            },
-        }),
+        !support::may_account_for(&installed, &id),
         "uninstalled id must not appear in list"
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_services() {
     let id = support::random_test_id();
     // A foreign service runs no shim, so it needs no `ShimGuard`.
@@ -184,17 +179,7 @@ fn list_ignores_foreign_services() {
     let mgr = manager();
     let installed = mgr.list().expect("list");
     assert!(
-        installed.iter().all(|entry| match entry {
-            Installed::Ours { spec, .. } => spec.id.as_str() != id,
-            Installed::OursUnusable { name, .. } => name != &id,
-            Installed::Undetermined { name, .. } => match name {
-                Some(n) => n != &id,
-                // An aggregate may stand for this id, so its absence cannot
-                // be concluded: fail rather than certify what list cannot
-                // establish. See `Installed::Undetermined`.
-                None => false,
-            },
-        }),
+        !support::may_account_for(&installed, &id),
         "a foreign service must never appear in list"
     );
 }
