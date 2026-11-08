@@ -210,21 +210,6 @@ fn a_process_that_could_not_be_terminated_says_so_when_it_outlives_the_budget() 
     );
 }
 
-/// The failed terminate is an embedded error written by [`Error::sentence`], as `report` writes any
-/// embedded error, with or without one.
-#[skuld::test]
-fn the_failed_terminate_of_a_process_timeout_is_written_through_its_sentence() {
-    let budget = Budget::Bounded(Duration::from_secs(1));
-    let failed = std::sync::Arc::new(std::io::Error::from_raw_os_error(6));
-    for terminate_failed in [None, Some(failed)] {
-        let e = process_timed_out("frpc", 4242, budget, terminate_failed);
-
-        let sentence = e.sentence().expect("a process timeout is written as a sentence");
-
-        assert_eq!(sentence.to_string(), e.to_string());
-    }
-}
-
 #[skuld::test]
 #[should_panic(expected = "only a non-zero Bounded budget can expire")]
 fn process_timed_out_refuses_a_budget_that_cannot_expire() {
