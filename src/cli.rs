@@ -22,6 +22,7 @@ mod exit;
 pub mod install;
 pub mod kill;
 pub mod list;
+mod refusal;
 mod report;
 pub mod restart;
 pub mod show;
@@ -39,10 +40,27 @@ use clap::{Parser, Subcommand};
 pub use elevation::is_elevated;
 pub use exit::ExitCode;
 
-use crate::error::Result;
+use crate::error::{EscapedStream, Result};
 use crate::manager::ServiceManager;
 
 // Cli =================================================================================================================
+
+/// Parses `args` as clap does, except that what clap would print goes through the escaping streams
+/// like all other output: a usage error quotes the argument as typed. `Err` is the exit code, with
+/// the text already written, to `out` for help and version and to `err` otherwise, as clap does.
+pub fn parse<I, T>(args: I, out: &mut dyn Write, err: &mut dyn Write) -> std::result::Result<Cli, i32>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    Cli::try_parse_from(args).map_err(|e| {
+        // `StyledStr`'s `Display` drops clap's colour, whose ESC bytes the stream would escape.
+        let mut stream = EscapedStream::new(if e.use_stderr() { err } else { out });
+        let _ = write!(stream, "{}", e.render());
+        let _ = stream.flush();
+        e.exit_code()
+    })
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -57,7 +75,7 @@ pub struct Cli {
     /// `unsupported` error document and exit `2`, before running anything.
     /// `global` so both `goetia --json daemon list` and
     /// `goetia daemon list --json` work. See [`dispatch`] for the exact
-    /// invariant and its clap-level carve-outs.
+    /// invariant.
     #[arg(long, global = true)]
     pub json: bool,
     /// Reserved for increased output verbosity (repeatable). Accepted and
@@ -172,14 +190,9 @@ pub enum DaemonCommand {
 /// render one, and every other subcommand is refused with one below, before
 /// it runs.
 ///
-/// Anything clap short-circuits on is a deliberate carve-out, because it
-/// happens before `dispatch` is ever called: `--help`/`--version` print
-/// their own text and exit `0`, and a usage error (`goetia --json daemon
-/// uninstall`, with `<IDS>` missing) prints clap's message to stderr, leaves
-/// stdout empty, and exits `2`. Rendering those as JSON would mean
-/// pre-scanning `std::env::args()` before parsing, or intercepting
-/// `try_parse` and re-rendering clap's own diagnostics — both worse than the
-/// carve-out.
+/// What clap short-circuits on never reaches `dispatch`; [`parse`] answers it: `--help` and
+/// `--version` print their text and exit `0`, and a usage error (`goetia --json daemon uninstall`,
+/// with `<IDS>` missing) is plain text on stderr, with stdout empty, and exits `2`.
 pub fn dispatch(
     cli: &Cli,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
@@ -187,7 +200,17 @@ pub fn dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    run(cli, get_manager, is_elevated, out, err).code()
+    // `out` is left alone under `--json`, which carries the exact text: U+2028 and the direction
+    // controls are valid JSON as they are, where the wrapper's `\u{2028}` is not.
+    let mut err = EscapedStream::new(err);
+    let mut escaped_out;
+    let out: &mut dyn Write = if cli.json {
+        out
+    } else {
+        escaped_out = EscapedStream::new(out);
+        &mut escaped_out
+    };
+    run(cli, get_manager, is_elevated, out, &mut err).code()
 }
 
 fn run(
