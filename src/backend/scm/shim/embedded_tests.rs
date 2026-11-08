@@ -1,6 +1,6 @@
-//! `shim_file` on every host. The Windows-only tests stop short of writing: that sets an owner
-//! (Administrators), which needs an elevated token, so `tests/shim_integration/provision.rs` covers
-//! `provide`.
+//! `shim_file` on every host. The Windows-only tests stop short of `provide`, which
+//! `tests/shim_integration/provision.rs` covers; the ones that set an owner (Administrators) need
+//! an elevated token.
 
 use super::*;
 
@@ -40,12 +40,13 @@ fn shim_file_refuses_what_is_not_a_shim_name() {
 
 #[cfg(windows)]
 mod windows {
-    use std::io::{self, Cursor, Read};
+    use std::io::{self, Cursor, Read, Write as _};
     use std::path::{Path, PathBuf};
 
     use super::stock::*;
     use super::*;
     use crate::backend::scm::shim::acl::{CheckPermissions, Descriptor, FolderCheck};
+    use crate::backend::test_elevation::{ELEVATED, elevated};
     use crate::error::{Error, Result};
     use crate::shim::{HostCommand, ShimProvider};
 
@@ -220,12 +221,56 @@ mod windows {
         assert_eq!(hash_reader(Cursor::new(Vec::new())).unwrap(), Image::new(b"").digest());
     }
 
-    /// What `inspect` says of `path` when the file would otherwise be as wanted but for what the test
-    /// did to it: the test creates the file itself, so its owner and DACL are never the stock ones,
-    /// and every case below is `Bad` for that reason too unless `inspect` failed first.
+    /// What `inspect` says of `path`, as the provider asks it, for the image of `b"abc"`.
+    ///
+    /// A file a test creates plainly has an owner and DACL that are never the stock ones, which
+    /// `inspect` judges after it has opened the file. The cases that end before that (not a file, an
+    /// open that is refused) are `Bad` for their own cause: without their branch `inspect` is an
+    /// error. The cases after it are made from [`stock_file`] and told apart from the plain one.
     fn inspected(path: &Path) -> Result<Existing> {
         let wanted = Descriptor::for_file().unwrap().wanted().unwrap();
         inspect(path, &Image::new(b"abc"), &wanted)
+    }
+
+    /// A file at `path` with the stock owner and permissions and `bytes`, which needs an elevated
+    /// token to name Administrators as its owner.
+    fn stock_file(path: &Path, bytes: &[u8]) {
+        let mut file = Descriptor::for_file().unwrap().create_file(path).unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    #[skuld::test(requires = [elevated], labels = [ELEVATED])]
+    fn a_file_with_the_stock_owner_permissions_and_bytes_is_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shim.exe");
+        stock_file(&path, b"abc");
+
+        assert!(matches!(inspected(&path), Ok(Existing::Good)));
+    }
+
+    /// The file is stock but for its bytes, so only the hash can make it `Bad`.
+    #[skuld::test(requires = [elevated], labels = [ELEVATED])]
+    fn a_stock_file_with_other_bytes_is_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let (same, other) = (dir.path().join("same.exe"), dir.path().join("other.exe"));
+        stock_file(&same, b"abc");
+        stock_file(&other, b"abd");
+
+        assert!(matches!(inspected(&same), Ok(Existing::Good)));
+        assert!(matches!(inspected(&other), Ok(Existing::Bad)));
+    }
+
+    /// The bytes are right, so only the owner or the permissions can make it `Bad`: the same bytes
+    /// in a stock file are `Good`.
+    #[skuld::test(requires = [elevated], labels = [ELEVATED])]
+    fn a_file_with_the_right_bytes_and_other_permissions_is_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stock, plain) = (dir.path().join("stock.exe"), dir.path().join("plain.exe"));
+        stock_file(&stock, b"abc");
+        std::fs::write(&plain, b"abc").unwrap();
+
+        assert!(matches!(inspected(&stock), Ok(Existing::Good)));
+        assert!(matches!(inspected(&plain), Ok(Existing::Bad)));
     }
 
     #[skuld::test]
