@@ -289,7 +289,8 @@ impl Backend for Scm {
     /// nothing references are swept, and then the host is provided and checked before anything is
     /// read: `provide` must return the host `desired` registers (the flow's render, from the
     /// provider's first `preview`: a sibling shim upgraded while the install waited on the lock
-    /// would otherwise register a file that was never placed), an absolute path whose folder passes
+    /// would otherwise register a file that was never placed; see [`confirm_provided`] for how a
+    /// mismatch is told apart), an absolute path whose folder passes
     /// the folder check, to a file carrying this library's marker. A sweep that cannot read what is
     /// referenced or cannot delete a file does not fail the install: the file is not what the
     /// install needs, and the next sweep finds it (owner, 2026-11-02). `type: managed` has no host,
@@ -308,12 +309,7 @@ impl Backend for Scm {
             exe: desired.executable.clone(),
             args: desired.arguments.clone(),
         };
-        if provided != rendered {
-            return Err(Error::ShimHostChanged {
-                rendered: Box::new(rendered),
-                provided: Box::new(provided),
-            });
-        }
+        let provided = confirm_provided(shim, rendered, provided)?;
         provided
             .exe
             .parent()
@@ -588,6 +584,28 @@ impl Backend for Scm {
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
 /// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
 /// has no second proof of ownership.
+/// `provided`, the host `provide` returned, when it is `rendered`, the host the registration names.
+/// When it is not, `preview` is asked once more, which is pure: a `preview` that now names `provided`
+/// says the host changed while the install waited for the lock ([`Error::ShimHostChanged`], run the
+/// install again); any other answer is a provider whose `preview` and `provide` disagree
+/// ([`Error::ShimProviderDisagrees`], which running again would not fix).
+fn confirm_provided(shim: &dyn ShimProvider, rendered: HostCommand, provided: HostCommand) -> Result<HostCommand> {
+    if provided == rendered {
+        return Ok(provided);
+    }
+    Err(if shim.preview()? == provided {
+        Error::ShimHostChanged {
+            rendered: Box::new(rendered),
+            provided: Box::new(provided),
+        }
+    } else {
+        Error::ShimProviderDisagrees {
+            previewed: Box::new(rendered),
+            provided: Box::new(provided),
+        }
+    })
+}
+
 fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
     let blob = match generate::extract(&parameters.fields, &parameters.strays) {
         Ok(None) => return ReadOutcome::Foreign { recovery: None },

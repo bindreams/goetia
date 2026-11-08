@@ -659,6 +659,9 @@ fn every_account_type_runs_the_shim() {
 struct Recording {
     calls: Arc<Mutex<Vec<&'static str>>>,
     preview: HostCommand,
+    /// What every `preview` after the first answers, for a provider whose answer changes between
+    /// the flow's render and the install lock (an upgrade of the sibling shim).
+    later_preview: Option<HostCommand>,
     provide: HostCommand,
 }
 
@@ -668,16 +671,29 @@ impl Recording {
         let provider = Self {
             calls: Arc::clone(&calls),
             preview,
+            later_preview: None,
             provide,
         };
         (provider, calls)
+    }
+
+    fn previewing_after_the_first(self, later: HostCommand) -> Self {
+        Self {
+            later_preview: Some(later),
+            ..self
+        }
     }
 }
 
 impl ShimProvider for Recording {
     fn preview(&self) -> goetia::error::Result<HostCommand> {
-        self.calls.lock().unwrap().push("preview");
-        Ok(self.preview.clone())
+        let mut calls = self.calls.lock().unwrap();
+        let first = !calls.contains(&"preview");
+        calls.push("preview");
+        match (&self.later_preview, first) {
+            (Some(later), false) => Ok(later.clone()),
+            _ => Ok(self.preview.clone()),
+        }
     }
 
     fn provide(&self, _folders: &FolderCheck) -> goetia::error::Result<HostCommand> {
@@ -699,9 +715,10 @@ fn command(exe: impl Into<PathBuf>) -> HostCommand {
 }
 
 /// The install renders from the first `preview`, so the registration names that host. A provider
-/// that provides another (the sibling shim upgraded while the install waited on the lock) has placed
-/// a file the registration does not name: refused as a changed host, with nothing registered. This
-/// install fails before anything is registered, so nothing needs a guard but the temp dir.
+/// whose `preview` changes before `provide` (the sibling shim upgraded while the install waited on
+/// the lock) provides a file the registration does not name: refused as a changed host, with nothing
+/// registered. This install fails before anything is registered, so nothing needs a guard but the
+/// temp dir.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_refuses_a_host_that_changed_after_the_render() {
     let dir = DirGuard::new(tempfile::tempdir().expect("tempdir").keep());
@@ -709,7 +726,10 @@ fn install_refuses_a_host_that_changed_after_the_render() {
     let spec = simple_spec(&support::random_test_id(), fixture_command("report", &["1"]), &logs);
     let (rendered, upgraded) = (dir.path().join("rendered.exe"), dir.path().join("upgraded.exe"));
     let (provider, calls) = Recording::new(command(&rendered), command(&upgraded));
-    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+    let mgr = Scm::with_shim(
+        provider.previewing_after_the_first(command(&upgraded)),
+        CheckPermissions::Disable,
+    );
 
     match mgr.install(&spec, false) {
         Err(Error::ShimHostChanged {
@@ -718,7 +738,33 @@ fn install_refuses_a_host_that_changed_after_the_render() {
         }) => assert_eq!((*said, *gave), (command(rendered), command(upgraded))),
         other => panic!("a host other than the one the registration names must be refused, got {other:?}"),
     }
-    assert_eq!(*calls.lock().unwrap(), ["preview", "sweep", "provide"]);
+    assert_eq!(*calls.lock().unwrap(), ["preview", "sweep", "provide", "preview"]);
+    assert!(
+        matches!(mgr.status(&spec.id), Err(Error::NotInstalled { .. })),
+        "a refused install registered the service"
+    );
+}
+
+/// A provider whose `preview` keeps naming one host while its `provide` places another is not racing
+/// anything: running the install again would be refused the same way, so the refusal says the
+/// provider disagrees with itself.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn install_refuses_a_provider_that_disagrees_with_itself() {
+    let dir = DirGuard::new(tempfile::tempdir().expect("tempdir").keep());
+    let logs = LogDir::new();
+    let spec = simple_spec(&support::random_test_id(), fixture_command("report", &["1"]), &logs);
+    let (previewed, provided) = (dir.path().join("previewed.exe"), dir.path().join("provided.exe"));
+    let (provider, calls) = Recording::new(command(&previewed), command(&provided));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    match mgr.install(&spec, false) {
+        Err(Error::ShimProviderDisagrees {
+            previewed: said,
+            provided: gave,
+        }) => assert_eq!((*said, *gave), (command(previewed), command(provided))),
+        other => panic!("a provider that provides what it does not preview must be refused, got {other:?}"),
+    }
+    assert_eq!(*calls.lock().unwrap(), ["preview", "sweep", "provide", "preview"]);
     assert!(
         matches!(mgr.status(&spec.id), Err(Error::NotInstalled { .. })),
         "a refused install registered the service"

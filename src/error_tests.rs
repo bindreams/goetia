@@ -164,6 +164,16 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
                 args: vec![],
             }),
         },
+        Error::ShimProviderDisagrees {
+            previewed: Box::new(crate::shim::HostCommand {
+                exe: PathBuf::new(),
+                args: vec![],
+            }),
+            provided: Box::new(crate::shim::HostCommand {
+                exe: PathBuf::new(),
+                args: vec![],
+            }),
+        },
         Error::SiblingShimMissing { path: PathBuf::new() },
         Error::ShimMarkerVersion {
             path: PathBuf::new(),
@@ -825,8 +835,29 @@ fn report_of_a_host_changed_while_the_install_waited_says_what_to_do() {
         e.report().to_string(),
         "the service host changed while this install waited for the install lock: it was /a/old.exe \
          [\"--service-host\"] when the install began and is /a/new.exe [\"--service-host\"] now. Nothing was \
-         registered. Run the install again to use the new one. The file just provided stays, and the next sweep \
-         removes it if nothing references it"
+         registered. Run the install again to use the new one. The file just provided stays; the provider's next \
+         sweep may remove it if nothing references it"
+    );
+    assert!(!e.is_indeterminate());
+    assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_provider_that_disagrees_with_itself_names_both_hosts_and_says_it_is_a_defect() {
+    let host = |exe: &str| crate::shim::HostCommand {
+        exe: PathBuf::from(exe),
+        args: vec!["--service-host".to_string()],
+    };
+    let e = Error::ShimProviderDisagrees {
+        previewed: Box::new(host(r"\\?\C:\a\host.exe")),
+        provided: Box::new(host(r"C:\a\host.exe")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "the shim provider disagrees with itself: its `preview` names \\\\?\\C:\\a\\host.exe [\"--service-host\"] \
+         but its `provide` returned C:\\a\\host.exe [\"--service-host\"]. Nothing was registered. This is a defect \
+         of the provider, and running the install again will not help. The file just provided stays; the \
+         provider's next sweep may remove it if nothing references it"
     );
     assert!(!e.is_indeterminate());
     assert!(std::error::Error::source(&e).is_none());
