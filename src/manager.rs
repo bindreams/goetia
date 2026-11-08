@@ -321,8 +321,9 @@ pub enum Installed {
 }
 
 impl Installed {
-    /// What `list` prints for an [`OursUnusable`](Installed::OursUnusable) entry; `None` for any
-    /// other entry.
+    /// The reason `list` prints for an [`OursUnusable`](Installed::OursUnusable) entry, exactly as
+    /// it prints it ([`Reason`]'s `Display`: escaped, a child's stderr laid out as the report lays
+    /// it out); `None` for any other entry.
     pub fn unusable_reason(&self) -> Option<String> {
         match self {
             Installed::OursUnusable { reason, .. } => Some(reason.to_string()),

@@ -2012,7 +2012,7 @@ fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
         "{e:?}"
     );
     assert!(e.to_string().contains(&format!("goetia daemon stop {name}")), "{e}");
-    assert!(e.to_string().contains("Input/output error"), "{e}");
+    assert!(e.report().to_string().contains("Input/output error"), "{}", e.report());
     script.assert_spent("install, unreadable recheck");
     assert_restored_and_rerun_refused(&spec, &name, &installed);
 }

@@ -511,3 +511,28 @@ fn an_id_with_no_dropin_installs_as_its_fragment_alone() {
     assert_eq!(read.definition, text);
     assert!(matches!(read.external, ExternalConfig::Absent));
 }
+
+/// A recovery is one line of text: a path can hold a line feed of its own, so a list laid out with
+/// them could be forged, and layout is the report's to decide.
+#[skuld::test]
+fn a_recovery_names_its_paths_on_one_line() {
+    let paths = [
+        Path::new("/run/systemd/system/x.service.d"),
+        Path::new("/usr/lib/systemd/system/x.service.d"),
+    ];
+    let dropin = dropin_recovery(&paths);
+    let residue = residue_recovery(
+        "x",
+        &Residue {
+            dropin: vec![(paths[0].to_path_buf(), String::new())],
+            links: vec![paths[1].to_path_buf()],
+        },
+    );
+    for recovery in [dropin, residue] {
+        assert!(!recovery.contains('\n'), "{recovery}");
+        assert!(
+            paths.iter().all(|p| recovery.contains(&*p.to_string_lossy())),
+            "{recovery}"
+        );
+    }
+}

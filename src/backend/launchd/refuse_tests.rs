@@ -158,7 +158,7 @@ fn an_unreadable_recheck_is_in_doubt_and_names_the_remedy_and_the_failure() {
     let read = failed_print();
     let e = state_unknown_after_write(&Id::try_from("frpc").unwrap(), read, Ok(()));
     assert!(matches!(e, Error::LoadedStateInDoubt { .. }), "{e:?}");
-    let message = e.to_string();
+    let message = e.report().to_string();
     assert!(message.contains("`frpc`"), "{message}");
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
     assert!(message.contains("goetia daemon start frpc"), "{message}");

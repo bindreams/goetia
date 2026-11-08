@@ -244,6 +244,19 @@ struct FlakyManager {
     /// Makes `install`/`preview_install` return `RefuseUnusable` with this reason and no recovery,
     /// the refusal discovery gives when no goetia action unblocks the id. `Fake` always names one.
     recoveryless_unusable: Option<String>,
+    /// `list` fails as a tool goetia ran does, with this as the tool's stderr.
+    list_command_stderr: Option<String>,
+}
+
+/// The status of a command that exited with code 1.
+#[cfg(unix)]
+fn failed_status() -> std::process::ExitStatus {
+    std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
+}
+
+#[cfg(windows)]
+fn failed_status() -> std::process::ExitStatus {
+    std::os::windows::process::ExitStatusExt::from_raw(1)
 }
 
 /// The failure [`FlakyManager`] injects for `fail_list`/`unqueryable`: the
@@ -420,6 +433,13 @@ impl ServiceManager for FlakyManager {
     fn list(&self) -> goetia::Result<Vec<Installed>> {
         if self.fail_list {
             return Err(unqueryable_failure());
+        }
+        if let Some(stderr) = &self.list_command_stderr {
+            return Err(goetia::Error::Command {
+                command: "query-live-state".to_string(),
+                status: failed_status(),
+                stderr: stderr.clone(),
+            });
         }
         let mut installed = self.inner.list()?;
         for entry in &mut installed {
@@ -4331,4 +4351,276 @@ fn status_by_id_where_no_manager_can_be_asked_answers_every_other_id() {
         err.contains("error: frpc: goetia does not manage systemd here (seeded)"),
         "{err}"
     );
+}
+
+// Escaping at the stream ==============================================================================================
+
+/// Text from outside with a line separator, an escape and a direction override in it.
+const HOSTILE: &str = "a\u{2028}b\u{1b}[31m\u{202e}c";
+
+/// A sink that writes a value itself (`show`'s YAML) is still escaped.
+#[skuld::test]
+fn human_output_is_escaped_as_a_stream_and_keeps_its_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon, \"a\\u2028b\\u202ec\"]\n");
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "show", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 0, "{err}");
+    assert!(out.starts_with("# frpc\n"), "{out}");
+    // The YAML writer folds at U+2028, so the value is not on one line: that is why the artifact is
+    // the exact copy.
+    assert!(out.contains(r"a\u{2028}") && out.contains(r"b\u{202e}c"), "{out}");
+    assert!(!out.contains(['\u{2028}', '\u{202e}']), "{out:?}");
+    assert!(out.lines().count() > 2, "the YAML keeps its lines: {out}");
+}
+
+/// `--json` writes its own document: the encoder leaves U+2028 and the direction controls as they
+/// are, which is valid JSON, and `\u{2028}` from the wrapper would not be.
+#[skuld::test]
+fn json_output_is_not_wrapped() {
+    let fake = Fake::new();
+    fake.seed_aggregate_undetermined(HOSTILE);
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "--json", "daemon", "list"], &fake);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(
+        out.contains(['\u{2028}', '\u{202e}']),
+        "the encoder's text is as it is: {out:?}"
+    );
+    assert!(!out.contains(r"\u{"), "{out}");
+    assert_eq!(parse_json(&out)["undetermined"][0]["reason"], HOSTILE, "{out}");
+}
+
+/// Why a refusal and a conflict are escaped whole as well: the stream keeps a line feed, so a
+/// `recovery` or a `reason` with one would start a line of its own on both streams.
+#[skuld::test]
+fn a_refusal_and_a_conflict_with_a_line_feed_in_what_they_quote_stay_one_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
+    let manifest = manifest.to_str().unwrap();
+    let text = "move it\nerror: forged";
+    let escaped = r"move it\u{a}error: forged";
+
+    let conflicted = FlakyManager {
+        unclearable_conflict: Some(text.to_string()),
+        ..Default::default()
+    };
+    let unusable = FlakyManager {
+        recoveryless_unusable: Some(text.to_string()),
+        ..Default::default()
+    };
+
+    for mgr in [&conflicted, &unusable] {
+        let (_, out, err) = dispatch_with(&["goetia", "daemon", "install", "-f", manifest], mgr, &|| true);
+        assert!(err.contains(escaped), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(out.lines().next().unwrap().contains(escaped), "{out}");
+
+        let (_, out, err) = dispatch_with(&["goetia", "daemon", "diff", "-f", manifest], mgr, &never_elevated);
+        assert!(err.contains(escaped), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(out.lines().next().unwrap().contains(escaped), "{out}");
+    }
+}
+
+/// `show` prints a listed reason and the id it was asked for, both from outside, in one-line
+/// messages.
+#[skuld::test]
+fn show_escapes_the_reason_and_the_id_it_quotes() {
+    let fake = Fake::new();
+    fake.seed_aggregate_undetermined("scan stopped\nerror: forged");
+
+    let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "show", "a\nb"], &fake);
+
+    assert_eq!(code, 4, "{err}");
+    assert!(
+        err.contains(
+            r"error: daemon `a\u{a}b`: installation state could not be determined: scan stopped\u{a}error: forged"
+        ),
+        "{err}"
+    );
+    assert!(!err.lines().any(|line| line.starts_with("error: forged")), "{err}");
+
+    let (code, _out, err) = dispatch_read_only(&["goetia", "daemon", "show", "a\nb"], &Fake::new());
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(err, "error: daemon `a\\u{a}b` is not installed\n");
+}
+
+/// A tool's stderr reaches the terminal escaped but laid out as the tool wrote it. Under `--json`
+/// it is the document's, exact, and nothing else is written to stderr.
+#[skuld::test]
+fn a_command_stderr_is_escaped_for_a_person_and_exact_in_the_document() {
+    let mgr = FlakyManager {
+        list_command_stderr: Some("first\n\tsecond\u{1b}[31m\u{202e}\u{2028}end".to_string()),
+        ..Default::default()
+    };
+
+    let (code, out, err) = dispatch_with(&["goetia", "daemon", "list"], &mgr, &never_elevated);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(out, "");
+    assert!(
+        err.contains(&format!("`query-live-state` failed ({})", failed_status())),
+        "the command and its status: {err:?}"
+    );
+    assert!(
+        err.contains("first\n\tsecond\\u{1b}[31m\\u{202e}\\u{2028}end"),
+        "layout kept, the rest escaped: {err:?}"
+    );
+    assert!(!err.contains(['\u{1b}', '\u{202e}', '\u{2028}']), "{err:?}");
+
+    let (code, out, err) = dispatch_with(&["goetia", "--json", "daemon", "list"], &mgr, &never_elevated);
+    assert_eq!(code, 1, "{err}");
+    assert_eq!(err, "");
+    let doc = parse_json(&out);
+    assert!(
+        doc["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("first\n\tsecond\u{1b}[31m\u{202e}\u{2028}end"),
+        "{out}"
+    );
+}
+
+/// A warning quotes the path as the manifest wrote it, and a warning is printed with the rest of
+/// the error text, escaped. Only Windows resolves a drive-relative path, so only it warns.
+#[cfg(windows)]
+#[skuld::test]
+fn a_path_warning_is_escaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [\"C:bin\\u202e\\u2028x\"]\n");
+
+    let (code, _out, err) = dispatch_read_only(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "--dry-run",
+            "-f",
+            manifest.to_str().unwrap(),
+        ],
+        &Fake::new(),
+    );
+
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("`C:bin\\u{202e}\\u{2028}x`, a drive-relative path"),
+        "{err}"
+    );
+    assert!(!err.contains(['\u{202e}', '\u{2028}']), "{err:?}");
+}
+
+/// What `parse` returns for `args`, with what it wrote to stdout and to stderr.
+fn parse_args(args: &[&str]) -> (Result<Cli, i32>, String, String) {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let parsed = cli::parse(args, &mut out, &mut err);
+    (
+        parsed,
+        String::from_utf8(out).expect("stdout is UTF-8"),
+        String::from_utf8(err).expect("stderr is UTF-8"),
+    )
+}
+
+/// A usage error quotes what was typed, and clap prints it before `dispatch` runs: it is escaped
+/// as the rest of the output is, and goes to stderr with clap's exit code.
+#[skuld::test]
+fn a_usage_error_quotes_the_argument_escaped() {
+    let (parsed, out, err) = parse_args(&["goetia", "daemon", "--bad\u{85}\u{202e}\u{2028}x"]);
+
+    assert_eq!(parsed.unwrap_err(), 2);
+    assert_eq!(out, "");
+    assert!(err.contains("'--bad\\u{85}\\u{202e}\\u{2028}x'"), "{err:?}");
+    assert!(!err.contains(['\u{85}', '\u{202e}', '\u{2028}']), "{err:?}");
+    assert!(err.starts_with("error:"), "{err:?}");
+}
+
+/// Help and version are not errors: stdout, exit `0`, and the text as clap renders it.
+#[skuld::test]
+fn help_and_version_go_to_stdout_with_exit_zero() {
+    for flag in ["--help", "--version"] {
+        let (parsed, out, err) = parse_args(&["goetia", flag]);
+
+        assert_eq!(parsed.unwrap_err(), 0, "{flag}");
+        assert_eq!(err, "", "{flag}");
+        assert!(out.contains("goetia"), "{flag}: {out}");
+        assert!(out.ends_with('\n'), "{flag}: {out:?}");
+    }
+    let (_, out, _) = parse_args(&["goetia", "--help"]);
+    assert!(out.lines().count() > 1, "help keeps its lines: {out}");
+}
+
+/// A command line that parses writes nothing.
+#[skuld::test]
+fn a_command_line_that_parses_is_returned_and_writes_nothing() {
+    let (parsed, out, err) = parse_args(&["goetia", "--json", "daemon", "list"]);
+
+    assert!(parsed.unwrap().json);
+    assert_eq!((out.as_str(), err.as_str()), ("", ""));
+}
+
+/// The version that built an artifact is read from the artifact, so the line that says it was
+/// regenerated writes it as one escaped line, in `install` and in `diff`.
+#[skuld::test]
+fn a_stale_artifacts_version_is_escaped_in_one_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new();
+    fake.seed_stale(&mk("frpc"), "1.0\nerror: forged\u{202e}");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
+    let manifest = manifest.to_str().unwrap();
+    let escaped = r"(built by goetia 1.0\u{a}error: forged\u{202e})";
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest], &fake);
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(out, format!("frpc: would be regenerated {escaped}\n"));
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "install", "-f", manifest], &fake);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        out,
+        "frpc: regenerated (was built by goetia 1.0\\u{a}error: forged\\u{202e})\n"
+    );
+}
+
+/// The one failure of the `--json` document's own write, whose text comes from the stream.
+#[skuld::test]
+fn a_failed_json_write_is_reported_as_one_escaped_line() {
+    struct Refusing;
+    impl std::io::Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk\nerror: forged\u{202e}"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let cli = Cli::try_parse_from(["goetia", "--json", "daemon", "list"]).unwrap();
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Fake::new())) };
+    let mut err = Vec::new();
+
+    let code = cli::dispatch(&cli, &get_manager, &never_elevated, &no_host, &mut Refusing, &mut err);
+
+    assert_eq!(code, 1);
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "error: failed to write the --json document to stdout: disk\\u{a}error: forged\\u{202e}\n"
+    );
+}
+
+/// A conflict's diff is the artifact's text: it reaches stdout escaped, with the diff's line feeds.
+#[skuld::test]
+fn a_conflict_with_a_hostile_artifact_diff_is_escaped_on_stdout_with_its_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new();
+    fake.install_then_hand_edit(&mk("frpc"), "# edited\u{1b}[31m\u{202e}\u{2028}x\n# second line\n");
+    let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
+
+    let (code, out, err) = dispatch_read_only(&["goetia", "daemon", "diff", "-f", manifest.to_str().unwrap()], &fake);
+
+    assert_eq!(code, 5, "{err}");
+    assert!(!out.contains(['\u{1b}', '\u{202e}', '\u{2028}']), "{out:?}");
+    assert!(out.contains("\\u{1b}[31m\\u{202e}\\u{2028}x\n"), "{out:?}");
+    assert!(out.contains("# second line\n"), "{out:?}");
 }

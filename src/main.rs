@@ -19,9 +19,12 @@ fn stock_shim() -> impl goetia::shim::ShimProvider {
 fn main() {
     use std::io;
 
-    use clap::Parser as _;
-
-    let cli = goetia::cli::Cli::parse();
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    let cli = match goetia::cli::parse(std::env::args_os(), &mut stdout, &mut stderr) {
+        Ok(cli) => cli,
+        Err(code) => std::process::exit(code),
+    };
 
     // All three lazy: `dispatch` only builds a manager, checks elevation or asks for the host
     // command when the dispatched subcommand actually needs it — see `goetia::cli`'s module doc
@@ -42,8 +45,6 @@ fn main() {
         unreachable!("only a Windows `install --dry-run` asks for the host command")
     };
 
-    let mut stdout = io::stdout();
-    let mut stderr = io::stderr();
     let code = goetia::cli::dispatch(&cli, &get_manager, &is_elevated, &host, &mut stdout, &mut stderr);
     std::process::exit(code);
 }

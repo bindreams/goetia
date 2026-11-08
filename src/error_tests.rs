@@ -454,27 +454,43 @@ fn a_kept_error_reads_as_the_error_it_keeps() {
     assert!(undetermined.is_indeterminate());
 }
 
-/// The errors written into a variant's own `Display` are exactly those `embedded` names, so
+/// The errors written into a variant's own `Display` are exactly those `sentence` names, so
 /// `report` can collect their remedies.
 #[skuld::test]
-fn embedded_names_the_error_a_variant_writes_into_its_own_text() {
+fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
     let inner = || undetermined("re-run as root");
     let loaded = Error::LoadedStateInDoubt {
         id: id(),
         read_failed: Box::new(inner()),
         restore_failed: None,
     };
-    assert!(matches!(loaded.embedded(), Some(Error::Undetermined { .. })));
     assert!(matches!(
-        start_as_managed(not_installed()).embedded(),
+        loaded.sentence().map(|s| s.error),
+        Some(Error::Undetermined { .. })
+    ));
+    assert!(matches!(
+        start_as_managed(not_installed()).sentence().map(|s| s.error),
         Some(Error::Blob { .. })
     ));
     assert!(matches!(
-        Error::Kept(Arc::new(loaded)).embedded(),
+        Error::Kept(Arc::new(loaded)).sentence().map(|s| s.error),
         Some(Error::Undetermined { .. })
     ));
-    assert!(not_installed().embedded().is_none());
-    assert!(step("a", inner()).embedded().is_none());
+    assert!(not_installed().sentence().map(|s| s.error).is_none());
+    assert!(step("a", inner()).sentence().map(|s| s.error).is_none());
+}
+
+/// A kept error answers `stderr` as the error it holds, however deep.
+#[skuld::test]
+fn a_kept_commands_stderr_is_the_commands() {
+    let command = Error::Command {
+        command: "systemctl start x".to_string(),
+        status: exit_status(1),
+        stderr: "Access denied".to_string(),
+    };
+    let kept = Error::Kept(Arc::new(Error::Kept(Arc::new(command))));
+    assert_eq!(kept.stderr(), Some("Access denied"));
+    assert_eq!(Error::Kept(Arc::new(not_installed())).stderr(), None);
 }
 
 #[skuld::test]
