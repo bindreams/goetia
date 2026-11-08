@@ -508,28 +508,50 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
     )
 }
 
-/// The `ImagePath` of the service `name`: the command line SCM starts for it. `None` when the
-/// service is marked for deletion (its record outlives it until the last handle closes, but it
-/// starts nothing), when it has no `ImagePath` or none that is a string, and when it was removed
-/// since it was listed. Any other failure to read is an error: what the service runs is then unknown.
-pub fn read_registered_image(name: &str) -> Result<Option<String>> {
+/// The `ImagePath` of the service `name`, read below `services`, the key a scan lists it from (see
+/// [`read_parameters_in`]): the command line SCM starts for it. `None` when the service is marked for
+/// deletion (its record outlives it until the last handle closes, but it starts nothing), when it
+/// has no `ImagePath` or none that is a string, and when it is gone: its key is not there, or the
+/// service key was marked deleted at the open or mid-read and the service no longer stands, which is
+/// how [`settle`] reads every key that vanishes (the scan vouches for the name, [`Origin::Vouched`]).
+/// Any other failure to read is an error, a key that vanished under a service that still stands
+/// included: what the service runs is then unknown.
+pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<Option<String>> {
     let path = service_key_path(name);
-    let key = match RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_READ) {
-        Ok(key) => key,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(registry_error("open", &path, e)),
-    };
-    match key.get_value::<u32, _>(DELETE_FLAG_VALUE) {
-        Ok(0) => {}
-        Ok(_) => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(registry_error(&format!("read {DELETE_FLAG_VALUE} under"), &path, e)),
-    }
-    match key.get_raw_value(IMAGE_PATH_VALUE) {
-        Ok(raw) => Ok(String::from_reg_value(&raw).ok()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(registry_error(&format!("read {IMAGE_PATH_VALUE} under"), &path, e)),
-    }
+    let read = read_settled(
+        Origin::Vouched,
+        || service_stands(name),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || {
+            let key = counted::open_child(services.0, &name.encode_utf16().collect::<Vec<_>>(), KEY_READ)
+                .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
+            match key.get_value::<u32, _>(DELETE_FLAG_VALUE) {
+                Ok(0) => {}
+                Ok(_) => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Stop::mid_read(failure(
+                        &format!("read {DELETE_FLAG_VALUE} under"),
+                        &path,
+                        e,
+                    )));
+                }
+            }
+            match key.get_raw_value(IMAGE_PATH_VALUE) {
+                Ok(raw) => Ok(String::from_reg_value(&raw).ok()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(Stop::mid_read(failure(
+                    &format!("read {IMAGE_PATH_VALUE} under"),
+                    &path,
+                    e,
+                ))),
+            }
+        },
+    )?;
+    Ok(match read {
+        RegistryReadOutcome::ServiceGone => None,
+        RegistryReadOutcome::Read(image) => image,
+    })
 }
 
 #[cfg(test)]
