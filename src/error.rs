@@ -1179,6 +1179,10 @@ fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
 pub(crate) struct Sentence<'a> {
     pub(crate) before: Cow<'a, str>,
     pub(crate) error: Option<&'a (dyn std::error::Error + 'static)>,
+    /// Whether `error` is a cause of the failure the sentence states, so that its OS code is the
+    /// failure's ([`Error::raw_os_error`]). It is not for an error the sentence mentions in passing,
+    /// as the failed attempt to end a process under a timeout that is no OS failure.
+    pub(crate) error_is_cause: bool,
     pub(crate) after: Cow<'a, str>,
 }
 
@@ -1206,6 +1210,7 @@ pub(crate) fn terminating_failed<'a>(
             Some(_) => format!("{lead}, and terminating it failed: ").into(),
         },
         error: terminate_failed.map(|e| e as &(dyn std::error::Error + 'static)),
+        error_is_cause: false,
         after: tail.into(),
     }
 }
@@ -1215,6 +1220,7 @@ fn start_as_managed_message(blob: &Error) -> Sentence<'_> {
     Sentence {
         before: "its spec blob could not be read, so the start was judged as a `type: managed` service's (".into(),
         error: Some(blob),
+        error_is_cause: true,
         after: ")".into(),
     }
 }
@@ -1252,6 +1258,7 @@ fn loaded_state_in_doubt<'a>(id: &str, read_failed: &'a Error, restore_failed: b
         before: format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read (")
             .into(),
         error: Some(read_failed),
+        error_is_cause: true,
         after: format!("){}", loaded_in_doubt_tail(id, restore_failed)).into(),
     }
 }

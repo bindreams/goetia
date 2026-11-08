@@ -85,6 +85,7 @@ impl Reason {
                 let sentence = Sentence {
                     before: before.as_str().into(),
                     error: Some(error.as_ref()),
+                    error_is_cause: true,
                     after: after.as_str().into(),
                 };
                 write_sentence(sentence, out, &mut remedies)?;

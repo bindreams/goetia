@@ -144,13 +144,12 @@ pub(super) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> 
     match ours {
         Some(Error::Both { first, then }) => return os_error_in(first.as_ref()).or_else(|| os_error_in(then.as_ref())),
         Some(Error::Kept(kept)) => return os_error_in(kept.as_ref()),
-        // The timeout is no OS failure, whatever code the terminate it names failed with.
-        Some(Error::ProcessWaitTimeout { .. }) => return None,
         _ => {}
     }
-    e.source()
-        .and_then(os_error_in)
-        .or_else(|| ours.and_then(Error::sentence).and_then(|s| os_error_in(s.error?)))
+    e.source().and_then(os_error_in).or_else(|| {
+        let sentence = ours.and_then(Error::sentence)?;
+        os_error_in(sentence.error.filter(|_| sentence.error_is_cause)?)
+    })
 }
 
 /// Writes `sentence`: its error is written as any error is, so its remedies are collected into
