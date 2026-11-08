@@ -31,6 +31,11 @@ pub(crate) fn abs(p: &str) -> PathBuf {
     }
 }
 
+/// A message that lost a `\` line continuation shows as a long run of spaces.
+pub(crate) fn assert_no_run_of_spaces(msg: &str) {
+    assert!(!msg.contains("  "), "a run of spaces in {msg:?}");
+}
+
 /// An absolute program path `bin/<name>` on the host, as a `command[0]`.
 pub(crate) fn program(name: &str) -> String {
     abs(&format!("bin/{name}")).to_string_lossy().into_owned()
