@@ -1171,11 +1171,15 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     }
 }
 
-/// Shell builtins only, so it forks nothing and the scope's task count is unchanged: prints the
-/// scope's cgroup path, `pids.max` and `pids.current` on stderr (v1/hybrid `pids` line, else v2 `0::`
-/// line), then `exec`s `$0 "$@"`. `printf '%s\n'`, not `echo`, which would interpret backslash
-/// escapes in the evidence.
+/// Shell builtins only, so it forks nothing and the scope's task count is unchanged. Takes the
+/// `TasksMax` as `$1` and spins until the scope's `pids.max` (v1/hybrid `pids` line of its cgroup,
+/// else the v2 `0::` line) equals it: systemd moves the command into a new scope before it has applied
+/// the `pids` controller, so without the spin the limit may not yet be in force when the verb first
+/// makes a task. The spin has no cap; it ends when the cgroup shows the limit. Then prints the cgroup
+/// path, `pids.max` and `pids.current` on stderr and `exec`s `$0 "$@"`. `printf '%s\n'`, not `echo`,
+/// which would interpret backslash escapes in the evidence.
 const SCOPE_PIDS_PREAMBLE: &str = r#"
+want=$1; shift
 cg=; v1=; v1ctl=; seen=
 while read -r line; do
   seen="$seen[$line]"
@@ -1188,7 +1192,8 @@ if [ -n "$v1" ]; then tree=v1; dir=/sys/fs/cgroup/$v1ctl$v1
 elif [ -n "$cg" ]; then tree=v2; dir=/sys/fs/cgroup$cg; fi
 if [ -n "$dir" ]; then
   max=unreadable; cur=unreadable
-  read -r max < "$dir/pids.max"; read -r cur < "$dir/pids.current"
+  until [ "$max" = "$want" ]; do [ -r "$dir/pids.max" ] && read -r max < "$dir/pids.max"; done
+  read -r cur < "$dir/pids.current"
   printf '%s\n' "scope at start: tree=$tree cgroup=$dir pids.max=$max pids.current=$cur" >&2
 else
   printf '%s\n' "scope at start: no pids cgroup in /proc/self/cgroup: $seen" >&2
@@ -1226,6 +1231,7 @@ fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Out
         .args(["--quiet", "--scope", "--unit", unit, "-p", &format!("TasksMax={tasks}")])
         .args(["sh", "-c", SCOPE_PIDS_PREAMBLE])
         .arg(env!("CARGO_BIN_EXE_goetia"))
+        .arg(tasks.to_string())
         .args(args)
         .output()
         .expect("spawn systemd-run")
