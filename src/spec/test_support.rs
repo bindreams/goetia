@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use super::{DaemonFields, Id, Kind, Restart, User};
+use super::{BackendKind, DaemonFields, Id, Kind, Restart, User};
 
 /// A plain root, `restart: never`, `type: managed` daemon named `id`; panics on an invalid `Id`.
 /// Mirrors `tests/support/daemon_spec.rs` (integration tests cannot reach `#[cfg(test)]`).
@@ -30,6 +30,14 @@ pub(crate) fn abs(p: &str) -> PathBuf {
         PathBuf::from(format!("/{p}"))
     }
 }
+
+/// The backends a resolve test may simulate on this host: those whose path style is the host's.
+/// `resolve` reads the host's `std::path`, so another backend's rules would run on paths it never meets.
+pub(crate) const HOST_BACKENDS: &[BackendKind] = if cfg!(windows) {
+    &[BackendKind::Scm]
+} else {
+    &[BackendKind::Systemd, BackendKind::Launchd]
+};
 
 /// A message that lost a `\` line continuation shows as a long run of spaces.
 pub(crate) fn assert_no_run_of_spaces(msg: &str) {
