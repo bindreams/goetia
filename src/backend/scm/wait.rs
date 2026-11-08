@@ -181,7 +181,7 @@ pub trait ScmActor {
 pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     // Issued whatever is left of the budget: only the *waiting* is bounded.
     control_stop_or_underway(a)?;
-    wait_after_stop(a, deadline, " Run `stop` again.")
+    wait_after_stop(a, deadline, " Run `stop` again.", StopSeen::Requested)
 }
 
 /// How [`stop_and_await_exit`] ended.
@@ -425,9 +425,9 @@ pub(crate) fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
                 match a.control_stop() {
-                    Ok(()) => return wait_after_stop(a, deadline, ""),
+                    Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
-                        return wait_after_stop(a, deadline, "");
+                        return wait_after_stop(a, deadline, "", StopSeen::Requested);
                     }
                     Err(e) if is_stop_refusal(&e) => {
                         refused = e.raw_os_error();
@@ -479,12 +479,21 @@ fn seen_in(status: QueriedStatus) -> Option<Seen> {
     }
 }
 
+/// What the caller of [`wait_after_stop`] has seen of the stop.
+#[derive(Debug, Clone, Copy)]
+pub enum StopSeen {
+    /// The STOP was sent and nothing has shown yet: a first read other than `STOPPED` waits.
+    Requested,
+    /// `STOP_PENDING` was already seen: any first read other than `STOP_PENDING` or `STOPPED` fails.
+    Pending,
+}
+
 /// The wait of a stop once the STOP is accepted or known to be under way: arm for `STOPPED` (and
 /// `STOP_PENDING`), which cancels the settle registration if [`settle_and_stop`] acted on a read and left
 /// it unfired.
 ///
-/// What the first arm reads other than `STOPPED` waits: the STOP may not have taken yet, and a `simple`
-/// service reads `RUNNING` until its shim takes it. Once a notification was delivered, the service had
+/// After [`StopSeen::Requested`], what the first arm reads other than `STOPPED` waits: the STOP may not
+/// have taken yet, and a `simple` service reads `RUNNING` until its shim takes it. Once a notification was delivered, the service had
 /// begun to stop, and a re-arm that reads anything but `STOP_PENDING` means it did not stay stopped: a
 /// failure that races the stop goes `STOPPED (1066)` and SCM restarts the service under its restart
 /// policy (P18a), which can reach `RUNNING` before the re-arm. An error says so, ending in `advice`; it
@@ -493,15 +502,22 @@ fn seen_in(status: QueriedStatus) -> Option<Seen> {
 /// The re-arm is `STOPPED` alone, not the first mask again: after a lag reopen the new handle delivers
 /// the current state at once (P27 c, f), which over an already-reported `STOP_PENDING` would wake the
 /// wait with a state it has seen. [`wait_until`] documents the same reason for `rearm`.
-fn wait_after_stop<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str) -> io::Result<Waited> {
+///
+/// `seen` is what the caller has already seen of the stop: after [`StopSeen::Requested`] the first arm
+/// is `STOPPED` and `STOP_PENDING`, and a first read of anything else waits; after [`StopSeen::Pending`]
+/// the first arm is `STOPPED` alone, and a first read of anything but `STOP_PENDING` or `STOPPED` fails.
+pub fn wait_after_stop<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str, seen: StopSeen) -> io::Result<Waited> {
     wait_until(
         a,
-        WantState::Stopped,
+        match seen {
+            StopSeen::Requested => WantState::Stopped,
+            StopSeen::Pending => WantState::StoppedOnly,
+        },
         WantState::StoppedOnly,
         QueriedState::Stopped,
         deadline,
         |sighting| match sighting.status.state {
-            _ if !sighting.pending_delivered => Ok(ControlFlow::Continue(())),
+            _ if matches!(seen, StopSeen::Requested) && !sighting.pending_delivered => Ok(ControlFlow::Continue(())),
             QueriedState::StopPending => Ok(ControlFlow::Continue(())),
             state => Err(io::Error::other(not_left_stopped(state, advice))),
         },
