@@ -289,8 +289,7 @@ impl Backend for Scm {
     /// nothing references are swept, and then the host is provided and checked before anything is
     /// read: `provide` must return the host `desired` registers (the flow's render, from the
     /// provider's first `preview`: a sibling shim upgraded while the install waited on the lock
-    /// would otherwise register a file that was never placed; see [`confirm_provided`] for how a
-    /// mismatch is told apart), an absolute path whose folder passes
+    /// would otherwise register a file that was never placed), an absolute path whose folder passes
     /// the folder check, to a file carrying this library's marker. A sweep that cannot read what is
     /// referenced or cannot delete a file does not fail the install: the file is not what the
     /// install needs, and the next sweep finds it (owner, 2026-11-02). `type: managed` has no host,
@@ -309,7 +308,7 @@ impl Backend for Scm {
             exe: desired.executable.clone(),
             args: desired.arguments.clone(),
         };
-        let provided = confirm_provided(shim, rendered, provided)?;
+        let provided = confirm_provided(rendered, provided)?;
         provided
             .exe
             .parent()
@@ -581,31 +580,16 @@ impl Backend for Scm {
     }
 }
 
-/// `provided`, the host `provide` returned, when it is `rendered`, the host the registration names.
-/// When it is not, `preview` is asked once more, which is pure, and only an answer equal to
-/// `rendered` proves a provider whose `preview` and `provide` disagree
-/// ([`Error::ShimProviderDisagrees`], which running again would not fix). Any other answer, a third
-/// host or a failed `preview` (kept as the changed host's cause), is a host that changed while the
-/// install waited for the lock ([`Error::ShimHostChanged`], run the install again).
-fn confirm_provided(shim: &dyn ShimProvider, rendered: HostCommand, provided: HostCommand) -> Result<HostCommand> {
+/// `provided`, the host `provide` returned, when it is `rendered`, the host the registration names;
+/// otherwise [`Error::ShimHostMismatch`], which does not say why (a changed host and a provider
+/// whose `preview` and `provide` disagree look alike from here).
+fn confirm_provided(rendered: HostCommand, provided: HostCommand) -> Result<HostCommand> {
     if provided == rendered {
         return Ok(provided);
     }
-    Err(match shim.preview() {
-        Ok(again) if again == rendered => Error::ShimProviderDisagrees {
-            previewed: Box::new(rendered),
-            provided: Box::new(provided),
-        },
-        Ok(_) => Error::ShimHostChanged {
-            rendered: Box::new(rendered),
-            provided: Box::new(provided),
-            preview_failed: None,
-        },
-        Err(failed) => Error::ShimHostChanged {
-            rendered: Box::new(rendered),
-            provided: Box::new(provided),
-            preview_failed: Some(Box::new(failed)),
-        },
+    Err(Error::ShimHostMismatch {
+        rendered: Box::new(rendered),
+        provided: Box::new(provided),
     })
 }
 

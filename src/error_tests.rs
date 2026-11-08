@@ -154,19 +154,8 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         },
         Error::ShimMarkerMissing { path: PathBuf::new() },
         Error::ShimNotEmbedded,
-        Error::ShimHostChanged {
+        Error::ShimHostMismatch {
             rendered: Box::new(crate::shim::HostCommand {
-                exe: PathBuf::new(),
-                args: vec![],
-            }),
-            provided: Box::new(crate::shim::HostCommand {
-                exe: PathBuf::new(),
-                args: vec![],
-            }),
-            preview_failed: None,
-        },
-        Error::ShimProviderDisagrees {
-            previewed: Box::new(crate::shim::HostCommand {
                 exe: PathBuf::new(),
                 args: vec![],
             }),
@@ -822,72 +811,28 @@ fn report_of_a_host_version_holds_the_file_supplied_bytes_exactly_and_the_sink_e
     );
 }
 
+/// The mismatch names both hosts and both causes, and has no source and no OS code to report.
 #[skuld::test]
-fn report_of_a_host_changed_while_the_install_waited_says_what_to_do() {
+fn report_of_a_host_mismatch_names_both_hosts_and_both_causes() {
     let host = |exe: &str| crate::shim::HostCommand {
         exe: PathBuf::from(exe),
         args: vec!["--service-host".to_string()],
     };
-    let e = Error::ShimHostChanged {
+    let e = Error::ShimHostMismatch {
         rendered: Box::new(host("/a/old.exe")),
         provided: Box::new(host("/a/new.exe")),
-        preview_failed: None,
     };
     assert_eq!(
         e.report().to_string(),
-        "the service host changed while this install waited for the install lock: it was /a/old.exe \
-         [\"--service-host\"] when the install began, and the provider has since provided /a/new.exe \
-         [\"--service-host\"]. Nothing was registered. Run the install again to use the current one. The file \
-         just provided stays; the provider's next sweep may remove it if nothing references it"
+        "the service host this install rendered is /a/old.exe [\"--service-host\"], but the provider placed \
+         /a/new.exe [\"--service-host\"]. Nothing was registered. Either the service host changed while this \
+         install waited for the install lock, and running the install again picks up the new one, or the \
+         provider's `preview` and `provide` disagree, which running the install again does not fix. The file just \
+         provided stays; the provider's next sweep may remove it if nothing references it"
     );
     assert!(!e.is_indeterminate());
     assert!(std::error::Error::source(&e).is_none());
-}
-
-/// A changed host whose second `preview` failed writes that failure as it writes any embedded
-/// error, once, inside the sentence; it is not the error's source.
-#[skuld::test]
-fn report_of_a_host_changed_whose_preview_failed_writes_that_failure_once() {
-    let host = |exe: &str| crate::shim::HostCommand {
-        exe: PathBuf::from(exe),
-        args: vec![],
-    };
-    let e = Error::ShimHostChanged {
-        rendered: Box::new(host("/a/old.exe")),
-        provided: Box::new(host("/a/new.exe")),
-        preview_failed: Some(Box::new(os("locate the host", "/a", "denied"))),
-    };
-    assert_eq!(
-        e.report().to_string(),
-        "the service host changed while this install waited for the install lock: it was /a/old.exe [] when the \
-         install began, the provider has since provided /a/new.exe [], and asking it which host it names now \
-         failed (failed to locate the host /a: denied). Nothing was registered. Run the install again to use \
-         the current one. The file just provided stays; the provider's next sweep may remove it if nothing \
-         references it"
-    );
-    assert!(std::error::Error::source(&e).is_none());
-    assert!(!e.is_indeterminate());
-}
-
-#[skuld::test]
-fn report_of_a_provider_that_disagrees_with_itself_names_both_hosts_and_says_it_is_a_defect() {
-    let host = |exe: &str| crate::shim::HostCommand {
-        exe: PathBuf::from(exe),
-        args: vec!["--service-host".to_string()],
-    };
-    let e = Error::ShimProviderDisagrees {
-        previewed: Box::new(host(r"\\?\C:\a\host.exe")),
-        provided: Box::new(host(r"C:\a\host.exe")),
-    };
-    assert_eq!(
-        e.report().to_string(),
-        "the shim provider disagrees with itself: its `preview` names \\\\?\\C:\\a\\host.exe [\"--service-host\"] \
-         but its `provide` returned C:\\a\\host.exe [\"--service-host\"]. Nothing was registered. This is a defect \
-         of the provider, and running the install again will not help. The file just provided stays; the \
-         provider's next sweep may remove it if nothing references it"
-    );
-    assert!(!e.is_indeterminate());
-    assert!(std::error::Error::source(&e).is_none());
+    assert_eq!(e.raw_os_error(), None);
 }
 
 #[skuld::test]

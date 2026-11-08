@@ -605,16 +605,10 @@ fn simple_daemon() -> DaemonSpec {
 ///
 /// The same provider is `Recording` in `tests/shim_integration/provision.rs`, which this module
 /// cannot share (an integration test reaches the library only through its public API, and this is
-/// `cfg(test)` inside it): keep the two identical in behaviour, but for `later_preview_fails`, which
-/// only this module's tests use.
+/// `cfg(test)` inside it): keep the two identical in behaviour.
 struct Recording {
     calls: Arc<Mutex<Vec<&'static str>>>,
     preview: HostCommand,
-    /// What every `preview` after the first answers, for a provider whose answer changes between
-    /// the flow's render and the install lock (an upgrade of the sibling shim).
-    later_preview: Option<HostCommand>,
-    /// Whether every `preview` after the first fails.
-    later_preview_fails: bool,
     provide: HostCommand,
 }
 
@@ -624,40 +618,16 @@ impl Recording {
         let provider = Self {
             calls: Arc::clone(&calls),
             preview,
-            later_preview: None,
-            later_preview_fails: false,
             provide,
         };
         (provider, calls)
-    }
-
-    fn previewing_after_the_first(self, later: HostCommand) -> Self {
-        Self {
-            later_preview: Some(later),
-            ..self
-        }
-    }
-
-    fn failing_to_preview_after_the_first(self) -> Self {
-        Self {
-            later_preview_fails: true,
-            ..self
-        }
     }
 }
 
 impl ShimProvider for Recording {
     fn preview(&self) -> Result<HostCommand> {
-        let mut calls = self.calls.lock().unwrap();
-        let first = !calls.contains(&"preview");
-        calls.push("preview");
-        if !first && self.later_preview_fails {
-            return Err(Error::os("locate the host", std::io::Error::other("preview failed")));
-        }
-        match (&self.later_preview, first) {
-            (Some(later), false) => Ok(later.clone()),
-            _ => Ok(self.preview.clone()),
-        }
+        self.calls.lock().unwrap().push("preview");
+        Ok(self.preview.clone())
     }
 
     fn provide(&self, _folders: &FolderCheck) -> Result<HostCommand> {
@@ -737,104 +707,31 @@ fn managed_begin_install_takes_no_lock_and_calls_no_provider() {
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());
 }
 
-/// A provided host that is the rendered one is accepted without asking the provider again.
+/// A provided host that is the rendered one is accepted.
 #[skuld::test]
 fn a_provided_host_that_is_the_rendered_one_is_accepted() {
     let host = command(r"C:\app\host.exe");
-    let (provider, calls) = Recording::new(host.clone(), host.clone());
-    let rendered = provider.preview().unwrap();
 
-    let accepted = confirm_provided(&provider, rendered, host.clone()).expect("the host agrees");
+    let accepted = confirm_provided(host.clone(), host.clone()).expect("the host agrees");
 
     assert_eq!(accepted, host);
-    assert_eq!(*calls.lock().unwrap(), ["preview"]);
 }
 
-/// A `preview` that now names the host `provide` placed says the host changed while the install
-/// waited (the sibling shim was upgraded): the caller runs the install again.
+/// A provided host that is not the rendered one is refused as a mismatch, whatever its cause (a
+/// host that changed while the install waited, or a provider whose `preview` and `provide` disagree).
 #[skuld::test]
-fn a_provided_host_the_provider_now_previews_is_a_host_that_changed() {
-    let (old, upgraded) = (command(r"C:\app\old.exe"), command(r"C:\app\new.exe"));
-    let (provider, _) = Recording::new(old.clone(), upgraded.clone());
-    let provider = provider.previewing_after_the_first(upgraded.clone());
-    let rendered = provider.preview().unwrap();
+fn a_provided_host_that_is_not_the_rendered_one_is_a_mismatch() {
+    let (rendered, provided) = (command(r"C:\app\old.exe"), command(r"C:\app\new.exe"));
 
-    let Err(Error::ShimHostChanged {
+    let Err(Error::ShimHostMismatch {
         rendered: said,
         provided: gave,
-        preview_failed: None,
-    }) = confirm_provided(&provider, rendered, upgraded.clone())
+    }) = confirm_provided(rendered.clone(), provided.clone())
     else {
-        panic!("a host the provider previews now is a changed host");
+        panic!("a provided host that is not the rendered one must be a mismatch");
     };
 
-    assert_eq!((*said, *gave), (old, upgraded));
-}
-
-/// A `preview` that names a third host, neither the rendered nor the provided one, proves no
-/// disagreement either: the host changed again, and the install is run again.
-#[skuld::test]
-fn a_provided_host_that_is_not_the_one_now_previewed_is_still_a_host_that_changed() {
-    let (old, upgraded, newer) = (
-        command(r"C:\app\old.exe"),
-        command(r"C:\app\new.exe"),
-        command(r"C:\app\newer.exe"),
-    );
-    let (provider, _) = Recording::new(old.clone(), upgraded.clone());
-    let provider = provider.previewing_after_the_first(newer);
-    let rendered = provider.preview().unwrap();
-
-    let Err(Error::ShimHostChanged {
-        rendered: said,
-        provided: gave,
-        preview_failed: None,
-    }) = confirm_provided(&provider, rendered, upgraded.clone())
-    else {
-        panic!("a third host is a changed host");
-    };
-
-    assert_eq!((*said, *gave), (old, upgraded));
-}
-
-/// A `preview` that fails proves no disagreement: the answer is the changed host, with the failed
-/// `preview` as its cause, not the error returned.
-#[skuld::test]
-fn a_preview_that_fails_after_a_mismatch_is_a_host_that_changed_with_that_cause() {
-    let (old, upgraded) = (command(r"C:\app\old.exe"), command(r"C:\app\new.exe"));
-    let (provider, _) = Recording::new(old.clone(), upgraded.clone());
-    let provider = provider.failing_to_preview_after_the_first();
-    let rendered = provider.preview().unwrap();
-
-    let Err(Error::ShimHostChanged {
-        rendered: said,
-        provided: gave,
-        preview_failed: Some(failed),
-    }) = confirm_provided(&provider, rendered, upgraded.clone())
-    else {
-        panic!("a failed preview must leave the changed host, with its error kept");
-    };
-
-    assert_eq!((*said, *gave), (old, upgraded));
-    assert!(matches!(*failed, Error::Os { .. }), "{failed:?}");
-}
-
-/// A `preview` that still names the host it named, while `provide` placed another, is no race: the
-/// two disagree, and an install run again would be refused the same way.
-#[skuld::test]
-fn a_provider_whose_preview_and_provide_disagree_is_refused_as_one_that_disagrees() {
-    let (previewed, provided) = (command(r"\\?\C:\app\host.exe"), command(r"C:\app\host.exe"));
-    let (provider, _) = Recording::new(previewed.clone(), provided.clone());
-    let rendered = provider.preview().unwrap();
-
-    let Err(Error::ShimProviderDisagrees {
-        previewed: said,
-        provided: gave,
-    }) = confirm_provided(&provider, rendered, provided.clone())
-    else {
-        panic!("a provider that disagrees with itself must be named so");
-    };
-
-    assert_eq!((*said, *gave), (previewed, provided));
+    assert_eq!((*said, *gave), (rendered, provided));
 }
 
 /// Every refusal `render_for_install` makes comes before the lock is taken and before the provider

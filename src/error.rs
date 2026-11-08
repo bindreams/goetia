@@ -252,38 +252,27 @@ pub enum Error {
     #[error("no shim provider configured")]
     NoShimProvider,
 
-    /// An install rendered its registration from the service host the provider named, and the
-    /// provider has provided another by the time the install holds the lock (the sibling shim was
-    /// upgraded while it waited), so the registration would name a file that was never placed. Asked
-    /// again, the provider's `preview` did not name the host the registration names: it named
-    /// another, or failed (`preview_failed`, set inside the sentence, as
-    /// [`Error::sentence`] does, not the source). Nothing was registered, and the file provided
-    /// stays for the provider's next sweep. No OS call failed.
-    #[error("{}", host_changed_message(rendered, provided, preview_failed.as_deref()))]
-    ShimHostChanged {
-        // Boxed: two inline commands make `Error`, and every `Result` over it, large (`clippy::result_large_err`).
-        rendered: Box<crate::shim::HostCommand>,
-        provided: Box<crate::shim::HostCommand>,
-        preview_failed: Option<Box<Error>>,
-    },
-
-    /// A shim provider's `provide` returned a command other than the one its `preview` named, and
-    /// `preview`, asked again, still names that one: no change of host explains it, so the two
-    /// disagree, which is a defect of the provider. Running the install again would be refused the
-    /// same way. Nothing was registered, and the file provided stays for the provider's next sweep.
-    /// No OS call failed.
+    /// An install rendered its registration from the service host the provider's `preview` named,
+    /// and the host the provider's `provide` placed under the install lock is another, so the
+    /// registration would name a file that was never placed. Either the host changed while the
+    /// install waited for the lock (the sibling shim was upgraded; running the install again picks up
+    /// the new one), or `preview` and `provide` disagree (a defect of the provider, which running
+    /// again does not fix): nothing here tells them apart. Nothing was registered, and the file
+    /// provided stays for the provider's next sweep. No OS call failed.
     #[error(
-        "the shim provider disagrees with itself: its `preview` names {} {:?} but its `provide` returned {} {:?}. \
-         Nothing was registered. This is a defect of the provider, and running the install again will not help. The \
-         file just provided stays; the provider's next sweep may remove it if nothing references it",
-        previewed.exe.display(),
-        previewed.args,
+        "the service host this install rendered is {} {:?}, but the provider placed {} {:?}. Nothing was registered. \
+         Either the service host changed while this install waited for the install lock, and running the install \
+         again picks up the new one, or the provider's `preview` and `provide` disagree, which running the install \
+         again does not fix. The file just provided stays; the provider's next sweep may remove it if nothing \
+         references it",
+        rendered.exe.display(),
+        rendered.args,
         provided.exe.display(),
         provided.args
     )]
-    ShimProviderDisagrees {
-        // Boxed, as in `ShimHostChanged`.
-        previewed: Box<crate::shim::HostCommand>,
+    ShimHostMismatch {
+        // Boxed: two inline commands make `Error`, and every `Result` over it, large (`clippy::result_large_err`).
+        rendered: Box<crate::shim::HostCommand>,
         provided: Box<crate::shim::HostCommand>,
     },
 
@@ -694,8 +683,7 @@ impl Error {
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
             | Error::NoShimProvider
-            | Error::ShimHostChanged { .. }
-            | Error::ShimProviderDisagrees { .. }
+            | Error::ShimHostMismatch { .. }
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
@@ -837,11 +825,6 @@ impl Error {
                 restore_failed,
             } => Some(loaded_state_in_doubt(id, read_failed, restore_failed.is_some())),
             Error::StartAsManaged { blob, .. } => Some(start_as_managed_message(blob)),
-            Error::ShimHostChanged {
-                rendered,
-                provided,
-                preview_failed,
-            } => Some(host_changed_message(rendered, provided, preview_failed.as_deref())),
             Error::ProcessWaitTimeout {
                 id,
                 pid,
@@ -881,7 +864,7 @@ impl Error {
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
             | Error::NoShimProvider
-            | Error::ShimProviderDisagrees { .. }
+            | Error::ShimHostMismatch { .. }
             | Error::ShimPathRelative { .. }
             | Error::ShimNotEmbedded
             | Error::SiblingShimMissing { .. }
@@ -1233,39 +1216,6 @@ fn start_as_managed_message(blob: &Error) -> Sentence<'_> {
         before: "its spec blob could not be read, so the start was judged as a `type: managed` service's (".into(),
         error: Some(blob),
         after: ")".into(),
-    }
-}
-
-/// The message of [`Error::ShimHostChanged`]: `preview_failed` is why the provider's second
-/// `preview` failed, if it did.
-fn host_changed_message<'a>(
-    rendered: &crate::shim::HostCommand,
-    provided: &crate::shim::HostCommand,
-    preview_failed: Option<&'a Error>,
-) -> Sentence<'a> {
-    let (rendered, provided) = (
-        format!("{} {:?}", rendered.exe.display(), rendered.args),
-        format!("{} {:?}", provided.exe.display(), provided.args),
-    );
-    let before = format!(
-        "the service host changed while this install waited for the install lock: it was {rendered} when the \
-         install began"
-    );
-    Sentence {
-        before: match preview_failed {
-            None => format!("{before}, and the provider has since provided {provided}"),
-            Some(_) => format!(
-                "{before}, the provider has since provided {provided}, and asking it which host it names now failed ("
-            ),
-        }
-        .into(),
-        error: preview_failed.map(|e| e as &(dyn std::error::Error + 'static)),
-        after: format!(
-            "{}. Nothing was registered. Run the install again to use the current one. The file just provided stays; \
-             the provider's next sweep may remove it if nothing references it",
-            if preview_failed.is_some() { ")" } else { "" }
-        )
-        .into(),
     }
 }
 
