@@ -100,13 +100,24 @@ pub(super) fn gone_is_done(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// Whether the service key opened. A key not found or deleted is gone; a denied open stands,
-/// because resolving the path comes before the access check.
-pub(super) fn stands(opened: io::Result<()>) -> io::Result<bool> {
-    match opened {
+/// Whether the service key stands, from `through`, its open as SCM reads it (a registry link is
+/// followed). A key not found or deleted is gone; a denied open stands, because resolving the path
+/// comes before the access check.
+///
+/// A key gone through the link is gone only if `itself`, asked then, finds it gone as itself too.
+/// If `itself` finds a key there, it is a link whose target is missing, which SCM has a service at
+/// and which is no service gone: that is `through`'s error, the failure of a read that cannot see
+/// through it.
+pub(super) fn stands(through: io::Result<()>, itself: impl FnOnce() -> io::Result<()>) -> io::Result<bool> {
+    let denied = |e: &io::Error| e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    match through {
         Ok(()) => Ok(true),
-        Err(e) if is_gone(&e) => Ok(false),
-        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => Ok(true),
+        Err(e) if denied(&e) => Ok(true),
+        Err(e) if is_gone(&e) => match itself() {
+            Err(again) if is_gone(&again) => Ok(false),
+            Err(again) if !denied(&again) => Err(again),
+            Ok(()) | Err(_) => Err(e),
+        },
         Err(e) => Err(e),
     }
 }

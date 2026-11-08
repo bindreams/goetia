@@ -108,29 +108,20 @@ fn read_settled<T>(
     }
 }
 
-/// Whether `Services\<name>` exists, asked only after a read met a missing key.
-fn service_stands(name: &str) -> std::result::Result<bool, Failure> {
-    let services = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(SERVICES_KEY, KEY_READ)
-        .map_err(|source| failure("open", SERVICES_KEY, source))?;
-    service_stands_in(&ServicesRoot::new(&services), name)
-}
-
-/// [`service_stands`] below a `Services` key that is already open. The key is opened as itself: a
-/// registry link at it is a key SCM has a service at, even when the link's target is missing, and
-/// the read that met a missing key below it is then a failure, not a service that is gone.
-fn service_stands_in(services: &ServicesRoot<'_>, name: &str) -> std::result::Result<bool, Failure> {
-    let path = service_key_path(name);
-    stands(
-        counted::open_child(
-            services.0,
-            &name.encode_utf16().collect::<Vec<_>>(),
-            KEY_READ,
-            LinkHandling::Itself,
-        )
-        .map(drop),
-    )
-    .map_err(|source| failure("open", &path, source))
+/// Whether `Services\<name>` exists below `services`, an open `Services` key, asked only after a
+/// read met a missing key. `wide` is `name` as UTF-16, which the read has encoded already.
+///
+/// The key is opened as SCM reads it, through a registry link. A link whose target is missing is a
+/// key SCM has a service at, so the read that met a missing key below it is a failure, not a service
+/// that is gone (see [`stands`]).
+fn service_stands_in(services: &ServicesRoot<'_>, name: &str, wide: &[u16]) -> std::result::Result<bool, Failure> {
+    debug_assert!(
+        wide.iter().copied().eq(name.encode_utf16()),
+        "`wide` is `name` in UTF-16"
+    );
+    let open = |links| counted::open_child(services.0, wide, KEY_READ, links).map(drop);
+    stands(open(LinkHandling::Followed), || open(LinkHandling::Itself))
+        .map_err(|source| failure("open", &service_key_path(name), source))
 }
 
 fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
@@ -161,8 +152,10 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///   gone. A [`Origin::Vouched`] name is not checked for a plain missing `Parameters` key, which
 ///   reads as the service standing without it; it is checked only when the key is lost mid-read.
 /// - [`registry_undetermined`] for every other failure, among them a key that vanishes or is marked
-///   deleted under a service that still stands. Never Foreign: this key holds the only proof of
-///   ownership a `type: managed` service has.
+///   deleted under a service that still stands, and a service key that is a registry link to a
+///   missing key (SCM has a service there, and the check above finds it standing, but nothing below
+///   it can be read). Never Foreign: this key holds the only proof of ownership a `type: managed`
+///   service has.
 ///
 /// goetia's own writes remove `Parameters` only when it is a registry link (see
 /// [`write_parameters`]), which a read classifies as not goetia's, so a write meets one only when
@@ -186,7 +179,7 @@ pub fn read_parameters_in(
     let path = parameters_key_path(name);
     read_settled(
         origin,
-        || service_stands_in(services, name),
+        || service_stands_in(services, name, &name.encode_utf16().collect::<Vec<_>>()),
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
             let (relative, access) = parameters_read_request(name);
@@ -379,16 +372,25 @@ fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
 /// The lines of `Services\<name>\Environment`; empty when the value is absent. Errs only when the
 /// value cannot be read at all; anything that is not what [`write_environment`] writes reads as the
 /// marker lines [`environment_lines`] describes. [`RegistryReadOutcome::ServiceGone`] when the service
-/// is gone, the same classification as [`read_parameters`]'s.
+/// is gone, the same classification as [`read_parameters`]'s: a key that vanished under a service
+/// that still stands, a service key that is a registry link to a missing key included, is an error.
 pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
+    let services = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(SERVICES_KEY, KEY_READ)
+        .map_err(|e| registry_error("open", SERVICES_KEY, e))?;
+    read_environment_in(&ServicesRoot::new(&services), name)
+}
+
+/// [`read_environment`] below a `Services` key that is already open.
+fn read_environment_in(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
     let path = service_key_path(name);
+    let wide: Vec<u16> = name.encode_utf16().collect();
     read_settled(
         Origin::Opened,
-        || service_stands(name),
+        || service_stands_in(services, name, &wide),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
-            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
-                .open_subkey_with_flags(&path, KEY_READ)
+            let key = counted::open_child(services.0, &wide, KEY_READ, LinkHandling::Followed)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
             let mut bytes = Vec::new();
             match query_raw_value(&key, ENVIRONMENT_VALUE, &mut bytes) {
@@ -535,18 +537,14 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
 /// service, and the sweep asks it.
 pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<Option<String>> {
     let path = service_key_path(name);
+    let wide: Vec<u16> = name.encode_utf16().collect();
     let read = read_settled(
         Origin::Vouched,
-        || service_stands_in(services, name),
+        || service_stands_in(services, name, &wide),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
-            let key = counted::open_child(
-                services.0,
-                &name.encode_utf16().collect::<Vec<_>>(),
-                KEY_READ,
-                LinkHandling::Followed,
-            )
-            .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
+            let key = counted::open_child(services.0, &wide, KEY_READ, LinkHandling::Followed)
+                .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
             match key.get_value::<u32, _>(DELETE_FLAG_VALUE) {
                 Ok(0) => {}
                 Ok(_) => return Ok(None),

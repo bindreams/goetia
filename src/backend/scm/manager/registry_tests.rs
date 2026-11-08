@@ -504,10 +504,12 @@ fn a_service_key_that_is_a_link_to_a_missing_key_is_a_failed_read_not_an_absent_
     );
 }
 
-/// Writes keys under `HKLM\SOFTWARE`. The same link, read for `Parameters` as a service looked up by
-/// name: the service stands without them, which reads as not goetia's, and is not gone.
+/// Writes keys under `HKLM\SOFTWARE`. The same link, read for `Parameters` and for `Environment` as a
+/// service looked up by name, is a failure of both, and is neither not goetia's (no `Parameters`
+/// found: `Parameters` holds the only proof of ownership a `type: managed` service has, which this
+/// read could not see) nor a service that is gone.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_service_key_that_is_a_link_to_a_missing_key_stands_for_a_parameters_read() {
+fn a_service_key_that_is_a_link_to_a_missing_key_fails_a_parameters_read_and_an_environment_read() {
     let unique = std::process::id();
     let target = ScratchKey::new(&format!("parameters-{unique}-dangling-target"));
     let root_scratch = ScratchKey::new(&format!("parameters-{unique}-dangling-root"));
@@ -515,12 +517,47 @@ fn a_service_key_that_is_a_link_to_a_missing_key_stands_for_a_parameters_read() 
     let _link = create_link(&root, "dangling", &target.nt_path());
     let services = ServicesRoot::new(&root);
 
-    let read = read_parameters_in(&services, "dangling", Origin::Opened).expect("read the linked service");
+    let parameters = read_parameters_in(&services, "dangling", Origin::Opened);
+    let environment = read_environment_in(&services, "dangling");
 
     assert!(
-        matches!(read, RegistryReadOutcome::Read(_)),
+        matches!(parameters, Err(Error::Undetermined { .. })),
+        "a service key whose target is missing is neither foreign nor gone"
+    );
+    assert!(
+        environment.is_err(),
         "a service key whose target is missing is not a service that is gone"
     );
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. A service key that is there with no `Parameters` and no
+/// `Environment` in it is a service that stands without them, which a read of each says plainly.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_with_no_parameters_or_environment_stands_for_both_reads() {
+    let scratch = ScratchKey::new(&format!("bare-{}-root", std::process::id()));
+    let root = scratch.create();
+    root.create_subkey("bare").expect("create the service key");
+    let services = ServicesRoot::new(&root);
+
+    let parameters = read_parameters_in(&services, "bare", Origin::Opened).expect("read Parameters");
+    let environment = read_environment_in(&services, "bare").expect("read Environment");
+
+    assert!(matches!(parameters, RegistryReadOutcome::Read(_)));
+    assert!(matches!(environment, RegistryReadOutcome::Read(lines) if lines.is_empty()));
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. A service whose key is not there is gone for both reads.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_not_there_is_gone_for_both_reads() {
+    let scratch = ScratchKey::new(&format!("absent-{}-root", std::process::id()));
+    let root = scratch.create();
+    let services = ServicesRoot::new(&root);
+
+    let parameters = read_parameters_in(&services, "absent", Origin::Opened).expect("read Parameters");
+    let environment = read_environment_in(&services, "absent").expect("read Environment");
+
+    assert!(matches!(parameters, RegistryReadOutcome::ServiceGone));
+    assert!(matches!(environment, RegistryReadOutcome::ServiceGone));
 }
 
 /// Writes keys under `HKLM\SOFTWARE`. A `Services` key that is marked deleted while the scan holds

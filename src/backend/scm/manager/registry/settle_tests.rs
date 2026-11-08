@@ -96,27 +96,54 @@ fn a_key_gone_or_deleted_is_a_delete_that_is_done_and_any_other_failure_is_not()
     assert_eq!(denied.raw_os_error(), Some(ACCESS_DENIED));
 }
 
-#[skuld::test]
-fn a_service_key_that_opens_stands() {
-    assert!(stands(Ok(())).unwrap());
+fn os(code: i32) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(code))
+}
+
+/// The open of the key as itself, for a test that must not reach it.
+fn itself_never_asked() -> io::Result<()> {
+    panic!("the key as itself must not be opened here")
 }
 
 #[skuld::test]
-fn a_service_key_not_found_or_deleted_does_not_stand() {
+fn a_service_key_that_opens_stands() {
+    assert!(stands(Ok(()), itself_never_asked).unwrap());
+}
+
+#[skuld::test]
+fn a_service_key_not_found_or_deleted_as_itself_too_does_not_stand() {
     for code in [NOT_FOUND, KEY_DELETED] {
-        assert!(!stands(Err(io::Error::from_raw_os_error(code))).unwrap(), "{code}");
+        assert!(!stands(os(code), || os(code)).unwrap(), "{code}");
     }
 }
 
 /// Resolving the path comes before the access check, so a denial proves the key is there.
 #[skuld::test]
 fn a_service_key_that_denies_the_open_stands() {
-    assert!(stands(Err(io::Error::from_raw_os_error(ACCESS_DENIED))).unwrap());
+    assert!(stands(os(ACCESS_DENIED), itself_never_asked).unwrap());
 }
 
 #[skuld::test]
 fn a_service_key_that_fails_otherwise_says_nothing() {
-    let e = stands(Err(io::Error::from_raw_os_error(IO_DEVICE))).unwrap_err();
+    let e = stands(os(IO_DEVICE), itself_never_asked).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(IO_DEVICE));
+}
+
+/// A registry link whose target is gone opens as itself and not through: SCM has a service at that
+/// key, and the read that cannot see through it is a failure with the open's own error, not a
+/// service that is gone. The same holds for a target marked deleted, and a link that denies the
+/// open as itself.
+#[skuld::test]
+fn a_service_key_that_is_there_but_does_not_resolve_is_the_failure_of_the_open_through_it() {
+    for (through, itself) in [(NOT_FOUND, None), (KEY_DELETED, None), (NOT_FOUND, Some(ACCESS_DENIED))] {
+        let e = stands(os(through), || itself.map_or(Ok(()), os)).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(through), "{through} with {itself:?}");
+    }
+}
+
+#[skuld::test]
+fn a_service_key_gone_through_whose_own_open_fails_otherwise_says_nothing() {
+    let e = stands(os(NOT_FOUND), || os(IO_DEVICE)).unwrap_err();
     assert_eq!(e.raw_os_error(), Some(IO_DEVICE));
 }
 
