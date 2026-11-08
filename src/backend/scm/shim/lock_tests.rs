@@ -166,6 +166,22 @@ fn a_lock_taken_again_by_its_holder_is_released_one_level_at_a_time() {
     assert!(!is_held_by_another_thread());
 }
 
+/// A holder that exits without releasing leaves the mutex abandoned, which the next to take it
+/// owns all the same.
+#[skuld::test(requires = [elevated], labels = [ELEVATED, INSTALL_LOCK], serial = INSTALL_LOCK)]
+fn a_lock_whose_holder_exited_without_releasing_it_is_taken() {
+    thread::spawn(|| {
+        // Never released: the thread's exit abandons the mutex. The handle leaks with it.
+        std::mem::forget(InstallLock::acquire().unwrap());
+    })
+    .join()
+    .unwrap();
+
+    let taken = InstallLock::acquire();
+
+    assert!(taken.is_ok(), "{:?}", taken.err());
+}
+
 /// Any other failure is the OS's, as it was.
 #[skuld::test]
 fn any_other_failure_to_create_the_lock_is_the_os_error() {
