@@ -1661,20 +1661,21 @@ fn a_stop_whose_bootout_expires_is_a_wait_timeout() {
     fake.assert_spent("the bootout was sent");
 }
 
-/// A waited `start` of a loaded job that is not running, whose `kickstart` outlasts the budget and
-/// is left running, then `print` answered by `after` (`None`: the call itself fails). The error the
-/// `start` ended with, and how the `kickstart` ended up.
+/// A waited `start` of a loaded job that reads `NOT_RUNNING`, whose `kickstart` outlasts the budget
+/// and is left running, then `print` answered by `after` (`None`: the call itself fails). The error
+/// the `start` ended with, and how the `kickstart` ended up.
 fn start_whose_kickstart_expires(after: Option<Entry>) -> (Error, Ended) {
-    let (e, ended, _fake) = start_whose_kickstart_expires_over(after);
+    let (e, ended, _fake) = start_whose_kickstart_expires_over(NOT_RUNNING, after);
     (e, ended)
 }
 
-/// [`start_whose_kickstart_expires`], with the fake that answered.
-fn start_whose_kickstart_expires_over(after: Option<Entry>) -> (Error, Ended, Fake) {
+/// [`start_whose_kickstart_expires`] after a read of the job that answered `before`, with the fake
+/// that answered.
+fn start_whose_kickstart_expires_over(before: Answer, after: Option<Entry>) -> (Error, Ended, Fake) {
     let id = never_installed();
     let (kickstart, ended) = lingering(&["kickstart"]);
     let fake = Fake::new(
-        [answer("print", DONE), answer("print", NOT_RUNNING), kickstart]
+        [answer("print", DONE), answer("print", before), kickstart]
             .into_iter()
             .chain(after),
     );
@@ -1716,11 +1717,27 @@ fn a_kickstart_that_outlasts_the_budget_is_ended_once_launchd_holds_the_start() 
     }
 }
 
+/// Only a clean `Stopped` read before the `kickstart` lets a later `running` end it. After a read
+/// that was `Unknown`, the `running` could be an old instance still tearing down, which nothing
+/// re-checks under `restart: never`, so the `kickstart` is left running; a queued start still ends it.
+#[skuld::test]
+fn a_kickstart_after_an_unknown_read_is_ended_only_by_a_queued_start() {
+    const UNRECOGNISED: Answer = (0, "\tstate = someday-new-apple-state\n", "");
+    for before in [UNREADABLE, SPAWN_SCHEDULED, UNRECOGNISED] {
+        for (shown, fate) in [(RUNNING, Fate::Release), (SPAWN_SCHEDULED, Fate::Kill)] {
+            let (e, ended, _fake) = start_whose_kickstart_expires_over(before, Some(answer("print", shown)));
+
+            assert_wait_timeout(&e);
+            assert_eq!(ended.fate(), Some(fate), "{before:?} then {shown:?}");
+        }
+    }
+}
+
 /// The read that decides is a bounded query, so a `launchctl` that never answers cannot hold a
 /// `start --timeout` past its timeout without end.
 #[skuld::test]
 fn the_print_after_an_expired_kickstart_is_a_bounded_query() {
-    let (_e, _ended, fake) = start_whose_kickstart_expires_over(Some(answer("print", SPAWN_SCHEDULED)));
+    let (_e, _ended, fake) = start_whose_kickstart_expires_over(NOT_RUNNING, Some(answer("print", SPAWN_SCHEDULED)));
 
     assert_ends_with_a_bounded_query(&fake);
 }
