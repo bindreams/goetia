@@ -448,6 +448,26 @@ fn a_service_key_that_is_a_link_to_a_missing_key_fails_a_parameters_read() {
     );
 }
 
+/// Writes keys under `HKLM\SOFTWARE`. The service-existence check `read_environment` shares with the
+/// `Parameters` read: a service key that is a link to a missing key is an error, not a service gone.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_environment_read() {
+    let unique = std::process::id();
+    // The target is never created.
+    let root_scratch = ScratchKey::new(&format!("environment-{unique}-dangling-root"));
+    let target = ScratchKey::new(&format!("environment-{unique}-dangling-target"));
+    let root = root_scratch.create();
+    let _link = create_link(&root, "dangling", &target.nt_path());
+    let services = ServicesRoot::new(&root);
+
+    let read = read_environment_in(&services, "dangling");
+
+    assert!(
+        read.is_err(),
+        "a service key whose target is missing is not a service that is gone"
+    );
+}
+
 /// Writes keys under `HKLM\SOFTWARE`. A service key that is there with no `Parameters` stands without
 /// it, which reads as empty `Parameters`: not goetia's.
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]

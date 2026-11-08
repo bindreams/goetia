@@ -102,15 +102,8 @@ fn read_settled<T>(
     }
 }
 
-/// Whether `Services\<name>` exists, asked only after a read met a missing key.
-fn service_stands(name: &str) -> std::result::Result<bool, Failure> {
-    let services = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(SERVICES_KEY, KEY_READ)
-        .map_err(|source| failure("open", SERVICES_KEY, source))?;
-    service_stands_in(&ServicesRoot::new(&services), name)
-}
-
-/// [`service_stands`] below a `Services` key that is already open, as a scan holds one.
+/// Whether `Services\<name>` exists below `services`, an open `Services` key, asked only after a
+/// read met a missing key.
 ///
 /// The key is opened as SCM reads it, through a registry link. A link whose target is missing is a
 /// key SCM has a service at, so the read that met a missing key below it is a failure, not a service
@@ -139,10 +132,10 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 /// - A service with no `Parameters` key reads as empty `Parameters`, so `generate::extract` finds
 ///   no marker and the service is `Ownership::Foreign`. This covers a service goetia never touched
 ///   and one whose install crashed between `CreateServiceW` and the metadata write. `Parameters` is
-///   opened in one step below `Services`, so the service key is never opened, and a service whose
-///   own key denies the reader is read as any other. A key not found does not say whether the
-///   service key is there: that key is opened to check that it stands, and gone, the read is
-///   [`RegistryReadOutcome::ServiceGone`].
+///   opened in one step below `Services`, so the service key is not opened while `Parameters` is
+///   there. A key not found does not say whether the service key is there: that key is opened to
+///   check that it stands, and gone, the read is [`RegistryReadOutcome::ServiceGone`]. A denied open
+///   counts as standing, so a service whose own key denies the reader is read as any other.
 /// - [`RegistryReadOutcome::ServiceGone`] when the service key is gone: the read found the
 ///   `Parameters` key missing and the check above finds the service key missing too, or it lost the
 ///   `Parameters` key (marked deleted, or gone mid-read) and the same check finds the service key
@@ -365,13 +358,21 @@ fn create_parameters_key(service: &RegKey) -> std::io::Result<RegKey> {
 /// is gone, the same classification as [`read_parameters`]'s: a key that vanished under a service
 /// that still stands, a service key that is a registry link to a missing key included, is an error.
 pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
+    let services = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(SERVICES_KEY, KEY_READ)
+        .map_err(|e| registry_error("open", SERVICES_KEY, e))?;
+    read_environment_in(&ServicesRoot::new(&services), name)
+}
+
+/// [`read_environment`] below a `Services` key that is already open.
+fn read_environment_in(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
     let path = service_key_path(name);
+    let wide: Vec<u16> = name.encode_utf16().collect();
     read_settled(
-        || service_stands(name),
+        || service_stands_in(services, name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
-            let key = RegKey::predef(HKEY_LOCAL_MACHINE)
-                .open_subkey_with_flags(&path, KEY_READ)
+            let key = counted::open_child(services.0, &wide, KEY_READ, LinkHandling::Followed)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
             let mut bytes = Vec::new();
             match query_raw_value(&key, ENVIRONMENT_VALUE, &mut bytes) {

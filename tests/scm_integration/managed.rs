@@ -1559,8 +1559,9 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
     );
 }
 
-/// `list` opens `Parameters` in one step below `Services`, and never the service's own key, which
-/// a service that is not goetia's may deny to the unelevated reader. An explicit `Deny` ACE stops
+/// `list` opens `Parameters` in one step below `Services`, so it opens the service's own key only
+/// for a service without `Parameters`, to ask whether it stands, and a denied open counts as
+/// standing. A service that is not goetia's may deny that key to the unelevated reader. An explicit `Deny` ACE stops
 /// the elevated reader the same way (see `deny.rs`), so this stands in for an unelevated `list`,
 /// which this suite has no way to run. Such a service is a stranger's, not an unreadable one: it is
 /// not claimed, and nothing in `list` says a read did not complete. Reading the service key first
