@@ -20,7 +20,7 @@
 use std::io;
 
 use crate::backend::scm::wait::Waited;
-use crate::error::{Chain, TERMINATE_FAILED_CLAUSE, within};
+use crate::error::{Chain, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
 /// What a kill did.
@@ -298,10 +298,7 @@ pub(crate) fn hold_if_possible_unbounded<T: KillTarget>(target: &mut T) -> io::R
 
 /// What an unbounded wait for `id`'s process `pid` says it is blocked on.
 fn waiting_notice(id: &str, pid: u32, terminate_failed: Option<&io::Error>) -> String {
-    match terminate_failed {
-        None => format!("{id}: waiting for process {pid} to exit"),
-        Some(e) => format!("{id}: waiting for process {pid} to exit{TERMINATE_FAILED_CLAUSE}: {e}"),
-    }
+    terminating_failed(format!("{id}: waiting for process {pid} to exit"), terminate_failed, "").to_string()
 }
 
 #[cfg(windows)]

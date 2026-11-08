@@ -484,20 +484,20 @@ fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
         read_failed: Box::new(inner()),
         restore_failed: None,
     };
+    fn embedded(e: &Error) -> Option<&Error> {
+        e.sentence().and_then(|s| s.error?.downcast_ref::<Error>())
+    }
+    assert!(matches!(embedded(&loaded), Some(Error::Undetermined { .. })));
     assert!(matches!(
-        loaded.sentence().map(|s| s.error),
-        Some(Error::Undetermined { .. })
-    ));
-    assert!(matches!(
-        start_as_managed(not_installed()).sentence().map(|s| s.error),
+        embedded(&start_as_managed(not_installed())),
         Some(Error::Blob { .. })
     ));
     assert!(matches!(
-        Error::Kept(Arc::new(loaded)).sentence().map(|s| s.error),
+        embedded(&Error::Kept(Arc::new(loaded))),
         Some(Error::Undetermined { .. })
     ));
-    assert!(not_installed().sentence().map(|s| s.error).is_none());
-    assert!(step("a", inner()).sentence().map(|s| s.error).is_none());
+    assert!(not_installed().sentence().is_none());
+    assert!(step("a", inner()).sentence().is_none());
 }
 
 /// A kept error answers `stderr` as the error it holds, however deep.

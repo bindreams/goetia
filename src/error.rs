@@ -27,10 +27,6 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// cheap to share inside the `Arc<Error>` a snapshot keeps.
 pub type SharedError = Arc<dyn std::error::Error + Send + Sync>;
 
-/// The clause that says ending a process failed, which the failure's own text follows: written once,
-/// for [`Error::ProcessWaitTimeout`] and the notice of a wait for the process.
-pub(crate) const TERMINATE_FAILED_CLAUSE: &str = ", and terminating it failed";
-
 /// Every goetia error. A variant is named for the layer that raised it, and its `Display` is its
 /// own context only, never its source's text: print the whole chain with [`Error::report`].
 #[derive(Debug, thiserror::Error)]
@@ -481,15 +477,9 @@ pub enum Error {
     /// finished, though not failed.
     ///
     /// `terminate_failed` is not the source: the timeout is not an OS failure, and a source would
-    /// have [`raw_os_error`](Error::raw_os_error) answer with the terminate's code. Its text follows
-    /// [`TERMINATE_FAILED_CLAUSE`] in the `Display`, which ends with `recovery`.
-    #[error(
-        "`{id}` is stopped, but its process (pid {pid}) had not exited within {waited}{}. {recovery}",
-        terminate_failed
-            .as_ref()
-            .map_or_else(String::new, |e| format!("{TERMINATE_FAILED_CLAUSE}: {e}")),
-        waited = humantime::format_duration(*waited)
-    )]
+    /// have [`raw_os_error`](Error::raw_os_error) answer with the terminate's code. The `Display`
+    /// sets it inside its sentence (see [`Error::sentence`]) and ends with `recovery`.
+    #[error("{}", process_wait_timeout_message(id, *pid, *waited, terminate_failed.as_deref(), recovery))]
     ProcessWaitTimeout {
         id: String,
         pid: u32,
@@ -851,6 +841,19 @@ impl Error {
                 restore_failed,
             } => Some(loaded_state_in_doubt(id, read_failed, restore_failed.is_some())),
             Error::StartAsManaged { blob, .. } => Some(start_as_managed_message(blob)),
+            Error::ProcessWaitTimeout {
+                id,
+                pid,
+                waited,
+                terminate_failed,
+                recovery,
+            } => Some(process_wait_timeout_message(
+                id,
+                *pid,
+                *waited,
+                terminate_failed.as_deref(),
+                recovery,
+            )),
             Error::Os { .. }
             | Error::Command { .. }
             | Error::Spawn { .. }
@@ -893,7 +896,6 @@ impl Error {
             | Error::Foreign { .. }
             | Error::Undetermined { .. }
             | Error::WaitTimeout { .. }
-            | Error::ProcessWaitTimeout { .. }
             | Error::NotRunning { .. }
             | Error::Unestablished { .. }
             | Error::RequestInDoubt { .. }
@@ -1188,18 +1190,40 @@ fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
     }
 }
 
-/// A message with an error set inside it: `before`, the error, `after`. `Display` writes the
-/// error as [`Chain`] does, without its stderr; [`Error::report`] and [`Reason`] write it as they
-/// write any error (see [`Error::sentence`]).
+/// A message with an error set inside it, when there is one: `before`, the error, `after`.
+/// `Display` writes the error as [`Chain`] does, without its stderr; [`Error::report`] and
+/// [`Reason`] write it as they write any error (see [`Error::sentence`]).
 pub(crate) struct Sentence<'a> {
     pub(crate) before: Cow<'a, str>,
-    pub(crate) error: &'a Error,
+    pub(crate) error: Option<&'a (dyn std::error::Error + 'static)>,
     pub(crate) after: Cow<'a, str>,
 }
 
 impl fmt::Display for Sentence<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}{}", self.before, Chain(self.error), self.after)
+        f.write_str(&self.before)?;
+        if let Some(error) = self.error {
+            write!(f, "{}", Chain(error))?;
+        }
+        f.write_str(&self.after)
+    }
+}
+
+/// `lead`, then, if ending a process failed, that it did and `terminate_failed`, then `tail`: how
+/// [`Error::ProcessWaitTimeout`] and the notice of a wait for the process say the process is still
+/// running because goetia could not end it.
+pub(crate) fn terminating_failed<'a>(
+    lead: String,
+    terminate_failed: Option<&'a std::io::Error>,
+    tail: impl Into<Cow<'a, str>>,
+) -> Sentence<'a> {
+    Sentence {
+        before: match terminate_failed {
+            None => lead.into(),
+            Some(_) => format!("{lead}, and terminating it failed: ").into(),
+        },
+        error: terminate_failed.map(|e| e as &(dyn std::error::Error + 'static)),
+        after: tail.into(),
     }
 }
 
@@ -1207,9 +1231,28 @@ impl fmt::Display for Sentence<'_> {
 fn start_as_managed_message(blob: &Error) -> Sentence<'_> {
     Sentence {
         before: "its spec blob could not be read, so the start was judged as a `type: managed` service's (".into(),
-        error: blob,
+        error: Some(blob),
         after: ")".into(),
     }
+}
+
+/// The message of [`Error::ProcessWaitTimeout`]: `terminate_failed` is why goetia's attempt to end
+/// the process failed, if it did.
+fn process_wait_timeout_message<'a>(
+    id: &str,
+    pid: u32,
+    waited: std::time::Duration,
+    terminate_failed: Option<&'a std::io::Error>,
+    recovery: &'a str,
+) -> Sentence<'a> {
+    terminating_failed(
+        format!(
+            "`{id}` is stopped, but its process (pid {pid}) had not exited within {}",
+            humantime::format_duration(waited)
+        ),
+        terminate_failed,
+        format!(". {recovery}"),
+    )
 }
 
 /// The message of [`Error::LoadedJobInDoubt`].
@@ -1225,7 +1268,7 @@ fn loaded_state_in_doubt<'a>(id: &str, read_failed: &'a Error, restore_failed: b
     Sentence {
         before: format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read (")
             .into(),
-        error: read_failed,
+        error: Some(read_failed),
         after: format!("){}", loaded_in_doubt_tail(id, restore_failed)).into(),
     }
 }

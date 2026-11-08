@@ -144,18 +144,22 @@ pub(super) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> 
     match ours {
         Some(Error::Both { first, then }) => return os_error_in(first.as_ref()).or_else(|| os_error_in(then.as_ref())),
         Some(Error::Kept(kept)) => return os_error_in(kept.as_ref()),
+        // The timeout is no OS failure, whatever code the terminate it names failed with.
+        Some(Error::ProcessWaitTimeout { .. }) => return None,
         _ => {}
     }
     e.source()
         .and_then(os_error_in)
-        .or_else(|| ours.and_then(Error::sentence).and_then(|s| os_error_in(s.error)))
+        .or_else(|| ours.and_then(Error::sentence).and_then(|s| os_error_in(s.error?)))
 }
 
 /// Writes `sentence`: its error is written as any error is, so its remedies are collected into
 /// `remedies`.
 pub(super) fn write_sentence<'a>(sentence: Sentence<'a>, out: &mut Sink, remedies: &mut Vec<&'a str>) -> fmt::Result {
     out.write_str(&sentence.before)?;
-    write_chain(sentence.error, out, remedies)?;
+    if let Some(error) = sentence.error {
+        write_chain(error, out, remedies)?;
+    }
     out.write_str(&sentence.after)
 }
 
