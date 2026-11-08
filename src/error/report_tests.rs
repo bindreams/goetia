@@ -72,6 +72,18 @@ fn command(stderr: &str) -> Error {
     }
 }
 
+/// A child's stderr is the last words before the remedy, so its closing period is the sentence's.
+#[skuld::test]
+fn a_remedy_follows_a_childs_stderr_that_ends_in_a_period_without_doubling_it() {
+    let e = Error::Undetermined {
+        id: id(),
+        reason: Box::new(command("boom.")),
+        recovery: "re-run as root".to_string(),
+    };
+    let report = e.report().to_string();
+    assert!(report.ends_with("boom. re-run as root"), "{report}");
+}
+
 /// Every link of a chain reaches a person through the report, so a value that came from a manifest,
 /// an environment file or the command line cannot carry a control or direction character into it.
 #[skuld::test]
