@@ -70,9 +70,14 @@ impl<'a> Sink<'a> {
 
 impl Sink<'_> {
     /// Writes `remedy` as a sentence after what is written so far: `. remedy`, or ` remedy` when
-    /// that already ends in a period. The one rule that joins a remedy to the words before it.
+    /// that already ends in `.`, `!` or `?`. A remedy needs words before it.
     pub(crate) fn write_remedy(&mut self, remedy: &str) -> fmt::Result {
-        let join = if self.last == Some('.') { " " } else { ". " };
+        debug_assert!(self.last.is_some(), "a remedy follows words");
+        let join = if matches!(self.last, Some('.' | '!' | '?')) {
+            " "
+        } else {
+            ". "
+        };
         self.write_str(join)?;
         self.write_str(remedy)
     }
@@ -175,7 +180,7 @@ pub(super) fn write_sentence<'a>(sentence: Sentence<'a>, out: &mut Sink, remedie
     out.write_str(&sentence.after)
 }
 
-/// Writes each of `remedies` after what `out` has written, as [`Sink::write_remedy`] does.
+/// Writes each of `remedies` with [`Sink::write_remedy`].
 pub(super) fn write_remedies(out: &mut Sink, remedies: &[&str]) -> fmt::Result {
     for remedy in remedies {
         out.write_remedy(remedy)?;

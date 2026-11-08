@@ -72,6 +72,24 @@ fn command(stderr: &str) -> Error {
     }
 }
 
+/// `!` and `?` end a sentence as `.` does, and each remedy is the words the next one follows: a
+/// remedy ending in a period is not followed by a doubled one.
+#[skuld::test]
+fn remedies_join_after_any_sentence_terminator_and_each_after_the_one_before() {
+    for (words, expected) in [("what now?", "what now? fix it"), ("it broke!", "it broke! fix it")] {
+        let mut text = String::new();
+        let mut sink = Sink::new(&mut text, true);
+        sink.write_str(words).unwrap();
+        sink.write_remedy("fix it").unwrap();
+        assert_eq!(text, expected);
+    }
+    let mut text = String::new();
+    let mut sink = Sink::new(&mut text, true);
+    sink.write_str("it broke").unwrap();
+    write_remedies(&mut sink, &["fix it.", "then retry", "or ask?", "ok"]).unwrap();
+    assert_eq!(text, "it broke. fix it. then retry. or ask? ok");
+}
+
 /// A child's stderr is the last words before the remedy, so its closing period is the sentence's.
 #[skuld::test]
 fn a_remedy_follows_a_childs_stderr_that_ends_in_a_period_without_doubling_it() {
