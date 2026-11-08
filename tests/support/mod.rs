@@ -12,11 +12,16 @@ pub mod cleanup;
 pub mod cmd;
 pub mod connect_back;
 pub mod daemon_spec;
+pub mod elevation;
 pub mod kill;
+#[cfg(windows)]
+pub mod raw_registry;
 #[cfg(windows)]
 pub mod registry;
 #[cfg(windows)]
 pub mod scm_wait;
+#[cfg(windows)]
+pub mod scratch;
 pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
@@ -32,6 +37,9 @@ use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
 pub use daemon_spec::spec;
+pub use elevation::{ELEVATED, elevated};
+#[cfg(windows)]
+pub use scratch::ScratchKey;
 pub use service_guard::ServiceGuard;
 
 // Artifact locations --------------------------------------------------------------------------------------------------
@@ -42,35 +50,6 @@ pub use service_guard::ServiceGuard;
 pub const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
 pub const LAUNCHD_DAEMON_DIR: &str = "/Library/LaunchDaemons";
 pub const SCM_SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
-
-/// Opt-out marker for the probes, all of which register real system services:
-/// `SKULD_LABELS='!elevated'`.
-#[skuld::label]
-pub const ELEVATED: skuld::Label;
-
-/// Skuld precondition. CI runs the test binaries under elevation precisely so
-/// this never reports unavailable there — an unmet precondition in CI is a
-/// silent skip of the tests that gate the metadata design.
-pub fn elevated() -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        if unsafe { libc::geteuid() } == 0 {
-            Ok(())
-        } else {
-            Err("registers real system services; re-run the test binary under sudo".to_string())
-        }
-    }
-    #[cfg(windows)]
-    {
-        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-
-        // The capability, not the token: creating a service is exactly what
-        // these probes need and exactly what a filtered admin token refuses.
-        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::ALL_ACCESS)
-            .map(drop)
-            .map_err(|e| format!("registers real system services; re-run elevated (SCM open failed: {e})"))
-    }
-}
 
 /// Fails the test unless `dir`, a directory the system provides (`multi-user.target.wants`,
 /// `/Library/LaunchDaemons`), exists. A test never creates one: every test running concurrently

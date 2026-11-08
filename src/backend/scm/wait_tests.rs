@@ -1281,7 +1281,7 @@ fn a_start_whose_service_is_running_before_the_re_arm_is_confirmed_by_the_read()
 #[skuld::test]
 fn a_start_whose_service_stopped_before_the_re_arm_is_judged_like_a_notified_stopped() {
     type Script = fn(FakeScm) -> FakeScm;
-    let cases: [(&str, Kind, Script, Option<&str>); 5] = [
+    let cases: [(&str, Kind, Script, Option<&str>); 6] = [
         (
             "daemon ended",
             Kind::Simple,
@@ -1299,6 +1299,12 @@ fn a_start_whose_service_stopped_before_the_re_arm_is_judged_like_a_notified_sto
             Kind::Simple,
             |f| f.stopped_after(Reported::incomplete_stop()),
             Some("may still be running"),
+        ),
+        (
+            "refusal",
+            Kind::Simple,
+            |f| f.stopped_after(Reported::Refused),
+            Some("no daemon"),
         ),
         (
             "SCM's failed start, joined",
@@ -1435,6 +1441,26 @@ fn an_incomplete_stop_record_is_a_failed_start() {
     }
 }
 
+/// The shim's `(0, SHIM_REFUSED)` says it refused before it started a daemon: a failed start that says
+/// so, never one that claims a daemon ran or may still be running.
+#[skuld::test]
+fn a_refusal_record_is_a_failed_start_with_no_daemon() {
+    for joined in [None, Some(QueriedState::StartPending)] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::Refused);
+        if let Some(queried) = joined {
+            fake = fake.already_running(queried);
+        }
+
+        let err = start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("failed start"), "{joined:?}: {message}");
+        assert!(message.contains("refused"), "{joined:?}: {message}");
+        assert!(message.contains("no daemon"), "{joined:?}: {message}");
+        assert!(!message.contains("may still be running"), "{joined:?}: {message}");
+    }
+}
+
 /// A daemon that exits with code 1003 is `(1066, 1003)`, not the incomplete-stop record.
 #[skuld::test]
 fn a_daemon_exiting_1003_is_still_a_started_service() {
@@ -1540,6 +1566,7 @@ fn a_managed_service_that_stops_before_running_is_a_failed_start_whatever_it_rec
         Reported::from_daemon_code(7),
         Reported::Clean,
         Reported::incomplete_stop(),
+        Reported::Refused,
         Reported::shim_failure(Some(2)),
     ] {
         let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(reported);

@@ -17,6 +17,7 @@ use crate::spec::test_support::plain_fields;
 use crate::spec::{Id, Kind, Restart, User};
 
 use crate::backend::test_cleanup::{FileGuard, remove_or_warn};
+use crate::backend::test_elevation::{ELEVATED, elevated};
 
 fn sample_plist(id: &str) -> String {
     sample_plist_restarting(id, Restart::Never)
@@ -1301,17 +1302,6 @@ fn a_live_status_whose_launchctl_cannot_be_run_is_an_error() {
 }
 
 // Every verb path stays inside its reservation ========================================================================
-
-#[skuld::label]
-const ELEVATED: skuld::Label;
-
-fn elevated() -> std::result::Result<(), String> {
-    if unsafe { libc::geteuid() } == 0 {
-        Ok(())
-    } else {
-        Err("writes a plist under /Library/Application Support/Goetia; re-run under sudo".to_string())
-    }
-}
 
 /// What one `launchctl` call answers with: its exit code, stdout and stderr.
 type Answer = (i32, &'static str, &'static str);

@@ -128,6 +128,29 @@ pub(super) fn write_chain<'a>(
     Ok(())
 }
 
+/// The first OS error code in `e`: its own, then its source's, then that of what it embeds. A
+/// [`Both`](Error::Both) is searched first half first; [`Error::Kept`] is searched as the error it
+/// holds.
+pub(super) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
+    if let Some(code) = e
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+    {
+        return Some(code);
+    }
+    let ours = e
+        .downcast_ref::<Error>()
+        .or_else(|| e.downcast_ref::<Box<Error>>().map(|b| &**b));
+    match ours {
+        Some(Error::Both { first, then }) => return os_error_in(first.as_ref()).or_else(|| os_error_in(then.as_ref())),
+        Some(Error::Kept(kept)) => return os_error_in(kept.as_ref()),
+        _ => {}
+    }
+    e.source()
+        .and_then(os_error_in)
+        .or_else(|| ours.and_then(Error::sentence).and_then(|s| os_error_in(s.error)))
+}
+
 /// Writes `sentence`: its error is written as any error is, so its remedies are collected into
 /// `remedies`.
 pub(super) fn write_sentence<'a>(sentence: Sentence<'a>, out: &mut Sink, remedies: &mut Vec<&'a str>) -> fmt::Result {
