@@ -451,12 +451,15 @@ fn a_registered_image_is_read_below_the_root_it_is_given() {
     root.create_subkey("no-image").expect("create the service key");
     let services = ServicesRoot::new(&root);
 
-    let read = |name: &str| read_registered_image(&services, name).expect(name);
+    let read = |name: &str| match read_registered_image(&services, name).expect(name) {
+        RegistryReadOutcome::Read(image) => Some(image),
+        RegistryReadOutcome::ServiceGone => None,
+    };
 
-    assert_eq!(read("runs").as_deref(), Some(r"C:\a\host.exe --x"));
-    assert_eq!(read("marked"), None);
-    assert_eq!(read("not-a-string"), None);
-    assert_eq!(read("no-image"), None);
+    assert_eq!(read("runs"), Some(Some(r"C:\a\host.exe --x".to_string())));
+    assert_eq!(read("marked"), Some(None));
+    assert_eq!(read("not-a-string"), Some(None));
+    assert_eq!(read("no-image"), Some(None));
     assert_eq!(read("not-listed-any-more"), None);
 }
 
@@ -479,7 +482,10 @@ fn a_service_key_that_is_a_link_is_read_through_to_its_target() {
 
     let read = read_registered_image(&services, "linked").expect("read the linked service");
 
-    assert_eq!(read.as_deref(), Some(r"C:\linked\host.exe --x"));
+    assert!(
+        matches!(&read, RegistryReadOutcome::Read(Some(image)) if image == r"C:\linked\host.exe --x"),
+        "the target's ImagePath was not read"
+    );
 }
 
 /// Writes keys under `HKLM\SOFTWARE`. A link at a service key whose target is missing is a key SCM
@@ -500,7 +506,7 @@ fn a_service_key_that_is_a_link_to_a_missing_key_is_a_failed_read_not_an_absent_
 
     assert!(
         read.is_err(),
-        "a service key whose target is missing is not an absent service: {read:?}"
+        "a service key whose target is missing is not an absent service"
     );
 }
 
@@ -577,7 +583,13 @@ fn a_root_marked_deleted_under_the_scan_reads_the_service_as_gone() {
         &format!("goetia-test-no-such-service-{}", std::process::id()),
     );
 
-    assert_eq!(read.expect("a service whose key is gone is not a failure"), None);
+    assert!(
+        matches!(
+            read.expect("a service whose key is gone is not a failure"),
+            RegistryReadOutcome::ServiceGone
+        ),
+        "a service whose key is gone reads as gone"
+    );
 }
 
 /// Writes keys under `HKLM\SOFTWARE`. A read classifies a `Parameters` that is a link as not

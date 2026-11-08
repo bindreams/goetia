@@ -526,19 +526,20 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
 }
 
 /// The `ImagePath` of the service `name`, read below `services`, the key a scan lists it from (see
-/// [`read_parameters_in`]): the command line SCM starts for it. `None` when the service is marked for
-/// deletion (its record outlives it until the last handle closes, but it starts nothing), when it
-/// has no `ImagePath` or none that is a string, and when it is gone: its key is not there, or the
-/// service key was marked deleted at the open or mid-read and the service no longer stands, which is
-/// how [`settle`] reads every key that vanishes (the scan vouches for the name, [`Origin::Vouched`]).
-/// Any other failure to read is an error, a key that vanished under a service that still stands
-/// included: what the service runs is then unknown. A service key that is a registry link is read
-/// through it, as SCM reads it, and one whose target is missing is such a failure: SCM has the
+/// [`read_parameters_in`]): the command line SCM starts for it. `Read(None)` when the service is
+/// marked for deletion (its record outlives it until the last handle closes, but it starts nothing),
+/// and when it has no `ImagePath` or none that is a string. [`RegistryReadOutcome::ServiceGone`]
+/// when its key is not there, or the service key was marked deleted at the open or mid-read and the
+/// service no longer stands, which is how [`settle`] reads every key that vanishes (the scan vouches
+/// for the name, [`Origin::Vouched`]): the registry's word only, which the sweep does not take
+/// alone. Any other failure to read is an error, a key that vanished under a service that still
+/// stands included: what the service runs is then unknown. A service key that is a registry link is
+/// read through it, as SCM reads it, and one whose target is missing is such a failure: SCM has the
 /// service, and the sweep asks it.
-pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<Option<String>> {
+pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Option<String>>> {
     let path = service_key_path(name);
     let wide: Vec<u16> = name.encode_utf16().collect();
-    let read = read_settled(
+    read_settled(
         Origin::Vouched,
         || service_stands_in(services, name, &wide),
         |f| registry_error(&f.op, &f.path, f.source),
@@ -567,11 +568,7 @@ pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<
                 ))),
             }
         },
-    )?;
-    Ok(match read {
-        RegistryReadOutcome::ServiceGone => None,
-        RegistryReadOutcome::Read(image) => image,
-    })
+    )
 }
 
 #[cfg(test)]

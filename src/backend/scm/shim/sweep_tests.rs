@@ -167,14 +167,19 @@ fn denied(what: &str) -> Error {
 
 #[skuld::test]
 fn an_image_read_from_the_registry_does_not_ask_scm() {
-    let image = image_of("frpc", Ok(Some("C:/a.exe".to_string())), || panic!("SCM was asked"));
+    let image = image_of("frpc", Ok(RegistryImage::Read(Some("C:/a.exe".to_string()))), || {
+        panic!("SCM was asked")
+    });
 
     assert_eq!(image.unwrap(), Some("C:/a.exe".to_string()));
 }
 
 #[skuld::test]
 fn a_service_with_no_image_in_the_registry_is_not_asked_of_scm_either() {
-    assert_eq!(image_of("frpc", Ok(None), || panic!("SCM was asked")).unwrap(), None);
+    assert_eq!(
+        image_of("frpc", Ok(RegistryImage::Read(None)), || panic!("SCM was asked")).unwrap(),
+        None
+    );
 }
 
 #[skuld::test]
@@ -190,6 +195,29 @@ fn a_service_scm_has_no_image_for_is_none_when_the_key_cannot_be_read() {
         image_of("frpc", Err(denied("open the key")), || Ok(None)).unwrap(),
         None
     );
+}
+
+/// A key the registry says is gone is not taken as the service gone: a registry link to a missing
+/// key reads so, and SCM still has a service there that starts its image.
+#[skuld::test]
+fn a_service_the_registry_says_is_gone_but_scm_has_is_scms_image() {
+    let image = image_of("frpc", Ok(RegistryImage::Gone), || Ok(Some("C:/b.exe".to_string())));
+
+    assert_eq!(image.unwrap(), Some("C:/b.exe".to_string()));
+}
+
+#[skuld::test]
+fn a_service_the_registry_says_is_gone_is_gone_when_scm_says_so() {
+    assert_eq!(image_of("frpc", Ok(RegistryImage::Gone), || Ok(None)).unwrap(), None);
+}
+
+#[skuld::test]
+fn a_service_the_registry_says_is_gone_and_scm_cannot_read_is_an_error_naming_the_service() {
+    let error = image_of("frpc", Ok(RegistryImage::Gone), || Err(denied("query the service"))).unwrap_err();
+
+    let said = error.report().to_string();
+    assert!(said.contains("`frpc`") && said.contains("query the service"), "{said}");
+    assert!(said.contains("SERVICE_QUERY_CONFIG"), "{said}");
 }
 
 #[skuld::test]

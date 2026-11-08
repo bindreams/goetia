@@ -117,30 +117,49 @@ fn name_key(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// The `ImagePath` of the service `name`, from `from_registry` (the read of its key) or, when that
-/// failed, from `through_scm`: a key that denies `KEY_READ` to Administrators still answers SCM,
-/// which reads it as the service control manager. An error only when both failed; it names the
-/// service, since one unreadable service must not fail every uninstall without saying which.
+/// What the registry key of a service says of its image.
+pub(crate) enum RegistryImage {
+    /// The service's key is not there, or is marked deleted and no service stands at it.
+    Gone,
+    /// The key is read: its `ImagePath`, or `None` for a service that starts nothing (marked for
+    /// deletion, no `ImagePath`, or one that is not a string).
+    Read(Option<String>),
+}
+
+/// The `ImagePath` of the service `name`, from `from_registry` (the read of its key) or from
+/// `through_scm`, which is asked when the read failed or found the service gone: a key that denies
+/// `KEY_READ` to Administrators still answers SCM, which reads it as the service control manager,
+/// and a registry link to a missing key reads as gone where SCM has a service. Only SCM's answer
+/// makes a service gone. An error only when SCM failed too; it names the service, since one
+/// unreadable service must not fail every uninstall without saying which.
 pub(crate) fn image_of(
     name: &str,
-    from_registry: Result<Option<String>>,
+    from_registry: Result<RegistryImage>,
     through_scm: impl FnOnce() -> Result<Option<String>>,
 ) -> Result<Option<String>> {
-    let Err(registry) = from_registry else {
-        return from_registry;
+    let registry = match from_registry {
+        Ok(RegistryImage::Read(image)) => return Ok(image),
+        Ok(RegistryImage::Gone) => None,
+        Err(registry) => Some(registry),
     };
-    through_scm().map_err(|scm| Error::ServiceImageUnreadable {
-        name: name.to_string(),
-        source: Box::new(Error::Both {
-            first: Box::new(Error::Step {
-                what: "its registry key".to_string(),
-                source: Box::new(registry),
+    through_scm().map_err(|scm| {
+        let scm = Error::Step {
+            what: "SCM".to_string(),
+            source: Box::new(scm),
+        };
+        Error::ServiceImageUnreadable {
+            name: name.to_string(),
+            source: Box::new(match registry {
+                Some(registry) => Error::Both {
+                    first: Box::new(Error::Step {
+                        what: "its registry key".to_string(),
+                        source: Box::new(registry),
+                    }),
+                    then: Box::new(scm),
+                },
+                None => scm,
             }),
-            then: Box::new(Error::Step {
-                what: "SCM".to_string(),
-                source: Box::new(scm),
-            }),
-        }),
+        }
     })
 }
 
@@ -282,7 +301,8 @@ mod system {
     use super::super::processes::running_images;
     use windows_service::service_manager::ServiceManagerAccess;
 
-    use super::{SweepFailure, image_of, image_references, same_path, unreferenced};
+    use super::{RegistryImage, SweepFailure, image_of, image_references, same_path, unreferenced};
+    use crate::backend::scm::manager::registry::RegistryReadOutcome;
     use crate::backend::scm::manager::{open_scm, read_image_through_scm, registry};
     use crate::error::{Error, Reason, Result};
     use crate::manager::Installed;
@@ -320,7 +340,11 @@ mod system {
                 };
                 read_image_through_scm(scm, &name)
             };
-            match image_of(&name, registry::read_registered_image(services, &name), through_scm) {
+            let from_registry = registry::read_registered_image(services, &name).map(|read| match read {
+                RegistryReadOutcome::ServiceGone => RegistryImage::Gone,
+                RegistryReadOutcome::Read(image) => RegistryImage::Read(image),
+            });
+            match image_of(&name, from_registry, through_scm) {
                 Ok(Some(image)) => hosts.extend(image_references(&image, &expand_environment(&image)).iter().map(
                     // A bare file name stands for every file of that name: it is not a path to resolve.
                     |reference| match reference.contains(['\\', '/']) {
