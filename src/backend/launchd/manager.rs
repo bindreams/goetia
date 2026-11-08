@@ -978,7 +978,7 @@ const KILL_REQUESTS: usize = 1;
 
 /// Most `launchctl` calls per verb, reads included: each draws its role's temp files from the same
 /// reservation. `install` adds two `is_loaded`s; `start` two `is_loaded`s and five `live_state`s. The
-/// post-expiry `print` has its own bound ([`HELD_READ_BOUND`]).
+/// `print` after an expired `kickstart` is not counted: the verb ends there, in place of its last read.
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2;
 const START_CALLS: usize = START_REQUESTS + 7;
 const STOP_CALLS: usize = STOP_REQUESTS;

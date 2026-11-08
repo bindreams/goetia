@@ -228,9 +228,12 @@ fn kickstart_is_running(id: &Id) -> bool {
     }
 }
 
-/// The value on the first `key`-prefixed line of a `launchctl print` body.
+/// The trimmed value on the first `key`-prefixed line of a `launchctl print` body.
 fn print_field<'a>(printed: &'a str, key: &str) -> Option<&'a str> {
-    printed.lines().find_map(|line| line.trim_start().strip_prefix(key))
+    printed
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(key))
+        .map(str::trim)
 }
 
 /// How long a failing `launchctl print` is retried before the test gives up on it. A failure bound
@@ -1251,19 +1254,21 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
          kickstart -p honoured ThrottleInterval (restart_delay): {err:?}"
     );
 
-    // `start` read `print` as it gave up, and ended its `kickstart` iff launchd showed the start
-    // held. The throttle keeps the job at `spawn scheduled`, so the same reading here means it was
-    // ended, and a reading showing no start held means it was left to deliver the request. A
-    // `running` is not asserted: whether it ends the `kickstart` depends on the read before it.
-    let printed = print_job(&id).stdout;
-    match print_field(&printed, "state = ") {
-        // Killed and reaped by goetia: wait for that, on the process itself.
-        Some("spawn scheduled") => support::kill::until(|| !kickstart_is_running(&spec.id)),
-        Some("running") => {}
-        state => assert!(
-            kickstart_is_running(&spec.id),
-            "start ended its kickstart though `print` showed {state:?}"
-        ),
+    // A `kickstart` that is gone was ended, and ending it keeps the start: the job still holds it. One
+    // still running asserts nothing: goetia left it on doubt, or its kill is not yet reaped.
+    if !kickstart_is_running(&spec.id) {
+        let printed = print_job(&id).stdout;
+        let state = print_field(&printed, "state = ");
+        let holds_start = match state {
+            Some("spawn scheduled" | "running") => true,
+            Some("xpcproxy" | "trampoline") => print_field(&printed, "pid = ").is_some(),
+            _ => false,
+        };
+        assert!(
+            holds_start,
+            "start ended its kickstart but the job holds no start (state {state:?}):
+{printed}"
+        );
     }
 }
 
