@@ -9,11 +9,9 @@
 //! probe already exercises with raw `winreg`.
 
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStrExt as _;
 
-use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
@@ -57,11 +55,11 @@ fn parameters_read_request(name: &str) -> (Vec<u16>, u32) {
 
 /// An open `Services` key, which a read opens one service's `Parameters` below. It borrows the key
 /// it is made from, so it cannot outlive the handle.
-pub struct ServicesRoot<'r>(HANDLE, PhantomData<&'r RegKey>);
+pub struct ServicesRoot<'r>(&'r RegKey);
 
 impl<'r> ServicesRoot<'r> {
     fn new(key: &'r RegKey) -> Self {
-        Self(key.raw_handle(), PhantomData)
+        Self(key)
     }
 }
 
@@ -170,7 +168,7 @@ pub fn read_parameters_in(
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
             let (relative, access) = parameters_read_request(name);
-            let key = counted::open_child(services.0, &relative, access)
+            let key = counted::open_child(services.0.raw_handle(), &relative, access)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), Some(Parameters::default())))?;
             let mut parameters = Parameters::default();
             // The names as stored, for a field found not to be a string.
@@ -516,14 +514,13 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
 /// service there, which is why the sweep asks it.
 pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Option<String>>> {
     let path = service_key_path(name);
-    // `services` lends its handle: wrapped so that dropping the key does not close it.
-    let root = ManuallyDrop::new(RegKey::predef(services.0));
     read_settled(
         Origin::Vouched,
         || service_stands(name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
-            let key = root
+            let key = services
+                .0
                 .open_subkey_with_flags(name, KEY_READ)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
             match key.get_value::<u32, _>(DELETE_FLAG_VALUE) {
