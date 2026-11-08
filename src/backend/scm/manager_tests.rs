@@ -677,7 +677,10 @@ fn managed_begin_install_takes_no_lock_and_calls_no_provider() {
     let (provider, calls) = Recording::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
-    let scope = mgr.begin_install(&daemon_spec(Restart::Never)).unwrap();
+    let spec = daemon_spec(Restart::Never);
+    let desired = mgr.render(&spec).unwrap();
+
+    let scope = mgr.begin_install(&spec, &desired).unwrap();
 
     assert!(scope.is_none(), "a managed install holds no lock");
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());

@@ -246,8 +246,9 @@ pub enum Error {
     #[error("no shim provider configured")]
     NoShimProvider,
 
-    /// A shim provider's `provide` returned a command other than the one its `preview` named, so
-    /// what `--dry-run` and `render` show is not what an install registers. No OS call failed.
+    /// A shim provider's `provide` returned a command other than the one its `preview` named when
+    /// the install rendered, so the registration would name a file that was never placed. No OS call
+    /// failed.
     #[error(
         "the shim provider's `provide` returned {} {:?}, but its `preview` named {} {:?}",
         provided.exe.display(),

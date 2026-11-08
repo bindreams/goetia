@@ -154,7 +154,7 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
     // lock and its provider's file) is never taken for an install that cannot be rendered.
     let desired = b.render_for_install(spec)?;
     let desired_text = desired.to_string();
-    let mut scope = b.begin_install(spec)?;
+    let mut scope = b.begin_install(spec, &desired)?;
 
     // No cap: `Raced` is a state change the backend detected, not a wait for time to pass.
     loop {
