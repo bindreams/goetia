@@ -1232,7 +1232,7 @@ fn start_via_notify_starts_then_arms_running_and_gates_on_running() {
         start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
         Waited::Confirmed
     );
-    // The critical ordering: arm RUNNING strictly AFTER start, so only what follows it decides.
+    // The critical ordering: arm the settled mask strictly AFTER start, so only what follows it decides.
     assert_eq!(fake.log, vec!["start", "arm_settle", "wait", "got_running"]);
 }
 
@@ -1247,7 +1247,11 @@ fn a_start_is_not_confirmed_by_a_running_the_service_left_before_the_start() {
         start_via_notify(&mut fake, unbounded(), Kind::Simple).unwrap(),
         Waited::Confirmed
     );
-    assert_eq!(fake.state, Some(QueriedState::Running), "confirmed on a stale RUNNING");
+    assert_eq!(
+        fake.state,
+        Some(QueriedState::Running),
+        "the start came before the arm, so the RUNNING that answered is the new run's"
+    );
     assert_eq!(fake.log, vec!["start", "arm_settle", "wait", "got_running"]);
 }
 
@@ -2033,8 +2037,7 @@ fn a_cancel_whose_fresh_open_fails_otherwise_touches_nothing() {
 
 #[skuld::test]
 fn a_queried_running_recovers_an_already_running_start() {
-    // The service is up and the wait, armed for SERVICE_NOTIFY_RUNNING,
-    // immediate-fires on it.
+    // The service is up: 1056 here is the goal reached.
     assert!(already_running_is_recoverable(QueriedState::Running));
 }
 
@@ -2132,6 +2135,29 @@ fn a_start_over_a_stopping_service_says_it_is_stopping() {
         assert!(text.contains("restart policy"), "{text}");
         assert!(!text.contains("stay down"), "{text}");
     }
+}
+
+/// A start over a paused service says the same whether the pause came before the start (1056) or
+/// settled after it, and names the state and the way out.
+#[skuld::test]
+fn a_start_over_a_paused_service_says_it_is_paused() {
+    let notified = start_via_notify(&mut FakeScm::new([Some(Observed::Paused)]), unbounded(), Kind::Managed)
+        .unwrap_err()
+        .to_string();
+    let mut fake = FakeScm::new([]).already_running(QueriedState::Paused);
+    let waiting = start_via_notify(&mut fake, unbounded(), Kind::Managed)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(fake.log, vec!["start"], "nothing is waited for");
+    let immediate = request_start(&mut FakeScm::new([]).already_running(QueriedState::Paused))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        notified.contains("paused, not running") && notified.contains("`sc continue`"),
+        "{notified}"
+    );
+    assert_eq!(waiting, notified);
+    assert_eq!(immediate, notified);
 }
 
 #[skuld::test]

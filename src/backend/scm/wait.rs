@@ -51,9 +51,11 @@ impl WantState {
 
 /// The service state a `wait_callback` observed. Distinct from [`WantState`]:
 /// a callback can report a state that is neither what the caller wants nor
-/// its opposite. `Running`/`Paused`/`Stopped` are terminal for both waits (the stop wait sends or
-/// fails on a `Paused`, the start wait fails on it); `Pending` is any intermediate
-/// (`StartPending`/`StopPending`) and re-arms.
+/// its opposite. `Running`, `Paused` and `Stopped` are settled. The start wait ends on each: `Running`
+/// confirms, `Paused` fails, `Stopped` is read by `kind`. `settle_and_stop` sends STOP on `Running` or
+/// `Paused` (an error if the service does not accept it) and ends on `Stopped`; `stop_via_notify` is
+/// never delivered `Paused`. `Pending` is any intermediate (`StartPending`/`StopPending`) and re-arms
+/// the stop waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
     Running,
@@ -590,6 +592,7 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
         StartReply::Accepted => Ok(()),
         StartReply::AlreadyRunning(queried) if already_running_is_recoverable(queried) => Ok(()),
         StartReply::AlreadyRunning(QueriedState::StopPending) => Err(io::Error::other(STOPPING)),
+        StartReply::AlreadyRunning(QueriedState::Paused) => Err(io::Error::other(PAUSED)),
         StartReply::AlreadyRunning(queried) => Err(io::Error::other(format!(
             "StartServiceW reported ERROR_SERVICE_ALREADY_RUNNING, but the service is actually \
              {queried:?} — neither Running nor StartPending, so nothing is on its way to running"
@@ -597,7 +600,9 @@ fn accept_as_started(reply: StartReply) -> io::Result<()> {
     }
 }
 
-/// What a start is told when the service settles `PAUSED` instead of `RUNNING`.
+/// What a start is told when the service is `PAUSED` instead of `RUNNING`, whether it settled so after
+/// the start or SCM answered 1056 over it. The caller's error prefix names the service; `sc continue`
+/// takes its name too.
 const PAUSED: &str = "the service is paused, not running: `sc continue` resumes it";
 
 /// What a start over a `STOP_PENDING` service is told. SCM refuses the start (1056), so reporting it
@@ -618,12 +623,13 @@ const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be 
 /// before `Running` is how it reports a failed start, so for it any `Stopped` before `Running` is a
 /// failed start. Neither blocks forever.
 ///
-/// Critical ordering: arm `RUNNING` strictly AFTER issuing `start`, and decide on the status the arm
-/// returns and the notifications after it. A registration made before the start would fire at once for
-/// a `RUNNING` already current, and a run that then failed would have that stale `RUNNING` confirm a
-/// start whose new run has reported nothing. A service that reached `RUNNING` (or stopped) before the
-/// arm is seen in the status the arm returns, as is one a re-arm finds: a registration is not
-/// delivered for a state already current, so the status is read before every wait.
+/// Critical ordering: arm the settled mask ([`WantState::RunningPausedOrStopped`]) strictly AFTER
+/// issuing `start`, and decide on the status the arm returns and the notifications after it. A
+/// registration made before the start would fire at once for a `RUNNING` already current, and a run
+/// that then failed would have that stale `RUNNING` confirm a start whose new run has reported
+/// nothing. A service that reached `RUNNING`, `PAUSED` or `STOPPED` before the arm is seen in the
+/// status the arm returns, as a registration is not delivered for a state already current. Every
+/// state the mask delivers ends the wait, so the start never re-arms.
 ///
 /// An `ERROR_SERVICE_ALREADY_RUNNING` over a service the query reports
 /// `Running` is the SCM's own answer that the goal is reached, so it is the
