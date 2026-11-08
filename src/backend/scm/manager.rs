@@ -441,7 +441,8 @@ impl Backend for Scm {
 
     /// A service that may run a shim file takes the install lock first and keeps it to the end, so
     /// that no install places or sweeps a file between the stop and the sweep. If the service's host
-    /// is a shim file by name, its process is held before the stop, and once the service is stopped
+    /// is a shim file by name, its process is held after the service is disabled and has settled,
+    /// just before the stop (see [`uninstall_locked`]), and once the service is stopped
     /// and deleted the uninstall waits for that process and sweeps the folders the files can be in:
     /// see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
     fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
@@ -457,13 +458,9 @@ impl Backend for Scm {
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
-        let held = match host {
-            Some(_) => hold_process_unbounded(&id, &format!("`{id}` was NOT deleted and is unchanged"))?,
-            None => None,
-        };
         let scm = open_scm_to_classify(id.as_str())?;
-        match (uninstall_locked(&scm, &id)?, host) {
-            (Uninstalled::Deleted, Some(host)) => self.finish_uninstall(&id, &host, held),
+        match (uninstall_locked(&scm, &id, host.is_some())?, host) {
+            (Uninstalled::Deleted { held }, Some(host)) => self.finish_uninstall(&id, &host, held),
             _ => Ok(()),
         }
     }
@@ -1000,7 +997,14 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// (`ERROR_SERVICE_DOES_NOT_EXIST`, 1060) at any of the opens, the disable or the delete is success:
 /// the record is removed, which is what `uninstall` is for. A second `uninstall` racing the first
 /// can meet 1060 at the first open.
-fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<Uninstalled> {
+///
+/// With `hold`, the service's process is held once it is disabled and settled, just before each STOP,
+/// and handed back in [`Uninstalled::Deleted`] for the caller to wait for: SCM records `STOPPED`
+/// before the process exits, and reports no pid after it. It may be running an older file than the
+/// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
+/// process that cannot be opened is none (see [`hold_if_possible`]). The service handle each hold
+/// uses is closed before it returns, or the service could not be deleted.
+fn uninstall_locked(scm: &WinServiceManager, id: &Id, hold: bool) -> Result<Uninstalled> {
     // Opened first and kept through the stop: no state change slips between the disable and the wait.
     let mut actor = match super::wait::SystemScmActor::open(id.as_str()) {
         Ok(actor) => actor,
@@ -1019,7 +1023,27 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<Uninstalled> {
         Disabled::Now { previous } => (false, previous),
     };
 
-    match super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start()) {
+    // Taken here and not before the disable: a start in flight at the disable, or a recovery
+    // restart, replaces the process, and a disabled service cannot be started again. Taken again for
+    // each STOP the loop sends, so the one kept is the process that STOP is for.
+    let mut held = None;
+    let mut hold_failed = None;
+    let settled = super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start(), |_| {
+        if !hold {
+            return Ok(());
+        }
+        match hold_process_unbounded(id, &format!("`{id}`'s process could not be held before its STOP")) {
+            Ok(process) => {
+                held = process;
+                Ok(())
+            }
+            Err(e) => {
+                hold_failed = Some(e);
+                Err(std::io::Error::other("the service's process could not be held"))
+            }
+        }
+    });
+    match settled {
         Ok(Waited::Confirmed) => {}
         // `let _ = ...` is the write that turns an unreachable case into a silent one, and this
         // is precisely the case where a later edit narrowing that budget must not pass quietly.
@@ -1030,7 +1054,8 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<Uninstalled> {
             } else {
                 UninstallFailure::Stop { previous }
             };
-            return Err(uninstall_failed(id, &state, Error::os(format!("stop `{id}`"), e)));
+            let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
+            return Err(uninstall_failed(id, &state, cause));
         }
     }
     // Closed before the delete: an open handle would keep the record after it.
@@ -1044,12 +1069,12 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<Uninstalled> {
     };
     let service = match scm.open_service(id.as_str(), ServiceAccess::DELETE) {
         Ok(service) => service,
-        Err(e) if is_not_found(&e) => return Ok(Uninstalled::Deleted),
+        Err(e) if is_not_found(&e) => return Ok(Uninstalled::Deleted { held }),
         Err(e) => return Err(not_deleted(format!("open `{id}` to delete it"), e)),
     };
     match service.delete() {
-        Ok(()) => Ok(Uninstalled::Deleted),
-        Err(e) if is_not_found(&e) || is_marked_for_delete(&e) => Ok(Uninstalled::Deleted),
+        Ok(()) => Ok(Uninstalled::Deleted { held }),
+        Err(e) if is_not_found(&e) || is_marked_for_delete(&e) => Ok(Uninstalled::Deleted { held }),
         Err(e) => Err(not_deleted(format!("delete service `{id}`"), e)),
     }
 }
@@ -1057,8 +1082,9 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<Uninstalled> {
 /// How far a successful [`uninstall_locked`] got.
 enum Uninstalled {
     /// The service was stopped and is deleted, or is about to be when a handle closes: nothing it
-    /// ran is running or will start again, once the process SCM reported has exited.
-    Deleted,
+    /// ran is running or will start again, once the process SCM reported has exited. `held` is
+    /// that process, when it was held.
+    Deleted { held: Option<Held> },
     /// Nothing of this call's is left to wait for: the service was already gone (1060), or someone
     /// else had marked it for deletion, so it was stopped but not deleted by this call. What it ran
     /// is left for the next sweep.

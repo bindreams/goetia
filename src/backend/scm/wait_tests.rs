@@ -1189,6 +1189,86 @@ fn a_stop_is_issued_even_when_the_arm_after_it_expires() {
 
 // settle_and_stop ----
 
+/// [`super::settle_and_stop`] for a caller that has nothing to do before the STOP.
+fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
+    super::settle_and_stop(a, deadline, |_| Ok(()))
+}
+
+/// The `before_stop` of a caller that logs it in the fake's own log, so that its place among the
+/// steps is what the log says.
+fn holding(fake: &mut FakeScm) -> io::Result<()> {
+    fake.log.push("hold");
+    Ok(())
+}
+
+/// The caller's `before_stop` runs once the state is settled and before each STOP, not before the
+/// wait: what it holds is the process of the service as it is now. A service that is already
+/// stopped has no STOP and no hold.
+#[skuld::test]
+fn settle_and_stop_runs_the_callers_step_before_each_stop_it_sends() {
+    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]);
+    assert_eq!(
+        super::settle_and_stop(&mut fake, unbounded(), holding).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(
+        fake.log,
+        [
+            "arm_settle",
+            "wait",
+            "got_running",
+            "hold",
+            "control_stop",
+            "arm_stopped",
+            "wait",
+            "got_stopped"
+        ]
+    );
+
+    // A refused STOP is sent again after the re-arm, and the process is held again for it: the
+    // service may have been restarted in between.
+    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)])
+        .stop_replies([StopReply::Os(INVALID_SERVICE_CONTROL), StopReply::Ok]);
+    assert_eq!(
+        super::settle_and_stop(&mut fake, unbounded(), holding).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(
+        fake.log,
+        [
+            "arm_settle",
+            "wait",
+            "got_running",
+            "hold",
+            "control_stop",
+            "arm_settle",
+            "hold",
+            "control_stop",
+            "arm_stopped",
+            "wait",
+            "got_stopped"
+        ]
+    );
+
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+    assert_eq!(
+        super::settle_and_stop(&mut fake, unbounded(), holding).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(fake.log, ["arm_settle", "wait", "got_stopped"]);
+}
+
+/// A step that fails ends the settle with its error and no STOP: the service is left as it was.
+#[skuld::test]
+fn settle_and_stop_sends_no_stop_when_the_callers_step_fails() {
+    let mut fake = FakeScm::new([Some(Observed::Running)]);
+
+    let error = super::settle_and_stop(&mut fake, unbounded(), |_| Err(io::Error::other("no hold"))).unwrap_err();
+
+    assert_eq!(error.to_string(), "no hold");
+    assert_eq!(fake.log, ["arm_settle", "wait", "got_running"]);
+}
+
 /// What one SCM interleaving must make [`settle_and_stop`] do.
 enum Outcome {
     Confirmed,
