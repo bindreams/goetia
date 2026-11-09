@@ -35,7 +35,7 @@ fn a_child_is_opened_as_the_key_it_is_even_when_it_is_a_link() {
     let name = counted(&"Sub".encode_utf16().collect::<Vec<u16>>());
     let parent = 0x1234 as HANDLE;
 
-    let attributes = child_attributes(parent, &name);
+    let attributes = child_attributes(parent, &name, LinkHandling::Itself);
 
     assert_ne!(
         attributes.Attributes & OBJ_OPENLINK,
@@ -45,6 +45,17 @@ fn a_child_is_opened_as_the_key_it_is_even_when_it_is_a_link() {
     assert_ne!(attributes.Attributes & OBJ_CASE_INSENSITIVE, 0);
     assert_eq!(attributes.RootDirectory, parent);
     assert!(std::ptr::eq(attributes.ObjectName, &name));
+}
+
+/// `Followed` enters a link.
+#[skuld::test]
+fn a_child_is_opened_through_a_link_when_asked_to_follow_it() {
+    let name = counted(&"Sub".encode_utf16().collect::<Vec<u16>>());
+
+    let attributes = child_attributes(0x1234 as HANDLE, &name, LinkHandling::Followed);
+
+    assert_eq!(attributes.Attributes & OBJ_OPENLINK, 0, "the link would not be entered");
+    assert_ne!(attributes.Attributes & OBJ_CASE_INSENSITIVE, 0);
 }
 
 /// `KEY_BASIC_INFORMATION`: an 8-byte time, a 4-byte title index, a 4-byte name length in bytes,
@@ -132,7 +143,7 @@ fn a_key_marked_deleted_while_the_walk_holds_it_is_done_at_its_listing() {
     let (top, _) = parent.create_subkey("Top").expect("create Top");
     top.create_subkey("Leaf").expect("create Leaf");
     drop(top);
-    let held = open_raw(parent.raw_handle(), &units("Top"), CHILD_ACCESS).expect("open Top");
+    let held = open_raw(parent.raw_handle(), &units("Top"), CHILD_ACCESS, LinkHandling::Itself).expect("open Top");
 
     // Another handle deletes the tree under the walk's open handle: `Top` is marked deleted.
     parent

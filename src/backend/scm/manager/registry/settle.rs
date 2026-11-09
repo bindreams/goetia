@@ -100,41 +100,31 @@ pub(super) fn gone_is_done(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// Whether the service key opened. A key not found or deleted is gone; a denied open stands,
-/// because resolving the path comes before the access check.
-pub(super) fn stands(opened: io::Result<()>) -> io::Result<bool> {
-    match opened {
+/// Whether the service key stands, from `through`, its open as SCM reads it (a registry link is
+/// followed). A key not found or deleted is gone; a denied open stands, because resolving the path
+/// comes before the access check.
+///
+/// A key gone through the link is gone only if `itself`, asked then, finds it gone as itself too.
+/// If `itself` finds a key, it is a link with a missing target: `through`'s error stands.
+pub(super) fn stands(through: io::Result<()>, itself: impl FnOnce() -> io::Result<()>) -> io::Result<bool> {
+    let denied = |e: &io::Error| e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    match through {
         Ok(()) => Ok(true),
-        Err(e) if is_gone(&e) => Ok(false),
-        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => Ok(true),
+        Err(e) if denied(&e) => Ok(true),
+        Err(e) if is_gone(&e) => match itself() {
+            Err(again) if is_gone(&again) => Ok(false),
+            Err(again) if !denied(&again) => Err(again),
+            Ok(()) | Err(_) => Err(e),
+        },
         Err(e) => Err(e),
     }
 }
 
-/// What vouches that the service stands, for a read that finds an optional key missing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    /// No enumeration vouches for the name: the service was looked up by name, so a missing
-    /// optional key may mean it is gone, and the read asks.
-    Opened,
-    /// Something other than a lookup vouches for the name: the enumeration of `Services` listed it,
-    /// or the caller holds an open handle to the service. A missing optional key, or a service key
-    /// that is gone, is then taken as the service standing without it: a service that is gone
-    /// leaves at most a stale row, which the user's own concurrent uninstall explains, and a
-    /// deleted service that is held is only marked, its key staying until the handle closes.
-    Vouched,
-}
-
-/// Resolves `stop`; `service_stands` runs for `Vanished`, and for `Absent` unless the name is
-/// [`Origin::Vouched`].
-pub(super) fn settle<T>(
-    stop: Stop<T>,
-    origin: Origin,
-    service_stands: impl FnOnce() -> Result<bool, Failure>,
-) -> Settled<T> {
+/// Resolves `stop`; `service_stands` runs for `Absent` and `Vanished` alike, since a key not found
+/// says nothing about the service key above it.
+pub(super) fn settle<T>(stop: Stop<T>, service_stands: impl FnOnce() -> Result<bool, Failure>) -> Settled<T> {
     let (stands, on_standing) = match stop {
         Stop::Other(failure) => return Settled::Failed(failure),
-        Stop::Absent(value) if origin == Origin::Vouched => return Settled::Value(value),
         Stop::Absent(value) => (service_stands(), Settled::Value(value)),
         Stop::Vanished(failure) => (service_stands(), Settled::Failed(failure)),
     };
