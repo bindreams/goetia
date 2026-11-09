@@ -247,6 +247,11 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 /// the failed terminate, if any. No process held (none reported, or none that could be opened) is the
 /// stop alone.
 ///
+/// `held` is the hold as it was made, and what is left in it afterwards is what the caller still has
+/// to say: the process is taken out of [`Held`](HoldOutcome::Held) and passed to `end`, and a
+/// [`Refused`](HoldOutcome::Refused) stays, with the reason the process could not be opened, for the
+/// caller to report: this is where a refused process counts as not held, and the only place.
+///
 /// An expired hold is sent the STOP all the same, and it ends there, whatever SCM answers: the held
 /// process died (a crash), SCM may have a recovery restart pending, and a restarted process may have
 /// reported `STOPPED` and still be exiting, so the STOP may have reached a process that nothing
@@ -257,22 +262,25 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     a: &mut A,
     deadline: Deadline,
-    held: HoldOutcome<P>,
+    held: &mut HoldOutcome<P>,
     end: impl FnOnce(P, Deadline) -> io::Result<EndProcessOutcome<P>>,
 ) -> io::Result<StopAndAwaitExitOutcome<P>> {
-    let held = match held {
-        HoldOutcome::Held(process) => Some(process),
+    if let HoldOutcome::Expired { pid } = *held {
+        control_stop_or_underway(a)?;
+        return Ok(StopAndAwaitExitOutcome::Unconfirmed { pid });
+    }
+    let process = match held {
+        HoldOutcome::Held(_) => match std::mem::replace(held, HoldOutcome::NoProcess) {
+            HoldOutcome::Held(process) => Some(process),
+            _ => unreachable!("the outcome was just matched as held"),
+        },
         // Why a refused process is not held is the caller's to report: it knows where.
-        HoldOutcome::NoProcess | HoldOutcome::Refused(_) => None,
-        HoldOutcome::Expired { pid } => {
-            control_stop_or_underway(a)?;
-            return Ok(StopAndAwaitExitOutcome::Unconfirmed { pid });
-        }
+        HoldOutcome::NoProcess | HoldOutcome::Refused(_) | HoldOutcome::Expired { .. } => None,
     };
     if stop_via_notify(a, deadline)? == Waited::Expired {
         return Ok(StopAndAwaitExitOutcome::ServiceExpired);
     }
-    let Some(process) = held else {
+    let Some(process) = process else {
         return Ok(StopAndAwaitExitOutcome::Stopped);
     };
     Ok(match end(process, deadline)? {

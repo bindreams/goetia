@@ -569,7 +569,7 @@ fn stop_and_await_exit_terminates_then_waits_for_the_held_process_after_stopped(
     let outcome = stop_and_await_exit(
         &mut fake,
         deadline,
-        HoldOutcome::Held(7u32),
+        &mut HoldOutcome::Held(7u32),
         ending(
             |process| {
                 calls.borrow_mut().push(("terminate", *process, None));
@@ -599,7 +599,7 @@ fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
     let outcome = stop_and_await_exit(
         &mut fake,
         unbounded(),
-        HoldOutcome::Held(7u32),
+        &mut HoldOutcome::Held(7u32),
         ending(|_| Ok(()), |_, _, _| Ok(Waited::Expired)),
     );
 
@@ -616,7 +616,7 @@ fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
 fn stop_and_await_exit_does_not_end_the_process_when_stopped_was_not_confirmed() {
     let mut fake = FakeScm::new([None]);
 
-    let outcome = stop_and_await_exit(&mut fake, unbounded(), HoldOutcome::Held(7u32), no_end);
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), &mut HoldOutcome::Held(7u32), no_end);
 
     assert!(matches!(outcome.unwrap(), StopAndAwaitExitOutcome::ServiceExpired));
 }
@@ -625,9 +625,36 @@ fn stop_and_await_exit_does_not_end_the_process_when_stopped_was_not_confirmed()
 fn stop_and_await_exit_without_a_held_process_is_the_stop() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
 
-    let outcome = stop_and_await_exit(&mut fake, unbounded(), HoldOutcome::<u32>::NoProcess, no_end);
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), &mut HoldOutcome::<u32>::NoProcess, no_end);
 
     assert!(matches!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped));
+}
+
+/// A process that could not be opened is not held, and the hold keeps why for the caller, which
+/// knows where to report it; a process that was held is taken out of it.
+#[skuld::test]
+fn stop_and_await_exit_is_the_stop_alone_for_a_refused_process_and_leaves_its_reason() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+    let mut held = HoldOutcome::<u32>::Refused(io::Error::other("access denied"));
+
+    let outcome = stop_and_await_exit(&mut fake, unbounded(), &mut held, no_end);
+
+    assert!(matches!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped));
+    let HoldOutcome::Refused(reason) = held else {
+        panic!("the reason is kept: {held:?}");
+    };
+    assert_eq!(reason.to_string(), "access denied");
+
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+    let mut held = HoldOutcome::Held(7u32);
+    let outcome = stop_and_await_exit(
+        &mut fake,
+        unbounded(),
+        &mut held,
+        ending(|_| Ok(()), |_, _, _| Ok(Waited::Confirmed)),
+    );
+    assert!(matches!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped));
+    assert!(matches!(held, HoldOutcome::NoProcess), "{held:?}");
 }
 
 #[skuld::test]
@@ -637,7 +664,7 @@ fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
     let outcome = stop_and_await_exit(
         &mut fake,
         unbounded(),
-        HoldOutcome::Held(7u32),
+        &mut HoldOutcome::Held(7u32),
         ending(|_| Ok(()), |_, _, _| Err(io::Error::other("wait failed"))),
     );
 
@@ -737,7 +764,7 @@ fn stop_and_await_exit_ends_the_process_as_end_process_does_after_a_failed_termi
     let outcome = stop_and_await_exit(
         &mut fake,
         unbounded(),
-        HoldOutcome::Held(7u32),
+        &mut HoldOutcome::Held(7u32),
         ending(terminate_fails, |_, _, _| Ok(Waited::Confirmed)),
     );
     assert!(matches!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped));
@@ -746,7 +773,7 @@ fn stop_and_await_exit_ends_the_process_as_end_process_does_after_a_failed_termi
     let outcome = stop_and_await_exit(
         &mut fake,
         unbounded(),
-        HoldOutcome::Held(7u32),
+        &mut HoldOutcome::Held(7u32),
         ending(terminate_fails, |_, _, _| Ok(Waited::Expired)),
     );
     let StopAndAwaitExitOutcome::ProcessExpired {
@@ -770,7 +797,7 @@ fn stop_and_await_exit_ends_the_process_as_end_process_does_after_a_failed_termi
 fn stop_and_await_exit_after_an_expired_hold_sends_the_stop_and_is_unconfirmed() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
 
-    let outcome = stop_and_await_exit(&mut fake, spent(), HoldOutcome::<u32>::Expired { pid: 9 }, no_end);
+    let outcome = stop_and_await_exit(&mut fake, spent(), &mut HoldOutcome::<u32>::Expired { pid: 9 }, no_end);
 
     assert!(matches!(
         outcome.unwrap(),
@@ -806,7 +833,7 @@ fn stop_and_await_exit_after_an_expired_hold_is_unconfirmed_whichever_way_the_st
             vec!["control_stop", "query_status"],
         ),
     ] {
-        let outcome = stop_and_await_exit(&mut fake, spent(), HoldOutcome::<u32>::Expired { pid: 9 }, no_end);
+        let outcome = stop_and_await_exit(&mut fake, spent(), &mut HoldOutcome::<u32>::Expired { pid: 9 }, no_end);
 
         assert!(
             matches!(outcome.unwrap(), StopAndAwaitExitOutcome::Unconfirmed { pid: 9 }),
@@ -824,7 +851,7 @@ fn stop_and_await_exit_after_an_expired_hold_reports_a_refused_stop() {
         .stop_replies([StopReply::Os(ERROR_INVALID_SERVICE_CONTROL)])
         .queried(QueriedState::Running, true);
 
-    let outcome = stop_and_await_exit(&mut fake, spent(), HoldOutcome::<u32>::Expired { pid: 9 }, no_end);
+    let outcome = stop_and_await_exit(&mut fake, spent(), &mut HoldOutcome::<u32>::Expired { pid: 9 }, no_end);
 
     assert!(outcome.is_err());
 }

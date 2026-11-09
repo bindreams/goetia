@@ -552,14 +552,8 @@ impl Backend for Scm {
         }
         // Before the STOP: SCM reports `STOPPED` before the process exits, and no pid after it. An
         // expired hold is sent the STOP all the same, and is not a stop: see `stop_and_await_exit`.
-        let held = hold_process(&id, deadline, &format!("`{id}` was NOT stopped"))?;
-        // A process that cannot be opened is not waited for, and a `stop` that succeeds has no
-        // channel to say so: the reason leads the error of one that fails.
-        let (held, unopened) = match held {
-            HoldOutcome::Refused(reason) => (HoldOutcome::NoProcess, Some(reason)),
-            other => (other, None),
-        };
-        let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, held, |held, deadline| {
+        let mut held = hold_process(&id, deadline, &format!("`{id}` was NOT stopped"))?;
+        let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, &mut held, |held, deadline| {
             end_held(&id, held, deadline)
         })
         .map_err(|e| Error::os(format!("stop `{id}`"), e))
@@ -578,9 +572,11 @@ impl Backend for Scm {
                 terminate_failed,
             )),
         });
-        stopped.map_err(|error| match unopened {
-            Some(reason) => unwaited(&id, reason, error),
-            None => error,
+        // A process that cannot be opened is not waited for (see `stop_and_await_exit`), and a `stop`
+        // that succeeds has no channel to say so: the reason leads the error of one that fails.
+        stopped.map_err(|error| match held {
+            HoldOutcome::Refused(reason) => unwaited(&id, reason, error),
+            _ => error,
         })
     }
 
