@@ -181,3 +181,8 @@ harness = false
 name = "shim_integration"
 path = "tests/shim_integration.rs"
 harness = false
+
+[[test]]
+name = "launchd_probes"
+path = "tests/launchd_probes.rs"
+harness = false
