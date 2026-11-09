@@ -156,10 +156,11 @@ fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {
 
 /// An open made after `read` established that the id is installed and goetia's is an ordinary
 /// failure of the verb, exit `1`: `Undetermined` would say goetia does not know what is installed
-/// there, and exit `4`. A denial names the verb and advises elevation; any other failure does not.
+/// there, and exit `4`. A denial is named as the verb's; no failure advises elevation, since the
+/// CLI's gate has already run.
 #[skuld::test]
 fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
-    for (raw, wants_elevation) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
+    for (raw, denied) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
         let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(raw));
         let err = open_refused("x", "enable", "open service `x` to enable it", e);
 
@@ -173,13 +174,11 @@ fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
         let report = err.report().to_string();
         assert!(report.contains("open service `x` to enable it"), "{raw}: {report}");
         assert_eq!(
-            report.contains("re-run as Administrator"),
-            wants_elevation,
+            report.contains("`enable` was denied access to service `x`"),
+            denied,
             "{raw}: {report}"
         );
-        if wants_elevation {
-            assert!(report.contains("enable"), "{raw}: the advice names the verb: {report}");
-        }
+        assert!(!report.contains("Administrator"), "{raw}: {report}");
         assert!(
             !report.contains("determine whether"),
             "{raw}: that is the read's sentence: {report}"

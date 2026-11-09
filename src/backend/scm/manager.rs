@@ -1100,7 +1100,7 @@ fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> E
 
 /// A failed open made after `read` established that `id` is installed and goetia's, so the verb
 /// `operation` failed and nothing is in doubt: an `Os` error (exit `1`), never [`undetermined`],
-/// which says goetia cannot tell whether anything is installed. A denial also advises elevation.
+/// which says goetia cannot tell whether anything is installed. A denial is named as the verb's.
 ///
 /// `context` is the open, as [`to_error`] takes it.
 fn open_refused(id: &str, operation: &str, context: &str, e: windows_service::Error) -> Error {
@@ -1110,7 +1110,7 @@ fn open_refused(id: &str, operation: &str, context: &str, e: windows_service::Er
         return failed;
     }
     Error::Step {
-        what: format!("`{operation}` was denied access to `{id}`; re-run as Administrator"),
+        what: format!("`{operation}` was denied access to service `{id}`"),
         source: Box::new(failed),
     }
 }
