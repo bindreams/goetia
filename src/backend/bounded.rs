@@ -65,8 +65,7 @@ pub(crate) struct Capture {
 pub(crate) enum Finished {
     /// The child exited on its own, inside the budget.
     Exited { status: ExitStatus, capture: Capture },
-    /// The deadline expired first. The child was killed and reaped — or, under
-    /// [`Role::Request`], left running, to be reaped on a thread of its own once it exits.
+    /// The deadline expired first. The child was killed and reaped.
     ///
     /// Carries no capture. Whatever the child had written by then is a
     /// prefix no consumer may treat as whole, and the one thing every
@@ -76,6 +75,61 @@ pub(crate) enum Finished {
     /// expiry identically. A field nothing may read and nothing does read is
     /// surplus.
     Expired,
+    /// The deadline expired first, and the child is a [`Role::Request`] left running: the caller
+    /// may end it ([`Left::kill`]) or, by dropping this, leave it to its [`Reaper`].
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Left(Left),
+}
+
+/// Carries a [`Fate`] out on the child a [`Left`] holds.
+type Settle = Box<dyn FnOnce(Fate) + Send>;
+
+/// How a request left running by an expiry ends up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fate {
+    /// The caller ended the child.
+    Kill,
+    /// The child runs on, and its [`Reaper`] reaps it once it exits.
+    Release,
+}
+
+/// A [`Role::Request`] the deadline left running, held until its caller decides its [`Fate`].
+///
+/// goetia cannot tell from the client whether the request is out, and a kill before it is would
+/// lose it, so nothing here kills unasked: dropping a `Left` releases the child to its reaper. A
+/// caller that learns by other means that the manager has the request may [`kill`](Left::kill) the
+/// child, which then costs the request nothing.
+pub(crate) struct Left(Option<Settle>);
+
+impl Left {
+    pub(crate) fn new(settle: impl FnOnce(Fate) + Send + 'static) -> Left {
+        Left(Some(Box::new(settle)))
+    }
+
+    /// End the child. One that already exited is not an error; one that cannot be signalled runs
+    /// on, which is [`Fate::Release`], and says so on stderr.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn kill(mut self) {
+        self.settle(Fate::Kill);
+    }
+
+    fn settle(&mut self, fate: Fate) {
+        if let Some(settle) = self.0.take() {
+            settle(fate);
+        }
+    }
+}
+
+impl Drop for Left {
+    fn drop(&mut self) {
+        self.settle(Fate::Release);
+    }
+}
+
+impl std::fmt::Debug for Left {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Left")
+    }
 }
 
 /// What the child does for its caller, which decides what the deadline may cut short, and where its
@@ -103,9 +157,9 @@ pub(crate) enum Role {
     AnnouncedRequest(fn(&[u8]) -> bool),
     /// A request that never says when the manager has it. The deadline applies from the spawn, but
     /// an expiry leaves the child running rather than killing it, since a kill could land before
-    /// the request is out, and its [`Reaper`] reaps it once it exits. launchd's alone: on Linux,
-    /// cosca 0.4's cgroup containment kills a detached tree when it drops the leaf, so a
-    /// [`command`] child would not be left running.
+    /// the request is out, and its [`Reaper`] reaps it once it exits. The caller gets the child
+    /// back as a [`Left`]. launchd's alone: on Linux, cosca 0.4's cgroup containment kills a
+    /// detached tree when it drops the leaf, so a [`command`] child would not be left running.
     ///
     /// Its output goes to temp files, never pipes: a pipe goetia stopped reading — on expiry, or by
     /// exiting — kills the writer with `SIGPIPE`, and a file does not.
@@ -284,8 +338,10 @@ pub(crate) struct Lost {
 }
 
 /// Block until the child exits or `deadline` expires, under its [`Role`]'s rule for what an expiry
-/// does: kill the child, tear its tree down and reap it — or, for [`Role::Request`], leave it
-/// running for its [`Reaper`]. Nothing here makes a thread or a file: [`spawn`] made them all.
+/// does: kill the child, tear its tree down and reap it ([`Finished::Expired`]) — or, for
+/// [`Role::Request`], leave it running and hand it back as [`Finished::Left`], which releases it to
+/// its [`Reaper`] unless the caller kills it. Nothing here makes a thread or a file: [`spawn`] made
+/// them all.
 pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, Lost> {
     let Spawned {
         child,
@@ -332,11 +388,16 @@ fn waited_out(
     let status = match (waited, role) {
         (Some(status), _) => status,
         (None, Role::Request(reaper)) => {
-            // Not killed: goetia cannot tell whether the request is out yet, and a request left
-            // unsent because goetia ran out of budget is the one answer worse than waiting. Its
-            // output files stay open in it, and a file never breaks under its writer.
-            reaper.reap(child);
-            return Ok(Finished::Expired);
+            // Left to the caller: see `Left`. Its output files stay open in it, and a file never
+            // breaks under its writer.
+            return Ok(Finished::Left(Left::new(move |fate| {
+                if fate == Fate::Kill
+                    && let Err(e) = child.kill()
+                {
+                    eprintln!("warning: could not kill a request left running, which runs on: {e}");
+                }
+                reaper.reap(child);
+            })));
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
             // The root first, and its `Ok` is what makes the reap below unable to block.

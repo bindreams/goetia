@@ -100,6 +100,25 @@ fn a_recovery_is_appended_to_an_unusable_refusal_after_the_reason() {
     assert_eq!(out, "frpc: refused: blob is damaged. uninstall it\n");
 }
 
+#[skuld::test]
+fn a_recovery_follows_a_reason_that_ends_in_a_period_without_doubling_it() {
+    let reason = Reason::around(
+        "scan failed (",
+        Error::NotInstalled { id: id().to_string() },
+        "). Ownership is unknown.",
+    );
+    let (_, out, _) = reported(Mood::Done, |lines, out, err| {
+        lines.unusable(&reason, Some("uninstall it"), out, err)
+    });
+    assert!(
+        out.ends_with(
+            "Ownership is unknown. uninstall it
+"
+        ),
+        "{out}"
+    );
+}
+
 /// `recovery` and `reason` carry text from outside, and a line feed in one would start a line of
 /// its own on either stream.
 #[skuld::test]

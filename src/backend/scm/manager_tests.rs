@@ -440,6 +440,31 @@ fn unreadable_notice_is_one_line_and_says_what_it_stands_for() {
     }
 }
 
+/// SCM has the service open, so a registry that finds its key gone disagrees with SCM: the read
+/// failed, and the service is neither absent nor foreign.
+#[skuld::test]
+fn a_service_scm_holds_whose_registry_key_is_gone_is_undetermined_naming_the_key() {
+    let Err(Error::Undetermined { id, reason, .. }) =
+        held_service("held", registry::RegistryReadOutcome::<Vec<String>>::ServiceGone)
+    else {
+        panic!("a held service whose key is gone must be undetermined");
+    };
+
+    assert_eq!(id, "held");
+    let reason = reason.report().to_string();
+    assert!(
+        reason.contains(r"Services\held"),
+        "the reason must name the missing service key: {reason}"
+    );
+}
+
+#[skuld::test]
+fn a_service_scm_holds_with_a_registry_read_is_that_read() {
+    let read = held_service("held", registry::RegistryReadOutcome::Read(Parameters::default()));
+
+    assert!(read.is_ok());
+}
+
 /// What the `Parameters` of an openable service say about ownership. The snapshot is the map as it
 /// was read, so `installed` compares what `read` saw.
 #[skuld::test]

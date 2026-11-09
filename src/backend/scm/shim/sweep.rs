@@ -122,8 +122,8 @@ fn name_key(path: &Path) -> String {
 /// for a service that starts nothing, being marked for deletion or having no `ImagePath` that is a
 /// string) or from `through_scm`, which is asked when the read failed or found the service gone: a
 /// key that denies `KEY_READ` to Administrators still answers SCM, which reads it as the service
-/// control manager, and a registry link to a missing key reads as gone where SCM has a service.
-/// Only SCM's answer makes a service gone. An error only when SCM failed too; it names the service,
+/// control manager, and a registry that says gone and a registry link to a missing key (a read
+/// failure) both leave SCM's word to settle. Only SCM's answer makes a service gone. An error only when SCM failed too; it names the service,
 /// since one unreadable service must not fail every uninstall without saying which.
 pub(crate) fn image_of(
     name: &str,

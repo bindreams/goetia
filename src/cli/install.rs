@@ -64,7 +64,7 @@ pub fn run(
 
     if args.dry_run {
         let _ = writeln!(out, "# {}", spec.id);
-        return match preview_artifact(&spec, host, err) {
+        return match preview_artifact(&spec, host) {
             Ok(artifact) => {
                 let _ = write!(out, "{artifact}");
                 ExitCode::Success
@@ -200,28 +200,24 @@ fn preview_root_account() -> String {
 /// an executable path its registration writer rewrites; systemd refuses the values `refuse_unrepresentable` lists.
 ///
 /// Writes nothing; on Windows a `type: simple` daemon's preview asks `host` for the host command.
-///
-/// `err` is threaded through on every platform so a generator warning cannot
-/// be dropped; no generator produces a [`crate::spec::Warning`] here today. `host` is
-/// called only by the Windows preview of a `type: simple` daemon, whose artifact names it.
-fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>, err: &mut dyn Write) -> Result<String> {
+/// `host` is called only by that preview, whose artifact names it.
+fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>) -> Result<String> {
     let identity = preview_identity(&spec.user);
 
     #[cfg(target_os = "linux")]
     {
-        let _ = (err, host);
+        let _ = host;
         crate::backend::systemd::generate::unit(spec, &identity)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (err, host);
+        let _ = host;
         Ok(crate::backend::launchd::generate::plist(spec, &identity))
     }
     #[cfg(windows)]
     {
         // The SCM generator's warning (a too-large `restart-delay`) fires at
         // resolve time, from `BackendKind::Scm.warn`, before this runs.
-        let _ = err;
         // Asked only for a `type: simple` daemon: a managed one runs no host, and a provider that
         // cannot name one must not fail its preview. The real host, so the preview refuses a path
         // the install would.
@@ -234,7 +230,7 @@ fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>, e
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
-        let _ = (err, host);
+        let _ = host;
         Ok("# no dry-run preview generator for this platform\n".to_string())
     }
 }

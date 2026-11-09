@@ -895,8 +895,8 @@ impl Error {
     }
 
     /// The error and its causes, joined as `context: cause: cause`, then each [`remedy`](Error::remedy)
-    /// found along the chain, outermost first, as `. remedy`; a [`Both`](Error::Both) prints as
-    /// `first; then: then`. What the CLI prints: [`Display`](fmt::Display) alone is the outermost
+    /// found along the chain, outermost first, each as `. remedy`, or ` remedy` after words that end in
+    /// `.`, `!` or `?`; a [`Both`](Error::Both) prints as `first; then: then`. What the CLI prints: [`Display`](fmt::Display) alone is the outermost
     /// context. The control and direction characters of what an error quotes are written as
     /// `\u{XXXX}`, as the CLI's other human sinks write them; a child's stderr keeps its line feeds
     /// and tabs.

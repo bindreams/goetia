@@ -38,7 +38,7 @@ fn a_child_that_exits_is_reported_with_its_output() {
             assert_eq!(capture.stdout, b"hi\n");
             assert!(capture.complete);
         }
-        Finished::Expired => panic!("expected Exited, got Expired"),
+        Finished::Expired | Finished::Left(_) => panic!("expected Exited, got an expiry"),
     }
 }
 
@@ -52,7 +52,7 @@ fn a_nonzero_exit_is_reported_not_an_error() {
             assert_eq!(capture.stderr, b"boom\n");
             assert!(capture.complete);
         }
-        Finished::Expired => panic!("expected Exited, got Expired"),
+        Finished::Expired | Finished::Left(_) => panic!("expected Exited, got an expiry"),
     }
 }
 
@@ -197,7 +197,7 @@ fn a_heard_stream_a_descendant_holds_is_read_only_until_the_deadline() {
             assert!(!capture.complete, "the spent deadline ended the read: {capture:?}");
             assert!(announced(&capture.stderr), "{capture:?}");
         }
-        Finished::Expired => panic!("the child exited on its own: expected Exited, got Expired"),
+        Finished::Expired | Finished::Left(_) => panic!("the child exited on its own: expected Exited, got an expiry"),
     }
     ask.write_all(b"now\n").unwrap();
     let mut held = String::new();
@@ -312,7 +312,7 @@ fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
                 assert_eq!(capture.stderr.len(), ISSUED.len() + 1 + 200_000);
                 assert!(capture.complete);
             }
-            Finished::Expired => panic!("expected Exited, got Expired"),
+            Finished::Expired | Finished::Left(_) => panic!("expected Exited, got an expiry"),
         }
     }
 }
@@ -389,7 +389,7 @@ fn an_announced_request_that_ends_unannounced_is_reported_exited() {
             assert_eq!(status.code(), Some(3));
             assert_eq!(capture.stderr, b"refused\n");
         }
-        Finished::Expired => panic!("expected Exited, got Expired"),
+        Finished::Expired | Finished::Left(_) => panic!("expected Exited, got an expiry"),
     }
 }
 
@@ -408,7 +408,7 @@ fn what_an_announced_request_wrote_before_announcing_is_kept() {
             assert_eq!(capture.stderr, b"early\nrequest issued\n");
             assert_eq!(capture.stdout, b"out\n");
         }
-        Finished::Expired => panic!("expected Exited, got Expired"),
+        Finished::Expired | Finished::Left(_) => panic!("expected Exited, got an expiry"),
     }
 }
 
@@ -447,10 +447,29 @@ fn an_expired_request_that_writes_afterwards_is_not_killed_for_it() {
     );
 }
 
+/// The caller of an expired request may end the child it was left holding, and its reaper still
+/// reaps it. The child would exit `7` at EOF, so only the kill ends it with `SIGKILL`.
+#[skuld::test]
+fn a_left_request_the_caller_kills_dies_of_it_and_is_reaped() {
+    let status = expired_request_settled_by("exit 7", |finished| match finished {
+        Finished::Left(left) => left.kill(),
+        other => panic!("expected Left, got {other:?}"),
+    });
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+}
+
 /// Spawn `sh -c 'read line; <then>'` as a [`Role::Request`], let it expire at once, and return how
 /// it ended as its reaper reports it. It reads EOF on its stdin, and so runs `then`, only once the
 /// reaper holds it and is waiting — after the expiry.
 fn expired_request_released_by_its_reaper(then: &str) -> ExitStatus {
+    expired_request_settled_by(then, |finished| {
+        assert!(matches!(finished, Finished::Left(_)), "{finished:?}");
+    })
+}
+
+/// [`expired_request_released_by_its_reaper`], with what the caller does with the expiry given as
+/// `settle`: it holds the child until `settle` returns, and a [`Left`] it drops is released.
+fn expired_request_settled_by(then: &str, settle: impl FnOnce(Finished)) -> ExitStatus {
     let (writer_tx, writer_rx) = mpsc::channel::<io::PipeWriter>();
     let (tx, rx) = mpsc::channel();
     let reaper = Reaper::with(
@@ -466,7 +485,7 @@ fn expired_request_released_by_its_reaper(then: &str) -> ExitStatus {
 
     let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
 
-    assert!(matches!(finished, Finished::Expired), "{finished:?}");
+    settle(finished);
     rx.recv()
         .expect("a request left running must be reaped once it exits")
         .expect("waiting on the child")

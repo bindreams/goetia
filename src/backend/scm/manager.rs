@@ -108,7 +108,7 @@ use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_MARKED_F
 use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
-use self::registry::{Origin, RegistryReadOutcome};
+use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_process};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
@@ -363,11 +363,8 @@ impl Backend for Scm {
             Err(e) if is_not_found(&e) => return Ok(ReadOutcome::Absent),
             Err(e) => return Err(service_undetermined(id.as_str(), &format!("open service `{id}`"), e)),
         };
-        // `service` is open: the service key outlives it, so no second open asks whether it stands.
-        Ok(match registry::read_parameters(id.as_str(), Origin::Vouched)? {
-            RegistryReadOutcome::ServiceGone => ReadOutcome::Absent,
-            RegistryReadOutcome::Read(parameters) => read_marker(parameters, Some(service)).named(id, ScmSnapshot::new),
-        })
+        let parameters = held_service(id.as_str(), registry::read_parameters(id.as_str())?)?;
+        Ok(read_marker(parameters, Some(service)).named(id, ScmSnapshot::new))
     }
 
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
@@ -415,11 +412,10 @@ impl Backend for Scm {
             // neither omitted nor claimed: collected whole here, reported by
             // `unreadable_aggregate`, which names the id, the failure and its remedy when it turns
             // out to be the only one.
-            match registry::read_parameters_in(services, &name, Origin::Vouched) {
-                // Gone since `scan_services` listed it: not there to list. Only a `Parameters` key
-                // lost (marked deleted at open, or gone mid-read) reaches this, with the service
-                // key gone too; a plain missing key reads as a service that stands without it, a
-                // stale row at worst.
+            match registry::read_parameters_in(services, &name) {
+                // Gone since `scan_services` listed it: not there to list. A `Parameters` key not
+                // found, marked deleted or gone mid-read reaches this only if the service key is
+                // gone too.
                 Ok(RegistryReadOutcome::ServiceGone) => {}
                 Ok(RegistryReadOutcome::Read(params)) => {
                     let entry = ScanEntry::of(&name, read_marker(params, None), ScmSnapshot::new);
@@ -610,6 +606,15 @@ fn confirm_provided(rendered: HostCommand, provided: HostCommand) -> Result<Host
     })
 }
 
+/// A registry read of a service SCM has open: SCM says the service exists, so a registry that finds
+/// its key gone disagrees with SCM, and the read failed. The service is neither absent nor foreign.
+fn held_service<T>(id: &str, read: RegistryReadOutcome<T>) -> Result<T> {
+    match read {
+        RegistryReadOutcome::Read(value) => Ok(value),
+        RegistryReadOutcome::ServiceGone => Err(registry::missing_service_key(id)),
+    }
+}
+
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
 /// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
 /// has no second proof of ownership.
@@ -635,7 +640,7 @@ fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<
 /// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no goetia `Marker` (none, or
 /// another service's own), kept apart from `Err` so callers can tell it from an undecodable spec.
 pub(crate) fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
-    match registry::read_parameters(id, Origin::Opened)? {
+    match registry::read_parameters(id)? {
         RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),
         RegistryReadOutcome::Read(params) => generate::extract(&params.fields, &params.strays),
     }
@@ -692,10 +697,7 @@ fn read_live_registration(
         // one-off `LocalSystem`-only filter.
         .and_then(|a| generate::canonical_account(&a));
     let failure_actions = read_failure_actions(service, name)?;
-    let environment = match registry::read_environment(name)? {
-        RegistryReadOutcome::ServiceGone => return Err(Error::NotInstalled { id: name.to_string() }),
-        RegistryReadOutcome::Read(lines) => lines,
-    };
+    let environment = held_service(name, registry::read_environment(name)?)?;
 
     Ok(ScmRegistration {
         name: name.to_string(),

@@ -199,8 +199,8 @@ fn a_service_scm_has_no_image_for_is_none_when_the_key_cannot_be_read() {
     );
 }
 
-/// A key the registry says is gone is not taken as the service gone: a registry link to a missing
-/// key reads so, and SCM still has a service there that starts its image.
+/// A key the registry says is gone is not taken as the service gone: the registry's word is not
+/// SCM's, which may still have a service there that starts its image.
 #[skuld::test]
 fn a_service_the_registry_says_is_gone_but_scm_has_is_scms_image() {
     let image = image_of("frpc", Ok(RegistryReadOutcome::ServiceGone), || {

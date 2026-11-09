@@ -98,8 +98,7 @@ fn decode_utf16(units: &[u16], escaped: impl Fn(char) -> bool) -> String {
 
 /// What a read of a service's registry values found.
 pub enum RegistryReadOutcome<T> {
-    /// The registry says the service no longer exists. That is its word, not proof: a service key
-    /// that is a link to a missing target reads as gone while SCM has the service, so a caller that
+    /// The registry says the service no longer exists. That is its word, not proof: a caller that
     /// must not take a live service for gone asks SCM too (the sweep does).
     ServiceGone,
     Read(T),

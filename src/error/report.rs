@@ -27,11 +27,13 @@ pub(super) fn write_report(e: &Error, out: &mut Sink) -> fmt::Result {
 /// Where error text goes. The one place it is written for a person is [`write_chain`], so the one
 /// place it is escaped: `escaped` is whether this destination is one. The text goes through
 /// [`fmt::Write`]; a child's stderr is written with [`write_layout`](Sink::write_layout). A sink
-/// writes a child's stderr only if it was made to: [`Chain`] makes one that does not.
+/// writes a child's stderr only if it was made to: [`Chain`] makes one that does not. It remembers
+/// the last character written, so that [`write_remedy`](Sink::write_remedy) can join a remedy to it.
 pub(crate) struct Sink<'a> {
     out: &'a mut dyn fmt::Write,
     escaped: bool,
     stderr: bool,
+    last: Option<char>,
 }
 
 impl<'a> Sink<'a> {
@@ -40,6 +42,7 @@ impl<'a> Sink<'a> {
             out,
             escaped,
             stderr: true,
+            last: None,
         }
     }
 
@@ -49,12 +52,14 @@ impl<'a> Sink<'a> {
             out,
             escaped: false,
             stderr: false,
+            last: None,
         }
     }
 
     /// Writes `text`, a child's diagnostic, as it is laid out: for a person its line feeds, tabs
     /// and CRLFs are kept and the rest of the escaped set is escaped.
     fn write_layout(&mut self, text: &str) -> fmt::Result {
+        self.last = text.chars().next_back().or(self.last);
         if self.escaped {
             write_escaped_keeping_layout(self.out, text)
         } else {
@@ -63,8 +68,24 @@ impl<'a> Sink<'a> {
     }
 }
 
+impl Sink<'_> {
+    /// Writes `remedy` as a sentence after what is written so far: `. remedy`, or ` remedy` when
+    /// that already ends in `.`, `!` or `?`. A remedy needs words before it.
+    pub(crate) fn write_remedy(&mut self, remedy: &str) -> fmt::Result {
+        debug_assert!(self.last.is_some(), "a remedy follows words");
+        let join = if matches!(self.last, Some('.' | '!' | '?')) {
+            " "
+        } else {
+            ". "
+        };
+        self.write_str(join)?;
+        self.write_str(remedy)
+    }
+}
+
 impl fmt::Write for Sink<'_> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.last = text.chars().next_back().or(self.last);
         if self.escaped {
             write_escaped(self.out, text)
         } else {
@@ -162,10 +183,10 @@ pub(super) fn write_sentence<'a>(sentence: Sentence<'a>, out: &mut Sink, remedie
     out.write_str(&sentence.after)
 }
 
-/// Writes each of `remedies` as `. remedy`.
+/// Writes each of `remedies` with [`Sink::write_remedy`].
 pub(super) fn write_remedies(out: &mut Sink, remedies: &[&str]) -> fmt::Result {
     for remedy in remedies {
-        write!(out, ". {remedy}")?;
+        out.write_remedy(remedy)?;
     }
     Ok(())
 }
