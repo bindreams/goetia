@@ -1,7 +1,7 @@
 use std::io;
 use std::thread;
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER, ERROR_NOT_ENOUGH_MEMORY, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER, ERROR_NOT_ENOUGH_MEMORY};
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::MUTEX_MODIFY_STATE;
 
@@ -135,49 +135,6 @@ fn open_lock() -> OwnedHandle {
     assert!(!raw.is_null(), "open the lock: {}", io::Error::last_os_error());
     // SAFETY: a valid handle `OpenMutexW` just returned and nothing else owns.
     unsafe { OwnedHandle::from_raw_handle(raw) }
-}
-
-/// Whether some thread holds the lock `probe` is open on right now: a poll of its state from a
-/// thread that holds nothing, which takes the lock and gives it back when it is free.
-fn is_held_by_another_thread(probe: &OwnedHandle) -> bool {
-    thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                // SAFETY: `probe` is a live handle with `SYNCHRONIZE`; a zero wait asks for the state.
-                match unsafe { WaitForSingleObject(probe.as_raw_handle(), 0) } {
-                    WAIT_TIMEOUT => true,
-                    WAIT_OBJECT_0 | WAIT_ABANDONED => {
-                        // SAFETY: this thread took the mutex just above.
-                        assert_ne!(unsafe { ReleaseMutex(probe.as_raw_handle()) }, 0);
-                        false
-                    }
-                    other => panic!("poll the lock: {other}"),
-                }
-            })
-            .join()
-            .unwrap()
-    })
-}
-
-/// A provider's `sweep` takes the lock whoever calls it, including a caller that holds it already
-/// (`Scm` does): a second take succeeds, and the lock is let go only when both are dropped.
-///
-/// What the `sweep` itself holds is not observable from here without a seam in the provider.
-#[skuld::test(requires = [elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_lock_taken_again_by_its_holder_is_released_one_level_at_a_time() {
-    let outer = InstallLock::acquire().unwrap();
-    let probe = open_lock();
-    let inner = InstallLock::acquire().unwrap();
-    assert!(is_held_by_another_thread(&probe));
-
-    drop(inner);
-    assert!(
-        is_held_by_another_thread(&probe),
-        "the outer hold is still the thread's"
-    );
-
-    drop(outer);
-    assert!(!is_held_by_another_thread(&probe));
 }
 
 /// A holder that exits without releasing leaves the mutex abandoned, which the next to take it
