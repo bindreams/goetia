@@ -1,27 +1,22 @@
 //! Helpers the library's unit tests and its integration tests share. An integration test reaches the
 //! library only through its public API, so what both need is exported here, under the `testing`
-//! feature (and under `cfg(test)`, for the unit tests). Not public API: nothing here is stable.
+//! feature (and under `cfg(test)`, for the unit tests), on Windows only: its users are the SCM
+//! backend's tests. Not public API: nothing here is stable.
 
 use std::path::PathBuf;
-#[cfg(windows)]
 use std::sync::{Arc, Mutex};
 
-#[cfg(windows)]
 use crate::error::Result;
-use crate::shim::HostCommand;
-#[cfg(windows)]
-use crate::shim::{FolderCheck, ShimProvider, SweepFailure};
+use crate::shim::{FolderCheck, HostCommand, ShimProvider, SweepFailure};
 
 /// A [`ShimProvider`] that records the calls it gets (`"preview"`, `"provide"`, `"sweep"`, in
 /// order) and answers with the commands it was given. It touches nothing.
-#[cfg(windows)]
 pub struct FakeProvider {
     calls: Arc<Mutex<Vec<&'static str>>>,
     preview: HostCommand,
     provide: HostCommand,
 }
 
-#[cfg(windows)]
 impl FakeProvider {
     /// The provider, answering `preview` with `preview` and `provide` with `provide`, and the
     /// calls it records.
@@ -36,7 +31,6 @@ impl FakeProvider {
     }
 }
 
-#[cfg(windows)]
 impl ShimProvider for FakeProvider {
     fn preview(&self) -> Result<HostCommand> {
         self.calls.lock().unwrap().push("preview");
