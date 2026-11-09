@@ -881,7 +881,7 @@ pub(super) fn start_impl(id: &str, budget: Budget, deadline: Deadline) -> Result
     match run_verb("start", &unit, budget, deadline)? {
         Finished::Exited { status, capture } if status.success() => took("start", &unit, &capture),
         Finished::Exited { status, capture } => Err(failed("start", &unit, status, &capture)),
-        Finished::Expired => Err(budget::timed_out(id, "running", budget)),
+        Finished::Expired | Finished::Left(_) => Err(budget::timed_out(id, "running", budget)),
     }
 }
 
@@ -894,7 +894,7 @@ pub(super) fn stop_impl(id: &str, budget: Budget, deadline: Deadline) -> Result<
         Finished::Exited { status, capture } if status.success() => took("stop", &unit, &capture),
         Finished::Exited { status, .. } if status.code() == Some(5) => Ok(()),
         Finished::Exited { status, capture } => Err(failed("stop", &unit, status, &capture)),
-        Finished::Expired => Err(budget::timed_out(id, "stopped", budget)),
+        Finished::Expired | Finished::Left(_) => Err(budget::timed_out(id, "stopped", budget)),
     }
 }
 
@@ -972,7 +972,9 @@ pub(super) fn request_restart_impl(id: &str) -> Result<()> {
     match run_verb("restart", &unit, Budget::Immediate, Budget::Immediate.start())? {
         Finished::Exited { status, capture } if status.success() => took("restart", &unit, &capture),
         Finished::Exited { status, capture } => Err(failed("restart", &unit, status, &capture)),
-        Finished::Expired => unreachable!("a budget that does not wait never takes the bounded path"),
+        Finished::Expired | Finished::Left(_) => {
+            unreachable!("a budget that does not wait never takes the bounded path")
+        }
     }
 }
 
