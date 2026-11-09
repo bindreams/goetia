@@ -91,7 +91,7 @@ pub(crate) mod fake {
     use std::sync::{Arc, Mutex};
 
     use super::{Client, ClientError, Finished, Reservation, Role, Wait};
-    use crate::backend::bounded::Capture;
+    use crate::backend::bounded::{Capture, Fate, Left};
 
     /// Replies consumed in order. Each entry names the argv prefix it expects, and may carry an
     /// action the test runs at the instant of the call, such as moving a file, to state a
@@ -174,6 +174,25 @@ pub(crate) mod fake {
                 complete: true,
             },
         }
+    }
+
+    /// How a [`lingering`] reply's request ended up: `None` until its [`Left`] is settled.
+    #[derive(Clone, Default)]
+    pub(crate) struct Ended(Arc<Mutex<Option<Fate>>>);
+
+    impl Ended {
+        pub(crate) fn fate(&self) -> Option<Fate> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// A request the deadline left running: the call expires with a [`Left`] that records its
+    /// [`Fate`] in the returned [`Ended`].
+    pub(crate) fn lingering(prefix: &[&str]) -> (Entry, Ended) {
+        let ended = Ended::default();
+        let record = ended.0.clone();
+        let left = Left::new(move |fate| *record.lock().unwrap() = Some(fate));
+        (entry(prefix, Ok(Finished::Left(left))), ended)
     }
 
     impl Entry {
