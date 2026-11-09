@@ -1946,8 +1946,7 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
 }
 
 /// A spec whose `logs` parent is `logs_parent` and whose `cwd` lies under a regular file, so the
-/// install creates what is missing of the former and then fails on the latter: a step after the
-/// directories exist.
+/// install creates what is missing of the former and then fails on the latter.
 fn spec_failing_on_cwd_after_logs_parent(id: &str, base: &Path, logs_parent: &Path) -> DaemonSpec {
     let file = base.join("file");
     fs::write(&file, b"x").unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
@@ -1980,20 +1979,67 @@ fn a_failed_install_removes_the_directories_it_created() {
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_failed_install_leaves_a_directory_that_existed_before() {
+fn a_failed_install_removes_a_new_directory_in_one_that_existed_before() {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let base = std::env::temp_dir().join(format!("{}-undo-preexisting", guard.id()));
     let _rm = DirGuard::new(base.clone());
     let existing = base.join("logs");
     fs::create_dir_all(&existing).unwrap_or_else(|e| panic!("mkdir {}: {e}", existing.display()));
-    let spec = spec_failing_on_cwd_after_logs_parent(guard.id(), &base, &existing);
+    let created = existing.join("new");
+    let spec = spec_failing_on_cwd_after_logs_parent(guard.id(), &base, &created);
 
     Systemd::new()
         .install(&spec, false)
         .expect_err("the cwd is under a file");
 
+    assert!(!created.exists(), "the failed install left {}", created.display());
     assert!(existing.is_dir(), "a directory that existed before must stay");
+}
+
+/// Makes a file immutable, so the drop-in clearing that follows an update's write cannot remove it.
+struct Immutable(PathBuf);
+
+impl Immutable {
+    fn new(path: PathBuf) -> Self {
+        cmd::run("chattr", &["+i", path.to_str().unwrap()]).expect_ok();
+        Self(path)
+    }
+}
+
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        warn_left_behind(cmd::run_cleanup("chattr", &[&["-i", self.0.to_str().unwrap()]], &[]));
+    }
+}
+
+/// The unit is replaced, then clearing its drop-in fails: the install fails with the new unit in
+/// place, so the directories it created for that unit stay.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_install_that_fails_after_writing_the_unit_keeps_its_directories() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let base = std::env::temp_dir().join(format!("{}-late-failure", guard.id()));
+    let _rm = DirGuard::new(base.clone());
+    let mgr = Systemd::new();
+    mgr.install(&mk(guard.id()), false).expect("install");
+    write_dropin(guard.id());
+    // Declared after the guard, so it drops first: the guard's cleanup needs the drop-in removable.
+    let _immutable = Immutable::new(dropin_dir(guard.id()).join("override.conf"));
+    let cwd = base.join("work");
+    let mut spec = mk(guard.id()).into_fields();
+    spec.cwd = Some(cwd.clone());
+    let spec = DaemonSpec::new(spec).unwrap();
+
+    mgr.install(&spec, true).expect_err("the drop-in cannot be cleared");
+
+    assert!(
+        fs::read_to_string(unit_path(guard.id()))
+            .expect("read the unit")
+            .contains(cwd.to_str().unwrap()),
+        "the update was not written"
+    );
+    assert!(cwd.is_dir(), "the directories of an installed unit must stay");
 }
 
 // Backslashes =========================================================================================================

@@ -405,7 +405,7 @@ fn prepare_parent_dirs_records_the_cwd_it_made_before_the_logs_parent_failed() {
     assert!(!cwd.exists());
 }
 
-// plist_stands ========================================================================================================
+// plist_standing ======================================================================================================
 
 #[skuld::test]
 fn a_regular_file_holding_the_plist_stands() {
@@ -413,14 +413,17 @@ fn a_regular_file_holding_the_plist_stands() {
     let path = tmp.path().join("id.plist");
     std::fs::write(&path, "text").unwrap();
 
-    assert!(plist_stands(&path, "text"));
+    assert!(matches!(plist_standing(&path, "text"), Standing::Yes));
 }
 
 #[skuld::test]
 fn an_absent_plist_does_not_stand() {
     let tmp = tempfile::tempdir().unwrap();
 
-    assert!(!plist_stands(&tmp.path().join("id.plist"), "text"));
+    assert!(matches!(
+        plist_standing(&tmp.path().join("id.plist"), "text"),
+        Standing::No
+    ));
 }
 
 #[skuld::test]
@@ -429,7 +432,7 @@ fn a_plist_holding_other_text_does_not_stand() {
     let path = tmp.path().join("id.plist");
     std::fs::write(&path, "someone else's").unwrap();
 
-    assert!(!plist_stands(&path, "text"));
+    assert!(matches!(plist_standing(&path, "text"), Standing::No));
 }
 
 /// Never opened, so it cannot block.
@@ -439,7 +442,7 @@ fn a_fifo_does_not_stand() {
     let path = tmp.path().join("id.plist");
     nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
 
-    assert!(!plist_stands(&path, "text"));
+    assert!(matches!(plist_standing(&path, "text"), Standing::No));
 }
 
 #[skuld::test]
@@ -448,18 +451,50 @@ fn a_dangling_symlink_does_not_stand() {
     let path = tmp.path().join("id.plist");
     std::os::unix::fs::symlink(tmp.path().join("nowhere"), &path).unwrap();
 
-    assert!(!plist_stands(&path, "text"));
+    assert!(matches!(plist_standing(&path, "text"), Standing::No));
 }
 
-/// A read that does not complete says nothing about the plist; the directories stay.
 #[skuld::test]
-fn a_plist_that_cannot_be_read_stands() {
+fn a_plist_that_cannot_be_read_is_unknown() {
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("file");
     std::fs::write(&file, "x").unwrap();
 
     // `ENOTDIR` on the parent: presence is unsettled.
-    assert!(plist_stands(&file.join("id.plist"), "text"));
+    assert!(matches!(
+        plist_standing(&file.join("id.plist"), "text"),
+        Standing::Unknown(_)
+    ));
+}
+
+// written_at ==========================================================================================================
+
+#[skuld::test]
+fn an_update_and_a_stale_write_land_where_read_found_the_plist() {
+    let id = Id::try_from("written-at").unwrap();
+    let snapshot = marked_plist(&id);
+
+    for outcome in [
+        Outcome::Update {
+            spec_diff: String::new(),
+        },
+        Outcome::Stale {
+            from_version: "0.0.0".to_string(),
+        },
+    ] {
+        assert_eq!(
+            written_at(&outcome, Some(&snapshot), &id),
+            snapshot.location.path,
+            "{outcome:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_create_lands_in_the_staging_directory() {
+    let id = Id::try_from("written-at").unwrap();
+
+    assert_eq!(written_at(&Outcome::Create, None, &id), staging_path(id.as_str()));
 }
 
 // resolve_account =====================================================================================================

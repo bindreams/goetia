@@ -1259,8 +1259,7 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account() {
 }
 
 /// A spec whose `cwd` is `cwd` and whose `logs` parent lies under a regular file, so the install
-/// creates what is missing of the former and then fails on the latter: a step after the directories
-/// exist.
+/// creates what is missing of the former and then fails on the latter.
 fn spec_failing_on_logs_after_cwd(id: &str, base: &Path, cwd: &Path) -> DaemonSpec {
     let file = base.join("file");
     std::fs::write(&file, b"x").unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
@@ -1288,19 +1287,21 @@ fn a_failed_install_removes_the_directories_it_created() {
 }
 
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_failed_install_leaves_a_directory_that_existed_before() {
+fn a_failed_install_removes_a_new_directory_in_one_that_existed_before() {
     let id = support::random_test_id();
     let base = Path::new("/tmp").join(format!("{id}-undo-preexisting"));
     let _cleanup = DirGuard::new(base.clone());
     let existing = base.join("cwd");
     std::fs::create_dir_all(&existing).unwrap_or_else(|e| panic!("mkdir {}: {e}", existing.display()));
-    let spec = spec_failing_on_logs_after_cwd(&id, &base, &existing);
+    let created = existing.join("new");
+    let spec = spec_failing_on_logs_after_cwd(&id, &base, &created);
     let _guard = Guard(spec.id.clone());
 
     Launchd::new()
         .install(&spec, false)
         .expect_err("the logs parent is under a file");
 
+    assert!(!created.exists(), "the failed install left {}", created.display());
     assert!(existing.is_dir(), "a directory that existed before must stay");
 }
 

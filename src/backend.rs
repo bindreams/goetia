@@ -15,9 +15,7 @@ pub(crate) mod bounded;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod client;
 mod contract;
-/// Compiled on every target so its tests run on Windows too; only the unix backends use it.
-#[cfg(any(unix, test))]
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(unix)]
 pub(crate) mod created_dirs;
 pub mod launchd;
 pub mod scm;

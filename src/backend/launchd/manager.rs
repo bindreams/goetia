@@ -55,7 +55,7 @@ use std::{fs, io};
 
 use crate::backend::bounded::{self, Finished, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
-use crate::backend::created_dirs::CreatedDirs;
+use crate::backend::created_dirs::{CreatedDirs, Standing};
 use crate::backend::launchd::state::Evidence;
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
@@ -454,7 +454,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// its directory), both world-readable and searchable. Each component created is handed to
 /// `account`, so a non-root daemon can write there. Otherwise a non-root daemon whose
 /// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a
-/// missing `WorkingDirectory` refuses the job outright. Each directory created is recorded in `created`.
+/// missing `WorkingDirectory` refuses the job outright.
 fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut CreatedDirs) -> Result<()> {
     if let Some(cwd) = &spec.cwd {
         ensure_dir_owned_by(cwd, account, created)?;
@@ -500,8 +500,7 @@ fn missing_components(dir: &Path) -> Result<Vec<&Path>> {
 }
 
 /// `mkdir` each of `missing` (outermost first), then `chmod` and `chown` it. `AlreadyExists` means
-/// another install created it after the walk: not ours, so left alone. Each directory created is
-/// recorded in `created` before its `chmod` and `chown`, so a failure there is undone with it.
+/// another install created it after the walk: not ours, so left alone.
 fn create_owned(missing: &[&Path], account: &Account, created: &mut CreatedDirs) -> Result<()> {
     for path in missing {
         match fs::DirBuilder::new().mode(0o755).create(path) {
@@ -632,16 +631,22 @@ fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> 
     })
 }
 
-/// Whether the plist at `path` is `desired`, read as [`obtain`] reads one: only a regular file
-/// holding exactly that stands. Absent, a dangling symlink, a FIFO or a directory do not; a symlink
-/// to such a file does, as everywhere else for a plist. A read that did not complete leaves it
-/// unknown, and unknown counts as standing: the directories stay, since removing them could break an
-/// installed plist.
-fn plist_stands(path: &Path, desired: &str) -> bool {
+/// Where `write` put, or would have put, the plist: `Create` stages a new one, `Update` and `Stale`
+/// replace the one `read` found.
+fn written_at(outcome: &Outcome, snapshot: Option<&Plist>, id: &Id) -> PathBuf {
+    match (outcome, snapshot) {
+        (Outcome::Update { .. } | Outcome::Stale { .. }, Some(snapshot)) => snapshot.location.path.clone(),
+        _ => staging_path(id.as_str()),
+    }
+}
+
+/// Whether the plist at `path` is `desired`, as [`obtain`] reads it. A read that did not complete
+/// counts as standing: removing the directories could break an installed plist.
+fn plist_standing(path: &Path, desired: &str) -> Standing {
     match obtain(path) {
-        Obtained::Bytes(bytes) => bytes == desired.as_bytes(),
-        Obtained::Absent | Obtained::NonRegular => false,
-        Obtained::Failed(_) => true,
+        Obtained::Bytes(bytes) if bytes == desired.as_bytes() => Standing::Yes,
+        Obtained::Bytes(_) | Obtained::Absent | Obtained::NonRegular => Standing::No,
+        Obtained::Failed(e) => Standing::Unknown(e.to_string()),
     }
 }
 
@@ -1204,18 +1209,11 @@ impl backend::Backend for Launchd {
         _scope: &mut (),
         reservation: &mut Reservation,
     ) -> Result<WriteOutcome> {
-        // Dropped at the end: the directories go unless the plist this wrote is in place, whether the
-        // write failed, was put back after a doubt, lost a race (the retry creates them again) or
-        // went through.
+        // The directories go on drop unless the plist this wrote is in place.
         let mut created = CreatedDirs::new();
         let written = self.write_plist(spec, desired, outcome, snapshot, reservation, &mut created);
-        let target = match (outcome, snapshot) {
-            (Outcome::Update { .. } | Outcome::Stale { .. }, Some(snapshot)) => snapshot.location.path.clone(),
-            _ => staging_path(spec.id.as_str()),
-        };
-        if plist_stands(&target, desired) {
-            created.keep();
-        }
+        let target = written_at(outcome, snapshot, &spec.id);
+        created.settle(&target, plist_standing(&target, desired));
         written
     }
 

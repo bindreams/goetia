@@ -1,6 +1,8 @@
+use std::fs;
+
 use super::*;
 
-/// `root/a/b/c`, created outermost first and recorded in that order. Returns the guard.
+/// Creates and records `root/a/b/c`.
 fn create_chain(root: &Path) -> CreatedDirs {
     let mut created = CreatedDirs::new();
     let mut dir = root.to_path_buf();
@@ -49,9 +51,9 @@ fn drop_leaves_a_directory_that_is_no_longer_empty_and_its_ancestors() {
     assert_eq!(fs::read(&file).unwrap(), b"x");
 }
 
-/// A removal that fails is reported, never a panic: the guard runs while an error unwinds.
+/// A path that is not a directory cannot be tracked: reported, never a panic, and left.
 #[skuld::test]
-fn drop_does_not_panic_when_a_removal_fails() {
+fn record_leaves_a_path_that_is_not_a_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("not-a-dir");
     fs::write(&file, b"x").unwrap();
@@ -63,12 +65,67 @@ fn drop_does_not_panic_when_a_removal_fails() {
     assert!(file.is_file());
 }
 
+/// The account a daemon runs as owns what the install created for it and can swap a recorded
+/// directory for a symlink before the drop; the drop, which runs as root, must not follow it.
 #[skuld::test]
-fn keep_keeps_every_recorded_directory() {
+fn drop_does_not_follow_a_symlink_swapped_in_for_a_recorded_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    fs::create_dir(other.path().join("c")).unwrap();
+    let created = create_chain(tmp.path());
+    fs::rename(tmp.path().join("a/b"), tmp.path().join("moved")).unwrap();
+    std::os::unix::fs::symlink(other.path(), tmp.path().join("a/b")).unwrap();
+
+    drop(created);
+
+    assert!(other.path().join("c").is_dir(), "the symlink's target was emptied");
+}
+
+/// What the name refers to now is not what the install created, so it is left.
+#[skuld::test]
+fn drop_leaves_a_directory_that_is_no_longer_the_one_created() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut created = CreatedDirs::new();
+    let dir = tmp.path().join("a");
+    fs::create_dir(&dir).unwrap();
+    created.record(&dir);
+    fs::rename(&dir, tmp.path().join("moved")).unwrap();
+    fs::create_dir(&dir).unwrap();
+
+    drop(created);
+
+    assert!(dir.is_dir());
+}
+
+#[skuld::test]
+fn settle_keeps_every_recorded_directory_when_the_definition_stands() {
     let tmp = tempfile::tempdir().unwrap();
     let mut created = create_chain(tmp.path());
 
-    created.keep();
+    created.settle(Path::new("unit"), Standing::Yes);
+    drop(created);
+
+    assert!(tmp.path().join("a/b/c").is_dir());
+}
+
+#[skuld::test]
+fn settle_removes_the_directories_when_the_definition_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut created = create_chain(tmp.path());
+
+    created.settle(Path::new("unit"), Standing::No);
+    drop(created);
+
+    assert!(!tmp.path().join("a").exists());
+}
+
+/// A read that did not complete says nothing about the definition; the directories stay.
+#[skuld::test]
+fn settle_keeps_the_directories_when_the_read_did_not_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut created = create_chain(tmp.path());
+
+    created.settle(Path::new("unit"), Standing::Unknown("permission denied".to_string()));
     drop(created);
 
     assert!(tmp.path().join("a/b/c").is_dir());

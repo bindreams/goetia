@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::spec::{AccountId, DaemonSpec, User};
 
 /// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself.
-/// Runs while still elevated. Each directory it creates is recorded in `created`.
+/// Runs while still elevated.
 pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -> Result<()> {
     if let Some(logs) = &spec.logs
         && let Some(parent) = logs.parent()
@@ -33,8 +33,7 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
 /// ancestor already existed — would let a manifest silently widen or reassign an arbitrary existing
 /// system directory (`/var/log`, `/etc`, another user's home). A directory that already existed (or
 /// that a concurrent, racing install created first — see the loop below) is left exactly as it was;
-/// only a non-directory at that path is an error. Each component this call creates is recorded in
-/// `created`, before its `chmod` and `chown`, so a failure there is undone with it.
+/// only a non-directory at that path is an error.
 pub(super) fn ensure_dir(dir: &Path, user: &User, created: &mut CreatedDirs) -> Result<()> {
     let mut missing = Vec::new();
     let mut cursor = dir;

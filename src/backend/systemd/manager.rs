@@ -80,7 +80,7 @@ use systemctl::{
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
-use crate::backend::created_dirs::CreatedDirs;
+use crate::backend::created_dirs::{CreatedDirs, Standing};
 use crate::backend::systemd::generate;
 use crate::backend::{
     Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry,
@@ -166,13 +166,11 @@ impl Backend for Systemd {
         _scope: &mut GateScope,
         _reservation: &mut Held,
     ) -> Result<WriteOutcome> {
-        // Dropped at the end: the directories go unless the unit this wrote is in place, whether the
-        // write failed, lost a race (the retry creates them again) or went through.
+        // The directories go on drop unless the unit this wrote is in place.
         let mut created = CreatedDirs::new();
         let written = write_unit(spec, definition, outcome, snapshot, &mut created);
-        if unit_stands(&unit_path(spec.id.as_str()), definition) {
-            created.keep();
-        }
+        let unit = unit_path(spec.id.as_str());
+        created.settle(&unit, unit_standing(&unit, definition));
         written
     }
 
@@ -304,20 +302,18 @@ impl Backend for Systemd {
     }
 }
 
-/// Whether the unit at `path` is `definition`, read as `discover` reads a fragment: only a regular
-/// file holding exactly that stands. Absent, a symlink (a masked unit), a FIFO, a directory or other
-/// bytes do not. A read that did not complete leaves it unknown, and unknown counts as standing: the
-/// directories stay, since removing them could break an installed unit.
-fn unit_stands(path: &Path, definition: &str) -> bool {
+/// Whether the unit at `path` is `definition`, as `discover` reads it. A read that did not complete
+/// counts as standing: removing the directories could break an installed unit.
+fn unit_standing(path: &Path, definition: &str) -> Standing {
     match classify_and_read(path) {
-        Ok(RawState::Regular(text)) => text == definition,
-        Ok(RawState::Absent | RawState::NotOurs) => false,
-        Err(_) => true,
+        Ok(RawState::Regular(text)) if text == definition => Standing::Yes,
+        Ok(_) => Standing::No,
+        Err(failure) => Standing::Unknown(failure.into_os_error().to_string()),
     }
 }
 
-/// Everything `write` does for the unit: the parent directories, recorded in `created`, then the
-/// unit itself and the reload that makes systemd see it.
+/// Everything `write` does for the unit: the parent directories, then the unit itself and the
+/// reload that makes systemd see it.
 fn write_unit(
     spec: &DaemonSpec,
     definition: &str,
