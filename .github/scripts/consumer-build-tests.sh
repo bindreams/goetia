@@ -117,7 +117,6 @@ goetia-shim = []
 [dependencies]
 goetia = "=$version"
 clap = "4"
-cosca = "0.4"
 $pinned_crate = "=$pinned_version"
 
 [patch.crates-io]
@@ -142,7 +141,7 @@ fn main() {
     let cli = goetia::cli::Cli::parse();
 
     let get_manager = || goetia::cli::manager(stock_shim());
-    let is_elevated = cosca::elevation::is_elevated;
+    let is_elevated = goetia::cli::is_elevated;
     let host = || stock_shim().preview();
 
     let mut stdout = io::stdout();
