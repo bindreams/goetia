@@ -37,7 +37,7 @@ fn a_reason_around_an_error_prints_the_remedy_after_its_closing_words() {
         )
         .to_string(),
         "scan failed (cannot determine whether daemon `x` is installed: failed to read /p: denied). Ownership is \
-         unknown.. re-run as root"
+         unknown. re-run as root"
     );
 }
 

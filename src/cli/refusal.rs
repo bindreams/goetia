@@ -106,7 +106,7 @@ impl Lines<'_> {
         self.emit("", out, err, |sink| {
             write!(sink, "{mood}: ")?;
             reason.write_to(sink)?;
-            recovery.map_or(Ok(()), |recovery| write!(sink, ". {recovery}"))
+            recovery.map_or(Ok(()), |recovery| sink.write_remedy(recovery))
         });
         // `install` failed to install; `diff` could not answer.
         match self.mood {
