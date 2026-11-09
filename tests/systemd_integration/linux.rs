@@ -1209,7 +1209,11 @@ fn cap_evidence(unit: &str) -> String {
          journalctl -b --no-pager -o short-precise -n 40 _PID=1"
     );
     let out = Command::new("sh").args(["-c", &script]).output().expect("cap evidence");
-    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 /// goetia never panics for want of a task; a verb that cannot get what its request needs exits `1`,
