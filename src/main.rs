@@ -34,7 +34,7 @@ fn main() {
     let get_manager = || goetia::cli::manager(stock_shim());
     #[cfg(not(windows))]
     let get_manager = || goetia::manager::native();
-    let is_elevated = goetia::cli::is_elevated;
+    let is_elevated = cosca::elevation::is_elevated;
     #[cfg(windows)]
     let host = || {
         use goetia::shim::ShimProvider as _;

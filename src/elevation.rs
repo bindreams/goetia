@@ -1,30 +1,13 @@
-//! What goetia asks of the caller's authority on Windows. Two questions, which an unelevated
-//! administrator answers the same way and which differ for other tokens:
-//! - `is_elevated`, a capability the CLI asks: can this process open SCM with every right.
-//! - [`token_has_administrators`], a fact about the token that the library needs, `cli` feature or
-//!   not: is Administrators enabled in it.
+//! What the library asks of the caller's token on Windows: [`token_has_administrators`]. The CLI's
+//! "is the process elevated" is `cosca::elevation::is_elevated`, which reads `TokenIsElevated` of
+//! the process token; it does not report whether Administrators is enabled, and does not follow a
+//! thread that impersonates.
 
 use std::io;
 
 use windows_sys::Win32::Security::CheckTokenMembership;
 
 use crate::backend::scm::shim::acl::administrators;
-
-/// Whether the current process can open SCM with `ALL_ACCESS`.
-///
-/// Probes the capability rather than the token: opening SCM with
-/// `ALL_ACCESS` is exactly what a mutating subcommand needs and exactly
-/// what a filtered (non-elevated) admin token refuses. The same technique
-/// `tests/support/mod.rs`'s `elevated()` precondition already uses. What a
-/// token that has Administrators enabled but is refused SCM (a policy,
-/// a different SCM security descriptor) is told is that it is not elevated;
-/// whether the token has Administrators is [`token_has_administrators`]. Only the CLI asks.
-#[cfg(feature = "cli")]
-pub fn is_elevated() -> bool {
-    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-
-    ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::ALL_ACCESS).is_ok()
-}
 
 /// Whether the calling thread's token (the process's, for a thread that does not impersonate) has
 /// Administrators enabled, which is what an object owned by Administrators needs of its creator.

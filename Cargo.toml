@@ -43,11 +43,10 @@ harness = false
 
 [features]
 default = ["cli"]
-# CLI-only deps (clap, output formatting, and the elevation check) are
-# optional behind this feature, so
+# CLI-only deps (clap and output formatting) are optional behind this feature, so
 # `goetia = { version = "0.1", default-features = false }` stays a clean
 # library dependency (see the design spec's crate table, §1).
-cli = ["dep:clap", "dep:libc"]
+cli = ["dep:clap"]
 # Set only by a build that embeds the stock shim (`goetia::embed_shim!()` is `Some` under it). The
 # release workflow turns it on for the `goetia` binary, whose `stock_shim()` then embeds it rather
 # than reading `goetia-shim.exe` beside it; the library never reads it.
@@ -80,10 +79,6 @@ tempfile = "3"
 thiserror = "2"
 yaml_serde = "0.10.7"
 
-[target.'cfg(unix)'.dependencies]
-# Only `geteuid()`, for the CLI's elevation check.
-libc = { version = "0.2", optional = true }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 # Unconditional (not behind the `cli` feature): the systemd backend itself
 # classifies a unit path with `O_PATH | O_NOFOLLOW` before opening it for
@@ -107,10 +102,9 @@ libc = "0.2"
 nix = { version = "0.31", features = ["user", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
-# The real SCM backend (`src/backend/scm/manager.rs`) plus the CLI's
-# elevation probe. Not `optional`/`cli`-gated: `manager::native()` needs it
-# on every Windows build regardless of the `cli` feature, since it is part
-# of the core library, not CLI-only output formatting.
+# The real SCM backend (`src/backend/scm/manager.rs`). Not `optional`/`cli`-gated:
+# `manager::native()` needs it on every Windows build regardless of the `cli`
+# feature, since it is part of the core library, not CLI-only output formatting.
 windows-service = "0.8"
 # `EmbeddedStockShim` names the stock shim by the SHA-256 of its bytes and verifies a file
 # of that name against it.

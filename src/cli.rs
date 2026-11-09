@@ -18,7 +18,6 @@
 
 pub mod diff;
 pub mod disable;
-mod elevation;
 pub mod enable;
 mod exit;
 pub mod install;
@@ -39,7 +38,6 @@ use std::io::Write;
 
 use clap::{Parser, Subcommand};
 
-pub use elevation::is_elevated;
 pub use exit::ExitCode;
 
 use crate::error::{EscapedStream, Result};
