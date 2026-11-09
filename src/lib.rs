@@ -13,6 +13,9 @@ pub mod error;
 pub mod manager;
 pub mod shim;
 pub mod spec;
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub mod testing;
 
 #[cfg(test)]
 mod version_tests;

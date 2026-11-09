@@ -51,6 +51,8 @@ cli = ["dep:clap"]
 # release workflow turns it on for the `goetia` binary, whose `stock_shim()` then embeds it rather
 # than reading `goetia-shim.exe` beside it; the library never reads it.
 goetia-shim = []
+# Exports helpers the crate's own tests share; adds items only, gates no behaviour.
+testing = []
 
 [dependencies]
 base64 = "0.23"
@@ -150,6 +152,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Turns on `testing` for the integration tests, which reach the library only through its public API.
+goetia = { path = ".", features = ["testing"] }
 skuld = "0.3"
 rand = "0.10"
 

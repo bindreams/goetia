@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Mutex, mpsc};
 
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
@@ -20,6 +20,7 @@ use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
 use goetia::spec::{DaemonFields, DaemonSpec, User};
+use goetia::testing::{FakeProvider, command};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -651,53 +652,6 @@ fn every_account_type_runs_the_shim() {
 
 // What `begin_install` checks of a provider ===========================================================================
 
-/// A provider that records the calls it gets and answers with the commands it was given.
-///
-/// The same provider is `Recording` in `src/backend/scm/manager_tests.rs`, which this crate cannot
-/// share (that one is `cfg(test)` inside the library, and this crate reaches the library only through
-/// its public API): keep the two identical in behaviour.
-struct Recording {
-    calls: Arc<Mutex<Vec<&'static str>>>,
-    preview: HostCommand,
-    provide: HostCommand,
-}
-
-impl Recording {
-    fn new(preview: HostCommand, provide: HostCommand) -> (Self, Arc<Mutex<Vec<&'static str>>>) {
-        let calls = Arc::default();
-        let provider = Self {
-            calls: Arc::clone(&calls),
-            preview,
-            provide,
-        };
-        (provider, calls)
-    }
-}
-
-impl ShimProvider for Recording {
-    fn preview(&self) -> goetia::error::Result<HostCommand> {
-        self.calls.lock().unwrap().push("preview");
-        Ok(self.preview.clone())
-    }
-
-    fn provide(&self, _folders: &FolderCheck) -> goetia::error::Result<HostCommand> {
-        self.calls.lock().unwrap().push("provide");
-        Ok(self.provide.clone())
-    }
-
-    fn sweep(&self, _referenced: &[PathBuf], _folders: &FolderCheck) -> Result<(), SweepFailure> {
-        self.calls.lock().unwrap().push("sweep");
-        Ok(())
-    }
-}
-
-fn command(exe: impl Into<PathBuf>) -> HostCommand {
-    HostCommand {
-        exe: exe.into(),
-        args: vec![],
-    }
-}
-
 /// The install renders from the `preview`, so the registration names that host. A provider
 /// whose `provide` places another (the sibling shim upgraded while the install waited on the lock,
 /// or a `preview` and `provide` that disagree) provides a file the registration does not name:
@@ -709,7 +663,7 @@ fn install_refuses_a_host_other_than_the_one_rendered() {
     let logs = LogDir::new();
     let spec = simple_spec(&support::random_test_id(), fixture_command("report", &["1"]), &logs);
     let (rendered, provided) = (dir.path().join("rendered.exe"), dir.path().join("provided.exe"));
-    let (provider, calls) = Recording::new(command(&rendered), command(&provided));
+    let (provider, calls) = FakeProvider::new(command(&rendered), command(&provided));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
     match mgr.install(&spec, false) {
@@ -733,7 +687,7 @@ fn install_refuses_a_host_with_no_marker() {
     let spec = simple_spec(&support::random_test_id(), fixture_command("report", &["1"]), &logs);
     let exe = dir.path().join("host.exe");
     std::fs::write(&exe, b"not a goetia host").unwrap();
-    let (provider, calls) = Recording::new(command(&exe), command(&exe));
+    let (provider, calls) = FakeProvider::new(command(&exe), command(&exe));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
     match mgr.install(&spec, false) {
@@ -749,7 +703,7 @@ fn install_refuses_a_host_with_no_marker() {
 fn install_refuses_a_host_named_by_a_relative_path() {
     let logs = LogDir::new();
     let spec = simple_spec(&support::random_test_id(), fixture_command("report", &["1"]), &logs);
-    let (provider, _) = Recording::new(command(r"bin\host.exe"), command(r"bin\host.exe"));
+    let (provider, _) = FakeProvider::new(command(r"bin\host.exe"), command(r"bin\host.exe"));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
     match mgr.install(&spec, false) {

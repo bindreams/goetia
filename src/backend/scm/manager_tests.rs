@@ -5,15 +5,16 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::*;
 use crate::backend::scm::parameters::Stray;
 use crate::manager::ServiceManager;
-use crate::shim::{CheckPermissions, FolderCheck, HostCommand, ShimProvider, SweepFailure};
+use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::Restart;
 use crate::spec::test_support::{plain_fields, program};
 use crate::spec::{AccountId, DaemonFields, User};
+use crate::testing::{FakeProvider, command};
 use windows_sys::Win32::System::Registry::REG_DWORD;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
@@ -626,53 +627,6 @@ fn simple_daemon() -> DaemonSpec {
     DaemonSpec::new(simple_fields()).unwrap()
 }
 
-/// A provider that records the calls it gets and answers with the commands it was given.
-///
-/// The same provider is `Recording` in `tests/shim_integration/provision.rs`, which this module
-/// cannot share (an integration test reaches the library only through its public API, and this is
-/// `cfg(test)` inside it): keep the two identical in behaviour.
-struct Recording {
-    calls: Arc<Mutex<Vec<&'static str>>>,
-    preview: HostCommand,
-    provide: HostCommand,
-}
-
-impl Recording {
-    fn new(preview: HostCommand, provide: HostCommand) -> (Self, Arc<Mutex<Vec<&'static str>>>) {
-        let calls = Arc::default();
-        let provider = Self {
-            calls: Arc::clone(&calls),
-            preview,
-            provide,
-        };
-        (provider, calls)
-    }
-}
-
-impl ShimProvider for Recording {
-    fn preview(&self) -> Result<HostCommand> {
-        self.calls.lock().unwrap().push("preview");
-        Ok(self.preview.clone())
-    }
-
-    fn provide(&self, _folders: &FolderCheck) -> Result<HostCommand> {
-        self.calls.lock().unwrap().push("provide");
-        Ok(self.provide.clone())
-    }
-
-    fn sweep(&self, _referenced: &[PathBuf], _folders: &FolderCheck) -> std::result::Result<(), SweepFailure> {
-        self.calls.lock().unwrap().push("sweep");
-        Ok(())
-    }
-}
-
-fn command(exe: impl Into<PathBuf>) -> HostCommand {
-    HostCommand {
-        exe: exe.into(),
-        args: vec![],
-    }
-}
-
 #[skuld::test]
 fn new_has_no_provider() {
     let mgr = Scm::new();
@@ -700,7 +654,7 @@ fn render_names_the_previewed_host_verbatim() {
         exe: PathBuf::from(r"C:\app\app.exe"),
         args: vec!["--service-host".to_string()],
     };
-    let (provider, _) = Recording::new(host.clone(), host.clone());
+    let (provider, _) = FakeProvider::new(host.clone(), host.clone());
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
     let reg = mgr.render(&simple_daemon()).unwrap();
@@ -710,7 +664,7 @@ fn render_names_the_previewed_host_verbatim() {
 
 #[skuld::test]
 fn managed_render_never_touches_the_provider() {
-    let (provider, calls) = Recording::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let (provider, calls) = FakeProvider::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
     mgr.render(&daemon_spec(Restart::Never)).unwrap();
@@ -720,7 +674,7 @@ fn managed_render_never_touches_the_provider() {
 
 #[skuld::test]
 fn managed_begin_install_takes_no_lock_and_calls_no_provider() {
-    let (provider, calls) = Recording::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let (provider, calls) = FakeProvider::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
     let spec = daemon_spec(Restart::Never);
@@ -903,7 +857,7 @@ fn a_refused_simple_install_never_reaches_the_provider() {
         ),
     ];
     for (what, fields, host) in refused {
-        let (provider, calls) = Recording::new(host.clone(), host);
+        let (provider, calls) = FakeProvider::new(host.clone(), host);
         let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
         let err = mgr
@@ -951,7 +905,7 @@ fn snapshot_with_config(spec: &DaemonSpec, command_line: &str) -> ScmSnapshot {
 fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
     let spec = simple_daemon();
     let snapshot = snapshot_with_config(&spec, r#""C:\Program Files\App\app.exe" --service-host"#);
-    let (provider, calls) = Recording::new(command(r"C:\elsewhere\host.exe"), command(r"C:\elsewhere\host.exe"));
+    let (provider, calls) = FakeProvider::new(command(r"C:\elsewhere\host.exe"), command(r"C:\elsewhere\host.exe"));
     let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
     let reg = mgr.regenerate(&spec, &snapshot).unwrap();
