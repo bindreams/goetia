@@ -158,7 +158,8 @@ impl Scm {
 
     /// A manager whose `type: simple` services run the host `provider` supplies. `check` says
     /// whether the folder of what `provider` returns is checked for permissions that would let
-    /// another account replace it.
+    /// another account replace it. It also decides which folders `provider`'s sweep may list and
+    /// delete in: a sweep checks the folder with it too.
     pub fn with_shim(provider: impl ShimProvider + 'static, check: CheckPermissions) -> Self {
         Self {
             shim: Some(Box::new(provider)),
