@@ -47,7 +47,8 @@
 //!    already-existing directory is not checked, because install is not a start. systemd opens the
 //!    log file as root before it drops privileges, so an existing log directory is never a problem
 //!    for the account; it `chdir`s into `cwd` after the switch, so only a `cwd` the account cannot
-//!    traverse fails at start.
+//!    traverse fails at start. Those it creates are removed again, deepest first, unless the unit
+//!    is in place when `write` ends ([`CreatedDirs`]).
 //! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
 //!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
 //!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for.
@@ -79,6 +80,7 @@ use systemctl::{
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::systemd::generate;
 use crate::backend::{
     Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry,
@@ -164,34 +166,12 @@ impl Backend for Systemd {
         _scope: &mut GateScope,
         _reservation: &mut Held,
     ) -> Result<WriteOutcome> {
-        let id = spec.id.as_str();
-        dirs::ensure_parent_dirs(spec)?;
-        match outcome {
-            Outcome::Create => match create_unit(id, definition)? {
-                CreateOutcome::Created => {
-                    daemon_reload_or_report(id)?;
-                    Ok(WriteOutcome::Done)
-                }
-                CreateOutcome::Raced => Ok(WriteOutcome::Raced),
-            },
-            Outcome::Update { .. } | Outcome::Stale { .. } => {
-                let expected = snapshot.expect("an id `decide` chose to update was read as marked");
-                match replace_unit_verified(id, definition, expected.text())? {
-                    ReplaceOutcome::Replaced => {
-                        // Only after the write has actually committed: clearing the drop-in
-                        // first (before the write) would delete an admin's overrides even on a
-                        // path that turns out `Raced` and never writes anything, or errors out
-                        // partway through — `uninstall` clears its own fragment before its
-                        // drop-in for the identical reason.
-                        remove_dir_if_present(&dropin_dir(id))?;
-                        daemon_reload_or_report(id)?;
-                        Ok(WriteOutcome::Done)
-                    }
-                    ReplaceOutcome::Raced => Ok(WriteOutcome::Raced),
-                }
-            }
-            other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
-        }
+        // Dropped at the end: the directories go unless the unit this wrote is in place, whether the
+        // write failed, lost a race (the retry creates them again) or went through.
+        let mut created = CreatedDirs::new();
+        let written = write_unit(spec, definition, outcome, snapshot, &mut created);
+        created.keep_if_in_place(&unit_path(spec.id.as_str()), definition);
+        written
     }
 
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
@@ -319,6 +299,45 @@ impl Backend for Systemd {
 
     fn kill(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<()> {
         kill_impl(snapshot.id().as_str())
+    }
+}
+
+/// Everything `write` does for the unit: the parent directories, recorded in `created`, then the
+/// unit itself and the reload that makes systemd see it.
+fn write_unit(
+    spec: &DaemonSpec,
+    definition: &str,
+    outcome: &Outcome,
+    snapshot: Option<&Fragment>,
+    created: &mut CreatedDirs,
+) -> Result<WriteOutcome> {
+    let id = spec.id.as_str();
+    dirs::ensure_parent_dirs(spec, created)?;
+    match outcome {
+        Outcome::Create => match create_unit(id, definition)? {
+            CreateOutcome::Created => {
+                daemon_reload_or_report(id)?;
+                Ok(WriteOutcome::Done)
+            }
+            CreateOutcome::Raced => Ok(WriteOutcome::Raced),
+        },
+        Outcome::Update { .. } | Outcome::Stale { .. } => {
+            let expected = snapshot.expect("an id `decide` chose to update was read as marked");
+            match replace_unit_verified(id, definition, expected.text())? {
+                ReplaceOutcome::Replaced => {
+                    // Only after the write has actually committed: clearing the drop-in
+                    // first (before the write) would delete an admin's overrides even on a
+                    // path that turns out `Raced` and never writes anything, or errors out
+                    // partway through — `uninstall` clears its own fragment before its
+                    // drop-in for the identical reason.
+                    remove_dir_if_present(&dropin_dir(id))?;
+                    daemon_reload_or_report(id)?;
+                    Ok(WriteOutcome::Done)
+                }
+                ReplaceOutcome::Raced => Ok(WriteOutcome::Raced),
+            }
+        }
+        other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
     }
 }
 

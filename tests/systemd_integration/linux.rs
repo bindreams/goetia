@@ -1945,6 +1945,57 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched() {
     );
 }
 
+/// A spec whose `logs` parent is `logs_parent` and whose `cwd` lies under a regular file, so the
+/// install creates what is missing of the former and then fails on the latter: a step after the
+/// directories exist.
+fn spec_failing_on_cwd_after_logs_parent(id: &str, base: &Path, logs_parent: &Path) -> DaemonSpec {
+    let file = base.join("file");
+    fs::write(&file, b"x").unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
+    let mut spec = mk(id).into_fields();
+    spec.logs = Some(logs_parent.join("out.log"));
+    spec.cwd = Some(file.join("work"));
+    DaemonSpec::new(spec).unwrap()
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_failed_install_removes_the_directories_it_created() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let base = std::env::temp_dir().join(format!("{}-undo-created", guard.id()));
+    let _rm = DirGuard::new(base.clone());
+    fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
+    let created = base.join("a").join("b");
+    let spec = spec_failing_on_cwd_after_logs_parent(guard.id(), &base, &created);
+
+    Systemd::new()
+        .install(&spec, false)
+        .expect_err("the cwd is under a file");
+
+    assert!(
+        !base.join("a").exists(),
+        "the failed install left {}",
+        created.display()
+    );
+    assert!(base.is_dir(), "a directory that existed before must stay");
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_failed_install_leaves_a_directory_that_existed_before() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let base = std::env::temp_dir().join(format!("{}-undo-preexisting", guard.id()));
+    let _rm = DirGuard::new(base.clone());
+    let existing = base.join("logs");
+    fs::create_dir_all(&existing).unwrap_or_else(|e| panic!("mkdir {}: {e}", existing.display()));
+    let spec = spec_failing_on_cwd_after_logs_parent(guard.id(), &base, &existing);
+
+    Systemd::new()
+        .install(&spec, false)
+        .expect_err("the cwd is under a file");
+
+    assert!(existing.is_dir(), "a directory that existed before must stay");
+}
+
 // Backslashes =========================================================================================================
 
 /// Values that end in backslashes are written so that systemd reads each back exactly, and the

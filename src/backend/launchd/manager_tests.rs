@@ -16,6 +16,7 @@ use crate::spec::DaemonFields;
 use crate::spec::test_support::plain_fields;
 use crate::spec::{Id, Kind, Restart, User};
 
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::test_cleanup::{FileGuard, remove_or_warn};
 use crate::backend::test_elevation::{ELEVATED, elevated};
 
@@ -306,7 +307,7 @@ fn ensure_dir_owned_by_leaves_an_existing_directory_exactly_as_found() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let before = mode_and_gid(&dir);
 
-    ensure_dir_owned_by(&dir, &account).expect("an existing directory is accepted");
+    ensure_dir_owned_by(&dir, &account, &mut CreatedDirs::new()).expect("an existing directory is accepted");
 
     assert_eq!(mode_and_gid(&dir), before);
     assert_eq!(before.0, 0o700);
@@ -318,7 +319,7 @@ fn ensure_dir_owned_by_creates_and_hands_over_every_missing_component() {
     let account = other_group_account(tmp.path());
     let leaf = tmp.path().join("a").join("b").join("c");
 
-    ensure_dir_owned_by(&leaf, &account).expect("create the whole chain");
+    ensure_dir_owned_by(&leaf, &account, &mut CreatedDirs::new()).expect("create the whole chain");
 
     for dir in [tmp.path().join("a"), tmp.path().join("a/b"), leaf] {
         assert_eq!(
@@ -345,7 +346,7 @@ fn create_owned_leaves_a_component_that_appeared_after_the_walk() {
     std::fs::set_permissions(&raced, std::fs::Permissions::from_mode(0o700)).unwrap();
     let before = mode_and_gid(&raced);
 
-    create_owned(&missing, &account).expect("a lost race is not an error");
+    create_owned(&missing, &account, &mut CreatedDirs::new()).expect("a lost race is not an error");
 
     assert_eq!(
         mode_and_gid(&raced),
@@ -364,7 +365,7 @@ fn ensure_dir_owned_by_treats_a_dangling_symlink_as_existing() {
     let link = tmp.path().join("link");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    ensure_dir_owned_by(&link, &account).expect("an existing path of any kind is accepted");
+    ensure_dir_owned_by(&link, &account, &mut CreatedDirs::new()).expect("an existing path of any kind is accepted");
 
     assert!(!target.exists(), "the link's target must not be created");
     assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
@@ -377,9 +378,31 @@ fn ensure_dir_owned_by_accepts_a_regular_file() {
     let file = tmp.path().join("file");
     std::fs::write(&file, b"x").unwrap();
 
-    ensure_dir_owned_by(&file, &account).expect("an existing path of any kind is accepted");
+    ensure_dir_owned_by(&file, &account, &mut CreatedDirs::new()).expect("an existing path of any kind is accepted");
 
     assert_eq!(std::fs::read(&file).unwrap(), b"x");
+}
+
+/// `cwd` is made before the parent of `logs` is looked at, so a failure on the latter leaves `cwd`
+/// for the caller's guard to take back.
+#[skuld::test]
+fn prepare_parent_dirs_records_the_cwd_it_made_before_the_logs_parent_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let account = other_group_account(tmp.path());
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let cwd = tmp.path().join("cwd");
+    let mut fields = plain_fields("dirs", vec!["/bin/true".to_string()]);
+    fields.cwd = Some(cwd.clone());
+    fields.logs = Some(file.join("sub").join("out.log"));
+    let spec = DaemonSpec::new(fields).unwrap();
+    let mut created = CreatedDirs::new();
+
+    prepare_parent_dirs(&spec, &account, &mut created).expect_err("the logs parent is under a file");
+    assert!(cwd.is_dir(), "the cwd was made before the failure");
+    drop(created);
+
+    assert!(!cwd.exists());
 }
 
 // resolve_account =====================================================================================================

@@ -55,6 +55,7 @@ use std::{fs, io};
 
 use crate::backend::bounded::{self, Finished, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::launchd::state::Evidence;
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
@@ -453,16 +454,16 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// its directory), both world-readable and searchable. Each component created is handed to
 /// `account`, so a non-root daemon can write there. Otherwise a non-root daemon whose
 /// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a
-/// missing `WorkingDirectory` refuses the job outright.
-fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account) -> Result<()> {
+/// missing `WorkingDirectory` refuses the job outright. Each directory created is recorded in `created`.
+fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut CreatedDirs) -> Result<()> {
     if let Some(cwd) = &spec.cwd {
-        ensure_dir_owned_by(cwd, account)?;
+        ensure_dir_owned_by(cwd, account, created)?;
     }
     if let Some(logs) = &spec.logs
         && let Some(parent) = logs.parent()
         && !parent.as_os_str().is_empty()
     {
-        ensure_dir_owned_by(parent, account)?;
+        ensure_dir_owned_by(parent, account, created)?;
     }
     Ok(())
 }
@@ -473,8 +474,8 @@ fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account) -> Result<()> {
 /// exists would hand ownership of, and strip the mode from, whatever happened to be there
 /// (`/var/log`, a user's home directory, ...). A path that already exists — of any kind, a dangling
 /// symlink included — is left untouched, and so is one a concurrent install creates first.
-fn ensure_dir_owned_by(dir: &Path, account: &Account) -> Result<()> {
-    create_owned(&missing_components(dir)?, account)
+fn ensure_dir_owned_by(dir: &Path, account: &Account, created: &mut CreatedDirs) -> Result<()> {
+    create_owned(&missing_components(dir)?, account, created)
 }
 
 /// The components of `dir` that do not exist, outermost first. A dangling symlink exists.
@@ -499,11 +500,13 @@ fn missing_components(dir: &Path) -> Result<Vec<&Path>> {
 }
 
 /// `mkdir` each of `missing` (outermost first), then `chmod` and `chown` it. `AlreadyExists` means
-/// another install created it after the walk: not ours, so left alone.
-fn create_owned(missing: &[&Path], account: &Account) -> Result<()> {
+/// another install created it after the walk: not ours, so left alone. Each directory created is
+/// recorded in `created` before its `chmod` and `chown`, so a failure there is undone with it.
+fn create_owned(missing: &[&Path], account: &Account, created: &mut CreatedDirs) -> Result<()> {
     for path in missing {
         match fs::DirBuilder::new().mode(0o755).create(path) {
             Ok(()) => {
+                created.record(path);
                 fs::set_permissions(path, fs::Permissions::from_mode(0o755))
                     .map_err(|e| Error::os_at("chmod", *path, e))?;
                 nix::unistd::chown(*path, Some(account.uid), Some(account.gid))
@@ -1055,6 +1058,89 @@ impl Launchd {
             )),
         }
     }
+
+    /// `install` has no `--timeout` of its own, so its own `launchctl` calls are deliberately
+    /// unbounded.
+    ///
+    /// `Raced` only where no `launchctl` call has been made yet: another pass could then make more
+    /// calls than the verb reserved ([`INSTALL_CALLS`]), so a race after one is an error instead.
+    fn write_plist(
+        &self,
+        spec: &DaemonSpec,
+        desired: &str,
+        outcome: &Outcome,
+        snapshot: Option<&Plist>,
+        reservation: &mut Reservation,
+        created: &mut CreatedDirs,
+    ) -> Result<WriteOutcome> {
+        // Resolved again: `render` kept only the plist, which names the account, and launchd
+        // resolves that name at launch too.
+        let account = resolve_account(&spec.user)?;
+        let deadline = Budget::Unbounded.start();
+
+        match outcome {
+            Outcome::Create => {
+                // A job may already answer to this label with no plist of ours (a hand-installed
+                // predecessor, or a booted-out one still tearing down). `start` would see it loaded and
+                // running and return Ok while our daemon never ran, and label-scoped checks cannot tell
+                // whose job it is, so boot it out here, where the artifact is known to be new.
+                //
+                // Staging comes first, so a failure there stops nothing. A read or `bootout` that fails
+                // leaves no plist, so a rerun is a `Create` again and reaches the stale job; after a
+                // plist is written the rerun would read `UpToDate` and never look.
+                let target = staging_path(spec.id.as_str());
+                prepare_parent_dirs(spec, &account, created)?;
+                let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), desired)?;
+                let loaded = never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?);
+                if loaded {
+                    never_expires(self.launchctl.bootout(spec.id.as_str(), deadline, reservation)?);
+                }
+                match persist_new(staged, &target)? {
+                    PersistOutcome::Written => {}
+                    // Something now exists where `read` saw nothing, and `is_loaded` has been called.
+                    PersistOutcome::Raced => {
+                        return Err(if loaded {
+                            refuse::slot_taken_after_bootout(&spec.id, &target, describe_at(&target))
+                        } else {
+                            refuse::changed_during_install(&spec.id, &target)
+                        });
+                    }
+                }
+                self.recheck_after_write(&spec.id, deadline, &target, desired, None, reservation)?;
+            }
+            Outcome::Update { .. } | Outcome::Stale { .. } => {
+                let snapshot = snapshot.expect("an id `decide` chose to update was read as marked");
+                let previous = snapshot.text.as_str();
+                // `Stale` is checked too: a release can change what the generator renders.
+                let changes_job = refuse::changes_loaded_job(previous, desired);
+                if changes_job && never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?) {
+                    return Err(refuse::loaded_refusal(&spec.id));
+                }
+                prepare_parent_dirs(spec, &account, created)?;
+                let target = snapshot.location.path.as_path();
+                // `target` was captured by `read`, before `decide` ran. A concurrent `enable` or
+                // `disable` may have moved it since, and writing here would put a plist in both
+                // directories, which `locate` errors on; a concurrent `uninstall` would report
+                // success and leave the write's plist installed. This check only narrows the race to
+                // the window between it and `write_existing`'s rename onto `target`; it does not
+                // close it.
+                if !still_present(target)? {
+                    return if changes_job {
+                        // `is_loaded` has been called.
+                        Err(refuse::changed_during_install(&spec.id, target))
+                    } else {
+                        Ok(WriteOutcome::Raced)
+                    };
+                }
+                write_existing(target, desired)?;
+                if changes_job {
+                    self.recheck_after_write(&spec.id, deadline, target, desired, Some(previous), reservation)?;
+                }
+            }
+            other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
+        }
+        Ok(WriteOutcome::Done)
+    }
 }
 
 impl backend::Backend for Launchd {
@@ -1096,11 +1182,6 @@ impl backend::Backend for Launchd {
         })
     }
 
-    /// `install` has no `--timeout` of its own, so its own `launchctl` calls are deliberately
-    /// unbounded.
-    ///
-    /// `Raced` only where no `launchctl` call has been made yet: another pass could then make more
-    /// calls than the verb reserved ([`INSTALL_CALLS`]), so a race after one is an error instead.
     fn write(
         &self,
         spec: &DaemonSpec,
@@ -1110,73 +1191,17 @@ impl backend::Backend for Launchd {
         _scope: &mut (),
         reservation: &mut Reservation,
     ) -> Result<WriteOutcome> {
-        // Resolved again: `render` kept only the plist, which names the account, and launchd
-        // resolves that name at launch too.
-        let account = resolve_account(&spec.user)?;
-        let deadline = Budget::Unbounded.start();
-
-        match outcome {
-            Outcome::Create => {
-                // A job may already answer to this label with no plist of ours (a hand-installed
-                // predecessor, or a booted-out one still tearing down). `start` would see it loaded and
-                // running and return Ok while our daemon never ran, and label-scoped checks cannot tell
-                // whose job it is, so boot it out here, where the artifact is known to be new.
-                //
-                // Staging comes first, so a failure there stops nothing. A read or `bootout` that fails
-                // leaves no plist, so a rerun is a `Create` again and reaches the stale job; after a
-                // plist is written the rerun would read `UpToDate` and never look.
-                let target = staging_path(spec.id.as_str());
-                prepare_parent_dirs(spec, &account)?;
-                let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), desired)?;
-                let loaded = never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?);
-                if loaded {
-                    never_expires(self.launchctl.bootout(spec.id.as_str(), deadline, reservation)?);
-                }
-                match persist_new(staged, &target)? {
-                    PersistOutcome::Written => {}
-                    // Something now exists where `read` saw nothing, and `is_loaded` has been called.
-                    PersistOutcome::Raced => {
-                        return Err(if loaded {
-                            refuse::slot_taken_after_bootout(&spec.id, &target, describe_at(&target))
-                        } else {
-                            refuse::changed_during_install(&spec.id, &target)
-                        });
-                    }
-                }
-                self.recheck_after_write(&spec.id, deadline, &target, desired, None, reservation)?;
-            }
-            Outcome::Update { .. } | Outcome::Stale { .. } => {
-                let snapshot = snapshot.expect("an id `decide` chose to update was read as marked");
-                let previous = snapshot.text.as_str();
-                // `Stale` is checked too: a release can change what the generator renders.
-                let changes_job = refuse::changes_loaded_job(previous, desired);
-                if changes_job && never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?) {
-                    return Err(refuse::loaded_refusal(&spec.id));
-                }
-                prepare_parent_dirs(spec, &account)?;
-                let target = snapshot.location.path.as_path();
-                // `target` was captured by `read`, before `decide` ran. A concurrent `enable` or
-                // `disable` may have moved it since, and writing here would put a plist in both
-                // directories, which `locate` errors on; a concurrent `uninstall` would report
-                // success and leave the write's plist installed. This check only narrows the race to
-                // the window between it and `write_existing`'s rename onto `target`; it does not
-                // close it.
-                if !still_present(target)? {
-                    return if changes_job {
-                        // `is_loaded` has been called.
-                        Err(refuse::changed_during_install(&spec.id, target))
-                    } else {
-                        Ok(WriteOutcome::Raced)
-                    };
-                }
-                write_existing(target, desired)?;
-                if changes_job {
-                    self.recheck_after_write(&spec.id, deadline, target, desired, Some(previous), reservation)?;
-                }
-            }
-            other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
-        }
-        Ok(WriteOutcome::Done)
+        // Dropped at the end: the directories go unless the plist this wrote is in place, whether the
+        // write failed, was put back after a doubt, lost a race (the retry creates them again) or
+        // went through.
+        let mut created = CreatedDirs::new();
+        let written = self.write_plist(spec, desired, outcome, snapshot, reservation, &mut created);
+        let target = match (outcome, snapshot) {
+            (Outcome::Update { .. } | Outcome::Stale { .. }, Some(snapshot)) => snapshot.location.path.clone(),
+            _ => staging_path(spec.id.as_str()),
+        };
+        created.keep_if_in_place(&target, desired);
+        written
     }
 
     fn live_status(&self, snapshot: &Plist) -> Result<Status> {

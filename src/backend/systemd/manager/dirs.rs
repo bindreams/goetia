@@ -8,20 +8,21 @@ use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::process::Command;
 
+use crate::backend::created_dirs::CreatedDirs;
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, DaemonSpec, User};
 
 /// Create (and, for a non-root account, `chown`) the parent of `logs` and the `cwd` directory itself.
-/// Runs while still elevated.
-pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
+/// Runs while still elevated. Each directory it creates is recorded in `created`.
+pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -> Result<()> {
     if let Some(logs) = &spec.logs
         && let Some(parent) = logs.parent()
         && !parent.as_os_str().is_empty()
     {
-        ensure_dir(parent, &spec.user)?;
+        ensure_dir(parent, &spec.user, created)?;
     }
     if let Some(cwd) = &spec.cwd {
-        ensure_dir(cwd, &spec.user)?;
+        ensure_dir(cwd, &spec.user, created)?;
     }
     Ok(())
 }
@@ -32,8 +33,9 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec) -> Result<()> {
 /// ancestor already existed — would let a manifest silently widen or reassign an arbitrary existing
 /// system directory (`/var/log`, `/etc`, another user's home). A directory that already existed (or
 /// that a concurrent, racing install created first — see the loop below) is left exactly as it was;
-/// only a non-directory at that path is an error.
-pub(super) fn ensure_dir(dir: &Path, user: &User) -> Result<()> {
+/// only a non-directory at that path is an error. Each component this call creates is recorded in
+/// `created`, before its `chmod` and `chown`, so a failure there is undone with it.
+pub(super) fn ensure_dir(dir: &Path, user: &User, created: &mut CreatedDirs) -> Result<()> {
     let mut missing = Vec::new();
     let mut cursor = dir;
     loop {
@@ -69,6 +71,7 @@ pub(super) fn ensure_dir(dir: &Path, user: &User) -> Result<()> {
         // change here only ever narrows the window, from "up to 0777" down to "at most 0755".
         match fs::DirBuilder::new().mode(0o755).create(path) {
             Ok(()) => {
+                created.record(path);
                 fs::set_permissions(path, fs::Permissions::from_mode(0o755))
                     .map_err(|e| Error::os_at("chmod", path, e))?;
                 if let Some(owner) = &owner {

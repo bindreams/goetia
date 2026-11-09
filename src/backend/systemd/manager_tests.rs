@@ -22,6 +22,7 @@ use crate::spec::DaemonFields;
 use crate::spec::Kind;
 use crate::spec::test_support::plain_fields;
 
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::test_cleanup::{DirGuard, FileGuard, remove_or_warn};
 use crate::backend::test_elevation::{ELEVATED, elevated};
 
@@ -226,7 +227,7 @@ fn ensure_dir_leaves_a_preexisting_directory_untouched() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     let _cleanup = DirGuard::new(dir.clone());
 
-    ensure_dir(&dir, &User::Root).expect("ensure_dir on a pre-existing dir");
+    ensure_dir(&dir, &User::Root, &mut CreatedDirs::new()).expect("ensure_dir on a pre-existing dir");
 
     let meta = std::fs::metadata(&dir).expect("stat");
     assert_eq!(
@@ -245,7 +246,7 @@ fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     let _cleanup = DirGuard::new(dir.clone());
 
-    ensure_dir(&dir, &User::Name("nobody".to_string())).expect("ensure_dir");
+    ensure_dir(&dir, &User::Name("nobody".to_string()), &mut CreatedDirs::new()).expect("ensure_dir");
 
     let meta = std::fs::metadata(&dir).expect("stat");
     assert_eq!(meta.permissions().mode() & 0o777, 0o700, "mode must be untouched");
@@ -258,8 +259,23 @@ fn ensure_dir_refuses_a_preexisting_file() {
     std::fs::write(&path, b"").expect("create file");
     let _cleanup = FileGuard::new(path.clone());
 
-    let err = ensure_dir(&path, &User::Root).expect_err("a file cannot be a directory");
+    let err = ensure_dir(&path, &User::Root, &mut CreatedDirs::new()).expect_err("a file cannot be a directory");
     assert!(err.to_string().contains("not a directory"), "{err}");
+}
+
+/// The `chown` after the `mkdir` fails for an account that does not exist, with or without root:
+/// the directories made so far are the caller's to take back.
+#[skuld::test]
+fn ensure_dir_records_what_it_created_before_a_failed_chown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("a").join("b");
+    let mut created = CreatedDirs::new();
+
+    ensure_dir(&dir, &User::Name("goetia-no-such-account".to_string()), &mut created)
+        .expect_err("no such account to chown to");
+    drop(created);
+
+    assert!(!tmp.path().join("a").exists());
 }
 
 // replace_unit_verified / quarantine_if_still_ours: the remaining race branches =======================================
