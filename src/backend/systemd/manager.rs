@@ -73,7 +73,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use discover::{DROPIN_SEARCH_DIRS, Fragment};
+use discover::{DROPIN_SEARCH_DIRS, Fragment, RawState, classify_and_read};
 use systemctl::{
     GateScope, daemon_reload, daemon_reload_or_report, disable_impl, enable_impl, gate_scope, kill_impl,
     request_restart_impl, require_supported, start_impl, status_from_unit, stop_impl,
@@ -170,7 +170,9 @@ impl Backend for Systemd {
         // write failed, lost a race (the retry creates them again) or went through.
         let mut created = CreatedDirs::new();
         let written = write_unit(spec, definition, outcome, snapshot, &mut created);
-        created.keep_if_in_place(&unit_path(spec.id.as_str()), definition);
+        if unit_stands(&unit_path(spec.id.as_str()), definition) {
+            created.keep();
+        }
         written
     }
 
@@ -299,6 +301,18 @@ impl Backend for Systemd {
 
     fn kill(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<()> {
         kill_impl(snapshot.id().as_str())
+    }
+}
+
+/// Whether the unit at `path` is `definition`, read as `discover` reads a fragment: only a regular
+/// file holding exactly that stands. Absent, a symlink (a masked unit), a FIFO, a directory or other
+/// bytes do not. A read that did not complete leaves it unknown, and unknown counts as standing: the
+/// directories stay, since removing them could break an installed unit.
+fn unit_stands(path: &Path, definition: &str) -> bool {
+    match classify_and_read(path) {
+        Ok(RawState::Regular(text)) => text == definition,
+        Ok(RawState::Absent | RawState::NotOurs) => false,
+        Err(_) => true,
     }
 }
 

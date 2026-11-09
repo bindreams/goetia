@@ -405,6 +405,63 @@ fn prepare_parent_dirs_records_the_cwd_it_made_before_the_logs_parent_failed() {
     assert!(!cwd.exists());
 }
 
+// plist_stands ========================================================================================================
+
+#[skuld::test]
+fn a_regular_file_holding_the_plist_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("id.plist");
+    std::fs::write(&path, "text").unwrap();
+
+    assert!(plist_stands(&path, "text"));
+}
+
+#[skuld::test]
+fn an_absent_plist_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    assert!(!plist_stands(&tmp.path().join("id.plist"), "text"));
+}
+
+#[skuld::test]
+fn a_plist_holding_other_text_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("id.plist");
+    std::fs::write(&path, "someone else's").unwrap();
+
+    assert!(!plist_stands(&path, "text"));
+}
+
+/// Never opened, so it cannot block.
+#[skuld::test]
+fn a_fifo_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("id.plist");
+    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+    assert!(!plist_stands(&path, "text"));
+}
+
+#[skuld::test]
+fn a_dangling_symlink_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("id.plist");
+    std::os::unix::fs::symlink(tmp.path().join("nowhere"), &path).unwrap();
+
+    assert!(!plist_stands(&path, "text"));
+}
+
+/// A read that does not complete says nothing about the plist; the directories stay.
+#[skuld::test]
+fn a_plist_that_cannot_be_read_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, "x").unwrap();
+
+    // `ENOTDIR` on the parent: presence is unsettled.
+    assert!(plist_stands(&file.join("id.plist"), "text"));
+}
+
 // resolve_account =====================================================================================================
 
 #[skuld::test]

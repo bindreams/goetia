@@ -64,53 +64,27 @@ fn drop_does_not_panic_when_a_removal_fails() {
 }
 
 #[skuld::test]
-fn keep_if_in_place_keeps_the_directories_when_the_definition_stands() {
+fn keep_keeps_every_recorded_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let mut created = create_chain(tmp.path());
-    let definition = tmp.path().join("unit");
-    fs::write(&definition, "text").unwrap();
 
-    created.keep_if_in_place(&definition, "text");
+    created.keep();
     drop(created);
 
     assert!(tmp.path().join("a/b/c").is_dir());
 }
 
+/// A panic may come after the definition was written: the directories of an installed service stay.
 #[skuld::test]
-fn keep_if_in_place_removes_the_directories_when_the_definition_is_absent() {
+fn drop_keeps_the_directories_while_a_panic_unwinds() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut created = create_chain(tmp.path());
+    let root = tmp.path().to_path_buf();
 
-    created.keep_if_in_place(&tmp.path().join("unit"), "text");
-    drop(created);
+    let unwound = std::panic::catch_unwind(move || {
+        let _created = create_chain(&root);
+        panic!("a step after the write");
+    });
 
-    assert!(!tmp.path().join("a").exists());
-}
-
-#[skuld::test]
-fn keep_if_in_place_removes_the_directories_when_something_else_is_there() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut created = create_chain(tmp.path());
-    let definition = tmp.path().join("unit");
-    fs::write(&definition, "someone else's").unwrap();
-
-    created.keep_if_in_place(&definition, "text");
-    drop(created);
-
-    assert!(!tmp.path().join("a").exists());
-}
-
-/// A definition that cannot be read says nothing about whether it stands; the directories stay.
-#[skuld::test]
-fn keep_if_in_place_keeps_the_directories_when_the_definition_cannot_be_read() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut created = create_chain(tmp.path());
-    // Reading a directory fails with neither "not found" nor "invalid data".
-    let unreadable = tmp.path().join("unit");
-    fs::create_dir(&unreadable).unwrap();
-
-    created.keep_if_in_place(&unreadable, "text");
-    drop(created);
-
+    assert!(unwound.is_err());
     assert!(tmp.path().join("a/b/c").is_dir());
 }

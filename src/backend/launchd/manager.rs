@@ -632,6 +632,19 @@ fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> 
     })
 }
 
+/// Whether the plist at `path` is `desired`, read as [`obtain`] reads one: only a regular file
+/// holding exactly that stands. Absent, a dangling symlink, a FIFO or a directory do not; a symlink
+/// to such a file does, as everywhere else for a plist. A read that did not complete leaves it
+/// unknown, and unknown counts as standing: the directories stay, since removing them could break an
+/// installed plist.
+fn plist_stands(path: &Path, desired: &str) -> bool {
+    match obtain(path) {
+        Obtained::Bytes(bytes) => bytes == desired.as_bytes(),
+        Obtained::Absent | Obtained::NonRegular => false,
+        Obtained::Failed(_) => true,
+    }
+}
+
 /// What is at `path`, for a message.
 fn describe_at(path: &Path) -> Occupant {
     match fs::symlink_metadata(path) {
@@ -1200,7 +1213,9 @@ impl backend::Backend for Launchd {
             (Outcome::Update { .. } | Outcome::Stale { .. }, Some(snapshot)) => snapshot.location.path.clone(),
             _ => staging_path(spec.id.as_str()),
         };
-        created.keep_if_in_place(&target, desired);
+        if plist_stands(&target, desired) {
+            created.keep();
+        }
         written
     }
 

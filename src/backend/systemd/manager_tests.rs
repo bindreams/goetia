@@ -278,6 +278,66 @@ fn ensure_dir_records_what_it_created_before_a_failed_chown() {
     assert!(!tmp.path().join("a").exists());
 }
 
+// unit_stands =========================================================================================================
+
+#[skuld::test]
+fn a_regular_file_holding_the_definition_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("u.service");
+    std::fs::write(&path, "text").unwrap();
+
+    assert!(unit_stands(&path, "text"));
+}
+
+#[skuld::test]
+fn an_absent_unit_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    assert!(!unit_stands(&tmp.path().join("u.service"), "text"));
+}
+
+#[skuld::test]
+fn a_unit_holding_other_text_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("u.service");
+    std::fs::write(&path, "someone else's").unwrap();
+
+    assert!(!unit_stands(&path, "text"));
+}
+
+/// Not opened for reading, so it cannot block.
+#[skuld::test]
+fn a_fifo_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("u.service");
+    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+    assert!(!unit_stands(&path, "text"));
+}
+
+/// A masked unit is a symlink; one to a file holding the definition is still not the unit written.
+#[skuld::test]
+fn a_symlink_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    std::fs::write(&target, "text").unwrap();
+    let path = tmp.path().join("u.service");
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    assert!(!unit_stands(&path, "text"));
+}
+
+/// A read that does not complete says nothing about the unit; the directories stay.
+#[skuld::test]
+fn a_unit_that_cannot_be_read_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, "x").unwrap();
+
+    // `ENOTDIR` on the parent: presence is unsettled.
+    assert!(unit_stands(&file.join("u.service"), "text"));
+}
+
 // replace_unit_verified / quarantine_if_still_ours: the remaining race branches =======================================
 
 /// The one non-clobber branch none of the other tests reach: a *third* file appearing at
