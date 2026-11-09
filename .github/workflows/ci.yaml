@@ -98,11 +98,11 @@ jobs:
         # renovate: datasource=pypi depName=prek
         run: uv tool install prek==0.5.9
 
-      # Clippy is defined in prek.toml: the default build, the library-only build and the library
-      # with the `testing` feature.
+      # Clippy is defined in prek.toml: the default build (with the `testing` feature, which the
+      # self dev-dependency turns on) and the library-only build.
       - name: Clippy
         if: matrix.toolchain != 'stable'
-        run: prek run --all-files cargo-clippy cargo-clippy-lib-only cargo-clippy-lib-testing
+        run: prek run --all-files cargo-clippy cargo-clippy-lib-only
 
       # A plain `cargo test` leaves every elevation-gated test reported by
       # skuld as *unavailable*, not failed — a silent skip, which this
@@ -221,7 +221,7 @@ jobs:
       # single-platform clippy run would miss them).
       - name: Run linters
         env:
-          SKIP: cargo-clippy,cargo-clippy-lib-only,cargo-clippy-lib-testing
+          SKIP: cargo-clippy,cargo-clippy-lib-only
         run: prek run --all-files
 
       - name: Test release helper scripts

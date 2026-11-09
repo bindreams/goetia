@@ -58,15 +58,6 @@ types = ["rust"]
 pass_filenames = false
 
 [[repos.hooks]]
-id = "cargo-clippy-lib-testing"
-name = "cargo clippy (library with the testing feature)"
-# The `testing` module builds only under its feature or `cfg(test)`; this lints it as an integration test sees it.
-entry = "cargo clippy --lib --features testing --locked -- -D warnings"
-language = "system"
-types = ["rust"]
-pass_filenames = false
-
-[[repos.hooks]]
 id = "format-section-comments"
 name = "format section comments"
 entry = "python scripts/format-section-comments.py"
