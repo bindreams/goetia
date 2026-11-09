@@ -1123,10 +1123,20 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     }
 }
 
+/// Exit code of [`SCOPE_PIDS_PREAMBLE`] when the scope's `pids.max` is not `$EXPECTED_TASKS_MAX`;
+/// the script hardcodes it.
+const CAP_NOT_IN_FORCE: i32 = 97;
+
 /// Shell builtins only, so it forks nothing and the scope's task count is unchanged: prints the
 /// scope's cgroup path, `pids.max` and `pids.current` on stderr (v1/hybrid `pids` line, else v2 `0::`
 /// line), then `exec`s `$0 "$@"`. `printf '%s\n'`, not `echo`, which would interpret backslash
 /// escapes in the evidence.
+///
+/// A scope whose `pids.max` is absent or not `$EXPECTED_TASKS_MAX` never got the cap, so the script
+/// exits [`CAP_NOT_IN_FORCE`] without running the verb. The extra evidence tells a `pids` controller
+/// missing from the root at boot (`root.controllers`) from the parent failing to enable it for its
+/// children (`parent.subtree` lacking `pids` while `root.subtree` has it). `parent.subtree` and
+/// `root.subtree` exist only on cgroup v2; on v1/hybrid they read `unreadable`.
 const SCOPE_PIDS_PREAMBLE: &str = r#"
 cg=; v1=; v1ctl=; seen=
 while read -r line; do
@@ -1140,11 +1150,16 @@ if [ -n "$v1" ]; then tree=v1; dir=/sys/fs/cgroup/$v1ctl$v1
 elif [ -n "$cg" ]; then tree=v2; dir=/sys/fs/cgroup$cg; fi
 if [ -n "$dir" ]; then
   max=unreadable; cur=unreadable
+  psub=unreadable; sctl=unreadable; rctl=unreadable; rsub=unreadable
+  read -r psub < "${dir%/*}/cgroup.subtree_control"; read -r sctl < "$dir/cgroup.controllers"
+  read -r rctl < /sys/fs/cgroup/cgroup.controllers; read -r rsub < /sys/fs/cgroup/cgroup.subtree_control
   read -r max < "$dir/pids.max"; read -r cur < "$dir/pids.current"
-  printf '%s\n' "scope at start: tree=$tree cgroup=$dir pids.max=$max pids.current=$cur" >&2
+  printf '%s\n' "scope at start: tree=$tree cgroup=$dir pids.max=$max pids.current=$cur parent.subtree=[$psub] scope.controllers=[$sctl] root.controllers=[$rctl] root.subtree=[$rsub]" >&2
 else
+  max=unreadable
   printf '%s\n' "scope at start: no pids cgroup in /proc/self/cgroup: $seen" >&2
 fi
+if [ "$max" != "$EXPECTED_TASKS_MAX" ]; then exit 97; fi
 exec "$0" "$@"
 "#;
 
@@ -1179,8 +1194,31 @@ fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Out
         .args(["sh", "-c", SCOPE_PIDS_PREAMBLE])
         .arg(env!("CARGO_BIN_EXE_goetia"))
         .args(args)
+        .env("EXPECTED_TASKS_MAX", tasks.to_string())
         .output()
         .expect("spawn systemd-run")
+}
+
+/// The host's cgroup state after a scope that did not get its cap: root and `system.slice`
+/// controllers, uptime, whether the unit is still loaded and PID 1's recent journal. It runs after
+/// the scope exited, so it cannot show the cap at start; the scope's own stderr line is the only
+/// start-time evidence.
+fn cap_evidence(unit: &str) -> String {
+    let script = format!(
+        "cd /sys/fs/cgroup; for f in cgroup.controllers cgroup.subtree_control system.slice/cgroup.controllers \
+         system.slice/cgroup.subtree_control; do echo \"$f: $(cat $f)\"; done; \
+         echo \"uptime: $(cut -d' ' -f1 /proc/uptime)\"; \
+         systemctl show -p ActiveState,LoadState {unit}; \
+         journalctl -b --no-pager -o short-precise -n 40 _PID=1"
+    );
+    match Command::new("sh").args(["-c", &script]).output() {
+        Ok(out) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(err) => format!("the evidence command failed to spawn: {err}"),
+    }
 }
 
 /// goetia never panics for want of a task; a verb that cannot get what its request needs exits `1`,
@@ -1202,6 +1240,11 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
             match output.status.code() {
+                Some(CAP_NOT_IN_FORCE) => panic!(
+                    "harness defect: {unit} did not have pids.max={tasks} at start, so the verb was not run\n\
+                     --- scope evidence (stderr) ---\n{stderr}\n--- host evidence ---\n{}",
+                    cap_evidence(&unit),
+                ),
                 Some(0) => {
                     // One task is below goetia's own need, so a success here means the sweep never
                     // starved the verb.
