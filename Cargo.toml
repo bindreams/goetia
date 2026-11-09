@@ -153,7 +153,8 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 # Turns on `testing` for the integration tests, which reach the library only through its public API.
-goetia = { path = ".", features = ["testing"] }
+# Without `default-features = false` it would also turn on `cli` in a `--no-default-features` build.
+goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.3"
 rand = "0.10"
 
