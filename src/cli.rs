@@ -36,6 +36,9 @@ use std::io::Write;
 
 use clap::{Parser, Subcommand};
 
+/// What `dispatch`'s `is_elevated` should be for a real run, so a crate embedding the CLI needs no
+/// dependency of its own to supply it.
+pub use cosca::elevation::is_elevated;
 pub use exit::ExitCode;
 
 use crate::error::{EscapedStream, Result};
