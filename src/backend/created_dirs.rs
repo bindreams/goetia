@@ -8,7 +8,8 @@ use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag, open, openat, readlinkat};
+use nix::fcntl::readlinkat;
+use nix::fcntl::{AtFlags, OFlag, open, openat};
 use nix::sys::stat::{FileStat, Mode, SFlag, fchmod, fstat, fstatat, mkdirat};
 use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, unlinkat};
 
@@ -24,6 +25,11 @@ use crate::error::{Error, Result};
 /// later removed by name from the parent's descriptor (`unlinkat`) only while the name still refers
 /// to the same inode. A descriptor stays open per directory until the guard is dropped; running out
 /// of them fails the install and leaves the directory being made.
+///
+/// The resolution follows systemd's `CHASE_SAFE`, on every step and plain directories included:
+/// going on from an entry owned by a non-root uid to one owned by a different uid is refused. A path
+/// that steps between owners (an account's directory holding one root or another account owns) is
+/// therefore refused, not created in.
 #[derive(Debug, Default)]
 pub(crate) struct CreatedDirs(Vec<Created>);
 
@@ -33,6 +39,20 @@ pub(crate) struct Owner {
     pub(crate) uid: Uid,
     /// `None` leaves the group as the creating process's.
     pub(crate) gid: Option<Gid>,
+}
+
+impl Owner {
+    /// `(uid_t)-1` and `(gid_t)-1` mean "unchanged" to `fchown`: no account has either.
+    pub(crate) fn new(uid: Uid, gid: Option<Gid>) -> Result<Self> {
+        let unchanged = |id: u32| id == u32::MAX;
+        if unchanged(uid.as_raw()) || gid.is_some_and(|gid| unchanged(gid.as_raw())) {
+            return Err(Error::AccountLookup {
+                detail: format!("id {} names no account: `chown` reads it as \"unchanged\"", u32::MAX),
+                source: None,
+            });
+        }
+        Ok(Self { uid, gid })
+    }
 }
 
 /// Whether the definition an install wrote is in place, as its backend's guarded read found it.
@@ -173,30 +193,127 @@ struct Walk {
     missing: Vec<(PathBuf, OsString)>,
 }
 
-/// How a directory is opened to be searched. An `O_PATH` descriptor needs no read permission on the
-/// directory and is enough for `openat`, `mkdirat`, `fstatat` and `unlinkat`; macOS has none.
+/// How a directory is opened to be searched. On Linux an `O_PATH` descriptor needs no read
+/// permission on the directory and is enough for `openat`, `mkdirat`, `fstatat` and `unlinkat`. macOS
+/// has no `O_PATH`; `O_SEARCH` (`O_EXEC | O_DIRECTORY`) is its open for search only.
 #[cfg(target_os = "linux")]
 const SEARCH: OFlag = OFlag::O_PATH;
 #[cfg(not(target_os = "linux"))]
-const SEARCH: OFlag = OFlag::O_RDONLY;
+const SEARCH: OFlag = OFlag::O_SEARCH;
 
-/// Symlinks one walk follows before it gives up on a cycle: the kernel's own bound.
+/// Symlinks one walk follows before it gives up on a cycle: the kernel's own bound, Linux's
+/// `MAXSYMLINKS`, and macOS's.
+#[cfg(target_os = "linux")]
 const SYMLINK_LIMIT: usize = 40;
+#[cfg(not(target_os = "linux"))]
+const SYMLINK_LIMIT: usize = 32;
 
-/// Resolve `dir` from `/` one component at a time, on descriptors, following the symlinks that
-/// lead through it and none that is the last component. A step from an entry owned by a non-root
-/// uid to one owned by a different uid, a symlink included and judged by its own owner, is refused:
-/// the rule of systemd's `CHASE_SAFE`, so a symlink the daemon's account plants cannot lead root
-/// into a directory the account does not own.
-fn walk(dir: &Path) -> Result<Walk> {
-    let search = OFlag::O_DIRECTORY | SEARCH | OFlag::O_CLOEXEC;
-    let mut so_far = PathBuf::new();
-    let mut cur = open(if dir.has_root() { "/" } else { "." }, search, Mode::empty())
-        .map_err(|e| Error::os_at("open", dir, e))?;
-    if dir.has_root() {
-        so_far.push("/");
+/// What a directory entry is, read through a descriptor the walk then holds, so that what was judged
+/// is what is used.
+enum Entry {
+    /// A directory, and the descriptor it was read through.
+    Dir(OwnedFd, FileStat),
+    /// A symlink and where it points.
+    Link(FileStat, OsString),
+    Other(FileStat),
+}
+
+impl Entry {
+    fn uid(&self) -> libc::uid_t {
+        match self {
+            Entry::Dir(_, stat) | Entry::Link(stat, _) | Entry::Other(stat) => stat.st_uid,
+        }
     }
-    let mut owner = fstat(&cur).map_err(|e| Error::os_at("stat", &so_far, e))?.st_uid;
+}
+
+/// `name` in `parent`, not followed: `None` if there is none. As systemd's `chase` does on Linux, the
+/// entry is opened `O_PATH | O_NOFOLLOW` and judged by `fstat` of that descriptor, which for a link is
+/// the link itself, and a link is read through the same descriptor: the entry that was judged is the
+/// entry that is used, however the name is renamed meanwhile.
+#[cfg(target_os = "linux")]
+fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<Entry>> {
+    let fd = match openat(
+        parent,
+        name,
+        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let stat = fstat(&fd)?;
+    Ok(Some(match SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT {
+        SFlag::S_IFDIR => Entry::Dir(fd, stat),
+        // An empty path reads the link the descriptor is on (Linux 2.6.39).
+        SFlag::S_IFLNK => Entry::Link(stat, readlinkat(&fd, "")?),
+        _ => Entry::Other(stat),
+    }))
+}
+
+/// `name` in `parent`, not followed: `None` if there is none. macOS cannot open a symlink as a
+/// descriptor to read it through (`O_SYMLINK` opens it, but it cannot be read from the descriptor),
+/// so a directory is opened `O_SEARCH | O_NOFOLLOW` and judged by `fstat` of that descriptor, which
+/// must be the inode the name had; a link is read by name and the name must still be the link that
+/// was judged afterwards. A change in between is an error, never a guess.
+#[cfg(not(target_os = "linux"))]
+fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<Entry>> {
+    let named = match fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let same = |a: &FileStat, b: &FileStat| a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+    match SFlag::from_bits_truncate(named.st_mode) & SFlag::S_IFMT {
+        SFlag::S_IFDIR => {
+            let fd = openat(
+                parent,
+                name,
+                SEARCH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )?;
+            let held = fstat(&fd)?;
+            if !same(&named, &held) {
+                return Err(Errno::EAGAIN);
+            }
+            Ok(Some(Entry::Dir(fd, held)))
+        }
+        SFlag::S_IFLNK => {
+            let target = readlinkat(parent, name)?;
+            match fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(again) if same(&named, &again) => Ok(Some(Entry::Link(named, target))),
+                _ => Err(Errno::EAGAIN),
+            }
+        }
+        _ => Ok(Some(Entry::Other(named))),
+    }
+}
+
+/// Resolve `dir`, which must be absolute, from `/` one component at a time, on descriptors,
+/// following the symlinks that lead through it and none that is the last component. As in systemd's
+/// `CHASE_SAFE`, going on from an entry owned by a non-root uid to one owned by a different uid is
+/// refused at every step, plain directories and the last existing component included, and a link
+/// carries its own owner onto whatever it leads to: so a symlink the daemon's account plants cannot
+/// lead root into a directory the account does not own. An absolute link is judged against `/`,
+/// which root owns, and is followed only from root's.
+fn walk(dir: &Path) -> Result<Walk> {
+    if !dir.has_root() {
+        return Err(Error::os_at(
+            "create directory",
+            dir,
+            io::Error::other("not an absolute path"),
+        ));
+    }
+    let search = OFlag::O_DIRECTORY | SEARCH | OFlag::O_CLOEXEC;
+    let root = || open("/", search, Mode::empty()).map_err(|e| Error::os_at("open", "/", e));
+    let mut cur = root()?;
+    let mut owner = fstat(&cur).map_err(|e| Error::os_at("stat", "/", e))?.st_uid;
+    // The link `owner` was carried from, if the walk has not entered a directory since.
+    let mut carried: Option<PathBuf> = None;
+    // Where `cur` is, as far as the walk can tell, for naming what it refuses.
+    let mut shown = PathBuf::from("/");
+    // The requested path up to the component being taken, which is what is created.
+    let mut so_far = PathBuf::from("/");
     let mut queue = components(dir, false);
     let mut missing: Vec<(PathBuf, OsString)> = Vec::new();
     let mut links = 0;
@@ -208,70 +325,69 @@ fn walk(dir: &Path) -> Result<Walk> {
             if name == ".." {
                 return Err(Error::os_at(
                     "create directory",
-                    dir,
-                    io::Error::from(io::ErrorKind::InvalidInput),
+                    &so_far,
+                    io::Error::other("`..` below a component that does not exist"),
                 ));
             }
             missing.push((so_far.clone(), name));
             continue;
         }
+        let at = shown.join(&name);
         if name == ".." {
-            let up = open_beneath(cur.as_fd(), &name, SEARCH).map_err(|e| Error::os_at("open", &so_far, e))?;
-            let up_owner = fstat(&up).map_err(|e| Error::os_at("stat", &so_far, e))?.st_uid;
-            refuse_unsafe(owner, up_owner, &so_far)?;
+            let up = open_beneath(cur.as_fd(), &name, SEARCH).map_err(|e| Error::os_at("open", &at, e))?;
+            let up_owner = fstat(&up).map_err(|e| Error::os_at("stat", &at, e))?.st_uid;
+            refuse_unsafe(owner, up_owner, &at, carried.as_deref())?;
             owner = up_owner;
+            carried = None;
+            shown.pop();
             cur = up;
             continue;
         }
-        let entry = match fstatat(cur.as_fd(), name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-            Ok(entry) => entry,
+        let Some(found) = entry(cur.as_fd(), &name).map_err(|e| Error::os_at("open", &at, e))? else {
             // Below a symlink that leads nowhere nothing may be made: that would make its target.
-            Err(Errno::ENOENT) if from_link => {
-                return Err(Error::os_at(
-                    "resolve",
-                    &so_far,
-                    io::Error::from(io::ErrorKind::NotFound),
-                ));
+            if from_link {
+                return Err(Error::os_at("resolve", &at, io::Error::from(io::ErrorKind::NotFound)));
             }
-            Err(Errno::ENOENT) => {
-                missing.push((so_far.clone(), name));
-                continue;
-            }
-            Err(e) => return Err(Error::os_at("stat", &so_far, e)),
+            missing.push((so_far.clone(), name));
+            continue;
         };
-        // The last component exists, of whatever kind: not ours to make, so not ours to vouch for.
+        let uid = found.uid();
+        refuse_unsafe(owner, uid, &at, carried.as_deref())?;
+        // The last component exists, of whatever kind: not ours to make.
         if queue.is_empty() {
             return Ok(Walk {
                 holder: cur,
                 missing: Vec::new(),
             });
         }
-        refuse_unsafe(owner, entry.st_uid, &so_far)?;
-        let kind = SFlag::from_bits_truncate(entry.st_mode) & SFlag::S_IFMT;
-        if kind == SFlag::S_IFDIR {
-            cur = open_beneath(cur.as_fd(), &name, SEARCH).map_err(|e| Error::os_at("open", &so_far, e))?;
-            owner = entry.st_uid;
-        } else if kind == SFlag::S_IFLNK {
-            links += 1;
-            if links > SYMLINK_LIMIT {
-                return Err(Error::os_at(
-                    "resolve",
-                    &so_far,
-                    io::Error::from_raw_os_error(libc::ELOOP),
-                ));
+        match found {
+            Entry::Dir(fd, _) => {
+                cur = fd;
+                owner = uid;
+                carried = None;
+                shown = at;
             }
-            let target =
-                readlinkat(cur.as_fd(), name.as_os_str()).map_err(|e| Error::os_at("read link", &so_far, e))?;
-            if Path::new(&target).has_root() {
-                cur = open("/", search, Mode::empty()).map_err(|e| Error::os_at("open", &so_far, e))?;
+            Entry::Link(_, target) => {
+                links += 1;
+                if links > SYMLINK_LIMIT {
+                    return Err(Error::os_at("resolve", &at, io::Error::from_raw_os_error(libc::ELOOP)));
+                }
+                if Path::new(&target).has_root() {
+                    cur = root()?;
+                    let root_owner = fstat(&cur).map_err(|e| Error::os_at("stat", "/", e))?.st_uid;
+                    refuse_unsafe(uid, root_owner, &at, None)?;
+                    owner = root_owner;
+                    carried = None;
+                    shown = PathBuf::from("/");
+                } else {
+                    owner = uid;
+                    carried = Some(at);
+                }
+                for step in components(Path::new(&target), true).into_iter().rev() {
+                    queue.push_front(step);
+                }
             }
-            // What the link leads to is judged from the link's owner.
-            owner = entry.st_uid;
-            for step in components(Path::new(&target), true).into_iter().rev() {
-                queue.push_front(step);
-            }
-        } else {
-            return Err(Error::os_at("stat", &so_far, Errno::ENOTDIR));
+            Entry::Other(_) => return Err(Error::os_at("stat", &at, Errno::ENOTDIR)),
         }
     }
     Ok(Walk { holder: cur, missing })
@@ -289,17 +405,21 @@ fn components(path: &Path, from_link: bool) -> VecDeque<(OsString, bool)> {
         .collect()
 }
 
-/// Refuse to go on from an entry owned by `from` to one owned by `to`, unless `from` is root or
-/// `to` itself.
-fn refuse_unsafe(from: libc::uid_t, to: libc::uid_t, at: &Path) -> Result<()> {
+/// Refuse to go on from an entry owned by `from` to `at`, owned by `to`, unless `from` is root or
+/// `to` itself. `carried` is the link `from` is the owner of, when the walk has not entered a
+/// directory since.
+fn refuse_unsafe(from: libc::uid_t, to: libc::uid_t, at: &Path, carried: Option<&Path>) -> Result<()> {
     if from == 0 || from == to {
         return Ok(());
     }
+    let carried = carried
+        .map(|link| format!(", carried from link {}", link.display()))
+        .unwrap_or_default();
     Err(Error::os_at(
         "resolve",
         at,
         io::Error::other(format!(
-            "not followed: it leads from an entry owned by uid {from} to one owned by uid {to}"
+            "not followed: owned by uid {to}, and the walk comes from uid {from}{carried}"
         )),
     ))
 }

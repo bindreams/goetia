@@ -461,10 +461,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// already exists would hand ownership of, and strip the mode from, whatever happened to be there
 /// (`/var/log`, a user's home directory, ...).
 fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut CreatedDirs) -> Result<()> {
-    let owner = Some(Owner {
-        uid: account.uid,
-        gid: Some(account.gid),
-    });
+    let owner = Some(Owner::new(account.uid, Some(account.gid))?);
     if let Some(cwd) = &spec.cwd {
         created.create(cwd, owner)?;
     }

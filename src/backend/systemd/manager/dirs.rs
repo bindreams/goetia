@@ -71,12 +71,5 @@ pub(super) fn owner_of(user: &User) -> Result<Option<Owner>> {
         // silently-skipped case.
         User::Id(AccountId::Sid(_)) => unreachable!("a SID user must already have been rejected by identity_for"),
     };
-    // `(uid_t)-1` is "leave the owner unchanged" to `fchown`: no account to hand a directory to.
-    if uid.as_raw() == u32::MAX {
-        return Err(Error::AccountLookup {
-            detail: format!("uid {} names no account: `chown` reads it as \"unchanged\"", u32::MAX),
-            source: None,
-        });
-    }
-    Ok(Some(Owner { uid, gid: None }))
+    Owner::new(uid, None).map(Some)
 }
