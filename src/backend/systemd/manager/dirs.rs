@@ -49,7 +49,7 @@ pub(super) fn ensure_dir(dir: &std::path::Path, user: &User, created: &mut Creat
 /// (directories created by this — already-elevated — process are already root-owned). The owner
 /// only, not the group: the daemon runs *as* this account, so owner-bit access suffices. A name is
 /// looked up in the passwd database and, failing that, read as a number, as `chown` reads one.
-fn owner_of(user: &User) -> Result<Option<Owner>> {
+pub(super) fn owner_of(user: &User) -> Result<Option<Owner>> {
     let uid = match user {
         User::Root => return Ok(None),
         User::Id(AccountId::Uid(uid)) => Uid::from_raw(*uid),
@@ -71,5 +71,12 @@ fn owner_of(user: &User) -> Result<Option<Owner>> {
         // silently-skipped case.
         User::Id(AccountId::Sid(_)) => unreachable!("a SID user must already have been rejected by identity_for"),
     };
+    // `(uid_t)-1` is "leave the owner unchanged" to `fchown`: no account to hand a directory to.
+    if uid.as_raw() == u32::MAX {
+        return Err(Error::AccountLookup {
+            detail: format!("uid {} names no account: `chown` reads it as \"unchanged\"", u32::MAX),
+            source: None,
+        });
+    }
     Ok(Some(Owner { uid, gid: None }))
 }

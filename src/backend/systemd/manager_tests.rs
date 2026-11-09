@@ -12,7 +12,7 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::dirs::ensure_dir;
+use super::dirs::{ensure_dir, owner_of};
 use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
@@ -274,6 +274,45 @@ fn ensure_dir_for_an_unknown_account_creates_nothing() {
         .expect_err("no such account to hand the directory to");
 
     assert!(!tmp.path().join("a").exists());
+}
+
+// owner_of ============================================================================================================
+
+fn owner_uid(user: &User) -> Option<u32> {
+    owner_of(user).expect("an account").map(|owner| owner.uid.as_raw())
+}
+
+#[skuld::test]
+fn root_is_handed_nothing() {
+    assert_eq!(owner_uid(&User::Root), None);
+}
+
+#[skuld::test]
+fn a_numeric_id_is_used_as_it_is() {
+    assert_eq!(owner_uid(&User::Id(AccountId::Uid(4242))), Some(4242));
+}
+
+/// A name that is no account is read as a number, as `chown` reads one.
+#[skuld::test]
+fn a_numeric_name_that_is_no_account_is_its_uid() {
+    assert_eq!(owner_uid(&User::Name("4243".to_string())), Some(4243));
+}
+
+#[skuld::test]
+fn an_unknown_name_is_refused() {
+    let err = owner_of(&User::Name("goetia-no-such-account".to_string())).expect_err("no such account");
+
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+}
+
+/// `u32::MAX` is `(uid_t)-1`, which `fchown` reads as "leave the owner unchanged".
+#[skuld::test]
+fn the_uid_that_means_unchanged_is_refused() {
+    for user in [User::Id(AccountId::Uid(u32::MAX)), User::Name(u32::MAX.to_string())] {
+        let err = owner_of(&user).expect_err("not an account");
+
+        assert!(matches!(err, Error::AccountLookup { .. }), "{user:?}: {err:?}");
+    }
 }
 
 // unit_standing =======================================================================================================
