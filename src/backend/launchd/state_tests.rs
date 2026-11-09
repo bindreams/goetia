@@ -93,6 +93,39 @@ fn the_pid_is_returned_alongside_every_state() {
     );
 }
 
+// Evidence ============================================================================================================
+
+#[skuld::test]
+fn queued_or_running_accepts_a_queued_start_and_a_running_job() {
+    let shown = |body: &str| Evidence::QueuedOrRunning.shown_by(body);
+    assert!(shown(&print_body("spawn scheduled", None)));
+    assert!(shown(&print_body("running", Some(4242))));
+    assert!(shown(&print_body("xpcproxy", Some(39459))));
+}
+
+#[skuld::test]
+fn no_evidence_accepts_any_other_reading() {
+    for evidence in [Evidence::Queued, Evidence::QueuedOrRunning] {
+        let shown = |body: &str| evidence.shown_by(body);
+        assert!(!shown(&print_body("not running", None)), "{evidence:?}");
+        assert!(!shown(&print_body("exited", None)), "{evidence:?}");
+        assert!(!shown(&print_body("xpcproxy", None)), "{evidence:?}");
+        assert!(!shown(&print_body("someday-new-apple-state", None)), "{evidence:?}");
+        assert!(
+            !shown("system/com.example.daemon = {\n\tactive count = 1\n}\n"),
+            "{evidence:?}"
+        );
+        assert!(!shown(""), "{evidence:?}");
+    }
+}
+
+#[skuld::test]
+fn queued_accepts_only_a_queued_start() {
+    assert!(Evidence::Queued.shown_by(&print_body("spawn scheduled", None)));
+    assert!(!Evidence::Queued.shown_by(&print_body("running", Some(4242))));
+    assert!(!Evidence::Queued.shown_by(&print_body("xpcproxy", Some(39459))));
+}
+
 // find_field ==========================================================================================================
 
 #[skuld::test]
