@@ -263,17 +263,15 @@ fn ensure_dir_refuses_a_preexisting_file() {
     assert!(err.to_string().contains("not a directory"), "{err}");
 }
 
-/// The `chown` after the `mkdir` fails for an account that does not exist, with or without root:
-/// the directories made so far are the caller's to take back.
+/// The account is resolved before anything is made, so one that does not exist creates nothing.
 #[skuld::test]
-fn ensure_dir_records_what_it_created_before_a_failed_chown() {
+fn ensure_dir_for_an_unknown_account_creates_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("a").join("b");
     let mut created = CreatedDirs::new();
 
     ensure_dir(&dir, &User::Name("goetia-no-such-account".to_string()), &mut created)
-        .expect_err("no such account to chown to");
-    drop(created);
+        .expect_err("no such account to hand the directory to");
 
     assert!(!tmp.path().join("a").exists());
 }

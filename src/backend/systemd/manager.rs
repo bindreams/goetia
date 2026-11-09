@@ -166,7 +166,7 @@ impl Backend for Systemd {
         _scope: &mut GateScope,
         _reservation: &mut Held,
     ) -> Result<WriteOutcome> {
-        // The directories go on drop unless the unit this wrote is in place.
+        // The directories go on drop unless the unit this wrote is in place, or could not be read.
         let mut created = CreatedDirs::new();
         let written = write_unit(spec, definition, outcome, snapshot, &mut created);
         let unit = unit_path(spec.id.as_str());
@@ -303,7 +303,8 @@ impl Backend for Systemd {
 }
 
 /// Whether the unit at `path` is `definition`, as `discover` reads it. A read that did not complete
-/// counts as standing: removing the directories could break an installed unit.
+/// is [`Standing::Unknown`], which keeps the directories: removing them could break an installed
+/// unit.
 fn unit_standing(path: &Path, definition: &str) -> Standing {
     match classify_and_read(path) {
         Ok(RawState::Regular(text)) if text == definition => Standing::Yes,

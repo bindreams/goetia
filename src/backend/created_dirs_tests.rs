@@ -1,21 +1,48 @@
 use std::fs;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+use nix::unistd::{Gid, Uid};
 
 use super::*;
 
-/// Creates and records `root/a/b/c`.
+/// Creates `root/a/b/c`, all of it recorded.
 fn create_chain(root: &Path) -> CreatedDirs {
     let mut created = CreatedDirs::new();
-    let mut dir = root.to_path_buf();
-    for name in ["a", "b", "c"] {
-        dir.push(name);
-        fs::create_dir(&dir).unwrap();
-        created.record(&dir);
-    }
+    created.create(&root.join("a/b/c"), None).unwrap();
     created
 }
 
+/// An owner for this process's uid and a group other than the temp directory's, so a `fchown` is
+/// visible in the result: one of the process's groups, or, as root, any other.
+fn other_owner(tmp: &Path) -> Owner {
+    let inherited = fs::metadata(tmp).unwrap().gid();
+    // SAFETY: a zero-length query takes no buffer; the second call's buffer holds `n` gids.
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    assert!(n >= 0, "getgroups: {}", io::Error::last_os_error());
+    let mut groups: Vec<libc::gid_t> = vec![0; n as usize];
+    let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    assert!(n >= 0, "getgroups: {}", io::Error::last_os_error());
+    groups.truncate(n as usize);
+    let gid = groups.into_iter().find(|g| *g != inherited).unwrap_or_else(|| {
+        assert!(
+            Uid::effective().is_root(),
+            "the test user must belong to a group other than the temp directory's"
+        );
+        inherited + 1
+    });
+    Owner {
+        uid: Uid::current(),
+        gid: Some(Gid::from_raw(gid)),
+    }
+}
+
+fn mode_and_gid(path: &Path) -> (u32, u32) {
+    let meta = fs::metadata(path).unwrap();
+    (meta.permissions().mode() & 0o777, meta.gid())
+}
+
 #[skuld::test]
-fn drop_removes_every_recorded_directory_deepest_first() {
+fn drop_removes_every_created_directory_deepest_first() {
     let tmp = tempfile::tempdir().unwrap();
 
     drop(create_chain(tmp.path()));
@@ -30,8 +57,7 @@ fn drop_leaves_a_directory_that_existed_before() {
     fs::create_dir(&before).unwrap();
     let mut created = CreatedDirs::new();
     let new = before.join("b");
-    fs::create_dir(&new).unwrap();
-    created.record(&new);
+    created.create(&new, None).unwrap();
 
     drop(created);
 
@@ -51,24 +77,10 @@ fn drop_leaves_a_directory_that_is_no_longer_empty_and_its_ancestors() {
     assert_eq!(fs::read(&file).unwrap(), b"x");
 }
 
-/// A path that is not a directory cannot be tracked: reported, never a panic, and left.
-#[skuld::test]
-fn record_leaves_a_path_that_is_not_a_directory() {
-    let tmp = tempfile::tempdir().unwrap();
-    let file = tmp.path().join("not-a-dir");
-    fs::write(&file, b"x").unwrap();
-    let mut created = CreatedDirs::new();
-    created.record(&file);
-
-    drop(created);
-
-    assert!(file.is_file());
-}
-
-/// The account a daemon runs as owns what the install created for it and can swap a recorded
+/// The account a daemon runs as owns what the install created for it and can swap a created
 /// directory for a symlink before the drop; the drop, which runs as root, must not follow it.
 #[skuld::test]
-fn drop_does_not_follow_a_symlink_swapped_in_for_a_recorded_directory() {
+fn drop_does_not_follow_a_symlink_swapped_in_for_a_created_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     fs::create_dir(other.path().join("c")).unwrap();
@@ -87,8 +99,7 @@ fn drop_leaves_a_directory_that_is_no_longer_the_one_created() {
     let tmp = tempfile::tempdir().unwrap();
     let mut created = CreatedDirs::new();
     let dir = tmp.path().join("a");
-    fs::create_dir(&dir).unwrap();
-    created.record(&dir);
+    created.create(&dir, None).unwrap();
     fs::rename(&dir, tmp.path().join("moved")).unwrap();
     fs::create_dir(&dir).unwrap();
 
@@ -98,7 +109,7 @@ fn drop_leaves_a_directory_that_is_no_longer_the_one_created() {
 }
 
 #[skuld::test]
-fn settle_keeps_every_recorded_directory_when_the_definition_stands() {
+fn settle_keeps_every_created_directory_when_the_definition_stands() {
     let tmp = tempfile::tempdir().unwrap();
     let mut created = create_chain(tmp.path());
 
@@ -144,4 +155,152 @@ fn drop_keeps_the_directories_while_a_panic_unwinds() {
 
     assert!(unwound.is_err());
     assert!(tmp.path().join("a/b/c").is_dir());
+}
+
+#[skuld::test]
+fn create_leaves_an_existing_directory_exactly_as_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner = other_owner(tmp.path());
+    let dir = tmp.path().join("existing");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = mode_and_gid(&dir);
+
+    CreatedDirs::new().create(&dir, Some(owner)).unwrap();
+
+    assert_eq!(mode_and_gid(&dir), before);
+    assert_eq!(before.0, 0o700);
+}
+
+/// The mode and owner land on the inode that was created: read back through the guard's own
+/// descriptor, which is the inode the path names.
+#[skuld::test]
+fn create_hands_every_created_directory_to_the_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner = other_owner(tmp.path());
+    let mut created = CreatedDirs::new();
+
+    created.create(&tmp.path().join("a/b"), Some(owner)).unwrap();
+
+    assert_eq!(created.0.len(), 2);
+    for entry in &created.0 {
+        let held = fstat(&entry.dir).unwrap();
+        assert_eq!(held.st_mode as u32 & 0o777, 0o755, "{}", entry.path.display());
+        assert_eq!(held.st_gid, owner.gid.unwrap().as_raw(), "{}", entry.path.display());
+        let named = fs::metadata(&entry.path).unwrap();
+        assert_eq!((named.dev(), named.ino()), (held.st_dev as u64, held.st_ino as u64));
+    }
+}
+
+#[skuld::test]
+fn create_without_an_owner_changes_no_ownership() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut created = CreatedDirs::new();
+
+    created.create(&tmp.path().join("a"), None).unwrap();
+
+    let parent = fs::metadata(tmp.path()).unwrap();
+    let made = fs::metadata(tmp.path().join("a")).unwrap();
+    assert_eq!((made.uid(), made.gid()), (parent.uid(), parent.gid()));
+}
+
+/// The account a daemon runs as owns the parent it was handed and can plant a symlink at the name
+/// about to be created. `mkdirat` fails on it with `EEXIST`, so the symlink's target is never
+/// chmodded or chowned.
+#[skuld::test]
+fn create_leaves_a_symlink_planted_at_the_last_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner = other_owner(tmp.path());
+    let other = tempfile::tempdir().unwrap();
+    fs::set_permissions(other.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let before = mode_and_gid(other.path());
+    let dir = tmp.path().join("a");
+    let missing = missing_components(&dir).unwrap();
+    std::os::unix::fs::symlink(other.path(), &dir).unwrap();
+    let mut created = CreatedDirs::new();
+
+    created.create_missing(&missing, Some(owner)).unwrap();
+
+    assert_eq!(mode_and_gid(other.path()), before);
+    assert!(created.0.is_empty());
+}
+
+/// The same on a name above the last: the symlink is not descended into.
+#[skuld::test]
+fn create_does_not_descend_into_a_symlink_planted_above_the_last_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner = other_owner(tmp.path());
+    let other = tempfile::tempdir().unwrap();
+    let leaf = tmp.path().join("a/b");
+    let missing = missing_components(&leaf).unwrap();
+    std::os::unix::fs::symlink(other.path(), tmp.path().join("a")).unwrap();
+    let mut created = CreatedDirs::new();
+
+    created
+        .create_missing(&missing, Some(owner))
+        .expect_err("a symlink is not a directory");
+
+    assert_eq!(fs::read_dir(other.path()).unwrap().count(), 0);
+}
+
+/// A component another install creates after the walk is not ours to chmod or chown; those below
+/// it still are.
+#[skuld::test]
+fn create_leaves_a_component_that_appeared_after_the_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner = other_owner(tmp.path());
+    let raced = tmp.path().join("a");
+    let leaf = raced.join("b");
+    let missing = missing_components(&leaf).unwrap();
+    assert_eq!(missing, [raced.as_path(), leaf.as_path()]);
+    fs::create_dir(&raced).unwrap();
+    fs::set_permissions(&raced, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = mode_and_gid(&raced);
+
+    let mut created = CreatedDirs::new();
+
+    created.create_missing(&missing, Some(owner)).unwrap();
+
+    assert_eq!(mode_and_gid(&raced), before);
+    assert_eq!(mode_and_gid(&leaf), (0o755, owner.gid.unwrap().as_raw()));
+}
+
+/// A path that exists, of any kind and a dangling symlink included, is left untouched.
+#[skuld::test]
+fn create_treats_a_dangling_symlink_as_existing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("nowhere");
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut created = CreatedDirs::new();
+
+    created.create(&link, None).unwrap();
+
+    assert!(!target.exists());
+    assert!(created.0.is_empty());
+}
+
+#[skuld::test]
+fn create_accepts_a_regular_file_as_existing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    fs::write(&file, b"x").unwrap();
+
+    CreatedDirs::new().create(&file, None).unwrap();
+
+    assert_eq!(fs::read(&file).unwrap(), b"x");
+}
+
+#[skuld::test]
+fn create_under_a_regular_file_fails_and_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    fs::write(&file, b"x").unwrap();
+    let mut created = CreatedDirs::new();
+
+    created
+        .create(&file.join("a"), None)
+        .expect_err("a file has no children");
+
+    assert!(created.0.is_empty());
 }
