@@ -153,10 +153,7 @@ mod windows {
             beside.display()
         );
 
-        for result in [
-            SiblingStockShim.preview(),
-            SiblingStockShim.provide(&disabled()),
-        ] {
+        for result in [SiblingStockShim.preview(), SiblingStockShim.provide(&disabled())] {
             match result {
                 Err(Error::SiblingShimMissing { path }) => assert_eq!(path, beside),
                 other => panic!("a missing sibling must name its path, got {other:?}"),
