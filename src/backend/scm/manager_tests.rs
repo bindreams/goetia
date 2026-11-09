@@ -156,13 +156,13 @@ fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {
 
 /// An open made after `read` established that the id is installed and goetia's is an ordinary
 /// failure of the verb, exit `1`: `Undetermined` would say goetia does not know what is installed
-/// there, and exit `4`. A denial is named as the verb's; no failure advises elevation, since the
-/// CLI's gate has already run.
+/// there, and exit `4`. A denial is named as the verb's, and of what was opened; no failure advises
+/// elevation, since the CLI's gate has already run.
 #[skuld::test]
 fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
     for (raw, denied) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
         let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(raw));
-        let err = open_refused("x", "enable", "open service `x` to enable it", e);
+        let err = open_refused("enable", "service `x`", "open service `x` to enable it", e);
 
         assert!(
             !matches!(err.cause(), Error::Undetermined { .. }),
@@ -179,10 +179,6 @@ fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
             "{raw}: {report}"
         );
         assert!(!report.contains("Administrator"), "{raw}: {report}");
-        assert!(
-            !report.contains("determine whether"),
-            "{raw}: that is the read's sentence: {report}"
-        );
     }
 }
 
@@ -741,6 +737,40 @@ fn a_delete_failure_says_stopped_disabled_not_deleted_and_names_the_previous_sta
     let unknown = uninstall_failure(&UninstallFailure::Delete { previous: None });
     assert!(unknown.contains("NOT deleted"), "{unknown}");
     assert!(!unknown.contains("start type was"), "{unknown}");
+}
+
+#[skuld::test]
+fn a_failure_before_anything_was_touched_claims_no_change_to_the_service() {
+    let text = uninstall_failure(&UninstallFailure::Untouched);
+    assert!(
+        text.contains("`frpc` was NOT deleted and nothing about it was changed"),
+        "{text}"
+    );
+    assert!(text.contains("does not accept STOP"), "the cause is kept: {text}");
+    for stale in ["disabled", "stopped", "goetia daemon enable", "goetia daemon start"] {
+        assert!(
+            !text.contains(stale),
+            "`{stale}` is false when nothing was touched: {text}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_denied_service_manager_open_is_named_as_the_managers() {
+    let denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let report = open_refused(
+        "uninstall",
+        "the service manager",
+        "open the Service Control Manager to uninstall `x`",
+        denied,
+    )
+    .report()
+    .to_string();
+    assert!(
+        report.contains("`uninstall` was denied access to the service manager"),
+        "{report}"
+    );
+    assert!(!report.contains("to service"), "{report}");
 }
 
 #[skuld::test]

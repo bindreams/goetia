@@ -316,7 +316,7 @@ impl Backend for Scm {
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
-        let scm = open_scm_for(&id, "uninstall")?;
+        let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
         uninstall_locked(&scm, &id)
     }
 
@@ -925,6 +925,8 @@ fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
 
 /// How a failed `uninstall` left the service, which decides what [`uninstall_failed`] may say.
 enum UninstallFailure {
+    /// It failed before it changed anything: the service is as it was.
+    Untouched,
     /// The stop failed. The service is running and disabled; `previous` is its start type before.
     Stop { previous: Option<ServiceStartType> },
     /// The delete failed. The service is stopped and disabled; `previous` is its start type before.
@@ -939,6 +941,7 @@ enum UninstallFailure {
 fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
     let kill = format!("if the service does not accept STOP, run `goetia daemon kill {id}`");
     let what = match state {
+        UninstallFailure::Untouched => format!("`{id}` was NOT deleted and nothing about it was changed"),
         UninstallFailure::Stop { previous } => format!(
             "`{id}` could not be stopped. It was NOT deleted and is now disabled, so \
              `goetia daemon start {id}` fails.{} Re-run `goetia daemon uninstall {id}` to retry; {kill} first",
@@ -1098,19 +1101,20 @@ fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> E
     undetermined(id, to_error(context, e), access_denied)
 }
 
-/// A failed open made after `read` established that `id` is installed and goetia's, so the verb
+/// A failed open made after `read` established that the id is installed and goetia's, so the verb
 /// `operation` failed and nothing is in doubt: an `Os` error (exit `1`), never [`undetermined`],
-/// which says goetia cannot tell whether anything is installed. A denial is named as the verb's.
+/// which says goetia cannot tell whether anything is installed. A denial is named as the verb's,
+/// of `target`, what was opened.
 ///
 /// `context` is the open, as [`to_error`] takes it.
-fn open_refused(id: &str, operation: &str, context: &str, e: windows_service::Error) -> Error {
+fn open_refused(operation: &str, target: &str, context: &str, e: windows_service::Error) -> Error {
     let access_denied = is_access_denied(&e);
     let failed = to_error(context, e);
     if !access_denied {
         return failed;
     }
     Error::Step {
-        what: format!("`{operation}` was denied access to service `{id}`"),
+        what: format!("`{operation}` was denied access to {target}"),
         source: Box::new(failed),
     }
 }
@@ -1120,8 +1124,8 @@ fn open_refused(id: &str, operation: &str, context: &str, e: windows_service::Er
 fn open_scm_for(id: &Id, operation: &str) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(|e| {
         open_refused(
-            id.as_str(),
             operation,
+            "the service manager",
             &format!("open the Service Control Manager to {operation} `{id}`"),
             e,
         )
@@ -1140,8 +1144,8 @@ fn open_existing(id: &Id, operation: &str, access: ServiceAccess) -> Result<(Win
             }
         } else {
             open_refused(
-                id.as_str(),
                 operation,
+                &format!("service `{id}`"),
                 &format!("open service `{id}` to {operation} it"),
                 e,
             )

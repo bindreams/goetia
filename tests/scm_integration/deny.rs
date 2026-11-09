@@ -201,6 +201,13 @@ impl Denied {
         )
     }
 
+    /// Deny `SERVICE_CHANGE_CONFIG` (`DC`) on the service object itself, and nothing else: `read`'s
+    /// `QUERY_STATUS | QUERY_CONFIG` open still succeeds, so goetia knows the service is its own,
+    /// and only the verbs that change its configuration (`enable`, `disable`) are stopped.
+    pub fn service_change_config(id: &str) -> Self {
+        Self::seal(id.to_string(), SE_SERVICE, service_dacl(Some("DC")), service_dacl(None))
+    }
+
     fn seal(object: String, object_type: SE_OBJECT_TYPE, deny: String, on_drop: String) -> Self {
         set_dacl(&object, object_type, &deny).unwrap_or_else(|e| panic!("{e}"));
         Self {

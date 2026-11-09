@@ -1859,3 +1859,52 @@ fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
         "a denial is the one cause elevation fixes: {recovery}"
     );
 }
+
+/// The service object denies only changing its configuration, so `read` still proves the service is
+/// goetia's and the verb's own open is what fails. That is a failure of the verb (exit `1`), never
+/// `Undetermined` (exit `4`, "cannot determine whether `x` is installed"): ownership was
+/// established before the open. Pins that `enable` and `disable` reach their service through
+/// `open_existing`'s mapping rather than `read`'s.
+///
+/// Runs only on CI: it writes the DACL of a real service, which `CLAUDE.local.md` keeps off the
+/// developer's host. `Denied`'s guard is declared after `ServiceGuard`, so its `Drop` restores the
+/// DACL before the service is deleted. Denying `DC` alone leaves `list` and every other test's
+/// reads as they were, so it carries no `SCM_DENIAL` label.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn enable_and_disable_of_a_service_that_denies_changing_its_config_fail_as_the_verb() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, guard.id());
+
+    let _denied = Denied::service_change_config(&id);
+
+    // The deny ACE really took, as `ERROR_ACCESS_DENIED`, and queries still work.
+    let scm = WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+    let blocked = scm
+        .open_service(&id, ServiceAccess::CHANGE_CONFIG)
+        .err()
+        .unwrap_or_else(|| panic!("the deny ACE did not apply: `{id}` is still changeable"));
+    assert!(
+        matches!(&blocked, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(5)),
+        "{blocked:?}"
+    );
+    mgr.status(&spec.id)
+        .expect("the deny leaves the read intact, so the id stays classified as goetia's");
+
+    type Verb = fn(&Scm, &Id) -> goetia::Result<()>;
+    let verbs: [(&str, Verb); 2] = [("enable", |m, id| m.enable(id)), ("disable", |m, id| m.disable(id))];
+    for (verb, run) in verbs {
+        let err = run(&mgr, &spec.id).expect_err("a denied open cannot enable or disable");
+        assert!(
+            !matches!(err.cause(), goetia::Error::Undetermined { .. }),
+            "{verb}: ownership was established by the read before the open: {err:?}"
+        );
+        assert!(!err.is_indeterminate(), "{verb}: exit 1, not 4: {err:?}");
+        let report = err.report().to_string();
+        assert!(
+            report.contains(&format!("`{verb}` was denied access to service `{id}`")),
+            "{verb}: {report}"
+        );
+    }
+}
