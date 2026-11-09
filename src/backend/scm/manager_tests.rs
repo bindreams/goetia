@@ -154,6 +154,39 @@ fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {
     }
 }
 
+/// An open made after `read` established that the id is installed and goetia's is an ordinary
+/// failure of the verb, exit `1`: `Undetermined` would say goetia does not know what is installed
+/// there, and exit `4`. A denial names the verb and advises elevation; any other failure does not.
+#[skuld::test]
+fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
+    for (raw, wants_elevation) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
+        let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(raw));
+        let err = open_refused("x", "enable", "open service `x` to enable it", e);
+
+        assert!(
+            !matches!(err.cause(), Error::Undetermined { .. }),
+            "{raw}: ownership was established before this open: {err:?}"
+        );
+        assert!(!err.is_indeterminate(), "{raw}: a refusal is not an answer in doubt");
+        assert_eq!(err.raw_os_error(), Some(raw), "{raw}: the cause is kept");
+
+        let report = err.report().to_string();
+        assert!(report.contains("open service `x` to enable it"), "{raw}: {report}");
+        assert_eq!(
+            report.contains("re-run as Administrator"),
+            wants_elevation,
+            "{raw}: {report}"
+        );
+        if wants_elevation {
+            assert!(report.contains("enable"), "{raw}: the advice names the verb: {report}");
+        }
+        assert!(
+            !report.contains("determine whether"),
+            "{raw}: that is the read's sentence: {report}"
+        );
+    }
+}
+
 #[skuld::test]
 fn is_access_denied_matches_only_error_access_denied() {
     let denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));

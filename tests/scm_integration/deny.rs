@@ -189,7 +189,7 @@ impl Denied {
     }
 
     /// Deny `SERVICE_QUERY_CONFIG` (`CC`) and `SERVICE_QUERY_STATUS` (`LC`) on
-    /// the service object itself — exactly the pair `manager::open_existing`
+    /// the service object itself — exactly the pair `Backend::read`
     /// asks for, and a boundary the `Parameters` deny cannot reach, since
     /// every verb opens the service object first.
     pub fn service_query(id: &str) -> Self {
