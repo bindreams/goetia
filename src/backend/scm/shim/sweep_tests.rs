@@ -340,17 +340,42 @@ fn text(provider: Option<&str>, second_folder: &str, files: &[&str]) -> String {
 /// A provider whose `preview` failed is not the absence of one: its sweep is what the retry runs, so
 /// the text says that, and claims neither that its folder is the retried one nor that it is not.
 #[skuld::test]
-fn a_provider_whose_folder_is_not_known_is_still_retried() {
-    for files in [vec![], vec![PathBuf::from("/q/Other/b.exe")]] {
-        let said = left_behind_text("frpc", &ProviderFolder::Unknown, Some(Path::new("/q/Other")), &files);
+fn a_provider_whose_folder_is_not_known_is_retried_for_its_own_folder_only() {
+    let unknown = |second: Option<&str>, files: &[&str]| {
+        let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+        left_behind_text("frpc", &ProviderFolder::Unknown, second.map(Path::new), &files)
+    };
 
-        assert!(said.contains(RETRY), "{said}");
-        assert!(
-            !said.contains("not retried") && !said.contains("does not retry"),
-            "{said}"
-        );
-        assert!(!said.contains(NEXT), "{said}");
-    }
+    // The retry sweeps the provider's folder alone, which these files may not be in: no file is
+    // promised it.
+    assert_eq!(
+        unknown(Some("/q/Other"), &["/q/Other/b.exe", "/p/a.exe"]),
+        "`frpc` was deleted, but `/q/Other/b.exe`, `/p/a.exe` could not be removed. Re-run `goetia daemon uninstall \
+         frpc` to retry the ones in the folder this program's shim provider uses, which is not known. A file in any \
+         other folder is not retried by that command: the next install or uninstall of a manager whose provider \
+         uses that folder removes it."
+    );
+    assert_eq!(
+        unknown(None, &["/p/a.exe"]),
+        "`frpc` was deleted, but `/p/a.exe` could not be removed. Re-run `goetia daemon uninstall frpc` to retry the \
+         ones in the folder this program's shim provider uses, which is not known. A file in any other folder is \
+         not retried by that command: the next install or uninstall of a manager whose provider uses that folder \
+         removes it."
+    );
+
+    // No file named: the folder swept besides the provider's is named, and may be the provider's.
+    assert_eq!(
+        unknown(Some("/q/Other"), &[]),
+        "`frpc` was deleted, but the shim files it used were not cleaned up. Re-run `goetia daemon uninstall frpc` \
+         to retry what is in the folder this program's shim provider uses, which is not known. What is in \
+         `/q/Other` is retried by that command only if it is that folder: otherwise the next install or uninstall \
+         of a manager whose provider uses that folder removes it."
+    );
+    assert_eq!(
+        unknown(None, &[]),
+        "`frpc` was deleted, but the shim files it used were not cleaned up. Re-run `goetia daemon uninstall frpc` \
+         to retry what is in the folder this program's shim provider uses, which is not known."
+    );
 }
 
 #[skuld::test]

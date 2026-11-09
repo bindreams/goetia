@@ -240,7 +240,8 @@ impl ProviderFolder {
 /// The retry, `uninstall` of an id that is no longer installed, sweeps the provider's folder alone:
 /// a file in another folder is removed by the next install or uninstall of a manager whose provider
 /// uses that folder, and with no provider nothing is retried at all. For a provider whose folder is
-/// [`Unknown`](ProviderFolder::Unknown) the text says only that the retry runs its sweep.
+/// [`Unknown`](ProviderFolder::Unknown) the text promises the retry for what is in that folder and
+/// for no listed file by name, since none is known to be in it.
 pub(crate) fn left_behind_text(
     id: impl std::fmt::Display,
     provider: &ProviderFolder,
@@ -259,18 +260,24 @@ pub(crate) fn left_behind_text(
             .join(", ")
     };
 
+    let unknown = *provider == ProviderFolder::Unknown;
     if files.is_empty() {
         let mut said = format!("`{id}` was deleted, but the shim files it used were not cleaned up.");
         if *provider != ProviderFolder::None {
             said.push_str(&format!(
-                " {retry} what is in the folder this program's shim provider uses."
+                " {retry} what is in the folder this program's shim provider uses{}.",
+                if unknown { ", which is not known" } else { "" }
             ));
         }
-        if let Some(folder) = second_folder.filter(|folder| !in_providers(folder))
-            && *provider != ProviderFolder::Unknown
-        {
+        if let Some(folder) = second_folder.filter(|folder| !in_providers(folder)) {
+            // An unknown provider's folder may be this one, which then is retried.
+            let retried = if unknown {
+                "retried by that command only if it is that folder: otherwise"
+            } else {
+                "not retried by that command:"
+            };
             said.push_str(&format!(
-                " What is in `{}` is not retried by that command: {elsewhere} it.",
+                " What is in `{}` is {retried} {elsewhere} it.",
                 folder.display()
             ));
         }
@@ -278,9 +285,11 @@ pub(crate) fn left_behind_text(
     }
     let all: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
     let mut said = format!("`{id}` was deleted, but {} could not be removed.", list(&all));
-    if *provider == ProviderFolder::Unknown {
+    if unknown {
+        // The retry sweeps the provider's folder alone, and these files may not be in it.
         said.push_str(&format!(
-            " {retry} those in the folder this program's shim provider uses, which is not known."
+            " {retry} the ones in the folder this program's shim provider uses, which is not known. A file in \
+             any other folder is not retried by that command: {elsewhere} it."
         ));
         return said;
     }
