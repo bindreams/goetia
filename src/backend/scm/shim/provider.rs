@@ -32,13 +32,11 @@ pub trait ShimProvider: Send + Sync {
     /// refuses. Idempotent. A provider that writes checks its folder with `folders` first.
     fn provide(&self, folders: &FolderCheck) -> Result<HostCommand>;
 
-    /// Called by anyone, and by `Scm` before an install provides, after an uninstall, and for an
-    /// uninstall of an id that is not installed. A provider that deletes serialises itself with
-    /// the install lock, which a caller that holds it already can take again. `referenced` is
-    /// every file a registered service or a running process names, as a path that has been
-    /// normalised. Removes what this provider wrote and nothing references, tries every file, and
-    /// reports every failure after the last, with the files it could not delete. It deletes only in
-    /// a folder that passes the check `provide` is handed, which is the manager's, so the provider
-    /// is built with the same one: a folder that fails it is a failure, not swept.
-    fn sweep(&self, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure>;
+    /// Under the install lock, as `provide`: `Scm` calls it before an install provides, after an
+    /// uninstall, and for an uninstall of an id that is not installed. `referenced` is every file a
+    /// registered service or a running process names, as a path that has been normalised. Removes
+    /// what this provider wrote and nothing references, tries every file, and reports every failure
+    /// after the last, with the files it could not delete. It checks each folder it deletes in with
+    /// `folders`: a folder that fails is a failure, not swept.
+    fn sweep(&self, referenced: &[PathBuf], folders: &FolderCheck) -> std::result::Result<(), SweepFailure>;
 }

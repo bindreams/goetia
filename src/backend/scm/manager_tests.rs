@@ -660,7 +660,7 @@ impl ShimProvider for Recording {
         Ok(self.provide.clone())
     }
 
-    fn sweep(&self, _referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+    fn sweep(&self, _referenced: &[PathBuf], _folders: &FolderCheck) -> std::result::Result<(), SweepFailure> {
         self.calls.lock().unwrap().push("sweep");
         Ok(())
     }

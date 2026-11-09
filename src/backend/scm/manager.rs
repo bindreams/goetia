@@ -286,7 +286,7 @@ impl Backend for Scm {
     /// For `type: simple`: the install flow has rendered the definition already, so every refusal
     /// `render_for_install` can make (the previewed host's path, an account, `restart: always`)
     /// has come before the lock is taken or the provider writes. The lock is taken and the files
-    /// nothing references are swept (by the provider, in a folder that exists and passes its check: see
+    /// nothing references are swept (by the provider, in a folder that exists and passes the folder check: see
     /// [`sweep_folder`]), and then the host is provided and checked before anything is
     /// read: `provide` must return the host `desired` registers (the flow's render, from the
     /// provider's `preview`: a sibling shim upgraded while the install waited on the lock
@@ -302,7 +302,7 @@ impl Backend for Scm {
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
         if let Ok(referenced) = referenced_hosts() {
-            let _ = shim.sweep(&referenced);
+            let _ = shim.sweep(&referenced, &self.folders);
         }
         let provided = shim.provide(&self.folders)?;
         let rendered = HostCommand {
@@ -477,7 +477,8 @@ impl Backend for Scm {
             return Ok(());
         };
         let _lock = InstallLock::acquire()?;
-        shim.sweep(&referenced_hosts()?).map_err(|failure| *failure.error)
+        shim.sweep(&referenced_hosts()?, &self.folders)
+            .map_err(|failure| *failure.error)
     }
 
     fn enable(&self, snapshot: ScmSnapshot) -> Result<()> {
@@ -1318,7 +1319,7 @@ impl Scm {
             }
         };
         if let Some(shim) = &self.shim {
-            failures.extend(shim.sweep(&referenced).err());
+            failures.extend(shim.sweep(&referenced, &self.folders).err());
         }
         if let Some(folder) = second {
             // It is the default folder, by `second_folder`'s choice.

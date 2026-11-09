@@ -685,7 +685,7 @@ impl ShimProvider for Recording {
         Ok(self.provide.clone())
     }
 
-    fn sweep(&self, _referenced: &[PathBuf]) -> Result<(), SweepFailure> {
+    fn sweep(&self, _referenced: &[PathBuf], _folders: &FolderCheck) -> Result<(), SweepFailure> {
         self.calls.lock().unwrap().push("sweep");
         Ok(())
     }
@@ -791,8 +791,8 @@ impl ShimProvider for Gated {
         self.inner.provide(folders)
     }
 
-    fn sweep(&self, referenced: &[PathBuf]) -> Result<(), SweepFailure> {
-        self.inner.sweep(referenced)
+    fn sweep(&self, referenced: &[PathBuf], folders: &FolderCheck) -> Result<(), SweepFailure> {
+        self.inner.sweep(referenced, folders)
     }
 }
 
@@ -1165,7 +1165,7 @@ fn uninstall_keeps_a_running_old_shim() {
     let started = ConnectBack::listen();
     let first = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
     let second = Scm::with_shim(
-        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())).with_check(CheckPermissions::Disable),
+        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())),
         CheckPermissions::Disable,
     );
     let a_spec = simple_spec(&a_id, fixture_command("report", &[&started.port().to_string()]), &logs);
@@ -1310,7 +1310,7 @@ fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file() {
     let started = ConnectBack::listen();
     let first = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
     let second = Scm::with_shim(
-        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())).with_check(CheckPermissions::Disable),
+        EmbeddedStockShim::new(Some(other_shim_bytes()), Some(folder.clone())),
         CheckPermissions::Disable,
     );
     let a_spec = simple_spec(&a_id, fixture_command("report", &["1"]), &logs);
@@ -1386,4 +1386,20 @@ fn uninstall_retry_sweeps() {
 
     assert!(matches!(result, Err(Error::NotInstalled { .. })), "{result:?}");
     assert!(!stray.exists(), "the retry sweeps");
+}
+
+/// The retry checks the folder as the manager is built to: the provider's sweep takes no setting of
+/// its own. A folder in the temp directory gives its owner's account rights over it, so a manager
+/// that checks refuses it and sweeps nothing.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_retry_checks_the_folder_as_the_manager_does() {
+    let (_root, folder) = temp_shim_folder();
+    let stray = stray_shim_in(&folder);
+    let mgr = embedded_manager(Some(folder), CheckPermissions::Enable);
+    let id = goetia::spec::Id::try_from(support::random_test_id().as_str()).expect("a test id is an Id");
+
+    let result = mgr.uninstall(&id);
+
+    assert!(matches!(result, Err(Error::ShimFolderUnsafe { .. })), "{result:?}");
+    assert!(stray.exists(), "a refused folder is not swept");
 }
