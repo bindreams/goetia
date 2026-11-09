@@ -1135,7 +1135,8 @@ const CAP_NOT_IN_FORCE: i32 = 97;
 /// A scope whose `pids.max` is absent or not `$EXPECTED_TASKS_MAX` never got the cap, so the script
 /// exits [`CAP_NOT_IN_FORCE`] without running the verb. The extra evidence tells a `pids` controller
 /// missing from the root at boot (`root.controllers`) from the parent failing to enable it for its
-/// children (`parent.subtree` lacking `pids` while `root.subtree` has it).
+/// children (`parent.subtree` lacking `pids` while `root.subtree` has it). `parent.subtree` and
+/// `root.subtree` exist only on cgroup v2; on v1/hybrid they read `unreadable`.
 const SCOPE_PIDS_PREAMBLE: &str = r#"
 cg=; v1=; v1ctl=; seen=
 while read -r line; do
@@ -1199,21 +1200,25 @@ fn goetia_with_tasks(unit: &str, tasks: u32, args: &[&str]) -> std::process::Out
 }
 
 /// The host's cgroup state after a scope that did not get its cap: root and `system.slice`
-/// controllers, uptime, the unit's properties and PID 1's recent journal.
+/// controllers, uptime, whether the unit is still loaded and PID 1's recent journal. It runs after
+/// the scope exited, so it cannot show the cap at start; the scope's own stderr line is the only
+/// start-time evidence.
 fn cap_evidence(unit: &str) -> String {
     let script = format!(
         "cd /sys/fs/cgroup; for f in cgroup.controllers cgroup.subtree_control system.slice/cgroup.controllers \
          system.slice/cgroup.subtree_control; do echo \"$f: $(cat $f)\"; done; \
          echo \"uptime: $(cut -d' ' -f1 /proc/uptime)\"; \
-         systemctl show -p TasksMax,TasksAccounting,ControlGroup,ActiveState,LoadState {unit}; \
+         systemctl show -p ActiveState,LoadState {unit}; \
          journalctl -b --no-pager -o short-precise -n 40 _PID=1"
     );
-    let out = Command::new("sh").args(["-c", &script]).output().expect("cap evidence");
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
+    match Command::new("sh").args(["-c", &script]).output() {
+        Ok(out) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(err) => format!("the evidence command failed to spawn: {err}"),
+    }
 }
 
 /// goetia never panics for want of a task; a verb that cannot get what its request needs exits `1`,
@@ -1236,7 +1241,7 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
             assert!(!stderr.contains("panicked"), "{args:?} TasksMax={tasks}: {stderr}");
             match output.status.code() {
                 Some(CAP_NOT_IN_FORCE) => panic!(
-                    "harness defect: {unit} had no pids.max={tasks} at start, so the verb was not run\n\
+                    "harness defect: {unit} did not have pids.max={tasks} at start, so the verb was not run\n\
                      --- scope evidence (stderr) ---\n{stderr}\n--- host evidence ---\n{}",
                     cap_evidence(&unit),
                 ),
