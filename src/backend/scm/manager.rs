@@ -837,10 +837,11 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
         Ok(actor) => actor,
         Err(e) if is_not_found_io(&e) => return Ok(()),
         Err(e) => {
-            return Err(Error::Step {
-                what: format!("`{id}` was NOT deleted"),
-                source: Box::new(Error::os(format!("open `{id}` before uninstall"), e)),
-            });
+            return Err(uninstall_failed(
+                id,
+                &UninstallFailure::Untouched,
+                Error::os(format!("open `{id}` before uninstall"), e),
+            ));
         }
     };
 
@@ -901,10 +902,7 @@ enum Disabled {
 /// neither is an error. A start type that cannot be read is not an error either: only the message
 /// that names it needs it, so it is left out.
 fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
-    let not_changed = |source: Error| Error::Step {
-        what: format!("`{id}` was NOT deleted and its start type is unchanged"),
-        source: Box::new(source),
-    };
+    let not_changed = |source: Error| uninstall_failed(id, &UninstallFailure::Untouched, source);
     let service = match scm.open_service(id.as_str(), ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG) {
         Ok(service) => service,
         Err(e) if is_not_found(&e) => return Ok(Disabled::Gone),
