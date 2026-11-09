@@ -18,7 +18,7 @@ fn main() {
     // `goetia::cli`'s module doc comment for why (`install --dry-run` and
     // `show`/`diff -f` need neither).
     let get_manager = || goetia::manager::native();
-    let is_elevated = goetia::cli::is_elevated;
+    let is_elevated = cosca::elevation::is_elevated;
 
     let code = goetia::cli::dispatch(&cli, &get_manager, &is_elevated, &mut stdout, &mut stderr);
     std::process::exit(code);
