@@ -1,13 +1,10 @@
 //! Shared helpers for the `type: simple` integration tests.
 
-use std::ops::ControlFlow;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
-use goetia::backend::scm::wait::{QueriedState, SystemScmActor, Waited, WantState, wait_until};
-use goetia::manager::Budget;
 use goetia::spec::{DaemonFields, DaemonSpec, Kind};
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -226,27 +223,7 @@ impl ShimProcess {
         let service = manager
             .open_service(id, ServiceAccess::QUERY_STATUS)
             .unwrap_or_else(|e| panic!("open service {id}: {e}"));
-        let mut actor = SystemScmActor::open(id).unwrap_or_else(|e| panic!("open {id} to wait for RUNNING: {e}"));
-        // Settled states other than `RUNNING` fail the test instead of hanging it; pending ones wait.
-        let waited = wait_until(
-            &mut actor,
-            WantState::Running,
-            WantState::Running,
-            QueriedState::Running,
-            Budget::Unbounded.start(),
-            |sighting| match sighting.status.state {
-                QueriedState::Paused | QueriedState::Stopped => {
-                    panic!("waiting for Running, {id} reached {:?}", sighting.status.state)
-                }
-                _ => Ok(ControlFlow::Continue(())),
-            },
-        )
-        .unwrap_or_else(|e| panic!("wait for {id} to report RUNNING: {e}"));
-        assert_eq!(
-            waited,
-            Waited::Confirmed,
-            "an unbounded wait for {id} to report RUNNING expired"
-        );
+        support::scm_wait::wait_for_running(&mut support::scm_wait::open(id), id);
         let running = service
             .query_status()
             .unwrap_or_else(|e| panic!("query status of {id}: {e}"));

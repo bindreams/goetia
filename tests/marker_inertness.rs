@@ -7,9 +7,9 @@
 //! documentation saying otherwise. This suite establishes the truth before
 //! three backends are built on it.
 //!
-//! Nothing here consumes Goetia: the artifacts are hand-written and driven
-//! through raw `systemctl` / `launchctl` / `sc.exe`, so the probe runs before
-//! any backend exists.
+//! The artifacts are hand-written and driven through raw `systemctl` /
+//! `launchctl` / `sc.exe`; the Windows probe waits for SCM state through
+//! goetia's notification wait.
 
 #[path = "support/mod.rs"]
 mod support;
