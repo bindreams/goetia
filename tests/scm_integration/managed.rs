@@ -1860,16 +1860,11 @@ fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
     );
 }
 
-/// The service object denies only changing its configuration, so `read` still proves the service is
-/// goetia's and the verb's own open is what fails. That is a failure of the verb (exit `1`), never
-/// `Undetermined` (exit `4`, "cannot determine whether `x` is installed"): ownership was
-/// established before the open. Pins that `enable` and `disable` reach their service through
-/// `open_existing`'s mapping rather than `read`'s.
+/// The service denies only `DC`, so `read` still proves it is goetia's and the verb's own open
+/// fails: exit `1`, not `Undetermined` (exit `4`).
 ///
-/// Runs only on CI: it writes the DACL of a real service, which `CLAUDE.local.md` keeps off the
-/// developer's host. `Denied`'s guard is declared after `ServiceGuard`, so its `Drop` restores the
-/// DACL before the service is deleted. Denying `DC` alone leaves `list` and every other test's
-/// reads as they were, so it carries no `SCM_DENIAL` label.
+/// Writes a real service's DACL, so it runs only on CI. `Denied` drops before `ServiceGuard`,
+/// restoring the DACL before the delete.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn enable_and_disable_of_a_service_that_denies_changing_its_config_fail_as_the_verb() {
     let mgr = Scm::new();
@@ -1906,5 +1901,54 @@ fn enable_and_disable_of_a_service_that_denies_changing_its_config_fail_as_the_v
             report.contains(&format!("`{verb}` was denied access to service `{id}`")),
             "{verb}: {report}"
         );
+    }
+}
+
+/// As above, for `uninstall`'s own opens of the service object: one that denies `DC` stops the
+/// disable that precedes the delete, one that denies `DELETE` stops the delete. Either is exit `1`
+/// naming `uninstall` and the service, says it was not deleted, and leaves the service installed.
+/// `kill` has no case here: its open needs only `QUERY_STATUS`, which `read` needs too, so a denial
+/// there is `read`'s `Undetermined`.
+///
+/// Writes a real service's DACL, so it runs only on CI.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn uninstall_of_a_service_that_denies_a_step_fails_as_the_verb_and_leaves_it_installed() {
+    type Case = (&'static str, fn(&str) -> Denied, &'static str);
+    let cases: [Case; 2] = [
+        (
+            "DC",
+            Denied::service_change_config,
+            "was NOT deleted and nothing about it was changed",
+        ),
+        (
+            "SD",
+            Denied::service_delete,
+            "is stopped and disabled but was NOT deleted",
+        ),
+    ];
+    for (denied_right, deny, says) in cases {
+        let mgr = Scm::new();
+        let id = support::random_test_id();
+        let guard = ServiceGuard::new(&id);
+        let spec = install_plain(&mgr, guard.id());
+
+        let _denied = deny(&id);
+
+        let err = mgr
+            .uninstall(&spec.id)
+            .expect_err("a denied open cannot disable or delete the service");
+        assert!(
+            !matches!(err.cause(), goetia::Error::Undetermined { .. }),
+            "{denied_right}: ownership was established by the read before the open: {err:?}"
+        );
+        assert!(!err.is_indeterminate(), "{denied_right}: exit 1, not 4: {err:?}");
+        let report = err.report().to_string();
+        assert!(
+            report.contains(&format!("`uninstall` was denied access to service `{id}`")),
+            "{denied_right}: {report}"
+        );
+        assert!(report.contains(says), "{denied_right}: {report}");
+        mgr.status(&spec.id)
+            .unwrap_or_else(|e| panic!("{denied_right}: the service must still be installed: {e:?}"));
     }
 }

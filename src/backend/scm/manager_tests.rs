@@ -156,8 +156,7 @@ fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {
 
 /// An open made after `read` established that the id is installed and goetia's is an ordinary
 /// failure of the verb, exit `1`: `Undetermined` would say goetia does not know what is installed
-/// there, and exit `4`. A denial is named as the verb's, and of what was opened; no failure advises
-/// elevation, since the CLI's gate has already run.
+/// there, and exit `4`. No failure advises elevation, since the CLI's gate has already run.
 #[skuld::test]
 fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
     for (raw, denied) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
@@ -746,11 +745,37 @@ fn a_failure_before_anything_was_touched_claims_no_change_to_the_service() {
         text.contains("`frpc` was NOT deleted and nothing about it was changed"),
         "{text}"
     );
-    assert!(text.contains("does not accept STOP"), "the cause is kept: {text}");
+    assert!(
+        text.contains("Re-run `goetia daemon uninstall frpc` to retry"),
+        "{text}"
+    );
+    assert!(text.contains("does not accept STOP"), "{text}");
     for stale in ["disabled", "stopped", "goetia daemon enable", "goetia daemon start"] {
         assert!(
             !text.contains(stale),
             "`{stale}` is false when nothing was touched: {text}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_failed_disable_claims_only_that_the_service_was_not_deleted() {
+    let text = uninstall_failure(&UninstallFailure::DisableFailed);
+    assert!(text.contains("`frpc` was NOT deleted"), "{text}");
+    assert!(
+        text.contains("Re-run `goetia daemon uninstall frpc` to retry"),
+        "{text}"
+    );
+    assert!(text.contains("does not accept STOP"), "{text}");
+    for unproven in [
+        "nothing about it was changed",
+        "unchanged",
+        "is now disabled",
+        "stopped",
+    ] {
+        assert!(
+            !text.contains(unproven),
+            "a failed ChangeServiceConfig is not documented as all-or-nothing: {text}"
         );
     }
 }

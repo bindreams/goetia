@@ -837,11 +837,13 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
         Ok(actor) => actor,
         Err(e) if is_not_found_io(&e) => return Ok(()),
         Err(e) => {
-            return Err(uninstall_failed(
-                id,
-                &UninstallFailure::Untouched,
-                Error::os(format!("open `{id}` before uninstall"), e),
-            ));
+            let refused = open_refused(
+                "uninstall",
+                &format!("service `{id}`"),
+                &format!("open `{id}` before uninstall"),
+                windows_service::Error::Winapi(e),
+            );
+            return Err(uninstall_failed(id, &UninstallFailure::Untouched, refused));
         }
     };
 
@@ -871,18 +873,27 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
         return Ok(());
     }
 
-    let not_deleted = |context: String, e: windows_service::Error| {
-        uninstall_failed(id, &UninstallFailure::Delete { previous }, to_error(&context, e))
-    };
     let service = match scm.open_service(id.as_str(), ServiceAccess::DELETE) {
         Ok(service) => service,
         Err(e) if is_not_found(&e) => return Ok(()),
-        Err(e) => return Err(not_deleted(format!("open `{id}` to delete it"), e)),
+        Err(e) => {
+            let refused = open_refused(
+                "uninstall",
+                &format!("service `{id}`"),
+                &format!("open `{id}` to delete it"),
+                e,
+            );
+            return Err(uninstall_failed(id, &UninstallFailure::Delete { previous }, refused));
+        }
     };
     match service.delete() {
         Ok(()) => Ok(()),
         Err(e) if is_not_found(&e) || is_marked_for_delete(&e) => Ok(()),
-        Err(e) => Err(not_deleted(format!("delete service `{id}`"), e)),
+        Err(e) => Err(uninstall_failed(
+            id,
+            &UninstallFailure::Delete { previous },
+            to_error(&format!("delete service `{id}`"), e),
+        )),
     }
 }
 
@@ -902,11 +913,18 @@ enum Disabled {
 /// neither is an error. A start type that cannot be read is not an error either: only the message
 /// that names it needs it, so it is left out.
 fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
-    let not_changed = |source: Error| uninstall_failed(id, &UninstallFailure::Untouched, source);
     let service = match scm.open_service(id.as_str(), ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG) {
         Ok(service) => service,
         Err(e) if is_not_found(&e) => return Ok(Disabled::Gone),
-        Err(e) => return Err(not_changed(to_error(&format!("open `{id}` to disable it"), e))),
+        Err(e) => {
+            let refused = open_refused(
+                "uninstall",
+                &format!("service `{id}`"),
+                &format!("open `{id}` to disable it"),
+                e,
+            );
+            return Err(uninstall_failed(id, &UninstallFailure::Untouched, refused));
+        }
     };
     let previous = match service.query_config() {
         Ok(cfg) => Some(cfg.start_type),
@@ -917,7 +935,13 @@ fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
         Ok(()) => Ok(Disabled::Now { previous }),
         Err(e) if is_marked_io(&e) => Ok(Disabled::AlreadyMarked),
         Err(e) if is_not_found_io(&e) => Ok(Disabled::Gone),
-        Err(e) => Err(not_changed(Error::os(format!("disable `{id}` before uninstall"), e))),
+        // `ChangeServiceConfigW` is not documented to leave the configuration as it was when it
+        // fails, so this claims only that the delete did not happen.
+        Err(e) => Err(uninstall_failed(
+            id,
+            &UninstallFailure::DisableFailed,
+            Error::os(format!("disable `{id}` before uninstall"), e),
+        )),
     }
 }
 
@@ -925,6 +949,8 @@ fn disable_before_delete(scm: &WinServiceManager, id: &Id) -> Result<Disabled> {
 enum UninstallFailure {
     /// It failed before it changed anything: the service is as it was.
     Untouched,
+    /// The disable that precedes the delete failed. Whether it changed the start type is unknown.
+    DisableFailed,
     /// The stop failed. The service is running and disabled; `previous` is its start type before.
     Stop { previous: Option<ServiceStartType> },
     /// The delete failed. The service is stopped and disabled; `previous` is its start type before.
@@ -939,7 +965,14 @@ enum UninstallFailure {
 fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
     let kill = format!("if the service does not accept STOP, run `goetia daemon kill {id}`");
     let what = match state {
-        UninstallFailure::Untouched => format!("`{id}` was NOT deleted and nothing about it was changed"),
+        UninstallFailure::Untouched => format!(
+            "`{id}` was NOT deleted and nothing about it was changed. Re-run \
+             `goetia daemon uninstall {id}` to retry"
+        ),
+        UninstallFailure::DisableFailed => format!(
+            "`{id}` was NOT deleted, and the disable that precedes the delete failed, so its start type \
+             may have changed. Re-run `goetia daemon uninstall {id}` to retry"
+        ),
         UninstallFailure::Stop { previous } => format!(
             "`{id}` could not be stopped. It was NOT deleted and is now disabled, so \
              `goetia daemon start {id}` fails.{} Re-run `goetia daemon uninstall {id}` to retry; {kill} first",
@@ -991,8 +1024,8 @@ fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
 /// [`open_scm`] for the caller that is about to *classify* `id`, [`Backend::read`]. A manager that
 /// would not open leaves that id exactly as unclassified as a service object that would not open
 /// does, so it takes the same class: an `Os` error here would reach `status_error`'s catch-all as
-/// `Kind::Unusable`, which claims ownership. Every other caller opens only after ownership is
-/// settled, where `Os` is the true statement ([`open_scm_for`] for a verb, [`open_scm`] otherwise).
+/// `Kind::Unusable`, which claims ownership. Callers that open after ownership is settled use
+/// [`open_scm_for`] or [`open_scm`].
 ///
 /// Deliberately untested, and stated rather than contrived: `SC_MANAGER_CONNECT` is granted to every
 /// token on a working host, and the only way to withhold it is to rewrite the SCM database's own
@@ -1026,8 +1059,8 @@ fn is_marked_io(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(ERROR_SERVICE_MARKED_FOR_DELETE as i32)
 }
 
-/// Whether `e` is `ERROR_ACCESS_DENIED` — the one thing the error code decides,
-/// and it decides only which of [`undetermined`]'s two `recovery` texts applies.
+/// Whether `e` is `ERROR_ACCESS_DENIED` — the one thing the error code decides: which of
+/// [`undetermined`]'s two `recovery` texts applies, and whether [`open_refused`] names a denial.
 fn is_access_denied(e: &windows_service::Error) -> bool {
     matches!(
         e,
@@ -1101,8 +1134,8 @@ fn service_undetermined(id: &str, context: &str, e: windows_service::Error) -> E
 
 /// A failed open made after `read` established that the id is installed and goetia's, so the verb
 /// `operation` failed and nothing is in doubt: an `Os` error (exit `1`), never [`undetermined`],
-/// which says goetia cannot tell whether anything is installed. A denial is named as the verb's,
-/// of `target`, what was opened.
+/// which says goetia cannot tell whether anything is installed. A denial's message names the verb
+/// and the `target` it was denied.
 ///
 /// `context` is the open, as [`to_error`] takes it.
 fn open_refused(operation: &str, target: &str, context: &str, e: windows_service::Error) -> Error {

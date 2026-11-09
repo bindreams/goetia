@@ -208,6 +208,12 @@ impl Denied {
         Self::seal(id.to_string(), SE_SERVICE, service_dacl(Some("DC")), service_dacl(None))
     }
 
+    /// Deny `DELETE` (`SD`) on the service object itself, and nothing else: `uninstall` gets as far
+    /// as the delete and its open is the one refused.
+    pub fn service_delete(id: &str) -> Self {
+        Self::seal(id.to_string(), SE_SERVICE, service_dacl(Some("SD")), service_dacl(None))
+    }
+
     fn seal(object: String, object_type: SE_OBJECT_TYPE, deny: String, on_drop: String) -> Self {
         set_dacl(&object, object_type, &deny).unwrap_or_else(|e| panic!("{e}"));
         Self {
