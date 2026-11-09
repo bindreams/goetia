@@ -93,7 +93,6 @@ fn os_code(error: &Error) -> Option<i32> {
 #[skuld::test]
 fn a_read_that_finds_no_optional_key_under_a_service_that_is_gone_is_service_gone() {
     let read = read_settled(
-        Origin::Opened,
         || Ok(false),
         |f| registry_error(&f.op, &f.path, f.source),
         || Err(Stop::at_open(failed_with(NOT_FOUND), Some(7))),
@@ -105,7 +104,6 @@ fn a_read_that_finds_no_optional_key_under_a_service_that_is_gone_is_service_gon
 #[skuld::test]
 fn a_read_that_finds_no_optional_key_under_a_service_that_stands_is_the_empty_value() {
     let read = read_settled(
-        Origin::Opened,
         || Ok(true),
         |f| registry_error(&f.op, &f.path, f.source),
         || Err(Stop::at_open(failed_with(NOT_FOUND), Some(7))),
@@ -117,7 +115,6 @@ fn a_read_that_finds_no_optional_key_under_a_service_that_stands_is_the_empty_va
 #[skuld::test]
 fn a_key_that_vanishes_under_a_service_that_stands_fails_with_the_cause_it_met() {
     let read = read_settled(
-        Origin::Opened,
         || Ok(true),
         |f| registry_error(&f.op, &f.path, f.source),
         || Err::<(), _>(Stop::mid_read(failed_with(KEY_DELETED))),
@@ -129,7 +126,6 @@ fn a_key_that_vanishes_under_a_service_that_stands_fails_with_the_cause_it_met()
 #[skuld::test]
 fn a_pass_that_completes_is_its_value_without_asking_whether_the_service_stands() {
     let read = read_settled(
-        Origin::Opened,
         || panic!("the service's existence is asked only after a pass stops"),
         |f| registry_error(&f.op, &f.path, f.source),
         || Ok(7),
@@ -428,6 +424,70 @@ fn an_event_message_file_needs_a_system_root() {
         let message = e.to_string();
         assert!(message.contains("SystemRoot"), "{message}");
     }
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. A service key that is a link to a missing key reads as an
+/// error: neither Foreign nor gone.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_to_a_missing_key_fails_a_parameters_read() {
+    let unique = std::process::id();
+    let root_scratch = ScratchKey::new(&format!("parameters-{unique}-dangling-root"));
+    let target = ScratchKey::new(&format!("parameters-{unique}-dangling-target"));
+    let root = root_scratch.create();
+    let _link = create_link(&root, "dangling", &target.nt_path());
+    let services = ServicesRoot::new(&root);
+
+    let read = read_parameters_in(&services, "dangling");
+
+    assert!(
+        matches!(read, Err(Error::Undetermined { .. })),
+        "a service key whose target is missing is neither foreign nor gone"
+    );
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. `read_environment` on a dangling-link service key is an error.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_environment_read() {
+    let unique = std::process::id();
+    let root_scratch = ScratchKey::new(&format!("environment-{unique}-dangling-root"));
+    let target = ScratchKey::new(&format!("environment-{unique}-dangling-target"));
+    let root = root_scratch.create();
+    let _link = create_link(&root, "dangling", &target.nt_path());
+    let services = ServicesRoot::new(&root);
+
+    let read = read_environment_in(&services, "dangling");
+
+    let error = read
+        .err()
+        .expect("a service key whose target is missing is not a service that is gone");
+    assert!(matches!(error, Error::Os { .. }), "{error:?}");
+    assert_eq!(os_code(&error), Some(NOT_FOUND), "{error:?}");
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. A service key that is there with no `Parameters` stands without
+/// it, which reads as empty `Parameters`: not goetia's.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_with_no_parameters_reads_as_empty_parameters() {
+    let scratch = ScratchKey::new(&format!("bare-{}-root", std::process::id()));
+    let root = scratch.create();
+    root.create_subkey("bare").expect("create the service key");
+    let services = ServicesRoot::new(&root);
+
+    let read = read_parameters_in(&services, "bare").expect("read Parameters");
+
+    assert!(matches!(read, RegistryReadOutcome::Read(_)));
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. A service whose key is not there is gone.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_not_there_is_gone_for_a_parameters_read() {
+    let scratch = ScratchKey::new(&format!("absent-{}-root", std::process::id()));
+    let root = scratch.create();
+    let services = ServicesRoot::new(&root);
+
+    let read = read_parameters_in(&services, "absent").expect("read Parameters");
+
+    assert!(matches!(read, RegistryReadOutcome::ServiceGone));
 }
 
 /// Writes keys under `HKLM\SOFTWARE`. A read classifies a `Parameters` that is a link as not
