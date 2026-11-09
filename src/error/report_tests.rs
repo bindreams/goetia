@@ -5,6 +5,19 @@ use super::*;
 use crate::error::Reason;
 use crate::error::error_tests::{exit_status, id, os, undetermined};
 
+/// A remedy is its own sentence: it follows a period the words before it already ended with, and
+/// supplies one when they did not.
+#[skuld::test]
+fn a_remedy_follows_the_closing_period_of_the_words_before_it_without_doubling_it() {
+    for (words, expected) in [("it broke", "it broke. fix it"), ("it broke.", "it broke. fix it")] {
+        let mut text = String::new();
+        let mut sink = Sink::new(&mut text, true);
+        sink.write_str(words).unwrap();
+        sink.write_remedy("fix it").unwrap();
+        assert_eq!(text, expected);
+    }
+}
+
 /// The failed read sits inside the sentence of the error that embeds it: its remedy must not
 /// interrupt that sentence, and still prints once, last.
 #[skuld::test]
@@ -57,6 +70,36 @@ fn command(stderr: &str) -> Error {
         status: exit_status(1),
         stderr: stderr.to_string(),
     }
+}
+
+/// `!` and `?` end a sentence as `.` does, and each remedy is the words the next one follows: a
+/// remedy ending in a period is not followed by a doubled one.
+#[skuld::test]
+fn remedies_join_after_any_sentence_terminator_and_each_after_the_one_before() {
+    for (words, expected) in [("what now?", "what now? fix it"), ("it broke!", "it broke! fix it")] {
+        let mut text = String::new();
+        let mut sink = Sink::new(&mut text, true);
+        sink.write_str(words).unwrap();
+        sink.write_remedy("fix it").unwrap();
+        assert_eq!(text, expected);
+    }
+    let mut text = String::new();
+    let mut sink = Sink::new(&mut text, true);
+    sink.write_str("it broke").unwrap();
+    write_remedies(&mut sink, &["fix it.", "then retry", "or ask?", "ok"]).unwrap();
+    assert_eq!(text, "it broke. fix it. then retry. or ask? ok");
+}
+
+/// A child's stderr is the last words before the remedy, so its closing period is the sentence's.
+#[skuld::test]
+fn a_remedy_follows_a_childs_stderr_that_ends_in_a_period_without_doubling_it() {
+    let e = Error::Undetermined {
+        id: id(),
+        reason: Box::new(command("boom.")),
+        recovery: "re-run as root".to_string(),
+    };
+    let report = e.report().to_string();
+    assert!(report.ends_with("boom. re-run as root"), "{report}");
 }
 
 /// Every link of a chain reaches a person through the report, so a value that came from a manifest,
