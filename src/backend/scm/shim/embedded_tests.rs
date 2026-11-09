@@ -154,8 +154,8 @@ mod windows {
         );
 
         for result in [
-            SiblingStockShim::new().preview(),
-            SiblingStockShim::new().provide(&disabled()),
+            SiblingStockShim.preview(),
+            SiblingStockShim.provide(&disabled()),
         ] {
             match result {
                 Err(Error::SiblingShimMissing { path }) => assert_eq!(path, beside),

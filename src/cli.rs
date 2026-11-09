@@ -66,7 +66,7 @@ pub fn manager(provider: impl ShimProvider + 'static) -> Result<Box<dyn ServiceM
 /// stays crate-private; a consumer supplies its own provider.
 #[cfg(windows)]
 pub fn sibling_stock_shim() -> impl ShimProvider {
-    crate::backend::scm::shim::embedded::SiblingStockShim::new()
+    crate::backend::scm::shim::embedded::SiblingStockShim
 }
 
 // Cli =================================================================================================================

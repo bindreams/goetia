@@ -149,10 +149,6 @@ mod stock {
 
     #[cfg(feature = "cli")]
     impl SiblingStockShim {
-        pub(crate) fn new() -> Self {
-            Self
-        }
-
         /// The sibling's bytes, or [`Error::SiblingShimMissing`] naming where it should be.
         fn read(&self) -> Result<Vec<u8>> {
             let exe = std::env::current_exe().map_err(|e| Error::os("locate the running executable", e))?;
