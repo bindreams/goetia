@@ -43,6 +43,12 @@ use crate::support::{self, ConnectBack, ELEVATED, ScratchKey, ServiceGuard};
 #[skuld::label]
 const SCM_DENIAL: skuld::Label;
 
+/// Held by every test here that takes the machine-wide install lock (a `type: simple` install),
+/// which the lock tests in `src/backend/scm/shim/lock_tests.rs` and `tests/shim_integration` poll
+/// for who holds it. Shared with both by label *name*.
+#[skuld::label]
+const UNIT_DIR_EXCLUSIVE: skuld::Label;
+
 fn id_of(s: &str) -> Id {
     Id::try_from(s).expect("random_test_id/short local ids are valid Ids")
 }
@@ -724,7 +730,7 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
 /// service's `Environment` is empty on both sides, whatever its spec's `env` says. It is registered
 /// but never started, so the shim is only provided and checked, never run: its manager has a provider,
 /// which `Scm::new()` has not.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_twice_is_up_to_date_for_both_kinds() {
     for kind in [Kind::Managed, Kind::Simple] {
         let mgr = match kind {
