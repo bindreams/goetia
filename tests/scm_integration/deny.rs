@@ -189,7 +189,7 @@ impl Denied {
     }
 
     /// Deny `SERVICE_QUERY_CONFIG` (`CC`) and `SERVICE_QUERY_STATUS` (`LC`) on
-    /// the service object itself — exactly the pair `manager::open_existing`
+    /// the service object itself — exactly the pair `Backend::read`
     /// asks for, and a boundary the `Parameters` deny cannot reach, since
     /// every verb opens the service object first.
     pub fn service_query(id: &str) -> Self {
@@ -199,6 +199,19 @@ impl Denied {
             service_dacl(Some("CCLC")),
             service_dacl(None),
         )
+    }
+
+    /// Deny `SERVICE_CHANGE_CONFIG` (`DC`) on the service object itself, and nothing else: `read`'s
+    /// `QUERY_STATUS | QUERY_CONFIG` open still succeeds, so goetia knows the service is its own,
+    /// and only the verbs that change its configuration (`enable`, `disable`) are stopped.
+    pub fn service_change_config(id: &str) -> Self {
+        Self::seal(id.to_string(), SE_SERVICE, service_dacl(Some("DC")), service_dacl(None))
+    }
+
+    /// Deny `DELETE` (`SD`) on the service object itself, and nothing else: `uninstall` gets as far
+    /// as the delete and its open is the one refused.
+    pub fn service_delete(id: &str) -> Self {
+        Self::seal(id.to_string(), SE_SERVICE, service_dacl(Some("SD")), service_dacl(None))
     }
 
     fn seal(object: String, object_type: SE_OBJECT_TYPE, deny: String, on_drop: String) -> Self {
