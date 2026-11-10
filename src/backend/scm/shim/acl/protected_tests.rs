@@ -4,13 +4,9 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::backend::scm::shim::acl::acl_tests::{allow, users};
-use crate::backend::scm::shim::acl::{ObjectSecurity, administrators, everyone, system};
-
-const FULL: u32 = 0x1F_01FF;
-const READ_EXECUTE: u32 = 0x12_00A9;
-const OBJECT_INHERIT: u8 = 0x01;
-const CONTAINER_INHERIT: u8 = 0x02;
+use crate::backend::scm::shim::acl::ObjectSecurity;
+use crate::backend::scm::shim::acl::acl_tests::{CONTAINER_INHERIT, FULL, OBJECT_INHERIT, READ_EXECUTE, allow, users};
+use crate::backend::scm::sid::{administrators, everyone, system};
 
 /// What the stock shim file has, with `path` as the label an existing file is read under.
 fn stock_file(path: &str) -> ObjectSecurity {

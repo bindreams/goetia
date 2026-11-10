@@ -2,24 +2,26 @@
 //! Windows-only tests read a temp directory this test created and nothing else.
 
 use super::*;
+use crate::backend::scm::sid::sid_from_parts;
 
 // Access masks, spelled out as `icacls` prints them: (F), (M), (RX).
-const FULL: u32 = FILE_ALL_ACCESS;
+pub(super) const FULL: u32 = FILE_ALL_ACCESS;
 const MODIFY: u32 = 0x13_01BF;
-const READ_EXECUTE: u32 = 0x12_00A0;
+/// `icacls` (RX), which is not `FILE_GENERIC_EXECUTE` alone.
+pub(super) const READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 const GENERIC_READ_EXECUTE: u32 = GENERIC_READ | GENERIC_EXECUTE;
 const FILE_ADD_FILE: u32 = 0x2;
 const FILE_WRITE_EA: u32 = 0x10;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
 
 // ACE flags.
-const OBJECT_INHERIT: u8 = 0x01;
-const CONTAINER_INHERIT: u8 = 0x02;
+pub(super) const OBJECT_INHERIT: u8 = 0x01;
+pub(super) const CONTAINER_INHERIT: u8 = 0x02;
 const INHERIT_ONLY: u8 = INHERIT_ONLY_ACE;
 const OI_CI: u8 = OBJECT_INHERIT | CONTAINER_INHERIT;
 const OI_CI_IO: u8 = OI_CI | INHERIT_ONLY;
 
-pub(in crate::backend::scm::shim) fn users() -> Sid {
+pub(super) fn users() -> Sid {
     sid_from_parts(5, &[32, 545])
 }
 fn creator_owner() -> Sid {
@@ -32,7 +34,7 @@ fn application_packages() -> Sid {
     sid_from_parts(15, &[2, 1])
 }
 
-pub(in crate::backend::scm::shim) fn allow(trustee: Sid, mask: u32, flags: u8) -> Ace {
+pub(super) fn allow(trustee: Sid, mask: u32, flags: u8) -> Ace {
     Ace {
         trustee,
         mask,
@@ -705,30 +707,17 @@ pub(in crate::backend::scm::shim) mod windows {
         assert_eq!(display_path(Path::new(r"\\?\UNC\h\s\a")), Path::new(r"\\h\s\a"));
     }
 
+    /// What the refusal says depends on who owns the folder (the owner, or the entry for Everyone),
+    /// so only that it is refused, and where, is asserted; the owner's cases are `verdict`'s.
     #[skuld::test]
     fn a_folder_everyone_can_write_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let target = world_writable_folder(dir.path());
-        // Whoever owns it, it is refused: an untrusted owner as the owner, a trusted one for the
-        // entry that gives Everyone control of its permissions.
-        let owner = read_chain(&target).unwrap()[0].owner.clone();
-        let (account, right) = if is_trusted(&owner) {
-            (everyone(), "change permissions of")
-        } else {
-            (owner, "own")
-        };
 
-        let Err(Error::ShimFolderUnsafe {
-            path,
-            account: named,
-            right: said,
-        }) = enabled().check(&target)
-        else {
+        let Err(Error::ShimFolderUnsafe { path, .. }) = enabled().check(&target) else {
             panic!("a folder everyone can write must be refused");
         };
         assert_eq!(path, display_path(&target));
-        assert_eq!(named, account_name(&account));
-        assert_eq!(said, right);
     }
 
     /// An in-memory ACL holding one full-control entry of `ace_type` for `trustee`.
@@ -736,7 +725,7 @@ pub(in crate::backend::scm::shim) mod windows {
         use windows_sys::Win32::Security::{ACL, ACL_REVISION, AddAce, InitializeAcl};
         let mut ace = vec![0, 0];
         ace.extend_from_slice(&((8 + trustee.len()) as u16).to_le_bytes());
-        ace.extend_from_slice(&0x1F_01FFu32.to_le_bytes());
+        ace.extend_from_slice(&FULL.to_le_bytes());
         ace.extend_from_slice(trustee);
         let mut acl = vec![0u32; 64];
         let pointer = acl.as_mut_ptr().cast::<ACL>();
@@ -757,7 +746,7 @@ pub(in crate::backend::scm::shim) mod windows {
 
     #[skuld::test]
     fn an_entry_goetia_cannot_read_is_told_from_a_read_that_failed() {
-        let owner = sid_from_parts(5, &[18]);
+        let owner = system();
         // A compound entry (type 4), which goetia does not read.
         let mut acl = acl_with_entry(4, &owner);
         let acl = acl.as_mut_ptr().cast();
@@ -775,7 +764,7 @@ pub(in crate::backend::scm::shim) mod windows {
 
     #[skuld::test]
     fn an_entry_goetia_can_read_is_read() {
-        let owner = sid_from_parts(5, &[18]);
+        let owner = system();
         let mut acl = acl_with_entry(0, &owner);
         let acl = acl.as_mut_ptr().cast();
 

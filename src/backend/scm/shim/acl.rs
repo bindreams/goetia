@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 #[cfg(windows)]
 use crate::backend::scm::sid::sid_string;
-use crate::backend::scm::sid::{Sid, sid_from_parts};
+use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_installer};
 
 #[cfg(windows)]
 pub(crate) use protected::{Descriptor, is_as_wanted};
@@ -113,24 +113,6 @@ const FILE_TAMPERING: [(u32, &str); 4] = [
     (WRITE_OWNER, "take ownership of"),
     (DELETE, "delete or rename"),
 ];
-
-// Well-known SIDs =====================================================================================================
-
-pub(crate) fn system() -> Sid {
-    sid_from_parts(5, &[18])
-}
-
-pub(crate) fn administrators() -> Sid {
-    sid_from_parts(5, &[32, 544])
-}
-
-pub(crate) fn trusted_installer() -> Sid {
-    sid_from_parts(5, &[80, 956008885, 3418522649, 1831038044, 1853292631, 2271478464])
-}
-
-pub(crate) fn everyone() -> Sid {
-    sid_from_parts(1, &[0])
-}
 
 // verdict =============================================================================================================
 
