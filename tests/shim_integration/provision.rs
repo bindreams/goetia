@@ -830,10 +830,12 @@ fn lock_is_exclusive() {
 /// The DACL of the kernel object `handle` (open with `READ_CONTROL`): whether it is protected, and
 /// its entries as the library reads them.
 fn dacl_of(handle: HANDLE) -> (bool, Vec<DaclEntry>) {
-    let (protected, entries) = goetia::testing::kernel_object_dacl(handle, Path::new("the lock"))
+    let dacl = goetia::testing::kernel_object_dacl(handle, Path::new("the lock"))
         .unwrap_or_else(|e| panic!("read the permissions of the lock: {}", e.report()));
-    let entries = entries.expect("the lock has a NULL DACL, which grants everyone every right");
-    (protected, entries)
+    let entries = dacl
+        .entries
+        .expect("the lock has a NULL DACL, which grants everyone every right");
+    (dacl.protected, entries)
 }
 
 /// The lock is for SYSTEM and Administrators alone, each with a plain allow entry that applies to

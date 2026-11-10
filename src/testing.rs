@@ -44,32 +44,39 @@ pub struct DaclEntry {
     pub conditional: bool,
 }
 
-/// The DACL of the kernel object `handle`, which is open with `READ_CONTROL`: whether it is
-/// protected, and its entries (`None` for a NULL DACL). Read by the library's own parser, which
-/// fails on an entry type it does not understand. The owner is not read. `name` stands for the
-/// object in an error.
 #[cfg(windows)]
-pub fn kernel_object_dacl(
-    handle: *mut std::ffi::c_void,
-    name: &std::path::Path,
-) -> Result<(bool, Option<Vec<DaclEntry>>)> {
-    use crate::backend::scm::shim::acl::{Read, kernel_object_security};
+impl From<crate::backend::scm::shim::acl::Ace> for DaclEntry {
+    fn from(ace: crate::backend::scm::shim::acl::Ace) -> Self {
+        Self {
+            trustee: ace.trustee,
+            mask: ace.mask,
+            allow: ace.allow,
+            flags: ace.flags,
+            conditional: ace.conditional,
+        }
+    }
+}
 
-    let dacl = kernel_object_security(handle, name, Read::Dacl)?
-        .dacl
-        .expect("the DACL was asked for");
-    let entries = dacl.aces.map(|aces| {
-        aces.into_iter()
-            .map(|ace| DaclEntry {
-                trustee: ace.trustee,
-                mask: ace.mask,
-                allow: ace.allow,
-                flags: ace.flags,
-                conditional: ace.conditional,
-            })
-            .collect()
-    });
-    Ok((dacl.protected, entries))
+/// A DACL as the library reads it.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dacl {
+    /// Whether it ignores what a parent would have it inherit.
+    pub protected: bool,
+    /// `None` is a NULL DACL, which grants everyone every right.
+    pub entries: Option<Vec<DaclEntry>>,
+}
+
+/// The DACL of the kernel object `handle`, which is open with `READ_CONTROL`, read by the library's
+/// own parser, which fails on an entry type it does not understand. The owner is not read. `name`
+/// stands for the object in an error.
+#[cfg(windows)]
+pub fn kernel_object_dacl(handle: *mut std::ffi::c_void, name: &std::path::Path) -> Result<Dacl> {
+    let dacl = crate::backend::scm::shim::acl::kernel_object_dacl(handle, name)?;
+    Ok(Dacl {
+        protected: dacl.protected,
+        entries: dacl.aces.map(|aces| aces.into_iter().map(DaclEntry::from).collect()),
+    })
 }
 
 pub mod cleanup;

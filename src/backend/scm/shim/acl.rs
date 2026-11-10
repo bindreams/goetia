@@ -31,9 +31,11 @@ use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_in
 
 #[cfg(windows)]
 pub(crate) use protected::{Descriptor, is_as_wanted};
+#[cfg(all(windows, any(test, feature = "testing")))]
+pub(crate) use system::kernel_object_dacl;
 #[cfg(windows)]
 pub(crate) use system::{
-    Read, display_path, is_unreadable, kernel_object_security, normalise as lexical, read_object, require_acls_under,
+    display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, require_acls_under,
 };
 
 #[cfg(windows)]
@@ -66,9 +68,9 @@ pub(crate) struct Ace {
     /// The ACE header's flags, of which only `INHERIT_ONLY_ACE` is read.
     pub(crate) flags: u8,
     pub(crate) allow: bool,
-    /// A callback entry (a condition follows its SID, which is not read, so [`verdict`] treats it
-    /// as one that always applies), allow or deny by `allow`.
-    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    /// A callback entry: a condition follows its SID, which is not read, so [`verdict`] treats it
+    /// as one that always applies. Two entries that differ only in this are different entries,
+    /// which [`is_as_wanted`] tells apart.
     pub(crate) conditional: bool,
 }
 
@@ -600,29 +602,23 @@ mod system {
         }
     }
 
-    /// Which parts of a kernel object's security [`kernel_object_security`] reads and parses. A part
-    /// not asked for is not parsed, so what is unreadable in it cannot fail the read.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Read {
-        Owner,
-        /// Only the `testing` helper and unit tests read a DACL.
-        #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
-        Dacl,
-        /// Only a unit test reads both.
-        #[cfg_attr(not(test), allow(dead_code))]
-        Both,
-    }
-
-    /// The parts of a kernel object's security that were read.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(crate) struct KernelSecurity {
-        /// `Some` for [`Read::Owner`] and [`Read::Both`].
-        pub(crate) owner: Option<Sid>,
-        /// `Some` for [`Read::Dacl`] and [`Read::Both`].
-        pub(crate) dacl: Option<Dacl>,
+    /// The owner of the kernel object `handle` (a mutex, say), which must be open with
+    /// `READ_CONTROL`. The DACL is not read, so what is unreadable in it cannot fail this. `name`
+    /// stands for the object in an error.
+    pub(crate) fn kernel_object_owner(handle: HANDLE, name: &Path) -> Result<Sid> {
+        let info = security_info(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            "read the owner of",
+            name,
+        )?;
+        // SAFETY: `owner` points into `descriptor`, which `info` keeps live.
+        unsafe { copy_sid(info.owner, name) }
     }
 
     /// A DACL as read.
+    #[cfg(any(test, feature = "testing"))]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct Dacl {
         /// Whether it ignores what a parent would have it inherit.
@@ -631,34 +627,22 @@ mod system {
         pub(crate) aces: Option<Vec<Ace>>,
     }
 
-    /// The part `read` asks for of the security of the kernel object `handle` (a mutex, say), which
-    /// must be open with `READ_CONTROL`. `name` stands for the object in an error.
-    pub(crate) fn kernel_object_security(handle: HANDLE, name: &Path, read: Read) -> Result<KernelSecurity> {
-        let (information, what) = match read {
-            Read::Owner => (OWNER_SECURITY_INFORMATION, "read the owner of"),
-            Read::Dacl => (DACL_SECURITY_INFORMATION, "read the permissions of"),
-            Read::Both => (
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                "read the permissions of",
-            ),
-        };
-        let info = security_info(handle, SE_KERNEL_OBJECT, information, what, name)?;
-        let owner = if information & OWNER_SECURITY_INFORMATION != 0 {
-            // SAFETY: `owner` points into `descriptor`, which `info` keeps live.
-            Some(unsafe { copy_sid(info.owner, name)? })
-        } else {
-            None
-        };
-        let dacl = if information & DACL_SECURITY_INFORMATION != 0 {
-            // SAFETY: `descriptor` is live, and `dacl` points into it.
-            let protected = unsafe { is_protected(info.descriptor, name)? };
-            // SAFETY: as above.
-            let aces = unsafe { parse_dacl(info.dacl, name)? };
-            Some(Dacl { protected, aces })
-        } else {
-            None
-        };
-        Ok(KernelSecurity { owner, dacl })
+    /// The DACL of the kernel object `handle`, which must be open with `READ_CONTROL`. The owner
+    /// is not read. `name` stands for the object in an error.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn kernel_object_dacl(handle: HANDLE, name: &Path) -> Result<Dacl> {
+        let info = security_info(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            "read the permissions of",
+            name,
+        )?;
+        // SAFETY: `descriptor` is live, and `dacl` points into it.
+        let protected = unsafe { is_protected(info.descriptor, name)? };
+        // SAFETY: as above.
+        let aces = unsafe { parse_dacl(info.dacl, name)? };
+        Ok(Dacl { protected, aces })
     }
 
     /// Copies the owner, the DACL and whether it is protected out of a security descriptor of a

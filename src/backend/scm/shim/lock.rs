@@ -15,14 +15,13 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_OWNER, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_OWNER, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, OpenMutexW, ReleaseMutex, WaitForSingleObject};
 
-use super::acl::{Descriptor, Read, account_name, is_trusted, kernel_object_security};
+use super::acl::{Descriptor, account_name, is_trusted, kernel_object_owner};
 use crate::backend::scm::manager::identity::wide_null;
-use crate::backend::scm::sid::Sid;
 use crate::elevation::token_has_administrators;
 use crate::error::{Error, Result};
 
@@ -57,7 +56,7 @@ impl InstallLock {
         // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns.
         let mutex = unsafe { OwnedHandle::from_raw_handle(raw) };
         if existed {
-            let owner = owner_of(mutex.as_raw_handle())?;
+            let owner = kernel_object_owner(mutex.as_raw_handle(), Path::new(NAME))?;
             if !is_trusted(&owner) {
                 return Err(Error::ShimLockForeign {
                     account: account_name(&owner),
@@ -143,12 +142,6 @@ fn failure(
     }
 }
 
-/// The owner of the lock that `mutex`, open with `READ_CONTROL`, is a handle to. Its DACL is not read.
-fn owner_of(mutex: HANDLE) -> Result<Sid> {
-    let security = kernel_object_security(mutex, Path::new(NAME), Read::Owner)?;
-    Ok(security.owner.expect("the owner was asked for"))
-}
-
 /// The owner of the lock that refused the caller, read through an open that asks for no more than
 /// `READ_CONTROL`, or `None` when it could not be read: the DACL that refused the caller may refuse
 /// that too.
@@ -161,7 +154,9 @@ fn denied_lock_owner() -> Option<String> {
     }
     // SAFETY: a valid handle `OpenMutexW` just returned and nothing else owns.
     let mutex = unsafe { OwnedHandle::from_raw_handle(raw) };
-    owner_of(mutex.as_raw_handle()).map(|owner| account_name(&owner)).ok()
+    kernel_object_owner(mutex.as_raw_handle(), Path::new(NAME))
+        .map(|owner| account_name(&owner))
+        .ok()
 }
 
 impl Drop for InstallLock {

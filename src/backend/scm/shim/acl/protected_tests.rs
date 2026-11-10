@@ -84,6 +84,24 @@ fn a_deny_entry_is_not_an_allow_entry() {
 }
 
 #[skuld::test]
+fn a_conditional_entry_is_not_a_plain_one() {
+    let mut actual = stock_file("");
+    actual.dacl.as_mut().unwrap()[2].conditional = true;
+
+    assert!(!is_as_wanted(&actual, &stock_file("")));
+    // Order does not matter between a conditional entry and a plain one of the same trustee.
+    let mut wanted = stock_file("");
+    let dacl = wanted.dacl.as_mut().unwrap();
+    dacl.push(Ace {
+        conditional: true,
+        ..dacl[2].clone()
+    });
+    let mut reversed = wanted.clone();
+    reversed.dacl.as_mut().unwrap().reverse();
+    assert!(is_as_wanted(&reversed, &wanted));
+}
+
+#[skuld::test]
 fn a_null_dacl_is_not_as_wanted() {
     let mut actual = stock_file("");
     actual.dacl = None;

@@ -20,7 +20,7 @@ pub(crate) fn is_as_wanted(actual: &ObjectSecurity, wanted: &ObjectSecurity) -> 
 
 fn sorted(aces: &[Ace]) -> Vec<&Ace> {
     let mut sorted: Vec<&Ace> = aces.iter().collect();
-    sorted.sort_by_key(|ace| (&ace.trustee, ace.mask, ace.flags, ace.allow));
+    sorted.sort_by_key(|ace| (&ace.trustee, ace.mask, ace.flags, ace.allow, ace.conditional));
     sorted
 }
 

@@ -414,7 +414,7 @@ fn the_nearest_object_to_the_target_is_reported_first() {
 #[cfg(windows)]
 pub(in crate::backend::scm::shim) mod windows {
     use super::system::{
-        ObjectId, Read, display_path, identity_of, is_unreadable, kernel_object_security, parse, read_chain,
+        ObjectId, display_path, identity_of, is_unreadable, kernel_object_dacl, kernel_object_owner, parse, read_chain,
         resolve_target,
     };
     use super::*;
@@ -439,10 +439,10 @@ pub(in crate::backend::scm::shim) mod windows {
         folder.canonicalize().unwrap()
     }
 
-    /// An unnamed mutex of this process, with a protected DACL of one entry for Everyone: what
-    /// `kernel_object_security` reads back of it, whole or in the part asked for.
+    /// An unnamed mutex of this process, with a protected DACL of one entry for Everyone, which
+    /// `kernel_object_owner` and `kernel_object_dacl` read back, each its own part.
     #[skuld::test]
-    fn a_kernel_objects_owner_and_dacl_are_read_back_as_asked() {
+    fn a_kernel_objects_owner_and_dacl_are_read_back() {
         use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
         use windows_sys::Win32::System::Threading::CreateMutexW;
 
@@ -453,26 +453,18 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(!raw.is_null(), "{}", io::Error::last_os_error());
         // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns.
         let mutex = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let read = |part| kernel_object_security(mutex.as_raw_handle(), Path::new("a test mutex"), part).unwrap();
+        let name = Path::new("a test mutex");
 
-        let both = read(Read::Both);
-        assert!(crate::backend::scm::sid::is_whole_sid(
-            &both.owner.clone().expect("the owner was asked for")
-        ));
-        let dacl = both.dacl.expect("the DACL was asked for");
+        let owner = kernel_object_owner(mutex.as_raw_handle(), name).unwrap();
+        let dacl = kernel_object_dacl(mutex.as_raw_handle(), name).unwrap();
+
+        assert!(crate::backend::scm::sid::is_whole_sid(&owner));
         assert!(dacl.protected);
         let aces = dacl.aces.expect("the DACL was set");
         assert_eq!(aces.len(), 1);
         assert_eq!(aces[0].trustee, everyone());
         assert!(aces[0].allow);
         assert!(!aces[0].conditional);
-
-        let owner_only = read(Read::Owner);
-        assert_eq!(owner_only.owner, both.owner);
-        assert!(owner_only.dacl.is_none());
-        let dacl_only = read(Read::Dacl);
-        assert!(dacl_only.owner.is_none());
-        assert_eq!(dacl_only.dacl.unwrap().aces.unwrap().len(), 1);
     }
 
     /// A volume that keeps no ACLs is refused: no owner or permissions can be read back from it.
