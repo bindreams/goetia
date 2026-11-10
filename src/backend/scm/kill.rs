@@ -343,13 +343,11 @@ pub(in crate::backend::scm) mod system {
         notifier: Option<SystemScmActor>,
     }
 
-    /// The rights the service's process is opened with: to terminate it, to wait for its exit and to
-    /// read its image.
-    const PROCESS_ACCESS: u32 = PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+    /// The rights the service's process is opened with: to terminate it and to wait for its exit.
+    const PROCESS_ACCESS: u32 = PROCESS_TERMINATE | PROCESS_SYNCHRONIZE;
 
     impl SystemKillTarget {
-        /// A target whose process is opened with the rights to terminate it, wait for its exit and read
-        /// its image.
+        /// A target whose process is opened with the rights to terminate it and to wait for its exit.
         pub fn new(service: Service, id: String) -> Self {
             Self {
                 service,
@@ -387,10 +385,13 @@ pub(in crate::backend::scm) mod system {
             self.pid
         }
 
-        /// The path of the executable this process was started from, read through the handle, so a
-        /// pid reused meanwhile cannot mislead.
+        /// The path of the executable this process was started from, read through a separate
+        /// query-limited open of its pid, so the hold's own access never widens. This handle keeps
+        /// the pid from being reused meanwhile. Fails when that open or the read does.
         pub(in crate::backend::scm) fn image(&self) -> io::Result<PathBuf> {
-            image_of(&self.handle)
+            let reader = open_process_with(self.pid, PROCESS_QUERY_LIMITED_INFORMATION)?
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            image_of(&reader)
         }
 
         /// Ends the process through this handle, never by pid, with exit code `code`, and does not

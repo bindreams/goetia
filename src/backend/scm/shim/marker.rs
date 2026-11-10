@@ -142,6 +142,13 @@ pub(crate) fn verify(host: &Path) -> Result<()> {
     }
 }
 
+/// Whether `host` holds a marker of any version, which is what makes it a goetia host, whichever
+/// goetia placed it.
+#[cfg(windows)]
+pub(crate) fn carries_marker(host: &Path) -> io::Result<bool> {
+    Ok(scan(File::open(host)?, 0)?.is_some())
+}
+
 #[cfg(test)]
 #[path = "marker_tests.rs"]
 mod marker_tests;

@@ -530,7 +530,7 @@ impl Backend for Scm {
     /// stopped ends that process through its handle (the documentation of `SetServiceStatus` allows
     /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
     /// runs is free when `stop` returns. A held process ends with the code of the shim report its record
-    /// decodes to when its image is a goetia shim, else with `KILLED_EXIT_CODE` (see [`stop_exit_code`]:
+    /// decodes to when its image carries a goetia shim marker of any version, else with `KILLED_EXIT_CODE` (see [`stop_exit_code`]:
     /// the audit log records the code, and a forced kill of a `type: managed` exe must not read as a
     /// clean exit). A shim's no-record case is another process deleting the service during the
     /// wait, which goetia does not guard against.
@@ -1214,7 +1214,8 @@ fn stop_exit_code(is_shim: bool, exit: Option<RecordedExit>) -> i32 {
 /// The held process is always terminated, and then waited for: that is what ends a `Kind::Managed`
 /// service's own exe, which lingers after `STOPPED`, and what backs a shim that does not exit.
 /// It is terminated with [`stop_exit_code`], decided by whether the held process's image carries a
-/// goetia shim's marker: a shim ends with the code of its own report, so whichever terminator wins
+/// goetia shim marker of any version (an older goetia's shim, not yet restarted, exits with its own
+/// report's code too): a shim ends with the code of its own report, so whichever terminator wins
 /// the race writes the same code; any other process, or one whose image or marker cannot be read
 /// (which is not an error of the stop), ends with `KILLED_EXIT_CODE`. A shim has no record only when
 /// another process deletes the service during the wait, the user's own concurrency, which goetia
@@ -1225,7 +1226,9 @@ fn end_held(
     deadline: Deadline,
     exit: Option<RecordedExit>,
 ) -> std::io::Result<EndProcessOutcome<Held>> {
-    let is_shim = held.image().is_ok_and(|image| marker::verify(&image).is_ok());
+    let is_shim = held
+        .image()
+        .is_ok_and(|image| marker::carries_marker(&image).unwrap_or(false));
     let code = stop_exit_code(is_shim, exit);
     end_process(
         held,
@@ -1364,7 +1367,7 @@ impl Scm {
             // ended, through the handle held since before the stop, and waited for as `stop` waits
             // for it (see [`end_held`]), with no bound: the shim exits by itself after it reports
             // `STOPPED`, and the terminate is a backstop that always runs: with the code of the shim
-            // report the record decodes to when the held image is a shim, else `KILLED_EXIT_CODE`
+            // report the record decodes to when the held image carries a shim marker of any version, else `KILLED_EXIT_CODE`
             // (see [`stop_exit_code`]).
             HoldOutcome::Held(held) => match end_held(id, held, Budget::Unbounded.start(), exit) {
                 Ok(EndProcessOutcome::Exited) => {}
