@@ -307,15 +307,21 @@ pub use system::SystemKillTarget;
 
 #[cfg(windows)]
 pub(in crate::backend::scm) mod system {
+    use std::ffi::OsString;
     use std::io;
     use std::mem::size_of;
+    use std::os::windows::ffi::OsStringExt as _;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::path::PathBuf;
 
     use windows_service::service::Service;
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::System::Services::{QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS};
     use windows_sys::Win32::System::Threading::{
-        INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        INFINITE, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     };
 
     use crate::backend::scm::wait::{
@@ -337,11 +343,13 @@ pub(in crate::backend::scm) mod system {
         notifier: Option<SystemScmActor>,
     }
 
-    /// The rights the service's process is opened with: to terminate it and to wait for its exit.
-    const PROCESS_ACCESS: u32 = PROCESS_TERMINATE | PROCESS_SYNCHRONIZE;
+    /// The rights the service's process is opened with: to terminate it, to wait for its exit and to
+    /// read its image.
+    const PROCESS_ACCESS: u32 = PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
 
     impl SystemKillTarget {
-        /// A target whose process is opened with the rights to terminate it and to wait for its exit.
+        /// A target whose process is opened with the rights to terminate it, wait for its exit and read
+        /// its image.
         pub fn new(service: Service, id: String) -> Self {
             Self {
                 service,
@@ -377,6 +385,12 @@ pub(in crate::backend::scm) mod system {
 
         pub(in crate::backend::scm) fn pid(&self) -> u32 {
             self.pid
+        }
+
+        /// The path of the executable this process was started from, read through the handle, so a
+        /// pid reused meanwhile cannot mislead.
+        pub(in crate::backend::scm) fn image(&self) -> io::Result<PathBuf> {
+            image_of(&self.handle)
         }
 
         /// Ends the process through this handle, never by pid, with exit code `code`, and does not
@@ -487,6 +501,27 @@ pub(in crate::backend::scm) mod system {
         }
         // SAFETY: a valid handle `OpenProcess` just returned and nothing else owns.
         Ok(Some(unsafe { OwnedHandle::from_raw_handle(handle) }))
+    }
+
+    /// The path of the executable the process behind `process` was started from.
+    pub(in crate::backend::scm) fn image_of(process: &OwnedHandle) -> io::Result<PathBuf> {
+        let mut buf = vec![0u16; 1024];
+        loop {
+            let mut len = buf.len() as u32;
+            // SAFETY: `process` is a live handle with `PROCESS_QUERY_LIMITED_INFORMATION`; `buf` is
+            // `len` writable units, and `len` is a valid in-out parameter.
+            let ok = unsafe {
+                QueryFullProcessImageNameW(process.as_raw_handle(), PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+            };
+            if ok != 0 {
+                return Ok(PathBuf::from(OsString::from_wide(&buf[..len as usize])));
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+                return Err(e);
+            }
+            buf.resize(buf.len() * 2, 0);
+        }
     }
 
     /// Terminate the process behind `process`, an [`open_process_with`] handle with `PROCESS_TERMINATE`,
