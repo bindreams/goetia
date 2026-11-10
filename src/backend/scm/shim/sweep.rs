@@ -306,11 +306,19 @@ pub(crate) fn left_behind_text(
         } else {
             ("are", "them")
         };
-        said.push_str(&format!(
-            " {} {is} not in the folder this program's shim provider uses, so that command does not retry \
-             {them}: {elsewhere} {them}.",
-            list(&outside)
-        ));
+        if *provider == ProviderFolder::None {
+            said.push_str(&format!(
+                " No shim provider of this program sweeps a folder, so that command does not retry {}: \
+                 {elsewhere} {them}.",
+                list(&outside)
+            ));
+        } else {
+            said.push_str(&format!(
+                " {} {is} not in the folder this program's shim provider uses, so that command does not retry \
+                 {them}: {elsewhere} {them}.",
+                list(&outside)
+            ));
+        }
     }
     said
 }

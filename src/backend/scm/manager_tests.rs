@@ -773,11 +773,11 @@ fn only_a_gone_or_marked_service_is_an_expected_refusal_to_read_its_host() {
     assert!(!is_gone_or_marked(&os(ERROR_ACCESS_DENIED)));
 }
 
-/// The provider's folder, as an uninstall tells it: none without a provider or for one that sweeps no
-/// folder, its `folder()`, and unknown (with the failure) for a provider whose `folder()` fails, which
-/// is not the absence of one.
+/// The provider's folder, as an uninstall tells it: none without a provider, and unknown (with the
+/// failure) for a provider whose `folder()` fails, which is not the absence of one. A known folder is
+/// asserted by `the_providers_folder_does_not_need_its_preview`.
 #[skuld::test]
-fn the_providers_folder_is_none_known_or_unknown() {
+fn the_providers_folder_is_none_or_unknown() {
     let (folder, failed) = Scm::new().provider_folder();
     assert_eq!((folder, failed.is_none()), (ProviderFolder::None, true));
 
@@ -791,15 +791,6 @@ fn the_providers_folder_is_none_known_or_unknown() {
         matches!(&failed, Some(Error::Step { source, .. }) if matches!(**source, Error::ShimPathRelative { .. })),
         "{failed:?}"
     );
-
-    // A host with no folder fails as a real provider does, instead of naming an empty one.
-    let rootless = Scm::with_shim(
-        FakeProvider::new(command(r"C:\"), command(r"C:\")).0,
-        CheckPermissions::Disable,
-    );
-    let (folder, failed) = rootless.provider_folder();
-    assert_eq!(folder, ProviderFolder::Unknown);
-    assert!(failed.is_some());
 }
 
 /// A provider that sweeps nothing has no folder, whatever its host's path is: not the host's folder,

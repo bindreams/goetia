@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::shim::{FolderCheck, HostCommand, ShimProvider, SweepFailure};
 
 /// A [`ShimProvider`] that records the calls it gets (`"preview"`, `"provide"`, `"sweep"`, in
@@ -37,16 +37,9 @@ impl ShimProvider for FakeProvider {
         Ok(self.preview.clone())
     }
 
-    /// The folder of the previewed host, without recording a call: it is no step of an install.
+    /// None, without recording a call: its `sweep` removes nothing, so it covers no folder.
     fn folder(&self) -> Result<Option<PathBuf>> {
-        match self.preview.exe.parent() {
-            Some(folder) => Ok(Some(folder.to_path_buf())),
-            None => Err(Error::os_at(
-                "find the folder of",
-                &self.preview.exe,
-                std::io::Error::from(std::io::ErrorKind::InvalidInput),
-            )),
-        }
+        Ok(None)
     }
 
     fn provide(&self, _folders: &FolderCheck) -> Result<HostCommand> {

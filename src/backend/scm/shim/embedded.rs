@@ -289,9 +289,11 @@ mod stock {
         }
     }
 
+    /// The command for `image` in `dir`, which the caller has checked is absolute.
     fn preview_in(dir: &Path, image: &Image<'_>) -> Result<HostCommand> {
+        debug_assert!(dir.is_absolute(), "{}", dir.display());
         Ok(HostCommand {
-            exe: absolute(dir)?.join(image.file_name()),
+            exe: dir.join(image.file_name()),
             args: vec![],
         })
     }

@@ -409,6 +409,14 @@ fn with_no_provider_nothing_is_retried() {
 
     assert!(said.contains(NEXT), "{said}");
     assert!(!said.contains(RETRY), "{said}");
+    // It does not claim a provider folder these files are outside of.
+    assert!(!said.contains("not in the folder"), "{said}");
+    assert!(
+        said.contains(
+            "No shim provider of this program sweeps a folder, so that command does not retry `/q/Other/b.exe`"
+        ),
+        "{said}"
+    );
 }
 
 /// The default folder itself, which is what a failed removal of it names, is the provider's.
