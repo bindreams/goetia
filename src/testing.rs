@@ -37,6 +37,11 @@ impl ShimProvider for FakeProvider {
         Ok(self.preview.clone())
     }
 
+    /// The folder of the previewed host, without recording a call: it is no step of an install.
+    fn folder(&self) -> Result<PathBuf> {
+        Ok(self.preview.exe.parent().map(PathBuf::from).unwrap_or_default())
+    }
+
     fn provide(&self, _folders: &FolderCheck) -> Result<HostCommand> {
         self.calls.lock().unwrap().push("provide");
         Ok(self.provide.clone())

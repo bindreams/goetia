@@ -33,6 +33,20 @@ impl ShimProvider for StandaloneShim {
         })
     }
 
+    /// The folder of `exe`: where the host is, not a folder the provider sweeps, since its `sweep`
+    /// removes nothing. A relative `exe` is [`Error::ShimPathRelative`].
+    fn folder(&self) -> Result<PathBuf> {
+        let command = self.preview()?;
+        match command.exe.parent() {
+            Some(folder) => Ok(folder.to_path_buf()),
+            None => Err(Error::os_at(
+                "find the folder of",
+                &command.exe,
+                std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            )),
+        }
+    }
+
     /// The same, once the file is confirmed to exist.
     fn provide(&self, _folders: &FolderCheck) -> Result<HostCommand> {
         let command = self.preview()?;

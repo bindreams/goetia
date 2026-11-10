@@ -773,9 +773,8 @@ fn only_a_gone_or_marked_service_is_an_expected_refusal_to_read_its_host() {
     assert!(!is_gone_or_marked(&os(ERROR_ACCESS_DENIED)));
 }
 
-/// The provider's folder, as an uninstall tells it: none without a provider, the folder of the
-/// previewed host, and unknown (with the failure) for a provider whose `preview` fails, which is not
-/// the absence of one.
+/// The provider's folder, as an uninstall tells it: none without a provider, its `folder()`, and
+/// unknown (with the failure) for a provider whose `folder()` fails, which is not the absence of one.
 #[skuld::test]
 fn the_providers_folder_is_none_known_or_unknown() {
     let (folder, failed) = Scm::new().provider_folder();
@@ -803,11 +802,39 @@ fn the_providers_folder_is_none_known_or_unknown() {
     );
 }
 
-/// What an uninstall makes of the failures of its cleanup and of a failed `preview`: the provider's
-/// sweep does not depend on `preview`, so a folder that could not be named is no failure of its own,
-/// and is told only beside one that is.
+/// A provider that cannot `preview` (its shim is not embedded) still has a folder, which an uninstall
+/// names without reading the shim.
 #[skuld::test]
-fn a_failed_preview_is_no_failed_cleanup_and_is_context_for_one() {
+fn the_providers_folder_does_not_need_its_preview() {
+    use crate::shim::EmbeddedStockShim;
+
+    let given = Scm::with_shim(
+        EmbeddedStockShim::new(None, Some(PathBuf::from(r"C:\app"))),
+        CheckPermissions::Disable,
+    );
+    assert!(matches!(
+        given.provider().unwrap().preview(),
+        Err(Error::ShimNotEmbedded)
+    ));
+    let (folder, failed) = given.provider_folder();
+    assert_eq!(
+        (folder, failed.is_none()),
+        (ProviderFolder::At(PathBuf::from(r"C:\app")), true)
+    );
+
+    let default = Scm::with_shim(EmbeddedStockShim::new(None, None), CheckPermissions::Disable);
+    let (folder, failed) = default.provider_folder();
+    assert_eq!(
+        (folder, failed.is_none()),
+        (ProviderFolder::At(normalise(&default_dir().unwrap())), true)
+    );
+}
+
+/// What an uninstall makes of the failures of its cleanup and of a provider folder that could not be
+/// named: the provider's sweep does not depend on it, so it is no failure of its own, and is told only
+/// beside one that is.
+#[skuld::test]
+fn an_unnamed_provider_folder_is_no_failed_cleanup_and_is_context_for_one() {
     let id = Id::try_from("frpc").unwrap();
     let unknown = || {
         Some(Error::Step {

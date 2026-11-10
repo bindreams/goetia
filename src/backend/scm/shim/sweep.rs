@@ -217,7 +217,7 @@ pub(crate) fn second_folder<'a>(
 pub(crate) enum ProviderFolder {
     /// The manager has no provider: nothing is retried.
     None,
-    /// It has one, and which folder it uses is not known (its `preview` failed): its sweep is still
+    /// It has one, and which folder it uses is not known (its `folder()` failed): its sweep is still
     /// what the retry runs.
     Unknown,
     At(PathBuf),

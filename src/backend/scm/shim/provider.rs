@@ -28,6 +28,12 @@ pub trait ShimProvider: Send + Sync {
     /// What `provide` would return, touching nothing. `--dry-run` and `render` use it.
     fn preview(&self) -> Result<HostCommand>;
 
+    /// The folder this provider's host is in, which its `sweep` covers. Needs neither the host's
+    /// bytes nor a successful `preview`: an uninstall names the folder whatever `preview` says. An
+    /// error when the folder cannot be known (a relative path, a default folder that cannot be
+    /// located). Touches nothing.
+    fn folder(&self) -> Result<PathBuf>;
+
     /// Under the install lock. Leaves the host ready at the returned path: writes, repairs or
     /// refuses. Idempotent. A provider that writes checks its folder with `folders` first.
     fn provide(&self, folders: &FolderCheck) -> Result<HostCommand>;

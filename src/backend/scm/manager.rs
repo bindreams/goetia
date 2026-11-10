@@ -1218,18 +1218,14 @@ fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
 
 impl Scm {
     /// The folder of the provider, as an uninstall tells it: [`ProviderFolder::None`] without a
-    /// provider, the normalised folder of the host its `preview` names, and
-    /// [`ProviderFolder::Unknown`] when the `preview` fails, which is not the absence of a provider:
-    /// the failure comes with it, for the uninstall to report.
+    /// provider, its normalised `folder()`, and [`ProviderFolder::Unknown`] when that fails, which is
+    /// not the absence of a provider: the failure comes with it, for the uninstall to report.
     fn provider_folder(&self) -> (ProviderFolder, Option<Error>) {
         let Some(shim) = &self.shim else {
             return (ProviderFolder::None, None);
         };
-        match shim.preview() {
-            Ok(command) => match command.exe.parent() {
-                Some(folder) => (ProviderFolder::At(normalise(folder)), None),
-                None => (ProviderFolder::Unknown, None),
-            },
+        match shim.folder() {
+            Ok(folder) => (ProviderFolder::At(normalise(&folder)), None),
             Err(e) => (
                 ProviderFolder::Unknown,
                 Some(Error::Step {
@@ -1277,7 +1273,7 @@ impl Scm {
     /// host's, and is reported with whatever else fails: the wait and the provider's sweep go on.
     /// A provider's sweep that fails on the same lookup reports it too.
     ///
-    /// A provider whose `preview` failed has no folder to name, and sweeps all the same; that is told
+    /// A provider whose `folder()` failed has no folder to name, and sweeps all the same; that is told
     /// only beside a failure of the cleanup, see [`finished_cleanup`].
     ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and

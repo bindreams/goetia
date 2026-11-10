@@ -734,6 +734,10 @@ impl ShimProvider for Gated {
         self.inner.preview()
     }
 
+    fn folder(&self) -> goetia::error::Result<PathBuf> {
+        self.inner.folder()
+    }
+
     fn provide(&self, folders: &FolderCheck) -> goetia::error::Result<HostCommand> {
         self.events
             .lock()
