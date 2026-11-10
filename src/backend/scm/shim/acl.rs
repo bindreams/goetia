@@ -385,9 +385,16 @@ mod system {
         ))
     }
 
-    /// Which object a handle is open on: the volume's serial number and the file's ID, which no
-    /// spelling of a path changes.
-    type ObjectId = (u64, [u8; 16]);
+    /// Which object a handle is open on, which no spelling of a path changes: by the file ID, or by
+    /// the older file index where the volume has no file ID. The forms never compare equal, since a
+    /// file index and a file ID can hold the same numbers and name two objects.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ObjectId {
+        /// The volume's 64-bit serial number and the file's 128-bit ID.
+        Id { volume: u64, id: [u8; 16] },
+        /// The volume's 32-bit serial number and the file's 64-bit index.
+        Index { volume: u32, index: u64 },
+    }
 
     /// The chain being read, and the objects in it.
     #[derive(Default)]
@@ -437,8 +444,8 @@ mod system {
     /// `by_id`, or when it failed, `by_index`; an error only when both did.
     ///
     /// The fallback is meant for volumes that have no file ID, but it fires on any error of
-    /// `by_id`. On another volume an object can then get two keys, one from each form, and the walk
-    /// reads it twice: that costs one read and never changes the verdict.
+    /// `by_id`. An object can then be keyed twice, once by each form, and the walk reads it twice:
+    /// one extra read. Keys of different forms never match, so no other object is skipped for it.
     pub(super) fn identity_of(
         by_id: io::Result<ObjectId>,
         by_index: impl FnOnce() -> io::Result<ObjectId>,
@@ -464,10 +471,13 @@ mod system {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+        Ok(ObjectId::Id {
+            volume: info.VolumeSerialNumber,
+            id: info.FileId.Identifier,
+        })
     }
 
-    /// The 64-bit file index, widened to an [`ObjectId`] with the volume's 32-bit serial.
+    /// The file index of `file`, with the volume's serial number.
     fn file_index(file: &File) -> io::Result<ObjectId> {
         // SAFETY: an all-zero `BY_HANDLE_FILE_INFORMATION` is a valid value of plain integers.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -475,10 +485,10 @@ mod system {
         if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-        let mut id = [0u8; 16];
-        id[..8].copy_from_slice(&index.to_le_bytes());
-        Ok((u64::from(info.dwVolumeSerialNumber), id))
+        Ok(ObjectId::Index {
+            volume: info.dwVolumeSerialNumber,
+            index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
     }
 
     /// Where the link at `link` leads, as one hop, with `.` and `..` applied lexically. A relative

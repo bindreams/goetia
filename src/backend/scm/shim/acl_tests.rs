@@ -445,7 +445,7 @@ fn bytes_that_are_not_a_sid_are_written_as_such_not_panicked_on() {
 
 #[cfg(windows)]
 pub(in crate::backend::scm::shim) mod windows {
-    use super::system::{display_path, identity_of, is_unreadable, parse, read_chain, resolve_target};
+    use super::system::{ObjectId, display_path, identity_of, is_unreadable, parse, read_chain, resolve_target};
     use super::*;
     use crate::error::Error;
     use std::io;
@@ -700,13 +700,23 @@ pub(in crate::backend::scm::shim) mod windows {
     #[skuld::test]
     fn the_file_index_stands_in_when_the_file_id_is_unsupported() {
         let unsupported = || Err(io::Error::from_raw_os_error(87));
-        let index = || Ok((7, [1; 16]));
+        let index = || Ok(ObjectId::Index { volume: 7, index: 1 });
+        let id = ObjectId::Id { volume: 1, id: [2; 16] };
+        assert_eq!(identity_of(Ok(id), || panic!("not needed")).unwrap(), id);
         assert_eq!(
-            identity_of(Ok((1, [2; 16])), || panic!("not needed")).unwrap(),
-            (1, [2; 16])
+            identity_of(unsupported(), index).unwrap(),
+            ObjectId::Index { volume: 7, index: 1 }
         );
-        assert_eq!(identity_of(unsupported(), index).unwrap(), (7, [1; 16]));
         assert!(identity_of(unsupported(), unsupported).is_err());
+    }
+
+    /// A file index and a file ID that spell the same bytes are two identities: an object that the
+    /// walk knows by one form is not taken for another object known by the other.
+    #[skuld::test]
+    fn an_identity_by_file_index_never_equals_one_by_file_id() {
+        let mut id = [0; 16];
+        id[..8].copy_from_slice(&5u64.to_le_bytes());
+        assert_ne!(ObjectId::Index { volume: 3, index: 5 }, ObjectId::Id { volume: 3, id });
     }
 
     #[skuld::test]
