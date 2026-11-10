@@ -2,13 +2,8 @@
 
 use std::sync::Arc;
 
-use crate::os::fake::{Fake, KILL_REFUSED};
-use crate::stop_bus::Supervisor;
-
-// The shim is its own crate and cannot reach `spec::test_support::plain_fields`; share the integration suites'
-// constructor.
-#[path = "../../../tests/support/daemon_spec.rs"]
-pub(crate) mod daemon_spec;
+use super::os::fake::{Fake, KILL_REFUSED};
+use super::stop_bus::Supervisor;
 
 /// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
 /// error code (`os_tests` pins it against `Real`, with the absolute-path case, which carries

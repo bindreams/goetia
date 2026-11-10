@@ -43,6 +43,12 @@ use crate::support::{self, ConnectBack, ELEVATED, ScratchKey, ServiceGuard};
 #[skuld::label]
 const SCM_DENIAL: skuld::Label;
 
+/// Held by every test here that takes the machine-wide install lock (a `type: simple` install),
+/// which the lock tests in `src/backend/scm/shim/lock_tests.rs` and `tests/shim_integration` poll
+/// for who holds it. Shared with both by label *name*.
+#[skuld::label]
+const UNIT_DIR_EXCLUSIVE: skuld::Label;
+
 fn id_of(s: &str) -> Id {
     Id::try_from(s).expect("random_test_id/short local ids are valid Ids")
 }
@@ -722,11 +728,15 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
 /// An `UpToDate` install writes nothing, so a second install of either kind must compare equal on
 /// everything the first wrote: failure actions, `Environment`, `Parameters`. A `type: simple`
 /// service's `Environment` is empty on both sides, whatever its spec's `env` says. It is registered
-/// but never started, so no shim binary is needed.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+/// but never started, so the shim is only provided and checked, never run: its manager has a provider,
+/// which `Scm::new()` has not.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_twice_is_up_to_date_for_both_kinds() {
-    let mgr = Scm::new();
     for kind in [Kind::Managed, Kind::Simple] {
+        let mgr = match kind {
+            Kind::Managed => Scm::new(),
+            Kind::Simple => support::stock_shim_manager(),
+        };
         let id = support::random_test_id();
         let _guard = ServiceGuard::new(&id);
         let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
@@ -1048,31 +1058,6 @@ fn force_install_rewrites_parameters_in_place_so_a_handle_held_across_it_still_r
 
 // Step 7: a real account gets SeServiceLogonRight =====================================================================
 
-struct LocalUserGuard {
-    name: String,
-}
-
-impl LocalUserGuard {
-    fn create(name: &str, password: &str) -> Self {
-        // Built after the add, not before: `/add` is atomic, so on failure nothing
-        // was created and a guard would delete an account this test did not make.
-        support::cmd::run("net.exe", &["user", name, password, "/add"]).expect_ok();
-        Self { name: name.to_string() }
-    }
-}
-
-impl Drop for LocalUserGuard {
-    fn drop(&mut self) {
-        // `net.exe` exits 2 for every error; the message names the Win32 one, and 2221 is
-        // NERR_UserNotFound ("NET HELPMSG 2221"), the account already gone.
-        support::cleanup::warn_left_behind(support::cmd::run_cleanup_unless(
-            "net.exe",
-            &[&["user", &self.name, "/delete"]],
-            |run| run.stderr.contains("2221"),
-        ));
-    }
-}
-
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn real_account_gets_service_logon_right() {
     // Windows local (SAM) account names are capped at 20 characters.
@@ -1082,7 +1067,7 @@ fn real_account_gets_service_logon_right() {
     // interactively about pre-Windows-2000 compatibility, which hangs
     // waiting on stdin in CI.
     let password = "Goetia!Test12";
-    let _user_guard = LocalUserGuard::create(&account, password);
+    let _user_guard = support::LocalUserGuard::create(&account, password);
 
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1192,7 +1177,7 @@ fn a_local_service_daemon_actually_runs() {
     let _guard = ServiceGuard::new(&id);
     // Held past the `install`/`start`/`stop` calls below and dropped (which
     // deletes the copy) only once nothing further needs to launch it.
-    let exe = common::WorldReadableExe::new(&id);
+    let exe = support::WorldReadableExe::new(&id);
     let started = ConnectBack::listen();
     let stopped = ConnectBack::listen();
     let spec = DaemonSpec::new(DaemonFields {
@@ -1402,7 +1387,7 @@ fn deleted_account_makes_the_service_oursunusable() {
     // interactively about pre-Windows-2000 compatibility, which hangs
     // waiting on stdin in CI.
     let password = "Goetia!Test12";
-    let user_guard = LocalUserGuard::create(&account, password);
+    let user_guard = support::LocalUserGuard::create(&account, password);
     let sid = common::sid_string_for_account(&account);
 
     let id = support::random_test_id();
@@ -1858,4 +1843,97 @@ fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
         recovery.contains("re-run as Administrator"),
         "a denial is the one cause elevation fixes: {recovery}"
     );
+}
+
+/// The service denies only `DC`, so `read` still proves it is goetia's and the verb's own open
+/// fails: exit `1`, not `Undetermined` (exit `4`).
+///
+/// Writes a real service's DACL, so it runs only on CI. `Denied` drops before `ServiceGuard`,
+/// restoring the DACL before the delete.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn enable_and_disable_of_a_service_that_denies_changing_its_config_fail_as_the_verb() {
+    let mgr = Scm::new();
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+    let spec = install_plain(&mgr, guard.id());
+
+    let _denied = Denied::service_change_config(&id);
+
+    // The deny ACE really took, as `ERROR_ACCESS_DENIED`, and queries still work.
+    let scm = WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("open SCM");
+    let blocked = scm
+        .open_service(&id, ServiceAccess::CHANGE_CONFIG)
+        .err()
+        .unwrap_or_else(|| panic!("the deny ACE did not apply: `{id}` is still changeable"));
+    assert!(
+        matches!(&blocked, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(5)),
+        "{blocked:?}"
+    );
+    mgr.status(&spec.id)
+        .expect("the deny leaves the read intact, so the id stays classified as goetia's");
+
+    type Verb = fn(&Scm, &Id) -> goetia::Result<()>;
+    let verbs: [(&str, Verb); 2] = [("enable", |m, id| m.enable(id)), ("disable", |m, id| m.disable(id))];
+    for (verb, run) in verbs {
+        let err = run(&mgr, &spec.id).expect_err("a denied open cannot enable or disable");
+        assert!(
+            !matches!(err.cause(), goetia::Error::Undetermined { .. }),
+            "{verb}: ownership was established by the read before the open: {err:?}"
+        );
+        assert!(!err.is_indeterminate(), "{verb}: exit 1, not 4: {err:?}");
+        let report = err.report().to_string();
+        assert!(
+            report.contains(&format!("`{verb}` was denied access to service `{id}`")),
+            "{verb}: {report}"
+        );
+    }
+}
+
+/// As above, for `uninstall`'s own opens of the service object: one that denies `DC` stops the
+/// disable that precedes the delete, one that denies `DELETE` stops the delete. Either is exit `1`
+/// naming `uninstall` and the service, says it was not deleted, and leaves the service installed.
+/// `kill` has no case here: its open needs only `QUERY_STATUS`, which `read` needs too, so a denial
+/// there is `read`'s `Undetermined`.
+///
+/// Writes a real service's DACL, so it runs only on CI.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn uninstall_of_a_service_that_denies_a_step_fails_as_the_verb_and_leaves_it_installed() {
+    type Case = (&'static str, fn(&str) -> Denied, &'static str);
+    let cases: [Case; 2] = [
+        (
+            "DC",
+            Denied::service_change_config,
+            "was NOT deleted and nothing about it was changed",
+        ),
+        (
+            "SD",
+            Denied::service_delete,
+            "is stopped and disabled but was NOT deleted",
+        ),
+    ];
+    for (denied_right, deny, says) in cases {
+        let mgr = Scm::new();
+        let id = support::random_test_id();
+        let guard = ServiceGuard::new(&id);
+        let spec = install_plain(&mgr, guard.id());
+
+        let _denied = deny(&id);
+
+        let err = mgr
+            .uninstall(&spec.id)
+            .expect_err("a denied open cannot disable or delete the service");
+        assert!(
+            !matches!(err.cause(), goetia::Error::Undetermined { .. }),
+            "{denied_right}: ownership was established by the read before the open: {err:?}"
+        );
+        assert!(!err.is_indeterminate(), "{denied_right}: exit 1, not 4: {err:?}");
+        let report = err.report().to_string();
+        assert!(
+            report.contains(&format!("`uninstall` was denied access to service `{id}`")),
+            "{denied_right}: {report}"
+        );
+        assert!(report.contains(says), "{denied_right}: {report}");
+        mgr.status(&spec.id)
+            .unwrap_or_else(|e| panic!("{denied_right}: the service must still be installed: {e:?}"));
+    }
 }

@@ -77,6 +77,24 @@ fn install_and_preview_refuse_what_only_render_for_install_refuses() {
     assert_eq!(fake.writes(), 0);
 }
 
+/// The definition is rendered, once, before anything the backend holds or writes: a refusal of the
+/// render is the one an install reports, ahead of `begin_install`'s (here an opaque id, which
+/// `begin_install` refuses), so a backend's scope (SCM's lock and provider write) is never taken for
+/// an install that cannot be rendered.
+#[skuld::test]
+fn install_renders_before_it_begins() {
+    let fake = Fake::new();
+    fake.seed_unfit_for_install("host");
+    fake.seed_opaque("frpc");
+
+    let err = fake
+        .install(&mk_as("frpc", "host"), false)
+        .expect_err("the render is refused");
+
+    assert!(err.to_string().contains("unfit for install (seeded)"), "{err}");
+    assert_eq!(fake.writes(), 0);
+}
+
 #[skuld::test]
 fn install_refuses_an_undecodable_blob_with_uninstall_advice() {
     let fake = Fake::new();
@@ -224,6 +242,63 @@ fn external_configuration_is_carried_into_the_outcome() {
     assert!(matches!(forced, Outcome::Stale { .. }), "{forced:?}");
 }
 
+// regenerate ==========================================================================================================
+
+/// A service whose host the provider now names elsewhere is the spec's own, unchanged: judged by
+/// the installed host, it is an `Update` to the new one, never a hand-edit's `Conflict`.
+#[skuld::test]
+fn moved_shim_reads_as_update() {
+    let fake = Fake::new();
+    fake.seed_host("old");
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_host("new");
+
+    let previewed = fake.preview_install(&mk("frpc")).unwrap();
+    let installed = fake.install(&mk("frpc"), false).unwrap();
+
+    assert!(matches!(previewed, Outcome::Update { .. }), "{previewed:?}");
+    assert!(matches!(installed, Outcome::Update { .. }), "{installed:?}");
+}
+
+/// `status` and `list` only check that the stored spec still regenerates, which needs no provider.
+#[skuld::test]
+fn status_and_list_use_regenerate() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_no_provider();
+
+    fake.status(&Id::try_from("frpc").unwrap())
+        .expect("status regenerates, which needs no provider");
+    let listed = fake.list().unwrap();
+
+    assert!(
+        matches!(listed.as_slice(), [Installed::Ours { spec, .. }] if spec.id.as_str() == "frpc"),
+        "{listed:?}"
+    );
+}
+
+/// A name that is no id has no snapshot, so it is reported by that name alone, whatever its spec
+/// would do when regenerated.
+#[skuld::test]
+fn misnamed_entry_is_reported_without_regenerating() {
+    let fake = Fake::new();
+    let name = "not a valid id";
+    fake.seed_foreign(name, generate(&mk_as("frpc", "gone")));
+    fake.seed_unresolvable_account("gone");
+    let invalid = Id::try_from(name).unwrap_err();
+
+    let listed = fake.list().unwrap();
+
+    let [entry @ Installed::OursUnusable { name: got, .. }] = listed.as_slice() else {
+        panic!("one unusable entry expected, got {listed:?}");
+    };
+    assert_eq!(got, name);
+    assert_eq!(
+        entry.unusable_reason(),
+        Some(format!("marked ours, but its name is not a valid daemon id: {invalid}"))
+    );
+}
+
 // status and list =====================================================================================================
 
 #[skuld::test]
@@ -241,6 +316,106 @@ fn status_reports_an_unresolvable_account_as_an_error() {
         ),
         other => panic!("expected Error::Step, got {other:?}"),
     }
+}
+
+fn installed_host_unreadable() -> Error {
+    Error::InstalledUnreadable {
+        id: "frpc".to_string(),
+        source: Box::new(Error::os(
+            "query configuration for `frpc`",
+            std::io::Error::other("access denied"),
+        )),
+    }
+}
+
+/// The one place a failed `regenerate` is told apart: `judge`, `status` and `list` all use it.
+#[skuld::test]
+fn a_failed_read_of_the_installed_host_is_told_from_a_spec_that_cannot_be_regenerated() {
+    assert!(matches!(
+        RegenerationFailure::of(installed_host_unreadable()),
+        RegenerationFailure::HostUnreadable(Error::InstalledUnreadable { .. })
+    ));
+    assert!(matches!(
+        RegenerationFailure::of(Error::os("resolve the account", std::io::Error::other("gone"))),
+        RegenerationFailure::SpecUnregenerable(Error::Os { .. })
+    ));
+}
+
+/// The read's failure is found under the wrappers a backend puts around it, as the classification of
+/// `NotInstalled` does: the whole error is kept, wrappers included.
+#[skuld::test]
+fn a_failed_read_of_the_installed_host_is_found_under_a_step_or_a_kept_error() {
+    let stepped = Error::Step {
+        what: "regenerate".to_string(),
+        source: Box::new(installed_host_unreadable()),
+    };
+    let kept = Error::Kept(Arc::new(installed_host_unreadable()));
+
+    for wrapped in [stepped, kept] {
+        match RegenerationFailure::of(wrapped) {
+            RegenerationFailure::HostUnreadable(whole) => {
+                assert!(
+                    whole.report().to_string().contains("failed to query configuration"),
+                    "{whole:?}"
+                )
+            }
+            RegenerationFailure::SpecUnregenerable(e) => panic!("classified as a spec failure: {e:?}"),
+        }
+    }
+    assert!(matches!(
+        RegenerationFailure::of(Error::Step {
+            what: "regenerate".to_string(),
+            source: Box::new(Error::os("resolve the account", std::io::Error::other("gone"))),
+        }),
+        RegenerationFailure::SpecUnregenerable(_)
+    ));
+}
+
+/// A failed read of what is installed is not a spec that cannot be regenerated.
+#[skuld::test]
+fn status_names_a_failed_read_of_the_installed_host_as_that() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_installed_fails("frpc", installed_host_unreadable);
+
+    let err = fake.status(&Id::try_from("frpc").unwrap()).unwrap_err();
+
+    assert_eq!(
+        err.report().to_string(),
+        "read `frpc`'s installed host: failed to query configuration for `frpc`: access denied"
+    );
+    assert!(matches!(err, Error::InstalledUnreadable { .. }), "{err:?}");
+}
+
+#[skuld::test]
+fn list_names_a_failed_read_of_the_installed_host_as_that() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_installed_fails("frpc", installed_host_unreadable);
+
+    let listed = fake.list().unwrap();
+
+    let [entry @ Installed::OursUnusable { name, .. }] = listed.as_slice() else {
+        panic!("one unusable entry expected, got {listed:?}");
+    };
+    assert_eq!(name, "frpc");
+    assert_eq!(
+        entry.unusable_reason().as_deref(),
+        Some("read `frpc`'s installed host: failed to query configuration for `frpc`: access denied")
+    );
+}
+
+/// The read finding the service gone is absence, however it is labelled.
+#[skuld::test]
+fn list_omits_a_service_whose_installed_host_read_found_it_gone() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_installed_fails("frpc", || Error::InstalledUnreadable {
+        id: "frpc".to_string(),
+        source: Box::new(Error::NotInstalled { id: "frpc".to_string() }),
+    });
+
+    assert!(fake.list().unwrap().is_empty());
 }
 
 #[skuld::test]
@@ -434,7 +609,8 @@ fn owned_maps_absent_foreign_and_marked() {
 }
 
 /// A verb takes the snapshot the gate yields, so the blanket impl alone gates every verb: on an id
-/// that is not goetia's each says why, and the backend is never asked to act.
+/// that is not goetia's each says why, and the backend is never asked to act. The one thing it is
+/// asked is the cleanup `uninstall` of an absent id offers it, which acts on nothing of the id's.
 #[skuld::test]
 fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
     let fake = Fake::new();
@@ -472,7 +648,11 @@ fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
         );
     }
 
-    assert_eq!(fake.calls(), [], "no verb reached the backend");
+    assert_eq!(
+        fake.calls(),
+        [("uninstall_absent", "nobody".to_string())],
+        "no verb reached the backend but the absent id's cleanup, once"
+    );
     assert_eq!(fake.prepared(), [], "no verb reserved anything before the gate passed");
     assert_eq!(fake.writes(), 0);
     let after = fake.preview_install(&mk("stranger")).unwrap();

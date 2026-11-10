@@ -5,13 +5,16 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::*;
 use crate::backend::scm::parameters::Stray;
 use crate::manager::ServiceManager;
-use crate::spec::DaemonFields;
+use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::Restart;
 use crate::spec::test_support::{plain_fields, program};
+use crate::spec::{AccountId, DaemonFields, User};
+use crate::testing::{FakeProvider, command};
 use windows_sys::Win32::System::Registry::REG_DWORD;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
@@ -151,6 +154,33 @@ fn the_scm_undetermined_recovery_names_both_causes_and_not_uninstall() {
             !recovery.contains("uninstall"),
             "{raw}: uninstall certifies ownership this read never established: {recovery}"
         );
+    }
+}
+
+/// An open made after `read` established that the id is installed and goetia's is an ordinary
+/// failure of the verb, exit `1`: `Undetermined` would say goetia does not know what is installed
+/// there, and exit `4`. No failure advises elevation, since the CLI's gate has already run.
+#[skuld::test]
+fn an_open_refused_after_ownership_is_an_ordinary_failure_of_the_verb() {
+    for (raw, denied) in [(ERROR_ACCESS_DENIED as i32, true), (1117, false)] {
+        let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(raw));
+        let err = open_refused("enable", "service `x`", "open service `x` to enable it", e);
+
+        assert!(
+            !matches!(err.cause(), Error::Undetermined { .. }),
+            "{raw}: ownership was established before this open: {err:?}"
+        );
+        assert!(!err.is_indeterminate(), "{raw}: a refusal is not an answer in doubt");
+        assert_eq!(err.raw_os_error(), Some(raw), "{raw}: the cause is kept");
+
+        let report = err.report().to_string();
+        assert!(report.contains("open service `x` to enable it"), "{raw}: {report}");
+        assert_eq!(
+            report.contains("`enable` was denied access to service `x`"),
+            denied,
+            "{raw}: {report}"
+        );
+        assert!(!report.contains("Administrator"), "{raw}: {report}");
     }
 }
 
@@ -611,6 +641,326 @@ fn install_and_preview_install_refuse_restart_always() {
     }
 }
 
+// The shim provider ---------------------------------------------------------------------------------------------------
+
+fn simple_fields() -> DaemonFields {
+    DaemonFields {
+        kind: Kind::Simple,
+        ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+    }
+}
+
+fn simple_daemon() -> DaemonSpec {
+    DaemonSpec::new(simple_fields()).unwrap()
+}
+
+#[skuld::test]
+fn new_has_no_provider() {
+    let mgr = Scm::new();
+
+    let err = mgr.render(&simple_daemon()).expect_err("a simple service needs a host");
+    assert!(matches!(err, Error::NoShimProvider), "{err:?}");
+    mgr.render(&daemon_spec(Restart::Never))
+        .expect("a managed service needs none");
+}
+
+/// With no provider there is nothing of the manager's own to sweep, so the retry of an uninstall
+/// for an absent id succeeds without taking the machine-wide lock or reading anything: a library
+/// caller that is not elevated keeps getting `NotInstalled` from `uninstall`. (A regression would
+/// try to create `Global\goetia-shim`, which fails unelevated, and this would be an error.)
+#[skuld::test]
+fn uninstall_of_an_absent_id_without_a_provider_takes_no_lock() {
+    Scm::new()
+        .uninstall_absent(&Id::try_from("never-installed").unwrap())
+        .expect("nothing to sweep");
+}
+
+#[skuld::test]
+fn render_names_the_previewed_host_verbatim() {
+    let host = HostCommand {
+        exe: PathBuf::from(r"C:\app\app.exe"),
+        args: vec!["--service-host".to_string()],
+    };
+    let (provider, _) = FakeProvider::new(host.clone(), host.clone());
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    let reg = mgr.render(&simple_daemon()).unwrap();
+
+    assert_eq!((reg.executable, reg.arguments), (host.exe, host.args));
+}
+
+#[skuld::test]
+fn managed_render_never_touches_the_provider() {
+    let (provider, calls) = FakeProvider::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    mgr.render(&daemon_spec(Restart::Never)).unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());
+}
+
+#[skuld::test]
+fn managed_begin_install_takes_no_lock_and_calls_no_provider() {
+    let (provider, calls) = FakeProvider::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    let spec = daemon_spec(Restart::Never);
+    let desired = mgr.render(&spec).unwrap();
+
+    let scope = mgr.begin_install(&spec, &desired).unwrap();
+
+    assert!(scope.is_none(), "a managed install holds no lock");
+    assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new());
+}
+
+/// A provided host that is the rendered one is accepted.
+#[skuld::test]
+fn a_provided_host_that_is_the_rendered_one_is_accepted() {
+    let host = command(r"C:\app\host.exe");
+
+    let accepted = confirm_provided(host.clone(), host.clone()).expect("the host agrees");
+
+    assert_eq!(accepted, host);
+}
+
+/// A provided host that is not the rendered one is refused as a mismatch, whatever its cause (a
+/// host that changed while the install waited, or a provider whose `preview` and `provide` disagree).
+#[skuld::test]
+fn a_provided_host_that_is_not_the_rendered_one_is_a_mismatch() {
+    let (rendered, provided) = (command(r"C:\app\old.exe"), command(r"C:\app\new.exe"));
+
+    let Err(Error::ShimHostMismatch {
+        rendered: said,
+        provided: gave,
+    }) = confirm_provided(rendered.clone(), provided.clone())
+    else {
+        panic!("a provided host that is not the rendered one must be a mismatch");
+    };
+
+    assert_eq!((*said, *gave), (rendered, provided));
+}
+
+const SHIM_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+/// A registered host is the shim by its file name alone, quoted or not, with or without arguments.
+#[skuld::test]
+fn a_registered_host_is_a_shim_by_its_file_name() {
+    let shim = format!(r"C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe");
+
+    assert_eq!(
+        shim_host(&format!(r#""{shim}" --service-host"#)),
+        Some(PathBuf::from(&shim))
+    );
+    assert_eq!(shim_host(r"C:\bin\frpc.exe"), None);
+    assert_eq!(
+        shim_host(&format!(
+            r"C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.k3j9.stale.exe"
+        )),
+        None,
+        "a file set aside is not a service's host"
+    );
+}
+
+/// Only a service that is gone or marked for deletion refuses the read of its host as a matter of
+/// course; any other failure is not "no shim", and is reported.
+#[skuld::test]
+fn only_a_gone_or_marked_service_is_an_expected_refusal_to_read_its_host() {
+    let os = |code: u32| Error::os("query configuration", std::io::Error::from_raw_os_error(code as i32));
+
+    assert!(is_gone_or_marked(&Error::NotInstalled { id: "x".to_string() }));
+    assert!(is_gone_or_marked(&os(ERROR_SERVICE_MARKED_FOR_DELETE)));
+    assert!(is_gone_or_marked(&os(ERROR_SERVICE_DOES_NOT_EXIST)));
+    assert!(!is_gone_or_marked(&os(ERROR_ACCESS_DENIED)));
+}
+
+/// The provider's folder, as an uninstall tells it: none without a provider, the folder of the
+/// previewed host, and unknown (with the failure) for a provider whose `preview` fails, which is not
+/// the absence of one.
+#[skuld::test]
+fn the_providers_folder_is_none_known_or_unknown() {
+    let (folder, failed) = Scm::new().provider_folder();
+    assert_eq!((folder, failed.is_none()), (ProviderFolder::None, true));
+
+    let known = Scm::with_shim(
+        crate::shim::StandaloneShim::new(PathBuf::from(r"C:\app\host.exe"), vec![]),
+        CheckPermissions::Disable,
+    );
+    let (folder, failed) = known.provider_folder();
+    assert_eq!(
+        (folder, failed.is_none()),
+        (ProviderFolder::At(PathBuf::from(r"C:\app")), true)
+    );
+
+    let relative = Scm::with_shim(
+        crate::shim::StandaloneShim::new(PathBuf::from("host.exe"), vec![]),
+        CheckPermissions::Disable,
+    );
+    let (folder, failed) = relative.provider_folder();
+    assert_eq!(folder, ProviderFolder::Unknown);
+    assert!(
+        matches!(&failed, Some(Error::Step { source, .. }) if matches!(**source, Error::ShimPathRelative { .. })),
+        "{failed:?}"
+    );
+}
+
+/// What an uninstall makes of the failures of its cleanup and of a failed `preview`: the provider's
+/// sweep does not depend on `preview`, so a folder that could not be named is no failure of its own,
+/// and is told only beside one that is.
+#[skuld::test]
+fn a_failed_preview_is_no_failed_cleanup_and_is_context_for_one() {
+    let id = Id::try_from("frpc").unwrap();
+    let unknown = || {
+        Some(Error::Step {
+            what: "the folder of this program's shim provider could not be determined".to_string(),
+            source: Box::new(Error::ShimPathRelative {
+                path: PathBuf::from("host.exe"),
+            }),
+        })
+    };
+
+    finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), vec![])
+        .expect("every sweep succeeded, so the folder is not an error");
+
+    let file = PathBuf::from(r"C:\app\goetia-shim.exe");
+    let failure = SweepFailure {
+        error: Box::new(Error::os_at(
+            "delete",
+            &file,
+            std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32),
+        )),
+        not_deleted: vec![file],
+    };
+    let said = finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), vec![failure])
+        .expect_err("a file could not be deleted")
+        .report()
+        .to_string();
+    assert!(said.contains("could not be removed"), "{said}");
+    assert!(said.contains("could not be determined"), "{said}");
+}
+
+/// A `stop` whose process could not be opened says so in the error that follows, led by it, and the
+/// error under it keeps its class: a timeout is still indeterminate.
+#[skuld::test]
+fn a_stop_error_says_when_the_process_could_not_be_waited_for() {
+    let id = Id::try_from("frpc").unwrap();
+    let timeout = budget::timed_out("frpc", "stopped", Budget::Bounded(std::time::Duration::from_secs(1)));
+    let error = unwaited(&id, std::io::Error::other("access denied"), timeout);
+
+    assert!(error.is_indeterminate(), "{error:?}");
+    let said = error.report().to_string();
+    assert!(
+        said.contains("`frpc`'s process") && said.contains("access denied"),
+        "{said}"
+    );
+    assert!(said.contains("goetia stopped waiting"), "{said}");
+}
+
+/// Every refusal `render_for_install` makes comes before the lock is taken and before the provider
+/// writes: a refused install leaves no file behind. The install flow renders before it begins, and
+/// `begin_install` renders nothing.
+#[skuld::test]
+fn a_refused_simple_install_never_reaches_the_provider() {
+    let refused = [
+        (
+            "restart: always",
+            DaemonFields {
+                restart: Restart::Always,
+                ..simple_fields()
+            },
+            command(r"C:\app\app.exe"),
+        ),
+        (
+            "an account that does not resolve",
+            DaemonFields {
+                user: User::Id(AccountId::Uid(1000)),
+                ..simple_fields()
+            },
+            command(r"C:\app\app.exe"),
+        ),
+        (
+            "a host path the registration writer would mangle",
+            simple_fields(),
+            command(r"C:\Program Files\Goetia\"),
+        ),
+    ];
+    for (what, fields, host) in refused {
+        let (provider, calls) = FakeProvider::new(host.clone(), host);
+        let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+        let err = mgr
+            .install(&DaemonSpec::new(fields).unwrap(), false)
+            .map(|_| ())
+            .expect_err(what);
+
+        assert!(
+            matches!(err, Error::Invalid { .. } | Error::AccountLookup { .. }),
+            "{what}: {err:?}"
+        );
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"provide") && !calls.contains(&"sweep"),
+            "{what}: a refused install wrote through the provider: {calls:?}"
+        );
+    }
+}
+
+/// A snapshot that has never opened a service, with `config` already queried: any further SCM
+/// access would fail or find no such service, so a test that gets an answer shows there was none.
+fn snapshot_with_config(spec: &DaemonSpec, command_line: &str) -> ScmSnapshot {
+    let blob = Blob {
+        schema: 1,
+        version: crate::version().to_string(),
+        spec: spec.clone(),
+    };
+    let snapshot = ScmSnapshot::new(spec.id.clone(), Ok(blob), (Parameters::default(), None));
+    let config = windows_service::service::ServiceConfig {
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::OnDemand,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: PathBuf::from(command_line),
+        load_order_group: None,
+        tag_id: 0,
+        dependencies: vec![],
+        account_name: None,
+        display_name: "frpc".into(),
+    };
+    assert!(snapshot.config.set(config).is_ok());
+    snapshot
+}
+
+#[skuld::test]
+fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
+    let spec = simple_daemon();
+    let snapshot = snapshot_with_config(&spec, r#""C:\Program Files\App\app.exe" --service-host"#);
+    let (provider, calls) = FakeProvider::new(command(r"C:\elsewhere\host.exe"), command(r"C:\elsewhere\host.exe"));
+    let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    let reg = mgr.regenerate(&spec, &snapshot).unwrap();
+
+    assert_eq!(reg.executable, PathBuf::from(r"C:\Program Files\App\app.exe"));
+    assert_eq!(reg.arguments, ["--service-host"]);
+    assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "no provider is consulted");
+}
+
+/// A stop whose hold expired and whose STOP was sent is the wait that ran out, led by the process SCM
+/// still named.
+#[skuld::test]
+fn an_unconfirmed_stop_names_the_process_scm_still_named_and_is_a_wait_timeout() {
+    let budget = Budget::Bounded(std::time::Duration::from_secs(5));
+
+    let error = unconfirmed_stop(&Id::try_from("frpc").unwrap(), 4242, budget);
+
+    assert_eq!(
+        error.report().to_string(),
+        "goetia could not hold `frpc`'s process before the time ran out (SCM still named process 4242, which was \
+         gone), so it cannot confirm that the service's process exited, whether or not SCM reports the service \
+         stopped: `frpc` did not report stopped within 5s: goetia stopped waiting. The \
+         request was not cancelled, so `frpc` may still reach stopped; `goetia daemon status frpc` shows the \
+         manager's current view. Allow longer with `--timeout <duration>`, or wait indefinitely with `--no-timeout`."
+    );
+    assert!(error.is_indeterminate());
+}
+
 // uninstall's failures ================================================================================================
 
 fn uninstall_failure(state: &UninstallFailure) -> String {
@@ -709,6 +1059,66 @@ fn a_delete_failure_says_stopped_disabled_not_deleted_and_names_the_previous_sta
     let unknown = uninstall_failure(&UninstallFailure::Delete { previous: None });
     assert!(unknown.contains("NOT deleted"), "{unknown}");
     assert!(!unknown.contains("start type was"), "{unknown}");
+}
+
+#[skuld::test]
+fn a_failure_before_anything_was_touched_claims_no_change_to_the_service() {
+    let text = uninstall_failure(&UninstallFailure::Untouched);
+    assert!(
+        text.contains("`frpc` was NOT deleted and nothing about it was changed"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Re-run `goetia daemon uninstall frpc` to retry"),
+        "{text}"
+    );
+    assert!(text.contains("does not accept STOP"), "{text}");
+    for stale in ["disabled", "stopped", "goetia daemon enable", "goetia daemon start"] {
+        assert!(
+            !text.contains(stale),
+            "`{stale}` is false when nothing was touched: {text}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_failed_disable_claims_only_that_the_service_was_not_deleted() {
+    let text = uninstall_failure(&UninstallFailure::DisableFailed);
+    assert!(text.contains("`frpc` was NOT deleted"), "{text}");
+    assert!(
+        text.contains("Re-run `goetia daemon uninstall frpc` to retry"),
+        "{text}"
+    );
+    assert!(text.contains("does not accept STOP"), "{text}");
+    for unproven in [
+        "nothing about it was changed",
+        "unchanged",
+        "is now disabled",
+        "stopped",
+    ] {
+        assert!(
+            !text.contains(unproven),
+            "a failed ChangeServiceConfig is not documented as all-or-nothing: {text}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_denied_service_manager_open_is_named_as_the_managers() {
+    let denied = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let report = open_refused(
+        "uninstall",
+        "the service manager",
+        "open the Service Control Manager to uninstall `x`",
+        denied,
+    )
+    .report()
+    .to_string();
+    assert!(
+        report.contains("`uninstall` was denied access to the service manager"),
+        "{report}"
+    );
+    assert!(!report.contains("to service"), "{report}");
 }
 
 #[skuld::test]

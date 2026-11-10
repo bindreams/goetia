@@ -2,7 +2,8 @@
 name = "goetia"
 version = "0.3.0"
 edition = "2024"
-# Let-chains and `slice::as_chunks` (both stable in 1.88) force the floor.
+# Let-chains and `slice::as_chunks` (both stable in 1.88) force the floor; `sha2` 0.11, which hashes the
+# stock shim on Windows, declares 1.88 too.
 rust-version = "1.88"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
@@ -22,19 +23,18 @@ path = "src/main.rs"
 harness = false
 required-features = ["cli"]
 
-# Windows-only (the service host `type: simple` daemons run under), but not
-# `required-features`-gated the way `goetia` is `cli`-gated: there is no
-# platform-conditional feature in Cargo, so this target's own source is
-# `#[cfg(windows)]`-gated internally instead (see `src/bin/shim/main.rs`) and
-# reduces to an inert stub on every other target — it still needs to *build*
-# everywhere so `cargo test`/`cargo clippy --all-targets` stay green on
-# Linux/macOS CI, and so `CARGO_BIN_EXE_goetia-shim` resolves unconditionally
-# for `tests/shim_integration.rs`, whose own real assertions are themselves
-# `#[cfg(windows)]`-gated.
+# The stock shim: the Windows service host `type: simple` daemons run under.
+# `goetia::stock_shim!()` expands to its `fn main`, so this target is one line
+# and builds on every target (the library's `shim::main` reduces to an
+# "only on Windows" exit elsewhere), so `CARGO_BIN_EXE_goetia-shim` resolves
+# unconditionally for `tests/shim_integration.rs`. Its code is
+# `backend::scm::shim::run` in the library. No `required-features`: Cargo has
+# no platform-conditional feature. goetia.exe installs it from beside itself
+# (`cargo install` and `cargo build` lay both binaries out together) unless
+# built with the `goetia-shim` feature, which embeds it instead.
 [[bin]]
 name = "goetia-shim"
-path = "src/bin/shim/main.rs"
-harness = false
+path = "src/bin/goetia-shim.rs"
 
 [lib]
 name = "goetia"
@@ -47,13 +47,19 @@ default = ["cli"]
 # `goetia = { version = "0.1", default-features = false }` stays a clean
 # library dependency (see the design spec's crate table, §1).
 cli = ["dep:clap"]
+# Set only by a build that embeds the stock shim (`goetia::embed_shim!()` is `Some` under it). The
+# release workflow turns it on for the `goetia` binary, whose `stock_shim()` then embeds it rather
+# than reading `goetia-shim.exe` beside it; the library never reads it.
+goetia-shim = []
+# Exports helpers the crate's own tests share; adds items only, gates no behaviour.
+testing = []
 
 [dependencies]
 base64 = "0.23"
 clap = { version = "4.6.6", features = ["derive"], optional = true }
 # The shim's process-tree containment, spawn, and waiting: `.contain()` is a
 # Windows Job Object with `KILL_ON_JOB_CLOSE`, and `wait()`/`wait_tree()` are
-# real, event-driven kernel waits — see `src/bin/shim/service.rs`. Also the
+# real, event-driven kernel waits — see `src/backend/scm/shim/run/service.rs`. Also the
 # Unix backends' bounded subprocess wait (`backend::bounded`): `Child::wait_deadline`
 # and `Child::kill_tree` bound and reap the `systemctl`/`launchctl` calls
 # `daemon start --timeout` waits on. 0.x with an explicitly unstable API.
@@ -65,6 +71,9 @@ cosca = "0.4"
 # still returns a queued item rather than timing out).
 crossbeam-channel = "0.5.17"
 humantime = "2"
+# The marker scan (`backend::scm::shim::marker`): a SIMD substring search, so a multi-gigabyte host
+# costs one fast pass.
+memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "3"
@@ -100,6 +109,9 @@ nix = { version = "0.31", features = ["user", "fs"] }
 # `manager::native()` needs it on every Windows build regardless of the `cli`
 # feature, since it is part of the core library, not CLI-only output formatting.
 windows-service = "0.8"
+# `EmbeddedStockShim` names the stock shim by the SHA-256 of its bytes and verifies a file
+# of that name against it.
+sha2 = "0.11.1"
 # `Services\<name>\Parameters` (the metadata blob) and `Services\<name>\Environment`
 # (see `manager::registry`) are read and written directly through the
 # registry: `windows-service`'s `ServiceConfig` exposes neither.
@@ -112,12 +124,13 @@ winreg = "0.56"
 # `RegQueryValueExW` and `RegEnumValueW`, which read an `Environment` or `Parameters` value of any
 # type where `winreg` fails on one above `REG_QWORD`, and `NtDeleteValueKey` and `NtOpenKey`, which
 # remove a name that holds a NUL by its stated length where `RegDeleteValueW` would stop at it
-# (`manager::registry`).
+# (`manager::registry`); the owner and DACL reads of the shim folder check (`scm::shim::acl`), the
+# protected DACL a shim file is created with, and `%ProgramFiles%` (`SHGetKnownFolderPath`, whose
+# string `CoTaskMemFree` releases: `Win32_System_Com`).
 #
-# The shim (`src/bin/shim/`, same crate/dependency graph — see the
-# `goetia-shim` `[[bin]]` above) adds `Win32_System_EventLog`, the
+# The shim (`src/backend/scm/shim/run/`) adds `Win32_System_EventLog`, the
 # version-skew/log-path-denied fallback channel — see
-# `src/bin/shim/os/eventlog.rs`. Process-tree containment (the Windows Job
+# `src/backend/scm/shim/run/os/eventlog.rs`. Process-tree containment (the Windows Job
 # Object a supervised daemon's whole descendant tree is killed through) is
 # `cosca`'s own dependency, not a windows-sys feature this crate needs to
 # request itself.
@@ -126,6 +139,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Authentication_Identity",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
     "Win32_System_EventLog",
     "Win32_System_Registry",
     "Win32_System_Services",
@@ -136,6 +153,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Turns on `testing` for the integration tests, which reach the library only through its public API.
+# Without `default-features = false` it would also turn on `cli` in a `--no-default-features` build.
+goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.3"
 rand = "0.10"
 

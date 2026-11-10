@@ -19,6 +19,7 @@ mod contract;
 pub(crate) mod created_dirs;
 pub mod launchd;
 pub mod scm;
+pub(crate) mod standby;
 pub mod systemd;
 
 /// The integration suites' removal of what a test created, shared with the library's unit tests;

@@ -223,7 +223,18 @@ jobs:
           if [[ "$TARGET" == *musl* ]]; then
             export RUSTFLAGS="-Ctarget-feature=+crt-static -Clink-self-contained=yes"
           fi
-          cargo build --release --locked --target "$TARGET"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            # Two stages: goetia.exe embeds the stock shim, so the archive
+            # ships goetia.exe alone. Stage 1 builds the shim; stage 2 builds
+            # the program target alone with the `goetia-shim` feature and
+            # the shim's absolute path (`include_bytes!` resolves a relative
+            # one against the source file).
+            cargo build --release --locked --target "$TARGET" --bin goetia-shim
+            GOETIA_SHIM_EXE="$(cygpath -m "$PWD/target/${TARGET}/release/goetia-shim.exe")" \
+              cargo build --release --locked --target "$TARGET" --bin goetia --features goetia-shim
+          else
+            cargo build --release --locked --target "$TARGET" --bin goetia
+          fi
 
       - name: Stage and archive (Unix)
         if: runner.os != 'Windows'
@@ -237,7 +248,7 @@ jobs:
           # target/<target>/release/, never target/release/ — the latter
           # holds the same host binaries on every native row and would
           # silently produce five archives of one host's binaries.
-          cp "target/${TARGET}/release/goetia" "target/${TARGET}/release/goetia-shim" "$dir/"
+          cp "target/${TARGET}/release/goetia" "$dir/"
           cp README.md LICENSE.md "$dir/"
           tar -cJf "${dir}.tar.xz" "$dir/"
 
@@ -251,7 +262,6 @@ jobs:
           $dir = "goetia-$env:TARGET"
           New-Item -ItemType Directory -Path $dir | Out-Null
           Copy-Item "target/$env:TARGET/release/goetia.exe" "$dir/"
-          Copy-Item "target/$env:TARGET/release/goetia-shim.exe" "$dir/"
           Copy-Item README.md, LICENSE.md "$dir/"
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
 
@@ -280,6 +290,37 @@ jobs:
             Write-Error "zip entries use backslash separators: $($bad.FullName -join ', ')"
             exit 1
           }
+
+      # The staged goetia.exe alone must install, run and uninstall a
+      # `type: simple` service: it carries the stock shim. The runner is
+      # elevated; goetia puts the shim under Program Files and sweeps it on
+      # uninstall.
+      - name: Smoke test the staged goetia.exe (Windows)
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exe="$PWD/goetia-${TARGET}/goetia.exe"
+          id=goetia-release-smoke
+          dir="$RUNNER_TEMP/smoke"
+          mkdir -p "$dir"
+          cat > "$dir/goetia.yaml" <<EOF
+          id: $id
+          command: ['C:/Windows/System32/ping.exe', '-t', '127.0.0.1']
+          type: simple
+          EOF
+          trap '"$exe" daemon uninstall "$id" || true' EXIT
+          "$exe" daemon install -f "$dir" --start
+          status="$("$exe" daemon status "$id")"
+          echo "$status"
+          [[ "$status" == *"$id: running"* ]]
+          "$exe" daemon uninstall "$id"
+          if compgen -G "$(cygpath -u "$PROGRAMFILES")/Goetia/goetia-shim-*.exe" > /dev/null; then
+            echo "::error::a goetia-shim-*.exe remains under Program Files after uninstall"
+            exit 1
+          fi
 
       - name: Upload archive (Unix)
         if: runner.os != 'Windows'

@@ -10,16 +10,17 @@ use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
 
+use crate::spec::test_support::plain_fields;
+use crate::spec::{DaemonFields, DaemonSpec};
 use cosca::identity::{Liveness, Resolved};
 use cosca::{Process, Stdio};
-use goetia::spec::{DaemonFields, DaemonSpec};
 use skuld::temp_dir;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 
 use super::*;
-use crate::os::fake::FakeGuard;
-use crate::service::build_command;
-use crate::test_support::{daemon_spec, not_found};
+use crate::backend::scm::shim::run::os::fake::FakeGuard;
+use crate::backend::scm::shim::run::service::build_command;
+use crate::backend::scm::shim::run::test_support::not_found;
 
 /// Holds a real daemon and ends it when dropped, so a failing test leaves no sleeper behind. Made
 /// before the spawn it will hold.
@@ -241,7 +242,7 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
         cwd: Some(cwd.clone()),
         env: BTreeMap::from([("GOETIA_TEST_VAR".to_string(), "from-spec".to_string())]),
         logs: Some(logs.clone()),
-        ..daemon_spec::spec(ID, command.map(str::to_string).to_vec())
+        ..plain_fields(ID, command.map(str::to_string).to_vec())
     })
     .unwrap();
     let fake = FakeGuard::new();

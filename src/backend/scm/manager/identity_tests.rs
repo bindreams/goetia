@@ -80,3 +80,18 @@ fn password_var_not_unicode_errs_rather_than_downgrading_to_none() {
         "`GOETIA_SERVICE_PASSWORD` is set but its value is not valid Unicode"
     );
 }
+
+// account_name_of_sid =================================================================================================
+
+#[skuld::test]
+fn a_sid_in_bytes_resolves_to_its_account_name() {
+    // S-1-5-18, LocalSystem.
+    let name = account_name_of_sid(&[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]).expect("S-1-5-18 always resolves");
+    assert!(name.contains("SYSTEM"), "{name}");
+}
+
+#[skuld::test]
+fn bytes_that_are_not_a_sid_are_an_error_not_a_read_past_them() {
+    let err = account_name_of_sid(&[1, 3, 0, 0, 0, 0, 0, 5, 1, 0]).expect_err("truncated");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+}

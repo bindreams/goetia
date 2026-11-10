@@ -256,35 +256,34 @@ should_omit() {
     return 1
 }
 
-# write_members <dir> <goetia-content> <shim-content> [omit...]
-# Populates <dir> with goetia, goetia-shim, README.md and LICENSE.md,
-# skipping any name passed in the trailing omit list.
+# write_members <dir> <goetia-content> [omit...]
+# Populates <dir> with goetia, README.md and LICENSE.md, skipping any name
+# passed in the trailing omit list.
 write_members() {
-    local dir="$1" goetia_content="$2" shim_content="$3"
-    shift 3
+    local dir="$1" goetia_content="$2"
+    shift 2
     mkdir -p "$dir"
 
     local name
-    for name in goetia goetia-shim README.md LICENSE.md; do
+    for name in goetia README.md LICENSE.md; do
         if should_omit "$name" "$@"; then
             continue
         fi
         case "$name" in
             goetia) printf '%s' "$goetia_content" > "${dir}/${name}" ;;
-            goetia-shim) printf '%s' "$shim_content" > "${dir}/${name}" ;;
             *) printf '%s content\n' "$name" > "${dir}/${name}" ;;
         esac
     done
 }
 
-# make_tar_archive <output> <target> <goetia-content> <shim-content> [omit...]
+# make_tar_archive <output> <target> <goetia-content> [omit...]
 # Builds a `.tar.xz` the same way the workflow does: a single top-level
 # `goetia-<target>/` directory, tarred from its parent.
 make_tar_archive() {
-    local out="$1" target="$2" goetia_content="$3" shim_content="$4"
-    shift 4
+    local out="$1" target="$2" goetia_content="$3"
+    shift 3
     local root; root="$(mktemp -d -p "$archive_root")"
-    write_members "${root}/goetia-${target}" "$goetia_content" "$shim_content" "$@"
+    write_members "${root}/goetia-${target}" "$goetia_content" "$@"
     tar -cJf "$out" -C "$root" "goetia-${target}"
 }
 
@@ -349,23 +348,20 @@ with zipfile.ZipFile(out, "w") as archive:
 PY
 }
 
-# make_zip_archive <output> <target> <goetia-content> <shim-content> [omit...]
-# A well-formed Windows archive: forward-slash separators, `.exe` on both
-# binaries.
+# make_zip_archive <output> <target> <goetia-content> [omit...]
+# A well-formed Windows archive: forward-slash separators, `.exe` on the
+# binary.
 make_zip_archive() {
-    local out="$1" target="$2" goetia_content="$3" shim_content="$4"
-    shift 4
+    local out="$1" target="$2" goetia_content="$3"
+    shift 3
     local root; root="$(mktemp -d -p "$archive_root")"
     local staged="${root}/goetia-${target}"
-    write_members "$staged" "$goetia_content" "$shim_content" "$@"
+    write_members "$staged" "$goetia_content" "$@"
 
     local prefix="goetia-${target}"
     local entries=()
     if [[ -f "${staged}/goetia" ]]; then
         entries+=("${prefix}/goetia.exe=${staged}/goetia")
-    fi
-    if [[ -f "${staged}/goetia-shim" ]]; then
-        entries+=("${prefix}/goetia-shim.exe=${staged}/goetia-shim")
     fi
     if [[ -f "${staged}/README.md" ]]; then
         entries+=("${prefix}/README.md=${staged}/README.md")
@@ -423,20 +419,20 @@ unix_targets=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-
 windows_target=x86_64-pc-windows-msvc
 
 # build_complete_set — prints five well-formed archive paths, one per line,
-# one per target, each binary's content unique to its (target, role) pair so
-# the cross-archive distinctness check never fires by accident.
+# one per target, each binary's content unique to its target so the
+# cross-archive distinctness check never fires by accident.
 build_complete_set() {
     local root; root="$(mktemp -d -p "$archive_root")"
     local target archive
 
     for target in "${unix_targets[@]}"; do
         archive="${root}/goetia-${target}.tar.xz"
-        make_tar_archive "$archive" "$target" "goetia bytes for ${target}" "shim bytes for ${target}"
+        make_tar_archive "$archive" "$target" "goetia bytes for ${target}"
         printf '%s\n' "$archive"
     done
 
     archive="${root}/goetia-${windows_target}.zip"
-    make_zip_archive "$archive" "$windows_target" "goetia bytes for ${windows_target}" "shim bytes for ${windows_target}"
+    make_zip_archive "$archive" "$windows_target" "goetia bytes for ${windows_target}"
     printf '%s\n' "$archive"
 }
 
@@ -461,49 +457,65 @@ fi
 
 root="$(mktemp -d -p "$archive_root")"
 archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
-make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes" "shim bytes" goetia-shim
-assert_archives_rejects "rejects an archive missing goetia-shim" 1 "$archive"
-
-root="$(mktemp -d -p "$archive_root")"
-archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
-make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes" "shim bytes" goetia
+make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes" goetia
 assert_archives_rejects "rejects an archive missing goetia" 1 "$archive"
 
 root="$(mktemp -d -p "$archive_root")"
 archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
-make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes" "shim bytes" README.md
+make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes" README.md
 assert_archives_rejects "rejects an archive missing README.md" 1 "$archive"
 
 root="$(mktemp -d -p "$archive_root")"
 archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
-make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes" "shim bytes" LICENSE.md
+make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes" LICENSE.md
 assert_archives_rejects "rejects an archive missing LICENSE.md" 1 "$archive"
 
 root="$(mktemp -d -p "$archive_root")"
 flat_staged="${root}/flat"
-write_members "$flat_staged" "goetia bytes" "shim bytes"
+write_members "$flat_staged" "goetia bytes"
 archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
-tar -cJf "$archive" -C "$flat_staged" goetia goetia-shim README.md LICENSE.md
+tar -cJf "$archive" -C "$flat_staged" goetia README.md LICENSE.md
 assert_archives_rejects "rejects a flat archive with no goetia-<target>/ prefix" 1 "$archive"
 
-# The same five member-set rejections against the `.zip` branch. It runs
+# The archives ship `goetia` alone: the stock shim is embedded in it, so a
+# `goetia-shim` member is an extra member, not a requirement.
+root="$(mktemp -d -p "$archive_root")"
+staged="${root}/goetia-x86_64-unknown-linux-musl"
+write_members "$staged" "goetia bytes"
+printf 'shim bytes' > "${staged}/goetia-shim"
+archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
+tar -cJf "$archive" -C "$root" goetia-x86_64-unknown-linux-musl
+assert_archives_rejects_matching "rejects an archive that still ships goetia-shim" 1 "member set mismatch" "$archive"
+
+root="$(mktemp -d -p "$archive_root")"
+staged="${root}/stage"
+write_members "$staged" "goetia bytes"
+printf 'shim bytes' > "${staged}/goetia-shim"
+archive="${root}/goetia-${windows_target}.zip"
+make_zip_entries "$archive" \
+    "goetia-${windows_target}/goetia.exe=${staged}/goetia" \
+    "goetia-${windows_target}/goetia-shim.exe=${staged}/goetia-shim" \
+    "goetia-${windows_target}/README.md=${staged}/README.md" \
+    "goetia-${windows_target}/LICENSE.md=${staged}/LICENSE.md"
+assert_archives_rejects_matching "rejects a zip that still ships goetia-shim.exe" 1 "member set mismatch" "$archive"
+
+# The same member-set rejections against the `.zip` branch. It runs
 # different listing and extraction commands (`unzip -Z1`/`unzip -p`) and
 # interpolates `.exe` into the expected set, so nothing above covers it —
 # and Windows is the row most likely to diverge.
-for omitted in goetia-shim goetia README.md LICENSE.md; do
+for omitted in goetia README.md LICENSE.md; do
     root="$(mktemp -d -p "$archive_root")"
     archive="${root}/goetia-${windows_target}.zip"
-    make_zip_archive "$archive" "$windows_target" "goetia bytes" "shim bytes" "$omitted"
+    make_zip_archive "$archive" "$windows_target" "goetia bytes" "$omitted"
     assert_archives_rejects_matching "rejects a zip missing ${omitted}" 1 "member set mismatch" "$archive"
 done
 
 root="$(mktemp -d -p "$archive_root")"
 staged="${root}/flat"
-write_members "$staged" "goetia bytes" "shim bytes"
+write_members "$staged" "goetia bytes"
 archive="${root}/goetia-${windows_target}.zip"
 make_zip_entries "$archive" \
     "goetia.exe=${staged}/goetia" \
-    "goetia-shim.exe=${staged}/goetia-shim" \
     "README.md=${staged}/README.md" \
     "LICENSE.md=${staged}/LICENSE.md"
 assert_archives_rejects_matching "rejects a flat zip with no goetia-<target>/ prefix" 1 \
@@ -546,7 +558,7 @@ assert_archives_rejects "rejects an archive with an unrecognized extension" 1 "$
 
 root="$(mktemp -d -p "$archive_root")"
 archive="${root}/not-goetia-x86_64-unknown-linux-musl.tar.xz"
-make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes" "shim bytes"
+make_tar_archive "$archive" x86_64-unknown-linux-musl "goetia bytes"
 assert_archives_rejects "rejects a filename that doesn't start with goetia-" 1 "$archive"
 
 # A corrupt archive must fail with the real listing error, not a misleading
@@ -569,7 +581,7 @@ assert_archives_rejects_matching "surfaces the real listing failure for a corrup
 # than left as a bare `unzip` CRC diagnostic.
 root="$(mktemp -d -p "$archive_root")"
 archive="${root}/goetia-${windows_target}.zip"
-make_zip_archive "$archive" "$windows_target" "goetia bytes" "shim bytes"
+make_zip_archive "$archive" "$windows_target" "goetia bytes"
 python3 - "$archive" <<'PY'
 import sys
 
@@ -585,62 +597,51 @@ assert_archives_rejects_matching "surfaces the real extraction failure for a CRC
 
 root="$(mktemp -d -p "$archive_root")"
 staged="${root}/goetia-${windows_target}"
-write_members "$staged" "goetia bytes" "shim bytes"
+write_members "$staged" "goetia bytes"
 archive="${root}/goetia-${windows_target}.zip"
 make_zip_entries "$archive" \
     "goetia-${windows_target}/goetia=${staged}/goetia" \
-    "goetia-${windows_target}/goetia-shim=${staged}/goetia-shim" \
     "goetia-${windows_target}/README.md=${staged}/README.md" \
     "goetia-${windows_target}/LICENSE.md=${staged}/LICENSE.md"
 assert_archives_rejects "rejects a Windows archive whose members lack .exe" 1 "$archive"
 
 root="$(mktemp -d -p "$archive_root")"
 staged="${root}/flat"
-write_members "$staged" "goetia bytes" "shim bytes"
+write_members "$staged" "goetia bytes"
 archive="${root}/goetia-${windows_target}.zip"
 win_prefix="goetia-${windows_target}"
 make_zip_entries "$archive" \
     "${win_prefix}\\goetia.exe=${staged}/goetia" \
-    "${win_prefix}\\goetia-shim.exe=${staged}/goetia-shim" \
     "${win_prefix}\\README.md=${staged}/README.md" \
     "${win_prefix}\\LICENSE.md=${staged}/LICENSE.md"
 assert_archives_rejects "rejects backslash separators in the zip" 1 "$archive"
 
-# Distinctness must also hold *within* one archive: if goetia and
-# goetia-shim are byte-identical, the staging step copied one program over
-# the other, even though only a single archive is involved.
-root="$(mktemp -d -p "$archive_root")"
-archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
-make_tar_archive "$archive" x86_64-unknown-linux-musl "same bytes" "same bytes"
-assert_archives_rejects "rejects an archive whose own goetia and goetia-shim are byte-identical" 1 "$archive"
-
 root="$(mktemp -d -p "$archive_root")"
 shared_content="identical goetia bytes"
 archive1="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
-make_tar_archive "$archive1" x86_64-unknown-linux-musl "$shared_content" "shim bytes for a"
+make_tar_archive "$archive1" x86_64-unknown-linux-musl "$shared_content"
 archive2="${root}/goetia-aarch64-unknown-linux-musl.tar.xz"
-make_tar_archive "$archive2" aarch64-unknown-linux-musl "$shared_content" "shim bytes for b"
+make_tar_archive "$archive2" aarch64-unknown-linux-musl "$shared_content"
 archive3="${root}/goetia-x86_64-apple-darwin.tar.xz"
-make_tar_archive "$archive3" x86_64-apple-darwin "goetia bytes for c" "shim bytes for c"
+make_tar_archive "$archive3" x86_64-apple-darwin "goetia bytes for c"
 archive4="${root}/goetia-aarch64-apple-darwin.tar.xz"
-make_tar_archive "$archive4" aarch64-apple-darwin "goetia bytes for d" "shim bytes for d"
+make_tar_archive "$archive4" aarch64-apple-darwin "goetia bytes for d"
 archive5="${root}/goetia-${windows_target}.zip"
-make_zip_archive "$archive5" "$windows_target" "goetia bytes for e" "shim bytes for e"
+make_zip_archive "$archive5" "$windows_target" "goetia bytes for e"
 assert_archives_rejects "rejects two archives holding identical binaries" 5 \
     "$archive1" "$archive2" "$archive3" "$archive4" "$archive5"
 
-# Reproduces the IFS-joined-string collision directly: a 3-member archive
-# (goetia, goetia-shim, and ONE member literally named
+# Reproduces the IFS-joined-string collision directly: a 2-member archive
+# (goetia and one member literally named
 # "<prefix>/LICENSE.md <prefix>/README.md" with an embedded space) is
 # missing LICENSE.md and README.md as their own members, but its sorted
 # member list joins via "${arr[*]}" to the exact same string as the real
-# 4-member expected set.
+# 3-member expected set.
 root="$(mktemp -d -p "$archive_root")"
 archive="${root}/goetia-x86_64-unknown-linux-musl.tar.xz"
 prefix="goetia-x86_64-unknown-linux-musl"
 make_tar_with_raw_members "$archive" \
     "${prefix}/goetia=goetia bytes" \
-    "${prefix}/goetia-shim=shim bytes" \
     "${prefix}/LICENSE.md ${prefix}/README.md=combined bytes"
 assert_archives_rejects_matching "rejects a member set whose IFS-joined string collides with the expected set" 1 \
     "member set mismatch" "$archive"
@@ -668,7 +669,7 @@ complete_listing_lines=(
     "README.md"
     "src/lib.rs"
     "src/main.rs"
-    "src/bin/shim/main.rs"
+    "src/bin/goetia-shim.rs"
     "src/backend/launchd.rs"
 )
 
@@ -705,17 +706,17 @@ assert_package_list_ok "accepts a well-formed listing" "$listing"
 
 # Positive control: each required-present path missing must be caught on its
 # own terms, not misreported as a leaked exclusion.
-listing="$(write_package_listing missing-cargo-toml Cargo.lock LICENSE.md README.md src/lib.rs src/main.rs src/bin/shim/main.rs)"
+listing="$(write_package_listing missing-cargo-toml Cargo.lock LICENSE.md README.md src/lib.rs src/main.rs src/bin/goetia-shim.rs)"
 assert_package_list_rejects_matching "rejects a listing missing Cargo.toml" "$listing" "Cargo.toml"
 
-listing="$(write_package_listing missing-lib-rs Cargo.toml Cargo.lock LICENSE.md README.md src/main.rs src/bin/shim/main.rs)"
+listing="$(write_package_listing missing-lib-rs Cargo.toml Cargo.lock LICENSE.md README.md src/main.rs src/bin/goetia-shim.rs)"
 assert_package_list_rejects_matching "rejects a listing missing src/lib.rs" "$listing" "src/lib.rs"
 
-listing="$(write_package_listing missing-main-rs Cargo.toml Cargo.lock LICENSE.md README.md src/lib.rs src/bin/shim/main.rs)"
+listing="$(write_package_listing missing-main-rs Cargo.toml Cargo.lock LICENSE.md README.md src/lib.rs src/bin/goetia-shim.rs)"
 assert_package_list_rejects_matching "rejects a listing missing the goetia bin source (src/main.rs)" "$listing" "src/main.rs"
 
 listing="$(write_package_listing missing-shim-main-rs Cargo.toml Cargo.lock LICENSE.md README.md src/lib.rs src/main.rs)"
-assert_package_list_rejects_matching "rejects a listing missing the goetia-shim bin source (src/bin/shim/main.rs)" "$listing" "src/bin/shim/main.rs"
+assert_package_list_rejects_matching "rejects a listing missing the goetia-shim bin source (src/bin/goetia-shim.rs)" "$listing" "src/bin/goetia-shim.rs"
 
 # An empty (or otherwise truncated) listing must be caught by the positive
 # control, never mistaken for "nothing leaked".

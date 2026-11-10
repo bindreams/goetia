@@ -160,6 +160,62 @@ fn timed_out_refuses_a_zero_length_budget() {
     let _ = timed_out("frpc", "running", Budget::Bounded(Duration::ZERO));
 }
 
+// process_timed_out ===================================================================================================
+
+/// A stop that SCM confirmed, with a process that outlived the budget: the service is stopped, and
+/// the message says which wait ran out.
+#[skuld::test]
+fn a_process_that_outlives_the_budget_after_a_confirmed_stop_says_so() {
+    let e = process_timed_out("frpc", 4242, Budget::Bounded(Duration::from_secs(1)), None);
+
+    let expected = "`frpc` is stopped, but its process (pid 4242) had not exited within 1s. goetia stopped waiting. The \
+                    stop was not undone; until the process exits, the files it runs stay in use. `goetia daemon \
+                    status frpc` shows the manager's current view. Allow longer with `--timeout <duration>`, or wait \
+                    indefinitely with `--no-timeout`.";
+    assert_eq!(e.to_string(), expected);
+    assert_eq!(e.report().to_string(), expected);
+    assert_eq!(e.remedy(), None, "the advice is in the text, as `WaitTimeout`'s is");
+    assert!(std::error::Error::source(&e).is_none());
+    assert!(e.is_indeterminate());
+}
+
+/// The process goetia could not end is the likely reason it outlived the budget, so the text says so,
+/// once. The failure is named, not the error's source: a timeout is no OS failure, so its
+/// `raw_os_error` is `None` whatever code the terminate failed with.
+#[skuld::test]
+fn a_process_that_could_not_be_terminated_says_so_when_it_outlives_the_budget() {
+    let terminate_failed = std::sync::Arc::new(std::io::Error::from_raw_os_error(6));
+    let e = process_timed_out(
+        "frpc",
+        4242,
+        Budget::Bounded(Duration::from_secs(1)),
+        Some(terminate_failed.clone()),
+    );
+
+    let expected = format!(
+        "`frpc` is stopped, but its process (pid 4242) had not exited within 1s, and terminating it failed: {terminate_failed}. \
+         goetia stopped waiting. The stop was not undone; until the process exits, the files it runs stay in use. \
+         `goetia daemon status frpc` shows the manager's current view. Allow longer with `--timeout <duration>`, or \
+         wait indefinitely with `--no-timeout`."
+    );
+    assert_eq!(e.to_string(), expected);
+    assert_eq!(e.report().to_string(), expected);
+    assert_eq!(e.report().to_string().matches(&terminate_failed.to_string()).count(), 1);
+    assert!(std::error::Error::source(&e).is_none());
+    assert_eq!(e.raw_os_error(), None, "the timeout is no OS failure");
+    assert_eq!(
+        terminate_failed.raw_os_error(),
+        Some(6),
+        "the terminate's own code is an OS code"
+    );
+}
+
+#[skuld::test]
+#[should_panic(expected = "only a non-zero Bounded budget can expire")]
+fn process_timed_out_refuses_a_budget_that_cannot_expire() {
+    let _ = process_timed_out("frpc", 4242, Budget::Unbounded, None);
+}
+
 // Deadline ============================================================================================================
 
 #[skuld::test]

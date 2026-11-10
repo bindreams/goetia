@@ -40,8 +40,30 @@ fn classify<B: Backend>(b: &B, read: ReadOutcome<B::Snapshot>) -> Found<B::Snaps
     }
 }
 
-/// A marked service's ownership: its embedded spec must name the requested id, and is rendered and
-/// compared with what is installed.
+/// Why [`Backend::regenerate`] failed. A backend that reads what is installed to regenerate (SCM)
+/// can fail on that read, which is not a spec that cannot be regenerated: no goetia action
+/// unblocks a comparison that could not be read, so it carries no advice to uninstall.
+enum RegenerationFailure {
+    /// The read of what is installed failed ([`Error::InstalledUnreadable`]): already says what failed.
+    HostUnreadable(Error),
+    /// The spec cannot be rendered.
+    SpecUnregenerable(Error),
+}
+
+impl RegenerationFailure {
+    /// Classified by the chain, not the outermost error: a backend may wrap the read's failure in a
+    /// `Step` or hand it out `Kept`. The whole error is carried, wrappers included.
+    fn of(error: Error) -> Self {
+        if error.wraps_unreadable_host() {
+            Self::HostUnreadable(error)
+        } else {
+            Self::SpecUnregenerable(error)
+        }
+    }
+}
+
+/// A marked service's ownership: its embedded spec must name the requested id, and is regenerated
+/// against the snapshot and compared with what is installed.
 fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfig) {
     let id = snapshot.id();
     let unusable = |reason, recovery| (Ownership::OursUnusable { reason, recovery }, ExternalConfig::Absent);
@@ -61,26 +83,29 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
             ExternalConfig::Absent,
         );
     }
-    let regenerated = match b.render(&blob.spec) {
-        Ok(regenerated) => regenerated.to_string(),
-        Err(e) => {
-            return unusable(
-                Reason::because("cannot regenerate the embedded spec", e),
-                uninstall_advice(),
-            );
-        }
+    // Read first: a backend that reads what is installed to regenerate (SCM) would otherwise report
+    // a failed read as a spec that cannot be regenerated, with advice to uninstall a healthy service.
+    // No goetia action unblocks a comparison that could not be read.
+    let on_disk = match b.installed(snapshot) {
+        Ok(on_disk) => on_disk,
+        Err(e) => return unusable(Reason::failed(e), None),
     };
-    match b.installed(snapshot) {
-        // No goetia action unblocks a comparison that could not be read.
-        Err(e) => unusable(Reason::failed(e), None),
-        Ok(on_disk) => (
+    match b.regenerate(&blob.spec, snapshot) {
+        Ok(regenerated) => (
             Ownership::Ours {
                 blob: blob.clone(),
-                regenerated,
+                regenerated: regenerated.to_string(),
                 on_disk: on_disk.definition.to_string(),
             },
             on_disk.external,
         ),
+        Err(e) => match RegenerationFailure::of(e) {
+            RegenerationFailure::HostUnreadable(read) => unusable(Reason::failed(read), None),
+            RegenerationFailure::SpecUnregenerable(e) => unusable(
+                Reason::because("cannot regenerate the embedded spec", e),
+                uninstall_advice(),
+            ),
+        },
     }
 }
 
@@ -125,9 +150,11 @@ pub(crate) fn reserved<B: Backend>(b: &B, id: &Id, step: Step, budget: Budget) -
 pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
     // `install` has no `--timeout` of its own: its calls are unbounded.
     let mut reservation = reserved(b, &spec.id, Step::Install, Budget::Unbounded)?;
-    let mut scope = b.begin_install(spec)?;
+    // Rendered once, before the scope: what a backend takes or writes in `begin_install` (SCM's
+    // lock and its provider's file) is never taken for an install that cannot be rendered.
     let desired = b.render_for_install(spec)?;
     let desired_text = desired.to_string();
+    let mut scope = b.begin_install(spec, &desired)?;
 
     // No cap: `Raced` is a state change the backend detected, not a wait for time to pass.
     loop {
@@ -185,10 +212,14 @@ pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
 pub(crate) fn status<B: Backend>(b: &B, id: &Id) -> Result<Status> {
     let snapshot = owned(b, id)?;
     let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
-    b.render(&blob.spec).map_err(|e| Error::Step {
-        what: format!("`{id}`'s embedded spec cannot be regenerated"),
-        source: Box::new(e),
-    })?;
+    b.regenerate(&blob.spec, &snapshot)
+        .map_err(|e| match RegenerationFailure::of(e) {
+            RegenerationFailure::HostUnreadable(read) => read,
+            RegenerationFailure::SpecUnregenerable(e) => Error::Step {
+                what: format!("`{id}`'s embedded spec cannot be regenerated"),
+                source: Box::new(e),
+            },
+        })?;
     b.live_status(&snapshot)
 }
 
@@ -214,15 +245,8 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 continue;
             }
         };
-        if let Err(e) = b.render(&blob.spec) {
-            out.push(unusable(Reason::because(
-                "marked ours, but its embedded spec cannot be regenerated",
-                e,
-            )));
-            continue;
-        }
-        // One entry's failure must not take down the listing of every other daemon, except that
-        // no manager to ask is every entry's.
+        // A name that is no id has no snapshot to regenerate against, so it is reported by its name
+        // alone.
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(e) => {
@@ -234,6 +258,21 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
                 continue;
             }
         };
+        if let Err(e) = b.regenerate(&blob.spec, snapshot) {
+            // A backend that reads what is installed to regenerate can find the service gone: as
+            // for `live_status`, absence is established and the entry is omitted.
+            if !matches!(e.cause(), Error::NotInstalled { .. }) {
+                out.push(unusable(match RegenerationFailure::of(e) {
+                    RegenerationFailure::HostUnreadable(read) => Reason::failed(read),
+                    RegenerationFailure::SpecUnregenerable(e) => {
+                        Reason::because("marked ours, but its embedded spec cannot be regenerated", e)
+                    }
+                }));
+            }
+            continue;
+        }
+        // One entry's failure must not take down the listing of every other daemon, except that
+        // no manager to ask is every entry's.
         match b.live_status(snapshot) {
             Ok(status) => out.push(Installed::Ours {
                 spec: blob.spec.clone(),

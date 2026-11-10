@@ -63,7 +63,7 @@ fn restart(mgr: &dyn ServiceManager, id: &Id, budget: Budget) -> Result<()> {
 /// Under a budget that waits the legs need nothing between them: the stop leg
 /// is only ever handed a budget that waits (see [`stop_leg`]), so a `stop` that
 /// returned `Ok` has confirmed stopped, and one that ran out returned
-/// `WaitTimeout`, so the start is never reached. Under a budget that does not
+/// `WaitTimeout` or `ProcessWaitTimeout`, so the start is never reached. Under a budget that does not
 /// wait, nothing is confirmed or read. Either way no state is queried between
 /// the legs, which keeps the exit code from being a stopwatch question.
 fn restart_until(mgr: &dyn ServiceManager, id: &Id, budget: Budget, deadline: Deadline) -> Result<()> {
@@ -141,12 +141,13 @@ fn stop_leg(requested: Budget, left: Budget) -> Budget {
 
 // wording =============================================================================================================
 
-/// The stop leg's expiry (the stop ran out of budget, or the budget was spent
-/// before it was issued), re-worded before it propagates: it is a stop in
-/// doubt, which may have stopped the daemon. The variant is preserved (exit
-/// `4`); the words change because the shared texts ([`budget::timed_out`]'s
-/// and the in-doubt request's) speak for a bare `stop` and do not say the
-/// restart was abandoned or that the daemon may be left down; `waited` is
+/// The stop leg's expiry (the stop, or the exit of the process it stopped, ran
+/// out of budget, or the budget was spent before it was issued), re-worded
+/// before it propagates: it is a stop in doubt, which may have stopped the
+/// daemon. The variant is preserved (exit `4`); the words change because the
+/// shared texts ([`budget::timed_out`]'s, [`budget::process_timed_out`]'s and
+/// the in-doubt request's) speak for a bare `stop` and do not say the restart
+/// was abandoned or that the daemon may be left down; `waited` is
 /// likewise re-based (see [`as_given`]). Every other failure passes through: a
 /// stop that determinately failed changed nothing and is still exit `1`.
 fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
@@ -164,6 +165,25 @@ fn abandoned_before_start(id: &Id, e: Error, budget: Budget) -> Error {
             ),
             id,
             awaited,
+        },
+        // SCM confirmed the stop; its process had not exited when the budget ran out.
+        Error::ProcessWaitTimeout {
+            id,
+            pid,
+            waited,
+            terminate_failed,
+            ..
+        } => Error::ProcessWaitTimeout {
+            terminate_failed,
+            waited: as_given(budget, waited),
+            recovery: format!(
+                "The restart was abandoned: no start was issued, so `{id}` is left stopped, while its \
+                 process keeps the files it runs in use until it exits. `goetia daemon status {id}` shows \
+                 the manager's current view, and `goetia daemon start {id}` brings it back up. Allow \
+                 longer with `--timeout <duration>`, or wait indefinitely with `--no-timeout`."
+            ),
+            id,
+            pid,
         },
         e @ Error::RequestInDoubt { .. } => e.in_doubt_context(format!(
             "the restart was abandoned: no start was issued, so `{id}` may be left stopped. `goetia daemon \

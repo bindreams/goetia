@@ -19,6 +19,13 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             waited: Duration::ZERO,
             recovery: String::new(),
         },
+        Error::ProcessWaitTimeout {
+            id: id(),
+            pid: 1,
+            waited: Duration::ZERO,
+            terminate_failed: None,
+            recovery: String::new(),
+        },
         Error::Unestablished {
             id: id(),
             refused: Box::new(not_installed()),
@@ -80,9 +87,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::NoManager {
             evidence: String::new(),
         },
-        Error::ElevationRequired {
-            subcommand: String::new(),
-        },
+        Error::ElevationRequired { what: String::new() },
         Error::UnsupportedPlatform {
             platform: String::new(),
         },
@@ -138,6 +143,33 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             source: std::io::Error::other("x"),
         },
         Error::NotADirectory { path: PathBuf::new() },
+        Error::InstalledUnreadable {
+            id: id(),
+            source: Box::new(not_installed()),
+        },
+        Error::ShimFolderUnsafe {
+            path: PathBuf::new(),
+            account: String::new(),
+            right: "own",
+        },
+        Error::ShimMarkerMissing { path: PathBuf::new() },
+        Error::ShimNotEmbedded,
+        Error::ShimHostMismatch {
+            rendered: Box::new(crate::shim::HostCommand {
+                exe: PathBuf::new(),
+                args: vec![],
+            }),
+            provided: Box::new(crate::shim::HostCommand {
+                exe: PathBuf::new(),
+                args: vec![],
+            }),
+        },
+        Error::SiblingShimMissing { path: PathBuf::new() },
+        Error::ShimMarkerVersion {
+            path: PathBuf::new(),
+            found: String::new(),
+            expected: String::new(),
+        },
         Error::InvalidPassword { variable: id() },
         Error::PutBackBlocked {
             path: PathBuf::new(),
@@ -157,6 +189,42 @@ fn a_start_judged_as_managed_is_indeterminate_when_the_failed_start_is() {
     };
     assert!(over(in_doubt()).is_indeterminate());
     assert!(!over(not_installed()).is_indeterminate());
+}
+
+#[skuld::test]
+fn a_failed_read_of_the_installed_host_is_indeterminate_when_the_read_is() {
+    let over = |source: Error| Error::InstalledUnreadable {
+        id: "x".to_string(),
+        source: Box::new(source),
+    };
+    assert!(over(in_doubt()).is_indeterminate());
+    assert!(!over(not_installed()).is_indeterminate());
+    assert!(matches!(over(not_installed()).cause(), Error::NotInstalled { .. }));
+}
+
+#[skuld::test]
+fn an_unreadable_service_image_is_indeterminate_when_the_read_is_and_its_advice_is_its_remedy() {
+    let over = |source: Error| Error::ServiceImageUnreadable {
+        name: "x".to_string(),
+        source: Box::new(source),
+    };
+    assert!(over(in_doubt()).is_indeterminate());
+    assert!(!over(not_installed()).is_indeterminate());
+    assert_eq!(
+        over(not_installed()).remedy(),
+        Some(
+            "An administrator must make each named service's registry key readable, or let SCM query it \
+             (`SERVICE_QUERY_CONFIG`)"
+        )
+    );
+    assert_eq!(
+        over(not_installed())
+            .report()
+            .to_string()
+            .matches("administrator")
+            .count(),
+        1
+    );
 }
 
 #[cfg(unix)]
@@ -217,6 +285,71 @@ fn report_prints_both_halves() {
         e.report().to_string(),
         "failed to remove /a: boom; then: daemon `x` is not installed"
     );
+}
+
+#[skuld::test]
+fn both_all_folds_in_order() {
+    assert!(Error::both_all([]).is_none());
+
+    let one = Error::both_all([os("remove", "/a", "boom")]).unwrap();
+    assert!(matches!(one, Error::Os { .. }), "{one:?}");
+
+    let three = Error::both_all([
+        os("remove", "/a", "one"),
+        os("remove", "/b", "two"),
+        os("remove", "/c", "three"),
+    ])
+    .unwrap();
+    assert_eq!(
+        three.report().to_string(),
+        "failed to remove /a: one; then: failed to remove /b: two; then: failed to remove /c: three"
+    );
+}
+
+#[skuld::test]
+fn a_shim_lock_owned_by_another_account_names_it() {
+    let e = Error::ShimLockForeign {
+        account: r"EVE\eve".to_string(),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "the install lock `Global\\goetia-shim` is owned by EVE\\eve, which is not an account goetia trusts (SYSTEM, \
+         Administrators, TrustedInstaller), so it cannot be trusted to serialise installs: close every handle to it, by \
+         ending that account's processes that have it open"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+    assert!(!e.is_indeterminate());
+}
+
+/// A lock that denied a token with Administrators enabled says only that, names the owner when it
+/// could be read, lists the causes it cannot tell apart, and tells the user to end processes only
+/// for the case that the lock is someone else's. It says nothing of trust: the caller never learned
+/// who the owner is, or that they are untrusted.
+#[skuld::test]
+fn a_shim_lock_that_denied_administrators_says_so_and_names_the_owner_when_read() {
+    let readable = Error::ShimLockDenied {
+        owner: Some(r"EVE\eve".to_string()),
+    };
+    assert_eq!(
+        readable.report().to_string(),
+        "access to the install lock `Global\\goetia-shim`, which is owned by EVE\\eve, was denied to a token with \
+         Administrators enabled: either the lock's permissions or the token's integrity level or privileges refuse \
+         it. If the lock is someone else's, close every handle to it, by ending the processes that have it open"
+    );
+
+    let unreadable = Error::ShimLockDenied { owner: None };
+    assert_eq!(
+        unreadable.report().to_string(),
+        "access to the install lock `Global\\goetia-shim` was denied to a token with Administrators enabled, and its \
+         owner could not be read: either the lock's permissions or the token's integrity level or privileges refuse \
+         it. If the lock is someone else's, close every handle to it, by ending the processes that have it open"
+    );
+
+    for e in [&readable, &unreadable] {
+        assert!(std::error::Error::source(e).is_none());
+        assert!(!e.is_indeterminate());
+        assert!(!e.to_string().contains("trust"), "{e}");
+    }
 }
 
 #[skuld::test]
@@ -341,20 +474,20 @@ fn sentence_names_the_error_a_variant_writes_into_its_own_text() {
         read_failed: Box::new(inner()),
         restore_failed: None,
     };
+    fn embedded(e: &Error) -> Option<&Error> {
+        e.sentence().and_then(|s| s.error?.downcast_ref::<Error>())
+    }
+    assert!(matches!(embedded(&loaded), Some(Error::Undetermined { .. })));
     assert!(matches!(
-        loaded.sentence().map(|s| s.error),
-        Some(Error::Undetermined { .. })
-    ));
-    assert!(matches!(
-        start_as_managed(not_installed()).sentence().map(|s| s.error),
+        embedded(&start_as_managed(not_installed())),
         Some(Error::Blob { .. })
     ));
     assert!(matches!(
-        Error::Kept(Arc::new(loaded)).sentence().map(|s| s.error),
+        embedded(&Error::Kept(Arc::new(loaded))),
         Some(Error::Undetermined { .. })
     ));
-    assert!(not_installed().sentence().map(|s| s.error).is_none());
-    assert!(step("a", inner()).sentence().map(|s| s.error).is_none());
+    assert!(not_installed().sentence().is_none());
+    assert!(step("a", inner()).sentence().is_none());
 }
 
 /// A kept error answers `stderr` as the error it holds, however deep.
@@ -596,6 +729,113 @@ fn report_of_a_path_that_is_not_a_directory() {
 }
 
 #[skuld::test]
+fn report_of_an_unsafe_shim_folder_names_the_path_the_account_and_the_right() {
+    let e = Error::ShimFolderUnsafe {
+        path: PathBuf::from("/p"),
+        account: "Users".to_string(),
+        right: "change permissions of",
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "refusing to use /p for the shim: Users can change permissions of it, so it could replace the shim; fix its permissions"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_host_without_a_marker_names_the_path() {
+    let e = Error::ShimMarkerMissing {
+        path: PathBuf::from("/h.exe"),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "/h.exe is not a goetia service host: it carries no version marker, so it was not built with \
+         `goetia::shim::main()`"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_host_of_another_version_names_both_versions() {
+    let e = Error::ShimMarkerVersion {
+        path: PathBuf::from("/h.exe"),
+        found: "0.1.0".to_string(),
+        expected: "0.2.0".to_string(),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "/h.exe is a goetia service host of version 0.1.0, and this goetia is version 0.2.0: rebuild the host with \
+         this version"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+}
+
+#[skuld::test]
+fn report_of_a_build_without_a_stock_shim_names_the_variable_and_the_feature() {
+    assert_eq!(
+        Error::ShimNotEmbedded.report().to_string(),
+        "built without a stock shim: GOETIA_SHIM_EXE was not set under the goetia-shim feature"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_missing_sibling_shim_names_its_path() {
+    let e = Error::SiblingShimMissing {
+        path: PathBuf::from("/b/goetia-shim.exe"),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "the stock shim /b/goetia-shim.exe is missing: goetia looks for goetia-shim.exe beside goetia.exe"
+    );
+    assert!(std::error::Error::source(&e).is_none());
+}
+
+/// The error holds the file's exact bytes: the human report escapes them, as it does every quoted
+/// value, and the `--json` report writes them as they are. A backslash is not doubled.
+#[skuld::test]
+fn report_of_a_host_version_holds_the_file_supplied_bytes_exactly_and_the_sink_escapes() {
+    let e = Error::ShimMarkerVersion {
+        path: PathBuf::from("/h.exe"),
+        found: "\u{1b}[31m\n\\".to_string(),
+        expected: "0.2.0".to_string(),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "/h.exe is a goetia service host of version \\u{1b}[31m\\u{a}\\, and this goetia is version 0.2.0: rebuild \
+         the host with this version"
+    );
+    assert_eq!(
+        e.report_unescaped().to_string(),
+        "/h.exe is a goetia service host of version \u{1b}[31m\n\\, and this goetia is version 0.2.0: rebuild the \
+         host with this version"
+    );
+}
+
+/// The mismatch names both hosts and both causes, and has no source and no OS code to report.
+#[skuld::test]
+fn report_of_a_host_mismatch_names_both_hosts_and_both_causes() {
+    let host = |exe: &str| crate::shim::HostCommand {
+        exe: PathBuf::from(exe),
+        args: vec!["--service-host".to_string()],
+    };
+    let e = Error::ShimHostMismatch {
+        rendered: Box::new(host("/a/old.exe")),
+        provided: Box::new(host("/a/new.exe")),
+    };
+    assert_eq!(
+        e.report().to_string(),
+        "the service host this install rendered is /a/old.exe [\"--service-host\"], but the provider placed \
+         /a/new.exe [\"--service-host\"]. Nothing was registered. Either the service host changed while this \
+         install waited for the install lock, and running the install again picks up the new one, or the \
+         provider's `preview` and `provide` disagree, which running the install again does not fix. The file just \
+         provided stays; the provider's next sweep may remove it if nothing references it"
+    );
+    assert!(!e.is_indeterminate());
+    assert!(std::error::Error::source(&e).is_none());
+    assert_eq!(e.raw_os_error(), None);
+}
+
+#[skuld::test]
 fn report_of_an_invalid_password_variable_has_no_source() {
     let e = Error::InvalidPassword {
         variable: "GOETIA_SERVICE_PASSWORD".to_string(),
@@ -820,6 +1060,32 @@ fn an_undetermined_step_chain_gives_up_its_read_and_recovery() {
     };
     let back = other.into_undetermined().expect_err("not an Undetermined");
     assert_eq!(back.report().to_string(), "check: daemon `x` is not installed");
+}
+
+#[skuld::test]
+fn a_failed_read_of_the_installed_host_is_found_under_every_wrapper_and_only_there() {
+    let unreadable = || Error::InstalledUnreadable {
+        id: "x".to_string(),
+        source: Box::new(os("read", "/p", "denied")),
+    };
+    let step = |source: Error| Error::Step {
+        what: "regenerate".to_string(),
+        source: Box::new(source),
+    };
+    let start = |source: Error| Error::StartAsManaged {
+        blob: Arc::new(Error::blob(String::new())),
+        source: Box::new(source),
+    };
+
+    assert!(unreadable().wraps_unreadable_host());
+    assert!(step(unreadable()).wraps_unreadable_host());
+    assert!(start(step(unreadable())).wraps_unreadable_host());
+    assert!(Error::Kept(Arc::new(step(unreadable()))).wraps_unreadable_host());
+    assert!(step(Error::Kept(Arc::new(unreadable()))).wraps_unreadable_host());
+
+    assert!(!os("read", "/p", "denied").wraps_unreadable_host());
+    assert!(!step(start(not_installed())).wraps_unreadable_host());
+    assert!(!Error::Kept(Arc::new(step(os("read", "/p", "denied")))).wraps_unreadable_host());
 }
 
 // The OS error an error carries ---------------------------------------------------------------------------------------
