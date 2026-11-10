@@ -177,11 +177,13 @@ fn main() {
     let _: Option<&'static [u8]> = goetia::embed_shim!();
 }
 EOF
-    (
-        cd "$dir"
-        env -u GOETIA_SHIM_EXE cargo rustc --locked --profile check \
-            --target-dir "$(winpath "$consumer/target")" -- -D unexpected_cfgs
-    )
+    if ! (
+        cd "$dir" &&
+            env -u GOETIA_SHIM_EXE cargo rustc --locked --profile check \
+                --target-dir "$(winpath "$consumer/target")" -- -D unexpected_cfgs
+    ); then
+        fail "a consumer that never declared the feature does not type-check with unexpected_cfgs denied"
+    fi
 }
 
 consumer_routes() {
