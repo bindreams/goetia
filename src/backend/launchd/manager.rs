@@ -45,9 +45,10 @@
 //! `launchctl bootout` returns within milliseconds, but launchd goes on answering for the label
 //! (`print` shows `state = SIGTERMed`) until the job has exited. A step that acts on the label
 //! afterwards must not meet the old job, so it waits until `print` reports the label not found (see
-//! [`Launchctl::bootout`]). Which steps wait, under which bound, what a start does over a job that
-//! holds the label, and when a job may never go, is listed once, in the README's "Waiting for a
-//! start or stop".
+//! [`Launchctl::bootout`]). Which steps wait, under which bound, and when a job may never go, is
+//! listed once, in the README's "Waiting for a start or stop". A start that finds a job holding the
+//! label and not going away takes it as loaded: it skips `bootstrap`, and sends no `kickstart` if
+//! that job reads as running.
 //!
 //! The waits that have no bound are part of sending a request: bounded by a deadline, one could end
 //! with the old job still loaded, the `bootstrap` unsent and the daemon left unloaded.

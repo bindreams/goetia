@@ -732,8 +732,8 @@ goetia does not load a job over one that is still going away. So on macOS:
 - A start (`daemon start`, `restart`, `install --start`) that finds the job
   still going away waits, without bound, until it is gone, then loads it. This
   wait counts against `--timeout`.
-- For `restart: always`, a start with a waiting `--timeout` that finds the
-  daemon not running boots it out, waits without bound until it is gone, and
+- For `restart: always`, a start with a waiting `--timeout` that does not find
+  the daemon running boots it out, waits without bound until it is gone, and
   loads it again.
 
 These waits normally end within the job's `ExitTimeOut`, after which launchd
