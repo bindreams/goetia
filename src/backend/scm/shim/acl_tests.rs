@@ -463,7 +463,16 @@ pub(in crate::backend::scm::shim) mod windows {
     fn a_volume_that_keeps_no_acls_is_refused() {
         let refusal = require_acls_under(Path::new(r"\\.\pipe\")).expect_err("the pipe file system keeps no ACLs");
 
-        assert!(matches!(refusal, Error::ShimFolderUnsafe { .. }), "{refusal:?}");
+        assert!(
+            matches!(
+                refusal,
+                Error::ShimFolderUnsafe {
+                    right: "bypass access control on",
+                    ..
+                }
+            ),
+            "{refusal:?}"
+        );
     }
 
     #[skuld::test]
