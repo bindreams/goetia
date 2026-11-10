@@ -204,7 +204,7 @@ fn a_win32_zero_record_with_a_specific_code_names_both() {
     );
 }
 
-// The process exit code of a recorded exit ----------------------------------------------------------------------------
+// A recorded exit and the report behind it ----------------------------------------------------------------------------
 
 /// What SCM recorded for a report names that report again.
 #[skuld::test]
@@ -214,5 +214,18 @@ fn a_recorded_exit_maps_back_to_the_report_that_produced_it() {
         let record = RecordedExit { win32, specific };
 
         assert_eq!(Reported::from_record(record), Some(reported), "{reported:?}");
+    }
+}
+
+/// A pair no `Reported` produces (a `Managed` service's own codes) names no report; `(1066, 0)` is
+/// SCM's wrapper with no code, which no report carries.
+#[skuld::test]
+fn a_pair_no_report_produces_names_no_report() {
+    for (win32, specific) in [(ERROR_SERVICE_SPECIFIC_ERROR, 0), (5, 9), (0, 42)] {
+        assert_eq!(
+            Reported::from_record(RecordedExit { win32, specific }),
+            None,
+            "({win32}, {specific})"
+        );
     }
 }

@@ -529,8 +529,9 @@ impl Backend for Scm {
     /// With a wait, holds the service's process before the STOP, and once SCM reports the service
     /// stopped ends that process through its handle (the documentation of `SetServiceStatus` allows
     /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
-    /// runs is free when `stop` returns. It ends with the code SCM recorded, or `KILLED_EXIT_CODE`
-    /// where SCM holds no record; only a record guarantees the shim's own exit code matches.
+    /// runs is free when `stop` returns. A shim ends with the code of its own report, a `type: managed`
+    /// exe, or a shim with no decodable record, with `KILLED_EXIT_CODE`; the shim's no-record case is
+    /// another process deleting the service during the wait, which goetia does not guard against.
     ///
     /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
@@ -543,6 +544,8 @@ impl Backend for Scm {
         // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
         // whatever is left of it.
         let deadline = budget.start();
+        // An unreadable blob reads as `Managed`: its held process is ended with the kill's code.
+        let kind = start_kind(snapshot.blob()).0;
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::os(format!("open `{id}` to stop it"), e))?;
@@ -553,7 +556,7 @@ impl Backend for Scm {
         // expired hold is sent the STOP all the same, and is not a stop: see `stop_and_await_exit`.
         let mut held = hold_process(&id, "stop", deadline, &format!("`{id}` was NOT stopped"))?;
         let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, &mut held, |held, deadline, exit| {
-            end_held(&id, held, deadline, exit)
+            end_held(&id, kind, held, deadline, exit)
         })
         .map_err(|e| Error::os(format!("stop `{id}`"), e))
         .and_then(|outcome| match outcome {
@@ -1188,13 +1191,18 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
         .map_err(|e| not_done(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)))
 }
 
-/// The code a held process is terminated with once SCM confirmed `STOPPED` with `exit`:
-/// the code of the `Reported` that record names, which is what the shim itself exits with; or
-/// [`KILLED_EXIT_CODE`] with no record, or one no report produces (a `Managed` service's own codes).
-/// SCM reads no process exit code, so any fixed code serves where the shim's is unknown.
-fn stop_exit_code(exit: Option<RecordedExit>) -> i32 {
-    exit.and_then(Reported::from_record)
-        .map_or(KILLED_EXIT_CODE, Reported::process_exit_code)
+/// The code a held process of a `kind` service is terminated with once SCM confirmed `STOPPED` with
+/// `exit`. A shim's is the code of the `Reported` that record names, which is what the shim itself
+/// exits with. A `Managed` service's is [`KILLED_EXIT_CODE`], as is a shim's with no record. SCM reads
+/// no process exit code, so any fixed code serves where the shim's is unknown.
+fn stop_exit_code(kind: Kind, exit: Option<RecordedExit>) -> i32 {
+    match kind {
+        Kind::Simple => exit
+            .and_then(Reported::from_record)
+            .map_or(KILLED_EXIT_CODE, Reported::process_exit_code),
+        // Its own pair is not the shim's protocol: decoding it could name a report it never made.
+        Kind::Managed => KILLED_EXIT_CODE,
+    }
 }
 
 /// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]
@@ -1204,19 +1212,19 @@ fn stop_exit_code(exit: Option<RecordedExit>) -> i32 {
 ///
 /// The held process is always terminated, and then waited for: that is what ends a `Kind::Managed`
 /// service's own exe, which lingers after `STOPPED`, and what backs a shim that does not exit.
-/// It is terminated with [`stop_exit_code`] of `exit`, the record SCM confirmed `STOPPED` with. For
-/// `Kind::Simple` the record is the shim's own `Reported`, which maps to the code the shim ends itself
-/// with, so whichever terminator wins the race writes the same code. Where SCM holds no record (the
-/// service found gone) the codes are not guaranteed to match: this one uses `KILLED_EXIT_CODE`. That
-/// race arises only when another process deletes the service during the wait, the user's own
+/// It is terminated with [`stop_exit_code`] of `kind` and `exit`, the record SCM confirmed `STOPPED`
+/// with: a shim ends with the code of its own report, so whichever terminator wins the race writes the
+/// same code; a `Managed` exe, or a shim with no decodable record, ends with `KILLED_EXIT_CODE`. A
+/// shim has no record only when another process deletes the service during the wait, the user's own
 /// concurrency, which goetia does not guard against.
 fn end_held(
     id: &Id,
+    kind: Kind,
     held: Held,
     deadline: Deadline,
     exit: Option<RecordedExit>,
 ) -> std::io::Result<EndProcessOutcome<Held>> {
-    let code = stop_exit_code(exit);
+    let code = stop_exit_code(kind, exit);
     end_process(
         held,
         deadline,
@@ -1353,9 +1361,11 @@ impl Scm {
             // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
             // ended, through the handle held since before the stop, and waited for as `stop` waits
             // for it (see [`end_held`]), with no bound: the shim exits by itself after it reports
-            // `STOPPED`, and the terminate is a backstop that always runs, with the recorded code or
-            // else `KILLED_EXIT_CODE`.
-            HoldOutcome::Held(held) => match end_held(id, held, Budget::Unbounded.start(), exit) {
+            // `STOPPED`, and the terminate is a backstop that always runs: a shim ends with the code of
+            // its own report, or `KILLED_EXIT_CODE` with no decodable record (another process deleting
+            // the service during the wait, which goetia does not guard against). Only a shim is
+            // held here, since the host is a goetia shim.
+            HoldOutcome::Held(held) => match end_held(id, Kind::Simple, held, Budget::Unbounded.start(), exit) {
                 Ok(EndProcessOutcome::Exited) => {}
                 Ok(EndProcessOutcome::Lingers { .. }) => unreachable!("an unbounded deadline never expires"),
                 Err(e) => {
