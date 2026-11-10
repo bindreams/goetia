@@ -326,65 +326,54 @@ fn a_stray_renders_its_name_as_it_is_stored_and_its_type() {
     );
 }
 
-/// A name shows as it can be typed into regedit: a backslash is not doubled, but a quote is
-/// escaped so that the name cannot close the quotes it is shown in.
+/// A name with a line break and a quote stays on one line, and reads differently from the name
+/// that spells the same escapes out with a backslash.
 #[skuld::test]
-fn a_stray_name_shows_its_backslash_as_it_is_and_escapes_its_quote() {
-    assert_eq!(
-        value_stray(&utf16(r#"a\b"c"#), vtype::REG_SZ).to_string(),
-        r#"value "a\b\"c" of type REG_SZ"#
-    );
-}
-
-/// A name with a line break must not break the line a diff is made of.
-#[skuld::test]
-fn a_stray_name_with_a_control_character_is_escaped_on_one_line() {
-    let shown = Stray::Subkey { name: utf16("a\nb") }.to_string();
-
-    assert_eq!(shown, r#"subkey "a\nb""#);
-}
-
-/// The characters escaped, and how, do not depend on what else the name holds.
-#[skuld::test]
-fn a_name_is_escaped_the_same_whether_or_not_it_is_valid_utf16() {
-    let escaped = ["a\nb", "a\tb", "a\u{7f}b", r#"a"b"#, r"a\b", "a=b"];
-    let want = [r"a\nb", r"a\tb", r"a\u{7f}b", r#"a\"b"#, r"a\b", "a=b"];
-    for (text, want) in escaped.iter().zip(want) {
-        let mut broken = utf16(text);
-        broken.push(0xD800);
-
-        assert_eq!(shown_name(&utf16(text)), want, "{text:?}");
-        assert_eq!(
-            shown_name(&broken),
-            format!(r"(not valid UTF-16: {want}\u{{D800}})"),
-            "{text:?}"
-        );
-    }
-}
-
-#[skuld::test]
-fn a_stray_name_that_is_not_valid_utf16_renders_without_losing_the_unit() {
-    let shown = Stray::Subkey {
-        name: vec![0x41, 0xD800, 0x3D],
+fn a_stray_name_stays_on_one_line_and_reads_differently_from_its_escape_spelling() {
+    let broken = Stray::Subkey { name: utf16("a\n\"b") }.to_string();
+    let spelled = Stray::Subkey {
+        name: utf16(r#"a\n"b"#),
     }
     .to_string();
 
-    assert_eq!(shown, r#"subkey "(not valid UTF-16: A\u{D800}=)""#);
+    assert!(!broken.contains('\n'), "{broken}");
+    assert_ne!(broken, spelled);
 }
 
+/// A name is quoted as `ScmRegistration` quotes every other value it reads back.
 #[skuld::test]
-fn text_from_utf16_is_the_text_when_valid() {
-    assert_eq!(text_from_utf16(&utf16("A=\u{1F600}\n")), "A=\u{1F600}\n");
+fn a_stray_name_is_quoted_like_the_registrations_other_values() {
+    let name = "a\\b\"c\n";
+
+    assert_eq!(shown_name(&utf16(name)), format!("{name:?}"));
 }
 
-/// Invalid text is escaped by one rule: every unpaired surrogate, control character and `=`, and
-/// nothing else, a backslash and a quote included.
+/// The run of a name around an unpaired unit is escaped exactly as `{:?}` escapes the same text
+/// when the whole name is valid, and the name stays on one line.
 #[skuld::test]
-fn text_from_utf16_escapes_what_it_escapes_by_one_rule_when_invalid() {
-    let mut units = utf16("A=b\n\\\"");
-    units.push(0xD800);
+fn a_name_is_escaped_the_same_whether_or_not_it_is_valid_utf16() {
+    let text = "a\n\t\u{7f}\"\\b";
+    let escaped = format!("{text:?}");
+    let escaped = &escaped[1..escaped.len() - 1];
+    let mut broken = utf16(text);
+    broken.push(0xD800);
+    broken.extend(utf16(text));
 
-    assert_eq!(text_from_utf16(&units), r#"(not valid UTF-16: A\u{3D}b\n\"\u{D800})"#);
+    let shown = shown_name(&broken);
+
+    assert_eq!(shown, format!(r#""{escaped}\u{{d800}}{escaped}""#));
+    assert!(!shown.contains('\n'), "{shown}");
+}
+
+/// A name that is not valid UTF-16 keeps its unpaired unit, in a form no valid name can spell.
+#[skuld::test]
+fn a_stray_name_that_is_not_valid_utf16_renders_without_losing_the_unit() {
+    let shown = Stray::Subkey {
+        name: vec![0x41, 0xD800, 0x22, 0x5C],
+    }
+    .to_string();
+
+    assert_eq!(shown, r#"subkey "A\u{d800}\"\\""#);
 }
 
 #[skuld::test]
