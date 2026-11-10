@@ -23,8 +23,8 @@ use crate::backend::scm::wait::Waited;
 use crate::error::{Chain, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
-/// The exit code a kill ends the process with, and `stop` ends one SCM recorded no exit for: SCM sees a
-/// failure, the same as for a crash.
+/// The exit code a kill ends the process with, and `stop` and `uninstall` end one SCM recorded no exit
+/// for: SCM sees a failure, the same as for a crash.
 pub(crate) const KILLED_EXIT_CODE: i32 = 1;
 
 /// What a kill did.

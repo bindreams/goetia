@@ -243,22 +243,26 @@ fn a_recorded_exit_maps_back_to_the_report_that_produced_it() {
     }
 }
 
-/// A pair no `Reported` produces (a `Managed` service's own codes) names no report, and keeps its
-/// Win32 code, or its service-specific one when the Win32 code is 0.
+/// A pair no `Reported` produces (a `Managed` service's own codes) names no report, and ends the
+/// process as SCM reads the pair: the service-specific code only under `ERROR_SERVICE_SPECIFIC_ERROR`
+/// and non-zero, 0 for Win32 0 whatever else is recorded, else the Win32 code.
 #[skuld::test]
-fn a_recorded_exit_no_report_produces_keeps_its_win32_code_or_else_its_specific_one() {
+fn a_recorded_exit_no_report_produces_ends_the_process_as_scm_reads_it() {
     let record = |win32, specific| RecordedExit { win32, specific };
 
-    for (win32, specific, code) in [
-        (5, 9, 5),
-        (0, 9, 9),
-        (ERROR_SERVICE_SPECIFIC_ERROR, 0, ERROR_SERVICE_SPECIFIC_ERROR as i32),
-    ] {
+    for (win32, specific) in [(5, 9), (0, 42), (ERROR_SERVICE_SPECIFIC_ERROR, 0)] {
         assert_eq!(
             Reported::from_record(record(win32, specific)),
             None,
             "({win32}, {specific})"
         );
+    }
+    for (win32, specific, code) in [
+        (5, 9, 5),
+        (0, 42, 0),
+        (ERROR_SERVICE_SPECIFIC_ERROR, 7, 7),
+        (ERROR_SERVICE_SPECIFIC_ERROR, 0, ERROR_SERVICE_SPECIFIC_ERROR as i32),
+    ] {
         assert_eq!(
             record(win32, specific).process_exit_code(),
             code,

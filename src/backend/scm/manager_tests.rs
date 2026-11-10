@@ -1134,17 +1134,9 @@ fn a_stop_failure_on_a_service_marked_by_someone_else_does_not_claim_a_disable()
     }
 }
 
-/// A `stop` ends the process it held with the code SCM recorded, and with the kill's code when SCM
-/// recorded nothing (a service found gone): the process is ended either way.
+/// A held process SCM recorded no exit for (a service found gone) is still ended, with the kill's
+/// code. The recorded cases are `RecordedExit::process_exit_code`'s.
 #[skuld::test]
-fn a_stop_ends_the_held_process_with_the_recorded_code_or_the_kill_code_without_one() {
-    use crate::backend::scm::exit_status::ERROR_SERVICE_SPECIFIC_ERROR;
-
+fn a_stop_ends_the_held_process_with_the_kill_code_when_nothing_was_recorded() {
     assert_eq!(stop_exit_code(None), KILLED_EXIT_CODE);
-    assert_eq!(stop_exit_code(Some(RecordedExit { win32: 0, specific: 0 })), 0);
-    let daemon = RecordedExit {
-        win32: ERROR_SERVICE_SPECIFIC_ERROR,
-        specific: 7,
-    };
-    assert_eq!(stop_exit_code(Some(daemon)), 7);
 }

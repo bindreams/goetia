@@ -1204,7 +1204,9 @@ fn stop_exit_code(exit: Option<RecordedExit>) -> i32 {
 /// It is terminated with [`stop_exit_code`] of `exit`, the record SCM confirmed `STOPPED` with. For
 /// `Kind::Simple` the record is the shim's own `Reported`, which maps to the code the shim ends itself
 /// with, so whichever terminator wins the race writes the same code. Where SCM holds no record (the
-/// service found gone) the codes are not guaranteed to match: this one uses `KILLED_EXIT_CODE`.
+/// service found gone) the codes are not guaranteed to match: this one uses `KILLED_EXIT_CODE`. That
+/// race arises only when another process deletes the service during the wait, the user's own
+/// concurrency, which goetia does not guard against.
 fn end_held(
     id: &Id,
     held: Held,
