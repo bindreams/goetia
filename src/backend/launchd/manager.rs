@@ -48,8 +48,9 @@
 //! [`Launchctl::bootout`]). Which steps wait, under which bound, and when a job may never go, is
 //! listed once, in the README's "Waiting for a start or stop".
 //!
-//! The waits that have no bound are part of sending a request: bounded by a deadline, one could end
-//! with the old job still loaded, the `bootstrap` unsent and the daemon left unloaded.
+//! A start's or an install's wait that has no bound is part of sending a request: bounded by a
+//! deadline, it could end with the old job still loaded, the `bootstrap` unsent and the daemon left
+//! unloaded.
 //!
 //! Only the modern verbs (`bootstrap`/`bootout`/`kickstart`/`print`) are used, never legacy
 //! `load`/`unload`. `launchctl enable`/`disable` and the plist's `Disabled` key are never touched:
