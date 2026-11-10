@@ -7,7 +7,7 @@
 #
 #   1. a consumer built without the `goetia-shim` feature type-checks with no variable set, and
 #      its `install` reports "built without a stock shim"; one that never declared the feature
-#      type-checks without a warning;
+#      type-checks with `unexpected_cfgs` denied;
 #   2. the same consumer built in two stages (shim first, then the program with the feature and
 #      `GOETIA_SHIM_EXE`) installs, runs and uninstalls a `type: simple` service, leaving no shim;
 #   3. goetia's own two-stage build does the same;
@@ -164,9 +164,11 @@ assert_lock_differs() {
 }
 
 # `goetia::embed_shim!` names the expanding crate's own `goetia-shim` feature. A consumer that never
-# declared it must still type-check without rustc warning about an unexpected cfg.
+# declared it must still type-check with `unexpected_cfgs` denied. `cargo rustc` passes the flag to
+# the consumer's crate alone, so step (1)'s artifacts for the dependencies are reused (`RUSTFLAGS`
+# would rebuild every one of them).
 assert_undeclared_feature_is_quiet() {
-    local consumer="$1" dir="$work/undeclared-consumer" out
+    local consumer="$1" dir="$work/undeclared-consumer"
     mkdir -p "$dir/src"
     sed -e '/^\[features\]$/d' -e '/^goetia-shim = \[\]$/d' "$consumer/Cargo.toml" > "$dir/Cargo.toml"
     cp "$consumer/Cargo.lock" "$dir/Cargo.lock"
@@ -175,14 +177,11 @@ fn main() {
     let _: Option<&'static [u8]> = goetia::embed_shim!();
 }
 EOF
-    if ! out="$(cd "$dir" && env -u GOETIA_SHIM_EXE cargo check --locked 2>&1)"; then
-        echo "$out"
-        fail "a consumer without the feature does not type-check"
-    fi
-    if [[ "$out" == *"unexpected \`cfg\`"* ]]; then
-        echo "$out"
-        fail "embed_shim! warns in a consumer that never declared the feature"
-    fi
+    (
+        cd "$dir"
+        env -u GOETIA_SHIM_EXE cargo rustc --locked --profile check \
+            --target-dir "$(winpath "$consumer/target")" -- -D unexpected_cfgs
+    )
 }
 
 consumer_routes() {
