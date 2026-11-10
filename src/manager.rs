@@ -151,8 +151,9 @@ pub trait ServiceManager {
     ///
     /// **Where a platform offers no request-only form,
     /// [`Budget::Immediate`] still performs the full blocking call.**
-    /// `launchctl bootout` has no non-blocking spelling: a `stop` with no
-    /// budget still boots the job out to completion.
+    /// launchd's `launchctl bootout` returns before the job's process has
+    /// exited, so a `stop` with no budget still waits until launchd no longer
+    /// has the job: the start that may follow must not meet the old instance.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never

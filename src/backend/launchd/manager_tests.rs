@@ -1319,12 +1319,19 @@ const PID: Answer = (0, "4242\n", "");
 const SPAWN_SCHEDULED: Answer = (0, "\tstate = spawn scheduled\n", "");
 /// A `print` whose `state` no recognised value names.
 const UNRECOGNISED: Answer = (0, "\tstate = someday-new-apple-state\n", "");
+/// A `print` of a job whose `bootout` has returned and whose process has not yet exited (measured:
+/// `launchctl bootout` does not wait for the process).
+const SIGTERMED: Answer = (0, "\tstate = SIGTERMed\n\tpid = 4242\n", "");
+/// The `print` that ends the wait after a `bootout`: launchd no longer has the job. It is not counted
+/// in the reservation (see [`Launchctl::bootout`]), so the tables carry it beyond their `*_CALLS`.
+const GONE: (&str, Answer) = ("print", NOT_LOADED);
 
-/// `start`'s longest path, every one of its [`START_CALLS`] `launchctl` calls: not loaded; a
-/// `bootstrap` refused, by a concurrent start that loaded it meanwhile; a `kickstart -p` that names
-/// no pid, so a bounded read decides; and then, `restart: always` reading not running, the
-/// corrective `bootout`, `bootstrap` and `kickstart`, and the read that confirms it.
-const START_LONGEST: [(&str, Answer); START_CALLS] = [
+/// `start`'s longest path, every one of its [`START_CALLS`] `launchctl` calls and the [`GONE`] read
+/// after the `bootout`: not loaded; a `bootstrap` refused, by a concurrent start that loaded it
+/// meanwhile; a `kickstart -p` that names no pid, so a bounded read decides; and then, `restart:
+/// always` reading not running, the corrective `bootout`, `bootstrap` and `kickstart`, and the read
+/// that confirms it.
+const START_LONGEST: [(&str, Answer); START_CALLS + 1] = [
     ("print", NOT_LOADED),
     ("bootstrap", REFUSED),
     ("print", DONE),
@@ -1333,6 +1340,7 @@ const START_LONGEST: [(&str, Answer); START_CALLS] = [
     ("print", RUNNING),
     ("print", NOT_RUNNING),
     ("bootout", DONE),
+    GONE,
     ("bootstrap", DONE),
     ("print", NOT_RUNNING),
     ("kickstart", PID),
@@ -1349,16 +1357,17 @@ const START_NOT_WAITING: [(&str, Answer); 5] = [
     ("kickstart", DONE),
 ];
 
-/// `install`'s longest path, [`INSTALL_CALLS`] calls: a `Create`'s read, the `bootout` of the stale job
-/// it finds loaded, and the read after the write. An `Update` makes two reads, before the write and
-/// after it.
-const INSTALL_LONGEST: [(&str, Answer); INSTALL_CALLS] = [("print", DONE), ("bootout", DONE), ("print", NOT_LOADED)];
+/// `install`'s longest path, [`INSTALL_CALLS`] calls and the [`GONE`] read: a `Create`'s read, the
+/// `bootout` of the stale job it finds loaded, and the read after the write. An `Update` makes two
+/// reads, before the write and after it.
+const INSTALL_LONGEST: [(&str, Answer); INSTALL_CALLS + 1] =
+    [("print", DONE), ("bootout", DONE), GONE, ("print", NOT_LOADED)];
 
 /// A `Create` over no loaded job: the read before the write and the read after it.
 const CREATED: [(&str, Answer); 2] = [("print", NOT_LOADED), ("print", NOT_LOADED)];
 
-/// `stop`'s and `uninstall`'s one call.
-const BOOTOUT: [(&str, Answer); STOP_CALLS] = [("bootout", DONE)];
+/// `stop`'s and `uninstall`'s one counted call, and the [`GONE`] read after it.
+const BOOTOUT: [(&str, Answer); STOP_CALLS + 1] = [("bootout", DONE), GONE];
 
 /// One scripted call: `verb` answers `answer`.
 fn answer(verb: &str, (code, stdout, stderr): Answer) -> Entry {
@@ -1568,9 +1577,23 @@ fn launchctl_sends_requests_as_requests_and_reads_as_queries() {
     launchctl.bootstrap(path, deadline, &mut held).unwrap();
     assert_eq!(fake.waits(), waited(RoleKind::Request));
 
-    let (launchctl, fake) = done("bootout");
+    // The `bootout` is a request; the wait after it reads, uncounted.
+    let fake = Fake::new([answer("bootout", DONE), answer(GONE.0, GONE.1)]);
+    let launchctl = Launchctl::new(Box::new(fake.clone()));
     launchctl.bootout(id, deadline, &mut held).unwrap();
-    assert_eq!(fake.waits(), waited(RoleKind::Request));
+    assert_eq!(
+        fake.waits(),
+        [
+            Waited {
+                role: RoleKind::Request,
+                bounded: true
+            },
+            Waited {
+                role: RoleKind::UncountedQuery,
+                bounded: true
+            },
+        ]
+    );
 
     let (launchctl, fake) = done("kickstart");
     launchctl
@@ -1663,6 +1686,185 @@ fn a_stop_whose_bootout_expires_is_a_wait_timeout() {
     fake.assert_spent("the bootout was sent");
 }
 
+// A bootout returns before the job's process exits ====================================================================
+
+/// What `launchctl` answers over a job that outlives its `bootout`: the `bootout` returns at once, and
+/// `print` goes on answering for the label until the old instance is gone.
+const BOOTOUT_OF_A_SLOW_JOB: [(&str, Answer); 4] =
+    [("bootout", DONE), ("print", SIGTERMED), ("print", SIGTERMED), GONE];
+
+/// `stop` is over when launchd no longer has the job, not when `bootout` returns: under every budget,
+/// since an `Ok` confirms the job stopped and `restart`'s start follows it.
+#[skuld::test]
+fn a_stop_waits_until_the_old_instance_is_gone() {
+    use crate::backend::Backend;
+
+    for budget in [Budget::DEFAULT, Budget::Unbounded, Budget::Immediate] {
+        let (mgr, script) = scripted(&BOOTOUT_OF_A_SLOW_JOB);
+
+        Backend::stop(
+            &mgr,
+            marked_plist(&never_installed()),
+            budget,
+            &mut reserved(&[Step::Stop]),
+        )
+        .unwrap_or_else(|e| panic!("{budget:?}: {e:?}"));
+
+        script.assert_spent(&format!("{budget:?}: the wait for the old instance"));
+    }
+}
+
+/// A bounded `stop` whose job outlasts the budget is a wait timeout, as a `bootout` that outlasts it is.
+#[skuld::test]
+fn a_stop_whose_old_instance_outlasts_the_budget_is_a_wait_timeout() {
+    use crate::backend::Backend;
+
+    let id = never_installed();
+    let fake = Fake::new([
+        answer("bootout", DONE),
+        answer("print", SIGTERMED),
+        reply(&["print"], Finished::Expired),
+    ]);
+    let mgr = launchd_over(fake.clone());
+
+    let e = Backend::stop(&mgr, marked_plist(&id), Budget::DEFAULT, &mut reserved(&[Step::Stop])).expect_err("expired");
+
+    assert!(
+        matches!(&e, Error::WaitTimeout { id: named, awaited: "stopped", .. } if named == id.as_str()),
+        "{e:?}"
+    );
+    fake.assert_spent("the wait was driven to the expiry");
+}
+
+/// `uninstall` removes the plist only once the old instance is gone, so a job is never left running
+/// with nothing installed to own it.
+#[skuld::test]
+fn an_uninstall_removes_the_plist_only_after_the_old_instance_is_gone() {
+    use crate::backend::Backend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("goetia-uninstall-slow.plist");
+    std::fs::write(&path, "plist").unwrap();
+    let still_there = {
+        let path = path.clone();
+        move || {
+            assert!(
+                path.exists(),
+                "the plist was removed while the old instance was still up"
+            )
+        }
+    };
+    let fake = Fake::new([
+        answer("bootout", DONE),
+        answer("print", SIGTERMED).then(still_there),
+        answer(GONE.0, GONE.1),
+    ]);
+    let mgr = launchd_over(fake.clone());
+    let plist = Plist {
+        location: Location {
+            path: path.clone(),
+            enabled: false,
+        },
+        ..marked_plist(&never_installed())
+    };
+
+    Backend::uninstall(&mgr, plist, &mut reserved(&[Step::Uninstall])).expect("uninstall");
+
+    fake.assert_spent("the wait for the old instance");
+    assert!(!path.exists(), "uninstall left the plist");
+}
+
+/// A `Create` over a stale job boots it out, and reads the label again after writing. The old instance
+/// still tearing down must not answer that read: it is not the job loaded in between, and reading it
+/// as one would refuse the install and take the plist back out.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_create_over_a_stale_job_still_tearing_down_is_not_in_doubt() {
+    let name = format!("goetia-create-slow-{:x}", std::process::id());
+    let _plists = Plists::new(&name);
+    let spec = spec_named(&name);
+    let calls = then(&[&[("print", DONE)], &BOOTOUT_OF_A_SLOW_JOB, &[("print", NOT_LOADED)]]);
+
+    let (mgr, script) = scripted(&calls);
+
+    assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
+    script.assert_spent("create over a job that outlives its bootout");
+    assert!(staging_path(&name).exists(), "the plist was taken back out");
+}
+
+/// A start after a stop finds the label free. `restart` is these two verbs back to back, and a start
+/// that met the old instance still answering would skip its `bootstrap` and leave nothing running once
+/// that instance exits, reporting `Ok`. Under `--timeout 0` the start is the plain request.
+#[skuld::test]
+fn a_start_after_a_stop_does_not_meet_the_old_instance() {
+    use crate::backend::Backend;
+
+    let id = never_installed();
+    for budget in [Budget::DEFAULT, Budget::Immediate] {
+        let start_calls: &[(&str, Answer)] = if budget.waits() {
+            &[
+                ("print", NOT_LOADED),
+                ("bootstrap", DONE),
+                ("print", NOT_RUNNING),
+                ("kickstart", PID),
+            ]
+        } else {
+            &[
+                ("print", NOT_LOADED),
+                ("bootstrap", DONE),
+                ("print", NOT_RUNNING),
+                ("kickstart", DONE),
+            ]
+        };
+        let (mgr, script) = scripted(&then(&[&BOOTOUT_OF_A_SLOW_JOB, start_calls]));
+        let mut held = reserved(&[Step::Stop, Step::Start]);
+
+        Backend::stop(&mgr, marked_plist(&id), budget, &mut held).unwrap_or_else(|e| panic!("{budget:?}: {e:?}"));
+        let started = if budget.waits() {
+            Backend::start(&mgr, marked_plist(&id), budget, &mut held)
+        } else {
+            Backend::request_start_after_stop(&mgr, marked_plist(&id), &mut held)
+        };
+        started.unwrap_or_else(|e| panic!("{budget:?}: {e:?}"));
+
+        script.assert_spent(&format!("{budget:?}: the stop, the wait and the start"));
+    }
+}
+
+/// The corrective cycle boots the stale job out and bootstraps ours: the `bootstrap` goes out once the
+/// old instance is gone, not while it is still answering for the label.
+#[skuld::test]
+fn a_corrective_cycle_bootstraps_only_after_the_old_instance_is_gone() {
+    use crate::backend::Backend;
+
+    let id = never_installed();
+    let calls = then(&[
+        &[
+            ("print", DONE),
+            ("print", NOT_RUNNING),
+            ("kickstart", PID),
+            ("print", NOT_RUNNING),
+        ],
+        &BOOTOUT_OF_A_SLOW_JOB,
+        &[
+            ("bootstrap", DONE),
+            ("print", NOT_RUNNING),
+            ("kickstart", PID),
+            ("print", RUNNING),
+        ],
+    ]);
+    let (mgr, script) = scripted(&calls);
+
+    Backend::start(
+        &mgr,
+        marked_plist_restarting(&id, Restart::Always),
+        Budget::DEFAULT,
+        &mut reserved(&[Step::Start]),
+    )
+    .expect("start");
+
+    script.assert_spent("the corrective cycle's wait for the old instance");
+}
+
 /// A waited `start` of a loaded job that reads `NOT_RUNNING`, whose `kickstart` outlasts the budget
 /// and is left running, then `print` answered by `after`.
 fn start_whose_kickstart_expires(after: Entry) -> (Error, Ended) {
@@ -1749,7 +1951,7 @@ fn a_kickstart_that_outlasts_the_budget_is_left_running_when_the_print_expires()
 fn corrective_start_whose_kickstart_expires(after: Answer) -> (Error, Ended, Fake) {
     let id = never_installed();
     let (kickstart, ended) = lingering(&["kickstart"]);
-    let head = &START_LONGEST[..START_CALLS - 2];
+    let head = &START_LONGEST[..START_CALLS - 1];
     let fake = Fake::new(
         head.iter()
             .map(|&(verb, a)| answer(verb, a))
@@ -2060,12 +2262,13 @@ fn a_kickstart_that_names_no_pid_and_reads_back_stopped_did_not_start() {
 
 /// A `restart: always` start down to the corrective cycle's `kickstart`, ahead of its closing read:
 /// a pid named, then not running, so `bootout`, `bootstrap` and `kickstart` again.
-const CORRECTIVE_CYCLE: [(&str, Answer); 8] = [
+const CORRECTIVE_CYCLE: [(&str, Answer); 9] = [
     ("print", DONE),
     ("print", NOT_RUNNING),
     ("kickstart", PID),
     ("print", NOT_RUNNING),
     ("bootout", DONE),
+    GONE,
     ("bootstrap", DONE),
     ("print", NOT_RUNNING),
     ("kickstart", PID),
@@ -2413,7 +2616,7 @@ fn a_job_loaded_after_a_create_leaves_the_install_in_doubt_with_no_plist() {
             "loaded after the write",
         ),
         (
-            vec![("print", DONE), ("bootout", DONE), ("print", RUNNING)],
+            vec![("print", DONE), ("bootout", DONE), GONE, ("print", RUNNING)],
             "reloaded after the bootout",
         ),
     ] {
@@ -2467,6 +2670,7 @@ fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls()
     let script = Fake::new([
         answer("print", DONE),
         answer("bootout", DONE).then(move || std::fs::write(taken, "someone else\n").unwrap()),
+        answer(GONE.0, GONE.1),
     ]);
     let mgr = launchd_over(script.clone());
     let e = mgr

@@ -608,8 +608,8 @@ fn an_unstalled_entry_is_left_alone_under_a_budget_that_does_not_wait() {
 }
 
 /// [`an_unstalled_entry_is_left_alone_under_a_budget_that_does_not_wait`]'s
-/// stop mirror. launchd's `bootout` has no non-blocking form, so there an
-/// `Immediate` stop does settle — but that is more than the contract
+/// stop mirror. launchd's `Immediate` stop waits for the job to be gone, so
+/// there it does settle — but that is more than the contract
 /// promises, and systemd (`stop --no-block`) and SCM (`request_stop`) settle
 /// nothing. The Fake models the contract's minimum, so no test can come to
 /// depend on an `Immediate` stop having established `Stopped`.

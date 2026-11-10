@@ -27,7 +27,10 @@
 //!   bounds the wait for the pid and nothing else: every `launchctl` call that issues the request
 //!   runs to completion. The throttle is keyed to the job, so `bootout` plus `bootstrap` does not
 //!   clear it and there is no remedy to apply.
-//! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded.
+//! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded, and waits until
+//!   launchd no longer has it: `bootout` returns before the job's process has exited, and until it
+//!   has, `print` still answers for the label. Every verb that acts on the label after a `bootout`
+//!   waits the same way.
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`] (`/Library/LaunchDaemons`).
 //!   Does not start it.
 //! - `disable` moves the plist back to [`STAGING_DIR`]. It does not `bootout` the job:
@@ -716,11 +719,11 @@ fn command_failed(args: &[&str], status: std::process::ExitStatus, stderr: &[u8]
 
 /// The one [`Deadline`] a budgeted verb derives, first thing at entry.
 ///
-/// A budget that does not wait gets an unbounded deadline, not `budget.start()`: `launchctl` has no
-/// non-blocking `bootout`, so issuing that request is the blocking call, and an already-expired
-/// deadline would stop waiting at once and reach `budget::timed_out(.., Budget::Immediate)`,
-/// tripping its `debug_assert!`. What a non-waiting budget declines to wait for is the pid, and the
-/// plain `kickstart` is what declines it.
+/// A budget that does not wait gets an unbounded deadline, not `budget.start()`: a `bootout` is
+/// followed by the wait for the job to be gone (see [`Launchctl::bootout`]), which a non-waiting
+/// `stop` still performs, and an already-expired deadline would stop it at once and reach
+/// `budget::timed_out(.., Budget::Immediate)`, tripping its `debug_assert!`. What a non-waiting
+/// budget declines to wait for is the pid, and the plain `kickstart` is what declines it.
 fn verb_deadline(budget: Budget) -> Deadline {
     if budget.waits() {
         budget.start()
@@ -749,6 +752,10 @@ enum Kickstarted {
 /// bound for an external process that might never exit, never taken as proof of state: expiry only
 /// leaves the `kickstart` running. `print` answers in milliseconds.
 const HELD_READ_BOUND: Duration = Duration::from_secs(5);
+
+/// How long [`Launchctl::bootout`]'s wait rests between two reads of the label. Pacing, never proof
+/// of state: each read asks launchd, and the wait ends on its answer.
+const UNLOAD_POLL: Duration = Duration::from_millis(50);
 
 /// Exit codes `launchctl` uses for "no such job": 3 ("no such process") and 113 ("could not find
 /// specified service").
@@ -797,10 +804,21 @@ impl Launchctl {
     /// Only success and the not-found codes in [`is_not_found`] answer the question; any other failure is
     /// an `Err`, since callers act on "not loaded" by writing or bootstrapping.
     fn is_loaded(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<bool>> {
+        self.is_loaded_as(id, deadline, Role::Query, reservation)
+    }
+
+    /// [`Self::is_loaded`], read as `role`.
+    fn is_loaded_as(
+        &self,
+        id: &str,
+        deadline: Deadline,
+        role: Role,
+        reservation: &mut Reservation,
+    ) -> Result<Option<bool>> {
         // Only the exit code is read, never the body of `print`'s output.
         let target = target(id);
         let args = ["print", target.as_str()];
-        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Query, reservation)? else {
+        let Finished::Exited { status, capture } = self.run(&args, deadline, role, reservation)? else {
             return Ok(None);
         };
         if status.success() {
@@ -895,10 +913,20 @@ impl Launchctl {
         }
     }
 
-    /// `bootout`, with no `is_loaded` pre-check: the job could unload between check and act (a
-    /// concurrent `stop`, an operator's `launchctl bootout`), failing this call for an already
-    /// stopped service and breaking the idempotency [`ServiceManager::stop`] requires. Success and
-    /// the [`is_not_found`] codes are both `Ok`.
+    /// `bootout`, then the wait until launchd no longer has `id` loaded. `Ok(None)` iff `deadline`
+    /// expired, in either.
+    ///
+    /// No `is_loaded` pre-check: the job could unload between check and act (a concurrent `stop`, an
+    /// operator's `launchctl bootout`), failing this call for an already stopped service and
+    /// breaking the idempotency [`ServiceManager::stop`] requires. Success and the
+    /// [`is_not_found`] codes are both `Ok`.
+    ///
+    /// `launchctl bootout` returns within milliseconds, not when the job's process has exited: until
+    /// then `print` still answers for the label (`state = SIGTERMed`), for as long as the process
+    /// takes to exit or launchd's `ExitTimeOut` (default 20s) takes to kill it. A caller that acts
+    /// on the label after a `bootout` (`bootstrap`, a read, a plist removed) must not meet the old
+    /// instance, so this waits for it. The wait is `deadline`'s, so it ends only on the job being
+    /// gone or on that bound; a caller that cannot be cut short passes an unbounded one.
     ///
     /// [`ServiceManager::stop`]: crate::manager::ServiceManager::stop
     fn bootout(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<()>> {
@@ -908,10 +936,25 @@ impl Launchctl {
         let Finished::Exited { status, capture } = self.run(&args, deadline, role, reservation)? else {
             return Ok(None);
         };
-        if status.success() || is_not_found(status.code()) {
-            Ok(Some(()))
-        } else {
-            Err(command_failed(&args, status, &capture.stderr))
+        if !(status.success() || is_not_found(status.code())) {
+            return Err(command_failed(&args, status, &capture.stderr));
+        }
+        self.wait_unloaded(id, deadline)
+    }
+
+    /// Reads until launchd no longer has `id` loaded. `Ok(None)` iff `deadline` expired first.
+    ///
+    /// Every read re-checks the real condition; [`UNLOAD_POLL`] only paces them. Uncounted: how many
+    /// reads a job's exit takes is not known when the verb reserves.
+    fn wait_unloaded(&self, id: &str, deadline: Deadline) -> Result<Option<()>> {
+        loop {
+            match self.is_loaded_as(id, deadline, Role::UncountedQuery, &mut Reservation::default())? {
+                None => return Ok(None),
+                Some(false) => return Ok(Some(())),
+                Some(true) => {}
+            }
+            let pause = deadline.remaining().map_or(UNLOAD_POLL, |left| left.min(UNLOAD_POLL));
+            std::thread::sleep(pause);
         }
     }
 
@@ -979,6 +1022,8 @@ const KILL_REQUESTS: usize = 1;
 /// Most `launchctl` calls per verb, reads included: each draws its role's temp files from the same
 /// reservation. `install` adds two `is_loaded`s; `start` two `is_loaded`s and five `live_state`s. The
 /// `print` after an expired `kickstart` is not counted: the verb ends there, in place of its last read.
+/// Neither are the reads of the wait after a `bootout`, which are uncounted queries: there are as many
+/// as the job's exit takes.
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2;
 const START_CALLS: usize = START_REQUESTS + 7;
 const STOP_CALLS: usize = STOP_REQUESTS;
@@ -1317,7 +1362,8 @@ impl backend::Backend for Launchd {
             && blob.spec.restart == Restart::Always
             && self.launchctl.live_state(id.as_str(), issuing, reservation)?.0 != State::Running
         {
-            // One corrective cycle, not a retry loop: tear the stale job down by label and load ours.
+            // One corrective cycle, not a retry loop: tear the stale job down by label, wait until
+            // it is gone so that the `bootstrap` does not meet it, and load ours.
             // Issued whatever is left of the budget, like the request above: when a stale job
             // answered to the label, this cycle is the request, and skipping it would report a start
             // never sent as one that may still arrive.
@@ -1340,8 +1386,9 @@ impl backend::Backend for Launchd {
         Ok(())
     }
 
-    /// The plain request-only start. The stop before it ran `bootout` to completion (it has no
-    /// request-only form), so the instance it stopped cannot be what answers for the label here.
+    /// The plain request-only start. The stop before it waited until launchd no longer had the job
+    /// (`bootout` itself returns before the process exits, see [`Launchctl::bootout`]), even under
+    /// [`Budget::Immediate`], so the instance it stopped cannot be what answers for the label here.
     fn request_start_after_stop(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
         backend::Backend::start(self, snapshot, Budget::Immediate, reservation)
     }

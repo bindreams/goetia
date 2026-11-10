@@ -1058,27 +1058,27 @@ fn root_user_runs_as_uid_zero() {
 
 // Budgets =============================================================================================================
 
-/// `launchctl` exposes no non-blocking `bootout`, so under `Budget::Immediate` `stop` still runs it
-/// to completion: issuing the request *is* the wait here, which is why the trait doc comment says
+/// `launchctl bootout` returns before the job's process has exited, so under `Budget::Immediate`
+/// `stop` still waits until launchd no longer has the job, which is why the trait doc comment says
 /// so on `stop` rather than leaving it to be rediscovered per platform.
 ///
 /// Against the trap — handing `wait_bounded` the `Immediate` budget's own already-expired deadline
 /// — `bootout` is SIGKILLed the instant it is spawned, so this returns a `WaitTimeout` instead of
 /// stopping anything, or trips `budget::timed_out`'s `debug_assert!` outright in a debug build.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_stop_with_no_budget_runs_bootout_to_completion() {
+fn a_stop_with_no_budget_waits_for_the_job_to_be_gone() {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
 
     mgr.stop(&spec.id, Budget::Immediate)
-        .expect("bootout has no non-blocking form, so a stop with no budget still completes");
+        .expect("a stop with no budget still waits for the job to be gone, and completes");
 
-    assert_ne!(
+    assert_eq!(
         mgr.status(&spec.id).expect("status after stop").state,
-        State::Running,
-        "the bootout ran to completion, so the job really is down"
+        State::Stopped,
+        "launchd no longer has the job, so it reads as stopped"
     );
 }
 
