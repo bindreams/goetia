@@ -88,17 +88,16 @@ impl WaitEnd {
         exit: None,
     };
 
+    /// A service found gone: stopped, with nothing read.
+    const CONFIRMED_WITHOUT_A_RECORD: WaitEnd = WaitEnd {
+        waited: Waited::Confirmed,
+        exit: None,
+    };
+
     fn confirmed_by(status: QueriedStatus) -> WaitEnd {
         WaitEnd {
             waited: Waited::Confirmed,
             exit: Some(status.exit),
-        }
-    }
-
-    fn confirmed_without_a_record() -> WaitEnd {
-        WaitEnd {
-            waited: Waited::Confirmed,
-            exit: None,
         }
     }
 }
@@ -502,12 +501,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
             }
         };
         match seen {
-            Seen::Stopped(exit) => {
-                return Ok(WaitEnd {
-                    waited: Waited::Confirmed,
-                    exit: Some(exit),
-                });
-            }
+            Seen::Stopped(status) => return Ok(WaitEnd::confirmed_by(status)),
             Seen::Pending => {
                 let status = match decided_or_status(
                     a.arm(WantState::RunningPausedOrStopped, deadline)?,
@@ -551,8 +545,8 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
 
 /// What [`settle_and_stop`] learned, from a notification or from the status an arm returned.
 enum Seen {
-    /// With the exit SCM recorded.
-    Stopped(RecordedExit),
+    /// With the exit SCM recorded, in its status.
+    Stopped(QueriedStatus),
     /// A pending state.
     Pending,
     /// `RUNNING` or `PAUSED`, named as the errors name it.
@@ -563,7 +557,7 @@ enum Seen {
 /// which is waited for.
 fn seen_in(status: QueriedStatus) -> Option<Seen> {
     match status.state {
-        QueriedState::Stopped => Some(Seen::Stopped(status.exit)),
+        QueriedState::Stopped => Some(Seen::Stopped(status)),
         QueriedState::Running => Some(Seen::Settled {
             state: "RUNNING",
             accepts_stop: status.accepts_stop,
@@ -743,7 +737,7 @@ fn decided_or_status(armed: Armed, wanted: QueriedState) -> io::Result<Result<Qu
         Armed::Expired => Ok(Err(WaitEnd::EXPIRED)),
         Armed::Unwatchable(status) if status.state == wanted => Ok(Err(WaitEnd::confirmed_by(status))),
         Armed::Unwatchable(status) => Err(marked_for_deletion(status.state)),
-        Armed::Gone if wanted == QueriedState::Stopped => Ok(Err(WaitEnd::confirmed_without_a_record())),
+        Armed::Gone if wanted == QueriedState::Stopped => Ok(Err(WaitEnd::CONFIRMED_WITHOUT_A_RECORD)),
         Armed::Gone => Err(service_gone()),
     }
 }

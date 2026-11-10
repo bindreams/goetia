@@ -205,11 +205,19 @@ fn a_win32_zero_record_with_a_specific_code_names_both() {
 
 // The process exit code of a recorded exit ----------------------------------------------------------------------------
 
-/// A `stop` that ends the shim itself ends it with what SCM recorded, which is what the shim itself
-/// exits with: `Reported::process_exit_code`, through `scm_codes` and back.
-#[skuld::test]
-fn a_recorded_exit_maps_back_to_the_process_exit_code_of_what_was_reported() {
-    let every_reported = [
+/// One of each [`Reported`] shape. The exhaustive match fails to compile when a variant is added,
+/// so the list below cannot silently miss it.
+fn every_reported() -> Vec<Reported> {
+    fn exhaustive(reported: Reported) {
+        match reported {
+            Reported::Clean
+            | Reported::DaemonExit(_)
+            | Reported::ShimFailure(_)
+            | Reported::IncompleteStop
+            | Reported::Refused => {}
+        }
+    }
+    let every = vec![
         Reported::Clean,
         Reported::from_daemon_code(7),
         Reported::from_daemon_code(-1073741819),
@@ -218,26 +226,39 @@ fn a_recorded_exit_maps_back_to_the_process_exit_code_of_what_was_reported() {
         Reported::incomplete_stop(),
         Reported::Refused,
     ];
+    every.iter().copied().for_each(exhaustive);
+    every
+}
 
-    for reported in every_reported {
+/// What SCM recorded for a report names that report again, so a `stop` that ends the shim itself ends
+/// it with the code the shim exits with.
+#[skuld::test]
+fn a_recorded_exit_maps_back_to_the_report_that_produced_it() {
+    for reported in every_reported() {
         let (win32, specific) = reported.scm_codes();
+        let record = RecordedExit { win32, specific };
 
-        assert_eq!(
-            RecordedExit { win32, specific }.process_exit_code(),
-            reported.process_exit_code(),
-            "{reported:?}"
-        );
+        assert_eq!(Reported::from_record(record), Some(reported), "{reported:?}");
+        assert_eq!(record.process_exit_code(), reported.process_exit_code(), "{reported:?}");
     }
 }
 
-/// A pair no `Reported` produces keeps its Win32 code, or its service-specific one when the Win32
-/// code is 0 or SCM's service-specific wrapper.
+/// A pair no `Reported` produces (a `Managed` service's own codes) names no report, and keeps its
+/// Win32 code, or its service-specific one when the Win32 code is 0.
 #[skuld::test]
 fn a_recorded_exit_no_report_produces_keeps_its_win32_code_or_else_its_specific_one() {
-    let exit = |win32, specific| RecordedExit { win32, specific }.process_exit_code();
+    let record = |win32, specific| RecordedExit { win32, specific };
 
-    assert_eq!(exit(1067, 0), 1067);
-    assert_eq!(exit(5, 9), 5);
-    assert_eq!(exit(0, 9), 9);
-    assert_eq!(exit(ERROR_SERVICE_SPECIFIC_ERROR, 9), 9);
+    for (win32, specific, code) in [(5, 9, 5), (0, 9, 9), (ERROR_SERVICE_SPECIFIC_ERROR, 0, 1066)] {
+        assert_eq!(
+            Reported::from_record(record(win32, specific)),
+            None,
+            "({win32}, {specific})"
+        );
+        assert_eq!(
+            record(win32, specific).process_exit_code(),
+            code,
+            "({win32}, {specific})"
+        );
+    }
 }

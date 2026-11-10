@@ -34,7 +34,7 @@ use super::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_f
 
 /// The name SCM's service table carries. SCM ignores it for `SERVICE_WIN32_OWN_PROCESS`; the
 /// service's real name is `service_main`'s first argument.
-const TABLE_NAME: &str = "goetia-shim";
+pub(super) const TABLE_NAME: &str = "goetia-shim";
 
 /// Called from `main()`. Hands control to SCM, and never returns normally. [`finish`] records what
 /// every path that reports `STOPPED` reported, and the dispatcher returns once SCM has processed it,
@@ -306,7 +306,7 @@ fn run_daemon(
     on_running();
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
-    // leaves a daemon that may be running.
+    // leaves a daemon that may be running, and `TreeMayRun` its tree.
     match supervisor.wait_for_child_or_stop(waiter, &child, id, on_stopping) {
         WaitOutcome::ChildExited => {
             let code = match child.wait() {

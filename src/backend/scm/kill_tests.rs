@@ -968,3 +968,18 @@ fn every_state_with_a_process_yields_its_pid() {
     }
     assert_eq!(system::process_of(&status(SERVICE_STOPPED, 0)), None);
 }
+
+/// `stop` ends the process with what SCM recorded, and with the kill's code when SCM recorded
+/// nothing (a service found gone).
+#[skuld::test]
+fn a_stop_ends_the_process_with_the_recorded_code_or_the_kill_code_without_one() {
+    use crate::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
+
+    assert_eq!(stop_exit_code(None), KILLED_EXIT_CODE);
+    assert_eq!(stop_exit_code(Some(RecordedExit { win32: 0, specific: 0 })), 0);
+    let daemon = RecordedExit {
+        win32: ERROR_SERVICE_SPECIFIC_ERROR,
+        specific: 7,
+    };
+    assert_eq!(stop_exit_code(Some(daemon)), 7);
+}

@@ -113,7 +113,7 @@ use super::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit};
 use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, WaitEnd, Waited, end_process};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
-use crate::backend::scm::kill::{HoldOutcome, KILLED_EXIT_CODE, hold_if_possible};
+use crate::backend::scm::kill::{HoldOutcome, hold_if_possible, stop_exit_code};
 use crate::backend::scm::parameters::Parameters;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
@@ -1192,16 +1192,17 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
 /// is blocked; a bounded one is the usual case (the shim exits just after it reports `STOPPED`) and
 /// says nothing.
 ///
-/// The process ends with `exit`, the record SCM confirmed `STOPPED` with, as the shim itself exits
-/// with it: [`RecordedExit::process_exit_code`]. With no record (a service found gone) it ends with
-/// [`KILLED_EXIT_CODE`].
+/// The process ends with [`stop_exit_code`] of `exit`, the record SCM confirmed `STOPPED` with. Both
+/// terminators are kept: this one is what ends a `Kind::Managed` service's own exe, which lingers
+/// after `STOPPED`. For `Kind::Simple` the record is the shim's own `Reported`, which maps to the code
+/// the shim ends itself with, so whichever terminator wins the race writes the same code.
 fn end_held(
     id: &Id,
     held: Held,
     deadline: Deadline,
     exit: Option<RecordedExit>,
 ) -> std::io::Result<EndProcessOutcome<Held>> {
-    let code = exit.map_or(KILLED_EXIT_CODE, RecordedExit::process_exit_code);
+    let code = stop_exit_code(exit);
     end_process(
         held,
         deadline,

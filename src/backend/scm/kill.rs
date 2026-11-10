@@ -19,6 +19,7 @@
 
 use std::io;
 
+use crate::backend::scm::exit_status::RecordedExit;
 use crate::backend::scm::wait::Waited;
 use crate::error::{Chain, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
@@ -26,6 +27,12 @@ use crate::manager::budget::{Budget, Deadline};
 /// The exit code a kill ends the process with, and `stop` ends one SCM recorded no exit for: SCM sees a
 /// failure, the same as for a crash.
 pub(crate) const KILLED_EXIT_CODE: i32 = 1;
+
+/// The exit code `stop` ends the service's process with after SCM confirmed `STOPPED` with `exit`:
+/// the one the shim itself exits with, or [`KILLED_EXIT_CODE`] when nothing was recorded.
+pub(crate) fn stop_exit_code(exit: Option<RecordedExit>) -> i32 {
+    exit.map_or(KILLED_EXIT_CODE, RecordedExit::process_exit_code)
+}
 
 /// What a kill did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -156,6 +156,33 @@ fn stop_kills_the_whole_process_tree() {
     );
 }
 
+/// A STOP that nothing waits for (`Budget::Immediate` sends it and returns) leaves the shim to end
+/// itself, which is the path under test: it ends with the code it reported to SCM, 0 for a clean stop.
+/// The waiting `stop` above ends the same process, so the two cannot share a service.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+fn a_stop_nothing_waits_for_ends_the_shim_with_the_code_it_reported() {
+    let id = support::random_test_id();
+    let logs = LogDir::new();
+    let mgr = manager();
+    let _guard = ShimGuard::new(&id);
+    let reported = ConnectBack::listen();
+
+    let spec = simple_spec(&id, fixture_command("report", &[&reported.port().to_string()]), &logs);
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    reported.accept("the fixture to start");
+    let shim = ShimProcess::attach(&id);
+
+    mgr.stop(&spec.id, Budget::Immediate).expect("request the stop");
+
+    assert_eq!(
+        shim.wait_for_exit(),
+        0,
+        "the shim's process exit code differs from the clean stop it reported to SCM"
+    );
+    assert_eq!(recorded_exit(&id), RecordedExit { win32: 0, specific: 0 });
+}
+
 /// `tasklist /FI "PID eq <pid>"` prints an informational "no tasks found"
 /// line (not a CSV row) when nothing matches, so a matching row is
 /// distinguished by the output actually containing `pid` as a field —

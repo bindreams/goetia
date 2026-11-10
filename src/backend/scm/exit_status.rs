@@ -98,6 +98,19 @@ impl Reported {
             Reported::Refused => (0, SHIM_REFUSED),
         }
     }
+
+    /// The report whose [`Reported::scm_codes`] are `record`, the inverse of that mapping; `None` for
+    /// a pair no report produces.
+    pub fn from_record(record: RecordedExit) -> Option<Reported> {
+        match (record.win32, record.specific) {
+            (0, 0) => Some(Reported::Clean),
+            (INCOMPLETE_STOP_WIN32, ERROR_CAN_NOT_COMPLETE) => Some(Reported::IncompleteStop),
+            (0, SHIM_REFUSED) => Some(Reported::Refused),
+            (ERROR_SERVICE_SPECIFIC_ERROR, code) if code != 0 => Some(Reported::DaemonExit(code)),
+            (code, 0) if code != 0 && code != ERROR_SERVICE_SPECIFIC_ERROR => Some(Reported::ShimFailure(code)),
+            _ => None,
+        }
+    }
 }
 
 /// The exit codes SCM holds for a service that reached `STOPPED`: what the shim reported, or
@@ -125,14 +138,14 @@ impl RecordedExit {
         !self.is_refusal() && (self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR)
     }
 
-    /// The process exit code of the shim that reported this, the inverse of
-    /// [`Reported::scm_codes`] into [`Reported::process_exit_code`]: the service-specific code when
-    /// the Win32 code is 0 or [`ERROR_SERVICE_SPECIFIC_ERROR`], else the Win32 code. A pair no
-    /// [`Reported`] produces follows the same rule.
+    /// The process exit code of the shim that reported this: [`Reported::process_exit_code`] of the
+    /// report [`Reported::from_record`] names. A pair no report produces (a `Managed` service's own
+    /// codes) ends with its Win32 code, or its service-specific one when the Win32 code is 0.
     pub fn process_exit_code(self) -> i32 {
-        match self.win32 {
-            0 | ERROR_SERVICE_SPECIFIC_ERROR => self.specific as i32,
-            win32 => win32 as i32,
+        match Reported::from_record(self) {
+            Some(reported) => reported.process_exit_code(),
+            None if self.win32 == 0 => self.specific as i32,
+            None => self.win32 as i32,
         }
     }
 
