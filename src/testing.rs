@@ -22,10 +22,35 @@ pub fn shown_sid(sid: &[u8]) -> String {
     crate::backend::scm::sid::try_sid_display(sid).unwrap_or_else(|| panic!("{sid:?} is not a SID Windows can show"))
 }
 
+/// The SID of the local account `account_name`, as the library looks it up when it installs a
+/// daemon that runs as it.
 #[cfg(windows)]
-pub use crate::backend::scm::manager::identity::sid_for_account_name;
+pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
+    crate::backend::scm::manager::sid_for_account_name(account_name)
+}
+
 #[cfg(windows)]
 pub use crate::backend::scm::sid::copy_sid;
+
+/// One entry of a DACL: its trustee's SID bytes, its mask, and whether it allows (else denies).
+#[cfg(windows)]
+pub type DaclEntry = (Vec<u8>, u32, bool);
+
+/// The DACL of the kernel object `handle`, which is open with `READ_CONTROL`: whether it is
+/// protected, and its entries (`None` for a NULL DACL). Read by the library's own check of
+/// permissions, which fails on an entry type it does not understand. `name` stands for the object
+/// in an error.
+#[cfg(windows)]
+pub fn kernel_object_dacl(
+    handle: *mut std::ffi::c_void,
+    name: &std::path::Path,
+) -> Result<(bool, Option<Vec<DaclEntry>>)> {
+    let security = crate::backend::scm::shim::acl::kernel_object_security(handle, name)?;
+    let entries = security
+        .dacl
+        .map(|dacl| dacl.into_iter().map(|ace| (ace.trustee, ace.mask, ace.allow)).collect());
+    Ok((security.protected, entries))
+}
 
 pub mod cleanup;
 pub mod elevation;

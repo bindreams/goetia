@@ -411,7 +411,9 @@ fn the_nearest_object_to_the_target_is_reported_first() {
 
 #[cfg(windows)]
 pub(in crate::backend::scm::shim) mod windows {
-    use super::system::{ObjectId, display_path, identity_of, is_unreadable, parse, read_chain, resolve_target};
+    use super::system::{
+        ObjectId, display_path, identity_of, is_unreadable, kernel_object_security, parse, read_chain, resolve_target,
+    };
     use super::*;
     use crate::error::Error;
     use std::io;
@@ -432,6 +434,31 @@ pub(in crate::backend::scm::shim) mod windows {
             .create_dir(&folder)
             .unwrap();
         folder.canonicalize().unwrap()
+    }
+
+    /// An unnamed mutex of this process, with a protected DACL of one entry for Everyone: what
+    /// `kernel_object_security` reads back of it.
+    #[skuld::test]
+    fn a_kernel_objects_owner_and_dacl_are_read_back() {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        let descriptor = Descriptor::from_sddl("D:P(A;;GA;;;WD)").unwrap();
+        let attributes = descriptor.attributes();
+        // SAFETY: `attributes` points at `descriptor`, live for the call; the mutex has no name.
+        let raw = unsafe { CreateMutexW(&attributes, 0, std::ptr::null()) };
+        assert!(!raw.is_null(), "{}", io::Error::last_os_error());
+        // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns.
+        let mutex = unsafe { OwnedHandle::from_raw_handle(raw) };
+
+        let security = kernel_object_security(mutex.as_raw_handle(), Path::new("a test mutex")).unwrap();
+
+        assert!(security.protected);
+        assert!(crate::backend::scm::sid::is_whole_sid(&security.owner));
+        let dacl = security.dacl.expect("the DACL was set");
+        assert_eq!(dacl.len(), 1);
+        assert_eq!(dacl[0].trustee, everyone());
+        assert!(dacl[0].allow);
     }
 
     /// A volume that keeps no ACLs is refused: no owner or permissions can be read back from it.

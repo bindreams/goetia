@@ -33,7 +33,8 @@ use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_in
 pub(crate) use protected::{Descriptor, is_as_wanted};
 #[cfg(windows)]
 pub(crate) use system::{
-    display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, require_acls_under,
+    display_path, is_unreadable, kernel_object_owner, kernel_object_security, normalise as lexical, read_object,
+    require_acls_under,
 };
 
 #[cfg(windows)]
@@ -608,6 +609,20 @@ mod system {
         )?;
         // SAFETY: `owner` points into `descriptor`, which `info` keeps live.
         unsafe { copy_sid(info.owner, name) }
+    }
+
+    /// The owner and DACL of the kernel object `handle`, which must be open with `READ_CONTROL`;
+    /// [`ObjectSecurity::directory`] is false. `name` stands for the object in an error.
+    pub(crate) fn kernel_object_security(handle: HANDLE, name: &Path) -> Result<ObjectSecurity> {
+        let info = security_info(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            "read the permissions of",
+            name,
+        )?;
+        // SAFETY: `owner` and `dacl` point into `descriptor`, which `info` keeps live.
+        unsafe { describe(info.descriptor, info.owner, info.dacl, name.to_path_buf(), false) }
     }
 
     /// Copies the owner, the DACL and whether it is protected out of a security descriptor of a

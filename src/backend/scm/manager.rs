@@ -91,8 +91,10 @@
 //! reach `CreateServiceW`/`ChangeServiceConfigW` for one that needs none —
 //! Windows rejects a password outright for those accounts.
 
-pub(crate) mod identity;
+pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use identity::sid_for_account_name;
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;

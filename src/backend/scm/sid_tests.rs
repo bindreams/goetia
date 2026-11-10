@@ -105,4 +105,13 @@ mod windows {
         // SAFETY: `sid` is as long as its header says, live for the call.
         assert_eq!(unsafe { copy_sid(sid.as_mut_ptr() as PSID) }, None);
     }
+
+    /// The copy is as long as the SID's own header says, not as long as the buffer it stands in.
+    #[skuld::test]
+    fn a_sid_in_a_larger_buffer_is_copied_without_what_follows_it() {
+        let mut buffer = administrators();
+        buffer.extend_from_slice(&[0xAA; 7]);
+        // SAFETY: `buffer` starts with a whole SID and is live for the call.
+        assert_eq!(unsafe { copy_sid(buffer.as_mut_ptr() as PSID) }, Some(administrators()));
+    }
 }

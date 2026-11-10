@@ -1,6 +1,7 @@
 //! A security identifier as bytes: how one is built, checked, copied and shown. Plain data, so it
-//! works on every host except [`try_sid_display`] and [`copy_sid`], which call Windows; looking an
-//! account up by it is Windows-only, in `manager::identity`.
+//! works on every host except what asks Windows: [`try_sid_display`], [`sid_display`] with its
+//! messages `INVALID` and `UNSHOWABLE`, and [`copy_sid`]. Looking an account up by a SID is
+//! Windows-only too, in `manager::identity`.
 
 /// A security identifier in its binary form, as `LookupAccountNameW` and `GetAce` return it.
 pub(crate) type Sid = Vec<u8>;
