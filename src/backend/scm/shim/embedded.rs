@@ -102,11 +102,8 @@ mod stock {
             Ok(self.image.get_or_init(|| Image::new(bytes)))
         }
 
-        /// The folder: `dir`, or the default one. A relative `dir` is [`Error::ShimPathRelative`].
         fn dir(&self) -> Result<PathBuf> {
-            let dir = self.dir.clone().map_or_else(default_dir, Ok)?;
-            absolute(&dir)?;
-            Ok(dir)
+            folder_in(self.dir.as_deref())
         }
     }
 
@@ -115,7 +112,7 @@ mod stock {
         /// [`Error::ShimNotEmbedded`]; with a relative `dir`, [`Error::ShimPathRelative`].
         fn preview(&self) -> Result<HostCommand> {
             let image = self.image()?;
-            preview_in(&self.dir()?, image)
+            Ok(preview_in(&self.dir()?, image))
         }
 
         /// Checks `dir` with `folders`, creates what is missing of it, and leaves the file in place
@@ -170,22 +167,22 @@ mod stock {
     impl ShimProvider for SiblingStockShim {
         fn preview(&self) -> Result<HostCommand> {
             let bytes = self.read()?;
-            preview_in(&default_dir()?, &Image::new(&bytes))
+            Ok(preview_in(&folder_in(None)?, &Image::new(&bytes)))
         }
 
         fn provide(&self, folders: &FolderCheck) -> Result<HostCommand> {
             let bytes = self.read()?;
-            provide_in(&default_dir()?, &Image::new(&bytes), folders)
+            provide_in(&folder_in(None)?, &Image::new(&bytes), folders)
         }
 
         /// The default folder, which does not depend on the sibling.
         fn folder(&self) -> Result<Option<PathBuf>> {
-            default_dir().map(Some)
+            folder_in(None).map(Some)
         }
 
         /// As [`EmbeddedStockShim`]'s, over the default folder, and whether or not the sibling is there.
         fn sweep(&self, referenced: &[PathBuf], folders: &FolderCheck) -> std::result::Result<(), SweepFailure> {
-            let dir = default_dir()?;
+            let dir = folder_in(None)?;
             sweep_folder(&dir, referenced, folders, || Ok(dir.clone()))
         }
     }
@@ -278,31 +275,33 @@ mod stock {
         Error::os("locate %ProgramFiles%", source)
     }
 
-    /// `dir`, if it is an absolute path.
-    fn absolute(dir: &Path) -> Result<&Path> {
-        if dir.is_absolute() {
-            Ok(dir)
-        } else {
-            Err(Error::ShimPathRelative {
-                path: dir.to_path_buf(),
-            })
+    /// The folder a stock shim goes in: `dir`, or the default one. A relative one is
+    /// [`Error::ShimPathRelative`]. Every provider's folder comes from here, so every path into
+    /// `preview_in`, `provide_in` and `folder()` has had this check.
+    pub(super) fn folder_in(dir: Option<&Path>) -> Result<PathBuf> {
+        let folder = match dir {
+            Some(dir) => dir.to_path_buf(),
+            None => default_dir()?,
+        };
+        if !folder.is_absolute() {
+            return Err(Error::ShimPathRelative { path: folder });
         }
+        Ok(folder)
     }
 
-    /// The command for `image` in `dir`, which the caller has checked is absolute.
-    fn preview_in(dir: &Path, image: &Image<'_>) -> Result<HostCommand> {
-        debug_assert!(dir.is_absolute(), "{}", dir.display());
-        Ok(HostCommand {
+    /// The command for `image` in `dir`, which comes from [`folder_in`].
+    fn preview_in(dir: &Path, image: &Image<'_>) -> HostCommand {
+        HostCommand {
             exe: dir.join(image.file_name()),
             args: vec![],
-        })
+        }
     }
 
     // Provisioning ====================================================================================================
 
     /// The core of every `provide`: the file for `image` in `dir`, checked, written or repaired.
     fn provide_in(dir: &Path, image: &Image<'_>, folders: &FolderCheck) -> Result<HostCommand> {
-        let command = preview_in(dir, image)?;
+        let command = preview_in(dir, image);
         // Before anything is created, so that a folder under an unsafe ancestor is refused without
         // a trace. For a folder that does not exist this judges its first existing ancestor alone.
         folders.check(dir)?;

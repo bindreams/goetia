@@ -411,11 +411,11 @@ fn with_no_provider_nothing_is_retried() {
     assert!(!said.contains(RETRY), "{said}");
     // It does not claim a provider folder these files are outside of.
     assert!(!said.contains("not in the folder"), "{said}");
-    assert!(
-        said.contains(
-            "No shim provider of this program sweeps a folder, so that command does not retry `/q/Other/b.exe`"
-        ),
-        "{said}"
+    assert_eq!(
+        said,
+        "`frpc` was deleted, but `/q/Other/b.exe` could not be removed. No shim provider of this program sweeps a \
+         folder, so `/q/Other/b.exe` is not retried: the next install or uninstall of a manager whose provider uses \
+         that folder removes it."
     );
 }
 
@@ -439,9 +439,11 @@ fn a_failure_that_names_no_file_says_where_the_files_may_be() {
     );
 
     let none = text(None, "/q/Other", &[]);
-    assert!(
-        !none.contains(RETRY) && none.contains(NEXT) && none.contains("/q/Other"),
-        "{none}"
+    assert_eq!(
+        none,
+        "`frpc` was deleted, but the shim files it used were not cleaned up. What is in `/q/Other` is not retried, \
+         since no shim provider of this program sweeps a folder: the next install or uninstall of a manager whose \
+         provider uses that folder removes it."
     );
 }
 

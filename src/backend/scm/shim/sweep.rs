@@ -274,6 +274,8 @@ pub(crate) fn left_behind_text(
             // An unknown provider's folder may be this one, which then is retried.
             let retried = if unknown {
                 "retried by that command only if it is that folder: otherwise"
+            } else if *provider == ProviderFolder::None {
+                "not retried, since no shim provider of this program sweeps a folder:"
             } else {
                 "not retried by that command:"
             };
@@ -306,19 +308,18 @@ pub(crate) fn left_behind_text(
         } else {
             ("are", "them")
         };
-        if *provider == ProviderFolder::None {
-            said.push_str(&format!(
-                " No shim provider of this program sweeps a folder, so that command does not retry {}: \
-                 {elsewhere} {them}.",
+        let why = if *provider == ProviderFolder::None {
+            format!(
+                "No shim provider of this program sweeps a folder, so {} {is} not retried",
                 list(&outside)
-            ));
+            )
         } else {
-            said.push_str(&format!(
-                " {} {is} not in the folder this program's shim provider uses, so that command does not retry \
-                 {them}: {elsewhere} {them}.",
+            format!(
+                "{} {is} not in the folder this program's shim provider uses, so that command does not retry {them}",
                 list(&outside)
-            ));
-        }
+            )
+        };
+        said.push_str(&format!(" {why}: {elsewhere} {them}."));
     }
     said
 }

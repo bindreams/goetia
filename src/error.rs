@@ -642,7 +642,8 @@ pub enum Error {
 
 /// A pattern for the variants that wrap one error, binding it as `$source`: the only list of them.
 /// [`Error::wrapped`] reads the chain through it and [`Error::map_cause`] rewrites it, so a new
-/// wrapping variant is added here and nowhere else.
+/// wrapping variant is added here and nowhere else. The docs of [`Error::cause`] and
+/// [`Error::wraps_unreadable_host`] name this list, and are edited with it.
 macro_rules! wrapper {
     ($source:ident) => {
         Error::Step { source: $source, .. }
@@ -714,18 +715,20 @@ impl Error {
         }
     }
 
-    /// The error a chain of variants that each carry another error as their cause ends in, which
-    /// classification reads: a step over [`NotInstalled`](Error::NotInstalled) is still "not
-    /// installed". [`Both`](Error::Both) has two causes, so it is itself the cause.
+    /// The error a chain of [`Step`](Error::Step), [`StartAsManaged`](Error::StartAsManaged) and
+    /// [`InstalledUnreadable`](Error::InstalledUnreadable) ends in, which classification reads: a step
+    /// over [`NotInstalled`](Error::NotInstalled) is still "not installed". An error that carries
+    /// another one in any other variant ([`Kept`](Error::Kept), [`Undetermined`](Error::Undetermined),
+    /// [`Both`](Error::Both), and the rest) is itself the cause: that error is not walked.
     /// [`map_cause`](Error::map_cause) walks the same chain.
     pub fn cause(&self) -> &Error {
         self.wrapped().map_or(self, Error::cause)
     }
 
-    /// Whether this error, or what it wraps in a variant that carries another error as its cause (see
-    /// [`cause`](Error::cause)) or in a [`Kept`](Error::Kept), is an
+    /// Whether this error, or what it wraps in a [`Step`](Error::Step),
+    /// [`StartAsManaged`](Error::StartAsManaged) or [`Kept`](Error::Kept), is an
     /// [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
-    /// walks through that variant.
+    /// walks through that variant. The errors carried by any other variant are not walked.
     pub(crate) fn wraps_unreadable_host(&self) -> bool {
         match self {
             Error::InstalledUnreadable { .. } => true,
