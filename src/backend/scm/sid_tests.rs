@@ -51,15 +51,17 @@ fn a_whole_sid_is_told_from_bytes_that_are_not_one() {
 
 #[cfg(windows)]
 mod windows {
+    use windows_sys::Win32::Security::PSID;
+
     use super::*;
 
     #[skuld::test]
     fn the_well_known_sids_are_shown_as_windows_writes_them() {
-        assert_eq!(sid_display(&system()), "S-1-5-18");
-        assert_eq!(sid_display(&administrators()), "S-1-5-32-544");
-        assert_eq!(sid_display(&everyone()), "S-1-1-0");
+        assert_eq!(try_sid_display(&system()).unwrap(), "S-1-5-18");
+        assert_eq!(try_sid_display(&administrators()).unwrap(), "S-1-5-32-544");
+        assert_eq!(try_sid_display(&everyone()).unwrap(), "S-1-1-0");
         assert_eq!(
-            sid_display(&trusted_installer()),
+            try_sid_display(&trusted_installer()).unwrap(),
             "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
         );
     }
@@ -67,21 +69,40 @@ mod windows {
     /// 2^32 is the first authority that Windows writes in hex, measured with `ConvertSidToStringSidW`.
     #[skuld::test]
     fn a_large_identifier_authority_is_shown_in_hex() {
-        assert_eq!(sid_display(&[1, 1, 0, 1, 0, 0, 0, 0, 7, 0, 0, 0]), "S-1-0x100000000-7");
+        assert_eq!(
+            try_sid_display(&[1, 1, 0, 1, 0, 0, 0, 0, 7, 0, 0, 0]).unwrap(),
+            "S-1-0x100000000-7"
+        );
     }
 
     /// 2^32 - 1 is the last authority that Windows writes in decimal.
     #[skuld::test]
     fn the_largest_decimal_identifier_authority_is_shown_in_decimal() {
         assert_eq!(
-            sid_display(&[1, 1, 0, 0, 255, 255, 255, 255, 7, 0, 0, 0]),
+            try_sid_display(&[1, 1, 0, 0, 255, 255, 255, 255, 7, 0, 0, 0]).unwrap(),
             "S-1-4294967295-7"
         );
     }
 
+    /// `None` for a whole SID would mean `ConvertSidToStringSidW` failing for want of memory, which
+    /// a test cannot make happen; the bytes that are not a SID are the contract's other side.
     #[skuld::test]
-    fn bytes_that_are_not_a_sid_are_shown_as_such() {
-        assert_eq!(sid_display(&[]), INVALID);
-        assert_eq!(sid_display(&[1, 3, 0, 0, 0, 0, 0, 5, 1, 0]), INVALID);
+    fn bytes_that_are_not_a_sid_have_no_display_and_a_description() {
+        for bytes in [&[][..], &[1, 3, 0, 0, 0, 0, 0, 5, 1, 0]] {
+            assert_eq!(try_sid_display(bytes), None);
+            assert_eq!(sid_display(bytes), INVALID);
+        }
+    }
+
+    #[skuld::test]
+    fn a_sid_is_copied_from_where_it_stands_and_a_null_or_invalid_one_is_not() {
+        let mut sid = administrators();
+        // SAFETY: `sid` is a whole SID, live for the call.
+        assert_eq!(unsafe { copy_sid(sid.as_mut_ptr() as PSID) }, Some(administrators()));
+        // SAFETY: a null pointer is allowed.
+        assert_eq!(unsafe { copy_sid(std::ptr::null_mut()) }, None);
+        sid[0] = 2;
+        // SAFETY: `sid` is as long as its header says, live for the call.
+        assert_eq!(unsafe { copy_sid(sid.as_mut_ptr() as PSID) }, None);
     }
 }

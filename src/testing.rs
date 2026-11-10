@@ -22,16 +22,10 @@ pub fn shown_sid(sid: &[u8]) -> String {
     crate::backend::scm::sid::try_sid_display(sid).unwrap_or_else(|| panic!("{sid:?} is not a SID Windows can show"))
 }
 
-/// The bytes of the SID at `sid`; fails the calling test when it is null or not a valid SID.
-///
-/// # Safety
-/// `sid` is null or points at readable memory.
 #[cfg(windows)]
-pub unsafe fn sid_bytes(sid: *mut std::ffi::c_void) -> Vec<u8> {
-    // SAFETY: the caller's contract is `copy_sid`'s.
-    unsafe { crate::backend::scm::shim::acl::system::copy_sid(sid, std::path::Path::new("a SID in a test")) }
-        .unwrap_or_else(|e| panic!("{e}"))
-}
+pub use crate::backend::scm::manager::identity::sid_for_account_name;
+#[cfg(windows)]
+pub use crate::backend::scm::sid::copy_sid;
 
 pub mod cleanup;
 pub mod elevation;

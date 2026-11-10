@@ -251,7 +251,7 @@ pub(crate) fn account_name(sid: &Sid) -> String {
 // The filesystem ======================================================================================================
 
 #[cfg(windows)]
-pub(crate) mod system {
+mod system {
     use std::ffi::{OsString, c_void};
     use std::fs::{File, OpenOptions};
     use std::io;
@@ -265,8 +265,8 @@ pub(crate) mod system {
         GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
     };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid,
-        GetSecurityDescriptorControl, IsValidSid, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
+        OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -766,16 +766,11 @@ pub(crate) mod system {
     /// The bytes of the SID at `sid`, or an error naming `path` when it is null or not a valid SID.
     ///
     /// # Safety
-    /// `sid` is null or points at readable memory.
-    pub(crate) unsafe fn copy_sid(sid: PSID, path: &Path) -> Result<Sid> {
-        // SAFETY: `IsValidSid` checks the structure before `GetLengthSid` reads it; a null pointer
-        // is rejected first.
-        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
-            return Err(unreadable(path, "an account that is not a valid SID".to_string()));
-        }
-        // SAFETY: valid per the check above, so `GetLengthSid` bytes are readable from `sid`.
-        let bytes = unsafe { std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize) };
-        Ok(bytes.to_vec())
+    /// As [`sid::copy_sid`](crate::backend::scm::sid::copy_sid).
+    unsafe fn copy_sid(sid: PSID, path: &Path) -> Result<Sid> {
+        // SAFETY: the caller's contract is `sid::copy_sid`'s.
+        unsafe { crate::backend::scm::sid::copy_sid(sid) }
+            .ok_or_else(|| unreadable(path, "an account that is not a valid SID".to_string()))
     }
 }
 

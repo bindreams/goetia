@@ -1,6 +1,6 @@
-//! A security identifier as bytes: how one is built, checked and shown. Plain data, so it works on
-//! every host except [`sid_display`], which asks Windows; looking an account up by it is
-//! Windows-only, in `manager::identity`.
+//! A security identifier as bytes: how one is built, checked, copied and shown. Plain data, so it
+//! works on every host except [`try_sid_display`] and [`copy_sid`], which call Windows; looking an
+//! account up by it is Windows-only, in `manager::identity`.
 
 /// A security identifier in its binary form, as `LookupAccountNameW` and `GetAce` return it.
 pub(crate) type Sid = Vec<u8>;
@@ -33,6 +33,24 @@ const INVALID: &str = "an invalid SID";
 /// What [`sid_display`] says of a whole SID that `ConvertSidToStringSidW` refused.
 #[cfg(windows)]
 const UNSHOWABLE: &str = "a SID that could not be shown";
+
+/// The bytes of the SID at `psid`, or `None` when it is null or not a valid SID.
+///
+/// # Safety
+/// `psid` is null or points at a SID structure whole enough to read: its header and the
+/// sub-authorities the header counts.
+#[cfg(windows)]
+pub unsafe fn copy_sid(psid: windows_sys::Win32::Security::PSID) -> Option<Sid> {
+    use windows_sys::Win32::Security::{GetLengthSid, IsValidSid};
+
+    // SAFETY: `IsValidSid` reads the structure the caller vouches for; a null pointer is rejected first.
+    if psid.is_null() || unsafe { IsValidSid(psid) } == 0 {
+        return None;
+    }
+    // SAFETY: valid per the check above, so `GetLengthSid` bytes are readable from `psid`.
+    let bytes = unsafe { std::slice::from_raw_parts(psid as *const u8, GetLengthSid(psid) as usize) };
+    Some(bytes.to_vec())
+}
 
 /// `sid` as `ConvertSidToStringSidW` writes it, `S-1-5-32-544` for Administrators; `None` for bytes
 /// that are not a whole SID or that Windows refuses to show.

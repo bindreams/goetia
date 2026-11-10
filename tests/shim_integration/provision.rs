@@ -882,7 +882,8 @@ fn dacl_of(handle: HANDLE) -> (bool, Vec<(String, u32, u8)>) {
             )
         };
         // SAFETY: `sid` points at the SID inside the entry just read, which `descriptor` keeps live.
-        let sid_text = goetia::testing::shown_sid(&unsafe { goetia::testing::sid_bytes(sid) });
+        let sid_bytes = unsafe { goetia::testing::copy_sid(sid) }.expect("an entry's trustee is a valid SID");
+        let sid_text = goetia::testing::shown_sid(&sid_bytes);
         entries.push((sid_text, mask, kind));
     }
     // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last read.

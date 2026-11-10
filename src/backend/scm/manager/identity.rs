@@ -210,7 +210,7 @@ fn lookup_account_sid(psid: PSID, sid_str: impl FnOnce() -> String) -> Result<St
 /// user>` fails, the bare name and a fully domain-qualified name both
 /// succeed). A bare local account name resolves against the local machine
 /// on its own, so dropping the prefix loses nothing.
-fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
+pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     let account_name = account_name.strip_prefix(r".\").unwrap_or(account_name);
     let wide_name = wide_null(account_name);
     let mut sid_len: u32 = 0;
