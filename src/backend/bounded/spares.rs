@@ -176,9 +176,9 @@ impl Reservation {
 /// (a wait for a job to be gone), where a count cannot be made ahead of time.
 ///
 /// A spawn consumes the files it draws, so each repetition gets a [`Reservation`] of its own from
-/// [`Kept::again`]: the kept files emptied and rewound, then duplicated. The child writes through a
-/// duplicate, which shares the open file's offset and contents, so the kept file is the same file and
-/// the next read starts on an empty one.
+/// [`Kept::again`], which reuses the kept files: each is emptied and rewound, and a duplicate of it is
+/// handed over. The child writes through the duplicate, which shares the open file's offset and
+/// contents, so the kept file is the same file and the next read starts on an empty one.
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct Kept {

@@ -2000,15 +2000,16 @@ fn a_stop_whose_label_is_loaded_again_waits_until_its_deadline() {
     fake.assert_spent("the bootout, the old instance, the new one, and the read the deadline cut");
 }
 
-/// A `start` that finds the label's job being torn down waits for it under the caller's budget, as
-/// `--timeout` says: a spent budget reads once more, a budget that expires mid-wait ends it, and
-/// neither bootstraps over the old job.
+/// A `start` that finds the label's job being torn down waits for it under the caller's own budget, as
+/// `--timeout` says. When that ends first (a spent budget reads once more, a budget that expires
+/// mid-wait, `--timeout 0`, which does not wait at all), the old job is still there: the `start` fails
+/// saying nothing was sent, and no `bootstrap` goes out over the old job.
 #[skuld::test]
-fn a_start_over_a_label_being_torn_down_honours_the_budget() {
+fn a_start_whose_budget_ends_over_a_label_being_torn_down_sent_nothing() {
     use crate::backend::Backend;
 
     let spent = Budget::Bounded(Duration::from_nanos(1));
-    let cases: [(&str, Budget, Vec<Entry>); 2] = [
+    let cases: [(&str, Budget, Vec<Entry>); 4] = [
         (
             "a spent budget",
             spent,
@@ -2023,6 +2024,12 @@ fn a_start_over_a_label_being_torn_down_honours_the_budget() {
                 reply(&["print"], Finished::Expired),
             ],
         ),
+        ("--timeout 0", Budget::Immediate, vec![answer("print", SIGTERMED)]),
+        (
+            "a zero bound",
+            Budget::Bounded(Duration::ZERO),
+            vec![answer("print", SIGTERMED)],
+        ),
     ];
     for (what, budget, calls) in cases {
         let fake = Fake::new(calls);
@@ -2036,38 +2043,49 @@ fn a_start_over_a_label_being_torn_down_honours_the_budget() {
         )
         .expect_err(what);
 
-        assert_wait_timeout(&e);
+        match &e {
+            Error::WaitTimeout {
+                awaited: "stopped",
+                recovery,
+                ..
+            } => {
+                assert!(recovery.contains("no `bootstrap` was sent"), "{what}: {recovery}");
+                assert!(recovery.contains("goetia daemon start"), "{what}: {recovery}");
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+        assert!(
+            fake.calls().iter().all(|call| call[0] != "bootstrap"),
+            "{what}: a bootstrap was sent over the old job"
+        );
         fake.assert_spent(what);
     }
 }
 
-/// A `print` whose output is not whole cannot say whether the job is being torn down, so `start`
-/// fails: it neither takes the job for a loaded one, which would skip the `bootstrap` for a job about
-/// to go, nor sends one over it.
+/// `--no-timeout` waits for the label's old job for as long as it takes, then bootstraps.
 #[skuld::test]
-fn a_start_whose_label_read_is_not_whole_is_an_error() {
+fn an_unbounded_start_waits_for_a_label_being_torn_down_then_bootstraps() {
     use crate::backend::Backend;
 
-    let cut = Finished::Exited {
-        status: std::os::unix::process::ExitStatusExt::from_raw(0),
-        capture: bounded::Capture {
-            stdout: b"\tstate = SIGT".to_vec(),
-            stderr: Vec::new(),
-            complete: false,
-        },
-    };
-    let fake = Fake::new([reply(&["print"], cut)]);
-    let mgr = launchd_over(fake.clone());
+    let (mgr, script) = scripted(&[
+        ("print", SIGTERMED),
+        ("print", SIGTERMED),
+        ("print", SIGTERMED),
+        GONE,
+        ("bootstrap", DONE),
+        ("print", NOT_RUNNING),
+        ("kickstart", PID),
+    ]);
 
-    let result = Backend::start(
+    Backend::start(
         &mgr,
         marked_plist(&never_installed()),
-        Budget::DEFAULT,
+        Budget::Unbounded,
         &mut reserved(&[Step::Start]),
-    );
+    )
+    .expect("start");
 
-    assert!(matches!(&result, Err(Error::IncompleteAnswer { .. })), "{result:?}");
-    fake.assert_spent("the one read");
+    script.assert_spent("the wait for the old job, then the bootstrap");
 }
 
 /// A wait whose files cannot be reused for a read fails, as a read that fails does: the `bootout`

@@ -731,6 +731,24 @@ fn verb_deadline(budget: Budget) -> Deadline {
     }
 }
 
+/// A `start` that gave up waiting for the label's old job to be torn down. Not
+/// [`budget::timed_out`]: no request is on its way, since no `bootstrap` was sent. Built here because
+/// a budget that does not wait is no expiry for it to describe.
+fn old_job_still_going(id: &Id, budget: Budget) -> Error {
+    Error::WaitTimeout {
+        id: id.as_str().to_string(),
+        awaited: "stopped",
+        waited: match budget {
+            Budget::Bounded(d) => d,
+            Budget::Immediate | Budget::Unbounded => Duration::ZERO,
+        },
+        recovery: format!(
+            "the previous job of `{id}` is still being torn down, so no `bootstrap` was sent and `{id}` was not              started. `goetia daemon status {id}` shows the manager's current view; once the old job is gone,              `goetia daemon start {id}` loads it. Allow longer with `--timeout <duration>`, or wait indefinitely              with `--no-timeout`.",
+            id = id.as_str()
+        ),
+    }
+}
+
 /// `Deadline(None)` never expires, so no step driven by an unbounded deadline reports an expiry.
 /// `expect`, never `let _ =`, which would turn an unreachable case into a silent one.
 fn never_expires<T>(step: Option<T>) -> T {
@@ -760,16 +778,6 @@ const UNLOAD_POLL: Duration = Duration::from_millis(50);
 /// specified service").
 fn is_not_found(code: Option<i32>) -> bool {
     matches!(code, Some(3 | 113))
-}
-
-/// What `launchctl print` shows for a label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Label {
-    /// launchd has no job under it.
-    Free,
-    Loaded,
-    /// A job whose `bootout` has returned and whose process has not exited: see [`state::tearing_down`].
-    TearingDown,
 }
 
 /// What `launchctl print` answered for a label that did not fail.
@@ -831,32 +839,6 @@ impl Launchctl {
         Ok(self
             .print(id, deadline, reservation)?
             .map(|printed| matches!(printed, Printed::Present(_))))
-    }
-
-    /// What `launchctl print` shows for `id`, read over `kept`'s files. `Ok(None)` iff `deadline`
-    /// expired.
-    ///
-    /// The one read of the label that parses `print`'s body, for the one question the exit code
-    /// cannot answer: whether the job is being torn down. A body that is not whole cannot answer it,
-    /// and is an `Err`.
-    fn label(&self, id: &str, deadline: Deadline, kept: &Kept) -> Result<Option<Label>> {
-        let mut held = reread(id, kept)?;
-        let Some(printed) = self.print(id, deadline, &mut held)? else {
-            return Ok(None);
-        };
-        Ok(Some(match printed {
-            Printed::Absent => Label::Free,
-            Printed::Present(capture) if !capture.complete => {
-                return Err(Error::IncompleteAnswer {
-                    command: format!("launchctl print {}", target(id)),
-                    missing: vec!["the whole of its output".to_string()],
-                });
-            }
-            Printed::Present(capture) if state::tearing_down(&String::from_utf8_lossy(&capture.stdout)) => {
-                Label::TearingDown
-            }
-            Printed::Present(_) => Label::Loaded,
-        }))
     }
 
     /// `launchctl print` for `id`. `Ok(None)` iff `deadline` expired. Any failure but the not-found codes
@@ -1364,17 +1346,27 @@ impl backend::Backend for Launchd {
         let kept = reservation
             .keep(Role::COUNTED_FILES)
             .map_err(|source| Error::Reservation { id: None, source })?;
-        let loaded = match never_expires(self.launchctl.label(id.as_str(), issuing, &kept)?) {
-            Label::Free => false,
-            Label::Loaded => true,
-            // A job being torn down (after a `stop` that timed out, or another program's `launchctl
-            // bootout`) answers for the label and would pass for a loaded job, so `bootstrap` would be
-            // skipped and the job gone once it exits. Wait it out under the caller's budget.
-            Label::TearingDown => {
-                self.launchctl
-                    .wait_unloaded(id.as_str(), deadline, &kept)?
-                    .ok_or_else(timed_out)?;
-                false
+        // The one read of the label that parses `print`'s body, for the one question its exit code
+        // cannot answer: whether the job is being torn down. Under `issuing`, which never expires,
+        // so the capture is whole (a deadline is all that cuts one short).
+        let mut held = reread(id.as_str(), &kept)?;
+        let loaded = match never_expires(self.launchctl.print(id.as_str(), issuing, &mut held)?) {
+            Printed::Absent => false,
+            Printed::Present(capture) => {
+                debug_assert!(capture.complete, "a read under an unbounded deadline is whole");
+                if state::tearing_down(&String::from_utf8_lossy(&capture.stdout)) {
+                    // A job being torn down (after a `stop` that timed out, or another program's
+                    // `launchctl bootout`) answers for the label and would pass for a loaded job, so
+                    // `bootstrap` would be skipped and the job gone once it exits. Wait it out under
+                    // the caller's budget, which `--timeout 0` makes no wait at all; when that ends
+                    // first, nothing was sent.
+                    if !budget.waits() || self.launchctl.wait_unloaded(id.as_str(), deadline, &kept)?.is_none() {
+                        return Err(old_job_still_going(id, budget));
+                    }
+                    false
+                } else {
+                    true
+                }
             }
         };
         if !loaded
