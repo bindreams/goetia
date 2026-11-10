@@ -598,10 +598,15 @@ fn a_root_relative_path_uses_only_the_directorys_drive() {
 #[skuld::test]
 fn a_root_relative_path_carries_a_defect_of_the_directorys_share_to_the_directory() {
     // The share `sh<U+FFFE>re` is what the root-relative `\data` keeps; no `.env` text is its cause.
+    // Shaped as the native pass does, from the value `${D:-\data}` becomes: `resolve` would read
+    // `.env` from the share, a network lookup of the host `server`.
+    let id = Id::try_from("frpc").unwrap();
     let dir = PathBuf::from("\\\\server\\sh\u{FFFE}re\\app");
-    let yaml = "id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: ${D:-\\data}\n";
-    let msg = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Scm))
+    let raw = parse_manifest("id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: '\\data'\n");
+    let from_env = BTreeSet::from([Field::Cwd]);
+    let msg = resolve_shape(&id, raw, &dir, Substitution::Done, Some(BackendKind::Scm))
         .unwrap_err()
+        .attributed(&from_env)
         .to_string();
     assert!(msg.contains("the manifest directory's drive or share"), "{msg}");
     assert!(msg.contains("U+FFFE"), "{msg}");
