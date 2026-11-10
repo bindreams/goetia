@@ -774,26 +774,15 @@ fn only_a_gone_or_marked_service_is_an_expected_refusal_to_read_its_host() {
     assert!(!is_gone_or_marked(&os(ERROR_ACCESS_DENIED)));
 }
 
-/// The provider's folder, as an uninstall tells it: none without a provider, the folder of the
-/// previewed host, and unknown (with the failure) for a provider whose `preview` fails, which is not
-/// the absence of one.
+/// The provider's folder, as an uninstall tells it: none without a provider, and unknown (with the
+/// failure) for a provider whose `folder()` fails, which is not the absence of one.
 #[skuld::test]
-fn the_providers_folder_is_none_known_or_unknown() {
+fn the_providers_folder_is_none_or_unknown() {
     let (folder, failed) = Scm::new().provider_folder();
     assert_eq!((folder, failed.is_none()), (ProviderFolder::None, true));
 
-    let known = Scm::with_shim(
-        crate::shim::StandaloneShim::new(PathBuf::from(r"C:\app\host.exe"), vec![]),
-        CheckPermissions::Disable,
-    );
-    let (folder, failed) = known.provider_folder();
-    assert_eq!(
-        (folder, failed.is_none()),
-        (ProviderFolder::At(PathBuf::from(r"C:\app")), true)
-    );
-
     let relative = Scm::with_shim(
-        crate::shim::StandaloneShim::new(PathBuf::from("host.exe"), vec![]),
+        crate::shim::EmbeddedStockShim::new(None, Some(PathBuf::from("app"))),
         CheckPermissions::Disable,
     );
     let (folder, failed) = relative.provider_folder();
@@ -804,11 +793,77 @@ fn the_providers_folder_is_none_known_or_unknown() {
     );
 }
 
-/// What an uninstall makes of the failures of its cleanup and of a failed `preview`: the provider's
-/// sweep does not depend on `preview`, so a folder that could not be named is no failure of its own,
-/// and is told only beside one that is.
+/// A provider that sweeps nothing has no folder, whatever its host's path is: not the host's folder,
+/// and no failure for a host with none or a relative one.
 #[skuld::test]
-fn a_failed_preview_is_no_failed_cleanup_and_is_context_for_one() {
+fn a_standalone_provider_has_no_folder() {
+    for exe in [r"C:\app\host.exe", "host.exe", r"C:\"] {
+        let standalone = Scm::with_shim(
+            crate::shim::StandaloneShim::new(PathBuf::from(exe), vec![]),
+            CheckPermissions::Disable,
+        );
+        let (folder, failed) = standalone.provider_folder();
+        assert_eq!((folder, failed.is_none()), (ProviderFolder::None, true), "{exe}");
+    }
+}
+
+/// An uninstall of a standalone host whose cleanup fails promises no retry: there is no folder of its
+/// provider for `uninstall` of an id that is no longer installed to sweep.
+#[skuld::test]
+fn a_failed_cleanup_of_a_standalone_host_promises_no_retry() {
+    let id = Id::try_from("frpc").unwrap();
+    let standalone = Scm::with_shim(
+        crate::shim::StandaloneShim::new(PathBuf::from(r"C:\app\host.exe"), vec![]),
+        CheckPermissions::Disable,
+    );
+    let (provider, unknown) = standalone.provider_folder();
+    let failure = SweepFailure {
+        error: Box::new(Error::os("list the running processes", std::io::Error::other("failed"))),
+        not_deleted: vec![],
+    };
+
+    let said = finished_cleanup(&id, &provider, None, unknown, false, vec![failure])
+        .expect_err("the cleanup failed")
+        .report()
+        .to_string();
+
+    assert!(said.contains("were not cleaned up"), "{said}");
+    assert!(!said.contains("Re-run"), "{said}");
+}
+
+/// A provider that cannot `preview` (its shim is not embedded) still has a folder, which an uninstall
+/// names without reading the shim.
+#[skuld::test]
+fn the_providers_folder_does_not_need_its_preview() {
+    use crate::shim::EmbeddedStockShim;
+
+    let given = Scm::with_shim(
+        EmbeddedStockShim::new(None, Some(PathBuf::from(r"C:\app"))),
+        CheckPermissions::Disable,
+    );
+    assert!(matches!(
+        given.provider().unwrap().preview(),
+        Err(Error::ShimNotEmbedded)
+    ));
+    let (folder, failed) = given.provider_folder();
+    assert_eq!(
+        (folder, failed.is_none()),
+        (ProviderFolder::At(PathBuf::from(r"C:\app")), true)
+    );
+
+    let default = Scm::with_shim(EmbeddedStockShim::new(None, None), CheckPermissions::Disable);
+    let (folder, failed) = default.provider_folder();
+    assert_eq!(
+        (folder, failed.is_none()),
+        (ProviderFolder::At(normalise(&folder_in(None).unwrap())), true)
+    );
+}
+
+/// What an uninstall makes of the failures of its cleanup and of a provider folder that could not be
+/// named: the provider's sweep does not depend on it, so it is no failure of its own, and is told only
+/// beside one that is.
+#[skuld::test]
+fn an_unnamed_provider_folder_is_no_failed_cleanup_and_is_context_for_one() {
     let id = Id::try_from("frpc").unwrap();
     let unknown = || {
         Some(Error::Step {
@@ -819,7 +874,7 @@ fn a_failed_preview_is_no_failed_cleanup_and_is_context_for_one() {
         })
     };
 
-    finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), vec![])
+    finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), false, vec![])
         .expect("every sweep succeeded, so the folder is not an error");
 
     let file = PathBuf::from(r"C:\app\goetia-shim.exe");
@@ -831,12 +886,41 @@ fn a_failed_preview_is_no_failed_cleanup_and_is_context_for_one() {
         )),
         not_deleted: vec![file],
     };
-    let said = finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), vec![failure])
+    let said = finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), false, vec![failure])
         .expect_err("a file could not be deleted")
         .report()
         .to_string();
     assert!(said.contains("could not be removed"), "{said}");
     assert!(said.contains("could not be determined"), "{said}");
+}
+
+/// A stock provider whose folder cannot be determined fails its sweep on the same cause: the cleanup
+/// reports that once, and promises no retry, which would fail again.
+#[skuld::test]
+fn a_provider_whose_folder_and_sweep_fail_alike_is_reported_once_with_no_retry() {
+    use crate::shim::EmbeddedStockShim;
+
+    let id = Id::try_from("frpc").unwrap();
+    let scm = Scm::with_shim(
+        EmbeddedStockShim::new(Some(b"abc"), Some(PathBuf::from("app"))),
+        CheckPermissions::Disable,
+    );
+    let (provider, unknown) = scm.provider_folder();
+    assert_eq!(provider, ProviderFolder::Unknown);
+    let swept = scm
+        .provider()
+        .unwrap()
+        .sweep(&[], &scm.folders)
+        .expect_err("a relative dir cannot be swept");
+
+    let said = finished_cleanup(&id, &provider, None, unknown, true, vec![swept])
+        .expect_err("the sweep failed")
+        .report()
+        .to_string();
+
+    assert!(!said.contains("Re-run"), "{said}");
+    assert_eq!(said.matches("which is not an absolute path").count(), 1, "{said}");
+    assert!(!said.contains("could not be determined"), "{said}");
 }
 
 /// A `stop` whose process could not be opened says so in the error that follows, led by it, and the
