@@ -140,8 +140,9 @@ impl RecordedExit {
 
     /// The process exit code of the shim that reported this: [`Reported::process_exit_code`] of the
     /// report [`Reported::from_record`] names. A pair no report produces (a `Managed` service's own
-    /// codes) ends with its Win32 code, or its service-specific one when that is 0. So SCM's
-    /// service-specific wrapper with code 0, a failure to SCM, is never a success exit.
+    /// codes) ends with its Win32 code, or its service-specific one when that is 0. So `(1066, 0)`, an
+    /// SCM failure with service-specific code 0, ends with 1066 and reads as a failure, while the
+    /// record's `Display` describes SCM's record.
     pub fn process_exit_code(self) -> i32 {
         match Reported::from_record(self) {
             Some(reported) => reported.process_exit_code(),

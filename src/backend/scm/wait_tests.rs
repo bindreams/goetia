@@ -561,10 +561,10 @@ fn no_end(_: u32, _: Deadline, _: Option<RecordedExit>) -> io::Result<EndProcess
 /// [`end_process`] over `terminate` and `exit`, in the shape [`stop_and_await_exit`] takes: the one
 /// function both `stop` and `uninstall` end the process they held with.
 fn ending(
-    terminate: impl FnOnce(&u32, i32) -> io::Result<()>,
+    terminate: impl FnOnce(&u32) -> io::Result<()>,
     exit: impl FnOnce(&u32, Deadline, Option<&io::Error>) -> io::Result<Waited>,
 ) -> impl FnOnce(u32, Deadline, Option<RecordedExit>) -> io::Result<EndProcessOutcome<u32>> {
-    move |process, deadline, recorded| end_process(process, deadline, recorded, terminate, exit)
+    move |process, deadline, _| end_process(process, deadline, terminate, exit)
 }
 
 /// SCM records `STOPPED` before the service's process exits, so a stop that held the process ends it
@@ -580,7 +580,7 @@ fn stop_and_await_exit_terminates_then_waits_for_the_held_process_after_stopped(
         deadline,
         &mut HoldOutcome::Held(7u32),
         ending(
-            |process, _| {
+            |process| {
                 calls.borrow_mut().push(("terminate", *process, None));
                 Ok(())
             },
@@ -609,7 +609,7 @@ fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
         &mut fake,
         unbounded(),
         &mut HoldOutcome::Held(7u32),
-        ending(|_, _| Ok(()), |_, _, _| Ok(Waited::Expired)),
+        ending(|_| Ok(()), |_, _, _| Ok(Waited::Expired)),
     );
 
     assert!(matches!(
@@ -660,7 +660,7 @@ fn stop_and_await_exit_is_the_stop_alone_for_a_refused_process_and_leaves_its_re
         &mut fake,
         unbounded(),
         &mut held,
-        ending(|_, _| Ok(()), |_, _, _| Ok(Waited::Confirmed)),
+        ending(|_| Ok(()), |_, _, _| Ok(Waited::Confirmed)),
     );
     assert!(matches!(outcome.unwrap(), StopAndAwaitExitOutcome::Stopped));
     assert!(matches!(held, HoldOutcome::NoProcess), "{held:?}");
@@ -674,7 +674,7 @@ fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
         &mut fake,
         unbounded(),
         &mut HoldOutcome::Held(7u32),
-        ending(|_, _| Ok(()), |_, _, _| Err(io::Error::other("wait failed"))),
+        ending(|_| Ok(()), |_, _, _| Err(io::Error::other("wait failed"))),
     );
 
     assert_eq!(outcome.unwrap_err().to_string(), "wait failed");
@@ -683,10 +683,7 @@ fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
 /// A terminate that fails when it is called, as the OS can fail one for a handle it no longer
 /// honours (`ERROR_INVALID_HANDLE`), which is not the 'already exiting' that `request_termination`
 /// turns an access denial into.
-/// The record of a clean stop.
-const CLEAN: Option<RecordedExit> = Some(RecordedExit { win32: 0, specific: 0 });
-
-fn terminate_fails(_: &u32, _: i32) -> io::Result<()> {
+fn terminate_fails(_: &u32) -> io::Result<()> {
     Err(io::Error::other("The handle is invalid. (os error 6)"))
 }
 
@@ -696,9 +693,7 @@ fn terminate_fails(_: &u32, _: i32) -> io::Result<()> {
 /// on its own just after it reports `STOPPED`, and the wait for the process decides.
 #[skuld::test]
 fn end_process_is_done_when_the_process_exits_after_a_failed_terminate() {
-    let outcome = end_process(7u32, unbounded(), CLEAN, terminate_fails, |_, _, _| {
-        Ok(Waited::Confirmed)
-    });
+    let outcome = end_process(7u32, unbounded(), terminate_fails, |_, _, _| Ok(Waited::Confirmed));
 
     assert!(matches!(outcome.unwrap(), EndProcessOutcome::Exited));
 }
@@ -709,7 +704,7 @@ fn end_process_is_done_when_the_process_exits_after_a_failed_terminate() {
 fn end_process_keeps_a_failed_terminate_for_the_wait_and_for_the_expiry() {
     let told = std::cell::RefCell::new(None);
 
-    let outcome = end_process(7u32, unbounded(), CLEAN, terminate_fails, |_, _, terminate_failed| {
+    let outcome = end_process(7u32, unbounded(), terminate_fails, |_, _, terminate_failed| {
         *told.borrow_mut() = terminate_failed.map(ToString::to_string);
         Ok(Waited::Expired)
     });
@@ -735,7 +730,7 @@ fn end_process_keeps_a_failed_terminate_for_the_wait_and_for_the_expiry() {
 /// The wait goes on after a terminate that failed, and its own failure is the error.
 #[skuld::test]
 fn end_process_reports_a_failed_wait_after_a_failed_terminate() {
-    let outcome = end_process(7u32, unbounded(), CLEAN, terminate_fails, |_, _, _| {
+    let outcome = end_process(7u32, unbounded(), terminate_fails, |_, _, _| {
         Err(io::Error::other("wait failed"))
     });
 
@@ -747,17 +742,11 @@ fn end_process_reports_a_failed_wait_after_a_failed_terminate() {
 fn end_process_terminates_then_waits_under_the_deadline() {
     let deadline = Budget::Bounded(std::time::Duration::from_secs(3600)).start();
     let calls = std::cell::RefCell::new(vec![]);
-    let ended_with = std::cell::Cell::new(None);
 
     let outcome = end_process(
         7u32,
         deadline,
-        Some(RecordedExit {
-            win32: 1066,
-            specific: 9,
-        }),
-        |process, code| {
-            ended_with.set(Some(code));
+        |process| {
             calls.borrow_mut().push(("terminate", *process, None, false));
             Ok(())
         },
@@ -774,35 +763,6 @@ fn end_process_terminates_then_waits_under_the_deadline() {
         *calls.borrow(),
         vec![("terminate", 7, None, false), ("wait", 7, Some(deadline), false)]
     );
-    assert_eq!(ended_with.get(), Some(9), "the process ends with the recorded code");
-}
-
-/// With no record (the service found gone) there is no code of SCM's to end the process with, and one
-/// of goetia's would race the shim's own: nothing is terminated, and the wait decides.
-#[skuld::test]
-fn end_process_waits_without_terminating_when_nothing_was_recorded() {
-    let waited = std::cell::Cell::new(false);
-
-    let outcome = end_process(
-        7u32,
-        unbounded(),
-        None,
-        |_, _| panic!("a process with no recorded exit is not terminated"),
-        |_, _, terminate_failed| {
-            assert!(terminate_failed.is_none());
-            waited.set(true);
-            Ok(Waited::Expired)
-        },
-    );
-
-    assert!(waited.get());
-    assert!(matches!(
-        outcome.unwrap(),
-        EndProcessOutcome::Lingers {
-            process: 7,
-            terminate_failed: None
-        }
-    ));
 }
 
 /// `stop` ends its held process through [`end_process`] too: a failed terminate there is the same

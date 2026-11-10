@@ -226,27 +226,23 @@ pub(crate) enum EndProcessOutcome<P> {
 /// Ends `process`, the service's process held before its STOP, once SCM has confirmed `STOPPED`: the
 /// one end of a held process, for `stop` and `uninstall` alike. SCM records `STOPPED` before the
 /// process exits (a shim reports it and then exits), so `STOPPED` alone leaves a file the process
-/// runs in use.
+/// runs in use. The process is terminated whatever was recorded: a service's own exe lingers after
+/// `STOPPED`, and an unbounded wait needs the backstop.
 ///
-/// `terminate` ends the process with the code SCM recorded, `exit` being that record, as the
-/// documentation of `SetServiceStatus` allows once `SERVICE_STOPPED` is reported, and `wait_exit` then
-/// waits for its exit under `deadline` and says whether it did. With no record (the service
-/// found gone) nothing is terminated: a code of goetia's own would race the shim's, so the process is
-/// only waited for. Whatever `terminate` returns, the wait follows: SCM has confirmed the stop, so a failure
+/// `terminate` ends the process, as the documentation of `SetServiceStatus` allows once
+/// `SERVICE_STOPPED` is reported, and `exit` then waits for its exit under `deadline` and says whether
+/// it did. Whatever `terminate` returns, the wait follows: SCM has confirmed the stop, so a failure
 /// to end the process is no failure of the end, and the process may be on its way out by itself. The
 /// failure is kept: `exit` is handed it for its notice, and [`Lingers`](EndProcessOutcome::Lingers)
 /// carries it. An `exit` that fails is the error.
 pub(crate) fn end_process<P>(
     process: P,
     deadline: Deadline,
-    exit: Option<RecordedExit>,
-    terminate: impl FnOnce(&P, i32) -> io::Result<()>,
-    wait_exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
+    terminate: impl FnOnce(&P) -> io::Result<()>,
+    exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
 ) -> io::Result<EndProcessOutcome<P>> {
-    let terminate_failed = exit
-        .and_then(|exit| terminate(&process, exit.process_exit_code()).err())
-        .map(Arc::new);
-    Ok(match wait_exit(&process, deadline, terminate_failed.as_deref())? {
+    let terminate_failed = terminate(&process).err().map(Arc::new);
+    Ok(match exit(&process, deadline, terminate_failed.as_deref())? {
         Waited::Confirmed => EndProcessOutcome::Exited,
         Waited::Expired => EndProcessOutcome::Lingers {
             process,
@@ -277,8 +273,9 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 
 /// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the end of `held`, the service's
 /// process as it was before the STOP was sent. `end` is [`end_process`] over the real process, under
-/// the same `deadline`, and is told the exit SCM recorded when it confirmed `STOPPED`, which the
-/// process is ended with; a process that outlasts it is
+/// the same `deadline`, and is told the exit SCM recorded when it confirmed `STOPPED` (`None` for a
+/// service found gone), which decides the code the process is ended with. The process is ended either
+/// way; one that outlasts the deadline is
 /// [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired), not an unconfirmed stop, and carries
 /// the failed terminate, if any. No process held (none reported, or none that could be opened) is the
 /// stop alone.

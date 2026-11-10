@@ -113,7 +113,7 @@ use super::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit};
 use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, WaitEnd, Waited, end_process};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
-use crate::backend::scm::kill::{HoldOutcome, hold_if_possible};
+use crate::backend::scm::kill::{HoldOutcome, KILLED_EXIT_CODE, hold_if_possible};
 use crate::backend::scm::parameters::Parameters;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
@@ -529,7 +529,8 @@ impl Backend for Scm {
     /// With a wait, holds the service's process before the STOP, and once SCM reports the service
     /// stopped ends that process through its handle (the documentation of `SetServiceStatus` allows
     /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
-    /// runs is free when `stop` returns.
+    /// runs is free when `stop` returns. It ends with the code SCM recorded, or `KILLED_EXIT_CODE`
+    /// where SCM holds no record; only a record guarantees the shim's own exit code matches.
     ///
     /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
@@ -1187,28 +1188,34 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
         .map_err(|e| not_done(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)))
 }
 
+/// The code a held process is terminated with once SCM confirmed `STOPPED` with `exit`:
+/// [`RecordedExit::process_exit_code`], or [`KILLED_EXIT_CODE`] with no record.
+fn stop_exit_code(exit: Option<RecordedExit>) -> i32 {
+    exit.map_or(KILLED_EXIT_CODE, RecordedExit::process_exit_code)
+}
+
 /// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]
 /// over the real process, for `stop` and `uninstall` alike. A wait with no end says on stderr why it
 /// is blocked; a bounded one is the usual case (the shim exits just after it reports `STOPPED`) and
 /// says nothing.
 ///
-/// With `exit`, the record SCM confirmed `STOPPED` with, the process is terminated with the code that
-/// record maps to ([`RecordedExit::process_exit_code`]). Both terminators are kept: this one is what
-/// ends a `Kind::Managed` service's own exe, which lingers after `STOPPED`. For `Kind::Simple` the
-/// record is the shim's own `Reported`, which maps to the code the shim ends itself with, so whichever
-/// terminator wins the race writes the same code. With no record (the service found gone) nothing is
-/// terminated, as that would race the shim's own code: the process is only waited for.
+/// The held process is always terminated, and then waited for: that is what ends a `Kind::Managed`
+/// service's own exe, which lingers after `STOPPED`, and what backs a shim that does not exit.
+/// It is terminated with [`stop_exit_code`] of `exit`, the record SCM confirmed `STOPPED` with. For
+/// `Kind::Simple` the record is the shim's own `Reported`, which maps to the code the shim ends itself
+/// with, so whichever terminator wins the race writes the same code. Where SCM holds no record (the
+/// service found gone) the codes are not guaranteed to match: this one uses `KILLED_EXIT_CODE`.
 fn end_held(
     id: &Id,
     held: Held,
     deadline: Deadline,
     exit: Option<RecordedExit>,
 ) -> std::io::Result<EndProcessOutcome<Held>> {
+    let code = stop_exit_code(exit);
     end_process(
         held,
         deadline,
-        exit,
-        Held::terminate,
+        |held| held.terminate(code),
         |held, deadline, terminate_failed| {
             held.wait_for_exit(deadline, || {
                 if deadline.at().is_none() {
@@ -1341,7 +1348,8 @@ impl Scm {
             // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
             // ended, through the handle held since before the stop, and waited for as `stop` waits
             // for it (see [`end_held`]), with no bound: the shim exits by itself after it reports
-            // `STOPPED`, and the terminate is a backstop.
+            // `STOPPED`, and the terminate is a backstop that always runs, with the recorded code or
+            // else `KILLED_EXIT_CODE`.
             HoldOutcome::Held(held) => match end_held(id, held, Budget::Unbounded.start(), exit) {
                 Ok(EndProcessOutcome::Exited) => {}
                 Ok(EndProcessOutcome::Lingers { .. }) => unreachable!("an unbounded deadline never expires"),
