@@ -1129,3 +1129,35 @@ fn a_failed_stopped_report_says_scm_is_expected_to_read_a_crash() {
         assert!(text.contains(part), "missing {part:?}: {text}");
     }
 }
+
+// The process exit ----------------------------------------------------------------------------------------------------
+
+/// The service thread stores the code and returns; the main thread, once the dispatcher returns,
+/// exits with it. Every `Reported` reaches the main thread as its own `process_exit_code`.
+#[skuld::test]
+fn the_code_the_service_thread_stores_is_the_one_the_main_thread_exits_with() {
+    let reports = [
+        Reported::Clean,
+        Reported::from_daemon_code(7),
+        Reported::from_daemon_code(0xC000_0005_u32 as i32),
+        Reported::shim_failure(Some(ERROR_ACCESS_DENIED as i32)),
+        Reported::incomplete_stop(),
+        Reported::Refused,
+    ];
+    for reported in reports {
+        let slot = std::sync::Arc::new(ExitSlot::new());
+        let service_thread = std::thread::spawn({
+            let slot = std::sync::Arc::clone(&slot);
+            move || slot.store(reported.process_exit_code())
+        });
+        service_thread.join().expect("the service thread stores the code");
+
+        assert_eq!(slot.process_exit_code(), reported.process_exit_code(), "{reported:?}");
+    }
+}
+
+/// A dispatcher that returns without a service having run (nothing stored) exits clean, as before.
+#[skuld::test]
+fn a_dispatcher_that_returns_before_any_service_ran_exits_clean() {
+    assert_eq!(ExitSlot::new().process_exit_code(), Reported::Clean.process_exit_code());
+}
