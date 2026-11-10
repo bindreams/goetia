@@ -1135,32 +1135,22 @@ fn a_stop_failure_on_a_service_marked_by_someone_else_does_not_claim_a_disable()
     }
 }
 
-/// A `type: simple` service's held process is ended with the code of the report SCM's record names,
-/// which is what the shim itself exits with; with no record (a service found gone) it is the kill's.
+/// A held process is ended with the code of the shim report its record decodes to, which is what the
+/// shim itself exits with; with no record, or one no report produces, with the kill's code.
 #[skuld::test]
-fn a_simple_services_process_is_ended_with_its_reports_code_or_the_kill_code_without_a_record() {
+fn a_held_process_is_ended_with_its_reports_code_or_else_the_kill_code() {
     for reported in every_reported() {
         let (win32, specific) = reported.scm_codes();
 
         assert_eq!(
-            stop_exit_code(Kind::Simple, Some(RecordedExit { win32, specific })),
+            stop_exit_code(Some(RecordedExit { win32, specific })),
             reported.process_exit_code(),
             "{reported:?}"
         );
     }
-    assert_eq!(stop_exit_code(Kind::Simple, None), KILLED_EXIT_CODE);
-}
-
-/// A `type: managed` service's own exe is ended with the kill's code, whatever pair it recorded: its
-/// codes are not the shim's protocol, and `(5, 0)` would read as a shim failure.
-#[skuld::test]
-fn a_managed_services_process_is_ended_with_the_kill_code_whatever_it_recorded() {
-    for (win32, specific) in [(5, 0), (0, 1), (0, 1003), (1066, 7)] {
-        assert_eq!(
-            stop_exit_code(Kind::Managed, Some(RecordedExit { win32, specific })),
-            KILLED_EXIT_CODE,
-            "({win32}, {specific})"
-        );
-    }
-    assert_eq!(stop_exit_code(Kind::Managed, None), KILLED_EXIT_CODE);
+    assert_eq!(stop_exit_code(None), KILLED_EXIT_CODE);
+    assert_eq!(
+        stop_exit_code(Some(RecordedExit { win32: 5, specific: 9 })),
+        KILLED_EXIT_CODE
+    );
 }
