@@ -14,8 +14,10 @@
 
 use std::io;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, SHIM_REFUSED};
+use crate::backend::scm::kill::HoldOutcome;
 use crate::manager::budget::Deadline;
 use crate::spec::Kind;
 
@@ -177,6 +179,122 @@ pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
     wait_after_stop(a, deadline, " Run `stop` again.", StopSeen::Requested)
 }
 
+/// How [`end_process`] ended.
+#[must_use = "a process that outlasted the deadline is not gone; decide what to report rather than discarding it"]
+#[derive(Debug)]
+pub(crate) enum EndProcessOutcome<P> {
+    /// The process has exited.
+    Exited,
+    /// The process had not exited when the deadline ran out. `terminate_failed` is why the attempt
+    /// to end it failed, if it did.
+    Lingers {
+        process: P,
+        terminate_failed: Option<Arc<io::Error>>,
+    },
+}
+
+/// Ends `process`, the service's process held before its STOP, once SCM has confirmed `STOPPED`: the
+/// one end of a held process, for `stop` and `uninstall` alike. SCM records `STOPPED` before the
+/// process exits (a shim reports it and then exits), so `STOPPED` alone leaves a file the process
+/// runs in use.
+///
+/// `terminate` ends the process, as the documentation of `SetServiceStatus` allows once
+/// `SERVICE_STOPPED` is reported, and `exit` then waits for its exit under `deadline` and says whether
+/// it did. Whatever `terminate` returns, the wait follows: SCM has confirmed the stop, so a failure
+/// to end the process is no failure of the end, and the process may be on its way out by itself. The
+/// failure is kept: `exit` is handed it for its notice, and [`Lingers`](EndProcessOutcome::Lingers)
+/// carries it. An `exit` that fails is the error.
+pub(crate) fn end_process<P>(
+    process: P,
+    deadline: Deadline,
+    terminate: impl FnOnce(&P) -> io::Result<()>,
+    exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
+) -> io::Result<EndProcessOutcome<P>> {
+    let terminate_failed = terminate(&process).err().map(Arc::new);
+    Ok(match exit(&process, deadline, terminate_failed.as_deref())? {
+        Waited::Confirmed => EndProcessOutcome::Exited,
+        Waited::Expired => EndProcessOutcome::Lingers {
+            process,
+            terminate_failed,
+        },
+    })
+}
+
+/// How [`stop_and_await_exit`] ended.
+#[must_use = "an expiry is not a stop; decide what to report rather than discarding it"]
+#[derive(Debug)]
+pub(crate) enum StopAndAwaitExitOutcome<P> {
+    /// SCM confirmed `STOPPED`, and the process held before the STOP, if any, has exited.
+    Stopped,
+    /// SCM had not confirmed `STOPPED` when the deadline ran out.
+    ServiceExpired,
+    /// SCM confirmed `STOPPED`, and this held process had not exited when the deadline ran out.
+    /// `terminate_failed` is why the attempt to end it failed, if it did.
+    ProcessExpired {
+        process: P,
+        terminate_failed: Option<Arc<io::Error>>,
+    },
+    /// The hold expired, with SCM still naming process `pid`, which was gone, so the STOP was sent with
+    /// no process held, and nothing says that it took effect or which process it reached: not a stop,
+    /// whatever SCM answers afterwards.
+    Unconfirmed { pid: u32 },
+}
+
+/// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the end of `held`, the service's
+/// process as it was before the STOP was sent. `end` is [`end_process`] over the real process, under
+/// the same `deadline`; a process that outlasts it is
+/// [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired), not an unconfirmed stop, and carries
+/// the failed terminate, if any. No process held (none reported, or none that could be opened) is the
+/// stop alone.
+///
+/// `held` is the hold as it was made, and what is left in it afterwards is what the caller still has
+/// to say: the process is taken out of [`Held`](HoldOutcome::Held) and passed to `end`, and a
+/// [`Refused`](HoldOutcome::Refused) stays, with the reason the process could not be opened, for the
+/// caller to report: this is where a refused process counts as not held, and the only place.
+///
+/// An expired hold is sent the STOP all the same, and it ends there, whatever SCM answers: the held
+/// process died (a crash), SCM may have a recovery restart pending, and a restarted process may have
+/// reported `STOPPED` and still be exiting, so the STOP may have reached a process that nothing
+/// holds, or none, and a `STOPPED` after it says nothing of any one's exit. That is
+/// [`Unconfirmed`](StopAndAwaitExitOutcome::Unconfirmed), and nothing waits, for a STOP that finds
+/// the service already stopped (`ERROR_SERVICE_NOT_ACTIVE`, or a refusal over a `STOPPED` read)
+/// as for one that is delivered.
+pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
+    a: &mut A,
+    deadline: Deadline,
+    held: &mut HoldOutcome<P>,
+    end: impl FnOnce(P, Deadline) -> io::Result<EndProcessOutcome<P>>,
+) -> io::Result<StopAndAwaitExitOutcome<P>> {
+    if let HoldOutcome::Expired { pid } = *held {
+        control_stop_or_underway(a)?;
+        return Ok(StopAndAwaitExitOutcome::Unconfirmed { pid });
+    }
+    let process = match held {
+        HoldOutcome::Held(_) => match std::mem::replace(held, HoldOutcome::NoProcess) {
+            HoldOutcome::Held(process) => Some(process),
+            _ => unreachable!("the outcome was just matched as held"),
+        },
+        // Why a refused process is not held is the caller's to report: it knows where.
+        HoldOutcome::NoProcess | HoldOutcome::Refused(_) | HoldOutcome::Expired { .. } => None,
+    };
+    if stop_via_notify(a, deadline)? == Waited::Expired {
+        return Ok(StopAndAwaitExitOutcome::ServiceExpired);
+    }
+    let Some(process) = process else {
+        return Ok(StopAndAwaitExitOutcome::Stopped);
+    };
+    Ok(match end(process, deadline)? {
+        EndProcessOutcome::Exited => StopAndAwaitExitOutcome::Stopped,
+        EndProcessOutcome::Lingers {
+            process,
+            terminate_failed,
+        } => StopAndAwaitExitOutcome::ProcessExpired {
+            process,
+            terminate_failed,
+        },
+    })
+}
+
 /// [`ScmActor::control_stop`], where a stop already under way counts as sent.
 ///
 /// SCM refuses a STOP with 1061 (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) or 1052
@@ -309,14 +427,29 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 ///
 /// It does not use [`wait_until`]: this loop ignores its first arm's status on purpose, and its
 /// `RUNNING`/`PAUSED` action needs the actor, which `wait_until` holds.
-pub(crate) fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
-    // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so
-    // the status it returns is not needed, unless SCM refused to watch the service.
-    if let Err(waited) = decided_or_status(
+///
+/// `hold` runs on the actor where a caller takes hold of what the service runs now, so that the
+/// process can be waited for after `STOPPED`: just before each STOP is sent, once the state it is
+/// sent on has settled (a start in flight at the disable replaces the process, which no earlier read
+/// can say; a STOP that is refused and sent again runs it again), and once, before the wait, for a
+/// service the first arm finds `STOP_PENDING`, which is stopping without a STOP of ours (someone
+/// else's, or a `stop` whose wait ran out) and has its process still. Its error ends the wait, with
+/// no STOP sent.
+pub(crate) fn settle_and_stop<A: ScmActor>(
+    a: &mut A,
+    deadline: Deadline,
+    mut hold: impl FnMut(&mut A) -> io::Result<()>,
+) -> io::Result<Waited> {
+    // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so a
+    // `RUNNING`, `PAUSED` or `STOPPED` service is read from the notification; the status it returns
+    // is for the states the mask excludes, `STOP_PENDING` among them, which no notification reports.
+    match decided_or_status(
         a.arm(WantState::RunningPausedOrStopped, deadline)?,
         QueriedState::Stopped,
     )? {
-        return Ok(waited);
+        Err(waited) => return Ok(waited),
+        Ok(status) if status.state == QueriedState::StopPending => hold(a)?,
+        Ok(_) => {}
     }
     // What the status returned by the latest re-arm showed, when it is a state to act on.
     let mut read = None;
@@ -354,6 +487,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io:
                     )));
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
+                hold(a)?;
                 match a.control_stop() {
                     Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {

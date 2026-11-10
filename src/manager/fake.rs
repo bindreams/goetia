@@ -126,10 +126,16 @@ struct Store {
     no_manager: bool,
     unresolvable: BTreeSet<String>,
     unfit_for_install: BTreeSet<String>,
+    /// The host a provider names now, written into what `render` produces — see [`Fake::seed_host`].
+    host: Option<String>,
+    /// `render` fails for want of a shim provider — see [`Fake::seed_no_provider`].
+    no_provider: bool,
     installed_fails: BTreeMap<String, Failure>,
+    /// What `uninstall_absent` fails with, if seeded — see [`Fake::seed_absent_cleanup_fails`].
+    absent_cleanup_fails: Option<Failure>,
     live_status_fails: BTreeMap<String, Failure>,
     write_races: BTreeMap<String, usize>,
-    /// Ids whose service is gone by the time its live state is queried.
+    /// Ids whose service is gone by the time it is regenerated against or its live state is queried.
     live_status_gone: BTreeSet<String>,
     /// Text another process puts at an id just before this Fake's next write there, by id.
     interlopers: BTreeMap<String, String>,
@@ -146,6 +152,19 @@ impl Store {
         if self.no_manager {
             return Err(Error::NoManager {
                 evidence: "seeded".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// [`Fake::seed_unresolvable_account`]'s refusal of `spec`, if seeded.
+    fn resolve_account(&self, spec: &DaemonSpec) -> Result<()> {
+        if let User::Name(user) = &spec.user
+            && self.unresolvable.contains(user)
+        {
+            return Err(Error::AccountLookup {
+                detail: format!("account `{user}` cannot be resolved (seeded)"),
+                source: None,
             });
         }
         Ok(())
@@ -428,6 +447,20 @@ impl Fake {
         state.unresolvable.insert(user.to_string());
     }
 
+    /// Test-only seeding: `render` names `host` as the service host, as an SCM manager's provider
+    /// does. What is installed keeps the host it was written with, and `regenerate` reads it back.
+    pub fn seed_host(&self, host: &str) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.host = Some(host.to_string());
+    }
+
+    /// Test-only seeding: `render` fails with [`Error::NoShimProvider`], as an SCM manager with no
+    /// provider does for a service that needs a host; `regenerate` never asks for one.
+    pub fn seed_no_provider(&self) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.no_provider = true;
+    }
+
     /// Test-only seeding: `render_for_install` fails for a spec whose `user` is `User::Name(user)`,
     /// where `render` succeeds, as a backend's does for a host that cannot carry the definition.
     pub fn seed_unfit_for_install(&self, user: &str) {
@@ -440,6 +473,14 @@ impl Fake {
     pub fn seed_installed_fails(&self, id: &str, error: impl Fn() -> Error + Send + Sync + 'static) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.installed_fails.insert(id.to_string(), Failure(Arc::new(error)));
+    }
+
+    /// Test-only seeding: what `uninstall` of an id that is not installed cleans up (see
+    /// `Backend::uninstall_absent`) fails with what `error` makes, as a backend's sweep does for a file
+    /// it cannot delete.
+    pub fn seed_absent_cleanup_fails(&self, error: impl Fn() -> Error + Send + Sync + 'static) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.absent_cleanup_fails = Some(Failure(Arc::new(error)));
     }
 
     /// Test-only seeding: the live state of `id` cannot be queried, failing with what `error` makes
@@ -459,7 +500,7 @@ impl Fake {
 
     /// Test-only seeding: `id` is found gone when its live state is queried, as when a concurrent
     /// uninstall removes it after `read` or `scan` saw it. The query completes and says
-    /// [`Error::NotInstalled`].
+    /// [`Error::NotInstalled`], and so does `regenerate`, which reads what is installed on SCM.
     pub fn seed_live_status_gone(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.live_status_gone.insert(id.to_string());
@@ -528,6 +569,9 @@ impl Fake {
 }
 
 // generate/extract ====================================================================================================
+
+/// The prefix of the line that names a host in what [`Fake::render`] writes after seeding one.
+const HOST_LINE: &str = "Host: ";
 
 pub(in crate::manager) fn generate(spec: &DaemonSpec) -> String {
     format!("{FAKE_MARKER}\nSpec: {}\n", blob::encode(spec))
@@ -647,7 +691,7 @@ impl crate::backend::Backend for Fake {
     }
 
     /// An opaque id, then no manager. Before `read`, which has no way to say a manager is missing.
-    fn begin_install(&self, spec: &DaemonSpec) -> Result<()> {
+    fn begin_install(&self, spec: &DaemonSpec, _desired: &String) -> Result<()> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         if state.opaque.contains(spec.id.as_str()) {
             return Err(Store::undetermined(&spec.id));
@@ -656,16 +700,37 @@ impl crate::backend::Backend for Fake {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
-        if let User::Name(user) = &spec.user {
-            let state = self.state.lock().expect("Fake mutex poisoned");
-            if state.unresolvable.contains(user) {
-                return Err(Error::AccountLookup {
-                    detail: format!("account `{user}` cannot be resolved (seeded)"),
-                    source: None,
-                });
-            }
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.resolve_account(spec)?;
+        if state.no_provider {
+            return Err(Error::NoShimProvider);
         }
-        Ok(generate(spec))
+        let mut text = generate(spec);
+        if let Some(host) = &state.host {
+            text.push_str(&format!("{HOST_LINE}{host}\n"));
+        }
+        Ok(text)
+    }
+
+    /// `spec` with the host the installed text names, if any, whatever the provider names now.
+    /// Reads what is installed to find it, as SCM's does, so it fails where [`Fake::seed_installed_fails`]
+    /// makes that read fail.
+    fn regenerate(&self, spec: &DaemonSpec, snapshot: &Artifact) -> Result<String> {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        if state.live_status_gone.contains(snapshot.id().as_str()) {
+            return Err(Error::NotInstalled {
+                id: snapshot.id().as_str().to_string(),
+            });
+        }
+        if let Some(failure) = state.installed_fails.get(snapshot.id().as_str()) {
+            return Err(failure.0());
+        }
+        state.resolve_account(spec)?;
+        let mut text = generate(spec);
+        if let Some(host) = snapshot.entry.text.lines().find_map(|l| l.strip_prefix(HOST_LINE)) {
+            text.push_str(&format!("{HOST_LINE}{host}\n"));
+        }
+        Ok(text)
     }
 
     fn render_for_install(&self, spec: &DaemonSpec) -> Result<String> {
@@ -798,6 +863,16 @@ impl crate::backend::Backend for Fake {
         state.confirm(&snapshot)?;
         state.entries.remove(snapshot.id().as_str());
         Ok(())
+    }
+
+    /// Recorded as `uninstall_absent`, and fails where [`Fake::seed_absent_cleanup_fails`] says.
+    fn uninstall_absent(&self, id: &Id) -> Result<()> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("uninstall_absent", id.as_str().to_string()));
+        match &state.absent_cleanup_fails {
+            Some(failure) => Err(failure.0()),
+            None => Ok(()),
+        }
     }
 
     fn enable(&self, snapshot: Artifact) -> Result<()> {

@@ -4,7 +4,7 @@
 //! daemon's own log, interleaved with the daemon's output. Before that, and whenever that file
 //! cannot be opened, it goes to [`Log::default_log_path`]: an old shim running against a newer blob
 //! fails to decode `Spec` before it learns the daemon's `logs:` path, so the path derivable from
-//! the service id (`argv[1]`) alone is the only file destination a decode failure can target.
+//! the service id alone is the only file destination a decode failure can target.
 //!
 //! **Event Log.** Every failure also goes to the Windows Event Log. `%ProgramData%\Goetia\logs\` is
 //! not writable by a non-admin service account, so a `user: someuser` daemon can die at boot
@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use crate::os::{Channels, Real, Severity};
+use super::os::{Channels, Real, Severity};
 
 /// The shim's failure log: composes the two channels for one service run. One shim serves one
 /// service, so one daemon log path.

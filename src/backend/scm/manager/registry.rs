@@ -18,8 +18,10 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
 use winreg::RegKey;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
+use winreg::types::FromRegValue as _;
 
 use crate::backend::scm::generate::{FIELDS, field_named};
+pub use crate::backend::scm::parameters::RegistryReadOutcome;
 use crate::backend::scm::parameters::{Parameters, field_named_utf16, shown_name, text_from_utf16, type_name};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
@@ -31,6 +33,9 @@ use settle::{Failure, Settled, Stop, settle, stands, tolerate_not_found};
 
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 const ENVIRONMENT_VALUE: &str = "Environment";
+const IMAGE_PATH_VALUE: &str = "ImagePath";
+/// Set by SCM on a service whose deletion waits for its last handle to close.
+const DELETE_FLAG_VALUE: &str = "DeleteFlag";
 const PARAMETERS_KEY: &str = "Parameters";
 
 fn service_key_path(name: &str) -> String {
@@ -84,13 +89,6 @@ pub fn missing_service_key(name: &str) -> Error {
 }
 
 // Parameters (the metadata blob) ======================================================================================
-
-/// What a read of a service's registry values found.
-pub enum RegistryReadOutcome<T> {
-    /// The service no longer exists.
-    ServiceGone,
-    Read(T),
-}
 
 /// Runs `pass` once and settles what it met (see [`settle`]). `service_stands` asks whether the
 /// service is still there; `fail` makes the error for a failure that leaves the read undecided.
@@ -509,6 +507,50 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
         },
         |op, source| registry_error(op, path, source),
         |(name, root)| keep(name, &root),
+    )
+}
+
+/// The `ImagePath` of the service `name`, read below `services`, the key a scan lists it from (see
+/// [`read_parameters_in`]): the command line SCM starts for it. `Read(None)` when the service is
+/// marked for deletion (its record outlives it until the last handle closes, but it starts nothing),
+/// and when it has no `ImagePath` or none that is a string. [`RegistryReadOutcome::ServiceGone`]
+/// when its key is not there, or the service key was marked deleted at the open or mid-read and the
+/// service no longer stands, which is how [`settle`] reads every key that vanishes: the registry's
+/// word only, which the sweep does not take alone. Any other failure to read is an error, a key that
+/// vanished under a service that still stands included, and a service key that is a registry link to
+/// a missing key (see [`stands`]): what the service runs is then unknown. A service key that is a
+/// registry link is read through it, as SCM reads it.
+pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Option<String>>> {
+    let path = service_key_path(name);
+    let wide: Vec<u16> = name.encode_utf16().collect();
+    read_settled(
+        || service_stands_in(services, name),
+        |f| registry_error(&f.op, &f.path, f.source),
+        || {
+            let key = counted::open_child(services.0, &wide, KEY_READ, LinkHandling::Followed)
+                .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
+            match key.get_value::<u32, _>(DELETE_FLAG_VALUE) {
+                Ok(0) => {}
+                Ok(_) => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Stop::mid_read(failure(
+                        &format!("read {DELETE_FLAG_VALUE} under"),
+                        &path,
+                        e,
+                    )));
+                }
+            }
+            match key.get_raw_value(IMAGE_PATH_VALUE) {
+                Ok(raw) => Ok(String::from_reg_value(&raw).ok()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(Stop::mid_read(failure(
+                    &format!("read {IMAGE_PATH_VALUE} under"),
+                    &path,
+                    e,
+                ))),
+            }
+        },
     )
 }
 

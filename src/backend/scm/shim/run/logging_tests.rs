@@ -3,7 +3,7 @@
 //! by the shim integration tests.
 
 use super::*;
-use crate::os::fake::{ChannelCall, FakeGuard};
+use crate::backend::scm::shim::run::os::fake::{ChannelCall, FakeGuard};
 
 const LINE: &str = "goetia-shim[svc]: the line";
 

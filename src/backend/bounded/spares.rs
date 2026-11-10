@@ -6,47 +6,31 @@
 //! listener threads come from this thread's [`Spares`].
 
 use std::cell::{Cell, RefCell};
-use std::fmt;
 use std::fs::File;
 use std::io::{self, PipeReader};
 use std::marker::PhantomData;
 use std::process::ExitStatus;
-use std::sync::mpsc;
 use std::thread;
 
 use crossbeam_channel::Receiver;
 
 use super::{Chunk, drain};
+use crate::backend::standby::Standby;
 
 // Standby =============================================================================================================
 
-/// A thread made before the child it serves is spawned, parked until it is handed its share of that
-/// child. Handed nothing — the child was never spawned, or needed nothing of it — it ends.
-struct Standby<T>(mpsc::Sender<T>);
-
-impl<T> fmt::Debug for Standby<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Standby")
-    }
-}
-
 impl<T: Send + 'static> Standby<T> {
+    /// A standby on a `std::thread`, whose handle is dropped: a failure to make it is `io::Error`,
+    /// and under test the hook may refuse it.
     fn new(name: &str, serve: impl FnOnce(T) + Send + 'static) -> io::Result<Standby<T>> {
         #[cfg(test)]
         test_hook::make(test_hook::Kind::Thread)?;
-        let (tx, rx) = mpsc::channel::<T>();
-        thread::Builder::new().name(name.to_string()).spawn(move || {
-            if let Ok(share) = rx.recv() {
-                serve(share);
-            }
-        })?;
-        Ok(Standby(tx))
-    }
-
-    /// Hand the thread its share. It is parked in `recv` until then, so this cannot fail; were it
-    /// to, the share comes back.
-    fn hand(self, share: T) -> Result<(), T> {
-        self.0.send(share).map_err(|mpsc::SendError(share)| share)
+        let (standby, _thread) = Standby::with(
+            name,
+            |name, run| thread::Builder::new().name(name.to_string()).spawn(run),
+            serve,
+        )?;
+        Ok(standby)
     }
 }
 
