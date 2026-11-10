@@ -434,7 +434,9 @@ fn create_follows_an_absolute_symlink_root_owns() {
 #[skuld::test]
 fn create_follows_a_chain_of_links_up_to_the_bound_and_no_further() {
     let tmp = tempfile::tempdir().unwrap();
-    fs::create_dir(tmp.path().join("end")).unwrap();
+    // Canonical, so the walk spends no link on the way to the chain: on macOS `/var` is one.
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    fs::create_dir(base.join("end")).unwrap();
     // link{n} -> link{n+1}, the last -> end.
     let chain = |len: usize| {
         for n in 1..=len {
@@ -443,18 +445,18 @@ fn create_follows_a_chain_of_links_up_to_the_bound_and_no_further() {
             } else {
                 format!("link{}", n + 1)
             };
-            let link = tmp.path().join(format!("link{n}"));
+            let link = base.join(format!("link{n}"));
             let _ = fs::remove_file(&link);
             std::os::unix::fs::symlink(target, link).unwrap();
         }
     };
 
     chain(SYMLINK_LIMIT);
-    CreatedDirs::new().create(&tmp.path().join("link1/ok"), None).unwrap();
+    CreatedDirs::new().create(&base.join("link1/ok"), None).unwrap();
 
     chain(SYMLINK_LIMIT + 1);
     let err = CreatedDirs::new()
-        .create(&tmp.path().join("link1/no"), None)
+        .create(&base.join("link1/no"), None)
         .expect_err("one link too many");
     let source = std::error::Error::source(&err).unwrap();
     let errno = source.downcast_ref::<io::Error>().and_then(io::Error::raw_os_error);
