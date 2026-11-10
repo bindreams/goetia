@@ -1,26 +1,8 @@
 //! Builders for this crate's unit tests.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use super::{BackendKind, DaemonFields, Id, Kind, Restart, User};
-
-/// A plain root, `restart: never`, `type: managed` daemon named `id`; panics on an invalid `Id`.
-/// Mirrors `tests/support/daemon_spec.rs` (integration tests cannot reach `#[cfg(test)]`).
-pub(crate) fn plain_fields(id: &str, command: Vec<String>) -> DaemonFields {
-    DaemonFields {
-        id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),
-        name: id.to_string(),
-        command,
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
-        restart: Restart::Never,
-        restart_delay: None,
-        logs: None,
-        kind: Kind::Managed,
-    }
-}
+use super::BackendKind;
 
 /// `p` made absolute on the host running the test, since `Path::is_absolute` is platform-defined.
 pub(crate) fn abs(p: &str) -> PathBuf {

@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::blob::{self, Blob};
-use crate::spec::test_support::{abs, plain_fields, program};
+use crate::spec::test_support::{abs, program};
 use crate::spec::{DaemonFields, DaemonSpec, Kind, Restart};
+use crate::testing::plain_fields;
 
 // Fixtures ============================================================================================================
 

@@ -107,7 +107,7 @@ fn kill_with_the_privilege_disabled(user: User) {
     let spec = DaemonSpec::new(DaemonFields {
         user,
         restart_delay: Some(Duration::from_secs(1)),
-        ..support::spec(
+        ..support::plain_fields(
             &id,
             fixture_command_with_exe(&exe.path_str(), &id, started.port(), stopped.port(), "plain"),
         )

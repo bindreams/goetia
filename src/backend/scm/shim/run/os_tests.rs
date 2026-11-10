@@ -10,8 +10,8 @@ use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
 
-use crate::spec::test_support::plain_fields;
 use crate::spec::{DaemonFields, DaemonSpec};
+use crate::testing::plain_fields;
 use cosca::identity::{Liveness, Resolved};
 use cosca::{Process, Stdio};
 use skuld::temp_dir;

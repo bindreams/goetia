@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use super::*;
 use crate::spec::DaemonFields;
-use crate::spec::test_support::{plain_fields, program};
+use crate::spec::test_support::program;
 use crate::spec::{Id, Kind, User};
+use crate::testing::plain_fields;
 
 // Fixtures ============================================================================================================
 //
