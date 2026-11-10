@@ -2002,7 +2002,8 @@ fn a_stop_whose_label_is_loaded_again_waits_until_its_deadline() {
 
 /// A `start` that finds the label's job being torn down waits for it whatever its budget, as part of
 /// sending the request, and then bootstraps: `--timeout 0`, a zero bound, a spent bound, a bounded
-/// budget and `--no-timeout` alike. The budget then bounds only the wait for running.
+/// budget and `--no-timeout` alike. The budget's clock started with the verb, so that wait spends it and
+/// only the wait for running is bounded by what is left.
 #[skuld::test]
 fn a_start_over_a_label_being_torn_down_waits_for_it_then_bootstraps_under_every_budget() {
     use crate::backend::Backend;

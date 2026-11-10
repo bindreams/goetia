@@ -26,7 +26,9 @@ pub struct WaitArgs {
     /// `restart: always` `start` on macOS that finds the label held by a job
     /// that is not running boots it out and waits until launchd has removed
     /// it, which `--timeout` does not cut short (for a job whose plist
-    /// disables `ExitTimeOut` that may not happen). Write a compound
+    /// disables `ExitTimeOut` that may not happen); and a `start` on macOS over
+    /// a job still being torn down, which waits for it whatever `--timeout` says,
+    /// and spends the budget doing so. Write a compound
     /// duration unspaced (`2m30s`), or quote it as one argument: every verb
     /// taking this flag also takes a variadic id list, so `--timeout 2m 30s`
     /// passes `2m` here and `30s` as a daemon id.

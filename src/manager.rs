@@ -88,8 +88,11 @@ pub trait ServiceManager {
     /// before the plain `kickstart` that declines to wait. Likewise on macOS
     /// a `restart: always` start that finds the label held by a job that is
     /// not running boots it out and waits until launchd has removed the job,
-    /// whatever the budget: the wait is part of sending the request. For a
-    /// job whose plist disables `ExitTimeOut` that may not happen.
+    /// whatever the budget: the wait is part of sending the request. A `start`
+    /// that finds the label's job still being torn down (after a `stop` that
+    /// timed out) waits for it the same way, and that wait spends the budget,
+    /// whose clock started with the verb. For a job whose plist disables
+    /// `ExitTimeOut` that may not happen.
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a
