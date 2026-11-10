@@ -19,7 +19,6 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::backend::scm::exit_status::Reported;
 
-use super::exit;
 use super::logging::Log;
 use super::os::{Os, Spawned, os_error_of};
 use crate::backend::standby::Standby;
@@ -63,17 +62,20 @@ pub enum WaitOutcome {
     /// The waiter's `child.wait()` failed, so whether the daemon ended was unknown. `kill_tree`
     /// terminated the tree, so the shim may report a restartable failure. `os_error` is the
     /// failure's OS error code. When the tree was not terminated the outcome is
-    /// [`WaitOutcome::DaemonMayRun`] instead.
+    /// [`WaitOutcome::DaemonMayRun`] or [`WaitOutcome::TreeMayRun`] instead.
     WaitFailed {
         os_error: Option<i32>,
     },
     /// A stop was requested, and `kill_tree` terminated the daemon's tree.
     Stopping,
-    /// The daemon may still be running: `kill_tree` failed, after a stop or a failed wait, and
-    /// the direct-child fallback, if it worked, does not reach descendants. See
-    /// [`Supervisor::wait_for_child_or_stop`] for why this is a return rather than a wait, and
-    /// `Reported::incomplete_stop` for what the caller reports for it.
+    /// The daemon may still be running: `kill_tree` and the direct-child fallback both failed, after
+    /// a stop or a failed wait. See [`Supervisor::wait_for_child_or_stop`] for why this is a return
+    /// rather than a wait, and `Reported::incomplete_stop` for what the caller reports for it.
     DaemonMayRun,
+    /// `kill_tree` failed, after a stop or a failed wait, and the direct child was killed and reaped:
+    /// its descendants may still be running. The caller reports `Reported::incomplete_stop` for it
+    /// too.
+    TreeMayRun,
 }
 
 // Waiter ==============================================================================================================
@@ -119,20 +121,12 @@ impl Waiter {
             move |child: Arc<dyn Spawned>| {
                 // A panic from here on reports as a failed wait, or `wait_while` would have no waker.
                 let mut report = ReportOnPanic { bus: &bus, armed: true };
-                let waited = child.wait();
-                // Everything after the wait is gated, the drops included: this thread is never
-                // joined when the daemon could not be killed, and the process must not end under it.
-                exit::gated(|| {
-                    // Notified on `Err` too: nothing else wakes `wait_while` in the no-stop case.
-                    let failure = waited.err().map(|e| {
-                        log.failure(&id, &wait_failed(&e));
-                        os_error_of(&e)
-                    });
-                    bus.report_done(failure);
-                    drop(child);
-                    drop(log);
-                    drop(id);
+                // Notified on `Err` too: nothing else wakes `wait_while` in the no-stop case.
+                let failure = child.wait().err().map(|e| {
+                    log.failure(&id, &wait_failed(&e));
+                    os_error_of(&e)
                 });
+                bus.report_done(failure);
                 report.armed = false;
             },
         )?;
@@ -143,8 +137,8 @@ impl Waiter {
         })
     }
 
-    /// End a waiter that is never handed a daemon, and wait for its thread: left to end on its own
-    /// it would free what it holds as the process may be ending.
+    /// End a waiter that is never handed a daemon, and wait for its thread, so that nothing of
+    /// this run is left running when the launch fails.
     pub(super) fn stand_down(self) {
         drop(self.standby);
         // A panic of the thread is of nothing it was handed: it was handed nothing.
@@ -347,11 +341,12 @@ impl Supervisor {
     /// failure may be reported as one SCM restarts only if `kill_tree` succeeded; the daemon always
     /// runs in a Job Object (`service::launch` refuses any other containment), where `Ok` means
     /// `TerminateJobObject` succeeded. Otherwise (the tree kill failed, even if the direct child's
-    /// fallback worked) the outcome is [`WaitOutcome::DaemonMayRun`], and the bus refuses later
+    /// fallback worked) the outcome is [`WaitOutcome::TreeMayRun`] (and [`WaitOutcome::DaemonMayRun`]
+    /// when it failed too), and the bus refuses later
     /// stops: a refused termination leaves the members running indefinitely, and reporting a
     /// restartable failure over them would start a second copy beside them.
     ///
-    /// **A stop whose tree kill failed** is [`WaitOutcome::DaemonMayRun`] too, even when the direct
+    /// **A stop whose tree kill failed** is [`WaitOutcome::TreeMayRun`] too, even when the direct
     /// child's fallback worked: its descendants may still run.
     ///
     /// **No drain after `kill_tree`.** `cosca`'s Job Object `hard_kill` closes the job handle as
@@ -414,7 +409,7 @@ impl Supervisor {
                     if !stopping {
                         self.bus.refuse_stops();
                     }
-                    WaitOutcome::DaemonMayRun
+                    WaitOutcome::TreeMayRun
                 }
                 _ if stopping => WaitOutcome::Stopping,
                 (Teardown::Tree, os_error) => WaitOutcome::WaitFailed {
@@ -445,7 +440,7 @@ struct ReportOnPanic<'a> {
 impl Drop for ReportOnPanic<'_> {
     fn drop(&mut self) {
         if self.armed {
-            exit::gated(|| self.bus.report_done(Some(None)));
+            self.bus.report_done(Some(None));
         }
     }
 }

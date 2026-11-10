@@ -37,8 +37,8 @@ use super::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_f
 const TABLE_NAME: &str = "goetia-shim";
 
 /// Called from `main()`. Hands control to SCM, and never returns normally. [`finish`] records what
-/// every path that reports `STOPPED` reported, and the dispatcher returns once the service thread
-/// does, so this ends the process with it (see [`exit`]); the paths that cannot report one end it
+/// every path that reports `STOPPED` reported, and the dispatcher returns once SCM has processed it,
+/// so this ends the process with the record (see [`exit`]); the paths that cannot report one end it
 /// themselves, with a code from `crate::backend::scm::exit_status`. Reads no process arguments: the
 /// service name comes from SCM.
 pub(crate) fn run() -> ! {
@@ -134,27 +134,13 @@ fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob,
 }
 
 /// Tell SCM the service stopped and return, leaving the exit to the main thread: the dispatcher
-/// returns once `service_main` does, and the main thread ends the process with what is recorded
-/// here, after waiting for this thread to end (see [`exit`]). When `STOPPED` cannot be reported, or
-/// this thread cannot be registered for that wait, the dispatcher is not trusted to return, or the
-/// exit would not wait for this thread, so the exit is here.
+/// returns once SCM has processed `STOPPED`, and the main thread ends the process with what is
+/// recorded here (see [`exit`]). When `STOPPED` cannot be reported the dispatcher is not trusted to
+/// return, so the exit is here.
 fn finish(log: &Log, id: &str, status_handle: StatusHandle, reported: Reported) {
-    exit::record(reported);
-    let registered = match exit::register_service_thread() {
-        Ok(()) => true,
-        Err(e) => {
-            log.failure(id, &thread_unregistered(&e));
-            false
-        }
-    };
-    let stopped = match report_stopped(status_handle, reported) {
-        Ok(()) => true,
-        Err(e) => {
-            log.failure(id, &stopped_report_failure(&e));
-            false
-        }
-    };
-    if !(registered && stopped) {
+    exit::stopping(reported);
+    if let Err(e) = report_stopped(status_handle, reported) {
+        log.failure(id, &stopped_report_failure(&e));
         exit::end_process(reported.process_exit_code());
     }
 }
@@ -235,15 +221,14 @@ unsafe extern "system" fn control_handler(
 /// `NO_ERROR` too. The decided exit is reported as it is; SCM restarts it if the restart policy
 /// covers it.
 fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
-    // Gated: the service thread can end the process while this runs on the dispatcher thread.
-    exit::gated(|| match control {
+    match control {
         SERVICE_CONTROL_STOP => {
             stop_bus.request_stop();
             NO_ERROR
         }
         SERVICE_CONTROL_INTERROGATE => NO_ERROR,
         _ => ERROR_CALL_NOT_IMPLEMENTED,
-    })
+    }
 }
 
 /// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
@@ -281,10 +266,6 @@ fn report_stopped(handle: StatusHandle, reported: Reported) -> std::io::Result<(
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
-}
-
-fn thread_unregistered(e: &std::io::Error) -> String {
-    format!("keep a handle to the service thread: {e}; the shim exits from that thread, without waiting for it to end")
 }
 
 /// The shim exits after this without a `STOPPED` report. SCM is expected to read that as a crash
@@ -356,6 +337,8 @@ fn run_daemon(
             std::mem::forget(child);
             Reported::incomplete_stop()
         }
+        // The root was killed and its waiter joined, so the drop is bounded.
+        WaitOutcome::TreeMayRun => Reported::incomplete_stop(),
     }
 }
 

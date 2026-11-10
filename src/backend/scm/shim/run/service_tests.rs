@@ -1132,8 +1132,8 @@ fn a_failed_stopped_report_says_scm_is_expected_to_read_a_crash() {
 
 // The waiter of a daemon that never ran -------------------------------------------------------------------------------
 
-/// A waiter not handed the daemon ends on its own once dropped, freeing what it holds on a thread
-/// nothing joins, as the process may be ending. `launch` waits for it instead.
+/// A waiter not handed the daemon ends on its own once dropped, on a thread nothing joins.
+/// `launch` waits for it instead.
 #[skuld::test]
 fn a_waiter_that_is_not_handed_the_daemon_has_ended_when_launch_returns() {
     let refused_spawn = FakeGuard::new();
@@ -1178,5 +1178,25 @@ fn a_daemon_whose_kills_were_refused_is_never_dropped() {
     assert_eq!(reported, Reported::incomplete_stop());
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert!(!daemon.dropped(), "the shim dropped a daemon it could not kill");
+    fake.take_failures();
+}
+
+/// A daemon whose root was killed is dropped as any other: its waiter was joined, so the drop's
+/// second kill is bounded and the child is reaped.
+#[skuld::test]
+fn a_daemon_whose_root_was_killed_is_dropped() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Ends);
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert!(daemon.dropped(), "the shim leaked a daemon whose root it had killed");
     fake.take_failures();
 }
