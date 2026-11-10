@@ -14,9 +14,11 @@ fn a_sid_is_written_in_the_standard_string_form() {
 }
 
 #[skuld::test]
-fn an_identifier_authority_of_2_to_the_32_or_more_is_written_as_twelve_hex_digits() {
-    let sid = [1, 1, 0, 1, 0, 0, 0, 0, 7, 0, 0, 0];
-    assert_eq!(sid_string(&sid), "S-1-0x000100000000-7");
+fn an_identifier_authority_of_2_to_the_32_or_more_is_written_as_unpadded_uppercase_hex() {
+    let first_hex = [1, 1, 0, 1, 0, 0, 0, 0, 7, 0, 0, 0];
+    assert_eq!(sid_string(&first_hex), "S-1-0x100000000-7");
+    let all_six_bytes = [1, 1, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 7, 0, 0, 0];
+    assert_eq!(sid_string(&all_six_bytes), "S-1-0xABCDEF123456-7");
 }
 
 #[skuld::test]

@@ -14,7 +14,7 @@ pub(crate) fn sid_from_parts(authority: u8, subauthorities: &[u32]) -> Sid {
 }
 
 /// `S-1-5-32-544`, or `None` when the bytes are not a SID. An identifier authority of 2^32 or more
-/// is written as `0x` and 12 hex digits.
+/// is written as `0x` and its uppercase hex digits, with no padding, as Windows writes it.
 pub(crate) fn sid_text(sid: &[u8]) -> Option<String> {
     let (&1, &count) = (sid.first()?, sid.get(1)?) else {
         return None;
@@ -27,7 +27,7 @@ pub(crate) fn sid_text(sid: &[u8]) -> Option<String> {
     let mut text = if authority < 1 << 32 {
         format!("S-1-{authority}")
     } else {
-        format!("S-1-0x{authority:012X}")
+        format!("S-1-0x{authority:X}")
     };
     for &sub in sid[8..].as_chunks::<4>().0 {
         text.push('-');

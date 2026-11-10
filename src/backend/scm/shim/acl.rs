@@ -97,6 +97,9 @@ const FILE_GENERIC_WRITE: u32 = 0x12_0116;
 const FILE_GENERIC_EXECUTE: u32 = 0x12_00A0;
 const FILE_ALL_ACCESS: u32 = 0x1F_01FF;
 
+/// What `verdict` says an untrusted owner does to a folder or a file.
+const OWNING: &str = "own";
+
 /// The rights that let an account replace what is in a folder, in the order they are reported.
 const DIRECTORY_TAMPERING: [(u32, &str); 4] = [
     (WRITE_DAC, "change permissions of"),
@@ -130,7 +133,7 @@ pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsaf
             right,
         };
         if !is_trusted(&object.owner) {
-            return Err(refuse(&object.owner, "own"));
+            return Err(refuse(&object.owner, OWNING));
         }
         let Some(dacl) = &object.dacl else {
             return Err(refuse(&everyone(), "do anything to"));

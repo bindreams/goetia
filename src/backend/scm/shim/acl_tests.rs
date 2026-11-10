@@ -719,10 +719,10 @@ pub(in crate::backend::scm::shim) mod windows {
             panic!("a folder everyone can write must be refused");
         };
         assert_eq!(path, display_path(&target));
-        assert!(["own", "change permissions of"].contains(&right), "{right}");
-        if right == "change permissions of" {
-            let everyone = identity::account_name_of_sid(&everyone()).unwrap_or_else(|_| sid_string(&everyone()));
-            assert_eq!(account, everyone);
+        let (_, change_permissions) = DIRECTORY_TAMPERING.iter().find(|(bit, _)| *bit == WRITE_DAC).unwrap();
+        assert!([OWNING, *change_permissions].contains(&right), "{right}");
+        if right == *change_permissions {
+            assert_eq!(account, account_name(&everyone()));
         }
     }
 
