@@ -1,6 +1,8 @@
 //! What a service host is, and who supplies it: [`HostCommand`] and the Windows-only
 //! [`ShimProvider`].
 
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(windows)]
@@ -8,7 +10,7 @@ use super::acl::FolderCheck;
 #[cfg(windows)]
 use super::sweep::SweepFailure;
 #[cfg(windows)]
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// The command SCM launches for a `type: simple` service: a host built from `goetia::shim::main()`
 /// and the arguments it is started with. The arguments are `String`s because the registry read
@@ -18,6 +20,19 @@ pub struct HostCommand {
     /// An absolute path: every provider refuses a relative one.
     pub exe: PathBuf,
     pub args: Vec<String>,
+}
+
+/// `path`, if it is absolute; else [`Error::ShimPathRelative`] naming it. The one check every
+/// shim path goes through: a provider's folder or command, and the host `Scm` is given back.
+#[cfg(windows)]
+pub(crate) fn require_absolute(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(Error::ShimPathRelative {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 /// Where the service host of a `type: simple` service comes from. `Scm` consults one for such a

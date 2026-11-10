@@ -119,7 +119,7 @@ use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
-use crate::backend::scm::shim::provider::ShimProvider;
+use crate::backend::scm::shim::provider::{ShimProvider, require_absolute};
 use crate::backend::scm::shim::sweep::{
     ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
@@ -311,13 +311,7 @@ impl Backend for Scm {
             args: desired.arguments.clone(),
         };
         let provided = confirm_provided(rendered, provided)?;
-        provided
-            .exe
-            .parent()
-            .filter(|folder| folder.is_absolute())
-            .ok_or_else(|| Error::ShimPathRelative {
-                path: provided.exe.clone(),
-            })?;
+        require_absolute(&provided.exe)?;
         self.folders.check(&provided.exe)?;
         marker::verify(&provided.exe)?;
         Ok(Some(lock))

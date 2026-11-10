@@ -64,7 +64,7 @@ mod stock {
         Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, read_object, require_acls_under,
     };
     use super::super::marker::read_retrying;
-    use super::super::provider::ShimProvider;
+    use super::super::provider::{ShimProvider, require_absolute};
     use super::super::sweep::{SweepFailure, sweep_folder};
     use crate::error::{Error, Result};
     use crate::shim::HostCommand;
@@ -136,7 +136,7 @@ mod stock {
         fn sweep(&self, referenced: &[PathBuf], folders: &FolderCheck) -> std::result::Result<(), SweepFailure> {
             let dir = self.dir()?;
             match &self.dir {
-                Some(_) => sweep_folder(&dir, referenced, folders, default_dir),
+                Some(_) => sweep_folder(&dir, referenced, folders, || folder_in(None)),
                 // The folder is the default one: the lookup that found it is the answer to the
                 // question of where the default folder is.
                 None => sweep_folder(&dir, referenced, folders, || Ok(dir.clone())),
@@ -283,14 +283,13 @@ mod stock {
             Some(dir) => dir.to_path_buf(),
             None => default_dir()?,
         };
-        if !folder.is_absolute() {
-            return Err(Error::ShimPathRelative { path: folder });
-        }
+        require_absolute(&folder)?;
         Ok(folder)
     }
 
     /// The command for `image` in `dir`, which comes from [`folder_in`].
     fn preview_in(dir: &Path, image: &Image<'_>) -> HostCommand {
+        debug_assert!(dir.is_absolute(), "{}", dir.display());
         HostCommand {
             exe: dir.join(image.file_name()),
             args: vec![],
@@ -301,6 +300,7 @@ mod stock {
 
     /// The core of every `provide`: the file for `image` in `dir`, checked, written or repaired.
     fn provide_in(dir: &Path, image: &Image<'_>, folders: &FolderCheck) -> Result<HostCommand> {
+        debug_assert!(dir.is_absolute(), "{}", dir.display());
         let command = preview_in(dir, image);
         // Before anything is created, so that a folder under an unsafe ancestor is refused without
         // a trace. For a folder that does not exist this judges its first existing ancestor alone.

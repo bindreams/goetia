@@ -270,7 +270,11 @@ pub(crate) fn left_behind_text(
                 if unknown { ", which is not known" } else { "" }
             ));
         }
-        if let Some(folder) = second_folder.filter(|folder| !in_providers(folder)) {
+        let beside = second_folder.filter(|folder| !in_providers(folder));
+        if *provider == ProviderFolder::None && beside.is_none() {
+            said.push_str(" No shim provider of this program sweeps a folder, so nothing is retried.");
+        }
+        if let Some(folder) = beside {
             // An unknown provider's folder may be this one, which then is retried.
             let retried = if unknown {
                 "retried by that command only if it is that folder: otherwise"

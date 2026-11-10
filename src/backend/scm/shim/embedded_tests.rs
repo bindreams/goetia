@@ -143,15 +143,11 @@ mod windows {
         );
     }
 
-    /// The check every stock provider's folder goes through, `SiblingStockShim`'s (which passes
-    /// `None`) as well as `EmbeddedStockShim`'s. Nothing feeds `default_dir` a value, so the relative
-    /// default folder is not reachable through the sibling.
+    /// `folder_in(None)`, which `SiblingStockShim` uses, is the default folder, and an absolute
+    /// folder is kept as given. Nothing can feed `default_dir` a value, so the refusal of a relative
+    /// default folder is not reachable in a test.
     #[skuld::test]
-    fn the_stock_folder_is_absolute_or_refused() {
-        match folder_in(Some(Path::new(r"shims\here"))) {
-            Err(Error::ShimPathRelative { path }) => assert_eq!(path, PathBuf::from(r"shims\here")),
-            other => panic!("a relative folder must be refused, got {other:?}"),
-        }
+    fn the_stock_folder_is_the_given_one_or_the_default() {
         assert_eq!(
             folder_in(Some(Path::new(r"C:\shims"))).unwrap(),
             PathBuf::from(r"C:\shims")

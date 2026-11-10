@@ -641,9 +641,8 @@ pub enum Error {
 }
 
 /// A pattern for the variants that wrap one error, binding it as `$source`: the only list of them.
-/// [`Error::wrapped`] reads the chain through it and [`Error::map_cause`] rewrites it, so a new
-/// wrapping variant is added here and nowhere else. The docs of [`Error::cause`] and
-/// [`Error::wraps_unreadable_host`] name this list, and are edited with it.
+/// [`Error::wrapped`] reads the chain through it and [`Error::map_cause`] rewrites it. The docs of
+/// [`Error::cause`] and [`Error::wraps_unreadable_host`] name its list, and are edited with it.
 macro_rules! wrapper {
     ($source:ident) => {
         Error::Step { source: $source, .. }

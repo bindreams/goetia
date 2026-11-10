@@ -407,15 +407,20 @@ fn files_in_both_get_each_their_own_advice() {
 fn with_no_provider_nothing_is_retried() {
     let said = text(None, "/q/Other", &["/q/Other/b.exe"]);
 
-    assert!(said.contains(NEXT), "{said}");
-    assert!(!said.contains(RETRY), "{said}");
-    // It does not claim a provider folder these files are outside of.
-    assert!(!said.contains("not in the folder"), "{said}");
     assert_eq!(
         said,
         "`frpc` was deleted, but `/q/Other/b.exe` could not be removed. No shim provider of this program sweeps a \
          folder, so `/q/Other/b.exe` is not retried: the next install or uninstall of a manager whose provider uses \
          that folder removes it."
+    );
+}
+
+#[skuld::test]
+fn with_no_provider_and_no_folder_named_nothing_is_retried_and_it_says_so() {
+    assert_eq!(
+        left_behind_text("frpc", &ProviderFolder::None, None, &[]),
+        "`frpc` was deleted, but the shim files it used were not cleaned up. No shim provider of this program \
+         sweeps a folder, so nothing is retried."
     );
 }
 
