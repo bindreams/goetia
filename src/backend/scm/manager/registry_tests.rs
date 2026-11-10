@@ -237,7 +237,7 @@ fn a_line_that_is_not_valid_utf16_reads_lossily_and_adds_a_layout_line() {
                 "A=\u{FFFD}",
                 "(REG_MULTI_SZ not laid out as goetia writes it: a line that is not valid UTF-16)"
             ],
-            "{surrogate:04x}"
+            "{surrogate:04X}"
         );
     }
 }
