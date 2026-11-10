@@ -2000,92 +2000,73 @@ fn a_stop_whose_label_is_loaded_again_waits_until_its_deadline() {
     fake.assert_spent("the bootout, the old instance, the new one, and the read the deadline cut");
 }
 
-/// A `start` that finds the label's job being torn down waits for it under the caller's own budget, as
-/// `--timeout` says. When that ends first (a spent budget reads once more, a budget that expires
-/// mid-wait, `--timeout 0`, which does not wait at all), the old job is still there: the `start` fails
-/// saying nothing was sent, and no `bootstrap` goes out over the old job.
+/// A `start` that finds the label's job being torn down waits for it whatever its budget, as part of
+/// sending the request, and then bootstraps: `--timeout 0`, a zero bound, a spent bound, a bounded
+/// budget and `--no-timeout` alike. The budget then bounds only the wait for running.
 #[skuld::test]
-fn a_start_whose_budget_ends_over_a_label_being_torn_down_sent_nothing() {
+fn a_start_over_a_label_being_torn_down_waits_for_it_then_bootstraps_under_every_budget() {
     use crate::backend::Backend;
 
     let spent = Budget::Bounded(Duration::from_nanos(1));
-    let cases: [(&str, Budget, Vec<Entry>); 4] = [
-        (
-            "a spent budget",
-            spent,
-            vec![answer("print", SIGTERMED), answer("print", SIGTERMED)],
-        ),
-        (
-            "a budget that expires in the wait",
-            Budget::DEFAULT,
-            vec![
-                answer("print", SIGTERMED),
-                answer("print", SIGTERMED),
-                reply(&["print"], Finished::Expired),
-            ],
-        ),
-        ("--timeout 0", Budget::Immediate, vec![answer("print", SIGTERMED)]),
-        (
-            "a zero bound",
-            Budget::Bounded(Duration::ZERO),
-            vec![answer("print", SIGTERMED)],
-        ),
+    let budgets = [
+        Budget::Immediate,
+        Budget::Bounded(Duration::ZERO),
+        spent,
+        Budget::DEFAULT,
+        Budget::Unbounded,
     ];
-    for (what, budget, calls) in cases {
-        let fake = Fake::new(calls);
-        let mgr = launchd_over(fake.clone());
+    for budget in budgets {
+        let kickstart = if budget.waits() { PID } else { DONE };
+        let (mgr, script) = scripted(&[
+            ("print", SIGTERMED),
+            ("print", SIGTERMED),
+            ("print", SIGTERMED),
+            GONE,
+            ("bootstrap", DONE),
+            ("print", NOT_RUNNING),
+            ("kickstart", kickstart),
+        ]);
 
-        let e = Backend::start(
+        Backend::start(
             &mgr,
             marked_plist(&never_installed()),
             budget,
             &mut reserved(&[Step::Start]),
         )
-        .expect_err(what);
+        .unwrap_or_else(|e| panic!("{budget:?}: {e:?}"));
 
-        match &e {
-            Error::WaitTimeout {
-                awaited: "stopped",
-                recovery,
-                ..
-            } => {
-                assert!(recovery.contains("no `bootstrap` was sent"), "{what}: {recovery}");
-                assert!(recovery.contains("goetia daemon start"), "{what}: {recovery}");
-            }
-            other => panic!("{what}: {other:?}"),
-        }
-        assert!(
-            fake.calls().iter().all(|call| call[0] != "bootstrap"),
-            "{what}: a bootstrap was sent over the old job"
-        );
-        fake.assert_spent(what);
+        script.assert_spent(&format!("{budget:?}: the wait for the old job, then the bootstrap"));
     }
 }
 
-/// `--no-timeout` waits for the label's old job for as long as it takes, then bootstraps.
+/// After that wait and the `bootstrap`, a bounded budget times out only on the wait for running, with
+/// the request sent.
 #[skuld::test]
-fn an_unbounded_start_waits_for_a_label_being_torn_down_then_bootstraps() {
+fn a_start_over_a_label_being_torn_down_times_out_only_on_the_wait_for_running() {
     use crate::backend::Backend;
 
-    let (mgr, script) = scripted(&[
-        ("print", SIGTERMED),
-        ("print", SIGTERMED),
-        ("print", SIGTERMED),
-        GONE,
-        ("bootstrap", DONE),
-        ("print", NOT_RUNNING),
-        ("kickstart", PID),
+    let (kickstart, _ended) = lingering(&["kickstart"]);
+    let fake = Fake::new([
+        answer("print", SIGTERMED),
+        answer("print", SIGTERMED),
+        answer(GONE.0, GONE.1),
+        answer("bootstrap", DONE),
+        answer("print", NOT_RUNNING),
+        kickstart,
+        answer("print", NOT_RUNNING),
     ]);
+    let mgr = launchd_over(fake.clone());
 
-    Backend::start(
+    let e = Backend::start(
         &mgr,
         marked_plist(&never_installed()),
-        Budget::Unbounded,
+        Budget::DEFAULT,
         &mut reserved(&[Step::Start]),
     )
-    .expect("start");
+    .expect_err("a kickstart that outlasts the budget");
 
-    script.assert_spent("the wait for the old job, then the bootstrap");
+    assert_wait_timeout(&e);
+    fake.assert_spent("the wait, the bootstrap, and the start driven to the expiry");
 }
 
 /// A wait whose files cannot be reused for a read fails, as a read that fails does: the `bootout`

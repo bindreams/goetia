@@ -29,8 +29,8 @@
 //!   clear it and there is no remedy to apply.
 //! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded, and waits until
 //!   launchd no longer has it (see [`Launchctl::bootout`]). Every verb that acts on the label after
-//!   a `bootout` waits the same way, and `start` waits first, under its budget, for a label whose job
-//!   is being torn down.
+//!   a `bootout` waits the same way, and `start` waits first, whatever its budget, for a label whose
+//!   job is being torn down: that wait is part of sending the request.
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`] (`/Library/LaunchDaemons`).
 //!   Does not start it.
 //! - `disable` moves the plist back to [`STAGING_DIR`]. It does not `bootout` the job:
@@ -731,24 +731,6 @@ fn verb_deadline(budget: Budget) -> Deadline {
     }
 }
 
-/// A `start` that gave up waiting for the label's old job to be torn down. Not
-/// [`budget::timed_out`]: no request is on its way, since no `bootstrap` was sent. Built here because
-/// a budget that does not wait is no expiry for it to describe.
-fn old_job_still_going(id: &Id, budget: Budget) -> Error {
-    Error::WaitTimeout {
-        id: id.as_str().to_string(),
-        awaited: "stopped",
-        waited: match budget {
-            Budget::Bounded(d) => d,
-            Budget::Immediate | Budget::Unbounded => Duration::ZERO,
-        },
-        recovery: format!(
-            "the previous job of `{id}` is still being torn down, so no `bootstrap` was sent and `{id}` was not              started. `goetia daemon status {id}` shows the manager's current view; once the old job is gone,              `goetia daemon start {id}` loads it. Allow longer with `--timeout <duration>`, or wait indefinitely              with `--no-timeout`.",
-            id = id.as_str()
-        ),
-    }
-}
-
 /// `Deadline(None)` never expires, so no step driven by an unbounded deadline reports an expiry.
 /// `expect`, never `let _ =`, which would turn an unreachable case into a silent one.
 fn never_expires<T>(step: Option<T>) -> T {
@@ -1357,12 +1339,10 @@ impl backend::Backend for Launchd {
                 if state::tearing_down(&String::from_utf8_lossy(&capture.stdout)) {
                     // A job being torn down (after a `stop` that timed out, or another program's
                     // `launchctl bootout`) answers for the label and would pass for a loaded job, so
-                    // `bootstrap` would be skipped and the job gone once it exits. Wait it out under
-                    // the caller's budget, which `--timeout 0` makes no wait at all; when that ends
-                    // first, nothing was sent.
-                    if !budget.waits() || self.launchctl.wait_unloaded(id.as_str(), deadline, &kept)?.is_none() {
-                        return Err(old_job_still_going(id, budget));
-                    }
+                    // `bootstrap` would be skipped and the job gone once it exits. Waiting it out is
+                    // part of sending the request, like the corrective cycle's: under `issuing`, so
+                    // no budget leaves the old job loaded with `bootstrap` unsent.
+                    never_expires(self.launchctl.wait_unloaded(id.as_str(), issuing, &kept)?);
                     false
                 } else {
                     true

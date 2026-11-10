@@ -311,12 +311,10 @@ pub enum Error {
     /// began. From a backend, the request was issued (the budget never decides
     /// that; on launchd it may still be on its way in a `launchctl` goetia left
     /// running) and goetia stopped watching for its outcome. It was not
-    /// cancelled, and the service may still arrive. Two producers also report
-    /// a step they never issued, and their messages say so: `cli::restart`, for
-    /// a start leg its budget ran out before, and launchd's `start`, for a label
-    /// whose old job was still being torn down when the budget ended (no
-    /// `bootstrap` sent). A backend must never report an expiry as `Ok(())`,
-    /// nor as `Undetermined`.
+    /// cancelled, and the service may still arrive. `cli::restart` is the one
+    /// producer that also reports a step it never issued: a start leg its
+    /// budget ran out before, whose message says so. A backend must never
+    /// report an expiry as `Ok(())`, nor as `Undetermined`.
     ///
     /// Exit `4` (indeterminate), like `Undetermined`.
     #[error("`{id}` did not report {awaited} within {waited}: {recovery}", waited = humantime::format_duration(*waited))]

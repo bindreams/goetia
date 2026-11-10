@@ -730,10 +730,10 @@ is part of sending the request, and a request that stopped partway would leave
 the daemon unloaded. For a job whose plist disables `ExitTimeOut` (`0`: launchd
 never kills the process), launchd may not remove it, and `start` then waits on.
 A `start` that finds the label's job already being torn down (after a `stop`
-that timed out) waits for it under `--timeout`, then loads the job. If the
-job is still there when `--timeout` ends (at once under `--timeout 0`),
-nothing was sent: `start` fails, and running it again once the old job is gone
-loads the job.
+that timed out) has the same exception: it waits until launchd has removed the
+job, whatever `--timeout` says, and then loads it. `--timeout` bounds only the
+wait for running that follows. For a job whose plist disables `ExitTimeOut`,
+that wait may not end, as with `stop`.
 
 The two flags are mutually exclusive. `install` accepts them only alongside
 `--start`: without it nothing is started, so there is nothing to wait for,
