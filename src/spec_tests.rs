@@ -1,5 +1,6 @@
-use super::test_support::{abs, non_utf8_absolute_path, plain_fields};
+use super::test_support::{abs, non_utf8_absolute_path};
 use super::*;
+use crate::testing::plain_fields;
 
 fn fields() -> DaemonFields {
     DaemonFields {

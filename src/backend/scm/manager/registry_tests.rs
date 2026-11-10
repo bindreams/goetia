@@ -4,9 +4,9 @@ use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
 use winreg::RegValue;
 use winreg::types::ToRegValue as _;
 
-use crate::backend::test_elevation::{ELEVATED, elevated};
-use crate::backend::test_raw_registry::{create_link, create_raw_key};
-use crate::backend::test_scratch::ScratchKey;
+use crate::testing::elevation::{ELEVATED, elevated};
+use crate::testing::raw_registry::{create_link, create_raw_key};
+use crate::testing::scratch::ScratchKey;
 
 #[skuld::test]
 fn service_key_path_is_under_current_control_set_services() {

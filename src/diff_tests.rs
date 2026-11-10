@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use super::*;
 use crate::spec::DaemonFields;
-use crate::spec::test_support::{abs, plain_fields, program};
+use crate::spec::test_support::{abs, program};
 use crate::spec::{Kind, Restart};
+use crate::testing::plain_fields;
 
 // The paths are absolute because `DaemonSpec::new` requires it; no assertion reads them, so their
 // platform spelling does not matter.
