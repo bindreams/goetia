@@ -8,7 +8,7 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::backend::{Backend, InstalledService, ReadOutcome, ScanEntry, WriteOutcome};
+use crate::backend::{Backend, InstalledService, ReadOutcome, ScanEntry, Settle as _, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
 use crate::error::{Error, Reason, Result};
 use crate::manager::{Budget, Installed, Status, Step};
@@ -169,14 +169,16 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
         );
         match outcome {
             Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. } => {
-                match b.write(
+                let written = b.write(
                     spec,
                     &desired,
                     &outcome,
                     found.snapshot.as_ref(),
                     &mut scope,
                     &mut reservation,
-                )? {
+                );
+                scope.settle(|| b.standing(spec, &desired, &outcome, found.snapshot.as_ref()));
+                match written? {
                     WriteOutcome::Done => return Ok(outcome),
                     WriteOutcome::Raced => {}
                 }

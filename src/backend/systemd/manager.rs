@@ -47,7 +47,8 @@
 //!    already-existing directory is not checked, because install is not a start. systemd opens the
 //!    log file as root before it drops privileges, so an existing log directory is never a problem
 //!    for the account; it `chdir`s into `cwd` after the switch, so only a `cwd` the account cannot
-//!    traverse fails at start.
+//!    traverse fails at start. Those it creates are removed again, deepest first, unless the unit
+//!    is in place when `write` ends ([`CreatedDirs`]).
 //! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
 //!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
 //!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for.
@@ -72,18 +73,20 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use discover::{DROPIN_SEARCH_DIRS, Fragment};
+use discover::{DROPIN_SEARCH_DIRS, Fragment, RawState, classify_and_read};
 use systemctl::{
     GateScope, daemon_reload, daemon_reload_or_report, disable_impl, enable_impl, gate_scope, kill_impl,
     request_restart_impl, require_supported, start_impl, status_from_unit, stop_impl,
 };
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::systemd::generate;
 use crate::backend::{
     Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry,
     WriteOutcome, bounded,
 };
+use crate::backend::{Settle, Standing};
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
 use crate::manager::{Budget, Installed, Status, Step, flow};
@@ -107,6 +110,18 @@ impl Systemd {
     }
 }
 
+/// What an install holds for systemd: the version gate, and the directories it creates.
+pub(crate) struct Scope {
+    _gate: GateScope,
+    dirs: CreatedDirs,
+}
+
+impl Settle for Scope {
+    fn settle(&mut self, standing: impl FnOnce() -> Standing) {
+        self.dirs.settle(standing);
+    }
+}
+
 /// What [`Backend::reserve`] holds for systemd: pooled listener threads and a share of the version
 /// gate.
 pub(crate) struct Held {
@@ -117,15 +132,18 @@ pub(crate) struct Held {
 impl Backend for Systemd {
     type Definition = String;
     type Snapshot = Fragment;
-    type InstallScope = GateScope;
+    type InstallScope = Scope;
     type Reservation = Held;
 
     /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
     /// answer holds for the `daemon-reload` after the write.
-    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String) -> Result<GateScope> {
+    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String) -> Result<Scope> {
         let gate = gate_scope();
         require_supported()?;
-        Ok(gate)
+        Ok(Scope {
+            _gate: gate,
+            dirs: CreatedDirs::default(),
+        })
     }
 
     /// Two listener threads (stderr, stdout; no temp files) per watched start or stop in `steps`,
@@ -161,11 +179,11 @@ impl Backend for Systemd {
         definition: &String,
         outcome: &Outcome,
         snapshot: Option<&Fragment>,
-        _scope: &mut GateScope,
+        scope: &mut Scope,
         _reservation: &mut Held,
     ) -> Result<WriteOutcome> {
         let id = spec.id.as_str();
-        dirs::ensure_parent_dirs(spec)?;
+        dirs::ensure_parent_dirs(spec, &mut scope.dirs)?;
         match outcome {
             Outcome::Create => match create_unit(id, definition)? {
                 CreateOutcome::Created => {
@@ -192,6 +210,16 @@ impl Backend for Systemd {
             }
             other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
         }
+    }
+
+    fn standing(
+        &self,
+        spec: &DaemonSpec,
+        definition: &String,
+        _outcome: &Outcome,
+        _snapshot: Option<&Fragment>,
+    ) -> Standing {
+        unit_standing(&unit_path(spec.id.as_str()), definition)
     }
 
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
@@ -319,6 +347,19 @@ impl Backend for Systemd {
 
     fn kill(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<()> {
         kill_impl(snapshot.id().as_str())
+    }
+}
+
+/// Whether the unit at `path` is `definition`, as `discover` reads it.
+fn unit_standing(path: &Path, definition: &str) -> Standing {
+    match classify_and_read(path) {
+        Ok(RawState::Regular(text)) if text == definition => Standing::Yes,
+        Ok(_) => Standing::No,
+        Err(failure) => Standing::Unknown(format!(
+            "could not read {}: {}",
+            path.display(),
+            failure.into_os_error()
+        )),
     }
 }
 

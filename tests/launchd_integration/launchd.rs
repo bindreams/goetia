@@ -1258,6 +1258,84 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account() {
     }
 }
 
+/// A spec whose `cwd` is `cwd` and whose `logs` parent lies under a regular file, so the install
+/// creates what is missing of the former and then fails on the latter.
+fn spec_failing_on_logs_after_cwd(id: &str, base: &Path, cwd: &Path) -> DaemonSpec {
+    let file = base.join("file");
+    std::fs::write(&file, b"x").unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
+    let mut spec = base_spec(id, vec!["/bin/true".to_string()]).into_fields();
+    spec.cwd = Some(cwd.to_path_buf());
+    spec.logs = Some(file.join("sub").join("out.log"));
+    DaemonSpec::new(spec).unwrap()
+}
+
+/// The install failed on the `logs` parent, after the `cwd` was made, and not earlier for some other
+/// reason. That the `cwd` existed before it was removed is the `write` unit test's.
+fn assert_logs_parent_under_a_file(err: &goetia::Error) {
+    let cause = std::error::Error::source(err)
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(cause.contains("ENOTDIR"), "{err}: {cause}");
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_failed_install_removes_the_directories_it_created() {
+    let id = support::random_test_id();
+    let base = Path::new("/tmp").join(format!("{id}-undo-created"));
+    let _cleanup = DirGuard::new(base.clone());
+    std::fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
+    let spec = spec_failing_on_logs_after_cwd(&id, &base, &base.join("a").join("b"));
+    let _guard = Guard(spec.id.clone());
+
+    let err = Launchd::new()
+        .install(&spec, false)
+        .expect_err("the logs parent is under a file");
+    assert_logs_parent_under_a_file(&err);
+
+    assert!(!base.join("a").exists(), "the failed install left its cwd");
+    assert!(base.is_dir(), "a directory that existed before must stay");
+}
+
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_failed_install_removes_a_new_directory_in_one_that_existed_before() {
+    let id = support::random_test_id();
+    let base = Path::new("/tmp").join(format!("{id}-undo-preexisting"));
+    let _cleanup = DirGuard::new(base.clone());
+    let existing = base.join("cwd");
+    std::fs::create_dir_all(&existing).unwrap_or_else(|e| panic!("mkdir {}: {e}", existing.display()));
+    let created = existing.join("new");
+    let spec = spec_failing_on_logs_after_cwd(&id, &base, &created);
+    let _guard = Guard(spec.id.clone());
+
+    let err = Launchd::new()
+        .install(&spec, false)
+        .expect_err("the logs parent is under a file");
+    assert_logs_parent_under_a_file(&err);
+
+    assert!(!created.exists(), "the failed install left {}", created.display());
+    assert!(existing.is_dir(), "a directory that existed before must stay");
+}
+
+/// An update that writes a plist asking for a new `cwd` makes it and keeps it: the directories are
+/// kept because the plist the install wrote stands where `read` found it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_update_keeps_the_cwd_it_made() {
+    let mgr = Launchd::new();
+    let id = support::random_test_id();
+    let spec = base_spec(&id, vec!["/bin/true".to_string()]);
+    let _guard = Guard::install(&mgr, &spec);
+    let cwd = Path::new("/tmp").join(format!("{id}-update-cwd"));
+    let _cleanup = DirGuard::new(cwd.clone());
+    let mut fields = spec.into_fields();
+    fields.cwd = Some(cwd.clone());
+    let updated = DaemonSpec::new(fields).unwrap();
+
+    let outcome = mgr.install(&updated, false).expect("update");
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert!(cwd.is_dir(), "the update's cwd must stay");
+}
+
 // Non-regular occupants ===============================================================================================
 
 /// Regression coverage for the `locate`/`persist_new` classification

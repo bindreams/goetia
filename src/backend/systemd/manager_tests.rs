@@ -12,7 +12,7 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::dirs::ensure_dir;
+use super::dirs::{ensure_parent_dirs, owner_of};
 use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
@@ -22,6 +22,7 @@ use crate::spec::DaemonFields;
 use crate::spec::Kind;
 use crate::spec::test_support::plain_fields;
 
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::test_cleanup::{DirGuard, FileGuard, remove_or_warn};
 use crate::backend::test_elevation::{ELEVATED, elevated};
 
@@ -217,49 +218,191 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
     });
 }
 
-// ensure_dir: parent directories ======================================================================================
+// ensure_parent_dirs ==================================================================================================
 
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn ensure_dir_leaves_a_preexisting_directory_untouched() {
-    let dir = std::env::temp_dir().join(format!("{}-preexisting", fresh_id("systemd")));
-    std::fs::create_dir(&dir).expect("create pre-existing dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let _cleanup = DirGuard::new(dir.clone());
-
-    ensure_dir(&dir, &User::Root).expect("ensure_dir on a pre-existing dir");
-
-    let meta = std::fs::metadata(&dir).expect("stat");
-    assert_eq!(
-        meta.permissions().mode() & 0o777,
-        0o700,
-        "a pre-existing directory's mode must not be widened"
-    );
+fn spec_with_dirs(user: User, cwd: Option<PathBuf>, logs: Option<PathBuf>) -> DaemonSpec {
+    DaemonSpec::new(DaemonFields {
+        user,
+        cwd,
+        logs,
+        kind: Kind::Simple,
+        ..plain_fields(&fresh_id("systemd"), vec!["/bin/true".to_string()])
+    })
+    .unwrap()
 }
 
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write() {
+fn ensure_parent_dirs_leaves_an_existing_directory_the_account_cannot_write_as_found() {
     use std::os::unix::fs::MetadataExt as _;
 
     let dir = std::env::temp_dir().join(format!("{}-unwritable", fresh_id("systemd")));
     std::fs::create_dir(&dir).expect("create pre-existing dir");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     let _cleanup = DirGuard::new(dir.clone());
+    let spec = spec_with_dirs(User::Name("nobody".to_string()), Some(dir.clone()), None);
+    let mut created = CreatedDirs::default();
 
-    ensure_dir(&dir, &User::Name("nobody".to_string())).expect("ensure_dir");
+    ensure_parent_dirs(&spec, &mut created).expect("ensure_parent_dirs");
 
     let meta = std::fs::metadata(&dir).expect("stat");
     assert_eq!(meta.permissions().mode() & 0o777, 0o700, "mode must be untouched");
     assert_eq!(meta.uid(), 0, "owner must be untouched");
 }
 
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn ensure_dir_refuses_a_preexisting_file() {
-    let path = std::env::temp_dir().join(format!("{}-a-file", fresh_id("systemd")));
-    std::fs::write(&path, b"").expect("create file");
-    let _cleanup = FileGuard::new(path.clone());
+/// The account is resolved before anything is made, so one that does not exist creates nothing.
+#[skuld::test]
+fn ensure_parent_dirs_for_an_unknown_account_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = spec_with_dirs(
+        User::Name("goetia-no-such-account".to_string()),
+        Some(tmp.path().join("a").join("b")),
+        None,
+    );
+    let mut created = CreatedDirs::default();
 
-    let err = ensure_dir(&path, &User::Root).expect_err("a file cannot be a directory");
-    assert!(err.to_string().contains("not a directory"), "{err}");
+    ensure_parent_dirs(&spec, &mut created).expect_err("no such account to hand the directory to");
+
+    assert!(!tmp.path().join("a").exists());
+}
+
+/// A `write` that fails in the directories leaves what it made to the scope: they exist when it
+/// returns, for the failure it reports, and go when the scope is dropped.
+#[skuld::test]
+fn a_write_that_fails_after_making_directories_leaves_them_to_the_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let made = tmp.path().join("a").join("b");
+    let spec = spec_with_dirs(User::Root, Some(file.join("work")), Some(made.join("out.log")));
+    let mut scope = Scope {
+        _gate: gate_scope(),
+        dirs: CreatedDirs::default(),
+    };
+    let mut held = Backend::reserve(&Systemd::new(), &[Step::Install], Budget::Unbounded).unwrap();
+
+    let err = Backend::write(
+        &Systemd::new(),
+        &spec,
+        &"unused".to_string(),
+        &Outcome::Create,
+        None,
+        &mut scope,
+        &mut held,
+    )
+    .err()
+    .expect("the cwd is under a file");
+
+    let cause = std::error::Error::source(&err)
+        .expect("an OS error has a source")
+        .to_string();
+    assert!(cause.contains("ENOTDIR"), "{cause}");
+    assert!(made.is_dir(), "made before the failure");
+    drop(scope);
+    assert!(!tmp.path().join("a").exists());
+}
+
+// owner_of ============================================================================================================
+
+fn owner_uid(user: &User) -> Option<u32> {
+    owner_of(user).expect("an account").map(|owner| owner.uid().as_raw())
+}
+
+#[skuld::test]
+fn root_is_handed_nothing() {
+    assert_eq!(owner_uid(&User::Root), None);
+}
+
+#[skuld::test]
+fn a_numeric_id_is_used_as_it_is() {
+    assert_eq!(owner_uid(&User::Id(AccountId::Uid(4242))), Some(4242));
+}
+
+/// A name that is no account is read as a number, as `chown` reads one.
+#[skuld::test]
+fn a_numeric_name_that_is_no_account_is_its_uid() {
+    assert_eq!(owner_uid(&User::Name("4243".to_string())), Some(4243));
+}
+
+#[skuld::test]
+fn an_unknown_name_is_refused() {
+    let err = owner_of(&User::Name("goetia-no-such-account".to_string())).expect_err("no such account");
+
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+}
+
+/// `u32::MAX` is `(uid_t)-1`, which `fchown` reads as "leave the owner unchanged".
+#[skuld::test]
+fn the_uid_that_means_unchanged_is_refused() {
+    for user in [User::Id(AccountId::Uid(u32::MAX)), User::Name(u32::MAX.to_string())] {
+        let err = owner_of(&user).expect_err("not an account");
+
+        assert!(matches!(err, Error::AccountLookup { .. }), "{user:?}: {err:?}");
+    }
+}
+
+// unit_standing =======================================================================================================
+
+#[skuld::test]
+fn a_regular_file_holding_the_definition_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("u.service");
+    std::fs::write(&path, "text").unwrap();
+
+    assert!(matches!(unit_standing(&path, "text"), Standing::Yes));
+}
+
+#[skuld::test]
+fn an_absent_unit_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    assert!(matches!(
+        unit_standing(&tmp.path().join("u.service"), "text"),
+        Standing::No
+    ));
+}
+
+#[skuld::test]
+fn a_unit_holding_other_text_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("u.service");
+    std::fs::write(&path, "someone else's").unwrap();
+
+    assert!(matches!(unit_standing(&path, "text"), Standing::No));
+}
+
+/// Not opened for reading, so it cannot block.
+#[skuld::test]
+fn a_fifo_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("u.service");
+    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+    assert!(matches!(unit_standing(&path, "text"), Standing::No));
+}
+
+/// A masked unit is a symlink; one to a file holding the definition is still not the unit written.
+#[skuld::test]
+fn a_symlink_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    std::fs::write(&target, "text").unwrap();
+    let path = tmp.path().join("u.service");
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    assert!(matches!(unit_standing(&path, "text"), Standing::No));
+}
+
+#[skuld::test]
+fn a_unit_that_cannot_be_read_is_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, "x").unwrap();
+
+    // `ENOTDIR` on the parent: presence is unsettled.
+    assert!(matches!(
+        unit_standing(&file.join("u.service"), "text"),
+        Standing::Unknown(_)
+    ));
 }
 
 // replace_unit_verified / quarantine_if_still_ours: the remaining race branches =======================================

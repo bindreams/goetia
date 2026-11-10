@@ -16,6 +16,7 @@ use crate::spec::DaemonFields;
 use crate::spec::test_support::plain_fields;
 use crate::spec::{Id, Kind, Restart, User};
 
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::test_cleanup::{FileGuard, remove_or_warn};
 use crate::backend::test_elevation::{ELEVATED, elevated};
 
@@ -263,123 +264,173 @@ fn move_no_clobber_does_not_clobber_existing_content() {
     assert!(src.exists(), "the source must not be consumed by a failed move");
 }
 
-// ensure_dir_owned_by =================================================================================================
+// write ===============================================================================================================
 
-/// An account whose uid is the test user's own (so `chown` needs no privilege) and whose gid is a
-/// group other than the one the temp directory carries, so a `chown` is visible in the result.
-fn other_group_account(tmp: &Path) -> Account {
-    use std::os::unix::fs::MetadataExt as _;
+/// `cwd` is made before the parent of `logs` is looked at, so a failure on the latter leaves `cwd`
+/// to the scope: it exists when `write` returns, for the failure it reports, and goes when the
+/// scope is dropped.
+#[skuld::test]
+fn a_write_that_fails_after_making_the_cwd_leaves_it_to_the_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let cwd = tmp.path().join("cwd");
+    let mut fields = plain_fields("dirs", vec!["/bin/true".to_string()]);
+    fields.cwd = Some(cwd.clone());
+    fields.logs = Some(file.join("sub").join("out.log"));
+    let spec = DaemonSpec::new(fields).unwrap();
+    let mut scope = CreatedDirs::default();
 
-    let inherited = nix::unistd::Gid::from_raw(std::fs::metadata(tmp).expect("stat tempdir").gid());
-    // SAFETY: a zero-length query takes no buffer; the second call's buffer holds `n` gids.
-    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    assert!(n >= 0, "getgroups: {}", io::Error::last_os_error());
-    let mut groups: Vec<libc::gid_t> = vec![0; n as usize];
-    let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
-    assert!(n >= 0, "getgroups: {}", io::Error::last_os_error());
-    groups.truncate(n as usize);
-    let gid = groups
-        .into_iter()
-        .map(nix::unistd::Gid::from_raw)
-        .find(|g| *g != inherited)
-        .expect("the test user must belong to a group other than the temp directory's");
-    Account {
-        name: "test".to_string(),
-        uid: nix::unistd::Uid::current(),
-        gid,
-    }
+    let err = backend::Backend::write(
+        &Launchd::new(),
+        &spec,
+        &"unused".to_string(),
+        &Outcome::Create,
+        None,
+        &mut scope,
+        &mut Reservation::default(),
+    )
+    .err()
+    .expect("the logs parent is under a file");
+
+    let cause = std::error::Error::source(&err)
+        .expect("an OS error has a source")
+        .to_string();
+    assert!(cause.contains("ENOTDIR"), "{cause}");
+    assert!(cwd.is_dir(), "the cwd was made before the failure");
+    drop(scope);
+    assert!(!cwd.exists());
 }
 
-fn mode_and_gid(path: &Path) -> (u32, u32) {
-    use std::os::unix::fs::MetadataExt as _;
+// plist_standing ======================================================================================================
 
-    let meta = std::fs::metadata(path).expect("stat");
-    (meta.permissions().mode() & 0o777, meta.gid())
+#[skuld::test]
+fn a_regular_file_holding_the_plist_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("id.plist");
+    std::fs::write(&path, "text").unwrap();
+
+    assert!(matches!(plist_standing(&path, "text"), Standing::Yes));
 }
 
 #[skuld::test]
-fn ensure_dir_owned_by_leaves_an_existing_directory_exactly_as_found() {
+fn an_absent_plist_does_not_stand() {
     let tmp = tempfile::tempdir().unwrap();
-    let account = other_group_account(tmp.path());
-    let dir = tmp.path().join("existing");
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let before = mode_and_gid(&dir);
 
-    ensure_dir_owned_by(&dir, &account).expect("an existing directory is accepted");
-
-    assert_eq!(mode_and_gid(&dir), before);
-    assert_eq!(before.0, 0o700);
+    assert!(matches!(
+        plist_standing(&tmp.path().join("id.plist"), "text"),
+        Standing::No
+    ));
 }
 
 #[skuld::test]
-fn ensure_dir_owned_by_creates_and_hands_over_every_missing_component() {
+fn a_plist_holding_other_text_does_not_stand() {
     let tmp = tempfile::tempdir().unwrap();
-    let account = other_group_account(tmp.path());
-    let leaf = tmp.path().join("a").join("b").join("c");
+    let path = tmp.path().join("id.plist");
+    std::fs::write(&path, "someone else's").unwrap();
 
-    ensure_dir_owned_by(&leaf, &account).expect("create the whole chain");
+    assert!(matches!(plist_standing(&path, "text"), Standing::No));
+}
 
-    for dir in [tmp.path().join("a"), tmp.path().join("a/b"), leaf] {
+/// Never opened, so it cannot block.
+#[skuld::test]
+fn a_fifo_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("id.plist");
+    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+    assert!(matches!(plist_standing(&path, "text"), Standing::No));
+}
+
+#[skuld::test]
+fn a_dangling_symlink_does_not_stand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("id.plist");
+    std::os::unix::fs::symlink(tmp.path().join("nowhere"), &path).unwrap();
+
+    assert!(matches!(plist_standing(&path, "text"), Standing::No));
+}
+
+#[skuld::test]
+fn a_plist_that_cannot_be_read_is_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    std::fs::write(&file, "x").unwrap();
+
+    // `ENOTDIR` on the parent: presence is unsettled.
+    assert!(matches!(
+        plist_standing(&file.join("id.plist"), "text"),
+        Standing::Unknown(_)
+    ));
+}
+
+// standing ============================================================================================================
+
+/// An update leaves the plist where `read` found it, which is where its standing is read, so an
+/// install that fails after writing it keeps the directories made for it.
+#[skuld::test]
+fn an_updated_plist_stands_where_read_found_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = Id::try_from("standing").unwrap();
+    let path = tmp.path().join("standing.plist");
+    let snapshot = Plist {
+        location: Location {
+            path: path.clone(),
+            enabled: false,
+        },
+        ..marked_plist(&id)
+    };
+    let spec = DaemonSpec::new(plain_fields(id.as_str(), vec!["/bin/true".to_string()])).unwrap();
+    let outcome = Outcome::Update {
+        spec_diff: String::new(),
+    };
+    let standing = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        backend::Backend::standing(&Launchd::new(), &spec, &"new".to_string(), &outcome, Some(&snapshot))
+    };
+
+    assert!(matches!(standing("new"), Standing::Yes));
+    assert!(matches!(standing("old"), Standing::No));
+}
+
+#[skuld::test]
+fn a_create_that_wrote_nothing_does_not_stand() {
+    let id = Id::try_from("standing-nothing-written").unwrap();
+    let spec = DaemonSpec::new(plain_fields(id.as_str(), vec!["/bin/true".to_string()])).unwrap();
+
+    let standing = backend::Backend::standing(&Launchd::new(), &spec, &"new".to_string(), &Outcome::Create, None);
+
+    assert!(matches!(standing, Standing::No), "{standing:?}");
+}
+
+// written_at ==========================================================================================================
+
+#[skuld::test]
+fn an_update_and_a_stale_write_land_where_read_found_the_plist() {
+    let id = Id::try_from("written-at").unwrap();
+    let snapshot = marked_plist(&id);
+
+    for outcome in [
+        Outcome::Update {
+            spec_diff: String::new(),
+        },
+        Outcome::Stale {
+            from_version: "0.0.0".to_string(),
+        },
+    ] {
         assert_eq!(
-            mode_and_gid(&dir),
-            (0o755, account.gid.as_raw()),
-            "{} must be 0755 and the account's",
-            dir.display()
+            written_at(&outcome, Some(&snapshot), &id),
+            snapshot.location.path,
+            "{outcome:?}"
         );
     }
 }
 
-/// A component another install creates after the walk and before the `mkdir` is not ours to
-/// `chmod` or `chown`; the components below it still are.
 #[skuld::test]
-fn create_owned_leaves_a_component_that_appeared_after_the_walk() {
-    let tmp = tempfile::tempdir().unwrap();
-    let account = other_group_account(tmp.path());
-    let raced = tmp.path().join("a");
-    let leaf = raced.join("b");
+fn a_create_lands_in_the_staging_directory() {
+    let id = Id::try_from("written-at").unwrap();
 
-    let missing = missing_components(&leaf).expect("walk");
-    assert_eq!(missing, [raced.as_path(), leaf.as_path()]);
-    std::fs::create_dir(&raced).unwrap();
-    std::fs::set_permissions(&raced, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let before = mode_and_gid(&raced);
-
-    create_owned(&missing, &account).expect("a lost race is not an error");
-
-    assert_eq!(
-        mode_and_gid(&raced),
-        before,
-        "the racing install's directory is untouched"
-    );
-    assert_eq!(mode_and_gid(&leaf), (0o755, account.gid.as_raw()));
-}
-
-/// A dangling symlink is an existing path: `exists()` would follow it and call it missing.
-#[skuld::test]
-fn ensure_dir_owned_by_treats_a_dangling_symlink_as_existing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let account = other_group_account(tmp.path());
-    let target = tmp.path().join("nowhere");
-    let link = tmp.path().join("link");
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-
-    ensure_dir_owned_by(&link, &account).expect("an existing path of any kind is accepted");
-
-    assert!(!target.exists(), "the link's target must not be created");
-    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-}
-
-#[skuld::test]
-fn ensure_dir_owned_by_accepts_a_regular_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let account = other_group_account(tmp.path());
-    let file = tmp.path().join("file");
-    std::fs::write(&file, b"x").unwrap();
-
-    ensure_dir_owned_by(&file, &account).expect("an existing path of any kind is accepted");
-
-    assert_eq!(std::fs::read(&file).unwrap(), b"x");
+    assert_eq!(written_at(&Outcome::Create, None, &id), staging_path(id.as_str()));
 }
 
 // resolve_account =====================================================================================================
@@ -947,7 +998,14 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
     let mut reservation = reserved(&[Step::Install]);
 
     let written = mgr
-        .write(&spec, &desired, &stale, Some(&snapshot), &mut (), &mut reservation)
+        .write(
+            &spec,
+            &desired,
+            &stale,
+            Some(&snapshot),
+            &mut CreatedDirs::default(),
+            &mut reservation,
+        )
         .expect("write");
 
     assert!(matches!(written, WriteOutcome::Raced));

@@ -46,15 +46,17 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, io};
 
+use crate::backend::Standing;
 use crate::backend::bounded::{self, Finished, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
+use crate::backend::created_dirs::{CreatedDirs, Owner};
 use crate::backend::launchd::state::Evidence;
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
@@ -450,70 +452,22 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 }
 
 /// Create `cwd` itself and the parent of `logs` (a file path; launchd creates the log file but not
-/// its directory), both world-readable and searchable. Each component created is handed to
-/// `account`, so a non-root daemon can write there. Otherwise a non-root daemon whose
-/// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a
-/// missing `WorkingDirectory` refuses the job outright.
-fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account) -> Result<()> {
+/// its directory), both world-readable and searchable. What is created is handed to `account`, so a
+/// non-root daemon can write there. Otherwise a non-root daemon whose `StandardOutPath` is in a
+/// root-only directory fails at launch with an opaque status, and a missing `WorkingDirectory`
+/// refuses the job outright.
+fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut CreatedDirs) -> Result<()> {
+    let owner = Owner::new(account.uid, Some(account.gid))?;
     if let Some(cwd) = &spec.cwd {
-        ensure_dir_owned_by(cwd, account)?;
+        created.create(cwd)?;
     }
     if let Some(logs) = &spec.logs
         && let Some(parent) = logs.parent()
         && !parent.as_os_str().is_empty()
     {
-        ensure_dir_owned_by(parent, account)?;
+        created.create(parent)?;
     }
-    Ok(())
-}
-
-/// Create `dir` and every missing ancestor, `chmod`ing `0755` and `chown`ing to `account` only the
-/// components this call itself creates. `dir` is an arbitrary absolute path a spec author supplied
-/// (`spec::resolve` guarantees only that it's absolute), so doing that to a path that already
-/// exists would hand ownership of, and strip the mode from, whatever happened to be there
-/// (`/var/log`, a user's home directory, ...). A path that already exists — of any kind, a dangling
-/// symlink included — is left untouched, and so is one a concurrent install creates first.
-fn ensure_dir_owned_by(dir: &Path, account: &Account) -> Result<()> {
-    create_owned(&missing_components(dir)?, account)
-}
-
-/// The components of `dir` that do not exist, outermost first. A dangling symlink exists.
-fn missing_components(dir: &Path) -> Result<Vec<&Path>> {
-    let mut missing = Vec::new();
-    let mut cursor = dir;
-    loop {
-        match fs::symlink_metadata(cursor) {
-            Ok(_) => break,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                missing.push(cursor);
-                match cursor.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
-                    _ => break,
-                }
-            }
-            Err(e) => return Err(Error::os_at("stat", cursor, e)),
-        }
-    }
-    missing.reverse();
-    Ok(missing)
-}
-
-/// `mkdir` each of `missing` (outermost first), then `chmod` and `chown` it. `AlreadyExists` means
-/// another install created it after the walk: not ours, so left alone.
-fn create_owned(missing: &[&Path], account: &Account) -> Result<()> {
-    for path in missing {
-        match fs::DirBuilder::new().mode(0o755).create(path) {
-            Ok(()) => {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-                    .map_err(|e| Error::os_at("chmod", *path, e))?;
-                nix::unistd::chown(*path, Some(account.uid), Some(account.gid))
-                    .map_err(|e| Error::os_at(format!("chown to {}", account.name), *path, e))?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(Error::os_at("create directory", *path, e)),
-        }
-    }
-    Ok(())
+    created.hand_over(Some(owner))
 }
 
 /// Build a `0644` named temp file in `dir` (so a later hard-link persist stays on one filesystem)
@@ -627,6 +581,24 @@ fn undo_write(target: &Path, wrote: &str, previous: Option<&str>) -> Result<()> 
         what: format!("{} still holds what install wrote", target.display()),
         source: Box::new(e),
     })
+}
+
+/// Where `write` put, or would have put, the plist: `Create` stages a new one, `Update` and `Stale`
+/// replace the one `read` found.
+fn written_at(outcome: &Outcome, snapshot: Option<&Plist>, id: &Id) -> PathBuf {
+    match (outcome, snapshot) {
+        (Outcome::Update { .. } | Outcome::Stale { .. }, Some(snapshot)) => snapshot.location.path.clone(),
+        _ => staging_path(id.as_str()),
+    }
+}
+
+/// Whether the plist at `path` is `desired`, as [`obtain`] reads it.
+fn plist_standing(path: &Path, desired: &str) -> Standing {
+    match obtain(path) {
+        Obtained::Bytes(bytes) if bytes == desired.as_bytes() => Standing::Yes,
+        Obtained::Bytes(_) | Obtained::Absent | Obtained::NonRegular => Standing::No,
+        Obtained::Failed(e) => Standing::Unknown(format!("could not read {}: {e}", path.display())),
+    }
 }
 
 /// What is at `path`, for a message.
@@ -1060,11 +1032,11 @@ impl Launchd {
 impl backend::Backend for Launchd {
     type Definition = String;
     type Snapshot = Plist;
-    type InstallScope = ();
+    type InstallScope = CreatedDirs;
     type Reservation = Reservation;
 
-    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String) -> Result<()> {
-        Ok(())
+    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String) -> Result<CreatedDirs> {
+        Ok(CreatedDirs::default())
     }
 
     /// Makes every reaper and temp file `steps` can draw now, so that no step fails for want of one
@@ -1107,7 +1079,7 @@ impl backend::Backend for Launchd {
         desired: &String,
         outcome: &Outcome,
         snapshot: Option<&Plist>,
-        _scope: &mut (),
+        dirs: &mut CreatedDirs,
         reservation: &mut Reservation,
     ) -> Result<WriteOutcome> {
         // Resolved again: `render` kept only the plist, which names the account, and launchd
@@ -1126,7 +1098,7 @@ impl backend::Backend for Launchd {
                 // leaves no plist, so a rerun is a `Create` again and reaches the stale job; after a
                 // plist is written the rerun would read `UpToDate` and never look.
                 let target = staging_path(spec.id.as_str());
-                prepare_parent_dirs(spec, &account)?;
+                prepare_parent_dirs(spec, &account, dirs)?;
                 let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), desired)?;
                 let loaded = never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?);
                 if loaded {
@@ -1153,7 +1125,7 @@ impl backend::Backend for Launchd {
                 if changes_job && never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?) {
                     return Err(refuse::loaded_refusal(&spec.id));
                 }
-                prepare_parent_dirs(spec, &account)?;
+                prepare_parent_dirs(spec, &account, dirs)?;
                 let target = snapshot.location.path.as_path();
                 // `target` was captured by `read`, before `decide` ran. A concurrent `enable` or
                 // `disable` may have moved it since, and writing here would put a plist in both
@@ -1177,6 +1149,10 @@ impl backend::Backend for Launchd {
             other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
         }
         Ok(WriteOutcome::Done)
+    }
+
+    fn standing(&self, spec: &DaemonSpec, desired: &String, outcome: &Outcome, snapshot: Option<&Plist>) -> Standing {
+        plist_standing(&written_at(outcome, snapshot, &spec.id), desired)
     }
 
     fn live_status(&self, snapshot: &Plist) -> Result<Status> {
