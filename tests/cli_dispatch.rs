@@ -33,7 +33,7 @@ fn mk(id: &str) -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         kind: Kind::Simple,
-        ..support::spec(
+        ..support::plain_fields(
             id,
             vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
         )

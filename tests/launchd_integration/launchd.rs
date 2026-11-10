@@ -43,11 +43,11 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 // Fixtures ============================================================================================================
 
-/// [`support::spec`] as a `simple` daemon: every spec this suite installs is one.
+/// [`support::plain_fields`] as a `simple` daemon: every spec this suite installs is one.
 fn base_spec(id: &str, command: Vec<String>) -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         kind: Kind::Simple,
-        ..support::spec(id, command)
+        ..support::plain_fields(id, command)
     })
     .unwrap()
 }

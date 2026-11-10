@@ -12,8 +12,9 @@ use crate::backend::scm::parameters::Stray;
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::Restart;
-use crate::spec::test_support::{plain_fields, program};
+use crate::spec::test_support::program;
 use crate::spec::{AccountId, DaemonFields, User};
+use crate::testing::plain_fields;
 use crate::testing::{FakeProvider, command};
 use windows_sys::Win32::System::Registry::REG_DWORD;
 

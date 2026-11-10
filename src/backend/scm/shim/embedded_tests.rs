@@ -48,9 +48,9 @@ mod windows {
     use super::stock::*;
     use super::*;
     use crate::backend::scm::shim::acl::{CheckPermissions, Descriptor, FolderCheck};
-    use crate::backend::test_elevation::{ELEVATED, elevated};
     use crate::error::{Error, Result};
     use crate::shim::{HostCommand, ShimProvider};
+    use crate::testing::elevation::{ELEVATED, elevated};
 
     fn disabled() -> FolderCheck {
         FolderCheck::new(CheckPermissions::Disable)

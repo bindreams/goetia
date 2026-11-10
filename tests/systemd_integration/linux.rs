@@ -36,7 +36,7 @@ pub(crate) fn mk(id: &str) -> DaemonSpec {
     DaemonSpec::new(DaemonFields {
         restart: Restart::OnFailure,
         kind: Kind::Simple,
-        ..support::spec(id, vec!["/bin/sleep".to_string(), "infinity".to_string()])
+        ..support::plain_fields(id, vec!["/bin/sleep".to_string(), "infinity".to_string()])
     })
     .unwrap()
 }
