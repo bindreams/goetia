@@ -1,9 +1,9 @@
 //! Shared support for the integration suites.
 //!
-//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only `kill`, `list_json`, `scm_wait`
-//! and `stock_shim_manager` depend on the `goetia` crate; the marker-inertness probe's
-//! hand-written artifacts use the rest. `cleanup`, `elevation`, `raw_registry`, `scratch` and
-//! `plain_fields` are `goetia::testing`'s, which the library's unit tests share.
+//! Pulled in with `#[path = "support/mod.rs"] mod support;`. `cleanup`, `elevation`,
+//! `raw_registry`, `scratch` and `plain_fields` are `goetia::testing`'s, which the library's unit
+//! tests share. Of the rest, only `kill`, `list_json`, `scm_wait` and `stock_shim_manager` call
+//! goetia's product code; the marker-inertness probe's hand-written artifacts use the others.
 
 #![allow(dead_code, unused_imports)]
 // Each probe module is `#[cfg]`-gated to one platform, so most of this is
