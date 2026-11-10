@@ -125,6 +125,17 @@ impl RecordedExit {
         !self.is_refusal() && (self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR)
     }
 
+    /// The process exit code of the shim that reported this, the inverse of
+    /// [`Reported::scm_codes`] into [`Reported::process_exit_code`]: the service-specific code when
+    /// the Win32 code is 0 or [`ERROR_SERVICE_SPECIFIC_ERROR`], else the Win32 code. A pair no
+    /// [`Reported`] produces follows the same rule.
+    pub fn process_exit_code(self) -> i32 {
+        match self.win32 {
+            0 | ERROR_SERVICE_SPECIFIC_ERROR => self.specific as i32,
+            win32 => win32 as i32,
+        }
+    }
+
     /// Whether this is [`Reported::Refused`]'s record: the shim started no daemon.
     pub fn is_refusal(self) -> bool {
         (self.win32, self.specific) == Reported::Refused.scm_codes()

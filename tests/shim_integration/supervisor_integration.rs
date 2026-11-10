@@ -124,14 +124,13 @@ fn stop_kills_the_whole_process_tree() {
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
     let shim = ShimProcess::attach(&id);
 
-    // A waiting `stop` ends the shim's process itself once SCM confirms `STOPPED`, with exit code 1,
-    // so only the STOP is sent here and the shim's own exit is awaited: it reported `STOPPED` first,
-    // so the record is final, and its exit code is the clean stop's.
-    mgr.stop(&spec.id, Budget::Immediate).expect("request the stop");
+    // A waiting `stop` returns once SCM confirms `STOPPED`, so the record is final, and ends the shim's
+    // process with that record: the shim's exit code is the one SCM holds, 0 for a clean stop.
+    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     assert_eq!(
         shim.wait_for_exit(),
-        0,
-        "the shim's process exit code differs from the clean stop it reported to SCM"
+        recorded_exit(&id).process_exit_code() as u32,
+        "the shim's process exit code differs from the code SCM recorded"
     );
 
     // The stop reached the whole tree, not only the direct child.

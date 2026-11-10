@@ -35,7 +35,7 @@ pub fn wait_for_running(actor: &mut SystemScmActor, id: &str) {
     )
     .unwrap_or_else(|e| panic!("wait for {id} to report RUNNING: {e}"));
     assert_eq!(
-        waited,
+        waited.waited,
         Waited::Confirmed,
         "an unbounded wait for {id} to report RUNNING expired"
     );
@@ -47,5 +47,9 @@ pub fn wait_for_running(actor: &mut SystemScmActor, id: &str) {
 pub fn wait_for_stopped(actor: &mut SystemScmActor, id: &str, stop: StopSeen) {
     let waited = wait_after_stop(actor, Budget::Unbounded.start(), "", stop)
         .unwrap_or_else(|e| panic!("wait for {id} to reach STOPPED: {e}"));
-    assert_eq!(waited, Waited::Confirmed, "an unbounded wait for {id} to stop expired");
+    assert_eq!(
+        waited.waited,
+        Waited::Confirmed,
+        "an unbounded wait for {id} to stop expired"
+    );
 }

@@ -23,6 +23,10 @@ use crate::backend::scm::wait::Waited;
 use crate::error::{Chain, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
+/// The exit code a kill ends the process with, and `stop` ends one SCM recorded no exit for: SCM sees a
+/// failure, the same as for a crash.
+pub(crate) const KILLED_EXIT_CODE: i32 = 1;
+
 /// What a kill did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Killed {
@@ -319,7 +323,7 @@ pub(in crate::backend::scm) mod system {
     use crate::manager::budget::{Budget, Deadline};
 
     use super::privilege::DebugPrivilege;
-    use super::{KillTarget, ReleaseWatch, Termination};
+    use super::{KILLED_EXIT_CODE, KillTarget, ReleaseWatch, Termination};
 
     /// The real SCM service; the process is a Win32 handle.
     pub struct SystemKillTarget {
@@ -374,10 +378,11 @@ pub(in crate::backend::scm) mod system {
             self.pid
         }
 
-        /// Ends the process through this handle, never by pid, and does not wait for it: a process
-        /// that has already exited, or is exiting, is success, and [`Self::wait_for_exit`] is the wait.
-        pub(in crate::backend::scm) fn terminate(&self) -> io::Result<()> {
-            request_termination(&self.handle).map(|_| ())
+        /// Ends the process through this handle, never by pid, with exit code `code`, and does not
+        /// wait for it: a process that has already exited, or is exiting, is success, and
+        /// [`Self::wait_for_exit`] is the wait.
+        pub(in crate::backend::scm) fn terminate(&self, code: i32) -> io::Result<()> {
+            request_termination(&self.handle, code).map(|_| ())
         }
 
         /// Blocks until the process has exited or `deadline` passes. [`wait_exit`] for a caller that
@@ -483,12 +488,13 @@ pub(in crate::backend::scm) mod system {
         Ok(Some(unsafe { OwnedHandle::from_raw_handle(handle) }))
     }
 
-    /// Terminate the process behind `process`, an [`open_process_with`] handle with `PROCESS_TERMINATE`.
+    /// Terminate the process behind `process`, an [`open_process_with`] handle with `PROCESS_TERMINATE`,
+    /// with [`KILLED_EXIT_CODE`].
     ///
     /// `on_wait` runs once, just before blocking on a process that is terminating but has not yet
     /// exited, so a caller can tell a human why nothing returns.
     pub(super) fn terminate_process(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<Termination> {
-        match request_termination(process)? {
+        match request_termination(process, KILLED_EXIT_CODE)? {
             Termination::Terminated => Ok(Termination::Terminated),
             Termination::AlreadyExited => wait_exit_unbounded(process, on_wait).map(|()| Termination::AlreadyExited),
         }
@@ -497,10 +503,9 @@ pub(in crate::backend::scm) mod system {
     /// Ask the process behind `process` to terminate, and do not wait: [`Termination::AlreadyExited`]
     /// is a process that is exiting or has exited, which the caller waits on the handle for as it
     /// needs.
-    fn request_termination(process: &OwnedHandle) -> io::Result<Termination> {
-        // Exit code `1`: SCM sees a failure, the same as for a crash.
+    fn request_termination(process: &OwnedHandle, code: i32) -> io::Result<Termination> {
         // SAFETY: `process` is a live handle with `PROCESS_TERMINATE`.
-        if unsafe { TerminateProcess(process.as_raw_handle(), 1) } != 0 {
+        if unsafe { TerminateProcess(process.as_raw_handle(), code as u32) } != 0 {
             return Ok(Termination::Terminated);
         }
         let e = io::Error::last_os_error();

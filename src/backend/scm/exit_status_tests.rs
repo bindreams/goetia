@@ -202,3 +202,42 @@ fn a_win32_zero_record_with_a_specific_code_names_both() {
         format!("exit code 0 with service-specific code {SHIM_REFUSED}")
     );
 }
+
+// The process exit code of a recorded exit ----------------------------------------------------------------------------
+
+/// A `stop` that ends the shim itself ends it with what SCM recorded, which is what the shim itself
+/// exits with: `Reported::process_exit_code`, through `scm_codes` and back.
+#[skuld::test]
+fn a_recorded_exit_maps_back_to_the_process_exit_code_of_what_was_reported() {
+    let every_reported = [
+        Reported::Clean,
+        Reported::from_daemon_code(7),
+        Reported::from_daemon_code(-1073741819),
+        Reported::shim_failure(None),
+        Reported::shim_failure(Some(2)),
+        Reported::incomplete_stop(),
+        Reported::Refused,
+    ];
+
+    for reported in every_reported {
+        let (win32, specific) = reported.scm_codes();
+
+        assert_eq!(
+            RecordedExit { win32, specific }.process_exit_code(),
+            reported.process_exit_code(),
+            "{reported:?}"
+        );
+    }
+}
+
+/// A pair no `Reported` produces keeps its Win32 code, or its service-specific one when the Win32
+/// code is 0 or SCM's service-specific wrapper.
+#[skuld::test]
+fn a_recorded_exit_no_report_produces_keeps_its_win32_code_or_else_its_specific_one() {
+    let exit = |win32, specific| RecordedExit { win32, specific }.process_exit_code();
+
+    assert_eq!(exit(1067, 0), 1067);
+    assert_eq!(exit(5, 9), 5);
+    assert_eq!(exit(0, 9), 9);
+    assert_eq!(exit(ERROR_SERVICE_SPECIFIC_ERROR, 9), 9);
+}
