@@ -199,6 +199,11 @@ pub(crate) fn state_str(state: State) -> &'static str {
 
 /// The message every mutating subcommand prints and the exit code
 /// ([`ExitCode::Error`]) it returns when `is_elevated` reports `false`.
+///
+/// Every backend would refuse an unelevated run on its own, but later and less helpfully: the raw OS
+/// or service-manager error carries no advice to re-run elevated, a systemd `uninstall` can stop and
+/// disable the service before the unit file's removal is denied, and on a desktop polkit can open a
+/// password prompt. Checking first gives one message, before anything changes.
 pub(crate) fn require_elevation(
     subcommand: &str,
     is_elevated: &dyn Fn() -> bool,
