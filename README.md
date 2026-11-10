@@ -720,48 +720,26 @@ share one pair of flags:
 | `--timeout 0`          | Issue the request and return without waiting. |
 | `--no-timeout`         | Wait indefinitely.                            |
 
-On macOS, launchd keeps a job's label until the job has exited, so several
-steps wait for that:
+On macOS, launchd keeps a job's label until the job's process has exited, and
+goetia does not load a job over one that is still going away. So on macOS:
 
-- `daemon stop` boots the job out and waits until launchd has removed it. With
-  `--timeout N` it gives up once `N` has passed (exit `4`); with `--timeout 0`
-  or `--no-timeout` it waits without bound.
-- `daemon restart` does the same in its stop leg, under restart's one deadline,
-  so `restart --timeout 0` also waits for the removal before it starts the job.
-  If that deadline is already spent before the stop leg, the stop is still
-  issued, but restart does not wait for the removal and reports a timeout.
-- `daemon uninstall` waits for the removal without bound.
-- `daemon install` of a new daemon whose label is already held by a loaded job
-  boots that job out and waits for its removal without bound. This happens
-  before any `--start`, so the install's own boot-out does not spend
-  `--timeout`.
+- `daemon stop`, the stop leg of `daemon restart`, and `daemon uninstall` boot
+  the job out and then wait until launchd no longer has it. `stop` and
+  `restart` stop waiting when `--timeout` runs out; under `--timeout 0` or
+  `--no-timeout`, and for `uninstall`, the wait has no bound.
+- `daemon install` of a new daemon whose label a loaded job already holds boots
+  that job out and waits, without bound, until it is gone.
+- A start (`daemon start`, `restart`, `install --start`) that finds the job
+  still going away waits, without bound, until it is gone, then loads it. This
+  wait counts against `--timeout`.
+- For `restart: always`, a start with a waiting `--timeout` that finds the
+  daemon not running boots it out, waits without bound until it is gone, and
+  loads it again.
 
-The next three run in any start: `daemon start`, `restart`'s start leg, and
-`install --start`. An install that would change what a loaded job reads is
-refused (`LoadedJob`) before any start, a job being removed included; only an
-install that leaves the job unchanged reaches the start's wait.
-
-- A start over a job launchd is still removing (`state = SIGTERMed`, after a
-  `stop` that timed out or another program's `launchctl bootout`) waits for the
-  removal without bound, then loads the job. The `--timeout` clock starts when
-  the start begins, so this wait spends it and the wait for running gets what
-  is left. For `start a b c` each id has its own clock; for `install --start`
-  the start step has its own; `restart` starts one deadline before its stop leg
-  and the start leg gets what is left of it.
-- A start over a job that holds the label and is not being removed (any other
-  `state`) takes it as loaded: it does not wait for it and skips `bootstrap`. A
-  stale or foreign job that reads as running gets no `kickstart`, and the start
-  returns without restarting it. One that is not running gets a `kickstart`
-  (the plain form under `--timeout 0`).
-- For `restart: always`, a waiting start (not `--timeout 0`) whose daemon reads
-  as not running boots the job out, waits for its removal without bound, loads
-  it again and reads it once more within what is left of `--timeout`. Under
-  `--timeout 0` this does not happen: the stale job stays.
-
-launchd kills a job that outlasts its `ExitTimeOut` after SIGTERM. An unbounded
-wait ends only when the job's process exits. It may not, if the plist sets
-`ExitTimeOut` to `0` and the process ignores SIGTERM, or if the process is
-stuck in uninterruptible sleep.
+These waits normally end within the job's `ExitTimeOut`, after which launchd
+kills it. A wait with no bound can last forever if the job's process never
+exits, for example when its plist sets `ExitTimeOut` to 0 and it ignores
+SIGTERM.
 
 The two flags are mutually exclusive. `install` accepts them only alongside
 `--start`: without it nothing is started, so there is nothing to wait for,
