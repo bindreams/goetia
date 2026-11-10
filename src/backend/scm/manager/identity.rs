@@ -25,7 +25,7 @@ use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::{IsValidSid, LookupAccountNameW, LookupAccountSidW, PSID};
 
 use crate::backend::Identity;
-use crate::backend::scm::shim::acl::sid_text;
+use crate::backend::scm::sid::sid_text;
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, User};
 
