@@ -102,8 +102,11 @@ mod stock {
             Ok(self.image.get_or_init(|| Image::new(bytes)))
         }
 
+        /// The folder: `dir`, or the default one. A relative `dir` is [`Error::ShimPathRelative`].
         fn dir(&self) -> Result<PathBuf> {
-            self.dir.clone().map_or_else(default_dir, Ok)
+            let dir = self.dir.clone().map_or_else(default_dir, Ok)?;
+            absolute(&dir)?;
+            Ok(dir)
         }
     }
 
@@ -126,16 +129,15 @@ mod stock {
         }
 
         /// `dir`, or the default folder. With a relative `dir` it is [`Error::ShimPathRelative`].
-        fn folder(&self) -> Result<PathBuf> {
-            let dir = self.dir()?;
-            absolute(&dir).map(Path::to_path_buf)
+        fn folder(&self) -> Result<Option<PathBuf>> {
+            self.dir().map(Some)
         }
 
         /// Deletes the shim files in `folder()`, and what a repair or a crash left beside them, that
         /// no path of `referenced` names, and removes it when that leaves it empty and it is the
         /// default folder; see [`sweep_folder`], which also refuses a folder `folders` refuses.
         fn sweep(&self, referenced: &[PathBuf], folders: &FolderCheck) -> std::result::Result<(), SweepFailure> {
-            let dir = self.folder()?;
+            let dir = self.dir()?;
             match &self.dir {
                 Some(_) => sweep_folder(&dir, referenced, folders, default_dir),
                 // The folder is the default one: the lookup that found it is the answer to the
@@ -168,22 +170,22 @@ mod stock {
     impl ShimProvider for SiblingStockShim {
         fn preview(&self) -> Result<HostCommand> {
             let bytes = self.read()?;
-            preview_in(&self.folder()?, &Image::new(&bytes))
+            preview_in(&default_dir()?, &Image::new(&bytes))
         }
 
         fn provide(&self, folders: &FolderCheck) -> Result<HostCommand> {
             let bytes = self.read()?;
-            provide_in(&self.folder()?, &Image::new(&bytes), folders)
+            provide_in(&default_dir()?, &Image::new(&bytes), folders)
         }
 
         /// The default folder, which does not depend on the sibling.
-        fn folder(&self) -> Result<PathBuf> {
-            default_dir()
+        fn folder(&self) -> Result<Option<PathBuf>> {
+            default_dir().map(Some)
         }
 
         /// As [`EmbeddedStockShim`]'s, over the default folder, and whether or not the sibling is there.
         fn sweep(&self, referenced: &[PathBuf], folders: &FolderCheck) -> std::result::Result<(), SweepFailure> {
-            let dir = self.folder()?;
+            let dir = default_dir()?;
             sweep_folder(&dir, referenced, folders, || Ok(dir.clone()))
         }
     }

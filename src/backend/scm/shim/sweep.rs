@@ -215,7 +215,7 @@ pub(crate) fn second_folder<'a>(
 /// What an uninstall knows of the folder its shim provider sweeps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProviderFolder {
-    /// The manager has no provider: nothing is retried.
+    /// The manager has no provider, or its provider sweeps no folder: nothing is retried.
     None,
     /// It has one, and which folder it uses is not known (its `folder()` failed): its sweep is still
     /// what the retry runs.
@@ -240,9 +240,9 @@ impl ProviderFolder {
 ///
 /// The retry, `uninstall` of an id that is no longer installed, sweeps the provider's folder alone:
 /// a file in another folder is removed by the next install or uninstall of a manager whose provider
-/// uses that folder, and with no provider nothing is retried at all. For a provider whose folder is
-/// [`Unknown`](ProviderFolder::Unknown) the text promises the retry for what is in that folder and
-/// for no listed file by name, since none is known to be in it.
+/// uses that folder, and with no provider, or one that sweeps no folder, nothing is retried at all.
+/// For a provider whose folder is [`Unknown`](ProviderFolder::Unknown) the text promises the retry
+/// for what is in that folder and for no listed file by name, since none is known to be in it.
 pub(crate) fn left_behind_text(
     id: impl std::fmt::Display,
     provider: &ProviderFolder,

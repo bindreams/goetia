@@ -734,7 +734,7 @@ impl ShimProvider for Gated {
         self.inner.preview()
     }
 
-    fn folder(&self) -> goetia::error::Result<PathBuf> {
+    fn folder(&self) -> goetia::error::Result<Option<PathBuf>> {
         self.inner.folder()
     }
 

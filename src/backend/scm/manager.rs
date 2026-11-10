@@ -1218,14 +1218,16 @@ fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
 
 impl Scm {
     /// The folder of the provider, as an uninstall tells it: [`ProviderFolder::None`] without a
-    /// provider, its normalised `folder()`, and [`ProviderFolder::Unknown`] when that fails, which is
-    /// not the absence of a provider: the failure comes with it, for the uninstall to report.
+    /// provider or for one that sweeps no folder, its normalised `folder()`, and
+    /// [`ProviderFolder::Unknown`] when that fails, which is not the absence of a provider: the
+    /// failure comes with it, for the uninstall to report.
     fn provider_folder(&self) -> (ProviderFolder, Option<Error>) {
         let Some(shim) = &self.shim else {
             return (ProviderFolder::None, None);
         };
         match shim.folder() {
-            Ok(folder) => (ProviderFolder::At(normalise(&folder)), None),
+            Ok(Some(folder)) => (ProviderFolder::At(normalise(&folder)), None),
+            Ok(None) => (ProviderFolder::None, None),
             Err(e) => (
                 ProviderFolder::Unknown,
                 Some(Error::Step {
