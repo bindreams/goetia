@@ -109,11 +109,11 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use super::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit};
+use super::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, stop_exit_code};
 use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, WaitEnd, Waited, end_process};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
-use crate::backend::scm::kill::{HoldOutcome, hold_if_possible, stop_exit_code};
+use crate::backend::scm::kill::{HoldOutcome, hold_if_possible};
 use crate::backend::scm::parameters::Parameters;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
 use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
@@ -1195,7 +1195,8 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
 /// The process ends with [`stop_exit_code`] of `exit`, the record SCM confirmed `STOPPED` with. Both
 /// terminators are kept: this one is what ends a `Kind::Managed` service's own exe, which lingers
 /// after `STOPPED`. For `Kind::Simple` the record is the shim's own `Reported`, which maps to the code
-/// the shim ends itself with, so whichever terminator wins the race writes the same code.
+/// the shim ends itself with, so whichever terminator wins the race writes the same code. With no
+/// record (the service found gone) this one uses `KILLED_EXIT_CODE` and may beat the shim's own code.
 fn end_held(
     id: &Id,
     held: Held,

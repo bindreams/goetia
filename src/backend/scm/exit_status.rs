@@ -10,6 +10,8 @@
 //! non-zero, a service-specific code included (it is carried as [`ERROR_SERVICE_SPECIFIC_ERROR`]),
 //! and it does so for a stop it commanded too.
 
+use crate::backend::scm::kill::KILLED_EXIT_CODE;
+
 /// SCM passed the shim no usable service name.
 pub const ERROR_BAD_ARGUMENTS: u32 = 160;
 /// The shim could not read its metadata, and the read says nothing about the record: a failure
@@ -140,26 +142,35 @@ impl RecordedExit {
 
     /// The process exit code of the shim that reported this: [`Reported::process_exit_code`] of the
     /// report [`Reported::from_record`] names. A pair no report produces (a `Managed` service's own
-    /// codes) ends with its Win32 code, or its service-specific one when the Win32 code is 0.
+    /// codes) ends with its service-specific code under [`ERROR_SERVICE_SPECIFIC_ERROR`], as
+    /// [`Display`](std::fmt::Display) reads it; otherwise with its Win32 code, or the service-specific
+    /// one when that is 0.
     pub fn process_exit_code(self) -> i32 {
         match Reported::from_record(self) {
             Some(reported) => reported.process_exit_code(),
-            None if self.win32 == 0 => self.specific as i32,
+            None if self.win32 == ERROR_SERVICE_SPECIFIC_ERROR || self.win32 == 0 => self.specific as i32,
             None => self.win32 as i32,
         }
     }
 
     /// Whether this is [`Reported::Refused`]'s record: the shim started no daemon.
     pub fn is_refusal(self) -> bool {
-        (self.win32, self.specific) == Reported::Refused.scm_codes()
+        Reported::from_record(self) == Some(Reported::Refused)
     }
 
     /// Whether this is [`Reported::IncompleteStop`]'s record: a daemon the shim launched may still
     /// be running. A daemon that itself exits 1003 is
     /// [`ERROR_SERVICE_SPECIFIC_ERROR`] with specific 1003, not this.
     pub fn is_incomplete_stop(self) -> bool {
-        (self.win32, self.specific) == Reported::IncompleteStop.scm_codes()
+        Reported::from_record(self) == Some(Reported::IncompleteStop)
     }
+}
+
+/// The exit code `stop` ends the service's process with after SCM confirmed `STOPPED` with `exit`:
+/// [`RecordedExit::process_exit_code`], the one the shim itself exits with, or [`KILLED_EXIT_CODE`]
+/// when nothing was recorded.
+pub(crate) fn stop_exit_code(exit: Option<RecordedExit>) -> i32 {
+    exit.map_or(KILLED_EXIT_CODE, RecordedExit::process_exit_code)
 }
 
 impl std::fmt::Display for RecordedExit {
