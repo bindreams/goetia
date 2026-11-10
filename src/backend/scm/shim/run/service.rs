@@ -35,12 +35,12 @@ use super::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_f
 /// service's real name is `service_main`'s first argument.
 const TABLE_NAME: &str = "goetia-shim";
 
-/// The process exit code the service thread decided. The main thread exits with it once the
+/// What the service thread reported to SCM. The main thread exits with its code once the
 /// dispatcher returns, so the process exits once, with the code SCM was told.
-static EXIT: ExitSlot = ExitSlot::new();
+static EXIT: OnceLock<Reported> = OnceLock::new();
 
-/// Called from `main()`. Hands control to SCM, and never returns normally. `service_main` stores
-/// the code of every path that reports `STOPPED`, and the dispatcher returns after it, so this
+/// Called from `main()`. Hands control to SCM, and never returns normally. [`finish`] stores
+/// what every path that reports `STOPPED` reported, and the dispatcher returns after it, so this
 /// exits with it; `service_main` exits itself on every path that cannot report one, with a code
 /// from `crate::backend::scm::exit_status`. Reads no process arguments: the service name comes
 /// from SCM.
@@ -51,69 +51,57 @@ pub(crate) fn run() -> ! {
         Log::real().failure(TABLE_NAME, &format!("connect to the SCM dispatcher: {e}"));
         std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
-    std::process::exit(EXIT.process_exit_code());
-}
-
-/// The code the service thread leaves for the main thread's exit.
-struct ExitSlot(OnceLock<i32>);
-
-impl ExitSlot {
-    const fn new() -> Self {
-        Self(OnceLock::new())
-    }
-
-    /// Called once, by the service thread, before it reports `STOPPED`.
-    fn store(&self, code: i32) {
-        let first = self.0.set(code).is_ok();
-        debug_assert!(first, "the service thread stored an exit code twice");
-    }
-
-    /// The stored code, or [`Reported::Clean`]'s when the dispatcher returned with no service run.
-    fn process_exit_code(&self) -> i32 {
-        self.0.get().copied().unwrap_or(Reported::Clean.process_exit_code())
-    }
+    // Clean when the dispatcher returned with no service run.
+    std::process::exit(EXIT.get().copied().unwrap_or(Reported::Clean).process_exit_code());
 }
 
 define_windows_service!(ffi_service_main, service_main);
 
 /// SCM's arguments to `ServiceMain`: the first is the service's name.
 fn service_main(scm_args: Vec<OsString>) {
-    let Some(id) = scm_args.first().and_then(|name| name.to_str()) else {
+    let Some(id) = scm_args.first().and_then(|name| name.to_str()).map(str::to_owned) else {
         Log::real().failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
         std::process::exit(ERROR_BAD_ARGUMENTS as i32);
     };
+    // Freed here, not at the end of this function: see `finish`.
+    drop(scm_args);
     run_service(id);
 }
 
-fn run_service(id: &str) {
+/// Everything `run_service` owns, other than the log and the id [`finish`] needs, is dropped
+/// before `finish` runs: nothing may run on this thread after `STOPPED` but the return.
+fn run_service(id: String) {
     let log = Arc::new(Log::real());
     let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
-    let status_handle = match register_control_handler(id, &supervisor.bus) {
+    let status_handle = match register_control_handler(&id, &supervisor.bus) {
         Ok(h) => h,
         Err(e) => {
-            log.failure(id, &format!("register SCM control handler: {e}"));
+            log.failure(&id, &format!("register SCM control handler: {e}"));
             std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
         }
     };
 
-    let blob = match spec_read(id, read_spec_blob(id)) {
+    let blob = match spec_read(&id, read_spec_blob(&id)) {
         Ok(blob) => blob,
         Err(stop) => {
-            log.failure(id, &stop.message);
-            return finish(&log, id, status_handle, stop.reported);
+            log.failure(&id, &stop.message);
+            drop(supervisor);
+            return finish(log, id, status_handle, stop.reported);
         }
     };
 
-    log.set_daemon_log(log.daemon_log_path(id, blob.spec.logs.as_deref()));
-    log_version_skew(&log, id, &blob.spec, &blob.version, crate::version());
+    log.set_daemon_log(log.daemon_log_path(&id, blob.spec.logs.as_deref()));
+    log_version_skew(&log, &id, &blob.spec, &blob.version, crate::version());
     let reported = run_daemon(
         &blob.spec,
         &supervisor,
-        id,
-        || report_running(&log, id, status_handle),
-        || report_stopping(&log, id, status_handle),
+        &id,
+        || report_running(&log, &id, status_handle),
+        || report_stopping(&log, &id, status_handle),
     );
-    finish(&log, id, status_handle, reported);
+    drop(blob);
+    drop(supervisor);
+    finish(log, id, status_handle, reported);
 }
 
 /// Why the shim reads no spec to run, and what it tells SCM.
@@ -157,13 +145,21 @@ fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob,
 }
 
 /// Tell SCM the service stopped and return, leaving the exit to the main thread: the dispatcher
-/// returns once `service_main` does, and the main thread exits with the stored code. When `STOPPED`
-/// cannot be reported the dispatcher does not return, so the exit is here.
-fn finish(log: &Log, id: &str, status_handle: StatusHandle, reported: Reported) {
-    EXIT.store(reported.process_exit_code());
-    if !report_stopped(log, id, status_handle, reported) {
+/// returns once `service_main` does, and the main thread exits with [`EXIT`]. The main thread's
+/// exit ends this thread wherever it is, possibly inside the allocator holding its lock, so once
+/// `STOPPED` is reported nothing runs here but the return: `log` and `id` are leaked rather than
+/// freed. Neither has a drop with an effect (the log's channels open and close the files and the
+/// event source per call), and the process ends at once. When `STOPPED` cannot be reported the
+/// dispatcher does not return, so the failure is logged and the exit is here.
+fn finish(log: Arc<Log>, id: String, status_handle: StatusHandle, reported: Reported) {
+    let first = EXIT.set(reported).is_ok();
+    debug_assert!(first, "the service thread finished twice");
+    if let Err(e) = report_stopped(status_handle, reported) {
+        log.failure(&id, &stopped_report_failure(&e));
         std::process::exit(reported.process_exit_code());
     }
+    std::mem::forget(log);
+    std::mem::forget(id);
 }
 
 /// The `STOP_PENDING` status held while the shim tears the daemon down, accepting no control. SCM
@@ -280,16 +276,13 @@ fn report_stopping(log: &Log, id: &str, handle: StatusHandle) {
     }
 }
 
-/// Whether SCM accepted `STOPPED`. A failure is logged.
-fn report_stopped(log: &Log, id: &str, handle: StatusHandle, reported: Reported) -> bool {
+fn report_stopped(handle: StatusHandle, reported: Reported) -> std::io::Result<()> {
     let status = stopped_status(reported);
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
-    let ok = unsafe { SetServiceStatus(handle.0, &status) };
-    if ok == 0 {
-        let e = std::io::Error::last_os_error();
-        log.failure(id, &stopped_report_failure(&e));
+    if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    ok != 0
+    Ok(())
 }
 
 /// The shim exits after this without a `STOPPED` report. SCM is expected to read that as a crash

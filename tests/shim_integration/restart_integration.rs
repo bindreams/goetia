@@ -224,9 +224,10 @@ fn uninstall_leaves_no_restarted_daemon_behind() {
 // What is reported ====================================================================================================
 
 /// Runs `exit-on-close` under `restart: never` (so SCM does nothing after the report), lets the
-/// daemon exit with `child_code`, and returns the exit codes SCM recorded once the shim is gone
-/// (the `ServiceExitCode` view and both raw codes of `sc query`) and the shim process's own.
-fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit, u32) {
+/// daemon exit with `child_code`, and returns the exit codes SCM recorded once the shim is gone:
+/// the `ServiceExitCode` view and both raw codes of `sc query`. The shim's process exit is checked
+/// here for every caller: it is the daemon's code, which the shim also reported to SCM.
+fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
     let reported = ConnectBack::listen();
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -248,10 +249,14 @@ fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit, u32) {
 
     drop(stream);
     let process_exit = shim.wait_for_exit();
+    assert_eq!(
+        process_exit, child_code as u32,
+        "the shim's process exit code differs from the daemon's, which it reported to SCM"
+    );
 
     let stopped = scm_status(&id);
     assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
-    (stopped.exit_code, recorded_exit(&id), process_exit)
+    (stopped.exit_code, recorded_exit(&id))
 }
 
 fn recorded_exit_code(child_code: i32) -> ServiceExitCode {
@@ -275,7 +280,7 @@ fn a_daemon_exit_code_is_recorded_as_service_specific_whatever_its_value() {
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
 fn a_daemon_exit_code_round_trips_through_the_recorded_pair() {
     for code in [0xC000_0005_u32 as i32, 1003] {
-        let (_, recorded, _) = exit_records(code);
+        let (_, recorded) = exit_records(code);
 
         assert_eq!(
             recorded,
@@ -284,20 +289,6 @@ fn a_daemon_exit_code_round_trips_through_the_recorded_pair() {
                 specific: code as u32
             },
             "daemon exit {code}"
-        );
-    }
-}
-
-/// The shim's process exits with the code it reported to SCM, which is the daemon's own. The main
-/// thread's exit and the service thread's must not disagree about it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
-fn the_shim_process_exits_with_the_code_it_reported_to_scm() {
-    for code in [0, 3, 7, 0xC000_0005_u32 as i32] {
-        let (_, recorded, process_exit) = exit_records(code);
-
-        assert_eq!(
-            process_exit, code as u32,
-            "daemon exit {code}: SCM recorded {recorded:?}"
         );
     }
 }

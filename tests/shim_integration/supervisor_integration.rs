@@ -15,7 +15,8 @@ use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::KEY_WRITE;
 
 use crate::common::{
-    LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, fixture_command, manager, recorded_exit, scm_status, simple_spec,
+    LogDir, ShimGuard, ShimProcess, UNIT_DIR_EXCLUSIVE, fixture_command, manager, recorded_exit, scm_status,
+    simple_spec,
 };
 use crate::support::registry::{parameters_key, service_key};
 use crate::support::{self, ConnectBack, ELEVATED};
@@ -121,9 +122,15 @@ fn stop_kills_the_whole_process_tree() {
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let child_pid = child_reported.accept_line("the direct child to start and report its pid");
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
+    let shim = ShimProcess::attach(&id);
 
     // `stop` returns once SCM confirms `STOPPED`, so the shim has reported and the record is final.
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    assert_eq!(
+        shim.wait_for_exit(),
+        0,
+        "the shim's process exit code differs from the clean stop it reported to SCM"
+    );
 
     // The stop reached the whole tree, not only the direct child.
     assert!(
