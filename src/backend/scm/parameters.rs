@@ -51,7 +51,7 @@ impl fmt::Display for Stray {
             }
             Stray::Layout { name, vtype } => write!(
                 out,
-                "value \"{name}\" stored as {}, not exactly as goetia writes it",
+                "value {name:?} stored as {}, not exactly as goetia writes it",
                 type_name(*vtype)
             ),
             Stray::Subkey { name } => write!(out, "subkey {}", shown_name(name)),
@@ -61,7 +61,7 @@ impl fmt::Display for Stray {
 
 /// `name` in double quotes, quoted as `ScmRegistration` quotes every other value it reads back
 /// (`{:?}`), so it stays on one line and cannot close its own quotes. A name that is not valid
-/// UTF-16 is quoted the same way with each unpaired unit as `\u{XXXX}`, which no valid name spells.
+/// UTF-16 is quoted the same way with each unpaired unit as `\u{d800}`, which no valid name spells.
 pub(crate) fn shown_name(name: &[u16]) -> String {
     if let Ok(text) = String::from_utf16(name) {
         return format!("{text:?}");
@@ -78,7 +78,7 @@ pub(crate) fn shown_name(name: &[u16]) -> String {
             Ok(c) => run.push(c),
             Err(e) => {
                 flush(&mut run, &mut shown);
-                shown.push_str(&format!(r"\u{{{:04X}}}", e.unpaired_surrogate()));
+                shown.push_str(&format!(r"\u{{{:x}}}", e.unpaired_surrogate()));
             }
         }
     }

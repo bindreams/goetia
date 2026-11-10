@@ -348,6 +348,23 @@ fn a_stray_name_is_quoted_like_the_registrations_other_values() {
     assert_eq!(shown_name(&utf16(name)), format!("{name:?}"));
 }
 
+/// The run of a name around an unpaired unit is escaped exactly as `{:?}` escapes the same text
+/// when the whole name is valid, and the name stays on one line.
+#[skuld::test]
+fn a_name_is_escaped_the_same_whether_or_not_it_is_valid_utf16() {
+    let text = "a\n\t\u{7f}\"\\b";
+    let escaped = format!("{text:?}");
+    let escaped = &escaped[1..escaped.len() - 1];
+    let mut broken = utf16(text);
+    broken.push(0xD800);
+    broken.extend(utf16(text));
+
+    let shown = shown_name(&broken);
+
+    assert_eq!(shown, format!(r#""{escaped}\u{{d800}}{escaped}""#));
+    assert!(!shown.contains('\n'), "{shown}");
+}
+
 /// A name that is not valid UTF-16 keeps its unpaired unit, in a form no valid name can spell.
 #[skuld::test]
 fn a_stray_name_that_is_not_valid_utf16_renders_without_losing_the_unit() {
@@ -356,7 +373,7 @@ fn a_stray_name_that_is_not_valid_utf16_renders_without_losing_the_unit() {
     }
     .to_string();
 
-    assert_eq!(shown, r#"subkey "A\u{D800}\"\\""#);
+    assert_eq!(shown, r#"subkey "A\u{d800}\"\\""#);
 }
 
 #[skuld::test]
