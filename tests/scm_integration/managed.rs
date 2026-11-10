@@ -1000,7 +1000,7 @@ fn force_install_removes_strays_that_winreg_cannot_enumerate() {
 
     set_raw_value(&parameters, &[0x41, 0xD800], REG_SZ, &sz("x"));
     let diff = assert_conflict_cleared_by_force(&mgr, &spec);
-    assert!(diff.contains("d800"), "{diff}");
+    assert!(diff.contains(r#"value "A\u{d800}" of type REG_SZ"#), "{diff}");
     mgr.status(&spec.id).expect("status: the service still reads as ours");
 }
 
