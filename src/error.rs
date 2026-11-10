@@ -714,14 +714,15 @@ impl Error {
         }
     }
 
-    /// The error a chain of the variants [`wrapper!`] lists ends in, which classification reads: a step over [`NotInstalled`](Error::NotInstalled) is
-    /// still "not installed". [`Both`](Error::Both) has two causes, so it is itself the cause.
-    /// [`map_cause`](Error::map_cause) walks the same chain.
+    /// The error a chain of wrappers ([`Step`](Error::Step), [`StartAsManaged`](Error::StartAsManaged) and
+    /// [`InstalledUnreadable`](Error::InstalledUnreadable)) ends in, which classification reads: a step
+    /// over [`NotInstalled`](Error::NotInstalled) is still "not installed". [`Both`](Error::Both) has
+    /// two causes, so it is itself the cause. [`map_cause`](Error::map_cause) walks the same chain.
     pub fn cause(&self) -> &Error {
         self.wrapped().map_or(self, Error::cause)
     }
 
-    /// Whether this error, or what it wraps in a variant [`wrapper!`] lists or in a
+    /// Whether this error, or what it wraps in a wrapper (see [`cause`](Error::cause)) or in a
     /// [`Kept`](Error::Kept), is an
     /// [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
     /// walks through that variant.
@@ -755,11 +756,13 @@ impl Error {
         match self {
             wrapper!(source) => source.map_cause_in_place(f),
             cause => {
-                // Stands in for the cause for the length of `f`, which owns it meanwhile.
-                let vacated = Error::os(
-                    "map_cause: the cause is with its mapper",
-                    std::io::Error::other("vacated"),
-                );
+                // Stands in for the cause for the length of `f`, which owns it meanwhile. It allocates
+                // nothing (an empty `what`, a zero-sized source) and is no error a caller can have made.
+                let vacated = Error::Os {
+                    what: String::new(),
+                    path: None,
+                    source: Box::new(std::fmt::Error),
+                };
                 let moved = std::mem::replace(cause, vacated);
                 *cause = f(moved);
             }
