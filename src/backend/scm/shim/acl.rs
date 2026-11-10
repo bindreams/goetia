@@ -105,7 +105,7 @@ pub const CHANGE_PERMISSIONS_OF: &str = "change permissions of";
 const TAKE_OWNERSHIP_OF: &str = "take ownership of";
 const DELETE_OR_RENAME: &str = "delete or rename";
 const DELETE_OR_RENAME_ENTRIES_IN: &str = "delete or rename entries in";
-const WRITE_TO: &str = "write to";
+pub const WRITE_TO: &str = "write to";
 
 /// The rights that let an account replace what is in a folder, in the order they are reported.
 const DIRECTORY_TAMPERING: [(u32, &str); 4] = [
@@ -251,7 +251,7 @@ pub(crate) fn account_name(sid: &Sid) -> String {
 // The filesystem ======================================================================================================
 
 #[cfg(windows)]
-mod system {
+pub(crate) mod system {
     use std::ffi::{OsString, c_void};
     use std::fs::{File, OpenOptions};
     use std::io;
@@ -763,9 +763,11 @@ mod system {
         Ok((owner, Some(aces)))
     }
 
+    /// The bytes of the SID at `sid`, or an error naming `path` when it is null or not a valid SID.
+    ///
     /// # Safety
     /// `sid` is null or points at readable memory.
-    unsafe fn copy_sid(sid: PSID, path: &Path) -> Result<Sid> {
+    pub(crate) unsafe fn copy_sid(sid: PSID, path: &Path) -> Result<Sid> {
         // SAFETY: `IsValidSid` checks the structure before `GetLengthSid` reads it; a null pointer
         // is rejected first.
         if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {

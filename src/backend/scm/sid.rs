@@ -28,17 +28,16 @@ pub(crate) fn is_whole_sid(sid: &[u8]) -> bool {
 
 /// What [`sid_display`] says of bytes that are not a whole SID.
 #[cfg(windows)]
-pub(crate) const INVALID: &str = "an invalid SID";
+const INVALID: &str = "an invalid SID";
 
 /// What [`sid_display`] says of a whole SID that `ConvertSidToStringSidW` refused.
 #[cfg(windows)]
-pub(crate) const UNSHOWABLE: &str = "a SID that could not be shown";
+const UNSHOWABLE: &str = "a SID that could not be shown";
 
-/// `sid` as `ConvertSidToStringSidW` writes it, `S-1-5-32-544` for Administrators; [`INVALID`] for
-/// bytes that are not a whole SID. What an error names an account by when `LookupAccountSidW` has
-/// no name for it, and what the integration tests compare against.
+/// `sid` as `ConvertSidToStringSidW` writes it, `S-1-5-32-544` for Administrators; `None` for bytes
+/// that are not a whole SID or that Windows refuses to show.
 #[cfg(windows)]
-pub(crate) fn sid_display(sid: &[u8]) -> String {
+pub(crate) fn try_sid_display(sid: &[u8]) -> Option<String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::PSID;
@@ -46,20 +45,28 @@ pub(crate) fn sid_display(sid: &[u8]) -> String {
     use super::wide::units_until_nul;
 
     if !is_whole_sid(sid) {
-        return INVALID.to_string();
+        return None;
     }
     let mut text: *mut u16 = std::ptr::null_mut();
     // SAFETY: `is_whole_sid` has checked that `sid` holds a whole SID's bytes; `text` is a valid out-pointer.
     if unsafe { ConvertSidToStringSidW(sid.as_ptr() as PSID, &mut text) } == 0 {
-        return UNSHOWABLE.to_string();
+        return None;
     }
     // SAFETY: on success `text` is a NUL-terminated string that is live until freed below, which
     // is once, after the last read.
-    unsafe {
+    Some(unsafe {
         let shown = String::from_utf16_lossy(units_until_nul(text));
         LocalFree(text.cast());
         shown
-    }
+    })
+}
+
+/// [`try_sid_display`], or a description of why there is none. What an error names an account by
+/// when `LookupAccountSidW` has no name for it. A test that needs the SID goes through
+/// `testing::shown_sid`, which never takes the description for one.
+#[cfg(windows)]
+pub(crate) fn sid_display(sid: &[u8]) -> String {
+    try_sid_display(sid).unwrap_or_else(|| if is_whole_sid(sid) { UNSHOWABLE } else { INVALID }.to_string())
 }
 
 // Well-known SIDs =====================================================================================================

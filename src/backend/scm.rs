@@ -11,8 +11,9 @@ pub(crate) mod sid;
 #[cfg(test)]
 pub(crate) mod test_support;
 // `pub` on Windows for the shim integration tests and the marker-inertness probe
-// (through `tests/support/scm_wait.rs`); crate-private elsewhere. Declared next to last because
-// `cargo fmt` sorts these alphabetically and would move a comment placed above `manager` onto it.
+// (through `tests/support/scm_wait.rs`); crate-private elsewhere. This comment stays on the `wait`
+// declarations only because `cargo fmt` sorts the declarations alphabetically and carries a
+// comment with the one below it.
 #[cfg(windows)]
 pub mod wait;
 #[cfg(not(windows))]

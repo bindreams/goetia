@@ -29,7 +29,7 @@ use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid, GetSecurityDescriptorControl,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, SYNCHRONIZE};
@@ -526,7 +526,7 @@ fn install_refuses_a_host_file_users_can_write_to() {
     match standalone(CheckPermissions::Enable).install(&spec, false) {
         Err(Error::ShimFolderUnsafe { path, account, right }) => {
             assert_eq!(path, host);
-            assert_eq!(right, "write to");
+            assert_eq!(right, goetia::testing::WRITE_TO);
             assert!(account.ends_with("Users"), "{account}");
         }
         other => panic!("a host file Users can write to must be refused, got {other:?}"),
@@ -881,10 +881,8 @@ fn dacl_of(handle: HANDLE) -> (bool, Vec<(String, u32, u8)>) {
                 std::ptr::addr_of!((*body).SidStart) as PSID,
             )
         };
-        // SAFETY: `sid` is a valid SID inside the entry, so `GetLengthSid` bytes are readable from it.
-        let sid_text = goetia::testing::shown_sid(unsafe {
-            std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize)
-        });
+        // SAFETY: `sid` points at the SID inside the entry just read, which `descriptor` keeps live.
+        let sid_text = goetia::testing::shown_sid(&unsafe { goetia::testing::sid_bytes(sid) });
         entries.push((sid_text, mask, kind));
     }
     // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last read.

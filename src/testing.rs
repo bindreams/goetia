@@ -13,19 +13,24 @@ use crate::error::Result;
 use crate::shim::{FolderCheck, HostCommand, ShimProvider, SweepFailure};
 use crate::spec::{DaemonFields, Id, Kind, Restart, User};
 
-pub use crate::backend::scm::shim::acl::CHANGE_PERMISSIONS_OF;
+pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
 
-/// `sid` as Windows writes it, and a failure of the calling test, naming the placeholder, when
-/// Windows could not show it: a test never takes a placeholder for a SID.
+/// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
+/// a test never takes a placeholder for a SID.
 #[cfg(windows)]
 pub fn shown_sid(sid: &[u8]) -> String {
-    use crate::backend::scm::sid::{INVALID, UNSHOWABLE, sid_display};
-    let shown = sid_display(sid);
-    assert!(
-        shown != INVALID && shown != UNSHOWABLE,
-        "{sid:?} is not shown as a SID: {shown}"
-    );
-    shown
+    crate::backend::scm::sid::try_sid_display(sid).unwrap_or_else(|| panic!("{sid:?} is not a SID Windows can show"))
+}
+
+/// The bytes of the SID at `sid`; fails the calling test when it is null or not a valid SID.
+///
+/// # Safety
+/// `sid` is null or points at readable memory.
+#[cfg(windows)]
+pub unsafe fn sid_bytes(sid: *mut std::ffi::c_void) -> Vec<u8> {
+    // SAFETY: the caller's contract is `copy_sid`'s.
+    unsafe { crate::backend::scm::shim::acl::system::copy_sid(sid, std::path::Path::new("a SID in a test")) }
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 pub mod cleanup;
