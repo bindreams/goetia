@@ -264,18 +264,14 @@ fn move_no_clobber_does_not_clobber_existing_content() {
     assert!(src.exists(), "the source must not be consumed by a failed move");
 }
 
-// prepare_parent_dirs =================================================================================================
+// write ===============================================================================================================
 
 /// `cwd` is made before the parent of `logs` is looked at, so a failure on the latter leaves `cwd`
-/// for the caller's guard to take back.
+/// to the scope: it exists when `write` returns, for the failure it reports, and goes when the
+/// scope is dropped.
 #[skuld::test]
-fn prepare_parent_dirs_records_the_cwd_it_made_before_the_logs_parent_failed() {
+fn a_write_that_fails_after_making_the_cwd_leaves_it_to_the_scope() {
     let tmp = tempfile::tempdir().unwrap();
-    let account = Account {
-        name: "test".to_string(),
-        uid: nix::unistd::Uid::current(),
-        gid: nix::unistd::Gid::current(),
-    };
     let file = tmp.path().join("file");
     std::fs::write(&file, b"x").unwrap();
     let cwd = tmp.path().join("cwd");
@@ -283,12 +279,26 @@ fn prepare_parent_dirs_records_the_cwd_it_made_before_the_logs_parent_failed() {
     fields.cwd = Some(cwd.clone());
     fields.logs = Some(file.join("sub").join("out.log"));
     let spec = DaemonSpec::new(fields).unwrap();
-    let mut created = CreatedDirs::new();
+    let mut scope = CreatedDirs::default();
 
-    prepare_parent_dirs(&spec, &account, &mut created).expect_err("the logs parent is under a file");
+    let err = backend::Backend::write(
+        &Launchd::new(),
+        &spec,
+        &"unused".to_string(),
+        &Outcome::Create,
+        None,
+        &mut scope,
+        &mut Reservation::default(),
+    )
+    .err()
+    .expect("the logs parent is under a file");
+
+    let cause = std::error::Error::source(&err)
+        .expect("an OS error has a source")
+        .to_string();
+    assert!(cause.contains("ENOTDIR"), "{cause}");
     assert!(cwd.is_dir(), "the cwd was made before the failure");
-    drop(created);
-
+    drop(scope);
     assert!(!cwd.exists());
 }
 
@@ -352,6 +362,45 @@ fn a_plist_that_cannot_be_read_is_unknown() {
         plist_standing(&file.join("id.plist"), "text"),
         Standing::Unknown(_)
     ));
+}
+
+// standing ============================================================================================================
+
+/// An update leaves the plist where `read` found it, which is where its standing is read, so an
+/// install that fails after writing it keeps the directories made for it.
+#[skuld::test]
+fn an_updated_plist_stands_where_read_found_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let id = Id::try_from("standing").unwrap();
+    let path = tmp.path().join("standing.plist");
+    let snapshot = Plist {
+        location: Location {
+            path: path.clone(),
+            enabled: false,
+        },
+        ..marked_plist(&id)
+    };
+    let spec = DaemonSpec::new(plain_fields(id.as_str(), vec!["/bin/true".to_string()])).unwrap();
+    let outcome = Outcome::Update {
+        spec_diff: String::new(),
+    };
+    let standing = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        backend::Backend::standing(&Launchd::new(), &spec, &"new".to_string(), &outcome, Some(&snapshot))
+    };
+
+    assert!(matches!(standing("new"), Standing::Yes));
+    assert!(matches!(standing("old"), Standing::No));
+}
+
+#[skuld::test]
+fn a_create_that_wrote_nothing_does_not_stand() {
+    let id = Id::try_from("standing-nothing-written").unwrap();
+    let spec = DaemonSpec::new(plain_fields(id.as_str(), vec!["/bin/true".to_string()])).unwrap();
+
+    let standing = backend::Backend::standing(&Launchd::new(), &spec, &"new".to_string(), &Outcome::Create, None);
+
+    assert!(matches!(standing, Standing::No), "{standing:?}");
 }
 
 // written_at ==========================================================================================================
@@ -949,7 +998,14 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
     let mut reservation = reserved(&[Step::Install]);
 
     let written = mgr
-        .write(&spec, &desired, &stale, Some(&snapshot), &mut (), &mut reservation)
+        .write(
+            &spec,
+            &desired,
+            &stale,
+            Some(&snapshot),
+            &mut CreatedDirs::default(),
+            &mut reservation,
+        )
         .expect("write");
 
     assert!(matches!(written, WriteOutcome::Raced));

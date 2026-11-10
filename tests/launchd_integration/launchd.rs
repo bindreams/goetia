@@ -1269,6 +1269,15 @@ fn spec_failing_on_logs_after_cwd(id: &str, base: &Path, cwd: &Path) -> DaemonSp
     DaemonSpec::new(spec).unwrap()
 }
 
+/// The install failed on the `logs` parent, after the `cwd` was made, and not earlier for some other
+/// reason. That the `cwd` existed before it was removed is the `write` unit test's.
+fn assert_logs_parent_under_a_file(err: &goetia::Error) {
+    let cause = std::error::Error::source(err)
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(cause.contains("ENOTDIR"), "{err}: {cause}");
+}
+
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_failed_install_removes_the_directories_it_created() {
     let id = support::random_test_id();
@@ -1278,9 +1287,10 @@ fn a_failed_install_removes_the_directories_it_created() {
     let spec = spec_failing_on_logs_after_cwd(&id, &base, &base.join("a").join("b"));
     let _guard = Guard(spec.id.clone());
 
-    Launchd::new()
+    let err = Launchd::new()
         .install(&spec, false)
         .expect_err("the logs parent is under a file");
+    assert_logs_parent_under_a_file(&err);
 
     assert!(!base.join("a").exists(), "the failed install left its cwd");
     assert!(base.is_dir(), "a directory that existed before must stay");
@@ -1297,12 +1307,33 @@ fn a_failed_install_removes_a_new_directory_in_one_that_existed_before() {
     let spec = spec_failing_on_logs_after_cwd(&id, &base, &created);
     let _guard = Guard(spec.id.clone());
 
-    Launchd::new()
+    let err = Launchd::new()
         .install(&spec, false)
         .expect_err("the logs parent is under a file");
+    assert_logs_parent_under_a_file(&err);
 
     assert!(!created.exists(), "the failed install left {}", created.display());
     assert!(existing.is_dir(), "a directory that existed before must stay");
+}
+
+/// An update that writes a plist asking for a new `cwd` makes it and keeps it: the directories are
+/// kept because the plist the install wrote stands where `read` found it.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn an_update_keeps_the_cwd_it_made() {
+    let mgr = Launchd::new();
+    let id = support::random_test_id();
+    let spec = base_spec(&id, vec!["/bin/true".to_string()]);
+    let _guard = Guard::install(&mgr, &spec);
+    let cwd = Path::new("/tmp").join(format!("{id}-update-cwd"));
+    let _cleanup = DirGuard::new(cwd.clone());
+    let mut fields = spec.into_fields();
+    fields.cwd = Some(cwd.clone());
+    let updated = DaemonSpec::new(fields).unwrap();
+
+    let outcome = mgr.install(&updated, false).expect("update");
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert!(cwd.is_dir(), "the update's cwd must stay");
 }
 
 // Non-regular occupants ===============================================================================================

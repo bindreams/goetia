@@ -13,35 +13,42 @@ use nix::fcntl::{AtFlags, OFlag, open, openat};
 use nix::sys::stat::{FileStat, Mode, SFlag, fchmod, fstat, fstatat, mkdirat};
 use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, unlinkat};
 
+use super::{Settle, Standing};
 use crate::error::{Error, Result};
 
 /// The directories one `write` has created, removed when it is dropped unless
-/// [`settle`](Self::settle) kept them. Make it before the first `create`.
+/// [`settle`](Settle::settle) kept them.
 ///
-/// Root creates these directories and hands them to the daemon's account, which can then swap one
-/// for a symlink. So every step on a directory goes by descriptor, never by path: the path to it is
-/// resolved component by component ([`walk`]), it is made with `mkdirat` under its parent's
-/// descriptor, opened `O_NOFOLLOW` from there, `fchmod`ed and `fchown`ed on that descriptor, and
-/// later removed by name from the parent's descriptor (`unlinkat`) only while the name still refers
-/// to the same inode. A descriptor stays open per directory until the guard is dropped; running out
-/// of them fails the install and leaves the directory being made.
+/// Root creates these directories and the daemon's account, which they are handed to, can swap one
+/// for a symlink. So every step on a directory goes by descriptor, never by path ([`walk`]
+/// resolves the path to one), and an account never owns a directory root is still working in:
+/// [`create`](Self::create) makes every directory root-owned and private, and only
+/// [`hand_over`](Self::hand_over), once all are made, gives them their mode and owner. A drop takes
+/// the owner back before it removes anything.
 ///
-/// The resolution follows systemd's `CHASE_SAFE`, on every step and plain directories included:
-/// going on from an entry owned by a non-root uid to one owned by a different uid is refused. A path
-/// that steps between owners (an account's directory holding one root or another account owns) is
-/// therefore refused, not created in.
+/// The resolution follows systemd's `CHASE_SAFE` (see [`refuse_unsafe`]) on every step, plain
+/// directories included. A path that steps between owners is therefore refused, not created in;
+/// the directories this guard made are the exception, as it knows whose they are.
+///
+/// A descriptor stays open per directory until the drop; running out of them fails the install and
+/// leaves the directory being made.
 #[derive(Debug, Default)]
 pub(crate) struct CreatedDirs(Vec<Created>);
 
 /// Whom a created directory is handed to.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Owner {
-    pub(crate) uid: Uid,
+    uid: Uid,
     /// `None` leaves the group as the creating process's.
-    pub(crate) gid: Option<Gid>,
+    gid: Option<Gid>,
 }
 
 impl Owner {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn uid(&self) -> Uid {
+        self.uid
+    }
+
     /// `(uid_t)-1` and `(gid_t)-1` mean "unchanged" to `fchown`: no account has either.
     pub(crate) fn new(uid: Uid, gid: Option<Gid>) -> Result<Self> {
         let unchanged = |id: u32| id == u32::MAX;
@@ -55,15 +62,6 @@ impl Owner {
     }
 }
 
-/// Whether the definition an install wrote is in place, as its backend's guarded read found it.
-#[derive(Debug)]
-pub(crate) enum Standing {
-    Yes,
-    No,
-    /// The read did not complete, for this reason.
-    Unknown(String),
-}
-
 #[derive(Debug)]
 struct Created {
     path: PathBuf,
@@ -73,6 +71,11 @@ struct Created {
     dir: OwnedFd,
     dev: libc::dev_t,
     ino: libc::ino_t,
+    /// Who made it, and its group then: what a drop gives back.
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    finished: bool,
+    handed: bool,
 }
 
 /// What a directory is created in, and removed from.
@@ -85,60 +88,85 @@ enum Parent {
 }
 
 impl CreatedDirs {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create `dir` and every missing ancestor, each `0755` whatever the umask and owned by `owner`.
-    /// A path that exists, of any kind (a dangling symlink included), is left untouched, and so is
-    /// one another install creates after the walk: not ours.
-    pub(crate) fn create(&mut self, dir: &Path, owner: Option<Owner>) -> Result<()> {
-        self.create_in(walk(dir)?, owner)
+    /// Create `dir` and every missing ancestor: private, and root's until [`hand_over`](Self::hand_over).
+    /// A path that exists is left untouched, and so is a component another install creates after the
+    /// walk: not ours. Whatever is at the end of the path must be a directory, or a symlink to one.
+    pub(crate) fn create(&mut self, dir: &Path) -> Result<()> {
+        let found = walk(dir, &self.0)?;
+        self.create_in(found)
     }
 
     /// Create what `walk` found missing, under the directory it holds open.
-    fn create_in(&mut self, walk: Walk, owner: Option<Owner>) -> Result<()> {
-        let Walk { holder, missing } = walk;
+    fn create_in(&mut self, found: Walk) -> Result<()> {
+        let Walk { holder, owner, missing } = found;
         let mut parent = Parent::Existing(holder);
+        let mut parent_owner = owner;
         for (n, (path, name)) in missing.iter().enumerate() {
-            // The mode given to `mkdirat` is masked by the umask; the `fchmod` below makes it
-            // exactly `0755`. Until then it is at most that, never wider.
-            match mkdirat(self.fd_of(&parent), name.as_os_str(), Mode::from_bits_truncate(0o755)) {
+            let last = n + 1 == missing.len();
+            // Private until `hand_over` makes it `0755` whatever the umask.
+            match mkdirat(self.fd_of(&parent), name.as_os_str(), Mode::from_bits_truncate(0o700)) {
                 Ok(()) => {
                     let opened = open_beneath(self.fd_of(&parent), name, OFlag::O_RDONLY)
                         .and_then(|dir| fstat(&dir).map(|stat| (dir, stat)));
-                    let (dir, FileStat { st_dev, st_ino, .. }) = opened.map_err(|e| {
-                        report(format_args!(
-                            "could not remove {}, which the failed install created: it could not be opened: {e}",
-                            path.display()
-                        ));
+                    let (dir, stat) = opened.map_err(|e| {
+                        report_stranded(path, &e);
                         Error::os_at("open", path, e)
                     })?;
+                    // The parent may be an account's: what is held must be the directory just made.
+                    if stat.st_uid != Uid::effective().as_raw() {
+                        let reason =
+                            io::Error::other(format!("not the directory just made: owned by uid {}", stat.st_uid));
+                        report_stranded(path, &reason);
+                        return Err(Error::os_at("open", path, reason));
+                    }
                     self.0.push(Created {
                         path: path.clone(),
                         name: name.clone(),
                         parent,
                         dir,
-                        dev: st_dev,
-                        ino: st_ino,
+                        dev: stat.st_dev,
+                        ino: stat.st_ino,
+                        uid: stat.st_uid,
+                        gid: stat.st_gid,
+                        finished: false,
+                        handed: false,
                     });
-                    let index = self.0.len() - 1;
-                    parent = Parent::Created(index);
-                    let dir = self.0[index].dir.as_fd();
-                    fchmod(dir, Mode::from_bits_truncate(0o755)).map_err(|e| Error::os_at("chmod", path, e))?;
-                    if let Some(owner) = owner {
-                        fchown(dir, Some(owner.uid), owner.gid).map_err(|e| Error::os_at("chown", path, e))?;
-                    }
+                    parent = Parent::Created(self.0.len() - 1);
+                    parent_owner = stat.st_uid;
                 }
-                // Another install created it first: not ours, so left as it is.
-                Err(Errno::EEXIST) if n + 1 == missing.len() => return Ok(()),
+                // Another install created it first: not ours, and judged as `walk` judges one.
                 Err(Errno::EEXIST) => {
-                    let held =
-                        open_beneath(self.fd_of(&parent), name, SEARCH).map_err(|e| Error::os_at("open", path, e))?;
+                    let found = entry(self.fd_of(&parent), name)
+                        .map_err(|e| Error::os_at("open", path, e))?
+                        .ok_or_else(|| Error::os_at("open", path, io::Error::from(io::ErrorKind::NotFound)))?;
+                    refuse_unsafe(parent_owner, found.uid(), path, None)?;
+                    if last {
+                        return require_directory(self.fd_of(&parent), name, &found, path);
+                    }
+                    let Entry::Dir(held, stat) = found else {
+                        return Err(Error::NotADirectory { path: path.clone() });
+                    };
                     parent = Parent::Existing(held);
+                    parent_owner = stat.st_uid;
                 }
                 Err(e) => return Err(Error::os_at("create directory", path, e)),
             }
+        }
+        Ok(())
+    }
+
+    /// Give every directory made so far its mode, `0755`, and `owner`. The daemon's account can
+    /// enter what it owns, so this is the last thing done to them: nothing is made inside after it.
+    pub(crate) fn hand_over(&mut self, owner: Option<Owner>) -> Result<()> {
+        for created in self.0.iter_mut().filter(|created| !created.finished) {
+            fchmod(&created.dir, Mode::from_bits_truncate(0o755))
+                .map_err(|e| Error::os_at("chmod", &created.path, e))?;
+            if let Some(owner) = owner {
+                created.handed = true;
+                fchown(&created.dir, Some(owner.uid), owner.gid)
+                    .map_err(|e| Error::os_at("chown", &created.path, e))?;
+            }
+            created.finished = true;
         }
         Ok(())
     }
@@ -150,22 +178,16 @@ impl CreatedDirs {
         }
     }
 
-    /// Keep every created directory unless the definition is not in place. An unknown answer keeps
-    /// them and says so: removing them could break an installed definition.
-    pub(crate) fn settle(&mut self, definition: &Path, standing: Standing) {
-        match standing {
-            Standing::Yes => self.0.clear(),
-            Standing::No => {}
-            Standing::Unknown(e) => {
-                if !self.0.is_empty() {
-                    report(format_args!(
-                        "could not read {}: {e}; keeping the directories the install created",
-                        definition.display()
-                    ));
-                }
-                self.0.clear();
-            }
-        }
+    /// Take `self.0[index]` back from the account: its owner and a mode nobody else can write.
+    fn reclaim(&self, index: usize) -> std::result::Result<(), String> {
+        let created = &self.0[index];
+        fchown(
+            &created.dir,
+            Some(Uid::from_raw(created.uid)),
+            Some(Gid::from_raw(created.gid)),
+        )
+        .map_err(|e| e.to_string())?;
+        fchmod(&created.dir, Mode::from_bits_truncate(0o755)).map_err(|e| e.to_string())
     }
 
     /// Remove `self.0[index]` from its parent if the name still refers to the directory that was
@@ -186,10 +208,29 @@ impl CreatedDirs {
     }
 }
 
-/// What a walk of a path found: the deepest directory that exists, held open, and the components
-/// below it that do not, each with its path, outermost first.
+impl Settle for CreatedDirs {
+    /// An unknown answer keeps the directories and says so: removing them could break an installed
+    /// definition.
+    fn settle(&mut self, standing: impl FnOnce() -> Standing) {
+        if self.0.is_empty() {
+            return;
+        }
+        match standing() {
+            Standing::Yes => self.0.clear(),
+            Standing::No => {}
+            Standing::Unknown(reason) => {
+                report(format_args!("{reason}; keeping the directories the install created"));
+                self.0.clear();
+            }
+        }
+    }
+}
+
+/// What a walk of a path found: the deepest directory that exists, held open, and the uid that owns
+/// it, and the components below it that do not, each with its path, outermost first.
 struct Walk {
     holder: OwnedFd,
+    owner: libc::uid_t,
     missing: Vec<(PathBuf, OsString)>,
 }
 
@@ -202,7 +243,7 @@ const SEARCH: OFlag = OFlag::O_PATH;
 const SEARCH: OFlag = OFlag::O_SEARCH;
 
 /// Symlinks one walk follows before it gives up on a cycle: the kernel's own bound, Linux's
-/// `MAXSYMLINKS`, and macOS's.
+/// `MAXSYMLINKS` (macOS's is 32).
 #[cfg(target_os = "linux")]
 const SYMLINK_LIMIT: usize = 40;
 #[cfg(not(target_os = "linux"))]
@@ -289,14 +330,29 @@ fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<Entry>> {
     }
 }
 
+/// The last component of a path exists, as `found` in `parent`: it must be a directory or a symlink
+/// that resolves to one.
+fn require_directory(parent: BorrowedFd<'_>, name: &OsStr, found: &Entry, path: &Path) -> Result<()> {
+    let not_a_directory = || Error::NotADirectory {
+        path: path.to_path_buf(),
+    };
+    match found {
+        Entry::Dir(..) => Ok(()),
+        Entry::Link(..) => match fstatat(parent, name, AtFlags::empty()) {
+            Ok(stat) if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFDIR => Ok(()),
+            Ok(_) => Err(not_a_directory()),
+            Err(e) => Err(Error::os_at("stat", path, e)),
+        },
+        Entry::Other(_) => Err(not_a_directory()),
+    }
+}
+
 /// Resolve `dir`, which must be absolute, from `/` one component at a time, on descriptors,
-/// following the symlinks that lead through it and none that is the last component. As in systemd's
-/// `CHASE_SAFE`, going on from an entry owned by a non-root uid to one owned by a different uid is
-/// refused at every step, plain directories and the last existing component included, and a link
-/// carries its own owner onto whatever it leads to: so a symlink the daemon's account plants cannot
-/// lead root into a directory the account does not own. An absolute link is judged against `/`,
-/// which root owns, and is followed only from root's.
-fn walk(dir: &Path) -> Result<Walk> {
+/// following the symlinks that lead through it and none that is the last component, which must
+/// be a directory or lead to one. Every step is judged by [`refuse_unsafe`]; a link carries its own
+/// owner onto whatever it leads to, and an absolute one is judged against `/`, which root owns.
+/// `made` are the directories the guard made, which are not judged.
+fn walk(dir: &Path, made: &[Created]) -> Result<Walk> {
     if !dir.has_root() {
         return Err(Error::os_at(
             "create directory",
@@ -352,11 +408,16 @@ fn walk(dir: &Path) -> Result<Walk> {
             continue;
         };
         let uid = found.uid();
-        refuse_unsafe(owner, uid, &at, carried.as_deref())?;
-        // The last component exists, of whatever kind: not ours to make.
+        let ours =
+            matches!(&found, Entry::Dir(_, stat) if made.iter().any(|c| c.dev == stat.st_dev && c.ino == stat.st_ino));
+        if !ours {
+            refuse_unsafe(owner, uid, &at, carried.as_deref())?;
+        }
         if queue.is_empty() {
+            require_directory(cur.as_fd(), &name, &found, &so_far)?;
             return Ok(Walk {
                 holder: cur,
+                owner,
                 missing: Vec::new(),
             });
         }
@@ -390,7 +451,11 @@ fn walk(dir: &Path) -> Result<Walk> {
             Entry::Other(_) => return Err(Error::os_at("stat", &at, Errno::ENOTDIR)),
         }
     }
-    Ok(Walk { holder: cur, missing })
+    Ok(Walk {
+        holder: cur,
+        owner,
+        missing,
+    })
 }
 
 /// The steps of `path`, as names and `..`, the root and `.` left out.
@@ -406,8 +471,9 @@ fn components(path: &Path, from_link: bool) -> VecDeque<(OsString, bool)> {
 }
 
 /// Refuse to go on from an entry owned by `from` to `at`, owned by `to`, unless `from` is root or
-/// `to` itself. `carried` is the link `from` is the owner of, when the walk has not entered a
-/// directory since.
+/// `to` itself: systemd's `CHASE_SAFE`, which keeps a path an account controls from leading root
+/// into a directory the account does not own. `carried` is the link `from` is the owner of, when
+/// the walk has not entered a directory since.
 fn refuse_unsafe(from: libc::uid_t, to: libc::uid_t, at: &Path, carried: Option<&Path>) -> Result<()> {
     if from == 0 || from == to {
         return Ok(());
@@ -436,13 +502,21 @@ fn open_beneath(parent: BorrowedFd<'_>, name: &OsStr, base: OFlag) -> nix::Resul
 }
 
 impl Drop for CreatedDirs {
-    /// Deepest first, since each directory was created after its parent. Does nothing while a panic
-    /// unwinds: the panic may be after the definition was written, and the directories of an
-    /// installed service must stay. A removal that fails is reported on stderr, and a failed report
-    /// is ignored: this never panics.
+    /// Takes every handed-over directory back, then removes them deepest first, since each was
+    /// created after its parent. Does nothing while a panic unwinds: the panic may be after the
+    /// definition was written, and the directories of an installed service must stay. A step that
+    /// fails is reported on stderr, and a failed report is ignored: this never panics.
     fn drop(&mut self) {
         if std::thread::panicking() {
             return;
+        }
+        for index in (0..self.0.len()).filter(|index| self.0[*index].handed) {
+            if let Err(e) = self.reclaim(index) {
+                report(format_args!(
+                    "could not take {} back from the account, which the failed install handed it to: {e}",
+                    self.0[index].path.display()
+                ));
+            }
         }
         for index in (0..self.0.len()).rev() {
             if let Err(e) = self.remove(index) {
@@ -453,6 +527,14 @@ impl Drop for CreatedDirs {
             }
         }
     }
+}
+
+/// The directory `path`, made by the install, that could not be opened, so it stays.
+fn report_stranded(path: &Path, why: &dyn std::fmt::Display) {
+    report(format_args!(
+        "could not remove {}, which the failed install created: it could not be opened: {why}",
+        path.display()
+    ));
 }
 
 /// A warning on stderr. A failed write is ignored: `eprintln!` would panic on one.

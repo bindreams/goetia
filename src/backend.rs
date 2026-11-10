@@ -48,9 +48,11 @@ pub(crate) mod test_scratch;
 #[path = "../tests/support/elevation.rs"]
 pub(crate) mod test_elevation;
 
+#[cfg(unix)]
+pub(crate) use contract::Standing;
 pub(crate) use contract::{
-    Backend, Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed,
-    WriteOutcome,
+    Backend, Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Settle,
+    Unnamed, WriteOutcome,
 };
 
 /// A platform account, already resolved from [`crate::spec::User`] by the
