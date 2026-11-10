@@ -2,18 +2,17 @@
 # assert-archives.sh <expected-count> <archive>...
 #
 # Exits 0 only when: the count matches; every archive's member set is exactly
-# `goetia-<target>/{goetia,goetia-shim,README.md,LICENSE.md}`, with `.exe` on
-# the two binaries and `/` as the only separator inside a `.zip`; and no two
-# binaries anywhere in the call — whether in the same archive or different
-# ones — carry byte-identical content.
+# `goetia-<target>/{goetia,README.md,LICENSE.md}`, with `.exe` on the binary
+# and `/` as the only separator inside a `.zip`; and no two archives carry
+# byte-identical `goetia` binaries. The stock shim is embedded in the
+# Windows `goetia.exe`, so no archive ships a `goetia-shim`.
 #
 # The member set is checked per archive, derived from that archive's own
 # filename — but the binary bytes are tracked across every archive in the
 # call. That is what catches a staging step that lost its `--target` and
 # copied one host's binary into every row (each archive's filename would
 # still look right, and a per-archive check alone would pass every one of
-# them), as well as a staging step that copied `goetia` over `goetia-shim`
-# (or vice versa) within a single archive.
+# them).
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -36,7 +35,7 @@ fi
 
 # list_members <kind> <archive> — one member path per line. Directory
 # entries are excluded: both `tar` and a directory-based `zip` emit a
-# `goetia-<target>/` entry alongside the four files, and it is not part of
+# `goetia-<target>/` entry alongside the three files, and it is not part of
 # the member set this script checks.
 #
 # Listing and filtering are separate steps, and only the listing decides
@@ -145,7 +144,6 @@ for archive in "$@"; do
 
     expected_members=(
         "${prefix}/goetia${ext}"
-        "${prefix}/goetia-shim${ext}"
         "${prefix}/README.md"
         "${prefix}/LICENSE.md"
     )
@@ -158,9 +156,9 @@ for archive in "$@"; do
     # elements where one member's name happens to contain a space can join
     # to the exact same string as a different-length set — ("a b") and ("a"
     # "b") compare equal as strings even though they are different sets.
-    # A 3-member archive whose third member is literally named
+    # A 2-member archive whose second member is literally named
     # "<prefix>/LICENSE.md <prefix>/README.md" (one member, embedded space)
-    # joins byte-for-byte identical to the real 4-member expected set.
+    # joins byte-for-byte identical to the real 3-member expected set.
     mismatch=0
     if [[ "${#actual_sorted[@]}" -ne "${#expected_sorted[@]}" ]]; then
         mismatch=1
@@ -180,31 +178,25 @@ for archive in "$@"; do
         exit 1
     fi
 
-    for name in goetia goetia-shim; do
-        member="${prefix}/${name}${ext}"
-        # Guarded the same way the `list_members` call above is: a member
-        # can pass listing (which reads only the central directory / tar
-        # headers) and still fail to extract (e.g. a corrupted zip entry
-        # fails its CRC check on `unzip -p`, but not on `unzip -Z1`).
-        # `set -e` + `pipefail` already fails the script closed on that —
-        # correct — but with no annotation, so the log shows only the raw
-        # `tar`/`unzip` diagnostic and no `::error::` line.
-        hash=""
-        if ! hash="$(extract_member "$kind" "$archive" "$member" | sha256sum | cut -d' ' -f1)"; then
-            echo "::error::${archive}: failed to extract member '${member}' (corrupt or unreadable archive?)" >&2
-            exit 1
-        fi
-        owner="${binary_owner[$hash]-}"
-        if [[ -n "$owner" ]]; then
-            if [[ "${owner%%:*}" == "$archive" ]]; then
-                echo "::error::${archive}:${member} is byte-identical to ${owner#*:} in the same archive — goetia and goetia-shim must be different programs; check the staging step" >&2
-            else
-                echo "::error::${archive}:${member} is byte-identical to ${owner} — two archives should never ship the same binary; check the staging step's --target" >&2
-            fi
-            exit 1
-        fi
-        binary_owner["$hash"]="${archive}:${member}"
-    done
+    member="${prefix}/goetia${ext}"
+    # Guarded the same way the `list_members` call above is: a member can
+    # pass listing (which reads only the central directory / tar headers)
+    # and still fail to extract (e.g. a corrupted zip entry fails its CRC
+    # check on `unzip -p`, but not on `unzip -Z1`). `set -e` + `pipefail`
+    # already fails the script closed on that — correct — but with no
+    # annotation, so the log shows only the raw `tar`/`unzip` diagnostic
+    # and no `::error::` line.
+    hash=""
+    if ! hash="$(extract_member "$kind" "$archive" "$member" | sha256sum | cut -d' ' -f1)"; then
+        echo "::error::${archive}: failed to extract member '${member}' (corrupt or unreadable archive?)" >&2
+        exit 1
+    fi
+    owner="${binary_owner[$hash]-}"
+    if [[ -n "$owner" ]]; then
+        echo "::error::${archive}:${member} is byte-identical to ${owner} — two archives should never ship the same binary; check the staging step's --target" >&2
+        exit 1
+    fi
+    binary_owner["$hash"]="${archive}:${member}"
 done
 
 echo "all ${expected_count} archive(s) verified"

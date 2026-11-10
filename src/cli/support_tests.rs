@@ -1,4 +1,6 @@
-use super::{UndeterminedEntry, print_undetermined_warnings, print_unusable_warnings, print_warnings};
+use super::{
+    UndeterminedEntry, print_undetermined_warnings, print_unusable_warnings, print_warnings, require_elevation,
+};
 use crate::error::Reason;
 use crate::spec::{Id, Warning};
 
@@ -24,6 +26,18 @@ fn a_manifest_level_warning_is_printed_with_no_id() {
     // advisory, which belongs to no daemon. Byte-exact, because the whole
     // of this arm is the absence of a prefix.
     assert_eq!(rendered(None), "warning: a message\n");
+}
+
+#[skuld::test]
+fn a_subcommand_that_needs_elevation_is_named_in_backticks() {
+    let mut err: Vec<u8> = Vec::new();
+
+    assert!(require_elevation("daemon install", &|| false, &mut err).is_err());
+
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "error: `daemon install` requires elevation (root/Administrator): re-run as root or Administrator\n"
+    );
 }
 
 #[skuld::test]

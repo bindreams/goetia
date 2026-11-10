@@ -46,8 +46,19 @@ fn shim_path() -> PathBuf {
     abs("Program Files/Goetia/goetia-shim.exe")
 }
 
+fn host() -> HostCommand {
+    host_at(shim_path())
+}
+
+fn host_at(exe: impl Into<PathBuf>) -> HostCommand {
+    HostCommand {
+        exe: exe.into(),
+        args: vec!["--service-host".to_string()],
+    }
+}
+
 fn build(spec: &DaemonSpec) -> ScmRegistration {
-    registration(spec, &identity(), &shim_path()).unwrap()
+    registration(spec, &identity(), Some(&host())).unwrap()
 }
 
 // executable/arguments per Kind =======================================================================================
@@ -58,11 +69,30 @@ fn simple_kind_executable_is_shim() {
     let reg = build(&spec);
 
     assert_eq!(reg.executable, shim_path());
-    assert_eq!(reg.arguments, vec![spec.id.as_str().to_string()]);
+    assert_eq!(
+        reg.arguments,
+        host().args,
+        "the host's arguments, verbatim: no id is appended"
+    );
     assert!(
         !reg.arguments.contains(&spec.command[0]),
         "the spec's own command must not appear in arguments: {:?}",
         reg.arguments
+    );
+}
+
+#[skuld::test]
+fn simple_kind_without_a_host_has_no_provider() {
+    let err = registration(&simple_spec(), &identity(), None).expect_err("a simple service needs a host");
+    assert!(matches!(err, Error::NoShimProvider), "{err:?}");
+}
+
+#[skuld::test]
+fn managed_kind_ignores_the_host() {
+    let spec = managed_spec();
+    assert_eq!(
+        registration(&spec, &identity(), None).unwrap().to_string(),
+        registration(&spec, &identity(), Some(&host())).unwrap().to_string()
     );
 }
 
@@ -151,7 +181,7 @@ fn named_user_account_uses_resolved_identity() {
     spec.user = User::Name("bindreams".to_string());
     let spec = DaemonSpec::new(spec).unwrap();
     let id = identity();
-    let reg = registration(&spec, &id, &shim_path()).unwrap();
+    let reg = registration(&spec, &id, Some(&host())).unwrap();
 
     assert_eq!(
         reg.account,
@@ -266,7 +296,7 @@ fn registration_canonicalizes_a_builtin_account() {
     let id = Identity {
         user: "LocalService".to_string(),
     };
-    let reg = registration(&spec, &id, &shim_path()).unwrap();
+    let reg = registration(&spec, &id, Some(&host())).unwrap();
 
     assert_eq!(reg.account, Some(r"NT AUTHORITY\LocalService".to_string()));
 }
@@ -282,7 +312,7 @@ fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
     // the empty-string path an unguarded `canonical_account` would map to
     // `Some("")` (see `windows_builtin("")`'s doc comment).
     let id = Identity { user: String::new() };
-    let reg = registration(&spec, &id, &shim_path()).unwrap();
+    let reg = registration(&spec, &id, Some(&host())).unwrap();
 
     assert_eq!(reg.account, None);
 }
@@ -840,7 +870,7 @@ fn registration_refuses_restart_always() {
             ..spec.into_fields()
         })
         .unwrap();
-        let err = registration(&spec, &identity(), &shim_path()).expect_err("`restart: always` must be refused");
+        let err = registration(&spec, &identity(), Some(&host())).expect_err("`restart: always` must be refused");
 
         assert!(
             matches!(&err, Error::Invalid { daemon, .. } if daemon.as_str() == "frpc"),
@@ -885,7 +915,7 @@ const EXECUTABLES_THE_WRITER_MANGLES: &[&str] = &[
 fn managed_refuses_an_executable_the_writer_would_mangle() {
     for executable in EXECUTABLES_THE_WRITER_MANGLES {
         let spec = managed_with_executable(executable);
-        let err = registration(&spec, &identity(), &shim_path()).expect_err(&format!(
+        let err = registration(&spec, &identity(), None).expect_err(&format!(
             "{executable:?} is rewritten by the writer and must be refused"
         ));
 
@@ -916,7 +946,7 @@ fn the_refusal_names_the_character_that_forced_the_quoting() {
         (r"C:\a b\", "space", "double quote"),
     ];
     for (executable, named, not_named) in cases {
-        let err = registration(&managed_with_executable(executable), &identity(), &shim_path())
+        let err = registration(&managed_with_executable(executable), &identity(), None)
             .expect_err(&format!("{executable:?} must be refused"));
         let text = err.to_string();
         assert!(text.contains(named), "{executable:?} should name a {named}: {text}");
@@ -933,7 +963,7 @@ fn the_refusal_names_the_character_that_forced_the_quoting() {
         ("C:\\a\u{b}b\\", "vertical tab", "space"),
     ];
     for (shim, named, not_named) in shim_cases {
-        let err = install_registration(&simple_spec(), &identity(), Path::new(shim))
+        let err = install_registration(&simple_spec(), &identity(), Some(&host_at(shim)))
             .expect_err(&format!("{shim:?} must be refused"));
         let text = err.to_string();
         assert!(text.contains(named), "{shim:?} should name a {named}: {text}");
@@ -949,7 +979,7 @@ fn the_refusal_names_the_character_that_forced_the_quoting() {
 fn managed_accepts_an_executable_the_writer_keeps() {
     for executable in EXECUTABLES_THE_WRITER_KEEPS {
         let spec = managed_with_executable(executable);
-        registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{executable:?}: {e}"));
+        registration(&spec, &identity(), None).unwrap_or_else(|e| panic!("{executable:?}: {e}"));
     }
 }
 
@@ -963,7 +993,7 @@ fn executable_refusal_matches_what_the_writer_loses() {
         .chain(EXECUTABLES_THE_WRITER_MANGLES)
     {
         let read_back = windows_style_split(&windows_style_command_line(executable, &["arg"]));
-        let refused = registration(&managed_with_executable(executable), &identity(), &shim_path()).is_err();
+        let refused = registration(&managed_with_executable(executable), &identity(), None).is_err();
         assert_eq!(
             refused,
             read_back[0] != *executable,
@@ -978,43 +1008,53 @@ fn executable_refusal_matches_what_the_writer_loses() {
 #[skuld::test]
 fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     let shim = PathBuf::from(r"C:\Program Files\Goetia\");
-    let err =
-        install_registration(&simple_spec(), &identity(), &shim).expect_err("a mangled shim path must be refused");
+    let err = install_registration(&simple_spec(), &identity(), Some(&host_at(&shim)))
+        .expect_err("a mangled shim path must be refused");
     let text = err.to_string();
     assert!(text.contains("service registration"), "{text}");
-    // No manifest sets the shim path: the message names it and its forcing character, and does
-    // not blame `command[0]`, name where the path came from, or send the user to an install location.
-    assert!(text.contains("goetia-shim path"), "{text}");
-    assert!(!text.contains("GOETIA_SHIM_PATH"), "{text}");
-    assert!(!text.contains("installed"), "{text}");
-    assert!(text.contains(&format!("{:?}", shim.display().to_string())), "{text}");
-    assert!(text.contains("space"), "{text}");
+    // No manifest sets the host path, and any provider's host reaches here: the message names it
+    // as the service host, with its forcing character, and does not blame `command[0]`.
+    assert!(
+        text.contains(&format!(
+            "the service host path {:?} cannot be written into the service registration: it holds a space, so \
+             the Windows service registration writer wraps it in quotes and doubles the backslashes it ends in, \
+             which SCM reads literally, so SCM would start a different path",
+            shim.display().to_string()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("goetia-shim"), "{text}");
     assert!(!text.contains("command[0]"), "{text}");
 
-    install_registration(&simple_spec(), &identity(), &shim_path()).unwrap();
+    install_registration(&simple_spec(), &identity(), Some(&host())).unwrap();
 }
 
 /// Rendering a `type: simple` daemon never fails for the shim path, whatever it is.
 #[skuld::test]
 fn rendering_a_simple_daemon_does_not_judge_the_shim_path() {
     for shim in [r"C:\Program Files\Goetia\", r#"C:\a"b\x"#] {
-        registration(&simple_spec(), &identity(), Path::new(shim)).unwrap_or_else(|e| panic!("{shim:?}: {e}"));
+        registration(&simple_spec(), &identity(), Some(&host_at(shim))).unwrap_or_else(|e| panic!("{shim:?}: {e}"));
     }
 }
 
 /// What install writes and `diff` shows is the registration, once the shim path is accepted.
 #[skuld::test]
 fn an_accepted_shim_path_gives_the_registration_itself() {
-    let shim = shim_path();
-    let installed = install_registration(&simple_spec(), &identity(), &shim).unwrap();
-    let rendered = registration(&simple_spec(), &identity(), &shim).unwrap();
+    let host = host();
+    let installed = install_registration(&simple_spec(), &identity(), Some(&host)).unwrap();
+    let rendered = registration(&simple_spec(), &identity(), Some(&host)).unwrap();
     assert_eq!(installed.to_string(), rendered.to_string());
 }
 
 /// A `type: managed` daemon has no shim: its own `command[0]` is what is judged, at rendering.
 #[skuld::test]
 fn a_managed_daemon_is_not_held_to_the_shim_path() {
-    install_registration(&managed_spec(), &identity(), Path::new(r"C:\Program Files\Goetia\")).unwrap();
+    install_registration(
+        &managed_spec(),
+        &identity(),
+        Some(&host_at(r"C:\Program Files\Goetia\")),
+    )
+    .unwrap();
 }
 
 #[skuld::test]
@@ -1026,7 +1066,7 @@ fn registration_accepts_never_and_on_failure() {
                 ..spec.into_fields()
             })
             .unwrap();
-            registration(&spec, &identity(), &shim_path()).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
+            registration(&spec, &identity(), Some(&host())).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
         }
     }
 }
@@ -1040,7 +1080,7 @@ fn managed_kind_clamps_absurdly_long_restart_delay() {
         ..managed_spec().into_fields()
     })
     .unwrap();
-    let reg = registration(&spec, &identity(), &shim_path()).unwrap();
+    let reg = registration(&spec, &identity(), Some(&host())).unwrap();
 
     let fa = reg
         .failure_actions
@@ -1105,7 +1145,7 @@ fn managed_kind_restart_delay_within_bound_does_not_clamp() {
     let mut spec = managed_spec().into_fields();
     spec.restart_delay = Some(Duration::from_secs(42));
     let spec = DaemonSpec::new(spec).unwrap();
-    let reg = registration(&spec, &identity(), &shim_path()).unwrap();
+    let reg = registration(&spec, &identity(), Some(&host())).unwrap();
 
     let fa = reg
         .failure_actions
@@ -1136,11 +1176,11 @@ fn parameters_round_trip_through_extract() {
 fn display_is_the_generation_invariant() {
     let spec = managed_spec();
     let id = identity();
-    let shim = shim_path();
+    let host = host();
 
-    let original = registration(&spec, &id, &shim).unwrap();
+    let original = registration(&spec, &id, Some(&host)).unwrap();
     let recovered_spec = extract(&original.parameters, &[]).unwrap().unwrap().spec;
-    let regenerated = registration(&recovered_spec, &id, &shim).unwrap();
+    let regenerated = registration(&recovered_spec, &id, Some(&host)).unwrap();
 
     assert_eq!(
         original.to_string(),

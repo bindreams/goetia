@@ -15,12 +15,13 @@
 //! [`StopBus`] is only the gate. [`Supervisor`] holds it with the [`Os`] and [`Log`] the run uses.
 
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
-use goetia::backend::scm::exit_status::Reported;
+use crate::backend::scm::exit_status::Reported;
 
-use crate::logging::Log;
-use crate::os::{Os, Spawned, os_error_of};
+use super::logging::Log;
+use super::os::{Os, Spawned, os_error_of};
+use crate::backend::standby::Standby;
 
 /// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
 /// decided wins over any failure; an exit decided first is reported whatever stop follows. SCM
@@ -91,14 +92,9 @@ pub enum WaitOutcome {
 /// clean start failure with nothing launched — see `service::launch`, the one caller that
 /// enforces the order.
 ///
-/// Deliberately not `goetia::backend::bounded`'s `Standby`, whose shape and vocabulary this
-/// follows: `spares` is a private module of the library's `pub(crate)` `backend::bounded` and
-/// this is a separate binary crate, and widening it would still not carry the part that matters
-/// most here — its failure-injection seam
-/// is `#[cfg(test)]` *inside the library*, which a binary linking that library never compiles, so
-/// no shim test could make a library `Standby` fail.
+/// A [`Standby`] of the daemon the thread waits on.
 pub struct Waiter {
-    hand: mpsc::Sender<Arc<dyn Spawned>>,
+    standby: Standby<Arc<dyn Spawned>>,
     thread: std::thread::JoinHandle<()>,
     /// The bus this waiter's thread reports the child's exit to, so
     /// [`Supervisor::wait_for_child_or_stop`] can check it is the bus that will
@@ -112,17 +108,14 @@ pub struct Waiter {
 
 impl Waiter {
     fn new(os: &dyn Os, log: &Arc<Log>, bus: &Arc<StopBus>, id: &str) -> io::Result<Waiter> {
-        let (hand, rx) = mpsc::channel::<Arc<dyn Spawned>>();
         let reporting_to = Arc::clone(bus);
         let bus = Arc::clone(bus);
         let log = Arc::clone(log);
         let id = id.to_string();
-        let thread = os.thread(
+        let (standby, thread) = Standby::with(
             "goetia-shim-waiter",
-            Box::new(move || {
-                let Ok(child) = rx.recv() else {
-                    return; // never handed a daemon: none was spawned
-                };
+            |name, run| os.thread(name, run),
+            move |child: Arc<dyn Spawned>| {
                 // A panic from here on reports as a failed wait, or `wait_while` would have no waker.
                 let mut report = ReportOnPanic { bus: &bus, armed: true };
                 // Notified on `Err` too: nothing else wakes `wait_while` in the no-stop case.
@@ -132,10 +125,10 @@ impl Waiter {
                 });
                 bus.report_done(failure);
                 report.armed = false;
-            }),
+            },
         )?;
         Ok(Waiter {
-            hand,
+            standby,
             thread,
             bus: reporting_to,
         })
@@ -143,12 +136,8 @@ impl Waiter {
 
     /// Hand the thread the daemon to wait on, and give back its handle to join once that wait can
     /// return — see [`Supervisor::wait_for_child_or_stop`], which is the only place that joins it.
-    ///
-    /// The thread is parked in `recv` with nothing before it that could end it, so the only way
-    /// the hand-off could fail is a thread that panicked before receiving anything, which nothing
-    /// in its body can do.
     fn watch(self, child: Arc<dyn Spawned>) -> std::thread::JoinHandle<()> {
-        let handed = self.hand.send(child);
+        let handed = self.standby.hand(child);
         debug_assert!(
             handed.is_ok(),
             "the waiter thread ended before it was handed the daemon"

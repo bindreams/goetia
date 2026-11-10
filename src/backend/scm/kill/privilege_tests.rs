@@ -4,99 +4,16 @@
 //! `tests/scm_integration` pin the whole path.
 
 use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NO_TOKEN, ERROR_SHARING_VIOLATION, LUID};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, LUID};
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx, GetTokenInformation, LUID_AND_ATTRIBUTES,
-    LookupPrivilegeValueW, PRIVILEGE_SET, PrivilegeCheck, SE_DEBUG_NAME, SecurityImpersonation,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenImpersonation,
-    TokenStatistics,
-};
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
+    GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PRIVILEGE_SET, PrivilegeCheck, SE_DEBUG_NAME,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
 };
 
 use super::{DebugPrivilege, enable_in, restore_notice};
-
-/// A copy of this process's token with every privilege removed, as an unelevated user has.
-fn token_without_privileges() -> OwnedHandle {
-    // SAFETY: plain Win32 calls with pointers to locals that outlive them.
-    unsafe {
-        let mut process = std::ptr::null_mut();
-        assert_ne!(
-            OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut process),
-            0,
-            "OpenProcessToken: {}",
-            io::Error::last_os_error()
-        );
-        let process = OwnedHandle::from_raw_handle(process);
-        let mut restricted = std::ptr::null_mut();
-        assert_ne!(
-            CreateRestrictedToken(
-                process.as_raw_handle(),
-                DISABLE_MAX_PRIVILEGE,
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                &mut restricted,
-            ),
-            0,
-            "CreateRestrictedToken: {}",
-            io::Error::last_os_error()
-        );
-        let restricted = OwnedHandle::from_raw_handle(restricted);
-        // The restricted token's own handle does not carry the right to adjust it.
-        let mut adjustable = std::ptr::null_mut();
-        assert_ne!(
-            DuplicateTokenEx(
-                restricted.as_raw_handle(),
-                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                std::ptr::null(),
-                SecurityImpersonation,
-                TokenImpersonation,
-                &mut adjustable,
-            ),
-            0,
-            "DuplicateTokenEx: {}",
-            io::Error::last_os_error()
-        );
-        OwnedHandle::from_raw_handle(adjustable)
-    }
-}
-
-/// An impersonation copy of this process's token, which holds whatever privileges the process does.
-fn process_token_copy(access: u32) -> OwnedHandle {
-    // SAFETY: plain Win32 calls with pointers to locals that outlive them.
-    unsafe {
-        let mut process = std::ptr::null_mut();
-        assert_ne!(
-            OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut process),
-            0,
-            "OpenProcessToken: {}",
-            io::Error::last_os_error()
-        );
-        let process = OwnedHandle::from_raw_handle(process);
-        let mut copy = std::ptr::null_mut();
-        assert_ne!(
-            DuplicateTokenEx(
-                process.as_raw_handle(),
-                access,
-                std::ptr::null(),
-                SecurityImpersonation,
-                TokenImpersonation,
-                &mut copy,
-            ),
-            0,
-            "DuplicateTokenEx: {}",
-            io::Error::last_os_error()
-        );
-        OwnedHandle::from_raw_handle(copy)
-    }
-}
+use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
 
 /// Skuld precondition: the process token holds `SeDebugPrivilege`, enabled or not.
 fn holds_debug_privilege() -> Result<(), String> {
@@ -108,18 +25,9 @@ fn holds_debug_privilege() -> Result<(), String> {
     }
 }
 
-/// The calling thread's own token, if it has one.
+/// The calling thread's own token, if it has one, opened to be queried.
 fn open_thread_token() -> Option<OwnedHandle> {
-    let mut token = std::ptr::null_mut();
-    // SAFETY: a pointer to a local; a returned token is owned below.
-    let ok = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
-    if ok != 0 {
-        // SAFETY: a valid handle `OpenThreadToken` just returned.
-        return Some(unsafe { OwnedHandle::from_raw_handle(token) });
-    }
-    let e = io::Error::last_os_error();
-    assert_eq!(e.raw_os_error(), Some(ERROR_NO_TOKEN as i32), "OpenThreadToken: {e}");
-    None
+    test_support::open_thread_token(TOKEN_QUERY)
 }
 
 fn thread_has_token() -> bool {
@@ -176,17 +84,6 @@ fn debug_privilege_enabled_on_thread() -> bool {
     result != 0
 }
 
-/// Removes any impersonation from the calling thread when dropped, so a failing assert leaves the
-/// test thread as it found it.
-struct ThreadTokenReset;
-
-impl Drop for ThreadTokenReset {
-    fn drop(&mut self) {
-        // SAFETY: a null thread means this one; a null token ends the impersonation.
-        unsafe { SetThreadToken(std::ptr::null(), std::ptr::null_mut()) };
-    }
-}
-
 #[skuld::test]
 fn a_token_without_the_privilege_is_not_enabled_and_not_an_error() {
     let token = token_without_privileges();
@@ -225,10 +122,8 @@ fn the_thread_has_the_privilege_enabled_exactly_while_the_guard_lives() {
 /// token back, not the process's and not none.
 #[skuld::test(requires = [holds_debug_privilege])]
 fn dropping_puts_back_the_thread_token_that_was_there() {
-    let _reset = ThreadTokenReset;
     let prior = process_token_copy(TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE);
-    // SAFETY: a null thread means this one; `prior` has `TOKEN_IMPERSONATE`.
-    assert_ne!(unsafe { SetThreadToken(std::ptr::null(), prior.as_raw_handle()) }, 0);
+    let _reset = ThreadTokenReset::impersonate(&prior);
     let prior_id = token_id(prior.as_raw_handle());
     assert_eq!(thread_token_id(), Some(prior_id));
 

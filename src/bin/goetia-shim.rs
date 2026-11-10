@@ -1,0 +1,1 @@
+goetia::stock_shim!();

@@ -10,7 +10,7 @@
 //! non-zero, a service-specific code included (it is carried as [`ERROR_SERVICE_SPECIFIC_ERROR`]),
 //! and it does so for a stop it commanded too.
 
-/// `argv[1]` (the service id) is missing.
+/// SCM passed the shim no usable service name.
 pub const ERROR_BAD_ARGUMENTS: u32 = 160;
 /// The shim could not read its metadata, and the read says nothing about the record: a failure
 /// SCM restarts, unlike [`Reported::Refused`].

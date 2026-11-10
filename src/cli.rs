@@ -10,9 +10,11 @@
 //! `show -f <file>` need no backend (pure generation, or a spec read from a
 //! file). `diff` always needs one, `-f` or not.
 //!
-//! `get_manager` and `is_elevated` are lazily-invoked closures so that a
-//! subcommand that needs neither never calls it; tests hand in a closure that
-//! panics if called.
+//! `get_manager`, `is_elevated` and `host` are lazily-invoked closures so that a
+//! subcommand that needs none of them never calls it; tests hand in a closure that
+//! panics if called. `host` names the command a Windows `type: simple` service is
+//! registered to run: it is called only by `install --dry-run` of such a daemon,
+//! which has no manager to ask. Linux and macOS never call it.
 
 pub mod diff;
 pub mod disable;
@@ -43,6 +45,29 @@ pub use exit::ExitCode;
 
 use crate::error::{EscapedStream, Result};
 use crate::manager::ServiceManager;
+use crate::shim::HostCommand;
+#[cfg(windows)]
+use crate::shim::{CheckPermissions, ShimProvider};
+
+// Windows providers ===================================================================================================
+
+/// The Windows manager whose `type: simple` services run the host `provider` supplies, with the
+/// folder permission check on.
+#[cfg(windows)]
+pub fn manager(provider: impl ShimProvider + 'static) -> Result<Box<dyn ServiceManager>> {
+    Ok(Box::new(crate::backend::scm::manager::Scm::with_shim(
+        provider,
+        CheckPermissions::Enable,
+    )))
+}
+
+/// goetia.exe's own provider for a build without the stock shim embedded (`cargo install`): it
+/// reads `goetia-shim.exe` beside `current_exe()` and places a copy under Program Files. The type
+/// stays crate-private; a consumer supplies its own provider.
+#[cfg(windows)]
+pub fn sibling_stock_shim() -> impl ShimProvider {
+    crate::backend::scm::shim::embedded::SiblingStockShim
+}
 
 // Cli =================================================================================================================
 
@@ -198,6 +223,7 @@ pub fn dispatch(
     cli: &Cli,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
     is_elevated: &dyn Fn() -> bool,
+    host: &dyn Fn() -> Result<HostCommand>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
@@ -211,13 +237,14 @@ pub fn dispatch(
         escaped_out = EscapedStream::new(out);
         &mut escaped_out
     };
-    run(cli, get_manager, is_elevated, out, &mut err).code()
+    run(cli, get_manager, is_elevated, host, out, &mut err).code()
 }
 
 fn run(
     cli: &Cli,
     get_manager: &dyn Fn() -> Result<Box<dyn ServiceManager>>,
     is_elevated: &dyn Fn() -> bool,
+    host: &dyn Fn() -> Result<HostCommand>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -246,7 +273,7 @@ fn run(
     }
 
     match cmd {
-        DaemonCommand::Install(args) => install::run(args, get_manager, is_elevated, out, err),
+        DaemonCommand::Install(args) => install::run(args, get_manager, is_elevated, host, out, err),
         DaemonCommand::Uninstall(args) => uninstall::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Start(args) => start::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Stop(args) => stop::run(args, get_manager, is_elevated, out, err),
