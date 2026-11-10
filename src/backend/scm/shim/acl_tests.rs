@@ -457,6 +457,15 @@ pub(in crate::backend::scm::shim) mod windows {
         FolderCheck::new(CheckPermissions::Enable)
     }
 
+    /// A volume that keeps no ACLs is refused: no owner or permissions can be read back from it.
+    /// The named-pipe file system is one that does not keep them.
+    #[skuld::test]
+    fn a_volume_that_keeps_no_acls_is_refused() {
+        let refusal = require_acls_under(Path::new(r"\\.\pipe\")).expect_err("the pipe file system keeps no ACLs");
+
+        assert!(matches!(refusal, Error::ShimFolderUnsafe { .. }), "{refusal:?}");
+    }
+
     #[skuld::test]
     fn a_disabled_check_reads_nothing() {
         let dir = tempfile::tempdir().unwrap();
