@@ -46,12 +46,17 @@
 //! (`print` shows `state = SIGTERMed`) until the job's process exits, or launchd kills it at the
 //! job's `ExitTimeOut`. A step that acts on the label afterwards must not meet the old job, so it
 //! waits until `print` reports the label not found (see [`Launchctl::bootout`]). Which steps wait,
-//! and under which bound, is listed once, in the README's "Waiting for a start or stop".
+//! and under which bound, is listed once, in the README's "Waiting for a start or stop". One rule
+//! that list leaves out: at its first read of the label, `start` waits only for a job whose `print`
+//! shows `state = SIGTERMed`. Any other job holding the label is taken as loaded: it is neither
+//! waited for nor removed there, and `bootstrap` is skipped (a `restart: always` job that is then
+//! not running is the corrective cycle's).
 //!
 //! The waits that have no bound are part of sending a request: bounded by a deadline, one could end
-//! with the old job still loaded, the `bootstrap` unsent and the daemon left unloaded. A job whose
-//! plist sets `ExitTimeOut` to 0 and ignores SIGTERM is never killed by launchd, and a process in
-//! uninterruptible sleep survives a kill, so such a wait may never end.
+//! with the old job still loaded, the `bootstrap` unsent and the daemon left unloaded. A job may
+//! never be removed if its plist sets `ExitTimeOut` to 0 and it ignores SIGTERM (launchd never
+//! kills it, so only a SIGKILL from outside ends it), or if its process is in uninterruptible sleep
+//! (which survives a kill). Any of these waits that has no bound may then never end.
 //!
 //! Only the modern verbs (`bootstrap`/`bootout`/`kickstart`/`print`) are used, never legacy
 //! `load`/`unload`. `launchctl enable`/`disable` and the plist's `Disabled` key are never touched:

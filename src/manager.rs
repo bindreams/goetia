@@ -87,7 +87,9 @@ pub trait ServiceManager {
     /// budget still probes and, if needed, bootstraps the job to completion
     /// before the plain `kickstart` that declines to wait. On macOS, stopping,
     /// restarting, uninstalling and some starts and installs wait for launchd
-    /// to remove a job; see the README's "Waiting for a start or stop".
+    /// to remove a job; see the README's "Waiting for a start or stop". A
+    /// `start`'s own wait for a removal is not bounded by the budget,
+    /// `Immediate` included.
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a
@@ -155,7 +157,8 @@ pub trait ServiceManager {
     /// [`Budget::Immediate`] still performs the full blocking call.**
     /// On macOS, stopping, restarting, uninstalling and some starts and
     /// installs wait for launchd to remove a job; see the README's "Waiting
-    /// for a start or stop".
+    /// for a start or stop". A `stop` under `Immediate` waits without bound
+    /// there; under a bounded budget it gives up at the deadline.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never

@@ -731,18 +731,25 @@ steps wait for that:
 - `daemon uninstall` waits for the removal without bound.
 - `daemon install` of a new daemon whose label is already held by a loaded job
   boots that job out and waits for its removal without bound. This happens
-  before any `--start`, so it does not spend `--timeout`.
-- `daemon start` over a job launchd is still removing (after a `stop` that
-  timed out, or another program's `launchctl bootout`) waits for the removal
-  without bound, then loads the job. The `--timeout` clock starts when the
-  command begins, so this wait spends it; the wait for running gets what is
-  left.
-- For `restart: always`, a waiting `start` (not `--timeout 0`) whose daemon
-  reads as not running boots the job out, waits for its removal without bound,
-  loads it again and reads it once more within what is left of `--timeout`.
+  before any `--start`, so the install's own boot-out does not spend
+  `--timeout`.
 
-A job whose plist sets `ExitTimeOut` to `0` and ignores SIGTERM is never
-removed, so any of these waits that has no bound never ends.
+The next two run in any start: `daemon start`, `restart`'s start leg, and
+`install --start`, including on an existing daemon whose job is being removed.
+
+- A start over a job launchd is still removing (after a `stop` that timed out,
+  or another program's `launchctl bootout`) waits for the removal without
+  bound, then loads the job. The `--timeout` clock starts when that daemon's
+  start begins (each id of `start a b c` has its own), so this wait spends it;
+  the wait for running gets what is left.
+- For `restart: always`, a waiting start (not `--timeout 0`) whose daemon reads
+  as not running boots the job out, waits for its removal without bound, loads
+  it again and reads it once more within what is left of `--timeout`.
+
+A job may never be removed if its plist sets `ExitTimeOut` to `0` and it
+ignores SIGTERM (launchd never kills it, so only a SIGKILL from outside ends
+it), or if its process is in uninterruptible sleep (which survives a kill). Any
+of these waits that has no bound may then never end.
 
 The two flags are mutually exclusive. `install` accepts them only alongside
 `--start`: without it nothing is started, so there is nothing to wait for,
@@ -950,18 +957,18 @@ So a timeout during `restart` leaves the daemon in an indeterminate state —
 it may or may not be stopped when you look, and a start may or may not have
 been issued. Which case you are in is in the error message.
 
-`restart --timeout 0` issues the stop and the start and confirms neither,
-which is what it is for. On systemd it is one `systemctl restart --no-block`,
+`restart --timeout 0` issues the stop and the start and, except for the macOS
+stop below, confirms neither, which is what it is for. On systemd it is one `systemctl restart --no-block`,
 one job, so no start can overtake the stop, and a restart systemd refuses has
 changed nothing (exit `1`). systemd stops the unit and starts it again, except
 while the unit is still starting: it folds the restart into the start already
 running, so nothing is stopped and the daemon comes up fresh from that start.
 On macOS
-it is a stop and then a start, and the stop waits for launchd to remove the job
-(see the list above). On Windows it is a stop and then a start, and a start
-refused in that window exits `4` rather than `0`: the daemon may be the
-instance the stop is still taking down, may be going down, or may never have
-moved.
+and Windows it is a stop and then a start. On macOS the stop waits for launchd
+to remove the job (see the list above), so the daemon is down before the start
+is issued, and only the start goes unconfirmed. On Windows a start refused in
+that window exits `4` rather than `0`: the daemon may be the instance the stop
+is still taking down, may be going down, or may never have moved.
 
 **On Windows, `restart --timeout 0` will usually stop the daemon and not
 restart it.** The start arrives while the service is still coming down and is

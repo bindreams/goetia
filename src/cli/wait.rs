@@ -22,9 +22,8 @@ pub struct WaitArgs {
     /// How long to wait for the manager to report the daemon reached the
     /// state asked for. Defaults to 10s. `--timeout 0` issues the request
     /// and returns without waiting, establishing nothing. On macOS, stopping,
-    /// restarting, uninstalling and some starts and installs wait for launchd
-    /// to remove a job; see the README's "Waiting for a start or stop". Write
-    /// a compound
+    /// restarting and some starts and installs wait for launchd to remove a
+    /// job; see the README's "Waiting for a start or stop". Write a compound
     /// duration unspaced (`2m30s`), or quote it as one argument: every verb
     /// taking this flag also takes a variadic id list, so `--timeout 2m 30s`
     /// passes `2m` here and `30s` as a daemon id.
