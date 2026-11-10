@@ -86,9 +86,9 @@ pub trait ServiceManager {
     /// print`/`bootstrap` have no non-blocking spelling: a `start` with no
     /// budget still probes and, if needed, bootstraps the job to completion
     /// before the plain `kickstart` that declines to wait.
-    /// On macOS a `stop` waits for launchd to remove the job, even under
-    /// `Immediate` (a bounded budget ends that wait at its deadline), and a
-    /// `start` waits for a job still going away before it loads it; see the
+    /// On macOS a `stop` waits for launchd to remove the job, and a budget that
+    /// does not wait (`Immediate`, a zero bound) does not bound that wait; a
+    /// `start` waits for a job still going away before it loads it. See the
     /// README's "Waiting for a start or stop".
     ///
     /// An answer from the manager that itself establishes the goal is the
@@ -156,9 +156,9 @@ pub trait ServiceManager {
     ///
     /// **Where a platform offers no request-only form,
     /// [`Budget::Immediate`] still performs the full blocking call.**
-    /// On macOS a `stop` waits for launchd to remove the job, even under
-    /// `Immediate` (a bounded budget ends that wait at its deadline), and a
-    /// `start` waits for a job still going away before it loads it; see the
+    /// On macOS a `stop` waits for launchd to remove the job, and a budget that
+    /// does not wait (`Immediate`, a zero bound) does not bound that wait; a
+    /// `start` waits for a job still going away before it loads it. See the
     /// README's "Waiting for a start or stop".
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
