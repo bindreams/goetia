@@ -43,7 +43,7 @@ pub use stock::EmbeddedStockShim;
 #[cfg(all(windows, feature = "cli"))]
 pub(crate) use stock::SiblingStockShim;
 #[cfg(windows)]
-pub(in crate::backend::scm) use stock::default_dir;
+pub(in crate::backend::scm) use stock::folder_in;
 
 #[cfg(windows)]
 mod stock {
@@ -64,7 +64,7 @@ mod stock {
         Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, read_object, require_acls_under,
     };
     use super::super::marker::read_retrying;
-    use super::super::provider::ShimProvider;
+    use super::super::provider::{ShimProvider, require_absolute};
     use super::super::sweep::{SweepFailure, sweep_folder};
     use crate::error::{Error, Result};
     use crate::shim::HostCommand;
@@ -103,7 +103,7 @@ mod stock {
         }
 
         fn dir(&self) -> Result<PathBuf> {
-            self.dir.clone().map_or_else(default_dir, Ok)
+            folder_in(self.dir.as_deref())
         }
     }
 
@@ -112,7 +112,7 @@ mod stock {
         /// [`Error::ShimNotEmbedded`]; with a relative `dir`, [`Error::ShimPathRelative`].
         fn preview(&self) -> Result<HostCommand> {
             let image = self.image()?;
-            preview_in(&self.dir()?, image)
+            Ok(preview_in(&self.dir()?, image))
         }
 
         /// Checks `dir` with `folders`, creates what is missing of it, and leaves the file in place
@@ -125,18 +125,21 @@ mod stock {
             provide_in(&self.dir()?, image, folders)
         }
 
-        /// Deletes the shim files in `dir`, and what a repair or a crash left beside them, that no
-        /// path of `referenced` names, and removes `dir` when that leaves it empty and it is the
+        /// `dir`, or the default folder. With a relative `dir` it is [`Error::ShimPathRelative`].
+        fn folder(&self) -> Result<Option<PathBuf>> {
+            self.dir().map(Some)
+        }
+
+        /// Deletes the shim files in `folder()`, and what a repair or a crash left beside them, that
+        /// no path of `referenced` names, and removes it when that leaves it empty and it is the
         /// default folder; see [`sweep_folder`], which also refuses a folder `folders` refuses.
         fn sweep(&self, referenced: &[PathBuf], folders: &FolderCheck) -> std::result::Result<(), SweepFailure> {
+            let dir = self.dir()?;
             match &self.dir {
-                Some(dir) => sweep_folder(absolute(dir)?, referenced, folders, default_dir),
+                Some(_) => sweep_folder(&dir, referenced, folders, || folder_in(None)),
                 // The folder is the default one: the lookup that found it is the answer to the
                 // question of where the default folder is.
-                None => {
-                    let dir = default_dir()?;
-                    sweep_folder(&dir, referenced, folders, || Ok(dir.clone()))
-                }
+                None => sweep_folder(&dir, referenced, folders, || Ok(dir.clone())),
             }
         }
     }
@@ -164,17 +167,22 @@ mod stock {
     impl ShimProvider for SiblingStockShim {
         fn preview(&self) -> Result<HostCommand> {
             let bytes = self.read()?;
-            preview_in(&default_dir()?, &Image::new(&bytes))
+            Ok(preview_in(&folder_in(None)?, &Image::new(&bytes)))
         }
 
         fn provide(&self, folders: &FolderCheck) -> Result<HostCommand> {
             let bytes = self.read()?;
-            provide_in(&default_dir()?, &Image::new(&bytes), folders)
+            provide_in(&folder_in(None)?, &Image::new(&bytes), folders)
+        }
+
+        /// The default folder, which does not depend on the sibling.
+        fn folder(&self) -> Result<Option<PathBuf>> {
+            folder_in(None).map(Some)
         }
 
         /// As [`EmbeddedStockShim`]'s, over the default folder, and whether or not the sibling is there.
         fn sweep(&self, referenced: &[PathBuf], folders: &FolderCheck) -> std::result::Result<(), SweepFailure> {
-            let dir = default_dir()?;
+            let dir = folder_in(None)?;
             sweep_folder(&dir, referenced, folders, || Ok(dir.clone()))
         }
     }
@@ -229,7 +237,7 @@ mod stock {
     // Where it goes ===================================================================================================
 
     /// `%ProgramFiles%\Goetia`.
-    pub(in crate::backend::scm) fn default_dir() -> Result<PathBuf> {
+    pub(super) fn default_dir() -> Result<PathBuf> {
         let mut path: *mut u16 = std::ptr::null_mut();
         // SAFETY: the folder ID is a static; `KF_FLAG_DEFAULT` and no token ask for the machine's
         // folder; `path` is a valid out-pointer.
@@ -267,29 +275,31 @@ mod stock {
         Error::os("locate %ProgramFiles%", source)
     }
 
-    /// `dir`, if it is an absolute path.
-    fn absolute(dir: &Path) -> Result<&Path> {
-        if dir.is_absolute() {
-            Ok(dir)
-        } else {
-            Err(Error::ShimPathRelative {
-                path: dir.to_path_buf(),
-            })
-        }
+    /// The folder a stock shim goes in: `dir`, or the default one. A relative one is
+    /// [`Error::ShimPathRelative`].
+    pub(in crate::backend::scm) fn folder_in(dir: Option<&Path>) -> Result<PathBuf> {
+        let folder = match dir {
+            Some(dir) => dir.to_path_buf(),
+            None => default_dir()?,
+        };
+        require_absolute(&folder)?;
+        Ok(folder)
     }
 
-    fn preview_in(dir: &Path, image: &Image<'_>) -> Result<HostCommand> {
-        Ok(HostCommand {
-            exe: absolute(dir)?.join(image.file_name()),
+    /// The command for `image` in `dir`, which comes from [`folder_in`].
+    fn preview_in(dir: &Path, image: &Image<'_>) -> HostCommand {
+        debug_assert!(dir.is_absolute(), "{}", dir.display());
+        HostCommand {
+            exe: dir.join(image.file_name()),
             args: vec![],
-        })
+        }
     }
 
     // Provisioning ====================================================================================================
 
     /// The core of every `provide`: the file for `image` in `dir`, checked, written or repaired.
     fn provide_in(dir: &Path, image: &Image<'_>, folders: &FolderCheck) -> Result<HostCommand> {
-        let command = preview_in(dir, image)?;
+        let command = preview_in(dir, image);
         // Before anything is created, so that a folder under an unsafe ancestor is refused without
         // a trace. For a folder that does not exist this judges its first existing ancestor alone.
         folders.check(dir)?;
