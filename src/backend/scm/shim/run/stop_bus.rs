@@ -19,6 +19,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::backend::scm::exit_status::Reported;
 
+use super::exit;
 use super::logging::Log;
 use super::os::{Os, Spawned, os_error_of};
 use crate::backend::standby::Standby;
@@ -118,12 +119,20 @@ impl Waiter {
             move |child: Arc<dyn Spawned>| {
                 // A panic from here on reports as a failed wait, or `wait_while` would have no waker.
                 let mut report = ReportOnPanic { bus: &bus, armed: true };
-                // Notified on `Err` too: nothing else wakes `wait_while` in the no-stop case.
-                let failure = child.wait().err().map(|e| {
-                    log.failure(&id, &wait_failed(&e));
-                    os_error_of(&e)
+                let waited = child.wait();
+                // Everything after the wait is gated, the drops included: this thread is never
+                // joined when the daemon could not be killed, and the process must not end under it.
+                exit::gated(|| {
+                    // Notified on `Err` too: nothing else wakes `wait_while` in the no-stop case.
+                    let failure = waited.err().map(|e| {
+                        log.failure(&id, &wait_failed(&e));
+                        os_error_of(&e)
+                    });
+                    bus.report_done(failure);
+                    drop(child);
+                    drop(log);
+                    drop(id);
                 });
-                bus.report_done(failure);
                 report.armed = false;
             },
         )?;
@@ -132,6 +141,14 @@ impl Waiter {
             thread,
             bus: reporting_to,
         })
+    }
+
+    /// End a waiter that is never handed a daemon, and wait for its thread: left to end on its own
+    /// it would free what it holds as the process may be ending.
+    pub(super) fn stand_down(self) {
+        drop(self.standby);
+        // A panic of the thread is of nothing it was handed: it was handed nothing.
+        let _ = self.thread.join();
     }
 
     /// Hand the thread the daemon to wait on, and give back its handle to join once that wait can
@@ -428,7 +445,7 @@ struct ReportOnPanic<'a> {
 impl Drop for ReportOnPanic<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.bus.report_done(Some(None));
+            exit::gated(|| self.bus.report_done(Some(None)));
         }
     }
 }

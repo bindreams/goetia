@@ -6,7 +6,7 @@
 //! start a new shim, which reads the installed spec afresh.
 
 use std::ffi::{OsString, c_void};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
@@ -25,6 +25,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use super::super::marker;
+use super::exit;
 use super::logging::Log;
 use super::os::{Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
@@ -35,73 +36,61 @@ use super::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_f
 /// service's real name is `service_main`'s first argument.
 const TABLE_NAME: &str = "goetia-shim";
 
-/// What the service thread reported to SCM. The main thread exits with its code once the
-/// dispatcher returns, so the process exits once, with the code SCM was told.
-static EXIT: OnceLock<Reported> = OnceLock::new();
-
-/// Called from `main()`. Hands control to SCM, and never returns normally. [`finish`] stores
-/// what every path that reports `STOPPED` reported, and the dispatcher returns after it, so this
-/// exits with it; `service_main` exits itself on every path that cannot report one, with a code
-/// from `crate::backend::scm::exit_status`. Reads no process arguments: the service name comes
-/// from SCM.
+/// Called from `main()`. Hands control to SCM, and never returns normally. [`finish`] records what
+/// every path that reports `STOPPED` reported, and the dispatcher returns once the service thread
+/// does, so this ends the process with it (see [`exit`]); the paths that cannot report one end it
+/// themselves, with a code from `crate::backend::scm::exit_status`. Reads no process arguments: the
+/// service name comes from SCM.
 pub(crate) fn run() -> ! {
     // Every host reaches here, and this read is what keeps its version marker in the linked binary.
     std::hint::black_box(&marker::MARKER);
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
         Log::real().failure(TABLE_NAME, &format!("connect to the SCM dispatcher: {e}"));
-        std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
+        exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
-    // Clean when the dispatcher returned with no service run.
-    std::process::exit(EXIT.get().copied().unwrap_or(Reported::Clean).process_exit_code());
+    exit::end_when_dispatched()
 }
 
 define_windows_service!(ffi_service_main, service_main);
 
 /// SCM's arguments to `ServiceMain`: the first is the service's name.
 fn service_main(scm_args: Vec<OsString>) {
-    let Some(id) = scm_args.first().and_then(|name| name.to_str()).map(str::to_owned) else {
+    let Some(id) = scm_args.first().and_then(|name| name.to_str()) else {
         Log::real().failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
-        std::process::exit(ERROR_BAD_ARGUMENTS as i32);
+        exit::end_process(ERROR_BAD_ARGUMENTS as i32);
     };
-    // Freed here, not at the end of this function: see `finish`.
-    drop(scm_args);
     run_service(id);
 }
 
-/// Everything `run_service` owns, other than the log and the id [`finish`] needs, is dropped
-/// before `finish` runs: nothing may run on this thread after `STOPPED` but the return.
-fn run_service(id: String) {
+fn run_service(id: &str) {
     let log = Arc::new(Log::real());
     let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
-    let status_handle = match register_control_handler(&id, &supervisor.bus) {
+    let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
         Err(e) => {
-            log.failure(&id, &format!("register SCM control handler: {e}"));
-            std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
+            log.failure(id, &format!("register SCM control handler: {e}"));
+            exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
         }
     };
 
-    let blob = match spec_read(&id, read_spec_blob(&id)) {
+    let blob = match spec_read(id, read_spec_blob(id)) {
         Ok(blob) => blob,
         Err(stop) => {
-            log.failure(&id, &stop.message);
-            drop(supervisor);
-            return finish(log, id, status_handle, stop.reported);
+            log.failure(id, &stop.message);
+            return finish(&log, id, status_handle, stop.reported);
         }
     };
 
-    log.set_daemon_log(log.daemon_log_path(&id, blob.spec.logs.as_deref()));
-    log_version_skew(&log, &id, &blob.spec, &blob.version, crate::version());
+    log.set_daemon_log(log.daemon_log_path(id, blob.spec.logs.as_deref()));
+    log_version_skew(&log, id, &blob.spec, &blob.version, crate::version());
     let reported = run_daemon(
         &blob.spec,
         &supervisor,
-        &id,
-        || report_running(&log, &id, status_handle),
-        || report_stopping(&log, &id, status_handle),
+        id,
+        || report_running(&log, id, status_handle),
+        || report_stopping(&log, id, status_handle),
     );
-    drop(blob);
-    drop(supervisor);
-    finish(log, id, status_handle, reported);
+    finish(&log, id, status_handle, reported);
 }
 
 /// Why the shim reads no spec to run, and what it tells SCM.
@@ -145,21 +134,29 @@ fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob,
 }
 
 /// Tell SCM the service stopped and return, leaving the exit to the main thread: the dispatcher
-/// returns once `service_main` does, and the main thread exits with [`EXIT`]. The main thread's
-/// exit ends this thread wherever it is, possibly inside the allocator holding its lock, so once
-/// `STOPPED` is reported nothing runs here but the return: `log` and `id` are leaked rather than
-/// freed. Neither has a drop with an effect (the log's channels open and close the files and the
-/// event source per call), and the process ends at once. When `STOPPED` cannot be reported the
-/// dispatcher does not return, so the failure is logged and the exit is here.
-fn finish(log: Arc<Log>, id: String, status_handle: StatusHandle, reported: Reported) {
-    let first = EXIT.set(reported).is_ok();
-    debug_assert!(first, "the service thread finished twice");
-    if let Err(e) = report_stopped(status_handle, reported) {
-        log.failure(&id, &stopped_report_failure(&e));
-        std::process::exit(reported.process_exit_code());
+/// returns once `service_main` does, and the main thread ends the process with what is recorded
+/// here, after waiting for this thread to end (see [`exit`]). When `STOPPED` cannot be reported, or
+/// this thread cannot be registered for that wait, the dispatcher is not trusted to return, or the
+/// exit would not wait for this thread, so the exit is here.
+fn finish(log: &Log, id: &str, status_handle: StatusHandle, reported: Reported) {
+    exit::record(reported);
+    let registered = match exit::register_service_thread() {
+        Ok(()) => true,
+        Err(e) => {
+            log.failure(id, &thread_unregistered(&e));
+            false
+        }
+    };
+    let stopped = match report_stopped(status_handle, reported) {
+        Ok(()) => true,
+        Err(e) => {
+            log.failure(id, &stopped_report_failure(&e));
+            false
+        }
+    };
+    if !(registered && stopped) {
+        exit::end_process(reported.process_exit_code());
     }
-    std::mem::forget(log);
-    std::mem::forget(id);
 }
 
 /// The `STOP_PENDING` status held while the shim tears the daemon down, accepting no control. SCM
@@ -238,14 +235,15 @@ unsafe extern "system" fn control_handler(
 /// `NO_ERROR` too. The decided exit is reported as it is; SCM restarts it if the restart policy
 /// covers it.
 fn handle_control(stop_bus: &StopBus, control: u32) -> u32 {
-    match control {
+    // Gated: the service thread can end the process while this runs on the dispatcher thread.
+    exit::gated(|| match control {
         SERVICE_CONTROL_STOP => {
             stop_bus.request_stop();
             NO_ERROR
         }
         SERVICE_CONTROL_INTERROGATE => NO_ERROR,
         _ => ERROR_CALL_NOT_IMPLEMENTED,
-    }
+    })
 }
 
 /// Report `RUNNING`. A failure is logged: SCM keeps the last state it confirmed.
@@ -283,6 +281,10 @@ fn report_stopped(handle: StatusHandle, reported: Reported) -> std::io::Result<(
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn thread_unregistered(e: &std::io::Error) -> String {
+    format!("keep a handle to the service thread: {e}; the shim exits from that thread, without waiting for it to end")
 }
 
 /// The shim exits after this without a `STOPPED` report. SCM is expected to read that as a crash
@@ -346,8 +348,14 @@ fn run_daemon(
         WaitOutcome::WaitFailed { os_error } => supervisor.bus.settle(Reported::shim_failure(os_error)),
         // `wait_for_child_or_stop` terminated the tree before returning this.
         WaitOutcome::Stopping => Reported::Clean,
-        // Still reports STOPPED so the service stays stoppable and uninstallable.
-        WaitOutcome::DaemonMayRun => Reported::incomplete_stop(),
+        // Still reports STOPPED so the service stays stoppable and uninstallable. Its kills were
+        // refused, and dropping the child kills it again and waits, with no bound on a backend
+        // that cannot contain it: it is leaked, as `require_job_object` lets its child go. The
+        // Job Object, which `launch` requires, closes with the process.
+        WaitOutcome::DaemonMayRun => {
+            std::mem::forget(child);
+            Reported::incomplete_stop()
+        }
     }
 }
 
@@ -393,10 +401,18 @@ fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<d
             return Err(Reported::shim_failure(e.raw_os_error()));
         }
     };
+    // A waiter that is not handed the daemon is stood down, not dropped: see `Waiter::stand_down`.
     match supervisor.os.spawn(build_command(spec, &*supervisor.os, log, id)) {
-        Ok(child) => require_job_object(child, spec, log, id).map(|child| (Arc::from(child), waiter)),
+        Ok(child) => match require_job_object(child, spec, log, id) {
+            Ok(child) => Ok((Arc::from(child), waiter)),
+            Err(reported) => {
+                waiter.stand_down();
+                Err(reported)
+            }
+        },
         Err(e) => {
             log.failure(id, &spawn_failed(&spec.command, &e));
+            waiter.stand_down();
             Err(Reported::shim_failure(spawn_error_code(&e)))
         }
     }

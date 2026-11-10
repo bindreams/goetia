@@ -1129,3 +1129,54 @@ fn a_failed_stopped_report_says_scm_is_expected_to_read_a_crash() {
         assert!(text.contains(part), "missing {part:?}: {text}");
     }
 }
+
+// The waiter of a daemon that never ran -------------------------------------------------------------------------------
+
+/// A waiter not handed the daemon ends on its own once dropped, freeing what it holds on a thread
+/// nothing joins, as the process may be ending. `launch` waits for it instead.
+#[skuld::test]
+fn a_waiter_that_is_not_handed_the_daemon_has_ended_when_launch_returns() {
+    let refused_spawn = FakeGuard::new();
+    refused_spawn.will_make_thread();
+    refused_spawn.will_refuse_spawn(not_found());
+    let uncontained = FakeGuard::new();
+    uncontained.will_make_thread();
+    uncontained.will_spawn(
+        FakeProcess::new()
+            .containment(Containment::TreeWalk)
+            .kill_tree(KillReply::Ends),
+    );
+
+    for fake in [&refused_spawn, &uncontained] {
+        let launched = launch(&spec(), &supervisor(fake), ID);
+
+        assert!(launched.is_err());
+        assert!(
+            fake.waiter_has_ended(0),
+            "launch returned with the waiter still running"
+        );
+        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+        fake.take_failures();
+    }
+}
+
+/// A daemon whose kills were refused is never dropped, whichever thread would hold the last
+/// reference: dropping kills it again and waits, with no bound on a backend that cannot contain it.
+/// The waiter here ended with a failed wait before the kills, so the pass holds the last one.
+#[skuld::test]
+fn a_daemon_whose_kills_were_refused_is_never_dropped() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Refuses);
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert!(!daemon.dropped(), "the shim dropped a daemon it could not kill");
+    fake.take_failures();
+}
