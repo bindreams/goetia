@@ -213,7 +213,7 @@ pub(crate) fn require_elevation(
         return Ok(());
     }
     let e = Error::ElevationRequired {
-        subcommand: subcommand.to_string(),
+        what: format!("`{subcommand}`"),
     };
     print_error(err, None, "", &e);
     Err(ExitCode::Error)

@@ -52,9 +52,12 @@ pub(crate) trait Backend {
 
     // Primitives ------------------------------------------------------------------------------------------------------
 
-    /// Everything an install needs before it reads anything, held until it ends: a version gate, a
-    /// lock, the check that a manager can be asked. Fails before anything is read or written.
-    fn begin_install(&self, spec: &DaemonSpec) -> Result<Self::InstallScope>;
+    /// Everything an install needs before it reads the installed definition, held until it ends: a
+    /// version gate, a lock, the check that a manager can be asked. Fails before that is read or
+    /// anything is written. Run after [`Self::render_for_install`] has succeeded, so it holds or
+    /// writes nothing for an install that cannot be rendered. `desired` is that render: what a
+    /// backend places for the install (SCM's service host) must be what `desired` names.
+    fn begin_install(&self, spec: &DaemonSpec, desired: &Self::Definition) -> Result<Self::InstallScope>;
 
     /// Make ready, all or none, what each of `steps` can draw under `budget`, before the first of
     /// them sends anything: a failure here means nothing was sent. See [`ServiceManager::prepare`].
@@ -63,6 +66,19 @@ pub(crate) trait Backend {
     /// `spec` in this manager's form. Fails where the platform cannot express it (an account that
     /// does not resolve).
     fn render(&self, spec: &DaemonSpec) -> Result<Self::Definition>;
+
+    /// `spec` as `render` would write it, judged against `snapshot`: what `judge`, `status` and
+    /// `list` regenerate from a stored spec. A backend whose rendering depends on something that
+    /// outlives the install (SCM's service host, which a provider may place elsewhere later) keeps
+    /// that part from what is installed, so the comparison is of the spec alone. `install` and
+    /// `preview_install` still render the desired definition, with [`Self::render_for_install`]. What it reads of the installed
+    /// service must be no more than `live_status` reads, so `status` and `list` gain no failure
+    /// mode; `judge` calls [`Self::installed`] first, so a failed read is never taken for a bad spec.
+    /// A failed read of what is installed is [`Error::InstalledUnreadable`], which `status` and `list`
+    /// report as that, not as a spec that cannot be regenerated.
+    fn regenerate(&self, spec: &DaemonSpec, _snapshot: &Self::Snapshot) -> Result<Self::Definition> {
+        self.render(spec)
+    }
 
     /// [`Self::render`], for the definition an install writes and `diff` previews: also fails where
     /// the host, not the daemon, cannot carry it. `list` and `status` render every daemon with
@@ -107,6 +123,15 @@ pub(crate) trait Backend {
 
     /// See [`ServiceManager::uninstall`].
     fn uninstall(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<()>;
+
+    /// What `uninstall` of an `id` that is not installed does before it says so: a backend that keeps
+    /// something of its own beyond the service itself (SCM's shim files, which an uninstall that
+    /// failed to sweep leaves behind) cleans it up. A failure replaces [`Error::NotInstalled`], which
+    /// the CLI renders as success, so that re-running `uninstall` is how a failed cleanup is retried.
+    /// Never called for an id that is foreign or whose state is undetermined.
+    fn uninstall_absent(&self, _id: &Id) -> Result<()> {
+        Ok(())
+    }
 
     /// See [`ServiceManager::enable`].
     fn enable(&self, snapshot: Self::Snapshot) -> Result<()>;
@@ -237,7 +262,12 @@ impl<B: Backend> ServiceManager for B {
     }
 
     fn uninstall(&self, id: &Id) -> Result<()> {
-        let snapshot = flow::owned(self, id)?;
+        let snapshot = match flow::owned(self, id) {
+            Err(absent @ Error::NotInstalled { .. }) => {
+                return Err(Backend::uninstall_absent(self, id).err().unwrap_or(absent));
+            }
+            owned => owned?,
+        };
         // `uninstall` has no `--timeout` of its own: its stop is unbounded.
         let mut reservation = flow::reserved(self, id, Step::Uninstall, Budget::Unbounded)?;
         Backend::uninstall(self, snapshot, &mut reservation)

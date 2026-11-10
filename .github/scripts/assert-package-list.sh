@@ -11,7 +11,7 @@
 # whether nothing leaked or the listing itself is empty or truncated — so
 # before trusting a clean exclusion result, this asserts that a path known
 # to ship (`Cargo.toml`, `src/lib.rs`) and both `[[bin]]` sources
-# (`src/main.rs`, `src/bin/shim/main.rs`) are actually present. The bin
+# (`src/main.rs`, `src/bin/goetia-shim.rs`) are actually present. The bin
 # sources double as a build-breaking check of their own: an `exclude` entry
 # that swallowed one would fail every consumer's build, not just fail to
 # publish.
@@ -62,7 +62,7 @@ required_paths=(
     "Cargo.toml"
     "src/lib.rs"
     "src/main.rs"
-    "src/bin/shim/main.rs"
+    "src/bin/goetia-shim.rs"
 )
 
 for required in "${required_paths[@]}"; do

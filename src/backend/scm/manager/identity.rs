@@ -22,9 +22,10 @@ use windows_sys::Win32::Security::Authentication::Identity::{
     POLICY_CREATE_ACCOUNT, POLICY_LOOKUP_NAMES,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
-use windows_sys::Win32::Security::{LookupAccountNameW, LookupAccountSidW, PSID};
+use windows_sys::Win32::Security::{IsValidSid, LookupAccountNameW, LookupAccountSidW, PSID};
 
 use crate::backend::Identity;
+use crate::backend::scm::shim::acl::sid_text;
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, User};
 
@@ -121,6 +122,27 @@ fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
         LocalFree(psid);
     }
     result
+}
+
+/// The domain-qualified name of the account a binary SID names. An error when the bytes are not
+/// a SID or no account has it (a deleted account's SID still appears in ACLs).
+pub(in crate::backend::scm) fn account_name_of_sid(sid: &[u8]) -> Result<String> {
+    // `sid_text` checks that the bytes hold the sub-authorities they declare, which `IsValidSid`
+    // would otherwise read past a short slice to find out.
+    let Some(sid_str) = sid_text(sid) else {
+        return Err(Error::AccountLookup {
+            detail: format!("{sid:?} is not a SID"),
+            source: None,
+        });
+    };
+    // SAFETY: `sid_text` has checked that `sid` holds a whole SID's bytes.
+    if unsafe { IsValidSid(sid.as_ptr() as PSID) } == 0 {
+        return Err(Error::AccountLookup {
+            detail: format!("{sid_str} is not a valid SID"),
+            source: None,
+        });
+    }
+    lookup_account_sid(sid.as_ptr() as PSID, &sid_str)
 }
 
 fn lookup_account_sid(psid: PSID, sid_str: &str) -> Result<String> {

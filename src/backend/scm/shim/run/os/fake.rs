@@ -23,7 +23,7 @@ use std::thread::JoinHandle;
 use cosca::Containment;
 
 use super::{Channels, Os, Severity, Spawned};
-use crate::logging::Log;
+use crate::backend::scm::shim::run::logging::Log;
 
 /// The message of the usual refused thread: `io::Error::other(NO_THREAD)`.
 pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";
