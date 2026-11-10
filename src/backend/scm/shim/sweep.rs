@@ -478,13 +478,15 @@ mod system {
             Err(e) => return Err(Error::os_at("read", dir, e).into()),
         }
         folders.check(dir)?;
-        let swept = sweep_files(dir, referenced);
-        // A sweep that failed leaves its folder for the retry, and has said why: a folder it could
-        // not list is not listed again to be reported twice.
-        let removed = match swept {
-            Ok(()) => remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir)))),
-            Err(_) => Ok(()),
+        // A folder that cannot be listed is reported here, once, and is not listed again to be
+        // asked whether it is empty.
+        let listing = match fs::read_dir(dir) {
+            Ok(listing) => listing,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::os_at("read", dir, e).into()),
         };
+        let swept = sweep_files(dir, listing, referenced);
+        let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir))));
         SweepFailure::all(swept.err().into_iter().chain(removed.err())).map_or(Ok(()), Err)
     }
 
@@ -518,22 +520,16 @@ mod system {
     }
 
     /// The deletion half of [`sweep_folder`].
-    fn sweep_files(dir: &Path, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+    fn sweep_files(dir: &Path, listing: fs::ReadDir, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
         let mut failures = Vec::new();
         let mut entries = Vec::new();
-        match fs::read_dir(dir) {
-            Ok(listing) => {
-                for entry in listing {
-                    match entry {
-                        // A name that is no shim file's is dropped by `unreferenced`; a folder that a
-                        // repair set aside whole is a shim file's name too.
-                        Ok(entry) => entries.push((entry.file_name(), entry.file_type().is_ok_and(|t| t.is_dir()))),
-                        Err(e) => failures.push(Error::os_at("read an entry of", dir, e).into()),
-                    }
-                }
+        for entry in listing {
+            match entry {
+                // A name that is no shim file's is dropped by `unreferenced`; a folder that a
+                // repair set aside whole is a shim file's name too.
+                Ok(entry) => entries.push((entry.file_name(), entry.file_type().is_ok_and(|t| t.is_dir()))),
+                Err(e) => failures.push(Error::os_at("read an entry of", dir, e).into()),
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(Error::os_at("read", dir, e).into()),
         }
         entries.sort();
 
