@@ -485,8 +485,14 @@ mod system {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(Error::os_at("read", dir, e).into()),
         };
-        let swept = sweep_files(dir, listing, referenced);
-        let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir))));
+        let (swept, listed) = sweep_files(dir, listing, referenced);
+        // A listing that failed on an entry is reported by the sweep, and leaves the folder not known
+        // to be empty: it stays, and is not listed again to say so a second time.
+        let removed = if listed {
+            remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir))))
+        } else {
+            Ok(())
+        };
         SweepFailure::all(swept.err().into_iter().chain(removed.err())).map_or(Ok(()), Err)
     }
 
@@ -519,16 +525,24 @@ mod system {
         }
     }
 
-    /// The deletion half of [`sweep_folder`].
-    fn sweep_files(dir: &Path, listing: fs::ReadDir, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+    /// The deletion half of [`sweep_folder`], and whether every entry of the listing was read.
+    fn sweep_files(
+        dir: &Path,
+        listing: fs::ReadDir,
+        referenced: &[PathBuf],
+    ) -> (std::result::Result<(), SweepFailure>, bool) {
         let mut failures = Vec::new();
         let mut entries = Vec::new();
+        let mut listed = true;
         for entry in listing {
             match entry {
                 // A name that is no shim file's is dropped by `unreferenced`; a folder that a
                 // repair set aside whole is a shim file's name too.
                 Ok(entry) => entries.push((entry.file_name(), entry.file_type().is_ok_and(|t| t.is_dir()))),
-                Err(e) => failures.push(Error::os_at("read an entry of", dir, e).into()),
+                Err(e) => {
+                    listed = false;
+                    failures.push(Error::os_at("read an entry of", dir, e).into());
+                }
             }
         }
         entries.sort();
@@ -551,7 +565,7 @@ mod system {
                 _ => {}
             }
         }
-        SweepFailure::all(failures).map_or(Ok(()), Err)
+        (SweepFailure::all(failures).map_or(Ok(()), Err), listed)
     }
 
     fn delete_failed(path: impl Into<PathBuf>, source: io::Error) -> SweepFailure {
