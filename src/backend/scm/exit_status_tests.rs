@@ -243,14 +243,17 @@ fn a_recorded_exit_maps_back_to_the_report_that_produced_it() {
     }
 }
 
-/// A pair no `Reported` produces (a `Managed` service's own codes) names no report. It keeps the
-/// service-specific code under SCM's wrapper, even 0, and otherwise its Win32 code, or the
-/// service-specific one when the Win32 code is 0.
+/// A pair no `Reported` produces (a `Managed` service's own codes) names no report, and keeps its
+/// Win32 code, or its service-specific one when the Win32 code is 0.
 #[skuld::test]
 fn a_recorded_exit_no_report_produces_keeps_its_win32_code_or_else_its_specific_one() {
     let record = |win32, specific| RecordedExit { win32, specific };
 
-    for (win32, specific, code) in [(5, 9, 5), (0, 9, 9), (ERROR_SERVICE_SPECIFIC_ERROR, 0, 0)] {
+    for (win32, specific, code) in [
+        (5, 9, 5),
+        (0, 9, 9),
+        (ERROR_SERVICE_SPECIFIC_ERROR, 0, ERROR_SERVICE_SPECIFIC_ERROR as i32),
+    ] {
         assert_eq!(
             Reported::from_record(record(win32, specific)),
             None,
@@ -262,17 +265,4 @@ fn a_recorded_exit_no_report_produces_keeps_its_win32_code_or_else_its_specific_
             "({win32}, {specific})"
         );
     }
-}
-
-/// `stop` ends the process with what SCM recorded, and with the kill's code when SCM recorded
-/// nothing (a service found gone).
-#[skuld::test]
-fn a_stop_ends_the_process_with_the_recorded_code_or_the_kill_code_without_one() {
-    assert_eq!(stop_exit_code(None), KILLED_EXIT_CODE);
-    assert_eq!(stop_exit_code(Some(RecordedExit { win32: 0, specific: 0 })), 0);
-    let daemon = RecordedExit {
-        win32: ERROR_SERVICE_SPECIFIC_ERROR,
-        specific: 7,
-    };
-    assert_eq!(stop_exit_code(Some(daemon)), 7);
 }

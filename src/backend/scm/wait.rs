@@ -228,20 +228,25 @@ pub(crate) enum EndProcessOutcome<P> {
 /// process exits (a shim reports it and then exits), so `STOPPED` alone leaves a file the process
 /// runs in use.
 ///
-/// `terminate` ends the process, as the documentation of `SetServiceStatus` allows once
-/// `SERVICE_STOPPED` is reported, and `exit` then waits for its exit under `deadline` and says whether
-/// it did. Whatever `terminate` returns, the wait follows: SCM has confirmed the stop, so a failure
+/// `terminate` ends the process with the code SCM recorded, `exit` being that record, as the
+/// documentation of `SetServiceStatus` allows once `SERVICE_STOPPED` is reported, and `wait_exit` then
+/// waits for its exit under `deadline` and says whether it did. With no record (the service
+/// found gone) nothing is terminated: a code of goetia's own would race the shim's, so the process is
+/// only waited for. Whatever `terminate` returns, the wait follows: SCM has confirmed the stop, so a failure
 /// to end the process is no failure of the end, and the process may be on its way out by itself. The
 /// failure is kept: `exit` is handed it for its notice, and [`Lingers`](EndProcessOutcome::Lingers)
 /// carries it. An `exit` that fails is the error.
 pub(crate) fn end_process<P>(
     process: P,
     deadline: Deadline,
-    terminate: impl FnOnce(&P) -> io::Result<()>,
-    exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
+    exit: Option<RecordedExit>,
+    terminate: impl FnOnce(&P, i32) -> io::Result<()>,
+    wait_exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
 ) -> io::Result<EndProcessOutcome<P>> {
-    let terminate_failed = terminate(&process).err().map(Arc::new);
-    Ok(match exit(&process, deadline, terminate_failed.as_deref())? {
+    let terminate_failed = exit
+        .and_then(|exit| terminate(&process, exit.process_exit_code()).err())
+        .map(Arc::new);
+    Ok(match wait_exit(&process, deadline, terminate_failed.as_deref())? {
         Waited::Confirmed => EndProcessOutcome::Exited,
         Waited::Expired => EndProcessOutcome::Lingers {
             process,

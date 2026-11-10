@@ -227,8 +227,8 @@ fn uninstall_leaves_no_restarted_daemon_behind() {
 /// daemon exit with `child_code`, and returns the exit codes SCM recorded once the shim is gone:
 /// the `ServiceExitCode` view and both raw codes of `sc query`. The shim's process exit is checked
 /// here for every caller: it is the daemon's code, which the shim also reported to SCM. The callers
-/// pass distinct codes (3, 7, 0xC0000005, 1003), so this is what pins the shim's own exit path: a
-/// shim that recorded nothing would end with 0, and the `stop`s that end it write the same code.
+/// pass 0, 3, 7, 0xC0000005 and 1003. The non-zero codes pin the shim's own exit path; the 0 caller
+/// cannot tell a shim that reported Clean from one that recorded nothing, as both exit 0.
 fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
     let reported = ConnectBack::listen();
     let id = support::random_test_id();

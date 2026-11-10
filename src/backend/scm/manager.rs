@@ -109,7 +109,7 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use super::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, stop_exit_code};
+use super::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit};
 use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, WaitEnd, Waited, end_process};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
@@ -1192,22 +1192,23 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
 /// is blocked; a bounded one is the usual case (the shim exits just after it reports `STOPPED`) and
 /// says nothing.
 ///
-/// The process ends with [`stop_exit_code`] of `exit`, the record SCM confirmed `STOPPED` with. Both
-/// terminators are kept: this one is what ends a `Kind::Managed` service's own exe, which lingers
-/// after `STOPPED`. For `Kind::Simple` the record is the shim's own `Reported`, which maps to the code
-/// the shim ends itself with, so whichever terminator wins the race writes the same code. With no
-/// record (the service found gone) this one uses `KILLED_EXIT_CODE` and may beat the shim's own code.
+/// With `exit`, the record SCM confirmed `STOPPED` with, the process is terminated with the code that
+/// record maps to ([`RecordedExit::process_exit_code`]). Both terminators are kept: this one is what
+/// ends a `Kind::Managed` service's own exe, which lingers after `STOPPED`. For `Kind::Simple` the
+/// record is the shim's own `Reported`, which maps to the code the shim ends itself with, so whichever
+/// terminator wins the race writes the same code. With no record (the service found gone) nothing is
+/// terminated, as that would race the shim's own code: the process is only waited for.
 fn end_held(
     id: &Id,
     held: Held,
     deadline: Deadline,
     exit: Option<RecordedExit>,
 ) -> std::io::Result<EndProcessOutcome<Held>> {
-    let code = stop_exit_code(exit);
     end_process(
         held,
         deadline,
-        |held| held.terminate(code),
+        exit,
+        Held::terminate,
         |held, deadline, terminate_failed| {
             held.wait_for_exit(deadline, || {
                 if deadline.at().is_none() {
