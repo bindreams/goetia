@@ -740,6 +740,20 @@ fn a_provided_host_that_is_not_the_rendered_one_is_a_mismatch() {
     assert_eq!((*said, *gave), (rendered, provided));
 }
 
+/// A host a provider returns that is relative, or is a root with no folder, is refused as a relative
+/// path before the folder check or any read of it, which `begin_install` makes next. A host with a
+/// folder passes.
+#[skuld::test]
+fn a_provided_host_must_be_absolute_and_have_a_folder() {
+    for exe in ["host.exe", r"C:\", r"\\?\C:\"] {
+        match require_host_folder(Path::new(exe)) {
+            Err(Error::ShimPathRelative { path }) => assert_eq!(path, PathBuf::from(exe)),
+            other => panic!("{exe}: expected ShimPathRelative, got {other:?}"),
+        }
+    }
+    require_host_folder(Path::new(r"C:\app\host.exe")).unwrap();
+}
+
 const SHIM_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 /// A registered host is the shim by its file name alone, quoted or not, with or without arguments.
@@ -855,7 +869,7 @@ fn the_providers_folder_does_not_need_its_preview() {
     let (folder, failed) = default.provider_folder();
     assert_eq!(
         (folder, failed.is_none()),
-        (ProviderFolder::At(normalise(&default_dir().unwrap())), true)
+        (ProviderFolder::At(normalise(&folder_in(None).unwrap())), true)
     );
 }
 

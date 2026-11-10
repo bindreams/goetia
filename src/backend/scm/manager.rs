@@ -116,7 +116,7 @@ use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HoldOutcome, hold_if_possible};
 use crate::backend::scm::parameters::Parameters;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
-use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
+use crate::backend::scm::shim::embedded::{ShimFile, folder_in, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
 use crate::backend::scm::shim::provider::{ShimProvider, require_absolute};
@@ -311,7 +311,7 @@ impl Backend for Scm {
             args: desired.arguments.clone(),
         };
         let provided = confirm_provided(rendered, provided)?;
-        require_absolute(&provided.exe)?;
+        require_host_folder(&provided.exe)?;
         self.folders.check(&provided.exe)?;
         marker::verify(&provided.exe)?;
         Ok(Some(lock))
@@ -599,6 +599,15 @@ fn confirm_provided(rendered: HostCommand, provided: HostCommand) -> Result<Host
     Err(Error::ShimHostMismatch {
         rendered: Box::new(rendered),
         provided: Box::new(provided),
+    })
+}
+
+/// `exe`, the host `provide` returned, when it is an absolute path with a folder: the folder check and
+/// the marker read that follow take its folder. Otherwise [`Error::ShimPathRelative`] naming `exe`.
+fn require_host_folder(exe: &Path) -> Result<()> {
+    require_absolute(exe)?;
+    exe.parent().map(|_| ()).ok_or_else(|| Error::ShimPathRelative {
+        path: exe.to_path_buf(),
     })
 }
 
@@ -1285,7 +1294,7 @@ impl Scm {
         let mut failures: Vec<SweepFailure> = Vec::new();
         let (second, unswept) = match host
             .parent()
-            .map(|folder| second_folder(folder, provider.path(), || Ok(normalise(&default_dir()?))))
+            .map(|folder| second_folder(folder, provider.path(), || Ok(normalise(&folder_in(None)?))))
             .transpose()
         {
             Ok(second) => (second.flatten(), second.flatten()),

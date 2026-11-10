@@ -640,9 +640,10 @@ pub enum Error {
     AlreadyExists { path: PathBuf },
 }
 
-/// A pattern for the variants that wrap one error, binding it as `$source`: the only list of them.
-/// [`Error::wrapped`] reads the chain through it and [`Error::map_cause`] rewrites it. The docs of
-/// [`Error::cause`] and [`Error::wraps_unreadable_host`] name its list, and are edited with it.
+/// A pattern for the variants that wrap one error, binding it as `$source`: the list that
+/// [`Error::wrapped`] reads the chain through, [`Error::map_cause`] rewrites and
+/// [`Error::is_indeterminate`] follows. The docs of [`Error::cause`] and
+/// [`Error::wraps_unreadable_host`] name these variants, and are edited with it.
 macro_rules! wrapper {
     ($source:ident) => {
         Error::Step { source: $source, .. }
@@ -737,7 +738,7 @@ impl Error {
     }
 
     /// The one error a wrapper variant adds its operation to. The chain every walk of
-    /// [`cause`](Error::cause)'s kind follows; the variants are listed by [`wrapper!`] alone.
+    /// [`cause`](Error::cause)'s kind follows; the variants are those of [`wrapper!`].
     fn wrapped(&self) -> Option<&Error> {
         match self {
             wrapper!(source) => Some(source),

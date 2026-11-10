@@ -261,6 +261,7 @@ pub(crate) fn left_behind_text(
             .join(", ")
     };
 
+    let no_sweep = "no shim provider of this program sweeps a folder";
     let unknown = *provider == ProviderFolder::Unknown;
     if files.is_empty() {
         let mut said = format!("`{id}` was deleted, but the shim files it used were not cleaned up.");
@@ -271,23 +272,25 @@ pub(crate) fn left_behind_text(
             ));
         }
         let beside = second_folder.filter(|folder| !in_providers(folder));
-        if *provider == ProviderFolder::None && beside.is_none() {
-            said.push_str(" No shim provider of this program sweeps a folder, so nothing is retried.");
-        }
-        if let Some(folder) = beside {
-            // An unknown provider's folder may be this one, which then is retried.
-            let retried = if unknown {
-                "retried by that command only if it is that folder: otherwise"
-            } else if *provider == ProviderFolder::None {
-                "not retried, since no shim provider of this program sweeps a folder:"
-            } else {
-                "not retried by that command:"
-            };
-            said.push_str(&format!(
-                " What is in `{}` is {retried} {elsewhere} it.",
-                folder.display()
-            ));
-        }
+        let tail = match (provider, beside) {
+            (ProviderFolder::None, None) => Some(format!(" Nothing is retried, since {no_sweep}.")),
+            (_, None) => None,
+            (provider, Some(folder)) => {
+                // An unknown provider's folder may be this one, which then is retried.
+                let retried = match provider {
+                    ProviderFolder::Unknown => {
+                        "retried by that command only if it is that folder: otherwise".to_string()
+                    }
+                    ProviderFolder::None => format!("not retried, since {no_sweep}:"),
+                    ProviderFolder::At(_) => "not retried by that command:".to_string(),
+                };
+                Some(format!(
+                    " What is in `{}` is {retried} {elsewhere} it.",
+                    folder.display()
+                ))
+            }
+        };
+        said.extend(tail);
         return said;
     }
     let all: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
@@ -313,10 +316,7 @@ pub(crate) fn left_behind_text(
             ("are", "them")
         };
         let why = if *provider == ProviderFolder::None {
-            format!(
-                "No shim provider of this program sweeps a folder, so {} {is} not retried",
-                list(&outside)
-            )
+            format!("{} {is} not retried, since {no_sweep}", list(&outside))
         } else {
             format!(
                 "{} {is} not in the folder this program's shim provider uses, so that command does not retry {them}",

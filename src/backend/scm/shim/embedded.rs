@@ -43,7 +43,7 @@ pub use stock::EmbeddedStockShim;
 #[cfg(all(windows, feature = "cli"))]
 pub(crate) use stock::SiblingStockShim;
 #[cfg(windows)]
-pub(in crate::backend::scm) use stock::default_dir;
+pub(in crate::backend::scm) use stock::folder_in;
 
 #[cfg(windows)]
 mod stock {
@@ -276,9 +276,10 @@ mod stock {
     }
 
     /// The folder a stock shim goes in: `dir`, or the default one. A relative one is
-    /// [`Error::ShimPathRelative`]. Every provider's folder comes from here, so every path into
-    /// `preview_in`, `provide_in` and `folder()` has had this check.
-    pub(super) fn folder_in(dir: Option<&Path>) -> Result<PathBuf> {
+    /// [`Error::ShimPathRelative`]. Every provider's folder, and the manager's lookup of the default
+    /// folder, come from here, so every path into `preview_in`, `provide_in` and `folder()` has had
+    /// this check.
+    pub(in crate::backend::scm) fn folder_in(dir: Option<&Path>) -> Result<PathBuf> {
         let folder = match dir {
             Some(dir) => dir.to_path_buf(),
             None => default_dir()?,
@@ -300,7 +301,6 @@ mod stock {
 
     /// The core of every `provide`: the file for `image` in `dir`, checked, written or repaired.
     fn provide_in(dir: &Path, image: &Image<'_>, folders: &FolderCheck) -> Result<HostCommand> {
-        debug_assert!(dir.is_absolute(), "{}", dir.display());
         let command = preview_in(dir, image);
         // Before anything is created, so that a folder under an unsafe ancestor is refused without
         // a trace. For a folder that does not exist this judges its first existing ancestor alone.

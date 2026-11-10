@@ -22,8 +22,8 @@ pub struct HostCommand {
     pub args: Vec<String>,
 }
 
-/// `path`, if it is absolute; else [`Error::ShimPathRelative`] naming it. The one check every
-/// shim path goes through: a provider's folder or command, and the host `Scm` is given back.
+/// Succeeds if `path` is absolute; else [`Error::ShimPathRelative`] naming it. Used for a stock
+/// provider's folder, a standalone provider's command, and the host `Scm` is given back.
 #[cfg(windows)]
 pub(crate) fn require_absolute(path: &Path) -> Result<()> {
     if path.is_absolute() {
