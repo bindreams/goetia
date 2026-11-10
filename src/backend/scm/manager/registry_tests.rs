@@ -234,6 +234,22 @@ fn a_lone_surrogate_is_not_the_replacement_character() {
     }
 }
 
+/// A line that is not valid UTF-16 reads lossily, and the layout line says so.
+#[skuld::test]
+fn a_line_that_is_not_valid_utf16_reads_lossily_and_adds_a_layout_line() {
+    let mut units = utf16("A=");
+    units.push(0xD800);
+    units.extend([0, 0]);
+
+    assert_eq!(
+        lines_of(&multi_sz(&units)),
+        [
+            "A=\u{FFFD}",
+            "(REG_MULTI_SZ not laid out as goetia writes it: a line that is not valid UTF-16)"
+        ]
+    );
+}
+
 #[skuld::test]
 fn a_surrogate_pair_is_one_character() {
     let mut units = utf16("A=\u{1F600}");

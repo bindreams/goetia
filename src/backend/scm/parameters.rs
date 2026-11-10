@@ -47,52 +47,43 @@ impl fmt::Display for Stray {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Stray::Value { name, vtype } => {
-                write!(out, "value \"{}\" of type {}", shown_name(name), type_name(*vtype))
+                write!(out, "value {} of type {}", shown_name(name), type_name(*vtype))
             }
             Stray::Layout { name, vtype } => write!(
                 out,
                 "value \"{name}\" stored as {}, not exactly as goetia writes it",
                 type_name(*vtype)
             ),
-            Stray::Subkey { name } => write!(out, "subkey \"{}\"", shown_name(name)),
+            Stray::Subkey { name } => write!(out, "subkey {}", shown_name(name)),
         }
     }
 }
 
-/// `name` on one line to sit inside double quotes, with every control character and `"` escaped
-/// (see [`decode_utf16`] for a name that is not valid UTF-16).
+/// `name` in double quotes, quoted as `ScmRegistration` quotes every other value it reads back
+/// (`{:?}`), so it stays on one line and cannot close its own quotes. A name that is not valid
+/// UTF-16 is quoted the same way with each unpaired unit as `\u{XXXX}`, which no valid name spells.
 pub(crate) fn shown_name(name: &[u16]) -> String {
-    decode_utf16(name, |c| c == '"' || c.is_control())
-}
-
-/// `units` as text, with each char `escaped` names shown as an escape sequence and no other char
-/// changed. Units that are not valid UTF-16 make the result `(not valid UTF-16: ` and `)` around
-/// the text, each unpaired surrogate as `\u{XXXX}`. The one place that decodes units for display.
-fn decode_utf16(units: &[u16], escaped: impl Fn(char) -> bool) -> String {
-    let decoded: Vec<_> = char::decode_utf16(units.iter().copied()).collect();
-    let valid = decoded.iter().all(|c| c.is_ok());
-    let mut shown = String::new();
-    if !valid {
-        shown.push_str("(not valid UTF-16: ");
+    if let Ok(text) = String::from_utf16(name) {
+        return format!("{text:?}");
     }
-    for c in decoded {
-        match c {
-            Ok(c) if escaped(c) => {
-                let escape: String = c.escape_debug().collect();
-                if escape.chars().eq([c]) {
-                    // `escape_debug` leaves a printable char as it is.
-                    shown.push_str(&format!(r"\u{{{:X}}}", u32::from(c)));
-                } else {
-                    shown.push_str(&escape);
-                }
+    let mut shown = String::from("\"");
+    let mut run = String::new();
+    let flush = |run: &mut String, shown: &mut String| {
+        let quoted = format!("{run:?}");
+        shown.push_str(&quoted[1..quoted.len() - 1]);
+        run.clear();
+    };
+    for decoded in char::decode_utf16(name.iter().copied()) {
+        match decoded {
+            Ok(c) => run.push(c),
+            Err(e) => {
+                flush(&mut run, &mut shown);
+                shown.push_str(&format!(r"\u{{{:04X}}}", e.unpaired_surrogate()));
             }
-            Ok(c) => shown.push(c),
-            Err(e) => shown.push_str(&format!(r"\u{{{:04X}}}", e.unpaired_surrogate())),
         }
     }
-    if !valid {
-        shown.push(')');
-    }
+    flush(&mut run, &mut shown);
+    shown.push('"');
     shown
 }
 
@@ -204,13 +195,6 @@ fn string_text(vtype: u32, data: &[u8]) -> Option<(String, bool)> {
     }
     let text = String::from_utf16(body).ok()?;
     Some((text, vtype == vtype::REG_SZ && units.len() == body.len() + 1))
-}
-
-/// `units` as text, exactly. Units that are not valid UTF-16 show as text that says so, with each
-/// unpaired surrogate, control character and `=` escaped: no such text can equal a `NAME=value` line.
-#[cfg(any(windows, test))]
-pub(crate) fn text_from_utf16(units: &[u16]) -> String {
-    String::from_utf16(units).unwrap_or_else(|_| decode_utf16(units, |c| c == '=' || c.is_control()))
 }
 
 /// The registry's own name for a value type, or its number when it has none.
