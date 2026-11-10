@@ -22,7 +22,7 @@ use winreg::types::FromRegValue as _;
 
 use crate::backend::scm::generate::{FIELDS, field_named};
 pub use crate::backend::scm::parameters::RegistryReadOutcome;
-use crate::backend::scm::parameters::{Parameters, field_named_utf16, shown_name, text_from_utf16, type_name};
+use crate::backend::scm::parameters::{Parameters, field_named_utf16, shown_name, type_name};
 use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
 
@@ -315,7 +315,7 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
     let present = enum_values(&key).map_err(|e| registry_error("enumerate", &path, e))?;
     for stray in strays(&present, params) {
         tolerate_not_found(counted::delete_value(&key, &stray.name))
-            .map_err(|e| registry_error(&format!("delete value \"{}\" under", shown_name(&stray.name)), &path, e))?;
+            .map_err(|e| registry_error(&format!("delete value {} under", shown_name(&stray.name)), &path, e))?;
     }
 
     let subkeys: Vec<Vec<u16>> = key
@@ -325,7 +325,7 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
         .map_err(|e| registry_error("enumerate subkeys of", &path, e))?;
     for subkey in &subkeys {
         counted::delete_subkey(&key, subkey)
-            .map_err(|e| registry_error(&format!("delete subkey \"{}\" under", shown_name(subkey)), &path, e))?;
+            .map_err(|e| registry_error(&format!("delete subkey {} under", shown_name(subkey)), &path, e))?;
     }
     Ok(())
 }
@@ -419,7 +419,7 @@ fn query_raw_value(key: &RegKey, name: &str, buffer: &mut Vec<u8>) -> std::io::R
 /// - `write_environment` writes each line followed by a NUL, then one more NUL, and writes an empty
 ///   list as no value. Any other NUL layout, an odd trailing byte or a present empty value adds a
 ///   line naming what differs, after the lines that could be read.
-/// - A line that is not valid UTF-16 is shown with each unpaired surrogate and every `=` escaped.
+/// - A line that is not valid UTF-16 is read lossily, and adds a line saying so.
 fn environment_lines(value: Option<(u32, &[u8])>) -> Vec<String> {
     let Some((vtype, bytes)) = value else {
         return Vec::new();
@@ -448,11 +448,17 @@ fn environment_lines(value: Option<(u32, &[u8])>) -> Vec<String> {
         problems.push("an empty string".to_string());
     }
 
-    let mut lines: Vec<String> = segments
-        .into_iter()
-        .filter(|segment| !segment.is_empty())
-        .map(text_from_utf16)
-        .collect();
+    let mut lines = Vec::new();
+    let mut lossy = false;
+    for segment in segments.into_iter().filter(|segment| !segment.is_empty()) {
+        lines.push(String::from_utf16(segment).unwrap_or_else(|_| {
+            lossy = true;
+            String::from_utf16_lossy(segment)
+        }));
+    }
+    if lossy {
+        problems.push("a line that is not valid UTF-16".to_string());
+    }
     if !problems.is_empty() {
         lines.push(format!(
             "(REG_MULTI_SZ not laid out as goetia writes it: {})",
