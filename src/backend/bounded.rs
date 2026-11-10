@@ -22,7 +22,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError};
 #[cfg(test)]
 pub(crate) use spares::test_hook;
-pub(crate) use spares::{Reaper, Reservation};
+pub(crate) use spares::{Kept, Reaper, Reservation};
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub(crate) use spares::{Spares, spare};
 

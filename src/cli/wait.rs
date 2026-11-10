@@ -22,11 +22,11 @@ pub struct WaitArgs {
     /// How long to wait for the manager to report the daemon reached the
     /// state asked for. Defaults to 10s. `--timeout 0` issues the request
     /// and returns without waiting, establishing nothing — except `stop` on
-    /// macOS, which waits until launchd no longer has the job, because
-    /// `launchctl bootout` returns before the job's process has exited; and
-    /// a `restart: always` `start` on macOS that finds the label held by a job
-    /// that is not running boots it out and waits for its process to exit, up
-    /// to that job's `ExitTimeOut`, which `--timeout` does not cut short. Write a compound
+    /// macOS, which waits until launchd no longer has the job; and a
+    /// `restart: always` `start` on macOS that finds the label held by a job
+    /// that is not running boots it out and waits until launchd has removed
+    /// it, which `--timeout` does not cut short (for a job whose plist
+    /// disables `ExitTimeOut` that may not happen). Write a compound
     /// duration unspaced (`2m30s`), or quote it as one argument: every verb
     /// taking this flag also takes a variadic id list, so `--timeout 2m 30s`
     /// passes `2m` here and `30s` as a daemon id.

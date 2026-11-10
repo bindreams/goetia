@@ -87,9 +87,9 @@ pub trait ServiceManager {
     /// budget still probes and, if needed, bootstraps the job to completion
     /// before the plain `kickstart` that declines to wait. Likewise on macOS
     /// a `restart: always` start that finds the label held by a job that is
-    /// not running boots it out and waits for its process to exit, up to that
-    /// job's `ExitTimeOut` (launchd's default is 20s), whatever the budget:
-    /// the wait is part of sending the request.
+    /// not running boots it out and waits until launchd has removed the job,
+    /// whatever the budget: the wait is part of sending the request. For a
+    /// job whose plist disables `ExitTimeOut` that may not happen.
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a
@@ -155,9 +155,9 @@ pub trait ServiceManager {
     ///
     /// **Where a platform offers no request-only form,
     /// [`Budget::Immediate`] still performs the full blocking call.**
-    /// launchd's `launchctl bootout` returns before the job's process has
-    /// exited, so a `stop` with no budget still waits until launchd no longer
-    /// has the job: the start that may follow must not meet the old instance.
+    /// On launchd a `stop` with no budget still waits until launchd no longer
+    /// has the job (see `Launchctl::bootout` in the launchd backend): the
+    /// start that may follow must not meet the old instance.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never

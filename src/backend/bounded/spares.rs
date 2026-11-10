@@ -178,8 +178,7 @@ impl Reservation {
 /// A spawn consumes the files it draws, so each repetition gets a [`Reservation`] of its own from
 /// [`Kept::again`]: the kept files emptied and rewound, then duplicated. The child writes through a
 /// duplicate, which shares the open file's offset and contents, so the kept file is the same file and
-/// the next read starts on an empty one. The duplicating is the one resource a repetition still
-/// needs, and a spawn already needs it for every call.
+/// the next read starts on an empty one.
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct Kept {
@@ -201,6 +200,8 @@ impl Kept {
     /// A reservation of one more read's files. The previous read must be over: nothing may still
     /// be writing to them.
     pub(crate) fn again(&self) -> io::Result<Reservation> {
+        #[cfg(test)]
+        test_hook::make(test_hook::Kind::Duplicate)?;
         let files = self
             .files
             .iter()
@@ -315,11 +316,13 @@ pub(crate) mod test_hook {
     pub(crate) enum Kind {
         Thread,
         TempFile,
+        Duplicate,
     }
 
     thread_local! {
         static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
         static TEMP_FILES: Cell<Option<usize>> = const { Cell::new(None) };
+        static DUPLICATES: Cell<Option<usize>> = const { Cell::new(None) };
         static SPAWNS: Cell<usize> = const { Cell::new(0) };
         static SPAWN_FAILS: std::cell::RefCell<Option<fn() -> cosca::error::Error>> =
             const { std::cell::RefCell::new(None) };
@@ -369,6 +372,7 @@ pub(crate) mod test_hook {
         match kind {
             Kind::Thread => &THREADS,
             Kind::TempFile => &TEMP_FILES,
+            Kind::Duplicate => &DUPLICATES,
         }
     }
 
@@ -380,6 +384,11 @@ pub(crate) mod test_hook {
     /// Let this thread make only `n` more temp files, until the returned guard drops.
     pub(crate) fn temp_files(n: usize) -> Allowance {
         allow(Kind::TempFile, n)
+    }
+
+    /// Let this thread run only `n` more [`super::Kept::again`]s, until the returned guard drops.
+    pub(crate) fn duplicates(n: usize) -> Allowance {
+        allow(Kind::Duplicate, n)
     }
 
     fn allow(kind: Kind, n: usize) -> Allowance {
@@ -402,6 +411,7 @@ pub(crate) mod test_hook {
             Some(0) => Err(std::io::Error::other(match kind {
                 Kind::Thread => "no thread may be made (test hook)",
                 Kind::TempFile => "no temp file may be made (test hook)",
+                Kind::Duplicate => "no file may be duplicated (test hook)",
             })),
             Some(n) => {
                 left.set(Some(n - 1));

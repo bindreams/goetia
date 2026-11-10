@@ -1059,9 +1059,8 @@ fn root_user_runs_as_uid_zero() {
 
 // Budgets =============================================================================================================
 
-/// `launchctl bootout` returns before the job's process has exited, so under `Budget::Immediate`
-/// `stop` still waits until launchd no longer has the job, which is why the trait doc comment says
-/// so on `stop` rather than leaving it to be rediscovered per platform.
+/// Under `Budget::Immediate` `stop` still waits until launchd no longer has the job (see the trait
+/// doc).
 ///
 /// Against the trap — handing `wait_bounded` the `Immediate` budget's own already-expired deadline
 /// — `bootout` is SIGKILLed the instant it is spawned, so this returns a `WaitTimeout` instead of
@@ -1085,9 +1084,8 @@ fn a_stop_with_no_budget_waits_for_the_job_to_be_gone() {
 
 /// A `stop` that timed out leaves the job `state = SIGTERMed` and still loaded, and the next `stop`
 /// boots it out a second time. What `launchctl bootout` answers a job already going away is
-/// unmeasured: this records it (the probe's exit code and stderr are printed) and requires the second
-/// `stop` to succeed once the job is gone. If it fails on a code `is_not_found` does not name, that
-/// code is "already going away", and is to be treated like one, citing this measurement.
+/// unmeasured: the second `stop` is the measurement, and a failure carries the exit code and stderr.
+/// The state read just before it is printed, so a pass over a job that was already gone is visible.
 ///
 /// The job ignores SIGTERM, so it outlives the first `stop`'s small budget, and its `ExitTimeOut` is
 /// short so that launchd's SIGKILL ends it soon after.
@@ -1130,8 +1128,13 @@ fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone() {
         "{first:?}"
     );
 
-    let probe = cmd::run("launchctl", &["bootout", &format!("system/{id}")]);
-    println!("a second `launchctl bootout` over a job already going away: {probe}");
+    let before = cmd::run("launchctl", &["print", &format!("system/{id}")]);
+    println!(
+        "before the second stop: print exited {:?}, state = {:?}, pid = {:?}",
+        before.code,
+        print_field(&before.stdout, "state = "),
+        print_field(&before.stdout, "pid = ")
+    );
 
     mgr.stop(&spec.id, Budget::Unbounded)
         .expect("the second stop returns Ok once the job is gone");

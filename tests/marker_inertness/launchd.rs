@@ -148,9 +148,9 @@ fn launchd_disabled_key_default_applies() {
     if boot_disabled.ok() {
         // `bootout` removes the job from the domain, but returns before a
         // running job's process has exited. This job never started, so there
-        // is no process to wait for (inferred: only a job with a process was
-        // measured), and past that point it can never run, so the check below
-        // is a proof of absence rather than a bet on how long to wait.
+        // is no process to wait for, and past that point it can never run, so
+        // the check below is a proof of absence rather than a bet on how long
+        // to wait.
         bootout(guard.id()).expect_ok();
     }
     assert!(
