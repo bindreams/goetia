@@ -31,10 +31,11 @@ use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_in
 
 #[cfg(windows)]
 pub(crate) use protected::{Descriptor, is_as_wanted};
+#[cfg(all(windows, any(test, feature = "testing")))]
+pub(crate) use system::kernel_object_security;
 #[cfg(windows)]
 pub(crate) use system::{
-    display_path, is_unreadable, kernel_object_owner, kernel_object_security, normalise as lexical, read_object,
-    require_acls_under,
+    display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, require_acls_under,
 };
 
 #[cfg(windows)]
@@ -611,6 +612,7 @@ mod system {
         unsafe { copy_sid(info.owner, name) }
     }
 
+    #[cfg(any(test, feature = "testing"))]
     /// The owner and DACL of the kernel object `handle`, which must be open with `READ_CONTROL`;
     /// [`ObjectSecurity::directory`] is false. `name` stands for the object in an error.
     pub(crate) fn kernel_object_security(handle: HANDLE, name: &Path) -> Result<ObjectSecurity> {
