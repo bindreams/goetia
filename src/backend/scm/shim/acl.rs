@@ -26,7 +26,7 @@ mod protected;
 use std::path::PathBuf;
 
 #[cfg(windows)]
-use crate::backend::scm::sid::sid_string;
+use crate::backend::scm::sid::sid_display;
 use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_installer};
 
 #[cfg(windows)]
@@ -97,24 +97,31 @@ const FILE_GENERIC_WRITE: u32 = 0x12_0116;
 const FILE_GENERIC_EXECUTE: u32 = 0x12_00A0;
 const FILE_ALL_ACCESS: u32 = 0x1F_01FF;
 
-/// What `verdict` says an untrusted owner does to a folder or a file.
-const OWNING: &str = "own";
+// What `Unsafe::right` says: a verb phrase that `{account} can {right} it` completes.
+const OWN: &str = "own";
+const DO_ANYTHING_TO: &str = "do anything to";
+const BYPASS_ACCESS_CONTROL_ON: &str = "bypass access control on";
+const CHANGE_PERMISSIONS_OF: &str = "change permissions of";
+const TAKE_OWNERSHIP_OF: &str = "take ownership of";
+const DELETE_OR_RENAME: &str = "delete or rename";
+const DELETE_OR_RENAME_ENTRIES_IN: &str = "delete or rename entries in";
+const WRITE_TO: &str = "write to";
 
 /// The rights that let an account replace what is in a folder, in the order they are reported.
 const DIRECTORY_TAMPERING: [(u32, &str); 4] = [
-    (WRITE_DAC, "change permissions of"),
-    (WRITE_OWNER, "take ownership of"),
-    (DELETE, "delete or rename"),
-    (FILE_DELETE_CHILD, "delete or rename entries in"),
+    (WRITE_DAC, CHANGE_PERMISSIONS_OF),
+    (WRITE_OWNER, TAKE_OWNERSHIP_OF),
+    (DELETE, DELETE_OR_RENAME),
+    (FILE_DELETE_CHILD, DELETE_OR_RENAME_ENTRIES_IN),
 ];
 
 /// The rights that let an account change a file's contents, or take it away or hand it over, in the
 /// order they are reported.
 const FILE_TAMPERING: [(u32, &str); 4] = [
-    (FILE_WRITE_DATA | FILE_APPEND_DATA, "write to"),
-    (WRITE_DAC, "change permissions of"),
-    (WRITE_OWNER, "take ownership of"),
-    (DELETE, "delete or rename"),
+    (FILE_WRITE_DATA | FILE_APPEND_DATA, WRITE_TO),
+    (WRITE_DAC, CHANGE_PERMISSIONS_OF),
+    (WRITE_OWNER, TAKE_OWNERSHIP_OF),
+    (DELETE, DELETE_OR_RENAME),
 ];
 
 // verdict =============================================================================================================
@@ -133,10 +140,10 @@ pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsaf
             right,
         };
         if !is_trusted(&object.owner) {
-            return Err(refuse(&object.owner, OWNING));
+            return Err(refuse(&object.owner, OWN));
         }
         let Some(dacl) = &object.dacl else {
-            return Err(refuse(&everyone(), "do anything to"));
+            return Err(refuse(&everyone(), DO_ANYTHING_TO));
         };
         let tampering = if object.directory {
             &DIRECTORY_TAMPERING
@@ -238,7 +245,7 @@ impl Unsafe {
 /// The name of the account `sid` is, or the SID's text when no account has it (a deleted one).
 #[cfg(windows)]
 pub(crate) fn account_name(sid: &Sid) -> String {
-    identity::account_name_of_sid(sid).unwrap_or_else(|_| sid_string(sid))
+    identity::account_name_of_sid(sid).unwrap_or_else(|_| sid_display(sid))
 }
 
 // The filesystem ======================================================================================================
@@ -267,7 +274,7 @@ mod system {
         GetVolumeInformationByHandleW, READ_CONTROL,
     };
 
-    use super::{Ace, ObjectSecurity, Sid, Unsafe, everyone};
+    use super::{Ace, BYPASS_ACCESS_CONTROL_ON, ObjectSecurity, Sid, Unsafe, everyone};
     use crate::error::{Error, Result};
 
     // The ACE types a file's DACL can hold: allow and deny, plain or conditional. A conditional ACE
@@ -661,7 +668,7 @@ mod system {
             return Err(Unsafe {
                 path: path.to_path_buf(),
                 account: everyone(),
-                right: "bypass access control on",
+                right: BYPASS_ACCESS_CONTROL_ON,
             }
             .into_error());
         }

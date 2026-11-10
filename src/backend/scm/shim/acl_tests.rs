@@ -186,13 +186,13 @@ fn the_stock_host_file_and_its_folders_are_accepted() {
 #[skuld::test]
 fn each_right_that_changes_a_file_is_refused_with_its_own_wording() {
     let cases = [
-        (FILE_WRITE_DATA, "write to"),
-        (FILE_APPEND_DATA, "write to"),
-        (GENERIC_WRITE, "write to"),
-        (MODIFY, "write to"),
-        (WRITE_DAC, "change permissions of"),
-        (WRITE_OWNER, "take ownership of"),
-        (DELETE, "delete or rename"),
+        (FILE_WRITE_DATA, WRITE_TO),
+        (FILE_APPEND_DATA, WRITE_TO),
+        (GENERIC_WRITE, WRITE_TO),
+        (MODIFY, WRITE_TO),
+        (WRITE_DAC, CHANGE_PERMISSIONS_OF),
+        (WRITE_OWNER, TAKE_OWNERSHIP_OF),
+        (DELETE, DELETE_OR_RENAME),
     ];
     for (mask, right) in cases {
         let mut chain = stock_host_chain();
@@ -240,7 +240,7 @@ fn a_file_an_untrusted_account_owns_is_refused_as_owned() {
     let mut chain = stock_host_chain();
     chain[0].owner = users();
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "own");
+    assert_eq!(refusal.right, OWN);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia\goetia-shim.exe"));
 }
 
@@ -248,7 +248,7 @@ fn a_file_an_untrusted_account_owns_is_refused_as_owned() {
 fn a_file_with_a_null_dacl_is_refused() {
     let mut chain = stock_host_chain();
     chain[0].dacl = None;
-    assert_eq!(refused(&chain).right, "do anything to");
+    assert_eq!(refused(&chain).right, DO_ANYTHING_TO);
 }
 
 /// A file inherits what a doctored folder grants, so both are unsafe for one cause: the folder is
@@ -260,7 +260,7 @@ fn an_unsafe_folder_is_reported_before_the_host_file_in_it() {
     chain[1].dacl.as_mut().unwrap().push(allow(users(), WRITE_DAC, 0));
     let refusal = refused(&chain);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia"));
-    assert_eq!(refusal.right, "change permissions of");
+    assert_eq!(refusal.right, CHANGE_PERMISSIONS_OF);
 }
 
 #[skuld::test]
@@ -283,7 +283,7 @@ fn a_file_the_chain_reaches_through_a_link_is_judged_as_a_file() {
     let mut chain = vec![link, target];
     chain.extend(stock_chain());
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "write to");
+    assert_eq!(refusal.right, WRITE_TO);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia\goetia-shim.exe"));
 }
 
@@ -311,10 +311,10 @@ fn trusted_accounts_may_do_anything() {
 #[skuld::test]
 fn each_dangerous_right_is_refused_with_its_own_wording() {
     let cases = [
-        (WRITE_DAC, "change permissions of"),
-        (WRITE_OWNER, "take ownership of"),
-        (DELETE, "delete or rename"),
-        (FILE_DELETE_CHILD, "delete or rename entries in"),
+        (WRITE_DAC, CHANGE_PERMISSIONS_OF),
+        (WRITE_OWNER, TAKE_OWNERSHIP_OF),
+        (DELETE, DELETE_OR_RENAME),
+        (FILE_DELETE_CHILD, DELETE_OR_RENAME_ENTRIES_IN),
     ];
     for (mask, right) in cases {
         let mut chain = stock_chain();
@@ -331,7 +331,7 @@ fn an_untrusted_owner_is_refused_as_owning() {
     let mut chain = stock_chain();
     chain[0].owner = users();
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "own");
+    assert_eq!(refusal.right, OWN);
     assert_eq!(refusal.account, users());
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia"));
 }
@@ -345,7 +345,7 @@ fn generic_all_is_mapped_before_it_is_judged() {
         .unwrap()
         .push(allow(everyone(), GENERIC_ALL, OI_CI));
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "change permissions of");
+    assert_eq!(refusal.right, CHANGE_PERMISSIONS_OF);
     assert_eq!(refusal.account, everyone());
 }
 
@@ -358,7 +358,7 @@ fn delete_child_on_the_parent_names_the_parent() {
         .unwrap()
         .push(allow(users(), FILE_DELETE_CHILD, 0));
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "delete or rename entries in");
+    assert_eq!(refusal.right, DELETE_OR_RENAME_ENTRIES_IN);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files"));
 }
 
@@ -371,7 +371,7 @@ fn delete_child_on_the_target_names_the_target() {
         .unwrap()
         .push(allow(users(), FILE_DELETE_CHILD, 0));
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "delete or rename entries in");
+    assert_eq!(refusal.right, DELETE_OR_RENAME_ENTRIES_IN);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia"));
 }
 
@@ -380,7 +380,7 @@ fn a_null_dacl_on_an_ancestor_is_refused_naming_the_ancestor() {
     let mut chain = stock_chain();
     chain[1].dacl = None;
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "do anything to");
+    assert_eq!(refusal.right, DO_ANYTHING_TO);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files"));
     assert_eq!(refusal.account, everyone());
 }
@@ -391,7 +391,7 @@ fn a_deny_ace_does_not_cancel_an_allow_ace() {
     let dacl = chain[0].dacl.as_mut().unwrap();
     dacl.insert(0, deny(users(), WRITE_DAC, 0));
     dacl.push(allow(users(), WRITE_DAC, 0));
-    assert_eq!(refused(&chain).right, "change permissions of");
+    assert_eq!(refused(&chain).right, CHANGE_PERMISSIONS_OF);
 }
 
 #[skuld::test]
@@ -444,7 +444,7 @@ pub(in crate::backend::scm::shim) mod windows {
             matches!(
                 refusal,
                 Error::ShimFolderUnsafe {
-                    right: "bypass access control on",
+                    right: BYPASS_ACCESS_CONTROL_ON,
                     ..
                 }
             ),
@@ -500,7 +500,12 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(chain.iter().all(|object| object.directory));
         for object in &chain {
             assert!(!object.owner.is_empty(), "{}", object.path.display());
-            assert_ne!(sid_string(&object.owner), "an invalid SID", "{}", object.path.display());
+            assert_ne!(
+                sid_display(&object.owner),
+                "an invalid SID",
+                "{}",
+                object.path.display()
+            );
         }
     }
 
@@ -719,9 +724,8 @@ pub(in crate::backend::scm::shim) mod windows {
             panic!("a folder everyone can write must be refused");
         };
         assert_eq!(path, display_path(&target));
-        let (_, change_permissions) = DIRECTORY_TAMPERING.iter().find(|(bit, _)| *bit == WRITE_DAC).unwrap();
-        assert!([OWNING, *change_permissions].contains(&right), "{right}");
-        if right == *change_permissions {
+        assert!([OWN, CHANGE_PERMISSIONS_OF].contains(&right), "{right}");
+        if right == CHANGE_PERMISSIONS_OF {
             assert_eq!(account, account_name(&everyone()));
         }
     }

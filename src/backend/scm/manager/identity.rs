@@ -25,7 +25,7 @@ use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::{IsValidSid, LookupAccountNameW, LookupAccountSidW, PSID};
 
 use crate::backend::Identity;
-use crate::backend::scm::sid::sid_text;
+use crate::backend::scm::sid::{sid_display, sid_text};
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, User};
 
@@ -129,20 +129,21 @@ fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
 pub(in crate::backend::scm) fn account_name_of_sid(sid: &[u8]) -> Result<String> {
     // `sid_text` checks that the bytes hold the sub-authorities they declare, which `IsValidSid`
     // would otherwise read past a short slice to find out.
-    let Some(sid_str) = sid_text(sid) else {
+    if sid_text(sid).is_none() {
         return Err(Error::AccountLookup {
             detail: format!("{sid:?} is not a SID"),
             source: None,
         });
-    };
+    }
+    let shown = sid_display(sid);
     // SAFETY: `sid_text` has checked that `sid` holds a whole SID's bytes.
     if unsafe { IsValidSid(sid.as_ptr() as PSID) } == 0 {
         return Err(Error::AccountLookup {
-            detail: format!("{sid_str} is not a valid SID"),
+            detail: format!("{shown} is not a valid SID"),
             source: None,
         });
     }
-    lookup_account_sid(sid.as_ptr() as PSID, &sid_str)
+    lookup_account_sid(sid.as_ptr() as PSID, &shown)
 }
 
 fn lookup_account_sid(psid: PSID, sid_str: &str) -> Result<String> {
