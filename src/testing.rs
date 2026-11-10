@@ -68,6 +68,11 @@ impl ShimProvider for FakeProvider {
         Ok(self.preview.clone())
     }
 
+    /// None, without recording a call: its `sweep` removes nothing, so it covers no folder.
+    fn folder(&self) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
     fn provide(&self, _folders: &FolderCheck) -> Result<HostCommand> {
         self.calls.lock().unwrap().push("provide");
         Ok(self.provide.clone())

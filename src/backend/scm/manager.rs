@@ -116,10 +116,10 @@ use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HoldOutcome, hold_if_possible};
 use crate::backend::scm::parameters::Parameters;
 use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
-use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
+use crate::backend::scm::shim::embedded::{ShimFile, folder_in, shim_file};
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::shim::marker;
-use crate::backend::scm::shim::provider::ShimProvider;
+use crate::backend::scm::shim::provider::{ShimProvider, require_absolute};
 use crate::backend::scm::shim::sweep::{
     ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
@@ -291,11 +291,11 @@ impl Backend for Scm {
     /// [`sweep_folder`]), and then the host is provided and checked before anything is
     /// read: `provide` must return the host `desired` registers (the flow's render, from the
     /// provider's `preview`: a sibling shim upgraded while the install waited on the lock
-    /// would otherwise register a file that was never placed), an absolute path whose folder passes
-    /// the folder check, to a file carrying this library's marker. A sweep that cannot read what is
-    /// referenced or cannot delete a file does not fail the install: the file is not what the
-    /// install needs, and the next sweep finds it. `type: managed` has no host,
-    /// so nothing is held or checked: its preconditions are `apply`'s, before any write.
+    /// would otherwise register a file that was never placed), an absolute path that passes the
+    /// folder check (which walks it and its ancestors), to a file carrying this library's marker. A
+    /// sweep that cannot read what is referenced or cannot delete a file does not fail the install:
+    /// the file is not what the install needs, and the next sweep finds it. `type: managed` has no
+    /// host, so nothing is held or checked: its preconditions are `apply`'s, before any write.
     fn begin_install(&self, spec: &DaemonSpec, desired: &ScmRegistration) -> Result<Option<InstallLock>> {
         if spec.kind != Kind::Simple {
             return Ok(None);
@@ -311,13 +311,7 @@ impl Backend for Scm {
             args: desired.arguments.clone(),
         };
         let provided = confirm_provided(rendered, provided)?;
-        provided
-            .exe
-            .parent()
-            .filter(|folder| folder.is_absolute())
-            .ok_or_else(|| Error::ShimPathRelative {
-                path: provided.exe.clone(),
-            })?;
+        require_absolute(&provided.exe)?;
         self.folders.check(&provided.exe)?;
         marker::verify(&provided.exe)?;
         Ok(Some(lock))
@@ -1218,18 +1212,16 @@ fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
 
 impl Scm {
     /// The folder of the provider, as an uninstall tells it: [`ProviderFolder::None`] without a
-    /// provider, the normalised folder of the host its `preview` names, and
-    /// [`ProviderFolder::Unknown`] when the `preview` fails, which is not the absence of a provider:
-    /// the failure comes with it, for the uninstall to report.
+    /// provider or for one that sweeps no folder, its normalised `folder()`, and
+    /// [`ProviderFolder::Unknown`] when that fails, which is not the absence of a provider: the
+    /// failure comes with it, for the uninstall to report.
     fn provider_folder(&self) -> (ProviderFolder, Option<Error>) {
         let Some(shim) = &self.shim else {
             return (ProviderFolder::None, None);
         };
-        match shim.preview() {
-            Ok(command) => match command.exe.parent() {
-                Some(folder) => (ProviderFolder::At(normalise(folder)), None),
-                None => (ProviderFolder::Unknown, None),
-            },
+        match shim.folder() {
+            Ok(Some(folder)) => (ProviderFolder::At(normalise(&folder)), None),
+            Ok(None) => (ProviderFolder::None, None),
             Err(e) => (
                 ProviderFolder::Unknown,
                 Some(Error::Step {
@@ -1275,10 +1267,11 @@ impl Scm {
     ///
     /// A default folder that cannot be located skips the second folder, as it cannot be told from the
     /// host's, and is reported with whatever else fails: the wait and the provider's sweep go on.
-    /// A provider's sweep that fails on the same lookup reports it too.
+    /// A provider's sweep that fails on the same lookup reports it too: twice in all.
     ///
-    /// A provider whose `preview` failed has no folder to name, and sweeps all the same; that is told
-    /// only beside a failure of the cleanup, see [`finished_cleanup`].
+    /// A provider whose `folder()` failed has no folder to name, and nothing is promised retried. The
+    /// stock providers fail their sweep on the same cause, which is then reported once; for another
+    /// provider it is told beside a failure of the cleanup, see [`finished_cleanup`].
     ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
@@ -1293,7 +1286,7 @@ impl Scm {
         let mut failures: Vec<SweepFailure> = Vec::new();
         let (second, unswept) = match host
             .parent()
-            .map(|folder| second_folder(folder, provider.path(), || Ok(normalise(&default_dir()?))))
+            .map(|folder| second_folder(folder, provider.path(), || Ok(normalise(&folder_in(None)?))))
             .transpose()
         {
             Ok(second) => (second.flatten(), second.flatten()),
@@ -1302,7 +1295,9 @@ impl Scm {
                 (None, host.parent())
             }
         };
-        let finish = |failures: Vec<SweepFailure>| finished_cleanup(id, &provider, unswept, unknown, failures);
+        let finish = |failures: Vec<SweepFailure>, provider_failed: bool| {
+            finished_cleanup(id, &provider, unswept, unknown, provider_failed, failures)
+        };
         match process {
             // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
             // ended, through the handle held since before the stop, and waited for as `stop` waits
@@ -1313,7 +1308,7 @@ impl Scm {
                 Ok(EndProcessOutcome::Lingers { .. }) => unreachable!("an unbounded deadline never expires"),
                 Err(e) => {
                     failures.push(Error::os(format!("wait for `{id}`'s process to exit"), e).into());
-                    return finish(failures);
+                    return finish(failures, false);
                 }
             },
             HoldOutcome::NoProcess => {}
@@ -1329,34 +1324,39 @@ impl Scm {
             Ok(referenced) => referenced,
             Err(e) => {
                 failures.push(e.into());
-                return finish(failures);
+                return finish(failures, false);
             }
         };
+        let mut provider_failed = false;
         if let Some(shim) = &self.shim {
-            failures.extend(shim.sweep(&referenced, &self.folders).err());
+            let swept = shim.sweep(&referenced, &self.folders).err();
+            provider_failed = swept.is_some();
+            failures.extend(swept);
         }
         if let Some(folder) = second {
             // It is the default folder, by `second_folder`'s choice.
             failures.extend(sweep_folder(folder, &referenced, &self.folders, || Ok(folder.to_path_buf())).err());
         }
-        finish(failures)
+        finish(failures, provider_failed)
     }
 }
 
 /// The result of the cleanup of an uninstall that deleted `id`: `Ok` when every sweep succeeded, and
 /// otherwise the failures, led by what remains (see [`left_behind_text`]). `unknown` is why the
-/// provider's folder could not be named. The provider's sweep does not depend on it, so it is no
-/// failure of its own, and is told as context of one that is.
+/// provider's folder could not be named: it is no failure of its own, and is told as context of one
+/// that is. Not when `provider_failed`, the provider's own sweep having failed: the stock providers
+/// fail it on that same cause, which is then already among `failures`.
 fn finished_cleanup(
     id: &Id,
     provider: &ProviderFolder,
     unswept: Option<&Path>,
     unknown: Option<Error>,
+    provider_failed: bool,
     failures: Vec<SweepFailure>,
 ) -> Result<()> {
     SweepFailure::all(failures).map_or(Ok(()), |failure| {
         let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
-        let cause = match unknown {
+        let cause = match unknown.filter(|_| !provider_failed) {
             Some(unknown) => Box::new(Error::Both {
                 first: failure.error,
                 then: Box::new(unknown),
