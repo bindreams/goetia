@@ -43,20 +43,14 @@
 //! # Waits for a job's removal
 //!
 //! `launchctl bootout` returns within milliseconds, but launchd goes on answering for the label
-//! (`print` shows `state = SIGTERMed`) until the job's process exits, or launchd kills it at the
-//! job's `ExitTimeOut`. A step that acts on the label afterwards must not meet the old job, so it
-//! waits until `print` reports the label not found (see [`Launchctl::bootout`]). Which steps wait,
-//! and under which bound, is listed once, in the README's "Waiting for a start or stop". One rule
-//! that list leaves out: at its first read of the label, `start` waits only for a job whose `print`
-//! shows `state = SIGTERMed`. Any other job holding the label is taken as loaded: it is neither
-//! waited for nor removed there, and `bootstrap` is skipped (a `restart: always` job that is then
-//! not running is the corrective cycle's).
+//! (`print` shows `state = SIGTERMed`) until the job has exited. A step that acts on the label
+//! afterwards must not meet the old job, so it waits until `print` reports the label not found (see
+//! [`Launchctl::bootout`]). Which steps wait, under which bound, what a start does over a job that
+//! holds the label, and when a job may never go, is listed once, in the README's "Waiting for a
+//! start or stop".
 //!
 //! The waits that have no bound are part of sending a request: bounded by a deadline, one could end
-//! with the old job still loaded, the `bootstrap` unsent and the daemon left unloaded. A job may
-//! never be removed if its plist sets `ExitTimeOut` to 0 and it ignores SIGTERM (launchd never
-//! kills it, so only a SIGKILL from outside ends it), or if its process is in uninterruptible sleep
-//! (which survives a kill). Any of these waits that has no bound may then never end.
+//! with the old job still loaded, the `bootstrap` unsent and the daemon left unloaded.
 //!
 //! Only the modern verbs (`bootstrap`/`bootout`/`kickstart`/`print`) are used, never legacy
 //! `load`/`unload`. `launchctl enable`/`disable` and the plist's `Disabled` key are never touched:
@@ -943,9 +937,8 @@ impl Launchctl {
     /// expired, in either.
     ///
     /// `launchctl bootout` returns within milliseconds, not when the job's process has exited: until
-    /// then `print` still answers for the label (`state = SIGTERMed`). That lasts until the process
-    /// exits or launchd kills it at the job's `ExitTimeOut`; with `ExitTimeOut` 0 in the plist launchd
-    /// never kills it, and a process in uninterruptible sleep survives a kill. A caller that acts on
+    /// then `print` still answers for the label (`state = SIGTERMed`). That lasts until the job has
+    /// exited; the README's "Waiting for a start or stop" says when it may not. A caller that acts on
     /// the label after a `bootout` (`bootstrap`, a read, a plist removed) must not meet the old
     /// instance, so this waits for it, under `deadline`: a caller that cannot be cut short passes an
     /// unbounded one. The wait is over when `print` reports the label not found, whatever job answered

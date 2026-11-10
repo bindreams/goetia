@@ -76,8 +76,8 @@ pub trait ServiceManager {
     /// budget that is already spent still reaches the manager.
     ///
     /// [`Budget::Immediate`] issues the request and returns without waiting,
-    /// establishing nothing: `Ok(())` then means only that the request was
-    /// accepted, so neither a caller nor the implementation may read any state
+    /// establishing nothing (except for the macOS waits named below):
+    /// `Ok(())` then means only that the request was accepted, so neither a caller nor the implementation may read any state
     /// from it. Every state assertion a backend makes belongs behind
     /// [`Budget::waits`].
     ///
@@ -158,7 +158,8 @@ pub trait ServiceManager {
     /// On macOS, stopping, restarting, uninstalling and some starts and
     /// installs wait for launchd to remove a job; see the README's "Waiting
     /// for a start or stop". A `stop` under `Immediate` waits without bound
-    /// there; under a bounded budget it gives up at the deadline.
+    /// there; under a bounded budget it gives up at the deadline, after one
+    /// last read.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never
