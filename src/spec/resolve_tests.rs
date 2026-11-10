@@ -594,21 +594,8 @@ fn a_root_relative_path_uses_only_the_directorys_drive() {
     assert_eq!(spec.cwd, Some(PathBuf::from(r"C:\data")));
 }
 
-#[cfg(windows)]
-#[skuld::test]
-fn a_root_relative_path_carries_a_defect_of_the_directorys_share_to_the_directory() {
-    // The share `sh<U+FFFE>re` is what the root-relative `\data` keeps; no `.env` text is its cause.
-    let dir = PathBuf::from("\\\\server\\sh\u{FFFE}re\\app");
-    let yaml = "id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: ${D:-\\data}\n";
-    let msg = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Scm))
-        .unwrap_err()
-        .to_string();
-    assert!(msg.contains("the manifest directory's drive or share"), "{msg}");
-    assert!(msg.contains("U+FFFE"), "{msg}");
-    assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
-}
-
-/// A share's defect is put there by `-f`, not by `.env`; a defect beside it is the field's.
+/// A root-relative path joined with a share directory keeps the share, so the share's defect is the
+/// directory's, put there by `-f`, not by `.env`; a defect beside it is the field's.
 #[cfg(windows)]
 #[skuld::test]
 fn a_share_defect_a_root_relative_path_keeps_is_not_blamed_on_env_but_one_beside_it_is() {
@@ -626,6 +613,15 @@ fn a_share_defect_a_root_relative_path_keeps_is_not_blamed_on_env_but_one_beside
 
     let msg = refused("C:\\da\u{7}ta").attributed(&from_env).to_string();
     assert!(msg.contains("after substituting from .env: "), "{msg}");
+
+    // End to end. No `$` in the manifest, so `.env` is never read from the share.
+    let dir = PathBuf::from("\\\\server\\sh\u{FFFE}re\\app");
+    let yaml = "id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: '\\data'\n";
+    let msg = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Scm))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("the manifest directory's drive or share"), "{msg}");
+    assert!(msg.contains("U+FFFE"), "{msg}");
 }
 
 #[skuld::test]
