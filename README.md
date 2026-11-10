@@ -724,6 +724,13 @@ On macOS, `stop --timeout 0` is the exception: `launchctl bootout` returns
 before the daemon's process has exited, so it still waits until launchd no
 longer has the job, and the daemon is down when goetia returns.
 
+A `restart: always` start on macOS has the same kind of exception. If the
+label is held by a job that is not running, `start` boots that job out and
+waits for its process to exit, up to that job's `ExitTimeOut` (launchd's
+default is 20s), and `--timeout` does not cut this short: it is part of
+sending the request, and a request that stopped partway would leave the daemon
+unloaded.
+
 The two flags are mutually exclusive. `install` accepts them only alongside
 `--start`: without it nothing is started, so there is nothing to wait for,
 and the command line is refused at exit `2` having run nothing. Under

@@ -85,7 +85,11 @@ pub trait ServiceManager {
     /// still performs the full blocking call.** launchd's `launchctl
     /// print`/`bootstrap` have no non-blocking spelling: a `start` with no
     /// budget still probes and, if needed, bootstraps the job to completion
-    /// before the plain `kickstart` that declines to wait.
+    /// before the plain `kickstart` that declines to wait. Likewise on macOS
+    /// a `restart: always` start that finds the label held by a job that is
+    /// not running boots it out and waits for its process to exit, up to that
+    /// job's `ExitTimeOut` (launchd's default is 20s), whatever the budget:
+    /// the wait is part of sending the request.
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a

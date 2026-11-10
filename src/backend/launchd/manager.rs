@@ -939,19 +939,40 @@ impl Launchctl {
         if !(status.success() || is_not_found(status.code())) {
             return Err(command_failed(&args, status, &capture.stderr));
         }
-        self.wait_unloaded(id, deadline)
+        self.wait_unloaded(id, deadline, reservation)
     }
 
     /// Reads until launchd no longer has `id` loaded. `Ok(None)` iff `deadline` expired first.
     ///
-    /// Every read re-checks the real condition; [`UNLOAD_POLL`] only paces them. Uncounted: how many
-    /// reads a job's exit takes is not known when the verb reserves.
-    fn wait_unloaded(&self, id: &str, deadline: Deadline) -> Result<Option<()>> {
+    /// Every read re-checks the real condition; [`UNLOAD_POLL`] only paces them. How many reads a job's
+    /// exit takes is not known when the verb reserves, so the wait counts as one call: it keeps that
+    /// call's temp files from `reservation` and serves every read from them (`Reservation::keep`), so no read can
+    /// fail for want of a file once the `bootout` is out. A read that fails is an `Err`, never a job
+    /// that is gone.
+    ///
+    /// A deadline already spent still gets one last read, under [`HELD_READ_BOUND`] (`print` answers
+    /// in milliseconds), so a job that went in the last interval is reported gone; no read is made
+    /// under a spent deadline, which would be killed at once.
+    fn wait_unloaded(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<()>> {
+        let target = target(id);
+        let args = ["print", target.as_str()];
+        let kept = reservation
+            .keep(Role::COUNTED_FILES)
+            .map_err(|source| Error::Reservation { id: None, source })?;
         loop {
-            match self.is_loaded_as(id, deadline, Role::UncountedQuery, &mut Reservation::default())? {
-                None => return Ok(None),
+            let spent = deadline.expired();
+            let read_deadline = if spent {
+                Budget::Bounded(HELD_READ_BOUND).start()
+            } else {
+                deadline
+            };
+            let mut held = kept
+                .again()
+                .map_err(|e| failed(&args, false, ClientError::NotRun(e.into())))?;
+            match self.is_loaded_as(id, read_deadline, Role::Query, &mut held)? {
                 Some(false) => return Ok(Some(())),
-                Some(true) => {}
+                Some(true) if !spent => {}
+                Some(true) | None => return Ok(None),
             }
             let pause = deadline.remaining().map_or(UNLOAD_POLL, |left| left.min(UNLOAD_POLL));
             std::thread::sleep(pause);
@@ -1022,11 +1043,11 @@ const KILL_REQUESTS: usize = 1;
 /// Most `launchctl` calls per verb, reads included: each draws its role's temp files from the same
 /// reservation. `install` adds two `is_loaded`s; `start` two `is_loaded`s and five `live_state`s. The
 /// `print` after an expired `kickstart` is not counted: the verb ends there, in place of its last read.
-/// Neither are the reads of the wait after a `bootout`, which are uncounted queries: there are as many
-/// as the job's exit takes.
-const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2;
-const START_CALLS: usize = START_REQUESTS + 7;
-const STOP_CALLS: usize = STOP_REQUESTS;
+/// The wait after a `bootout` is one call however many reads it makes (see [`Launchctl::wait_unloaded`]),
+/// and `install`'s, `start`'s and `stop`'s each have one.
+const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2 + 1;
+const START_CALLS: usize = START_REQUESTS + 7 + 1;
+const STOP_CALLS: usize = STOP_REQUESTS + 1;
 const KILL_CALLS: usize = KILL_REQUESTS;
 
 /// The most `step` draws, as `(requests, calls)`. A draw past it is a miscount, caught by the
@@ -1349,7 +1370,9 @@ impl backend::Backend for Launchd {
         // cannot tell whose job answers to it: a job from a plist we just replaced, or one that was
         // booted out and is still tearing down, satisfies both, so each check above can be skipped
         // on the strength of a job about to cease to exist. That left a daemon stopped after
-        // `install --start` returned `Ok`.
+        // `install --start` returned `Ok`. A job tearing down no longer comes from goetia, whose
+        // `bootout`s wait for the job to be gone; what remains is another program's or the
+        // operator's `launchctl bootout`.
         //
         // Only `KeepAlive: true` (`restart: always`) licenses this check: launchd keeps such a job
         // running whenever it is loaded. Under `on-failure` or `never` a job may have run and
@@ -1366,7 +1389,10 @@ impl backend::Backend for Launchd {
             // it is gone so that the `bootstrap` does not meet it, and load ours.
             // Issued whatever is left of the budget, like the request above: when a stale job
             // answered to the label, this cycle is the request, and skipping it would report a start
-            // never sent as one that may still arrive.
+            // never sent as one that may still arrive. The `bootout`'s wait for the old process is
+            // part of sending it, so it runs under `issuing` on purpose and can outlast the budget,
+            // up to that job's `ExitTimeOut`: bounded by `deadline`, it could end with the old job
+            // still loaded, `bootstrap` unsent and the daemon left unloaded.
             never_expires(self.launchctl.bootout(id.as_str(), issuing, reservation)?);
             never_expires(self.launchctl.bootstrap(&location.path, issuing, reservation)?);
             if self.launchctl.live_state(id.as_str(), issuing, reservation)?.0 != State::Running {

@@ -839,6 +839,36 @@ fn an_uncounted_query_never_draws_on_a_reservation() {
     }
 }
 
+/// A read repeated as often as it takes (a wait for a job to be gone) takes its files from the
+/// reservation once, and serves every repetition from them: none is made after the first, and each
+/// read starts on an empty file, so it sees what its own child wrote and no earlier child's output.
+#[skuld::test]
+fn kept_files_serve_a_read_again_and_again_each_starting_empty() {
+    let mut reservation = Reservation::make(0, STREAMS).unwrap();
+    let kept = reservation.keep(STREAMS).unwrap();
+    assert_eq!(test_hook::left(&reservation), (0, 0), "the files were taken once");
+    let _no_file = test_hook::temp_files(0);
+
+    // Each read writes less than the one before, so a file not emptied shows the longer one's tail.
+    for (round, (out, err)) in [("hello", "world"), ("hi", "yo"), ("h", "y")].into_iter().enumerate() {
+        let mut again = kept.again().unwrap();
+
+        let spawned = spawn(
+            &mut sh(&format!("printf %s {out}; printf %s {err} >&2")),
+            Role::Query,
+            &mut again,
+        )
+        .unwrap();
+        let finished = wait_bounded(spawned, Budget::Unbounded.start()).unwrap();
+
+        assert!(
+            matches!(&finished, Finished::Exited { capture, .. }
+                if capture.stdout == out.as_bytes() && capture.stderr == err.as_bytes()),
+            "round {round}: {finished:?}"
+        );
+    }
+}
+
 // Spares ==============================================================================================================
 
 /// A sequence's spares are what its announced requests' threads are taken from, so nothing need be

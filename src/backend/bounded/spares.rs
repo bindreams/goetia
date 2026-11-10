@@ -8,7 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, PipeReader};
+use std::io::{self, PipeReader, Seek as _};
 use std::marker::PhantomData;
 use std::process::ExitStatus;
 use std::sync::mpsc;
@@ -169,6 +169,51 @@ impl Reservation {
                 make_file()
             }
         }
+    }
+}
+
+/// Temp files taken out of a [`Reservation`] once, to serve a read repeated as often as it takes
+/// (a wait for a job to be gone), where a count cannot be made ahead of time.
+///
+/// A spawn consumes the files it draws, so each repetition gets a [`Reservation`] of its own from
+/// [`Kept::again`]: the kept files emptied and rewound, then duplicated. The child writes through a
+/// duplicate, which shares the open file's offset and contents, so the kept file is the same file and
+/// the next read starts on an empty one. The duplicating is the one resource a repetition still
+/// needs, and a spawn already needs it for every call.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct Kept {
+    files: Vec<File>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl Reservation {
+    /// `files` of this reservation's temp files, taken once: see [`Kept`].
+    pub(crate) fn keep(&mut self, files: usize) -> io::Result<Kept> {
+        Ok(Kept {
+            files: (0..files).map(|_| self.file()).collect::<io::Result<_>>()?,
+        })
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl Kept {
+    /// A reservation of one more read's files. The previous read must be over: nothing may still
+    /// be writing to them.
+    pub(crate) fn again(&self) -> io::Result<Reservation> {
+        let files = self
+            .files
+            .iter()
+            .map(|file| {
+                file.set_len(0)?;
+                (&*file).rewind()?;
+                file.try_clone()
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(Reservation {
+            reapers: Vec::new(),
+            files,
+        })
     }
 }
 

@@ -173,8 +173,9 @@ impl Drop for Guard {
 
 /// Kills the `launchctl kickstart -p system/<id>` that a `start` answering `WaitTimeout` leaves
 /// running on purpose when its `print` did not show launchd holding the start, which a long
-/// `ThrottleInterval` would keep alive for an hour. Whether the
-/// `bootout` in `Guard`'s uninstall ends it, or waits on it, is unmeasured, so this kills it first.
+/// `ThrottleInterval` would keep alive for an hour. Whether the `bootout` in `Guard`'s uninstall, or
+/// the wait for the job to be gone that follows it, ends it or waits on it is unmeasured, so this
+/// kills it first.
 /// Declare it after the [`Guard`], so it drops before the uninstall; launchd keeps the request, and
 /// the `bootout` discards it. `id` is the test's random id, so only this test's process can match.
 struct KickstartGuard(Id);
@@ -1080,6 +1081,61 @@ fn a_stop_with_no_budget_waits_for_the_job_to_be_gone() {
         State::Stopped,
         "launchd no longer has the job, so it reads as stopped"
     );
+}
+
+/// A `stop` that timed out leaves the job `state = SIGTERMed` and still loaded, and the next `stop`
+/// boots it out a second time. What `launchctl bootout` answers a job already going away is
+/// unmeasured: this records it (the probe's exit code and stderr are printed) and requires the second
+/// `stop` to succeed once the job is gone. If it fails on a code `is_not_found` does not name, that
+/// code is "already going away", and is to be treated like one, citing this measurement.
+///
+/// The job ignores SIGTERM, so it outlives the first `stop`'s small budget, and its `ExitTimeOut` is
+/// short so that launchd's SIGKILL ends it soon after.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone() {
+    let mgr = Launchd::new();
+    let id = support::random_test_id();
+    let listener = ConnectBack::listen();
+    // `trap '' TERM` first, then the report: once the listener has accepted, SIGTERM is ignored.
+    let spec = base_spec(
+        &id,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "trap '' TERM; \"$0\" \"$@\"; while :; do /bin/sleep 1; done".to_string(),
+            support::current_exe_str(),
+            support::sentinel::CONNECT_BACK.to_string(),
+            listener.port().to_string(),
+        ],
+    );
+    let _guard = Guard::install(&mgr, &spec);
+    // The generator writes no `ExitTimeOut`, so the staged plist gets one before the job is loaded.
+    let staged = staging_path(&id);
+    let plist = std::fs::read_to_string(&staged).expect("read the staged plist");
+    let end = plist.rfind("</dict>").expect("the plist's top-level dict");
+    let plist = format!(
+        "{}\t<key>ExitTimeOut</key>\n\t<integer>5</integer>\n{}",
+        &plist[..end],
+        &plist[end..]
+    );
+    write_plist(&staged, &plist);
+    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    listener.accept("the job to be up with SIGTERM ignored");
+
+    let first = mgr
+        .stop(&spec.id, Budget::Bounded(Duration::from_millis(500)))
+        .expect_err("a job that ignores SIGTERM outlives the budget");
+    assert!(
+        matches!(first, goetia::Error::WaitTimeout { awaited: "stopped", .. }),
+        "{first:?}"
+    );
+
+    let probe = cmd::run("launchctl", &["bootout", &format!("system/{id}")]);
+    println!("a second `launchctl bootout` over a job already going away: {probe}");
+
+    mgr.stop(&spec.id, Budget::Unbounded)
+        .expect("the second stop returns Ok once the job is gone");
+    assert!(!is_loaded(&id), "the job is still loaded after the second stop");
 }
 
 /// With `ThrottleInterval` longer than the budget, a bounded `start` of a job with respawn history
