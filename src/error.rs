@@ -640,6 +640,17 @@ pub enum Error {
     AlreadyExists { path: PathBuf },
 }
 
+/// A pattern for the variants that wrap one error, binding it as `$source`: the only list of them.
+/// [`Error::wrapped`] reads the chain through it and [`Error::map_cause`] rewrites it, so a new
+/// wrapping variant is added here and nowhere else.
+macro_rules! wrapper {
+    ($source:ident) => {
+        Error::Step { source: $source, .. }
+            | Error::StartAsManaged { source: $source, .. }
+            | Error::InstalledUnreadable { source: $source, .. }
+    };
+}
+
 impl Error {
     /// Whether this failure left the outcome open: what is at the id, whether a request reached the
     /// manager, or where the daemon ended up. `false` means goetia established that the operation
@@ -728,34 +739,24 @@ impl Error {
     }
 
     /// The one error a wrapper variant adds its operation to. The chain every walk of
-    /// [`cause`](Error::cause)'s kind follows; [`map_cause`](Error::map_cause) owns what it maps, so
-    /// it lists the same variants.
+    /// [`cause`](Error::cause)'s kind follows; the variants are listed by [`wrapper!`] alone.
     fn wrapped(&self) -> Option<&Error> {
         match self {
-            Error::Step { source, .. }
-            | Error::StartAsManaged { source, .. }
-            | Error::InstalledUnreadable { source, .. } => Some(source),
+            wrapper!(source) => Some(source),
             _ => None,
         }
     }
 
     /// This error with `f` applied to its [`cause`](Error::cause), the wrappers kept around the
     /// result: the operation that failed on the cause stays in the report.
-    pub fn map_cause(self, f: impl FnOnce(Error) -> Error) -> Error {
-        match self {
-            Error::Step { what, source } => Error::Step {
-                what,
-                source: Box::new(source.map_cause(f)),
-            },
-            Error::StartAsManaged { blob, source } => Error::StartAsManaged {
-                blob,
-                source: Box::new(source.map_cause(f)),
-            },
-            Error::InstalledUnreadable { id, source } => Error::InstalledUnreadable {
-                id,
-                source: Box::new(source.map_cause(f)),
-            },
-            cause => f(cause),
+    pub fn map_cause(mut self, f: impl FnOnce(Error) -> Error) -> Error {
+        match &mut self {
+            wrapper!(source) => {
+                let inner = std::mem::replace(&mut **source, Error::LoadedJob { id: String::new() });
+                **source = inner.map_cause(f);
+                self
+            }
+            _ => f(self),
         }
     }
 
