@@ -61,7 +61,8 @@ impl fmt::Display for Stray {
 
 /// `name` in double quotes, quoted as `ScmRegistration` quotes every other value it reads back
 /// (`{:?}`), so it stays on one line and cannot close its own quotes. A name that is not valid
-/// UTF-16 is quoted the same way with each unpaired unit as `\u{d800}`, which no valid name spells.
+/// UTF-16 is quoted the same way with each unpaired unit in hex (`\u{d800}`), which no valid name
+/// spells.
 pub(crate) fn shown_name(name: &[u16]) -> String {
     if let Ok(text) = String::from_utf16(name) {
         return format!("{text:?}");
