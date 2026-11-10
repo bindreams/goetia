@@ -85,9 +85,9 @@ pub trait ServiceManager {
     /// still performs the full blocking call.** launchd's `launchctl
     /// print`/`bootstrap` have no non-blocking spelling: a `start` with no
     /// budget still probes and, if needed, bootstraps the job to completion
-    /// before the plain `kickstart` that declines to wait. On macOS some steps
-    /// also wait for launchd to remove a job whatever the budget: see the
-    /// README's "Waiting for a start or stop" section.
+    /// before the plain `kickstart` that declines to wait. On macOS, stopping,
+    /// restarting, uninstalling and some starts and installs wait for launchd
+    /// to remove a job; see the README's "Waiting for a start or stop".
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a
@@ -153,9 +153,9 @@ pub trait ServiceManager {
     ///
     /// **Where a platform offers no request-only form,
     /// [`Budget::Immediate`] still performs the full blocking call.**
-    /// On macOS some steps wait for launchd to remove a job whatever the
-    /// budget, `stop` among them: see the README's "Waiting for a start or
-    /// stop" section.
+    /// On macOS, stopping, restarting, uninstalling and some starts and
+    /// installs wait for launchd to remove a job; see the README's "Waiting
+    /// for a start or stop".
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never

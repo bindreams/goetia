@@ -720,24 +720,29 @@ share one pair of flags:
 | `--timeout 0`          | Issue the request and return without waiting. |
 | `--no-timeout`         | Wait indefinitely.                            |
 
-On macOS some steps wait for launchd to remove a job whatever `--timeout` says:
+On macOS, launchd keeps a job's label until the job has exited, so several
+steps wait for that:
 
-- `daemon stop` waits for the job it boots out. A bounded `--timeout` gives up
-  at its deadline; `--timeout 0` and `--no-timeout` wait without bound.
-- `daemon uninstall` waits for the job it boots out, without bound.
-- `daemon install` waits without bound for a job that already holds the label,
-  which it boots out first.
-- `daemon start`, before it loads the job, waits without bound for a job left
-  by a `stop` that timed out or by another program's `launchctl bootout`
-  (`state = SIGTERMed`), `--timeout 0` included. Any other job holding the label
-  is taken as loaded.
-- `daemon start` of a `restart: always` daemon that is not running after
-  its first start boots the job out, waits without bound for it to be removed,
-  and loads it again. Under `--timeout 0` this does not happen.
+- `daemon stop` boots the job out and waits until launchd has removed it. With
+  `--timeout N` it gives up after `N` (exit `4`); with `--timeout 0` or
+  `--no-timeout` it waits without bound.
+- `daemon restart` does the same in its stop leg, so `restart --timeout 0` also
+  waits for the removal before it starts the job.
+- `daemon uninstall` waits for the removal without bound.
+- `daemon install` of a new daemon whose label is already held by a loaded job
+  boots that job out and waits for its removal without bound. This happens
+  before any `--start`, so it does not spend `--timeout`.
+- `daemon start` over a job launchd is still removing (after a `stop` that
+  timed out, or another program's `launchctl bootout`) waits for the removal
+  without bound, then loads the job. The `--timeout` clock starts when the
+  command begins, so this wait spends it; the wait for running gets what is
+  left.
+- For `restart: always`, a waiting `start` (not `--timeout 0`) whose daemon
+  reads as not running boots the job out, waits for its removal without bound,
+  loads it again and reads it once more within what is left of `--timeout`.
 
-A bounded `--timeout` clock starts when the verb begins, so these waits spend
-it. A job whose plist sets `ExitTimeOut` to `0` and ignores SIGTERM is never
-killed by launchd, so any wait that has no bound may never end.
+A job whose plist sets `ExitTimeOut` to `0` and ignores SIGTERM is never
+removed, so any of these waits that has no bound never ends.
 
 The two flags are mutually exclusive. `install` accepts them only alongside
 `--start`: without it nothing is started, so there is nothing to wait for,
@@ -952,9 +957,11 @@ changed nothing (exit `1`). systemd stops the unit and starts it again, except
 while the unit is still starting: it folds the restart into the start already
 running, so nothing is stopped and the daemon comes up fresh from that start.
 On macOS
-and Windows it is a stop and then a start, and a start refused in that window
-exits `4` rather than `0`: the daemon may be the instance the stop is still
-taking down, may be going down, or may never have moved.
+it is a stop and then a start, and the stop waits for launchd to remove the job
+(see the list above). On Windows it is a stop and then a start, and a start
+refused in that window exits `4` rather than `0`: the daemon may be the
+instance the stop is still taking down, may be going down, or may never have
+moved.
 
 **On Windows, `restart --timeout 0` will usually stop the daemon and not
 restart it.** The start arrives while the service is still coming down and is
