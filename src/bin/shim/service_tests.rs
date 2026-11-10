@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use cosca::Containment;
 use goetia::backend::scm::exit_status::{
-    ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_SERVICE_SPECIFIC_ERROR, Reported,
+    ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
 use goetia::spec::{Kind, Restart};
 use windows_sys::Win32::Foundation::{
@@ -861,7 +861,10 @@ fn each_report_maps_to_the_exit_codes_scm_records() {
 
     assert_eq!(codes(Reported::Clean), (0, 0));
     assert_eq!(codes(Reported::DaemonExit(7)), (ERROR_SERVICE_SPECIFIC_ERROR, 7));
-    assert_eq!(codes(Reported::shim_failure(Some(13))), (13, 0));
+    assert_eq!(
+        codes(Reported::shim_failure(Some(ERROR_INVALID_DATA as i32))),
+        (ERROR_INVALID_DATA, 0)
+    );
     assert_ne!(
         codes(Reported::shim_failure(Some(ERROR_SERVICE_SPECIFIC_ERROR as i32))).0,
         ERROR_SERVICE_SPECIFIC_ERROR,
@@ -879,6 +882,142 @@ fn an_incomplete_stop_is_reported_as_win32_zero_with_specific_1003() {
         (status.dwWin32ExitCode, status.dwServiceSpecificExitCode),
         (0, ERROR_CAN_NOT_COMPLETE)
     );
+}
+
+/// A refusal reports Win32 0 with the code that says no daemon ran.
+#[skuld::test]
+fn a_refusal_is_reported_as_win32_zero_with_its_own_specific_code() {
+    let status = stopped_status(Reported::Refused);
+
+    assert_eq!(
+        (status.dwWin32ExitCode, status.dwServiceSpecificExitCode),
+        (0, SHIM_REFUSED)
+    );
+}
+
+// What the shim does with its read of the spec ------------------------------------------------------------------------
+
+fn undetermined(source: Error) -> Error {
+    Error::Undetermined {
+        id: ID.to_string(),
+        reason: Box::new(source),
+        recovery: "resolve that failure and re-run".to_string(),
+    }
+}
+
+/// The refusals are the reads that answered that no daemon can run.
+#[skuld::test]
+fn a_gone_service_a_missing_marker_and_an_undecodable_spec_are_refused() {
+    let reads = [
+        Err(Error::NotInstalled { id: ID.to_string() }),
+        Ok(None),
+        Err(Error::Blob {
+            message: "invalid base64".to_string(),
+            source: None,
+        }),
+        Err(Error::Invalid {
+            daemon: ID.to_string(),
+            message: "id is not valid".to_string(),
+            source: None,
+        }),
+        Err(Error::Step {
+            what: "read the spec".to_string(),
+            source: Box::new(Error::NotInstalled { id: ID.to_string() }),
+        }),
+        Err(Error::Kept(std::sync::Arc::new(Error::NotInstalled {
+            id: ID.to_string(),
+        }))),
+    ];
+
+    for read in reads {
+        let shown = format!("{read:?}");
+        let stop = spec_read(ID, read).map(|_| ()).expect_err(&shown);
+        assert_eq!(stop.reported, Reported::Refused, "{shown}");
+    }
+}
+
+#[skuld::test]
+fn a_spec_that_was_read_is_the_one_to_run() {
+    let blob = goetia::blob::Blob {
+        schema: goetia::blob::SCHEMA,
+        version: goetia::version().to_string(),
+        spec: spec(),
+    };
+
+    let read = spec_read(ID, Ok(Some(blob))).expect("a read spec is run");
+
+    assert_eq!(read.spec, spec());
+}
+
+/// A read that did not complete says nothing about the record, so the shim fails restartably (SCM
+/// retries it) and the message names the registry read, not decoding. The failure carries the OS
+/// error the read met, however deep in the chain.
+#[skuld::test]
+fn a_read_that_did_not_complete_is_a_restartable_failure_naming_the_read() {
+    let io = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+    let read = Err(Error::Step {
+        what: "read the spec".to_string(),
+        source: Box::new(undetermined(Error::Os {
+            what: r"enumerate HKLM\SYSTEM\CurrentControlSet\Services\x\Parameters".to_string(),
+            path: None,
+            source: Box::new(io),
+        })),
+    });
+
+    let stop = spec_read(ID, read)
+        .map(|_| ())
+        .expect_err("an undetermined read stops the shim");
+
+    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_ACCESS_DENIED as i32)));
+    assert_ne!(stop.reported.scm_codes().0, 0, "SCM restarts a non-zero Win32 code");
+    assert!(
+        stop.message.starts_with("read the metadata under Services"),
+        "{}",
+        stop.message
+    );
+    assert!(stop.message.contains("enumerate"), "{}", stop.message);
+    assert!(!stop.message.contains("decode"), "{}", stop.message);
+}
+
+/// Refusal is by cause, not by whether the read is in doubt: a definite error that is none of the
+/// three causes (here an OS error from a read that failed outright) is still restartable, and
+/// carries the real OS error.
+#[skuld::test]
+fn a_definite_os_error_is_a_restartable_failure_carrying_it() {
+    let read = Err(Error::Step {
+        what: "read the spec".to_string(),
+        source: Box::new(Error::Os {
+            what: r"read HKLM\SYSTEM\CurrentControlSet\Services\x\Parameters".to_string(),
+            path: None,
+            source: Box::new(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+        }),
+    });
+
+    let stop = spec_read(ID, read)
+        .map(|_| ())
+        .expect_err("a failed read stops the shim");
+
+    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_ACCESS_DENIED as i32)));
+    assert!(
+        stop.message.starts_with("read the metadata under Services"),
+        "{}",
+        stop.message
+    );
+}
+
+/// With no OS error to carry, the failure still restarts: `ERROR_INVALID_DATA`.
+#[skuld::test]
+fn an_incomplete_read_with_no_os_error_fails_with_invalid_data() {
+    let read = Err(undetermined(Error::Blob {
+        message: "no code here".to_string(),
+        source: None,
+    }));
+
+    let stop = spec_read(ID, read)
+        .map(|_| ())
+        .expect_err("an undetermined read stops the shim");
+
+    assert_eq!(stop.reported, Reported::shim_failure(Some(ERROR_INVALID_DATA as i32)));
 }
 
 #[skuld::test]

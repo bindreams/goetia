@@ -566,6 +566,12 @@ impl Error {
         }
     }
 
+    /// The first OS error code this error carries, anywhere in it; the search order is
+    /// `report::os_error_in`'s.
+    pub fn raw_os_error(&self) -> Option<i32> {
+        report::os_error_in(self)
+    }
+
     /// The failed read and its recovery, when this error's [`cause`](Error::cause) is an
     /// [`Undetermined`](Error::Undetermined); any other error comes back as it is. The wrappers
     /// stay around the read. Only the launchd and SCM `list` scans take an `Undetermined` apart.
