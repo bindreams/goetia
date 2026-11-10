@@ -23,8 +23,10 @@ use crate::error::{Error, Result};
 /// for a symlink. So every step on a directory goes by descriptor, never by path ([`walk`]
 /// resolves the path to one), and an account never owns a directory root is still working in:
 /// [`create`](Self::create) makes every directory root-owned and private, and only
-/// [`hand_over`](Self::hand_over), once all are made, gives them their mode and owner. A drop takes
-/// the owner back before it removes anything.
+/// [`hand_over`](Self::hand_over), once all are made, gives them their mode and owner. A directory
+/// that is kept is handed over whether or not `hand_over` was reached, so none stays private. A drop
+/// takes a directory back from the account only to remove something from it, and puts it back as it
+/// was if that does not remove it.
 ///
 /// The resolution follows systemd's `CHASE_SAFE` (see [`refuse_unsafe`]) on every step, plain
 /// directories included. A path that steps between owners is therefore refused, not created in;
@@ -74,8 +76,57 @@ struct Created {
     /// Who made it, and its group then: what a drop gives back.
     uid: libc::uid_t,
     gid: libc::gid_t,
-    finished: bool,
-    handed: bool,
+    /// Whom it is handed to, if anyone.
+    owner: Option<Owner>,
+    state: State,
+}
+
+/// How far a created directory has come, each step set only after the call that makes it succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Made `0700`, and the creator's.
+    Private,
+    /// Given its mode, `0755`; not yet given to its owner.
+    Opened,
+    /// Given to its owner, if it has one: nothing is left to do.
+    Handed,
+}
+
+/// What a directory was before a drop took it back from the account.
+#[derive(Debug)]
+struct Prior {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    mode: libc::mode_t,
+}
+
+impl Created {
+    /// Take it from [`State::Private`] to [`State::Handed`], one call at a time.
+    fn hand_over(&mut self) -> Result<()> {
+        if self.state == State::Private {
+            fchmod(&self.dir, Mode::from_bits_truncate(0o755)).map_err(|e| Error::os_at("chmod", &self.path, e))?;
+            self.state = State::Opened;
+        }
+        if self.state == State::Opened {
+            if let Some(owner) = self.owner {
+                fchown(&self.dir, Some(owner.uid), owner.gid).map_err(|e| Error::os_at("chown", &self.path, e))?;
+            }
+            self.state = State::Handed;
+        }
+        Ok(())
+    }
+
+    /// Whether the account it was handed to owns it.
+    fn account_owns(&self) -> bool {
+        self.state == State::Handed && self.owner.is_some()
+    }
+}
+
+/// Whether a removal went through.
+enum RemoveOutcome {
+    Removed,
+    /// The directory is not removed: it has content, or is not the one created.
+    Stays,
 }
 
 /// What a directory is created in, and removed from.
@@ -88,19 +139,24 @@ enum Parent {
 }
 
 impl CreatedDirs {
-    /// Create `dir` and every missing ancestor: private, and root's until [`hand_over`](Self::hand_over).
-    /// A path that exists is left untouched, and so is a component another install creates after the
-    /// walk: not ours. Whatever is at the end of the path must be a directory, or a symlink to one.
-    pub(crate) fn create(&mut self, dir: &Path) -> Result<()> {
+    /// Create `dir` and every missing ancestor: private, and root's until [`hand_over`](Self::hand_over)
+    /// gives them to `owner`, which a directory that is kept is given too. A path that exists is left
+    /// untouched, and so is a component another install creates after the walk: not ours. Whatever is
+    /// at the end of the path must be a directory, or a symlink to one.
+    pub(crate) fn create(&mut self, dir: &Path, owner: Option<Owner>) -> Result<()> {
         let found = walk(dir, &self.0)?;
-        self.create_in(found)
+        self.create_in(found, owner)
     }
 
     /// Create what `walk` found missing, under the directory it holds open.
-    fn create_in(&mut self, found: Walk) -> Result<()> {
-        let Walk { holder, owner, missing } = found;
+    fn create_in(&mut self, found: Walk, owner: Option<Owner>) -> Result<()> {
+        let Walk {
+            holder,
+            owner: holder_uid,
+            missing,
+        } = found;
         let mut parent = Parent::Existing(holder);
-        let mut parent_owner = owner;
+        let mut parent_owner = holder_uid;
         for (n, (path, name)) in missing.iter().enumerate() {
             let last = n + 1 == missing.len();
             // Private until `hand_over` makes it `0755` whatever the umask.
@@ -112,10 +168,16 @@ impl CreatedDirs {
                         report_stranded(path, &e);
                         Error::os_at("open", path, e)
                     })?;
-                    // The parent may be an account's: what is held must be the directory just made.
-                    if stat.st_uid != Uid::effective().as_raw() {
-                        let reason =
-                            io::Error::other(format!("not the directory just made: owned by uid {}", stat.st_uid));
+                    // The parent may be writable by an account: what is held must be the directory just made.
+                    let ours = fstat(self.fd_of(&parent)).map_err(|e| e.to_string()).and_then(|held| {
+                        if made_here(&held, stat.st_uid, Uid::effective().as_raw()) {
+                            Ok(())
+                        } else {
+                            Err(format!("not the directory just made: owned by uid {}", stat.st_uid))
+                        }
+                    });
+                    if let Err(why) = ours {
+                        let reason = io::Error::other(why);
                         report_stranded(path, &reason);
                         return Err(Error::os_at("open", path, reason));
                     }
@@ -128,8 +190,8 @@ impl CreatedDirs {
                         ino: stat.st_ino,
                         uid: stat.st_uid,
                         gid: stat.st_gid,
-                        finished: false,
-                        handed: false,
+                        owner,
+                        state: State::Private,
                     });
                     parent = Parent::Created(self.0.len() - 1);
                     parent_owner = stat.st_uid;
@@ -155,20 +217,24 @@ impl CreatedDirs {
         Ok(())
     }
 
-    /// Give every directory made so far its mode, `0755`, and `owner`. The daemon's account can
+    /// Give every directory made so far its mode, `0755`, and its owner. The daemon's account can
     /// enter what it owns, so this is the last thing done to them: nothing is made inside after it.
-    pub(crate) fn hand_over(&mut self, owner: Option<Owner>) -> Result<()> {
-        for created in self.0.iter_mut().filter(|created| !created.finished) {
-            fchmod(&created.dir, Mode::from_bits_truncate(0o755))
-                .map_err(|e| Error::os_at("chmod", &created.path, e))?;
-            if let Some(owner) = owner {
-                created.handed = true;
-                fchown(&created.dir, Some(owner.uid), owner.gid)
-                    .map_err(|e| Error::os_at("chown", &created.path, e))?;
+    pub(crate) fn hand_over(&mut self) -> Result<()> {
+        self.0.iter_mut().try_for_each(Created::hand_over)
+    }
+
+    /// Hand over everything still private, and let go of all of it: the directories stay. A step that
+    /// fails is reported, and the rest still go.
+    fn keep(&mut self) {
+        for created in &mut self.0 {
+            if let Err(e) = created.hand_over() {
+                report(format_args!(
+                    "could not hand {} over, which the install created and keeps: {e}",
+                    created.path.display()
+                ));
             }
-            created.finished = true;
         }
-        Ok(())
+        self.0.clear();
     }
 
     fn fd_of<'a>(&'a self, parent: &'a Parent) -> BorrowedFd<'a> {
@@ -178,32 +244,102 @@ impl CreatedDirs {
         }
     }
 
-    /// Take `self.0[index]` back from the account: its owner and a mode nobody else can write.
-    fn reclaim(&self, index: usize) -> std::result::Result<(), String> {
+    /// Take `self.0[index]` back from the account: its creator's, and a mode nobody else can write.
+    /// A failure leaves it as it was.
+    fn reclaim(&self, index: usize) -> std::result::Result<Prior, String> {
         let created = &self.0[index];
-        fchown(
+        let held = fstat(&created.dir).map_err(|e| e.to_string())?;
+        let prior = Prior {
+            uid: held.st_uid,
+            gid: held.st_gid,
+            mode: held.st_mode & 0o7777,
+        };
+        let taken = fchown(
             &created.dir,
             Some(Uid::from_raw(created.uid)),
             Some(Gid::from_raw(created.gid)),
         )
-        .map_err(|e| e.to_string())?;
-        fchmod(&created.dir, Mode::from_bits_truncate(0o755)).map_err(|e| e.to_string())
+        .and_then(|()| fchmod(&created.dir, Mode::from_bits_truncate(0o755)));
+        match taken {
+            Ok(()) => Ok(prior),
+            Err(e) => Err(match self.restore(index, &prior) {
+                Ok(()) => e.to_string(),
+                Err(again) => format!("{e}, and it could not be put back: {again}"),
+            }),
+        }
+    }
+
+    /// Give `self.0[index]` back what it was before [`reclaim`](Self::reclaim).
+    fn restore(&self, index: usize, prior: &Prior) -> std::result::Result<(), String> {
+        let dir = &self.0[index].dir;
+        fchown(dir, Some(Uid::from_raw(prior.uid)), Some(Gid::from_raw(prior.gid))).map_err(|e| e.to_string())?;
+        fchmod(dir, Mode::from_bits_truncate(prior.mode)).map_err(|e| e.to_string())
     }
 
     /// Remove `self.0[index]` from its parent if the name still refers to the directory that was
-    /// created. A directory that is gone, or has gained content, is left without a word.
-    fn remove(&self, index: usize) -> std::result::Result<(), String> {
+    /// created. A directory that is gone is removed; one that has gained content stays, without a
+    /// word. While the account owns the parent it can swap the name between the look and the unlink,
+    /// so the parent is taken back first, and is recorded in `taken` for the caller to put back.
+    fn remove(&self, index: usize, taken: &mut [Option<Prior>]) -> std::result::Result<RemoveOutcome, String> {
         let created = &self.0[index];
+        if let Parent::Created(parent) = created.parent
+            && self.0[parent].account_owns()
+            && taken[parent].is_none()
+        {
+            let prior = self.reclaim(parent).map_err(|e| {
+                format!(
+                    "could not take {} back from the account first: {e}",
+                    self.0[parent].path.display()
+                )
+            })?;
+            taken[parent] = Some(prior);
+        }
         let parent = self.fd_of(&created.parent);
         match fstatat(parent, created.name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(now) if now.st_dev == created.dev && now.st_ino == created.ino => {}
             Ok(_) => return Err("it is no longer the directory the install created".to_string()),
-            Err(Errno::ENOENT) => return Ok(()),
+            Err(Errno::ENOENT) => return Ok(RemoveOutcome::Removed),
             Err(e) => return Err(e.to_string()),
         }
         match unlinkat(parent, created.name.as_os_str(), UnlinkatFlags::RemoveDir) {
-            Ok(()) | Err(Errno::ENOENT | Errno::ENOTEMPTY | Errno::EEXIST) => Ok(()),
+            Ok(()) | Err(Errno::ENOENT) => Ok(RemoveOutcome::Removed),
+            Err(Errno::ENOTEMPTY | Errno::EEXIST) => Ok(RemoveOutcome::Stays),
             Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Remove what can be removed, deepest first, since each was created after its parent. A
+    /// directory that stays keeps its ancestors, which then hold content, as the account had them.
+    fn undo(&self) {
+        let mut taken: Vec<Option<Prior>> = self.0.iter().map(|_| None).collect();
+        let mut stays = vec![false; self.0.len()];
+        for index in (0..self.0.len()).rev() {
+            if !stays[index] {
+                match self.remove(index, &mut taken) {
+                    Ok(RemoveOutcome::Removed) => {}
+                    Ok(RemoveOutcome::Stays) => stays[index] = true,
+                    Err(e) => {
+                        report(format_args!(
+                            "could not remove {}, which the failed install created: {e}",
+                            self.0[index].path.display()
+                        ));
+                        stays[index] = true;
+                    }
+                }
+            }
+            if stays[index] {
+                if let Parent::Created(parent) = self.0[index].parent {
+                    stays[parent] = true;
+                }
+                if let Some(prior) = taken[index].take()
+                    && let Err(e) = self.restore(index, &prior)
+                {
+                    report(format_args!(
+                        "could not give {} back to the account after taking it back: {e}",
+                        self.0[index].path.display()
+                    ));
+                }
+            }
         }
     }
 }
@@ -216,11 +352,11 @@ impl Settle for CreatedDirs {
             return;
         }
         match standing() {
-            Standing::Yes => self.0.clear(),
+            Standing::Yes => self.keep(),
             Standing::No => {}
             Standing::Unknown(reason) => {
                 report(format_args!("{reason}; keeping the directories the install created"));
-                self.0.clear();
+                self.keep();
             }
         }
     }
@@ -502,31 +638,27 @@ fn open_beneath(parent: BorrowedFd<'_>, name: &OsStr, base: OFlag) -> nix::Resul
 }
 
 impl Drop for CreatedDirs {
-    /// Takes every handed-over directory back, then removes them deepest first, since each was
-    /// created after its parent. Does nothing while a panic unwinds: the panic may be after the
-    /// definition was written, and the directories of an installed service must stay. A step that
-    /// fails is reported on stderr, and a failed report is ignored: this never panics.
+    /// Removes what was not kept: see [`undo`](CreatedDirs::undo). A panic may come after the
+    /// definition was written, which leaves its standing as unknown as an unreadable one does, so the
+    /// directories are kept, and kept means handed over. A step that fails is reported on stderr, and
+    /// a failed report is ignored: this never panics.
     fn drop(&mut self) {
         if std::thread::panicking() {
-            return;
-        }
-        for index in (0..self.0.len()).filter(|index| self.0[*index].handed) {
-            if let Err(e) = self.reclaim(index) {
-                report(format_args!(
-                    "could not take {} back from the account, which the failed install handed it to: {e}",
-                    self.0[index].path.display()
-                ));
-            }
-        }
-        for index in (0..self.0.len()).rev() {
-            if let Err(e) = self.remove(index) {
-                report(format_args!(
-                    "could not remove {}, which the failed install created: {e}",
-                    self.0[index].path.display()
-                ));
-            }
+            self.keep();
+        } else {
+            self.undo();
         }
     }
+}
+
+/// Whether `uid`, the owner of a directory just made in `parent`, is what a directory this process
+/// made would have. A swap between the `mkdirat` and the open needs someone besides root who can
+/// write `parent`: its owner, or anyone through group or other write permission without the sticky
+/// bit. Where nobody can, the owner says nothing, since a file system may map it (NFS with
+/// `root_squash` gives 65534, a vfat mount gives its `uid=`), and anything is accepted.
+fn made_here(parent: &FileStat, uid: libc::uid_t, euid: libc::uid_t) -> bool {
+    let others_write = parent.st_mode & (libc::S_IWGRP | libc::S_IWOTH) != 0 && parent.st_mode & libc::S_ISVTX == 0;
+    (parent.st_uid == 0 && !others_write) || uid == euid
 }
 
 /// The directory `path`, made by the install, that could not be opened, so it stays.

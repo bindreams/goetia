@@ -15,12 +15,12 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
         && let Some(parent) = logs.parent()
         && !parent.as_os_str().is_empty()
     {
-        created.create(parent)?;
+        created.create(parent, owner)?;
     }
     if let Some(cwd) = &spec.cwd {
-        created.create(cwd)?;
+        created.create(cwd, owner)?;
     }
-    created.hand_over(owner)
+    created.hand_over()
 }
 
 /// Who to hand a created directory to so a non-root daemon can use it, or `None` for `User::Root`

@@ -459,15 +459,15 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut CreatedDirs) -> Result<()> {
     let owner = Owner::new(account.uid, Some(account.gid))?;
     if let Some(cwd) = &spec.cwd {
-        created.create(cwd)?;
+        created.create(cwd, Some(owner))?;
     }
     if let Some(logs) = &spec.logs
         && let Some(parent) = logs.parent()
         && !parent.as_os_str().is_empty()
     {
-        created.create(parent)?;
+        created.create(parent, Some(owner))?;
     }
-    created.hand_over(Some(owner))
+    created.hand_over()
 }
 
 /// Build a `0644` named temp file in `dir` (so a later hard-link persist stays on one filesystem)

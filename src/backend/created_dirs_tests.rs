@@ -9,7 +9,7 @@ use crate::backend::test_elevation::{ELEVATED, elevated};
 /// Creates `root/a/b/c`, all of it recorded.
 fn create_chain(root: &Path) -> CreatedDirs {
     let mut created = CreatedDirs::default();
-    created.create(&root.join("a/b/c")).unwrap();
+    created.create(&root.join("a/b/c"), None).unwrap();
     created
 }
 
@@ -72,7 +72,7 @@ fn drop_leaves_a_directory_that_existed_before() {
     fs::create_dir(&before).unwrap();
     let mut created = CreatedDirs::default();
     let new = before.join("b");
-    created.create(&new).unwrap();
+    created.create(&new, None).unwrap();
 
     drop(created);
 
@@ -114,7 +114,7 @@ fn drop_leaves_a_directory_that_is_no_longer_the_one_created() {
     let tmp = tempfile::tempdir().unwrap();
     let mut created = CreatedDirs::default();
     let dir = tmp.path().join("a");
-    created.create(&dir).unwrap();
+    created.create(&dir, None).unwrap();
     fs::rename(&dir, tmp.path().join("moved")).unwrap();
     fs::create_dir(&dir).unwrap();
 
@@ -182,8 +182,8 @@ fn create_leaves_an_existing_directory_exactly_as_found() {
     let before = mode_and_gid(&dir);
 
     let mut created = CreatedDirs::default();
-    created.create(&dir).unwrap();
-    created.hand_over(Some(owner)).unwrap();
+    created.create(&dir, Some(owner)).unwrap();
+    created.hand_over().unwrap();
 
     assert_eq!(mode_and_gid(&dir), before);
     assert_eq!(before.0, 0o700);
@@ -197,8 +197,8 @@ fn create_hands_every_created_directory_to_the_owner() {
     let owner = other_owner(tmp.path());
     let mut created = CreatedDirs::default();
 
-    created.create(&tmp.path().join("a/b")).unwrap();
-    created.hand_over(Some(owner)).unwrap();
+    created.create(&tmp.path().join("a/b"), Some(owner)).unwrap();
+    created.hand_over().unwrap();
 
     assert_eq!(created.0.len(), 2);
     for entry in &created.0 {
@@ -215,7 +215,7 @@ fn create_without_an_owner_changes_no_ownership() {
     let tmp = tempfile::tempdir().unwrap();
     let mut created = CreatedDirs::default();
 
-    created.create(&tmp.path().join("a")).unwrap();
+    created.create(&tmp.path().join("a"), None).unwrap();
 
     let parent = fs::metadata(tmp.path()).unwrap();
     let made = fs::metadata(tmp.path().join("a")).unwrap();
@@ -237,8 +237,8 @@ fn create_leaves_a_symlink_planted_at_the_last_name() {
     std::os::unix::fs::symlink(other.path(), &dir).unwrap();
     let mut created = CreatedDirs::default();
 
-    created.create_in(found).unwrap();
-    created.hand_over(Some(owner)).unwrap();
+    created.create_in(found, Some(owner)).unwrap();
+    created.hand_over().unwrap();
 
     assert_eq!(mode_and_gid(other.path()), before);
     assert!(created.0.is_empty());
@@ -253,7 +253,9 @@ fn create_does_not_descend_into_a_symlink_planted_above_the_last_name() {
     std::os::unix::fs::symlink(other.path(), tmp.path().join("a")).unwrap();
     let mut created = CreatedDirs::default();
 
-    created.create_in(found).expect_err("a symlink is not a directory");
+    created
+        .create_in(found, None)
+        .expect_err("a symlink is not a directory");
 
     assert_eq!(fs::read_dir(other.path()).unwrap().count(), 0);
 }
@@ -275,8 +277,8 @@ fn create_leaves_a_component_that_appeared_after_the_walk() {
 
     let mut created = CreatedDirs::default();
 
-    created.create_in(found).unwrap();
-    created.hand_over(Some(owner)).unwrap();
+    created.create_in(found, Some(owner)).unwrap();
+    created.hand_over().unwrap();
 
     assert_eq!(mode_and_gid(&raced), before);
     assert_eq!(mode_and_gid(&leaf), (0o755, owner.gid.unwrap().as_raw()));
@@ -290,7 +292,7 @@ fn create_accepts_a_symlink_to_a_directory_as_existing() {
     std::os::unix::fs::symlink("real", tmp.path().join("link")).unwrap();
     let mut created = CreatedDirs::default();
 
-    created.create(&tmp.path().join("link")).unwrap();
+    created.create(&tmp.path().join("link"), None).unwrap();
 
     assert!(created.0.is_empty());
 }
@@ -302,7 +304,9 @@ fn create_refuses_a_dangling_symlink_as_the_last_component() {
     let link = tmp.path().join("link");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    CreatedDirs::default().create(&link).expect_err("a link to nothing");
+    CreatedDirs::default()
+        .create(&link, None)
+        .expect_err("a link to nothing");
 
     assert!(!target.exists());
 }
@@ -314,7 +318,7 @@ fn create_refuses_a_regular_file_as_the_last_component() {
     fs::write(&file, b"x").unwrap();
 
     let err = CreatedDirs::default()
-        .create(&file)
+        .create(&file, None)
         .expect_err("a file is not a directory");
 
     assert!(matches!(err, Error::NotADirectory { .. }), "{err:?}");
@@ -328,7 +332,9 @@ fn create_under_a_regular_file_fails_and_creates_nothing() {
     fs::write(&file, b"x").unwrap();
     let mut created = CreatedDirs::default();
 
-    created.create(&file.join("a")).expect_err("a file has no children");
+    created
+        .create(&file.join("a"), None)
+        .expect_err("a file has no children");
 
     assert!(created.0.is_empty());
 }
@@ -350,7 +356,7 @@ fn create_refuses_to_follow_an_account_owned_symlink_into_a_root_owned_directory
     let mut created = CreatedDirs::default();
 
     let err = created
-        .create(&owned.join("link/new"))
+        .create(&owned.join("link/new"), None)
         .expect_err("the link leads from the account's directory into root's");
 
     let reason = reason(&err);
@@ -370,7 +376,7 @@ fn create_follows_a_symlinked_ancestor_the_caller_owns() {
     std::os::unix::fs::symlink("real", tmp.path().join("link")).unwrap();
     let mut created = CreatedDirs::default();
 
-    created.create(&tmp.path().join("link/a/b")).unwrap();
+    created.create(&tmp.path().join("link/a/b"), None).unwrap();
 
     assert!(real.join("a/b").is_dir());
     assert_eq!(created.0.len(), 2);
@@ -388,7 +394,9 @@ fn create_refuses_a_plain_directory_owned_by_another_account() {
     std::os::unix::fs::chown(&inner, Some(21_001), None).unwrap();
     let mut created = CreatedDirs::default();
 
-    let err = created.create(&inner.join("c")).expect_err("uid 21000 to uid 21001");
+    let err = created
+        .create(&inner.join("c"), None)
+        .expect_err("uid 21000 to uid 21001");
 
     let reason = reason(&err);
     assert!(reason.contains("owned by uid 21001"), "{reason}");
@@ -407,7 +415,9 @@ fn create_refuses_an_existing_last_component_owned_by_another_account() {
     fs::create_dir_all(&last).unwrap();
     std::os::unix::fs::chown(&outer, Some(21_000), None).unwrap();
 
-    let err = CreatedDirs::default().create(&last).expect_err("uid 21000 to root");
+    let err = CreatedDirs::default()
+        .create(&last, None)
+        .expect_err("uid 21000 to root");
 
     assert!(reason(&err).contains("owned by uid 0"), "{err}");
 }
@@ -424,7 +434,7 @@ fn create_refuses_an_absolute_symlink_the_account_owns() {
     std::os::unix::fs::lchown(&link, Some(21_000), None).unwrap();
 
     let err = CreatedDirs::default()
-        .create(&link.join("new"))
+        .create(&link.join("new"), None)
         .expect_err("an absolute link of the account's");
 
     let reason = reason(&err);
@@ -446,7 +456,7 @@ fn create_follows_an_absolute_symlink_root_owns() {
     std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
     let mut created = CreatedDirs::default();
 
-    created.create(&tmp.path().join("link/a")).unwrap();
+    created.create(&tmp.path().join("link/a"), None).unwrap();
 
     assert!(real.join("a").is_dir());
 }
@@ -473,11 +483,11 @@ fn create_follows_a_chain_of_links_up_to_the_bound_and_no_further() {
     };
 
     chain(SYMLINK_LIMIT);
-    CreatedDirs::default().create(&base.join("link1/ok")).unwrap();
+    CreatedDirs::default().create(&base.join("link1/ok"), None).unwrap();
 
     chain(SYMLINK_LIMIT + 1);
     let err = CreatedDirs::default()
-        .create(&base.join("link1/no"))
+        .create(&base.join("link1/no"), None)
         .expect_err("one link too many");
     let source = std::error::Error::source(&err).unwrap();
     let errno = source.downcast_ref::<io::Error>().and_then(io::Error::raw_os_error);
@@ -498,7 +508,7 @@ fn create_refuses_dotdot_below_a_missing_component() {
     let mut created = CreatedDirs::default();
 
     created
-        .create(&tmp.path().join("missing/../x"))
+        .create(&tmp.path().join("missing/../x"), None)
         .expect_err("`..` below a missing component");
 
     assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
@@ -511,7 +521,7 @@ fn create_refuses_to_make_anything_below_a_dangling_link() {
     std::os::unix::fs::symlink("nowhere", tmp.path().join("link")).unwrap();
 
     CreatedDirs::default()
-        .create(&tmp.path().join("link/x"))
+        .create(&tmp.path().join("link/x"), None)
         .expect_err("a dangling link");
 
     assert!(!tmp.path().join("nowhere").exists());
@@ -520,7 +530,7 @@ fn create_refuses_to_make_anything_below_a_dangling_link() {
 #[skuld::test]
 fn create_refuses_a_relative_path() {
     CreatedDirs::default()
-        .create(Path::new("goetia-relative"))
+        .create(Path::new("goetia-relative"), None)
         .expect_err("a relative path");
 
     assert!(!Path::new("goetia-relative").exists());
@@ -541,7 +551,7 @@ fn create_makes_directories_private_and_the_creators_until_they_are_handed_over(
     let tmp = tempfile::tempdir().unwrap();
     let mut created = CreatedDirs::default();
 
-    created.create(&tmp.path().join("a/b")).unwrap();
+    created.create(&tmp.path().join("a/b"), None).unwrap();
 
     for dir in ["a", "a/b"] {
         let meta = fs::metadata(tmp.path().join(dir)).unwrap();
@@ -556,9 +566,9 @@ fn create_makes_directories_private_and_the_creators_until_they_are_handed_over(
 fn hand_over_without_an_owner_makes_the_directories_0755() {
     let tmp = tempfile::tempdir().unwrap();
     let mut created = CreatedDirs::default();
-    created.create(&tmp.path().join("a/b")).unwrap();
+    created.create(&tmp.path().join("a/b"), None).unwrap();
 
-    created.hand_over(None).unwrap();
+    created.hand_over().unwrap();
 
     for dir in ["a", "a/b"] {
         let mode = fs::metadata(tmp.path().join(dir)).unwrap().permissions().mode() & 0o777;
@@ -574,7 +584,7 @@ fn a_failure_after_a_made_directory_leaves_it_to_the_drop() {
     let mut created = CreatedDirs::default();
 
     created
-        .create(&tmp.path().join("a").join("x".repeat(300)))
+        .create(&tmp.path().join("a").join("x".repeat(300)), None)
         .expect_err("a name too long for the file system");
 
     assert_eq!(created.0.len(), 1);
@@ -592,7 +602,7 @@ fn create_refuses_a_last_component_another_install_made_as_a_file() {
     let found = walk(&dir, &[]).unwrap();
     fs::write(&dir, b"x").unwrap();
 
-    let err = CreatedDirs::default().create_in(found).expect_err("a file");
+    let err = CreatedDirs::default().create_in(found, None).expect_err("a file");
 
     assert!(matches!(err, Error::NotADirectory { .. }), "{err:?}");
 }
@@ -602,16 +612,15 @@ fn create_refuses_a_last_component_another_install_made_as_a_file() {
 #[skuld::test(requires = [elevated], labels = [ELEVATED])]
 fn hand_over_gives_every_directory_of_every_create_to_the_owner_at_once() {
     let tmp = tempfile::tempdir().unwrap();
+    let owner = Some(Owner::new(Uid::from_raw(21_000), None).unwrap());
     let mut created = CreatedDirs::default();
-    created.create(&tmp.path().join("a/b")).unwrap();
-    created.create(&tmp.path().join("a/b/c")).unwrap();
+    created.create(&tmp.path().join("a/b"), owner).unwrap();
+    created.create(&tmp.path().join("a/b/c"), owner).unwrap();
     for dir in ["a", "a/b", "a/b/c"] {
         assert_eq!(fs::metadata(tmp.path().join(dir)).unwrap().uid(), 0, "{dir}");
     }
 
-    created
-        .hand_over(Some(Owner::new(Uid::from_raw(21_000), None).unwrap()))
-        .unwrap();
+    created.hand_over().unwrap();
 
     for dir in ["a", "a/b", "a/b/c"] {
         assert_eq!(fs::metadata(tmp.path().join(dir)).unwrap().uid(), 21_000, "{dir}");
@@ -627,9 +636,9 @@ fn create_walks_through_a_directory_it_made_under_another_accounts() {
     fs::create_dir(&outer).unwrap();
     std::os::unix::fs::chown(&outer, Some(21_000), None).unwrap();
     let mut created = CreatedDirs::default();
-    created.create(&outer.join("a")).unwrap();
+    created.create(&outer.join("a"), None).unwrap();
 
-    created.create(&outer.join("a/work")).unwrap();
+    created.create(&outer.join("a/work"), None).unwrap();
 
     assert!(outer.join("a/work").is_dir());
 }
@@ -647,32 +656,252 @@ fn create_refuses_a_component_another_install_made_for_another_account() {
     std::os::unix::fs::chown(holder.join("q"), Some(21_001), None).unwrap();
     let mut created = CreatedDirs::default();
 
-    let err = created.create_in(found).expect_err("uid 21000 to uid 21001");
+    let err = created.create_in(found, None).expect_err("uid 21000 to uid 21001");
 
     assert!(reason(&err).contains("owned by uid 21001"), "{err}");
     assert!(!holder.join("q/r").exists());
 }
 
-/// A drop takes a directory back from the account before it removes anything: here `a` stays (it
-/// has content), and is root's and `0755` again, whatever the account did to it.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn drop_takes_a_handed_over_directory_back() {
+/// A directory the drop removes was taken back from the account for it; one it leaves is as the
+/// account had it. Here `a/b` is removed, and `a`, which has content, stays with the owner and mode
+/// the account gave it, though it was taken back to remove `b` from it.
+#[skuld::test(requires = [second_group])]
+fn drop_leaves_a_directory_it_does_not_remove_as_the_account_had_it() {
     let tmp = tempfile::tempdir().unwrap();
+    let owner = other_owner(tmp.path());
     let mut created = CreatedDirs::default();
-    created.create(&tmp.path().join("a/b")).unwrap();
-    created
-        .hand_over(Some(
-            Owner::new(Uid::from_raw(21_000), Some(Gid::from_raw(21_000))).unwrap(),
-        ))
-        .unwrap();
+    created.create(&tmp.path().join("a/b"), Some(owner)).unwrap();
+    created.hand_over().unwrap();
     fs::write(tmp.path().join("a/keep"), b"x").unwrap();
     fs::set_permissions(tmp.path().join("a"), fs::Permissions::from_mode(0o777)).unwrap();
 
     drop(created);
 
-    let meta = fs::metadata(tmp.path().join("a")).unwrap();
-    assert_eq!((meta.uid(), meta.permissions().mode() & 0o777), (0, 0o755));
+    assert_eq!(
+        mode_and_gid(&tmp.path().join("a")),
+        (0o777, owner.gid.unwrap().as_raw())
+    );
     assert!(!tmp.path().join("a/b").exists());
+}
+
+/// A child that stays keeps its parent as it was, and a child that is not the directory created
+/// stays untouched: here `a/b` was swapped, so it and `a` are left as the account had them.
+#[skuld::test(requires = [second_group])]
+fn drop_leaves_a_swapped_directory_and_its_parent_as_the_account_had_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner = other_owner(tmp.path());
+    let mut created = CreatedDirs::default();
+    created.create(&tmp.path().join("a/b"), Some(owner)).unwrap();
+    created.hand_over().unwrap();
+    fs::rename(tmp.path().join("a/b"), tmp.path().join("a/moved")).unwrap();
+    fs::create_dir(tmp.path().join("a/b")).unwrap();
+    let gid = owner.gid.unwrap().as_raw();
+    let before = (
+        mode_and_gid(&tmp.path().join("a")),
+        mode_and_gid(&tmp.path().join("a/b")),
+    );
+    assert_eq!(before.0.1, gid);
+
+    drop(created);
+
+    let after = (
+        mode_and_gid(&tmp.path().join("a")),
+        mode_and_gid(&tmp.path().join("a/b")),
+    );
+    assert_eq!(after, before);
+    assert!(tmp.path().join("a/moved").is_dir());
+}
+
+/// What `reclaim` takes it back to is the creator's and `0755`, and `restore` gives back exactly
+/// what it was.
+#[skuld::test(requires = [second_group])]
+fn reclaim_takes_a_directory_back_and_restore_gives_it_as_it_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner = other_owner(tmp.path());
+    let mut created = CreatedDirs::default();
+    created.create(&tmp.path().join("a"), Some(owner)).unwrap();
+    created.hand_over().unwrap();
+    let dir = tmp.path().join("a");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+    let handed = mode_and_gid(&dir);
+    assert_eq!(handed.1, owner.gid.unwrap().as_raw());
+
+    let prior = created.reclaim(0).unwrap();
+    assert_eq!(mode_and_gid(&dir), (0o755, created.0[0].gid));
+
+    created.restore(0, &prior).unwrap();
+    assert_eq!(mode_and_gid(&dir), handed);
+}
+
+/// A directory kept stays handed over whatever its install did before: `create` made it private and
+/// the creator's, and a failure before `hand_over` must not leave it so, as a rerun would find it
+/// and take it for existing.
+#[skuld::test(requires = [second_group])]
+fn settle_hands_over_a_kept_directory_that_never_was() {
+    for standing in [Standing::Yes, Standing::Unknown("unreadable".to_string())] {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = other_owner(tmp.path());
+        let mut created = CreatedDirs::default();
+        created.create(&tmp.path().join("a/b"), Some(owner)).unwrap();
+
+        created.settle(|| standing);
+        drop(created);
+
+        for dir in ["a", "a/b"] {
+            assert_eq!(
+                mode_and_gid(&tmp.path().join(dir)),
+                (0o755, owner.gid.unwrap().as_raw()),
+                "{dir}"
+            );
+        }
+    }
+}
+
+/// With no account to hand to, kept means `0755`.
+#[skuld::test]
+fn settle_makes_a_kept_directory_0755_when_there_is_no_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut created = CreatedDirs::default();
+    created.create(&tmp.path().join("a"), None).unwrap();
+
+    created.settle(|| Standing::Yes);
+    drop(created);
+
+    assert_eq!(mode_and_gid(&tmp.path().join("a")).0, 0o755);
+}
+
+/// A panic leaves the definition's standing unknown, as an unreadable one does: kept, and so handed
+/// over.
+#[skuld::test(requires = [second_group])]
+fn drop_hands_the_directories_over_while_a_panic_unwinds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner = other_owner(tmp.path());
+    let root = tmp.path().to_path_buf();
+
+    let unwound = std::panic::catch_unwind(move || {
+        let mut created = CreatedDirs::default();
+        created.create(&root.join("a/b"), Some(owner)).unwrap();
+        panic!("a step before `hand_over`");
+    });
+
+    assert!(unwound.is_err());
+    for dir in ["a", "a/b"] {
+        assert_eq!(
+            mode_and_gid(&tmp.path().join(dir)),
+            (0o755, owner.gid.unwrap().as_raw()),
+            "{dir}"
+        );
+    }
+}
+
+/// `CAP_CHOWN` dropped from this thread until the guard goes, so that a `fchown` to a group the
+/// process is not in fails, as it does for anyone unprivileged, even when the suite runs as root.
+#[cfg(target_os = "linux")]
+struct NoChown {
+    header: CapHeader,
+    saved: [CapData; 2],
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl NoChown {
+    const VERSION_3: u32 = 0x2008_0522;
+    const CAP_CHOWN: u32 = 1;
+
+    fn new() -> Self {
+        let header = CapHeader {
+            version: Self::VERSION_3,
+            pid: 0,
+        };
+        let mut saved = [CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // SAFETY: `capget` fills the two `CapData` of version 3 and reads the header; pid 0 is this thread.
+        let got = unsafe { libc::syscall(libc::SYS_capget, &header, saved.as_mut_ptr()) };
+        assert_eq!(got, 0, "capget: {}", io::Error::last_os_error());
+        let mut lowered = saved;
+        lowered[0].effective &= !Self::CAP_CHOWN;
+        // SAFETY: `capset` reads the header and the two `CapData` of version 3.
+        let set = unsafe { libc::syscall(libc::SYS_capset, &header, lowered.as_ptr()) };
+        assert_eq!(set, 0, "capset: {}", io::Error::last_os_error());
+        Self { header, saved }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NoChown {
+    fn drop(&mut self) {
+        // SAFETY: as in `new`.
+        let set = unsafe { libc::syscall(libc::SYS_capset, &self.header, self.saved.as_ptr()) };
+        assert_eq!(set, 0, "capset: {}", io::Error::last_os_error());
+    }
+}
+
+/// A directory is handed over only once `fchown` has succeeded: here it fails (a group this process
+/// is not in), and the directory is opened but not handed.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn a_failed_chown_does_not_read_as_handed_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    // SAFETY: no arguments, no failure.
+    let egid = unsafe { libc::getegid() };
+    let foreign = (1..).find(|gid| *gid != egid && !groups().contains(gid)).unwrap();
+    let owner = Owner::new(Uid::current(), Some(Gid::from_raw(foreign))).unwrap();
+    let mut created = CreatedDirs::default();
+    created.create(&tmp.path().join("a"), Some(owner)).unwrap();
+    assert_eq!(created.0[0].state, State::Private);
+    let _no_chown = NoChown::new();
+
+    created
+        .hand_over()
+        .expect_err("this process may not give a directory to that group");
+
+    assert_eq!(created.0[0].state, State::Opened);
+}
+
+fn parent_stat(uid: libc::uid_t, mode: libc::mode_t) -> FileStat {
+    // SAFETY: `stat` is plain integers; all zero is a valid value.
+    let mut stat: FileStat = unsafe { std::mem::zeroed() };
+    stat.st_uid = uid;
+    stat.st_mode = libc::S_IFDIR | mode;
+    stat
+}
+
+/// A swap between `mkdirat` and the open needs someone besides root who can write the parent. Where
+/// nobody can, the entry's owner says nothing: a file system maps it (NFS with `root_squash` gives
+/// 65534, a vfat mount gives its `uid=`).
+#[skuld::test]
+fn a_made_directory_in_a_parent_only_root_can_write_is_accepted_whoever_owns_it() {
+    for mode in [0o755, 0o700, 0o1777, 0o3777] {
+        assert!(made_here(&parent_stat(0, mode), 65_534, 0), "{mode:o}");
+    }
+}
+
+#[skuld::test]
+fn a_made_directory_in_a_parent_another_can_write_must_be_the_creators() {
+    // Owned by an account; group-writable; world-writable without the sticky bit.
+    for (owner, mode) in [(1000, 0o755), (0, 0o775), (0, 0o757), (0, 0o777), (1000, 0o1777)] {
+        let parent = parent_stat(owner, mode);
+        assert!(!made_here(&parent, 65_534, 0), "{owner} {mode:o}");
+        assert!(made_here(&parent, 0, 0), "{owner} {mode:o}");
+    }
 }
 
 #[skuld::test]
