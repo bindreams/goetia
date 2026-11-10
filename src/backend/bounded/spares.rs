@@ -387,6 +387,7 @@ pub(crate) mod test_hook {
     }
 
     /// Let this thread run only `n` more [`super::Kept::again`]s, until the returned guard drops.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn duplicates(n: usize) -> Allowance {
         allow(Kind::Duplicate, n)
     }
