@@ -1269,15 +1269,6 @@ fn spec_failing_on_logs_after_cwd(id: &str, base: &Path, cwd: &Path) -> DaemonSp
     DaemonSpec::new(spec).unwrap()
 }
 
-/// The install failed on the `logs` parent, after the `cwd` was made, and not earlier for some other
-/// reason. That the `cwd` existed before it was removed is the `write` unit test's.
-fn assert_logs_parent_under_a_file(err: &goetia::Error) {
-    let cause = std::error::Error::source(err)
-        .map(ToString::to_string)
-        .unwrap_or_default();
-    assert!(cause.contains("ENOTDIR"), "{err}: {cause}");
-}
-
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_failed_install_removes_the_directories_it_created() {
     let id = support::random_test_id();
@@ -1290,7 +1281,7 @@ fn a_failed_install_removes_the_directories_it_created() {
     let err = Launchd::new()
         .install(&spec, false)
         .expect_err("the logs parent is under a file");
-    assert_logs_parent_under_a_file(&err);
+    support::assert_failed_on_a_path_under_a_file(&err);
 
     assert!(!base.join("a").exists(), "the failed install left its cwd");
     assert!(base.is_dir(), "a directory that existed before must stay");
@@ -1310,7 +1301,7 @@ fn a_failed_install_removes_a_new_directory_in_one_that_existed_before() {
     let err = Launchd::new()
         .install(&spec, false)
         .expect_err("the logs parent is under a file");
-    assert_logs_parent_under_a_file(&err);
+    support::assert_failed_on_a_path_under_a_file(&err);
 
     assert!(!created.exists(), "the failed install left {}", created.display());
     assert!(existing.is_dir(), "a directory that existed before must stay");

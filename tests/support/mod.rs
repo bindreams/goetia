@@ -1,7 +1,7 @@
 //! Shared support for the integration suites.
 //!
-//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only `daemon_spec`, `kill`, `list_json`,
-//! `scm_wait` and `stock_shim_manager` depend on the `goetia` crate; the marker-inertness probe's
+//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only `daemon_spec`, `failed_install`, `kill`,
+//! `list_json`, `scm_wait` and `stock_shim_manager` depend on the `goetia` crate; the marker-inertness probe's
 //! hand-written artifacts use the rest.
 
 #![allow(dead_code, unused_imports)]
@@ -13,6 +13,7 @@ pub mod cmd;
 pub mod connect_back;
 pub mod daemon_spec;
 pub mod elevation;
+pub mod failed_install;
 pub mod kill;
 pub mod list_json;
 #[cfg(windows)]
@@ -43,6 +44,7 @@ use rand::RngExt as _;
 pub use connect_back::ConnectBack;
 pub use daemon_spec::spec;
 pub use elevation::{ELEVATED, elevated};
+pub use failed_install::assert_failed_on_a_path_under_a_file;
 pub use list_json::{ListJson, assert_own, list_json, may_account_for};
 #[cfg(windows)]
 pub use local_user::LocalUserGuard;
