@@ -5,8 +5,9 @@ use skuld::temp_dir;
 
 use super::*;
 use crate::spec::interpolate;
-use crate::spec::test_support::{HOST_BACKENDS, abs, plain_fields, program};
+use crate::spec::test_support::{HOST_BACKENDS, abs, program};
 use crate::spec::vars::Vars;
+use crate::testing::plain_fields;
 
 // `Path::new("/opt/rt").is_absolute()` is `false` on Windows, and
 // `PathBuf::from(r"C:\base").join("/opt/rt")` yields `C:/opt/rt` — so every
