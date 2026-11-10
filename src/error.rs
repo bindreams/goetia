@@ -668,10 +668,7 @@ impl Error {
             | Error::LoadedStateInDoubt { .. }
             | Error::StaleJobBootedOut { .. }
             | Error::StartUnconfirmed { .. } => true,
-            Error::Step { source, .. }
-            | Error::StartAsManaged { source, .. }
-            | Error::ServiceImageUnreadable { source, .. }
-            | Error::InstalledUnreadable { source, .. } => source.is_indeterminate(),
+            wrapper!(source) | Error::ServiceImageUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
@@ -717,17 +714,15 @@ impl Error {
         }
     }
 
-    /// The error a chain of [`Step`](Error::Step)s, [`StartAsManaged`](Error::StartAsManaged)s and
-    /// [`InstalledUnreadable`](Error::InstalledUnreadable)s
-    /// ends in, which classification reads: a step over [`NotInstalled`](Error::NotInstalled) is
+    /// The error a chain of the variants [`wrapper!`] lists ends in, which classification reads: a step over [`NotInstalled`](Error::NotInstalled) is
     /// still "not installed". [`Both`](Error::Both) has two causes, so it is itself the cause.
     /// [`map_cause`](Error::map_cause) walks the same chain.
     pub fn cause(&self) -> &Error {
         self.wrapped().map_or(self, Error::cause)
     }
 
-    /// Whether this error, or what it wraps in a [`Step`](Error::Step), a
-    /// [`StartAsManaged`](Error::StartAsManaged) or a [`Kept`](Error::Kept), is an
+    /// Whether this error, or what it wraps in a variant [`wrapper!`] lists or in a
+    /// [`Kept`](Error::Kept), is an
     /// [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
     /// walks through that variant.
     pub(crate) fn wraps_unreadable_host(&self) -> bool {
@@ -750,13 +745,24 @@ impl Error {
     /// This error with `f` applied to its [`cause`](Error::cause), the wrappers kept around the
     /// result: the operation that failed on the cause stays in the report.
     pub fn map_cause(mut self, f: impl FnOnce(Error) -> Error) -> Error {
-        match &mut self {
-            wrapper!(source) => {
-                let inner = std::mem::replace(&mut **source, Error::LoadedJob { id: String::new() });
-                **source = inner.map_cause(f);
-                self
+        self.map_cause_in_place(f);
+        self
+    }
+
+    /// [`map_cause`](Error::map_cause) on the error where it stands: the wrappers are never taken
+    /// apart, only the cause is moved out, mapped and put back.
+    fn map_cause_in_place(&mut self, f: impl FnOnce(Error) -> Error) {
+        match self {
+            wrapper!(source) => source.map_cause_in_place(f),
+            cause => {
+                // Stands in for the cause for the length of `f`, which owns it meanwhile.
+                let vacated = Error::os(
+                    "map_cause: the cause is with its mapper",
+                    std::io::Error::other("vacated"),
+                );
+                let moved = std::mem::replace(cause, vacated);
+                *cause = f(moved);
             }
-            _ => f(self),
         }
     }
 
