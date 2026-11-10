@@ -122,7 +122,7 @@ impl Backend for Systemd {
 
     /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
     /// answer holds for the `daemon-reload` after the write.
-    fn begin_install(&self, _spec: &DaemonSpec) -> Result<GateScope> {
+    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String) -> Result<GateScope> {
         let gate = gate_scope();
         require_supported()?;
         Ok(gate)

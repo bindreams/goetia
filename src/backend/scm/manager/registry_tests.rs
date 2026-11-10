@@ -1,6 +1,7 @@
 use super::*;
 
 use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
+use winreg::RegValue;
 use winreg::types::ToRegValue as _;
 
 use crate::backend::test_elevation::{ELEVATED, elevated};
@@ -424,6 +425,110 @@ fn an_event_message_file_needs_a_system_root() {
         let message = e.to_string();
         assert!(message.contains("SystemRoot"), "{message}");
     }
+}
+
+/// Writes keys under `HKLM\SOFTWARE`, a scratch key standing for `Services`. The image is read
+/// below the root the scan hands over: a service marked for deletion, one with no key, and one whose
+/// `ImagePath` is not a string start nothing.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_registered_image_is_read_below_the_root_it_is_given() {
+    let scratch = ScratchKey::new(&format!("image-{}-root", std::process::id()));
+    let root = scratch.create();
+    let set_image = |name: &str, image: RegValue| {
+        let (key, _) = root.create_subkey(name).expect("create the service key");
+        key.set_raw_value(IMAGE_PATH_VALUE, &image).expect("write ImagePath");
+        key
+    };
+    set_image("runs", r"C:\a\host.exe --x".to_reg_value());
+    set_image("marked", r"C:\a\host.exe".to_reg_value())
+        .set_value(DELETE_FLAG_VALUE, &1u32)
+        .expect("write DeleteFlag");
+    set_image("not-a-string", 7u32.to_reg_value());
+    root.create_subkey("no-image").expect("create the service key");
+    let services = ServicesRoot::new(&root);
+
+    let read = |name: &str| match read_registered_image(&services, name).expect(name) {
+        RegistryReadOutcome::Read(image) => Some(image),
+        RegistryReadOutcome::ServiceGone => None,
+    };
+
+    assert_eq!(read("runs"), Some(Some(r"C:\a\host.exe --x".to_string())));
+    assert_eq!(read("marked"), Some(None));
+    assert_eq!(read("not-a-string"), Some(None));
+    assert_eq!(read("no-image"), Some(None));
+    assert_eq!(read("not-listed-any-more"), None);
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. SCM follows a registry link at `Services\<name>`, and so the
+/// sweep reads the target's `ImagePath`: left out of what is referenced, the host the service starts
+/// would be deleted.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_is_read_through_to_its_target() {
+    let unique = std::process::id();
+    // The target first, so that it is removed last.
+    let target = ScratchKey::new(&format!("image-{unique}-link-target"));
+    let root_scratch = ScratchKey::new(&format!("image-{unique}-link-root"));
+    target
+        .create()
+        .set_raw_value(IMAGE_PATH_VALUE, &r"C:\linked\host.exe --x".to_reg_value())
+        .expect("write ImagePath");
+    let root = root_scratch.create();
+    let _link = create_link(&root, "linked", &target.nt_path());
+    let services = ServicesRoot::new(&root);
+
+    let read = read_registered_image(&services, "linked").expect("read the linked service");
+
+    assert!(
+        matches!(&read, RegistryReadOutcome::Read(Some(image)) if image == r"C:\linked\host.exe --x"),
+        "the target's ImagePath was not read"
+    );
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. A `Services` key that is marked deleted while the scan holds
+/// it (another handle deleted it) fails the open of a service below it with KEY_DELETED, which the
+/// read settles the service as gone, not as a failure, as it does when its own key is gone.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_root_marked_deleted_under_the_scan_reads_the_service_as_gone() {
+    let scratch = ScratchKey::new(&format!("image-{}-deleted-root", std::process::id()));
+    let root = scratch.create();
+    let services = ServicesRoot::new(&root);
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .delete_subkey(scratch.path())
+        .expect("delete the root through another handle");
+
+    let read = read_registered_image(
+        &services,
+        &format!("goetia-test-no-such-service-{}", std::process::id()),
+    );
+
+    assert!(
+        matches!(
+            read.expect("a service whose key is gone is not a failure"),
+            RegistryReadOutcome::ServiceGone
+        ),
+        "a service whose key is gone reads as gone"
+    );
+}
+
+/// Writes keys under `HKLM\SOFTWARE`. A service key that is a link to a missing key fails the image
+/// read, as it fails the other reads: the registry cannot say the service is gone where SCM may have
+/// one, and the sweep then asks SCM (`image_of`).
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_image_read() {
+    let unique = std::process::id();
+    let root_scratch = ScratchKey::new(&format!("image-{unique}-dangling-root"));
+    let target = ScratchKey::new(&format!("image-{unique}-dangling-target"));
+    let root = root_scratch.create();
+    let _link = create_link(&root, "dangling", &target.nt_path());
+    let services = ServicesRoot::new(&root);
+
+    let read = read_registered_image(&services, "dangling");
+
+    let error = read
+        .err()
+        .expect("a service key whose target is missing is not a service that is gone");
+    assert!(matches!(error, Error::Os { .. }), "{error:?}");
+    assert_eq!(os_code(&error), Some(NOT_FOUND), "{error:?}");
 }
 
 /// Writes keys under `HKLM\SOFTWARE`. A service key that is a link to a missing key reads as an

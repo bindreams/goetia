@@ -5,10 +5,21 @@
 //! not the test's to control.
 
 use std::cell::Cell;
+use std::io;
+use std::os::windows::io::OwnedHandle;
 use std::process::{Child, Command, Stdio};
 
+use windows_sys::Win32::System::Threading::{PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+
 use super::Termination;
-use super::system::{open_process, terminate_process};
+use super::system::{open_process_with, terminate_process, wait_exit};
+use crate::backend::scm::wait::Waited;
+use crate::manager::budget::Budget;
+
+/// `pid` opened with the rights `kill` holds a service's process with.
+fn open_process(pid: u32) -> io::Result<Option<OwnedHandle>> {
+    open_process_with(pid, PROCESS_TERMINATE | PROCESS_SYNCHRONIZE)
+}
 
 /// A child that is killed and reaped on drop, so a failing assert leaves nothing running.
 struct Spawned(Child);
@@ -110,4 +121,47 @@ fn terminating_a_process_that_exited_with_259_is_already_exited() {
     let result = terminate_process(&process, || unreachable!("an exited process is not waited for"));
 
     assert_eq!(result.unwrap(), Termination::AlreadyExited);
+}
+
+/// A deadline that has passed is the caller's bound, reached while the process still runs.
+#[skuld::test]
+fn waiting_for_a_running_process_under_a_passed_deadline_expires() {
+    let child = spawn_long_running();
+    let process = open_process(child.0.id()).unwrap().expect("the child is running");
+    let notices = Cell::new(0);
+
+    let waited = wait_exit(&process, Budget::Immediate.start(), || notices.set(notices.get() + 1));
+
+    assert_eq!(waited.unwrap(), Waited::Expired);
+    assert_eq!(notices.get(), 1, "a wait that blocks says why");
+}
+
+#[skuld::test]
+fn waiting_for_an_exited_process_confirms_whatever_the_deadline() {
+    let mut child = spawn_exiting_with(0);
+    let process = open_process(child.0.id())
+        .unwrap()
+        .expect("the child's object is held by its handle");
+    child.0.wait().unwrap();
+
+    let waited = wait_exit(&process, Budget::Immediate.start(), || {
+        unreachable!("an exited process is not waited for")
+    });
+
+    assert_eq!(waited.unwrap(), Waited::Confirmed);
+}
+
+#[skuld::test]
+fn waiting_without_a_bound_returns_when_the_process_exits() {
+    let mut child = spawn_long_running();
+    let process = open_process(child.0.id()).unwrap().expect("the child is running");
+    assert_eq!(
+        terminate_process(&process, || unreachable!("a live process is not waited for")).unwrap(),
+        Termination::Terminated
+    );
+
+    let waited = wait_exit(&process, Budget::Unbounded.start(), || {});
+
+    assert_eq!(waited.unwrap(), Waited::Confirmed);
+    child.0.wait().unwrap();
 }

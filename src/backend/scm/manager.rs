@@ -1,6 +1,7 @@
 //! The effectful SCM backend (`#[cfg(windows)]`).
 //!
-//! Handles both `Kind::Simple` (via `goetia-shim`, `src/bin/shim/`) and
+//! Handles both `Kind::Simple` (under the host the manager's
+//! [`ShimProvider`](crate::shim::ShimProvider) supplies, which runs `shim::run`) and
 //! `Kind::Managed`; `generate::registration` builds the `ImagePath`/blob
 //! for both. `Kind::Simple`'s own integration tests live in
 //! `tests/shim_integration.rs`, not `tests/scm_integration.rs`, because they
@@ -9,7 +10,7 @@
 //! ## The five traps this module addresses
 //!
 //! **1. Ownership has only one proof for `type: managed`.** `type: simple`'s
-//! `ImagePath` (`goetia-shim.exe <id>`, written atomically by `CreateServiceW`)
+//! `ImagePath` (the service host's command, written atomically by `CreateServiceW`)
 //! is a second proof of ownership independent of `Parameters`; `type: managed`'s
 //! `ImagePath` is just the daemon's own command, indistinguishable from any
 //! other service that happens to run the same executable, so it cannot serve
@@ -44,7 +45,9 @@
 //! is sent on a notification and, when SCM rejects it because the state changed, the state is read
 //! again. The service is not marked during the stop, so notifications keep working on it. A failure
 //! before the delete leaves the service in place and disabled, and re-running `uninstall` is the
-//! retry.
+//! retry. A service that ran a shim file also has that file to clean up: `uninstall` holds the
+//! install lock, holds the host's process before the stop, waits for it after the delete, and then
+//! sweeps what nothing references (see `Scm::finish_uninstall`).
 //!
 //! **4. A real account needs `SeServiceLogonRight`.** `CreateServiceW`
 //! succeeds without it; the first start then fails with error 1069
@@ -89,16 +92,16 @@
 //! Windows rejects a password outright for those accounts.
 
 pub(in crate::backend::scm) mod identity;
-mod registry;
+pub(in crate::backend::scm) mod registry;
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use windows_service::service::{
-    Service, ServiceAccess, ServiceActionType, ServiceErrorControl, ServiceFailureResetPeriod, ServiceInfo,
-    ServiceStartType, ServiceState as WinState, ServiceType,
+    Service, ServiceAccess, ServiceActionType, ServiceConfig, ServiceErrorControl, ServiceFailureResetPeriod,
+    ServiceInfo, ServiceStartType, ServiceState as WinState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SERVICE_MARKED_FOR_DELETE, LocalFree};
@@ -107,29 +110,81 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
-use super::wait::Waited;
+use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_process};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
+use crate::backend::scm::kill::system::Held;
+use crate::backend::scm::kill::{HoldOutcome, hold_if_possible};
 use crate::backend::scm::parameters::Parameters;
+use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
+use crate::backend::scm::shim::embedded::{ShimFile, default_dir, shim_file};
+use crate::backend::scm::shim::lock::InstallLock;
+use crate::backend::scm::shim::marker;
+use crate::backend::scm::shim::provider::ShimProvider;
+use crate::backend::scm::shim::sweep::{
+    ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
+};
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Error, Reason, Result};
-use crate::manager::{Budget, Installed, State, Status, Step, budget};
+use crate::error::{Chain, Error, Reason, Result};
+use crate::manager::budget::{self, Deadline};
+use crate::manager::{Budget, Installed, State, Status, Step};
+use crate::shim::HostCommand;
 use crate::spec::{DaemonSpec, Id, Kind};
 
 // Scm =================================================================================================================
 
-/// The Windows service manager. Holds no state of its own —
-/// every operation opens exactly the SCM/registry handles it needs and
-/// closes them again.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Scm;
+/// The Windows service manager. Holds no state of its own — every operation opens exactly the
+/// SCM/registry handles it needs and closes them again — only the source of `type: simple`
+/// services' host and the check on the folder it lives in.
+pub struct Scm {
+    /// `None` for [`Scm::new`]: no host to provide, and no files of the manager's own to sweep.
+    shim: Option<Box<dyn ShimProvider>>,
+    folders: FolderCheck,
+}
 
 impl Scm {
+    /// A manager with no shim provider: `type: managed` services work, a `type: simple` one cannot
+    /// be installed or previewed ([`Error::NoShimProvider`]), and `status` and `list` judge what is
+    /// installed without one.
     pub fn new() -> Self {
-        Self
+        Self {
+            shim: None,
+            folders: FolderCheck::new(CheckPermissions::Enable),
+        }
+    }
+
+    /// A manager whose `type: simple` services run the host `provider` supplies. `check` says
+    /// whether the folder of what `provider` returns is checked for permissions that would let
+    /// another account replace it. It also decides which folders `provider`'s sweep may list and
+    /// delete in: a sweep checks the folder with it too.
+    pub fn with_shim(provider: impl ShimProvider + 'static, check: CheckPermissions) -> Self {
+        Self {
+            shim: Some(Box::new(provider)),
+            folders: FolderCheck::new(check),
+        }
+    }
+
+    /// The provider, or [`Error::NoShimProvider`] for a manager built without one.
+    fn provider(&self) -> Result<&dyn ShimProvider> {
+        self.shim.as_deref().ok_or(Error::NoShimProvider)
+    }
+
+    /// The host `spec` would be installed with, as the provider previews it: `Some` for `type: simple`
+    /// only, which has a host.
+    fn host_of(&self, spec: &DaemonSpec) -> Result<Option<HostCommand>> {
+        match spec.kind {
+            Kind::Simple => Ok(Some(self.provider()?.preview()?)),
+            Kind::Managed => Ok(None),
+        }
+    }
+}
+
+impl Default for Scm {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -139,22 +194,32 @@ pub(crate) struct ScmSnapshot {
     blob: Decoded,
     /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
     parameters: Parameters,
-    /// The object `read` opened to classify it, so `installed` and `live_status` ask that object:
-    /// a service deleted since then does not turn into an unusable one. `None` for what `scan`
-    /// saw, which opens no service.
-    service: Option<Service>,
+    /// The one object every query of this snapshot asks, so that a service deleted and recreated
+    /// meanwhile cannot answer part of them: the one `read` opened to classify it, or, for what
+    /// `scan` saw (which opens no service), the one [`Self::service`] opens on first use.
+    service: OnceLock<Service>,
+    /// The service's configuration, queried by whichever of `installed`, `regenerate` and
+    /// `live_status` asks first and kept: a verb that needs it twice (`judge` reads what is
+    /// installed, then regenerates against it) cannot fail on the second read.
+    config: OnceLock<ServiceConfig>,
 }
 
 /// What `read_marker` hands on of a service: its `Parameters` and the object `read` opened.
 type Opened = (Parameters, Option<Service>);
 
 impl ScmSnapshot {
-    fn new(id: Id, blob: Decoded, (parameters, service): Opened) -> Self {
+    fn new(id: Id, blob: Decoded, (parameters, opened): Opened) -> Self {
+        let service = OnceLock::new();
+        if let Some(opened) = opened {
+            // A fresh cell takes the first value.
+            let _ = service.set(opened);
+        }
         Self {
             id,
             blob,
             parameters,
             service,
+            config: OnceLock::new(),
         }
     }
 }
@@ -170,26 +235,38 @@ impl InstalledService for ScmSnapshot {
 }
 
 impl ScmSnapshot {
-    /// Runs `ask` on the service `read` opened, or on one opened by name with `access` where the
-    /// snapshot holds none; a service gone by then is [`Error::NotInstalled`].
-    fn ask<T>(&self, access: ServiceAccess, context: &str, ask: impl FnOnce(&Service) -> Result<T>) -> Result<T> {
-        match &self.service {
-            Some(service) => ask(service),
-            None => {
-                let service = open_scm(ServiceManagerAccess::CONNECT)?
-                    .open_service(self.id.as_str(), access)
-                    .map_err(|e| {
-                        if is_not_found(&e) || is_marked_for_delete(&e) {
-                            Error::NotInstalled {
-                                id: self.id.as_str().to_string(),
-                            }
-                        } else {
-                            to_error(context, e)
-                        }
-                    })?;
-                ask(&service)
-            }
+    /// The snapshot's service: the one `read` opened, or one opened by name on first use. A service
+    /// gone by then is [`Error::NotInstalled`].
+    fn service(&self) -> Result<&Service> {
+        if let Some(service) = self.service.get() {
+            return Ok(service);
         }
+        let id = &self.id;
+        let service = open_scm(ServiceManagerAccess::CONNECT)?
+            .open_service(id.as_str(), ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG)
+            .map_err(|e| {
+                if is_not_found(&e) || is_marked_for_delete(&e) {
+                    Error::NotInstalled {
+                        id: id.as_str().to_string(),
+                    }
+                } else {
+                    to_error(&format!("open `{id}` to query it"), e)
+                }
+            })?;
+        Ok(self.service.get_or_init(|| service))
+    }
+
+    /// The service's configuration, queried on the first call and kept.
+    fn config(&self) -> Result<&ServiceConfig> {
+        if let Some(config) = self.config.get() {
+            return Ok(config);
+        }
+        let id = &self.id;
+        let config = self
+            .service()?
+            .query_config()
+            .map_err(|e| to_error(&format!("query configuration for `{id}`"), e))?;
+        Ok(self.config.get_or_init(|| config))
     }
 
     /// The id, with the service `read` opened closed: a verb that deletes the service, or waits on
@@ -202,13 +279,48 @@ impl ScmSnapshot {
 impl Backend for Scm {
     type Definition = ScmRegistration;
     type Snapshot = ScmSnapshot;
-    type InstallScope = ();
+    /// The install lock, which `type: simple` holds until its install ends: what places, repairs
+    /// and deletes shim files, for this process and every other, takes it.
+    type InstallScope = Option<InstallLock>;
     type Reservation = ();
 
-    /// SCM has nothing to hold across an install: its preconditions are `render_for_install`'s and
-    /// `apply`'s, before any write.
-    fn begin_install(&self, _spec: &DaemonSpec) -> Result<()> {
-        Ok(())
+    /// For `type: simple`: the install flow has rendered the definition already, so every refusal
+    /// `render_for_install` can make (the previewed host's path, an account, `restart: always`)
+    /// has come before the lock is taken or the provider writes. The lock is taken and the files
+    /// nothing references are swept (by the provider, in a folder that exists and passes the folder check: see
+    /// [`sweep_folder`]), and then the host is provided and checked before anything is
+    /// read: `provide` must return the host `desired` registers (the flow's render, from the
+    /// provider's `preview`: a sibling shim upgraded while the install waited on the lock
+    /// would otherwise register a file that was never placed), an absolute path whose folder passes
+    /// the folder check, to a file carrying this library's marker. A sweep that cannot read what is
+    /// referenced or cannot delete a file does not fail the install: the file is not what the
+    /// install needs, and the next sweep finds it. `type: managed` has no host,
+    /// so nothing is held or checked: its preconditions are `apply`'s, before any write.
+    fn begin_install(&self, spec: &DaemonSpec, desired: &ScmRegistration) -> Result<Option<InstallLock>> {
+        if spec.kind != Kind::Simple {
+            return Ok(None);
+        }
+        let shim = self.provider()?;
+        let lock = InstallLock::acquire()?;
+        if let Ok(referenced) = referenced_hosts() {
+            let _ = shim.sweep(&referenced, &self.folders);
+        }
+        let provided = shim.provide(&self.folders)?;
+        let rendered = HostCommand {
+            exe: desired.executable.clone(),
+            args: desired.arguments.clone(),
+        };
+        let provided = confirm_provided(rendered, provided)?;
+        provided
+            .exe
+            .parent()
+            .filter(|folder| folder.is_absolute())
+            .ok_or_else(|| Error::ShimPathRelative {
+                path: provided.exe.clone(),
+            })?;
+        self.folders.check(&provided.exe)?;
+        marker::verify(&provided.exe)?;
+        Ok(Some(lock))
     }
 
     /// SCM sends its requests through the OS, with no thread or file of ours to run out.
@@ -218,13 +330,29 @@ impl Backend for Scm {
 
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.user)?;
-        generate::registration(spec, &identity, &shim_path())
+        generate::registration(spec, &identity, self.host_of(spec)?.as_ref())
     }
 
-    /// The shim path is read once, for the check and the registration alike.
+    /// Keeps the host command a `type: simple` service is installed with, so that a host another
+    /// provider (a moved folder, another goetia version, a standalone host) put there is the same
+    /// spec, and no provider is consulted. `type: managed` has no host.
+    fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
+        if spec.kind == Kind::Managed {
+            return self.render(spec);
+        }
+        let identity = identity::resolve(&spec.user)?;
+        let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
+            id: snapshot.id().as_str().to_string(),
+            source: Box::new(e),
+        })?;
+        let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
+        generate::registration(spec, &identity, Some(&HostCommand { exe, args }))
+    }
+
+    /// The host is previewed once, for the check and the registration alike.
     fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.user)?;
-        generate::install_registration(spec, &identity, &shim_path())
+        generate::install_registration(spec, &identity, self.host_of(spec)?.as_ref())
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
@@ -243,10 +371,8 @@ impl Backend for Scm {
     /// SCM has no drop-in mechanism: everything goetia writes lives under the service's own key.
     fn installed(&self, snapshot: &ScmSnapshot) -> Result<InstalledDefinition<ScmRegistration>> {
         let id = snapshot.id();
-        let context = format!("open `{id}` to read its configuration");
-        let (definition, _) = snapshot.ask(ServiceAccess::QUERY_CONFIG, &context, |service| {
-            read_live_registration(service, id.as_str(), &snapshot.parameters)
-        })?;
+        let config = snapshot.config()?;
+        let definition = read_live_registration(config, snapshot.service()?, id.as_str(), &snapshot.parameters)?;
         Ok(InstalledDefinition {
             definition,
             external: ExternalConfig::Absent,
@@ -259,7 +385,7 @@ impl Backend for Scm {
         definition: &ScmRegistration,
         _outcome: &Outcome,
         snapshot: Option<&ScmSnapshot>,
-        _scope: &mut (),
+        _scope: &mut Option<InstallLock>,
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         apply(definition, snapshot.is_none())?;
@@ -268,12 +394,8 @@ impl Backend for Scm {
 
     fn live_status(&self, snapshot: &ScmSnapshot) -> Result<Status> {
         let id = snapshot.id();
-        let context = format!("open `{id}` to query its live status");
-        let (state, pid, enabled) = snapshot.ask(
-            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
-            &context,
-            |service| query_live(service, id.as_str()),
-        )?;
+        let enabled = snapshot.config()?.start_type == ServiceStartType::AutoStart;
+        let (state, pid) = query_live(snapshot.service()?, id.as_str())?;
         Ok(Status { state, pid, enabled })
     }
 
@@ -312,12 +434,52 @@ impl Backend for Scm {
         }
     }
 
+    /// A service that may run a shim file takes the install lock first and keeps it to the end, so
+    /// that no install places or sweeps a file between the stop and the sweep. If the service's host
+    /// is a shim file by name, its process is held after the service is disabled, before the stop or
+    /// the wait for one under way (see [`uninstall_locked`]), and once the service is stopped
+    /// and deleted the uninstall waits for that process and sweeps the folders the files can be in:
+    /// see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
     fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
+        // A blob that will not decode leaves the kind open: the host's name then decides.
+        let may_run_a_shim = snapshot.blob().map_or(true, |blob| blob.spec.kind == Kind::Simple);
+        // First, so that the host read below is not one an install in progress is about to change.
+        let lock = may_run_a_shim.then(InstallLock::acquire).transpose()?;
+        let host = if lock.is_some() {
+            registered_shim(&snapshot)
+        } else {
+            Ok(None)
+        };
+        // A host that could not be read is not "no shim": the uninstall goes on, since the service
+        // is deleted either way, and says that the cleanup was skipped, and why, if it succeeds.
+        let (host, unread) = match host {
+            Ok(host) => (host, None),
+            Err(e) => (None, Some(e)),
+        };
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
         let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
-        uninstall_locked(&scm, &id)
+        match uninstall_locked(&scm, &id, host.is_some())? {
+            Uninstalled::Deleted { process } => match (host, unread) {
+                (Some(host), _) => self.finish_uninstall(&id, &host, process),
+                (None, Some(unread)) => Err(self.cleanup_skipped(&id, unread)),
+                (None, None) => Ok(()),
+            },
+            Uninstalled::Left => Ok(()),
+        }
+    }
+
+    /// Under the lock, the sweep an `install` makes before it provides, which is how an `uninstall`
+    /// that stopped short of its own sweep is retried: by running it again. A manager with no
+    /// provider has nothing of its own to sweep, and takes no lock and reads nothing.
+    fn uninstall_absent(&self, _id: &Id) -> Result<()> {
+        let Some(shim) = &self.shim else {
+            return Ok(());
+        };
+        let _lock = InstallLock::acquire()?;
+        shim.sweep(&referenced_hosts()?, &self.folders)
+            .map_err(|failure| *failure.error)
     }
 
     fn enable(&self, snapshot: ScmSnapshot) -> Result<()> {
@@ -364,6 +526,18 @@ impl Backend for Scm {
         super::wait::request_start_after_stop(&mut actor).map_err(|e| Error::os(format!("start `{id}`"), e))
     }
 
+    /// With a wait, holds the service's process before the STOP, and once SCM reports the service
+    /// stopped ends that process through its handle (the documentation of `SetServiceStatus` allows
+    /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
+    /// runs is free when `stop` returns.
+    ///
+    /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
+    /// say so; one that fails leads its error with it (see [`unwaited`]).
+    ///
+    /// The gap: if the held process crashes and Windows' recovery restarts the service before the
+    /// STOP is sent, the STOP reaches the new process, which goetia does not hold. `stop` can then
+    /// return while that process is still exiting, and an `uninstall` right after may leave the shim
+    /// file for the next sweep.
     fn stop(&self, snapshot: ScmSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
         // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
         // whatever is left of it.
@@ -374,12 +548,34 @@ impl Backend for Scm {
         if !budget.waits() {
             return super::wait::request_stop(&mut actor).map_err(|e| Error::os(format!("stop `{id}`"), e));
         }
-        let waited =
-            super::wait::stop_via_notify(&mut actor, deadline).map_err(|e| Error::os(format!("stop `{id}`"), e))?;
-        match waited {
-            Waited::Confirmed => Ok(()),
-            Waited::Expired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
-        }
+        // Before the STOP: SCM reports `STOPPED` before the process exits, and no pid after it. An
+        // expired hold is sent the STOP all the same, and is not a stop: see `stop_and_await_exit`.
+        let mut held = hold_process(&id, "stop", deadline, &format!("`{id}` was NOT stopped"))?;
+        let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, &mut held, |held, deadline| {
+            end_held(&id, held, deadline)
+        })
+        .map_err(|e| Error::os(format!("stop `{id}`"), e))
+        .and_then(|outcome| match outcome {
+            StopAndAwaitExitOutcome::Stopped => Ok(()),
+            // The STOP was sent and its effect is not confirmed, as when SCM does not answer in time.
+            StopAndAwaitExitOutcome::ServiceExpired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
+            StopAndAwaitExitOutcome::Unconfirmed { pid } => Err(unconfirmed_stop(&id, pid, budget)),
+            StopAndAwaitExitOutcome::ProcessExpired {
+                process,
+                terminate_failed,
+            } => Err(budget::process_timed_out(
+                id.as_str(),
+                process.pid(),
+                budget,
+                terminate_failed,
+            )),
+        });
+        // A process that cannot be opened is not waited for (see `stop_and_await_exit`), and a `stop`
+        // that succeeds has no channel to say so: the reason leads the error of one that fails.
+        stopped.map_err(|error| match held {
+            HoldOutcome::Refused(reason) => unwaited(&id, reason, error),
+            _ => error,
+        })
     }
 
     /// See [`super::kill::kill_service`] for how the process is chosen safely. Exit code `1`
@@ -397,6 +593,19 @@ impl Backend for Scm {
             }),
         }
     }
+}
+
+/// `provided`, the host `provide` returned, when it is `rendered`, the host the registration names;
+/// otherwise [`Error::ShimHostMismatch`], which does not say why (a changed host and a provider
+/// whose `preview` and `provide` disagree look alike from here).
+fn confirm_provided(rendered: HostCommand, provided: HostCommand) -> Result<HostCommand> {
+    if provided == rendered {
+        return Ok(provided);
+    }
+    Err(Error::ShimHostMismatch {
+        rendered: Box::new(rendered),
+        provided: Box::new(provided),
+    })
 }
 
 /// A registry read of a service SCM has open: SCM says the service exists, so a registry that finds
@@ -426,17 +635,13 @@ fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<
 // shim support ========================================================================================================
 
 /// Read and decode the metadata blob for `id` directly from
-/// `Services\<id>\Parameters`. `goetia-shim` (`src/bin/shim/`, a separate
-/// `[[bin]]` target and therefore a separate crate that only ever sees this
-/// module's `pub` surface) calls this: it knows only its service id
-/// (`argv[1]`), not a `DaemonSpec` to hand to `render`, and must not
-/// pull in `ServiceManager`'s effectful install path just to read one
-/// value. `registry` itself stays private — this is the one read the shim
-/// needs, not the whole module.
+/// `Services\<id>\Parameters`. The shim calls this: it knows only its service
+/// name, not a `DaemonSpec` to hand to `render`, and must not pull in
+/// `ServiceManager`'s effectful install path just to read one value.
 ///
 /// A service that is gone is [`Error::NotInstalled`]. `Ok(None)` means no goetia `Marker` (none, or
 /// another service's own), kept apart from `Err` so callers can tell it from an undecodable spec.
-pub fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
+pub(crate) fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     match registry::read_parameters(id)? {
         RegistryReadOutcome::ServiceGone => Err(Error::NotInstalled { id: id.to_string() }),
         RegistryReadOutcome::Read(params) => generate::extract(&params.fields, &params.strays),
@@ -468,46 +673,21 @@ fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Arc<Error>>) -> E
     }
 }
 
-// shim path ===========================================================================================================
-
-/// The shim's expected location: a sibling of the currently running
-/// `goetia` binary. Only consulted for `Kind::Simple` — `generate::registration`
-/// ignores it entirely for `Kind::Managed`.
-///
-/// `GOETIA_SHIM_PATH` overrides this, read fresh on every call rather than
-/// cached. Production `goetia.exe` never sets it, so it always falls
-/// through to the sibling-of-`current_exe` heuristic below — appropriate
-/// for the `cargo install`-style layout the design's "Windows shim path"
-/// open item describes, where both binaries land in the same directory.
-/// `tests/shim_integration.rs`'s own `main` sets it once, before any test
-/// runs — see that file's doc comment for why a plain `current_exe()`-based
-/// guess cannot find the shim binary from inside a test crate.
-pub(crate) fn shim_path() -> PathBuf {
-    if let Some(overridden) = std::env::var_os("GOETIA_SHIM_PATH") {
-        return PathBuf::from(overridden);
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join("goetia-shim.exe")))
-        .unwrap_or_else(|| PathBuf::from("goetia-shim.exe"))
-}
-
 /// Read back everything `ScmRegistration`'s `Display` text needs from the service actually
 /// installed at `name`, for the `on_disk` side of `decide`'s comparison —
 /// SCM's "artifact" for diffing, since there is no file (see the
 /// crate-level design notes on this).
 fn read_live_registration(
+    cfg: &ServiceConfig,
     service: &Service,
     name: &str,
     live_params: &Parameters,
-) -> Result<(ScmRegistration, ServiceStartType)> {
-    let cfg = service
-        .query_config()
-        .map_err(|e| to_error(&format!("query configuration for `{name}`"), e))?;
+) -> Result<ScmRegistration> {
     let cmdline = cfg.executable_path.to_string_lossy().into_owned();
     let (executable, arguments) = split_command_line(&cmdline);
     let account = cfg
         .account_name
+        .as_ref()
         .map(|a| a.to_string_lossy().into_owned())
         // `ChangeServiceConfigW`'s NULL-means-"unchanged" quirk (see `apply`'s
         // doc comment) forces a live `LocalSystem` account to be written back
@@ -521,20 +701,17 @@ fn read_live_registration(
     let failure_actions = read_failure_actions(service, name)?;
     let environment = held_service(name, registry::read_environment(name)?)?;
 
-    Ok((
-        ScmRegistration {
-            name: name.to_string(),
-            display_name: cfg.display_name.to_string_lossy().into_owned(),
-            executable,
-            arguments,
-            account,
-            failure_actions,
-            environment,
-            parameters: live_params.fields.clone(),
-            stray_parameters: live_params.strays.clone(),
-        },
-        cfg.start_type,
-    ))
+    Ok(ScmRegistration {
+        name: name.to_string(),
+        display_name: cfg.display_name.to_string_lossy().into_owned(),
+        executable,
+        arguments,
+        account,
+        failure_actions,
+        environment,
+        parameters: live_params.fields.clone(),
+        stray_parameters: live_params.strays.clone(),
+    })
 }
 
 fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailureActions>> {
@@ -572,7 +749,7 @@ fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailu
 /// why `ScmRegistration` keeps them separate). Splits it with the real
 /// `CommandLineToArgvW`, the same authority `generate_tests.rs`'s
 /// `windows_style_split` is checked against.
-fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
+pub(in crate::backend::scm) fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
     let wide = identity::wide_null(cmdline);
     let mut argc: i32 = 0;
     // SAFETY: `wide` is a valid null-terminated UTF-16 string that outlives
@@ -831,11 +1008,19 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// (`ERROR_SERVICE_DOES_NOT_EXIST`, 1060) at any of the opens, the disable or the delete is success:
 /// the record is removed, which is what `uninstall` is for. A second `uninstall` racing the first
 /// can meet 1060 at the first open.
-fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
+///
+/// With `hold`, the service's process is held once it is disabled: just before each STOP, once the
+/// state has settled, or at once for a service already `STOP_PENDING`, with no STOP of ours. It is
+/// handed back in [`Uninstalled::Deleted`] for the caller to wait for: SCM records `STOPPED`
+/// before the process exits, and reports no pid after it. It may be running an older file than the
+/// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
+/// process that cannot be opened is none (see [`hold_if_possible`]). The service handle each hold
+/// uses is closed before it returns, or the service could not be deleted.
+fn uninstall_locked(scm: &WinServiceManager, id: &Id, hold: bool) -> Result<Uninstalled> {
     // Opened first and kept through the stop: no state change slips between the disable and the wait.
     let mut actor = match super::wait::SystemScmActor::open(id.as_str()) {
         Ok(actor) => actor,
-        Err(e) if is_not_found_io(&e) => return Ok(()),
+        Err(e) if is_not_found_io(&e) => return Ok(Uninstalled::Left),
         Err(e) => {
             let refused = open_refused(
                 "uninstall",
@@ -848,12 +1033,35 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
     };
 
     let (marked, previous) = match disable_before_delete(scm, id)? {
-        Disabled::Gone => return Ok(()),
+        Disabled::Gone => return Ok(Uninstalled::Left),
         Disabled::AlreadyMarked => (true, None),
         Disabled::Now { previous } => (false, previous),
     };
 
-    match super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start()) {
+    // Taken here and not before the disable: a start in flight at the disable, or a recovery
+    // restart, replaces the process, and a disabled service cannot be started again. Taken again for
+    // each STOP the loop sends, so the one kept is the process that STOP is for, and once for a
+    // service that is already `STOP_PENDING`, which no STOP of ours is sent to.
+    let mut process = HoldOutcome::NoProcess;
+    let mut hold_failed = None;
+    let settled = super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start(), |_| {
+        if !hold {
+            return Ok(());
+        }
+        let not_done = format!("`{id}`'s process could not be held to wait for its exit");
+        match hold_process(id, "uninstall", Budget::Unbounded.start(), &not_done) {
+            Ok(HoldOutcome::Expired { .. }) => unreachable!("an unbounded deadline does not expire"),
+            Ok(held) => {
+                process = held;
+                Ok(())
+            }
+            Err(e) => {
+                hold_failed = Some(e);
+                Err(std::io::Error::other("the service's process could not be held"))
+            }
+        }
+    });
+    match settled {
         Ok(Waited::Confirmed) => {}
         // `let _ = ...` is the write that turns an unreachable case into a silent one, and this
         // is precisely the case where a later edit narrowing that budget must not pass quietly.
@@ -864,18 +1072,19 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
             } else {
                 UninstallFailure::Stop { previous }
             };
-            return Err(uninstall_failed(id, &state, Error::os(format!("stop `{id}`"), e)));
+            let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
+            return Err(uninstall_failed(id, &state, cause));
         }
     }
     // Closed before the delete: an open handle would keep the record after it.
     drop(actor);
     if marked {
-        return Ok(());
+        return Ok(Uninstalled::Left);
     }
 
     let service = match scm.open_service(id.as_str(), ServiceAccess::DELETE) {
         Ok(service) => service,
-        Err(e) if is_not_found(&e) => return Ok(()),
+        Err(e) if is_not_found(&e) => return Ok(Uninstalled::Deleted { process }),
         Err(e) => {
             let refused = open_refused(
                 "uninstall",
@@ -887,14 +1096,278 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id) -> Result<()> {
         }
     };
     match service.delete() {
-        Ok(()) => Ok(()),
-        Err(e) if is_not_found(&e) || is_marked_for_delete(&e) => Ok(()),
+        Ok(()) => Ok(Uninstalled::Deleted { process }),
+        Err(e) if is_not_found(&e) || is_marked_for_delete(&e) => Ok(Uninstalled::Deleted { process }),
         Err(e) => Err(uninstall_failed(
             id,
             &UninstallFailure::Delete { previous },
             to_error(&format!("delete service `{id}`"), e),
         )),
     }
+}
+
+/// How far a successful [`uninstall_locked`] got.
+enum Uninstalled {
+    /// The service was stopped and is deleted, or is about to be when a handle closes: nothing it
+    /// ran is running or will start again, once the process SCM reported has exited. `process` is
+    /// what holding it came to: never an expiry, since the hold has no bound.
+    Deleted { process: HoldOutcome<Held> },
+    /// Nothing of this call's is left to wait for: the service was already gone (1060), or someone
+    /// else had marked it for deletion, so it was stopped but not deleted by this call. What it ran
+    /// is left for the next sweep.
+    Left,
+}
+
+// A shim host ---------------------------------------------------------------------------------------------------------
+
+/// The host `snapshot`'s service is registered with, when its file name is that of a shim file
+/// placed by a provider (`goetia-shim-<hex>.exe`): the one case whose file an uninstall may sweep.
+/// `None` for another host, and for a service already marked for deletion or gone, which refuses the
+/// read as a matter of course (`uninstall_locked` still finishes it). Any other failure to read the
+/// configuration is an error: the host is not known, which is not "no shim".
+fn registered_shim(snapshot: &ScmSnapshot) -> Result<Option<PathBuf>> {
+    match snapshot.config() {
+        Ok(config) => Ok(shim_host(&config.executable_path.to_string_lossy())),
+        Err(e) if is_gone_or_marked(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The host the command line `image` starts, when its file name is that of a shim file placed by a
+/// provider.
+fn shim_host(image: &str) -> Option<PathBuf> {
+    let (exe, _) = split_command_line(image);
+    let is_shim = exe.file_name()?.to_str().and_then(shim_file) == Some(ShimFile::Current);
+    is_shim.then_some(exe)
+}
+
+/// Whether `error`, from reading a service's configuration, says the service is gone or marked for
+/// deletion.
+fn is_gone_or_marked(error: &Error) -> bool {
+    matches!(error, Error::NotInstalled { .. })
+        || matches!(
+            error.raw_os_error(),
+            Some(code) if code == ERROR_SERVICE_MARKED_FOR_DELETE as i32 || code == ERROR_SERVICE_DOES_NOT_EXIST as i32
+        )
+}
+
+/// The process SCM reports for `id`, held before the service is stopped: SCM records `STOPPED`
+/// before the process exits, and reports no pid after it. For an uninstall it may be running an
+/// older file than the one registered (an `Update` it has not restarted into), which no read of the
+/// registry shows. [`HoldOutcome::NoProcess`] when SCM reports none, and [`HoldOutcome::Refused`],
+/// with why, when the process cannot be opened (see [`hold_if_possible`]): the caller goes on, and
+/// what that process runs stays referenced by its image until it exits. A failure to read SCM is an
+/// error, led by `not_done`, what the caller did not do. The wait for SCM to let go of a pid whose
+/// process is gone ends at `deadline`, and is [`HoldOutcome::Expired`]: a `stop` sends its STOP all
+/// the same. A service gone since it was read has none. The service handle the hold used is closed
+/// before this returns, or the service could not be deleted. `operation` is the verb the hold is
+/// for, which [`open_existing`] names in a denial.
+fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) -> Result<HoldOutcome<Held>> {
+    let not_done = |e: Error| Error::Step {
+        what: not_done.to_string(),
+        source: Box::new(e),
+    };
+    let (_scm, service) = match open_existing(id, operation, ServiceAccess::QUERY_STATUS) {
+        Ok(opened) => opened,
+        Err(Error::NotInstalled { .. }) => return Ok(HoldOutcome::NoProcess),
+        Err(e) => return Err(not_done(e)),
+    };
+    let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
+    hold_if_possible(&mut target, deadline)
+        .map_err(|e| not_done(Error::os(format!("hold `{id}`'s process to wait for its exit"), e)))
+}
+
+/// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]
+/// over the real process, for `stop` and `uninstall` alike. A wait with no end says on stderr why it
+/// is blocked; a bounded one is the usual case (the shim exits just after it reports `STOPPED`) and
+/// says nothing.
+fn end_held(id: &Id, held: Held, deadline: Deadline) -> std::io::Result<EndProcessOutcome<Held>> {
+    end_process(held, deadline, Held::terminate, |held, deadline, terminate_failed| {
+        held.wait_for_exit(deadline, || {
+            if deadline.at().is_none() {
+                held.notice(id.as_str(), terminate_failed);
+            }
+        })
+    })
+}
+
+/// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not open, for
+/// `reason`: led by what that left undone, with the class of `error`.
+fn unwaited(id: &Id, reason: std::io::Error, error: Error) -> Error {
+    Error::Step {
+        what: format!(
+            "goetia could not open `{id}`'s process ({}), so it could not wait for the process to exit",
+            Chain(&reason)
+        ),
+        source: Box::new(error),
+    }
+}
+
+/// The error of a `stop` whose hold expired and whose STOP was sent with nothing held: the
+/// [`WaitTimeout`](Error::WaitTimeout) of a stop SCM did not confirm, led by what makes it so.
+fn unconfirmed_stop(id: &Id, pid: u32, budget: Budget) -> Error {
+    Error::Step {
+        what: format!(
+            "goetia could not hold `{id}`'s process before the time ran out (SCM still named process {pid}, which \
+             was gone), so it cannot confirm that the service's process exited, whether or not SCM reports the \
+             service stopped"
+        ),
+        source: Box::new(budget::timed_out(id.as_str(), "stopped", budget)),
+    }
+}
+
+impl Scm {
+    /// The folder of the provider, as an uninstall tells it: [`ProviderFolder::None`] without a
+    /// provider, the normalised folder of the host its `preview` names, and
+    /// [`ProviderFolder::Unknown`] when the `preview` fails, which is not the absence of a provider:
+    /// the failure comes with it, for the uninstall to report.
+    fn provider_folder(&self) -> (ProviderFolder, Option<Error>) {
+        let Some(shim) = &self.shim else {
+            return (ProviderFolder::None, None);
+        };
+        match shim.preview() {
+            Ok(command) => match command.exe.parent() {
+                Some(folder) => (ProviderFolder::At(normalise(folder)), None),
+                None => (ProviderFolder::Unknown, None),
+            },
+            Err(e) => (
+                ProviderFolder::Unknown,
+                Some(Error::Step {
+                    what: "the folder of this program's shim provider could not be determined".to_string(),
+                    source: Box::new(e),
+                }),
+            ),
+        }
+    }
+
+    /// The error of an uninstall that deleted `id` but did not clean up its shim files, because the
+    /// read of its registered host failed with `unread`: the host is not known, so nothing was
+    /// waited for or swept. Told as [`finish_uninstall`](Self::finish_uninstall) tells a cleanup that
+    /// failed, with the retry that applies.
+    fn cleanup_skipped(&self, id: &Id, unread: Error) -> Error {
+        let (provider, unknown) = self.provider_folder();
+        let skipped = Error::Step {
+            what: format!("`{id}`'s host could not be read, so no shim file of it was waited for or swept"),
+            source: Box::new(unread),
+        };
+        let cause = match unknown {
+            Some(unknown) => Error::Both {
+                first: Box::new(skipped),
+                then: Box::new(unknown),
+            },
+            None => skipped,
+        };
+        Error::Step {
+            what: left_behind_text(id, &provider, None, &[]),
+            source: Box::new(cause),
+        }
+    }
+
+    /// What an uninstall does once `id` is stopped and deleted, for a service whose host was the shim
+    /// file `host`: ends the process that was held, as the documentation of `SetServiceStatus`
+    /// allows once `SERVICE_STOPPED` is reported, and waits, with no bound, for it to exit (SCM
+    /// recorded `STOPPED` before it exits, and a `stop` that waited has left none to hold), and for
+    /// no other: a process it did not hold cannot be tied to the service it is uninstalling, and
+    /// waiting for another service's stuck process would hold the install lock. Then sweeps the
+    /// provider's folder and, when `host` was in the default folder and that is another, that one
+    /// too (see [`second_folder`]): the service may have been installed by another goetia version or
+    /// provider. A host in any other folder is not swept, since that folder is not goetia's.
+    ///
+    /// A default folder that cannot be located skips the second folder, as it cannot be told from the
+    /// host's, and is reported with whatever else fails: the wait and the provider's sweep go on.
+    /// A provider's sweep that fails on the same lookup reports it too.
+    ///
+    /// A provider whose `preview` failed has no folder to name, and sweeps all the same; that is told
+    /// only beside a failure of the cleanup, see [`finished_cleanup`].
+    ///
+    /// A failure here leaves the service deleted, and says so, naming each file that remains and
+    /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
+    /// runs it is in use, and is skipped without an error: the next sweep removes it once it is free.
+    fn finish_uninstall(&self, id: &Id, host: &Path, process: HoldOutcome<Held>) -> Result<()> {
+        let host = normalise(host);
+        let (provider, unknown) = self.provider_folder();
+        // A second folder is the host's folder only when it is the default, and that is what its
+        // sweep removes it by. The provider asks where the default folder is too, so a lookup that
+        // fails can be reported twice. When it cannot be located the host's folder may be it, so it
+        // is named, not swept, and nothing else is skipped.
+        let mut failures: Vec<SweepFailure> = Vec::new();
+        let (second, unswept) = match host
+            .parent()
+            .map(|folder| second_folder(folder, provider.path(), || Ok(normalise(&default_dir()?))))
+            .transpose()
+        {
+            Ok(second) => (second.flatten(), second.flatten()),
+            Err(e) => {
+                failures.push(e.into());
+                (None, host.parent())
+            }
+        };
+        let finish = |failures: Vec<SweepFailure>| finished_cleanup(id, &provider, unswept, unknown, failures);
+        match process {
+            // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
+            // ended, through the handle held since before the stop, and waited for as `stop` waits
+            // for it (see [`end_held`]), with no bound: the shim exits by itself after it reports
+            // `STOPPED`, and the terminate is a backstop.
+            HoldOutcome::Held(held) => match end_held(id, held, Budget::Unbounded.start()) {
+                Ok(EndProcessOutcome::Exited) => {}
+                Ok(EndProcessOutcome::Lingers { .. }) => unreachable!("an unbounded deadline never expires"),
+                Err(e) => {
+                    failures.push(Error::os(format!("wait for `{id}`'s process to exit"), e).into());
+                    return finish(failures);
+                }
+            },
+            HoldOutcome::NoProcess => {}
+            // Not waited for, and said so: the file it runs stays until it exits, and the sweep below
+            // keeps it by its image.
+            HoldOutcome::Refused(reason) => {
+                failures.push(Error::os(format!("open `{id}`'s process to wait for its exit"), reason).into())
+            }
+            HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
+        }
+        // After the wait: what has exited no longer references its file.
+        let referenced = match referenced_hosts() {
+            Ok(referenced) => referenced,
+            Err(e) => {
+                failures.push(e.into());
+                return finish(failures);
+            }
+        };
+        if let Some(shim) = &self.shim {
+            failures.extend(shim.sweep(&referenced, &self.folders).err());
+        }
+        if let Some(folder) = second {
+            // It is the default folder, by `second_folder`'s choice.
+            failures.extend(sweep_folder(folder, &referenced, &self.folders, || Ok(folder.to_path_buf())).err());
+        }
+        finish(failures)
+    }
+}
+
+/// The result of the cleanup of an uninstall that deleted `id`: `Ok` when every sweep succeeded, and
+/// otherwise the failures, led by what remains (see [`left_behind_text`]). `unknown` is why the
+/// provider's folder could not be named. The provider's sweep does not depend on it, so it is no
+/// failure of its own, and is told as context of one that is.
+fn finished_cleanup(
+    id: &Id,
+    provider: &ProviderFolder,
+    unswept: Option<&Path>,
+    unknown: Option<Error>,
+    failures: Vec<SweepFailure>,
+) -> Result<()> {
+    SweepFailure::all(failures).map_or(Ok(()), |failure| {
+        let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
+        let cause = match unknown {
+            Some(unknown) => Box::new(Error::Both {
+                first: failure.error,
+                then: Box::new(unknown),
+            }),
+            None => failure.error,
+        };
+        Err(Error::Step {
+            what: left_behind_text(id, provider, unswept, &files),
+            source: cause,
+        })
+    })
 }
 
 /// What [`disable_before_delete`] did.
@@ -1017,7 +1490,7 @@ fn previous_start_type(id: &Id, previous: Option<ServiceStartType>) -> String {
 
 // shared helpers ======================================================================================================
 
-fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
+pub(in crate::backend::scm) fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, access).map_err(|e| to_error("open the Service Control Manager", e))
 }
 
@@ -1040,6 +1513,22 @@ fn open_scm(access: ServiceManagerAccess) -> Result<WinServiceManager> {
 fn open_scm_to_classify(id: &str) -> Result<WinServiceManager> {
     WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| service_undetermined(id, "open the Service Control Manager", e))
+}
+
+/// The `ImagePath` of the service `name`, read through `scm` (`SERVICE_QUERY_CONFIG`) rather than its
+/// registry key, which may deny reads that SCM does not. `None` when the service is gone or marked
+/// for deletion, which start nothing.
+pub(in crate::backend::scm) fn read_image_through_scm(scm: &WinServiceManager, name: &str) -> Result<Option<String>> {
+    let service = match scm.open_service(name, ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => service,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(to_error(&format!("open service `{name}` to read its image path"), e)),
+    };
+    match service.query_config() {
+        Ok(config) => Ok(Some(config.executable_path.to_string_lossy().into_owned())),
+        Err(e) if is_marked_for_delete(&e) => Ok(None),
+        Err(e) => Err(to_error(&format!("query configuration for `{name}`"), e)),
+    }
 }
 
 fn is_not_found(e: &windows_service::Error) -> bool {
@@ -1207,18 +1696,11 @@ fn map_state(s: WinState) -> State {
     }
 }
 
-fn query_live(service: &Service, name: &str) -> Result<(State, Option<u32>, bool)> {
+fn query_live(service: &Service, name: &str) -> Result<(State, Option<u32>)> {
     let status = service
         .query_status()
         .map_err(|e| to_error(&format!("query status for `{name}`"), e))?;
-    let cfg = service
-        .query_config()
-        .map_err(|e| to_error(&format!("query configuration for `{name}`"), e))?;
-    Ok((
-        map_state(status.current_state),
-        status.process_id,
-        cfg.start_type == ServiceStartType::AutoStart,
-    ))
+    Ok((map_state(status.current_state), status.process_id))
 }
 
 /// Flip `dwStartType` alone, via a raw `ChangeServiceConfigW` with

@@ -67,14 +67,26 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    /// A backend that regenerates a spec from what is installed (SCM's service host) could not read
+    /// it, which says nothing about the spec: the read's failure is under it, and
+    /// [`Backend::regenerate`](crate::backend::Backend::regenerate) is where one is made.
+    #[error("read `{id}`'s installed host")]
+    InstalledUnreadable {
+        id: String,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// An error a snapshot kept (its blob's failure), handed out again as it was: its text, source,
     /// remedy and indeterminacy are the kept error's. Neither [`cause`](Error::cause) nor
     /// [`map_cause`](Error::map_cause) goes into it.
     #[error(transparent)]
     Kept(Arc<Error>),
 
-    /// A step failed, and so did the one after it. `report()` prints both, `first` then `then`.
-    #[error("a step failed, and so did the one after it")]
+    /// Several steps failed, each after the ones before it: `first` is what failed earlier, `then`
+    /// the failure after it. Any number nest to the left (`Both { Both { a, b }, c }`), built by
+    /// [`Error::both_all`]; `report()` prints them in order.
+    #[error("several steps failed")]
     Both {
         #[source]
         first: Box<Error>,
@@ -196,6 +208,121 @@ pub enum Error {
         path.display()
     )]
     NotADirectory { path: PathBuf },
+
+    /// A folder the shim would be written to, one of its ancestors, or the host file itself can be
+    /// modified by an account goetia does not trust, so that account could replace the shim, which
+    /// runs as `LocalSystem`. No OS call failed.
+    #[error(
+        "refusing to use {} for the shim: {account} can {right} it, so it could replace the shim; fix its \
+         permissions",
+        path.display()
+    )]
+    ShimFolderUnsafe {
+        path: PathBuf,
+        account: String,
+        right: &'static str,
+    },
+
+    /// A file that is to be the shim host has no goetia version marker: it is not a service host
+    /// built from this library. No OS call failed.
+    #[error(
+        "{} is not a goetia service host: it carries no version marker, so it was not built with \
+         `goetia::shim::main()`",
+        path.display()
+    )]
+    ShimMarkerMissing { path: PathBuf },
+
+    /// A file that is to be the shim host carries the marker of another goetia version. Hosts and
+    /// the program that installs them are built from one checkout, so this is a stale file. `found`
+    /// is the file's own bytes, exactly (the output sink escapes them), and at most `expected`'s
+    /// length plus one. No OS call failed.
+    #[error(
+        "{} is a goetia service host of version {found}, and this goetia is version {expected}: rebuild the host \
+         with this version",
+        path.display()
+    )]
+    ShimMarkerVersion {
+        path: PathBuf,
+        found: String,
+        expected: String,
+    },
+
+    /// A `type: simple` service needs a service host and the manager was built without a shim
+    /// provider. No OS call failed.
+    #[error("no shim provider configured")]
+    NoShimProvider,
+
+    /// An install rendered its registration from the service host the provider's `preview` named,
+    /// and the host the provider's `provide` placed under the install lock is another, so the
+    /// registration would name a file that was never placed. Either the host changed while the
+    /// install waited for the lock (the sibling shim was upgraded; running the install again picks up
+    /// the new one), or `preview` and `provide` disagree (a defect of the provider, which running
+    /// again does not fix): nothing here tells them apart. Nothing was registered, and the file
+    /// provided stays for the provider's next sweep. No OS call failed.
+    #[error(
+        "the service host this install rendered is {} {:?}, but the provider placed {} {:?}. Nothing was registered. \
+         Either the service host changed while this install waited for the install lock, and running the install \
+         again picks up the new one, or the provider's `preview` and `provide` disagree, which running the install \
+         again does not fix. The file just provided stays; the provider's next sweep may remove it if nothing \
+         references it",
+        rendered.exe.display(),
+        rendered.args,
+        provided.exe.display(),
+        provided.args
+    )]
+    ShimHostMismatch {
+        // Boxed: two inline commands make `Error`, and every `Result` over it, large (`clippy::result_large_err`).
+        rendered: Box<crate::shim::HostCommand>,
+        provided: Box<crate::shim::HostCommand>,
+    },
+
+    /// A shim provider named its host, or the folder it keeps it in, by a path that is not
+    /// absolute, which SCM would resolve against a directory goetia does not control. No OS call
+    /// failed.
+    #[error("the shim provider named {}, which is not an absolute path", path.display())]
+    ShimPathRelative { path: PathBuf },
+
+    /// `EmbeddedStockShim` holds no bytes: the program was built without the stock shim. No OS
+    /// call failed.
+    #[error("built without a stock shim: GOETIA_SHIM_EXE was not set under the goetia-shim feature")]
+    ShimNotEmbedded,
+
+    /// The stock shim `goetia.exe` reads from beside itself is not there. No OS call failed.
+    #[error(
+        "the stock shim {} is missing: goetia looks for goetia-shim.exe beside goetia.exe",
+        path.display()
+    )]
+    SiblingShimMissing { path: PathBuf },
+
+    /// The machine-wide install lock exists and belongs to an account that is not SYSTEM,
+    /// Administrators or TrustedInstaller, so what holds it cannot be trusted to serialise installs.
+    /// `account` is its name, or its SID when it has none. The lock lives while any process has a
+    /// handle to it, not only the one that holds it.
+    #[error(
+        "the install lock `Global\\goetia-shim` is owned by {account}, which is not an account goetia trusts (SYSTEM, \
+         Administrators, TrustedInstaller), so it cannot be trusted to serialise installs: close every handle to it, by \
+         ending that account's processes that have it open"
+    )]
+    ShimLockForeign { account: String },
+
+    /// Access to the machine-wide install lock was denied to a token with Administrators enabled.
+    /// Its permissions, or the token's integrity level or privileges, may be the cause; goetia does
+    /// not know which. `owner` is the lock's owner's name (or SID), or `None` when it could not be
+    /// read (the permissions that refused the open may refuse that too). Nothing says whether the
+    /// owner is trusted: it was not read to decide that.
+    #[error("{}", shim_lock_denied(owner))]
+    ShimLockDenied { owner: Option<String> },
+
+    /// SCM could not give the `ImagePath` of the service `name`, and its registry key gave none (the
+    /// read failed, or said the service is gone, which is not taken as proof), as the chain holds, so
+    /// what it references is unknown. A remedy, which follows the chain: see
+    /// [`remedy`](Error::remedy).
+    #[error("read the image path of the service `{name}`, which SCM could not give and its registry key did not")]
+    ServiceImageUnreadable {
+        name: String,
+        #[source]
+        source: Box<Error>,
+    },
 
     /// A `.env` file beside the manifest could not be parsed. Distinct from
     /// [`Os`](Error::Os), which means the file could not be read at all.
@@ -326,6 +453,28 @@ pub enum Error {
         recovery: String,
     },
 
+    /// A `stop` of `id` ran out of budget waiting on the service's process, not on SCM's answer.
+    /// Produced only through [`crate::manager::budget::process_timed_out`].
+    ///
+    /// The stop was sent and SCM confirmed `STOPPED`; the process (`pid`) had not exited: the
+    /// service is stopped, and a file the process runs stays in use until it does.
+    ///
+    /// Exit `4` (indeterminate), like [`WaitTimeout`](Error::WaitTimeout): the stop is not
+    /// finished, though not failed.
+    ///
+    /// `terminate_failed` is not the source: the timeout is not an OS failure, and a source would
+    /// have [`raw_os_error`](Error::raw_os_error) answer with the terminate's code. The `Display`
+    /// sets it inside its sentence (see [`Error::sentence`]) and ends with `recovery`.
+    #[error("{}", process_wait_timeout_message(id, *pid, *waited, terminate_failed.as_deref(), recovery))]
+    ProcessWaitTimeout {
+        id: String,
+        pid: u32,
+        waited: std::time::Duration,
+        /// Why goetia's attempt to end the process failed, if it did.
+        terminate_failed: Option<Arc<std::io::Error>>,
+        recovery: String,
+    },
+
     /// `kill` found no process of `id`'s to end: the service is stopped, or between runs. Nothing
     /// was signalled.
     #[error("daemon `{id}` is not running: there is no process to kill")]
@@ -449,10 +598,12 @@ pub enum Error {
     NoManager { evidence: String },
 
     /// A mutating CLI subcommand was invoked without the elevation
-    /// (root/Administrator) it requires. Never returned for `list`,
-    /// `status`, `show`, `diff`, or `install --dry-run`.
-    #[error("`{subcommand}` requires elevation (root/Administrator): re-run as root or Administrator")]
-    ElevationRequired { subcommand: String },
+    /// (root/Administrator) it requires, or, for a library caller on Windows, the install lock
+    /// could not be created or opened for want of it. `what` is the noun phrase that needs it, as the
+    /// message starts with it: the subcommand in backticks, or the action as a gerund. Never
+    /// returned for `list`, `status`, `show`, `diff`, or `install --dry-run`.
+    #[error("{what} requires elevation (root/Administrator): re-run as root or Administrator")]
+    ElevationRequired { what: String },
 
     /// [`crate::manager::native`] has no [`ServiceManager`] implementation
     /// for the running platform — anything but Linux, macOS or Windows. An
@@ -499,13 +650,17 @@ impl Error {
         match self {
             Error::Undetermined { .. }
             | Error::WaitTimeout { .. }
+            | Error::ProcessWaitTimeout { .. }
             | Error::Unestablished { .. }
             | Error::RequestInDoubt { .. }
             | Error::LoadedJobInDoubt { .. }
             | Error::LoadedStateInDoubt { .. }
             | Error::StaleJobBootedOut { .. }
             | Error::StartUnconfirmed { .. } => true,
-            Error::Step { source, .. } | Error::StartAsManaged { source, .. } => source.is_indeterminate(),
+            Error::Step { source, .. }
+            | Error::StartAsManaged { source, .. }
+            | Error::ServiceImageUnreadable { source, .. }
+            | Error::InstalledUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
             Error::Os { .. }
@@ -525,6 +680,16 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::ShimFolderUnsafe { .. }
+            | Error::ShimMarkerMissing { .. }
+            | Error::ShimMarkerVersion { .. }
+            | Error::NoShimProvider
+            | Error::ShimHostMismatch { .. }
+            | Error::ShimPathRelative { .. }
+            | Error::ShimNotEmbedded
+            | Error::SiblingShimMissing { .. }
+            | Error::ShimLockForeign { .. }
+            | Error::ShimLockDenied { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -541,14 +706,36 @@ impl Error {
         }
     }
 
-    /// The error a chain of [`Step`](Error::Step)s and [`StartAsManaged`](Error::StartAsManaged)s
+    /// The error a chain of [`Step`](Error::Step)s, [`StartAsManaged`](Error::StartAsManaged)s and
+    /// [`InstalledUnreadable`](Error::InstalledUnreadable)s
     /// ends in, which classification reads: a step over [`NotInstalled`](Error::NotInstalled) is
     /// still "not installed". [`Both`](Error::Both) has two causes, so it is itself the cause.
     /// [`map_cause`](Error::map_cause) walks the same chain.
     pub fn cause(&self) -> &Error {
+        self.wrapped().map_or(self, Error::cause)
+    }
+
+    /// Whether this error, or what it wraps in a [`Step`](Error::Step), a
+    /// [`StartAsManaged`](Error::StartAsManaged) or a [`Kept`](Error::Kept), is an
+    /// [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
+    /// walks through that variant.
+    pub(crate) fn wraps_unreadable_host(&self) -> bool {
         match self {
-            Error::Step { source, .. } | Error::StartAsManaged { source, .. } => source.cause(),
-            e => e,
+            Error::InstalledUnreadable { .. } => true,
+            Error::Kept(kept) => kept.wraps_unreadable_host(),
+            e => e.wrapped().is_some_and(Error::wraps_unreadable_host),
+        }
+    }
+
+    /// The one error a wrapper variant adds its operation to. The chain every walk of
+    /// [`cause`](Error::cause)'s kind follows; [`map_cause`](Error::map_cause) owns what it maps, so
+    /// it lists the same variants.
+    fn wrapped(&self) -> Option<&Error> {
+        match self {
+            Error::Step { source, .. }
+            | Error::StartAsManaged { source, .. }
+            | Error::InstalledUnreadable { source, .. } => Some(source),
+            _ => None,
         }
     }
 
@@ -562,6 +749,10 @@ impl Error {
             },
             Error::StartAsManaged { blob, source } => Error::StartAsManaged {
                 blob,
+                source: Box::new(source.map_cause(f)),
+            },
+            Error::InstalledUnreadable { id, source } => Error::InstalledUnreadable {
+                id,
                 source: Box::new(source.map_cause(f)),
             },
             cause => f(cause),
@@ -590,6 +781,20 @@ impl Error {
         Ok((Box::new(read), recovery))
     }
 
+    /// The failures of `errors` in one error: `None` for none, the error itself for one, and for
+    /// more nested [`Both`](Error::Both)s in the order given. How every caller that tries each of
+    /// several things and reports what failed folds them.
+    #[cfg_attr(
+        not(any(windows, target_os = "macos")),
+        allow(dead_code, reason = "the SCM and launchd backends fold their failures with it")
+    )]
+    pub(crate) fn both_all(errors: impl IntoIterator<Item = Error>) -> Option<Error> {
+        errors.into_iter().reduce(|first, then| Error::Both {
+            first: Box::new(first),
+            then: Box::new(then),
+        })
+    }
+
     /// What would clear this failure, when it is written to follow the failure's cause: a remedy
     /// says "that read", so it cannot lead. [`report`](Error::report) prints it after the whole
     /// chain, and this variant's [`Display`](fmt::Display) leaves it out.
@@ -598,6 +803,10 @@ impl Error {
     pub fn remedy(&self) -> Option<&str> {
         match self {
             Error::Undetermined { recovery, .. } => Some(recovery),
+            Error::ServiceImageUnreadable { .. } => Some(
+                "An administrator must make each named service's registry key readable, or let SCM query it \
+                 (`SERVICE_QUERY_CONFIG`)",
+            ),
             Error::Kept(kept) => kept.remedy(),
             _ => None,
         }
@@ -617,10 +826,25 @@ impl Error {
                 restore_failed,
             } => Some(loaded_state_in_doubt(id, read_failed, restore_failed.is_some())),
             Error::StartAsManaged { blob, .. } => Some(start_as_managed_message(blob)),
+            Error::ProcessWaitTimeout {
+                id,
+                pid,
+                waited,
+                terminate_failed,
+                recovery,
+            } => Some(process_wait_timeout_message(
+                id,
+                *pid,
+                *waited,
+                terminate_failed.as_deref(),
+                recovery,
+            )),
             Error::Os { .. }
             | Error::Command { .. }
             | Error::Spawn { .. }
             | Error::Step { .. }
+            | Error::InstalledUnreadable { .. }
+            | Error::ServiceImageUnreadable { .. }
             | Error::Both { .. }
             | Error::ConcurrentChange { .. }
             | Error::QuarantineStranded { .. }
@@ -637,6 +861,16 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::ShimFolderUnsafe { .. }
+            | Error::ShimMarkerMissing { .. }
+            | Error::ShimMarkerVersion { .. }
+            | Error::NoShimProvider
+            | Error::ShimHostMismatch { .. }
+            | Error::ShimPathRelative { .. }
+            | Error::ShimNotEmbedded
+            | Error::SiblingShimMissing { .. }
+            | Error::ShimLockForeign { .. }
+            | Error::ShimLockDenied { .. }
             | Error::EnvFile { .. }
             | Error::Interpolate { .. }
             | Error::Yaml(_)
@@ -904,6 +1138,23 @@ fn why(diagnostic: &Option<String>) -> String {
     }
 }
 
+/// [`Error::ShimLockDenied`]'s message.
+fn shim_lock_denied(owner: &Option<String>) -> String {
+    const CAUSES: &str = "either the lock's permissions or the token's integrity level or privileges refuse it. If \
+                          the lock is someone else's, close every handle to it, by ending the processes that have \
+                          it open";
+    match owner {
+        Some(owner) => format!(
+            "access to the install lock `Global\\goetia-shim`, which is owned by {owner}, was denied to a token with \
+             Administrators enabled: {CAUSES}"
+        ),
+        None => format!(
+            "access to the install lock `Global\\goetia-shim` was denied to a token with Administrators enabled, and \
+             its owner could not be read: {CAUSES}"
+        ),
+    }
+}
+
 fn id_prefix(id: &Option<String>) -> String {
     id.as_deref().map(|id| format!("`{id}`: ")).unwrap_or_default()
 }
@@ -923,18 +1174,45 @@ fn in_doubt(request: &str, reached: bool, note: &Option<String>) -> String {
     }
 }
 
-/// A message with an error set inside it: `before`, the error, `after`. `Display` writes the
-/// error as [`Chain`] does, without its stderr; [`Error::report`] and [`Reason`] write it as they
-/// write any error (see [`Error::sentence`]).
+/// A message with an error set inside it, when there is one: `before`, the error, `after`.
+/// `Display` writes the error as [`Chain`] does, without its stderr; [`Error::report`] and
+/// [`Reason`] write it as they write any error (see [`Error::sentence`]).
 pub(crate) struct Sentence<'a> {
     pub(crate) before: Cow<'a, str>,
-    pub(crate) error: &'a Error,
+    pub(crate) error: Option<&'a (dyn std::error::Error + 'static)>,
+    /// Whether `error` is a cause of the failure the sentence states, so that its OS code is the
+    /// failure's ([`Error::raw_os_error`]). It is not for an error the sentence mentions in passing,
+    /// as the failed attempt to end a process under a timeout that is no OS failure.
+    pub(crate) error_is_cause: bool,
     pub(crate) after: Cow<'a, str>,
 }
 
 impl fmt::Display for Sentence<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}{}", self.before, Chain(self.error), self.after)
+        f.write_str(&self.before)?;
+        if let Some(error) = self.error {
+            write!(f, "{}", Chain(error))?;
+        }
+        f.write_str(&self.after)
+    }
+}
+
+/// `lead`, then, if ending a process failed, that it did and `terminate_failed`, then `tail`: how
+/// [`Error::ProcessWaitTimeout`] and the notice of a wait for the process say the process is still
+/// running because goetia could not end it.
+pub(crate) fn terminating_failed<'a>(
+    lead: String,
+    terminate_failed: Option<&'a std::io::Error>,
+    tail: impl Into<Cow<'a, str>>,
+) -> Sentence<'a> {
+    Sentence {
+        before: match terminate_failed {
+            None => lead.into(),
+            Some(_) => format!("{lead}, and terminating it failed: ").into(),
+        },
+        error: terminate_failed.map(|e| e as &(dyn std::error::Error + 'static)),
+        error_is_cause: false,
+        after: tail.into(),
     }
 }
 
@@ -942,9 +1220,29 @@ impl fmt::Display for Sentence<'_> {
 fn start_as_managed_message(blob: &Error) -> Sentence<'_> {
     Sentence {
         before: "its spec blob could not be read, so the start was judged as a `type: managed` service's (".into(),
-        error: blob,
+        error: Some(blob),
+        error_is_cause: true,
         after: ")".into(),
     }
+}
+
+/// The message of [`Error::ProcessWaitTimeout`]: `terminate_failed` is why goetia's attempt to end
+/// the process failed, if it did.
+fn process_wait_timeout_message<'a>(
+    id: &str,
+    pid: u32,
+    waited: std::time::Duration,
+    terminate_failed: Option<&'a std::io::Error>,
+    recovery: &'a str,
+) -> Sentence<'a> {
+    terminating_failed(
+        format!(
+            "`{id}` is stopped, but its process (pid {pid}) had not exited within {}",
+            humantime::format_duration(waited)
+        ),
+        terminate_failed,
+        format!(". {recovery}"),
+    )
 }
 
 /// The message of [`Error::LoadedJobInDoubt`].
@@ -960,7 +1258,8 @@ fn loaded_state_in_doubt<'a>(id: &str, read_failed: &'a Error, restore_failed: b
     Sentence {
         before: format!("`{id}`'s plist was written, but whether launchd has its job loaded could not be read (")
             .into(),
-        error: read_failed,
+        error: Some(read_failed),
+        error_is_cause: true,
         after: format!("){}", loaded_in_doubt_tail(id, restore_failed)).into(),
     }
 }

@@ -1,8 +1,8 @@
 //! Shared support for the integration suites.
 //!
-//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only
-//! `daemon_spec`, `kill`, `list_json` and `scm_wait` depend on the `goetia` crate; the
-//! marker-inertness probe's hand-written artifacts use the rest.
+//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only `daemon_spec`, `kill`, `list_json`,
+//! `scm_wait` and `stock_shim_manager` depend on the `goetia` crate; the marker-inertness probe's
+//! hand-written artifacts use the rest.
 
 #![allow(dead_code, unused_imports)]
 // Each probe module is `#[cfg]`-gated to one platform, so most of this is
@@ -16,6 +16,8 @@ pub mod elevation;
 pub mod kill;
 pub mod list_json;
 #[cfg(windows)]
+pub mod local_user;
+#[cfg(windows)]
 pub mod raw_registry;
 #[cfg(windows)]
 pub mod registry;
@@ -27,6 +29,8 @@ pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
 pub mod service_guard;
+#[cfg(windows)]
+pub mod world_readable_exe;
 
 use std::fs;
 use std::path::PathBuf;
@@ -41,8 +45,12 @@ pub use daemon_spec::spec;
 pub use elevation::{ELEVATED, elevated};
 pub use list_json::{ListJson, assert_own, list_json, may_account_for};
 #[cfg(windows)]
+pub use local_user::LocalUserGuard;
+#[cfg(windows)]
 pub use scratch::ScratchKey;
 pub use service_guard::ServiceGuard;
+#[cfg(windows)]
+pub use world_readable_exe::WorldReadableExe;
 
 // Artifact locations --------------------------------------------------------------------------------------------------
 // Shared with `service_guard`, whose cleanup has to reach the very paths
@@ -52,6 +60,18 @@ pub use service_guard::ServiceGuard;
 pub const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
 pub const LAUNCHD_DAEMON_DIR: &str = "/Library/LaunchDaemons";
 pub const SCM_SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
+
+/// A manager whose `type: simple` services run the stock shim this package builds, wherever cargo put
+/// it, through a `StandaloneShim`. The folder check is off: the build directory is the user's, not a
+/// protected one. `Scm::new()` has no provider, so a test that installs a `type: simple` service
+/// without caring where its host comes from uses this.
+#[cfg(windows)]
+pub fn stock_shim_manager() -> goetia::backend::scm::manager::Scm {
+    goetia::backend::scm::manager::Scm::with_shim(
+        goetia::shim::StandaloneShim::new(PathBuf::from(env!("CARGO_BIN_EXE_goetia-shim")), vec![]),
+        goetia::shim::CheckPermissions::Disable,
+    )
+}
 
 /// Fails the test unless `dir`, a directory the system provides (`multi-user.target.wants`,
 /// `/Library/LaunchDaemons`), exists. A test never creates one: every test running concurrently

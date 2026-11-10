@@ -7,9 +7,15 @@ pub mod blob;
 pub mod cli;
 pub mod decide;
 pub mod diff;
+#[cfg(windows)]
+mod elevation;
 pub mod error;
 pub mod manager;
+pub mod shim;
 pub mod spec;
+#[cfg(all(windows, any(test, feature = "testing")))]
+#[doc(hidden)]
+pub mod testing;
 
 #[cfg(test)]
 mod version_tests;

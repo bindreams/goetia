@@ -98,7 +98,8 @@ jobs:
         # renovate: datasource=pypi depName=prek
         run: uv tool install prek==0.5.9
 
-      # Clippy is defined in prek.toml: the default build and the library-only build.
+      # Clippy is defined in prek.toml: the default build (with the `testing` feature, which the
+      # self dev-dependency turns on) and the library-only build.
       - name: Clippy
         if: matrix.toolchain != 'stable'
         run: prek run --all-files cargo-clippy cargo-clippy-lib-only
@@ -215,7 +216,7 @@ jobs:
         # renovate: datasource=pypi depName=prek
         run: uv tool install prek==0.5.10
 
-      # Both clippy hooks are skipped here because they already run per-platform
+      # The clippy hooks are skipped here because they already run per-platform
       # in the `test` job above (the `#[cfg]` halves differ per platform, so a
       # single-platform clippy run would miss them).
       - name: Run linters
@@ -232,7 +233,7 @@ jobs:
   # only ever compiles for its own host, and `test` builds the *repository*
   # rather than the *tarball*, so nothing else here would catch an
   # `exclude` that breaks a non-Linux build — goetia is more exposed to
-  # this than most crates, since `src/bin/shim` is `#[cfg(windows)]`-gated
+  # this than most crates, since the shim's code is `#[cfg(windows)]`-gated
   # internally and the three backends have disjoint dependency sets.
   package:
     name: Package (${{ matrix.os }})
@@ -276,3 +277,29 @@ jobs:
           list="${RUNNER_TEMP}/pkg-list.txt"
           cargo package --list --locked > "$list"
           bash .github/scripts/assert-package-list.sh "$list"
+
+  # A library consumer of the *packaged* crate ships the stock shim, and goetia's own two-stage and
+  # `cargo install` builds do too. Windows only, and elevated like the `test` job's runner: the round
+  # trips install a `type: simple` service. See `.github/scripts/consumer-build-tests.sh`.
+  consumer-build:
+    name: Consumer build (windows-latest)
+    needs: rust-version
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: consumer-build
+
+      - name: Build and install the stock shim as a consumer
+        shell: bash
+        run: bash .github/scripts/consumer-build-tests.sh

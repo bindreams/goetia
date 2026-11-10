@@ -167,16 +167,19 @@ pub(super) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> 
         Some(Error::Kept(kept)) => return os_error_in(kept.as_ref()),
         _ => {}
     }
-    e.source()
-        .and_then(os_error_in)
-        .or_else(|| ours.and_then(Error::sentence).and_then(|s| os_error_in(s.error)))
+    e.source().and_then(os_error_in).or_else(|| {
+        let sentence = ours.and_then(Error::sentence)?;
+        os_error_in(sentence.error.filter(|_| sentence.error_is_cause)?)
+    })
 }
 
 /// Writes `sentence`: its error is written as any error is, so its remedies are collected into
 /// `remedies`.
 pub(super) fn write_sentence<'a>(sentence: Sentence<'a>, out: &mut Sink, remedies: &mut Vec<&'a str>) -> fmt::Result {
     out.write_str(&sentence.before)?;
-    write_chain(sentence.error, out, remedies)?;
+    if let Some(error) = sentence.error {
+        write_chain(error, out, remedies)?;
+    }
     out.write_str(&sentence.after)
 }
 
