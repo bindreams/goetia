@@ -237,7 +237,7 @@ mod stock {
     // Where it goes ===================================================================================================
 
     /// `%ProgramFiles%\Goetia`.
-    pub(in crate::backend::scm) fn default_dir() -> Result<PathBuf> {
+    pub(super) fn default_dir() -> Result<PathBuf> {
         let mut path: *mut u16 = std::ptr::null_mut();
         // SAFETY: the folder ID is a static; `KF_FLAG_DEFAULT` and no token ask for the machine's
         // folder; `path` is a valid out-pointer.

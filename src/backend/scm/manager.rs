@@ -291,11 +291,11 @@ impl Backend for Scm {
     /// [`sweep_folder`]), and then the host is provided and checked before anything is
     /// read: `provide` must return the host `desired` registers (the flow's render, from the
     /// provider's `preview`: a sibling shim upgraded while the install waited on the lock
-    /// would otherwise register a file that was never placed), an absolute path whose folder passes
-    /// the folder check, to a file carrying this library's marker. A sweep that cannot read what is
-    /// referenced or cannot delete a file does not fail the install: the file is not what the
-    /// install needs, and the next sweep finds it. `type: managed` has no host,
-    /// so nothing is held or checked: its preconditions are `apply`'s, before any write.
+    /// would otherwise register a file that was never placed), an absolute path that passes the
+    /// folder check (which walks it and its ancestors), to a file carrying this library's marker. A
+    /// sweep that cannot read what is referenced or cannot delete a file does not fail the install:
+    /// the file is not what the install needs, and the next sweep finds it. `type: managed` has no
+    /// host, so nothing is held or checked: its preconditions are `apply`'s, before any write.
     fn begin_install(&self, spec: &DaemonSpec, desired: &ScmRegistration) -> Result<Option<InstallLock>> {
         if spec.kind != Kind::Simple {
             return Ok(None);
@@ -311,7 +311,7 @@ impl Backend for Scm {
             args: desired.arguments.clone(),
         };
         let provided = confirm_provided(rendered, provided)?;
-        require_host_folder(&provided.exe)?;
+        require_absolute(&provided.exe)?;
         self.folders.check(&provided.exe)?;
         marker::verify(&provided.exe)?;
         Ok(Some(lock))
@@ -599,15 +599,6 @@ fn confirm_provided(rendered: HostCommand, provided: HostCommand) -> Result<Host
     Err(Error::ShimHostMismatch {
         rendered: Box::new(rendered),
         provided: Box::new(provided),
-    })
-}
-
-/// `exe`, the host `provide` returned, when it is an absolute path with a folder: the folder check and
-/// the marker read that follow take its folder. Otherwise [`Error::ShimPathRelative`] naming `exe`.
-fn require_host_folder(exe: &Path) -> Result<()> {
-    require_absolute(exe)?;
-    exe.parent().map(|_| ()).ok_or_else(|| Error::ShimPathRelative {
-        path: exe.to_path_buf(),
     })
 }
 
