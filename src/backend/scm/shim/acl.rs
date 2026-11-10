@@ -31,11 +31,9 @@ use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_in
 
 #[cfg(windows)]
 pub(crate) use protected::{Descriptor, is_as_wanted};
-#[cfg(all(windows, any(test, feature = "testing")))]
-pub(crate) use system::kernel_object_security;
 #[cfg(windows)]
 pub(crate) use system::{
-    display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, require_acls_under,
+    Read, display_path, is_unreadable, kernel_object_security, normalise as lexical, read_object, require_acls_under,
 };
 
 #[cfg(windows)]
@@ -68,6 +66,10 @@ pub(crate) struct Ace {
     /// The ACE header's flags, of which only `INHERIT_ONLY_ACE` is read.
     pub(crate) flags: u8,
     pub(crate) allow: bool,
+    /// A callback entry (a condition follows its SID, which is not read, so [`verdict`] treats it
+    /// as one that always applies), allow or deny by `allow`.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) conditional: bool,
 }
 
 /// The first reason found to refuse a folder or a file.
@@ -598,33 +600,65 @@ mod system {
         }
     }
 
-    /// The owner of the kernel object `handle` (a mutex, say), which must be open with
-    /// `READ_CONTROL`. `name` stands for the object in an error.
-    pub(crate) fn kernel_object_owner(handle: HANDLE, name: &Path) -> Result<Sid> {
-        let info = security_info(
-            handle,
-            SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            "read the owner of",
-            name,
-        )?;
-        // SAFETY: `owner` points into `descriptor`, which `info` keeps live.
-        unsafe { copy_sid(info.owner, name) }
+    /// Which parts of a kernel object's security [`kernel_object_security`] reads and parses. A part
+    /// not asked for is not parsed, so what is unreadable in it cannot fail the read.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Read {
+        Owner,
+        /// Only the `testing` helper and unit tests read a DACL.
+        #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+        Dacl,
+        /// Only a unit test reads both.
+        #[cfg_attr(not(test), allow(dead_code))]
+        Both,
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    /// The owner and DACL of the kernel object `handle`, which must be open with `READ_CONTROL`;
-    /// [`ObjectSecurity::directory`] is false. `name` stands for the object in an error.
-    pub(crate) fn kernel_object_security(handle: HANDLE, name: &Path) -> Result<ObjectSecurity> {
-        let info = security_info(
-            handle,
-            SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            "read the permissions of",
-            name,
-        )?;
-        // SAFETY: `owner` and `dacl` point into `descriptor`, which `info` keeps live.
-        unsafe { describe(info.descriptor, info.owner, info.dacl, name.to_path_buf(), false) }
+    /// The parts of a kernel object's security that were read.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct KernelSecurity {
+        /// `Some` for [`Read::Owner`] and [`Read::Both`].
+        pub(crate) owner: Option<Sid>,
+        /// `Some` for [`Read::Dacl`] and [`Read::Both`].
+        pub(crate) dacl: Option<Dacl>,
+    }
+
+    /// A DACL as read.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Dacl {
+        /// Whether it ignores what a parent would have it inherit.
+        pub(crate) protected: bool,
+        /// `None` is a NULL DACL, which grants everyone every right.
+        pub(crate) aces: Option<Vec<Ace>>,
+    }
+
+    /// The part `read` asks for of the security of the kernel object `handle` (a mutex, say), which
+    /// must be open with `READ_CONTROL`. `name` stands for the object in an error.
+    pub(crate) fn kernel_object_security(handle: HANDLE, name: &Path, read: Read) -> Result<KernelSecurity> {
+        let (information, what) = match read {
+            Read::Owner => (OWNER_SECURITY_INFORMATION, "read the owner of"),
+            Read::Dacl => (DACL_SECURITY_INFORMATION, "read the permissions of"),
+            Read::Both => (
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                "read the permissions of",
+            ),
+        };
+        let info = security_info(handle, SE_KERNEL_OBJECT, information, what, name)?;
+        let owner = if information & OWNER_SECURITY_INFORMATION != 0 {
+            // SAFETY: `owner` points into `descriptor`, which `info` keeps live.
+            Some(unsafe { copy_sid(info.owner, name)? })
+        } else {
+            None
+        };
+        let dacl = if information & DACL_SECURITY_INFORMATION != 0 {
+            // SAFETY: `descriptor` is live, and `dacl` points into it.
+            let protected = unsafe { is_protected(info.descriptor, name)? };
+            // SAFETY: as above.
+            let aces = unsafe { parse_dacl(info.dacl, name)? };
+            Some(Dacl { protected, aces })
+        } else {
+            None
+        };
+        Ok(KernelSecurity { owner, dacl })
     }
 
     /// Copies the owner, the DACL and whether it is protected out of a security descriptor of a
@@ -640,6 +674,24 @@ mod system {
         path: PathBuf,
         directory: bool,
     ) -> Result<ObjectSecurity> {
+        // SAFETY: the caller's contract covers `descriptor`.
+        let protected = unsafe { is_protected(descriptor, &path)? };
+        // SAFETY: the caller's contract covers `owner` and `dacl`.
+        let (owner, dacl) = unsafe { parse(owner, dacl, &path)? };
+        Ok(ObjectSecurity {
+            path,
+            owner,
+            protected,
+            directory,
+            dacl,
+        })
+    }
+
+    /// Whether the DACL of `descriptor` is protected.
+    ///
+    /// # Safety
+    /// `descriptor` is a live security descriptor.
+    unsafe fn is_protected(descriptor: *mut c_void, path: &Path) -> Result<bool> {
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
         // SAFETY: the caller's contract covers `descriptor`; the out-pointers are valid lvalues.
@@ -650,15 +702,7 @@ mod system {
                 io::Error::last_os_error(),
             ));
         }
-        // SAFETY: the caller's contract covers `owner` and `dacl`.
-        let (owner, dacl) = unsafe { parse(owner, dacl, &path)? };
-        Ok(ObjectSecurity {
-            path,
-            owner,
-            protected: control & SE_DACL_PROTECTED != 0,
-            directory,
-            dacl,
-        })
+        Ok(control & SE_DACL_PROTECTED != 0)
     }
 
     /// Refuses a volume that keeps no ACLs, where every account can do anything.
@@ -733,8 +777,18 @@ mod system {
     pub(super) unsafe fn parse(owner: PSID, dacl: *mut ACL, path: &Path) -> Result<(Sid, Option<Vec<Ace>>)> {
         // SAFETY: the caller's contract covers `owner`.
         let owner = unsafe { copy_sid(owner, path)? };
+        // SAFETY: the caller's contract covers `dacl`.
+        let aces = unsafe { parse_dacl(dacl, path)? };
+        Ok((owner, aces))
+    }
+
+    /// Copies the entries out of a DACL, `None` for a NULL one.
+    ///
+    /// # Safety
+    /// `dacl` is what `GetSecurityInfo` returned, and the descriptor it points into is live.
+    unsafe fn parse_dacl(dacl: *mut ACL, path: &Path) -> Result<Option<Vec<Ace>>> {
         if dacl.is_null() {
-            return Ok((owner, None));
+            return Ok(None);
         }
         // SAFETY: `dacl` is non-null and live, so its header is readable.
         let count = unsafe { (*dacl).AceCount };
@@ -759,9 +813,11 @@ mod system {
                     std::ptr::addr_of!((*body).SidStart) as PSID,
                 )
             };
-            let allow = match header.AceType {
-                ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => true,
-                ACCESS_DENIED_ACE_TYPE | ACCESS_DENIED_CALLBACK_ACE_TYPE => false,
+            let (allow, conditional) = match header.AceType {
+                ACCESS_ALLOWED_ACE_TYPE => (true, false),
+                ACCESS_ALLOWED_CALLBACK_ACE_TYPE => (true, true),
+                ACCESS_DENIED_ACE_TYPE => (false, false),
+                ACCESS_DENIED_CALLBACK_ACE_TYPE => (false, true),
                 other => {
                     return Err(unreadable(
                         path,
@@ -775,9 +831,10 @@ mod system {
                 mask,
                 flags: header.AceFlags,
                 allow,
+                conditional,
             });
         }
-        Ok((owner, Some(aces)))
+        Ok(Some(aces))
     }
 
     /// The bytes of the SID at `sid`, or an error naming `path` when it is null or not a valid SID.

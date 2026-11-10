@@ -19,7 +19,7 @@ use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
 use goetia::spec::{DaemonFields, DaemonSpec, User};
-use goetia::testing::{FakeProvider, command};
+use goetia::testing::{DaclEntry, FakeProvider, command};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -28,7 +28,7 @@ use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, SYNCHRONIZE};
 use windows_sys::Win32::System::Threading::{
@@ -827,43 +827,48 @@ fn lock_is_exclusive() {
     assert_ne!(unsafe { ReleaseMutex(lock.as_raw_handle()) }, 0);
 }
 
-/// The DACL of the kernel object `handle` (open with `READ_CONTROL`), as what it means: whether it
-/// is protected, and each entry as its trustee's SID text, its mask and whether it allows. The
-/// kernel stores a generic right as the object's specific mask, so a text comparison would test the
-/// spelling.
-fn dacl_of(handle: HANDLE) -> (bool, Vec<(String, u32, bool)>) {
+/// The DACL of the kernel object `handle` (open with `READ_CONTROL`): whether it is protected, and
+/// its entries as the library reads them.
+fn dacl_of(handle: HANDLE) -> (bool, Vec<DaclEntry>) {
     let (protected, entries) = goetia::testing::kernel_object_dacl(handle, Path::new("the lock"))
         .unwrap_or_else(|e| panic!("read the permissions of the lock: {}", e.report()));
     let entries = entries.expect("the lock has a NULL DACL, which grants everyone every right");
-    let entries = entries
-        .into_iter()
-        .map(|(sid, mask, allow)| (goetia::testing::shown_sid(&sid), mask, allow))
-        .collect();
     (protected, entries)
 }
 
-/// The lock is for SYSTEM and Administrators alone, each with every right the mutex has, in a DACL
-/// that inherits nothing.
+/// The lock is for SYSTEM and Administrators alone, each with a plain allow entry that applies to
+/// the lock itself and grants every right the mutex has, in a DACL that inherits nothing.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn lock_is_for_system_and_administrators_only() {
     probing_the_lock_during_an_install(|lock| {
         let (protected, entries) = dacl_of(lock.as_raw_handle());
 
         assert!(protected, "the lock's DACL must not inherit: {entries:?}");
-        let mut trustees: Vec<&str> = entries.iter().map(|(sid, ..)| sid.as_str()).collect();
+        let mut trustees: Vec<String> = entries
+            .iter()
+            .map(|entry| goetia::testing::shown_sid(&entry.trustee))
+            .collect();
         trustees.sort();
         assert_eq!(
             trustees,
             ["S-1-5-18", "S-1-5-32-544"],
             "SYSTEM and Administrators alone: {entries:?}"
         );
-        for (sid, mask, allow) in &entries {
-            assert!(*allow, "{sid} is allowed, not denied");
+        for entry in &entries {
+            let who = goetia::testing::shown_sid(&entry.trustee);
+            assert!(entry.allow, "{who} is allowed, not denied");
+            assert!(!entry.conditional, "{who}'s entry has a condition: {entry:?}");
+            assert_eq!(
+                entry.flags & INHERIT_ONLY_ACE as u8,
+                0,
+                "{who}'s entry grants nothing to the lock itself: {entry:?}"
+            );
             // The kernel stores a generic right as the object's own mask: all of the mutex's rights.
-            let full = mask & GENERIC_ALL != 0 || mask & MUTEX_ALL_ACCESS == MUTEX_ALL_ACCESS;
+            let full = entry.mask & GENERIC_ALL != 0 || entry.mask & MUTEX_ALL_ACCESS == MUTEX_ALL_ACCESS;
             assert!(
                 full,
-                "{sid} has {mask:#x}, not every right of the mutex ({MUTEX_ALL_ACCESS:#x})"
+                "{who} has {:#x}, not every right of the mutex ({MUTEX_ALL_ACCESS:#x})",
+                entry.mask
             );
         }
     });

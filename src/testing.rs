@@ -29,27 +29,47 @@ pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     crate::backend::scm::manager::sid_for_account_name(account_name)
 }
 
+/// One entry of a DACL as the library reads it.
 #[cfg(windows)]
-pub use crate::backend::scm::sid::copy_sid;
-
-/// One entry of a DACL: its trustee's SID bytes, its mask, and whether it allows (else denies).
-#[cfg(windows)]
-pub type DaclEntry = (Vec<u8>, u32, bool);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaclEntry {
+    /// The trustee's SID bytes.
+    pub trustee: Vec<u8>,
+    pub mask: u32,
+    /// Allows, else denies.
+    pub allow: bool,
+    /// The ACE's flags, `INHERIT_ONLY_ACE` among them.
+    pub flags: u8,
+    /// A callback entry, which has a condition after its SID that the library does not read.
+    pub conditional: bool,
+}
 
 /// The DACL of the kernel object `handle`, which is open with `READ_CONTROL`: whether it is
-/// protected, and its entries (`None` for a NULL DACL). Read by the library's own check of
-/// permissions, which fails on an entry type it does not understand. `name` stands for the object
-/// in an error.
+/// protected, and its entries (`None` for a NULL DACL). Read by the library's own parser, which
+/// fails on an entry type it does not understand. The owner is not read. `name` stands for the
+/// object in an error.
 #[cfg(windows)]
 pub fn kernel_object_dacl(
     handle: *mut std::ffi::c_void,
     name: &std::path::Path,
 ) -> Result<(bool, Option<Vec<DaclEntry>>)> {
-    let security = crate::backend::scm::shim::acl::kernel_object_security(handle, name)?;
-    let entries = security
+    use crate::backend::scm::shim::acl::{Read, kernel_object_security};
+
+    let dacl = kernel_object_security(handle, name, Read::Dacl)?
         .dacl
-        .map(|dacl| dacl.into_iter().map(|ace| (ace.trustee, ace.mask, ace.allow)).collect());
-    Ok((security.protected, entries))
+        .expect("the DACL was asked for");
+    let entries = dacl.aces.map(|aces| {
+        aces.into_iter()
+            .map(|ace| DaclEntry {
+                trustee: ace.trustee,
+                mask: ace.mask,
+                allow: ace.allow,
+                flags: ace.flags,
+                conditional: ace.conditional,
+            })
+            .collect()
+    });
+    Ok((dacl.protected, entries))
 }
 
 pub mod cleanup;

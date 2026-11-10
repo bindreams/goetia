@@ -1,7 +1,7 @@
 //! A security identifier as bytes: how one is built, checked, copied and shown. Plain data, so it
-//! works on every host except what asks Windows: [`try_sid_display`], [`sid_display`] with its
-//! messages `INVALID` and `UNSHOWABLE`, and [`copy_sid`]. Looking an account up by a SID is
-//! Windows-only too, in `manager::identity`.
+//! works on every host except what asks Windows: [`try_sid_display`], [`sid_display`] and
+//! [`copy_sid`]. `sid_display`'s two messages, `INVALID` and `UNSHOWABLE`, exist only beside it, on
+//! Windows. Looking an account up by a SID is Windows-only too, in `manager::identity`.
 
 /// A security identifier in its binary form, as `LookupAccountNameW` and `GetAce` return it.
 pub(crate) type Sid = Vec<u8>;
@@ -41,7 +41,7 @@ const UNSHOWABLE: &str = "a SID that could not be shown";
 /// `psid` is null or points at a SID structure whole enough to read: its header and the
 /// sub-authorities the header counts.
 #[cfg(windows)]
-pub unsafe fn copy_sid(psid: windows_sys::Win32::Security::PSID) -> Option<Sid> {
+pub(crate) unsafe fn copy_sid(psid: windows_sys::Win32::Security::PSID) -> Option<Sid> {
     use windows_sys::Win32::Security::{GetLengthSid, IsValidSid};
 
     // SAFETY: `IsValidSid` reads the structure the caller vouches for; a null pointer is rejected first.

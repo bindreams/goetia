@@ -40,6 +40,7 @@ pub(super) fn allow(trustee: Sid, mask: u32, flags: u8) -> Ace {
         mask,
         flags,
         allow: true,
+        conditional: false,
     }
 }
 fn deny(trustee: Sid, mask: u32, flags: u8) -> Ace {
@@ -48,6 +49,7 @@ fn deny(trustee: Sid, mask: u32, flags: u8) -> Ace {
         mask,
         flags,
         allow: false,
+        conditional: false,
     }
 }
 fn object(path: &str, owner: Sid, dacl: Vec<Ace>) -> ObjectSecurity {
@@ -412,7 +414,8 @@ fn the_nearest_object_to_the_target_is_reported_first() {
 #[cfg(windows)]
 pub(in crate::backend::scm::shim) mod windows {
     use super::system::{
-        ObjectId, display_path, identity_of, is_unreadable, kernel_object_security, parse, read_chain, resolve_target,
+        ObjectId, Read, display_path, identity_of, is_unreadable, kernel_object_security, parse, read_chain,
+        resolve_target,
     };
     use super::*;
     use crate::error::Error;
@@ -437,9 +440,9 @@ pub(in crate::backend::scm::shim) mod windows {
     }
 
     /// An unnamed mutex of this process, with a protected DACL of one entry for Everyone: what
-    /// `kernel_object_security` reads back of it.
+    /// `kernel_object_security` reads back of it, whole or in the part asked for.
     #[skuld::test]
-    fn a_kernel_objects_owner_and_dacl_are_read_back() {
+    fn a_kernel_objects_owner_and_dacl_are_read_back_as_asked() {
         use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
         use windows_sys::Win32::System::Threading::CreateMutexW;
 
@@ -450,15 +453,26 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(!raw.is_null(), "{}", io::Error::last_os_error());
         // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns.
         let mutex = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let read = |part| kernel_object_security(mutex.as_raw_handle(), Path::new("a test mutex"), part).unwrap();
 
-        let security = kernel_object_security(mutex.as_raw_handle(), Path::new("a test mutex")).unwrap();
+        let both = read(Read::Both);
+        assert!(crate::backend::scm::sid::is_whole_sid(
+            &both.owner.clone().expect("the owner was asked for")
+        ));
+        let dacl = both.dacl.expect("the DACL was asked for");
+        assert!(dacl.protected);
+        let aces = dacl.aces.expect("the DACL was set");
+        assert_eq!(aces.len(), 1);
+        assert_eq!(aces[0].trustee, everyone());
+        assert!(aces[0].allow);
+        assert!(!aces[0].conditional);
 
-        assert!(security.protected);
-        assert!(crate::backend::scm::sid::is_whole_sid(&security.owner));
-        let dacl = security.dacl.expect("the DACL was set");
-        assert_eq!(dacl.len(), 1);
-        assert_eq!(dacl[0].trustee, everyone());
-        assert!(dacl[0].allow);
+        let owner_only = read(Read::Owner);
+        assert_eq!(owner_only.owner, both.owner);
+        assert!(owner_only.dacl.is_none());
+        let dacl_only = read(Read::Dacl);
+        assert!(dacl_only.owner.is_none());
+        assert_eq!(dacl_only.dacl.unwrap().aces.unwrap().len(), 1);
     }
 
     /// A volume that keeps no ACLs is refused: no owner or permissions can be read back from it.
@@ -805,6 +819,23 @@ pub(in crate::backend::scm::shim) mod windows {
 
         assert_eq!(found, owner);
         assert_eq!(dacl.unwrap().len(), 1);
+    }
+
+    /// A callback entry (types 9 and 10) is read as its plain kind, and told from it.
+    #[skuld::test]
+    fn a_conditional_entry_is_read_as_its_kind_and_marked() {
+        let owner = system();
+        for (ace_type, allow, conditional) in [(0, true, false), (1, false, false), (9, true, true), (10, false, true)]
+        {
+            let mut acl = acl_with_entry(ace_type, &owner);
+            let acl = acl.as_mut_ptr().cast();
+
+            // SAFETY: as above.
+            let (_, dacl) = unsafe { parse(owner.as_ptr() as _, acl, Path::new("f")) }.unwrap();
+
+            let ace = dacl.unwrap().remove(0);
+            assert_eq!((ace.allow, ace.conditional), (allow, conditional), "type {ace_type}");
+        }
     }
 
     #[skuld::test]
