@@ -276,6 +276,11 @@ impl ScmSnapshot {
     }
 }
 
+/// The lock makes nothing an install would take back.
+impl crate::backend::contract::Settle for Option<InstallLock> {
+    fn settle(&mut self, _standing: impl FnOnce() -> crate::backend::contract::Standing) {}
+}
+
 impl Backend for Scm {
     type Definition = ScmRegistration;
     type Snapshot = ScmSnapshot;
