@@ -6,7 +6,8 @@
 //! and of every ancestor up to the volume root, over the path as given and over its final path
 //! (links resolved). [`verdict`]
 //! judges plain data (SIDs as bytes, masks as `u32`) and is unit-tested on every host; reading the
-//! data and [`FolderCheck`] are Windows-only.
+//! data and [`FolderCheck`] are Windows-only. What counts as a link, and how other reparse points
+//! are read, is in [`FolderCheck::check`].
 //!
 //! What is judged, per object, folders before files and each nearest the target first:
 //! - an untrusted owner refuses (an owner can always change the DACL);
@@ -223,6 +224,12 @@ impl FolderCheck {
     /// can write to it, change its permissions, take it over or delete it; a link at `path` is read
     /// as itself, and so is what it leads to. An object that cannot be read is an error, never a
     /// pass.
+    ///
+    /// - A "link" is any name-surrogate reparse point (what [`std::fs::FileType::is_symlink`]
+    ///   reports), so WSL and container links count as well as symlinks and junctions.
+    /// - A link whose target `read_link` cannot read is an error, not a pass.
+    /// - Any other reparse point (a cloud-sync placeholder, say) is judged by its own owner and
+    ///   DACL; what a filter driver supplies behind it is not consulted.
     pub fn check(&self, path: &Path) -> Result<()> {
         if self.mode == CheckPermissions::Disable {
             return Ok(());
