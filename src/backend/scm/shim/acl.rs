@@ -435,6 +435,10 @@ mod system {
     }
 
     /// `by_id`, or when it failed, `by_index`; an error only when both did.
+    ///
+    /// The fallback is meant for volumes that have no file ID, but it fires on any error of
+    /// `by_id`. On another volume an object can then get two keys, one from each form, and the walk
+    /// reads it twice: that costs one read and never changes the verdict.
     pub(super) fn identity_of(
         by_id: io::Result<ObjectId>,
         by_index: impl FnOnce() -> io::Result<ObjectId>,
