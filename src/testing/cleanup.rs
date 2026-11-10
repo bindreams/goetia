@@ -1,18 +1,10 @@
 //! Removal of what a test created, retried for the transient failures cleanup meets (an antivirus
-//! holding a file, a process still exiting). Self-contained, so the library's unit tests load it as
-//! `backend::test_cleanup`.
+//! holding a file, a process still exiting).
 
 use std::time::{Duration, Instant};
 
 /// The problem a removal of `path` that returned `result` leaves, as a message for the caller to
 /// log; "not found" is success.
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "the library's Windows tests use only `retrying` and `warn_left_behind`"
-    )
-)]
 pub fn removal_problem(path: &std::path::Path, result: std::io::Result<()>) -> Option<String> {
     match result {
         Ok(()) => None,
@@ -22,13 +14,6 @@ pub fn removal_problem(path: &std::path::Path, result: std::io::Result<()>) -> O
 }
 
 /// Removes a file, or a directory tree when `dir`; see [`removal_problem`].
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "the library's Windows tests use only `retrying` and `warn_left_behind`"
-    )
-)]
 pub fn remove_path(path: &std::path::Path, dir: bool) -> Option<String> {
     let result = if dir {
         std::fs::remove_dir_all(path)
@@ -54,13 +39,6 @@ pub fn retrying(mut attempt: impl FnMut() -> Option<String>) -> Option<String> {
 }
 
 /// [`remove_path`], retried until it succeeds or [`CLEANUP_BOUND`] passes; then the last problem.
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "the library's Windows tests use only `retrying` and `warn_left_behind`"
-    )
-)]
 pub fn remove_path_retrying(path: &std::path::Path, dir: bool) -> Option<String> {
     retrying(|| remove_path(path, dir))
 }
@@ -74,26 +52,14 @@ pub fn warn_left_behind(problem: Option<String>) {
 
 /// [`remove_path_retrying`], then a warning naming what it could not remove. Never panics, so a
 /// cleanup that runs while the test unwinds still goes on.
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "the library's Windows tests use only `retrying` and `warn_left_behind`"
-    )
-)]
 pub fn remove_or_warn(path: &std::path::Path, dir: bool) {
     warn_left_behind(remove_path_retrying(path, dir));
 }
 
 /// A directory tree removed on drop with [`remove_or_warn`]. Never panics, so a drop that runs
 /// while the test unwinds still removes the tree.
-#[allow(dead_code, reason = "the library's launchd tests build none")]
 pub struct DirGuard(std::path::PathBuf);
 
-#[allow(
-    dead_code,
-    reason = "the library's launchd tests build no DirGuard, and its systemd tests never read the path"
-)]
 impl DirGuard {
     pub fn new(path: std::path::PathBuf) -> Self {
         Self(path)
@@ -111,22 +77,8 @@ impl Drop for DirGuard {
 }
 
 /// A file removed on drop with [`remove_or_warn`]; a symlink is unlinked, not followed.
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "the library's Windows tests use only `retrying` and `warn_left_behind`"
-    )
-)]
 pub struct FileGuard(std::path::PathBuf);
 
-#[cfg_attr(
-    windows,
-    allow(
-        dead_code,
-        reason = "the library's Windows tests use only `retrying` and `warn_left_behind`"
-    )
-)]
 impl FileGuard {
     pub fn new(path: std::path::PathBuf) -> Self {
         Self(path)

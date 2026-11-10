@@ -1,30 +1,24 @@
 //! Shared support for the integration suites.
 //!
-//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only `daemon_spec`, `kill`, `list_json`,
-//! `scm_wait` and `stock_shim_manager` depend on the `goetia` crate; the marker-inertness probe's
-//! hand-written artifacts use the rest.
+//! Pulled in with `#[path = "support/mod.rs"] mod support;`. Only `kill`, `list_json`, `scm_wait`
+//! and `stock_shim_manager` depend on the `goetia` crate; the marker-inertness probe's
+//! hand-written artifacts use the rest. `cleanup`, `elevation`, `raw_registry`, `scratch` and
+//! `plain_fields` are `goetia::testing`'s, which the library's unit tests share.
 
 #![allow(dead_code, unused_imports)]
 // Each probe module is `#[cfg]`-gated to one platform, so most of this is
 // unused in any single build.
 
-pub mod cleanup;
 pub mod cmd;
 pub mod connect_back;
-pub mod daemon_spec;
-pub mod elevation;
 pub mod kill;
 pub mod list_json;
 #[cfg(windows)]
 pub mod local_user;
 #[cfg(windows)]
-pub mod raw_registry;
-#[cfg(windows)]
 pub mod registry;
 #[cfg(windows)]
 pub mod scm_wait;
-#[cfg(windows)]
-pub mod scratch;
 pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
@@ -41,13 +35,16 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
-pub use daemon_spec::spec;
-pub use elevation::{ELEVATED, elevated};
+pub use goetia::testing::elevation::{ELEVATED, elevated};
+pub use goetia::testing::{cleanup, plain_fields};
+#[cfg(windows)]
+pub use goetia::testing::{
+    raw_registry,
+    scratch::{self, ScratchKey},
+};
 pub use list_json::{ListJson, assert_own, list_json, may_account_for};
 #[cfg(windows)]
 pub use local_user::LocalUserGuard;
-#[cfg(windows)]
-pub use scratch::ScratchKey;
 pub use service_guard::ServiceGuard;
 #[cfg(windows)]
 pub use world_readable_exe::WorldReadableExe;

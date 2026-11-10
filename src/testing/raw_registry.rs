@@ -1,6 +1,4 @@
-//! Registry calls that `winreg` cannot make: a name with a NUL in it, a key that is a link. Shared
-//! by the integration suites (through `support`) and the library's unit tests (as
-//! `backend::test_raw_registry`, by path).
+//! Registry calls that `winreg` cannot make: a name with a NUL in it, a key that is a link.
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::System::Registry::{

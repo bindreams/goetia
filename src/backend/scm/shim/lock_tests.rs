@@ -6,7 +6,7 @@ use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::MUTEX_MODIFY_STATE;
 
 use super::*;
-use crate::backend::test_elevation::{ELEVATED, elevated};
+use crate::testing::elevation::{ELEVATED, elevated};
 
 /// Carried by every test that takes the machine-wide lock `Global\goetia-shim`, which wait for each
 /// other: one's probe of who holds it must not see another's hold. Shared with

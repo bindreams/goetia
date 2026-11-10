@@ -53,7 +53,7 @@ pub fn query_account_name(id: &str) -> Option<String> {
 /// listens (see `fixture.rs`'s `connect`), and no conformance scenario reads
 /// the report.
 pub fn conformance_mk(id: &str) -> DaemonSpec {
-    DaemonSpec::new(support::spec(id, fixture_command(id, 1, 1, "plain"))).unwrap()
+    DaemonSpec::new(support::plain_fields(id, fixture_command(id, 1, 1, "plain"))).unwrap()
 }
 
 // Account SID lookup ==================================================================================================

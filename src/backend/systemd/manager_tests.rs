@@ -5,9 +5,7 @@
 //! something no interleaving of `install` calls alone can force deterministically.
 //!
 //! Most of these are elevated (they write real files under `/etc/systemd/system`), so they opt into
-//! the `elevated` precondition/label convention `tests/support/mod.rs` uses, as a local copy: that
-//! module pulls in the rest of the integration-test crate (`cmd`, `service_guard`, ...). Only
-//! `tests/support/cleanup.rs` is shared, as `backend::test_cleanup`.
+//! the `elevated` precondition and label of `crate::testing::elevation`.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,10 +18,10 @@ use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
 use crate::spec::DaemonFields;
 use crate::spec::Kind;
-use crate::spec::test_support::plain_fields;
+use crate::testing::plain_fields;
 
-use crate::backend::test_cleanup::{DirGuard, FileGuard, remove_or_warn};
-use crate::backend::test_elevation::{ELEVATED, elevated};
+use crate::testing::cleanup::{DirGuard, FileGuard, remove_or_warn};
+use crate::testing::elevation::{ELEVATED, elevated};
 
 /// On drop, removes every `unique_quarantine_path(id)` file the test's scenario left behind.
 /// Production deliberately leaves one on an unrecoverable double-race so a human can find it, and a
