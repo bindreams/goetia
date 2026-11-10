@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{BoxError, Error, Occupant, PutBackFound, VersionReading};
+use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, OWN};
 
 #[skuld::test]
 fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
@@ -150,7 +151,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::ShimFolderUnsafe {
             path: PathBuf::new(),
             account: String::new(),
-            right: "own",
+            right: OWN,
         },
         Error::ShimMarkerMissing { path: PathBuf::new() },
         Error::ShimNotEmbedded,
@@ -733,7 +734,7 @@ fn report_of_an_unsafe_shim_folder_names_the_path_the_account_and_the_right() {
     let e = Error::ShimFolderUnsafe {
         path: PathBuf::from("/p"),
         account: "Users".to_string(),
-        right: "change permissions of",
+        right: CHANGE_PERMISSIONS_OF,
     };
     assert_eq!(
         e.report().to_string(),

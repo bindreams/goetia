@@ -98,10 +98,10 @@ const FILE_GENERIC_EXECUTE: u32 = 0x12_00A0;
 const FILE_ALL_ACCESS: u32 = 0x1F_01FF;
 
 // What `Unsafe::right` says: a verb phrase that `{account} can {right} it` completes.
-const OWN: &str = "own";
+pub(crate) const OWN: &str = "own";
 const DO_ANYTHING_TO: &str = "do anything to";
 const BYPASS_ACCESS_CONTROL_ON: &str = "bypass access control on";
-const CHANGE_PERMISSIONS_OF: &str = "change permissions of";
+pub(crate) const CHANGE_PERMISSIONS_OF: &str = "change permissions of";
 const TAKE_OWNERSHIP_OF: &str = "take ownership of";
 const DELETE_OR_RENAME: &str = "delete or rename";
 const DELETE_OR_RENAME_ENTRIES_IN: &str = "delete or rename entries in";

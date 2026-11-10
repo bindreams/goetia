@@ -17,3 +17,5 @@ pub(crate) mod test_support;
 pub mod wait;
 #[cfg(not(windows))]
 pub(crate) mod wait;
+#[cfg(windows)]
+pub(crate) mod wide;

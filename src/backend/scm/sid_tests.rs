@@ -1,61 +1,78 @@
-//! `sid_text` over plain bytes, so these run on every host; `sid_display` calls Windows.
+//! `is_whole_sid` and the well-known SIDs' bytes, so these run on every host; `sid_display` asks
+//! Windows.
 
 use super::*;
 
 #[skuld::test]
-fn a_sid_is_written_in_the_standard_string_form() {
-    assert_eq!(sid_text(&system()).unwrap(), "S-1-5-18");
-    assert_eq!(sid_text(&administrators()).unwrap(), "S-1-5-32-544");
-    assert_eq!(sid_text(&everyone()).unwrap(), "S-1-1-0");
+fn the_well_known_sids_are_these_bytes() {
+    assert_eq!(system(), [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);
+    assert_eq!(administrators(), [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0]);
+    assert_eq!(everyone(), [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
     assert_eq!(
-        sid_text(&trusted_installer()).unwrap(),
-        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        trusted_installer(),
+        [
+            1, 6, 0, 0, 0, 0, 0, 5, // revision, six sub-authorities, authority 5
+            80, 0, 0, 0, //
+            181, 137, 251, 56, //
+            25, 132, 194, 203, //
+            92, 108, 35, 109, //
+            87, 0, 119, 110, //
+            192, 2, 100, 135,
+        ]
     );
 }
 
 #[skuld::test]
-fn bytes_that_are_not_a_sid_are_not_text_and_not_panicked_on() {
-    assert_eq!(sid_text(&[]), None);
-    assert_eq!(sid_text(&[1, 3, 0, 0, 0, 0, 0, 5, 1, 0]), None);
+fn a_whole_sid_is_told_from_bytes_that_are_not_one() {
+    for sid in [system(), administrators(), everyone(), trusted_installer()] {
+        assert!(is_whole_sid(&sid), "{sid:?}");
+    }
+    let mut sixteen = sid_from_parts(5, &[0; 15]);
+    assert!(is_whole_sid(&sixteen));
+    sixteen[1] = 16;
+    sixteen.extend_from_slice(&[0; 4]);
+    let mut other_revision = system();
+    other_revision[0] = 2;
+    let mut one_byte_short = administrators();
+    one_byte_short.pop();
+    let mut one_byte_long = administrators();
+    one_byte_long.push(0);
+    for bytes in [
+        &[][..],
+        &[1],
+        &sixteen,
+        &other_revision,
+        &one_byte_short,
+        &one_byte_long,
+    ] {
+        assert!(!is_whole_sid(bytes), "{bytes:?}");
+    }
 }
 
 #[cfg(windows)]
 mod windows {
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::PSID;
-
     use super::*;
 
-    /// What `ConvertSidToStringSidW` writes for `sid`; a pure conversion, which reads no OS state.
-    fn converted(sid: &[u8]) -> String {
-        let mut text: *mut u16 = std::ptr::null_mut();
-        // SAFETY: `sid` is a whole SID (the callers pass `sid_from_parts`); `text` is a valid out-pointer.
-        assert_ne!(unsafe { ConvertSidToStringSidW(sid.as_ptr() as PSID, &mut text) }, 0);
-        let mut len = 0;
-        // SAFETY: `text` is NUL-terminated and live until freed below.
-        while unsafe { *text.add(len) } != 0 {
-            len += 1;
-        }
-        // SAFETY: the `len` units before the NUL were just read; `text` is freed once.
-        unsafe {
-            let shown = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-            LocalFree(text.cast());
-            shown
-        }
+    #[skuld::test]
+    fn the_well_known_sids_are_shown_as_windows_writes_them() {
+        assert_eq!(sid_display(&system()), "S-1-5-18");
+        assert_eq!(sid_display(&administrators()), "S-1-5-32-544");
+        assert_eq!(sid_display(&everyone()), "S-1-1-0");
+        assert_eq!(
+            sid_display(&trusted_installer()),
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        );
     }
 
+    /// 2^32 is the first authority that Windows writes in hex, measured with `ConvertSidToStringSidW`.
     #[skuld::test]
-    fn a_large_identifier_authority_is_shown_as_windows_writes_it() {
-        // 2^32: the first authority that is not written in decimal.
-        let large = [1, 1, 0, 1, 0, 0, 0, 0, 7, 0, 0, 0];
-        assert_eq!(sid_display(&large), converted(&large));
-        assert_eq!(sid_display(&administrators()), converted(&administrators()));
+    fn a_large_identifier_authority_is_shown_in_hex() {
+        assert_eq!(sid_display(&[1, 1, 0, 1, 0, 0, 0, 0, 7, 0, 0, 0]), "S-1-0x100000000-7");
     }
 
     #[skuld::test]
     fn bytes_that_are_not_a_sid_are_shown_as_such() {
-        assert_eq!(sid_display(&[]), "an invalid SID");
-        assert_eq!(sid_display(&[1, 3, 0, 0, 0, 0, 0, 5, 1, 0]), "an invalid SID");
+        assert_eq!(sid_display(&[]), INVALID);
+        assert_eq!(sid_display(&[1, 3, 0, 0, 0, 0, 0, 5, 1, 0]), INVALID);
     }
 }

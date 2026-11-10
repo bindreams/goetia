@@ -25,12 +25,11 @@ use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid, GetSecurityDescriptorControl,
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, SYNCHRONIZE};
@@ -882,20 +881,10 @@ fn dacl_of(handle: HANDLE) -> (bool, Vec<(String, u32, u8)>) {
                 std::ptr::addr_of!((*body).SidStart) as PSID,
             )
         };
-        let mut text: *mut u16 = std::ptr::null_mut();
-        // SAFETY: `sid` is a valid SID inside the entry; `text` is a valid out-pointer.
-        assert_ne!(unsafe { ConvertSidToStringSidW(sid, &mut text) }, 0);
-        let mut len = 0;
-        // SAFETY: `text` is a NUL-terminated string, live until it is freed below.
-        while unsafe { *text.add(len) } != 0 {
-            len += 1;
-        }
-        // SAFETY: the `len` units before the NUL were just read; `text` is freed once.
-        let sid_text = unsafe {
-            let sid_text = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-            LocalFree(text.cast());
-            sid_text
-        };
+        // SAFETY: `sid` is a valid SID inside the entry, so `GetLengthSid` bytes are readable from it.
+        let sid_text = goetia::testing::sid_display(unsafe {
+            std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize)
+        });
         entries.push((sid_text, mask, kind));
     }
     // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last read.

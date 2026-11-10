@@ -413,6 +413,7 @@ fn the_nearest_object_to_the_target_is_reported_first() {
 pub(in crate::backend::scm::shim) mod windows {
     use super::system::{ObjectId, display_path, identity_of, is_unreadable, parse, read_chain, resolve_target};
     use super::*;
+    use crate::backend::scm::sid::INVALID;
     use crate::error::Error;
     use std::io;
 
@@ -500,12 +501,7 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(chain.iter().all(|object| object.directory));
         for object in &chain {
             assert!(!object.owner.is_empty(), "{}", object.path.display());
-            assert_ne!(
-                sid_display(&object.owner),
-                "an invalid SID",
-                "{}",
-                object.path.display()
-            );
+            assert_ne!(sid_display(&object.owner), INVALID, "{}", object.path.display());
         }
     }
 

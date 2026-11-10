@@ -13,6 +13,9 @@ use crate::error::Result;
 use crate::shim::{FolderCheck, HostCommand, ShimProvider, SweepFailure};
 use crate::spec::{DaemonFields, Id, Kind, Restart, User};
 
+#[cfg(windows)]
+pub use crate::backend::scm::sid::sid_display;
+
 pub mod cleanup;
 pub mod elevation;
 #[cfg(windows)]

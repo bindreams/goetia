@@ -66,11 +66,10 @@ pub fn conformance_mk(id: &str) -> DaemonSpec {
 // counterpart — sanctioned here the same way `fixture.rs` already uses raw
 // FFI for SCM dispatch.
 
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LocalFree};
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::Security::{LookupAccountNameW, PSID};
 
-/// `LookupAccountNameW` + `ConvertSidToStringSidW`: the string SID for a
+/// `LookupAccountNameW`, then `goetia::testing::sid_display`: the string SID for a
 /// local account name (e.g. one this test just created with `net user`).
 pub fn sid_string_for_account(account_name: &str) -> String {
     let wide_name = wide_null(account_name);
@@ -123,30 +122,5 @@ pub fn sid_string_for_account(account_name: &str) -> String {
         std::io::Error::last_os_error()
     );
 
-    let mut sid_string_ptr: *mut u16 = std::ptr::null_mut();
-    // SAFETY: `sid_buf` is a valid `PSID` buffer populated above;
-    // `sid_string_ptr` is a valid out-param. On success it must be freed
-    // with `LocalFree`.
-    let ok = unsafe { ConvertSidToStringSidW(sid_buf.as_mut_ptr() as PSID, &mut sid_string_ptr) };
-    assert!(
-        ok != 0,
-        "ConvertSidToStringSidW for `{account_name}`: {}",
-        std::io::Error::last_os_error()
-    );
-
-    let mut len = 0isize;
-    // SAFETY: `sid_string_ptr` is a valid null-terminated wide string per
-    // `ConvertSidToStringSidW`'s contract.
-    while unsafe { *sid_string_ptr.offset(len) } != 0 {
-        len += 1;
-    }
-    // SAFETY: `sid_string_ptr[0..len)` are exactly the UTF-16 units just counted.
-    let slice = unsafe { std::slice::from_raw_parts(sid_string_ptr, len as usize) };
-    let result = String::from_utf16_lossy(slice);
-    // SAFETY: `sid_string_ptr` was allocated by `ConvertSidToStringSidW` and
-    // is freed exactly once, after being copied out above.
-    unsafe {
-        LocalFree(sid_string_ptr as *mut core::ffi::c_void);
-    }
-    result
+    goetia::testing::sid_display(&sid_buf[..sid_len as usize])
 }
