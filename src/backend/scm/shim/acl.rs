@@ -477,7 +477,6 @@ mod system {
         })
     }
 
-    /// The file index of `file`, with the volume's serial number.
     fn file_index(file: &File) -> io::Result<ObjectId> {
         // SAFETY: an all-zero `BY_HANDLE_FILE_INFORMATION` is a valid value of plain integers.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };

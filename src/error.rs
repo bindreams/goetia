@@ -719,7 +719,7 @@ impl Error {
     /// [`InstalledUnreadable`](Error::InstalledUnreadable) ends in, which classification reads: a step
     /// over [`NotInstalled`](Error::NotInstalled) is still "not installed". An error that carries
     /// another one in any other variant ([`Kept`](Error::Kept), [`Undetermined`](Error::Undetermined),
-    /// [`Both`](Error::Both), and the rest) is itself the cause: that error is not walked.
+    /// [`Both`](Error::Both), and the rest) is itself the cause.
     /// [`map_cause`](Error::map_cause) walks the same chain.
     pub fn cause(&self) -> &Error {
         self.wrapped().map_or(self, Error::cause)

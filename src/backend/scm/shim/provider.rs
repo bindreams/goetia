@@ -22,8 +22,7 @@ pub struct HostCommand {
     pub args: Vec<String>,
 }
 
-/// Succeeds if `path` is absolute; else [`Error::ShimPathRelative`] naming it. Used for a stock
-/// provider's folder, a standalone provider's command, and the host `Scm` is given back.
+/// Succeeds if `path` is absolute; else [`Error::ShimPathRelative`] naming it.
 #[cfg(windows)]
 pub(crate) fn require_absolute(path: &Path) -> Result<()> {
     if path.is_absolute() {
@@ -46,7 +45,6 @@ pub trait ShimProvider: Send + Sync {
     /// The folder its `sweep` covers, or `None` when it sweeps none. Needs neither the host's bytes
     /// nor a successful `preview`: an uninstall names the folder whatever `preview` says. An error
     /// when the folder cannot be known (a relative path, a default folder that cannot be located).
-    /// Touches nothing.
     fn folder(&self) -> Result<Option<PathBuf>>;
 
     /// Under the install lock. Leaves the host ready at the returned path: writes, repairs or

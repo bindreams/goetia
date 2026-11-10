@@ -774,8 +774,7 @@ fn only_a_gone_or_marked_service_is_an_expected_refusal_to_read_its_host() {
 }
 
 /// The provider's folder, as an uninstall tells it: none without a provider, and unknown (with the
-/// failure) for a provider whose `folder()` fails, which is not the absence of one. A known folder is
-/// asserted by `the_providers_folder_does_not_need_its_preview`.
+/// failure) for a provider whose `folder()` fails, which is not the absence of one.
 #[skuld::test]
 fn the_providers_folder_is_none_or_unknown() {
     let (folder, failed) = Scm::new().provider_folder();
@@ -822,7 +821,7 @@ fn a_failed_cleanup_of_a_standalone_host_promises_no_retry() {
         not_deleted: vec![],
     };
 
-    let said = finished_cleanup(&id, &provider, None, unknown, vec![failure])
+    let said = finished_cleanup(&id, &provider, None, unknown, false, vec![failure])
         .expect_err("the cleanup failed")
         .report()
         .to_string();
@@ -874,7 +873,7 @@ fn an_unnamed_provider_folder_is_no_failed_cleanup_and_is_context_for_one() {
         })
     };
 
-    finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), vec![])
+    finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), false, vec![])
         .expect("every sweep succeeded, so the folder is not an error");
 
     let file = PathBuf::from(r"C:\app\goetia-shim.exe");
@@ -886,12 +885,41 @@ fn an_unnamed_provider_folder_is_no_failed_cleanup_and_is_context_for_one() {
         )),
         not_deleted: vec![file],
     };
-    let said = finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), vec![failure])
+    let said = finished_cleanup(&id, &ProviderFolder::Unknown, None, unknown(), false, vec![failure])
         .expect_err("a file could not be deleted")
         .report()
         .to_string();
     assert!(said.contains("could not be removed"), "{said}");
     assert!(said.contains("could not be determined"), "{said}");
+}
+
+/// A stock provider whose folder cannot be determined fails its sweep on the same cause: the cleanup
+/// reports that once, and promises no retry, which would fail again.
+#[skuld::test]
+fn a_provider_whose_folder_and_sweep_fail_alike_is_reported_once_with_no_retry() {
+    use crate::shim::EmbeddedStockShim;
+
+    let id = Id::try_from("frpc").unwrap();
+    let scm = Scm::with_shim(
+        EmbeddedStockShim::new(Some(b"abc"), Some(PathBuf::from("app"))),
+        CheckPermissions::Disable,
+    );
+    let (provider, unknown) = scm.provider_folder();
+    assert_eq!(provider, ProviderFolder::Unknown);
+    let swept = scm
+        .provider()
+        .unwrap()
+        .sweep(&[], &scm.folders)
+        .expect_err("a relative dir cannot be swept");
+
+    let said = finished_cleanup(&id, &provider, None, unknown, true, vec![swept])
+        .expect_err("the sweep failed")
+        .report()
+        .to_string();
+
+    assert!(!said.contains("Re-run"), "{said}");
+    assert_eq!(said.matches("which is not an absolute path").count(), 1, "{said}");
+    assert!(!said.contains("could not be determined"), "{said}");
 }
 
 /// A `stop` whose process could not be opened says so in the error that follows, led by it, and the

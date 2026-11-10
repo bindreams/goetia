@@ -1267,10 +1267,11 @@ impl Scm {
     ///
     /// A default folder that cannot be located skips the second folder, as it cannot be told from the
     /// host's, and is reported with whatever else fails: the wait and the provider's sweep go on.
-    /// A provider's sweep that fails on the same lookup reports it too.
+    /// A provider's sweep that fails on the same lookup reports it too: twice in all.
     ///
-    /// A provider whose `folder()` failed has no folder to name, and sweeps all the same; that is told
-    /// only beside a failure of the cleanup, see [`finished_cleanup`].
+    /// A provider whose `folder()` failed has no folder to name, and nothing is promised retried. The
+    /// stock providers fail their sweep on the same cause, which is then reported once; for another
+    /// provider it is told beside a failure of the cleanup, see [`finished_cleanup`].
     ///
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
@@ -1294,7 +1295,9 @@ impl Scm {
                 (None, host.parent())
             }
         };
-        let finish = |failures: Vec<SweepFailure>| finished_cleanup(id, &provider, unswept, unknown, failures);
+        let finish = |failures: Vec<SweepFailure>, provider_failed: bool| {
+            finished_cleanup(id, &provider, unswept, unknown, provider_failed, failures)
+        };
         match process {
             // `uninstall_locked` returned only after SCM recorded `STOPPED`, so the process may be
             // ended, through the handle held since before the stop, and waited for as `stop` waits
@@ -1305,7 +1308,7 @@ impl Scm {
                 Ok(EndProcessOutcome::Lingers { .. }) => unreachable!("an unbounded deadline never expires"),
                 Err(e) => {
                     failures.push(Error::os(format!("wait for `{id}`'s process to exit"), e).into());
-                    return finish(failures);
+                    return finish(failures, false);
                 }
             },
             HoldOutcome::NoProcess => {}
@@ -1321,34 +1324,39 @@ impl Scm {
             Ok(referenced) => referenced,
             Err(e) => {
                 failures.push(e.into());
-                return finish(failures);
+                return finish(failures, false);
             }
         };
+        let mut provider_failed = false;
         if let Some(shim) = &self.shim {
-            failures.extend(shim.sweep(&referenced, &self.folders).err());
+            let swept = shim.sweep(&referenced, &self.folders).err();
+            provider_failed = swept.is_some();
+            failures.extend(swept);
         }
         if let Some(folder) = second {
             // It is the default folder, by `second_folder`'s choice.
             failures.extend(sweep_folder(folder, &referenced, &self.folders, || Ok(folder.to_path_buf())).err());
         }
-        finish(failures)
+        finish(failures, provider_failed)
     }
 }
 
 /// The result of the cleanup of an uninstall that deleted `id`: `Ok` when every sweep succeeded, and
 /// otherwise the failures, led by what remains (see [`left_behind_text`]). `unknown` is why the
-/// provider's folder could not be named. The provider's sweep does not depend on it, so it is no
-/// failure of its own, and is told as context of one that is.
+/// provider's folder could not be named: it is no failure of its own, and is told as context of one
+/// that is. Not when `provider_failed`, the provider's own sweep having failed: the stock providers
+/// fail it on that same cause, which is then already among `failures`.
 fn finished_cleanup(
     id: &Id,
     provider: &ProviderFolder,
     unswept: Option<&Path>,
     unknown: Option<Error>,
+    provider_failed: bool,
     failures: Vec<SweepFailure>,
 ) -> Result<()> {
     SweepFailure::all(failures).map_or(Ok(()), |failure| {
         let files: Vec<PathBuf> = failure.not_deleted.iter().map(|file| normalise(file)).collect();
-        let cause = match unknown {
+        let cause = match unknown.filter(|_| !provider_failed) {
             Some(unknown) => Box::new(Error::Both {
                 first: failure.error,
                 then: Box::new(unknown),

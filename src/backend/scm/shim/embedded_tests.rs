@@ -144,8 +144,7 @@ mod windows {
     }
 
     /// `folder_in(None)`, which `SiblingStockShim` uses, is the default folder, and an absolute
-    /// folder is kept as given. Nothing can feed `default_dir` a value, so the refusal of a relative
-    /// default folder is not reachable in a test.
+    /// folder is kept as given.
     #[skuld::test]
     fn the_stock_folder_is_the_given_one_or_the_default() {
         assert_eq!(
@@ -153,6 +152,47 @@ mod windows {
             PathBuf::from(r"C:\shims")
         );
         assert_eq!(folder_in(None).unwrap(), default_dir().unwrap());
+    }
+
+    #[skuld::test]
+    fn a_relative_dir_is_no_folder_and_sweeps_nothing() {
+        let provider = EmbeddedStockShim::new(Some(b"abc"), Some(PathBuf::from(r"shims\here")));
+
+        match provider.folder() {
+            Err(Error::ShimPathRelative { path }) => assert_eq!(path, PathBuf::from(r"shims\here")),
+            other => panic!("a relative dir has no folder, got {other:?}"),
+        }
+        let failure = provider
+            .sweep(&[], &disabled())
+            .expect_err("a relative dir cannot be swept");
+        assert!(
+            matches!(&*failure.error, Error::ShimPathRelative { path } if path == Path::new(r"shims\here")),
+            "{:?}",
+            failure.error
+        );
+        assert!(failure.not_deleted.is_empty());
+        assert!(!Path::new(r"shims\here").exists());
+    }
+
+    #[skuld::test]
+    fn an_absolute_dir_is_the_folder() {
+        let provider = EmbeddedStockShim::new(None, Some(PathBuf::from(r"C:\shims")));
+
+        assert_eq!(provider.folder().unwrap(), Some(PathBuf::from(r"C:\shims")));
+    }
+
+    /// The default folder does not depend on the sibling.
+    #[cfg(feature = "cli")]
+    #[skuld::test]
+    fn the_siblings_folder_is_the_default_one_without_the_sibling() {
+        let beside = std::env::current_exe().unwrap().with_file_name("goetia-shim.exe");
+        assert!(
+            !beside.exists(),
+            "this test needs a test binary with no stock shim beside it: {}",
+            beside.display()
+        );
+
+        assert_eq!(SiblingStockShim.folder().unwrap(), Some(default_dir().unwrap()));
     }
 
     #[cfg(feature = "cli")]

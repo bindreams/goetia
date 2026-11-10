@@ -276,9 +276,7 @@ mod stock {
     }
 
     /// The folder a stock shim goes in: `dir`, or the default one. A relative one is
-    /// [`Error::ShimPathRelative`]. Every provider's folder, and the manager's lookup of the default
-    /// folder, come from here, so every path into `preview_in`, `provide_in` and `folder()` has had
-    /// this check.
+    /// [`Error::ShimPathRelative`].
     pub(in crate::backend::scm) fn folder_in(dir: Option<&Path>) -> Result<PathBuf> {
         let folder = match dir {
             Some(dir) => dir.to_path_buf(),
