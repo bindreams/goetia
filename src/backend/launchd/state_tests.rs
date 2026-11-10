@@ -169,26 +169,19 @@ fn kickstart_pid_rejects_a_truncated_line() {
     assert_eq!(kickstart_pid("4766"), None);
 }
 
-// instance ============================================================================================================
+// tearing_down ========================================================================================================
 
 /// The measured shape of a job whose `bootout` has returned and whose process has not exited.
 #[skuld::test]
-fn a_sigtermed_job_is_an_instance_being_torn_down() {
-    let seen = instance(&print_body("SIGTERMed", Some(4242)));
-
-    assert_eq!(
-        seen,
-        Instance {
-            pid: Some(4242),
-            tearing_down: true
-        }
-    );
+fn a_sigtermed_job_is_being_torn_down() {
+    assert!(tearing_down(&print_body("SIGTERMed", Some(4242))));
+    assert!(tearing_down(&print_body("SIGTERMed", None)));
 }
 
-/// Any other state, one this code does not recognise included, is not an instance a wait can
-/// identify: the wait ends on it, it does not go on waiting.
+/// Any other state, one this code does not recognise included, is a loaded job: a `start` does not
+/// wait on something it cannot identify.
 #[skuld::test]
-fn any_other_state_is_not_an_instance_being_torn_down() {
+fn any_other_state_is_not_a_job_being_torn_down() {
     for state in [
         "running",
         "not running",
@@ -197,38 +190,7 @@ fn any_other_state_is_not_an_instance_being_torn_down() {
         "xpcproxy",
         "someday-new-apple-state",
     ] {
-        assert!(!instance(&print_body(state, Some(4242))).tearing_down, "{state}");
+        assert!(!tearing_down(&print_body(state, Some(4242))), "{state}");
     }
-    assert!(!instance("no state line at all\n").tearing_down);
-}
-
-#[skuld::test]
-fn an_instance_carries_the_pid_its_print_shows() {
-    assert_eq!(instance(&print_body("running", Some(7))).pid, Some(7));
-    assert_eq!(instance(&print_body("SIGTERMed", None)).pid, None);
-}
-
-/// The instance a wait is for is the one being torn down whose pid is the pid read before the
-/// `bootout`. Where either pid is missing nothing tells two instances apart, and one being torn down
-/// counts.
-#[skuld::test]
-fn only_the_instance_booted_out_is_ours_to_wait_for() {
-    let going = |pid| Instance {
-        pid,
-        tearing_down: true,
-    };
-    let up = Instance {
-        pid: Some(4242),
-        tearing_down: false,
-    };
-
-    assert!(going(Some(4242)).is_ours(Some(4242)));
-    assert!(
-        !going(Some(5151)).is_ours(Some(4242)),
-        "a later instance, torn down in its turn"
-    );
-    assert!(going(Some(5151)).is_ours(None), "no pid was read before the bootout");
-    assert!(going(None).is_ours(Some(4242)), "no pid is shown");
-    assert!(!up.is_ours(Some(4242)), "a running instance is not being torn down");
-    assert!(!up.is_ours(None));
+    assert!(!tearing_down("no state line at all\n"));
 }

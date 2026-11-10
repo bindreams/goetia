@@ -201,7 +201,7 @@ impl Kept {
     /// be writing to them.
     pub(crate) fn again(&self) -> io::Result<Reservation> {
         #[cfg(test)]
-        test_hook::make(test_hook::Kind::Duplicate)?;
+        test_hook::make(test_hook::Kind::Reuse)?;
         let files = self
             .files
             .iter()
@@ -316,13 +316,13 @@ pub(crate) mod test_hook {
     pub(crate) enum Kind {
         Thread,
         TempFile,
-        Duplicate,
+        Reuse,
     }
 
     thread_local! {
         static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
         static TEMP_FILES: Cell<Option<usize>> = const { Cell::new(None) };
-        static DUPLICATES: Cell<Option<usize>> = const { Cell::new(None) };
+        static REUSES: Cell<Option<usize>> = const { Cell::new(None) };
         static SPAWNS: Cell<usize> = const { Cell::new(0) };
         static SPAWN_FAILS: std::cell::RefCell<Option<fn() -> cosca::error::Error>> =
             const { std::cell::RefCell::new(None) };
@@ -372,7 +372,7 @@ pub(crate) mod test_hook {
         match kind {
             Kind::Thread => &THREADS,
             Kind::TempFile => &TEMP_FILES,
-            Kind::Duplicate => &DUPLICATES,
+            Kind::Reuse => &REUSES,
         }
     }
 
@@ -388,8 +388,8 @@ pub(crate) mod test_hook {
 
     /// Let this thread run only `n` more [`super::Kept::again`]s, until the returned guard drops.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) fn duplicates(n: usize) -> Allowance {
-        allow(Kind::Duplicate, n)
+    pub(crate) fn reuses(n: usize) -> Allowance {
+        allow(Kind::Reuse, n)
     }
 
     fn allow(kind: Kind, n: usize) -> Allowance {
@@ -412,7 +412,7 @@ pub(crate) mod test_hook {
             Some(0) => Err(std::io::Error::other(match kind {
                 Kind::Thread => "no thread may be made (test hook)",
                 Kind::TempFile => "no temp file may be made (test hook)",
-                Kind::Duplicate => "no file may be duplicated (test hook)",
+                Kind::Reuse => "no kept file may be reused (test hook)",
             })),
             Some(n) => {
                 left.set(Some(n - 1));

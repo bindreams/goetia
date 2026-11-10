@@ -729,6 +729,8 @@ waits until launchd has removed it, and `--timeout` does not cut this short: it
 is part of sending the request, and a request that stopped partway would leave
 the daemon unloaded. For a job whose plist disables `ExitTimeOut` (`0`: launchd
 never kills the process), launchd may not remove it, and `start` then waits on.
+A `start` that finds the label's job already being torn down (after a `stop`
+that timed out) waits for it under `--timeout`, then loads the job.
 
 The two flags are mutually exclusive. `install` accepts them only alongside
 `--start`: without it nothing is started, so there is nothing to wait for,

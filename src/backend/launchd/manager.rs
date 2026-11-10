@@ -29,8 +29,8 @@
 //!   clear it and there is no remedy to apply.
 //! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded, and waits until
 //!   launchd no longer has it (see [`Launchctl::bootout`]). Every verb that acts on the label after
-//!   a `bootout` waits the same way, and `start` waits first for a label whose job is being torn
-//!   down.
+//!   a `bootout` waits the same way, and `start` waits first, under its budget, for a label whose job
+//!   is being torn down.
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`] (`/Library/LaunchDaemons`).
 //!   Does not start it.
 //! - `disable` moves the plist back to [`STAGING_DIR`]. It does not `bootout` the job:
@@ -767,7 +767,23 @@ fn is_not_found(code: Option<i32>) -> bool {
 enum Label {
     /// launchd has no job under it.
     Free,
-    Loaded(state::Instance),
+    Loaded,
+    /// A job whose `bootout` has returned and whose process has not exited: see [`state::tearing_down`].
+    TearingDown,
+}
+
+/// What `launchctl print` answered for a label that did not fail.
+enum Printed {
+    /// Not found: launchd has no job under it.
+    Absent,
+    Present(bounded::Capture),
+}
+
+/// The files of one more read over `kept`, for a read repeated as often as it takes. A failure is a
+/// read that could not be made, never a job that is gone.
+fn reread(id: &str, kept: &Kept) -> Result<Reservation> {
+    kept.again()
+        .map_err(|e| failed(&["print", target(id).as_str()], false, ClientError::NotRun(e.into())))
 }
 
 /// `launchctl`, reached through a [`Client`]. Every call the verbs make goes through [`Launchctl::run`].
@@ -809,43 +825,55 @@ impl Launchctl {
     /// Whether launchd has `id` loaded. `Ok(None)` iff `deadline` expired.
     ///
     /// Only success and the not-found codes in [`is_not_found`] answer the question; any other failure is
-    /// an `Err`, since callers act on "not loaded" by writing or bootstrapping.
+    /// an `Err`, since callers act on "not loaded" by writing or bootstrapping. Only the exit code is
+    /// read, never the body of `print`'s output.
     fn is_loaded(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<bool>> {
-        let label = self.label(id, deadline, reservation)?;
-        Ok(label.map(|label| label != Label::Free))
+        Ok(self
+            .print(id, deadline, reservation)?
+            .map(|printed| matches!(printed, Printed::Present(_))))
     }
 
-    /// What `launchctl print` shows for `id`. `Ok(None)` iff `deadline` expired.
-    fn label(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<Label>> {
+    /// What `launchctl print` shows for `id`, read over `kept`'s files. `Ok(None)` iff `deadline`
+    /// expired.
+    ///
+    /// The one read of the label that parses `print`'s body, for the one question the exit code
+    /// cannot answer: whether the job is being torn down. A body that is not whole cannot answer it,
+    /// and is an `Err`.
+    fn label(&self, id: &str, deadline: Deadline, kept: &Kept) -> Result<Option<Label>> {
+        let mut held = reread(id, kept)?;
+        let Some(printed) = self.print(id, deadline, &mut held)? else {
+            return Ok(None);
+        };
+        Ok(Some(match printed {
+            Printed::Absent => Label::Free,
+            Printed::Present(capture) if !capture.complete => {
+                return Err(Error::IncompleteAnswer {
+                    command: format!("launchctl print {}", target(id)),
+                    missing: vec!["the whole of its output".to_string()],
+                });
+            }
+            Printed::Present(capture) if state::tearing_down(&String::from_utf8_lossy(&capture.stdout)) => {
+                Label::TearingDown
+            }
+            Printed::Present(_) => Label::Loaded,
+        }))
+    }
+
+    /// `launchctl print` for `id`. `Ok(None)` iff `deadline` expired. Any failure but the not-found codes
+    /// is an `Err`.
+    fn print(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<Printed>> {
         let target = target(id);
         let args = ["print", target.as_str()];
         let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Query, reservation)? else {
             return Ok(None);
         };
         if status.success() {
-            // A body that is not whole shows no instance this could tell from another.
-            let shown = if capture.complete {
-                state::instance(&String::from_utf8_lossy(&capture.stdout))
-            } else {
-                state::Instance {
-                    pid: None,
-                    tearing_down: false,
-                }
-            };
-            Ok(Some(Label::Loaded(shown)))
+            Ok(Some(Printed::Present(capture)))
         } else if is_not_found(status.code()) {
-            Ok(Some(Label::Free))
+            Ok(Some(Printed::Absent))
         } else {
             Err(command_failed(&args, status, &capture.stderr))
         }
-    }
-
-    /// [`Self::label`] over the files `kept` holds, for a read repeated as often as it takes.
-    fn label_again(&self, id: &str, deadline: Deadline, kept: &Kept) -> Result<Option<Label>> {
-        let mut held = kept
-            .again()
-            .map_err(|e| failed(&["print", target(id).as_str()], false, ClientError::NotRun(e.into())))?;
-        self.label(id, deadline, &mut held)
     }
 
     /// `Ok(None)` iff `deadline` expired.
@@ -931,8 +959,8 @@ impl Launchctl {
         }
     }
 
-    /// `bootout`, then the wait until launchd no longer has the instance it booted out. `Ok(None)` iff
-    /// `deadline` expired, in either.
+    /// `bootout`, then the wait until launchd no longer has `id` loaded. `Ok(None)` iff `deadline`
+    /// expired, in either.
     ///
     /// `launchctl bootout` returns within milliseconds, not when the job's process has exited: until
     /// then `print` still answers for the label (`state = SIGTERMed`). That lasts until the process
@@ -940,13 +968,13 @@ impl Launchctl {
     /// never kills it, and a process in uninterruptible sleep survives a kill. A caller that acts on
     /// the label after a `bootout` (`bootstrap`, a read, a plist removed) must not meet the old
     /// instance, so this waits for it, under `deadline`: a caller that cannot be cut short passes an
-    /// unbounded one. [`Self::wait_while_going`] says what the wait ends on.
+    /// unbounded one. The wait is over when `print` reports the label not found, whatever job answered
+    /// for it before: a label someone else loads again meanwhile keeps the wait going until `deadline`.
     ///
-    /// Success and the [`is_not_found`] codes are both `Ok`, and the `bootout` is sent whatever the
-    /// label shows: the job could unload between a check and the act (a concurrent `stop`, an operator's
-    /// `launchctl bootout`), failing this call for an already stopped service and breaking the
-    /// idempotency [`ServiceManager::stop`] requires. The one `print` before it only reads the pid of
-    /// the instance being booted out, so a failure of it is no pid, not a failure.
+    /// No `is_loaded` pre-check: the job could unload between check and act (a concurrent `stop`, an
+    /// operator's `launchctl bootout`), failing this call for an already stopped service and
+    /// breaking the idempotency [`ServiceManager::stop`] requires. Success and the
+    /// [`is_not_found`] codes are both `Ok`.
     ///
     /// What the wait needs is taken from `reservation` before anything is sent, so an
     /// [`Error::Reservation`] means nothing was.
@@ -956,35 +984,29 @@ impl Launchctl {
         let kept = reservation
             .keep(Role::COUNTED_FILES)
             .map_err(|source| Error::Reservation { id: None, source })?;
-        let role = request(reservation)?;
-        let ours = match self.label_again(id, Budget::Unbounded.start(), &kept) {
-            Ok(Some(Label::Loaded(instance))) => instance.pid,
-            _ => None,
-        };
         let target = target(id);
         let args = ["bootout", target.as_str()];
+        let role = request(reservation)?;
         let Finished::Exited { status, capture } = self.run(&args, deadline, role, reservation)? else {
             return Ok(None);
         };
         if !(status.success() || is_not_found(status.code())) {
             return Err(command_failed(&args, status, &capture.stderr));
         }
-        Ok(self.wait_while_going(id, ours, deadline, &kept)?.map(|_| ()))
+        self.wait_unloaded(id, deadline, &kept)
     }
 
-    /// Reads `id`'s label until it no longer shows the instance being torn down that `ours` names
-    /// (see [`state::Instance::is_ours`]), and returns what it then shows: [`Label::Free`], or a
-    /// [`Label::Loaded`] that is another instance's, which the caller reports as it finds it.
-    /// `Ok(None)` iff `deadline` expired first.
+    /// Reads until launchd no longer has `id` loaded. `Ok(None)` iff `deadline` expired first.
     ///
-    /// Every read re-checks the real condition; [`UNLOAD_POLL`] only paces them. How many reads a
-    /// job's exit takes is not known when the verb reserves, so the wait is one call, its files taken
-    /// once by the caller as `kept`. A read that fails is an `Err`, never a job that is gone.
+    /// Every read re-checks the real condition; [`UNLOAD_POLL`] only paces them. How many reads a job's
+    /// exit takes is not known when the verb reserves, so the wait is one call, its files taken once by
+    /// the caller as `kept`: no read can fail for want of a file once the request is out. A read that
+    /// fails is an `Err`, never a job that is gone.
     ///
     /// A deadline already spent still gets one last read, under [`HELD_READ_BOUND`] (`print` answers
-    /// in milliseconds), so an instance that went in the last interval is reported gone; no read is
-    /// made under a spent deadline, which would be killed at once.
-    fn wait_while_going(&self, id: &str, ours: Option<u32>, deadline: Deadline, kept: &Kept) -> Result<Option<Label>> {
+    /// in milliseconds), so a job that went in the last interval is reported gone; no read is made
+    /// under a spent deadline, which would be killed at once.
+    fn wait_unloaded(&self, id: &str, deadline: Deadline, kept: &Kept) -> Result<Option<()>> {
         loop {
             let spent = deadline.expired();
             let read_deadline = if spent {
@@ -992,14 +1014,10 @@ impl Launchctl {
             } else {
                 deadline
             };
-            match self.label_again(id, read_deadline, kept)? {
-                Some(Label::Loaded(instance)) if instance.is_ours(ours) => {
-                    if spent {
-                        return Ok(None);
-                    }
-                }
-                Some(label) => return Ok(Some(label)),
-                None => return Ok(None),
+            match self.is_loaded(id, read_deadline, &mut reread(id, kept)?)? {
+                Some(false) => return Ok(Some(())),
+                Some(true) if !spent => {}
+                Some(true) | None => return Ok(None),
             }
             let pause = deadline.remaining().map_or(UNLOAD_POLL, |left| left.min(UNLOAD_POLL));
             std::thread::sleep(pause);
@@ -1068,12 +1086,13 @@ const STOP_REQUESTS: usize = 1;
 const KILL_REQUESTS: usize = 1;
 
 /// Most `launchctl` calls per verb, reads included: each draws its role's temp files from the same
-/// reservation. `install` adds two `is_loaded`s; `start` two `is_loaded`s and five `live_state`s. The
+/// reservation. `install` adds two `is_loaded`s; `start` one `is_loaded` and five `live_state`s. The
 /// `print` after an expired `kickstart` is not counted: the verb ends there, in place of its last read.
-/// A wait ([`Launchctl::wait_while_going`]) is one call however many reads it makes: one after each
-/// `bootout`, and `start` has one more before its `bootstrap`.
+/// A wait ([`Launchctl::wait_unloaded`]) is one call however many reads it makes: one after each
+/// `bootout`. `start` has one more: its first read of the label and the wait that may follow it share
+/// one set of files.
 const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2 + 1;
-const START_CALLS: usize = START_REQUESTS + 7 + 2;
+const START_CALLS: usize = START_REQUESTS + 6 + 2;
 const STOP_CALLS: usize = STOP_REQUESTS + 1;
 const KILL_CALLS: usize = KILL_REQUESTS;
 
@@ -1345,19 +1364,20 @@ impl backend::Backend for Launchd {
         let kept = reservation
             .keep(Role::COUNTED_FILES)
             .map_err(|source| Error::Reservation { id: None, source })?;
-        let mut label = never_expires(self.launchctl.label(id.as_str(), issuing, reservation)?);
-        // An instance being torn down (after a `stop` that timed out, or another program's `launchctl
-        // bootout`) answers for the label and would pass for a loaded job, so `bootstrap` would be
-        // skipped and the job gone once it exits. Wait it out, as sending the request: under `issuing`.
-        if let Label::Loaded(instance) = label
-            && instance.tearing_down
-        {
-            label = never_expires(
+        let loaded = match never_expires(self.launchctl.label(id.as_str(), issuing, &kept)?) {
+            Label::Free => false,
+            Label::Loaded => true,
+            // A job being torn down (after a `stop` that timed out, or another program's `launchctl
+            // bootout`) answers for the label and would pass for a loaded job, so `bootstrap` would be
+            // skipped and the job gone once it exits. Wait it out under the caller's budget.
+            Label::TearingDown => {
                 self.launchctl
-                    .wait_while_going(id.as_str(), instance.pid, issuing, &kept)?,
-            );
-        }
-        if label == Label::Free
+                    .wait_unloaded(id.as_str(), deadline, &kept)?
+                    .ok_or_else(timed_out)?;
+                false
+            }
+        };
+        if !loaded
             && let Err(e) = self
                 .launchctl
                 .bootstrap(&location.path, issuing, reservation)

@@ -29,34 +29,11 @@ pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
     (state, pid)
 }
 
-/// What a loaded label's `launchctl print` shows of its instance, as far as a wait for a booted-out
-/// one needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Instance {
-    pub pid: Option<u32>,
-    pub tearing_down: bool,
-}
-
-/// The [`Instance`] one `launchctl print` body shows.
-///
-/// `state = SIGTERMed` is how `print` shows a job whose `bootout` has returned and whose process has not
-/// exited (measured on macOS CI, 2026-11-09). Apple does not guarantee the format, so any other `state`,
-/// one this does not recognise included, is not an instance being torn down: a wait ends on it rather
-/// than go on waiting for something it cannot identify.
-pub(crate) fn instance(print_body: &str) -> Instance {
-    Instance {
-        pid: classify(print_body).1,
-        tearing_down: find_field(print_body, "state").map(str::trim) == Some("SIGTERMed"),
-    }
-}
-
-impl Instance {
-    /// Whether this is the instance being torn down that a wait is for, `ours` being the pid read
-    /// before its `bootout`. Pids on both sides must agree; where either is missing nothing tells two
-    /// instances apart, and any one being torn down counts.
-    pub(crate) fn is_ours(self, ours: Option<u32>) -> bool {
-        self.tearing_down && (ours.is_none() || self.pid.is_none() || self.pid == ours)
-    }
+/// Whether one `launchctl print` body shows a job whose `bootout` has returned and whose process has
+/// not exited: `state = SIGTERMed` (measured on macOS CI, 2026-11-09). Apple does not guarantee the
+/// format, so any other `state`, one this does not recognise included, is a loaded job.
+pub(crate) fn tearing_down(print_body: &str) -> bool {
+    find_field(print_body, "state").map(str::trim) == Some("SIGTERMed")
 }
 
 /// What a `launchctl print` must show before goetia ends the `kickstart` an expiry left running.
