@@ -479,15 +479,20 @@ mod system {
         }
         folders.check(dir)?;
         let swept = sweep_files(dir, referenced);
-        let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir))));
+        // A sweep that failed leaves its folder for the retry, and has said why: a folder it could
+        // not list is not listed again to be reported twice.
+        let removed = match swept {
+            Ok(()) => remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir)))),
+            Err(_) => Ok(()),
+        };
         SweepFailure::all(swept.err().into_iter().chain(removed.err())).map_or(Ok(()), Err)
     }
 
     /// Removes `dir` if it is empty and `is_default` says it is the default folder, which is asked
     /// only of a folder that is empty: where the default folder is matters for nothing else.
     ///
-    /// A folder that cannot be listed is not known to be empty, and the sweep of its files has said
-    /// why it cannot be listed: it stays, without a second report.
+    /// A folder that cannot be listed is not known to be empty: it stays, and the failure to list it
+    /// is the removal's. A folder that is not there has nothing to remove.
     pub(super) fn remove_if_empty_default(
         dir: &Path,
         is_default: impl FnOnce() -> Result<bool>,
@@ -498,7 +503,8 @@ mod system {
                     return Ok(());
                 }
             }
-            Err(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::os_at("read", dir, e).into()),
         }
         if !is_default()? {
             return Ok(());

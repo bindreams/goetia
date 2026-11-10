@@ -756,6 +756,23 @@ mod windows {
         remove_if_empty_default(&folder, || unreachable!("a folder that is gone is not asked about")).unwrap();
     }
 
+    /// A folder that cannot be listed is not known to be empty: the failure comes back, and the
+    /// folder is not asked about. One that is not there has nothing to remove.
+    #[skuld::test]
+    fn a_folder_that_cannot_be_listed_is_a_failure_of_the_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_folder = dir.path().join("file.txt");
+        fs::write(&not_a_folder, b"x").unwrap();
+
+        let failure = remove_if_empty_default(&not_a_folder, || unreachable!("a folder not known to be empty"))
+            .expect_err("a file cannot be listed");
+
+        let report = failure.error.report().to_string();
+        assert!(report.contains("file.txt"), "{report}");
+        assert!(failure.not_deleted.is_empty());
+        assert!(not_a_folder.exists());
+    }
+
     /// The default folder the caller resolved is the one the sweep removes by, and the one a
     /// failure to resolve reports: nothing else is asked.
     #[skuld::test]
