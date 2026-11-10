@@ -51,8 +51,9 @@ cli = ["dep:clap"]
 # release workflow turns it on for the `goetia` binary, whose `stock_shim()` then embeds it rather
 # than reading `goetia-shim.exe` beside it; the library never reads it.
 goetia-shim = []
-# Exports helpers the crate's own tests share; adds items only, gates no behaviour.
-testing = []
+# Exports helpers the crate's own tests share; adds items only, gates no behaviour. `skuld` is the
+# `ELEVATED` label's.
+testing = ["dep:skuld"]
 
 [dependencies]
 base64 = "0.23"
@@ -77,6 +78,9 @@ memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "3"
+# Only under `testing`: the `ELEVATED` label of `testing::elevation`. The dev-dependency below is the
+# unit tests' own.
+skuld = { version = "0.3", optional = true }
 tempfile = "3"
 thiserror = "2"
 yaml_serde = "0.10.7"

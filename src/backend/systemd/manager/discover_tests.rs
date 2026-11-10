@@ -13,7 +13,7 @@
 use std::io;
 
 use super::*;
-use crate::spec::test_support::plain_fields;
+use crate::testing::plain_fields;
 
 /// `ENOTDIR`: a regular file where a directory component has to be. Not `NotFound`, not
 /// `PermissionDenied`, and identical for root and everyone else — which is what makes it the right

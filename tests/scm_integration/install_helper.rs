@@ -40,7 +40,7 @@ pub fn run_if_requested() -> bool {
     };
     let spec = DaemonSpec::new(DaemonFields {
         user,
-        ..support::spec(&id, common::fixture_command(&id, 1, 1, "plain"))
+        ..support::plain_fields(&id, common::fixture_command(&id, 1, 1, "plain"))
     })
     .unwrap();
 

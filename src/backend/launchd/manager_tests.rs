@@ -13,11 +13,11 @@ use crate::backend::client::fake::{Ended, Entry, Fake, RoleKind, Waited, exited,
 use crate::backend::client::{Client, ClientError, Real};
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
-use crate::spec::test_support::plain_fields;
 use crate::spec::{Id, Kind, Restart, User};
+use crate::testing::plain_fields;
 
-use crate::backend::test_cleanup::{FileGuard, remove_or_warn};
-use crate::backend::test_elevation::{ELEVATED, elevated};
+use crate::testing::cleanup::{FileGuard, remove_or_warn};
+use crate::testing::elevation::{ELEVATED, elevated};
 
 fn sample_plist(id: &str) -> String {
     sample_plist_restarting(id, Restart::Never)

@@ -4,9 +4,9 @@ use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
 use winreg::RegValue;
 use winreg::types::ToRegValue as _;
 
-use crate::backend::test_elevation::{ELEVATED, elevated};
-use crate::backend::test_raw_registry::{create_link, create_raw_key};
-use crate::backend::test_scratch::ScratchKey;
+use crate::testing::elevation::{ELEVATED, elevated};
+use crate::testing::raw_registry::{create_link, create_raw_key};
+use crate::testing::scratch::ScratchKey;
 
 #[skuld::test]
 fn service_key_path_is_under_current_control_set_services() {
@@ -222,15 +222,23 @@ fn an_empty_multi_string_environment_value_is_not_the_absent_value() {
     assert_not_read_as("an empty value", goetia_multi_sz(&[]), &[]);
 }
 
-/// Lossy decoding turns a lone surrogate into U+FFFD, so a hand-written `D800` would read as the
-/// `A=\u{FFFD}` goetia could have written.
+/// A line that is not valid UTF-16 reads lossily, so the lone surrogate reads as the `A=\u{FFFD}`
+/// goetia could have written, and the layout line is what tells them apart.
 #[skuld::test]
-fn a_lone_surrogate_is_not_the_replacement_character() {
+fn a_line_that_is_not_valid_utf16_reads_lossily_and_adds_a_layout_line() {
     for surrogate in [0xD800u16, 0xDBFF, 0xDC00, 0xDFFF] {
         let mut units = utf16("A=");
         units.push(surrogate);
         units.extend([0, 0]);
-        assert_not_read_as(&format!("{surrogate:04X}"), multi_sz(&units), &["A=\u{FFFD}"]);
+
+        assert_eq!(
+            lines_of(&multi_sz(&units)),
+            [
+                "A=\u{FFFD}",
+                "(REG_MULTI_SZ not laid out as goetia writes it: a line that is not valid UTF-16)"
+            ],
+            "{surrogate:04X}"
+        );
     }
 }
 

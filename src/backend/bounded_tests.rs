@@ -9,7 +9,7 @@ use super::*;
 use crate::manager::budget::Budget;
 
 #[cfg(target_os = "linux")]
-use crate::backend::test_cleanup::{removal_problem, retrying, warn_left_behind};
+use crate::testing::cleanup::{removal_problem, retrying, warn_left_behind};
 
 /// A reservation holding the temp files one child's streams draw.
 fn files() -> Reservation {

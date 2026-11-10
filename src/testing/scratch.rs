@@ -1,5 +1,4 @@
-//! A key under `HKLM\SOFTWARE` for a test to create, removed on drop. Shared by the integration
-//! suites (through `support`) and the library's unit tests (as `backend::test_scratch`, by path).
+//! A key under `HKLM\SOFTWARE` for a test to create, removed on drop.
 
 use winreg::RegKey;
 use winreg::enums::HKEY_LOCAL_MACHINE;
