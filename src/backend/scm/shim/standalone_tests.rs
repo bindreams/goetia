@@ -51,6 +51,13 @@ fn standalone_refuses_a_relative_exe() {
 }
 
 #[skuld::test]
+fn standalone_has_no_folder_whatever_its_exe() {
+    for exe in [r"C:\app\host.exe", "host.exe", r"C:\"] {
+        assert_eq!(shim(exe).folder().unwrap(), None, "{exe}");
+    }
+}
+
+#[skuld::test]
 fn standalone_sweep_removes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let exe = dir.path().join("host.exe");
