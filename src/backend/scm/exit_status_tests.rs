@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::scm::test_support::every_reported;
 
 #[skuld::test]
 fn clean_exit_is_win32_zero_and_process_zero() {
@@ -205,33 +206,7 @@ fn a_win32_zero_record_with_a_specific_code_names_both() {
 
 // The process exit code of a recorded exit ----------------------------------------------------------------------------
 
-/// One of each [`Reported`] shape. A new variant stops the match below from compiling, which is the
-/// prompt to add a sample to the list; nothing forces the sample itself.
-fn every_reported() -> Vec<Reported> {
-    fn exhaustive(reported: Reported) {
-        match reported {
-            Reported::Clean
-            | Reported::DaemonExit(_)
-            | Reported::ShimFailure(_)
-            | Reported::IncompleteStop
-            | Reported::Refused => {}
-        }
-    }
-    let every = vec![
-        Reported::Clean,
-        Reported::from_daemon_code(7),
-        Reported::from_daemon_code(-1073741819),
-        Reported::shim_failure(None),
-        Reported::shim_failure(Some(2)),
-        Reported::incomplete_stop(),
-        Reported::Refused,
-    ];
-    every.iter().copied().for_each(exhaustive);
-    every
-}
-
-/// What SCM recorded for a report names that report again, so a `stop` that ends the shim itself ends
-/// it with the code the shim exits with.
+/// What SCM recorded for a report names that report again.
 #[skuld::test]
 fn a_recorded_exit_maps_back_to_the_report_that_produced_it() {
     for reported in every_reported() {
@@ -239,34 +214,5 @@ fn a_recorded_exit_maps_back_to_the_report_that_produced_it() {
         let record = RecordedExit { win32, specific };
 
         assert_eq!(Reported::from_record(record), Some(reported), "{reported:?}");
-        assert_eq!(record.process_exit_code(), reported.process_exit_code(), "{reported:?}");
-    }
-}
-
-/// A pair no `Reported` produces (a `Managed` service's own codes) names no report, and ends the
-/// process as SCM reads the pair: the service-specific code only under `ERROR_SERVICE_SPECIFIC_ERROR`
-/// and non-zero, 0 for Win32 0 whatever else is recorded, else the Win32 code.
-#[skuld::test]
-fn a_recorded_exit_no_report_produces_ends_the_process_as_scm_reads_it() {
-    let record = |win32, specific| RecordedExit { win32, specific };
-
-    for (win32, specific) in [(5, 9), (0, 42), (ERROR_SERVICE_SPECIFIC_ERROR, 0)] {
-        assert_eq!(
-            Reported::from_record(record(win32, specific)),
-            None,
-            "({win32}, {specific})"
-        );
-    }
-    for (win32, specific, code) in [
-        (5, 9, 5),
-        (0, 42, 0),
-        (ERROR_SERVICE_SPECIFIC_ERROR, 7, 7),
-        (ERROR_SERVICE_SPECIFIC_ERROR, 0, ERROR_SERVICE_SPECIFIC_ERROR as i32),
-    ] {
-        assert_eq!(
-            record(win32, specific).process_exit_code(),
-            code,
-            "({win32}, {specific})"
-        );
     }
 }

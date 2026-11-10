@@ -109,7 +109,7 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use super::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit};
+use super::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, Reported};
 use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, WaitEnd, Waited, end_process};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
@@ -1189,9 +1189,12 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
 }
 
 /// The code a held process is terminated with once SCM confirmed `STOPPED` with `exit`:
-/// [`RecordedExit::process_exit_code`], or [`KILLED_EXIT_CODE`] with no record.
+/// the code of the `Reported` that record names, which is what the shim itself exits with; or
+/// [`KILLED_EXIT_CODE`] with no record, or one no report produces (a `Managed` service's own codes).
+/// SCM reads no process exit code, so any fixed code serves where the shim's is unknown.
 fn stop_exit_code(exit: Option<RecordedExit>) -> i32 {
-    exit.map_or(KILLED_EXIT_CODE, RecordedExit::process_exit_code)
+    exit.and_then(Reported::from_record)
+        .map_or(KILLED_EXIT_CODE, Reported::process_exit_code)
 }
 
 /// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use goetia::backend::scm::exit_status::{RecordedExit, SHIM_REFUSED};
+use goetia::backend::scm::exit_status::{RecordedExit, Reported, SHIM_REFUSED};
 use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonFields, DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
@@ -129,7 +129,9 @@ fn stop_kills_the_whole_process_tree() {
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
     assert_eq!(
         shim.wait_for_exit(),
-        recorded_exit(&id).process_exit_code() as u32,
+        Reported::from_record(recorded_exit(&id))
+            .expect("a clean stop's record is a report")
+            .process_exit_code() as u32,
         "the shim's process exit code differs from the code SCM recorded"
     );
 

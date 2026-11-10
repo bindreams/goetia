@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::backend::scm::parameters::Stray;
+use crate::backend::scm::test_support::every_reported;
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::Restart;
@@ -1134,9 +1135,31 @@ fn a_stop_failure_on_a_service_marked_by_someone_else_does_not_claim_a_disable()
     }
 }
 
-/// A held process SCM recorded no exit for (a service found gone) is still ended, with the kill's
-/// code. The recorded cases are `RecordedExit::process_exit_code`'s.
+/// A held process is ended with the code of the report SCM's record names, which is what the shim
+/// itself exits with.
 #[skuld::test]
-fn a_stop_ends_the_held_process_with_the_kill_code_when_nothing_was_recorded() {
+fn a_stop_ends_the_held_process_with_the_code_of_the_recorded_report() {
+    for reported in every_reported() {
+        let (win32, specific) = reported.scm_codes();
+
+        assert_eq!(
+            stop_exit_code(Some(RecordedExit { win32, specific })),
+            reported.process_exit_code(),
+            "{reported:?}"
+        );
+    }
+}
+
+/// A held process SCM recorded no exit for (a service found gone), or one no report produces (a
+/// `Managed` service's own codes), is still ended, with the kill's code.
+#[skuld::test]
+fn a_stop_ends_the_held_process_with_the_kill_code_without_a_report() {
     assert_eq!(stop_exit_code(None), KILLED_EXIT_CODE);
+    for (win32, specific) in [(5, 9), (0, 42)] {
+        assert_eq!(
+            stop_exit_code(Some(RecordedExit { win32, specific })),
+            KILLED_EXIT_CODE,
+            "({win32}, {specific})"
+        );
+    }
 }
