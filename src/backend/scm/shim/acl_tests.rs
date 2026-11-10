@@ -707,17 +707,23 @@ pub(in crate::backend::scm::shim) mod windows {
         assert_eq!(display_path(Path::new(r"\\?\UNC\h\s\a")), Path::new(r"\\h\s\a"));
     }
 
-    /// What the refusal says depends on who owns the folder (the owner, or the entry for Everyone),
-    /// so only that it is refused, and where, is asserted; the owner's cases are `verdict`'s.
+    /// An untrusted owner is refused as the owner; a trusted one, for the entry that gives Everyone
+    /// control of the permissions. Which it is depends on who owns the folder, and reading that
+    /// owner would use the code under test, so either is accepted.
     #[skuld::test]
     fn a_folder_everyone_can_write_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let target = world_writable_folder(dir.path());
 
-        let Err(Error::ShimFolderUnsafe { path, .. }) = enabled().check(&target) else {
+        let Err(Error::ShimFolderUnsafe { path, account, right }) = enabled().check(&target) else {
             panic!("a folder everyone can write must be refused");
         };
         assert_eq!(path, display_path(&target));
+        assert!(["own", "change permissions of"].contains(&right), "{right}");
+        if right == "change permissions of" {
+            let everyone = identity::account_name_of_sid(&everyone()).unwrap_or_else(|_| sid_string(&everyone()));
+            assert_eq!(account, everyone);
+        }
     }
 
     /// An in-memory ACL holding one full-control entry of `ace_type` for `trustee`.
