@@ -720,20 +720,24 @@ share one pair of flags:
 | `--timeout 0`          | Issue the request and return without waiting. |
 | `--no-timeout`         | Wait indefinitely.                            |
 
-On macOS, `stop --timeout 0` is the exception: it still waits until launchd
-no longer has the job, and the daemon is down when goetia returns.
+On macOS some steps wait for launchd to remove a job whatever `--timeout` says:
 
-A `start` on macOS has the same kind of exception. Before it loads the job,
-it waits for launchd to remove an old job still holding the label, whatever
-`--timeout` says, `--timeout 0` included: the wait is part of sending the
-request, and a request that stopped partway would leave the daemon unloaded.
-That happens after a `stop` that timed out, after another program's `launchctl
-bootout`, and, for `restart: always`, when `start` boots out a job that is not
-running. A bounded `--timeout` clock starts when the verb begins, so this wait
-spends it and the wait for running gets what is left. For a job whose plist
-disables `ExitTimeOut` (`0`: launchd never kills the process), launchd may not
-remove it, and this wait may never end, unlike a bounded `stop`, which gives up
-at its deadline.
+- `daemon stop` waits for the job it boots out. A bounded `--timeout` gives up
+  at its deadline; `--timeout 0` and `--no-timeout` wait without bound.
+- `daemon uninstall` waits for the job it boots out, without bound.
+- `daemon install` waits without bound for a job that already holds the label,
+  which it boots out first.
+- `daemon start`, before it loads the job, waits without bound for a job left
+  by a `stop` that timed out or by another program's `launchctl bootout`
+  (`state = SIGTERMed`), `--timeout 0` included. Any other job holding the label
+  is taken as loaded.
+- `daemon start` of a `restart: always` daemon that is not running after
+  its first start boots the job out, waits without bound for it to be removed,
+  and loads it again. Under `--timeout 0` this does not happen.
+
+A bounded `--timeout` clock starts when the verb begins, so these waits spend
+it. A job whose plist sets `ExitTimeOut` to `0` and ignores SIGTERM is never
+killed by launchd, so any wait that has no bound may never end.
 
 The two flags are mutually exclusive. `install` accepts them only alongside
 `--start`: without it nothing is started, so there is nothing to wait for,

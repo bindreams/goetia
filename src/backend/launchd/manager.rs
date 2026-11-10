@@ -27,10 +27,8 @@
 //!   bounds the wait for the pid and nothing else: every `launchctl` call that issues the request
 //!   runs to completion. The throttle is keyed to the job, so `bootout` plus `bootstrap` does not
 //!   clear it and there is no remedy to apply.
-//! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded, and waits until
-//!   launchd no longer has it (see [`Launchctl::bootout`]). Every verb that acts on the label after
-//!   a `bootout` waits the same way, and `start` waits first, whatever its budget, for a label whose
-//!   job is being torn down: that wait is part of sending the request.
+//! - `stop` `launchctl bootout`s the job, from whichever directory it was loaded, and waits for it to
+//!   be removed (see "Waits for a job's removal").
 //! - `enable` moves the plist from [`STAGING_DIR`] into [`ENABLED_DIR`] (`/Library/LaunchDaemons`).
 //!   Does not start it.
 //! - `disable` moves the plist back to [`STAGING_DIR`]. It does not `bootout` the job:
@@ -41,6 +39,34 @@
 //!   print`, whose format Apple does not guarantee. `status`'s live run state is the one exception,
 //!   since no file says whether a job is running. It reads `launchctl print` leniently: a shape it
 //!   does not recognize degrades to [`State::Unknown`].
+//!
+//! # Waits for a job's removal
+//!
+//! `launchctl bootout` returns within milliseconds, but launchd goes on answering for the label
+//! (`print` shows `state = SIGTERMed`) until the job's process exits, or launchd kills it at the
+//! job's `ExitTimeOut`. A step that acts on the label afterwards must not meet the old job, so each
+//! of these waits until `print` reports the label not found (see [`Launchctl::bootout`]):
+//!
+//! - `stop` waits for the job it boots out under its budget: a bounded one gives up at its
+//!   deadline (`WaitTimeout`), `--timeout 0` and `--no-timeout` wait without bound.
+//! - `uninstall` waits for the job it boots out without bound: it has no `--timeout`.
+//! - `install`, on a `Create` that finds a job already holding the label, boots it out and waits
+//!   without bound, whatever `--timeout` an `install --start` was given.
+//! - `start`, before its `bootstrap`, waits without bound, whatever its budget (`--timeout 0`
+//!   included), but only when `print` shows `state = SIGTERMed`: a job left by a `stop` that timed
+//!   out, or by another program's `launchctl bootout`. Any other job holding the label is taken as
+//!   loaded: it is neither waited for nor removed, and the `bootstrap` is skipped.
+//! - `start`'s corrective cycle runs only when the budget waits, the job is `restart: always`, and
+//!   it reads not running after the first `bootstrap`, `kickstart` and wait for running. It boots
+//!   the job out, waits without bound, `bootstrap`s, and reads once more under what is left of the
+//!   budget.
+//!
+//! The unbounded waits are part of sending a request: bounded by a deadline, one could end with the
+//! old job still loaded, the `bootstrap` unsent and the daemon left unloaded. A bounded budget's
+//! clock starts when the verb begins, so such a wait spends it.
+//!
+//! A job whose plist sets `ExitTimeOut` to 0 and ignores SIGTERM is never killed by launchd, and a
+//! process in uninterruptible sleep survives a kill, so any unbounded wait above may never end.
 //!
 //! Only the modern verbs (`bootstrap`/`bootout`/`kickstart`/`print`) are used, never legacy
 //! `load`/`unload`. `launchctl enable`/`disable` and the plist's `Disabled` key are never touched:

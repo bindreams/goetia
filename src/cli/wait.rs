@@ -21,13 +21,9 @@ use crate::manager::Budget;
 pub struct WaitArgs {
     /// How long to wait for the manager to report the daemon reached the
     /// state asked for. Defaults to 10s. `--timeout 0` issues the request
-    /// and returns without waiting, establishing nothing — except `stop` on
-    /// macOS, which waits until launchd no longer has the job. On macOS a
-    /// `start` also waits for launchd to remove an old job holding the label
-    /// (after a `stop` that timed out, another program's `launchctl bootout`,
-    /// or, for `restart: always`, its own boot-out) whatever `--timeout` says,
-    /// and a bounded `--timeout` is spent by it. For a job whose plist disables
-    /// `ExitTimeOut` this wait may never end. Write a compound
+    /// and returns without waiting, establishing nothing. On macOS some steps
+    /// wait for launchd to remove a job whatever `--timeout` says: see the
+    /// README's "Waiting for a start or stop" section. Write a compound
     /// duration unspaced (`2m30s`), or quote it as one argument: every verb
     /// taking this flag also takes a variadic id list, so `--timeout 2m 30s`
     /// passes `2m` here and `30s` as a daemon id.

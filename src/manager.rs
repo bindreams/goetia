@@ -85,16 +85,9 @@ pub trait ServiceManager {
     /// still performs the full blocking call.** launchd's `launchctl
     /// print`/`bootstrap` have no non-blocking spelling: a `start` with no
     /// budget still probes and, if needed, bootstraps the job to completion
-    /// before the plain `kickstart` that declines to wait. Likewise on macOS
-    /// a `start` waits for launchd to remove an old job still holding the label
-    /// before it `bootstrap`s, whatever the budget, `Immediate` included: the
-    /// wait is part of sending the request. That job is one left by a `stop`
-    /// that timed out, by another program's `launchctl bootout`, or, for
-    /// `restart: always`, the corrective boot-out. A bounded budget's clock
-    /// started with the verb, so this wait spends it and the wait for running
-    /// gets what is left. For a job whose plist disables `ExitTimeOut` this
-    /// wait may never end, unlike a bounded `stop`, which gives up at its
-    /// deadline.
+    /// before the plain `kickstart` that declines to wait. On macOS some steps
+    /// also wait for launchd to remove a job whatever the budget: see the
+    /// README's "Waiting for a start or stop" section.
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a
@@ -160,9 +153,9 @@ pub trait ServiceManager {
     ///
     /// **Where a platform offers no request-only form,
     /// [`Budget::Immediate`] still performs the full blocking call.**
-    /// On launchd a `stop` with no budget still waits until launchd no longer
-    /// has the job (see `Launchctl::bootout` in the launchd backend): the
-    /// start that may follow must not meet the old instance.
+    /// On macOS some steps wait for launchd to remove a job whatever the
+    /// budget, `stop` among them: see the README's "Waiting for a start or
+    /// stop" section.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never
