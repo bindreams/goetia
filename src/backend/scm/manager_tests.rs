@@ -641,6 +641,16 @@ fn install_and_preview_install_refuse_restart_always() {
     }
 }
 
+/// Its scope makes nothing to keep or take back, so what a write left always stands.
+#[skuld::test]
+fn the_definition_an_install_wrote_always_stands() {
+    let spec = daemon_spec(Restart::Never);
+
+    let standing = Scm::new().standing(&spec, &dummy_reg(None), &Outcome::Create, None);
+
+    assert!(matches!(standing, Standing::Yes), "{standing:?}");
+}
+
 // The shim provider ---------------------------------------------------------------------------------------------------
 
 fn simple_fields() -> DaemonFields {

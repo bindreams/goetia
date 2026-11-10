@@ -112,16 +112,15 @@ pub(crate) trait Backend {
 
     /// Whether the definition a [`Self::write`] of `outcome` was to leave is in place, read the way
     /// this backend reads one. Asked after every write, failed or not, and only if the write made
-    /// something to keep or take back.
+    /// something to keep or take back. Every backend states it: one whose scope makes nothing says
+    /// [`Standing::Yes`].
     fn standing(
         &self,
-        _spec: &DaemonSpec,
-        _definition: &Self::Definition,
-        _outcome: &crate::decide::Outcome,
-        _snapshot: Option<&Self::Snapshot>,
-    ) -> Standing {
-        Standing::Yes
-    }
+        spec: &DaemonSpec,
+        definition: &Self::Definition,
+        outcome: &crate::decide::Outcome,
+        snapshot: Option<&Self::Snapshot>,
+    ) -> Standing;
 
     /// The live state of a service `read` found marked. `Error::NotInstalled` where the query
     /// completed and found the service gone, which `list` omits; never for one that is present.

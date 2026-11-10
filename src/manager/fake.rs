@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{
-    Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Standing, Unnamed,
+    WriteOutcome,
 };
 use crate::blob::{self, Blob};
 use crate::decide::{ExternalConfig, Outcome};
@@ -812,6 +813,17 @@ impl crate::backend::Backend for Fake {
             },
         );
         Ok(WriteOutcome::Done)
+    }
+
+    /// The fake's scope makes nothing but the entry.
+    fn standing(
+        &self,
+        _spec: &DaemonSpec,
+        _definition: &String,
+        _outcome: &Outcome,
+        _snapshot: Option<&Artifact>,
+    ) -> Standing {
+        Standing::Yes
     }
 
     fn live_status(&self, snapshot: &Artifact) -> Result<Status> {
