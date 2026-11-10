@@ -76,8 +76,8 @@ pub trait ServiceManager {
     /// budget that is already spent still reaches the manager.
     ///
     /// [`Budget::Immediate`] issues the request and returns without waiting,
-    /// establishing nothing (except for the macOS waits named below):
-    /// `Ok(())` then means only that the request was accepted, so neither a caller nor the implementation may read any state
+    /// establishing nothing: `Ok(())` then means only that the request was
+    /// accepted, so neither a caller nor the implementation may read any state
     /// from it. Every state assertion a backend makes belongs behind
     /// [`Budget::waits`].
     ///
@@ -87,9 +87,9 @@ pub trait ServiceManager {
     /// budget still probes and, if needed, bootstraps the job to completion
     /// before the plain `kickstart` that declines to wait. On macOS, stopping,
     /// restarting, uninstalling and some starts and installs wait for launchd
-    /// to remove a job; see the README's "Waiting for a start or stop". A
-    /// `start`'s own wait for a removal is not bounded by the budget,
-    /// `Immediate` included.
+    /// to remove a job; see the README's "Waiting for a start or stop". That
+    /// wait is part of issuing the request, so under `Immediate` `Ok(())` still
+    /// establishes nothing a caller may read.
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a
@@ -157,9 +157,8 @@ pub trait ServiceManager {
     /// [`Budget::Immediate`] still performs the full blocking call.**
     /// On macOS, stopping, restarting, uninstalling and some starts and
     /// installs wait for launchd to remove a job; see the README's "Waiting
-    /// for a start or stop". A `stop` under `Immediate` waits without bound
-    /// there; under a bounded budget it gives up at the deadline, after one
-    /// last read.
+    /// for a start or stop". That wait is part of issuing the request, so
+    /// under `Immediate` `Ok(())` still establishes nothing a caller may read.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never
