@@ -32,13 +32,13 @@ pub(crate) const INVALID: &str = "an invalid SID";
 
 /// What [`sid_display`] says of a whole SID that `ConvertSidToStringSidW` refused.
 #[cfg(windows)]
-const UNSHOWABLE: &str = "a SID that could not be shown";
+pub(crate) const UNSHOWABLE: &str = "a SID that could not be shown";
 
 /// `sid` as `ConvertSidToStringSidW` writes it, `S-1-5-32-544` for Administrators; [`INVALID`] for
 /// bytes that are not a whole SID. What an error names an account by when `LookupAccountSidW` has
 /// no name for it, and what the integration tests compare against.
 #[cfg(windows)]
-pub fn sid_display(sid: &[u8]) -> String {
+pub(crate) fn sid_display(sid: &[u8]) -> String {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::PSID;

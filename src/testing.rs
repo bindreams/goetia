@@ -13,8 +13,20 @@ use crate::error::Result;
 use crate::shim::{FolderCheck, HostCommand, ShimProvider, SweepFailure};
 use crate::spec::{DaemonFields, Id, Kind, Restart, User};
 
+pub use crate::backend::scm::shim::acl::CHANGE_PERMISSIONS_OF;
+
+/// `sid` as Windows writes it, and a failure of the calling test, naming the placeholder, when
+/// Windows could not show it: a test never takes a placeholder for a SID.
 #[cfg(windows)]
-pub use crate::backend::scm::sid::sid_display;
+pub fn shown_sid(sid: &[u8]) -> String {
+    use crate::backend::scm::sid::{INVALID, UNSHOWABLE, sid_display};
+    let shown = sid_display(sid);
+    assert!(
+        shown != INVALID && shown != UNSHOWABLE,
+        "{sid:?} is not shown as a SID: {shown}"
+    );
+    shown
+}
 
 pub mod cleanup;
 pub mod elevation;

@@ -493,7 +493,7 @@ fn install_refuses_doctored_folder() {
     match mgr.install(&spec, false) {
         Err(Error::ShimFolderUnsafe { path, account, right }) => {
             assert_eq!(path, doctored.folder);
-            assert_eq!(right, "change permissions of");
+            assert_eq!(right, goetia::testing::CHANGE_PERMISSIONS_OF);
             assert!(account.ends_with("Users"), "{account}");
         }
         other => panic!("a folder Users can change the permissions of must be refused, got {other:?}"),
@@ -882,7 +882,7 @@ fn dacl_of(handle: HANDLE) -> (bool, Vec<(String, u32, u8)>) {
             )
         };
         // SAFETY: `sid` is a valid SID inside the entry, so `GetLengthSid` bytes are readable from it.
-        let sid_text = goetia::testing::sid_display(unsafe {
+        let sid_text = goetia::testing::shown_sid(unsafe {
             std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize)
         });
         entries.push((sid_text, mask, kind));

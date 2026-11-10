@@ -70,6 +70,15 @@ mod windows {
         assert_eq!(sid_display(&[1, 1, 0, 1, 0, 0, 0, 0, 7, 0, 0, 0]), "S-1-0x100000000-7");
     }
 
+    /// 2^32 - 1 is the last authority that Windows writes in decimal.
+    #[skuld::test]
+    fn the_largest_decimal_identifier_authority_is_shown_in_decimal() {
+        assert_eq!(
+            sid_display(&[1, 1, 0, 0, 255, 255, 255, 255, 7, 0, 0, 0]),
+            "S-1-4294967295-7"
+        );
+    }
+
     #[skuld::test]
     fn bytes_that_are_not_a_sid_are_shown_as_such() {
         assert_eq!(sid_display(&[]), INVALID);

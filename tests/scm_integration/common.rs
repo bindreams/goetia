@@ -67,9 +67,9 @@ pub fn conformance_mk(id: &str) -> DaemonSpec {
 // FFI for SCM dispatch.
 
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
-use windows_sys::Win32::Security::{LookupAccountNameW, PSID};
+use windows_sys::Win32::Security::{GetLengthSid, LookupAccountNameW, PSID};
 
-/// `LookupAccountNameW`, then `goetia::testing::sid_display`: the string SID for a
+/// `LookupAccountNameW`, then `goetia::testing::shown_sid`: the string SID for a
 /// local account name (e.g. one this test just created with `net user`).
 pub fn sid_string_for_account(account_name: &str) -> String {
     let wide_name = wide_null(account_name);
@@ -122,5 +122,7 @@ pub fn sid_string_for_account(account_name: &str) -> String {
         std::io::Error::last_os_error()
     );
 
-    goetia::testing::sid_display(&sid_buf[..sid_len as usize])
+    // SAFETY: `sid_buf` now holds a whole SID, so `GetLengthSid` bytes are readable from it.
+    let sid = unsafe { std::slice::from_raw_parts(sid_buf.as_ptr(), GetLengthSid(sid_buf.as_ptr() as PSID) as usize) };
+    goetia::testing::shown_sid(sid)
 }
