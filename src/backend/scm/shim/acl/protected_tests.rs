@@ -4,34 +4,13 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::backend::scm::shim::acl::{Ace, ObjectSecurity, Sid, sid_from_parts};
+use crate::backend::scm::shim::acl::acl_tests::{allow, users};
+use crate::backend::scm::shim::acl::{ObjectSecurity, administrators, everyone, system};
 
 const FULL: u32 = 0x1F_01FF;
 const READ_EXECUTE: u32 = 0x12_00A9;
 const OBJECT_INHERIT: u8 = 0x01;
 const CONTAINER_INHERIT: u8 = 0x02;
-
-fn system() -> Sid {
-    sid_from_parts(5, &[18])
-}
-fn administrators() -> Sid {
-    sid_from_parts(5, &[32, 544])
-}
-fn users() -> Sid {
-    sid_from_parts(5, &[32, 545])
-}
-fn everyone() -> Sid {
-    sid_from_parts(1, &[0])
-}
-
-fn allow(trustee: Sid, mask: u32, flags: u8) -> Ace {
-    Ace {
-        trustee,
-        mask,
-        flags,
-        allow: true,
-    }
-}
 
 /// What the stock shim file has, with `path` as the label an existing file is read under.
 fn stock_file(path: &str) -> ObjectSecurity {

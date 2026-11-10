@@ -123,7 +123,7 @@ pub(crate) fn sid_from_parts(authority: u8, subauthorities: &[u32]) -> Sid {
     sid
 }
 
-fn system() -> Sid {
+pub(crate) fn system() -> Sid {
     sid_from_parts(5, &[18])
 }
 
@@ -131,11 +131,11 @@ pub(crate) fn administrators() -> Sid {
     sid_from_parts(5, &[32, 544])
 }
 
-fn trusted_installer() -> Sid {
+pub(crate) fn trusted_installer() -> Sid {
     sid_from_parts(5, &[80, 956008885, 3418522649, 1831038044, 1853292631, 2271478464])
 }
 
-fn everyone() -> Sid {
+pub(crate) fn everyone() -> Sid {
     sid_from_parts(1, &[0])
 }
 

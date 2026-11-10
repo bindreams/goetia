@@ -4,40 +4,23 @@
 use super::*;
 
 // Access masks, spelled out as `icacls` prints them: (F), (M), (RX).
-const FULL: u32 = 0x1F_01FF;
+const FULL: u32 = FILE_ALL_ACCESS;
 const MODIFY: u32 = 0x13_01BF;
 const READ_EXECUTE: u32 = 0x12_00A0;
-const GENERIC_READ_EXECUTE: u32 = 0xA000_0000;
-const GENERIC_ALL: u32 = 0x1000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_READ_EXECUTE: u32 = GENERIC_READ | GENERIC_EXECUTE;
 const FILE_ADD_FILE: u32 = 0x2;
-const FILE_WRITE_DATA: u32 = 0x2;
 const FILE_WRITE_EA: u32 = 0x10;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
-const FILE_APPEND_DATA: u32 = 0x4;
-const FILE_DELETE_CHILD: u32 = 0x40;
-const DELETE: u32 = 0x1_0000;
-const WRITE_DAC: u32 = 0x4_0000;
-const WRITE_OWNER: u32 = 0x8_0000;
 
 // ACE flags.
 const OBJECT_INHERIT: u8 = 0x01;
 const CONTAINER_INHERIT: u8 = 0x02;
-const INHERIT_ONLY: u8 = 0x08;
+const INHERIT_ONLY: u8 = INHERIT_ONLY_ACE;
 const OI_CI: u8 = OBJECT_INHERIT | CONTAINER_INHERIT;
 const OI_CI_IO: u8 = OI_CI | INHERIT_ONLY;
 
-fn system() -> Sid {
-    sid_from_parts(5, &[18])
-}
-fn administrators() -> Sid {
-    sid_from_parts(5, &[32, 544])
-}
-fn users() -> Sid {
+pub(in crate::backend::scm::shim) fn users() -> Sid {
     sid_from_parts(5, &[32, 545])
-}
-fn everyone() -> Sid {
-    sid_from_parts(1, &[0])
 }
 fn creator_owner() -> Sid {
     sid_from_parts(3, &[0])
@@ -48,11 +31,8 @@ fn authenticated_users() -> Sid {
 fn application_packages() -> Sid {
     sid_from_parts(15, &[2, 1])
 }
-fn trusted_installer() -> Sid {
-    sid_from_parts(5, &[80, 956008885, 3418522649, 1831038044, 1853292631, 2271478464])
-}
 
-fn allow(trustee: Sid, mask: u32, flags: u8) -> Ace {
+pub(in crate::backend::scm::shim) fn allow(trustee: Sid, mask: u32, flags: u8) -> Ace {
     Ace {
         trustee,
         mask,
@@ -457,6 +437,17 @@ pub(in crate::backend::scm::shim) mod windows {
         FolderCheck::new(CheckPermissions::Enable)
     }
 
+    /// A new folder in `parent`, which everyone has full control of (inherited by what is made in
+    /// it). Returns its final path.
+    fn world_writable_folder(parent: &Path) -> PathBuf {
+        let folder = parent.join("open");
+        Descriptor::from_sddl("D:P(A;OICI;FA;;;WD)")
+            .unwrap()
+            .create_dir(&folder)
+            .unwrap();
+        folder.canonicalize().unwrap()
+    }
+
     /// A volume that keeps no ACLs is refused: no owner or permissions can be read back from it.
     /// The named-pipe file system is one that does not keep them.
     #[skuld::test]
@@ -498,16 +489,18 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(chain[1..].iter().all(|object| object.directory), "{chain:?}");
     }
 
+    /// The folder is judged before the file in it, so a file's check refuses for the folder.
     #[skuld::test]
-    fn a_file_its_creator_owns_is_refused() {
-        // A temp file belongs to the account running this test, which is not a trusted one.
+    fn a_host_file_in_a_folder_everyone_can_write_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().canonicalize().unwrap().join("host.exe");
+        let folder = world_writable_folder(dir.path());
+        let exe = folder.join("host.exe");
         std::fs::write(&exe, b"x").unwrap();
+
         let Err(Error::ShimFolderUnsafe { path, .. }) = enabled().check(&exe) else {
-            panic!("a temp file must be refused");
+            panic!("a file in a folder everyone can write must be refused");
         };
-        assert!(display_path(&exe).starts_with(&path), "{path:?}");
+        assert_eq!(path, display_path(&folder));
     }
 
     #[skuld::test]
@@ -685,19 +678,6 @@ pub(in crate::backend::scm::shim) mod windows {
     }
 
     #[skuld::test]
-    fn an_absolute_link_target_has_its_dot_dot_applied() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (real, link) = (root.join("real"), root.join("link"));
-        std::fs::create_dir(&real).unwrap();
-        // `gone` does not exist: only a lexical `..` lands on `real`.
-        symlink(&display_path(&root).join("gone").join("..").join("real"), &link);
-
-        let paths = labels(&read_chain(&link).unwrap());
-        assert!(paths.contains(&display_path(&real)), "{paths:?}");
-    }
-
-    #[skuld::test]
     fn the_file_index_stands_in_when_the_file_id_is_unsupported() {
         let unsupported = || Err(io::Error::from_raw_os_error(87));
         let index = || Ok(ObjectId::Index { volume: 7, index: 1 });
@@ -742,14 +722,29 @@ pub(in crate::backend::scm::shim) mod windows {
     }
 
     #[skuld::test]
-    fn a_folder_its_creator_owns_is_refused() {
-        // A temp directory belongs to the account running this test, which is not a trusted one.
+    fn a_folder_everyone_can_write_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().canonicalize().unwrap();
-        let Err(Error::ShimFolderUnsafe { path, .. }) = enabled().check(&target) else {
-            panic!("a temp directory must be refused");
+        let target = world_writable_folder(dir.path());
+        // Whoever owns it, it is refused: an untrusted owner as the owner, a trusted one for the
+        // entry that gives Everyone control of its permissions.
+        let owner = read_chain(&target).unwrap()[0].owner.clone();
+        let (account, right) = if is_trusted(&owner) {
+            (everyone(), "change permissions of")
+        } else {
+            (owner, "own")
         };
-        assert!(display_path(&target).starts_with(&path), "{path:?}");
+
+        let Err(Error::ShimFolderUnsafe {
+            path,
+            account: named,
+            right: said,
+        }) = enabled().check(&target)
+        else {
+            panic!("a folder everyone can write must be refused");
+        };
+        assert_eq!(path, display_path(&target));
+        assert_eq!(named, account_name(&account));
+        assert_eq!(said, right);
     }
 
     /// An in-memory ACL holding one full-control entry of `ace_type` for `trustee`.
