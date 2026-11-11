@@ -861,8 +861,11 @@ fn no_request_is_sent_before_the_manager_is_asked() {
 
 /// The backstop: a `systemctl` past the gate that says it ignored what it was asked is refused on
 /// every path, and never read as a success — in every wording [`IGNORED`] lists, on either stream.
-/// That every path asks it audibly is pinned by `the_paths_that_do_not_bound_keep_the_announcement_audible`
-/// and `the_bounded_path_keeps_the_announcement_audible`.
+/// The fake cannot see the environment a call is given, so that `run_verb` asks audibly, on its
+/// bounded and its other paths, is pinned against a real stand-in by
+/// `the_paths_that_do_not_bound_keep_the_announcement_audible` and
+/// `the_bounded_path_keeps_the_announcement_audible`; the other paths get the environment from the
+/// same `Real` and are not pinned one by one.
 #[skuld::test]
 fn a_systemctl_that_ignored_the_request_is_refused_on_every_path() {
     for (report, on_stderr) in [
