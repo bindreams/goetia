@@ -112,7 +112,7 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
-use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_process};
+use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, WaitEnd, Waited, end_process, incomplete_stop_failure};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HoldOutcome, hold_if_possible};
@@ -454,9 +454,10 @@ impl Backend for Scm {
         };
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
+        let (kind, _) = start_kind(snapshot.blob());
         let id = snapshot.into_id();
         let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
-        match uninstall_locked(&scm, &id, host.is_some())? {
+        match uninstall_locked(&scm, &id, kind, host.is_some())? {
             Uninstalled::Deleted { process } => match (host, unread) {
                 (Some(host), _) => self.finish_uninstall(&id, &host, process),
                 (None, Some(unread)) => Err(self.cleanup_skipped(&id, unread)),
@@ -525,7 +526,9 @@ impl Backend for Scm {
     /// With a wait, holds the service's process before the STOP, and once SCM reports the service
     /// stopped ends that process through its handle (the documentation of `SetServiceStatus` allows
     /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
-    /// runs is free when `stop` returns.
+    /// runs is free when `stop` returns. A `type: simple` service whose shim recorded an incomplete stop
+    /// (the daemon's tree may still be running) is a failed stop, once the process has ended; so is
+    /// `uninstall`'s own stop, which then leaves the service disabled and not deleted.
     ///
     /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
@@ -538,6 +541,7 @@ impl Backend for Scm {
         // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
         // whatever is left of it.
         let deadline = budget.start();
+        let (kind, _) = start_kind(snapshot.blob());
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::os(format!("open `{id}` to stop it"), e))?;
@@ -552,7 +556,11 @@ impl Backend for Scm {
         })
         .map_err(|e| Error::os(format!("stop `{id}`"), e))
         .and_then(|outcome| match outcome {
-            StopAndAwaitExitOutcome::Stopped => Ok(()),
+            // SCM confirmed `STOPPED` and the process is gone, and the shim may still say that the daemon
+            // is not: that is not a stop of the daemon.
+            StopAndAwaitExitOutcome::Stopped { exit } => {
+                incomplete_stop_failure(kind, exit).map_or(Ok(()), |e| Err(Error::os(format!("stop `{id}`"), e)))
+            }
             // The STOP was sent and its effect is not confirmed, as when SCM does not answer in time.
             StopAndAwaitExitOutcome::ServiceExpired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
             StopAndAwaitExitOutcome::Unconfirmed { pid } => Err(unconfirmed_stop(&id, pid, budget)),
@@ -1012,7 +1020,7 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
 /// process that cannot be opened is none (see [`hold_if_possible`]). The service handle each hold
 /// uses is closed before it returns, or the service could not be deleted.
-fn uninstall_locked(scm: &WinServiceManager, id: &Id, hold: bool) -> Result<Uninstalled> {
+fn uninstall_locked(scm: &WinServiceManager, id: &Id, kind: Kind, hold: bool) -> Result<Uninstalled> {
     // Opened first and kept through the stop: no state change slips between the disable and the wait.
     let mut actor = match super::wait::SystemScmActor::open(id.as_str()) {
         Ok(actor) => actor,
@@ -1057,20 +1065,29 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, hold: bool) -> Result<Unin
             }
         }
     });
-    match settled {
-        Ok(Waited::Confirmed) => {}
+    let stopped_but_not_the_daemon = match settled {
+        // The stop this call sent, or a stop it found, confirmed `STOPPED`; only a stop it sent has a
+        // record of the shim's to judge, and `settle_and_stop` reads none from a service already stopped.
+        Ok(WaitEnd {
+            waited: Waited::Confirmed,
+            exit,
+        }) => incomplete_stop_failure(kind, exit),
         // `let _ = ...` is the write that turns an unreachable case into a silent one, and this
         // is precisely the case where a later edit narrowing that budget must not pass quietly.
-        Ok(Waited::Expired) => unreachable!("uninstall's wait is Unbounded; an unbounded deadline never expires"),
-        Err(e) => {
-            let state = if marked {
-                UninstallFailure::AlreadyMarked
-            } else {
-                UninstallFailure::Stop { previous }
-            };
-            let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
-            return Err(uninstall_failed(id, &state, cause));
-        }
+        Ok(WaitEnd {
+            waited: Waited::Expired,
+            ..
+        }) => unreachable!("uninstall's wait is Unbounded; an unbounded deadline never expires"),
+        Err(e) => Some(e),
+    };
+    if let Some(e) = stopped_but_not_the_daemon {
+        let state = if marked {
+            UninstallFailure::AlreadyMarked
+        } else {
+            UninstallFailure::Stop { previous }
+        };
+        let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
+        return Err(uninstall_failed(id, &state, cause));
     }
     // Closed before the delete: an open handle would keep the record after it.
     drop(actor);
