@@ -17,6 +17,16 @@ exclude = ["/.github", "/.claude", "/CLAUDE.md", "/scripts", "/prek.toml", "/.ed
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
+# Every `cargo doc` and `docs.rs` build fails on these. Other rustdoc lints are `allow` by default.
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+bare_urls = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_html_tags = "deny"
+invalid_rust_codeblocks = "deny"
+redundant_explicit_links = "deny"
+
 [[bin]]
 name = "goetia"
 path = "src/main.rs"

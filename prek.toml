@@ -57,25 +57,43 @@ language = "system"
 types = ["rust"]
 pass_filenames = false
 
+# The rustdoc hooks are `manual`: they run when CI and the local lanes ask for them
+# (`prek run --stage manual --all-files cargo-doc ...`), not on every commit. Intra-doc links are
+# denied by `[lints.rustdoc]` in Cargo.toml; `-D warnings` here covers the warnings that are not
+# lints. Each OS runs them, as `docs.rs` documents the three OS targets and `#[cfg]` changes what
+# links resolve.
+
 [[repos.hooks]]
 id = "cargo-doc"
 name = "cargo doc"
-# Every rustdoc warning fails, broken intra-doc links first. Private items are documented too, so
-# their links are checked, and `--all-features` adds what `testing` exports. The platform halves are
-# checked by each OS's own run: the host target is one of `docs.rs`'s three.
+# Private items are documented too, so links inside private docs are checked. `--all-features`
+# adds what `cli` and `testing` gate.
 entry = """cargo doc --locked --no-deps --document-private-items --all-features --config 'build.rustdocflags=["-D", "warnings"]'"""
 language = "system"
 types = ["rust"]
 pass_filenames = false
+stages = ["manual"]
 
 [[repos.hooks]]
 id = "cargo-doc-lib-only"
 name = "cargo doc (library only)"
-# `cli` gates items and the links to them.
+# What `cli` gates is absent, so a link to it from anywhere else is broken.
 entry = """cargo doc --locked --no-deps --document-private-items --no-default-features --config 'build.rustdocflags=["-D", "warnings"]'"""
 language = "system"
 types = ["rust"]
 pass_filenames = false
+stages = ["manual"]
+
+[[repos.hooks]]
+id = "cargo-doc-public"
+name = "cargo doc (public items only)"
+# What `docs.rs` renders. `--document-private-items` turns `rustdoc::private_intra_doc_links` off,
+# so a public doc that links to a private item is found only here.
+entry = """cargo doc --locked --no-deps --all-features --config 'build.rustdocflags=["-D", "warnings"]'"""
+language = "system"
+types = ["rust"]
+pass_filenames = false
+stages = ["manual"]
 
 [[repos.hooks]]
 id = "format-section-comments"

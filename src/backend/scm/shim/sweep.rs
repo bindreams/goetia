@@ -350,7 +350,7 @@ mod system {
 
     // What references a file ------------------------------------------------------------------------------------------
 
-    /// Every executable SCM may start for any service's `ImagePath` (see [`super::host_candidates`]), with
+    /// Every executable SCM may start for any service's `ImagePath` (see [`host_candidates`](super::host_candidates)), with
     /// its environment variables expanded, [`normalise`]d. A
     /// service marked for deletion references nothing (its record outlives it until a handle
     /// closes), and one with no `ImagePath` has nothing to start. A service whose entry could not be
@@ -464,7 +464,7 @@ mod system {
     /// which a folder made by someone else meanwhile is not.
     ///
     /// The one mechanism behind a provider's `sweep` and the sweep of the default folder an
-    /// uninstalled service's host was in (see [`super::second_folder`]). `default_folder` says where the
+    /// uninstalled service's host was in (see [`second_folder`](super::second_folder)). `default_folder` says where the
     /// default folder is, and is asked only of a folder left empty; the second-folder sweep passes
     /// the answer it already has.
     pub(crate) fn sweep_folder(
