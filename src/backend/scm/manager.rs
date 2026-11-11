@@ -1142,7 +1142,16 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
             return Ok(());
         };
         match hold() {
-            Ok(HoldOutcome::Expired { .. }) => unreachable!("an unbounded deadline does not expire"),
+            // Only a bounded hold expires, and this one is not: told rather than gone on from.
+            Ok(HoldOutcome::Expired { pid }) => {
+                hold_failed = Some(Error::os(
+                    format!("hold `{id}`'s process"),
+                    std::io::Error::other(format!(
+                        "the hold expired with SCM still naming process {pid}, though it has no bound: goetia's own error"
+                    )),
+                ));
+                Err(std::io::Error::other("the service's process could not be held"))
+            }
             Ok(held) => {
                 process = held;
                 Ok(())

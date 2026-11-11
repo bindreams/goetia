@@ -3563,6 +3563,33 @@ fn an_uninstall_whose_process_could_not_be_held_fails_with_why() {
     assert!(err.report().to_string().contains("held badly"), "{}", err.report());
 }
 
+/// A hold that expired cannot be told by an uninstall, whose waits have no bound: it fails, naming the
+/// pid SCM still reported, rather than going on as if it had held a process.
+#[cfg(windows)]
+#[skuld::test]
+fn an_uninstall_whose_hold_expired_fails_naming_the_pid() {
+    use crate::backend::scm::manager::uninstall_stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]);
+    let (marked, previous) = DISABLED_BY_US;
+
+    let err = uninstall_stop_on(
+        &mut fake,
+        &Id::try_from("frpc").unwrap(),
+        &answer,
+        marked,
+        previous,
+        Some(|| Ok(HoldOutcome::<u32>::Expired { pid: 9 })),
+        no_end_of,
+    )
+    .expect_err("an expired hold is not a held process");
+
+    let said = err.report().to_string();
+    assert!(said.contains("process 9"), "{said}");
+}
+
 // the incomplete stop's wording ---------------------------------------------------------------------------------------
 
 /// A failed stop and a failed start over the shim's incomplete-stop record say what SCM recorded and
