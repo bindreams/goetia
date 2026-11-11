@@ -2,6 +2,10 @@ use cosca::error::{ChildFate, Error};
 
 use super::*;
 
+// `release_unreaped`'s `Some` branch has no test: cosca's `Unreaped` has no public constructor, and
+// a real spawn yields one only after a fault following `CreateProcess`, which goetia cannot force
+// without a system-affecting test.
+
 /// What the release leaves of an error is what cosca said of the failed spawn, so a caller still
 /// reads from the variant alone whether the program may have started. A `MayHaveStarted` holding no
 /// child, and an error of any other variant, come back whole.
