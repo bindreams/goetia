@@ -486,6 +486,36 @@ fn a_reserved_sequence_needs_nothing_made_later() {
     );
 }
 
+/// `install --enable --start` is one sequence over one reservation, so install, `enable` and `start`
+/// share one pair of version probes: the gate is asked once for the three.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn install_enable_and_start_in_one_sequence_probe_the_gate_once() {
+    let id = fresh_id("systemd");
+    let _cleanup = FileGuard::new(unit_path(&id));
+    let spec = mk(&id);
+    let fake = gate_then([
+        reply(&["daemon-reload"], exited(0, "", "")),
+        reply(&["enable"], exited(0, "", "")),
+        job("start"),
+    ]);
+    let mgr = over(fake.clone());
+
+    let mut sequence = mgr
+        .prepare(&[Step::Install, Step::Start], Budget::DEFAULT)
+        .expect("prepare");
+    sequence.install(&spec, false).expect("install");
+    sequence.enable(&spec.id).expect("enable");
+    sequence.start(&spec.id, Budget::DEFAULT).expect("start");
+
+    fake.assert_spent("the sequence");
+    let probes = fake
+        .calls()
+        .iter()
+        .filter(|call| call[0] == "--version" || call.contains(&"--property=Version".to_string()))
+        .count();
+    assert_eq!(probes, 2, "the gate's pair of probes ran once: {:?}", fake.calls());
+}
+
 /// A verb whose threads cannot be made is refused before it sends anything, as `Error::Reservation`:
 /// the stated refusal for a host short of tasks. The reservation fails as a whole, so no leg of a
 /// sequence goes out with the next one unable to follow.

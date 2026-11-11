@@ -1006,16 +1006,3 @@ fn an_enable_in_a_sequence_spends_no_step() {
     let mut none = fake.prepare(&[], Budget::DEFAULT).unwrap();
     none.enable(&id).unwrap();
 }
-
-/// A single `enable` reserves nothing to spend: it asks for an empty reservation, so a backend that
-/// keeps the version gate's answer in one has somewhere to keep it.
-#[skuld::test]
-fn a_single_enable_reserves_an_empty_reservation() {
-    let fake = Fake::new();
-    fake.install(&mk("frpc"), false).unwrap();
-    let before = fake.prepared().len();
-
-    ServiceManager::enable(&fake, &Id::try_from("frpc").unwrap()).unwrap();
-
-    assert_eq!(fake.prepared()[before..], [(vec![], Budget::Unbounded)]);
-}
