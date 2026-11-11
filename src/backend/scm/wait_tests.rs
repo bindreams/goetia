@@ -3663,31 +3663,6 @@ fn an_uninstall_holds_only_when_told_to_and_judges_only_what_may_be_a_shim() {
     }
 }
 
-/// A process that could not be held leads the error of an uninstall that fails for it.
-#[cfg(windows)]
-#[skuld::test]
-fn an_uninstall_whose_process_could_not_be_held_fails_with_why() {
-    use crate::backend::scm::manager::uninstall_stop_on;
-    use crate::spec::Id;
-
-    let [(_, answer), ..] = answers();
-    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]);
-    let (marked, previous) = DISABLED_BY_US;
-
-    let err = uninstall_stop_on(
-        &mut fake,
-        &Id::try_from("frpc").unwrap(),
-        &answer,
-        marked,
-        previous,
-        Some(|| -> crate::error::Result<HoldOutcome<u32>> { Err(crate::error::Error::blob("held badly")) }),
-        no_end_of,
-    )
-    .expect_err("the hold failed");
-
-    assert!(err.report().to_string().contains("held badly"), "{}", err.report());
-}
-
 /// A wait that expires under an uninstall's unbounded deadline is goetia's own invariant breach: a stop
 /// failure whether or not someone else had marked the service, never their doing.
 #[cfg(windows)]
@@ -3719,6 +3694,11 @@ fn an_uninstall_whose_unbounded_stop_expires_is_a_stop_failure_whether_or_not_it
             "marked {marked}: {said}"
         );
         assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
+        assert_eq!(
+            said.contains("already marked for deletion"),
+            marked,
+            "marked {marked}: {said}"
+        );
     }
 }
 
@@ -3754,11 +3734,17 @@ fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked
             "marked {marked}: {said}"
         );
         assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
+        assert_eq!(
+            said.contains("already marked for deletion"),
+            marked,
+            "marked {marked}: {said}"
+        );
     }
 }
 
 /// A hold that expired cannot be told by an uninstall, whose waits have no bound: it fails, naming the
-/// pid SCM still reported, rather than going on as if it had held a process.
+/// pid SCM still reported, rather than going on as if it had held a process. A marked service is no
+/// different.
 #[cfg(windows)]
 #[skuld::test]
 fn an_uninstall_whose_hold_expired_fails_naming_the_pid() {
@@ -3766,22 +3752,29 @@ fn an_uninstall_whose_hold_expired_fails_naming_the_pid() {
     use crate::spec::Id;
 
     let [(_, answer), ..] = answers();
-    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]);
-    let (marked, previous) = DISABLED_BY_US;
+    for marked in [false, true] {
+        let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]);
 
-    let err = uninstall_stop_on(
-        &mut fake,
-        &Id::try_from("frpc").unwrap(),
-        &answer,
-        marked,
-        previous,
-        Some(|| Ok(HoldOutcome::<u32>::Expired { pid: 9 })),
-        no_end_of,
-    )
-    .expect_err("an expired hold is not a held process");
+        let err = uninstall_stop_on(
+            &mut fake,
+            &Id::try_from("frpc").unwrap(),
+            &answer,
+            marked,
+            None,
+            Some(|| Ok(HoldOutcome::<u32>::Expired { pid: 9 })),
+            no_end_of,
+        )
+        .expect_err("an expired hold is not a held process");
 
-    let said = err.report().to_string();
-    assert!(said.contains("process 9"), "{said}");
+        let said = err.report().to_string();
+        assert!(said.contains("process 9"), "marked {marked}: {said}");
+        assert_eq!(
+            said.contains("already marked for deletion"),
+            marked,
+            "marked {marked}: {said}"
+        );
+        assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
+    }
 }
 
 // the incomplete stop's wording ---------------------------------------------------------------------------------------
