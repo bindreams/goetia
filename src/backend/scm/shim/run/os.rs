@@ -13,11 +13,14 @@ use std::thread::JoinHandle;
 use cosca::Containment;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
+use crate::backend::unreaped::release_unreaped;
+
 mod eventlog;
 
 /// What the supervisor asks the OS for.
 pub(crate) trait Os: Send + Sync {
-    /// Spawn the daemon `cmd` describes. A refusal leaves nothing running.
+    /// Spawn the daemon `cmd` describes. A refusal that says the program may have started
+    /// ([`cosca::error::Error::MayHaveStarted`]) may leave it running: read [`fate`](cosca::error::Error::fate).
     fn spawn(&self, cmd: cosca::Command) -> Result<Box<dyn Spawned>, cosca::error::Error>;
 
     /// Run `f` on a new thread named `name`; the OS may refuse.
@@ -28,8 +31,8 @@ pub(crate) trait Os: Send + Sync {
     fn open_log(&self, path: &Path) -> io::Result<File>;
 }
 
-/// A spawned daemon. Dropping it kills its tree and waits for it, as `cosca::Child` does; see
-/// [`Spawned::detach`] to avoid that.
+/// A spawned daemon. Dropping it kills its tree, as `cosca::Child` does; a kill the OS refuses is
+/// looked at once and never waited on.
 pub(crate) trait Spawned: Send + Sync {
     /// How the daemon's tree is contained.
     fn containment(&self) -> Containment;
@@ -42,9 +45,6 @@ pub(crate) trait Spawned: Send + Sync {
 
     /// Kill the daemon's whole tree.
     fn kill_tree(&self) -> Result<(), cosca::error::Error>;
-
-    /// Let the daemon go: dropping it no longer kills it.
-    fn detach(self: Box<Self>);
 }
 
 /// How a line is reported to the Event Log.
@@ -72,7 +72,7 @@ pub(crate) struct Real;
 
 impl Os for Real {
     fn spawn(&self, mut cmd: cosca::Command) -> Result<Box<dyn Spawned>, cosca::error::Error> {
-        Ok(Box::new(cmd.spawn()?))
+        Ok(Box::new(cmd.spawn().map_err(release_unreaped)?))
     }
 
     fn thread(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>> {
@@ -100,10 +100,6 @@ impl Spawned for cosca::Child {
     fn kill_tree(&self) -> Result<(), cosca::error::Error> {
         cosca::Child::kill_tree(self)
     }
-
-    fn detach(self: Box<Self>) {
-        cosca::Child::detach(*self);
-    }
 }
 
 impl Channels for Real {
@@ -116,10 +112,12 @@ impl Channels for Real {
     }
 }
 
-/// The OS error code behind a `cosca` failure, if it has one.
+/// The OS error code behind a `cosca` failure, if it has one. A failure after `CreateProcess` comes
+/// wrapped in [`cosca::error::Error::MayHaveStarted`]: its source's code is the failure's.
 pub(crate) fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
     match e {
         cosca::error::Error::Io(e) => e.raw_os_error(),
+        cosca::error::Error::MayHaveStarted { source, .. } => os_error_of(source),
         cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(std::io::Error::raw_os_error),
         _ => None,
     }
