@@ -298,7 +298,12 @@ impl Backend for Scm {
     /// sweep that cannot read what is referenced or cannot delete a file does not fail the install:
     /// the file is not what the install needs, and the next sweep finds it. `type: managed` has no
     /// host, so nothing is held or checked: its preconditions are `apply`'s, before any write.
-    fn begin_install(&self, spec: &DaemonSpec, desired: &ScmRegistration) -> Result<Option<InstallLock>> {
+    fn begin_install(
+        &self,
+        spec: &DaemonSpec,
+        desired: &ScmRegistration,
+        _reservation: &mut (),
+    ) -> Result<Option<InstallLock>> {
         if spec.kind != Kind::Simple {
             return Ok(None);
         }

@@ -1148,7 +1148,7 @@ impl backend::Backend for Launchd {
     type InstallScope = ();
     type Reservation = Reservation;
 
-    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String) -> Result<()> {
+    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String, _reservation: &mut Reservation) -> Result<()> {
         Ok(())
     }
 

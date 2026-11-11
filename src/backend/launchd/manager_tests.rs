@@ -945,8 +945,9 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
     let stale = Outcome::Stale {
         from_version: "0.0.1".to_string(),
     };
-    mgr.begin_install(&spec, &desired).expect("begin_install");
     let mut reservation = reserved(&[Step::Install]);
+    mgr.begin_install(&spec, &desired, &mut reservation)
+        .expect("begin_install");
 
     let written = mgr
         .write(&spec, &desired, &stale, Some(&snapshot), &mut (), &mut reservation)

@@ -10,8 +10,8 @@ use crate::manager::budget::Deadline;
 
 /// A service manager's command-line client.
 pub(crate) trait Client: Send + Sync {
-    /// Run the client with `args`, waiting as `wait` says. What the call's output needs is drawn
-    /// from `reservation`: see [`bounded::spawn`].
+    /// Run the client with `args`, waiting as `wait` says. What the call's output needs (temp files,
+    /// threads to read it) is drawn from `reservation`: see [`bounded::spawn`].
     fn run(&self, args: &[&str], wait: Wait, reservation: &mut Reservation) -> Result<Finished, ClientError>;
 }
 
@@ -92,7 +92,10 @@ impl Real {
         })
     }
 
-    /// Spawn, then read both streams to their end on the calling thread: no thread, no temp file.
+    /// Spawn, then read both streams to their end on the calling thread: goetia makes no thread and
+    /// no temp file. cosca's spawn does make one thread (cosca 0.7.0, on Linux: the pidfd handshake
+    /// helper, joined before `output` reads anything), which nothing here can reserve: see
+    /// `systemd::manager::systemctl::listeners`.
     fn to_completion(&self, args: &[&str]) -> Result<Finished, ClientError> {
         let mut cmd = cosca::run(self.argv(args));
         (self.environment)(&mut cmd);
@@ -282,16 +285,19 @@ pub(crate) mod fake {
     }
 
     impl Client for Fake {
-        /// Draws the files the real client's spawn would, so a verb that counted too few trips the
-        /// assertion in every test that drives it.
+        /// Draws the files and listener threads the real client's spawn would, so a verb that
+        /// counted too few trips the assertion in every test that drives it.
         fn run(&self, args: &[&str], wait: Wait, reservation: &mut Reservation) -> Result<Finished, ClientError> {
             let waited = Waited::of(&wait);
-            let files = match &wait {
-                Wait::ToCompletion => 0,
-                Wait::Bounded { role, .. } => role.files(),
+            let (files, listeners) = match &wait {
+                Wait::ToCompletion => (0, 0),
+                Wait::Bounded { role, .. } => (role.files(), role.listeners()),
             };
             for _ in 0..files {
                 reservation.file().map_err(|e| ClientError::NotRun(e.into()))?;
+            }
+            for _ in 0..listeners {
+                reservation.listener().map_err(|e| ClientError::NotRun(e.into()))?;
             }
             let argv: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
             let next = {

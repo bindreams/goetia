@@ -1235,9 +1235,15 @@ fn cap_evidence(unit: &str) -> String {
     }
 }
 
-/// goetia never panics for want of a task; a verb that cannot get what its request needs exits `1`,
-/// and `start` and a waited `restart` then leave the daemon untouched. Each verb sweeps a rising
-/// limit until it succeeds; the cutoff is goetia's business and is not asserted.
+/// The one end-to-end smoke test of a host short of tasks. goetia never panics for want of a task,
+/// and a waited `restart` that cannot get what its requests need exits `1` and leaves the daemon
+/// untouched, at every limit: below what goetia reserves (its listener threads, refused before
+/// anything is sent: see `a_verb_short_of_threads_is_refused_before_it_sends_anything`) and at the
+/// one that leaves that whole and fails only cosca's own spawn thread, which cosca 0.7.0 makes inside
+/// `spawn` and goetia cannot reserve, where the spawn fails before the fork and is a clean "not
+/// sent". A no-wait restart reserves nothing, so it meets only that last case at every limit. Exit
+/// `4` (in doubt) is never accepted. Each sweep rises until the verb succeeds; the cutoff is not
+/// asserted.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
     let id = support::random_test_id();
@@ -1281,13 +1287,10 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
         }
     };
 
-    sweep(&["daemon", "start", guard.id()], &|tasks| {
-        assert_eq!(
-            active_state_and_job(guard.id()),
-            ("inactive".to_string(), String::new()),
-            "a start short of tasks sent something: TasksMax={tasks}"
-        );
-    });
+    // Running, so the restarts have something to stop.
+    Systemd::new()
+        .start(&Id::try_from(guard.id()).expect("a valid id"), Budget::DEFAULT)
+        .expect("start");
 
     let before = main_pid(guard.id());
     sweep(&["daemon", "restart", guard.id()], &|tasks| {

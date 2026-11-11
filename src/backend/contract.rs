@@ -57,7 +57,14 @@ pub(crate) trait Backend {
     /// anything is written. Run after [`Self::render_for_install`] has succeeded, so it holds or
     /// writes nothing for an install that cannot be rendered. `desired` is that render: what a
     /// backend places for the install (SCM's service host) must be what `desired` names.
-    fn begin_install(&self, spec: &DaemonSpec, desired: &Self::Definition) -> Result<Self::InstallScope>;
+    /// `reservation` is the install's own, which a backend may keep an answer in for the steps that
+    /// follow (systemd's version gate).
+    fn begin_install(
+        &self,
+        spec: &DaemonSpec,
+        desired: &Self::Definition,
+        reservation: &mut Self::Reservation,
+    ) -> Result<Self::InstallScope>;
 
     /// Make ready, all or none, what each of `steps` can draw under `budget`, before the first of
     /// them sends anything: a failure here means nothing was sent. See [`ServiceManager::prepare`].

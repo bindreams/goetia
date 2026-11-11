@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::backend::client::fake::{Entry, Fake, RoleKind, Waited, exited, fail, reply};
-use crate::backend::{bounded, standby, test_allowance};
+use crate::backend::{bounded, standby};
 use std::os::unix::process::ExitStatusExt as _;
 use std::time::Duration;
 
@@ -91,12 +91,21 @@ fn real_sh(script: &str, arg0: &str) -> Systemctl {
     ))
 }
 
-/// While it lives, the version gate counts as passed, so a request asks no probe: for a program
+/// A reservation whose version gate counts as passed, so a request asks no probe: for a program
 /// that answers one verb only.
-fn gate_held() -> GateScope {
-    let scope = gate_scope();
-    gated(|| Ok(())).expect("a pass is remembered");
-    scope
+fn gate_held() -> Held {
+    Held {
+        gate_passed: true,
+        ..Held::default()
+    }
+}
+
+/// [`gate_held`], holding the threads one watched request reads its two streams with.
+fn watching() -> Held {
+    Held {
+        draws: Reservation::of_listeners(bounded::STREAMS).expect("threads for one watched request"),
+        ..gate_held()
+    }
 }
 
 /// The version gate's two probes, passing.
@@ -273,14 +282,14 @@ fn start_stop_and_restart_put_the_unit_after_the_option_terminator() {
 /// `uninstall` call.
 #[skuld::test]
 fn enable_and_disable_put_the_unit_after_the_option_terminator() {
-    type Verb = fn(&Systemctl, &str) -> Result<()>;
+    type Verb = fn(&Systemctl, &str, &mut Held) -> Result<()>;
     for (verb, run) in [
         ("enable", Systemctl::enable_impl as Verb),
         ("disable", Systemctl::disable_impl as Verb),
     ] {
         let fake = gate_then([reply(&[verb], exited(0, "", ""))]);
 
-        run(&on_booted(fake.clone()), "-h").unwrap();
+        run(&on_booted(fake.clone()), "-h", &mut Held::default()).unwrap();
 
         assert_eq!(fake.calls()[2], [verb, "--", "-h.service"]);
     }
@@ -288,14 +297,17 @@ fn enable_and_disable_put_the_unit_after_the_option_terminator() {
 
 #[skuld::test]
 fn enable_and_disable_failures_name_the_verb_the_unit_and_systemd_s_words() {
-    type Verb = fn(&Systemctl, &str) -> Result<()>;
+    type Verb = fn(&Systemctl, &str, &mut Held) -> Result<()>;
     for (verb, run) in [
         ("enable", Systemctl::enable_impl as Verb),
         ("disable", Systemctl::disable_impl as Verb),
     ] {
         let fake = gate_then([reply(&[verb], exited(1, "", "Access denied\n"))]);
 
-        let msg = run(&on_booted(fake), "x").expect_err(verb).report().to_string();
+        let msg = run(&on_booted(fake), "x", &mut Held::default())
+            .expect_err(verb)
+            .report()
+            .to_string();
 
         assert!(msg.contains(&format!("`systemctl {verb} x.service` failed")), "{msg}");
         assert!(msg.contains("Access denied"), "{msg}");
@@ -306,7 +318,7 @@ fn enable_and_disable_failures_name_the_verb_the_unit_and_systemd_s_words() {
 fn show_puts_the_unit_after_the_option_terminator() {
     let fake = Fake::new([reply(&["show"], exited(1, "", ""))]);
 
-    let _ = on_booted(fake.clone()).status_from_unit("-h.service");
+    let _ = on_booted(fake.clone()).status_from_unit("-h.service", &mut Held::default());
 
     assert_eq!(
         fake.calls(),
@@ -389,7 +401,12 @@ fn each_budget_takes_its_path() {
             exited(0, "", "Enqueued anchor job 1 x.service/start.\n"),
         )]);
         on_booted(fake.clone())
-            .start_impl("x", budget, budget.start())
+            .start_impl(
+                "x",
+                budget,
+                budget.start(),
+                &mut Held::of(&[Step::Start], budget).unwrap(),
+            )
             .expect("the job was enqueued");
         assert_eq!(fake.calls()[2], argv, "{budget:?}");
         assert_eq!(fake.waits()[2], waited, "{budget:?}");
@@ -405,7 +422,6 @@ fn each_budget_takes_its_path() {
 /// child forever.
 #[skuld::test]
 fn the_bounded_path_waits_on_the_deadline_it_was_given() {
-    let _gate = gate_held();
     let dir = tempfile::tempdir().unwrap();
     let finished = announces_then_blocks(&dir.path().join("request"))
         .run_verb(
@@ -413,6 +429,7 @@ fn the_bounded_path_waits_on_the_deadline_it_was_given() {
             "x.service",
             Budget::Bounded(Duration::MAX),
             Budget::Immediate.start(),
+            &mut watching(),
         )
         .expect("sh is spawnable");
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
@@ -423,7 +440,6 @@ fn the_bounded_path_waits_on_the_deadline_it_was_given() {
 /// short. Deterministic — the stand-in announces only after its request is out.
 #[skuld::test]
 fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
-    let _gate = gate_held();
     let dir = tempfile::tempdir().unwrap();
     let request = dir.path().join("request");
     announces_then_blocks(&request)
@@ -432,6 +448,7 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
             "x.service",
             Budget::Bounded(Duration::from_secs(10)),
             Budget::Immediate.start(),
+            &mut watching(),
         )
         .expect("sh is spawnable");
     assert!(
@@ -440,37 +457,34 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
     );
 }
 
-/// A watched `systemctl` whose stdout or stderr no thread could read is never run: `Error::Spawn`, which every verb exits `1` for, and no request — never a panic, and
-/// never a request out with nothing to watch it.
+/// A watched `systemctl` reads its stdout and stderr with the threads its reservation holds, so
+/// none is made once it is spawned: the request cannot go out with nothing to watch it. A host that
+/// cannot make them refuses the verb before it sends anything: see
+/// `a_verb_short_of_threads_is_refused_before_it_sends_anything`.
 #[skuld::test]
-fn a_request_nothing_could_watch_is_never_sent() {
-    type Allowance = fn() -> test_allowance::Allowance;
-    let shortfalls: [(Allowance, &str); 2] = [
-        (|| standby::test_hook::threads(0), "no thread"),
-        (|| standby::test_hook::threads(1), "no thread"),
-    ];
-    for (allowance, what) in shortfalls {
-        let _gate = gate_held();
-        let dir = tempfile::tempdir().unwrap();
-        let request = dir.path().join("request");
-        let _short = allowance();
-        let spawns = bounded::test_hook::spawns();
+fn a_watched_request_draws_its_threads_from_its_reservation() {
+    let mut held = watching();
+    let _no_thread = standby::test_hook::threads(0);
+    let dir = tempfile::tempdir().unwrap();
+    let request = dir.path().join("request");
 
-        let e = announces_then_blocks(&request)
-            .run_verb(
-                "start",
-                "x.service",
-                Budget::Bounded(Duration::from_secs(10)),
-                Budget::Immediate.start(),
-            )
-            .expect_err(what);
+    let finished = announces_then_blocks(&request)
+        .run_verb(
+            "start",
+            "x.service",
+            Budget::Bounded(Duration::from_secs(10)),
+            Budget::Immediate.start(),
+            &mut held,
+        )
+        .expect("its threads were reserved");
 
-        assert!(matches!(e, Error::Spawn { .. }), "{what}: {e:?}");
-        assert!(!e.is_indeterminate(), "{what}: {e:?}");
-        assert!(e.report().to_string().contains(what), "{}", e.report());
-        assert_eq!(bounded::test_hook::spawns(), spawns, "{what}: systemctl was spawned");
-        assert!(!request.exists(), "{what}: the request was sent");
-    }
+    assert!(matches!(finished, Finished::Expired), "{finished:?}");
+    assert!(request.exists());
+    assert_eq!(
+        bounded::test_hook::listeners_left(&held.draws),
+        0,
+        "its threads were spent"
+    );
 }
 
 /// A watched `systemctl` that may have run is a request in doubt — exit `4`, saying it may or may
@@ -482,6 +496,7 @@ fn a_watched_request_that_may_have_run_is_in_doubt() {
             "x",
             Budget::Bounded(Duration::from_secs(10)),
             Budget::Unbounded.start(),
+            &mut Held::of(&[Step::Start], Budget::DEFAULT).unwrap(),
         )
     };
     let may_or_may_not = |e: &Error| {
@@ -513,7 +528,12 @@ fn a_watched_request_that_may_have_run_is_in_doubt() {
 #[skuld::test]
 fn a_watched_request_lost_after_its_announcement_reached_the_manager() {
     let e = on_booted(gate_then([fail(&["start"], lost(true))]))
-        .start_impl("x", Budget::Bounded(Duration::from_secs(10)), Budget::Unbounded.start())
+        .start_impl(
+            "x",
+            Budget::Bounded(Duration::from_secs(10)),
+            Budget::Unbounded.start(),
+            &mut Held::of(&[Step::Start], Budget::DEFAULT).unwrap(),
+        )
         .expect_err("injected");
     assert!(matches!(e, Error::RequestInDoubt { reached: true, .. }), "{e:?}");
     let msg = e.to_string();
@@ -528,9 +548,8 @@ fn a_watched_request_lost_after_its_announcement_reached_the_manager() {
 /// that may have run is in doubt.
 #[skuld::test]
 fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
-    let _gate = gate_held();
     let e = on_booted(Real::new(vec!["/nonexistent/systemctl".to_string()], environment))
-        .enable_impl("x")
+        .enable_impl("x", &mut gate_held())
         .expect_err("no such program");
     assert!(matches!(e, Error::Spawn { .. }), "{e:?}");
     assert!(!e.is_indeterminate(), "{e:?}");
@@ -539,7 +558,7 @@ fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
         &["enable"],
         ClientError::MayHaveRun(std::io::Error::other("the read failed").into()),
     )]))
-    .enable_impl("x")
+    .enable_impl("x", &mut gate_held())
     .expect_err("injected");
     assert!(matches!(e, Error::RequestInDoubt { reached: false, .. }), "{e:?}");
 }
@@ -549,7 +568,7 @@ fn a_request_run_to_completion_is_in_doubt_only_once_it_ran() {
 #[skuld::test]
 fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
     let e = on_booted(gate_then([fail(&["daemon-reload"], lost(false))]))
-        .daemon_reload_or_report("x")
+        .daemon_reload_or_report("x", &mut Held::default())
         .expect_err("injected");
     assert!(
         matches!(&e, Error::RequestInDoubt { request, reached: false, .. } if request == "systemctl daemon-reload"),
@@ -560,7 +579,9 @@ fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
     assert!(msg.contains("the wait failed"), "{msg}");
 
     let refused = gate_then([reply(&["daemon-reload"], exited(1, "", "Access denied\n"))]);
-    let e = on_booted(refused).daemon_reload_or_report("x").expect_err("refused");
+    let e = on_booted(refused)
+        .daemon_reload_or_report("x", &mut Held::default())
+        .expect_err("refused");
     assert!(matches!(e, Error::Step { .. }), "{e:?}");
     assert!(!e.is_indeterminate(), "{e:?}");
     let msg = e.report().to_string();
@@ -571,7 +592,7 @@ fn a_reload_in_doubt_after_the_write_stays_in_doubt() {
 /// A watched `systemctl` needs no temp file: it runs where none may be writable.
 #[skuld::test]
 fn a_watched_request_needs_no_temp_file() {
-    let _gate = gate_held();
+    let mut held = watching();
     let _no_file = bounded::test_hook::temp_files(0);
     let dir = tempfile::tempdir().unwrap();
     let request = dir.path().join("request");
@@ -581,6 +602,7 @@ fn a_watched_request_needs_no_temp_file() {
             "x.service",
             Budget::Bounded(Duration::from_secs(10)),
             Budget::Immediate.start(),
+            &mut held,
         )
         .expect("no temp file is needed");
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
@@ -594,10 +616,9 @@ const UNLESS_AUDIBLE_EXIT_9: &str =
 
 #[skuld::test]
 fn the_paths_that_do_not_bound_keep_the_announcement_audible() {
-    let _gate = gate_held();
     for budget in [Budget::Immediate, Budget::Unbounded] {
         let finished = real_sh(&format!("{UNLESS_AUDIBLE_EXIT_9}; exit 0"), "systemctl")
-            .run_verb("start", "x.service", budget, budget.start())
+            .run_verb("start", "x.service", budget, budget.start(), &mut gate_held())
             .expect("sh is spawnable");
         assert!(
             matches!(&finished, Finished::Exited { status, .. } if status.success()),
@@ -608,7 +629,6 @@ fn the_paths_that_do_not_bound_keep_the_announcement_audible() {
 
 #[skuld::test]
 fn the_bounded_path_keeps_the_announcement_audible() {
-    let _gate = gate_held();
     let finished = real_sh(
         &format!("{UNLESS_AUDIBLE_EXIT_9}; echo 'Enqueued anchor job 1 x.service/start.' >&2; exec sleep 2147483647"),
         "systemctl",
@@ -618,6 +638,7 @@ fn the_bounded_path_keeps_the_announcement_audible() {
         "x.service",
         Budget::Bounded(Duration::from_secs(10)),
         Budget::Immediate.start(),
+        &mut watching(),
     )
     .expect("sh is spawnable");
     assert!(matches!(finished, Finished::Expired), "{finished:?}");
@@ -759,16 +780,18 @@ impl Way {
 /// every budget, bounded or not.
 fn every_path() -> Vec<Way> {
     let mut paths = vec![
-        Way::request("daemon-reload", |s: &Systemctl| s.daemon_reload()),
-        Way::request("enable", |s: &Systemctl| s.enable_impl("x")),
-        Way::request("disable", |s: &Systemctl| s.disable_impl("x")),
+        Way::request("daemon-reload", |s: &Systemctl| s.daemon_reload(&mut Held::default())),
+        Way::request("enable", |s: &Systemctl| s.enable_impl("x", &mut Held::default())),
+        Way::request("disable", |s: &Systemctl| s.disable_impl("x", &mut Held::default())),
         Way {
             name: "show".to_string(),
             gated: false,
-            run: Box::new(|s: &Systemctl| s.status_from_unit("x.service").map(drop)),
+            run: Box::new(|s: &Systemctl| s.status_from_unit("x.service", &mut Held::default()).map(drop)),
         },
-        Way::request("restart", |s: &Systemctl| s.request_restart_impl("x")),
-        Way::request("kill", |s: &Systemctl| s.kill_impl("x")),
+        Way::request("restart", |s: &Systemctl| {
+            s.request_restart_impl("x", &mut Held::default())
+        }),
+        Way::request("kill", |s: &Systemctl| s.kill_impl("x", &mut Held::default())),
     ];
     for budget in [
         Budget::Immediate,
@@ -776,10 +799,20 @@ fn every_path() -> Vec<Way> {
         Budget::Bounded(Duration::from_secs(600)),
     ] {
         paths.push(Way::request(format!("start {budget:?}"), move |s: &Systemctl| {
-            s.start_impl("x", budget, budget.start())
+            s.start_impl(
+                "x",
+                budget,
+                budget.start(),
+                &mut Held::of(&[Step::Start], budget).unwrap(),
+            )
         }));
         paths.push(Way::request(format!("stop {budget:?}"), move |s: &Systemctl| {
-            s.stop_impl("x", budget, budget.start())
+            s.stop_impl(
+                "x",
+                budget,
+                budget.start(),
+                &mut Held::of(&[Step::Stop], budget).unwrap(),
+            )
         }));
     }
     paths
@@ -828,7 +861,7 @@ fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
     for (host, evidence) in hosts {
         let fake = Fake::new([]);
         let systemctl = Systemctl::new(Box::new(fake.clone()), host);
-        assert_no_manager(systemctl.require_supported(), evidence, "the gate");
+        assert_no_manager(systemctl.require_supported(&mut Held::default()), evidence, "the gate");
         for Way { name, run, .. } in every_path() {
             assert_no_manager(run(&systemctl), evidence, &name);
         }
@@ -890,7 +923,6 @@ fn a_systemctl_that_ignored_the_request_is_refused_on_every_path() {
 /// ones', or 242 to 245's.
 #[skuld::test]
 fn a_real_offline_systemctl_is_refused_on_every_path() {
-    let _gate = gate_held();
     let offline = on_booted(Real::new(
         ["env", "SYSTEMD_OFFLINE=1", "systemctl"].map(String::from).to_vec(),
         environment,
@@ -901,7 +933,11 @@ fn a_real_offline_systemctl_is_refused_on_every_path() {
             Budget::Unbounded,
             Budget::Bounded(Duration::from_secs(600)),
         ] {
-            let result = offline.run_verb(verb, "goetia-offline-probe.service", budget, budget.start());
+            let mut held = Held {
+                draws: Reservation::of_listeners(bounded::STREAMS).unwrap(),
+                ..gate_held()
+            };
+            let result = offline.run_verb(verb, "goetia-offline-probe.service", budget, budget.start(), &mut held);
             let e = result.expect_err(verb);
             assert!(matches!(e, Error::NoManager { .. }), "{verb} {budget:?}: {e:?}");
             let msg = e.to_string();
@@ -946,7 +982,9 @@ fn a_show_answer_without_every_property_is_not_a_state() {
         ("ActiveState=active\n", "MainPID, UnitFileState, LoadState"),
         ("ActiveState=active\nMainPID=42\nUnitFileState=enabled\n", "LoadState"),
     ] {
-        let e = showing(answer).status_from_unit("x.service").expect_err(answer);
+        let e = showing(answer)
+            .status_from_unit("x.service", &mut Held::default())
+            .expect_err(answer);
         let msg = e.to_string();
         assert!(msg.contains(&format!("answered without {missing}")), "{answer}: {msg}");
     }
@@ -961,7 +999,7 @@ fn a_unit_systemd_has_not_loaded_is_not_a_state() {
     for (active, unit_file) in [("inactive", ""), ("active", "enabled")] {
         let answer = format!("ActiveState={active}\nMainPID=0\nUnitFileState={unit_file}\nLoadState=not-found\n");
         let msg = showing(&answer)
-            .status_from_unit("x.service")
+            .status_from_unit("x.service", &mut Held::default())
             .expect_err(&answer)
             .to_string();
         assert!(
@@ -972,7 +1010,9 @@ fn a_unit_systemd_has_not_loaded_is_not_a_state() {
     }
     for load in ["loaded", "masked", "bad-setting", "error"] {
         let answer = format!("ActiveState=inactive\nMainPID=0\nUnitFileState=\nLoadState={load}\n");
-        let status = showing(&answer).status_from_unit("x.service").expect(&answer);
+        let status = showing(&answer)
+            .status_from_unit("x.service", &mut Held::default())
+            .expect(&answer);
         assert_eq!(status.state, State::Stopped, "{answer}");
     }
 }
@@ -999,7 +1039,9 @@ fn a_show_answer_with_every_property_is_read() {
             },
         ),
     ] {
-        let status = showing(answer).status_from_unit("x.service").expect(answer);
+        let status = showing(answer)
+            .status_from_unit("x.service", &mut Held::default())
+            .expect(answer);
         assert_eq!(
             (status.state, status.pid, status.enabled),
             (expected.state, expected.pid, expected.enabled),
@@ -1113,79 +1155,57 @@ fn an_unreadable_version_is_refused_without_calling_it_old() {
     }
 }
 
-// gated ===============================================================================================================
+// the gate ============================================================================================================
 
-/// A check that counts how often it is asked, and passes.
-fn counted(asked: &std::cell::Cell<usize>) -> impl FnOnce() -> Result<()> + '_ {
-    move || {
-        asked.set(asked.get() + 1);
-        Ok(())
-    }
+/// What a `Fake` was asked, one name per call: the probes of the gate are `--version` and `show`.
+fn asked_of(fake: &Fake) -> Vec<String> {
+    fake.calls().into_iter().map(|argv| argv[0].clone()).collect()
 }
 
-/// Inside a scope the gate is asked once; outside one, every time — nothing is remembered past the
-/// invocation that opened it.
+/// A reservation asks the gate once, whichever verbs of its sequence it serves; another reservation
+/// asks again, so nothing is remembered past the invocation that held one.
 #[skuld::test]
-fn the_gate_is_asked_once_inside_a_scope_and_every_time_outside_one() {
-    let asked = std::cell::Cell::new(0);
-    gated(counted(&asked)).unwrap();
-    gated(counted(&asked)).unwrap();
-    assert_eq!(asked.get(), 2, "outside a scope, every verb asks");
+fn the_gate_is_asked_once_per_reservation() {
+    let fake = Fake::new(gate_passes().into_iter().chain(gate_passes()));
+    let systemctl = on_booted(fake.clone());
 
-    let scope = gate_scope();
-    gated(counted(&asked)).unwrap();
-    gated(counted(&asked)).unwrap();
-    assert_eq!(asked.get(), 3, "inside one, once");
+    let mut held = Held::default();
+    systemctl.require_supported(&mut held).unwrap();
+    systemctl.require_supported(&mut held).unwrap();
+    assert_eq!(asked_of(&fake), ["--version", "show"], "two steps, one pair of probes");
 
-    drop(scope);
-    gated(counted(&asked)).unwrap();
-    assert_eq!(asked.get(), 4, "the answer ends with the scope");
-}
-
-/// Scopes nest and end in any order, and share one answer until the last of them ends.
-#[skuld::test]
-fn nested_scopes_share_one_answer_until_the_last_ends() {
-    for outer_first in [false, true] {
-        let asked = std::cell::Cell::new(0);
-        let outer = gate_scope();
-        gated(counted(&asked)).unwrap();
-        let inner = gate_scope();
-        gated(counted(&asked)).unwrap();
-        let (first, last) = if outer_first { (outer, inner) } else { (inner, outer) };
-        drop(first);
-        gated(counted(&asked)).unwrap();
-        assert_eq!(asked.get(), 1, "outer first: {outer_first}");
-        drop(last);
-        gated(counted(&asked)).unwrap();
-        assert_eq!(asked.get(), 2, "outer first: {outer_first}");
-    }
+    systemctl.require_supported(&mut Held::default()).unwrap();
+    assert_eq!(
+        asked_of(&fake),
+        ["--version", "show", "--version", "show"],
+        "another reservation asks again"
+    );
 }
 
 /// A refusal is not remembered: the next step asks again.
 #[skuld::test]
 fn a_refused_gate_is_asked_again() {
-    let _scope = gate_scope();
-    assert!(
-        gated(|| Err(Error::NoManager {
-            evidence: "refused".to_string()
-        }))
-        .is_err()
-    );
-    let asked = std::cell::Cell::new(0);
-    gated(counted(&asked)).unwrap();
-    assert_eq!(asked.get(), 1);
+    let fake = Fake::new(two_versions("241", "257").into_iter().chain(gate_passes()));
+    let systemctl = on_booted(fake.clone());
+    let mut held = Held::default();
+
+    assert!(systemctl.require_supported(&mut held).is_err());
+    systemctl.require_supported(&mut held).unwrap();
+
+    assert_eq!(asked_of(&fake), ["--version", "show", "--version", "show"]);
 }
 
 /// A remembered pass never stands in for the evidence [`Systemctl::door`] reads without asking: that
 /// is read on every run.
 #[skuld::test]
 fn a_remembered_pass_does_not_skip_the_evidence() {
-    let _gate = gate_scope();
-    on_booted(Fake::new(gate_passes()))
-        .require_supported()
-        .expect("the fake passes the gate");
+    let mut held = gate_held();
     let offline = Systemctl::new(Box::new(Fake::new([])), offline_yes);
-    assert_no_manager(offline.daemon_reload(), "`SYSTEMD_OFFLINE=yes` is set", "daemon-reload");
+    assert_no_manager(
+        offline.daemon_reload(&mut held),
+        "`SYSTEMD_OFFLINE=yes` is set",
+        "daemon-reload",
+    );
 }
 
 // supported, asked ====================================================================================================
@@ -1209,7 +1229,7 @@ fn two_versions(manager: &str, client: &str) -> Vec<Entry> {
 
 /// [`Systemctl::supported`], with `probes` the replies on a booted host.
 fn supported_by(probes: impl IntoIterator<Item = Entry>) -> Result<()> {
-    on_booted(Fake::new(probes)).supported()
+    on_booted(Fake::new(probes)).supported(&mut Held::default())
 }
 
 fn refused(manager: &str, client: &str) -> String {
@@ -1463,7 +1483,11 @@ fn a_chroot_systemctl_reports_is_refused_and_cannot_be_silenced() {
             "[ \"$1\" = show ] && {{ {ONLY_GOETIAS_OWN_SWITCHES} && echo \"{notice}\" >&2; exit 0; }}; \
              echo 'systemd 257 (257)'"
         );
-        assert_no_manager(real_sh(&script, "systemctl").supported(), notice, notice);
+        assert_no_manager(
+            real_sh(&script, "systemctl").supported(&mut Held::default()),
+            notice,
+            notice,
+        );
     }
 }
 
@@ -1551,7 +1575,7 @@ fn any_other_failure_to_ask_the_manager_is_a_refusal() {
 fn every_probe_switches_colour_off() {
     let colours = "c() { [ \"$SYSTEMD_COLORS\" = 0 ] && echo \"$1\" || printf '\\033[0;1;39m%s\\033[0m\\n' \"$1\"; }; ";
     let script = format!("{colours}[ \"$1\" = show ] && c 257 || c 'systemd 257'");
-    assert!(real_sh(&script, "systemctl").supported().is_ok());
+    assert!(real_sh(&script, "systemctl").supported(&mut Held::default()).is_ok());
 }
 
 // kill ================================================================================================================
@@ -1559,7 +1583,7 @@ fn every_probe_switches_colour_off() {
 /// `kill` over `x`, with `rest` standing in for what systemd answers it: the calls it made, too.
 fn kill_with(rest: Entry) -> (Result<()>, Vec<Vec<String>>) {
     let fake = gate_then([rest]);
-    let result = on_booted(fake.clone()).kill_impl("x");
+    let result = on_booted(fake.clone()).kill_impl("x", &mut Held::default());
     (result, fake.calls())
 }
 
@@ -1581,7 +1605,7 @@ fn kill_runs_the_pinned_argv() {
 fn kill_of_an_id_starting_with_a_dash_names_the_unit_after_the_terminator() {
     let fake = gate_then([reply(&["kill"], exited(0, "", ""))]);
 
-    on_booted(fake.clone()).kill_impl("-h").unwrap();
+    on_booted(fake.clone()).kill_impl("-h", &mut Held::default()).unwrap();
 
     assert_eq!(
         fake.calls()[2],

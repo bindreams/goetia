@@ -342,6 +342,25 @@ fn the_fake_draws_a_calls_files_from_the_reservation() {
     );
 }
 
+/// An announced request draws its streams' listener threads from the reservation, as the real
+/// client's spawn does: a call leaves the reservation shorter by them.
+#[skuld::test]
+fn the_fake_draws_an_announced_requests_listeners_from_the_reservation() {
+    use fake::{Fake, exited, reply};
+
+    let announced = || Wait::Bounded {
+        role: Role::AnnouncedRequest(|_| true),
+        deadline: Budget::Unbounded.start(),
+    };
+    let mut reservation = Reservation::of_listeners(bounded::STREAMS + 1).unwrap();
+
+    Fake::new([reply(&["start"], exited(0, "", ""))])
+        .run(&["start"], announced(), &mut reservation)
+        .expect("a scripted reply");
+
+    assert_eq!(bounded::test_hook::listeners_left(&reservation), 1);
+}
+
 /// How a call was waited on is recorded, and a run to completion draws no file.
 #[skuld::test]
 fn the_fake_records_a_run_to_completion_and_draws_nothing_for_it() {
