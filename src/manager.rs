@@ -110,9 +110,8 @@ pub trait ServiceManager {
     ///
     /// On expiry, the error's [`cause`](Error::cause) is [`Error::WaitTimeout`], never `Ok(())` and
     /// never [`Error::Undetermined`], which claims the *installation* is in doubt when a settled
-    /// id's request was issued and not waited out. A backend may wrap the timeout in a
-    /// [`Step`](Error::Step) that says what else is true (SCM does), so match the cause, not the
-    /// error.
+    /// id's request was issued and not waited out. A backend may wrap the timeout, and
+    /// [`cause`](Error::cause) finds it: match the cause, not the error.
     ///
     /// Idempotent under every budget: starting an already-running service is
     /// `Ok(())`, not an error.
