@@ -88,16 +88,11 @@ impl WaitEnd {
         exit: None,
     };
 
-    /// A service found gone, or found stopped by something else: stopped, with no record to judge.
+    /// A service found gone: stopped, with nothing read.
     const CONFIRMED_WITHOUT_A_RECORD: WaitEnd = WaitEnd {
         waited: Waited::Confirmed,
         exit: None,
     };
-
-    /// This end, without its record: for a state `settle_and_stop` found rather than stopped itself.
-    fn unrecorded(self) -> WaitEnd {
-        WaitEnd { exit: None, ..self }
-    }
 
     fn confirmed_by(status: QueriedStatus) -> WaitEnd {
         WaitEnd {
@@ -208,10 +203,13 @@ pub trait ScmActor {
 /// fire at once for a `STOPPED` already current, and a service that failed to `STOPPED` just before it
 /// can be running again, by a recovery restart, when the STOP lands; that stale `STOPPED` would confirm
 /// a stop of a running service.
-pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<WaitEnd> {
+///
+/// `shim` is whether the service runs a goetia shim, whose incomplete-stop record fails the stop: see
+/// [`wait_after_stop`].
+pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, shim: bool) -> io::Result<Waited> {
     // Issued whatever is left of the budget: only the *waiting* is bounded.
     control_stop_or_underway(a)?;
-    wait_after_stop(a, deadline, " Run `stop` again.", StopSeen::Requested)
+    wait_after_stop(a, deadline, " Run `stop` again.", StopSeen::Requested, shim)
 }
 
 /// How [`end_process`] ended.
@@ -255,30 +253,12 @@ pub(crate) fn end_process<P>(
     })
 }
 
-/// Whether `exit` is the shim's incomplete-stop record: only a `type: simple` service has a shim, and a
-/// `type: managed` service's `(0, 1003)` is its own code.
-fn shim_reports_incomplete_stop(kind: Kind, exit: RecordedExit) -> bool {
-    kind == Kind::Simple && exit.is_incomplete_stop()
-}
-
-/// The failure of a stop that SCM confirmed with `exit`, when the shim reported that it could not show
-/// the daemon's tree gone: the service stopped, and the daemon may not have. `None` for any other record,
-/// and for a service found gone, which has none.
-pub(crate) fn incomplete_stop_failure(kind: Kind, exit: Option<RecordedExit>) -> Option<io::Error> {
-    exit.filter(|&exit| shim_reports_incomplete_stop(kind, exit)).map(|_| {
-        io::Error::other(
-            "service stopped with goetia-shim's incomplete-stop record (Win32 0, service-specific 1003): the shim could not show that the daemon's process tree was terminated, so the daemon may still be running; see the shim's log",
-        )
-    })
-}
-
 /// How [`stop_and_await_exit`] ended.
 #[must_use = "an expiry is not a stop; decide what to report rather than discarding it"]
 #[derive(Debug)]
 pub(crate) enum StopAndAwaitExitOutcome<P> {
-    /// SCM confirmed `STOPPED`, and the process held before the STOP, if any, has exited. `exit` is
-    /// what SCM recorded, `None` for a service found gone.
-    Stopped { exit: Option<RecordedExit> },
+    /// SCM confirmed `STOPPED`, and the process held before the STOP, if any, has exited.
+    Stopped,
     /// SCM had not confirmed `STOPPED` when the deadline ran out.
     ServiceExpired,
     /// SCM confirmed `STOPPED`, and this held process had not exited when the deadline ran out.
@@ -316,6 +296,7 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     a: &mut A,
     deadline: Deadline,
     held: &mut HoldOutcome<P>,
+    shim: bool,
     end: impl FnOnce(P, Deadline) -> io::Result<EndProcessOutcome<P>>,
 ) -> io::Result<StopAndAwaitExitOutcome<P>> {
     if let HoldOutcome::Expired { pid } = *held {
@@ -330,15 +311,14 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
         // Why a refused process is not held is the caller's to report: it knows where.
         HoldOutcome::NoProcess | HoldOutcome::Refused(_) | HoldOutcome::Expired { .. } => None,
     };
-    let stopped = stop_via_notify(a, deadline)?;
-    if stopped.waited == Waited::Expired {
+    if stop_via_notify(a, deadline, shim)? == Waited::Expired {
         return Ok(StopAndAwaitExitOutcome::ServiceExpired);
     }
     let Some(process) = process else {
-        return Ok(StopAndAwaitExitOutcome::Stopped { exit: stopped.exit });
+        return Ok(StopAndAwaitExitOutcome::Stopped);
     };
     Ok(match end(process, deadline)? {
-        EndProcessOutcome::Exited => StopAndAwaitExitOutcome::Stopped { exit: stopped.exit },
+        EndProcessOutcome::Exited => StopAndAwaitExitOutcome::Stopped,
         EndProcessOutcome::Lingers {
             process,
             terminate_failed,
@@ -468,7 +448,8 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// - any other state: wait for the next notification.
 ///
 /// No iteration limit and no timing; a settled state that refuses STOP is an error. A STOP SCM
-/// accepts is followed by the same wait as [`stop_via_notify`]'s, armed after the STOP; that holds
+/// accepts, and one it refuses a second time with 1061 (so one is under way), is followed by the
+/// same wait as [`stop_via_notify`]'s, armed after the STOP; that holds
 /// once nothing can start the service again, which `uninstall` arranges by setting
 /// `SERVICE_DISABLED` first: a restart queued before that, or after it, does not start (P21).
 /// The arm after the STOP returns the status too: the shim can be `STOPPED` before it, which
@@ -479,8 +460,9 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// to `RUNNING` and the status read right after the disable shows `START_PENDING` or `RUNNING`
 /// (P23), so the loop sees its `RUNNING` and stops it like any start.
 ///
-/// The end carries the exit SCM recorded only for a stop this call sent and saw confirmed: a service it
-/// finds `STOPPED` was stopped by something else, and its record is not this call's to judge.
+/// Every `STOPPED` it confirms is judged as [`wait_after_stop`] judges it, whether the STOP was this
+/// call's, one already under way, or a service found stopped: the record of a stopped service describes
+/// its last stop, which is its state now. `shim` is whether the service runs a goetia shim.
 ///
 /// It does not use [`wait_until`]: this loop ignores its first arm's status on purpose, and its
 /// `RUNNING`/`PAUSED` action needs the actor, which `wait_until` holds.
@@ -495,8 +477,9 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 pub(crate) fn settle_and_stop<A: ScmActor>(
     a: &mut A,
     deadline: Deadline,
+    shim: bool,
     mut hold: impl FnMut(&mut A) -> io::Result<()>,
-) -> io::Result<WaitEnd> {
+) -> io::Result<Waited> {
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so a
     // `RUNNING`, `PAUSED` or `STOPPED` service is read from the notification; the status it returns
     // is for the states the mask excludes, `STOP_PENDING` among them, which no notification reports.
@@ -504,7 +487,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
         a.arm(WantState::RunningPausedOrStopped, deadline)?,
         QueriedState::Stopped,
     )? {
-        Err(waited) => return Ok(waited.unrecorded()),
+        Err(end) => return judged(end, shim),
         Ok(status) if status.state == QueriedState::StopPending => hold(a)?,
         Ok(_) => {}
     }
@@ -518,7 +501,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
             None => {
                 refused = None;
                 match a.wait_callback(deadline)? {
-                    None => return Ok(WaitEnd::EXPIRED),
+                    None => return Ok(Waited::Expired),
                     Some(observed) => notified_state(observed)
                         .and_then(|state| seen_in(delivered_status(a, state)))
                         .unwrap_or(Seen::Pending),
@@ -526,14 +509,14 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
             }
         };
         match seen {
-            Seen::Stopped => return Ok(WaitEnd::CONFIRMED_WITHOUT_A_RECORD),
+            Seen::Stopped(status) => return judged(WaitEnd::confirmed_by(status), shim),
             Seen::Pending => {
                 let status = match decided_or_status(
                     a.arm(WantState::RunningPausedOrStopped, deadline)?,
                     QueriedState::Stopped,
                 )? {
                     Ok(status) => status,
-                    Err(waited) => return Ok(waited.unrecorded()),
+                    Err(end) => return judged(end, shim),
                 };
                 read = seen_in(status);
             }
@@ -546,9 +529,9 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
                 hold(a)?;
                 match a.control_stop() {
-                    Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested),
+                    Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested, shim),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
-                        return wait_after_stop(a, deadline, "", StopSeen::Requested);
+                        return wait_after_stop(a, deadline, "", StopSeen::Requested, shim);
                     }
                     Err(e) if is_stop_refusal(&e) => {
                         refused = e.raw_os_error();
@@ -557,7 +540,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
                             QueriedState::Stopped,
                         )? {
                             Ok(status) => status,
-                            Err(waited) => return Ok(waited.unrecorded()),
+                            Err(end) => return judged(end, shim),
                         };
                         read = seen_in(status);
                     }
@@ -570,21 +553,19 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
 
 /// What [`settle_and_stop`] learned, from a notification or from the status an arm returned.
 enum Seen {
-    Stopped,
+    /// With the status that showed it, whose record is the stop's.
+    Stopped(QueriedStatus),
     /// A pending state.
     Pending,
     /// `RUNNING` or `PAUSED`, named as the errors name it.
-    Settled {
-        state: &'static str,
-        accepts_stop: bool,
-    },
+    Settled { state: &'static str, accepts_stop: bool },
 }
 
 /// The state to act on in `status`, if it is one: the settled states, and `None` for every other,
 /// which is waited for.
 fn seen_in(status: QueriedStatus) -> Option<Seen> {
     match status.state {
-        QueriedState::Stopped => Some(Seen::Stopped),
+        QueriedState::Stopped => Some(Seen::Stopped(status)),
         QueriedState::Running => Some(Seen::Settled {
             state: "RUNNING",
             accepts_stop: status.accepts_stop,
@@ -627,13 +608,17 @@ pub enum StopSeen {
 /// `seen` is what the caller has already seen of the stop: after [`StopSeen::Requested`] the first arm
 /// is `STOPPED` and `STOP_PENDING`, and a first read of anything else waits; after [`StopSeen::Pending`]
 /// the first arm is `STOPPED` alone, and a first read of anything but `STOP_PENDING` or `STOPPED` fails.
+///
+/// A `STOPPED` is judged by the record it carries when `shim` says the service runs a goetia shim (see
+/// [`judged`]): the one place a stop's record is read, for `stop` and `uninstall` alike.
 pub fn wait_after_stop<A: ScmActor>(
     a: &mut A,
     deadline: Deadline,
     advice: &str,
     seen: StopSeen,
-) -> io::Result<WaitEnd> {
-    wait_until(
+    shim: bool,
+) -> io::Result<Waited> {
+    let end = wait_until_end(
         a,
         match seen {
             StopSeen::Requested => WantState::Stopped,
@@ -647,7 +632,49 @@ pub fn wait_after_stop<A: ScmActor>(
             QueriedState::StopPending => Ok(ControlFlow::Continue(())),
             state => Err(io::Error::other(not_left_stopped(state, advice))),
         },
-    )
+    )?;
+    judged(end, shim)
+}
+
+/// The shim's report that it could not show the daemon's process tree gone, which SCM recorded as
+/// [`Reported::IncompleteStop`](crate::backend::scm::exit_status::Reported::IncompleteStop): the service
+/// stopped and the daemon may not have. The one text of it, for a failed start and a failed stop.
+#[derive(Debug)]
+pub(crate) struct IncompleteStop {
+    /// Whether it was met reaching `RUNNING`: the start's wording says so.
+    failed_start: bool,
+}
+
+impl std::fmt::Display for IncompleteStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let start = if self.failed_start { "; failed start" } else { "" };
+        write!(
+            f,
+            "service stopped with goetia-shim's incomplete-stop record (Win32 0, service-specific 1003{start}): the shim could not show that the daemon's process tree was terminated, so the daemon may still be running; see the shim's log"
+        )
+    }
+}
+
+impl std::error::Error for IncompleteStop {}
+
+/// Whether `e` is an [`IncompleteStop`].
+pub(crate) fn is_incomplete_stop(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|source| source.is::<IncompleteStop>())
+}
+
+/// What a wait for `STOPPED` came to, judged: a confirmed `STOPPED` whose record is the shim's
+/// incomplete-stop one is the failure [`IncompleteStop`] when `shim` says the service runs a goetia shim
+/// (its registered image is one), whatever its `type`, and any other record, or a service found gone,
+/// which has none, is a stop. Whether the vocabulary applies is the caller's to say: a service's own
+/// `(0, 1003)` is not the shim's.
+fn judged(end: WaitEnd, shim: bool) -> io::Result<Waited> {
+    match end {
+        WaitEnd {
+            waited: Waited::Confirmed,
+            exit: Some(exit),
+        } if shim && exit.is_incomplete_stop() => Err(io::Error::other(IncompleteStop { failed_start: false })),
+        end => Ok(end.waited),
+    }
 }
 
 /// A state off the target that [`wait_until`] found, and what the wait knew of it.
@@ -682,6 +709,18 @@ pub struct Sighting {
 /// state already seen: the stop wait's re-arm is [`WantState::StoppedOnly`], as a new handle
 /// delivers the current state at once (P27 c, f). A wait with no such state passes `first` twice.
 pub fn wait_until<A: ScmActor>(
+    a: &mut A,
+    first: WantState,
+    rearm: WantState,
+    target: QueriedState,
+    deadline: Deadline,
+    other: impl FnMut(Sighting) -> io::Result<ControlFlow<Waited>>,
+) -> io::Result<Waited> {
+    wait_until_end(a, first, rearm, target, deadline, other).map(|end| end.waited)
+}
+
+/// [`wait_until`], with the exit record of what confirmed the target for a caller that judges it.
+fn wait_until_end<A: ScmActor>(
     a: &mut A,
     first: WantState,
     rearm: WantState,
@@ -856,7 +895,6 @@ pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind:
             _ => Ok(ControlFlow::Continue(())),
         },
     )
-    .map(|end| end.waited)
 }
 
 /// What a terminal `Stopped` before `Running` means, from the `exit` record and `wait_hint` it carried:
@@ -888,10 +926,8 @@ fn stopped_before_running(kind: Kind, joined_a_start: bool, exit: RecordedExit, 
     }
     // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
     // to confirm. The notification may follow a `RUNNING` the wait never saw.
-    if shim_reports_incomplete_stop(kind, exit) {
-        return Err(io::Error::other(
-            "service stopped with goetia-shim's incomplete-stop record (Win32 0, service-specific 1003; failed start): the shim could not show that the daemon's process tree was terminated, so the daemon may still be running; see the shim's log",
-        ));
+    if kind == Kind::Simple && exit.is_incomplete_stop() {
+        return Err(io::Error::other(IncompleteStop { failed_start: true }));
     }
     // `daemon_ran` is safe to ask here: a host that exits before it connects also
     // records `(0, 0)` with a wait hint (P25 c/d), and that is either our own start

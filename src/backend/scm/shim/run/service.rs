@@ -2,7 +2,8 @@
 //! daemon `goetia.yaml` describes, waits for it and reports how it ended.
 //!
 //! The shim never restarts the daemon. It reports the daemon's exit as the service's exit and
-//! exits, once, with the code it reported; SCM's recovery actions (`backend::scm::generate`)
+//! exits, once, with the code it reported, unless goetia ends it first after `STOPPED` (a waiting
+//! `stop` or `uninstall`, with exit code 1); SCM's recovery actions (`backend::scm::generate`)
 //! start a new shim, which reads the installed spec afresh.
 
 use std::ffi::{OsString, c_void};

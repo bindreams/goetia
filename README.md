@@ -995,7 +995,8 @@ never reads `running` while its job is being terminated. In that window
 transitional one. A `start` fails and says the service is stopping, that SCM may
 start it again itself under its restart policy, and to run the `start` again
 once the service has stopped; it does not queue a start behind the stop. A
-`stop` waits for the stopping to finish and then exits `0`. A `stop` of a
+`stop` waits for the stopping to finish and then exits `0`, unless the shim
+recorded the incomplete stop below. A `stop` of a
 running service that does not accept one fails and names `goetia daemon kill`;
 it does not wait. A `stop` (or the stop of a `restart`) that arrives while SCM is
 starting the service, as in a restart after a failure, fails and says the STOP
@@ -1008,12 +1009,17 @@ it does not wait for the restart. SCM treats the `STOPPED` that follows as it
 would one that follows `running`: a failure is restarted per `restart:`, a
 stop is not.
 
-Nothing guards against a possible survivor afterwards: `stop` exits `0`,
-including the `stop` that produced the record, and a later `start`, `restart` or
-`sc start` launches a second copy beside it. `goetia daemon status` and `list`
-show such a service as `stopped`, and so they do one waiting out its
-`restart-delay`. `goetia daemon uninstall` does not read the record either: it
-deletes such a service, and a surviving command is left with no service.
+A `stop` that finds that record fails: it exits non-zero and says the command's
+process tree may still be running. So does the stop of a `restart`, which then
+does not start. `goetia daemon uninstall` stops the service first and refuses to
+delete it over the record, the same way and on a re-run too, while the record
+stands: it leaves the service stopped, disabled and not deleted, and says so.
+It has no option that deletes over the record; if you know the tree is gone,
+`sc.exe delete <id>` removes the service. An `uninstall` of a service that was
+already stopped with that record is refused the same way. Nothing else guards
+against a possible survivor: a later `start`, `restart` or `sc start` launches a
+second copy beside it. `goetia daemon status` and `list` show such a service as `stopped`, and so they
+do one waiting out its `restart-delay`.
 
 "Terminated" means the shim asked Windows to terminate the job and the call
 succeeded. Windows does not report when that termination has finished, so a

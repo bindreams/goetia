@@ -762,6 +762,18 @@ fn a_registered_host_is_a_shim_by_its_file_name() {
     );
 }
 
+/// The shim's vocabulary applies to a service by its registered image, never by its blob: a shim host is
+/// a shim whatever the blob says, an exe of the user's own is not, and an image that could not be read
+/// is judged as a shim's.
+#[skuld::test]
+fn the_shims_vocabulary_applies_to_a_service_by_its_registered_image() {
+    let shim = format!(r"C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe");
+
+    assert!(is_shim_image(Some(&format!(r#""{shim}" --service-host"#))));
+    assert!(!is_shim_image(Some(r"C:\bin\frpc.exe")));
+    assert!(is_shim_image(None));
+}
+
 /// Only a service that is gone or marked for deletion refuses the read of its host as a matter of
 /// course; any other failure is not "no shim", and is reported.
 #[skuld::test]
@@ -1215,6 +1227,41 @@ fn a_stop_failure_on_a_service_marked_by_someone_else_does_not_claim_a_disable()
     assert!(!text.contains("changed nothing"), "a STOP may have been sent: {text}");
     assert!(text.contains("goetia daemon kill frpc"), "{text}");
     for stale in ["NOT deleted", "disabled", "goetia daemon enable", "goetia daemon start"] {
+        assert!(!text.contains(stale), "`{stale}` is false for a marked service: {text}");
+    }
+}
+
+/// The service is stopped and the shim could not end the daemon's tree: `kill` does nothing to a stopped
+/// service, a re-run fails the same, and the message says how to go on if the tree is known gone.
+#[skuld::test]
+fn an_uninstall_over_an_incomplete_stop_says_it_left_the_service_stopped_disabled_and_not_deleted() {
+    let text = uninstall_failure(&UninstallFailure::DaemonMayRun {
+        previous: Some(ServiceStartType::AutoStart),
+        marked: false,
+    });
+    assert!(text.contains("could not end the daemon's process tree"), "{text}");
+    assert!(text.contains("may still be running"), "{text}");
+    assert!(text.contains("NOT deleted and is now disabled"), "{text}");
+    assert!(text.contains("goetia daemon enable frpc"), "{text}");
+    assert!(text.contains("fails the same"), "{text}");
+    assert!(text.contains("sc.exe delete frpc"), "{text}");
+    for stale in ["goetia daemon kill", "could not be stopped", "to retry"] {
+        assert!(
+            !text.contains(stale),
+            "`{stale}` is false or useless for a stopped service: {text}"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_uninstall_over_an_incomplete_stop_of_a_marked_service_does_not_claim_a_disable() {
+    let text = uninstall_failure(&UninstallFailure::DaemonMayRun {
+        previous: None,
+        marked: true,
+    });
+    assert!(text.contains("may still be running"), "{text}");
+    assert!(text.contains("already marked for deletion"), "{text}");
+    for stale in ["NOT deleted", "disabled", "goetia daemon kill", "sc.exe delete"] {
         assert!(!text.contains(stale), "`{stale}` is false for a marked service: {text}");
     }
 }

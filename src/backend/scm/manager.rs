@@ -112,7 +112,7 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
-use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, WaitEnd, Waited, end_process, incomplete_stop_failure};
+use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_process, is_incomplete_stop};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HoldOutcome, hold_if_possible};
@@ -454,10 +454,10 @@ impl Backend for Scm {
         };
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
-        let (kind, _) = start_kind(snapshot.blob());
+        let shim = runs_a_shim(&snapshot);
         let id = snapshot.into_id();
         let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
-        match uninstall_locked(&scm, &id, kind, host.is_some())? {
+        match uninstall_locked(&scm, &id, shim, host.is_some())? {
             Uninstalled::Deleted { process } => match (host, unread) {
                 (Some(host), _) => self.finish_uninstall(&id, &host, process),
                 (None, Some(unread)) => Err(self.cleanup_skipped(&id, unread)),
@@ -526,9 +526,9 @@ impl Backend for Scm {
     /// With a wait, holds the service's process before the STOP, and once SCM reports the service
     /// stopped ends that process through its handle (the documentation of `SetServiceStatus` allows
     /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
-    /// runs is free when `stop` returns. A `type: simple` service whose shim recorded an incomplete stop
-    /// (the daemon's tree may still be running) is a failed stop, once the process has ended; so is
-    /// `uninstall`'s own stop, which then leaves the service disabled and not deleted.
+    /// runs is free when `stop` returns. A service whose shim recorded an incomplete stop (the daemon's
+    /// tree may still be running) is a failed stop, the process not ended; `uninstall` fails the same
+    /// way, and leaves the service stopped, disabled and not deleted (see [`runs_a_shim`]).
     ///
     /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
@@ -541,7 +541,7 @@ impl Backend for Scm {
         // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
         // whatever is left of it.
         let deadline = budget.start();
-        let (kind, _) = start_kind(snapshot.blob());
+        let shim = runs_a_shim(&snapshot);
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::os(format!("open `{id}` to stop it"), e))?;
@@ -551,16 +551,12 @@ impl Backend for Scm {
         // Before the STOP: SCM reports `STOPPED` before the process exits, and no pid after it. An
         // expired hold is sent the STOP all the same, and is not a stop: see `stop_and_await_exit`.
         let mut held = hold_process(&id, "stop", deadline, &format!("`{id}` was NOT stopped"))?;
-        let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, &mut held, |held, deadline| {
+        let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, &mut held, shim, |held, deadline| {
             end_held(&id, held, deadline)
         })
         .map_err(|e| Error::os(format!("stop `{id}`"), e))
         .and_then(|outcome| match outcome {
-            // SCM confirmed `STOPPED` and the process is gone, and the shim may still say that the daemon
-            // is not: that is not a stop of the daemon.
-            StopAndAwaitExitOutcome::Stopped { exit } => {
-                incomplete_stop_failure(kind, exit).map_or(Ok(()), |e| Err(Error::os(format!("stop `{id}`"), e)))
-            }
+            StopAndAwaitExitOutcome::Stopped => Ok(()),
             // The STOP was sent and its effect is not confirmed, as when SCM does not answer in time.
             StopAndAwaitExitOutcome::ServiceExpired => Err(budget::timed_out(id.as_str(), "stopped", budget)),
             StopAndAwaitExitOutcome::Unconfirmed { pid } => Err(unconfirmed_stop(&id, pid, budget)),
@@ -1020,7 +1016,7 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
 /// process that cannot be opened is none (see [`hold_if_possible`]). The service handle each hold
 /// uses is closed before it returns, or the service could not be deleted.
-fn uninstall_locked(scm: &WinServiceManager, id: &Id, kind: Kind, hold: bool) -> Result<Uninstalled> {
+fn uninstall_locked(scm: &WinServiceManager, id: &Id, shim: bool, hold: bool) -> Result<Uninstalled> {
     // Opened first and kept through the stop: no state change slips between the disable and the wait.
     let mut actor = match super::wait::SystemScmActor::open(id.as_str()) {
         Ok(actor) => actor,
@@ -1048,7 +1044,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, kind: Kind, hold: bool) ->
     // service that is already `STOP_PENDING`, which no STOP of ours is sent to.
     let mut process = HoldOutcome::NoProcess;
     let mut hold_failed = None;
-    let settled = super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start(), |_| {
+    let settled = super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start(), shim, |_| {
         if !hold {
             return Ok(());
         }
@@ -1065,29 +1061,21 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, kind: Kind, hold: bool) ->
             }
         }
     });
-    let stopped_but_not_the_daemon = match settled {
-        // The stop this call sent, or a stop it found, confirmed `STOPPED`; only a stop it sent has a
-        // record of the shim's to judge, and `settle_and_stop` reads none from a service already stopped.
-        Ok(WaitEnd {
-            waited: Waited::Confirmed,
-            exit,
-        }) => incomplete_stop_failure(kind, exit),
+    match settled {
+        Ok(Waited::Confirmed) => {}
         // `let _ = ...` is the write that turns an unreachable case into a silent one, and this
         // is precisely the case where a later edit narrowing that budget must not pass quietly.
-        Ok(WaitEnd {
-            waited: Waited::Expired,
-            ..
-        }) => unreachable!("uninstall's wait is Unbounded; an unbounded deadline never expires"),
-        Err(e) => Some(e),
-    };
-    if let Some(e) = stopped_but_not_the_daemon {
-        let state = if marked {
-            UninstallFailure::AlreadyMarked
-        } else {
-            UninstallFailure::Stop { previous }
-        };
-        let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
-        return Err(uninstall_failed(id, &state, cause));
+        Ok(Waited::Expired) => unreachable!("uninstall's wait is Unbounded; an unbounded deadline never expires"),
+        Err(e) => {
+            // A stop the shim could not complete is a stopped service, which a re-run reads the same.
+            let state = match (is_incomplete_stop(&e), marked) {
+                (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
+                (false, true) => UninstallFailure::AlreadyMarked,
+                (false, false) => UninstallFailure::Stop { previous },
+            };
+            let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
+            return Err(uninstall_failed(id, &state, cause));
+        }
     }
     // Closed before the delete: an open handle would keep the record after it.
     drop(actor);
@@ -1144,6 +1132,24 @@ fn registered_shim(snapshot: &ScmSnapshot) -> Result<Option<PathBuf>> {
         Err(e) if is_gone_or_marked(&e) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Whether the service's process may be a goetia shim, whose records the shim's vocabulary reads
+/// (an incomplete stop fails a `stop`): its registered image is a shim host, whatever its blob says, so
+/// a blob that will not decode over a shim host is still judged and a `type: managed` exe never is. A
+/// configuration that cannot be read leaves the host unknown, and unknown counts as a shim: a refusal
+/// to call a stop complete costs a re-run, and a tree left running costs a second copy beside it.
+fn runs_a_shim(snapshot: &ScmSnapshot) -> bool {
+    let image = snapshot
+        .config()
+        .ok()
+        .map(|config| config.executable_path.to_string_lossy().into_owned());
+    is_shim_image(image.as_deref())
+}
+
+/// [`runs_a_shim`] over the registered command line, `None` when it could not be read.
+fn is_shim_image(image: Option<&str>) -> bool {
+    image.map_or(true, |image| shim_host(image).is_some())
 }
 
 /// The host the command line `image` starts, when its file name is that of a shim file placed by a
@@ -1453,6 +1459,13 @@ enum UninstallFailure {
     /// Someone else had marked the service for deletion, so `uninstall` did not delete it. Its wait
     /// may already have sent a STOP before it failed.
     AlreadyMarked,
+    /// The service is stopped, and SCM recorded that the shim could not end the daemon's process tree.
+    /// Unless `marked` (someone else had marked it for deletion) it is disabled, with `previous` its
+    /// start type before, and was not deleted.
+    DaemonMayRun {
+        previous: Option<ServiceStartType>,
+        marked: bool,
+    },
 }
 
 /// An `uninstall` that failed with `cause`, led by what it left behind. Every state names the retry
@@ -1483,6 +1496,24 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
              so `uninstall` did not delete it. It is removed once it stops and its last handle closes; \
              {kill}"
         ),
+        UninstallFailure::DaemonMayRun { previous, marked } => {
+            let left = if *marked {
+                "It was already marked for deletion by someone else, so `uninstall` did not delete it; \
+                 it is removed once its last handle closes."
+                    .to_string()
+            } else {
+                format!(
+                    "It was NOT deleted and is now disabled, so `goetia daemon start {id}` fails.{} \
+                     `uninstall` fails the same while that record stands and has no option that deletes over \
+                     it. If you know the process tree is gone, `sc.exe delete {id}` removes the service.",
+                    previous_start_type(id, *previous)
+                )
+            };
+            format!(
+                "`{id}` is stopped, but SCM recorded that goetia-shim could not end the daemon's process \
+                 tree, so the daemon may still be running. {left}"
+            )
+        }
     };
     Error::Step {
         what,

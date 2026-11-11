@@ -1,4 +1,5 @@
-//! How the shim's process ends: once, with the code it reported to SCM, by [`end_process`].
+//! How the shim's process ends: once, with the code it reported to SCM, by [`end_process`], unless goetia
+//! ends it first after `STOPPED` with exit code 1 (a waiting `stop` or `uninstall`), which can win the race.
 //!
 //! The service thread (made by SCM, not by us) records what it reports ([`stopping`]) before it
 //! reports `STOPPED` and returns. The dispatcher on the main thread then returns, and the main thread
