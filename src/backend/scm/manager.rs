@@ -432,38 +432,25 @@ impl Backend for Scm {
         }
     }
 
-    /// A service that runs a shim (see [`runs_a_shim`]) takes the install lock first and keeps it to
-    /// the end, so that no install places or sweeps a file between the stop and the sweep. If the
-    /// service's host is a shim file by name, its process is held after the service is disabled,
-    /// before the stop or the wait for one under way (see [`uninstall_locked`]), and once the service
-    /// is stopped and deleted the uninstall waits for that process and sweeps the folders the files
-    /// can be in: see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
+    /// A service that runs a shim, or that may (see [`ShimAnswer::judges_stop_record`]), takes the
+    /// install lock first and keeps it to the end, so that no install places or sweeps a file between
+    /// the stop and the sweep. Its process is held after the service is disabled, before the stop or
+    /// the wait for one under way (see [`uninstall_locked`]), and once the service is stopped and
+    /// deleted the uninstall waits for that process and sweeps the folders the files can be in when
+    /// the host is a shim file by name: see [`Scm::finish_uninstall`]. Anything else is
+    /// [`uninstall_locked`] alone.
     fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
         let shim = runs_a_shim(&snapshot).judges_stop_record();
         // First, so that the host read below is not one an install in progress is about to change.
-        let lock = shim.then(InstallLock::acquire).transpose()?;
-        let host = if lock.is_some() {
-            registered_shim(&snapshot)
-        } else {
-            Ok(None)
-        };
-        // A host that could not be read is not "no shim": the uninstall goes on, since the service
-        // is deleted either way, and says that the cleanup was skipped, and why, if it succeeds.
-        let (host, unread) = match host {
-            Ok(host) => (host, None),
-            Err(e) => (None, Some(e)),
-        };
+        let _lock = shim.then(InstallLock::acquire).transpose()?;
+        let host = if shim { registered_shim(&snapshot) } else { Ok(None) };
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
         let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
-        match uninstall_locked(&scm, &id, shim, host.is_some())? {
-            Uninstalled::Deleted { process } => match (host, unread) {
-                (Some(host), _) => self.finish_uninstall(&id, &host, process),
-                (None, Some(unread)) => Err(self.cleanup_skipped(&id, unread)),
-                (None, None) => Ok(()),
-            },
-            Uninstalled::Left => Ok(()),
+        match uninstall_locked(&scm, &id, shim)? {
+            Uninstalled::Deleted { process } if shim => self.finish_uninstall(&id, host, process),
+            Uninstalled::Deleted { .. } | Uninstalled::Left => Ok(()),
         }
     }
 
@@ -1022,14 +1009,14 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// the record is removed, which is what `uninstall` is for. A second `uninstall` racing the first
 /// can meet 1060 at the first open.
 ///
-/// With `hold`, the service's process is held once it is disabled: just before each STOP, once the
+/// With `shim`, the service's process is held once it is disabled: just before each STOP, once the
 /// state has settled, or at once for a service already `STOP_PENDING`, with no STOP of ours. It is
 /// handed back in [`Uninstalled::Deleted`] for the caller to wait for: SCM records `STOPPED`
 /// before the process exits, and reports no pid after it. It may be running an older file than the
 /// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
 /// process that cannot be opened is none (see [`hold_if_possible`]). The service handle each hold
 /// uses is closed before it returns, or the service could not be deleted.
-fn uninstall_locked(scm: &WinServiceManager, id: &Id, shim: bool, hold: bool) -> Result<Uninstalled> {
+fn uninstall_locked(scm: &WinServiceManager, id: &Id, shim: bool) -> Result<Uninstalled> {
     // Opened first and kept through the stop: no state change slips between the disable and the wait.
     let mut actor = match super::wait::SystemScmActor::open(id.as_str()) {
         Ok(actor) => actor,
@@ -1058,7 +1045,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, shim: bool, hold: bool) ->
     let mut process = HoldOutcome::NoProcess;
     let mut hold_failed = None;
     let settled = super::wait::settle_and_stop(&mut actor, Budget::Unbounded.start(), shim, |_| {
-        if !hold {
+        if !shim {
             return Ok(());
         }
         let not_done = format!("`{id}`'s process could not be held to wait for its exit");
@@ -1324,31 +1311,8 @@ impl Scm {
         }
     }
 
-    /// The error of an uninstall that deleted `id` but did not clean up its shim files, because the
-    /// read of its registered host failed with `unread`: the host is not known, so nothing was
-    /// waited for or swept. Told as [`finish_uninstall`](Self::finish_uninstall) tells a cleanup that
-    /// failed, with the retry that applies.
-    fn cleanup_skipped(&self, id: &Id, unread: Error) -> Error {
-        let (provider, unknown) = self.provider_folder();
-        let skipped = Error::Step {
-            what: format!("`{id}`'s host could not be read, so no shim file of it was waited for or swept"),
-            source: Box::new(unread),
-        };
-        let cause = match unknown {
-            Some(unknown) => Error::Both {
-                first: Box::new(skipped),
-                then: Box::new(unknown),
-            },
-            None => skipped,
-        };
-        Error::Step {
-            what: left_behind_text(id, &provider, None, &[]),
-            source: Box::new(cause),
-        }
-    }
-
-    /// What an uninstall does once `id` is stopped and deleted, for a service whose host was the shim
-    /// file `host`: ends the process that was held, as the documentation of `SetServiceStatus`
+    /// What an uninstall does once `id` is stopped and deleted, for a service that runs a shim: ends
+    /// the process that was held, as the documentation of `SetServiceStatus`
     /// allows once `SERVICE_STOPPED` is reported, and waits, with no bound, for it to exit (SCM
     /// recorded `STOPPED` before it exits, and a `stop` that waited has left none to hold), and for
     /// no other: a process it did not hold cannot be tied to the service it is uninstalling, and
@@ -1356,6 +1320,11 @@ impl Scm {
     /// provider's folder and, when `host` was in the default folder and that is another, that one
     /// too (see [`second_folder`]): the service may have been installed by another goetia version or
     /// provider. A host in any other folder is not swept, since that folder is not goetia's.
+    ///
+    /// `host` is what [`registered_shim`] read: a shim file by name, the only file placed by a
+    /// provider that is swept; `None` for any other host, as a `StandaloneShim`'s is, whose process is
+    /// ended all the same. A host that could not be read is not "no shim": the process is ended, nothing
+    /// is swept, and the failure says why.
     ///
     /// A default folder that cannot be located skips the second folder, as it cannot be told from the
     /// host's, and is reported with whatever else fails: the wait and the provider's sweep go on.
@@ -1368,23 +1337,35 @@ impl Scm {
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
     /// runs it is in use, and is skipped without an error: the next sweep removes it once it is free.
-    fn finish_uninstall(&self, id: &Id, host: &Path, process: HoldOutcome<Held>) -> Result<()> {
-        let host = normalise(host);
+    fn finish_uninstall(&self, id: &Id, host: Result<Option<PathBuf>>, process: HoldOutcome<Held>) -> Result<()> {
+        let (host, unread) = match host {
+            Ok(host) => (host.map(|host| normalise(&host)), None),
+            Err(e) => (None, Some(e)),
+        };
         let (provider, unknown) = self.provider_folder();
         // A second folder is the host's folder only when it is the default, and that is what its
         // sweep removes it by. The provider asks where the default folder is too, so a lookup that
         // fails can be reported twice. When it cannot be located the host's folder may be it, so it
         // is named, not swept, and nothing else is skipped.
         let mut failures: Vec<SweepFailure> = Vec::new();
-        let (second, unswept) = match host
-            .parent()
+        if let Some(unread) = unread {
+            failures.push(
+                Error::Step {
+                    what: format!("`{id}`'s host could not be read, so no shim file of it was swept"),
+                    source: Box::new(unread),
+                }
+                .into(),
+            );
+        }
+        let host_folder = host.as_deref().and_then(Path::parent);
+        let (second, unswept) = match host_folder
             .map(|folder| second_folder(folder, provider.path(), || Ok(normalise(&folder_in(None)?))))
             .transpose()
         {
             Ok(second) => (second.flatten(), second.flatten()),
             Err(e) => {
                 failures.push(e.into());
-                (None, host.parent())
+                (None, host_folder)
             }
         };
         let finish = |failures: Vec<SweepFailure>, provider_failed: bool| {
@@ -1410,6 +1391,10 @@ impl Scm {
                 failures.push(Error::os(format!("open `{id}`'s process to wait for its exit"), reason).into())
             }
             HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
+        }
+        // Nothing is swept for a host that is no file a provider placed, or one that could not be read.
+        if host.is_none() {
+            return finish(failures, false);
         }
         // After the wait: what has exited no longer references its file.
         let referenced = match referenced_hosts() {
