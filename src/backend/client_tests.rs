@@ -188,15 +188,51 @@ fn real_to_completion_draws_nothing_from_the_reservation() {
     assert_eq!(bounded::test_hook::left(&reservation), (0, 0));
 }
 
+/// The child's stdin is `/dev/null`, not the test process's own: a child that inherited it would
+/// read from, and could block on, whatever the caller holds open.
+///
+/// A test runner may already give the test process `/dev/null` (nextest does), which an inherited
+/// stdin would then match. So the test runs itself again with a pipe on stdin, and the copy asks its
+/// child what it was given. Linux only: it asks `/proc`.
+#[cfg(target_os = "linux")]
 #[skuld::test]
 fn real_to_completion_gives_the_child_no_stdin() {
-    let Finished::Exited { capture, .. } = sh("cat; echo done")
-        .run(&[], Wait::ToCompletion, &mut Reservation::default())
-        .expect("sh runs")
-    else {
-        panic!("expired");
-    };
-    assert_eq!(capture.stdout, b"done\n");
+    use std::process::{Command, Stdio};
+
+    const PROBE: &str = "GOETIA_CLIENT_STDIN_PROBE";
+    const THIS_TEST: &str = "real_to_completion_gives_the_child_no_stdin";
+
+    if std::env::var_os(PROBE).is_some() {
+        let own = std::fs::read_link("/proc/self/fd/0").expect("read own stdin");
+        assert!(
+            own.to_string_lossy().starts_with("pipe:"),
+            "stdin is not the probe's pipe: {own:?}"
+        );
+        let Finished::Exited { capture, .. } = sh("readlink /proc/self/fd/0")
+            .run(&[], Wait::ToCompletion, &mut Reservation::default())
+            .expect("sh runs")
+        else {
+            panic!("expired");
+        };
+        println!("{PROBE}={}", String::from_utf8_lossy(&capture.stdout).trim());
+        return;
+    }
+
+    let probe = Command::new(std::env::current_exe().expect("this test binary"))
+        .args([THIS_TEST, "--nocapture"])
+        .env(PROBE, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run the test binary again");
+    let stdout = String::from_utf8_lossy(&probe.stdout);
+    let stderr = String::from_utf8_lossy(&probe.stderr);
+    assert!(
+        stdout.lines().any(|line| line == format!("{PROBE}=/dev/null")),
+        "the child's stdin was not /dev/null ({}):\n{stdout}\n{stderr}",
+        probe.status
+    );
 }
 
 #[skuld::test]
