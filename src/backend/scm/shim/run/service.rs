@@ -331,14 +331,8 @@ fn run_daemon(
         WaitOutcome::WaitFailed { os_error } => supervisor.bus.settle(Reported::shim_failure(os_error)),
         // `wait_for_child_or_stop` terminated the tree before returning this.
         WaitOutcome::Stopping => Reported::Clean,
-        // Still reports STOPPED so the service stays stoppable and uninstallable. Its kills were
-        // refused, and a drop would kill and wait with no bound: leaked, as `require_job_object` does.
-        WaitOutcome::DaemonMayRun => {
-            std::mem::forget(child);
-            Reported::incomplete_stop()
-        }
-        // The root was killed and its waiter joined, so the drop is bounded.
-        WaitOutcome::TreeMayRun => Reported::incomplete_stop(),
+        // Still reports STOPPED so the service stays stoppable and uninstallable.
+        WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => Reported::incomplete_stop(),
     }
 }
 
