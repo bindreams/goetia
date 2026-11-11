@@ -362,7 +362,7 @@ fn each_budget_takes_its_path() {
 /// The child cannot exit on its own and the deadline is spent, so `Expired` is the only answer and
 /// no timing is bet on. `Bounded(Duration::MAX)` is what makes a re-derivation fail: it overflows
 /// `Instant` into an unbounded deadline, so a `run_verb` that ignored `deadline` would wait on the
-/// child forever, which the suite's watchdog surfaces.
+/// child forever.
 #[skuld::test]
 fn the_bounded_path_waits_on_the_deadline_it_was_given() {
     let _gate = gate_held();
