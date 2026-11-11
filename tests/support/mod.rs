@@ -34,6 +34,8 @@ use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
 pub use goetia::testing::elevation::{ELEVATED, elevated};
+#[cfg(windows)]
+pub use goetia::testing::wide_null;
 pub use goetia::testing::{cleanup, plain_fields};
 #[cfg(windows)]
 pub use goetia::testing::{
@@ -80,16 +82,6 @@ pub fn require_system_dir(dir: &std::path::Path) {
 /// pid so a straggler from a crashed run can never collide with a live one.
 pub fn random_test_id() -> String {
     format!("goetia-test-{:016x}", rand::rng().random::<u64>())
-}
-
-/// `s` as NUL-terminated UTF-16, for the wide Win32 entry points.
-#[cfg(windows)]
-pub fn wide_null(s: &str) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt as _;
-    std::ffi::OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
 }
 
 /// The host's `%ProgramData%`.

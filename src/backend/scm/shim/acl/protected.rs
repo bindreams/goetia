@@ -34,7 +34,6 @@ mod system {
     use std::ffi::c_void;
     use std::fs::File;
     use std::io;
-    use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::FromRawHandle as _;
     use std::path::{Path, PathBuf};
 
@@ -50,6 +49,7 @@ mod system {
     };
 
     use super::super::{ObjectSecurity, system::describe};
+    use crate::backend::scm::wide::wide_null;
     use crate::error::{Error, Result};
 
     /// Administrators own it; SYSTEM (`SY`) and Administrators (`BA`) have full control (`FA`),
@@ -87,7 +87,7 @@ mod system {
 
         /// A descriptor written as SDDL.
         pub(crate) fn from_sddl(sddl: &str) -> Result<Self> {
-            let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+            let wide = wide_null(sddl);
             let mut raw: *mut c_void = std::ptr::null_mut();
             // SAFETY: `wide` is NUL-terminated; `raw` is a valid out-pointer, and the size is not asked for.
             let ok = unsafe {
@@ -189,11 +189,11 @@ mod system {
 
     /// `path` as NUL-terminated UTF-16; a NUL inside it would end the name early.
     fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if wide.contains(&0) {
+        let wide = wide_null(path);
+        if wide[..wide.len() - 1].contains(&0) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "the path holds a NUL"));
         }
-        Ok(wide.into_iter().chain(std::iter::once(0)).collect())
+        Ok(wide)
     }
 }
 
