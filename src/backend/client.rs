@@ -95,7 +95,7 @@ impl Real {
     /// Spawn, then read both streams to their end on the calling thread: goetia makes no thread and
     /// no temp file. cosca's spawn does make one thread (cosca 0.7.0, on Linux: the pidfd handshake
     /// helper, joined before `output` reads anything), which nothing here can reserve: see
-    /// `systemd::manager::systemctl::listeners`.
+    /// `systemd::manager::systemctl::Held::of`, where the rule and its re-measure on a cosca upgrade live.
     fn to_completion(&self, args: &[&str]) -> Result<Finished, ClientError> {
         let mut cmd = cosca::run(self.argv(args));
         (self.environment)(&mut cmd);

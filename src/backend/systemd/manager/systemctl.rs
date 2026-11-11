@@ -20,7 +20,7 @@ use crate::manager::{Budget, State, Status, Step};
 /// where it is spent and a verb run alone shares nothing with another.
 ///
 /// A [`Default`] holds nothing and has not passed the gate: for a call that draws nothing and
-/// asks the gate for itself (`disable`, a read of state).
+/// asks the gate for itself (`disable`, `request_restart`). A read never asks the gate.
 #[derive(Debug, Default)]
 pub(crate) struct Held {
     pub(super) draws: Reservation,
@@ -38,9 +38,12 @@ impl Held {
     /// It cannot be reserved, and does not need to be: it is needed at a spawn and held only while
     /// that spawn runs, so a leg that got its thread leaves one for the next. A host short by
     /// exactly that thread fails the spawn as [`Error::Spawn`], before the fork, which sent nothing.
-    /// goetia reads no other thread of cosca's: the drain pump a contained child's tree wait starts
-    /// (`cosca-cgrp-pump`) is started only by `Child::wait_tree` and `graceful_shutdown_tree`, which
-    /// goetia never calls. Re-measure both on a cosca upgrade.
+    /// goetia reads no other thread of cosca's: the drain pump of a contained child
+    /// (`cosca-cgrp-pump`) starts only on a blocking wait for the tree to drain, which is
+    /// `Child::wait_tree`, `Child::wait_tree_timeout`, `Child::graceful_shutdown_tree` and a leaf's
+    /// teardown on drop, and of those goetia never calls the first three. The teardown's pump is
+    /// joined before the drop returns, so it is gone before the next spawn. Re-measure both on a
+    /// cosca upgrade.
     pub(super) fn of(steps: &[Step], budget: Budget) -> io::Result<Held> {
         let needed: usize = steps.iter().map(|step| listeners(*step, budget)).sum();
         Ok(Held {
