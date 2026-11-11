@@ -93,6 +93,8 @@
 
 pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use identity::sid_for_account_name;
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt as _;

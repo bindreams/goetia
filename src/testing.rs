@@ -13,6 +13,25 @@ use crate::error::Result;
 use crate::shim::{FolderCheck, HostCommand, ShimProvider, SweepFailure};
 use crate::spec::{DaemonFields, Id, Kind, Restart, User};
 
+pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
+
+/// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
+/// a test never takes a placeholder for a SID.
+#[cfg(windows)]
+pub fn shown_sid(sid: &[u8]) -> String {
+    crate::backend::scm::sid::try_sid_display(sid).unwrap_or_else(|| panic!("{sid:?} is not a SID Windows can show"))
+}
+
+/// The SID of the local account `account_name`, as the library looks it up when it installs a
+/// daemon that runs as it.
+#[cfg(windows)]
+pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
+    crate::backend::scm::manager::sid_for_account_name(account_name)
+}
+
+#[cfg(windows)]
+pub use crate::backend::scm::shim::acl::{Ace, Dacl, kernel_object_dacl};
+
 pub mod cleanup;
 pub mod elevation;
 #[cfg(windows)]

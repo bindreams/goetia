@@ -13,7 +13,8 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
 
-use crate::backend::scm::shim::acl::{Descriptor, Sid};
+use crate::backend::scm::shim::acl::Descriptor;
+use crate::backend::scm::sid::Sid;
 
 /// This process's token, opened to be copied.
 fn process_token() -> OwnedHandle {
