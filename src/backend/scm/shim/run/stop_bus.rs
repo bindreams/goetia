@@ -436,8 +436,7 @@ impl Drop for ReportOnPanic<'_> {
 // Teardown ============================================================================================================
 
 /// What [`kill_for_stop`] reached.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Teardown {
+pub(super) enum Teardown {
     /// `kill_tree` succeeded.
     Tree,
     /// `kill_tree` failed and the direct child was killed: its descendants were not reached.
@@ -458,9 +457,12 @@ pub(crate) fn terminate_exited_tree(child: &dyn Spawned, log: &Log, id: &str) ->
 }
 
 /// Kill the daemon for a commanded stop: the whole contained tree, or failing that the direct
-/// child alone. See [`Supervisor::wait_for_child_or_stop`], the only caller, for what it does with
-/// [`Teardown::Failed`]. Each failure is logged as it happens.
-pub(crate) fn kill_for_stop(child: &dyn Spawned, log: &Log, id: &str) -> Teardown {
+/// child alone. Each failure is logged as it happens.
+///
+/// [`Supervisor::wait_for_child_or_stop`] acts on [`Teardown::Failed`]: it returns without joining
+/// the waiter. `service::require_job_object` also calls this, discards the [`Teardown`] and relies
+/// on dropping the child to retry the kill.
+pub(super) fn kill_for_stop(child: &dyn Spawned, log: &Log, id: &str) -> Teardown {
     let Err(e) = child.kill_tree() else {
         return Teardown::Tree;
     };
