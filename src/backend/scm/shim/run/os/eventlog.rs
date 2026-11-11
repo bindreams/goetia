@@ -4,7 +4,8 @@ use windows_sys::Win32::System::EventLog::{
     DeregisterEventSource, EVENTLOG_ERROR_TYPE, EVENTLOG_WARNING_TYPE, RegisterEventSourceW, ReportEventW,
 };
 
-use super::{Severity, wide_null};
+use super::Severity;
+use crate::backend::scm::wide::wide_null;
 
 const SOURCE: &str = "Goetia";
 

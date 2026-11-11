@@ -669,8 +669,7 @@ fn executable_trailing_backslash_does_not_round_trip_through_argv0() {
 
 #[cfg(windows)]
 mod real_win32 {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
+    use crate::backend::scm::wide::{units_until_nul, wide_null};
 
     #[link(name = "shell32")]
     unsafe extern "system" {
@@ -689,7 +688,7 @@ mod real_win32 {
     /// platform where that is possible, rather than exclusively against
     /// itself.
     pub fn split(cmdline: &str) -> Vec<String> {
-        let wide = crate::backend::scm::manager::identity::wide_null(cmdline);
+        let wide = wide_null(cmdline);
         let mut argc: i32 = 0;
         // SAFETY: `wide` is a valid null-terminated UTF-16 string that
         // outlives this call; `argc` is a valid, aligned `i32` out-param.
@@ -702,14 +701,8 @@ mod real_win32 {
             // null-terminated UTF-16 strings, per the documented
             // CommandLineToArgvW contract.
             let ptr = unsafe { *argv.offset(idx) };
-            let mut len = 0isize;
             // SAFETY: `ptr` is a valid null-terminated UTF-16 string.
-            while unsafe { *ptr.offset(len) } != 0 {
-                len += 1;
-            }
-            // SAFETY: `ptr[0..len)` are exactly the UTF-16 code units just counted.
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-            result.push(OsString::from_wide(slice).to_string_lossy().into_owned());
+            result.push(String::from_utf16_lossy(unsafe { units_until_nul(ptr) }));
         }
 
         // SAFETY: `argv` was allocated by `CommandLineToArgvW` and is

@@ -50,6 +50,7 @@ mod system {
     };
 
     use super::super::{ObjectSecurity, system::describe};
+    use crate::backend::scm::wide::wide_null;
     use crate::error::{Error, Result};
 
     /// Administrators own it; SYSTEM (`SY`) and Administrators (`BA`) have full control (`FA`),
@@ -87,7 +88,7 @@ mod system {
 
         /// A descriptor written as SDDL.
         pub(crate) fn from_sddl(sddl: &str) -> Result<Self> {
-            let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+            let wide = wide_null(sddl);
             let mut raw: *mut c_void = std::ptr::null_mut();
             // SAFETY: `wide` is NUL-terminated; `raw` is a valid out-pointer, and the size is not asked for.
             let ok = unsafe {
