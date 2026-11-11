@@ -19,7 +19,7 @@ use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
 use goetia::spec::{DaemonFields, DaemonSpec, User};
-use goetia::testing::{DaclEntry, FakeProvider, command};
+use goetia::testing::{Ace, FakeProvider, command};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -829,11 +829,11 @@ fn lock_is_exclusive() {
 
 /// The DACL of the kernel object `handle` (open with `READ_CONTROL`): whether it is protected, and
 /// its entries as the library reads them.
-fn dacl_of(handle: HANDLE) -> (bool, Vec<DaclEntry>) {
+fn dacl_of(handle: HANDLE) -> (bool, Vec<Ace>) {
     let dacl = goetia::testing::kernel_object_dacl(handle, Path::new("the lock"))
         .unwrap_or_else(|e| panic!("read the permissions of the lock: {}", e.report()));
     let entries = dacl
-        .entries
+        .aces
         .expect("the lock has a NULL DACL, which grants everyone every right");
     (dacl.protected, entries)
 }

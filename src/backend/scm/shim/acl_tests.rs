@@ -414,8 +414,8 @@ fn the_nearest_object_to_the_target_is_reported_first() {
 #[cfg(windows)]
 pub(in crate::backend::scm::shim) mod windows {
     use super::system::{
-        ObjectId, display_path, identity_of, is_unreadable, kernel_object_dacl, kernel_object_owner, parse, read_chain,
-        resolve_target,
+        ObjectId, copy_sid, display_path, identity_of, is_unreadable, kernel_object_dacl, kernel_object_owner, parse,
+        read_chain, resolve_target,
     };
     use super::*;
     use crate::error::Error;
@@ -828,6 +828,18 @@ pub(in crate::backend::scm::shim) mod windows {
             let ace = dacl.unwrap().remove(0);
             assert_eq!((ace.allow, ace.conditional), (allow, conditional), "type {ace_type}");
         }
+    }
+
+    /// What is named as unread is what the caller was reading: an owner is not "the permissions".
+    #[skuld::test]
+    fn a_sid_that_is_not_one_is_an_error_naming_what_was_read() {
+        let junk = [0xFFu8; 16];
+
+        // SAFETY: `junk` is readable for the call, which only validates it.
+        let owner = unsafe { copy_sid(junk.as_ptr() as _, "read the owner of", Path::new("f")) }.unwrap_err();
+
+        assert!(is_unreadable(&owner), "{owner:?}");
+        assert!(owner.to_string().contains("read the owner of"), "{owner}");
     }
 
     #[skuld::test]

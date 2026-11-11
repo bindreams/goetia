@@ -29,55 +29,8 @@ pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     crate::backend::scm::manager::sid_for_account_name(account_name)
 }
 
-/// One entry of a DACL as the library reads it.
 #[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DaclEntry {
-    /// The trustee's SID bytes.
-    pub trustee: Vec<u8>,
-    pub mask: u32,
-    /// Allows, else denies.
-    pub allow: bool,
-    /// The ACE's flags, `INHERIT_ONLY_ACE` among them.
-    pub flags: u8,
-    /// A callback entry, which has a condition after its SID that the library does not read.
-    pub conditional: bool,
-}
-
-#[cfg(windows)]
-impl From<crate::backend::scm::shim::acl::Ace> for DaclEntry {
-    fn from(ace: crate::backend::scm::shim::acl::Ace) -> Self {
-        Self {
-            trustee: ace.trustee,
-            mask: ace.mask,
-            allow: ace.allow,
-            flags: ace.flags,
-            conditional: ace.conditional,
-        }
-    }
-}
-
-/// A DACL as the library reads it.
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dacl {
-    /// Whether it ignores what a parent would have it inherit.
-    pub protected: bool,
-    /// `None` is a NULL DACL, which grants everyone every right.
-    pub entries: Option<Vec<DaclEntry>>,
-}
-
-/// The DACL of the kernel object `handle`, which is open with `READ_CONTROL`, read by the library's
-/// own parser, which fails on an entry type it does not understand. The owner is not read. `name`
-/// stands for the object in an error.
-#[cfg(windows)]
-pub fn kernel_object_dacl(handle: *mut std::ffi::c_void, name: &std::path::Path) -> Result<Dacl> {
-    let dacl = crate::backend::scm::shim::acl::kernel_object_dacl(handle, name)?;
-    Ok(Dacl {
-        protected: dacl.protected,
-        entries: dacl.aces.map(|aces| aces.into_iter().map(DaclEntry::from).collect()),
-    })
-}
+pub use crate::backend::scm::shim::acl::{Ace, Dacl, kernel_object_dacl};
 
 pub mod cleanup;
 pub mod elevation;

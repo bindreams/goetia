@@ -32,7 +32,8 @@ use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_in
 #[cfg(windows)]
 pub(crate) use protected::{Descriptor, is_as_wanted};
 #[cfg(all(windows, any(test, feature = "testing")))]
-pub(crate) use system::kernel_object_dacl;
+#[doc(hidden)]
+pub use system::{Dacl, kernel_object_dacl};
 #[cfg(windows)]
 pub(crate) use system::{
     display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, require_acls_under,
@@ -60,18 +61,20 @@ pub(crate) struct ObjectSecurity {
     pub(crate) dacl: Option<Vec<Ace>>,
 }
 
-/// An access-control entry that grants or denies a trustee a mask of rights.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Ace {
-    pub(crate) trustee: Sid,
-    pub(crate) mask: u32,
+/// An access-control entry that grants or denies a trustee a mask of rights. Ordered field by
+/// field, which is what makes [`is_as_wanted`] independent of the order of entries.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Ace {
+    pub trustee: Sid,
+    pub mask: u32,
     /// The ACE header's flags, of which only `INHERIT_ONLY_ACE` is read.
-    pub(crate) flags: u8,
-    pub(crate) allow: bool,
+    pub flags: u8,
+    pub allow: bool,
     /// A callback entry: a condition follows its SID, which is not read, so [`verdict`] treats it
-    /// as one that always applies. Two entries that differ only in this are different entries,
-    /// which [`is_as_wanted`] tells apart.
-    pub(crate) conditional: bool,
+    /// as one that always applies. A conditional entry is not a plain one, but two conditional
+    /// entries that differ only in their condition are the same to [`is_as_wanted`].
+    pub conditional: bool,
 }
 
 /// The first reason found to refuse a folder or a file.
@@ -522,9 +525,9 @@ mod system {
             .open(path)
     }
 
-    /// What `GetSecurityInfo` returned for one object: the owner, and the DACL when it was asked for,
-    /// which point into a descriptor the call allocated and this frees on drop. Read them only while
-    /// it is live.
+    /// What `GetSecurityInfo` returned for one object. Each of the owner and the DACL is there only
+    /// when [`security_info`] was asked for it, and null otherwise. They point into a descriptor the
+    /// call allocated and this frees on drop. Read them only while it is live.
     struct SecurityInfo {
         owner: PSID,
         dacl: *mut ACL,
@@ -542,8 +545,9 @@ mod system {
         }
     }
 
-    /// The owner, and the DACL if `information` includes it, of `handle`, an open object of `kind`
-    /// with `READ_CONTROL`. `what` and `label` stand for the call and the object in an error.
+    /// The parts `information` asks for (the owner, the DACL or both) of `handle`, an open object
+    /// of `kind` with `READ_CONTROL`; a part not asked for is null in the result. `what` and `label`
+    /// stand for the call and the object in an error.
     fn security_info(
         handle: HANDLE,
         kind: SE_OBJECT_TYPE,
@@ -614,23 +618,25 @@ mod system {
             name,
         )?;
         // SAFETY: `owner` points into `descriptor`, which `info` keeps live.
-        unsafe { copy_sid(info.owner, name) }
+        unsafe { copy_sid(info.owner, "read the owner of", name) }
     }
 
     /// A DACL as read.
     #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(crate) struct Dacl {
+    pub struct Dacl {
         /// Whether it ignores what a parent would have it inherit.
-        pub(crate) protected: bool,
+        pub protected: bool,
         /// `None` is a NULL DACL, which grants everyone every right.
-        pub(crate) aces: Option<Vec<Ace>>,
+        pub aces: Option<Vec<Ace>>,
     }
 
     /// The DACL of the kernel object `handle`, which must be open with `READ_CONTROL`. The owner
     /// is not read. `name` stands for the object in an error.
     #[cfg(any(test, feature = "testing"))]
-    pub(crate) fn kernel_object_dacl(handle: HANDLE, name: &Path) -> Result<Dacl> {
+    #[doc(hidden)]
+    pub fn kernel_object_dacl(handle: HANDLE, name: &Path) -> Result<Dacl> {
         let info = security_info(
             handle,
             SE_KERNEL_OBJECT,
@@ -734,8 +740,8 @@ mod system {
 
     impl std::error::Error for Unreadable {}
 
-    fn unreadable(path: &Path, what: String) -> Error {
-        Error::os_at("read the permissions of", path, Unreadable(what))
+    fn unreadable(verb: &str, path: &Path, what: String) -> Error {
+        Error::os_at(verb, path, Unreadable(what))
     }
 
     /// Whether `error` is a read of permissions that failed because the object holds something
@@ -760,7 +766,7 @@ mod system {
     /// is live.
     pub(super) unsafe fn parse(owner: PSID, dacl: *mut ACL, path: &Path) -> Result<(Sid, Option<Vec<Ace>>)> {
         // SAFETY: the caller's contract covers `owner`.
-        let owner = unsafe { copy_sid(owner, path)? };
+        let owner = unsafe { copy_sid(owner, "read the permissions of", path)? };
         // SAFETY: the caller's contract covers `dacl`.
         let aces = unsafe { parse_dacl(dacl, path)? };
         Ok((owner, aces))
@@ -804,6 +810,7 @@ mod system {
                 ACCESS_DENIED_CALLBACK_ACE_TYPE => (false, true),
                 other => {
                     return Err(unreadable(
+                        "read the permissions of",
                         path,
                         format!("an entry of type {other}, which goetia cannot read"),
                     ));
@@ -811,7 +818,7 @@ mod system {
             };
             aces.push(Ace {
                 // SAFETY: `trustee` points at the SID inside the entry just read.
-                trustee: unsafe { copy_sid(trustee, path)? },
+                trustee: unsafe { copy_sid(trustee, "read the permissions of", path)? },
                 mask,
                 flags: header.AceFlags,
                 allow,
@@ -821,14 +828,14 @@ mod system {
         Ok(Some(aces))
     }
 
-    /// The bytes of the SID at `sid`, or an error naming `path` when it is null or not a valid SID.
+    /// The bytes of the SID at `sid`, or an error that `verb`s `path` when it is null or not a valid SID.
     ///
     /// # Safety
     /// As [`sid::copy_sid`](crate::backend::scm::sid::copy_sid).
-    unsafe fn copy_sid(sid: PSID, path: &Path) -> Result<Sid> {
+    pub(super) unsafe fn copy_sid(sid: PSID, verb: &str, path: &Path) -> Result<Sid> {
         // SAFETY: the caller's contract is `sid::copy_sid`'s.
         unsafe { crate::backend::scm::sid::copy_sid(sid) }
-            .ok_or_else(|| unreadable(path, "an account that is not a valid SID".to_string()))
+            .ok_or_else(|| unreadable(verb, path, "an account that is not a valid SID".to_string()))
     }
 }
 
