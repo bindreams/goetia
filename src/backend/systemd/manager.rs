@@ -73,10 +73,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use discover::{DROPIN_SEARCH_DIRS, Fragment};
-use systemctl::{
-    GateScope, daemon_reload, daemon_reload_or_report, disable_impl, enable_impl, gate_scope, kill_impl,
-    request_restart_impl, require_supported, start_impl, status_from_unit, stop_impl,
-};
+use systemctl::{GateScope, Systemctl, gate_scope};
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
 use crate::backend::systemd::generate;
@@ -95,15 +92,33 @@ const UNIT_DIR: &str = "/etc/systemd/system";
 
 // Systemd =============================================================================================================
 
-/// The Linux [`ServiceManager`](crate::manager::ServiceManager). Holds no state of its own: every
-/// operation re-derives what it needs from the filesystem and `systemctl`, so nothing here can go
-/// stale between calls.
-#[derive(Debug, Default)]
-pub struct Systemd;
+/// The Linux [`ServiceManager`](crate::manager::ServiceManager). Holds no state of its own beyond
+/// how it reaches `systemctl`: every operation re-derives what it needs from the filesystem and
+/// `systemctl`, so nothing here can go stale between calls.
+pub struct Systemd {
+    systemctl: Systemctl,
+}
 
 impl Systemd {
     pub fn new() -> Self {
-        Self
+        Self::with(Systemctl::native())
+    }
+
+    /// A manager reaching `systemd` through `systemctl`.
+    fn with(systemctl: Systemctl) -> Self {
+        Self { systemctl }
+    }
+}
+
+impl Default for Systemd {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for Systemd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Systemd").finish_non_exhaustive()
     }
 }
 
@@ -124,7 +139,7 @@ impl Backend for Systemd {
     /// answer holds for the `daemon-reload` after the write.
     fn begin_install(&self, _spec: &DaemonSpec, _desired: &String) -> Result<GateScope> {
         let gate = gate_scope();
-        require_supported()?;
+        self.systemctl.require_supported()?;
         Ok(gate)
     }
 
@@ -169,7 +184,7 @@ impl Backend for Systemd {
         match outcome {
             Outcome::Create => match create_unit(id, definition)? {
                 CreateOutcome::Created => {
-                    daemon_reload_or_report(id)?;
+                    self.systemctl.daemon_reload_or_report(id)?;
                     Ok(WriteOutcome::Done)
                 }
                 CreateOutcome::Raced => Ok(WriteOutcome::Raced),
@@ -184,7 +199,7 @@ impl Backend for Systemd {
                         // partway through — `uninstall` clears its own fragment before its
                         // drop-in for the identical reason.
                         remove_dir_if_present(&dropin_dir(id))?;
-                        daemon_reload_or_report(id)?;
+                        self.systemctl.daemon_reload_or_report(id)?;
                         Ok(WriteOutcome::Done)
                     }
                     ReplaceOutcome::Raced => Ok(WriteOutcome::Raced),
@@ -195,7 +210,7 @@ impl Backend for Systemd {
     }
 
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
-        status_from_unit(&unit_name(snapshot.id().as_str()))
+        self.systemctl.status_from_unit(&unit_name(snapshot.id().as_str()))
     }
 
     /// Each id the unit directories name, read as `read` would. An id whose read did not complete
@@ -245,9 +260,10 @@ impl Backend for Systemd {
         // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop
         // is a means rather than an end, and bounding it would turn a slow-stopping service into a
         // failed uninstall where today it succeeds.
-        stop_impl(id, Budget::Unbounded, Budget::Unbounded.start())?;
+        self.systemctl
+            .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start())?;
 
-        disable_impl(id)?;
+        self.systemctl.disable_impl(id)?;
 
         // Verified removal, mirroring `replace_unit_verified`: the gap since `read` saw the
         // fragment spans two full `systemctl` round-trips, wide enough for something else to have
@@ -266,7 +282,7 @@ impl Backend for Systemd {
         // together: a partial failure here must not leave systemd's loaded view silently stale, the
         // same reasoning `daemon_reload_or_report` documents on the `install` side.
         let dropin_result = remove_dir_if_present(&dropin_dir(id));
-        let reload_result = daemon_reload();
+        let reload_result = self.systemctl.daemon_reload();
         match (dropin_result, reload_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(e), Ok(())) => Err(e),
@@ -282,18 +298,18 @@ impl Backend for Systemd {
     }
 
     fn enable(&self, snapshot: Fragment) -> Result<()> {
-        enable_impl(snapshot.id().as_str())
+        self.systemctl.enable_impl(snapshot.id().as_str())
     }
 
     fn disable(&self, snapshot: Fragment) -> Result<()> {
-        disable_impl(snapshot.id().as_str())
+        self.systemctl.disable_impl(snapshot.id().as_str())
     }
 
     fn start(&self, snapshot: Fragment, budget: Budget, _reservation: &mut Held) -> Result<()> {
         // Derived at verb entry. It bounds only the wait for the job, never whether the job is
         // enqueued — see `run_verb`.
         let deadline = budget.start();
-        start_impl(snapshot.id().as_str(), budget, deadline)
+        self.systemctl.start_impl(snapshot.id().as_str(), budget, deadline)
     }
 
     /// One `systemctl restart --no-block`: one job, so no start can overtake
@@ -301,7 +317,7 @@ impl Backend for Systemd {
     /// still activating, folds the restart into the start already running —
     /// see `request_restart_impl`.
     fn request_restart(&self) -> Option<NativeRestart<Self>> {
-        Some(|_, snapshot| request_restart_impl(snapshot.id().as_str()))
+        Some(|mgr, snapshot| mgr.systemctl.request_restart_impl(snapshot.id().as_str()))
     }
 
     /// The plain request-only start. `restart` never issues it here — see
@@ -314,11 +330,11 @@ impl Backend for Systemd {
     fn stop(&self, snapshot: Fragment, budget: Budget, _reservation: &mut Held) -> Result<()> {
         // Derived at verb entry, as for `start`.
         let deadline = budget.start();
-        stop_impl(snapshot.id().as_str(), budget, deadline)
+        self.systemctl.stop_impl(snapshot.id().as_str(), budget, deadline)
     }
 
     fn kill(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<()> {
-        kill_impl(snapshot.id().as_str())
+        self.systemctl.kill_impl(snapshot.id().as_str())
     }
 }
 
