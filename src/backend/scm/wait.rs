@@ -204,7 +204,7 @@ pub trait ScmActor {
 /// can be running again, by a recovery restart, when the STOP lands; that stale `STOPPED` would confirm
 /// a stop of a running service.
 ///
-/// `shim` is whether the service runs a goetia shim, whose incomplete-stop record fails the stop: see
+/// `shim` is whether the stop's record is judged, whose incomplete-stop one fails the stop: see
 /// [`wait_after_stop`].
 pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, shim: bool) -> io::Result<Waited> {
     // Issued whatever is left of the budget: only the *waiting* is bounded.
@@ -495,7 +495,7 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 ///
 /// Every `STOPPED` it confirms is judged as [`wait_after_stop`] judges it, whether the STOP was this
 /// call's, one already under way, or a service found stopped: the record of a stopped service describes
-/// its last stop, which is its state now. `shim` is whether the service runs a goetia shim.
+/// its last stop, which is its state now. `shim` is whether the stop's record is judged (see [`judged`]).
 ///
 /// It does not use [`wait_until`]: this loop ignores its first arm's status on purpose, and its
 /// `RUNNING`/`PAUSED` action needs the actor, which `wait_until` holds.
@@ -642,7 +642,7 @@ pub enum StopSeen {
 /// is `STOPPED` and `STOP_PENDING`, and a first read of anything else waits; after [`StopSeen::Pending`]
 /// the first arm is `STOPPED` alone, and a first read of anything but `STOP_PENDING` or `STOPPED` fails.
 ///
-/// A `STOPPED` is judged by the record it carries when `shim` says the service runs a goetia shim (see
+/// A `STOPPED` is judged by the record it carries when `shim` says it is judged (see
 /// [`judged`]): the one place a stop's record is read, for `stop` and `uninstall` alike.
 pub fn wait_after_stop<A: ScmActor>(
     a: &mut A,
@@ -696,10 +696,11 @@ pub(crate) fn is_incomplete_stop(e: &io::Error) -> bool {
 }
 
 /// What a wait for `STOPPED` came to, judged: a confirmed `STOPPED` whose record is the shim's
-/// incomplete-stop one is the failure [`IncompleteStop`] when `shim` says the service runs a goetia shim
-/// (its registered image is one), whatever its `type`, and any other record, or a service found gone,
-/// which has none, is a stop. Whether the vocabulary applies is the caller's to say: a service's own
-/// `(0, 1003)` is not the shim's.
+/// incomplete-stop one is the failure [`IncompleteStop`] when `shim` says the record is to be judged, and
+/// any other record, or a service found gone, which has none, is a stop. `shim` is true for a service
+/// that runs a goetia shim and for one not known not to (see `ShimAnswer::judges_stop_record`): a
+/// service's own `(0, 1003)` is not the shim's, and a refusal to call a stop complete costs a re-run
+/// where a tree left running costs a second copy beside it.
 fn judged(end: WaitEnd, shim: bool) -> io::Result<Waited> {
     match end {
         WaitEnd {
