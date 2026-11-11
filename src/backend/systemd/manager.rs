@@ -7,16 +7,16 @@
 //! 1. **A write must not clobber something it did not classify.** `rename(2)` unconditionally
 //!    replaces its destination, so a plain classify-then-write is a TOCTOU window: a package
 //!    postinst or a concurrent invocation can drop a foreign unit into the gap and have it destroyed
-//!    by the very code path that exists to refuse that. [`write::create_unit`] uses
+//!    by the very code path that exists to refuse that. `write::create_unit` uses
 //!    [`tempfile::NamedTempFile::persist_noclobber`] (`linkat(2)` without replace semantics) for the
-//!    create case; [`write::replace_unit_verified`] closes the same gap for the update/regenerate
+//!    create case; `write::replace_unit_verified` closes the same gap for the update/regenerate
 //!    case by quarantining the current occupant under a temporary name and verifying its identity
 //!    before committing to either direction.
 //! 2. **A masked unit is not absent.** `systemctl mask` replaces the fragment with a symlink to
 //!    `/dev/null`; reading it yields empty text, and a naive read-then-extract would see `Ok(None)`
 //!    and let `install` write over it, silently unmasking a deliberately-masked service.
-//!    [`discover::classify_and_read`] opens the path `O_PATH | O_NOFOLLOW` and classifies the
-//!    descriptor by `fstat`, reporting any non-regular file as [`discover::RawState::NotOurs`] —
+//!    `discover::classify_and_read` opens the path `O_PATH | O_NOFOLLOW` and classifies the
+//!    descriptor by `fstat`, reporting any non-regular file as `discover::RawState::NotOurs` —
 //!    always `Ownership::Foreign` — without ever opening it for reading. It answers the same for a
 //!    regular file whose bytes turn out not to be UTF-8, which is the same claim by a different
 //!    proof: goetia writes UTF-8 ini and nothing else. Only a read that *did not complete* is
@@ -25,7 +25,7 @@
 //! 3. **Drop-ins are drift.** `systemctl edit` — the officially recommended way to add exactly the
 //!    `MemoryMax=`/`After=` the design cites — writes `<id>.service.d/override.conf` and leaves the
 //!    fragment itself byte-identical, so drift detection over the fragment alone misses it entirely.
-//!    [`discover::installed`] folds `<id>.service.d`'s `*.conf` contents — across every root of
+//!    `discover::installed` folds `<id>.service.d`'s `*.conf` contents — across every root of
 //!    systemd's system unit search path, `/etc/systemd/system.control` included — into the text
 //!    handed to `decide` (never into what is actually written); `decide::decide`'s own
 //!    `external` parameter — never a backend-local override of its `Outcome` — closes the one
@@ -39,8 +39,8 @@
 //!    `service.d`) are deliberately outside this — see `discover`'s module doc comment.
 //! 4. **Permissions.** `NamedTempFile` is created mode 0600; after persisting, the unit would be
 //!    root-only, breaking the promise that `list`/`show`/`diff` need no elevation.
-//!    [`write::write_temp_unit`] `chmod`s 0644 before persisting.
-//! 5. **Parent directories.** [`dirs::ensure_parent_dirs`] creates and, for a non-root account,
+//!    `write::write_temp_unit` `chmod`s 0644 before persisting.
+//! 5. **Parent directories.** `dirs::ensure_parent_dirs` creates and, for a non-root account,
 //!    `chown`s the parents of `logs` and `cwd` while still elevated. A missing log directory fails
 //!    the unit at start (`ENOENT` opening `StandardOutput=append:`), and a missing `cwd` fails it
 //!    with `200/CHDIR`. Only path components this call actually creates are touched; an
@@ -56,7 +56,7 @@
 //!    backend reporting it off `<id>.service`'s absence alone would certify "confirmed gone" for an
 //!    id systemd still applies a drop-in to, or still enrolls at boot through a
 //!    `multi-user.target.wants` link. `discover::residue` is the one predicate behind
-//!    [`discover::fragmentless`], which every read of an id with no fragment asks — `install`'s and
+//!    `discover::fragmentless`, which every read of an id with no fragment asks — `install`'s and
 //!    every other verb's through `read`, so no two verbs can describe one filesystem state
 //!    differently, and `list`'s through `scan`, for every id it enumerates with no readable
 //!    fragment. A listing that asked less would leave out an id `status` answers

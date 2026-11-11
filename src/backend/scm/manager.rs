@@ -1,7 +1,7 @@
 //! The effectful SCM backend (`#[cfg(windows)]`).
 //!
 //! Handles both `Kind::Simple` (under the host the manager's
-//! [`ShimProvider`](crate::shim::ShimProvider) supplies, which runs `shim::run`) and
+//! [`ShimProvider`] supplies, which runs `shim::run`) and
 //! `Kind::Managed`; `generate::registration` builds the `ImagePath`/blob
 //! for both. `Kind::Simple`'s own integration tests live in
 //! `tests/shim_integration.rs`, not `tests/scm_integration.rs`, because they
@@ -36,7 +36,7 @@
 //! `DeleteService` on a running service only *marks* it for deletion: the record survives until
 //! every `SC_HANDLE` closes and the service stops, so the next `install` would meet
 //! `ERROR_SERVICE_MARKED_FOR_DELETE`. A restart policy adds a race: SCM can start the service
-//! between any read of its state and a later call. [`uninstall_locked`] therefore opens its wait
+//! between any read of its state and a later call. `uninstall_locked` therefore opens its wait
 //! actor first, sets the start type to `SERVICE_DISABLED` (a disabled service's recovery restart
 //! fails with `ERROR_SERVICE_DISABLED` and `StartService` is refused, so a restart queued or made
 //! after the disable starts nothing; a disable that lands once an attempt has begun does not stop
@@ -66,7 +66,7 @@
 //! meaningful failure mode here (see point 1 for the window that *is*).
 //! `enable`/`disable` flip between `SERVICE_AUTO_START` and
 //! `SERVICE_DEMAND_START` after the fact, via `ChangeServiceConfigW` with
-//! `SERVICE_NO_CHANGE` on every other field (see [`set_start_type`]).
+//! `SERVICE_NO_CHANGE` on every other field (see `set_start_type`).
 //!
 //! ## `env` on `type: managed` (spec §8 must-verify #5)
 //!
@@ -512,7 +512,7 @@ impl Backend for Scm {
         }
     }
 
-    /// [`super::wait::request_start_after_stop`]: every
+    /// `super::wait::request_start_after_stop`: every
     /// `ERROR_SERVICE_ALREADY_RUNNING` is a refusal here, since a `type:
     /// simple` service reads `RUNNING` until its shim has taken the stop.
     fn request_start_after_stop(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {

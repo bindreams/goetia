@@ -24,19 +24,19 @@
 //! than as one opaque quoted string.
 //!
 //! **That readback path has a real, residual limitation.** Real
-//! `CommandLineToArgvW` parses argv[0] (the program name) under different rules
+//! `CommandLineToArgvW` parses `argv[0]` (the program name) under different rules
 //! than every later argument: a backslash is always literal there, never doubled
 //! or halved the way `windows-service`'s escaping and every later argument's
 //! parsing treat it. So an `executable` that both needs quoting (holds a
 //! space, tab, newline or vertical tab) *and* ends in a backslash cannot be losslessly recovered from
 //! `lpBinaryPathName` — `windows-service` writes a doubled trailing backslash to
-//! protect its closing quote, and argv[0] parsing has no rule that undoes that
+//! protect its closing quote, and `argv[0]` parsing has no rule that undoes that
 //! doubling. See `generate_tests.rs`'s
 //! `windows_style_split_matches_real_command_line_to_argv_w` (which pins the
-//! argv[0] rule against the real Win32 API) and
+//! `argv[0]` rule against the real Win32 API) and
 //! `executable_trailing_backslash_does_not_round_trip_through_argv0` (which
 //! documents the writer's behaviour). `executable` is a `HostCommand`'s `exe` or, for a `type: managed`
-//! daemon, `command[0]`; one the writer would rewrite is refused, see [`refuse_unwritable_executable`]:
+//! daemon, `command[0]`; one the writer would rewrite is refused, see `refuse_unwritable_executable`:
 //! a `command[0]` by [`registration`], and a host's path by [`install_registration`], which `install` and
 //! `diff` call.
 
@@ -273,7 +273,7 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
 ///
 /// Its writer wraps the path in quotes when it is empty or holds a [`WRITER_QUOTE_TRIGGERS`]
 /// character. Inside those quotes it escapes a `"` with a backslash and doubles a trailing
-/// backslash run. argv[0] is read literally up to the next `"`, so neither undoes: a quoted path
+/// backslash run. `argv[0]` is read literally up to the next `"`, so neither undoes: a quoted path
 /// holding a `"`, or ending in any backslashes, registers as another path. An unquoted path is
 /// written as is.
 ///

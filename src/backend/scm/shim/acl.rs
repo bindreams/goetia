@@ -6,8 +6,8 @@
 //! and of every ancestor up to the volume root, over the path as given and over its final path
 //! (links resolved). [`verdict`]
 //! judges plain data (SIDs as bytes, masks as `u32`) and is unit-tested on every host; reading the
-//! data and [`FolderCheck`] are Windows-only. What counts as a link, and how other reparse points
-//! are read, is in [`FolderCheck::check`].
+//! data and `FolderCheck` are Windows-only. What counts as a link, and how other reparse points
+//! are read, is in `FolderCheck::check`.
 //!
 //! What is judged, per object, folders before files and each nearest the target first:
 //! - an untrusted owner refuses (an owner can always change the DACL);

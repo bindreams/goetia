@@ -1,7 +1,7 @@
 //! `goetia daemon status [ID...]`
 //!
 //! Read-only: never checks elevation. Every entry renders through
-//! [`format_status_line`], so `status` has one human shape however invoked.
+//! `format_status_line`, so `status` has one human shape however invoked.
 
 use std::io::Write;
 
