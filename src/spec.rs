@@ -62,7 +62,7 @@ fn is_valid_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// A daemon id that has already been checked against [`is_valid_id`].
+/// A daemon id that has already been checked against `is_valid_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Id(String);
 

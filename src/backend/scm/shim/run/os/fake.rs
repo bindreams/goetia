@@ -109,7 +109,6 @@ struct ProcState {
     exit: Option<ExitStatus>,
     killed: bool,
     dropped: bool,
-    detached: bool,
 }
 
 fn status(code: i32) -> ExitStatus {
@@ -147,7 +146,6 @@ impl FakeProcess {
                 exit: None,
                 killed: false,
                 dropped: false,
-                detached: false,
             }),
             ended: Condvar::new(),
         }))
@@ -201,13 +199,9 @@ impl FakeProcess {
         lock(&self.0.state).killed
     }
 
-    /// Whether the supervisor's instance of it was dropped, without being detached.
+    /// Whether the supervisor's instance of it was dropped.
     pub(crate) fn dropped(&self) -> bool {
         lock(&self.0.state).dropped
-    }
-
-    pub(crate) fn detached(&self) -> bool {
-        lock(&self.0.state).detached
     }
 }
 
@@ -215,7 +209,6 @@ impl FakeProcess {
 struct Instance {
     proc: Arc<Proc>,
     fake: Arc<Shared>,
-    detached: bool,
 }
 
 impl Instance {
@@ -266,18 +259,11 @@ impl Spawned for Instance {
         let reply = lock(&self.proc.state).tree_kills.pop_front();
         self.kill_with("kill_tree", reply)
     }
-
-    fn detach(mut self: Box<Self>) {
-        self.detached = true;
-        lock(&self.proc.state).detached = true;
-    }
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        if !self.detached {
-            lock(&self.proc.state).dropped = true;
-        }
+        lock(&self.proc.state).dropped = true;
     }
 }
 
@@ -572,7 +558,6 @@ impl Os for Fake {
                 Ok(Box::new(Instance {
                     proc,
                     fake: Arc::clone(&self.shared),
-                    detached: false,
                 }))
             }
         }

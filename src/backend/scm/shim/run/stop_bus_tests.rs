@@ -140,7 +140,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
 /// A panic between the hand-off and the join detaches the waiter, which still holds an
 /// `Arc<dyn Spawned>` clone — so the caller's own `Arc` going out of scope during the unwind is not
 /// the last reference and the daemon's drop, which kills its tree, does not run.
-/// [`StopBus::wait_for_child_or_stop`]'s doc comment states this; this is what will notice when
+/// [`Supervisor::wait_for_child_or_stop`]'s doc comment states this; this is what will notice when
 /// someone makes one of its `expect`s recoverable, reorders the kill and the join, or adds the
 /// `Drop`-guard join that would turn this unwind into a block.
 ///

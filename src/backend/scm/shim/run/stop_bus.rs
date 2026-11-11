@@ -448,8 +448,7 @@ impl Drop for ReportOnPanic<'_> {
 // Teardown ============================================================================================================
 
 /// What [`kill_for_stop`] reached.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Teardown {
+pub(super) enum Teardown {
     /// `kill_tree` succeeded.
     Tree,
     /// `kill_tree` failed and the direct child was killed: its descendants were not reached.
@@ -463,16 +462,15 @@ pub(crate) enum Teardown {
 /// so that a restart or `start` never runs beside a tree nobody told to end. `true` is `kill_tree`
 /// succeeding, which is not proof the members have finished exiting. `false` (logged) means the
 /// tree may still be running and the stop must be reported as incomplete.
-pub(crate) fn terminate_exited_tree(child: &dyn Spawned, log: &Log, id: &str) -> bool {
+pub(super) fn terminate_exited_tree(child: &dyn Spawned, log: &Log, id: &str) -> bool {
     let Err(e) = child.kill_tree() else { return true };
     log.failure(id, &exited_tree_unkilled(&e));
     false
 }
 
-/// Kill the daemon for a commanded stop: the whole contained tree, or failing that the direct
-/// child alone. See [`Supervisor::wait_for_child_or_stop`], the only caller, for what it does with
-/// [`Teardown::Failed`]. Each failure is logged as it happens.
-pub(crate) fn kill_for_stop(child: &dyn Spawned, log: &Log, id: &str) -> Teardown {
+/// Kill the daemon: the whole contained tree, or failing that the direct child alone. Each failure
+/// is logged as it happens; the [`Teardown`] says how far the kill reached.
+pub(super) fn kill_for_stop(child: &dyn Spawned, log: &Log, id: &str) -> Teardown {
     let Err(e) = child.kill_tree() else {
         return Teardown::Tree;
     };
@@ -500,7 +498,7 @@ fn kill_tree_failed(e: &cosca::error::Error) -> String {
 }
 
 /// What every report of a daemon that may still be running says SCM is told.
-const NOT_RESTARTED: &str = " — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
+pub(super) const NOT_RESTARTED: &str = " — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
 
 fn fallback_kill_failed(e: &cosca::error::Error) -> String {
     format!("fallback kill: {e}; the daemon was neither killed nor reaped and may still be running{NOT_RESTARTED}")

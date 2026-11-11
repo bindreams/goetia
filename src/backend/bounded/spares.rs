@@ -7,32 +7,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::fs::File;
-use std::io::{self, PipeReader, Seek as _};
+use std::io::{self, Seek as _};
 use std::marker::PhantomData;
 use std::process::ExitStatus;
-use std::thread;
 
 use crossbeam_channel::Receiver;
 
 use super::{Chunk, drain};
 use crate::backend::standby::Standby;
-
-// Standby =============================================================================================================
-
-impl<T: Send + 'static> Standby<T> {
-    /// A standby on a `std::thread`, whose handle is dropped: a failure to make it is `io::Error`,
-    /// and under test the hook may refuse it.
-    fn new(name: &str, serve: impl FnOnce(T) + Send + 'static) -> io::Result<Standby<T>> {
-        #[cfg(test)]
-        test_hook::make(test_hook::Kind::Thread)?;
-        let (standby, _thread) = Standby::with(
-            name,
-            |name, run| thread::Builder::new().name(name.to_string()).spawn(run),
-            serve,
-        )?;
-        Ok(standby)
-    }
-}
 
 // Reaper ==============================================================================================================
 
@@ -40,12 +22,10 @@ impl<T: Send + 'static> Standby<T> {
 /// running: it still exits, and a caller that outlives it must not collect one zombie per expiry.
 /// See [`Reservation`].
 ///
-/// The thread never kills the child, not even after the reap. It [`cosca::Child::detach`]es the
-/// reaped child rather than dropping it, because `Drop` tears a contained tree down, and after the
-/// reap that is the reap-then-recycle hazard [`super::wait_bounded`]'s kill path is ordered to
-/// avoid: macOS's `FdMarker` `killpg`s the root's pgid, which the kernel may by then have handed to
-/// another group. `detach` touches no pid. With nothing to reap — the request exited inside its
-/// budget — the thread ends.
+/// The thread never kills the child, not even after the reap: an expired request is left running.
+/// It [`cosca::Child::detach`]es the reaped child rather than dropping it, because `Drop` tears the
+/// contained tree down, and the request's descendants may still be in it. With nothing to reap, the
+/// request having exited inside its budget, the thread ends.
 #[derive(Debug)]
 pub(crate) struct Reaper(Standby<cosca::Child>);
 
@@ -65,7 +45,7 @@ impl Reaper {
     ) -> io::Result<Reaper> {
         Standby::new("goetia-reaper", move |child: cosca::Child| {
             let status = wait(&child);
-            child.detach();
+            let_go(child);
             reaped(status);
         })
         .map(Reaper)
@@ -74,8 +54,16 @@ impl Reaper {
     pub(super) fn reap(self, child: cosca::Child) {
         if let Err(child) = self.0.hand(child) {
             debug_assert!(false, "the reaper thread ended before it was handed its child");
-            child.detach(); // never killed
+            let_go(child); // never killed
         }
+    }
+}
+
+/// [`cosca::Child::detach`] it. Only Windows' disarm can be refused, and nothing here runs there:
+/// on a refusal the child would come back armed, and dropping it would kill the tree.
+fn let_go(child: cosca::Child) {
+    if let Err((_armed, e)) = child.detach() {
+        debug_assert!(false, "detach refused off Windows: {e}");
     }
 }
 
@@ -85,7 +73,7 @@ impl Reaper {
 /// one role that must see output before the child exits.
 #[derive(Debug)]
 pub(super) struct Listener {
-    standby: Standby<PipeReader>,
+    standby: Standby<cosca::PipeReader>,
     heard: Receiver<Chunk>,
 }
 
@@ -98,7 +86,7 @@ impl Listener {
 
     /// Start reading `pipe`: what it holds arrives on the returned receiver, which disconnects at its
     /// EOF. `None` — a stream that was not piped — reads as an immediate EOF, never a panic.
-    pub(super) fn listen(self, pipe: Option<PipeReader>) -> Receiver<Chunk> {
+    pub(super) fn listen(self, pipe: Option<cosca::PipeReader>) -> Receiver<Chunk> {
         if let Some(pipe) = pipe {
             let handed = self.standby.hand(pipe);
             debug_assert!(
@@ -185,7 +173,7 @@ impl Kept {
     /// be writing to them.
     pub(crate) fn again(&self) -> io::Result<Reservation> {
         #[cfg(test)]
-        test_hook::make(test_hook::Kind::Reuse)?;
+        test_hook::reuse()?;
         let files = self
             .files
             .iter()
@@ -284,27 +272,21 @@ pub(super) fn listener() -> io::Result<Listener> {
 /// own, whatever reservation it is handed.
 pub(super) fn make_file() -> io::Result<File> {
     #[cfg(test)]
-    test_hook::make(test_hook::Kind::TempFile)?;
+    test_hook::make_file()?;
     tempfile::tempfile()
 }
 
 // test_hook ===========================================================================================================
 
-/// Makes thread or temp-file creation fail on demand, on this thread only, so the paths that must
-/// refuse to send anything when it does are testable.
+/// Test controls: per-thread limits on temp files and reuses, a per-thread spawn count, injected
+/// spawn and wait failures, and readers of the pool and of a reservation.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
 
-    #[derive(Debug, Clone, Copy)]
-    pub(crate) enum Kind {
-        Thread,
-        TempFile,
-        Reuse,
-    }
+    use crate::backend::test_allowance::{Allowance, spend};
 
     thread_local! {
-        static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
         static TEMP_FILES: Cell<Option<usize>> = const { Cell::new(None) };
         static REUSES: Cell<Option<usize>> = const { Cell::new(None) };
         static SPAWNS: Cell<usize> = const { Cell::new(0) };
@@ -331,6 +313,16 @@ pub(crate) mod test_hook {
         SPAWN_FAILS.set(Some(error));
     }
 
+    /// What a cosca spawn fails with once its program may have started, `source` being what failed.
+    pub(crate) fn may_have_started(source: cosca::error::Error) -> cosca::error::Error {
+        cosca::error::Error::MayHaveStarted {
+            fate: cosca::error::ChildFate::Reaped,
+            wrapper_elevated: false,
+            source: Box::new(source),
+            unreaped: None,
+        }
+    }
+
     /// How many listeners this thread's pool holds now.
     pub(crate) fn pooled() -> usize {
         super::SPARES.with_borrow(|pool| pool.len())
@@ -352,57 +344,22 @@ pub(crate) mod test_hook {
         SPAWN_FAILS.take().map(|error| error())
     }
 
-    fn allowance(kind: Kind) -> &'static std::thread::LocalKey<Cell<Option<usize>>> {
-        match kind {
-            Kind::Thread => &THREADS,
-            Kind::TempFile => &TEMP_FILES,
-            Kind::Reuse => &REUSES,
-        }
-    }
-
-    /// Let this thread make only `n` more threads, until the returned guard drops.
-    pub(crate) fn threads(n: usize) -> Allowance {
-        allow(Kind::Thread, n)
-    }
-
     /// Let this thread make only `n` more temp files, until the returned guard drops.
     pub(crate) fn temp_files(n: usize) -> Allowance {
-        allow(Kind::TempFile, n)
+        Allowance::set(&TEMP_FILES, n)
     }
 
     /// Let this thread run only `n` more [`super::Kept::again`]s, until the returned guard drops.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn reuses(n: usize) -> Allowance {
-        allow(Kind::Reuse, n)
+        Allowance::set(&REUSES, n)
     }
 
-    fn allow(kind: Kind, n: usize) -> Allowance {
-        allowance(kind).set(Some(n));
-        Allowance(kind)
+    pub(super) fn make_file() -> std::io::Result<()> {
+        spend(&TEMP_FILES, "no temp file may be made (test hook)")
     }
 
-    /// See [`threads`] and [`temp_files`].
-    pub(crate) struct Allowance(Kind);
-
-    impl Drop for Allowance {
-        fn drop(&mut self) {
-            allowance(self.0).set(None);
-        }
-    }
-
-    pub(super) fn make(kind: Kind) -> std::io::Result<()> {
-        let left = allowance(kind);
-        match left.get() {
-            Some(0) => Err(std::io::Error::other(match kind {
-                Kind::Thread => "no thread may be made (test hook)",
-                Kind::TempFile => "no temp file may be made (test hook)",
-                Kind::Reuse => "no kept file may be reused (test hook)",
-            })),
-            Some(n) => {
-                left.set(Some(n - 1));
-                Ok(())
-            }
-            None => Ok(()),
-        }
+    pub(super) fn reuse() -> std::io::Result<()> {
+        spend(&REUSES, "no kept file may be reused (test hook)")
     }
 }

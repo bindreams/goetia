@@ -9,7 +9,7 @@
 //! pattern (`QueryServiceStatusEx` in a `Sleep` loop with a hardcoded bound)
 //! is exactly the sleep-poll this project forbids. The orchestration below
 //! is a pure state machine over [`ScmActor`], unit-tested with a fake in
-//! `wait_tests.rs`; [`system::SystemScmActor`] drives the real SCM.
+//! `wait_tests.rs`; `system::SystemScmActor` drives the real SCM.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::io;
@@ -628,7 +628,7 @@ pub enum StopSeen {
 }
 
 /// The wait of a stop once the STOP is accepted or known to be under way: arm for `STOPPED` (and
-/// `STOP_PENDING`), which cancels the settle registration if [`settle_and_stop`] acted on a read and left
+/// `STOP_PENDING`), which cancels the settle registration if `settle_and_stop` acted on a read and left
 /// it unfired.
 ///
 /// After [`StopSeen::Requested`], what the first arm reads other than `STOPPED` waits: the STOP may not
@@ -1009,7 +1009,7 @@ pub(crate) fn request_stop<A: ScmActor>(a: &mut A) -> io::Result<()> {
 
 // handle teardown =====================================================================================================
 
-/// The teardown half of [`system::SystemScmActor`], behind a trait for the
+/// The teardown half of `system::SystemScmActor`, behind a trait for the
 /// same reason [`ScmActor`] is one: the thing that matters here is an
 /// *order*, and an order is only assertable if a fake can record it.
 pub(crate) trait ScmHandles {
