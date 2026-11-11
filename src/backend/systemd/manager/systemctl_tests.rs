@@ -738,17 +738,6 @@ fn an_exit_that_enqueued_a_job_took_the_request() {
 
 // The manager boundary ================================================================================================
 
-/// A stand-in `systemctl` that passes the version gate, and answers anything else with `rest`.
-fn gate_passes_then(rest: &str) -> String {
-    format!(
-        "case \"$*\" in \
-           'show --property=Version --value') echo 257;; \
-           --version) echo 'systemd 257 (257)';; \
-           *) {rest};; \
-         esac"
-    )
-}
-
 type Run = Box<dyn Fn(&Systemctl) -> Result<()>>;
 
 /// One way in to the manager, named.
@@ -870,26 +859,33 @@ fn no_request_is_sent_before_the_manager_is_asked() {
 }
 
 /// The backstop: a `systemctl` past the gate that says it ignored what it was asked is refused on
-/// every path, and never read as a success — in every wording [`IGNORED`] lists, on either
-/// stream. The stand-in says so only when its log level is audible, as a real one under an
-/// inherited `SYSTEMD_LOG_LEVEL=warning` would not, so every path must also make it audible.
+/// every path, and never read as a success — in every wording [`IGNORED`] lists, on either stream.
+/// That every path asks it audibly is pinned by `the_paths_that_do_not_bound_keep_the_announcement_audible`
+/// and `the_bounded_path_keeps_the_announcement_audible`.
 #[skuld::test]
 fn a_systemctl_that_ignored_the_request_is_refused_on_every_path() {
-    for (report, stream) in [
-        ("Running in chroot, ignoring command '$1'", ">&2"),
-        ("Running in chroot, ignoring request: $1", ">&2"),
-        ("Running in chroot, ignoring request.", ">&2"),
-        ("Running in chroot, ignoring request.", ""),
+    for (report, on_stderr) in [
+        ("Running in chroot, ignoring command '$1'", true),
+        ("Running in chroot, ignoring request: $1", true),
+        ("Running in chroot, ignoring request.", true),
+        ("Running in chroot, ignoring request.", false),
     ] {
-        let script = gate_passes_then(&format!(
-            "[ \"$SYSTEMD_LOG_LEVEL\" = info ] && [ \"$SYSTEMD_LOG_TARGET\" = console ] && echo \"{report}\" {stream}; \
-             exit 0"
-        ));
-        let systemctl = real_sh(&script, "systemctl");
-        for Way { name, run, .. } in every_path() {
+        for Way { name, gated, run } in every_path() {
             let verb = name.split(' ').next().unwrap();
             let said = report.replace("$1", verb);
-            assert_no_manager(run(&systemctl), &said, &format!("{name} ({report:?} {stream:?})"));
+            let line = format!("{said}\n");
+            let (stdout, stderr) = if on_stderr {
+                ("", line.as_str())
+            } else {
+                (line.as_str(), "")
+            };
+            let probes = if gated { gate_passes() } else { Vec::new() };
+            let fake = Fake::new(probes.into_iter().chain([reply(&[verb], exited(0, stdout, stderr))]));
+
+            let result = run(&on_booted(fake.clone()));
+
+            assert_no_manager(result, &said, &format!("{name} ({report:?}, stderr: {on_stderr})"));
+            fake.assert_spent(&name);
         }
     }
 }
