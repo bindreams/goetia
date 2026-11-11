@@ -776,9 +776,9 @@ fn an_undecodable_blob_leaves_the_registered_image_to_decide_and_travels_with_th
     }
 }
 
-/// `stop` and `uninstall` judge the incomplete-stop record, and `uninstall` holds the process, for a
-/// shim and for an answer that is unknown: a wrong refusal costs a re-run, a wrong acceptance leaves a
-/// tree running.
+/// `stop` and `uninstall` judge the incomplete-stop record, and `uninstall` takes the install lock, for
+/// a shim and for an answer that is unknown: a wrong refusal costs a re-run, a wrong acceptance leaves
+/// a tree running.
 #[skuld::test]
 fn only_a_service_known_not_to_run_a_shim_is_left_unjudged() {
     let said = |kind| ShimAnswer { kind, blob_error: None };
@@ -786,36 +786,6 @@ fn only_a_service_known_not_to_run_a_shim_is_left_unjudged() {
     assert!(said(ShimKind::Shim).judges_stop_record());
     assert!(said(ShimKind::Unknown).judges_stop_record());
     assert!(!said(ShimKind::NotShim).judges_stop_record());
-}
-
-/// An incomplete stop of a service judged as a shim's over a blob that would not decode says so, and
-/// why: the user is not told of a shim's record for a service that may not run one. Over a blob
-/// that decoded, or a service known not to run a shim, the failure is as it was.
-#[skuld::test]
-fn an_incomplete_stop_names_the_blob_read_error_that_got_the_service_judged() {
-    let id = Id::try_from("frpc").unwrap();
-    let failed = || Error::os("stop `frpc`", std::io::Error::other("incomplete stop"));
-    let corrupt = Some(Arc::new(Error::blob("invalid blob JSON: EOF")));
-
-    for kind in [ShimKind::Unknown, ShimKind::Shim] {
-        let said = ShimAnswer {
-            kind,
-            blob_error: corrupt.clone(),
-        }
-        .explain_incomplete_stop(&id, failed())
-        .report()
-        .to_string();
-        assert!(said.contains("incomplete stop"), "{kind:?}: {said}");
-        assert!(said.contains("judged as a shim's"), "{kind:?}: {said}");
-        assert!(said.contains("invalid blob JSON: EOF"), "{kind:?}: {said}");
-    }
-    for (kind, blob_error) in [(ShimKind::Shim, None), (ShimKind::NotShim, corrupt)] {
-        let said = ShimAnswer { kind, blob_error }
-            .explain_incomplete_stop(&id, failed())
-            .report()
-            .to_string();
-        assert!(!said.contains("blob"), "{kind:?}: {said}");
-    }
 }
 
 /// Only a service that is gone or marked for deletion refuses the read of its host as a matter of
@@ -1282,6 +1252,7 @@ fn an_uninstall_over_an_incomplete_stop_says_it_left_the_service_stopped_disable
     let text = uninstall_failure(&UninstallFailure::DaemonMayRun {
         previous: Some(ServiceStartType::AutoStart),
         marked: false,
+        shim_known: true,
     });
     assert!(text.contains("could not end the daemon's process tree"), "{text}");
     assert!(text.contains("may still be running"), "{text}");
@@ -1302,10 +1273,38 @@ fn an_uninstall_over_an_incomplete_stop_of_a_marked_service_does_not_claim_a_dis
     let text = uninstall_failure(&UninstallFailure::DaemonMayRun {
         previous: None,
         marked: true,
+        shim_known: true,
     });
     assert!(text.contains("may still be running"), "{text}");
     assert!(text.contains("already marked for deletion"), "{text}");
     for stale in ["NOT deleted", "disabled", "goetia daemon kill", "sc.exe delete"] {
         assert!(!text.contains(stale), "`{stale}` is false for a marked service: {text}");
     }
+}
+
+/// A service read as a shim's without its blob has not been shown to run one: the incomplete-stop
+/// code is its own record as far as goetia knows, so the message does not say that the shim recorded
+/// it, and says the daemon may still be running only if the service runs a shim.
+#[skuld::test]
+fn an_uninstall_over_an_incomplete_stop_of_a_service_not_known_to_run_a_shim_does_not_say_the_shim_recorded_it() {
+    let text = uninstall_failure(&UninstallFailure::DaemonMayRun {
+        previous: None,
+        marked: false,
+        shim_known: false,
+    });
+    assert!(text.contains("SCM recorded the code goetia-shim uses"), "{text}");
+    assert!(text.contains("if the service runs a shim"), "{text}");
+    assert!(!text.contains("recorded that goetia-shim could not"), "{text}");
+}
+
+/// Only a blob that decodes as `type: simple` shows that the service runs a shim.
+#[skuld::test]
+fn a_shim_is_known_only_by_a_blob_that_decodes_as_simple() {
+    let corrupt = Arc::new(Error::blob("corrupt"));
+    let shim = format!(r#""C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe" --service-host"#);
+
+    assert!(shim_answer(Ok(&blob_of(Kind::Simple)), no_image).shim_is_known());
+    assert!(!shim_answer(Ok(&blob_of(Kind::Managed)), no_image).shim_is_known());
+    assert!(!shim_answer(Err(&corrupt), || Some(shim.clone())).shim_is_known());
+    assert!(!shim_answer(Err(&corrupt), || None).shim_is_known());
 }

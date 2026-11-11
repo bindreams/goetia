@@ -680,15 +680,36 @@ pub fn wait_after_stop<A: ScmActor>(
 pub(crate) struct IncompleteStop {
     /// Whether it was met reaching `RUNNING`: the start's wording says so.
     failed_start: bool,
+    /// Whether the text says the shim recorded it, as the wait does. A service read as a shim's without
+    /// its blob may have recorded `(0, 1003)` itself, and its stop is told without the claim.
+    shim_known: bool,
+}
+
+impl IncompleteStop {
+    /// The failure of a stop whose service was read as a shim's without its blob (see
+    /// `ShimAnswer::stop_failed`): SCM recorded the code, and what recorded it is not known.
+    pub(crate) fn of_a_stop_read_as_a_shims() -> io::Error {
+        io::Error::other(IncompleteStop {
+            failed_start: false,
+            shim_known: false,
+        })
+    }
 }
 
 impl std::fmt::Display for IncompleteStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let start = if self.failed_start { "; failed start" } else { "" };
-        write!(
-            f,
-            "service stopped with goetia-shim's incomplete-stop record (Win32 0, service-specific 1003{start}): the shim could not show that the daemon's process tree was terminated, so the daemon may still be running; see the shim's log"
-        )
+        if self.shim_known {
+            write!(
+                f,
+                "service stopped with goetia-shim's incomplete-stop record (Win32 0, service-specific 1003{start}): the shim could not show that the daemon's process tree was terminated, so the daemon may still be running; see the shim's log"
+            )
+        } else {
+            write!(
+                f,
+                "service stopped with the code goetia-shim records for an incomplete stop (Win32 0, service-specific 1003{start}): if the service runs a shim, it could not show that the daemon's process tree was terminated, so the daemon may still be running"
+            )
+        }
     }
 }
 
@@ -710,7 +731,10 @@ fn judged(end: WaitEnd, shim: bool) -> io::Result<Waited> {
         WaitEnd {
             waited: Waited::Confirmed,
             exit: Some(exit),
-        } if shim && exit.is_incomplete_stop() => Err(io::Error::other(IncompleteStop { failed_start: false })),
+        } if shim && exit.is_incomplete_stop() => Err(io::Error::other(IncompleteStop {
+            failed_start: false,
+            shim_known: true,
+        })),
         end => Ok(end.waited),
     }
 }
@@ -965,7 +989,10 @@ fn stopped_before_running(kind: Kind, joined_a_start: bool, exit: RecordedExit, 
     // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
     // to confirm. The notification may follow a `RUNNING` the wait never saw.
     if kind == Kind::Simple && exit.is_incomplete_stop() {
-        return Err(io::Error::other(IncompleteStop { failed_start: true }));
+        return Err(io::Error::other(IncompleteStop {
+            failed_start: true,
+            shim_known: true,
+        }));
     }
     // `daemon_ran` is safe to ask here: a host that exits before it connects also
     // records `(0, 0)` with a wait hint (P25 c/d), and that is either our own start

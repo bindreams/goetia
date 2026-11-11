@@ -113,7 +113,8 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
-    EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_on_incomplete_stop, end_process, is_incomplete_stop,
+    EndProcessOutcome, IncompleteStop, StopAndAwaitExitOutcome, Waited, end_on_incomplete_stop, end_process,
+    is_incomplete_stop,
 };
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
@@ -536,15 +537,7 @@ impl Backend for Scm {
         let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, &mut held, shim, |held, deadline| {
             end_held(&id, held, deadline)
         })
-        .map_err(|e| {
-            let incomplete = is_incomplete_stop(&e);
-            let error = Error::os(format!("stop `{id}`"), e);
-            if incomplete {
-                answer.explain_incomplete_stop(&id, error)
-            } else {
-                error
-            }
-        })
+        .map_err(|e| answer.stop_failed(&id, e))
         .and_then(|outcome| match outcome {
             StopAndAwaitExitOutcome::Stopped => Ok(()),
             // The STOP was sent and its effect is not confirmed, as when SCM does not answer in time.
@@ -1090,18 +1083,15 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
             let incomplete = is_incomplete_stop(&e);
             let state = match (incomplete, marked) {
-                (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
+                (true, _) => UninstallFailure::DaemonMayRun {
+                    previous,
+                    marked,
+                    shim_known: answer.shim_is_known(),
+                },
                 (false, true) => UninstallFailure::AlreadyMarked,
                 (false, false) => UninstallFailure::Stop { previous },
             };
-            let cause = hold_failed.unwrap_or_else(|| {
-                let stop = Error::os(format!("stop `{id}`"), e);
-                if incomplete {
-                    answer.explain_incomplete_stop(id, stop)
-                } else {
-                    stop
-                }
-            });
+            let cause = hold_failed.unwrap_or_else(|| answer.stop_failed(id, e));
             return Err(uninstall_failed(id, &state, cause));
         }
     }
@@ -1179,27 +1169,34 @@ pub(super) struct ShimAnswer {
 }
 
 impl ShimAnswer {
-    /// Whether `stop` and `uninstall` judge the service's incomplete-stop record, and `uninstall` holds its
-    /// process: for a shim and for an unknown answer, since a refusal to call a stop complete costs a
-    /// re-run, and a tree left running costs a second copy beside it. `start` takes the shim's
+    /// Whether `stop` and `uninstall` judge the service's incomplete-stop record, and `uninstall`
+    /// takes the install lock: for a shim and for an unknown answer, since a refusal to call a stop
+    /// complete costs a re-run, and a tree left running costs a second copy beside it. Only a host that
+    /// is a shim file by name is held and swept (see [`registered_shim`]). `start` takes the shim's
     /// vocabulary for [`ShimKind::Shim`] alone: see [`start_kind`].
     fn judges_stop_record(&self) -> bool {
         self.kind != ShimKind::NotShim
     }
 
-    /// `stop`, the incomplete stop of `id`, led by why it was judged as a shim's when the blob would
-    /// not decode: the user is told the service may not run a shim, and why goetia could not tell.
-    /// Unchanged when the blob decoded, or the service is known not to run a shim.
-    fn explain_incomplete_stop(&self, id: &Id, stop: Error) -> Error {
-        match (&self.blob_error, self.judges_stop_record()) {
-            (Some(blob), true) => Error::Step {
-                what: format!(
-                    "`{id}` was judged as a shim's, because its spec blob could not be read ({})",
-                    Chain(blob.as_ref())
-                ),
-                source: Box::new(stop),
+    /// Whether the service is known to run a shim: its blob decoded as `type: simple`. A shim read
+    /// from the image alone, or over an unreadable image, is only assumed.
+    fn shim_is_known(&self) -> bool {
+        self.kind == ShimKind::Shim && self.blob_error.is_none()
+    }
+
+    /// The error of the failed stop `e` of `id`. An incomplete stop of a service not known to run a shim
+    /// is told without saying that the shim recorded it, and is led by why the service was read as a
+    /// shim's: its blob would not decode, and the image decided or could not be read. Any other failure,
+    /// and an incomplete stop of a shim known by its blob, is told as it is.
+    pub(super) fn stop_failed(&self, id: &Id, e: std::io::Error) -> Error {
+        let what = format!("stop `{id}`");
+        match &self.blob_error {
+            Some(blob) if is_incomplete_stop(&e) => Error::StopAsShim {
+                blob: Arc::clone(blob),
+                image_is_shim: self.kind == ShimKind::Shim,
+                source: Box::new(Error::os(what, IncompleteStop::of_a_stop_read_as_a_shims())),
             },
-            _ => stop,
+            _ => Error::os(what, e),
         }
     }
 }
@@ -1547,12 +1544,15 @@ enum UninstallFailure {
     /// Someone else had marked the service for deletion, so `uninstall` did not delete it. Its wait
     /// may already have sent a STOP before it failed.
     AlreadyMarked,
-    /// The service is stopped, and SCM recorded that the shim could not end the daemon's process tree.
-    /// Unless `marked` (someone else had marked it for deletion) it is disabled, with `previous` its
-    /// start type before, and was not deleted.
+    /// The service is stopped, and SCM recorded the code the shim uses for failing to end the daemon's
+    /// process tree. Unless `marked` (someone else had marked it for deletion) it is disabled, with
+    /// `previous` its start type before, and was not deleted.
     DaemonMayRun {
         previous: Option<ServiceStartType>,
         marked: bool,
+        /// Whether the service is known to run the shim that recorded it (see
+        /// [`ShimAnswer::shim_is_known`]).
+        shim_known: bool,
     },
 }
 
@@ -1584,7 +1584,11 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
              so `uninstall` did not delete it. It is removed once it stops and its last handle closes; \
              {kill}"
         ),
-        UninstallFailure::DaemonMayRun { previous, marked } => {
+        UninstallFailure::DaemonMayRun {
+            previous,
+            marked,
+            shim_known,
+        } => {
             let left = if *marked {
                 "It was already marked for deletion by someone else, so `uninstall` did not delete it; \
                  it is removed once its last handle closes."
@@ -1597,10 +1601,14 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
                     previous_start_type(id, *previous)
                 )
             };
-            format!(
-                "`{id}` is stopped, but SCM recorded that goetia-shim could not end the daemon's process \
-                 tree, so the daemon may still be running. {left}"
-            )
+            let recorded = if *shim_known {
+                "SCM recorded that goetia-shim could not end the daemon's process tree, so the daemon may \
+                 still be running."
+            } else {
+                "SCM recorded the code goetia-shim uses for failing to end the daemon's process tree, so if \
+                 the service runs a shim, its daemon may still be running."
+            };
+            format!("`{id}` is stopped, but {recorded} {left}")
         }
     };
     Error::Step {
