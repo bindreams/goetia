@@ -240,6 +240,10 @@ fn a_contained_childs_descendant_dies_with_it() {
     let mut line = String::new();
     io::BufReader::new(fd3).read_line(&mut line).unwrap();
     let descendant: u32 = line.trim().parse().unwrap();
+    // Opened while it is alive: after the kill its pid may name another process.
+    let descendant = cosca::Process::open_pid(descendant)
+        .unwrap()
+        .expect("the descendant is alive");
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
     let finished = wait_bounded(child, deadline).unwrap();
@@ -250,9 +254,7 @@ fn a_contained_childs_descendant_dies_with_it() {
     // descendant dies, and hangs if the descendant is not in the child's
     // contained tree (e.g. `command()` without `.contain()`) — then neither
     // `kill_tree` nor `Drop` can reach it.
-    if let Some(p) = cosca::Process::open_pid(descendant).unwrap() {
-        p.wait().unwrap();
-    }
+    descendant.wait().unwrap();
 }
 
 /// More than a pipe holds, on every stream in every form it takes: a temp file, and the pipe
@@ -608,7 +610,7 @@ fn a_failed_spawn_is_not_run_unless_cosca_says_it_may_have_started() {
             || io::Error::from_raw_os_error(libc::ENOENT).into(),
             false,
         ),
-        // The errnos the waitpid of cosca 0.4 gave after exec: now only the variant tells.
+        // Whatever the OS error, only the variant decides.
         ("ECHILD", || io::Error::from_raw_os_error(libc::ECHILD).into(), false),
         ("EINVAL", || io::Error::from_raw_os_error(libc::EINVAL).into(), false),
         (
