@@ -1243,7 +1243,12 @@ fn cap_evidence(unit: &str) -> String {
 /// whole and fails only cosca's own spawn thread, which cosca 0.7.0 makes inside `spawn` and goetia
 /// cannot reserve, where the spawn fails before the fork and is a clean "not sent". A no-wait
 /// restart reserves nothing, so it meets only that last case at every limit. Exit `4` (in doubt) is
-/// never accepted. Each sweep rises until the verb succeeds; the cutoff is not asserted.
+/// never accepted, and each exit `1` must be one of the two refusals above. Each sweep rises until
+/// the verb succeeds; the cutoff is not asserted.
+///
+/// cosca's threads are not reserved, and one joined (like a goetia listener detached) may still hold
+/// its `TasksMax` slot, so a waited restart's `start` leg can fail after its `stop` was sent. That
+/// race is open: the untouched-daemon assertion on a restart can fail on it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
     let id = support::random_test_id();
@@ -1278,8 +1283,13 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
                     );
                     return;
                 }
-                // goetia's own refusal, not `systemd-run` failing to make the scope.
-                Some(1) if stderr.contains("error: ") && !stderr.contains("Failed to start transient scope unit") => {
+                // goetia's own refusal ([`Error::Reservation`] or [`Error::Spawn`] by their texts), not
+                // `systemd-run` failing to make the scope.
+                Some(1)
+                    if (stderr.contains("no thread or temp file could be made for a request, so none was sent")
+                        || stderr.contains("failed to run `"))
+                        && !stderr.contains("Failed to start transient scope unit") =>
+                {
                     untouched(tasks)
                 }
                 other => panic!("{args:?} TasksMax={tasks}: exit {other:?}: {stderr}"),
