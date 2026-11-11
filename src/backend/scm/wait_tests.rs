@@ -3229,3 +3229,33 @@ fn a_start_over_an_unreadable_blob_is_strict_unless_the_image_is_a_shim() {
         }
     }
 }
+
+/// A blob that decodes decides the vocabulary of `start`: `type: simple` is the shim's, so a service
+/// that ends right after it was started is started, and `type: managed` is strict and fails, with no
+/// blob error to name since the blob was read.
+#[cfg(windows)]
+#[skuld::test]
+fn a_start_over_a_decodable_blob_is_read_by_its_kind() {
+    use crate::backend::scm::manager::{shim_answer, start_on};
+    use crate::backend::scm::test_support::blob_of;
+    use crate::spec::Id;
+
+    let id = Id::try_from("frpc").unwrap();
+    let image_is_not_read = || panic!("a blob that decodes decides; the image is not read");
+
+    for kind in [Kind::Simple, Kind::Managed] {
+        let answer = shim_answer(Ok(&blob_of(kind)), image_is_not_read);
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::Clean);
+
+        let result = start_on(&mut fake, &id, Budget::Unbounded, unbounded(), &answer);
+
+        match (kind, result) {
+            (Kind::Simple, Ok(())) => {}
+            (Kind::Managed, Err(e)) => {
+                let said = e.report().to_string();
+                assert!(!said.contains("blob"), "{said}");
+            }
+            (kind, result) => panic!("{kind:?}: unexpected {result:?}"),
+        }
+    }
+}

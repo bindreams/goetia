@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use super::*;
 use crate::backend::scm::parameters::Stray;
+use crate::backend::scm::test_support::blob_of;
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::Restart;
-use crate::spec::test_support::program;
 use crate::spec::{AccountId, DaemonFields, User};
 use crate::testing::plain_fields;
 use crate::testing::{FakeProvider, command};
@@ -553,18 +553,6 @@ fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
 }
 
 // start's vocabulary --------------------------------------------------------------------------------------------------
-
-fn blob_of(kind: Kind) -> Blob {
-    Blob {
-        schema: 1,
-        version: "0.1.0".to_string(),
-        spec: DaemonSpec::new(DaemonFields {
-            kind,
-            ..plain_fields("frpc", vec![program("frpc")])
-        })
-        .unwrap(),
-    }
-}
 
 /// A start judged strictly because the blob could not be read says why, so the user is not told a
 /// `type: simple` daemon failed to start in a way that only a managed service's start can.
