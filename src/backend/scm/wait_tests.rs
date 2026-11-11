@@ -2800,9 +2800,8 @@ fn a_registrar_that_keeps_lagging_returns_expired_instead_of_looping() {
     // The 1294 remedy re-enters the loop, so the deadline is the only thing
     // that can end it — there is deliberately no retry counter. Remove the
     // `deadline.expired()` check and this test does not fail, it HANGS, so
-    // prove it bites under
-    // `python3 .github/scripts/run-with-timeout.py 120 cargo test <name>`
-    // and expect exit 124.
+    // prove it bites with `cargo nextest run --profile ci <name>` and expect
+    // it to be reported as TIMEOUT.
     let mut fake = FakeRegistrar::new([], ERROR_SERVICE_NOTIFY_CLIENT_LAGGING);
     assert_eq!(
         register_until_deadline(&mut fake, spent()).unwrap(),
