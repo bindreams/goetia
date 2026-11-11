@@ -100,13 +100,20 @@ jobs:
       # skuld has no per-test timeout by design; the `ci` profile in
       # `.config/nextest.toml` bounds each test and names the one that hangs.
       # `--no-tests fail` keeps a build that produced no tests from passing.
+      # The archive is extracted under `target/`, not into the runner's `%TEMP%`: a test that runs
+      # a service as a fresh local user needs the binary readable by that user, as `target/` is.
+      # nextest wants the directory to exist, and `--extract-overwrite` lets a restored cache leave one.
       - name: Run tests, elevated
         shell: bash
         run: |
           set -euo pipefail
 
           nextest="$(command -v cargo-nextest)"
-          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail)
+          mkdir -p target/nextest-extract
+          args=(
+            nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail
+            --extract-to target/nextest-extract --extract-overwrite
+          )
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             "$nextest" "${args[@]}"
           else
