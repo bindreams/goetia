@@ -53,8 +53,7 @@ impl Systemctl {
     /// without asking, that no manager can be asked here ([`Host::evidence`]); and for a request,
     /// until the manager has passed the version gate. The gate's `show` is what finds out, before
     /// anything acts, a chroot goetia could not see for itself: `enable` and `disable` act on unit
-    /// files offline, in a chroot and on a system systemd did not boot, and say nothing about it
-    /// (measured on 257). [`answered`] is the other half.
+    /// files offline and say nothing about it. [`answered`] is the other half.
     fn door(&self, purpose: Purpose) -> Result<()> {
         if let Some(evidence) = (self.host)().evidence() {
             return Err(no_manager(evidence));
@@ -113,23 +112,19 @@ fn unran(purpose: Purpose, args: &[&str], error: ClientError) -> Error {
     }
 }
 
-/// What `systemctl` says when it asked no manager and did nothing, exiting `0`: "Running in chroot,
-/// ignoring command 'start'" from systemd 246 on, "… ignoring request: start" on 242 to 245, and
-/// "… ignoring request." with no verb to name, on every version (systemd's `verbs.c` and
-/// `systemctl.c`; 257's binary has both).
+/// What `systemctl` says when it asked no manager and did nothing, exiting `0`: its chroot report,
+/// worded by version. Matched as a substring of a line.
 const IGNORED: [&str; 2] = ["ignoring command", "ignoring request"];
 
 /// Every `systemctl` answer, checked before anything reads it as one: an answer saying it ignored
-/// what it was asked ([`IGNORED`]) is the refusal on every path, and never a success: the backstop
-/// for what [`Systemctl::door`] could not see.
+/// what it was asked ([`IGNORED`]) is the refusal on every path, and never a success. The backstop
+/// for what [`Systemctl::door`] cannot see.
 ///
-/// It is the last line in a chroot with no `/proc` at all — `/proc/1/root` and both mount tables
-/// are `ENOENT`, so goetia establishes nothing, while `systemctl` reports the chroot from that same
-/// absence (MEASURED, 255 and 257). Nothing in the environment can put it there instead: every
-/// switch that would declare a chroot is taken off the child ([`DENIED`]), so what reaches this is
-/// always the child's own detection. Where PID 1 is hidden from goetia rather than absent, as under
-/// a `hidepid` `/proc`, `systemctl` runs with goetia's credentials and hits the same wall: it
-/// reports nothing, and this backstop does not fire either.
+/// It is the last line in a chroot with no `/proc` at all: goetia establishes nothing there, while
+/// `systemctl` reports the chroot from that same absence. Nothing in the environment can put the
+/// report there instead, since [`DENIED`] takes every switch that would declare a chroot off the
+/// child, so what reaches this is always the child's own detection. Where `/proc` hides PID 1
+/// rather than lacking it, `systemctl` is as blind as goetia and reports nothing.
 fn answered(stdout: &[u8], stderr: &[u8]) -> Result<()> {
     let ignored = |stream: &[u8]| {
         String::from_utf8_lossy(stream)
@@ -150,70 +145,29 @@ fn no_manager(evidence: Evidence) -> Error {
     }
 }
 
-/// What every `systemctl` goetia runs is given. An inherited `SYSTEMD_COLORS` wraps what it prints
-/// in escapes, and an inherited `SYSTEMD_LOG_LEVEL=warning` or `SYSTEMD_LOG_TARGET=null` silences
-/// the `log_info` lines goetia reads: the job `--show-transaction` announces ([`enqueued`]), and
-/// the report that it ignored the request ([`IGNORED`]).
+/// What every `systemctl` goetia runs is given: colour off, and a log level and target that keep the
+/// `log_info` lines goetia reads audible, the job `--show-transaction` announces ([`enqueued`]) and
+/// the report that the request was ignored ([`IGNORED`]).
 const ENVIRONMENT: [(&str, &str); 3] = [
     ("SYSTEMD_COLORS", "0"),
     ("SYSTEMD_LOG_LEVEL", "info"),
     ("SYSTEMD_LOG_TARGET", "console"),
 ];
 
-/// The two prefixes systemd's own switches for this binary carry, and which every `systemctl`
-/// goetia runs is denied: an inherited name under either is removed from the child whatever it is,
-/// and [`ENVIRONMENT`] alone is then given. Named by prefix rather than one switch at a time
-/// because the switches are systemd's to add, not goetia's to keep up with. MEASURED, `strings`
-/// anchored on each prefix: 255's `systemctl` links no systemd library — it is built against
-/// `libsystemd-shared` statically — and carries **44** `SYSTEMD_*` names by itself; 257's carries
-/// **90** with `libsystemd-shared-257.so`, which it does link; both carry the same **5**
-/// `SYSTEMCTL_*`. *Three* of the `SYSTEMD_*` turn off, each on its own, the chroot report
-/// [`answered`] is the last line against. Naming them is what missed the next one twice.
+/// The two prefixes systemd's own switches for this binary carry. An inherited name under either is
+/// removed from every `systemctl` goetia runs, whatever it is, and [`ENVIRONMENT`] alone is given.
 ///
-/// The three, MEASURED on 255 and 257 in a chroot with no `/proc`, where goetia establishes nothing
-/// of its own: `SYSTEMD_IGNORE_CHROOT` true; `SYSTEMD_IN_CHROOT` false, on 257 on; and
-/// `SYSTEMD_OFFLINE` false, on every supported version — `running_in_chroot_or_offline()`
-/// (systemd's `src/shared/verbs.c`) consults that one first and returns it whenever it *parses*, so
-/// a false value discards the chroot check as surely as `SYSTEMD_IGNORE_CHROOT=1` does. With any of
-/// the three inherited, `install` from such a chroot exited `0` and wrote the unit into it.
+/// By prefix, not by name: the switches are systemd's to add, and naming them one at a time missed
+/// the next one twice. Three of them turn off the chroot report [`answered`] is the last line
+/// against, and `SYSTEMCTL_FORCE_BUS` points `systemctl` at another bus. Removed rather than set,
+/// because every value asserts something goetia is in no position to assert, such as whether this
+/// is a chroot: detecting that is the child's job.
 ///
-/// Removed rather than set, because every value asserts something goetia is in no position to
-/// assert. `SYSTEMD_IN_CHROOT=0` asserts there is no chroot — measured on 257, it silences the
-/// report in one — and `=1` asserts there is one everywhere, which on a 257 host that is no chroot
-/// makes `systemctl` ignore every command. Detecting it is the child's job; goetia only declines to
-/// prejudge it.
-///
-/// `SYSTEMCTL_*` is systemd's second switch namespace for this binary, and is covered for the same
-/// reason rather than for anything it holds today: MEASURED, none of its five silences the chroot
-/// report on either version. `SYSTEMCTL_FORCE_BUS` is nonetheless the other shape goetia refuses
-/// for — it makes `systemctl` reach the manager over the bus
-/// `DBUS_SYSTEM_BUS_ADDRESS` names instead of this root's private socket. MEASURED as root, that
-/// address pointed at a path that does not exist: `show` answered `Version=…` without the switch
-/// and failed to connect with it.
-///
-/// The switch decides that only for the root `systemctl` every mutating verb runs. MEASURED at uid
-/// 502 on both versions: a non-root `systemctl` honours the address with NO switch set at all, this
-/// root's private socket not being its to open, and an unelevated `status` is then answered by
-/// whichever manager the address names. [`Systemctl::status_from_unit`]'s `LoadState=not-found` arm makes that
-/// exit `4` rather than a state, so it is refused rather than believed — but the address itself is
-/// outside this prefix's reach, and whether a read's child should lose `DBUS_*` too is an open
-/// question, not a settled one.
-///
-/// What removing the rest costs: nothing any real environment carries. MEASURED on 255 and 257 — a
-/// plain shell, a login shell and `sudo` carry no name under either prefix, and the one systemd
-/// itself puts in a process's environment, `SYSTEMD_EXEC_PID`, changes nothing `systemctl` does.
-/// Both of its streams are captured, never a terminal, so `SYSTEMD_PAGER`, `SYSTEMD_LESS` and
-/// `SYSTEMD_PAGERSECURE` changed nothing either.
-///
-/// What they do *not* reach is a variable under neither prefix that `systemctl` also reads:
-/// `PAGER`, `LESS`, `TERM`, and the locale. MEASURED on 255 and 257 with the report in force,
-/// `PAGER=cat`, `LESS=X` and `TERM=xterm-256color` leave it word for word in English, which is what
-/// [`IGNORED`] matches on. The locale cannot reach it at all, which is the stronger claim and the
-/// one that matters, because a locale a user has generated is not something a sweep can enumerate:
-/// the report is not a translatable string. MEASURED — 255 ships no systemd message catalog; 257
-/// ships 41, none of which contains `Running in chroot` (its `de` holds 672 strings and its `ja`
-/// 300, all polkit action descriptions), and the report itself sits in English in
-/// `libsystemd-shared-257.so`.
+/// Not reached: `DBUS_*`, which a non-root `systemctl` honours with no switch at all (whether a
+/// read's child should lose it too is open), and variables under neither prefix (`PAGER`, `LESS`,
+/// `TERM`, the locale), none of which changes the report. Measurements: the knowledge base's
+/// "systemd - Three SYSTEMD_ switches turn off the chroot report ..." and "systemd - systemctl in a
+/// chroot exits 0 having done nothing ...".
 const DENIED: [&str; 2] = ["SYSTEMD_", "SYSTEMCTL_"];
 
 /// The inherited names that are removed from a `systemctl`'s environment: every [`DENIED`] one that
@@ -607,8 +561,7 @@ fn refusal(client: VersionReading, manager: VersionReading) -> Result<()> {
 /// `--show-transaction` on every path: its announcement ([`enqueued`]) is the only evidence that
 /// systemd took the request — a `systemctl` that exits `0` having done nothing says so only when it
 /// knows it ([`answered`]) — and on the bounded path it is also what the wait holds out for. A
-/// budget that does not wait adds `--no-block`, which still announces the job (measured on systemd
-/// 257).
+/// budget that does not wait adds `--no-block`, which still announces the job.
 ///
 /// Its own function so that each path's flags are observable without a timing bet: no elevated test
 /// can see `--no-block` (`start` returns either way). `systemctl_tests.rs` asserts both argvs.
@@ -631,8 +584,7 @@ pub(super) fn unit_args<'a>(head: &[&'a str], unit: &'a str) -> Vec<&'a str> {
 /// job — the line it writes after `StartUnit`/`StopUnit` returns and before it waits for the job.
 /// A substring of the stream, not a whole line: the job number and unit follow it, and were a
 /// prefix ever to precede it the line would still be found. [`DENIED`] removes the switches that
-/// add one — `SYSTEMD_LOG_TIME`, `SYSTEMD_LOG_LOCATION`, `SYSTEMD_LOG_TID` — so no `systemctl`
-/// goetia runs can be given one; tolerating it anyway costs nothing.
+/// add one, so no `systemctl` goetia runs can be given one; tolerating it anyway costs nothing.
 fn enqueued(stderr: &[u8]) -> bool {
     const LINE: &[u8] = b"Enqueued anchor job ";
     stderr.windows(LINE.len()).any(|w| w == LINE)
@@ -777,16 +729,14 @@ impl Systemctl {
 /// `systemctl kill` of `unit`'s main process with `SIGKILL`, and nothing else of it: not the control
 /// process, not the rest of the cgroup, which systemd cleans up when the main process is gone.
 ///
-/// `--kill-who`, not `--kill-whom`: 245 and older do not know the second (MEASURED, 245), and the
-/// first is still accepted by 255 and 257. `main-fail` rather than `main`: `main` exits `0` having
-/// signalled nobody when there is no main process (MEASURED, 245 and 255), where `main-fail` fails
-/// with the answer [`no_process`] reads.
+/// `--kill-who`, not `--kill-whom`: 245 and older do not know the second. `main-fail` rather than
+/// `main`: `main` exits `0` having signalled nobody when there is no main process, where `main-fail`
+/// fails with the answer [`no_process`] reads.
 const KILL_ARGS: [&str; 3] = ["kill", "--kill-who=main-fail", "--signal=SIGKILL"];
 
-/// Whether `stderr` is systemd saying `unit` has no process to signal, word for word (MEASURED, 245
-/// and 255, exit `1` both): it is not loaded, which is what an inactive unit is once nothing holds
-/// it, or it is loaded and its main process is gone. Read off the kill's own answer, so no state
-/// read before it can race the kill.
+/// Whether `stderr` is systemd saying `unit` has no process to signal, word for word: it is not
+/// loaded, which is what an inactive unit is once nothing holds it, or it is loaded and its main
+/// process is gone. Read off the kill's own answer, so no state read before it can race the kill.
 fn no_process(stderr: &str, unit: &str) -> bool {
     stderr.contains(&format!("Unit {unit} not loaded.")) || stderr.contains("No main process to kill")
 }
@@ -882,9 +832,8 @@ impl Systemctl {
     ///
     /// Asked only about a unit goetia finds installed, so `LoadState=not-found` — systemd has no unit
     /// file for the name — is a unit file systemd cannot see, one goetia's own mount namespace holds,
-    /// say. Not one merely written and not yet reloaded: the manager picks a unit file up on demand and
-    /// reports `loaded` for one written a moment earlier (MEASURED, 255). What systemd reports for such
-    /// a name is not that unit's state, and never read as one.
+    /// say. Not one merely written and not yet reloaded: the manager picks a unit file up on demand.
+    /// What systemd reports for such a name is not that unit's state, and never read as one.
     pub(super) fn status_from_unit(&self, unit: &str) -> Result<Status> {
         let props = self.show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"])?;
         if props.get("LoadState").map(String::as_str) == Some("not-found") {
