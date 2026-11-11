@@ -3288,6 +3288,39 @@ fn a_failed_start_of_a_shim_known_by_its_image_names_the_unreadable_blob() {
     );
 }
 
+/// A start that times out over an unreadable blob names the blob too, whichever vocabulary the image
+/// gave it: the timeout is a start judged without the blob as much as a failed one.
+#[cfg(windows)]
+#[skuld::test]
+fn a_timed_out_start_over_an_unreadable_blob_names_the_blob() {
+    use crate::backend::scm::manager::{shim_answer, start_on};
+    use crate::backend::scm::test_support::SHIM_HEX;
+    use crate::spec::Id;
+
+    let shim = format!(r#""C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe" --service-host"#);
+    let corrupt = std::sync::Arc::new(crate::error::Error::blob("corrupt"));
+
+    for image in [shim.as_str(), r"C:inrpc.exe"] {
+        let answer = shim_answer(Err(&corrupt), || Some(image.to_string()));
+        let mut fake = FakeScm::new([None]);
+
+        let err = start_on(
+            &mut fake,
+            &Id::try_from("frpc").unwrap(),
+            Budget::Bounded(std::time::Duration::from_secs(3600)),
+            unbounded(),
+            &answer,
+        )
+        .unwrap_err();
+
+        let said = err.report().to_string();
+        assert!(
+            said.contains("could not be read") && said.contains("corrupt"),
+            "{image}: {said}"
+        );
+    }
+}
+
 /// A blob that decodes decides the vocabulary of `start`: `type: simple` is the shim's, so a service
 /// that ends right after it was started is started, and `type: managed` is strict and fails, with no
 /// blob error to name since the blob was read.

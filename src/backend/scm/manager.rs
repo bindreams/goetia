@@ -623,11 +623,16 @@ pub(super) fn start_on<A: super::wait::ScmActor>(
         return super::wait::request_start(actor).map_err(|e| Error::os(format!("start `{id}`"), e));
     }
     let (kind, unreadable) = start_kind(answer);
-    let waited =
-        super::wait::start_via_notify(actor, deadline, kind).map_err(|e| failed_start(id, e, kind, unreadable))?;
+    let waited = super::wait::start_via_notify(actor, deadline, kind)
+        .map_err(|e| failed_start(id, Error::os(format!("start `{id}`"), e), kind, unreadable.clone()))?;
     match waited {
         Waited::Confirmed => Ok(()),
-        Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
+        Waited::Expired => Err(failed_start(
+            id,
+            budget::timed_out(id.as_str(), "running", budget),
+            kind,
+            unreadable,
+        )),
     }
 }
 
@@ -687,11 +692,10 @@ fn start_kind(answer: &ShimAnswer) -> (Kind, Option<Arc<Error>>) {
     (kind, answer.blob_error.clone())
 }
 
-/// `start`'s error for a `start_via_notify` failure. When the blob was unreadable the start was
-/// judged without it, as `kind` says, and the error says why: neither is what a service whose blob
-/// reads would have been told.
-fn failed_start(id: &Id, e: std::io::Error, kind: Kind, unreadable: Option<Arc<Error>>) -> Error {
-    let failed = Error::os(format!("start `{id}`"), e);
+/// `failed`, a `start` that did not succeed (a failed wait or a timeout). When the blob was unreadable
+/// the start was judged without it, as `kind` says, and the error says why: neither is what a service
+/// whose blob reads would have been told.
+fn failed_start(id: &Id, failed: Error, kind: Kind, unreadable: Option<Arc<Error>>) -> Error {
     match (kind, unreadable) {
         (_, None) => failed,
         (Kind::Managed, Some(blob)) => Error::StartAsManaged {

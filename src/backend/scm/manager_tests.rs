@@ -559,7 +559,12 @@ fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
 #[skuld::test]
 fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     let id = Id::try_from("frpc").unwrap();
-    let e = || std::io::Error::other("service stopped before reaching Running");
+    let e = || {
+        Error::os(
+            "start `frpc`",
+            std::io::Error::other("service stopped before reaching Running"),
+        )
+    };
 
     let plain = failed_start(&id, e(), Kind::Managed, None).report().to_string();
     assert!(!plain.contains("blob"), "{plain}");
