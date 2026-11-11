@@ -553,8 +553,7 @@ fn a_stalled_stop_is_ok_under_no_budget_and_leaves_the_state_alone() {
 /// No tighter bound than the budget itself is asserted, deliberately: any
 /// smaller number would be a bet on how fast this machine is, which is the
 /// class of assertion this project forbids. A fake that actually slept would
-/// not fail this line — it would never reach it, and the suite's own
-/// watchdog is what surfaces that.
+/// not fail this line — it would never reach it.
 #[skuld::test]
 fn the_fake_never_sleeps() {
     let fake = Fake::new();

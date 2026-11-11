@@ -45,5 +45,5 @@ fn main() {
             return;
         }
     }
-    skuld::run_all();
+    goetia::testing::run_all();
 }
