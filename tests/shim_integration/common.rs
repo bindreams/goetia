@@ -11,7 +11,10 @@ use goetia::spec::{DaemonFields, DaemonSpec, Kind};
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    WaitForSingleObject,
+};
 
 use crate::fixture;
 use crate::support;
@@ -296,7 +299,7 @@ impl ShimProcess {
             .unwrap_or_else(|| panic!("SCM reports a running service with no process id: {running:?}"));
 
         // SAFETY: plain FFI call; the returned handle is checked and then owned.
-        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if raw.is_null() {
             panic!("OpenProcess({pid}): {}", std::io::Error::last_os_error());
         }
@@ -323,8 +326,9 @@ impl ShimProcess {
         unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 0) == WAIT_OBJECT_0 }
     }
 
-    /// Blocks until the shim process has exited. No bound: a shim that never exits is a hung test.
-    pub fn wait_for_exit(self) {
+    /// Blocks until the shim process has exited, and returns its exit code. No bound: a shim that
+    /// never exits is a hung test.
+    pub fn wait_for_exit(self) -> u32 {
         // SAFETY: `process` is a live handle with SYNCHRONIZE access.
         let waited = unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, INFINITE) };
         if waited != WAIT_OBJECT_0 {
@@ -334,5 +338,16 @@ impl ShimProcess {
                 std::io::Error::last_os_error()
             );
         }
+        let mut code = 0u32;
+        // SAFETY: `process` is live; `code` is a valid out-pointer.
+        let ok = unsafe { GetExitCodeProcess(self.process.as_raw_handle() as HANDLE, &mut code) };
+        assert_ne!(
+            ok,
+            0,
+            "GetExitCodeProcess on the shim (pid {}): {}",
+            self.pid,
+            std::io::Error::last_os_error()
+        );
+        code
     }
 }

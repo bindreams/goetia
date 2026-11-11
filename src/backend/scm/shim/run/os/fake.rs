@@ -416,6 +416,15 @@ impl Fake {
         lock(&self.shared.state).calls.get(&op).copied().unwrap_or(0)
     }
 
+    /// Whether thread `n` has ended, without waiting for it. Its end is still read with
+    /// [`Fake::waiter_end`].
+    pub(crate) fn waiter_has_ended(&self, n: usize) -> bool {
+        matches!(
+            lock(&self.shared.state).thread_ends.get(n),
+            Some(ThreadEnd::Ended(_) | ThreadEnd::Read)
+        )
+    }
+
     /// Block until thread `n` has ended, and say how. Everything that thread did happens-before
     /// this returns.
     pub(crate) fn waiter_end(&self, n: usize) -> WaiterEnd {

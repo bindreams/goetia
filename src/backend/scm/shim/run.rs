@@ -11,6 +11,7 @@
 //! its output, report its exit as the service's exit, and kill its whole
 //! process tree on `SERVICE_STOP`.
 
+mod exit;
 mod logging;
 mod os;
 mod service;

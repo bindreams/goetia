@@ -696,7 +696,7 @@ fn a_start_on_a_spent_budget_still_reaches_systemd() {
 
     assert!(
         matches!(
-            result,
+            result.as_ref().map_err(goetia::Error::cause),
             Ok(()) | Err(goetia::Error::WaitTimeout { awaited: "running", .. })
         ),
         "{result:?}"
