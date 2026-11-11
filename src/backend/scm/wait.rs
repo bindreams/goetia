@@ -314,9 +314,13 @@ pub(crate) fn end_on_incomplete_stop<P, T, R>(
 /// [`IncompleteStop`], after `end` has ended the process held (see [`end_on_incomplete_stop`]).
 ///
 /// `held` is the hold as it was made, and what is left in it afterwards is what the caller still has
-/// to say: the process is taken out of [`Held`](HoldOutcome::Held) and passed to `end`, and a
-/// [`Refused`](HoldOutcome::Refused) stays, with the reason the process could not be opened, for the
-/// caller to report: this is where a refused process counts as not held, and the only place.
+/// to say. A held process is taken out of [`Held`](HoldOutcome::Held), leaving
+/// [`NoProcess`](HoldOutcome::NoProcess), once it is passed to `end`: after a confirmed stop, whether it
+/// exits, outlasts the deadline or `end` fails, and after an incomplete one. It stays in `held`, for
+/// the caller to drop, when the stop failed any other way or the service did not stop within the
+/// deadline. A [`Refused`](HoldOutcome::Refused) stays on every outcome, with the reason the process
+/// could not be opened, for the caller to report: this is where a refused process counts as not held,
+/// and the only place. An [`Expired`](HoldOutcome::Expired) hold stays as it is.
 ///
 /// An expired hold is sent the STOP all the same, and it ends there, whatever SCM answers: the held
 /// process died (a crash), SCM may have a recovery restart pending, and a restarted process may have
