@@ -1149,7 +1149,7 @@ fn runs_a_shim(snapshot: &ScmSnapshot) -> bool {
 
 /// [`runs_a_shim`] over the registered command line, `None` when it could not be read.
 fn is_shim_image(image: Option<&str>) -> bool {
-    image.map_or(true, |image| shim_host(image).is_some())
+    image.is_none_or(|image| shim_host(image).is_some())
 }
 
 /// The host the command line `image` starts, when its file name is that of a shim file placed by a
