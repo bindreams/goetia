@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 mod support;
 
 fn main() {
-    skuld::run_all();
+    goetia::testing::run_all();
 }
 
 fn goetia_bin() -> &'static str {

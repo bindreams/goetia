@@ -77,8 +77,7 @@ pub fn fixture_command_with_exe(exe: &str, mode: &str, args: &[&str]) -> Vec<Str
 
 /// Cleanup for a shim-hosted service `id`, in this order:
 /// 1. the product's `uninstall`, which disables the service, waits out a start that has begun,
-///    stops it and deletes it. Its wait has no bound: a shim that never stops is a hung test, which
-///    the CI watchdog reports;
+///    stops it and deletes it. Its wait has no bound: a shim that never stops is a hung test;
 /// 2. a [`support::ServiceGuard`]'s `sc stop` and `sc delete`, for what `uninstall` does not own;
 /// 3. [`LeftoverLog`]: the file the shim writes when it fails before it has read the daemon's config.
 ///
@@ -324,8 +323,7 @@ impl ShimProcess {
         unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 0) == WAIT_OBJECT_0 }
     }
 
-    /// Blocks until the shim process has exited. No bound: a shim that never exits is a hung test,
-    /// which the CI watchdog reports.
+    /// Blocks until the shim process has exited. No bound: a shim that never exits is a hung test.
     pub fn wait_for_exit(self) {
         // SAFETY: `process` is a live handle with SYNCHRONIZE access.
         let waited = unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, INFINITE) };

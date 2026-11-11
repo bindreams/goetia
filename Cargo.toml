@@ -2,9 +2,8 @@
 name = "goetia"
 version = "0.3.0"
 edition = "2024"
-# Let-chains and `slice::as_chunks` (both stable in 1.88) force the floor; `sha2` 0.11, which hashes the
-# stock shim on Windows, declares 1.88 too.
-rust-version = "1.88"
+# `skuld` 0.6 (the test harness, also a `testing`-feature dependency) uses `File::lock`, stable in 1.89.
+rust-version = "1.89"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
 readme = "README.md"
@@ -12,7 +11,7 @@ repository = "https://github.com/bindreams/goetia"
 authors = ["bindreams"]
 keywords = ["daemon", "service", "systemd", "launchd", "windows-service"]
 categories = ["command-line-utilities", "os"]
-exclude = ["/.github", "/.claude", "/CLAUDE.md", "/scripts", "/prek.toml", "/.editorconfig", "/.gitattributes", "/.rustfmt.toml"]
+exclude = ["/.github", "/.claude", "/.config", "/CLAUDE.md", "/scripts", "/prek.toml", "/.editorconfig", "/.gitattributes", "/.rustfmt.toml"]
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
@@ -61,8 +60,8 @@ cli = ["dep:clap"]
 # release workflow turns it on for the `goetia` binary, whose `stock_shim()` then embeds it rather
 # than reading `goetia-shim.exe` beside it; the library never reads it.
 goetia-shim = []
-# Exports helpers the crate's own tests share; adds items only, gates no behaviour. `skuld` is the
-# `ELEVATED` label's.
+# Exports helpers the crate's own tests share; adds items only, gates no behaviour.
+# `skuld` is for the `ELEVATED` label and `testing::run_all`.
 testing = ["dep:skuld"]
 
 [dependencies]
@@ -88,9 +87,8 @@ memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "3"
-# Only under `testing`: the `ELEVATED` label of `testing::elevation`. The dev-dependency below is the
-# unit tests' own.
-skuld = { version = "0.3", optional = true }
+# `skuld` is for the `ELEVATED` label and `testing::run_all`.
+skuld = { version = "0.6", optional = true }
 tempfile = "3"
 thiserror = "2"
 yaml_serde = "0.10.7"
@@ -169,7 +167,7 @@ windows-sys = { version = "0.61", features = [
 # Turns on `testing` for the integration tests, which reach the library only through its public API.
 # Without `default-features = false` it would also turn on `cli` in a `--no-default-features` build.
 goetia = { path = ".", default-features = false, features = ["testing"] }
-skuld = "0.3"
+skuld = "0.6"
 rand = "0.10"
 
 [target.'cfg(unix)'.dev-dependencies]

@@ -7,7 +7,6 @@ assert_tag="${script_dir}/assert-tag-absent.sh"
 assert_archives="${script_dir}/assert-archives.sh"
 assert_package_list="${script_dir}/assert-package-list.sh"
 assert_asset_count="${script_dir}/assert-asset-count.sh"
-assert_test_binaries="${script_dir}/assert-test-binaries.sh"
 verify_sigstore="${script_dir}/verify-sigstore-bundle.sh"
 assert_commit_on_main="${script_dir}/assert-commit-on-main.sh"
 assert_checksums="${script_dir}/assert-checksums.sh"
@@ -75,12 +74,11 @@ stub_dir="$(mktemp -d)"
 archive_root="$(mktemp -d)"
 pkg_list_root="$(mktemp -d)"
 asset_count_root="$(mktemp -d)"
-test_binaries_root="$(mktemp -d)"
 sigstore_root="$(mktemp -d)"
 checksums_root="$(mktemp -d)"
 crates_root="$(mktemp -d)"
 tag_root="$(mktemp -d)"
-trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$test_binaries_root" "$sigstore_root" "$checksums_root" "$crates_root" "$tag_root"' EXIT
+trap 'rm -rf "$stub_dir" "$archive_root" "$pkg_list_root" "$asset_count_root" "$sigstore_root" "$checksums_root" "$crates_root" "$tag_root"' EXIT
 
 make_git_stub() {
     local exit_code="$1" expected_ref="$2"
@@ -731,6 +729,9 @@ assert_package_list_rejects_matching "rejects a leaked .github/ path" "$listing"
 
 listing="$(write_package_listing leaks-claude "${complete_listing_lines[@]}" .claude/settings.json)"
 assert_package_list_rejects_matching "rejects a leaked .claude/ path" "$listing" ".claude/settings.json"
+
+listing="$(write_package_listing leaks-config "${complete_listing_lines[@]}" .config/nextest.toml)"
+assert_package_list_rejects_matching "rejects a leaked .config/ path" "$listing" ".config/nextest.toml"
 
 listing="$(write_package_listing leaks-scripts "${complete_listing_lines[@]}" scripts/format-section-comments.py)"
 assert_package_list_rejects_matching "rejects a leaked scripts/ path" "$listing" "scripts/format-section-comments.py"
@@ -1568,78 +1569,6 @@ else
 fi
 
 rm -f "${stub_dir}/sigstore"
-
-# assert-test-binaries.sh -----------------------------------------------------
-#
-# The step this guards (`ci.yaml`'s "Run tests, elevated") drives a
-# `while IFS= read -r bin; do ...; done < test-binaries.txt` loop: an empty
-# file makes that loop iterate zero times and exit 0, having run nothing.
-# This is the release-gate promotion of the same vacuous-guard shape
-# `assert-archives.sh 0` was fixed for.
-
-assert_test_binaries_ok() {
-    local description="$1" listing="$2"
-    if bash "$assert_test_binaries" "$listing" >/dev/null 2>&1; then
-        echo "ok   - ${description}"
-    else
-        echo "FAIL - ${description} (expected success, got failure)"
-        failures=$((failures + 1))
-    fi
-}
-
-assert_test_binaries_rejects_matching() {
-    local description="$1" listing="$2" message="$3"
-    local output
-    if output="$(bash "$assert_test_binaries" "$listing" 2>&1)"; then
-        echo "FAIL - ${description} (expected rejection, got success)"
-        failures=$((failures + 1))
-    elif [[ "$output" == *"$message"* ]]; then
-        echo "ok   - ${description}"
-    else
-        echo "FAIL - ${description} (expected message containing '${message}', got: ${output})"
-        failures=$((failures + 1))
-    fi
-}
-
-listing="${test_binaries_root}/one-binary"
-printf '/path/to/some-test-bin\n' > "$listing"
-assert_test_binaries_ok "accepts a listing with one binary" "$listing"
-
-listing="${test_binaries_root}/multiple-binaries"
-printf '/path/to/bin-a\n/path/to/bin-b\n' > "$listing"
-assert_test_binaries_ok "accepts a listing with multiple binaries" "$listing"
-
-# CRLF is how the workflow's own filter emits this file on Windows (Python's
-# text-mode stdout), and the loop strips it — this script must count the
-# line as present, not blank.
-listing="${test_binaries_root}/crlf-binary"
-printf '/path/to/bin\r\n' > "$listing"
-assert_test_binaries_ok "accepts a CRLF-terminated listing" "$listing"
-
-listing="${test_binaries_root}/truly-empty"
-: > "$listing"
-assert_test_binaries_rejects_matching "rejects a completely empty listing" "$listing" "no test binaries found"
-
-# The exact reproduction from the hunt: a listing that is non-empty in bytes
-# (blank lines, or CRLF-only lines) but names zero binaries once the
-# workflow's own stripping rules are applied.
-listing="${test_binaries_root}/blank-lines-only"
-printf '\n\n' > "$listing"
-assert_test_binaries_rejects_matching "rejects a listing of blank lines only" "$listing" "no test binaries found"
-
-listing="${test_binaries_root}/crlf-blank-only"
-printf '\r\n\r\n' > "$listing"
-assert_test_binaries_rejects_matching "rejects a listing of CRLF-blank lines only" "$listing" "no test binaries found"
-
-assert_test_binaries_rejects_matching "rejects a listing file that does not exist" \
-    "${test_binaries_root}/nonexistent" "not found"
-
-if bash "$assert_test_binaries" >/dev/null 2>&1; then
-    echo "FAIL - rejects being called with no arguments at all (expected rejection, got success)"
-    failures=$((failures + 1))
-else
-    echo "ok   - rejects being called with no arguments at all"
-fi
 
 # --------------------------------------------------------------------------
 

@@ -29,5 +29,5 @@ pub fn version() -> &'static str {
 
 #[cfg(test)]
 fn main() {
-    skuld::run_all();
+    crate::testing::run_all();
 }
