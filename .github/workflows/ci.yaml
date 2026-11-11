@@ -104,6 +104,12 @@ jobs:
         if: matrix.toolchain != 'stable'
         run: prek run --all-files cargo-clippy cargo-clippy-lib-only
 
+      # Rustdoc is defined in prek.toml too, and fails on any warning. `docs.rs` builds the three OS targets,
+      # and links to `#[cfg]`-gated items resolve on one OS and break on another, so each OS runs it.
+      - name: Rustdoc
+        if: matrix.toolchain != 'stable'
+        run: prek run --all-files cargo-doc cargo-doc-lib-only
+
       # A plain `cargo test` leaves every elevation-gated test reported by
       # skuld as *unavailable*, not failed — a silent skip, which this
       # project forbids. Build unelevated, then run each produced test
@@ -216,12 +222,12 @@ jobs:
         # renovate: datasource=pypi depName=prek
         run: uv tool install prek==0.5.10
 
-      # The clippy hooks are skipped here because they already run per-platform
+      # The clippy and rustdoc hooks are skipped here because they already run per-platform
       # in the `test` job above (the `#[cfg]` halves differ per platform, so a
-      # single-platform clippy run would miss them).
+      # single-platform run would miss them).
       - name: Run linters
         env:
-          SKIP: cargo-clippy,cargo-clippy-lib-only
+          SKIP: cargo-clippy,cargo-clippy-lib-only,cargo-doc,cargo-doc-lib-only
         run: prek run --all-files
 
       - name: Test release helper scripts

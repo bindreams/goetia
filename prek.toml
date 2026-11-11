@@ -58,6 +58,26 @@ types = ["rust"]
 pass_filenames = false
 
 [[repos.hooks]]
+id = "cargo-doc"
+name = "cargo doc"
+# Every rustdoc warning fails, broken intra-doc links first. Private items are documented too, so
+# their links are checked, and `--all-features` adds what `testing` exports. The platform halves are
+# checked by each OS's own run: the host target is one of `docs.rs`'s three.
+entry = """cargo doc --locked --no-deps --document-private-items --all-features --config 'build.rustdocflags=["-D", "warnings"]'"""
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-doc-lib-only"
+name = "cargo doc (library only)"
+# `cli` gates items and the links to them.
+entry = """cargo doc --locked --no-deps --document-private-items --no-default-features --config 'build.rustdocflags=["-D", "warnings"]'"""
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
 id = "format-section-comments"
 name = "format section comments"
 entry = "python scripts/format-section-comments.py"
