@@ -386,12 +386,12 @@ fn waited_out(
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
             // The root first, and its `Ok` is what makes the reap below unable to block.
             child.kill()?;
-            // Then the tree, best-effort. What this achieves that `Drop` (at the end of
-            // this function) does not: it runs BEFORE the reap below, while the killed
-            // root is still a zombie pinning its pid and pgid. `Drop` tears a contained
-            // tree down too, but after the reap, where cosca skips every kill that names
-            // the tree by the root's number (macOS's `FdMarker` first pass, Linux's
-            // `ProcessGroup` fallback), which could by then name another process. An
+            // Then the tree, best-effort. This runs BEFORE the reap below, while the killed
+            // root is still a zombie pinning its pid and pgid, so a kill that names the tree
+            // by the root's number cannot hit another process on any platform. `Drop` (at the
+            // end of this function) tears a contained tree down too, but after the reap,
+            // where cosca skips every such kill on macOS and on Linux below 6.9 (Linux 6.9+
+            // decides the group by the root's pidfd and still kills it). An
             // uncontained child (the descendant test spawns one) reports `Unsupported`
             // here, and a contained tree whose member refused SIGKILL
             // reports `Containment`; the `Result` is discarded either way, so nothing
