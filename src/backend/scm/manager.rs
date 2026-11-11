@@ -113,7 +113,8 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
-    EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_on_incomplete_stop, end_process, is_incomplete_stop,
+    EndProcessOutcome, ProcessWaitFailure, StopAndAwaitExitOutcome, Waited, end_on_incomplete_stop, end_process,
+    is_incomplete_stop,
 };
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
@@ -132,7 +133,7 @@ use crate::backend::{
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
-use crate::error::{Chain, Error, Reason, Result};
+use crate::error::{Chain, Error, Reason, Result, terminating_failed};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, Installed, State, Status, Step};
 use crate::shim::HostCommand;
@@ -647,7 +648,7 @@ pub(super) fn stop_on<A: super::wait::ScmActor, P: HeldProcess>(
     deadline: Deadline,
     answer: &ShimAnswer,
     hold: impl FnOnce(Deadline) -> Result<HoldOutcome<P>>,
-    end: impl FnOnce(P, Deadline) -> std::io::Result<EndProcessOutcome<P>>,
+    end: impl FnOnce(P, Deadline) -> std::result::Result<EndProcessOutcome<P>, ProcessWaitFailure>,
 ) -> Result<()> {
     if !budget.waits() {
         return super::wait::request_stop(actor).map_err(|e| Error::os(format!("stop `{id}`"), e));
@@ -671,6 +672,9 @@ pub(super) fn stop_on<A: super::wait::ScmActor, P: HeldProcess>(
                 budget,
                 terminate_failed,
             )),
+            StopAndAwaitExitOutcome::ProcessWaitFailed(failure) => {
+                Err(process_wait_failed(id, format!("stop `{id}`"), failure))
+            }
         });
     // A process that cannot be opened is not waited for (see `stop_and_await_exit`), and a `stop`
     // that succeeds has no channel to say so: the reason leads the error of one that fails.
@@ -1131,7 +1135,7 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
     marked: bool,
     previous: Option<ServiceStartType>,
     mut hold: Option<impl FnMut() -> Result<HoldOutcome<P>>>,
-    end: impl FnOnce(P) -> std::io::Result<EndProcessOutcome<P>>,
+    end: impl FnOnce(P) -> std::result::Result<EndProcessOutcome<P>, ProcessWaitFailure>,
 ) -> Result<HoldOutcome<P>> {
     // Taken again for each STOP the loop sends, so the one kept is the process that STOP is for, and
     // once for a service that is already `STOP_PENDING`, which no STOP of ours is sent to.
@@ -1371,7 +1375,11 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
 ///
 /// The process is ended with exit code 1, which can reach it before the shim's own exit and replace
 /// the code the shim ends itself with; SCM's record is unaffected.
-fn end_held(id: &Id, held: Held, deadline: Deadline) -> std::io::Result<EndProcessOutcome<Held>> {
+fn end_held(
+    id: &Id,
+    held: Held,
+    deadline: Deadline,
+) -> std::result::Result<EndProcessOutcome<Held>, ProcessWaitFailure> {
     end_process(held, deadline, Held::terminate, |held, deadline, terminate_failed| {
         held.wait_for_exit(deadline, || {
             if deadline.at().is_none() {
@@ -1379,6 +1387,29 @@ fn end_held(id: &Id, held: Held, deadline: Deadline) -> std::io::Result<EndProce
             }
         })
     })
+}
+
+/// The error of a wait for `id`'s process to exit that failed: `what` failed with the wait's own error,
+/// its OS code intact. When goetia's attempt to end the process had failed too, the error leads with
+/// that, worded as every report of a failed terminate words it (see [`terminating_failed`]).
+fn process_wait_failed(id: &Id, what: String, failure: ProcessWaitFailure) -> Error {
+    let ProcessWaitFailure {
+        wait_failed,
+        terminate_failed,
+    } = failure;
+    let error = Error::os(what, wait_failed);
+    let Some(terminate_failed) = terminate_failed else {
+        return error;
+    };
+    Error::Step {
+        what: terminating_failed(
+            format!("`{id}` is stopped, but goetia could not tell that its process exited"),
+            Some(&*terminate_failed),
+            ". The wait for it failed",
+        )
+        .to_string(),
+        source: Box::new(error),
+    }
 }
 
 /// `error`, the failure of a `stop` whose process SCM vouched for and goetia could not open, for
@@ -1505,8 +1536,9 @@ impl Scm {
             HoldOutcome::Held(held) => match end_held(id, held, Budget::Unbounded.start()) {
                 Ok(EndProcessOutcome::Exited) => {}
                 Ok(EndProcessOutcome::Lingers { .. }) => unreachable!("an unbounded deadline never expires"),
-                Err(e) => {
-                    failures.push(Error::os(format!("wait for `{id}`'s process to exit"), e).into());
+                Err(failure) => {
+                    failures
+                        .push(process_wait_failed(id, format!("wait for `{id}`'s process to exit"), failure).into());
                     return finish(failures, false);
                 }
             },

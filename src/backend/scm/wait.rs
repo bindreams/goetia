@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExit, SHIM_REFUSED};
 use crate::backend::scm::kill::HoldOutcome;
-use crate::error::Chain;
+use crate::error::{Chain, terminating_failed};
 use crate::manager::budget::Deadline;
 use crate::spec::Kind;
 
@@ -227,32 +227,40 @@ pub(crate) enum EndProcessOutcome<P> {
     },
 }
 
+/// The wait for a process's exit failed, so it is neither seen to exit nor known to be running.
+/// `wait_failed` is the error of the wait as it was, with its OS code, kind and source; `terminate_failed`
+/// is why the attempt to end the process failed, if it did, since then both are why it is not known
+/// to be gone.
+#[derive(Debug)]
+pub(crate) struct ProcessWaitFailure {
+    pub(crate) wait_failed: io::Error,
+    pub(crate) terminate_failed: Option<Arc<io::Error>>,
+}
+
 /// Ends `process`, the service's process held before its STOP, once SCM has confirmed `STOPPED`: SCM
 /// records it before the process exits, so `STOPPED` alone leaves the file the process runs in use.
 ///
 /// `terminate` ends the process (allowed once `SERVICE_STOPPED` is reported), and `exit` then waits for
 /// its exit under `deadline`. The wait follows whatever `terminate` returns, since the process may be
 /// exiting by itself; a failure is handed to `exit` and carried by
-/// [`Lingers`](EndProcessOutcome::Lingers). An `exit` that fails is the error, and when the terminate
-/// failed too, the error says so, with the same kind.
+/// [`Lingers`](EndProcessOutcome::Lingers). An `exit` that fails is the error, as it was, and carries
+/// the failed terminate beside it: see [`ProcessWaitFailure`].
 pub(crate) fn end_process<P>(
     process: P,
     deadline: Deadline,
     terminate: impl FnOnce(&P) -> io::Result<()>,
     exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
-) -> io::Result<EndProcessOutcome<P>> {
+) -> Result<EndProcessOutcome<P>, ProcessWaitFailure> {
     let terminate_failed = terminate(&process).err().map(Arc::new);
-    let waited = exit(&process, deadline, terminate_failed.as_deref()).map_err(|failed| match &terminate_failed {
-        None => failed,
-        Some(terminate_failed) => io::Error::new(
-            failed.kind(),
-            format!(
-                "{}, and terminating it failed: {}",
-                Chain(&failed),
-                Chain(&**terminate_failed)
-            ),
-        ),
-    })?;
+    let waited = match exit(&process, deadline, terminate_failed.as_deref()) {
+        Ok(waited) => waited,
+        Err(wait_failed) => {
+            return Err(ProcessWaitFailure {
+                wait_failed,
+                terminate_failed,
+            });
+        }
+    };
     Ok(match waited {
         Waited::Confirmed => EndProcessOutcome::Exited,
         Waited::Expired => EndProcessOutcome::Lingers {
@@ -276,6 +284,8 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
         process: P,
         terminate_failed: Option<Arc<io::Error>>,
     },
+    /// SCM confirmed `STOPPED`, and the wait for the held process to exit failed.
+    ProcessWaitFailed(ProcessWaitFailure),
     /// The hold expired, with SCM still naming process `pid`, which was gone, so the STOP was sent with
     /// no process held, and nothing says that it took effect or which process it reached: not a stop,
     /// whatever SCM answers afterwards.
@@ -297,11 +307,12 @@ fn take_held<P>(held: &mut HoldOutcome<P>) -> Option<P> {
 /// process held before the STOP, ended by `end`, and `held` is left empty: the shim's `KILL_ON_JOB_CLOSE`
 /// job is the last thing that can still kill the daemon's tree. How that went does not change that the
 /// stop failed, but an `end` whose wait for the exit failed, or that left the process running, is
-/// told in the error. Any other result, or no process held, is returned as it is.
+/// told in the error, with the failed terminate worded as [`terminating_failed`] words it. Any other
+/// result, or no process held, is returned as it is.
 pub(crate) fn end_on_incomplete_stop<P, T>(
     waited: io::Result<T>,
     held: &mut HoldOutcome<P>,
-    end: impl FnOnce(P) -> io::Result<EndProcessOutcome<P>>,
+    end: impl FnOnce(P) -> Result<EndProcessOutcome<P>, ProcessWaitFailure>,
 ) -> io::Result<T> {
     let Err(e) = waited else {
         return waited;
@@ -314,13 +325,21 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
     };
     let process = match end(process) {
         Ok(EndProcessOutcome::Exited) => return Err(e),
-        Ok(EndProcessOutcome::Lingers { terminate_failed, .. }) => {
-            let why = terminate_failed.map_or(String::new(), |failed| {
-                format!(" (terminating it failed: {})", Chain(&*failed))
-            });
-            format!("it had not exited when the wait for it ended{why}")
-        }
-        Err(failed) => format!("waiting for it to exit failed: {}", Chain(&failed)),
+        Ok(EndProcessOutcome::Lingers { terminate_failed, .. }) => terminating_failed(
+            "it had not exited when the wait for it ended".to_string(),
+            terminate_failed.as_deref(),
+            "",
+        )
+        .to_string(),
+        Err(ProcessWaitFailure {
+            wait_failed,
+            terminate_failed,
+        }) => terminating_failed(
+            format!("waiting for it to exit failed: {}", Chain(&wait_failed)),
+            terminate_failed.as_deref(),
+            "",
+        )
+        .to_string(),
     };
     Err(io::Error::other(IncompleteStop {
         failed_start: incomplete.failed_start,
@@ -332,7 +351,8 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
 /// process as it was before the STOP was sent. `end` is [`end_process`] over the real process, under
 /// the same `deadline`; a process that outlasts it is
 /// [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired), not an unconfirmed stop, and carries
-/// the failed terminate, if any. No process held (none reported, or none that could be opened) is the
+/// the failed terminate, if any; a wait for it that failed is
+/// [`ProcessWaitFailed`](StopAndAwaitExitOutcome::ProcessWaitFailed). No process held (none reported, or none that could be opened) is the
 /// stop alone.
 ///
 /// A stop that SCM confirmed with the shim's incomplete-stop record (`shim`, see [`judged`]) fails with
@@ -354,7 +374,7 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     deadline: Deadline,
     held: &mut HoldOutcome<P>,
     shim: bool,
-    end: impl FnOnce(P, Deadline) -> io::Result<EndProcessOutcome<P>>,
+    end: impl FnOnce(P, Deadline) -> Result<EndProcessOutcome<P>, ProcessWaitFailure>,
 ) -> io::Result<StopAndAwaitExitOutcome<P>> {
     if let HoldOutcome::Expired { pid } = *held {
         control_stop_or_underway(a)?;
@@ -372,15 +392,16 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     let Some(process) = take_held(held) else {
         return Ok(StopAndAwaitExitOutcome::Stopped);
     };
-    Ok(match end(process, deadline)? {
-        EndProcessOutcome::Exited => StopAndAwaitExitOutcome::Stopped,
-        EndProcessOutcome::Lingers {
+    Ok(match end(process, deadline) {
+        Ok(EndProcessOutcome::Exited) => StopAndAwaitExitOutcome::Stopped,
+        Ok(EndProcessOutcome::Lingers {
             process,
             terminate_failed,
-        } => StopAndAwaitExitOutcome::ProcessExpired {
+        }) => StopAndAwaitExitOutcome::ProcessExpired {
             process,
             terminate_failed,
         },
+        Err(failure) => StopAndAwaitExitOutcome::ProcessWaitFailed(failure),
     })
 }
 

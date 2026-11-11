@@ -554,13 +554,13 @@ fn stop_over_a_stop_under_way_still_expires_on_the_deadline() {
 }
 
 /// An `end` that nothing may call: the process is not held, or SCM has not confirmed `STOPPED`.
-fn no_end(_: u32, _: Deadline) -> io::Result<EndProcessOutcome<u32>> {
+fn no_end(_: u32, _: Deadline) -> Result<EndProcessOutcome<u32>, ProcessWaitFailure> {
     panic!("a process is ended once SCM has confirmed the stop, and only a held one")
 }
 
 /// [`no_end`] in the shape an uninstall's `end` has, which takes no deadline.
 #[cfg(windows)]
-fn no_end_of(process: u32) -> io::Result<EndProcessOutcome<u32>> {
+fn no_end_of(process: u32) -> Result<EndProcessOutcome<u32>, ProcessWaitFailure> {
     no_end(process, unbounded())
 }
 
@@ -569,7 +569,7 @@ fn no_end_of(process: u32) -> io::Result<EndProcessOutcome<u32>> {
 fn ending(
     terminate: impl FnOnce(&u32) -> io::Result<()>,
     exit: impl FnOnce(&u32, Deadline, Option<&io::Error>) -> io::Result<Waited>,
-) -> impl FnOnce(u32, Deadline) -> io::Result<EndProcessOutcome<u32>> {
+) -> impl FnOnce(u32, Deadline) -> Result<EndProcessOutcome<u32>, ProcessWaitFailure> {
     move |process, deadline| end_process(process, deadline, terminate, exit)
 }
 
@@ -693,7 +693,11 @@ fn stop_and_await_exit_reports_a_failed_wait_for_the_process() {
         ending(|_| Ok(()), |_, _, _| Err(io::Error::other("wait failed"))),
     );
 
-    assert_eq!(outcome.unwrap_err().to_string(), "wait failed");
+    let StopAndAwaitExitOutcome::ProcessWaitFailed(failure) = outcome.unwrap() else {
+        panic!("the wait for the process failed");
+    };
+    assert_eq!(failure.wait_failed.to_string(), "wait failed");
+    assert!(failure.terminate_failed.is_none());
 }
 
 /// A terminate that fails when it is called, as the OS can fail one for a handle it no longer
@@ -743,32 +747,50 @@ fn end_process_keeps_a_failed_terminate_for_the_wait_and_for_the_expiry() {
     );
 }
 
-/// The wait goes on after a terminate that failed, and its failure is the error, which says that the
-/// terminate failed too: with the process neither ended nor seen to exit, both are why.
+/// The wait goes on after a terminate that failed, and its failure is the error as the wait gave it,
+/// its OS code and kind intact; the failed terminate is carried beside it, as the error it was: with
+/// the process neither ended nor seen to exit, both are why.
 #[skuld::test]
-fn end_process_reports_a_failed_wait_after_a_failed_terminate_with_both() {
+fn end_process_keeps_a_failed_wait_and_a_failed_terminate_each_as_it_was() {
     let outcome = end_process(7u32, unbounded(), terminate_fails, |_, _, _| {
-        Err(io::Error::other("wait failed"))
+        Err(io::Error::from_raw_os_error(6))
     });
 
-    let said = outcome.unwrap_err().to_string();
-    assert!(
-        said.contains("wait failed") && said.contains("terminating it failed") && said.contains("os error 6"),
-        "{said}"
+    let failure = outcome.unwrap_err();
+    assert_eq!(failure.wait_failed.raw_os_error(), Some(6));
+    assert_eq!(failure.wait_failed.kind(), io::Error::from_raw_os_error(6).kind());
+    assert_eq!(
+        failure
+            .terminate_failed
+            .expect("the failed terminate is kept")
+            .to_string(),
+        "The handle is invalid. (os error 6)"
     );
 }
 
-/// A wait that fails after a terminate that succeeded is told as it is.
+/// The kind of a wait that failed survives, whatever it is.
+#[skuld::test]
+fn end_process_keeps_the_kind_of_a_failed_wait() {
+    let outcome = end_process(7u32, unbounded(), terminate_fails, |_, _, _| {
+        Err(io::Error::new(io::ErrorKind::TimedOut, "wait failed"))
+    });
+
+    assert_eq!(outcome.unwrap_err().wait_failed.kind(), io::ErrorKind::TimedOut);
+}
+
+/// A wait that fails after a terminate that succeeded is told as it is, with no terminate failure.
 #[skuld::test]
 fn end_process_reports_a_failed_wait_alone_after_a_terminate_that_succeeded() {
     let outcome = end_process(
         7u32,
         unbounded(),
         |_| Ok(()),
-        |_, _, _| Err(io::Error::other("wait failed")),
+        |_, _, _| Err(io::Error::from_raw_os_error(6)),
     );
 
-    assert_eq!(outcome.unwrap_err().to_string(), "wait failed");
+    let failure = outcome.unwrap_err();
+    assert_eq!(failure.wait_failed.raw_os_error(), Some(6));
+    assert!(failure.terminate_failed.is_none());
 }
 
 /// `stop` over a confirmed `STOPPED` fails the same way, with both.
@@ -776,20 +798,19 @@ fn end_process_reports_a_failed_wait_alone_after_a_terminate_that_succeeded() {
 fn stop_and_await_exit_reports_a_failed_wait_after_a_failed_terminate_with_both() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
 
-    let said = stop_and_await_exit(
+    let outcome = stop_and_await_exit(
         &mut fake,
         unbounded(),
         &mut HoldOutcome::Held(7u32),
         false,
-        ending(terminate_fails, |_, _, _| Err(io::Error::other("wait failed"))),
-    )
-    .unwrap_err()
-    .to_string();
-
-    assert!(
-        said.contains("wait failed") && said.contains("terminating it failed") && said.contains("os error 6"),
-        "{said}"
+        ending(terminate_fails, |_, _, _| Err(io::Error::from_raw_os_error(6))),
     );
+
+    let StopAndAwaitExitOutcome::ProcessWaitFailed(failure) = outcome.unwrap() else {
+        panic!("the wait for the process failed");
+    };
+    assert_eq!(failure.wait_failed.raw_os_error(), Some(6));
+    assert!(failure.terminate_failed.is_some());
 }
 
 /// The terminate precedes the wait, and the wait is told of nothing when the terminate succeeded.
@@ -3517,6 +3538,36 @@ fn a_held_process_that_outlasts_the_stop_is_a_wait_timeout_naming_its_pid() {
     .unwrap_err();
 
     assert!(matches!(err, Error::ProcessWaitTimeout { pid: 7, .. }), "{err:?}");
+}
+
+/// A held process whose wait failed after its terminate failed leaves `stop` the wait's OS code, and
+/// says that terminating it failed too.
+#[cfg(windows)]
+#[skuld::test]
+fn a_failed_wait_for_the_held_process_is_a_stop_error_with_the_waits_code_and_the_failed_terminate() {
+    use crate::backend::scm::manager::stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+
+    let err = stop_on(
+        &mut fake,
+        &Id::try_from("frpc").unwrap(),
+        Budget::Unbounded,
+        unbounded(),
+        &answer,
+        |_| Ok(HoldOutcome::Held(7u32)),
+        ending(terminate_fails, |_, _, _| Err(io::Error::from_raw_os_error(6))),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.raw_os_error(), Some(6), "{}", err.report());
+    let said = err.report().to_string();
+    assert!(
+        said.contains("terminating it failed") && said.contains("os error 6"),
+        "{said}"
+    );
 }
 
 /// What an uninstall that disabled the service found it as: not marked, with this start type before.
