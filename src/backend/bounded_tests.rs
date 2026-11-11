@@ -6,8 +6,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
-use crate::manager::budget::Budget;
 use crate::backend::standby;
+use crate::manager::budget::Budget;
 
 /// A reservation holding the temp files one child's streams draw.
 fn files() -> Reservation {

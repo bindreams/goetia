@@ -10,9 +10,9 @@
 //! stdout fallback and both truncation messages shipped with no test at all.
 
 use super::*;
+use crate::backend::standby;
 use std::os::unix::process::ExitStatusExt as _;
 use std::time::Duration;
-use crate::backend::standby;
 
 /// A `systemctl` that exited with `code`.
 fn exit(code: i32) -> ExitStatus {
