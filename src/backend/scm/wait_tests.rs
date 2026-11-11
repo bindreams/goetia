@@ -3097,23 +3097,55 @@ fn stop_and_await_exit_ends_the_held_process_of_an_incomplete_stop_before_failin
     assert_eq!(*calls.borrow(), vec![("terminate", 7), ("wait", 7)]);
 }
 
-/// A process that cannot be ended, or does not exit, does not change what the stop says.
+/// The incomplete stop is returned whatever became of ending the held process, and says when the
+/// process was not seen to exit, with why: goetia has no log at this layer to say it in.
 #[skuld::test]
-fn an_incomplete_stop_is_returned_whatever_became_of_ending_the_held_process() {
-    for exit in [Ok(Waited::Expired), Err(io::Error::other("wait failed"))] {
+fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
+    let plain = stop_and_await_exit(
+        &mut incomplete(FakeScm::new([Some(Observed::Stopped)])),
+        unbounded(),
+        &mut HoldOutcome::<u32>::NoProcess,
+        true,
+        no_end,
+    )
+    .unwrap_err()
+    .to_string();
+    let ran = |terminate: io::Result<()>, exit: io::Result<Waited>| {
         let mut fake = incomplete(FakeScm::new([Some(Observed::Stopped)]));
-
         let err = stop_and_await_exit(
             &mut fake,
             unbounded(),
             &mut HoldOutcome::Held(7u32),
             true,
-            ending(|_| Err(io::Error::other("denied")), |_, _, _| exit),
+            ending(|_| terminate, |_, _, _| exit),
         )
         .unwrap_err();
-
         assert!(is_incomplete_stop(&err), "{err}");
-    }
+        err.to_string()
+    };
+
+    assert_eq!(
+        ran(Ok(()), Ok(Waited::Confirmed)),
+        plain,
+        "an exited process adds nothing"
+    );
+    assert_eq!(
+        ran(Err(io::Error::other("denied")), Ok(Waited::Confirmed)),
+        plain,
+        "a process that exited anyway adds nothing"
+    );
+    let lingers = ran(Ok(()), Ok(Waited::Expired));
+    assert!(
+        lingers.starts_with(&plain) && lingers.contains("had not exited"),
+        "{lingers}"
+    );
+    let refused = ran(Err(io::Error::other("denied")), Ok(Waited::Expired));
+    assert!(
+        refused.contains("had not exited") && refused.contains("denied"),
+        "{refused}"
+    );
+    let failed = ran(Ok(()), Err(io::Error::other("wait failed")));
+    assert!(failed.starts_with(&plain) && failed.contains("wait failed"), "{failed}");
 }
 
 // the process held across an incomplete stop --------------------------------------------------------------------------
@@ -3121,7 +3153,10 @@ fn an_incomplete_stop_is_returned_whatever_became_of_ending_the_held_process() {
 /// The process `end_on_incomplete_stop` ended, with what `held` was left as.
 fn ended_by_incomplete_stop(waited: io::Result<Waited>, held: &mut HoldOutcome<u32>) -> (io::Result<Waited>, Vec<u32>) {
     let ended = std::cell::RefCell::new(vec![]);
-    let waited = end_on_incomplete_stop(waited, held, |process| ended.borrow_mut().push(process));
+    let waited = end_on_incomplete_stop(waited, held, |process| {
+        ended.borrow_mut().push(process);
+        Ok(EndProcessOutcome::Exited)
+    });
     (waited, ended.into_inner())
 }
 
