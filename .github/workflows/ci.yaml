@@ -101,9 +101,12 @@ jobs:
       # profile (`.config/nextest.toml`) kills it after its slow-timeout and reports it by name as
       # TIMEOUT, or this job's `timeout-minutes` cancels the run first (tests run one at a time).
       # `--no-tests fail` keeps a build that produced no tests from passing.
-      # On Windows the archive is extracted under `target/`, not into the runner's `%TEMP%`: a test
-      # that runs a service as a fresh local user needs the binary readable by that user, as `target/`
-      # is. nextest wants the directory to exist, and `--extract-overwrite` lets a restored cache
+      # On Windows the archive is extracted under `target/`, not into the runner account's `%TEMP%`,
+      # which other accounts cannot read: `real_account_gets_service_logon_right` runs the extracted
+      # test binary as a fresh local user, and relies on `target/` being readable by it. The tests
+      # that run as a built-in service account (`LocalService`) do not: `target/` is not assumed
+      # readable by those, so they copy the binary to `%ProgramData%` (`WorldReadableExe`).
+      # nextest wants the directory to exist, and `--extract-overwrite` lets a restored cache
       # leave one. On Linux and macOS root extracts into nextest's default temporary directory:
       # root must not write `target/`, which the next unelevated build and the cache prune need to own.
       - name: Run tests, elevated
