@@ -189,13 +189,12 @@ jobs:
           path: probe-results/
           if-no-files-found: ignore
 
-      # Last, and whatever the tests did, so a doc warning hides no test result. The hooks are in
-      # prek.toml (manual stage, so a commit does not run them) and fail on any rustdoc warning.
-      # `docs.rs` builds the three OS targets, and links to `#[cfg]`-gated items resolve on one OS and
-      # break on another, so each OS runs them.
+      # Last, and whatever the tests did, so a doc warning hides no test result. `docs.rs` builds the
+      # three OS targets, and links to `#[cfg]`-gated items resolve on one OS and break on another, so
+      # each OS runs them.
       - name: Rustdoc
         if: ${{ !cancelled() && matrix.toolchain != 'stable' }}
-        run: prek run --stage manual --all-files cargo-doc cargo-doc-lib-only
+        run: prek run --stage manual --all-files cargo-doc cargo-doc-lib-only cargo-doc-tests
 
   lint:
     name: Lint

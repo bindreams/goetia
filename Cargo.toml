@@ -17,8 +17,7 @@ exclude = ["/.github", "/.claude", "/CLAUDE.md", "/scripts", "/prek.toml", "/.ed
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
-# A `cargo doc` fails on these in the docs it builds. The `prek.toml` doc hooks also build private
-# items' docs, and fail on every other rustdoc warning too (`-D warnings`).
+# A `cargo doc` fails on these in the docs it builds.
 [lints.rustdoc]
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"

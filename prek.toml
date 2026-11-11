@@ -57,18 +57,14 @@ language = "system"
 types = ["rust"]
 pass_filenames = false
 
-# The rustdoc hooks are `manual`: they run when CI and the local lanes ask for them
-# (`prek run --stage manual --all-files cargo-doc ...`), not on every commit. Intra-doc links are
-# denied by `[lints.rustdoc]` in Cargo.toml; `-D warnings` here adds any warn-by-default rustdoc lint
-# the table does not deny, and any other warning. Each OS runs them, as `docs.rs` documents the three
-# OS targets and `#[cfg]` changes what links resolve.
+# Manual stage: CI and the local lanes ask for these (`prek run --stage manual --all-files cargo-doc
+# ...`); a commit does not run them.
 
 [[repos.hooks]]
 id = "cargo-doc"
 name = "cargo doc"
 # Private items are documented too, so links inside private docs are checked, and a public doc that
-# links to a private item still fires `private_intra_doc_links`. `cli` is a default feature;
-# `--all-features` adds `testing` and `goetia-shim`.
+# links to a private item still fires `private_intra_doc_links`.
 entry = """cargo doc --locked --no-deps --document-private-items --all-features --config 'build.rustdocflags=["-D", "warnings"]'"""
 language = "system"
 types = ["rust"]
@@ -80,6 +76,17 @@ id = "cargo-doc-lib-only"
 name = "cargo doc (library only)"
 # What `cli` gates is absent, so a link to it from anywhere else is broken.
 entry = """cargo doc --locked --no-deps --document-private-items --no-default-features --config 'build.rustdocflags=["-D", "warnings"]'"""
+language = "system"
+types = ["rust"]
+pass_filenames = false
+stages = ["manual"]
+
+[[repos.hooks]]
+id = "cargo-doc-tests"
+name = "cargo doc (test modules)"
+# `cfg(test)` items are documented only under `--cfg test`; the hooks above skip them. `--all-features`
+# would need a built shim (`goetia-shim`), and the test modules need only these two.
+entry = """cargo rustdoc --locked --lib --features cli,testing -- --cfg test --document-private-items -D warnings"""
 language = "system"
 types = ["rust"]
 pass_filenames = false
