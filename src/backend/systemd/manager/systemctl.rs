@@ -157,14 +157,12 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 /// The two prefixes systemd's own switches for this binary carry. An inherited name under either is
 /// removed from every `systemctl` goetia runs, whatever it is, and [`ENVIRONMENT`] alone is given.
 ///
-/// By prefix, not by name: the switches are systemd's to add, and naming them one at a time missed
-/// the next one twice. Three of them turn off the chroot report [`answered`] is the last line
+/// Three of them turn off the chroot report [`answered`] is the last line
 /// against, and `SYSTEMCTL_FORCE_BUS` points `systemctl` at another bus. Removed rather than set,
 /// because every value asserts something goetia is in no position to assert, such as whether this
 /// is a chroot: detecting that is the child's job.
 ///
-/// Not reached: `DBUS_*`, which a non-root `systemctl` honours with no switch at all (whether a
-/// read's child should lose it too is open), and variables under neither prefix (`PAGER`, `LESS`,
+/// Not reached: `DBUS_*`, which a non-root `systemctl` honours with no switch at all, and variables under neither prefix (`PAGER`, `LESS`,
 /// `TERM`, the locale), none of which changes the report.
 const DENIED: [&str; 2] = ["SYSTEMD_", "SYSTEMCTL_"];
 
@@ -595,7 +593,7 @@ pub(super) fn watched(budget: Budget) -> bool {
 }
 
 impl Systemctl {
-    /// One `systemctl <verb> <unit>` under `budget`, as two deliberately different paths.
+    /// One `systemctl <verb> <unit>` under `budget`.
     ///
     /// A budget that does not wait becomes `systemctl <verb> --no-block`, the exact native
     /// expression of "issue the request and return": systemd enqueues the job and `systemctl` exits
@@ -711,8 +709,7 @@ impl Systemctl {
     }
 
     /// Idempotent per `ServiceManager::stop`'s doc comment. Exit code 5 ("unit not loaded") means there
-    /// was nothing to stop — the same convention `tests/support/service_guard.rs` already uses for
-    /// cleanup — which is success here, not a failure to stop something that was never running.
+    /// was nothing to stop, which is success here, not a failure to stop something that was never running.
     pub(super) fn stop_impl(&self, id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
         let unit = super::unit_name(id);
         match self.run_verb("stop", &unit, budget, deadline)? {
@@ -841,11 +838,7 @@ impl Systemctl {
             Some("active") => State::Running,
             Some("inactive") => State::Stopped,
             Some("failed") => State::Failed,
-            // `activating`/`deactivating` land here, along with anything else
-            // systemd reports. One of three places a `State::Starting` would be
-            // produced if goetia grows one (routed post-0.1.0) — the other two
-            // are `state::classify` in `src/backend/launchd/state.rs` and
-            // `map_state` in `src/backend/scm/manager.rs`.
+            // `activating`/`deactivating` land here, along with anything else systemd reports.
             _ => State::Unknown,
         };
         let pid = props

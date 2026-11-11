@@ -2,10 +2,6 @@
 //! the shapes a capture can arrive in, and the argv and environment each budget runs under; the
 //! manager boundary and the version gate, driven through a [`Fake`] table of stated replies; and
 //! what a real child does, driven through a [`Real`] client whose program is `sh`.
-//!
-//! `failed`'s whole job is the wording of a message, and `tests/systemd_integration/linux.rs` can
-//! only reach it through a `systemctl` that actually fails — which is how the stdout fallback and
-//! both truncation messages shipped with no test at all.
 
 use super::*;
 use crate::backend::client::fake::{Entry, Fake, RoleKind, Waited, exited, fail, reply};
@@ -860,12 +856,7 @@ fn no_request_is_sent_before_the_manager_is_asked() {
 }
 
 /// The backstop: a `systemctl` past the gate that says it ignored what it was asked is refused on
-/// every path, and never read as a success — in every wording [`IGNORED`] lists, on either stream.
-/// The fake cannot see the environment a call is given, so that `run_verb` asks audibly, on its
-/// bounded and its other paths, is pinned against a real stand-in by
-/// `the_paths_that_do_not_bound_keep_the_announcement_audible` and
-/// `the_bounded_path_keeps_the_announcement_audible`; the other paths get the environment from the
-/// same `Real` and are not pinned one by one.
+/// every path, and never read as a success: in every wording [`IGNORED`] lists, on either stream.
 #[skuld::test]
 fn a_systemctl_that_ignored_the_request_is_refused_on_every_path() {
     for (report, on_stderr) in [

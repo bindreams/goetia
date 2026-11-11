@@ -18,7 +18,7 @@ pub(crate) trait Client: Send + Sync {
 pub(crate) enum Wait {
     /// To completion: nothing bounds it, so it never expires and draws nothing from the
     /// reservation, and the child's tree is not contained, since there is no deadline to tear it
-    /// down on. What the output needs is made on the spot.
+    /// down on.
     // systemd's alone: `launchctl` is always waited on under a deadline.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ToCompletion,
@@ -125,7 +125,6 @@ impl Client for Real {
 }
 
 /// A test client: a table of stated replies, with no process behind it.
-// Some of its vocabulary, such as `then` and `lingering`, is launchd's.
 #[cfg(test)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod fake {
