@@ -148,11 +148,16 @@ fn real_loses_a_child_and_says_whether_it_announced() {
         ("echo 'request issued' >&2; exit 0", Role::Query, false),
     ] {
         bounded::test_hook::wait_fails(|| std::io::Error::other("the wait failed").into());
+        let role_listeners = role.listeners();
         let wait = Wait::Bounded {
             role,
             deadline: Budget::Unbounded.start(),
         };
-        match sh(script).run(&[], wait, &mut files()) {
+        let mut reservation = match role_listeners {
+            0 => files(),
+            listeners => Reservation::of_listeners(listeners).unwrap(),
+        };
+        match sh(script).run(&[], wait, &mut reservation) {
             Err(ClientError::Lost { error, announced }) => {
                 assert_eq!(announced, expected, "{script}");
                 assert!(error.to_string().contains("the wait failed"), "{script}: {error:?}");
