@@ -470,7 +470,7 @@ fn windows_style_escape(s: &str) -> String {
 
 /// Build a command line from `executable` + `arguments` exactly the way
 /// `windows-service`'s `RawServiceInfo::new` does: escape each element with
-/// the same algorithm — argv[0] included — then join with single spaces.
+/// the same algorithm — `argv[0]` included — then join with single spaces.
 fn windows_style_command_line(executable: &str, arguments: &[&str]) -> String {
     let mut parts = vec![windows_style_escape(executable)];
     parts.extend(arguments.iter().map(|a| windows_style_escape(a)));
@@ -478,9 +478,9 @@ fn windows_style_command_line(executable: &str, arguments: &[&str]) -> String {
 }
 
 /// A `CommandLineToArgvW`-equivalent splitter. Real `CommandLineToArgvW`
-/// parses argv[0] (the program name) under different rules than every
+/// parses `argv[0]` (the program name) under different rules than every
 /// later argument — see `parse_argv0` — which is the source of the
-/// argv[0]-corruption finding this module's doc comment documents; this
+/// `argv[0]`-corruption finding this module's doc comment documents; this
 /// split is only faithful to the real API *because* it special-cases the
 /// first token, confirmed against the real API by
 /// `windows_style_split_matches_real_command_line_to_argv_w`.
@@ -511,7 +511,7 @@ fn windows_style_split(cmdline: &str) -> Vec<String> {
     args
 }
 
-/// Parses the program-name token (argv[0]) under the special rule real
+/// Parses the program-name token (`argv[0]`) under the special rule real
 /// `CommandLineToArgvW` applies only to it: a backslash is always literal
 /// here — never counted or doubled the way `parse_arg` treats one — and a
 /// `"` is a pure, uncounted toggle of "in quotes" mode. This is not
@@ -519,7 +519,7 @@ fn windows_style_split(cmdline: &str) -> Vec<String> {
 /// describes only the `parse_arg` rule, as if it applied uniformly);
 /// confirmed empirically against the real API by
 /// `windows_style_split_matches_real_command_line_to_argv_w`. Getting this
-/// wrong — applying `parse_arg`'s rule to argv[0] too — is exactly the bug
+/// wrong — applying `parse_arg`'s rule to `argv[0]` too — is exactly the bug
 /// this function exists to not have: it silently "corrects" a trailing
 /// backslash that the real API does not correct, certifying a round trip
 /// that does not hold.
@@ -892,7 +892,7 @@ fn managed_with_executable(executable: &str) -> DaemonSpec {
     DaemonSpec::new(plain_fields("frpc", vec![executable.to_string(), "arg".to_string()])).unwrap()
 }
 
-/// Executables whose argv[0] the writer reads back exactly, and ones it does not.
+/// Executables whose `argv[0]` the writer reads back exactly, and ones it does not.
 #[cfg(windows)]
 const EXECUTABLES_THE_WRITER_KEEPS: &[&str] = &[
     r"C:\frpc",
@@ -984,7 +984,7 @@ fn managed_accepts_an_executable_the_writer_keeps() {
     }
 }
 
-/// The refusal is exactly the set the writer does not round-trip, for the argv[0] rule the real
+/// The refusal is exactly the set the writer does not round-trip, for the `argv[0]` rule the real
 /// `CommandLineToArgvW` applies (`windows_style_split_matches_real_command_line_to_argv_w`).
 #[cfg(windows)]
 #[skuld::test]

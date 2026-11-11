@@ -90,7 +90,7 @@ pub fn missing_service_key(name: &str) -> Error {
 
 // Parameters (the metadata blob) ======================================================================================
 
-/// Runs `pass` once and settles what it met (see [`settle`]). `service_stands` asks whether the
+/// Runs `pass` once and settles what it met (see [`settle()`]). `service_stands` asks whether the
 /// service is still there; `fail` makes the error for a failure that leaves the read undecided.
 fn read_settled<T>(
     service_stands: impl FnOnce() -> std::result::Result<bool, Failure>,
@@ -521,7 +521,7 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
 /// marked for deletion (its record outlives it until the last handle closes, but it starts nothing),
 /// and when it has no `ImagePath` or none that is a string. [`RegistryReadOutcome::ServiceGone`]
 /// when its key is not there, or the service key was marked deleted at the open or mid-read and the
-/// service no longer stands, which is how [`settle`] reads every key that vanishes: the registry's
+/// service no longer stands, which is how [`settle()`] reads every key that vanishes: the registry's
 /// word only, which the sweep does not take alone. Any other failure to read is an error, a key that
 /// vanished under a service that still stands included, and a service key that is a registry link to
 /// a missing key (see [`stands`]): what the service runs is then unknown. A service key that is a

@@ -2022,8 +2022,8 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly() {
 }
 
 /// systemd takes the executable path as written but substitutes `$FOO`/`${FOO}` and collapses `$$`
-/// in argv[0], so a path holding `$` must run the right file and still hand the daemon its own
-/// path as argv[0]. The directory also holds a space and a `%`, which quote and double the word.
+/// in `argv[0]`, so a path holding `$` must run the right file and still hand the daemon its own
+/// path as `argv[0]`. The directory also holds a space and a `%`, which quote and double the word.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn an_executable_path_with_dollars_runs_with_the_path_as_argv0() {
     let id = support::random_test_id();

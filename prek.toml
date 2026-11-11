@@ -57,6 +57,39 @@ language = "system"
 types = ["rust"]
 pass_filenames = false
 
+# Manual stage: CI and the local lanes ask for these (`prek run --stage manual --all-files cargo-doc
+# ...`); a commit does not run them.
+
+[[repos.hooks]]
+id = "cargo-doc"
+name = "cargo doc"
+# Private items are documented too, so links inside private docs are checked, and a public doc that
+# links to a private item still fires `private_intra_doc_links`.
+entry = """cargo doc --locked --no-deps --document-private-items --all-features --config 'build.rustdocflags=["-D", "warnings"]'"""
+language = "system"
+types = ["rust"]
+pass_filenames = false
+stages = ["manual"]
+
+[[repos.hooks]]
+id = "cargo-doc-lib-only"
+name = "cargo doc (library only)"
+# What `cli` gates is absent, so a link to it from anywhere else is broken.
+entry = """cargo doc --locked --no-deps --document-private-items --no-default-features --config 'build.rustdocflags=["-D", "warnings"]'"""
+language = "system"
+types = ["rust"]
+pass_filenames = false
+stages = ["manual"]
+
+[[repos.hooks]]
+id = "cargo-doc-tests"
+name = "cargo doc (tests)"
+entry = "bash .github/scripts/rustdoc-tests.sh -D warnings"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+stages = ["manual"]
+
 [[repos.hooks]]
 id = "format-section-comments"
 name = "format section comments"

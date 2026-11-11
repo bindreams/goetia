@@ -40,8 +40,8 @@ pub trait ServiceManager {
     /// (systemd, SCM). launchd cannot update a loaded job, so `install` returns
     /// an error and writes nothing; if the job turns out loaded only after the
     /// write, it restores the previous plist and returns
-    /// [`Error::LoadedJobInDoubt`](crate::error::Error::LoadedJobInDoubt) or
-    /// [`Error::LoadedStateInDoubt`](crate::error::Error::LoadedStateInDoubt)
+    /// [`Error::LoadedJobInDoubt`] or
+    /// [`Error::LoadedStateInDoubt`]
     /// (exit `4`).
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
@@ -55,10 +55,10 @@ pub trait ServiceManager {
     /// manager. Operates by id alone, so it works without the original manifest.
     ///
     /// On Windows a `type: simple` service leaves shim files behind (see
-    /// [`EmbeddedStockShim`](crate::shim::EmbeddedStockShim)), and this removes the ones no other
+    /// `EmbeddedStockShim`), and this removes the ones no other
     /// service or process uses once its own host has exited. If that cleanup fails the service is
     /// still deleted and the error says so: re-run `uninstall` to retry it. `uninstall` of an id that
-    /// is not installed is the same retry, and reports [`Error::NotInstalled`](crate::Error::NotInstalled)
+    /// is not installed is the same retry, and reports [`Error::NotInstalled`]
     /// when it has nothing left to do.
     fn uninstall(&self, id: &Id) -> Result<()>;
 
@@ -391,9 +391,9 @@ pub enum State {
 
 /// The platform's [`ServiceManager`] implementation.
 ///
-/// Linux returns [`Systemd`](crate::backend::systemd::manager::Systemd),
-/// macOS [`Launchd`](crate::backend::launchd::manager::Launchd),
-/// Windows [`Scm`](crate::backend::scm::manager::Scm). Any other
+/// Linux returns `Systemd`,
+/// macOS `Launchd`,
+/// Windows `Scm`. Any other
 /// target returns [`Error::UnsupportedPlatform`] rather than panicking.
 pub fn native() -> Result<Box<dyn ServiceManager>> {
     #[cfg(target_os = "linux")]

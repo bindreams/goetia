@@ -4,7 +4,7 @@
 //! budget that does not wait, on a manager with one request-only restart
 //! (`ServiceManager::request_restart`). Does not change boot-enablement.
 //!
-//! **One budget covers the whole restart, not each leg:** [`restart`] starts
+//! **One budget covers the whole restart, not each leg:** `restart` starts
 //! one deadline and hands both legs a budget from it. Per id, not per
 //! invocation: `restart a b c --timeout 30s` gives each of the three 30s.
 
