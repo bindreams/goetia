@@ -3219,7 +3219,7 @@ fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
 /// A service whose blob will not decode is a shim's only when its image says so: a start over an image
 /// of the user's own, or one that could not be read, is judged as strictly as a `type: managed`
 /// service's, and its failure says that the blob could not be read. Driven through `start`'s own wait
-/// over the scripted SCM, from the answer of the predicate `start`, `stop` and `uninstall` share.
+/// over the scripted SCM, from the answer of the predicate `start` and `stop` share.
 /// The service ends right after it was started, which only the shim's vocabulary calls a start.
 #[cfg(windows)]
 #[skuld::test]

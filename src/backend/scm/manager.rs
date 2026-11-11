@@ -508,7 +508,7 @@ impl Backend for Scm {
     /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
     /// runs is free when `stop` returns. A service whose shim recorded an incomplete stop (the daemon's
     /// tree may still be running) is a failed stop, once the process is ended; `uninstall` fails the
-    /// same way, and leaves the service stopped, disabled and not deleted (see [`runs_a_shim`]).
+    /// same way, and leaves the service stopped, disabled and not deleted (see [`plan_uninstall`]).
     ///
     /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
@@ -1267,7 +1267,7 @@ impl ShimAnswer {
 }
 
 /// [`shim_answer`] over a snapshot's blob, reading the registered image only when the blob will not
-/// decode. One answer for `start`, `stop` and `uninstall`.
+/// decode. One answer for `start` and `stop`; an uninstall's is [`plan_uninstall`]'s.
 fn runs_a_shim(snapshot: &ScmSnapshot) -> ShimAnswer {
     shim_answer(snapshot.blob(), || {
         snapshot
