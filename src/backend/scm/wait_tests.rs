@@ -3360,6 +3360,10 @@ fn a_timed_out_start_over_an_unreadable_blob_names_the_blob() {
         )
         .unwrap_err();
 
+        assert!(
+            matches!(err.cause(), Error::WaitTimeout { awaited: "running", .. }),
+            "{image}: {err:?}"
+        );
         let said = err.report().to_string();
         assert!(
             said.contains("could not be read") && said.contains("corrupt"),
