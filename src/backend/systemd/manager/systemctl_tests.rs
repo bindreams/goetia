@@ -37,9 +37,53 @@ fn booted() -> Host {
     }
 }
 
+/// A host told to ask no manager, by `SYSTEMD_OFFLINE` set to `value`.
+fn offline(value: &str) -> Host {
+    Host {
+        offline: Some(value.to_string()),
+        ..booted()
+    }
+}
+
+fn offline_one() -> Host {
+    offline("1")
+}
+
+fn offline_yes() -> Host {
+    offline("yes")
+}
+
+/// A host with no `/run/systemd/system`.
+fn unbooted() -> Host {
+    Host {
+        unbooted: true,
+        ..booted()
+    }
+}
+
+/// A host whose `/` is a root of its own, found as `chroot` says.
+fn chrooted(chroot: Chroot) -> Host {
+    Host {
+        chroot: Some(chroot),
+        ..booted()
+    }
+}
+
+fn chroot_root() -> Host {
+    chrooted(Chroot::Root)
+}
+
+fn chroot_mount() -> Host {
+    chrooted(Chroot::Mount)
+}
+
+fn chroot_no_mount() -> Host {
+    chrooted(Chroot::NoMount)
+}
+
 /// `systemctl` over `client`, on a booted host.
 fn on_booted(client: impl Client + 'static) -> Systemctl {
-    Systemctl::new(Box::new(client), Box::new(booted))
+    Systemctl::new(Box::new(client), booted)
 }
 
 /// `systemctl` as a real child, `sh -c <script>` with `arg0` as `$0`, on a booted host: for a test
@@ -773,54 +817,31 @@ fn assert_no_manager(result: Result<()>, evidence: &str, path: &str) {
 /// gate's own probes included: the fake has no entries, so a single call would fail the test.
 #[skuld::test]
 fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
-    let hosts = [
+    let hosts: [(fn() -> Host, &str); 5] = [
+        (offline_one, "`SYSTEMD_OFFLINE=1` is set"),
         (
-            Host {
-                offline: Some("1".to_string()),
-                unbooted: false,
-                chroot: None,
-            },
-            "`SYSTEMD_OFFLINE=1` is set",
-        ),
-        (
-            Host {
-                offline: None,
-                unbooted: true,
-                chroot: None,
-            },
+            unbooted,
             "`/run/systemd/system`, which systemd makes when it boots a system, does not exist here",
         ),
         (
-            Host {
-                offline: None,
-                unbooted: false,
-                chroot: Some(Chroot::Root),
-            },
+            chroot_root,
             "`/` is not PID 1's root (`/proc/1/root`), so goetia runs under another root than PID 1, as in a \
              chroot or a container sharing the host's PID namespace",
         ),
         (
-            Host {
-                offline: None,
-                unbooted: false,
-                chroot: Some(Chroot::Mount),
-            },
+            chroot_mount,
             "the mount at `/` is none of PID 1's (`/proc/self/mountinfo`, `/proc/1/mountinfo`), so goetia runs \
              under another root than PID 1",
         ),
         (
-            Host {
-                offline: None,
-                unbooted: false,
-                chroot: Some(Chroot::NoMount),
-            },
+            chroot_no_mount,
             "no mount is at `/` (`/proc/self/mountinfo`): `/` is a directory inside one, so goetia runs in a \
              chroot",
         ),
     ];
     for (host, evidence) in hosts {
         let fake = Fake::new([]);
-        let systemctl = Systemctl::new(Box::new(fake.clone()), Box::new(move || host.clone()));
+        let systemctl = Systemctl::new(Box::new(fake.clone()), host);
         assert_no_manager(systemctl.require_supported(), evidence, "the gate");
         for Way { name, run, .. } in every_path() {
             assert_no_manager(run(&systemctl), evidence, &name);
@@ -1172,14 +1193,7 @@ fn a_remembered_pass_does_not_skip_the_evidence() {
     on_booted(Fake::new(gate_passes()))
         .require_supported()
         .expect("the fake passes the gate");
-    let offline = Systemctl::new(
-        Box::new(Fake::new([])),
-        Box::new(|| Host {
-            offline: Some("yes".to_string()),
-            unbooted: false,
-            chroot: None,
-        }),
-    );
+    let offline = Systemctl::new(Box::new(Fake::new([])), offline_yes);
     assert_no_manager(offline.daemon_reload(), "`SYSTEMD_OFFLINE=yes` is set", "daemon-reload");
 }
 
@@ -1559,7 +1573,7 @@ fn this_hosts_systemd_is_supported() {
             ["/bin/sh", "-c", wrapper, "systemctl"].map(String::from).to_vec(),
             environment,
         )),
-        Box::new(Host::this),
+        Host::this,
     )
     .supported()
     .expect("the host running the tests runs systemd 242+, whatever colour is inherited");

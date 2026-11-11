@@ -33,11 +33,11 @@ enum Purpose {
 pub(super) struct Systemctl {
     client: Box<dyn Client>,
     /// Read at every [`Systemctl::door`], never kept: the evidence is the system as it is at the run.
-    host: Box<dyn Fn() -> Host + Send + Sync>,
+    host: fn() -> Host,
 }
 
 impl Systemctl {
-    pub(super) fn new(client: Box<dyn Client>, host: Box<dyn Fn() -> Host + Send + Sync>) -> Systemctl {
+    pub(super) fn new(client: Box<dyn Client>, host: fn() -> Host) -> Systemctl {
         Systemctl { client, host }
     }
 
@@ -45,7 +45,7 @@ impl Systemctl {
     pub(super) fn native() -> Systemctl {
         Systemctl::new(
             Box::new(Real::new(vec!["systemctl".to_string()], environment)),
-            Box::new(Host::this),
+            Host::this,
         )
     }
 
