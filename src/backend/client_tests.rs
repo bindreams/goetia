@@ -162,6 +162,66 @@ fn real_loses_a_child_and_says_whether_it_announced() {
     }
 }
 
+// Wait::ToCompletion ==================================================================================================
+
+#[skuld::test]
+fn real_runs_to_completion_and_captures() {
+    let finished = sh("echo out; echo err >&2; exit 3")
+        .run(&[], Wait::ToCompletion, &mut Reservation::default())
+        .expect("sh runs");
+    let Finished::Exited { status, capture } = finished else {
+        panic!("a run to completion never expires: {finished:?}");
+    };
+    assert_eq!(status.code(), Some(3));
+    assert_eq!(capture.stdout, b"out\n");
+    assert_eq!(capture.stderr, b"err\n");
+    assert!(capture.complete);
+}
+
+/// What a run to completion needs it makes itself: a reservation holding nothing is enough.
+#[skuld::test]
+fn real_to_completion_draws_nothing_from_the_reservation() {
+    let mut reservation = Reservation::make(0, 0).unwrap();
+    sh("echo out")
+        .run(&[], Wait::ToCompletion, &mut reservation)
+        .expect("sh runs");
+    assert_eq!(bounded::test_hook::left(&reservation), (0, 0));
+}
+
+#[skuld::test]
+fn real_to_completion_gives_the_child_no_stdin() {
+    let Finished::Exited { capture, .. } = sh("cat; echo done")
+        .run(&[], Wait::ToCompletion, &mut Reservation::default())
+        .expect("sh runs")
+    else {
+        panic!("expired");
+    };
+    assert_eq!(capture.stdout, b"done\n");
+}
+
+#[skuld::test]
+fn real_to_completion_applies_its_environment_to_the_child() {
+    let real = sh_with("echo \"$CLIENT_MARK\"", |cmd| {
+        cmd.env("CLIENT_MARK", "set");
+    });
+    let Finished::Exited { capture, .. } = real
+        .run(&[], Wait::ToCompletion, &mut Reservation::default())
+        .expect("sh runs")
+    else {
+        panic!("expired");
+    };
+    assert_eq!(capture.stdout, b"set\n");
+}
+
+#[skuld::test]
+fn real_to_completion_reports_a_missing_program_as_not_run() {
+    let real = Real::new(vec!["/nonexistent/client".to_string()], |_| {});
+    let e = real
+        .run(&["x"], Wait::ToCompletion, &mut Reservation::default())
+        .expect_err("no such program");
+    assert!(matches!(e, ClientError::NotRun(_)), "{e:?}");
+}
+
 // fake::Fake ==========================================================================================================
 
 /// The test client draws what the real one draws, from the reservation it is handed: a call leaves
@@ -196,4 +256,23 @@ fn the_fake_draws_a_calls_files_from_the_reservation() {
         drop(short.run(&["print"], query(), &mut reservation));
     }));
     assert!(drawn.is_err(), "a call past the reservation went unnoticed");
+}
+
+/// How a call was waited on is recorded, and a run to completion draws no file.
+#[skuld::test]
+fn the_fake_records_a_run_to_completion_and_draws_nothing_for_it() {
+    use fake::{Fake, RoleKind, Waited, exited, reply};
+
+    let mut reservation = Reservation::make(0, 0).unwrap();
+    let table = Fake::new([reply(&["show"], exited(0, "", ""))]);
+    table
+        .run(&["show"], Wait::ToCompletion, &mut reservation)
+        .expect("a scripted reply");
+    assert_eq!(
+        table.waits(),
+        [Waited {
+            role: RoleKind::ToCompletion,
+            bounded: false
+        }]
+    );
 }
