@@ -321,10 +321,8 @@ pub(crate) use system::{normalise, referenced_hosts, sweep_folder};
 
 #[cfg(windows)]
 mod system {
-    use std::ffi::OsString;
     use std::fs;
     use std::io;
-    use std::os::windows::ffi::OsStringExt as _;
     use std::path::{Path, PathBuf};
 
     use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
@@ -414,7 +412,7 @@ mod system {
             }
             if needed <= buf.len() {
                 // `needed` counts the NUL.
-                return OsString::from_wide(&buf[..needed - 1]).to_string_lossy().into_owned();
+                return String::from_utf16_lossy(&buf[..needed - 1]);
             }
             buf.resize(needed, 0);
         }

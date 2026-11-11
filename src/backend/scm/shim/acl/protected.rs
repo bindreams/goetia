@@ -34,7 +34,6 @@ mod system {
     use std::ffi::c_void;
     use std::fs::File;
     use std::io;
-    use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::FromRawHandle as _;
     use std::path::{Path, PathBuf};
 
@@ -190,11 +189,11 @@ mod system {
 
     /// `path` as NUL-terminated UTF-16; a NUL inside it would end the name early.
     fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if wide.contains(&0) {
+        let wide = wide_null(path);
+        if wide[..wide.len() - 1].contains(&0) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "the path holds a NUL"));
         }
-        Ok(wide.into_iter().chain(std::iter::once(0)).collect())
+        Ok(wide)
     }
 }
 

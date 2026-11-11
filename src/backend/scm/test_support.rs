@@ -10,7 +10,7 @@ pub(crate) fn units_bytes(units: &[u16]) -> Vec<u8> {
     units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
 }
 
-/// The hash in the file name of a shim host, as a provider places one.
+/// The hash in the file name of a shim host, as a provider places one: SHA-256 of `b"abc"`.
 pub(crate) const SHIM_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 /// A service's blob of `kind`, as `install` writes it for the plain daemon `frpc`.
