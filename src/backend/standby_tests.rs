@@ -48,6 +48,23 @@ fn a_refused_thread_is_the_makers_error_and_serves_nothing() {
     assert_eq!(refused.to_string(), "no thread");
 }
 
+/// The item is served on a thread of its own, not the caller's, and the call reports success.
+#[cfg(unix)]
+#[skuld::test]
+fn run_now_serves_the_item_on_a_thread_other_than_the_callers() {
+    let (served, seen) = mpsc::channel();
+    let caller = thread::current().id();
+
+    Standby::run_now("standby-test", 7, move |item: u32| {
+        served.send((item, thread::current().id())).unwrap()
+    })
+    .expect("a thread was to be had");
+
+    let (item, on) = seen.recv().expect("the item was served");
+    assert_eq!(item, 7);
+    assert_ne!(on, caller, "the item was served on the caller's thread");
+}
+
 /// With no thread to be had the item comes back, unserved: the caller decides what to give up.
 #[cfg(unix)]
 #[skuld::test]
