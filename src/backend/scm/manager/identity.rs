@@ -14,8 +14,6 @@
 //! caller in `manager.rs`), and neither reference repo (`hole`, `wsm`) has
 //! solved this for any other account.
 
-use std::os::windows::ffi::OsStrExt as _;
-
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LocalFree};
 use windows_sys::Win32::Security::Authentication::Identity::{
     LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose, LsaNtStatusToWinError, LsaOpenPolicy,
@@ -26,6 +24,7 @@ use windows_sys::Win32::Security::{LookupAccountNameW, LookupAccountSidW, PSID};
 
 use crate::backend::Identity;
 use crate::backend::scm::sid::{is_whole_sid, sid_display};
+use crate::backend::scm::wide::wide_null;
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, User};
 
@@ -87,13 +86,6 @@ fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> R
             variable: "GOETIA_SERVICE_PASSWORD".to_string(),
         }),
     }
-}
-
-pub(in crate::backend::scm) fn wide_null(s: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
 }
 
 fn last_error(context: &str) -> Error {

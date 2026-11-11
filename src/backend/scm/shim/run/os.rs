@@ -2,10 +2,8 @@
 //! [`Os`], [`Spawned`] and [`Channels`] instead of `cosca`, `std::thread` and the file system.
 //! [`Real`] implements them; tests use `fake::Fake`.
 
-use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::windows::ffi::OsStrExt as _;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::thread::JoinHandle;
@@ -135,11 +133,6 @@ pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
         }
         _ => os_error_of(e),
     }
-}
-
-/// `s` as the null-terminated UTF-16 string the Win32 wide-character APIs take.
-pub(crate) fn wide_null(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
 /// Open `path` for append, creating parent directories first.

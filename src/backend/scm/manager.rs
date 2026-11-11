@@ -97,7 +97,6 @@ pub(in crate::backend::scm) mod registry;
 pub(crate) use identity::sid_for_account_name;
 
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -128,6 +127,7 @@ use crate::backend::scm::shim::provider::{ShimProvider, require_absolute};
 use crate::backend::scm::shim::sweep::{
     ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
+use crate::backend::scm::wide::{units_until_nul, wide_null};
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
@@ -794,7 +794,7 @@ fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailu
 /// `CommandLineToArgvW`, the same authority `generate_tests.rs`'s
 /// `windows_style_split` is checked against.
 pub(in crate::backend::scm) fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
-    let wide = identity::wide_null(cmdline);
+    let wide = wide_null(cmdline);
     let mut argc: i32 = 0;
     // SAFETY: `wide` is a valid null-terminated UTF-16 string that outlives
     // this call; `argc` is a valid, aligned `i32` out-param.
@@ -812,14 +812,8 @@ pub(in crate::backend::scm) fn split_command_line(cmdline: &str) -> (PathBuf, Ve
         // SAFETY: `argv` points to `argc` valid pointers to null-terminated
         // UTF-16 strings, per the documented `CommandLineToArgvW` contract.
         let ptr = unsafe { *argv.offset(idx) };
-        let mut len = 0isize;
         // SAFETY: `ptr` is a valid null-terminated UTF-16 string.
-        while unsafe { *ptr.offset(len) } != 0 {
-            len += 1;
-        }
-        // SAFETY: `ptr[0..len)` are exactly the UTF-16 code units just counted.
-        let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        result.push(OsString::from_wide(slice).to_string_lossy().into_owned());
+        result.push(String::from_utf16_lossy(unsafe { units_until_nul(ptr) }));
     }
     // SAFETY: `argv` was allocated by `CommandLineToArgvW` and is freed
     // exactly once, after every element has already been copied out above.
