@@ -3,6 +3,7 @@ use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use super::*;
@@ -898,6 +899,30 @@ fn a_reaper_with_nothing_to_reap_ends() {
     drop(reaper);
 
     assert!(rx.recv().is_err(), "the reaper reaped something it was never handed");
+}
+
+/// What a failed spawn's child is waited for by: the wait runs on a thread of its own, so the
+/// caller that reports the failure is never held for the child.
+#[skuld::test]
+fn a_child_given_to_the_background_is_waited_for_off_the_callers_thread() {
+    let (tx, rx) = mpsc::channel();
+
+    spares::reap_in_background(7, move |item| tx.send((item, thread::current().id())).unwrap())
+        .expect("a thread may be made");
+
+    let (item, waiter) = rx.recv().expect("the background wait must run");
+    assert_eq!(item, 7);
+    assert_ne!(waiter, thread::current().id());
+}
+
+/// With no thread to be had the child comes back, unwaited for: the caller decides what to give up.
+#[skuld::test]
+fn a_child_is_handed_back_when_no_thread_can_wait_for_it() {
+    let _no_thread = test_hook::threads(0);
+
+    let back = spares::reap_in_background(7, |_| panic!("no thread was made to run this"));
+
+    assert_eq!(back, Err(7));
 }
 
 // expiry_disposition ==================================================================================================

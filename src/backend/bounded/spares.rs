@@ -77,6 +77,16 @@ impl Reaper {
     }
 }
 
+/// Make a thread now, give it `item` and run `serve` on it there: the reaper of a child that was
+/// not announced, such as a failed spawn's. With no thread to be had `item` comes back, still
+/// unserved. A caller that outlives the child must not collect a zombie for each one it leaves.
+pub(crate) fn reap_in_background<T: Send + 'static>(item: T, serve: impl FnOnce(T) + Send + 'static) -> Result<(), T> {
+    match Standby::new("goetia-reaper", serve) {
+        Ok(standby) => standby.hand(item),
+        Err(_) => Err(item),
+    }
+}
+
 /// [`cosca::Child::detach`] it. Only Windows' disarm can be refused, and nothing here runs there:
 /// on a refusal the child would come back armed, and dropping it would kill the tree.
 fn let_go(child: cosca::Child) {

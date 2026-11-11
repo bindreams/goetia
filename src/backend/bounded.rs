@@ -24,7 +24,7 @@ use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvEr
 pub(crate) use spares::Kept;
 #[cfg(test)]
 pub(crate) use spares::test_hook;
-pub(crate) use spares::{Reaper, Reservation};
+pub(crate) use spares::{Reaper, Reservation, reap_in_background};
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub(crate) use spares::{Spares, spare};
 
