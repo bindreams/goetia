@@ -1099,9 +1099,9 @@ fn goetia_logging_systemctl(dir: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// The version gate probes `systemctl` once per daemon per verb, however many steps the verb takes:
-/// `restart`'s stop and start, `install --start`'s install and start, `uninstall`'s stop, `disable`
-/// and `daemon-reload`, share one pair of probes, and so one share of the budget. `enable` and
-/// `disable` ask it too: no request is sent before the manager is asked.
+/// `restart`'s stop and start, `install --start`'s install, `--enable` and start, `uninstall`'s
+/// stop, `disable` and `daemon-reload`, share one pair of probes, and so one share of the budget.
+/// `enable` and `disable` ask it too: no request is sent before the manager is asked.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn the_version_gate_probes_once_per_daemon_per_verb() {
     let id = support::random_test_id();
@@ -1123,7 +1123,7 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     };
 
     for args in [
-        &["daemon", "install", "--file", manifest, "--start"][..],
+        &["daemon", "install", "--file", manifest, "--enable", "--start"][..],
         &["daemon", "restart", guard.id()],
         &["daemon", "restart", guard.id(), "--timeout", "0"],
         &["daemon", "start", guard.id()],
@@ -1235,9 +1235,20 @@ fn cap_evidence(unit: &str) -> String {
     }
 }
 
-/// goetia never panics for want of a task; a verb that cannot get what its request needs exits `1`,
-/// and `start` and a waited `restart` then leave the daemon untouched. Each verb sweeps a rising
-/// limit until it succeeds; the cutoff is goetia's business and is not asserted.
+/// The one end-to-end smoke test of a host short of tasks. goetia never panics for want of a task,
+/// and a `start` or a waited `restart` that cannot get what its requests need exits `1` and leaves
+/// the daemon untouched (a `start`'s stays inactive with no job queued), at every limit: below what
+/// goetia reserves (its listener threads, refused before anything is sent: see
+/// `a_verb_short_of_threads_is_refused_before_it_sends_anything`) and at the one that leaves that
+/// whole and fails only cosca's own spawn thread, which cosca 0.7.0 makes inside `spawn` and goetia
+/// cannot reserve, where the spawn fails before the fork and is a clean "not sent". A no-wait
+/// restart reserves nothing, so it meets only that last case at every limit. Exit `4` (in doubt) is
+/// never accepted, and each exit `1` must be one of the two refusals above. Each sweep rises until
+/// the verb succeeds; the cutoff is not asserted.
+///
+/// cosca's threads are not reserved, and one joined (like a goetia listener detached) may still hold
+/// its `TasksMax` slot, so a waited restart's `start` leg can fail after its `stop` was sent. That
+/// race is open: the untouched-daemon assertion on a restart can fail on it.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
     let id = support::random_test_id();
@@ -1272,8 +1283,13 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
                     );
                     return;
                 }
-                // goetia's own refusal, not `systemd-run` failing to make the scope.
-                Some(1) if stderr.contains("error: ") && !stderr.contains("Failed to start transient scope unit") => {
+                // goetia's own refusal ([`Error::Reservation`] or [`Error::Spawn`] by their texts), not
+                // `systemd-run` failing to make the scope.
+                Some(1)
+                    if (stderr.contains("no thread or temp file could be made for a request, so none was sent")
+                        || stderr.contains("failed to run `"))
+                        && !stderr.contains("Failed to start transient scope unit") =>
+                {
                     untouched(tasks)
                 }
                 other => panic!("{args:?} TasksMax={tasks}: exit {other:?}: {stderr}"),
@@ -1281,6 +1297,8 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics() {
         }
     };
 
+    // The lone `start`, installed and inactive: a refusal leaves it inactive with no job queued. The
+    // sweep ends on a successful start, which leaves it running for the restarts to stop.
     sweep(&["daemon", "start", guard.id()], &|tasks| {
         assert_eq!(
             active_state_and_job(guard.id()),

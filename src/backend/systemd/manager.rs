@@ -73,13 +73,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use discover::{DROPIN_SEARCH_DIRS, Fragment};
-use systemctl::{GateScope, Systemctl, gate_scope};
+use systemctl::{Held, Systemctl};
 use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 
 use crate::backend::systemd::generate;
 use crate::backend::{
-    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry,
-    WriteOutcome, bounded,
+    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, WriteOutcome,
 };
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
@@ -122,40 +121,22 @@ impl std::fmt::Debug for Systemd {
     }
 }
 
-/// What [`Backend::reserve`] holds for systemd: pooled listener threads and a share of the version
-/// gate.
-pub(crate) struct Held {
-    _spares: bounded::Spares,
-    _gate: GateScope,
-}
-
 impl Backend for Systemd {
     type Definition = String;
     type Snapshot = Fragment;
-    type InstallScope = GateScope;
+    type InstallScope = ();
     type Reservation = Held;
 
     /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
-    /// answer holds for the `daemon-reload` after the write.
-    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String) -> Result<GateScope> {
-        let gate = gate_scope();
-        self.systemctl.require_supported()?;
-        Ok(gate)
+    /// answer holds for the `daemon-reload` after the write, which draws on the same reservation.
+    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String, reservation: &mut Held) -> Result<()> {
+        self.systemctl.require_supported(reservation)
     }
 
-    /// Two listener threads (stderr, stdout; no temp files) per watched start or stop in `steps`,
-    /// plus a share of one version gate. `install` and unwatched budgets need none. Verbs take the
-    /// threads from this thread's pool, not from the `Held` they are handed.
+    /// The listener threads each watched start or stop in `steps` reads its streams with, made all
+    /// or none: see [`Held::of`]. `install` and unwatched budgets need none.
     fn reserve(&self, steps: &[Step], budget: Budget) -> Result<Held> {
-        let watched = steps
-            .iter()
-            .filter(|step| matches!(step, Step::Start | Step::Stop) && systemctl::watched(budget))
-            .count();
-        let spares = bounded::spare(2 * watched).map_err(|source| Error::Reservation { id: None, source })?;
-        Ok(Held {
-            _spares: spares,
-            _gate: gate_scope(),
-        })
+        Held::of(steps, budget).map_err(|source| Error::Reservation { id: None, source })
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
@@ -176,15 +157,15 @@ impl Backend for Systemd {
         definition: &String,
         outcome: &Outcome,
         snapshot: Option<&Fragment>,
-        _scope: &mut GateScope,
-        _reservation: &mut Held,
+        _scope: &mut (),
+        reservation: &mut Held,
     ) -> Result<WriteOutcome> {
         let id = spec.id.as_str();
         dirs::ensure_parent_dirs(spec)?;
         match outcome {
             Outcome::Create => match create_unit(id, definition)? {
                 CreateOutcome::Created => {
-                    self.systemctl.daemon_reload_or_report(id)?;
+                    self.systemctl.daemon_reload_or_report(id, reservation)?;
                     Ok(WriteOutcome::Done)
                 }
                 CreateOutcome::Raced => Ok(WriteOutcome::Raced),
@@ -199,7 +180,7 @@ impl Backend for Systemd {
                         // partway through — `uninstall` clears its own fragment before its
                         // drop-in for the identical reason.
                         remove_dir_if_present(&dropin_dir(id))?;
-                        self.systemctl.daemon_reload_or_report(id)?;
+                        self.systemctl.daemon_reload_or_report(id, reservation)?;
                         Ok(WriteOutcome::Done)
                     }
                     ReplaceOutcome::Raced => Ok(WriteOutcome::Raced),
@@ -210,6 +191,7 @@ impl Backend for Systemd {
     }
 
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
+        // A read: it draws nothing and asks no gate.
         self.systemctl.status_from_unit(&unit_name(snapshot.id().as_str()))
     }
 
@@ -250,10 +232,10 @@ impl Backend for Systemd {
         Scan { entries, reported }
     }
 
-    fn uninstall(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<()> {
+    fn uninstall(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
         let id = snapshot.id().as_str();
-        // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's.
-        let _gate = gate_scope();
+        // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's, kept in
+        // the reservation they share.
 
         // Order matters: stop, then disable (needs the fragment's `[Install]` section to know which
         // symlinks to remove), then remove the fragment and any drop-in, then reload.
@@ -261,9 +243,9 @@ impl Backend for Systemd {
         // is a means rather than an end, and bounding it would turn a slow-stopping service into a
         // failed uninstall where today it succeeds.
         self.systemctl
-            .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start())?;
+            .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), reservation)?;
 
-        self.systemctl.disable_impl(id)?;
+        self.systemctl.disable_impl(id, reservation)?;
 
         // Verified removal, mirroring `replace_unit_verified`: the gap since `read` saw the
         // fragment spans two full `systemctl` round-trips, wide enough for something else to have
@@ -282,7 +264,7 @@ impl Backend for Systemd {
         // together: a partial failure here must not leave systemd's loaded view silently stale, the
         // same reasoning `daemon_reload_or_report` documents on the `install` side.
         let dropin_result = remove_dir_if_present(&dropin_dir(id));
-        let reload_result = self.systemctl.daemon_reload();
+        let reload_result = self.systemctl.daemon_reload(reservation);
         match (dropin_result, reload_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(e), Ok(())) => Err(e),
@@ -297,19 +279,22 @@ impl Backend for Systemd {
         }
     }
 
-    fn enable(&self, snapshot: Fragment) -> Result<()> {
-        self.systemctl.enable_impl(snapshot.id().as_str())
+    // `disable` is handed none and asks the gate for itself.
+    fn enable(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
+        self.systemctl.enable_impl(snapshot.id().as_str(), reservation)
     }
 
     fn disable(&self, snapshot: Fragment) -> Result<()> {
-        self.systemctl.disable_impl(snapshot.id().as_str())
+        self.systemctl
+            .disable_impl(snapshot.id().as_str(), &mut Held::default())
     }
 
-    fn start(&self, snapshot: Fragment, budget: Budget, _reservation: &mut Held) -> Result<()> {
+    fn start(&self, snapshot: Fragment, budget: Budget, reservation: &mut Held) -> Result<()> {
         // Derived at verb entry. It bounds only the wait for the job, never whether the job is
         // enqueued — see `run_verb`.
         let deadline = budget.start();
-        self.systemctl.start_impl(snapshot.id().as_str(), budget, deadline)
+        self.systemctl
+            .start_impl(snapshot.id().as_str(), budget, deadline, reservation)
     }
 
     /// One `systemctl restart --no-block`: one job, so no start can overtake
@@ -317,7 +302,10 @@ impl Backend for Systemd {
     /// still activating, folds the restart into the start already running —
     /// see `request_restart_impl`.
     fn request_restart(&self) -> Option<NativeRestart<Self>> {
-        Some(|mgr, snapshot| mgr.systemctl.request_restart_impl(snapshot.id().as_str()))
+        Some(|mgr, snapshot| {
+            mgr.systemctl
+                .request_restart_impl(snapshot.id().as_str(), &mut Held::default())
+        })
     }
 
     /// The plain request-only start. `restart` never issues it here — see
@@ -327,14 +315,15 @@ impl Backend for Systemd {
         Backend::start(self, snapshot, Budget::Immediate, reservation)
     }
 
-    fn stop(&self, snapshot: Fragment, budget: Budget, _reservation: &mut Held) -> Result<()> {
+    fn stop(&self, snapshot: Fragment, budget: Budget, reservation: &mut Held) -> Result<()> {
         // Derived at verb entry, as for `start`.
         let deadline = budget.start();
-        self.systemctl.stop_impl(snapshot.id().as_str(), budget, deadline)
+        self.systemctl
+            .stop_impl(snapshot.id().as_str(), budget, deadline, reservation)
     }
 
-    fn kill(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<()> {
-        self.systemctl.kill_impl(snapshot.id().as_str())
+    fn kill(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
+        self.systemctl.kill_impl(snapshot.id().as_str(), reservation)
     }
 }
 

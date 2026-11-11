@@ -1148,7 +1148,7 @@ impl backend::Backend for Launchd {
     type InstallScope = ();
     type Reservation = Reservation;
 
-    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String) -> Result<()> {
+    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String, _reservation: &mut Reservation) -> Result<()> {
         Ok(())
     }
 
@@ -1297,7 +1297,7 @@ impl backend::Backend for Launchd {
         fs::remove_file(&location.path).map_err(|e| Error::os_at("remove", &location.path, e))
     }
 
-    fn enable(&self, snapshot: Plist) -> Result<()> {
+    fn enable(&self, snapshot: Plist, _reservation: &mut Reservation) -> Result<()> {
         let Plist { id, location, .. } = snapshot;
 
         if location.enabled {

@@ -1,9 +1,8 @@
 //! Thin wrappers over `systemctl` subprocess invocations: reload, start/stop, and reading a unit's
 //! live state back — every one through the manager boundary, [`Systemctl::door`] and [`answered`].
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
+use std::io;
 use std::process::ExitStatus;
 
 use crate::backend::bounded::{Capture, Finished, Reservation, Role};
@@ -11,7 +10,59 @@ use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::backend::systemd::SYSTEMD_FLOOR;
 use crate::error::{Error, Result, VersionReading};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, State, Status};
+use crate::manager::{Budget, State, Status, Step};
+
+// Held ================================================================================================================
+
+/// What one verb of systemd, or a sequence of them, draws on, made by [`Held::of`] before anything is
+/// sent and handed to every [`Systemctl`] call: the threads a watched `systemctl` reads its streams
+/// with, and whether the version gate has passed.
+///
+/// A [`Default`] holds nothing and has not passed the gate: for a call that draws nothing and
+/// asks the gate for itself (`disable`, `request_restart`). A read never asks the gate.
+#[derive(Debug, Default)]
+pub(crate) struct Held {
+    pub(super) draws: Reservation,
+    /// The gate passed on this reservation, so its remaining steps do not ask it again: `restart`'s
+    /// two legs, `uninstall`'s stop, `disable` and `daemon-reload`, and `install --start`'s install,
+    /// `--enable` and start share one pair of probes. A refusal is not kept, since it ends the verb.
+    gate_passed: bool,
+}
+
+impl Held {
+    /// What `steps` draw under `budget`, all or none: see [`listeners`].
+    ///
+    /// cosca 0.7.0, as measured: every Linux `spawn` runs a helper thread (`cosca-pidfd-handshake`)
+    /// that is joined before `spawn` returns. goetia cannot reserve it. A host short by exactly that
+    /// thread fails the spawn as [`Error::Spawn`], before the fork, which sent nothing. goetia reads
+    /// no other thread of cosca's: the drain pump of a contained child (`cosca-cgrp-pump`) starts
+    /// only on a blocking wait for the tree to drain, which is `Child::wait_tree`,
+    /// `Child::wait_tree_timeout`, `Child::graceful_shutdown_tree` and a leaf's teardown on drop,
+    /// and of those goetia never calls the first three. Re-measure both on a cosca upgrade.
+    ///
+    /// None of cosca's threads is reserved, and a thread joined, like a listener detached, may still
+    /// hold its `TasksMax` slot until the kernel releases it. At a limit the `stop` leg exactly fits,
+    /// a waited `restart`'s `start` leg can fail to spawn after the stop was sent. This is not
+    /// covered here.
+    pub(super) fn of(steps: &[Step], budget: Budget) -> io::Result<Held> {
+        let needed: usize = steps.iter().map(|step| listeners(*step, budget)).sum();
+        Ok(Held {
+            draws: Reservation::of_listeners(needed)?,
+            gate_passed: false,
+        })
+    }
+}
+
+/// The listener threads `step` draws under `budget`: [`Role::listeners`] for each watched `systemctl`
+/// it runs, which is one for a `start` or `stop` under a budget [`watched`], and none for anything
+/// that runs to completion. The count sits beside [`Systemctl::run_verb`], which draws them.
+fn listeners(step: Step, budget: Budget) -> usize {
+    match step {
+        Step::Start | Step::Stop if watched(budget) => Role::AnnouncedRequest(enqueued).listeners(),
+        // `uninstall`'s stop is unbounded, and `request_start_after_stop` does not wait.
+        Step::Start | Step::Stop | Step::Install | Step::Kill | Step::Uninstall | Step::RequestStartAfterStop => 0,
+    }
+}
 
 // The manager boundary ================================================================================================
 
@@ -54,24 +105,23 @@ impl Systemctl {
     /// until the manager has passed the version gate. The gate's `show` is what finds out, before
     /// anything acts, a chroot goetia could not see for itself: `enable` and `disable` act on unit
     /// files offline and say nothing about it. [`answered`] is the other half.
-    fn door(&self, purpose: Purpose) -> Result<()> {
+    fn door(&self, purpose: Purpose, held: &mut Held) -> Result<()> {
         if let Some(evidence) = (self.host)().evidence() {
             return Err(no_manager(evidence));
         }
         if purpose == Purpose::Request {
-            self.require_supported()?;
+            self.require_supported(held)?;
         }
         Ok(())
     }
 
     /// `systemctl <args>` for `purpose`, through [`Systemctl::door`], waited on as `wait`, and
-    /// [`answered`]. A failure to run it is [`unran`].
-    fn run(&self, purpose: Purpose, args: &[&str], wait: Wait) -> Result<Finished> {
-        self.door(purpose)?;
-        // Every call here draws nothing from a reservation: see [`Role::files`].
+    /// [`answered`]. What the run draws comes from `held`. A failure to run it is [`unran`].
+    fn run(&self, purpose: Purpose, args: &[&str], wait: Wait, held: &mut Held) -> Result<Finished> {
+        self.door(purpose, held)?;
         let finished = self
             .client
-            .run(args, wait, &mut Reservation::default())
+            .run(args, wait, &mut held.draws)
             .map_err(|error| unran(purpose, args, error))?;
         if let Finished::Exited { capture, .. } = &finished {
             answered(&capture.stdout, &capture.stderr)?;
@@ -79,9 +129,9 @@ impl Systemctl {
         Ok(finished)
     }
 
-    /// [`Systemctl::run`] to completion, which never expires.
-    fn completed(&self, purpose: Purpose, args: &[&str]) -> Result<(ExitStatus, Capture)> {
-        match self.run(purpose, args, Wait::ToCompletion)? {
+    /// [`Systemctl::run`] to completion, which never expires and draws nothing from `held`.
+    fn completed(&self, purpose: Purpose, args: &[&str], held: &mut Held) -> Result<(ExitStatus, Capture)> {
+        match self.run(purpose, args, Wait::ToCompletion, held)? {
             Finished::Exited { status, capture } => Ok((status, capture)),
             Finished::Expired | Finished::Left(_) => unreachable!("a run to completion does not expire"),
         }
@@ -389,8 +439,8 @@ fn is_true(value: &str) -> bool {
 // Requests ============================================================================================================
 
 impl Systemctl {
-    pub(super) fn daemon_reload(&self) -> Result<()> {
-        let (status, capture) = self.completed(Purpose::Request, &["daemon-reload"])?;
+    pub(super) fn daemon_reload(&self, held: &mut Held) -> Result<()> {
+        let (status, capture) = self.completed(Purpose::Request, &["daemon-reload"], held)?;
         if status.success() {
             Ok(())
         } else {
@@ -402,8 +452,8 @@ impl Systemctl {
     /// as a successful install — the on-disk artifact and systemd's loaded view of it may have diverged
     /// — and says the unit was written. A reload in doubt stays in doubt, exit `4`; any other failure
     /// is exit `1`.
-    pub(super) fn daemon_reload_or_report(&self, id: &str) -> Result<()> {
-        self.daemon_reload().map_err(|e| match e {
+    pub(super) fn daemon_reload_or_report(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.daemon_reload(held).map_err(|e| match e {
             e @ Error::RequestInDoubt { .. } => {
                 e.in_doubt_context(format!("wrote the unit for `{id}`, so systemd may not have picked it up yet"))
             }
@@ -422,54 +472,18 @@ impl Systemctl {
 /// Refuse a systemd older than [`SYSTEMD_FLOOR`]. Asked before goetia writes a unit, and by
 /// [`Systemctl::door`] before every request: an older systemd does not reject `Type=exec` but logs that it
 /// cannot parse it and runs the unit as `Type=simple`, silently losing the failed-exec detection
-/// the directive is there for. Asked once per [`GateScope`].
+/// the directive is there for. Asked once per [`Held`]: one pass is remembered there, so the steps of
+/// one sequence share one pair of probes, and a manager that changes between two invocations is asked
+/// again.
 impl Systemctl {
-    pub(super) fn require_supported(&self) -> Result<()> {
-        gated(|| self.supported())
+    pub(super) fn require_supported(&self, held: &mut Held) -> Result<()> {
+        if held.gate_passed {
+            return Ok(());
+        }
+        self.supported(held)?;
+        held.gate_passed = true;
+        Ok(())
     }
-}
-
-thread_local! {
-    /// How many [`GateScope`]s are open on this thread, and whether the version gate passed inside
-    /// them.
-    static GATE: Cell<(usize, bool)> = const { Cell::new((0, false)) };
-}
-
-/// While one lives on this thread, a version gate that passed there is not asked again: the steps of
-/// one verb for one id — `restart`'s two legs, `install --start`'s install and start, `uninstall`'s
-/// stop, `disable` and `daemon-reload` — share one answer, and one pair of probes spends one share
-/// of the budget. Scopes nest and end in any order; the answer is forgotten when the last one ends,
-/// so nothing outlives the invocation that opened them, and a manager that changes between two is
-/// asked again.
-pub(crate) struct GateScope {
-    this_thread: PhantomData<*const ()>,
-}
-
-pub(super) fn gate_scope() -> GateScope {
-    let (open, passed) = GATE.get();
-    GATE.set((open + 1, passed));
-    GateScope {
-        this_thread: PhantomData,
-    }
-}
-
-impl Drop for GateScope {
-    fn drop(&mut self) {
-        let (open, passed) = GATE.get();
-        GATE.set((open - 1, passed && open > 1));
-    }
-}
-
-/// `check`, unless it already passed inside the open [`GateScope`]s. Only a pass is remembered: a
-/// refusal ends the verb anyway, and one that did not is asked again.
-pub(super) fn gated(check: impl FnOnce() -> Result<()>) -> Result<()> {
-    if GATE.get().1 {
-        return Ok(());
-    }
-    check()?;
-    let (open, _) = GATE.get();
-    GATE.set((open, open > 0));
-    Ok(())
 }
 
 /// Whose version [`Systemctl::supported`] judges.
@@ -489,8 +503,8 @@ impl Systemctl {
     /// [`answered`] refuse there — and any other failure to read the manager's version is a
     /// refusal too: a manager that is running and could not be asked is not one goetia can vouch
     /// for.
-    fn supported(&self) -> Result<()> {
-        let (status, capture) = self.completed(Purpose::Probe, &["--version"])?;
+    fn supported(&self, held: &mut Held) -> Result<()> {
+        let (status, capture) = self.completed(Purpose::Probe, &["--version"], held)?;
         if !status.success() {
             return Err(Error::Step {
                 what: format!("goetia cannot tell whether this is systemd {SYSTEMD_FLOOR}+"),
@@ -499,7 +513,7 @@ impl Systemctl {
         }
         let client = String::from_utf8_lossy(&capture.stdout);
         let client = client.lines().next().unwrap_or_default();
-        let (status, manager) = self.completed(Purpose::Probe, &["show", "--property=Version", "--value"])?;
+        let (status, manager) = self.completed(Purpose::Probe, &["show", "--property=Version", "--value"], held)?;
         if !status.success() {
             return Err(Error::Step {
                 what: format!("goetia cannot tell whether the running systemd is {SYSTEMD_FLOOR}+"),
@@ -587,7 +601,8 @@ fn enqueued(stderr: &[u8]) -> bool {
 }
 
 /// Whether [`Systemctl::run_verb`] takes its bounded path under `budget` — the one whose `systemctl`
-/// goetia watches, and which takes two listener threads, one per stream ([`Role::AnnouncedRequest`]).
+/// goetia watches, and which draws two listener threads from its [`Held`], one per stream
+/// ([`Role::AnnouncedRequest`]).
 pub(super) fn watched(budget: Budget) -> bool {
     budget.waits() && budget != Budget::Unbounded
 }
@@ -606,7 +621,14 @@ impl Systemctl {
     /// the job ([`enqueued`]) the wait is unbounded, so a budget a few milliseconds long still
     /// reaches systemd, and an expiry is then exactly what `budget::timed_out` says it is. `budget`
     /// only picks the path and the wording.
-    fn run_verb(&self, verb: &str, unit: &str, budget: Budget, deadline: Deadline) -> Result<Finished> {
+    fn run_verb(
+        &self,
+        verb: &str,
+        unit: &str,
+        budget: Budget,
+        deadline: Deadline,
+        held: &mut Held,
+    ) -> Result<Finished> {
         let wait = if watched(budget) {
             Wait::Bounded {
                 role: Role::AnnouncedRequest(enqueued),
@@ -615,7 +637,7 @@ impl Systemctl {
         } else {
             Wait::ToCompletion
         };
-        self.run(Purpose::Request, &verb_args(verb, unit, budget), wait)
+        self.run(Purpose::Request, &verb_args(verb, unit, budget), wait, held)
     }
 }
 
@@ -699,9 +721,9 @@ impl Systemctl {
     /// Every generated unit carries `Type=exec` (see `generate::unit`'s doc comment for why), so a
     /// bounded `systemctl start` confirms the `exec` itself succeeded — not merely that systemd forked
     /// the process. A missing executable or missing user comes back as a failed start.
-    pub(super) fn start_impl(&self, id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
+    pub(super) fn start_impl(&self, id: &str, budget: Budget, deadline: Deadline, held: &mut Held) -> Result<()> {
         let unit = super::unit_name(id);
-        match self.run_verb("start", &unit, budget, deadline)? {
+        match self.run_verb("start", &unit, budget, deadline, held)? {
             Finished::Exited { status, capture } if status.success() => took("start", &unit, &capture),
             Finished::Exited { status, capture } => Err(failed("start", &unit, status, &capture)),
             Finished::Expired | Finished::Left(_) => Err(budget::timed_out(id, "running", budget)),
@@ -710,9 +732,9 @@ impl Systemctl {
 
     /// Idempotent per `ServiceManager::stop`'s doc comment. Exit code 5 ("unit not loaded") means there
     /// was nothing to stop, which is success here, not a failure to stop something that was never running.
-    pub(super) fn stop_impl(&self, id: &str, budget: Budget, deadline: Deadline) -> Result<()> {
+    pub(super) fn stop_impl(&self, id: &str, budget: Budget, deadline: Deadline, held: &mut Held) -> Result<()> {
         let unit = super::unit_name(id);
-        match self.run_verb("stop", &unit, budget, deadline)? {
+        match self.run_verb("stop", &unit, budget, deadline, held)? {
             Finished::Exited { status, capture } if status.success() => took("stop", &unit, &capture),
             Finished::Exited { status, .. } if status.code() == Some(5) => Ok(()),
             Finished::Exited { status, capture } => Err(failed("stop", &unit, status, &capture)),
@@ -739,9 +761,9 @@ fn no_process(stderr: &str, unit: &str) -> bool {
 impl Systemctl {
     /// `Ok` means the signal was delivered: systemd sends it before it answers, and goetia does not wait
     /// for the process to be gone.
-    pub(super) fn kill_impl(&self, id: &str) -> Result<()> {
+    pub(super) fn kill_impl(&self, id: &str, held: &mut Held) -> Result<()> {
         let unit = super::unit_name(id);
-        let (status, capture) = self.completed(Purpose::Request, &unit_args(&KILL_ARGS, &unit))?;
+        let (status, capture) = self.completed(Purpose::Request, &unit_args(&KILL_ARGS, &unit), held)?;
         if status.success() {
             return Ok(());
         }
@@ -752,18 +774,18 @@ impl Systemctl {
     }
 
     /// `systemctl enable` for `id`'s unit; a failure carries systemd's words.
-    pub(super) fn enable_impl(&self, id: &str) -> Result<()> {
-        self.unit_file_verb("enable", id)
+    pub(super) fn enable_impl(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.unit_file_verb("enable", id, held)
     }
 
     /// `systemctl disable` for `id`'s unit, as [`Systemctl::enable_impl`]: `Systemd::disable` and `uninstall` both.
-    pub(super) fn disable_impl(&self, id: &str) -> Result<()> {
-        self.unit_file_verb("disable", id)
+    pub(super) fn disable_impl(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.unit_file_verb("disable", id, held)
     }
 
-    fn unit_file_verb(&self, verb: &str, id: &str) -> Result<()> {
+    fn unit_file_verb(&self, verb: &str, id: &str, held: &mut Held) -> Result<()> {
         let unit = super::unit_name(id);
-        let (status, capture) = self.completed(Purpose::Request, &unit_args(&[verb], &unit))?;
+        let (status, capture) = self.completed(Purpose::Request, &unit_args(&[verb], &unit), held)?;
         if status.success() {
             return Ok(());
         }
@@ -779,9 +801,9 @@ impl Systemctl {
     /// still activating, when systemd folds the restart into the start job already running: nothing is
     /// stopped, and the daemon comes up fresh from that start. [`took`] as for `start`: an exit of `0`
     /// with no job is a restart nobody made.
-    pub(super) fn request_restart_impl(&self, id: &str) -> Result<()> {
+    pub(super) fn request_restart_impl(&self, id: &str, held: &mut Held) -> Result<()> {
         let unit = super::unit_name(id);
-        match self.run_verb("restart", &unit, Budget::Immediate, Budget::Immediate.start())? {
+        match self.run_verb("restart", &unit, Budget::Immediate, Budget::Immediate.start(), held)? {
             Finished::Exited { status, capture } if status.success() => took("restart", &unit, &capture),
             Finished::Exited { status, capture } => Err(failed("restart", &unit, status, &capture)),
             Finished::Expired | Finished::Left(_) => {
@@ -797,7 +819,11 @@ impl Systemctl {
     /// is no answer, and never the state its absence would default to.
     fn show_properties(&self, unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
         let joined = props.join(",");
-        let (status, capture) = self.completed(Purpose::Read, &unit_args(&["show", "--property", &joined], unit))?;
+        let (status, capture) = self.completed(
+            Purpose::Read,
+            &unit_args(&["show", "--property", &joined], unit),
+            &mut Held::default(),
+        )?;
         if !status.success() {
             return Err(Error::command(
                 format!("systemctl show {unit}"),

@@ -15,9 +15,10 @@ fn files() -> Reservation {
     Reservation::make(0, STREAMS).unwrap()
 }
 
-/// `cmd`, spawned under `role`.
+/// `cmd`, spawned under `role`, handed what its streams draw.
 fn spawned(mut cmd: cosca::Command, role: Role) -> Spawned {
-    spawn(&mut cmd, role, &mut files()).unwrap()
+    let mut reservation = Reservation::for_role(&role);
+    spawn(&mut cmd, role, &mut reservation).unwrap()
 }
 
 /// `/bin/sh -c <script>`, as [`command`] builds it.
@@ -471,51 +472,22 @@ fn marks(marker: &std::path::Path) -> cosca::Command {
 
 /// Whatever a role's output needs is made before the child is spawned, and a failure to make it
 /// means the child never ran: never a panic, and never a request out with nothing to watch it.
-/// Each allowance fails a different one: an uncounted read's stdout and stderr files, an announced
-/// request's stderr and stdout threads. A counted read or request has its files before it is
-/// spawned: see [`a_reservation_is_made_whole_or_not_at_all`].
+/// An uncounted read's stdout and stderr files are made on the spot, and one that cannot be made
+/// fails it before it runs. A counted read or request has its files, and an announced request its
+/// threads, before it is spawned: see [`a_reservation_is_made_whole_or_not_at_all`].
 #[skuld::test]
-fn a_child_whose_output_nothing_could_take_is_never_run() {
-    type Allowance = fn() -> test_allowance::Allowance;
-    type Case = (&'static str, fn() -> Role, Allowance, &'static str);
-    let cases: [Case; 4] = [
-        (
-            "uncounted stdout",
-            || Role::UncountedQuery,
-            || test_hook::temp_files(0),
-            "temp file",
-        ),
-        (
-            "uncounted stderr",
-            || Role::UncountedQuery,
-            || test_hook::temp_files(1),
-            "temp file",
-        ),
-        (
-            "announced stdout",
-            || Role::AnnouncedRequest(announced),
-            || standby::test_hook::threads(0),
-            "thread",
-        ),
-        (
-            "announced stderr",
-            || Role::AnnouncedRequest(announced),
-            || standby::test_hook::threads(1),
-            "thread",
-        ),
-    ];
-    for (case, role, allowance, what) in cases {
+fn an_uncounted_query_whose_output_nothing_could_take_is_never_run() {
+    for (case, allowance) in [("stdout", 0), ("stderr", 1)] {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("request");
-        let role = role();
-        let _short = allowance();
+        let _short = test_hook::temp_files(allowance);
         let spawns = test_hook::spawns();
 
-        let e = spawn(&mut marks(&marker), role, &mut Reservation::default())
+        let e = spawn(&mut marks(&marker), Role::UncountedQuery, &mut Reservation::default())
             .err()
             .expect(case);
 
-        assert!(e.to_string().contains(&format!("no {what} ")), "{case}: {e}");
+        assert!(e.to_string().contains("no temp file "), "{case}: {e}");
         assert!(e.to_string().contains("so it was not run"), "{case}: {e}");
         assert_eq!(test_hook::spawns(), spawns, "{case}: the child was spawned");
         assert!(!marker.exists(), "{case}: the child ran");
@@ -523,14 +495,14 @@ fn a_child_whose_output_nothing_could_take_is_never_run() {
 }
 
 /// An announced request — `systemctl` — makes no temp file at all: it runs where none may be
-/// writable.
+/// writable. Its threads come from the reservation it is handed.
 #[skuld::test]
 fn an_announced_request_needs_no_temp_file() {
     let _no_file = test_hook::temp_files(0);
     let spawned = spawn(
         &mut sh("echo out; echo 'request issued' >&2"),
         Role::AnnouncedRequest(announced),
-        &mut Reservation::default(),
+        &mut Reservation::of_listeners(STREAMS).unwrap(),
     )
     .unwrap();
     let finished = wait_bounded(spawned, Budget::Unbounded.start());
@@ -685,44 +657,68 @@ fn a_child_takes_its_output_from_the_reservation_it_is_handed() {
     assert_eq!(test_hook::left(&reservation), (0, STREAMS));
 }
 
-/// A reservation hands out what it made: each reaper and file, with nothing made meanwhile.
 #[skuld::test]
 fn a_reservation_hands_out_what_it_made() {
     let mut reservation = Reservation::make(2, 2).unwrap();
+    let mut listening = Reservation::of_listeners(2).unwrap();
     let _no_thread = standby::test_hook::threads(0);
     let _no_file = test_hook::temp_files(0);
 
     drop((reservation.reaper().unwrap(), reservation.reaper().unwrap()));
     drop((reservation.file().unwrap(), reservation.file().unwrap()));
+    drop((listening.listener().unwrap(), listening.listener().unwrap()));
 
     assert_eq!(test_hook::left(&reservation), (0, 0));
+    assert_eq!(test_hook::listeners_left(&listening), 0);
 }
 
 /// A reservation is made whole or not at all, so a verb whose last request could have no reaper
-/// never sends its first: `make` fails as a whole when any one thread or file cannot be made.
+/// never sends its first: `make` and `of_listeners` fail as a whole when any one thread or file
+/// cannot be made.
 #[skuld::test]
 fn a_reservation_is_made_whole_or_not_at_all() {
     type Case = (
         &'static str,
         fn() -> test_allowance::Allowance,
-        (usize, usize),
+        fn() -> io::Result<Reservation>,
         &'static str,
     );
-    let cases: [Case; 4] = [
-        ("third reaper", || standby::test_hook::threads(2), (3, 0), "no thread"),
-        ("first reaper", || standby::test_hook::threads(0), (1, 2), "no thread"),
-        ("second file", || test_hook::temp_files(1), (0, 2), "no temp file"),
+    let cases: [Case; 5] = [
+        (
+            "third reaper",
+            || standby::test_hook::threads(2),
+            || Reservation::make(3, 0),
+            "no thread",
+        ),
+        (
+            "first reaper",
+            || standby::test_hook::threads(0),
+            || Reservation::make(1, 2),
+            "no thread",
+        ),
+        (
+            "second file",
+            || test_hook::temp_files(1),
+            || Reservation::make(0, 2),
+            "no temp file",
+        ),
         (
             "file after the reapers",
             || test_hook::temp_files(0),
-            (1, 1),
+            || Reservation::make(1, 1),
             "no temp file",
         ),
+        (
+            "second listener",
+            || standby::test_hook::threads(1),
+            || Reservation::of_listeners(2),
+            "no thread",
+        ),
     ];
-    for (case, allowance, (reapers, files), what) in cases {
+    for (case, allowance, make, what) in cases {
         let _short = allowance();
 
-        let e = Reservation::make(reapers, files).expect_err(case);
+        let e = make().expect_err(case);
 
         assert!(e.to_string().contains(what), "{case}: {e}");
     }
@@ -734,6 +730,15 @@ fn a_reservation_is_made_whole_or_not_at_all() {
 fn a_draw_past_the_reservation_is_loud() {
     assert!(panics(|| drop(Reservation::default().reaper())), "a reaper");
     assert!(panics(|| drop(Reservation::default().file())), "a temp file");
+    assert!(panics(|| drop(Reservation::default().listener())), "a listener");
+    assert!(
+        panics(|| drop(spawn(
+            &mut sh("true"),
+            Role::AnnouncedRequest(announced),
+            &mut Reservation::of_listeners(1).unwrap()
+        ))),
+        "the second stream's listener"
+    );
     assert!(
         panics(|| drop(spawn(
             &mut sh("true"),
@@ -744,10 +749,10 @@ fn a_draw_past_the_reservation_is_loud() {
     );
 }
 
-/// `Role::files` is what a spawn under that role draws from its reservation, for every role: the one
-/// number the verbs' counts and the test `Fake` read, so none of them can drift from the real spawn.
+/// `Role::files` and `Role::listeners` are what a spawn under that role draws from its reservation,
+/// for every role.
 #[skuld::test]
-fn a_role_names_the_files_its_spawn_draws() {
+fn a_role_names_what_its_spawn_draws() {
     let roles: [fn() -> Role; 4] = [
         || Role::Query,
         || Role::UncountedQuery,
@@ -757,13 +762,23 @@ fn a_role_names_the_files_its_spawn_draws() {
     for make in roles {
         let role = make();
         let name = format!("{role:?}");
-        let files = role.files();
-        let mut reservation = Reservation::make(0, STREAMS + 1).unwrap();
+        let (files, listeners) = (role.files(), role.listeners());
+        // A role draws one of the two, so each is handed a reservation of the one it draws, and one
+        // more than that.
+        let mut reservation = if listeners > 0 {
+            Reservation::of_listeners(listeners + 1).unwrap()
+        } else {
+            Reservation::make(0, files + 1).unwrap()
+        };
 
         let spawned = spawn(&mut sh("true"), role, &mut reservation).unwrap();
         drop(spawned);
 
-        assert_eq!(test_hook::left(&reservation), (0, STREAMS + 1 - files), "{name}");
+        assert_eq!(
+            (test_hook::left(&reservation), test_hook::listeners_left(&reservation)),
+            ((0, usize::from(listeners == 0)), usize::from(listeners > 0)),
+            "{name}: one more than it draws was left"
+        );
     }
 }
 
@@ -821,79 +836,55 @@ fn kept_files_serve_a_read_again_and_again_each_starting_empty() {
     }
 }
 
-// Spares ==============================================================================================================
+// Listeners ===========================================================================================================
 
-/// A sequence's spares are what its announced requests' threads are taken from, so nothing need be
-/// made for them.
+/// An announced request takes the threads that read its streams from the reservation it is handed,
+/// so none need be made for it.
 #[skuld::test]
-fn an_announced_request_takes_its_threads_from_the_spares() {
-    let spares = spare(2).unwrap();
+fn an_announced_request_takes_its_threads_from_the_reservation_it_is_handed() {
+    let mut reservation = Reservation::of_listeners(STREAMS).unwrap();
     let _no_thread = standby::test_hook::threads(0);
 
     let finished = wait_bounded(
-        spawned(sh("echo 'request issued' >&2"), Role::AnnouncedRequest(announced)),
+        spawn(
+            &mut sh("echo 'request issued' >&2"),
+            Role::AnnouncedRequest(announced),
+            &mut reservation,
+        )
+        .unwrap(),
         Budget::Unbounded.start(),
     );
 
     assert!(matches!(finished, Ok(Finished::Exited { .. })), "{finished:?}");
-    assert_eq!(test_hook::pooled(), 0, "the spares are spent");
-    drop(spares);
+    assert_eq!(test_hook::listeners_left(&reservation), 0, "the listeners are spent");
 }
 
-/// While a reservation is live on this thread, everything its verbs need was to have been made in
-/// it: a listener made on the spot instead means one needed more than was counted, and fails
-/// loudly. With none live, making on the spot is how a lone verb gets what it needs.
+/// A reservation one thread short of an announced request's streams makes the missing one on the
+/// spot, and when no thread can be made the request is not spawned: [`SpawnError::NotRun`]. A debug
+/// build stops at the miscount before it gets there ([`Reservation::listener`]), so only a release
+/// build reaches this refusal.
+#[cfg(not(debug_assertions))]
 #[skuld::test]
-fn making_a_listener_on_the_spot_inside_a_reservation_is_loud() {
-    assert!(panics(|| drop((spare(0).unwrap(), spares::listener()))));
+fn an_announced_request_short_of_a_listener_thread_is_not_spawned() {
+    let mut reservation = Reservation::of_listeners(STREAMS - 1).unwrap();
+    let _no_thread = standby::test_hook::threads(0);
+    let spawned_before = test_hook::spawns();
 
-    drop(spares::listener().expect("no reservation is live"));
-}
-
-/// Sparing is all or nothing: a guard that could not make everything leaves nothing behind.
-#[skuld::test]
-fn a_spare_that_cannot_be_made_whole_spares_nothing() {
-    {
-        let _one = standby::test_hook::threads(1);
-        let e = spare(2).expect_err("a second thread may not be made");
-        assert!(e.to_string().contains("no thread may be made"), "{e}");
-    }
-    assert_eq!(
-        test_hook::pooled(),
-        0,
-        "the listener made before the failure was pooled"
+    let refused = spawn(
+        &mut sh("echo 'request issued' >&2"),
+        Role::AnnouncedRequest(announced),
+        &mut reservation,
     );
-}
 
-/// Dropping the guard drops what it left: nothing lingers for a later, unrelated verb.
-#[skuld::test]
-fn spares_are_released_with_their_guard() {
-    drop(spare(2).unwrap());
-    let _none = standby::test_hook::threads(0);
-
-    assert!(spares::listener().is_err(), "a released spare was still handed out");
-}
-
-/// A guard releases only the spares it made: an inner one dropped first leaves the outer one's for
-/// the verbs the outer one still covers.
-#[skuld::test]
-fn an_inner_guard_releases_only_its_own_spares() {
-    let outer = spare(2).unwrap();
-    drop(spare(1).unwrap());
-
-    assert_eq!(test_hook::pooled(), 2, "only the inner guard's spare goes with it");
-    drop(outer);
-}
-
-/// Guards may also end out of order: dropping the outer one first leaves the inner one's spares.
-#[skuld::test]
-fn an_outer_guard_dropped_first_leaves_the_inner_guards_spares() {
-    let outer = spare(2).unwrap();
-    let inner = spare(1).unwrap();
-    drop(outer);
-
-    assert_eq!(test_hook::pooled(), 1, "only the outer guard's spares go with it");
-    drop(inner);
+    match refused {
+        Err(SpawnError::NotRun(e)) => assert!(
+            e.to_string().contains("no thread to read its output could be made"),
+            "{e}"
+        ),
+        Err(SpawnError::MayHaveRun(e)) => panic!("a spawn that never happened may have run: {e}"),
+        Ok(_) => panic!("spawned with no thread to read its output"),
+    }
+    assert_eq!(test_hook::spawns(), spawned_before, "the child was spawned");
 }
 
 /// A reaper whose request exited inside its budget has nothing to reap, and its thread ends: the

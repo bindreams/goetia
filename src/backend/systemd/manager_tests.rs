@@ -15,10 +15,9 @@ use super::discover::{RawState, raw_state};
 use super::systemctl::systemctl_tests::{booted, gate_then};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
-use crate::backend::client::fake::{Fake, exited, reply};
-use crate::backend::standby;
-use crate::backend::test_allowance;
-use crate::manager::ServiceManager;
+use crate::backend::client::fake::{Entry, Fake, exited, reply};
+use crate::backend::{bounded, standby};
+use crate::manager::ServiceManager as _;
 use crate::manager::conformance::fresh_id;
 use crate::spec::DaemonFields;
 use crate::spec::Kind;
@@ -212,7 +211,8 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
         // raced one leaves that reply unused.
         let mgr = over(gate_then([reply(&["daemon-reload"], exited(0, "", ""))]));
         let stop = StopRacer(&done);
-        let outcome = flow::install(&mgr, &spec, false);
+        let mut held = Backend::reserve(&mgr, &[Step::Install], Budget::Unbounded).expect("reserve");
+        let outcome = flow::install(&mgr, &spec, false, &mut held);
         drop(stop);
         racer.join().expect("racer thread panicked");
 
@@ -444,85 +444,122 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
     assert_eq!(scan.dropins, ["blocked"], "{scan:?}");
 }
 
-// prepare =============================================================================================================
+// reserve =============================================================================================================
 
-/// Under a bounded budget `restart`'s legs, and `install --start`'s start, each run one watched
-/// `systemctl`, and `prepare` makes what every one of them needs before either sends anything: once
-/// it succeeded, no leg can fail for want of a thread or a file. It fails as a whole when one is
-/// short.
-#[skuld::test]
-fn prepared_steps_need_nothing_made_later() {
-    let mgr = over(Fake::new([]));
-    for (steps, watched) in [(&[Step::Stop, Step::Start][..], 2), (&[Step::Install, Step::Start], 1)] {
-        let _prepared = mgr.prepare(steps, Budget::DEFAULT).expect("prepare");
-        let _no_thread = standby::test_hook::threads(0);
-        let _no_file = bounded::test_hook::temp_files(0);
-        for _ in 0..watched {
-            let spawned = bounded::spawn(
-                &mut bounded::command("/bin/true", &[]).unwrap(),
-                bounded::Role::AnnouncedRequest(|_| true),
-                &mut bounded::Reservation::default(),
-            )
-            .expect("its threads were prepared");
-            bounded::wait_bounded(spawned, Budget::Unbounded.start()).expect("wait");
-        }
-        assert_eq!(
-            bounded::test_hook::pooled(),
-            0,
-            "{steps:?}: prepared more than its steps watch"
-        );
-    }
-
-    type Allowance = fn() -> test_allowance::Allowance;
-    let shortfalls: [Allowance; 3] = [
-        || standby::test_hook::threads(1),
-        || standby::test_hook::threads(3),
-        || bounded::test_hook::temp_files(0),
-    ];
-    for (i, allowance) in shortfalls.into_iter().enumerate() {
-        let _short = allowance();
-        let e = mgr.prepare(&[Step::Stop, Step::Start], Budget::DEFAULT).err();
-        if i < 2 {
-            let e = e.expect("threads short");
-            assert!(e.to_string().contains("so none was sent"), "{e}");
-        } else {
-            assert!(e.is_none(), "systemd prepares no temp file: {e:?}");
-        }
-    }
+/// The announcement `systemctl --show-transaction` makes of the job it enqueued for `verb`.
+fn job(verb: &str) -> Entry {
+    reply(
+        &[verb],
+        exited(0, "", &format!("Enqueued anchor job 1 x.service/{verb}.\n")),
+    )
 }
 
-/// A budget that does not wait, or never stops waiting, watches no `systemctl`, so nothing is made
-/// for one — a verb that makes no thread must not be refused for want of one.
+/// Under a bounded budget `restart`'s legs each run one watched `systemctl`, and `reserve` makes
+/// what every one of them needs before either sends anything: the threads each leg reads its
+/// streams with come from the reservation it is handed, not from anywhere made later, and one
+/// version gate serves both. A reservation holds no more than its steps watch.
 #[skuld::test]
-fn a_budget_that_watches_nothing_prepares_nothing() {
+fn a_reserved_sequence_needs_nothing_made_later() {
+    let fake = gate_then([job("stop"), job("start")]);
+    let mgr = over(fake.clone());
+    let mut held = Backend::reserve(&mgr, &[Step::Stop, Step::Start], Budget::DEFAULT).expect("reserve");
+    let _no_thread = standby::test_hook::threads(0);
+    let _no_file = bounded::test_hook::temp_files(0);
+
+    mgr.systemctl
+        .stop_impl("x", Budget::DEFAULT, Budget::DEFAULT.start(), &mut held)
+        .expect("its threads were reserved");
+    mgr.systemctl
+        .start_impl("x", Budget::DEFAULT, Budget::DEFAULT.start(), &mut held)
+        .expect("its threads were reserved");
+
+    assert_eq!(
+        bounded::test_hook::listeners_left(&held.draws),
+        0,
+        "it reserved more than it drew"
+    );
+    fake.assert_spent("the sequence");
+    assert_eq!(
+        fake.calls().len(),
+        4,
+        "the gate's pair of probes, then the two legs: {:?}",
+        fake.calls()
+    );
+}
+
+/// `install --enable --start` is one sequence over one reservation, so install, `enable` and `start`
+/// share one pair of version probes: the gate is asked once for the three.
+#[skuld::test(requires = [elevated], labels = [ELEVATED])]
+fn install_enable_and_start_in_one_sequence_probe_the_gate_once() {
+    let id = fresh_id("systemd");
+    let _cleanup = FileGuard::new(unit_path(&id));
+    let spec = mk(&id);
+    let fake = gate_then([
+        reply(&["daemon-reload"], exited(0, "", "")),
+        reply(&["enable"], exited(0, "", "")),
+        job("start"),
+    ]);
+    let mgr = over(fake.clone());
+
+    let mut sequence = mgr
+        .prepare(&[Step::Install, Step::Start], Budget::DEFAULT)
+        .expect("prepare");
+    sequence.install(&spec, false).expect("install");
+    sequence.enable(&spec.id).expect("enable");
+    sequence.start(&spec.id, Budget::DEFAULT).expect("start");
+
+    fake.assert_spent("the sequence");
+    let probes = fake
+        .calls()
+        .iter()
+        .filter(|call| call[0] == "--version" || call.contains(&"--property=Version".to_string()))
+        .count();
+    assert_eq!(probes, 2, "the gate's pair of probes ran once: {:?}", fake.calls());
+}
+
+/// A verb whose threads cannot be made is refused before it sends anything, as `Error::Reservation`:
+/// the stated refusal for a host short of tasks. The reservation fails as a whole, so no leg of a
+/// sequence goes out with the next one unable to follow.
+#[skuld::test]
+fn a_verb_short_of_threads_is_refused_before_it_sends_anything() {
+    let fake = Fake::new([]);
+    let mgr = over(fake.clone());
+    for (steps, threads) in [
+        (&[Step::Start][..], 0),
+        (&[Step::Start], 1),
+        (&[Step::Stop, Step::Start], 1),
+        (&[Step::Stop, Step::Start], 3),
+    ] {
+        let _short = standby::test_hook::threads(threads);
+
+        let e = Backend::reserve(&mgr, steps, Budget::DEFAULT)
+            .err()
+            .unwrap_or_else(|| panic!("{steps:?} with {threads} threads"));
+
+        assert!(matches!(e, Error::Reservation { .. }), "{steps:?}: {e:?}");
+        assert!(e.to_string().contains("so none was sent"), "{steps:?}: {e}");
+        assert!(!e.is_indeterminate(), "{steps:?}: {e:?}");
+    }
+    assert!(fake.calls().is_empty(), "something was sent: {:?}", fake.calls());
+}
+
+/// A budget that does not wait, or never stops waiting, watches no `systemctl`, and neither do the
+/// steps that run to completion, so nothing is made for them: a verb that makes no thread must not
+/// be refused for want of one.
+#[skuld::test]
+fn a_step_that_watches_nothing_reserves_nothing() {
     let _no_thread = standby::test_hook::threads(0);
     let _no_file = bounded::test_hook::temp_files(0);
     for budget in [Budget::Immediate, Budget::Unbounded] {
         assert!(
-            over(Fake::new([])).prepare(&[Step::Stop, Step::Start], budget).is_ok(),
+            Backend::reserve(&over(Fake::new([])), &[Step::Stop, Step::Start], budget).is_ok(),
             "{budget:?}"
         );
     }
-}
-
-/// The steps `prepare` covers share one version gate while it is held: `restart`'s stop and start,
-/// and `install --start`'s install and start, each probe `systemctl` once, not once per step.
-#[skuld::test]
-fn prepared_steps_share_one_version_gate() {
-    let asked = std::cell::Cell::new(0);
-    let count = || {
-        asked.set(asked.get() + 1);
-        Ok(())
-    };
-    let mgr = over(Fake::new([]));
-    for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
-        asked.set(0);
-        let prepared = mgr.prepare(&[Step::Stop, Step::Start], budget).expect("prepare");
-        systemctl::gated(count).unwrap();
-        systemctl::gated(count).unwrap();
-        assert_eq!(asked.get(), 1, "{budget:?}: the two legs asked twice");
-        drop(prepared);
-        systemctl::gated(count).unwrap();
-        assert_eq!(asked.get(), 2, "{budget:?}: the answer outlived the preparation");
+    for step in [Step::Install, Step::Uninstall, Step::Kill, Step::RequestStartAfterStop] {
+        assert!(
+            Backend::reserve(&over(Fake::new([])), &[step], Budget::DEFAULT).is_ok(),
+            "{step:?}"
+        );
     }
 }

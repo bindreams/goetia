@@ -691,7 +691,7 @@ impl crate::backend::Backend for Fake {
     }
 
     /// An opaque id, then no manager. Before `read`, which has no way to say a manager is missing.
-    fn begin_install(&self, spec: &DaemonSpec, _desired: &String) -> Result<()> {
+    fn begin_install(&self, spec: &DaemonSpec, _desired: &String, _reservation: &mut ()) -> Result<()> {
         let state = self.state.lock().expect("Fake mutex poisoned");
         if state.opaque.contains(spec.id.as_str()) {
             return Err(Store::undetermined(&spec.id));
@@ -875,7 +875,7 @@ impl crate::backend::Backend for Fake {
         }
     }
 
-    fn enable(&self, snapshot: Artifact) -> Result<()> {
+    fn enable(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.confirm(&snapshot)?.enabled = true;
         Ok(())

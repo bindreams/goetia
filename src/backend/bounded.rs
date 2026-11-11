@@ -3,7 +3,7 @@
 //! on its own.
 //!
 //! The deadline bounds waiting for the manager's answer, never whether a request is sent — see
-//! [`Role`]. Everything a child's output needs is made before it is spawned — see [`spares`].
+//! [`Role`]. Everything a child's output needs is made before it is spawned — see [`Reservation`].
 //!
 //! systemd and launchd both reach their manager through a subprocess that
 //! already blocks (`systemctl`/`launchctl`); this is the only machinery
@@ -25,8 +25,6 @@ pub(crate) use spares::Kept;
 #[cfg(test)]
 pub(crate) use spares::test_hook;
 pub(crate) use spares::{Reaper, Reservation};
-#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
-pub(crate) use spares::{Spares, spare};
 
 use crate::backend::unreaped::release_unreaped;
 use crate::error::within;
@@ -182,6 +180,17 @@ impl Role {
             Role::UncountedQuery | Role::AnnouncedRequest(_) => 0,
         }
     }
+
+    /// The listener threads a [`spawn`] under this role draws from its reservation: one for each
+    /// stream of an announced request, which is read as it is written. The one definition, as for
+    /// [`Role::files`].
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn listeners(&self) -> usize {
+        match self {
+            Role::AnnouncedRequest(_) => STREAMS,
+            Role::Query | Role::UncountedQuery | Role::Request(_) => 0,
+        }
+    }
 }
 
 /// A child [`spawn`]ed under its [`Role`], with where its output went.
@@ -207,12 +216,12 @@ enum Ready {
 }
 
 impl Ready {
-    /// A temp file, drawn from `reservation`, or for a [`Role::AnnouncedRequest`] a thread to read a
-    /// pipe: see [`Role`].
+    /// A temp file, or for a [`Role::AnnouncedRequest`] a thread to read a pipe, drawn from
+    /// `reservation`: see [`Role`].
     fn for_role(role: &Role, reservation: &mut Reservation) -> Result<Ready, cosca::error::Error> {
         Ok(match role {
             Role::AnnouncedRequest(_) => {
-                Ready::Listener(spares::listener().map_err(not_run("thread to read its output"))?)
+                Ready::Listener(reservation.listener().map_err(not_run("thread to read its output"))?)
             }
             _ if role.files() > 0 => Ready::File(reservation.file().map_err(not_run("temp file for its output"))?),
             _ => Ready::File(spares::make_file().map_err(not_run("temp file for its output"))?),
@@ -272,8 +281,8 @@ impl std::fmt::Display for SpawnError {
 /// stream — or, for a [`Role::AnnouncedRequest`], a thread to read each as it is written, since it
 /// announces on stderr and must not depend on a writable temp directory. A failure to make one is
 /// [`SpawnError::NotRun`], and says so. A [`Role::Request`] brings its [`Reaper`], made before the
-/// caller sent anything — see [`Reservation`]. Its files are drawn from `reservation`, [`STREAMS`] for
-/// each [`Role::Query`] and [`Role::Request`]; a call that draws none is handed an empty one.
+/// caller sent anything — see [`Reservation`]. Its files and threads are drawn from `reservation`:
+/// [`Role::files`] and [`Role::listeners`]; a call that draws none is handed an empty one.
 pub(crate) fn spawn(
     cmd: &mut cosca::Command,
     role: Role,

@@ -2,13 +2,10 @@
 //! nothing could take must not be sent, and a thread or file that could not be made once it was
 //! sent would leave it unwatched — or, in a sequence of requests, stop the sequence halfway.
 //!
-//! A launchd verb is handed a [`Reservation`] and draws its reapers and temp files from it. systemd's
-//! listener threads come from this thread's [`Spares`].
+//! A verb is handed a [`Reservation`] and draws its reapers, listener threads and temp files from it.
 
-use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::{self, Seek as _};
-use std::marker::PhantomData;
 use std::process::ExitStatus;
 
 use crossbeam_channel::Receiver;
@@ -72,7 +69,7 @@ fn let_go(child: cosca::Child) {
 /// A thread made before its child is spawned, to read one of its pipes as it is written — for the
 /// one role that must see output before the child exits.
 #[derive(Debug)]
-pub(super) struct Listener {
+pub(crate) struct Listener {
     standby: Standby<cosca::PipeReader>,
     heard: Receiver<Chunk>,
 }
@@ -100,14 +97,16 @@ impl Listener {
 
 // Reservation =========================================================================================================
 
-/// What one launchd verb, or a sequence of them, draws: a [`Reaper`] for each request and a temp
-/// file for each stream of each `launchctl` call, all made before anything is sent. Handed to every
-/// call that draws, never ambient: a draw past what was made is a miscount, which fails a debug
-/// assertion and is made on the spot in a release build.
+/// What one verb, or a sequence of them, draws: a [`Reaper`] for each launchd request, a temp file
+/// for each stream of each `launchctl` call, and a [`Listener`] for each stream of each announced
+/// `systemctl` request, all made before anything is sent. Handed to every call that draws, never
+/// ambient: a draw past what was made is a miscount, which fails a debug assertion and is made on
+/// the spot in a release build.
 #[derive(Debug, Default)]
 pub(crate) struct Reservation {
     reapers: Vec<Reaper>,
     files: Vec<File>,
+    listeners: Vec<Listener>,
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -118,6 +117,16 @@ impl Reservation {
         Ok(Reservation {
             reapers: made(reapers, Reaper::new)?,
             files: made(files, make_file)?,
+            ..Reservation::default()
+        })
+    }
+
+    /// `listeners` threads to read pipes with, all or none, as [`Reservation::make`]. systemd's.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn of_listeners(listeners: usize) -> io::Result<Reservation> {
+        Ok(Reservation {
+            listeners: made(listeners, Listener::new)?,
+            ..Reservation::default()
         })
     }
 
@@ -128,6 +137,17 @@ impl Reservation {
             None => {
                 miscounted("reaper");
                 Reaper::new()
+            }
+        }
+    }
+
+    /// A thread to read one pipe with.
+    pub(crate) fn listener(&mut self) -> io::Result<Listener> {
+        match self.listeners.pop() {
+            Some(listener) => Ok(listener),
+            None => {
+                miscounted("listener");
+                Listener::new()
             }
         }
     }
@@ -184,9 +204,22 @@ impl Kept {
             })
             .collect::<io::Result<_>>()?;
         Ok(Reservation {
-            reapers: Vec::new(),
             files,
+            ..Reservation::default()
         })
+    }
+}
+
+#[cfg(test)]
+impl Reservation {
+    /// Exactly what one [`super::spawn`] under `role` draws: its listener threads, or else its temp
+    /// files (a role draws one of the two).
+    pub(crate) fn for_role(role: &super::Role) -> Reservation {
+        match role.listeners() {
+            0 => Reservation::make(0, role.files()),
+            listeners => Reservation::of_listeners(listeners),
+        }
+        .expect("what one spawn draws")
     }
 }
 
@@ -201,73 +234,6 @@ fn made<T>(n: usize, make: fn() -> io::Result<T>) -> io::Result<Vec<T>> {
     (0..n).map(|_| make()).collect()
 }
 
-// Spares ==============================================================================================================
-
-/// The listener threads the [`Spares`] guards on this thread made ready, each tagged with its
-/// guard's number.
-type Pool = Vec<(u64, Listener)>;
-
-thread_local! {
-    static SPARES: RefCell<Pool> = const { RefCell::new(Vec::new()) };
-    /// The number the next [`Spares`] guard on this thread tags what it makes with.
-    static NEXT_GUARD: Cell<u64> = const { Cell::new(0) };
-    /// How many [`Spares`] guards are live on this thread.
-    static RESERVATIONS: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Called wherever a listener is made on the spot rather than taken from this thread's [`Spares`]:
-/// while a reservation is live, everything its verbs need was to have been made in it, so making
-/// one here means a verb needed more than was counted for it — a request could then fail halfway
-/// through a sequence for want of it. Loud in every debug build, the test suites' included, so an
-/// undercount fails them.
-fn made_on_the_spot(what: &str) {
-    debug_assert!(
-        RESERVATIONS.get() == 0,
-        "a {what} was made outside the reservation live on this thread: a verb needed more than was counted for it"
-    );
-}
-
-/// Make `listeners` threads ready, all or none, for the verbs this thread runs while the guard lives.
-/// Dropping it drops only its own unspent threads; guards nest and may end in any order.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn spare(listeners: usize) -> io::Result<Spares> {
-    let listeners = made(listeners, Listener::new)?;
-    let tag = NEXT_GUARD.get();
-    NEXT_GUARD.set(tag + 1);
-    RESERVATIONS.set(RESERVATIONS.get() + 1);
-    SPARES.with_borrow_mut(|pool| pool.extend(listeners.into_iter().map(|l| (tag, l))));
-    Ok(Spares {
-        tag,
-        this_thread: PhantomData,
-    })
-}
-
-/// See [`spare`]. Not `Send`: what it releases is this thread's.
-#[derive(Debug)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) struct Spares {
-    tag: u64,
-    this_thread: PhantomData<*const ()>,
-}
-
-impl Drop for Spares {
-    fn drop(&mut self) {
-        RESERVATIONS.set(RESERVATIONS.get() - 1);
-        SPARES.with_borrow_mut(|pool| pool.retain(|(tag, _)| *tag != self.tag));
-    }
-}
-
-/// A thread to read a pipe with: a spare, or made now.
-pub(super) fn listener() -> io::Result<Listener> {
-    match SPARES.with_borrow_mut(|pool| pool.pop()) {
-        Some((_, listener)) => Ok(listener),
-        None => {
-            made_on_the_spot("listener");
-            Listener::new()
-        }
-    }
-}
-
 /// An empty anonymous temp file. A read no verb counted ([`super::Role::UncountedQuery`]) makes its
 /// own, whatever reservation it is handed.
 pub(super) fn make_file() -> io::Result<File> {
@@ -279,7 +245,7 @@ pub(super) fn make_file() -> io::Result<File> {
 // test_hook ===========================================================================================================
 
 /// Test controls: per-thread limits on temp files and reuses, a per-thread spawn count, injected
-/// spawn and wait failures, and readers of the pool and of a reservation.
+/// spawn and wait failures, and a reader of a reservation.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
@@ -323,14 +289,14 @@ pub(crate) mod test_hook {
         }
     }
 
-    /// How many listeners this thread's pool holds now.
-    pub(crate) fn pooled() -> usize {
-        super::SPARES.with_borrow(|pool| pool.len())
-    }
-
     /// What `reservation` holds now: its reapers and its temp files.
     pub(crate) fn left(reservation: &super::Reservation) -> (usize, usize) {
         (reservation.reapers.len(), reservation.files.len())
+    }
+
+    /// How many listeners `reservation` holds now.
+    pub(crate) fn listeners_left(reservation: &super::Reservation) -> usize {
+        reservation.listeners.len()
     }
 
     /// How many children this thread has spawned through [`super::super::spawn`], or tried to.
