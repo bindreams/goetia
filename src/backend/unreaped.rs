@@ -10,10 +10,11 @@ use crate::backend::standby::Standby;
 /// dropped where it is reported, so a child whose kill was refused would stall a call past its
 /// deadline.
 ///
-/// On Unix the child is waited for on a thread of its own, so it is reaped once it exits; with no
-/// thread to be had it is given up, and stays a zombie until this process exits. On Windows it is
-/// given up, which only closes a handle. Its [`fate`](Error::fate) is cosca's: a `Killed` child is
-/// dead or dying.
+/// On Unix the child is waited for on a thread of its own, so it is reaped once it exits. With no
+/// thread to be had it is given up and runs on unreaped; one that exits before this process stays a
+/// zombie until this process exits. (cosca hands back a still-running child when its kill was
+/// refused, or for an elevation front.) On Windows it is given up, which only closes a handle. Its
+/// [`fate`](Error::fate) is cosca's: a `Killed` child is dead or dying.
 pub(crate) fn release_unreaped(mut e: Error) -> Error {
     if let Error::MayHaveStarted { unreaped, .. } = &mut e
         && let Some(child) = unreaped.take()
