@@ -274,6 +274,11 @@ pub(crate) enum HoldOutcome<P> {
     Expired { pid: u32 },
 }
 
+/// What a stop's error asks of a held process: the pid it was held by.
+pub(crate) trait HeldProcess {
+    fn pid(&self) -> u32;
+}
+
 /// [`hold_service_process`] for a caller that only wants the process to wait on. A failure to read
 /// SCM is an error: it says nothing about the process.
 pub(crate) fn hold_if_possible<T: KillTarget>(
@@ -370,10 +375,6 @@ pub(in crate::backend::scm) mod system {
             eprintln!("{}", super::waiting_notice(id, self.pid, terminate_failed));
         }
 
-        pub(in crate::backend::scm) fn pid(&self) -> u32 {
-            self.pid
-        }
-
         /// Ends the process through this handle, never by pid, and does not wait for it: a process
         /// that has already exited, or is exiting, is success, and [`Self::wait_for_exit`] is the wait.
         pub(in crate::backend::scm) fn terminate(&self) -> io::Result<()> {
@@ -389,6 +390,12 @@ pub(in crate::backend::scm) mod system {
             on_wait: impl FnOnce(),
         ) -> io::Result<Waited> {
             wait_exit(&self.handle, deadline, on_wait)
+        }
+    }
+
+    impl super::HeldProcess for Held {
+        fn pid(&self) -> u32 {
+            self.pid
         }
     }
 

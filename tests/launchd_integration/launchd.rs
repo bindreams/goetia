@@ -1214,7 +1214,7 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout() {
     );
 
     assert!(
-        matches!(err, goetia::Error::WaitTimeout { awaited: "running", .. }),
+        matches!(err.cause(), goetia::Error::WaitTimeout { awaited: "running", .. }),
         "an unconfirmed bounded start must be WaitTimeout; if it is another error, check whether \
          kickstart -p honoured ThrottleInterval (restart_delay): {err:?}"
     );

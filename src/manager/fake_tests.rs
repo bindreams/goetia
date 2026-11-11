@@ -473,10 +473,10 @@ fn a_stalled_start_times_out_under_a_bounded_budget() {
 
     let result = fake.start(&spec.id, Budget::Bounded(Duration::from_secs(10)));
 
-    match result {
+    match result.as_ref().map_err(Error::cause) {
         Err(Error::WaitTimeout { id, awaited, .. }) => {
             assert_eq!(id, "stalls");
-            assert_eq!(awaited, "running");
+            assert_eq!(*awaited, "running");
         }
         other => panic!("a stalled start under a bounded budget must time out, got {other:?}"),
     }
@@ -566,7 +566,10 @@ fn the_fake_never_sleeps() {
     let result = fake.start(&spec.id, Budget::Bounded(budget));
     let elapsed = before.elapsed();
 
-    assert!(matches!(result, Err(Error::WaitTimeout { .. })), "{result:?}");
+    assert!(
+        matches!(result.as_ref().map_err(Error::cause), Err(Error::WaitTimeout { .. })),
+        "{result:?}"
+    );
     assert!(
         elapsed < budget,
         "the fake derived a {budget:?} expiry by living it, taking {elapsed:?}"
