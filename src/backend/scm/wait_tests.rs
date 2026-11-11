@@ -3066,3 +3066,51 @@ fn stop_and_await_exit_fails_over_a_shims_incomplete_stop_record() {
 
     assert!(is_incomplete_stop(&err), "{err}");
 }
+
+/// The shim process goetia holds is ended before the incomplete stop is returned: its KILL_ON_JOB_CLOSE
+/// job is the last thing that can still kill the tree.
+#[skuld::test]
+fn stop_and_await_exit_ends_the_held_process_of_an_incomplete_stop_before_failing() {
+    let mut fake = incomplete(FakeScm::new([Some(Observed::Stopped)]));
+    let calls = std::cell::RefCell::new(vec![]);
+
+    let err = stop_and_await_exit(
+        &mut fake,
+        unbounded(),
+        &mut HoldOutcome::Held(7u32),
+        true,
+        ending(
+            |process| {
+                calls.borrow_mut().push(("terminate", *process));
+                Ok(())
+            },
+            |process, _, _| {
+                calls.borrow_mut().push(("wait", *process));
+                Ok(Waited::Confirmed)
+            },
+        ),
+    )
+    .unwrap_err();
+
+    assert!(is_incomplete_stop(&err), "{err}");
+    assert_eq!(*calls.borrow(), vec![("terminate", 7), ("wait", 7)]);
+}
+
+/// A process that cannot be ended, or does not exit, does not change what the stop says.
+#[skuld::test]
+fn an_incomplete_stop_is_returned_whatever_became_of_ending_the_held_process() {
+    for exit in [Ok(Waited::Expired), Err(io::Error::other("wait failed"))] {
+        let mut fake = incomplete(FakeScm::new([Some(Observed::Stopped)]));
+
+        let err = stop_and_await_exit(
+            &mut fake,
+            unbounded(),
+            &mut HoldOutcome::Held(7u32),
+            true,
+            ending(|_| Err(io::Error::other("denied")), |_, _, _| exit),
+        )
+        .unwrap_err();
+
+        assert!(is_incomplete_stop(&err), "{err}");
+    }
+}

@@ -280,6 +280,9 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 /// the failed terminate, if any. No process held (none reported, or none that could be opened) is the
 /// stop alone.
 ///
+/// A stop that SCM confirmed with the shim's incomplete-stop record (`shim`, see [`judged`]) fails with
+/// [`IncompleteStop`], after `end` has ended the process held, whatever became of that.
+///
 /// `held` is the hold as it was made, and what is left in it afterwards is what the caller still has
 /// to say: the process is taken out of [`Held`](HoldOutcome::Held) and passed to `end`, and a
 /// [`Refused`](HoldOutcome::Refused) stays, with the reason the process could not be opened, for the
@@ -311,8 +314,19 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
         // Why a refused process is not held is the caller's to report: it knows where.
         HoldOutcome::NoProcess | HoldOutcome::Refused(_) | HoldOutcome::Expired { .. } => None,
     };
-    if stop_via_notify(a, deadline, shim)? == Waited::Expired {
-        return Ok(StopAndAwaitExitOutcome::ServiceExpired);
+    match stop_via_notify(a, deadline, shim) {
+        Ok(Waited::Confirmed) => {}
+        Ok(Waited::Expired) => return Ok(StopAndAwaitExitOutcome::ServiceExpired),
+        Err(e) if is_incomplete_stop(&e) => {
+            // The service is stopped, and the process goetia holds is the shim's, whose
+            // KILL_ON_JOB_CLOSE job is the last thing that can still kill the daemon's tree: end it
+            // first. How that went does not change what the stop says.
+            if let Some(process) = process {
+                let _ = end(process, deadline);
+            }
+            return Err(e);
+        }
+        Err(e) => return Err(e),
     }
     let Some(process) = process else {
         return Ok(StopAndAwaitExitOutcome::Stopped);

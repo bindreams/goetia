@@ -1071,6 +1071,11 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, shim: bool, hold: bool) ->
                 (false, true) => UninstallFailure::AlreadyMarked,
                 (false, false) => UninstallFailure::Stop { previous },
             };
+            // The shim's process is ended first, as `stop` ends it: its job is the last thing that can
+            // still kill the daemon's tree. How that went does not change what the uninstall says.
+            if let (true, HoldOutcome::Held(held)) = (is_incomplete_stop(&e), process) {
+                let _ = end_held(id, held, Budget::Unbounded.start());
+            }
             let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
             return Err(uninstall_failed(id, &state, cause));
         }
