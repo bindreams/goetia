@@ -439,7 +439,7 @@ impl Backend for Scm {
     /// is stopped and deleted the uninstall waits for that process and sweeps the folders the files
     /// can be in: see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
     fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
-        let shim = runs_a_shim(&snapshot);
+        let shim = runs_a_shim(&snapshot).judges_stop_record();
         // First, so that the host read below is not one an install in progress is about to change.
         let lock = shim.then(InstallLock::acquire).transpose()?;
         let host = if lock.is_some() {
@@ -495,22 +495,11 @@ impl Backend for Scm {
         // First, so the wait is counted from the verb's entry. What it bounds is the wait:
         // `start_via_notify` issues the start whatever is left of it.
         let deadline = budget.start();
-        let (kind, unreadable) = start_kind(snapshot.blob(), runs_a_shim(&snapshot));
+        let answer = runs_a_shim(&snapshot);
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::os(format!("open `{id}` to start it"), e))?;
-        if !budget.waits() {
-            // Request-only: `StartServiceW` and return, arming no wait at
-            // all. `Ok(())` then means the request was accepted and nothing
-            // more, per the trait doc comment.
-            return super::wait::request_start(&mut actor).map_err(|e| Error::os(format!("start `{id}`"), e));
-        }
-        let waited =
-            super::wait::start_via_notify(&mut actor, deadline, kind).map_err(|e| failed_start(&id, e, unreadable))?;
-        match waited {
-            Waited::Confirmed => Ok(()),
-            Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
-        }
+        start_on(&mut actor, &id, budget, deadline, &answer)
     }
 
     /// [`super::wait::request_start_after_stop`]: every
@@ -541,7 +530,7 @@ impl Backend for Scm {
         // First, so the wait is counted from the verb's entry; `stop_via_notify` issues the stop
         // whatever is left of it.
         let deadline = budget.start();
-        let shim = runs_a_shim(&snapshot);
+        let shim = runs_a_shim(&snapshot).judges_stop_record();
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::os(format!("open `{id}` to stop it"), e))?;
@@ -648,14 +637,38 @@ pub(crate) fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     }
 }
 
+/// The wait of `start` once SCM is open: a request alone without a budget to wait with, otherwise
+/// [`start_via_notify`](super::wait::start_via_notify) in the vocabulary `answer` ([`runs_a_shim`])
+/// gives it.
+pub(super) fn start_on<A: super::wait::ScmActor>(
+    actor: &mut A,
+    id: &Id,
+    budget: Budget,
+    deadline: Deadline,
+    answer: &ShimAnswer,
+) -> Result<()> {
+    if !budget.waits() {
+        // Request-only: `StartServiceW` and return, arming no wait at
+        // all. `Ok(())` then means the request was accepted and nothing
+        // more, per the trait doc comment.
+        return super::wait::request_start(actor).map_err(|e| Error::os(format!("start `{id}`"), e));
+    }
+    let (kind, unreadable) = start_kind(answer);
+    let waited = super::wait::start_via_notify(actor, deadline, kind).map_err(|e| failed_start(id, e, unreadable))?;
+    match waited {
+        Waited::Confirmed => Ok(()),
+        Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
+    }
+}
+
 /// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not say:
-/// the shim's vocabulary when `shim` ([`runs_a_shim`]), otherwise as strict as `type: managed`. A
-/// service judged strictly over a blob that would not decode says why.
-fn start_kind(blob: std::result::Result<&Blob, &Arc<Error>>, shim: bool) -> (Kind, Option<Arc<Error>>) {
-    match (shim, blob) {
-        (true, _) => (Kind::Simple, None),
-        (false, Ok(_)) => (Kind::Managed, None),
-        (false, Err(e)) => (Kind::Managed, Some(Arc::clone(e))),
+/// the shim's vocabulary for a [`ShimKind::Shim`] only, and for anything else, a service not known to
+/// run a shim, as strict as `type: managed`. A service judged strictly over a blob that would not
+/// decode says why.
+fn start_kind(answer: &ShimAnswer) -> (Kind, Option<Arc<Error>>) {
+    match answer.kind {
+        ShimKind::Shim => (Kind::Simple, None),
+        ShimKind::NotShim | ShimKind::Unknown => (Kind::Managed, answer.blob_error.clone()),
     }
 }
 
@@ -1139,11 +1152,36 @@ fn registered_shim(snapshot: &ScmSnapshot) -> Result<Option<PathBuf>> {
     }
 }
 
-/// Whether the service's `STOPPED` record is read as a goetia shim's (an incomplete stop fails a
-/// `stop`, a refusal fails a `start`): [`is_shim`] over the snapshot's blob, reading the registered
-/// image only when the blob will not decode. One answer for `start`, `stop` and `uninstall`.
-fn runs_a_shim(snapshot: &ScmSnapshot) -> bool {
-    is_shim(snapshot.blob(), || {
+/// Whether a service's process is a goetia shim, from the service's own record and, when that cannot
+/// say, from the image it is registered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ShimKind {
+    Shim,
+    NotShim,
+    /// Neither the blob nor the image could be read.
+    Unknown,
+}
+
+/// [`ShimKind`], with the error of the blob if it would not decode, so that no caller drops it.
+pub(super) struct ShimAnswer {
+    kind: ShimKind,
+    blob_error: Option<Arc<Error>>,
+}
+
+impl ShimAnswer {
+    /// Whether `stop` and `uninstall` judge the service's incomplete-stop record, and `uninstall` holds its
+    /// process: for a shim and for an unknown answer, since a refusal to call a stop complete costs a
+    /// re-run, and a tree left running costs a second copy beside it. `start` takes the shim's
+    /// vocabulary for [`ShimKind::Shim`] alone: see [`start_kind`].
+    fn judges_stop_record(&self) -> bool {
+        self.kind != ShimKind::NotShim
+    }
+}
+
+/// [`shim_answer`] over a snapshot's blob, reading the registered image only when the blob will not
+/// decode. One answer for `start`, `stop` and `uninstall`.
+fn runs_a_shim(snapshot: &ScmSnapshot) -> ShimAnswer {
+    shim_answer(snapshot.blob(), || {
         snapshot
             .config()
             .ok()
@@ -1152,13 +1190,29 @@ fn runs_a_shim(snapshot: &ScmSnapshot) -> bool {
 }
 
 /// The blob's `type: simple` when it decodes: a `StandaloneShim` host is a shim whatever its file is
-/// called. Otherwise the registered `image`'s file name, `None` when it could not be read: a shim host
-/// is one, an exe of the user's own is not, and an unknown image counts as one, since a refusal to call
-/// a stop complete costs a re-run, and a tree left running costs a second copy beside it.
-fn is_shim(blob: std::result::Result<&Blob, &Arc<Error>>, image: impl FnOnce() -> Option<String>) -> bool {
+/// called. Otherwise the registered `image`'s file name: a shim host is one, an exe of the user's own is
+/// not, and an image that could not be read (`None`) leaves it [`Unknown`](ShimKind::Unknown).
+pub(super) fn shim_answer(
+    blob: std::result::Result<&Blob, &Arc<Error>>,
+    image: impl FnOnce() -> Option<String>,
+) -> ShimAnswer {
     match blob {
-        Ok(blob) => blob.spec.kind == Kind::Simple,
-        Err(_) => image().is_none_or(|image| shim_host(&image).is_some()),
+        Ok(blob) => ShimAnswer {
+            kind: if blob.spec.kind == Kind::Simple {
+                ShimKind::Shim
+            } else {
+                ShimKind::NotShim
+            },
+            blob_error: None,
+        },
+        Err(error) => ShimAnswer {
+            kind: match image() {
+                None => ShimKind::Unknown,
+                Some(image) if shim_host(&image).is_some() => ShimKind::Shim,
+                Some(_) => ShimKind::NotShim,
+            },
+            blob_error: Some(Arc::clone(error)),
+        },
     }
 }
 

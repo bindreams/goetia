@@ -3184,3 +3184,47 @@ fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
         );
     }
 }
+
+// start's vocabulary, through what `runs_a_shim` answers ---------------------------------------------------------------
+
+/// A service whose blob will not decode is a shim's only when its image says so: a start over an image
+/// of the user's own, or one that could not be read, is judged as strictly as a `type: managed`
+/// service's, and its failure says that the blob could not be read. Driven through `start`'s own wait
+/// over the scripted SCM, from the answer of the predicate `start`, `stop` and `uninstall` share.
+/// The service ends right after it was started, which only the shim's vocabulary calls a start.
+#[cfg(windows)]
+#[skuld::test]
+fn a_start_over_an_unreadable_blob_is_strict_unless_the_image_is_a_shim() {
+    use crate::backend::scm::manager::{shim_answer, start_on};
+    use crate::spec::Id;
+
+    let shim = format!(
+        r#""C:\Program Files\Goetia\goetia-shim-{}.exe" --service-host"#,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    let corrupt = std::sync::Arc::new(crate::error::Error::blob("corrupt"));
+    let id = Id::try_from("frpc").unwrap();
+
+    for (image, started) in [
+        (Some(shim.as_str()), true),
+        (Some(r"C:\bin\frpc.exe"), false),
+        (None, false),
+    ] {
+        let answer = shim_answer(Err(&corrupt), || image.map(str::to_string));
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::Clean);
+
+        let result = start_on(&mut fake, &id, Budget::Unbounded, unbounded(), &answer);
+
+        match (started, result) {
+            (true, Ok(())) => {}
+            (false, Err(e)) => {
+                let said = e.report().to_string();
+                assert!(
+                    said.contains("could not be read") && said.contains("corrupt"),
+                    "{image:?}: {said}"
+                );
+            }
+            (_, result) => panic!("{image:?}: started should be {started}, got {result:?}"),
+        }
+    }
+}
