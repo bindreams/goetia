@@ -1164,11 +1164,16 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
     });
     // Ends the held shim process before the failure is reported.
     let settled = end_on_incomplete_stop(settled, &mut process, end);
+    // An unbounded deadline never expires. Told as a failure, not dropped, so that a later edit
+    // narrowing the budget does not pass quietly.
+    let settled = settled.and_then(|waited| match waited {
+        Waited::Confirmed => Ok(()),
+        Waited::Expired => Err(std::io::Error::other(
+            "the wait for the stop expired though it has no bound: goetia's own error",
+        )),
+    });
     match settled {
-        Ok(Waited::Confirmed) => Ok(process),
-        // `let _ = ...` is the write that turns an unreachable case into a silent one, and this
-        // is precisely the case where a later edit narrowing that budget must not pass quietly.
-        Ok(Waited::Expired) => unreachable!("uninstall's wait is Unbounded; an unbounded deadline never expires"),
+        Ok(()) => Ok(process),
         Err(e) => {
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
             let state = match (is_incomplete_stop(&e), marked) {
