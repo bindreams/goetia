@@ -96,18 +96,23 @@ impl Real {
     fn to_completion(&self, args: &[&str]) -> Result<Finished, ClientError> {
         let mut cmd = cosca::run(self.argv(args));
         (self.environment)(&mut cmd);
-        let output = cmd
-            .output()
-            .map_err(|e| ClientError::from(SpawnError::of_spawn(release_unreaped(e))))?;
-        Ok(Finished::Exited {
-            status: output.status,
-            capture: Capture {
-                stdout: output.stdout,
-                stderr: output.stderr,
-                complete: true,
-            },
-        })
+        of_output(cmd.output())
     }
+}
+
+/// A run to completion's `output`, as [`Finished`], or why it failed: cosca's
+/// [`MayHaveStarted`](cosca::error::Error::MayHaveStarted), which it returns for a failure after the
+/// spawn, is [`ClientError::MayHaveRun`], and any other failure is [`ClientError::NotRun`].
+fn of_output(output: Result<cosca::Output, cosca::error::Error>) -> Result<Finished, ClientError> {
+    let output = output.map_err(|e| ClientError::from(SpawnError::of_spawn(release_unreaped(e))))?;
+    Ok(Finished::Exited {
+        status: output.status,
+        capture: Capture {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            complete: true,
+        },
+    })
 }
 
 impl Client for Real {

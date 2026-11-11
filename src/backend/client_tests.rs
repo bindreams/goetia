@@ -222,6 +222,30 @@ fn real_to_completion_reports_a_missing_program_as_not_run() {
     assert!(matches!(e, ClientError::NotRun(_)), "{e:?}");
 }
 
+/// A run to completion that fails after the spawn leaves the client possibly run: cosca says so with
+/// [`cosca::error::Error::MayHaveStarted`], and that is what [`Real`] reports as [`ClientError::MayHaveRun`]. A
+/// real child cannot be made to fail there, so the error is stated, as `bounded`'s spawn test does.
+#[skuld::test]
+fn real_to_completion_tells_a_failure_after_the_spawn_from_one_before_it() {
+    let after = bounded::test_hook::may_have_started(std::io::Error::other("the read failed").into());
+    assert!(
+        matches!(of_output(Err(after)), Err(ClientError::MayHaveRun(_))),
+        "a failure after the spawn"
+    );
+    for before in [
+        cosca::error::Error::from(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+        cosca::error::Error::Containment {
+            detail: "forced".into(),
+        },
+    ] {
+        let described = format!("{before:?}");
+        assert!(
+            matches!(of_output(Err(before)), Err(ClientError::NotRun(_))),
+            "a failure before the spawn: {described}"
+        );
+    }
+}
+
 // fake::Fake ==========================================================================================================
 
 /// The test client draws what the real one draws, from the reservation it is handed: a call leaves
