@@ -233,7 +233,8 @@ pub(crate) enum EndProcessOutcome<P> {
 /// `terminate` ends the process (allowed once `SERVICE_STOPPED` is reported), and `exit` then waits for
 /// its exit under `deadline`. The wait follows whatever `terminate` returns, since the process may be
 /// exiting by itself; a failure is handed to `exit` and carried by
-/// [`Lingers`](EndProcessOutcome::Lingers). An `exit` that fails is the error.
+/// [`Lingers`](EndProcessOutcome::Lingers). An `exit` that fails is the error, and when the terminate
+/// failed too, the error says so, with the same kind.
 pub(crate) fn end_process<P>(
     process: P,
     deadline: Deadline,
@@ -241,7 +242,18 @@ pub(crate) fn end_process<P>(
     exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
 ) -> io::Result<EndProcessOutcome<P>> {
     let terminate_failed = terminate(&process).err().map(Arc::new);
-    Ok(match exit(&process, deadline, terminate_failed.as_deref())? {
+    let waited = exit(&process, deadline, terminate_failed.as_deref()).map_err(|failed| match &terminate_failed {
+        None => failed,
+        Some(terminate_failed) => io::Error::new(
+            failed.kind(),
+            format!(
+                "{}, and terminating it failed: {}",
+                Chain(&failed),
+                Chain(&**terminate_failed)
+            ),
+        ),
+    })?;
+    Ok(match waited {
         Waited::Confirmed => EndProcessOutcome::Exited,
         Waited::Expired => EndProcessOutcome::Lingers {
             process,

@@ -743,14 +743,53 @@ fn end_process_keeps_a_failed_terminate_for_the_wait_and_for_the_expiry() {
     );
 }
 
-/// The wait goes on after a terminate that failed, and its own failure is the error.
+/// The wait goes on after a terminate that failed, and its failure is the error, which says that the
+/// terminate failed too: with the process neither ended nor seen to exit, both are why.
 #[skuld::test]
-fn end_process_reports_a_failed_wait_after_a_failed_terminate() {
+fn end_process_reports_a_failed_wait_after_a_failed_terminate_with_both() {
     let outcome = end_process(7u32, unbounded(), terminate_fails, |_, _, _| {
         Err(io::Error::other("wait failed"))
     });
 
+    let said = outcome.unwrap_err().to_string();
+    assert!(
+        said.contains("wait failed") && said.contains("terminating it failed") && said.contains("os error 6"),
+        "{said}"
+    );
+}
+
+/// A wait that fails after a terminate that succeeded is told as it is.
+#[skuld::test]
+fn end_process_reports_a_failed_wait_alone_after_a_terminate_that_succeeded() {
+    let outcome = end_process(
+        7u32,
+        unbounded(),
+        |_| Ok(()),
+        |_, _, _| Err(io::Error::other("wait failed")),
+    );
+
     assert_eq!(outcome.unwrap_err().to_string(), "wait failed");
+}
+
+/// `stop` over a confirmed `STOPPED` fails the same way, with both.
+#[skuld::test]
+fn stop_and_await_exit_reports_a_failed_wait_after_a_failed_terminate_with_both() {
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+
+    let said = stop_and_await_exit(
+        &mut fake,
+        unbounded(),
+        &mut HoldOutcome::Held(7u32),
+        false,
+        ending(terminate_fails, |_, _, _| Err(io::Error::other("wait failed"))),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        said.contains("wait failed") && said.contains("terminating it failed") && said.contains("os error 6"),
+        "{said}"
+    );
 }
 
 /// The terminate precedes the wait, and the wait is told of nothing when the terminate succeeded.
@@ -3155,6 +3194,14 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
             && failed.contains("waiting for it to exit failed")
             && failed.contains("wait failed"),
         "{failed}"
+    );
+    let both = ran(Err(io::Error::other("denied")), Err(io::Error::other("wait failed")));
+    assert!(
+        both.contains("waiting for it to exit failed")
+            && both.contains("wait failed")
+            && both.contains("terminating it failed")
+            && both.contains("denied"),
+        "{both}"
     );
 }
 
