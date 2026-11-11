@@ -3,9 +3,9 @@
 //! The plist's *directory* is the enrollment bit, never a plist key:
 //!
 //! - `install` writes the plist to [`STAGING_DIR`] (or, for an update, where the existing artifact
-//!   already lives; see [`locate`]). launchd scans neither directory on its own, so nothing loads
+//!   already lives; see `locate`). launchd scans neither directory on its own, so nothing loads
 //!   and nothing runs. A plist that would change what a loaded job reads is refused and nothing is
-//!   written (see [`refuse`]). A `Create` over a loaded job of the same label boots that job out
+//!   written (see `refuse`). A `Create` over a loaded job of the same label boots that job out
 //!   first.
 //! - `start` `launchctl bootstrap`s the plist from wherever it is (if not already loaded), then
 //!   `launchctl kickstart`s it, which is what launches a job with no `KeepAlive`/`RunAtLoad` (a
@@ -45,7 +45,7 @@
 //! `launchctl bootout` returns within milliseconds, but launchd goes on answering for the label
 //! (`print` shows `state = SIGTERMed`) until the job has exited. A step that acts on the label
 //! afterwards must not meet the old job, so it waits until `print` reports the label not found (see
-//! [`Launchctl::bootout`]). Which steps wait, under which bound, and when a job may never go, is
+//! `Launchctl::bootout`). Which steps wait, under which bound, and when a job may never go, is
 //! listed once, in the README's "Waiting for a start or stop".
 //!
 //! A start's wait that has no bound is part of sending a request: bounded by a deadline, it could
@@ -1083,7 +1083,7 @@ fn needs(step: Step) -> (usize, usize) {
     }
 }
 
-/// The reapers and temp files `steps` draw, summed: what [`Launchd::reserve`] makes.
+/// The reapers and temp files `steps` draw, summed: what `Launchd::reserve` makes.
 fn counted(steps: &[Step]) -> (usize, usize) {
     let (requests, calls) = steps
         .iter()

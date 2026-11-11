@@ -30,7 +30,7 @@ const FAKE_MARKER: &str = "FAKE-GOETIA-ARTIFACT";
 const FAKE_PID: u32 = 1;
 
 /// Why an opaque id could not be classified — see [`Fake::seed_opaque`].
-/// Shared by [`Store::undetermined`] and [`Fake::scan`] so the error and the
+/// Shared by [`Store::undetermined`] and `Fake::scan` so the error and the
 /// `list` entry describe the condition alike.
 fn opaque_reason() -> Error {
     Error::os(
@@ -170,7 +170,7 @@ impl Store {
         Ok(())
     }
 
-    /// What is at `id`, as [`Backend::read`] reports it. An opaque id fails
+    /// What is at `id`, as `Backend::read` reports it. An opaque id fails
     /// first: the read that would have found an entry is the one that failed.
     fn read(&self, id: &Id) -> Result<ReadOutcome<Artifact>> {
         if self.opaque.contains(id.as_str()) {
@@ -395,7 +395,7 @@ impl Fake {
     /// confirms a start — the state every timeout test needs and no
     /// sequence of real verbs can produce.
     ///
-    /// The fake **never sleeps** for it: [`stalled`] reads the budget and
+    /// The fake **never sleeps** for it: `stalled` reads the budget and
     /// reports the expiry directly, so a `--timeout 1h` test finishes instantly.
     pub fn seed_start_stalls(&self, id: &str) {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -570,7 +570,7 @@ impl Fake {
 
 // generate/extract ====================================================================================================
 
-/// The prefix of the line that names a host in what [`Fake::render`] writes after seeding one.
+/// The prefix of the line that names a host in what `Fake::render` writes after seeding one.
 const HOST_LINE: &str = "Host: ";
 
 pub(in crate::manager) fn generate(spec: &DaemonSpec) -> String {

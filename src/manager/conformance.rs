@@ -20,8 +20,8 @@
 //!
 //! ## The seeded ids
 //!
-//! Four of the scenarios ([`refuses_foreign_even_with_force`],
-//! [`foreign_refuses_every_verb`], [`conflict_requires_force`] and
+//! Four of the scenarios (`refuses_foreign_even_with_force`,
+//! `foreign_refuses_every_verb`, `conflict_requires_force` and
 //! [`an_unclassifiable_id_is_never_silently_absent`]) need state that cannot be
 //! produced through [`ServiceManager`]'s own methods: a foreign (unmarked)
 //! service, a hand-edited Goetia artifact, and an artifact no read can obtain.

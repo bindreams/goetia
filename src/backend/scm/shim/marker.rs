@@ -1,15 +1,15 @@
 //! The version marker compiled into every service host, and the check that reads it from a file.
 //!
-//! A host's file contains `needle ++ version ++ NUL` exactly once: [`MARKER`], which `run` keeps in
-//! the binary. [`verify`] streams the file through [`scan`] and compares the version with this
+//! A host's file contains `needle ++ version ++ NUL` exactly once: `MARKER`, which `run` keeps in
+//! the binary. `verify` streams the file through [`scan`] and compares the version with this
 //! library's, so a file that is no host, or a host of another version, is refused before it is
 //! registered as a service that runs as `LocalSystem`.
 //!
-//! The needle is the one thing a binary that links goetia must hold only inside [`MARKER`]: a
+//! The needle is the one thing a binary that links goetia must hold only inside `MARKER`: a
 //! second copy in the scanner's own code would be found first in any host. So [`needle`] never
 //! exists as a literal: the literal has a hole, filled at run time through an opaque read.
 //!
-//! [`scan`] is pure over any `Read` and builds on every host; [`MARKER`] and [`verify`] are
+//! [`scan`] is pure over any `Read` and builds on every host; `MARKER` and `verify` are
 //! Windows-only.
 #![cfg_attr(not(windows), allow(dead_code))]
 

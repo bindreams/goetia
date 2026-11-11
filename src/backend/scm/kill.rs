@@ -14,7 +14,7 @@
 //! process was gone (windows-latest, run 40119307045).
 //!
 //! A pure state machine over [`KillTarget`], unit-tested with a script in `kill_tests.rs`;
-//! [`SystemKillTarget`] drives the real SCM and `OpenProcess`/`TerminateProcess`.
+//! `SystemKillTarget` drives the real SCM and `OpenProcess`/`TerminateProcess`.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::io;
