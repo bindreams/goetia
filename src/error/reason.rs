@@ -95,6 +95,7 @@ impl Reason {
 
     /// This reason said after `installed but unusable: `: what `list` and `status` say of an
     /// installed daemon goetia cannot use.
+    #[cfg(feature = "cli")]
     pub(crate) fn installed_but_unusable(&self) -> Reason {
         const PREFIX: &str = "installed but unusable: ";
         match self {
