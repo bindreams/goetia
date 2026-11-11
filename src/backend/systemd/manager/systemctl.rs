@@ -639,7 +639,7 @@ fn enqueued(stderr: &[u8]) -> bool {
 }
 
 /// Whether [`Systemctl::run_verb`] takes its bounded path under `budget` — the one whose `systemctl`
-/// goetia watches, and which needs a thread to read its announcement.
+/// goetia watches, and which takes two listener threads, one per stream ([`Role::AnnouncedRequest`]).
 pub(super) fn watched(budget: Budget) -> bool {
     budget.waits() && budget != Budget::Unbounded
 }
