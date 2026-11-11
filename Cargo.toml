@@ -2,9 +2,10 @@
 name = "goetia"
 version = "0.3.0"
 edition = "2024"
-# Let-chains and `slice::as_chunks` (both stable in 1.88) force the floor; `sha2` 0.11, which hashes the
-# stock shim on Windows, declares 1.88 too.
-rust-version = "1.88"
+# `skuld` 0.6 (the test harness, also a `testing`-feature dependency) uses `File::lock`, stable in 1.89.
+# Let-chains and `slice::as_chunks` (both stable in 1.88) and `sha2` 0.11, which hashes the stock shim
+# on Windows, need less.
+rust-version = "1.89"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
 readme = "README.md"
@@ -80,7 +81,7 @@ serde_json = "1"
 similar = "3"
 # Only under `testing`: the `ELEVATED` label of `testing::elevation`. The dev-dependency below is the
 # unit tests' own.
-skuld = { version = "0.3", optional = true }
+skuld = { version = "0.6", optional = true }
 tempfile = "3"
 thiserror = "2"
 yaml_serde = "0.10.7"
@@ -159,7 +160,7 @@ windows-sys = { version = "0.61", features = [
 # Turns on `testing` for the integration tests, which reach the library only through its public API.
 # Without `default-features = false` it would also turn on `cli` in a `--no-default-features` build.
 goetia = { path = ".", default-features = false, features = ["testing"] }
-skuld = "0.3"
+skuld = "0.6"
 rand = "0.10"
 
 [target.'cfg(unix)'.dev-dependencies]
