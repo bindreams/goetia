@@ -361,28 +361,17 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
         return Ok(StopAndAwaitExitOutcome::Unconfirmed { pid });
     }
     // `end` ends the process on an incomplete stop, which returns, or after a confirmed one: never both.
-    let mut end = Some(end);
-    let stopped = stop_via_notify(a, deadline, shim);
-    let held_on_incomplete_stop =
-        stopped.as_ref().is_err_and(is_incomplete_stop) && matches!(held, HoldOutcome::Held(_));
-    let waited = end_on_incomplete_stop(stopped, held, |process| match end.take() {
-        Some(end) => end(process, deadline),
-        None => Err(io::Error::other("the held process was not ended: goetia's own error")),
-    });
-    debug_assert!(
-        !held_on_incomplete_stop || end.is_none(),
-        "a process held across an incomplete stop must reach `end`"
-    );
-    let waited = waited?;
-    match waited {
-        Waited::Confirmed => {}
-        Waited::Expired => return Ok(StopAndAwaitExitOutcome::ServiceExpired),
+    match stop_via_notify(a, deadline, shim) {
+        Ok(Waited::Confirmed) => {}
+        Ok(Waited::Expired) => return Ok(StopAndAwaitExitOutcome::ServiceExpired),
+        Err(e) => {
+            return end_on_incomplete_stop(Err(e), held, |process| end(process, deadline));
+        }
     }
     // Why a refused process is not held is the caller's to report: it knows where.
     let Some(process) = take_held(held) else {
         return Ok(StopAndAwaitExitOutcome::Stopped);
     };
-    let end = end.expect("`end` is taken only by an incomplete stop, which returned");
     Ok(match end(process, deadline)? {
         EndProcessOutcome::Exited => StopAndAwaitExitOutcome::Stopped,
         EndProcessOutcome::Lingers {
