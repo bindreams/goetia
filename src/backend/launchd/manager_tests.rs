@@ -12,6 +12,7 @@ use crate::backend::bounded::Fate;
 use crate::backend::client::fake::{Ended, Entry, Fake, RoleKind, Waited, exited, fail, lingering, reply};
 use crate::backend::client::{Client, ClientError, Real};
 use crate::backend::standby;
+use crate::backend::test_allowance;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
 use crate::spec::{Id, Kind, Restart, User};
@@ -1020,7 +1021,7 @@ fn a_reservation_holds_what_its_steps_count() {
 fn a_reservation_that_cannot_be_made_whole_is_refused() {
     use crate::backend::Backend;
 
-    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    type Allowance = fn(usize) -> test_allowance::Allowance;
     let mgr = Launchd::new();
     for steps in [&[Step::Stop, Step::Start][..], &[Step::Start]] {
         let (reapers, files) = counted(steps);
@@ -1187,7 +1188,7 @@ fn a_restart_that_cannot_reserve_sends_nothing() {
     use crate::cli::wait::WaitArgs;
     use crate::cli::{ExitCode, restart};
 
-    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    type Allowance = fn(usize) -> test_allowance::Allowance;
     let (reapers, files) = counted(&[Step::Stop, Step::Start]);
     let shortfalls: [(Allowance, usize); 2] = [
         (standby::test_hook::threads, reapers - 1),
@@ -1221,7 +1222,7 @@ fn a_restart_that_cannot_reserve_sends_nothing() {
 /// the test `Fake`, since the blanket impl is the same for every backend.
 #[skuld::test]
 fn an_install_that_cannot_reserve_sends_nothing_and_names_its_id() {
-    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    type Allowance = fn(usize) -> test_allowance::Allowance;
     let (reapers, files) = counted(&[Step::Install]);
     let shortfalls: [(Allowance, usize); 2] = [
         (standby::test_hook::threads, reapers - 1),

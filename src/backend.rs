@@ -19,6 +19,8 @@ pub mod launchd;
 pub mod scm;
 pub(crate) mod standby;
 pub mod systemd;
+#[cfg(test)]
+pub(crate) mod test_allowance;
 mod unreaped;
 
 pub(crate) use contract::{

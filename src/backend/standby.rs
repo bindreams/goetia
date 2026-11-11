@@ -82,10 +82,8 @@ impl<T: Send + 'static> Standby<T> {
 pub(crate) mod test_hook {
     use std::cell::Cell;
     use std::io;
-    use std::thread::LocalKey;
 
-    /// How many more of something this thread may make: `None` is no limit.
-    pub(crate) type Left = LocalKey<Cell<Option<usize>>>;
+    use crate::backend::test_allowance::{Allowance, spend};
 
     thread_local! {
         static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
@@ -98,34 +96,6 @@ pub(crate) mod test_hook {
 
     pub(super) fn make() -> io::Result<()> {
         spend(&THREADS, "no thread may be made (test hook)")
-    }
-
-    /// Spend one of `left`, or refuse with `refusal` when none remain.
-    pub(crate) fn spend(left: &'static Left, refusal: &str) -> io::Result<()> {
-        match left.get() {
-            Some(0) => Err(io::Error::other(refusal)),
-            Some(n) => {
-                left.set(Some(n - 1));
-                Ok(())
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// Holds a limit on `left` until it drops, which lifts it.
-    pub(crate) struct Allowance(&'static Left);
-
-    impl Allowance {
-        pub(crate) fn set(left: &'static Left, n: usize) -> Allowance {
-            left.set(Some(n));
-            Allowance(left)
-        }
-    }
-
-    impl Drop for Allowance {
-        fn drop(&mut self) {
-            self.0.set(None);
-        }
     }
 }
 

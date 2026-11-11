@@ -15,6 +15,7 @@ use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
 use crate::backend::standby;
+use crate::backend::test_allowance;
 use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
 use crate::spec::DaemonFields;
@@ -452,7 +453,7 @@ fn prepared_steps_need_nothing_made_later() {
         );
     }
 
-    type Allowance = fn() -> bounded::test_hook::Allowance;
+    type Allowance = fn() -> test_allowance::Allowance;
     let shortfalls: [Allowance; 3] = [
         || standby::test_hook::threads(1),
         || standby::test_hook::threads(3),

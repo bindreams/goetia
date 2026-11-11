@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::backend::standby;
+use crate::backend::test_allowance;
 use crate::manager::budget::Budget;
 
 /// A reservation holding the temp files one child's streams draw.
@@ -474,7 +475,7 @@ fn marks(marker: &std::path::Path) -> cosca::Command {
 /// spawned: see [`a_reservation_is_made_whole_or_not_at_all`].
 #[skuld::test]
 fn a_child_whose_output_nothing_could_take_is_never_run() {
-    type Allowance = fn() -> test_hook::Allowance;
+    type Allowance = fn() -> test_allowance::Allowance;
     type Case = (&'static str, fn() -> Role, Allowance, &'static str);
     let cases: [Case; 4] = [
         (
@@ -700,7 +701,12 @@ fn a_reservation_hands_out_what_it_made() {
 /// never sends its first: `make` fails as a whole when any one thread or file cannot be made.
 #[skuld::test]
 fn a_reservation_is_made_whole_or_not_at_all() {
-    type Case = (&'static str, fn() -> test_hook::Allowance, (usize, usize), &'static str);
+    type Case = (
+        &'static str,
+        fn() -> test_allowance::Allowance,
+        (usize, usize),
+        &'static str,
+    );
     let cases: [Case; 4] = [
         ("third reaper", || standby::test_hook::threads(2), (3, 0), "no thread"),
         ("first reaper", || standby::test_hook::threads(0), (1, 2), "no thread"),

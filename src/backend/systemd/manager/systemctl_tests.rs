@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::backend::standby;
+use crate::backend::test_allowance;
 use std::os::unix::process::ExitStatusExt as _;
 use std::time::Duration;
 
@@ -307,7 +308,7 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
 /// never a request out with nothing to watch it.
 #[skuld::test]
 fn a_request_nothing_could_watch_is_never_sent() {
-    type Allowance = fn() -> bounded::test_hook::Allowance;
+    type Allowance = fn() -> test_allowance::Allowance;
     let shortfalls: [(Allowance, &str); 2] = [
         (|| standby::test_hook::threads(0), "no thread"),
         (|| standby::test_hook::threads(1), "no thread"),

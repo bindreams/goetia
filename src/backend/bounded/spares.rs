@@ -285,14 +285,7 @@ pub(super) fn make_file() -> io::Result<File> {
 pub(crate) mod test_hook {
     use std::cell::Cell;
 
-    pub(crate) use crate::backend::standby::test_hook::Allowance;
-    use crate::backend::standby::test_hook::{Left, spend};
-
-    #[derive(Debug, Clone, Copy)]
-    enum Kind {
-        TempFile,
-        Reuse,
-    }
+    use crate::backend::test_allowance::{Allowance, spend};
 
     thread_local! {
         static TEMP_FILES: Cell<Option<usize>> = const { Cell::new(None) };
@@ -352,33 +345,22 @@ pub(crate) mod test_hook {
         SPAWN_FAILS.take().map(|error| error())
     }
 
-    fn allowance(kind: Kind) -> &'static Left {
-        match kind {
-            Kind::TempFile => &TEMP_FILES,
-            Kind::Reuse => &REUSES,
-        }
-    }
-
     /// Let this thread make only `n` more temp files, until the returned guard drops.
     pub(crate) fn temp_files(n: usize) -> Allowance {
-        allow(Kind::TempFile, n)
+        Allowance::set(&TEMP_FILES, n)
     }
 
     /// Let this thread run only `n` more [`super::Kept::again`]s, until the returned guard drops.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn reuses(n: usize) -> Allowance {
-        allow(Kind::Reuse, n)
-    }
-
-    fn allow(kind: Kind, n: usize) -> Allowance {
-        Allowance::set(allowance(kind), n)
+        Allowance::set(&REUSES, n)
     }
 
     pub(super) fn make_file() -> std::io::Result<()> {
-        spend(allowance(Kind::TempFile), "no temp file may be made (test hook)")
+        spend(&TEMP_FILES, "no temp file may be made (test hook)")
     }
 
     pub(super) fn reuse() -> std::io::Result<()> {
-        spend(allowance(Kind::Reuse), "no kept file may be reused (test hook)")
+        spend(&REUSES, "no kept file may be reused (test hook)")
     }
 }
