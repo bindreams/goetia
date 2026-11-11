@@ -8,8 +8,7 @@
 //!
 //! Every test here registers and removes real Windows services and needs
 //! `CARGO_BIN_EXE_goetia-shim`: `common::manager()` hands it to the manager as a `StandaloneShim`,
-//! since the directory of this test binary's `current_exe()` (a cargo build's `deps/`, a nextest
-//! archive's extraction) never holds a shim.
+//! since `current_exe()` is not beside `goetia-shim.exe`.
 
 #[path = "support/mod.rs"]
 mod support;
