@@ -730,6 +730,9 @@ assert_package_list_rejects_matching "rejects a leaked .github/ path" "$listing"
 listing="$(write_package_listing leaks-claude "${complete_listing_lines[@]}" .claude/settings.json)"
 assert_package_list_rejects_matching "rejects a leaked .claude/ path" "$listing" ".claude/settings.json"
 
+listing="$(write_package_listing leaks-config "${complete_listing_lines[@]}" .config/nextest.toml)"
+assert_package_list_rejects_matching "rejects a leaked .config/ path" "$listing" ".config/nextest.toml"
+
 listing="$(write_package_listing leaks-scripts "${complete_listing_lines[@]}" scripts/format-section-comments.py)"
 assert_package_list_rejects_matching "rejects a leaked scripts/ path" "$listing" "scripts/format-section-comments.py"
 
