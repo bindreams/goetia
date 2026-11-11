@@ -5,7 +5,7 @@ use std::fmt::{self, Write as _};
 use super::escape::{write_escaped, write_escaped_keeping_layout};
 use super::{Error, Sentence};
 
-/// What [`Error::report`] and [`Error::report_unescaped`] return: the chain, formatted on `Display`.
+/// What [`Error::report`] and `Error::report_unescaped` return: the chain, formatted on `Display`.
 pub(super) struct Report<'a> {
     pub(super) error: &'a Error,
     pub(super) escaped: bool,
@@ -99,7 +99,7 @@ impl fmt::Write for Sink<'_> {
 /// inside another's sentence is written to `Display`.
 ///
 /// Not escaped: the text lands in an error's `Display`, which the sink that prints it escapes. The
-/// report does not print a [`Sentence`](super::Sentence) through this, but writes the embedded error
+/// report does not print a [`Sentence`] through this, but writes the embedded error
 /// itself (see [`write_chain`]), so its remedies print once, last.
 pub(crate) struct Chain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 

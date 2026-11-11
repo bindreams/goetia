@@ -1,10 +1,10 @@
-//! The providers that place goetia's own stock shim: [`EmbeddedStockShim`] from bytes the program
+//! The providers that place goetia's own stock shim: `EmbeddedStockShim` from bytes the program
 //! carries, and the crate-private `SiblingStockShim` from `goetia-shim.exe` beside the running
 //! executable.
 //!
 //! The shim is a file named for the SHA-256 of its bytes, `goetia-shim-<hex>.exe`, in a folder only
 //! Administrators can write to. Several goetia versions can share the folder, each with its own
-//! file. `provide` creates the file with the permissions of [`Descriptor`], written under a
+//! file. `provide` creates the file with the permissions of `Descriptor`, written under a
 //! temporary name and then renamed into place, or verifies the file already there (owner,
 //! permissions, bytes against its name) and, when any is wrong, renames it aside and writes a fresh
 //! one. Both temporary and aside names are `goetia-shim-<hex>.<random>.stale.exe`, so that what a
@@ -133,7 +133,7 @@ mod stock {
 
         /// Deletes the shim files in `folder()`, and what a repair or a crash left beside them, that
         /// no path of `referenced` names, and removes it when that leaves it empty and it is the
-        /// default folder; see [`sweep_folder`], which also refuses a folder `folders` refuses.
+        /// default folder; see `sweep_folder`, which also refuses a folder `folders` refuses.
         fn sweep(&self, referenced: &[PathBuf], folders: &FolderCheck) -> std::result::Result<(), SweepFailure> {
             let dir = self.dir()?;
             match &self.dir {
