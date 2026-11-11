@@ -932,6 +932,20 @@ fn a_coloured_environment_does_not_fail_the_version_gate() {
     assert!(!unit_path(guard.id()).exists(), "uninstall left the unit");
 }
 
+/// The real `systemctl` on this host passes the version gate: an install asks it before it writes
+/// anything, so one that completes was not refused for the host's systemd. What an inherited
+/// `SYSTEMD_COLORS` does to the gate is `a_coloured_environment_does_not_fail_the_version_gate`'s.
+#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
+fn this_hosts_systemd_is_supported() {
+    let id = support::random_test_id();
+    let guard = ServiceGuard::new(&id);
+
+    let outcome = Systemd::new()
+        .install(&mk(guard.id()), false)
+        .expect("the host running the tests runs systemd 242+");
+    assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
+}
+
 /// `goetia <args>`, elevated as this test is, with a `systemctl` first on its `PATH` whose running
 /// manager reports `manager` and whose client reports `client`, and that fails anything else: a
 /// refusal must come before goetia asks systemd for anything more.

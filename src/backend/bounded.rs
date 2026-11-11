@@ -249,6 +249,17 @@ pub(crate) enum SpawnError {
     MayHaveRun(cosca::error::Error),
 }
 
+impl SpawnError {
+    /// `e`, as a spawn failed with it: placed by whether cosca says the program may have started.
+    pub(crate) fn of_spawn(e: cosca::error::Error) -> SpawnError {
+        if e.fate().is_some() {
+            SpawnError::MayHaveRun(e)
+        } else {
+            SpawnError::NotRun(e)
+        }
+    }
+}
+
 impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -280,13 +291,7 @@ pub(crate) fn spawn(
         Ok((stdout, stderr))
     })();
     let (stdout, stderr) = prepared.map_err(SpawnError::NotRun)?;
-    let mut child = start(cmd).map_err(|e| {
-        if e.fate().is_some() {
-            SpawnError::MayHaveRun(e)
-        } else {
-            SpawnError::NotRun(e)
-        }
-    })?;
+    let mut child = start(cmd).map_err(SpawnError::of_spawn)?;
     let (out, err) = (child.stdout(), child.stderr());
     Ok(Spawned {
         child,
