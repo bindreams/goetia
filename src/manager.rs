@@ -108,9 +108,11 @@ pub trait ServiceManager {
     /// same start of a running daemon expires on systemd and succeeds on the
     /// other two.
     ///
-    /// On expiry, [`Error::WaitTimeout`], never `Ok(())` and never
-    /// [`Error::Undetermined`], which claims the *installation* is in doubt
-    /// when a settled id's request was issued and not waited out.
+    /// On expiry, the error's [`cause`](Error::cause) is [`Error::WaitTimeout`], never `Ok(())` and
+    /// never [`Error::Undetermined`], which claims the *installation* is in doubt when a settled
+    /// id's request was issued and not waited out. A backend may wrap the timeout in a
+    /// [`Step`](Error::Step) that says what else is true (SCM does), so match the cause, not the
+    /// error.
     ///
     /// Idempotent under every budget: starting an already-running service is
     /// `Ok(())`, not an error.
