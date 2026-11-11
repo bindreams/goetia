@@ -79,7 +79,7 @@ fn run_service(id: &str) {
         Ok(blob) => blob,
         Err(stop) => {
             log.failure(id, &stop.message);
-            return finish(&log, id, status_handle, stop.reported);
+            return finish(&log, id, stop.reported, |r| report_stopped(status_handle, r));
         }
     };
 
@@ -92,7 +92,7 @@ fn run_service(id: &str) {
         || report_running(&log, id, status_handle),
         || report_stopping(&log, id, status_handle),
     );
-    finish(&log, id, status_handle, reported);
+    finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
 
 /// Why the shim reads no spec to run, and what it tells SCM.
@@ -139,9 +139,9 @@ fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob,
 /// returns once SCM has processed `STOPPED`, and the main thread ends the process with what is
 /// recorded here (see [`exit`]). When `STOPPED` cannot be reported the dispatcher is not trusted to
 /// return, so the exit is here.
-fn finish(log: &Log, id: &str, status_handle: StatusHandle, reported: Reported) {
+pub(super) fn finish(log: &Log, id: &str, reported: Reported, report: impl FnOnce(Reported) -> std::io::Result<()>) {
     exit::stopping(reported);
-    if let Err(e) = report_stopped(status_handle, reported) {
+    if let Err(e) = report(reported) {
         log.failure(id, &stopped_report_failure(&e));
         exit::end_process(reported.process_exit_code());
     }
