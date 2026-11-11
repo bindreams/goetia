@@ -6,10 +6,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
+use crate::backend::standby;
+use crate::backend::test_allowance;
 use crate::manager::budget::Budget;
-
-#[cfg(target_os = "linux")]
-use crate::testing::cleanup::{removal_problem, retrying, warn_left_behind};
 
 /// A reservation holding the temp files one child's streams draw.
 fn files() -> Reservation {
@@ -59,7 +58,7 @@ fn a_nonzero_exit_is_reported_not_an_error() {
 #[skuld::test]
 fn an_expired_deadline_kills_and_reaps_the_child() {
     let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
-    let pid = child.child.id().pid();
+    let pid = child.child.pid();
 
     // `sleep 2147483647` cannot exit on its own for 68 years, so the deadline
     // is provably the only way out and no budget value can make this flaky;
@@ -235,18 +234,18 @@ fn a_heard_stream_is_read_only_until_a_spent_deadline_even_at_its_end() {
 fn a_contained_childs_descendant_dies_with_it() {
     // Same script, same fd-3 handshake, but spawned through `bounded::command`
     // so the tree IS contained.
-    #[cfg(target_os = "linux")]
-    let mut leaf = DrainedLeaf::default();
     let mut cmd = sh("sleep 2147483647 & echo $! >&3; exec sleep 2147483647");
     cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
     let mut child = spawned(cmd, Role::Query);
-    #[cfg(target_os = "linux")]
-    leaf.set(contained_leaf(child.child.id().pid()));
 
     let fd3 = child.child.fd_read_end(3.into()).unwrap();
     let mut line = String::new();
     io::BufReader::new(fd3).read_line(&mut line).unwrap();
     let descendant: u32 = line.trim().parse().unwrap();
+    // Opened while it is alive: after the kill its pid may name another process.
+    let descendant = cosca::Process::open_pid(descendant)
+        .unwrap()
+        .expect("the descendant is alive");
 
     let deadline = Budget::Bounded(Duration::from_millis(50)).start();
     let finished = wait_bounded(child, deadline).unwrap();
@@ -257,45 +256,7 @@ fn a_contained_childs_descendant_dies_with_it() {
     // descendant dies, and hangs if the descendant is not in the child's
     // contained tree (e.g. `command()` without `.contain()`) — then neither
     // `kill_tree` nor `Drop` can reach it.
-    match cosca::Process::from_pid(descendant) {
-        cosca::identity::Resolved::Found(p) => p.wait().unwrap(),
-        cosca::identity::Resolved::Gone => {}
-        cosca::identity::Resolved::Unknown => panic!("could not resolve the descendant's identity"),
-    }
-}
-
-/// The cgroup leaf cosca placed `pid` in, or `None` where containment fell back to a process
-/// group — whose cgroup is this test process's own, and must not be touched.
-#[cfg(target_os = "linux")]
-fn contained_leaf(pid: u32) -> Option<std::path::PathBuf> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    let relative = text.lines().find_map(|line| line.strip_prefix("0::"))?;
-    let leaf = std::path::Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
-    leaf.file_name()?.to_str()?.starts_with("cosca-").then_some(leaf)
-}
-
-/// Removes the cgroup leaf cosca placed a child in, on drop: cosca's own `Drop` leaves it behind
-/// when a member is still dying, so the `rmdir` is retried while the member exits. It is declared
-/// before the spawn so it drops after `child`; [`DrainedLeaf::set`] names the leaf once the child
-/// is in it.
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct DrainedLeaf(Option<std::path::PathBuf>);
-
-#[cfg(target_os = "linux")]
-impl DrainedLeaf {
-    fn set(&mut self, leaf: Option<std::path::PathBuf>) {
-        self.0 = leaf;
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for DrainedLeaf {
-    fn drop(&mut self) {
-        if let Some(leaf) = &self.0 {
-            warn_left_behind(retrying(|| removal_problem(leaf, std::fs::remove_dir(leaf))));
-        }
-    }
+    descendant.wait().unwrap();
 }
 
 /// More than a pipe holds, on every stream in every form it takes: a temp file, and the pipe
@@ -470,7 +431,7 @@ fn expired_request_released_by_its_reaper(then: &str) -> ExitStatus {
 /// [`expired_request_released_by_its_reaper`], with what the caller does with the expiry given as
 /// `settle`: it holds the child until `settle` returns, and a [`Left`] it drops is released.
 fn expired_request_settled_by(then: &str, settle: impl FnOnce(Finished)) -> ExitStatus {
-    let (writer_tx, writer_rx) = mpsc::channel::<io::PipeWriter>();
+    let (writer_tx, writer_rx) = mpsc::channel::<cosca::PipeWriter>();
     let (tx, rx) = mpsc::channel();
     let reaper = Reaper::with(
         move |child| {
@@ -493,19 +454,8 @@ fn expired_request_settled_by(then: &str, settle: impl FnOnce(Finished)) -> Exit
 
 /// The child the reaper tests hand their reaper: runs `then` at EOF on its stdin, a pipe the test
 /// holds. `command()`'s, as launchd's `launchctl` — the one production `Role::Request` — is spawned.
-#[cfg(not(target_os = "linux"))]
 fn released_at_eof(then: &str) -> cosca::Command {
     let mut cmd = sh(&format!("read line; {then}"));
-    cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
-    cmd
-}
-
-/// On Linux, uncontained. cosca 0.4's cgroup containment kills a detached tree — the leaf's `Drop`
-/// writes `cgroup.kill` — and leaves the leaf behind, measured; nothing on Linux detaches, since
-/// `systemctl` announces its requests.
-#[cfg(target_os = "linux")]
-fn released_at_eof(then: &str) -> cosca::Command {
-    let mut cmd = cosca::run(["/bin/sh", "-c", &format!("read line; {then}")]);
     cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
     cmd
 }
@@ -525,7 +475,7 @@ fn marks(marker: &std::path::Path) -> cosca::Command {
 /// spawned: see [`a_reservation_is_made_whole_or_not_at_all`].
 #[skuld::test]
 fn a_child_whose_output_nothing_could_take_is_never_run() {
-    type Allowance = fn() -> test_hook::Allowance;
+    type Allowance = fn() -> test_allowance::Allowance;
     type Case = (&'static str, fn() -> Role, Allowance, &'static str);
     let cases: [Case; 4] = [
         (
@@ -543,13 +493,13 @@ fn a_child_whose_output_nothing_could_take_is_never_run() {
         (
             "announced stdout",
             || Role::AnnouncedRequest(announced),
-            || test_hook::threads(0),
+            || standby::test_hook::threads(0),
             "thread",
         ),
         (
             "announced stderr",
             || Role::AnnouncedRequest(announced),
-            || test_hook::threads(1),
+            || standby::test_hook::threads(1),
             "thread",
         ),
     ];
@@ -645,12 +595,11 @@ fn a_stream_file_that_cannot_be_read_back_names_the_stream_and_keeps_its_cause()
     );
 }
 
-/// A spawn that failed is placed before the child ran only when cosca's error says so: an `Io`
-/// carrying an OS error from a pipe, `fork` or `exec`. Everything else — cosca's identity read and
-/// `SharedChild::new` after `exec`, and the variants it raises on both sides of it — may have run
-/// the child, and so may have sent its request. Injected, so nothing runs.
+/// A spawn that failed is placed before the child ran unless cosca's error says the program may have
+/// started: [`cosca::error::Error::MayHaveStarted`], and no other variant, whatever its OS error.
+/// Injected, so nothing runs.
 #[skuld::test]
-fn a_failed_spawn_is_not_run_only_on_evidence() {
+fn a_failed_spawn_is_not_run_unless_cosca_says_it_may_have_started() {
     type Case = (&'static str, fn() -> cosca::error::Error, bool);
     let cases: [Case; 8] = [
         (
@@ -663,38 +612,35 @@ fn a_failed_spawn_is_not_run_only_on_evidence() {
             || io::Error::from_raw_os_error(libc::ENOENT).into(),
             false,
         ),
+        // Whatever the OS error, only the variant decides.
+        ("ECHILD", || io::Error::from_raw_os_error(libc::ECHILD).into(), false),
+        ("EINVAL", || io::Error::from_raw_os_error(libc::EINVAL).into(), false),
         (
-            "pipe: EMFILE",
-            || io::Error::from_raw_os_error(libc::EMFILE).into(),
+            "before the spawn: containment",
+            || cosca::error::Error::Containment {
+                detail: "forced".into(),
+            },
             false,
         ),
         (
-            "SharedChild::new: ECHILD",
-            || io::Error::from_raw_os_error(libc::ECHILD).into(),
-            true,
-        ),
-        (
-            "SharedChild::new or exec: EINVAL",
-            || io::Error::from_raw_os_error(libc::EINVAL).into(),
-            true,
-        ),
-        (
-            "identity: vanished",
-            || io::Error::other("spawned child vanished before its identity could be read").into(),
-            true,
-        ),
-        (
-            "identity: refused",
+            "macOS: its unique id unreadable",
             || cosca::error::Error::Unassessable {
-                detail: "the OS refused to report the spawned child's identity".into(),
+                detail: "the child could not read its own unique id".into(),
                 source: None,
             },
+            false,
+        ),
+        (
+            "after exec: the identity read",
+            || test_hook::may_have_started(io::Error::other("spawned child vanished").into()),
             true,
         ),
         (
-            "attach",
-            || cosca::error::Error::Containment {
-                detail: "forced".into(),
+            "after exec: the attach",
+            || {
+                test_hook::may_have_started(cosca::error::Error::Containment {
+                    detail: "forced".into(),
+                })
             },
             true,
         ),
@@ -742,7 +688,7 @@ fn a_child_takes_its_output_from_the_reservation_it_is_handed() {
 #[skuld::test]
 fn a_reservation_hands_out_what_it_made() {
     let mut reservation = Reservation::make(2, 2).unwrap();
-    let _no_thread = test_hook::threads(0);
+    let _no_thread = standby::test_hook::threads(0);
     let _no_file = test_hook::temp_files(0);
 
     drop((reservation.reaper().unwrap(), reservation.reaper().unwrap()));
@@ -755,10 +701,15 @@ fn a_reservation_hands_out_what_it_made() {
 /// never sends its first: `make` fails as a whole when any one thread or file cannot be made.
 #[skuld::test]
 fn a_reservation_is_made_whole_or_not_at_all() {
-    type Case = (&'static str, fn() -> test_hook::Allowance, (usize, usize), &'static str);
+    type Case = (
+        &'static str,
+        fn() -> test_allowance::Allowance,
+        (usize, usize),
+        &'static str,
+    );
     let cases: [Case; 4] = [
-        ("third reaper", || test_hook::threads(2), (3, 0), "no thread"),
-        ("first reaper", || test_hook::threads(0), (1, 2), "no thread"),
+        ("third reaper", || standby::test_hook::threads(2), (3, 0), "no thread"),
+        ("first reaper", || standby::test_hook::threads(0), (1, 2), "no thread"),
         ("second file", || test_hook::temp_files(1), (0, 2), "no temp file"),
         (
             "file after the reapers",
@@ -876,7 +827,7 @@ fn kept_files_serve_a_read_again_and_again_each_starting_empty() {
 #[skuld::test]
 fn an_announced_request_takes_its_threads_from_the_spares() {
     let spares = spare(2).unwrap();
-    let _no_thread = test_hook::threads(0);
+    let _no_thread = standby::test_hook::threads(0);
 
     let finished = wait_bounded(
         spawned(sh("echo 'request issued' >&2"), Role::AnnouncedRequest(announced)),
@@ -902,7 +853,7 @@ fn making_a_listener_on_the_spot_inside_a_reservation_is_loud() {
 #[skuld::test]
 fn a_spare_that_cannot_be_made_whole_spares_nothing() {
     {
-        let _one = test_hook::threads(1);
+        let _one = standby::test_hook::threads(1);
         let e = spare(2).expect_err("a second thread may not be made");
         assert!(e.to_string().contains("no thread may be made"), "{e}");
     }
@@ -917,7 +868,7 @@ fn a_spare_that_cannot_be_made_whole_spares_nothing() {
 #[skuld::test]
 fn spares_are_released_with_their_guard() {
     drop(spare(2).unwrap());
-    let _none = test_hook::threads(0);
+    let _none = standby::test_hook::threads(0);
 
     assert!(spares::listener().is_err(), "a released spare was still handed out");
 }

@@ -52,7 +52,7 @@ fn running_images_lists_a_running_copy() {
 #[skuld::test]
 fn a_process_that_has_exited_is_not_an_image() {
     let running = run_a_copy();
-    let held = open_process_with(running.child.id().pid(), ACCESS)
+    let held = open_process_with(running.child.pid(), ACCESS)
         .expect("open the copy")
         .expect("the copy is running");
     running.child.kill().unwrap();
