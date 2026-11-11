@@ -893,7 +893,7 @@ fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign() {
     assert!(matches!(status, goetia::Error::Foreign { .. }), "{status:?}");
 }
 
-/// [`locate`]'s two unresolved-probe arms, at the privilege boundary that produces them — the one
+/// `locate`'s two unresolved-probe arms, at the privilege boundary that produces them — the one
 /// call site that decides between reporting an id and dropping it. A stat that could not be
 /// performed establishes no absence, so an id under an unsearchable plist directory is exit `4` and
 /// a named path; `symlink_metadata(..).is_ok()` used to answer "nothing is there", which made every

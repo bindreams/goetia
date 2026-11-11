@@ -10,7 +10,7 @@ cargo rustdoc --locked --lib --features testing -- --cfg test --document-private
 
 # `cargo rustdoc` sets no `CARGO_BIN_EXE_*` for a test target, and the tests read them with `env!`
 # at compile time; documenting never runs them, so any value builds.
-targets=$(sed -n '/^\[\[test\]\]/{n;s/^name = "\(.*\)"$/\1/p}' Cargo.toml)
+targets=$(sed -n '/^\[\[test\]\]/{n;s/^name = "\(.*\)"$/\1/p;}' Cargo.toml)
 [[ -n "$targets" ]] || { echo "rustdoc-tests.sh: no [[test]] targets found in Cargo.toml" >&2; exit 1; }
 for target in $targets; do
     env "CARGO_BIN_EXE_goetia=unused" "CARGO_BIN_EXE_goetia-shim=unused" \
