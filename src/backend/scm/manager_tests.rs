@@ -567,15 +567,22 @@ fn blob_of(kind: Kind) -> Blob {
 }
 
 #[skuld::test]
-fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strictly() {
+fn start_reads_a_shims_service_by_the_shims_vocabulary_and_anything_else_strictly() {
     for kind in [Kind::Simple, Kind::Managed] {
-        let (read, why) = start_kind(Ok(&blob_of(kind)));
+        let (read, why) = start_kind(Ok(&blob_of(kind)), kind == Kind::Simple);
         assert_eq!(read, kind);
         assert!(why.is_none(), "{why:?}");
     }
-    let (kind, why) = start_kind(Err(&Arc::new(Error::blob("corrupt"))));
+    let corrupt = Arc::new(Error::blob("corrupt"));
+    let (kind, why) = start_kind(Err(&corrupt), false);
     assert_eq!(kind, Kind::Managed);
     assert!(matches!(why.as_deref(), Some(Error::Blob { message, .. }) if message == "corrupt"));
+
+    // A shim host over a blob that will not decode is read as a shim's, which the start was not
+    // judged strictly for.
+    let (kind, why) = start_kind(Err(&corrupt), true);
+    assert_eq!(kind, Kind::Simple);
+    assert!(why.is_none(), "{why:?}");
 }
 
 /// A start judged strictly because the blob could not be read says why, so the user is not told a
@@ -618,9 +625,7 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
         .expect("the blob is ours");
 
     assert_eq!(blob.spec.restart, Restart::Always);
-    let (kind, why) = start_kind(Ok(&blob));
-    assert_eq!(kind, Kind::Simple);
-    assert!(why.is_none(), "{why:?}");
+    assert!(is_shim(Ok(&blob), no_image));
 }
 
 // The generator's refusal at its call sites ---------------------------------------------------------------------------
@@ -762,16 +767,33 @@ fn a_registered_host_is_a_shim_by_its_file_name() {
     );
 }
 
-/// The shim's vocabulary applies to a service by its registered image, never by its blob: a shim host is
-/// a shim whatever the blob says, an exe of the user's own is not, and an image that could not be read
-/// is judged as a shim's.
-#[skuld::test]
-fn the_shims_vocabulary_applies_to_a_service_by_its_registered_image() {
-    let shim = format!(r"C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe");
+/// An image that is read by nobody: the blob decides, and asking for the image is a bug.
+fn no_image() -> Option<String> {
+    panic!("a blob that decodes decides; the image is not read")
+}
 
-    assert!(is_shim_image(Some(&format!(r#""{shim}" --service-host"#))));
-    assert!(!is_shim_image(Some(r"C:\bin\frpc.exe")));
-    assert!(is_shim_image(None));
+/// A decodable blob decides whether a service's record is the shim's, whatever its image is called: a
+/// `StandaloneShim` host is not named `goetia-shim-<hex>.exe`, and a `type: managed` service may be
+/// registered over one.
+#[skuld::test]
+fn a_decodable_blob_decides_whether_a_service_runs_a_shim() {
+    assert!(is_shim(Ok(&blob_of(Kind::Simple)), no_image));
+    assert!(!is_shim(Ok(&blob_of(Kind::Managed)), no_image));
+}
+
+/// A blob that will not decode leaves the image's file name to decide: a shim host is a shim, an exe of
+/// the user's own is not, and an image that could not be read is judged as a shim's.
+#[skuld::test]
+fn an_undecodable_blob_leaves_the_registered_image_to_decide() {
+    let shim = format!(r"C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe");
+    let corrupt = Arc::new(Error::blob("corrupt"));
+    let image = |image: Option<&str>| image.map(str::to_string);
+
+    assert!(is_shim(Err(&corrupt), || image(Some(&format!(
+        r#""{shim}" --service-host"#
+    )))));
+    assert!(!is_shim(Err(&corrupt), || image(Some(r"C:\bin\frpc.exe"))));
+    assert!(is_shim(Err(&corrupt), || image(None)));
 }
 
 /// Only a service that is gone or marked for deletion refuses the read of its host as a matter of

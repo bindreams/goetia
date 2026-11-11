@@ -430,17 +430,16 @@ impl Backend for Scm {
         }
     }
 
-    /// A service that may run a shim file takes the install lock first and keeps it to the end, so
-    /// that no install places or sweeps a file between the stop and the sweep. If the service's host
-    /// is a shim file by name, its process is held after the service is disabled, before the stop or
-    /// the wait for one under way (see [`uninstall_locked`]), and once the service is stopped
-    /// and deleted the uninstall waits for that process and sweeps the folders the files can be in:
-    /// see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
+    /// A service that runs a shim (see [`runs_a_shim`]) takes the install lock first and keeps it to
+    /// the end, so that no install places or sweeps a file between the stop and the sweep. If the
+    /// service's host is a shim file by name, its process is held after the service is disabled,
+    /// before the stop or the wait for one under way (see [`uninstall_locked`]), and once the service
+    /// is stopped and deleted the uninstall waits for that process and sweeps the folders the files
+    /// can be in: see [`Scm::finish_uninstall`]. Anything else is [`uninstall_locked`] alone.
     fn uninstall(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
-        // A blob that will not decode leaves the kind open: the host's name then decides.
-        let may_run_a_shim = snapshot.blob().map_or(true, |blob| blob.spec.kind == Kind::Simple);
+        let shim = runs_a_shim(&snapshot);
         // First, so that the host read below is not one an install in progress is about to change.
-        let lock = may_run_a_shim.then(InstallLock::acquire).transpose()?;
+        let lock = shim.then(InstallLock::acquire).transpose()?;
         let host = if lock.is_some() {
             registered_shim(&snapshot)
         } else {
@@ -454,7 +453,6 @@ impl Backend for Scm {
         };
         // `uninstall_locked` opens its own handles, and its delete needs this one closed: an open
         // handle leaves the service only marked for deletion.
-        let shim = runs_a_shim(&snapshot);
         let id = snapshot.into_id();
         let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
         match uninstall_locked(&scm, &id, shim, host.is_some())? {
@@ -495,7 +493,7 @@ impl Backend for Scm {
         // First, so the wait is counted from the verb's entry. What it bounds is the wait:
         // `start_via_notify` issues the start whatever is left of it.
         let deadline = budget.start();
-        let (kind, unreadable) = start_kind(snapshot.blob());
+        let (kind, unreadable) = start_kind(snapshot.blob(), runs_a_shim(&snapshot));
         let id = snapshot.into_id();
         let mut actor = super::wait::SystemScmActor::open(id.as_str())
             .map_err(|e| Error::os(format!("open `{id}` to start it"), e))?;
@@ -527,8 +525,8 @@ impl Backend for Scm {
     /// stopped ends that process through its handle (the documentation of `SetServiceStatus` allows
     /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
     /// runs is free when `stop` returns. A service whose shim recorded an incomplete stop (the daemon's
-    /// tree may still be running) is a failed stop, the process not ended; `uninstall` fails the same
-    /// way, and leaves the service stopped, disabled and not deleted (see [`runs_a_shim`]).
+    /// tree may still be running) is a failed stop, once the process is ended; `uninstall` fails the
+    /// same way, and leaves the service stopped, disabled and not deleted (see [`runs_a_shim`]).
     ///
     /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
@@ -648,14 +646,14 @@ pub(crate) fn read_spec_blob(id: &str) -> Result<Option<Blob>> {
     }
 }
 
-/// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not
-/// say. Only a decodable blob that says `type: simple` selects the shim's vocabulary; an unreadable
-/// one reads as strictly as `type: managed`, which is what a shim that cannot decode it reports
-/// anyway (a failed start).
-fn start_kind(blob: std::result::Result<&Blob, &Arc<Error>>) -> (Kind, Option<Arc<Error>>) {
-    match blob {
-        Ok(blob) => (blob.spec.kind, None),
-        Err(e) => (Kind::Managed, Some(Arc::clone(e))),
+/// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not say:
+/// the shim's vocabulary when `shim` ([`runs_a_shim`]), otherwise as strict as `type: managed`. A
+/// service judged strictly over a blob that would not decode says why.
+fn start_kind(blob: std::result::Result<&Blob, &Arc<Error>>, shim: bool) -> (Kind, Option<Arc<Error>>) {
+    match (shim, blob) {
+        (true, _) => (Kind::Simple, None),
+        (false, Ok(_)) => (Kind::Managed, None),
+        (false, Err(e)) => (Kind::Managed, Some(Arc::clone(e))),
     }
 }
 
@@ -1134,22 +1132,27 @@ fn registered_shim(snapshot: &ScmSnapshot) -> Result<Option<PathBuf>> {
     }
 }
 
-/// Whether the service's process may be a goetia shim, whose records the shim's vocabulary reads
-/// (an incomplete stop fails a `stop`): its registered image is a shim host, whatever its blob says, so
-/// a blob that will not decode over a shim host is still judged and a `type: managed` exe never is. A
-/// configuration that cannot be read leaves the host unknown, and unknown counts as a shim: a refusal
-/// to call a stop complete costs a re-run, and a tree left running costs a second copy beside it.
+/// Whether the service's `STOPPED` record is read as a goetia shim's (an incomplete stop fails a
+/// `stop`, a refusal fails a `start`): [`is_shim`] over the snapshot's blob, reading the registered
+/// image only when the blob will not decode. One answer for `start`, `stop` and `uninstall`.
 fn runs_a_shim(snapshot: &ScmSnapshot) -> bool {
-    let image = snapshot
-        .config()
-        .ok()
-        .map(|config| config.executable_path.to_string_lossy().into_owned());
-    is_shim_image(image.as_deref())
+    is_shim(snapshot.blob(), || {
+        snapshot
+            .config()
+            .ok()
+            .map(|config| config.executable_path.to_string_lossy().into_owned())
+    })
 }
 
-/// [`runs_a_shim`] over the registered command line, `None` when it could not be read.
-fn is_shim_image(image: Option<&str>) -> bool {
-    image.is_none_or(|image| shim_host(image).is_some())
+/// The blob's `type: simple` when it decodes: a `StandaloneShim` host is a shim whatever its file is
+/// called. Otherwise the registered `image`'s file name, `None` when it could not be read: a shim host
+/// is one, an exe of the user's own is not, and an unknown image counts as one, since a refusal to call
+/// a stop complete costs a re-run, and a tree left running costs a second copy beside it.
+fn is_shim(blob: std::result::Result<&Blob, &Arc<Error>>, image: impl FnOnce() -> Option<String>) -> bool {
+    match blob {
+        Ok(blob) => blob.spec.kind == Kind::Simple,
+        Err(_) => image().is_none_or(|image| shim_host(&image).is_some()),
+    }
 }
 
 /// The host the command line `image` starts, when its file name is that of a shim file placed by a
