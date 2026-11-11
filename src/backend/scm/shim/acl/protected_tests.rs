@@ -4,34 +4,9 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::backend::scm::shim::acl::{Ace, ObjectSecurity, Sid, sid_from_parts};
-
-const FULL: u32 = 0x1F_01FF;
-const READ_EXECUTE: u32 = 0x12_00A9;
-const OBJECT_INHERIT: u8 = 0x01;
-const CONTAINER_INHERIT: u8 = 0x02;
-
-fn system() -> Sid {
-    sid_from_parts(5, &[18])
-}
-fn administrators() -> Sid {
-    sid_from_parts(5, &[32, 544])
-}
-fn users() -> Sid {
-    sid_from_parts(5, &[32, 545])
-}
-fn everyone() -> Sid {
-    sid_from_parts(1, &[0])
-}
-
-fn allow(trustee: Sid, mask: u32, flags: u8) -> Ace {
-    Ace {
-        trustee,
-        mask,
-        flags,
-        allow: true,
-    }
-}
+use crate::backend::scm::shim::acl::ObjectSecurity;
+use crate::backend::scm::shim::acl::acl_tests::{CONTAINER_INHERIT, FULL, OBJECT_INHERIT, READ_EXECUTE, allow, users};
+use crate::backend::scm::sid::{administrators, everyone, system};
 
 /// What the stock shim file has, with `path` as the label an existing file is read under.
 fn stock_file(path: &str) -> ObjectSecurity {
@@ -106,6 +81,24 @@ fn a_deny_entry_is_not_an_allow_entry() {
     actual.dacl.as_mut().unwrap()[2].allow = false;
 
     assert!(!is_as_wanted(&actual, &stock_file("")));
+}
+
+#[skuld::test]
+fn a_conditional_entry_is_not_a_plain_one() {
+    let mut actual = stock_file("");
+    actual.dacl.as_mut().unwrap()[2].conditional = true;
+
+    assert!(!is_as_wanted(&actual, &stock_file("")));
+    // Order does not matter between a conditional entry and a plain one of the same trustee.
+    let mut wanted = stock_file("");
+    let dacl = wanted.dacl.as_mut().unwrap();
+    dacl.push(Ace {
+        conditional: true,
+        ..dacl[2].clone()
+    });
+    let mut reversed = wanted.clone();
+    reversed.dacl.as_mut().unwrap().reverse();
+    assert!(is_as_wanted(&reversed, &wanted));
 }
 
 #[skuld::test]
