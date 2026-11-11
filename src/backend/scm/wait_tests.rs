@@ -3253,6 +3253,7 @@ fn a_start_over_a_decodable_blob_is_read_by_its_kind() {
             (Kind::Simple, Ok(())) => {}
             (Kind::Managed, Err(e)) => {
                 let said = e.report().to_string();
+                assert!(said.contains("stopped before reaching Running"), "{said}");
                 assert!(!said.contains("blob"), "{said}");
             }
             (kind, result) => panic!("{kind:?}: unexpected {result:?}"),
