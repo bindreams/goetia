@@ -330,7 +330,7 @@ fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_
     let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
     assert!(
-        matches!(outcome, WaitOutcome::DaemonMayRun),
+        matches!(outcome, WaitOutcome::TreeMayRun),
         "the tree kill failed, so the daemon's descendants may still run"
     );
     assert!(daemon.killed(), "the fallback kill did not end the child");
@@ -421,7 +421,7 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
 
     let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
-    assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
+    assert!(matches!(outcome, WaitOutcome::TreeMayRun));
     assert!(daemon.killed());
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert_failures(&fake.take_failures(), ID, &tree_unkilled_failures());
@@ -461,7 +461,7 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
 
     let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
 
-    assert!(matches!(outcome, WaitOutcome::DaemonMayRun));
+    assert!(matches!(outcome, WaitOutcome::TreeMayRun));
     assert!(
         !supervisor.bus.request_stop(),
         "a stop was acknowledged over a daemon whose tree may still be running"

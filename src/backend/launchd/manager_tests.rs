@@ -2127,7 +2127,10 @@ fn assert_ends_with_a_bounded_query(fake: &Fake) {
 }
 
 fn assert_wait_timeout(e: &Error) {
-    assert!(matches!(e, Error::WaitTimeout { awaited: "running", .. }), "{e:?}");
+    assert!(
+        matches!(e.cause(), Error::WaitTimeout { awaited: "running", .. }),
+        "{e:?}"
+    );
 }
 
 /// A `kickstart` the budget ran out on is ended once a `print` shows the start queued or the job running.

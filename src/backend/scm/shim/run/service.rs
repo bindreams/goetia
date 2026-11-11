@@ -2,8 +2,8 @@
 //! daemon `goetia.yaml` describes, waits for it and reports how it ended.
 //!
 //! The shim never restarts the daemon. It reports the daemon's exit as the service's exit and
-//! exits; SCM's recovery actions (`backend::scm::generate`) start a new shim, which reads the
-//! installed spec afresh.
+//! exits, once, with the code it reported; SCM's recovery actions (`backend::scm::generate`) start a
+//! new shim, which reads the installed spec afresh.
 
 use std::ffi::{OsString, c_void};
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use super::super::marker;
+use super::exit;
 use super::logging::Log;
 use super::os::{Os, Real, Spawned, spawn_error_code};
 use super::stop_bus::{NOT_RESTARTED, StopBus, Supervisor, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
@@ -34,21 +35,21 @@ use super::stop_bus::{NOT_RESTARTED, StopBus, Supervisor, WaitOutcome, Waiter, k
 
 /// The name SCM's service table carries. SCM ignores it for `SERVICE_WIN32_OWN_PROCESS`; the
 /// service's real name is `service_main`'s first argument.
-const TABLE_NAME: &str = "goetia-shim";
+pub(super) const TABLE_NAME: &str = "goetia-shim";
 
-/// Called from `main()`. Hands control to SCM, and never returns normally: `run_service` (via
-/// `service_main`) calls `std::process::exit` on every path, including every failure one, with a
-/// code from `crate::backend::scm::exit_status`. Reads no process arguments: the service name
-/// comes from SCM.
+/// Called from `main()`. Hands control to SCM, and never returns normally. [`finish`] records what
+/// every path that reports `STOPPED` reported, and the dispatcher returns once SCM has processed it,
+/// so this ends the process with the record (see [`exit`]); the paths that cannot report one end it
+/// themselves, with a code from `crate::backend::scm::exit_status`. Reads no process arguments: the
+/// service name comes from SCM.
 pub(crate) fn run() -> ! {
     // Every host reaches here, and this read is what keeps its version marker in the linked binary.
     std::hint::black_box(&marker::MARKER);
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
         Log::real().failure(TABLE_NAME, &format!("connect to the SCM dispatcher: {e}"));
-        std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
+        exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
-    // `service_main` exits on every path; this covers the dispatcher returning anyway.
-    std::process::exit(Reported::Clean.process_exit_code());
+    exit::end_when_dispatched()
 }
 
 define_windows_service!(ffi_service_main, service_main);
@@ -57,7 +58,7 @@ define_windows_service!(ffi_service_main, service_main);
 fn service_main(scm_args: Vec<OsString>) {
     let Some(id) = scm_args.first().and_then(|name| name.to_str()) else {
         Log::real().failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
-        std::process::exit(ERROR_BAD_ARGUMENTS as i32);
+        exit::end_process(ERROR_BAD_ARGUMENTS as i32);
     };
     run_service(id);
 }
@@ -69,7 +70,7 @@ fn run_service(id: &str) {
         Ok(h) => h,
         Err(e) => {
             log.failure(id, &format!("register SCM control handler: {e}"));
-            std::process::exit(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
+            exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
         }
     };
 
@@ -77,7 +78,7 @@ fn run_service(id: &str) {
         Ok(blob) => blob,
         Err(stop) => {
             log.failure(id, &stop.message);
-            finish(&log, id, status_handle, stop.reported);
+            return finish(&log, id, stop.reported, |r| report_stopped(status_handle, r));
         }
     };
 
@@ -90,7 +91,7 @@ fn run_service(id: &str) {
         || report_running(&log, id, status_handle),
         || report_stopping(&log, id, status_handle),
     );
-    finish(&log, id, status_handle, reported);
+    finish(&log, id, reported, |r| report_stopped(status_handle, r));
 }
 
 /// Why the shim reads no spec to run, and what it tells SCM.
@@ -133,11 +134,16 @@ fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob,
     }
 }
 
-/// Tell SCM the service stopped, then end the process. SCM restarts the service or not from
-/// the status reported here, never from the process exit code.
-fn finish(log: &Log, id: &str, status_handle: StatusHandle, reported: Reported) -> ! {
-    report_stopped(log, id, status_handle, reported);
-    std::process::exit(reported.process_exit_code());
+/// Tell SCM the service stopped and return, leaving the exit to the main thread: the dispatcher
+/// returns once SCM has processed `STOPPED`, and the main thread ends the process with what is
+/// recorded here (see [`exit`]). When `STOPPED` cannot be reported the dispatcher is not trusted to
+/// return, so the exit is here.
+pub(super) fn finish(log: &Log, id: &str, reported: Reported, report: impl FnOnce(Reported) -> std::io::Result<()>) {
+    exit::stopping(reported);
+    if let Err(e) = report(reported) {
+        log.failure(id, &stopped_report_failure(&e));
+        exit::end_process(reported.process_exit_code());
+    }
 }
 
 /// The `STOP_PENDING` status held while the shim tears the daemon down, accepting no control. SCM
@@ -254,14 +260,13 @@ fn report_stopping(log: &Log, id: &str, handle: StatusHandle) {
     }
 }
 
-fn report_stopped(log: &Log, id: &str, handle: StatusHandle, reported: Reported) {
+fn report_stopped(handle: StatusHandle, reported: Reported) -> std::io::Result<()> {
     let status = stopped_status(reported);
     // SAFETY: `handle` is live for the life of the process, and `status` outlives the call.
-    let ok = unsafe { SetServiceStatus(handle.0, &status) };
-    if ok == 0 {
-        let e = std::io::Error::last_os_error();
-        log.failure(id, &stopped_report_failure(&e));
+    if unsafe { SetServiceStatus(handle.0, &status) } == 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
 }
 
 /// The shim exits after this without a `STOPPED` report. SCM is expected to read that as a crash
@@ -303,7 +308,7 @@ fn run_daemon(
     on_running();
 
     // `wait_for_child_or_stop` kills the tree on a stop or a failed wait, so only `DaemonMayRun`
-    // leaves a daemon that may be running.
+    // leaves a daemon that may be running, and `TreeMayRun` its tree.
     match supervisor.wait_for_child_or_stop(waiter, &child, id, on_stopping) {
         WaitOutcome::ChildExited => {
             let code = match child.wait() {
@@ -327,7 +332,7 @@ fn run_daemon(
         // `wait_for_child_or_stop` terminated the tree before returning this.
         WaitOutcome::Stopping => Reported::Clean,
         // Still reports STOPPED so the service stays stoppable and uninstallable.
-        WaitOutcome::DaemonMayRun => Reported::incomplete_stop(),
+        WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => Reported::incomplete_stop(),
     }
 }
 
@@ -373,14 +378,23 @@ fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<d
             return Err(Reported::shim_failure(e.raw_os_error()));
         }
     };
+    // A waiter that is not handed the daemon is stood down, not dropped: see `Waiter::stand_down`.
     match supervisor.os.spawn(build_command(spec, &*supervisor.os, log, id)) {
-        Ok(child) => require_job_object(child, spec, log, id).map(|child| (Arc::from(child), waiter)),
+        Ok(child) => match require_job_object(child, spec, log, id) {
+            Ok(child) => Ok((Arc::from(child), waiter)),
+            Err(reported) => {
+                waiter.stand_down();
+                Err(reported)
+            }
+        },
         Err(e) if may_still_run(&e) => {
             log.failure(id, &spawn_failed_daemon_may_run(&spec.command, &e));
+            waiter.stand_down();
             Err(Reported::incomplete_stop())
         }
         Err(e) => {
             log.failure(id, &spawn_failed(&spec.command, &e));
+            waiter.stand_down();
             Err(Reported::shim_failure(spawn_error_code(&e)))
         }
     }

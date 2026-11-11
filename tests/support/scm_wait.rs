@@ -45,7 +45,7 @@ pub fn wait_for_running(actor: &mut SystemScmActor, id: &str) {
 /// seen of the stop. A service that is running again after it began to stop (a recovery restart) is
 /// a panic naming that.
 pub fn wait_for_stopped(actor: &mut SystemScmActor, id: &str, stop: StopSeen) {
-    let waited = wait_after_stop(actor, Budget::Unbounded.start(), "", stop)
+    let waited = wait_after_stop(actor, Budget::Unbounded.start(), "", stop, false)
         .unwrap_or_else(|e| panic!("wait for {id} to reach STOPPED: {e}"));
     assert_eq!(waited, Waited::Confirmed, "an unbounded wait for {id} to stop expired");
 }

@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use super::*;
 use crate::backend::scm::parameters::Stray;
+use crate::backend::scm::test_support::{SHIM_HEX, blob_of};
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::Restart;
-use crate::spec::test_support::program;
 use crate::spec::{AccountId, DaemonFields, User};
 use crate::testing::plain_fields;
 use crate::testing::{FakeProvider, command};
@@ -552,45 +552,31 @@ fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
     .unwrap()
 }
 
-// start_kind ----------------------------------------------------------------------------------------------------------
-
-fn blob_of(kind: Kind) -> Blob {
-    Blob {
-        schema: 1,
-        version: "0.1.0".to_string(),
-        spec: DaemonSpec::new(DaemonFields {
-            kind,
-            ..plain_fields("frpc", vec![program("frpc")])
-        })
-        .unwrap(),
-    }
-}
-
-#[skuld::test]
-fn start_reads_a_simple_service_by_the_shims_vocabulary_and_anything_else_strictly() {
-    for kind in [Kind::Simple, Kind::Managed] {
-        let (read, why) = start_kind(Ok(&blob_of(kind)));
-        assert_eq!(read, kind);
-        assert!(why.is_none(), "{why:?}");
-    }
-    let (kind, why) = start_kind(Err(&Arc::new(Error::blob("corrupt"))));
-    assert_eq!(kind, Kind::Managed);
-    assert!(matches!(why.as_deref(), Some(Error::Blob { message, .. }) if message == "corrupt"));
-}
+// start's vocabulary --------------------------------------------------------------------------------------------------
 
 /// A start judged strictly because the blob could not be read says why, so the user is not told a
 /// `type: simple` daemon failed to start in a way that only a managed service's start can.
 #[skuld::test]
 fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     let id = Id::try_from("frpc").unwrap();
-    let e = || std::io::Error::other("service stopped before reaching Running");
+    let e = || {
+        Error::os(
+            "start `frpc`",
+            std::io::Error::other("service stopped before reaching Running"),
+        )
+    };
 
-    let plain = failed_start(&id, e(), None).report().to_string();
+    let plain = failed_start(&id, e(), Kind::Managed, None).report().to_string();
     assert!(!plain.contains("blob"), "{plain}");
 
-    let strict = failed_start(&id, e(), Some(Arc::new(Error::blob("invalid blob JSON: EOF"))))
-        .report()
-        .to_string();
+    let strict = failed_start(
+        &id,
+        e(),
+        Kind::Managed,
+        Some(Arc::new(Error::blob("invalid blob JSON: EOF"))),
+    )
+    .report()
+    .to_string();
     assert!(strict.contains("service stopped before reaching Running"), "{strict}");
     assert!(strict.contains("could not be read"), "{strict}");
     assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
@@ -618,9 +604,7 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
         .expect("the blob is ours");
 
     assert_eq!(blob.spec.restart, Restart::Always);
-    let (kind, why) = start_kind(Ok(&blob));
-    assert_eq!(kind, Kind::Simple);
-    assert!(why.is_none(), "{why:?}");
+    assert_eq!(shim_answer(Ok(&blob), no_image).kind, ShimKind::Shim);
 }
 
 // The generator's refusal at its call sites ---------------------------------------------------------------------------
@@ -741,8 +725,6 @@ fn a_provided_host_that_is_not_the_rendered_one_is_a_mismatch() {
     assert_eq!((*said, *gave), (rendered, provided));
 }
 
-const SHIM_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-
 /// A registered host is the shim by its file name alone, quoted or not, with or without arguments.
 #[skuld::test]
 fn a_registered_host_is_a_shim_by_its_file_name() {
@@ -760,6 +742,56 @@ fn a_registered_host_is_a_shim_by_its_file_name() {
         None,
         "a file set aside is not a service's host"
     );
+}
+
+/// An image that is read by nobody: the blob decides, and asking for the image is a bug.
+fn no_image() -> Option<String> {
+    panic!("a blob that decodes decides; the image is not read")
+}
+
+/// A decodable blob decides whether a service runs a shim, whatever its image is called: a
+/// `StandaloneShim` host is not named `goetia-shim-<hex>.exe`, and a `type: managed` service may be
+/// registered over one. It has no decode error to carry.
+#[skuld::test]
+fn a_decodable_blob_decides_whether_a_service_runs_a_shim() {
+    for (kind, answer) in [(Kind::Simple, ShimKind::Shim), (Kind::Managed, ShimKind::NotShim)] {
+        let said = shim_answer(Ok(&blob_of(kind)), no_image);
+        assert_eq!(said.kind, answer, "{kind:?}");
+        assert!(said.blob_error.is_none(), "{kind:?}");
+    }
+}
+
+/// A blob that will not decode leaves the image's file name to decide: a shim host is a shim, an exe of
+/// the user's own is not, and an image that could not be read is unknown. Each answer carries the
+/// decode error, so that no caller can drop it.
+#[skuld::test]
+fn an_undecodable_blob_leaves_the_registered_image_to_decide_and_travels_with_the_answer() {
+    let shim = format!(r#""C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe" --service-host"#);
+    let corrupt = Arc::new(Error::blob("corrupt"));
+    let image = |image: Option<&str>| image.map(str::to_string);
+
+    for (registered, answer) in [
+        (Some(shim.as_str()), ShimKind::Shim),
+        (Some(r"C:\bin\frpc.exe"), ShimKind::NotShim),
+        (None, ShimKind::Unknown),
+    ] {
+        let said = shim_answer(Err(&corrupt), || image(registered));
+        assert_eq!(said.kind, answer, "{registered:?}");
+        assert!(
+            matches!(said.blob_error.as_deref(), Some(Error::Blob { message, .. }) if message == "corrupt"),
+            "{registered:?}"
+        );
+    }
+}
+
+/// `stop` and `uninstall` judge the incomplete-stop record for a shim and for an unknown answer.
+#[skuld::test]
+fn only_a_service_known_not_to_run_a_shim_is_left_unjudged() {
+    let said = |kind| ShimAnswer { kind, blob_error: None };
+
+    assert!(said(ShimKind::Shim).judges_stop_record());
+    assert!(said(ShimKind::Unknown).judges_stop_record());
+    assert!(!said(ShimKind::NotShim).judges_stop_record());
 }
 
 /// Only a service that is gone or marked for deletion refuses the read of its host as a matter of
@@ -1206,15 +1238,213 @@ fn a_denied_service_manager_open_is_named_as_the_managers() {
     assert!(!report.contains("to service"), "{report}");
 }
 
+/// Whoever's failure it was, a marked service that could not be stopped is told in one shared sentence,
+/// claims no disable and does not say it was NOT deleted. Only the cause differs.
 #[skuld::test]
-fn a_stop_failure_on_a_service_marked_by_someone_else_does_not_claim_a_disable() {
-    let text = uninstall_failure(&UninstallFailure::AlreadyMarked);
+fn a_stop_failure_on_a_marked_service_says_the_same_whoever_failed_and_claims_no_disable() {
+    for ours in [false, true] {
+        let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours });
+        assert!(
+            text.contains("`frpc` could not be stopped. It was already marked for deletion"),
+            "{ours}: {text}"
+        );
+        assert!(text.contains("`uninstall` did not delete it"), "{ours}: {text}");
+        assert!(
+            text.contains("removed once it stops and its last handle closes"),
+            "{ours}: {text}"
+        );
+        assert!(
+            !text.contains("changed nothing"),
+            "a STOP may have been sent: {ours}: {text}"
+        );
+        for stale in ["NOT deleted", "disabled", "goetia daemon enable", "goetia daemon start"] {
+            assert!(
+                !text.contains(stale),
+                "`{stale}` is false for a marked service: {ours}: {text}"
+            );
+        }
+    }
+}
+
+/// A stop the service refused is the only case that sends the user to `kill`, and the only one that
+/// blames whoever marked it.
+#[skuld::test]
+fn a_marked_service_that_refused_the_stop_names_kill_and_who_marked_it() {
+    let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours: false });
     assert!(text.contains("does not accept STOP"), "{text}");
-    assert!(text.contains("already marked for deletion"), "{text}");
-    assert!(text.contains("`uninstall` did not delete it"), "{text}");
-    assert!(!text.contains("changed nothing"), "a STOP may have been sent: {text}");
+    assert!(text.contains("marked for deletion by someone else"), "{text}");
     assert!(text.contains("goetia daemon kill frpc"), "{text}");
-    for stale in ["NOT deleted", "disabled", "goetia daemon enable", "goetia daemon start"] {
+}
+
+/// A stop that goetia's own hold or unbounded wait failed is not the service's refusal or the marker's
+/// doing: the message says so and sends nowhere.
+#[skuld::test]
+fn a_marked_service_whose_stop_goetia_failed_blames_goetia_and_not_whoever_marked_it() {
+    let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours: true });
+    assert!(text.contains("goetia's own"), "{text}");
+    for stale in ["by someone else", "goetia daemon kill"] {
+        assert!(
+            !text.contains(stale),
+            "`{stale}` is false for goetia's own failure: {text}"
+        );
+    }
+}
+
+/// The service is stopped and the shim could not end the daemon's tree: `kill` does nothing to a stopped
+/// service, a re-run fails the same, and the message says how to go on if the tree is known gone.
+#[skuld::test]
+fn an_uninstall_over_an_incomplete_stop_says_it_left_the_service_stopped_disabled_and_not_deleted() {
+    let text = uninstall_failure(&UninstallFailure::DaemonMayRun {
+        previous: Some(ServiceStartType::AutoStart),
+        marked: false,
+    });
+    assert!(text.contains("could not end the daemon's process tree"), "{text}");
+    assert!(text.contains("may still be running"), "{text}");
+    assert!(text.contains("NOT deleted and is now disabled"), "{text}");
+    assert!(text.contains("goetia daemon enable frpc"), "{text}");
+    assert!(text.contains("fails the same"), "{text}");
+    assert!(text.contains("sc.exe delete frpc"), "{text}");
+    for stale in ["goetia daemon kill", "could not be stopped", "to retry"] {
+        assert!(
+            !text.contains(stale),
+            "`{stale}` is false or useless for a stopped service: {text}"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_uninstall_over_an_incomplete_stop_of_a_marked_service_does_not_claim_a_disable() {
+    let text = uninstall_failure(&UninstallFailure::DaemonMayRun {
+        previous: None,
+        marked: true,
+    });
+    assert!(text.contains("may still be running"), "{text}");
+    assert!(text.contains("already marked for deletion"), "{text}");
+    for stale in ["NOT deleted", "disabled", "goetia daemon kill", "sc.exe delete"] {
         assert!(!text.contains(stale), "`{stale}` is false for a marked service: {text}");
     }
+}
+
+// What an uninstall decides before the stop and after the delete ------------------------------------------------------
+
+/// `plan_uninstall` over `blob` and an image that reads as `image`, with what it asked for, in order:
+/// `"lock"` and `"image"`.
+fn planned(
+    blob: std::result::Result<&Blob, &Arc<Error>>,
+    image: impl Fn() -> Result<String>,
+) -> (Vec<&'static str>, Result<UninstallPlan<()>>) {
+    let asked = std::cell::RefCell::new(vec![]);
+    let plan = plan_uninstall(
+        blob,
+        || {
+            asked.borrow_mut().push("lock");
+            Ok(())
+        },
+        || {
+            asked.borrow_mut().push("image");
+            image()
+        },
+    );
+    (asked.into_inner(), plan)
+}
+
+fn shim_image() -> Result<String> {
+    Ok(format!(
+        r#""C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe" --service-host"#
+    ))
+}
+
+/// The install lock comes before the first read of the service's image, so that no read is one an
+/// install in progress is about to change: for a blob that may run a shim (`type: simple`, or one that
+/// would not decode), and a `type: managed` service takes neither.
+#[skuld::test]
+fn an_uninstall_takes_the_install_lock_before_it_reads_the_image() {
+    let corrupt = Arc::new(Error::blob("corrupt"));
+    for (what, blob) in [("simple", Ok(blob_of(Kind::Simple))), ("undecodable", Err(corrupt))] {
+        let (asked, plan) = planned(blob.as_ref(), shim_image);
+
+        assert!(plan.unwrap().lock.is_some(), "{what}");
+        assert_eq!(asked.first(), Some(&"lock"), "{what}: {asked:?}");
+        assert!(asked.contains(&"image"), "{what}: the host is read: {asked:?}");
+    }
+
+    let (asked, plan) = planned(Ok(&blob_of(Kind::Managed)), shim_image);
+
+    assert!(plan.unwrap().lock.is_none());
+    assert!(
+        asked.is_empty(),
+        "a managed service has no lock and no image read: {asked:?}"
+    );
+}
+
+/// A host that could not be read is not "no shim": it is reported, and no process is held for it. A
+/// host that is not a shim file by name is neither held nor reported, and nothing of it is swept.
+#[skuld::test]
+fn an_uninstall_holds_the_process_of_a_shim_file_alone() {
+    let blob = blob_of(Kind::Simple);
+    let unread = || -> Result<String> { Err(Error::os("query configuration", std::io::Error::other("denied"))) };
+    let user_exe = || -> Result<String> { Ok(r"C:\bin\frpc.exe".to_string()) };
+
+    let (_, shim) = planned(Ok(&blob), shim_image);
+    let shim = shim.unwrap();
+    assert!(matches!(shim.host, Ok(Some(_))));
+    assert!(shim.hold());
+
+    for (what, image, unread) in [
+        ("unread", &unread as &dyn Fn() -> Result<String>, true),
+        ("not a shim file", &user_exe, false),
+    ] {
+        let (_, plan) = planned(Ok(&blob), image);
+        let plan = plan.unwrap();
+
+        assert!(!plan.hold(), "{what}");
+        assert_eq!(plan.host.is_err(), unread, "{what}");
+        assert!(matches!(plan.host, Err(_) | Ok(None)), "{what}");
+    }
+}
+
+/// A service that is gone or marked for deletion refuses the read of its host as a matter of course,
+/// and has no shim file to hold.
+#[skuld::test]
+fn a_host_that_is_gone_is_not_an_unread_one() {
+    let gone = || -> Result<String> { Err(Error::NotInstalled { id: "frpc".to_string() }) };
+
+    let (_, plan) = planned(Ok(&blob_of(Kind::Simple)), gone);
+
+    assert!(matches!(plan.unwrap().host, Ok(None)));
+}
+
+/// `finish_uninstall` is told nothing for a host that is not a shim file, and for one that could not
+/// be read it reports that, and sweeps nothing.
+#[skuld::test]
+fn an_uninstall_reports_an_unread_host_and_sweeps_nothing_for_it() {
+    let id = Id::try_from("frpc").unwrap();
+    let unread = || Error::os("query configuration", std::io::Error::other("denied"));
+    let deleted = || Uninstalled::Deleted {
+        process: HoldOutcome::NoProcess,
+    };
+    let (provider, calls) = FakeProvider::new(command(r"C:\app\app.exe"), command(r"C:\app\app.exe"));
+    let scm = Scm::with_shim(provider, CheckPermissions::Disable);
+
+    scm.after_uninstall(&id, deleted(), Ok(None)).unwrap();
+    assert_eq!(
+        *calls.lock().unwrap(),
+        Vec::<&str>::new(),
+        "a host that is not a shim file is swept"
+    );
+
+    let said = scm
+        .after_uninstall(&id, deleted(), Err(unread()))
+        .expect_err("an unread host is reported")
+        .report()
+        .to_string();
+    assert!(said.contains("host could not be read"), "{said}");
+    assert!(said.contains("denied"), "{said}");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        Vec::<&str>::new(),
+        "nothing is swept for an unread host"
+    );
+
+    scm.after_uninstall(&id, Uninstalled::Left, Err(unread())).unwrap();
 }
