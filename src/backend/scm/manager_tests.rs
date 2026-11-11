@@ -561,12 +561,17 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     let id = Id::try_from("frpc").unwrap();
     let e = || std::io::Error::other("service stopped before reaching Running");
 
-    let plain = failed_start(&id, e(), None).report().to_string();
+    let plain = failed_start(&id, e(), Kind::Managed, None).report().to_string();
     assert!(!plain.contains("blob"), "{plain}");
 
-    let strict = failed_start(&id, e(), Some(Arc::new(Error::blob("invalid blob JSON: EOF"))))
-        .report()
-        .to_string();
+    let strict = failed_start(
+        &id,
+        e(),
+        Kind::Managed,
+        Some(Arc::new(Error::blob("invalid blob JSON: EOF"))),
+    )
+    .report()
+    .to_string();
     assert!(strict.contains("service stopped before reaching Running"), "{strict}");
     assert!(strict.contains("could not be read"), "{strict}");
     assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");

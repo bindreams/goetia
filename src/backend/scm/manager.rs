@@ -645,7 +645,8 @@ pub(super) fn start_on<A: super::wait::ScmActor>(
         return super::wait::request_start(actor).map_err(|e| Error::os(format!("start `{id}`"), e));
     }
     let (kind, unreadable) = start_kind(answer);
-    let waited = super::wait::start_via_notify(actor, deadline, kind).map_err(|e| failed_start(id, e, unreadable))?;
+    let waited =
+        super::wait::start_via_notify(actor, deadline, kind).map_err(|e| failed_start(id, e, kind, unreadable))?;
     match waited {
         Waited::Confirmed => Ok(()),
         Waited::Expired => Err(budget::timed_out(id.as_str(), "running", budget)),
@@ -653,25 +654,34 @@ pub(super) fn start_on<A: super::wait::ScmActor>(
 }
 
 /// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not say:
-/// the shim's vocabulary for a [`ShimKind::Shim`] only, and for anything else, a service not known to
-/// run a shim, as strict as `type: managed`. A service judged strictly over a blob that would not
-/// decode says why.
+/// the shim's vocabulary for a [`ShimKind::Shim`], and for anything else, a service not known to run
+/// a shim, as strict as `type: managed`. A service whose blob would not decode says why when its start
+/// fails, whichever kind it was judged as.
 fn start_kind(answer: &ShimAnswer) -> (Kind, Option<Arc<Error>>) {
-    match answer.kind {
-        ShimKind::Shim => (Kind::Simple, None),
-        ShimKind::NotShim | ShimKind::Unknown => (Kind::Managed, answer.blob_error.clone()),
-    }
+    let kind = match answer.kind {
+        ShimKind::Shim => Kind::Simple,
+        ShimKind::NotShim | ShimKind::Unknown => Kind::Managed,
+    };
+    (kind, answer.blob_error.clone())
 }
 
 /// `start`'s error for a `start_via_notify` failure. When the blob was unreadable the start was
-/// judged as a `type: managed` service's, and the error says why, since that is not what a
-/// `type: simple` service would have been told.
-fn failed_start(id: &Id, e: std::io::Error, unreadable: Option<Arc<Error>>) -> Error {
+/// judged without it, as `kind` says, and the error says why: neither is what a service whose blob
+/// reads would have been told.
+fn failed_start(id: &Id, e: std::io::Error, kind: Kind, unreadable: Option<Arc<Error>>) -> Error {
     let failed = Error::os(format!("start `{id}`"), e);
-    match unreadable {
-        None => failed,
-        Some(blob) => Error::StartAsManaged {
+    match (kind, unreadable) {
+        (_, None) => failed,
+        (Kind::Managed, Some(blob)) => Error::StartAsManaged {
             blob,
+            source: Box::new(failed),
+        },
+        (Kind::Simple, Some(blob)) => Error::Step {
+            what: format!(
+                "`{id}`'s spec blob could not be read, so the start was judged as a goetia shim's, by the \
+                 registered image ({})",
+                Chain(&*blob)
+            ),
             source: Box::new(failed),
         },
     }
