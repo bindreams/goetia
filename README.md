@@ -1011,7 +1011,8 @@ stop is not.
 
 A `stop` that finds that record fails: it exits non-zero and says the command's
 process tree may still be running. So does the stop of a `restart`, which then
-does not start. `goetia daemon uninstall` stops the service first and refuses to
+does not start. A `stop` that does not wait (`--timeout 0`) does not read the
+record, and exits `0`; so does `restart --timeout 0`. `goetia daemon uninstall` stops the service first and refuses to
 delete it over the record, the same way and on a re-run too, while the record
 stands: it leaves the service stopped, disabled and not deleted, and says so.
 It has no option that deletes over the record; if you know the tree is gone,
