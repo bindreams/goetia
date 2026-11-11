@@ -450,18 +450,14 @@ pub(super) enum Teardown {
 /// so that a restart or `start` never runs beside a tree nobody told to end. `true` is `kill_tree`
 /// succeeding, which is not proof the members have finished exiting. `false` (logged) means the
 /// tree may still be running and the stop must be reported as incomplete.
-pub(crate) fn terminate_exited_tree(child: &dyn Spawned, log: &Log, id: &str) -> bool {
+pub(super) fn terminate_exited_tree(child: &dyn Spawned, log: &Log, id: &str) -> bool {
     let Err(e) = child.kill_tree() else { return true };
     log.failure(id, &exited_tree_unkilled(&e));
     false
 }
 
-/// Kill the daemon for a commanded stop: the whole contained tree, or failing that the direct
-/// child alone. Each failure is logged as it happens.
-///
-/// [`Supervisor::wait_for_child_or_stop`] acts on [`Teardown::Failed`]: it returns without joining
-/// the waiter. `service::require_job_object` also calls this, discards the [`Teardown`] and relies
-/// on dropping the child to retry the kill.
+/// Kill the daemon: the whole contained tree, or failing that the direct child alone. Each failure
+/// is logged as it happens; the [`Teardown`] says how far the kill reached.
 pub(super) fn kill_for_stop(child: &dyn Spawned, log: &Log, id: &str) -> Teardown {
     let Err(e) = child.kill_tree() else {
         return Teardown::Tree;
