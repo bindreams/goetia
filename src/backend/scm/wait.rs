@@ -273,6 +273,36 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
     Unconfirmed { pid: u32 },
 }
 
+/// The process out of `held`, if one is held; anything else stays in it.
+fn take_held<P>(held: &mut HoldOutcome<P>) -> Option<P> {
+    match std::mem::replace(held, HoldOutcome::NoProcess) {
+        HoldOutcome::Held(process) => Some(process),
+        other => {
+            *held = other;
+            None
+        }
+    }
+}
+
+/// `waited`, the result of a stop wait, unchanged, after the one thing an incomplete stop (see
+/// [`judged`]) asks of the process held before the STOP: `end` ends it, and `held` is left empty. The
+/// service is stopped, and the held process is the shim's, whose `KILL_ON_JOB_CLOSE` job is the last
+/// thing that can still kill the daemon's tree. How that went does not change what the stop says. Any
+/// other result leaves `held` as it was. The one place a held process is ended on an incomplete stop,
+/// for `stop` and `uninstall` alike.
+pub(crate) fn end_on_incomplete_stop<P, T, R>(
+    waited: io::Result<T>,
+    held: &mut HoldOutcome<P>,
+    end: impl FnOnce(P) -> R,
+) -> io::Result<T> {
+    if waited.as_ref().is_err_and(is_incomplete_stop)
+        && let Some(process) = take_held(held)
+    {
+        let _ = end(process);
+    }
+    waited
+}
+
 /// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the end of `held`, the service's
 /// process as it was before the STOP was sent. `end` is [`end_process`] over the real process, under
 /// the same `deadline`; a process that outlasts it is
@@ -281,7 +311,7 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 /// stop alone.
 ///
 /// A stop that SCM confirmed with the shim's incomplete-stop record (`shim`, see [`judged`]) fails with
-/// [`IncompleteStop`], after `end` has ended the process held, whatever became of that.
+/// [`IncompleteStop`], after `end` has ended the process held (see [`end_on_incomplete_stop`]).
 ///
 /// `held` is the hold as it was made, and what is left in it afterwards is what the caller still has
 /// to say: the process is taken out of [`Held`](HoldOutcome::Held) and passed to `end`, and a
@@ -306,31 +336,20 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
         control_stop_or_underway(a)?;
         return Ok(StopAndAwaitExitOutcome::Unconfirmed { pid });
     }
-    let process = match held {
-        HoldOutcome::Held(_) => match std::mem::replace(held, HoldOutcome::NoProcess) {
-            HoldOutcome::Held(process) => Some(process),
-            _ => unreachable!("the outcome was just matched as held"),
-        },
-        // Why a refused process is not held is the caller's to report: it knows where.
-        HoldOutcome::NoProcess | HoldOutcome::Refused(_) | HoldOutcome::Expired { .. } => None,
-    };
-    match stop_via_notify(a, deadline, shim) {
-        Ok(Waited::Confirmed) => {}
-        Ok(Waited::Expired) => return Ok(StopAndAwaitExitOutcome::ServiceExpired),
-        Err(e) if is_incomplete_stop(&e) => {
-            // The service is stopped, and the process goetia holds is the shim's, whose
-            // KILL_ON_JOB_CLOSE job is the last thing that can still kill the daemon's tree: end it
-            // first. How that went does not change what the stop says.
-            if let Some(process) = process {
-                let _ = end(process, deadline);
-            }
-            return Err(e);
-        }
-        Err(e) => return Err(e),
+    // `end` ends the process on an incomplete stop, which returns, or after a confirmed one: never both.
+    let mut end = Some(end);
+    let waited = end_on_incomplete_stop(stop_via_notify(a, deadline, shim), held, |process| {
+        end.take().map(|end| end(process, deadline))
+    })?;
+    match waited {
+        Waited::Confirmed => {}
+        Waited::Expired => return Ok(StopAndAwaitExitOutcome::ServiceExpired),
     }
-    let Some(process) = process else {
+    // Why a refused process is not held is the caller's to report: it knows where.
+    let Some(process) = take_held(held) else {
         return Ok(StopAndAwaitExitOutcome::Stopped);
     };
+    let end = end.expect("`end` is taken only by an incomplete stop, which returned");
     Ok(match end(process, deadline)? {
         EndProcessOutcome::Exited => StopAndAwaitExitOutcome::Stopped,
         EndProcessOutcome::Lingers {

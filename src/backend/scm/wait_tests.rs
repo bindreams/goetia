@@ -2997,8 +2997,9 @@ fn is_judged(ended: io::Result<Waited>) -> bool {
 }
 
 /// A shim's stop that SCM confirmed with the incomplete-stop record fails, whichever way the stop was
-/// confirmed (a STOP we sent, one already under way (1061), a service already `STOPPED`), and the same in
-/// `stop`'s wait and `uninstall`'s.
+/// confirmed (see [`confirmations`]: a STOP we sent, one already under way (1061), the status of an arm,
+/// the status read in place of an arm refused on a marked service, a service already `STOPPED`), and the
+/// same in `stop`'s wait and `uninstall`'s.
 #[skuld::test]
 fn a_shims_stop_with_the_incomplete_stop_record_fails_however_it_was_confirmed() {
     for Confirming { name, stop, settle } in confirmations() {
@@ -3112,5 +3113,74 @@ fn an_incomplete_stop_is_returned_whatever_became_of_ending_the_held_process() {
         .unwrap_err();
 
         assert!(is_incomplete_stop(&err), "{err}");
+    }
+}
+
+// the process held across an incomplete stop --------------------------------------------------------------------------
+
+/// The process `end_on_incomplete_stop` ended, with what `held` was left as.
+fn ended_by_incomplete_stop(waited: io::Result<Waited>, held: &mut HoldOutcome<u32>) -> (io::Result<Waited>, Vec<u32>) {
+    let ended = std::cell::RefCell::new(vec![]);
+    let waited = end_on_incomplete_stop(waited, held, |process| ended.borrow_mut().push(process));
+    (waited, ended.into_inner())
+}
+
+/// What `uninstall` does with its stop wait: the wait is `settle_and_stop` over the shim's record, and
+/// the process held before the STOP goes through the helper `stop` uses, so it is ended there too.
+#[skuld::test]
+fn an_uninstalls_incomplete_stop_ends_the_held_process_before_failing() {
+    let mut fake =
+        incomplete(FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]));
+    let mut held = HoldOutcome::Held(7u32);
+
+    let settled = super::settle_and_stop(&mut fake, unbounded(), true, |_| Ok(()));
+    let (settled, ended) = ended_by_incomplete_stop(settled, &mut held);
+
+    assert!(is_incomplete_stop(&settled.unwrap_err()));
+    assert_eq!(ended, vec![7]);
+    assert!(matches!(held, HoldOutcome::NoProcess), "{held:?}");
+}
+
+/// Only an incomplete stop ends the process here: a confirmed stop and any other failure leave it to
+/// the caller, which ends it after a confirmed stop (see [`stop_and_await_exit`]) or drops it.
+#[skuld::test]
+fn only_an_incomplete_stop_ends_the_held_process() {
+    for waited in [
+        Ok(Waited::Confirmed),
+        Ok(Waited::Expired),
+        Err(io::Error::other("not left stopped")),
+    ] {
+        let mut held = HoldOutcome::Held(7u32);
+
+        let (passed, ended) = ended_by_incomplete_stop(waited, &mut held);
+
+        assert!(ended.is_empty(), "{passed:?}");
+        assert!(matches!(held, HoldOutcome::Held(7)), "{held:?}");
+    }
+}
+
+/// With nothing held the incomplete stop is returned as it is, and a process goetia could not open
+/// keeps the reason it was not held.
+#[skuld::test]
+fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
+    for held in [
+        HoldOutcome::NoProcess,
+        HoldOutcome::Refused(io::Error::other("access denied")),
+    ] {
+        let mut held = held;
+        let waited = stop_via_notify(
+            &mut incomplete(FakeScm::new([Some(Observed::Stopped)])),
+            unbounded(),
+            true,
+        );
+
+        let (waited, ended) = ended_by_incomplete_stop(waited, &mut held);
+
+        assert!(is_incomplete_stop(&waited.unwrap_err()));
+        assert!(ended.is_empty());
+        assert!(
+            matches!(held, HoldOutcome::NoProcess | HoldOutcome::Refused(_)),
+            "{held:?}"
+        );
     }
 }

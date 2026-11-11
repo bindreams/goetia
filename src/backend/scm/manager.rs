@@ -112,7 +112,9 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
-use super::wait::{EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_process, is_incomplete_stop};
+use super::wait::{
+    EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_on_incomplete_stop, end_process, is_incomplete_stop,
+};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HoldOutcome, hold_if_possible};
@@ -1059,6 +1061,11 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, shim: bool, hold: bool) ->
             }
         }
     });
+    // The shim's process is ended first, as `stop` ends it: its job is the last thing that can still
+    // kill the daemon's tree. How that went does not change what the uninstall says.
+    let settled = end_on_incomplete_stop(settled, &mut process, |held| {
+        end_held(id, held, Budget::Unbounded.start())
+    });
     match settled {
         Ok(Waited::Confirmed) => {}
         // `let _ = ...` is the write that turns an unreachable case into a silent one, and this
@@ -1071,11 +1078,6 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, shim: bool, hold: bool) ->
                 (false, true) => UninstallFailure::AlreadyMarked,
                 (false, false) => UninstallFailure::Stop { previous },
             };
-            // The shim's process is ended first, as `stop` ends it: its job is the last thing that can
-            // still kill the daemon's tree. How that went does not change what the uninstall says.
-            if let (true, HoldOutcome::Held(held)) = (is_incomplete_stop(&e), process) {
-                let _ = end_held(id, held, Budget::Unbounded.start());
-            }
             let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
             return Err(uninstall_failed(id, &state, cause));
         }
