@@ -469,18 +469,18 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
 
 /// A daemon whose tree could not be killed must not be reported as a failure SCM restarts: the
 /// restart would start a second copy beside it. The exit is decided, so the bus does not accept a
-/// later stop either.
+/// later stop either. The shim does not keep a daemon it has given up on: once the waiter has
+/// returned the daemon is dropped, though not while a detached waiter still holds it.
 #[skuld::test]
 fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Refuses);
     fake.will_make_thread();
-    fake.will_spawn(
-        FakeProcess::new()
-            .wait(WaitReply::Fails(None))
-            .kill_tree(KillReply::Refuses)
-            .kill(KillReply::Refuses),
-    );
+    fake.will_spawn(daemon.clone());
 
     let reported = run_daemon(&spec(), &supervisor, || {});
 
@@ -490,6 +490,8 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
         "the bus accepted a stop over a daemon that may still be running"
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert!(!daemon.ended(), "the daemon ended though neither kill worked");
+    assert!(daemon.dropped(), "the shim kept a daemon it had given up on");
     assert_failures(
         &fake.take_failures(),
         ID,
@@ -1178,4 +1180,54 @@ fn a_failed_stopped_report_says_scm_is_expected_to_read_a_crash() {
     ] {
         assert!(text.contains(part), "missing {part:?}: {text}");
     }
+}
+
+// The waiter of a daemon that never ran -------------------------------------------------------------------------------
+
+/// A waiter not handed the daemon ends on its own once dropped, on a thread nothing joins.
+/// `launch` waits for it instead.
+#[skuld::test]
+fn a_waiter_that_is_not_handed_the_daemon_has_ended_when_launch_returns() {
+    let refused_spawn = FakeGuard::new();
+    refused_spawn.will_make_thread();
+    refused_spawn.will_refuse_spawn(not_found());
+    let uncontained = FakeGuard::new();
+    uncontained.will_make_thread();
+    uncontained.will_spawn(
+        FakeProcess::new()
+            .containment(Containment::TreeWalk)
+            .kill_tree(KillReply::Ends),
+    );
+
+    for fake in [&refused_spawn, &uncontained] {
+        let launched = launch(&spec(), &supervisor(fake), ID);
+
+        assert!(launched.is_err());
+        assert!(
+            fake.waiter_has_ended(0),
+            "launch returned with the waiter still running"
+        );
+        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+        fake.take_failures();
+    }
+}
+
+/// A daemon whose root was killed is dropped as any other: its waiter was joined, so the child is
+/// reaped.
+#[skuld::test]
+fn a_daemon_whose_root_was_killed_is_dropped() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Ends);
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert!(daemon.dropped(), "the shim leaked a daemon whose root it had killed");
+    fake.take_failures();
 }
