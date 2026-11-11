@@ -12,7 +12,7 @@ use goetia::spec::Id;
 use super::ConnectBack;
 
 /// Re-check `condition` until it holds, with no cap: it is the state being waited for that ends the
-/// wait. A state that never arrives hangs the test for CI's watchdog to report.
+/// wait. A state that never arrives hangs the test.
 pub fn until(mut condition: impl FnMut() -> bool) {
     while !condition() {
         std::thread::yield_now();

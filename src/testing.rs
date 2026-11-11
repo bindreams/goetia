@@ -15,6 +15,16 @@ use crate::spec::{DaemonFields, Id, Kind, Restart, User};
 
 pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
 
+/// Runs every skuld test in the calling binary and exits; the `main` of every skuld test binary.
+///
+/// A test is named `module::fn` (a crate-root test keeps its bare name), so two modules may each hold
+/// a `fn x`; under skuld's default bare names the binary panics at startup on the second.
+pub fn run_all() -> ! {
+    let mut runner = skuld::TestRunner::new();
+    runner.libtest_names();
+    runner.run()
+}
+
 /// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
 /// a test never takes a placeholder for a SID.
 #[cfg(windows)]

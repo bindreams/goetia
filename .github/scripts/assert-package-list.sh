@@ -38,6 +38,7 @@ set -euo pipefail
 excluded_paths=(
     ".github/"
     ".claude/"
+    ".config/"
     "CLAUDE.md"
     "scripts/"
     "prek.toml"

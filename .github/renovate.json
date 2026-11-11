@@ -8,13 +8,14 @@
   "platformAutomerge": true,
   "customManagers": [
     {
-      "description": "Version-pinned tools installed by CI via `uv tool install <name>==<version>`, annotated with a `# renovate:` comment on the preceding line.",
+      "description": "Version-pinned tools installed by CI via `uv tool install <name>==<version>` or an install action's `tool: <name>@<version>`, annotated with a `# renovate:` comment on the preceding line.",
       "customType": "regex",
       "managerFilePatterns": [
         "/^\\.github/workflows/.+\\.ya?ml$/"
       ],
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+run:\\s*uv tool install \\S+==(?<currentValue>[^\\s\\\"']+)"
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+run:\\s*uv tool install \\S+==(?<currentValue>[^\\s\\\"']+)",
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+tool:\\s*\\S+@(?<currentValue>[^\\s\\\"']+)"
       ]
     }
   ],
