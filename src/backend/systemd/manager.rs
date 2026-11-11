@@ -191,7 +191,7 @@ impl Backend for Systemd {
     }
 
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
-        // A read: it draws nothing and asks no gate, so it holds nothing.
+        // A read: it draws nothing and asks no gate.
         self.systemctl.status_from_unit(&unit_name(snapshot.id().as_str()))
     }
 
@@ -279,7 +279,6 @@ impl Backend for Systemd {
         }
     }
 
-    // `enable` draws nothing: it shares the gate's answer the reservation it is handed holds.
     // `disable` is handed none and asks the gate for itself.
     fn enable(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
         self.systemctl.enable_impl(snapshot.id().as_str(), reservation)

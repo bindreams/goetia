@@ -89,10 +89,7 @@ pub fn run(
 
     // Each step (install, `--enable`, `--start`) contributes at most one code; see `ExitCode` for which wins.
     let mut codes: Vec<ExitCode> = Vec::new();
-    // One sequence for every step, prepared before the install sends anything: a start that ran out
-    // of threads or files after the install's bootout would strand the daemon, and the steps share
-    // what the sequence holds (systemd's version gate). Without `--start` the budget is the
-    // install's own: unbounded.
+    // Prepared before the install sends anything: a start that ran out of threads would strand the daemon.
     let (steps, budget) = if args.start {
         (&[Step::Install, Step::Start][..], args.wait.budget())
     } else {

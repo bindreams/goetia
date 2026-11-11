@@ -16,8 +16,7 @@ use crate::manager::{Budget, State, Status, Step};
 
 /// What one verb of systemd, or a sequence of them, draws on, made by [`Held::of`] before anything is
 /// sent and handed to every [`Systemctl`] call: the threads a watched `systemctl` reads its streams
-/// with, and whether the version gate has passed. Never ambient, so what a verb draws is counted
-/// where it is spent and a verb run alone shares nothing with another.
+/// with, and whether the version gate has passed.
 ///
 /// A [`Default`] holds nothing and has not passed the gate: for a call that draws nothing and
 /// asks the gate for itself (`disable`, `request_restart`). A read never asks the gate.
@@ -34,16 +33,17 @@ impl Held {
     /// What `steps` draw under `budget`, all or none: see [`listeners`].
     ///
     /// cosca 0.7.0, as measured: every Linux `spawn` runs a helper thread (`cosca-pidfd-handshake`)
-    /// that is joined before `spawn` returns, so it is gone before the next `systemctl` is spawned.
-    /// It cannot be reserved, and does not need to be: it is needed at a spawn and held only while
-    /// that spawn runs, so a leg that got its thread leaves one for the next. A host short by
-    /// exactly that thread fails the spawn as [`Error::Spawn`], before the fork, which sent nothing.
-    /// goetia reads no other thread of cosca's: the drain pump of a contained child
-    /// (`cosca-cgrp-pump`) starts only on a blocking wait for the tree to drain, which is
-    /// `Child::wait_tree`, `Child::wait_tree_timeout`, `Child::graceful_shutdown_tree` and a leaf's
-    /// teardown on drop, and of those goetia never calls the first three. The teardown's pump is
-    /// joined before the drop returns, so it is gone before the next spawn. Re-measure both on a
-    /// cosca upgrade.
+    /// that is joined before `spawn` returns. goetia cannot reserve it. A host short by exactly that
+    /// thread fails the spawn as [`Error::Spawn`], before the fork, which sent nothing. goetia reads
+    /// no other thread of cosca's: the drain pump of a contained child (`cosca-cgrp-pump`) starts
+    /// only on a blocking wait for the tree to drain, which is `Child::wait_tree`,
+    /// `Child::wait_tree_timeout`, `Child::graceful_shutdown_tree` and a leaf's teardown on drop,
+    /// and of those goetia never calls the first three. Re-measure both on a cosca upgrade.
+    ///
+    /// None of cosca's threads is reserved, and a thread joined, like a listener detached, may still
+    /// hold its `TasksMax` slot until the kernel releases it. At a limit the `stop` leg exactly fits,
+    /// a waited `restart`'s `start` leg can fail to spawn after the stop was sent. This is not
+    /// covered here.
     pub(super) fn of(steps: &[Step], budget: Budget) -> io::Result<Held> {
         let needed: usize = steps.iter().map(|step| listeners(*step, budget)).sum();
         Ok(Held {
