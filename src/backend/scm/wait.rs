@@ -227,17 +227,13 @@ pub(crate) enum EndProcessOutcome<P> {
     },
 }
 
-/// Ends `process`, the service's process held before its STOP, once SCM has confirmed `STOPPED`: the
-/// one end of a held process, for `stop` and `uninstall` alike. SCM records `STOPPED` before the
-/// process exits (a shim reports it and then exits), so `STOPPED` alone leaves a file the process
-/// runs in use.
+/// Ends `process`, the service's process held before its STOP, once SCM has confirmed `STOPPED`: SCM
+/// records it before the process exits, so `STOPPED` alone leaves the file the process runs in use.
 ///
-/// `terminate` ends the process, as the documentation of `SetServiceStatus` allows once
-/// `SERVICE_STOPPED` is reported, and `exit` then waits for its exit under `deadline` and says whether
-/// it did. Whatever `terminate` returns, the wait follows: SCM has confirmed the stop, so a failure
-/// to end the process is no failure of the end, and the process may be on its way out by itself. The
-/// failure is kept: `exit` is handed it for its notice, and [`Lingers`](EndProcessOutcome::Lingers)
-/// carries it. An `exit` that fails is the error.
+/// `terminate` ends the process (allowed once `SERVICE_STOPPED` is reported), and `exit` then waits for
+/// its exit under `deadline`. The wait follows whatever `terminate` returns, since the process may be
+/// exiting by itself; a failure is handed to `exit` and carried by
+/// [`Lingers`](EndProcessOutcome::Lingers). An `exit` that fails is the error.
 pub(crate) fn end_process<P>(
     process: P,
     deadline: Deadline,
@@ -330,14 +326,9 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
 /// A stop that SCM confirmed with the shim's incomplete-stop record (`shim`, see [`judged`]) fails with
 /// [`IncompleteStop`], after `end` has ended the process held (see [`end_on_incomplete_stop`]).
 ///
-/// `held` is the hold as it was made, and what is left in it afterwards is what the caller still has
-/// to say. A held process is taken out of [`Held`](HoldOutcome::Held), leaving
-/// [`NoProcess`](HoldOutcome::NoProcess), once it is passed to `end`: after a confirmed stop, whether it
-/// exits, outlasts the deadline or `end` fails, and after an incomplete one. It stays in `held`, for
-/// the caller to drop, when the stop failed any other way or the service did not stop within the
-/// deadline. A [`Refused`](HoldOutcome::Refused) stays on every outcome, with the reason the process
-/// could not be opened, for the caller to report: this is where a refused process counts as not held,
-/// and the only place. An [`Expired`](HoldOutcome::Expired) hold stays as it is.
+/// `held` is taken out of [`Held`](HoldOutcome::Held), leaving [`NoProcess`](HoldOutcome::NoProcess),
+/// once it is passed to `end`; otherwise it stays. A [`Refused`](HoldOutcome::Refused) stays on every
+/// outcome, with the reason the process could not be opened, for the caller to report.
 ///
 /// An expired hold is sent the STOP all the same, and it ends there, whatever SCM answers: the held
 /// process died (a crash), SCM may have a recovery restart pending, and a restarted process may have
@@ -667,8 +658,7 @@ pub enum StopSeen {
 /// is `STOPPED` and `STOP_PENDING`, and a first read of anything else waits; after [`StopSeen::Pending`]
 /// the first arm is `STOPPED` alone, and a first read of anything but `STOP_PENDING` or `STOPPED` fails.
 ///
-/// A `STOPPED` is judged by the record it carries when `shim` says it is judged (see
-/// [`judged`]): the one place a stop's record is read, for `stop` and `uninstall` alike.
+/// A `STOPPED` is judged by the record it carries when `shim` says it is judged (see [`judged`]).
 pub fn wait_after_stop<A: ScmActor>(
     a: &mut A,
     deadline: Deadline,
@@ -728,10 +718,8 @@ pub(crate) fn is_incomplete_stop(e: &io::Error) -> bool {
 
 /// What a wait for `STOPPED` came to, judged: a confirmed `STOPPED` whose record is the shim's
 /// incomplete-stop one is the failure [`IncompleteStop`] when `shim` says the record is to be judged, and
-/// any other record, or a service found gone, which has none, is a stop. `shim` is true for a service
-/// that runs a goetia shim and for one not known not to (see `ShimAnswer::judges_stop_record`): a
-/// service's own `(0, 1003)` is not the shim's, and a refusal to call a stop complete costs a re-run
-/// where a tree left running costs a second copy beside it.
+/// any other record, or a service found gone, which has none, is a stop. `shim` is whether the service
+/// may run a goetia shim: see `ShimAnswer::judges_stop_record`.
 fn judged(end: WaitEnd, shim: bool) -> io::Result<Waited> {
     match end {
         WaitEnd {

@@ -779,9 +779,7 @@ fn an_undecodable_blob_leaves_the_registered_image_to_decide_and_travels_with_th
     }
 }
 
-/// `stop` and `uninstall` judge the incomplete-stop record, and `uninstall` takes the install lock, for
-/// a shim and for an answer that is unknown: a wrong refusal costs a re-run, a wrong acceptance leaves
-/// a tree running.
+/// `stop` and `uninstall` judge the incomplete-stop record for a shim and for an unknown answer.
 #[skuld::test]
 fn only_a_service_known_not_to_run_a_shim_is_left_unjudged() {
     let said = |kind| ShimAnswer { kind, blob_error: None };

@@ -2,9 +2,8 @@
 //! daemon `goetia.yaml` describes, waits for it and reports how it ended.
 //!
 //! The shim never restarts the daemon. It reports the daemon's exit as the service's exit and
-//! exits, once, with the code it reported, unless goetia ends it first after `STOPPED` (a waiting
-//! `stop` or `uninstall`, with exit code 1); SCM's recovery actions (`backend::scm::generate`)
-//! start a new shim, which reads the installed spec afresh.
+//! exits, once, with the code it reported; SCM's recovery actions (`backend::scm::generate`) start a
+//! new shim, which reads the installed spec afresh.
 
 use std::ffi::{OsString, c_void};
 use std::sync::Arc;
@@ -333,9 +332,7 @@ fn run_daemon(
         // `wait_for_child_or_stop` terminated the tree before returning this.
         WaitOutcome::Stopping => Reported::Clean,
         // Still reports STOPPED so the service stays stoppable and uninstallable. Its kills were
-        // refused, and dropping the child kills it again and waits, with no bound on a backend
-        // that cannot contain it: it is leaked, as `require_job_object` lets its child go. The
-        // Job Object, which `launch` requires, closes with the process.
+        // refused, and a drop would kill and wait with no bound: leaked, as `require_job_object` does.
         WaitOutcome::DaemonMayRun => {
             std::mem::forget(child);
             Reported::incomplete_stop()

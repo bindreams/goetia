@@ -1017,8 +1017,7 @@ does not start. A `stop` with `--timeout 0`, and the stop of
 delete it over the record, the same way and on a re-run too, while the record
 stands: it leaves the service stopped, disabled and not deleted, and says so.
 It has no option that deletes over the record; if you know the tree is gone,
-`sc.exe delete <id>` removes the service. An `uninstall` of a service that was
-already stopped with that record is refused the same way. Nothing else guards
+`sc.exe delete <id>` removes the service. Nothing else guards
 against a possible survivor: a later `start`, `restart` or `sc start` launches a
 second copy beside it. `goetia daemon status` and `list` show such a service as `stopped`, and so they
 do one waiting out its `restart-delay`.

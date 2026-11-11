@@ -1258,12 +1258,9 @@ pub(super) struct ShimAnswer {
 }
 
 impl ShimAnswer {
-    /// Whether `stop` and `uninstall` judge the service's incomplete-stop record, and `uninstall`
-    /// takes the install lock: for a shim and for an unknown answer, since a refusal to call a stop
-    /// complete costs a re-run, and a tree left running costs a second copy beside it. `stop` holds
-    /// every service's process; only `uninstall` holds and sweeps just a host that is a shim file by
-    /// name (see [`registered_shim`]). `start` takes the shim's vocabulary for [`ShimKind::Shim`]
-    /// alone: see [`start_kind`].
+    /// Whether `stop` and `uninstall` judge the service's incomplete-stop record: for a shim and for
+    /// an unknown answer, since a refusal to call a stop complete costs a re-run, and a tree left
+    /// running costs a second copy beside it.
     fn judges_stop_record(&self) -> bool {
         self.kind != ShimKind::NotShim
     }
@@ -1352,9 +1349,7 @@ fn hold_process(id: &Id, operation: &str, deadline: Deadline, not_done: &str) ->
 }
 
 /// The end of a process held before `id`'s STOP, once SCM has confirmed `STOPPED`: [`end_process`]
-/// over the real process, for `stop` and `uninstall` alike. A wait with no end says on stderr why it
-/// is blocked; a bounded one is the usual case (the shim exits just after it reports `STOPPED`) and
-/// says nothing.
+/// over the real process. A wait with no end says on stderr why it is blocked.
 ///
 /// The process is ended with exit code 1, which can reach it before the shim's own exit and replace
 /// the code the shim ends itself with; SCM's record is unaffected.
