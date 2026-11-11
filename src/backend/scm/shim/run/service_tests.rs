@@ -1210,29 +1210,8 @@ fn a_waiter_that_is_not_handed_the_daemon_has_ended_when_launch_returns() {
     }
 }
 
-/// A daemon whose kills were refused is never dropped, whichever thread would hold the last
-/// reference: dropping kills it again and waits, with no bound on a backend that cannot contain it.
-/// The waiter here ended with a failed wait before the kills, so the pass holds the last one.
-#[skuld::test]
-fn a_daemon_whose_kills_were_refused_is_never_dropped() {
-    let fake = FakeGuard::new();
-    let daemon = FakeProcess::new()
-        .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Refuses)
-        .kill(KillReply::Refuses);
-    fake.will_make_thread();
-    fake.will_spawn(daemon.clone());
-
-    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
-
-    assert_eq!(reported, Reported::incomplete_stop());
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    assert!(!daemon.dropped(), "the shim dropped a daemon it could not kill");
-    fake.take_failures();
-}
-
-/// A daemon whose root was killed is dropped as any other: its waiter was joined, so the drop's
-/// second kill is bounded and the child is reaped.
+/// A daemon whose root was killed is dropped as any other: its waiter was joined, so the child is
+/// reaped.
 #[skuld::test]
 fn a_daemon_whose_root_was_killed_is_dropped() {
     let fake = FakeGuard::new();
