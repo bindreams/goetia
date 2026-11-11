@@ -31,8 +31,8 @@ pub(crate) trait Os: Send + Sync {
     fn open_log(&self, path: &Path) -> io::Result<File>;
 }
 
-/// A spawned daemon. Dropping it kills its tree and waits for it, as `cosca::Child` does; see
-/// [`Spawned::detach`] to avoid that.
+/// A spawned daemon. Dropping it kills its tree, as `cosca::Child` does; a kill the OS refuses is
+/// looked at once and never waited on.
 pub(crate) trait Spawned: Send + Sync {
     /// How the daemon's tree is contained.
     fn containment(&self) -> Containment;
@@ -45,10 +45,6 @@ pub(crate) trait Spawned: Send + Sync {
 
     /// Kill the daemon's whole tree.
     fn kill_tree(&self) -> Result<(), cosca::error::Error>;
-
-    /// Let the daemon go: dropping it no longer kills it. When the OS refuses, the daemon is leaked
-    /// instead, neither killed nor waited for: its job closes, killing its tree, with this process.
-    fn detach(self: Box<Self>) -> Result<(), cosca::error::Error>;
 }
 
 /// How a line is reported to the Event Log.
@@ -103,14 +99,6 @@ impl Spawned for cosca::Child {
 
     fn kill_tree(&self) -> Result<(), cosca::error::Error> {
         cosca::Child::kill_tree(self)
-    }
-
-    fn detach(self: Box<Self>) -> Result<(), cosca::error::Error> {
-        cosca::Child::detach(*self).map_err(|(child, e)| {
-            // Dropping it would kill the tree and wait for it, with no bound where the kill is refused.
-            std::mem::forget(child);
-            e
-        })
     }
 }
 

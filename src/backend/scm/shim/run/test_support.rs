@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::os::fake::{DETACH_REFUSED, Fake, KILL_REFUSED};
+use super::os::fake::{Fake, KILL_REFUSED};
 use super::stop_bus::Supervisor;
 
 /// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
@@ -46,12 +46,5 @@ pub(crate) fn tree_refused_failure() -> String {
 pub(crate) fn fallback_refused_failure() -> String {
     format!(
         "fallback kill: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
-    )
-}
-
-/// The line logged when a daemon that could not be killed cannot be let go either.
-pub(crate) fn detach_refused_failure() -> String {
-    format!(
-        "detach: {DETACH_REFUSED}; the daemon was left running, and its job closes, killing its tree, when this process ends"
     )
 }

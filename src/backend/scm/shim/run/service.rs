@@ -28,9 +28,7 @@ use windows_sys::Win32::System::Services::{
 use super::super::marker;
 use super::logging::Log;
 use super::os::{Os, Real, Spawned, spawn_error_code};
-use super::stop_bus::{
-    NOT_RESTARTED, StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree,
-};
+use super::stop_bus::{NOT_RESTARTED, StopBus, Supervisor, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
 
 // Entry ===============================================================================================================
 
@@ -411,13 +409,8 @@ fn require_job_object(
         return Ok(child);
     }
     log.failure(id, &not_job_contained(&spec.command, containment));
-    // Dropping the child kills it again and waits for it, with no bound when the kill is refused,
-    // so a child that could not be killed is let go: the record must still be reported.
-    if kill_for_stop(child.as_ref(), log, id) == Teardown::Failed
-        && let Err(e) = child.detach()
-    {
-        log.failure(id, &detach_failed(&e));
-    }
+    // Dropping the child tries the kill again, and a refusal is not waited on.
+    kill_for_stop(child.as_ref(), log, id);
     Err(Reported::incomplete_stop())
 }
 
@@ -427,10 +420,6 @@ const NO_EXIT_CODE: &str = "child exited with no reportable exit code";
 
 fn exit_status_unavailable(e: &cosca::error::Error) -> String {
     format!("query child exit status: {e}")
-}
-
-fn detach_failed(e: &cosca::error::Error) -> String {
-    format!("detach: {e}; the daemon was left running, and its job closes, killing its tree, when this process ends")
 }
 
 fn thread_refused(command: &[String], e: &std::io::Error) -> String {

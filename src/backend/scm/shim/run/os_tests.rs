@@ -27,26 +27,17 @@ use crate::backend::scm::shim::run::test_support::not_found;
 #[derive(Default)]
 struct Reap {
     child: Option<Box<dyn Spawned>>,
-    /// A daemon whose `Spawned` was detached: held by identity.
-    detached: Option<Process>,
 }
 
 impl Reap {
     fn hold(&mut self, child: Box<dyn Spawned>) -> &dyn Spawned {
         &**self.child.insert(child)
     }
-
-    fn hold_detached(&mut self, process: Process) -> &Process {
-        self.detached.insert(process)
-    }
 }
 
 impl Drop for Reap {
     fn drop(&mut self) {
         if let Some(Err(e)) = self.child.as_ref().map(|child| child.kill_tree()) {
-            eprintln!("Reap: left a daemon running: {e}");
-        }
-        if let Some(Err(e)) = self.detached.as_ref().map(Process::kill) {
             eprintln!("Reap: left a daemon running: {e}");
         }
     }
@@ -99,39 +90,6 @@ fn kill_ends_a_real_daemon() {
 
     let status = daemon.wait().expect("the daemon ends once it is killed");
     assert!(!status.success(), "a killed daemon exited cleanly");
-}
-
-/// Dropping the `Spawned` would kill the daemon's job. The daemon echoes its stdin, so a line
-/// written after the detach and read back proves it still ran then: for a daemon the job had
-/// ended, the write fails or the read sees end of file. The test then ends it through the `Reap`.
-/// This pins `Real::detach`'s delegation: without it `Child::drop` kills and waits before
-/// returning. Whether cosca's disarm itself holds is cosca's to test.
-#[skuld::test]
-fn detach_leaves_the_daemon_running_after_its_handle_is_gone() {
-    let mut reap = Reap::default();
-    let mut cmd = powershell("while (($l = [Console]::In.ReadLine()) -ne $null) { [Console]::Out.WriteLine($l) }");
-    cmd.stdin(Stdio::pipe()).expect("pipe the daemon's stdin");
-    cmd.stdout(Stdio::pipe()).expect("pipe the daemon's stdout");
-    let mut child = cmd.spawn().expect("spawn the daemon");
-    let id = child.id().expect("the OS reported the daemon's identity");
-    reap.hold_detached(
-        Process::open(id)
-            .expect("open the daemon")
-            .expect("the daemon is running"),
-    );
-    let mut stdin = child.stdin().expect("the daemon's stdin");
-    let mut stdout = BufReader::new(child.stdout().expect("the daemon's stdout"));
-
-    Spawned::detach(Box::new(child)).expect("let the daemon go");
-
-    if let Err(e) = stdin.write_all(b"ping\n") {
-        panic!("the daemon did not outlive its handle: the write to its stdin failed: {e}");
-    }
-    let mut echo = String::new();
-    stdout.read_line(&mut echo).expect("read the daemon's echo");
-    assert_eq!(echo.trim_end(), "ping", "the daemon did not outlive its handle");
-    // Killed before its stdin closes, which would end it on its own and race the kill.
-    drop(reap);
 }
 
 /// The supervisor asks for the status twice: the waiter's wait, then the one that reads the code.

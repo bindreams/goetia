@@ -26,8 +26,7 @@ use crate::backend::scm::shim::run::os::fake::{
     FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WAIT_FAILED, WaitReply, WaiterEnd,
 };
 use crate::backend::scm::shim::run::test_support::{
-    assert_failures, assert_one_failure, detach_refused_failure, fallback_refused_failure, not_found, supervisor,
-    tree_refused_failure,
+    assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
 };
 
 const ID: &str = "goetia-shim-launch-test";
@@ -791,45 +790,8 @@ fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
             fallback_refused_failure(),
         ],
     );
-    // A real refusal makes dropping the daemon wait with no bound for a process it cannot kill,
-    // before anything is reported, so `run_daemon` must let it go undropped.
-    assert!(
-        daemon.detached(),
-        "the shim did not let go of a daemon it could not kill"
-    );
-    assert!(!daemon.dropped(), "the shim dropped a daemon it could not kill");
     assert!(!daemon.ended(), "the daemon ended though neither kill worked");
-}
-
-/// A daemon that cannot be killed and cannot be let go either is reported, and still not dropped:
-/// the drop would wait with no bound for it. It is left armed, so its job closes with the shim.
-#[skuld::test]
-fn an_uncontained_daemon_that_cannot_be_killed_or_let_go_is_reported_and_not_dropped() {
-    let fake = FakeGuard::new();
-    let daemon = FakeProcess::new()
-        .containment(Containment::TreeWalk)
-        .kill_tree(KillReply::Refuses)
-        .kill(KillReply::Refuses)
-        .refuses_detach();
-    fake.will_make_thread();
-    fake.will_spawn(daemon.clone());
-
-    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
-
-    assert_eq!(reported, Reported::incomplete_stop());
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    assert_failures(
-        &fake.take_failures(),
-        ID,
-        &[
-            NOT_JOB_CONTAINED.to_string(),
-            tree_refused_failure(),
-            fallback_refused_failure(),
-            detach_refused_failure(),
-        ],
-    );
-    assert!(!daemon.detached(), "the daemon was let go though the OS refused");
-    assert!(!daemon.dropped(), "the shim dropped a daemon it could not kill");
+    assert!(daemon.dropped(), "the shim kept a daemon it had given up on");
 }
 
 /// The status query after `ChildExited` can fail; the exit is then a shim failure, not a daemon code.
