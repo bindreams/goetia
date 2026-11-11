@@ -213,8 +213,7 @@ fn real_to_completion_gives_the_child_no_stdin() {
         };
         // The leading newline puts the line on its own: the harness may have printed `test ... `
         // before it.
-        println!("
-{PROBE}={}", String::from_utf8_lossy(&capture.stdout).trim());
+        println!("\n{PROBE}={}", String::from_utf8_lossy(&capture.stdout).trim());
         return;
     }
 
@@ -230,9 +229,7 @@ fn real_to_completion_gives_the_child_no_stdin() {
     let stderr = String::from_utf8_lossy(&probe.stderr);
     assert!(
         stdout.lines().any(|line| line == format!("{PROBE}=null")),
-        "the child's stdin was not /dev/null ({}):
-{stdout}
-{stderr}",
+        "the child's stdin was not /dev/null ({}):\n{stdout}\n{stderr}",
         probe.status
     );
 }
