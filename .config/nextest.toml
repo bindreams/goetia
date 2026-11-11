@@ -3,7 +3,7 @@
 # job's `timeout-minutes` cancels the run first (tests run one at a time). Either only gets a human
 # to the hung test; it proves nothing about state. Outside this profile, nothing bounds a hang.
 [profile.ci]
-# Run every test and report every failure, as the per-binary loop did.
+# Run every test and report every failure.
 fail-fast = false
 # One test at a time, as under `cargo test`, where skuld's capture mode forces a single test thread
 # in a single binary at a time. The integration suites share one machine-wide service manager and
