@@ -12,7 +12,6 @@
 #[cfg(unix)]
 pub(crate) mod bounded;
 #[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod client;
 mod contract;
 pub mod launchd;

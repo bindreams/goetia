@@ -162,6 +162,143 @@ fn real_loses_a_child_and_says_whether_it_announced() {
     }
 }
 
+// Wait::ToCompletion ==================================================================================================
+
+#[skuld::test]
+fn real_runs_to_completion_and_captures() {
+    let finished = sh("echo out; echo err >&2; exit 3")
+        .run(&[], Wait::ToCompletion, &mut Reservation::default())
+        .expect("sh runs");
+    let Finished::Exited { status, capture } = finished else {
+        panic!("a run to completion never expires: {finished:?}");
+    };
+    assert_eq!(status.code(), Some(3));
+    assert_eq!(capture.stdout, b"out\n");
+    assert_eq!(capture.stderr, b"err\n");
+    assert!(capture.complete);
+}
+
+/// A child that fills one pipe past its buffer before it writes the other is not blocked by the
+/// stream read second: both captures arrive whole, whichever stream is read first.
+#[skuld::test]
+fn real_to_completion_drains_both_streams_past_a_pipe_buffer() {
+    const SIZE: usize = 100_000;
+    let script = format!("head -c {SIZE} /dev/zero | tr '\\0' e >&2; head -c {SIZE} /dev/zero | tr '\\0' o");
+    let finished = sh(&script)
+        .run(&[], Wait::ToCompletion, &mut Reservation::default())
+        .expect("sh runs");
+    let Finished::Exited { status, capture } = finished else {
+        panic!("a run to completion never expires: {finished:?}");
+    };
+    assert!(status.success(), "{status:?}");
+    assert_eq!(capture.stderr, vec![b'e'; SIZE]);
+    assert_eq!(capture.stdout, vec![b'o'; SIZE]);
+    assert!(capture.complete);
+}
+
+/// What a run to completion needs it makes itself: a reservation holding nothing is enough.
+#[skuld::test]
+fn real_to_completion_draws_nothing_from_the_reservation() {
+    let mut reservation = Reservation::make(0, 0).unwrap();
+    sh("echo out")
+        .run(&[], Wait::ToCompletion, &mut reservation)
+        .expect("sh runs");
+    assert_eq!(bounded::test_hook::left(&reservation), (0, 0));
+}
+
+/// The child's stdin is `/dev/null`, not the test process's own: a child that inherited it would
+/// read from, and could block on, whatever the caller holds open.
+///
+/// A test runner may already give the test process `/dev/null` (nextest does), which an inherited
+/// stdin would then match. So the test runs itself again with a pipe on stdin, and the copy asks its
+/// child whether its stdin is a pipe: `/dev/null` is not, an inherited stdin would be.
+#[skuld::test]
+fn real_to_completion_gives_the_child_no_stdin() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::process::{Command, Stdio};
+
+    const PROBE: &str = "GOETIA_CLIENT_STDIN_PROBE";
+    const THIS_TEST: &str = "real_to_completion_gives_the_child_no_stdin";
+
+    if std::env::var_os(PROBE).is_some() {
+        let own = std::fs::metadata("/dev/stdin").expect("stat own stdin");
+        assert!(own.file_type().is_fifo(), "stdin is not the probe's pipe: {own:?}");
+        let Finished::Exited { capture, .. } = sh("[ -p /dev/fd/0 ] && echo pipe || echo null")
+            .run(&[], Wait::ToCompletion, &mut Reservation::default())
+            .expect("sh runs")
+        else {
+            panic!("expired");
+        };
+        // The leading newline puts the line on its own: the harness may have printed `test ... `
+        // before it.
+        println!("\n{PROBE}={}", String::from_utf8_lossy(&capture.stdout).trim());
+        return;
+    }
+
+    let probe = Command::new(std::env::current_exe().expect("this test binary"))
+        .args([THIS_TEST, "--nocapture"])
+        .env(PROBE, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run the test binary again");
+    let stdout = String::from_utf8_lossy(&probe.stdout);
+    let stderr = String::from_utf8_lossy(&probe.stderr);
+    assert!(
+        stdout.lines().any(|line| line == format!("{PROBE}=null")),
+        "the child's stdin was not /dev/null ({}):\n{stdout}\n{stderr}",
+        probe.status
+    );
+}
+
+#[skuld::test]
+fn real_to_completion_applies_its_environment_to_the_child() {
+    let real = sh_with("echo \"$CLIENT_MARK\"", |cmd| {
+        cmd.env("CLIENT_MARK", "set");
+    });
+    let Finished::Exited { capture, .. } = real
+        .run(&[], Wait::ToCompletion, &mut Reservation::default())
+        .expect("sh runs")
+    else {
+        panic!("expired");
+    };
+    assert_eq!(capture.stdout, b"set\n");
+}
+
+#[skuld::test]
+fn real_to_completion_reports_a_missing_program_as_not_run() {
+    let real = Real::new(vec!["/nonexistent/client".to_string()], |_| {});
+    let e = real
+        .run(&["x"], Wait::ToCompletion, &mut Reservation::default())
+        .expect_err("no such program");
+    assert!(matches!(e, ClientError::NotRun(_)), "{e:?}");
+}
+
+/// A run to completion that fails after the spawn leaves the client possibly run: cosca says so with
+/// [`cosca::error::Error::MayHaveStarted`], and that is what [`Real`] reports as [`ClientError::MayHaveRun`]. A
+/// real child cannot be made to fail there, so the error is stated, as `bounded`'s spawn test does.
+#[skuld::test]
+fn real_to_completion_tells_a_failure_after_the_spawn_from_one_before_it() {
+    let after = bounded::test_hook::may_have_started(std::io::Error::other("the read failed").into());
+    assert!(
+        matches!(of_output(Err(after)), Err(ClientError::MayHaveRun(_))),
+        "a failure after the spawn"
+    );
+    for before in [
+        cosca::error::Error::from(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+        cosca::error::Error::Containment {
+            detail: "forced".into(),
+        },
+    ] {
+        let described = format!("{before:?}");
+        assert!(
+            matches!(of_output(Err(before)), Err(ClientError::NotRun(_))),
+            "a failure before the spawn: {described}"
+        );
+    }
+}
+
 // fake::Fake ==========================================================================================================
 
 /// The test client draws what the real one draws, from the reservation it is handed: a call leaves
@@ -195,5 +332,31 @@ fn the_fake_draws_a_calls_files_from_the_reservation() {
     let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drop(short.run(&["print"], query(), &mut reservation));
     }));
-    assert!(drawn.is_err(), "a call past the reservation went unnoticed");
+    // The reservation has nothing to give: it stays empty, whichever way the miscount went. The miscount
+    // itself is a debug assertion, so a release build makes the file on the spot and the call goes on.
+    assert_eq!(bounded::test_hook::left(&reservation), (0, 0));
+    assert_eq!(
+        drawn.is_err(),
+        cfg!(debug_assertions),
+        "a call past the reservation is a miscount in a debug build and is served in a release one"
+    );
+}
+
+/// How a call was waited on is recorded, and a run to completion draws no file.
+#[skuld::test]
+fn the_fake_records_a_run_to_completion_and_draws_nothing_for_it() {
+    use fake::{Fake, RoleKind, Waited, exited, reply};
+
+    let mut reservation = Reservation::make(0, 0).unwrap();
+    let table = Fake::new([reply(&["show"], exited(0, "", ""))]);
+    table
+        .run(&["show"], Wait::ToCompletion, &mut reservation)
+        .expect("a scripted reply");
+    assert_eq!(
+        table.waits(),
+        [Waited {
+            role: RoleKind::ToCompletion,
+            bounded: false
+        }]
+    );
 }
