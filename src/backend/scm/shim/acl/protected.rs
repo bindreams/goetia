@@ -3,7 +3,7 @@
 //!
 //! The file is owned by Administrators; SYSTEM and Administrators have full control, Everyone read
 //! and execute; the DACL is protected, so nothing it would inherit is added. A folder has the same,
-//! inherited by what is made in it. [`Descriptor`] holds them as SDDL, the one place the spec's
+//! inherited by what is made in it. `Descriptor` holds them as SDDL, the one place the spec's
 //! permissions are written down, and [`is_as_wanted`] compares what a file has with them.
 #![cfg_attr(not(windows), allow(dead_code))]
 

@@ -1,5 +1,5 @@
 //! What a service host is, and who supplies it: [`HostCommand`] and the Windows-only
-//! [`ShimProvider`].
+//! `ShimProvider`.
 
 #[cfg(windows)]
 use std::path::Path;

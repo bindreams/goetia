@@ -36,7 +36,7 @@ macro_rules! stock_shim {
     };
 }
 
-/// The stock shim's bytes for [`EmbeddedStockShim::new`](crate::shim::EmbeddedStockShim::new): an
+/// The stock shim's bytes for `EmbeddedStockShim::new`: an
 /// `Option<&'static [u8]>` that is `Some(include_bytes!(..))` of the file `GOETIA_SHIM_EXE` names
 /// when the crate it expands in has its own `goetia-shim` feature on, and `None` otherwise.
 ///

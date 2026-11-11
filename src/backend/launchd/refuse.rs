@@ -1,5 +1,5 @@
 //! When `install` must not write over a plist launchd has loaded. Pure, so it compiles and its tests
-//! run on every platform, unlike [`manager`](crate::backend::launchd::manager).
+//! run on every platform, unlike `manager`.
 //!
 //! launchd keeps the definition a job was bootstrapped with and has no way to update it. A plist
 //! rewritten under a loaded job would leave `start` kickstarting the old definition and reporting

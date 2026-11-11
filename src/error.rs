@@ -69,7 +69,7 @@ pub enum Error {
 
     /// A backend that regenerates a spec from what is installed (SCM's service host) could not read
     /// it, which says nothing about the spec: the read's failure is under it, and
-    /// [`Backend::regenerate`](crate::backend::Backend::regenerate) is where one is made.
+    /// `Backend::regenerate` is where one is made.
     #[error("read `{id}`'s installed host")]
     InstalledUnreadable {
         id: String,
@@ -85,7 +85,7 @@ pub enum Error {
 
     /// Several steps failed, each after the ones before it: `first` is what failed earlier, `then`
     /// the failure after it. Any number nest to the left (`Both { Both { a, b }, c }`), built by
-    /// [`Error::both_all`]; `report()` prints them in order.
+    /// `Error::both_all`; `report()` prints them in order.
     #[error("several steps failed")]
     Both {
         #[source]
@@ -464,7 +464,7 @@ pub enum Error {
     ///
     /// `terminate_failed` is not the source: the timeout is not an OS failure, and a source would
     /// have [`raw_os_error`](Error::raw_os_error) answer with the terminate's code. The `Display`
-    /// sets it inside its sentence (see [`Error::sentence`]) and ends with `recovery`.
+    /// sets it inside its sentence (see `Error::sentence`) and ends with `recovery`.
     #[error("{}", process_wait_timeout_message(id, *pid, *waited, terminate_failed.as_deref(), recovery))]
     ProcessWaitTimeout {
         id: String,
@@ -517,7 +517,7 @@ pub enum Error {
     /// tool carrying it — `systemctl`, `launchctl` — may have started when it
     /// failed, so whatever it sends may already be sent. `request` is the
     /// tool's command line; `source` is how it was lost, and `note` is what a
-    /// caller that knows more says before it ([`Error::in_doubt_context`]).
+    /// caller that knows more says before it (`Error::in_doubt_context`).
     /// `reached` is whether goetia knows the request reached the manager:
     /// systemd says so (`Enqueued anchor job`) once it has enqueued the job,
     /// which may already be running, and a request lost after that had
@@ -1291,7 +1291,7 @@ fn loaded_in_doubt_tail(id: &str, restore_failed: bool) -> String {
 }
 
 /// This crate's `Result` alias, used throughout [`crate::manager`] and
-/// [`crate::cli`].
+/// `crate::cli`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
