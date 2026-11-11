@@ -53,7 +53,8 @@ cli = ["dep:clap"]
 # than reading `goetia-shim.exe` beside it; the library never reads it.
 goetia-shim = []
 # Exports helpers the crate's own tests share; adds items only, gates no behaviour. `skuld` is the
-# `ELEVATED` label's.
+# `ELEVATED` label's and `testing::run_all`'s, the `main` of every test binary, `src/main.rs`'s
+# `cfg(test)` one included.
 testing = ["dep:skuld"]
 
 [dependencies]
@@ -79,8 +80,9 @@ memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "3"
-# Only under `testing`: the `ELEVATED` label of `testing::elevation`. The dev-dependency below is the
-# unit tests' own.
+# Only under `testing`: the `ELEVATED` label of `testing::elevation` and `testing::run_all`, the
+# `main` of every test binary, `src/main.rs`'s `cfg(test)` one included. The dev-dependency below is
+# the unit tests' own.
 skuld = { version = "0.6", optional = true }
 tempfile = "3"
 thiserror = "2"

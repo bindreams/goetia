@@ -1,6 +1,9 @@
 //! Helpers the library's unit tests and its integration tests share. An integration test reaches the
 //! library only through its public API, so what both need is exported here, under the `testing`
 //! feature (and under `cfg(test)`, for the unit tests). Not public API: nothing here is stable.
+//!
+//! The `testing` feature depends on `skuld` for the `ELEVATED` label and for [`run_all`], the `main`
+//! of every test binary, `src/main.rs`'s `cfg(test)` one included.
 
 #[cfg(windows)]
 use std::path::PathBuf;
