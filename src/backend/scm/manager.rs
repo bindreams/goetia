@@ -1170,17 +1170,22 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
     let settled = end_on_incomplete_stop(settled, &mut process, end);
     // An unbounded deadline never expires. Told as a failure, not dropped, so that a later edit
     // narrowing the budget does not pass quietly.
+    let mut expired = false;
     let settled = settled.and_then(|waited| match waited {
         Waited::Confirmed => Ok(()),
-        Waited::Expired => Err(std::io::Error::other(
-            "the wait for the stop expired though it has no bound: goetia's own error",
-        )),
+        Waited::Expired => {
+            expired = true;
+            Err(std::io::Error::other(
+                "the wait for the stop expired though it has no bound: goetia's own error",
+            ))
+        }
     });
     match settled {
         Ok(()) => Ok(process),
         Err(e) => {
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
-            let state = match (is_incomplete_stop(&e), marked) {
+            // An expiry is goetia's own breach, not the doing of whoever marked the service.
+            let state = match (is_incomplete_stop(&e), marked && !expired) {
                 (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
                 (false, true) => UninstallFailure::AlreadyMarked,
                 (false, false) => UninstallFailure::Stop { previous },

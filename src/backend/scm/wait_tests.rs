@@ -3688,6 +3688,39 @@ fn an_uninstall_whose_process_could_not_be_held_fails_with_why() {
     assert!(err.report().to_string().contains("held badly"), "{}", err.report());
 }
 
+/// A wait that expires under an uninstall's unbounded deadline is goetia's own invariant breach: a stop
+/// failure whether or not someone else had marked the service, never their doing.
+#[cfg(windows)]
+#[skuld::test]
+fn an_uninstall_whose_unbounded_stop_expires_is_a_stop_failure_whether_or_not_it_was_marked() {
+    use crate::backend::scm::manager::uninstall_stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    for marked in [false, true] {
+        let mut fake = FakeScm::new([Some(Observed::Running), None]).stop_replies([StopReply::Ok]);
+
+        let err = uninstall_stop_on(
+            &mut fake,
+            &Id::try_from("frpc").unwrap(),
+            &answer,
+            marked,
+            None,
+            None::<fn() -> crate::error::Result<HoldOutcome<u32>>>,
+            no_end_of,
+        )
+        .expect_err("an expiry with no bound is a failure");
+
+        let said = err.report().to_string();
+        assert!(said.contains("goetia's own error"), "marked {marked}: {said}");
+        assert!(said.contains("could not be stopped"), "marked {marked}: {said}");
+        assert!(
+            !said.contains("marked for deletion by someone else"),
+            "marked {marked}: {said}"
+        );
+    }
+}
+
 /// A hold that expired cannot be told by an uninstall, whose waits have no bound: it fails, naming the
 /// pid SCM still reported, rather than going on as if it had held a process.
 #[cfg(windows)]
