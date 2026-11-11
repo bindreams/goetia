@@ -113,8 +113,7 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
-    EndProcessOutcome, IncompleteStop, StopAndAwaitExitOutcome, Waited, end_on_incomplete_stop, end_process,
-    is_incomplete_stop,
+    EndProcessOutcome, StopAndAwaitExitOutcome, Waited, end_on_incomplete_stop, end_process, is_incomplete_stop,
 };
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
@@ -451,12 +450,10 @@ impl Backend for Scm {
         // handle leaves the service only marked for deletion.
         let id = snapshot.into_id();
         let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
-        match uninstall_locked(&scm, &id, &answer, hold)? {
+        match (uninstall_locked(&scm, &id, &answer, hold)?, host.transpose()) {
             // A host that is not a shim file has nothing to wait for or sweep, and no cleanup to report.
-            Uninstalled::Deleted { process } if shim && !matches!(host, Ok(None)) => {
-                self.finish_uninstall(&id, host, process)
-            }
-            Uninstalled::Deleted { .. } | Uninstalled::Left => Ok(()),
+            (Uninstalled::Deleted { process }, Some(host)) => self.finish_uninstall(&id, host, process),
+            _ => Ok(()),
         }
     }
 
@@ -537,7 +534,7 @@ impl Backend for Scm {
         let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, &mut held, shim, |held, deadline| {
             end_held(&id, held, deadline)
         })
-        .map_err(|e| answer.stop_failed(&id, e))
+        .map_err(|e| Error::os(format!("stop `{id}`"), e))
         .and_then(|outcome| match outcome {
             StopAndAwaitExitOutcome::Stopped => Ok(()),
             // The STOP was sent and its effect is not confirmed, as when SCM does not answer in time.
@@ -1083,15 +1080,11 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
             let incomplete = is_incomplete_stop(&e);
             let state = match (incomplete, marked) {
-                (true, _) => UninstallFailure::DaemonMayRun {
-                    previous,
-                    marked,
-                    shim_known: answer.shim_is_known(),
-                },
+                (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
                 (false, true) => UninstallFailure::AlreadyMarked,
                 (false, false) => UninstallFailure::Stop { previous },
             };
-            let cause = hold_failed.unwrap_or_else(|| answer.stop_failed(id, e));
+            let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
             return Err(uninstall_failed(id, &state, cause));
         }
     }
@@ -1171,33 +1164,12 @@ pub(super) struct ShimAnswer {
 impl ShimAnswer {
     /// Whether `stop` and `uninstall` judge the service's incomplete-stop record, and `uninstall`
     /// takes the install lock: for a shim and for an unknown answer, since a refusal to call a stop
-    /// complete costs a re-run, and a tree left running costs a second copy beside it. Only a host that
-    /// is a shim file by name is held and swept (see [`registered_shim`]). `start` takes the shim's
-    /// vocabulary for [`ShimKind::Shim`] alone: see [`start_kind`].
+    /// complete costs a re-run, and a tree left running costs a second copy beside it. `stop` holds
+    /// every service's process; only `uninstall` holds and sweeps just a host that is a shim file by
+    /// name (see [`registered_shim`]). `start` takes the shim's vocabulary for [`ShimKind::Shim`]
+    /// alone: see [`start_kind`].
     fn judges_stop_record(&self) -> bool {
         self.kind != ShimKind::NotShim
-    }
-
-    /// Whether the service is known to run a shim: its blob decoded as `type: simple`. A shim read
-    /// from the image alone, or over an unreadable image, is only assumed.
-    fn shim_is_known(&self) -> bool {
-        self.kind == ShimKind::Shim && self.blob_error.is_none()
-    }
-
-    /// The error of the failed stop `e` of `id`. An incomplete stop of a service not known to run a shim
-    /// is told without saying that the shim recorded it, and is led by why the service was read as a
-    /// shim's: its blob would not decode, and the image decided or could not be read. Any other failure,
-    /// and an incomplete stop of a shim known by its blob, is told as it is.
-    pub(super) fn stop_failed(&self, id: &Id, e: std::io::Error) -> Error {
-        let what = format!("stop `{id}`");
-        match &self.blob_error {
-            Some(blob) if is_incomplete_stop(&e) => Error::StopAsShim {
-                blob: Arc::clone(blob),
-                image_is_shim: self.kind == ShimKind::Shim,
-                source: Box::new(Error::os(what, IncompleteStop::of_a_stop_read_as_a_shims())),
-            },
-            _ => Error::os(what, e),
-        }
     }
 }
 
@@ -1358,9 +1330,8 @@ impl Scm {
     /// provider. A host in any other folder is not swept, since that folder is not goetia's.
     ///
     /// `host` is what [`registered_shim`] read: a shim file by name, the only file a provider places
-    /// that is swept, and the only host whose process is held. For any other host, a `StandaloneShim`'s
-    /// as well, nothing is held or swept. A host that could not be read is not "no shim": nothing is
-    /// held or swept, and the failure says why.
+    /// that is swept, and the only host whose process is held. A host that could not be read is not
+    /// "no shim": nothing is held or swept, and the failure says why.
     ///
     /// A default folder that cannot be located skips the second folder, as it cannot be told from the
     /// host's, and is reported with whatever else fails: the wait and the provider's sweep go on.
@@ -1373,9 +1344,9 @@ impl Scm {
     /// A failure here leaves the service deleted, and says so, naming each file that remains and
     /// what removes it: see [`left_behind_text`]. A file kept because a service names it or a process
     /// runs it is in use, and is skipped without an error: the next sweep removes it once it is free.
-    fn finish_uninstall(&self, id: &Id, host: Result<Option<PathBuf>>, process: HoldOutcome<Held>) -> Result<()> {
+    fn finish_uninstall(&self, id: &Id, host: Result<PathBuf>, process: HoldOutcome<Held>) -> Result<()> {
         let (host, unread) = match host {
-            Ok(host) => (host.map(|host| normalise(&host)), None),
+            Ok(host) => (Some(normalise(&host)), None),
             Err(e) => (None, Some(e)),
         };
         let (provider, unknown) = self.provider_folder();
@@ -1428,7 +1399,7 @@ impl Scm {
             }
             HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
         }
-        // Nothing is swept for a host that is no file a provider placed, or one that could not be read.
+        // Nothing is swept for a host that could not be read.
         if host.is_none() {
             return finish(failures, false);
         }
@@ -1550,9 +1521,6 @@ enum UninstallFailure {
     DaemonMayRun {
         previous: Option<ServiceStartType>,
         marked: bool,
-        /// Whether the service is known to run the shim that recorded it (see
-        /// [`ShimAnswer::shim_is_known`]).
-        shim_known: bool,
     },
 }
 
@@ -1584,11 +1552,7 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
              so `uninstall` did not delete it. It is removed once it stops and its last handle closes; \
              {kill}"
         ),
-        UninstallFailure::DaemonMayRun {
-            previous,
-            marked,
-            shim_known,
-        } => {
+        UninstallFailure::DaemonMayRun { previous, marked } => {
             let left = if *marked {
                 "It was already marked for deletion by someone else, so `uninstall` did not delete it; \
                  it is removed once its last handle closes."
@@ -1601,14 +1565,10 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
                     previous_start_type(id, *previous)
                 )
             };
-            let recorded = if *shim_known {
-                "SCM recorded that goetia-shim could not end the daemon's process tree, so the daemon may \
-                 still be running."
-            } else {
-                "SCM recorded the code goetia-shim uses for failing to end the daemon's process tree, so if \
-                 the service runs a shim, its daemon may still be running."
-            };
-            format!("`{id}` is stopped, but {recorded} {left}")
+            format!(
+                "`{id}` is stopped, but SCM recorded `(0, 1003)`, the code goetia-shim records when it could \
+                 not end the daemon's process tree, so the daemon may still be running. {left}"
+            )
         }
     };
     Error::Step {

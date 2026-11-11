@@ -633,18 +633,6 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    /// A `stop` that failed as an incomplete stop of a service read as a shim's, because its spec blob
-    /// could not be read. `blob` is the unreadable blob's error, printed in the message;
-    /// `image_is_shim` is whether the registered image is a shim file, which decided it, and when
-    /// false the image could not be read either; `source` is the failed stop.
-    #[error("{}", stop_as_shim_message(blob, *image_is_shim))]
-    StopAsShim {
-        blob: Arc<Error>,
-        image_is_shim: bool,
-        #[source]
-        source: Box<Error>,
-    },
-
     /// A backend tried to create or move an artifact to `path`, but
     /// something already occupies it — a state none of that backend's own
     /// operations should produce.
@@ -660,7 +648,6 @@ macro_rules! wrapper {
     ($source:ident) => {
         Error::Step { source: $source, .. }
             | Error::StartAsManaged { source: $source, .. }
-            | Error::StopAsShim { source: $source, .. }
             | Error::InstalledUnreadable { source: $source, .. }
     };
 }
@@ -728,8 +715,7 @@ impl Error {
         }
     }
 
-    /// The error a chain of [`Step`](Error::Step), [`StartAsManaged`](Error::StartAsManaged),
-    /// [`StopAsShim`](Error::StopAsShim) and
+    /// The error a chain of [`Step`](Error::Step), [`StartAsManaged`](Error::StartAsManaged) and
     /// [`InstalledUnreadable`](Error::InstalledUnreadable) ends in, which classification reads: a step
     /// over [`NotInstalled`](Error::NotInstalled) is still "not installed". An error that carries
     /// another one in any other variant ([`Kept`](Error::Kept), [`Undetermined`](Error::Undetermined),
@@ -740,8 +726,7 @@ impl Error {
     }
 
     /// Whether this error, or what it wraps in a [`Step`](Error::Step),
-    /// [`StartAsManaged`](Error::StartAsManaged), [`StopAsShim`](Error::StopAsShim) or
-    /// [`Kept`](Error::Kept), is an
+    /// [`StartAsManaged`](Error::StartAsManaged) or [`Kept`](Error::Kept), is an
     /// [`InstalledUnreadable`](Error::InstalledUnreadable). [`cause`](Error::cause) cannot say: it
     /// walks through that variant. The errors carried by any other variant are not walked.
     pub(crate) fn wraps_unreadable_host(&self) -> bool {
@@ -852,9 +837,6 @@ impl Error {
                 restore_failed,
             } => Some(loaded_state_in_doubt(id, read_failed, restore_failed.is_some())),
             Error::StartAsManaged { blob, .. } => Some(start_as_managed_message(blob)),
-            Error::StopAsShim {
-                blob, image_is_shim, ..
-            } => Some(stop_as_shim_message(blob, *image_is_shim)),
             Error::ProcessWaitTimeout {
                 id,
                 pid,
@@ -1249,21 +1231,6 @@ pub(crate) fn terminating_failed<'a>(
 fn start_as_managed_message(blob: &Error) -> Sentence<'_> {
     Sentence {
         before: "its spec blob could not be read, so the start was judged as a `type: managed` service's (".into(),
-        error: Some(blob),
-        error_is_cause: true,
-        after: ")".into(),
-    }
-}
-
-/// The message of [`Error::StopAsShim`]: `blob` is the unreadable blob's error.
-fn stop_as_shim_message(blob: &Error, image_is_shim: bool) -> Sentence<'_> {
-    Sentence {
-        before: if image_is_shim {
-            "its spec blob could not be read, so the stop was read as a shim's by its image, a shim file ("
-        } else {
-            "its spec blob and its image could not be read, so the stop was read as a shim's ("
-        }
-        .into(),
         error: Some(blob),
         error_is_cause: true,
         after: ")".into(),

@@ -109,11 +109,6 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             blob: Arc::new(Error::blob(String::new())),
             source: Box::new(not_installed()),
         },
-        Error::StopAsShim {
-            blob: Arc::new(Error::blob(String::new())),
-            image_is_shim: true,
-            source: Box::new(not_installed()),
-        },
         Error::AlreadyExists { path: PathBuf::new() },
         Error::ConcurrentChange { id: id(), path: None },
         Error::QuarantineStranded {
@@ -1050,26 +1045,6 @@ fn report_of_a_start_judged_as_managed_names_the_unreadable_blob_and_then_the_fa
     assert!(!e.is_indeterminate());
 }
 
-/// A stop read as a shim's over an unreadable blob says why it was read so, by the image when the
-/// image decided and without one when it could not be read either, and then the failed stop.
-#[skuld::test]
-fn report_of_a_stop_read_as_a_shims_names_the_unreadable_blob_and_then_the_failure() {
-    let stop = |image_is_shim| Error::StopAsShim {
-        blob: Arc::new(Error::blob("invalid blob JSON: EOF".to_string())),
-        image_is_shim,
-        source: Box::new(os("stop", "/p", "stopped")),
-    };
-    assert_eq!(
-        stop(true).report().to_string(),
-        "its spec blob could not be read, so the stop was read as a shim's by its image, a shim file (blob: invalid blob JSON: EOF): failed to stop /p: stopped"
-    );
-    assert_eq!(
-        stop(false).report().to_string(),
-        "its spec blob and its image could not be read, so the stop was read as a shim's (blob: invalid blob JSON: EOF): failed to stop /p: stopped"
-    );
-    assert!(!stop(true).is_indeterminate());
-}
-
 #[skuld::test]
 fn an_undetermined_step_chain_gives_up_its_read_and_recovery() {
     let step = Error::Step {
@@ -1102,15 +1077,8 @@ fn a_failed_read_of_the_installed_host_is_found_under_every_wrapper_and_only_the
         blob: Arc::new(Error::blob(String::new())),
         source: Box::new(source),
     };
-    let stop = |source: Error| Error::StopAsShim {
-        blob: Arc::new(Error::blob(String::new())),
-        image_is_shim: true,
-        source: Box::new(source),
-    };
 
     assert!(unreadable().wraps_unreadable_host());
-    assert!(stop(step(unreadable())).wraps_unreadable_host());
-    assert!(!step(stop(not_installed())).wraps_unreadable_host());
     assert!(step(unreadable()).wraps_unreadable_host());
     assert!(start(step(unreadable())).wraps_unreadable_host());
     assert!(Error::Kept(Arc::new(step(unreadable()))).wraps_unreadable_host());
@@ -1179,13 +1147,7 @@ fn the_os_error_of_an_embedded_error_is_found() {
         blob: Arc::new(os_code(9)),
         source: Box::new(not_installed()),
     };
-    let stop_read_as_shims = Error::StopAsShim {
-        blob: Arc::new(os_code(10)),
-        image_is_shim: false,
-        source: Box::new(not_installed()),
-    };
 
     assert_eq!(embedded.raw_os_error(), Some(8));
     assert_eq!(blob_unreadable.raw_os_error(), Some(9));
-    assert_eq!(stop_read_as_shims.raw_os_error(), Some(10));
 }

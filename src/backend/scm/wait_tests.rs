@@ -3197,12 +3197,10 @@ fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
 #[skuld::test]
 fn a_start_over_an_unreadable_blob_is_strict_unless_the_image_is_a_shim() {
     use crate::backend::scm::manager::{shim_answer, start_on};
+    use crate::backend::scm::test_support::SHIM_HEX;
     use crate::spec::Id;
 
-    let shim = format!(
-        r#""C:\Program Files\Goetia\goetia-shim-{}.exe" --service-host"#,
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    );
+    let shim = format!(r#""C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe" --service-host"#);
     let corrupt = std::sync::Arc::new(crate::error::Error::blob("corrupt"));
     let id = Id::try_from("frpc").unwrap();
 
@@ -3261,74 +3259,40 @@ fn a_start_over_a_decodable_blob_is_read_by_its_kind() {
     }
 }
 
-// stop's vocabulary, through what `runs_a_shim` answers ---------------------------------------------------------------
+// the incomplete stop's wording ---------------------------------------------------------------------------------------
 
-/// The failure of `stop_and_await_exit` over a stop SCM recorded as incomplete, as `stop` and
-/// `uninstall` return it for the service `answer` describes, and how it reads. The failure is the real
-/// one, from the wait, not one built by the test.
+/// A failed stop and a failed start over the shim's incomplete-stop record say what SCM recorded and
+/// what it means, and do not claim who wrote it.
 #[cfg(windows)]
-fn incomplete_stop_told_for(answer: &crate::backend::scm::manager::ShimAnswer) -> String {
+#[skuld::test]
+fn an_incomplete_stop_is_told_by_what_scm_recorded_and_not_by_who_wrote_it() {
+    use crate::backend::scm::manager::{shim_answer, start_on};
+    use crate::backend::scm::test_support::blob_of;
     use crate::spec::Id;
 
     let mut fake = incomplete(FakeScm::new([Some(Observed::Stopped)]));
-    let e = stop_and_await_exit(&mut fake, unbounded(), &mut HoldOutcome::<u32>::NoProcess, true, no_end).unwrap_err();
-    answer
-        .stop_failed(&Id::try_from("frpc").unwrap(), e)
-        .report()
-        .to_string()
-}
-
-/// A shim known by its blob has its incomplete stop told as the shim's own, with nothing about the
-/// blob, which was read. A service read as a shim's without its blob is told without that claim, and
-/// led by why it was read so: its blob would not decode, and its image is a shim file, or could not be
-/// read. The blob error is the one from the answer, so that nothing about it is lost.
-#[cfg(windows)]
-#[skuld::test]
-fn an_incomplete_stop_is_told_as_the_shims_only_for_a_shim_known_by_its_blob() {
-    use crate::backend::scm::manager::shim_answer;
-    use crate::backend::scm::test_support::blob_of;
-
-    let shim = format!(
-        r#""C:\Program Files\Goetia\goetia-shim-{}.exe" --service-host"#,
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    );
-    let corrupt = std::sync::Arc::new(crate::error::Error::blob("invalid blob JSON: EOF"));
-
-    let known = incomplete_stop_told_for(&shim_answer(Ok(&blob_of(Kind::Simple)), || None));
-    assert!(known.contains("goetia-shim's incomplete-stop record"), "{known}");
-    assert!(!known.contains("blob"), "{known}");
-
-    for (image, why) in [
-        (Some(shim.as_str()), "by its image, a shim file"),
-        (None, "its spec blob and its image could not be read"),
-    ] {
-        let said = incomplete_stop_told_for(&shim_answer(Err(&corrupt), || image.map(str::to_string)));
-        assert!(said.contains("invalid blob JSON: EOF"), "{image:?}: {said}");
-        assert!(said.contains(why), "{image:?}: {said}");
-        assert!(said.contains("stop `frpc`"), "{image:?}: {said}");
-        assert!(said.contains("service-specific 1003"), "{image:?}: {said}");
-        assert!(
-            !said.contains("goetia-shim's incomplete-stop record"),
-            "{image:?}: {said}"
-        );
-    }
-}
-
-/// A stop that failed for any other reason is told as it was, whatever the answer says of the blob.
-#[cfg(windows)]
-#[skuld::test]
-fn a_stop_that_failed_otherwise_is_told_as_it_was_whatever_the_blob_was() {
-    use crate::backend::scm::manager::shim_answer;
-    use crate::spec::Id;
-
-    let corrupt = std::sync::Arc::new(crate::error::Error::blob("corrupt"));
-    let answer = shim_answer(Err(&corrupt), || None);
-
-    let said = answer
-        .stop_failed(&Id::try_from("frpc").unwrap(), io::Error::other("access denied"))
-        .report()
+    let stop = stop_and_await_exit(&mut fake, unbounded(), &mut HoldOutcome::<u32>::NoProcess, true, no_end)
+        .unwrap_err()
         .to_string();
 
-    assert!(said.contains("stop `frpc`") && said.contains("access denied"), "{said}");
-    assert!(!said.contains("blob"), "{said}");
+    let answer = shim_answer(Ok(&blob_of(Kind::Simple)), || None);
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]).stopped_after(Reported::incomplete_stop());
+    let start = start_on(
+        &mut fake,
+        &Id::try_from("frpc").unwrap(),
+        Budget::Unbounded,
+        unbounded(),
+        &answer,
+    )
+    .unwrap_err()
+    .report()
+    .to_string();
+
+    for said in [stop, start] {
+        assert!(
+            said.contains("SCM recorded `(0, 1003)`, the code goetia-shim records when it could not end the daemon's process tree, so the daemon may still be running"),
+            "{said}"
+        );
+        assert!(!said.contains("if the service runs a shim"), "{said}");
+    }
 }
