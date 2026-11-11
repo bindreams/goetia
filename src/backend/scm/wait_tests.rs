@@ -2928,7 +2928,7 @@ struct Confirming {
     settle: Option<fn() -> FakeScm>,
 }
 
-fn confirmations() -> [Confirming; 3] {
+fn confirmations() -> [Confirming; 5] {
     let under_way = || {
         FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)])
             .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
@@ -2952,6 +2952,21 @@ fn confirmations() -> [Confirming; 3] {
                     StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL),
                 ])
             }),
+        },
+        // The status an arm returns, and the one read in place of an arm SCM refused on a marked service.
+        Confirming {
+            name: "the status of an arm",
+            stop: Some(|| FakeScm::new([]).drifting_after(0, QueriedState::Stopped)),
+            settle: None,
+        },
+        Confirming {
+            name: "the status of a refused arm on a marked service",
+            stop: Some(|| {
+                FakeScm::new([])
+                    .drifting_after(0, QueriedState::Stopped)
+                    .refusing_arms_in(STOPPED_ONLY)
+            }),
+            settle: None,
         },
         // `stop_via_notify` sends its STOP first, so it has no already-stopped service to find.
         Confirming {
