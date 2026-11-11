@@ -50,7 +50,7 @@ impl<T: Send + 'static> Standby<T> {
     }
 }
 
-// Unix makes its threads through these; Windows' only caller of `Standby` is `with`.
+// Unix makes its threads through these; Windows' only constructor is `with`.
 #[cfg_attr(not(unix), allow(dead_code))]
 impl<T: Send + 'static> Standby<T> {
     /// A standby on a `std::thread`, whose handle is dropped: a failure to make it is `io::Error`,
