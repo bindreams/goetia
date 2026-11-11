@@ -1297,7 +1297,7 @@ impl backend::Backend for Launchd {
         fs::remove_file(&location.path).map_err(|e| Error::os_at("remove", &location.path, e))
     }
 
-    fn enable(&self, snapshot: Plist) -> Result<()> {
+    fn enable(&self, snapshot: Plist, _reservation: &mut Reservation) -> Result<()> {
         let Plist { id, location, .. } = snapshot;
 
         if location.enabled {

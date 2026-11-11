@@ -280,9 +280,10 @@ impl Backend for Systemd {
         }
     }
 
-    // `enable` and `disable` draw nothing, so they hold nothing: each asks the gate for itself.
-    fn enable(&self, snapshot: Fragment) -> Result<()> {
-        self.systemctl.enable_impl(snapshot.id().as_str(), &mut Held::default())
+    // `enable` draws nothing: it shares the gate's answer the reservation it is handed holds.
+    // `disable` is handed none and asks the gate for itself.
+    fn enable(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
+        self.systemctl.enable_impl(snapshot.id().as_str(), reservation)
     }
 
     fn disable(&self, snapshot: Fragment) -> Result<()> {

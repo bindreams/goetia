@@ -16,7 +16,7 @@ use super::wait::WaitArgs;
 use crate::backend::Identity;
 use crate::decide::Outcome;
 use crate::error::Result;
-use crate::manager::{ServiceManager, Step};
+use crate::manager::{Budget, ServiceManager, Step};
 use crate::shim::HostCommand;
 use crate::spec::{AccountId, DaemonSpec, Id, User};
 
@@ -89,20 +89,23 @@ pub fn run(
 
     // Each step (install, `--enable`, `--start`) contributes at most one code; see `ExitCode` for which wins.
     let mut codes: Vec<ExitCode> = Vec::new();
-    // Prepared before the install sends anything: a start that ran out of threads or files after
-    // the install's bootout would strand the daemon. The install reserves its own.
-    let mut sequence = match args
-        .start
-        .then(|| mgr.prepare(&[Step::Start], args.wait.budget()))
-        .transpose()
-    {
+    // One sequence for every step, prepared before the install sends anything: a start that ran out
+    // of threads or files after the install's bootout would strand the daemon, and the steps share
+    // what the sequence holds (systemd's version gate). Without `--start` the budget is the
+    // install's own: unbounded.
+    let (steps, budget) = if args.start {
+        (&[Step::Install, Step::Start][..], args.wait.budget())
+    } else {
+        (&[Step::Install][..], Budget::Unbounded)
+    };
+    let mut sequence = match mgr.prepare(steps, budget) {
         Ok(sequence) => sequence,
         Err(e) => {
             print_error(err, Some(spec.id.as_str()), "", &e);
             return ExitCode::of(&e);
         }
     };
-    match mgr.install(&spec, args.force) {
+    match sequence.install(&spec, args.force) {
         Ok(outcome) => {
             match report_outcome(&spec.id, &outcome, out, err) {
                 ExitCode::Success => codes.push(ExitCode::Success),
@@ -114,12 +117,12 @@ pub fn run(
                 }
             }
             if args.enable
-                && let Err(e) = mgr.enable(&spec.id)
+                && let Err(e) = sequence.enable(&spec.id)
             {
                 print_error(err, Some(spec.id.as_str()), "enable: ", &e);
                 codes.push(ExitCode::of(&e));
             }
-            if let Some(sequence) = sequence.as_mut()
+            if args.start
                 && let Err(e) = sequence.start(&spec.id, args.wait.budget())
             {
                 print_error(err, Some(spec.id.as_str()), "start: ", &e);

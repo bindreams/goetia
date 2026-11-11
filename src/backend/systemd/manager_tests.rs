@@ -210,7 +210,8 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
         // raced one leaves that reply unused.
         let mgr = over(gate_then([reply(&["daemon-reload"], exited(0, "", ""))]));
         let stop = StopRacer(&done);
-        let outcome = flow::install(&mgr, &spec, false);
+        let mut held = Backend::reserve(&mgr, &[Step::Install], Budget::Unbounded).expect("reserve");
+        let outcome = flow::install(&mgr, &spec, false, &mut held);
         drop(stop);
         racer.join().expect("racer thread panicked");
 

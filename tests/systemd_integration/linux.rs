@@ -1099,9 +1099,9 @@ fn goetia_logging_systemctl(dir: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// The version gate probes `systemctl` once per daemon per verb, however many steps the verb takes:
-/// `restart`'s stop and start, `install --start`'s install and start, `uninstall`'s stop, `disable`
-/// and `daemon-reload`, share one pair of probes, and so one share of the budget. `enable` and
-/// `disable` ask it too: no request is sent before the manager is asked.
+/// `restart`'s stop and start, `install --start`'s install, `--enable` and start, `uninstall`'s
+/// stop, `disable` and `daemon-reload`, share one pair of probes, and so one share of the budget.
+/// `enable` and `disable` ask it too: no request is sent before the manager is asked.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn the_version_gate_probes_once_per_daemon_per_verb() {
     let id = support::random_test_id();
@@ -1123,7 +1123,7 @@ fn the_version_gate_probes_once_per_daemon_per_verb() {
     };
 
     for args in [
-        &["daemon", "install", "--file", manifest, "--start"][..],
+        &["daemon", "install", "--file", manifest, "--enable", "--start"][..],
         &["daemon", "restart", guard.id()],
         &["daemon", "restart", guard.id(), "--timeout", "0"],
         &["daemon", "start", guard.id()],

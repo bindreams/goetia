@@ -20,13 +20,13 @@ use crate::manager::{Budget, State, Status, Step};
 /// where it is spent and a verb run alone shares nothing with another.
 ///
 /// A [`Default`] holds nothing and has not passed the gate: for a call that draws nothing and
-/// asks the gate for itself (`enable`, `disable`, a read of state).
+/// asks the gate for itself (`disable`, a read of state).
 #[derive(Debug, Default)]
 pub(crate) struct Held {
     pub(super) draws: Reservation,
     /// The gate passed on this reservation, so its remaining steps do not ask it again: `restart`'s
-    /// two legs, and `uninstall`'s stop, `disable` and `daemon-reload`, share one pair of probes. A
-    /// refusal is not kept, since it ends the verb.
+    /// two legs, `uninstall`'s stop, `disable` and `daemon-reload`, and `install --start`'s install,
+    /// `--enable` and start share one pair of probes. A refusal is not kept, since it ends the verb.
     gate_passed: bool,
 }
 

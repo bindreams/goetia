@@ -345,6 +345,12 @@ impl FlakyManager {
 struct Direct<'a>(&'a dyn ServiceManager);
 
 impl Sequence for Direct<'_> {
+    fn install(&mut self, spec: &DaemonSpec, force: bool) -> goetia::Result<goetia::decide::Outcome> {
+        self.0.install(spec, force)
+    }
+    fn enable(&mut self, id: &Id) -> goetia::Result<()> {
+        self.0.enable(id)
+    }
     fn stop(&mut self, id: &Id, budget: Budget) -> goetia::Result<()> {
         self.0.stop(id, budget)
     }
@@ -3912,9 +3918,10 @@ fn install_start_that_cannot_prepare_installs_nothing() {
     );
 }
 
-/// Without `--start` there is no sequence: the install reserves for itself alone.
+/// Without `--start` the sequence holds the install alone, and the install draws on it: nothing
+/// else reserves.
 #[skuld::test]
-fn install_without_start_prepares_no_sequence() {
+fn install_without_start_prepares_the_install_alone() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
@@ -3970,10 +3977,10 @@ fn restart_prepares_both_legs_under_its_budget() {
     }
 }
 
-/// `install --start` prepares the start, under its budget, before the install sends anything; the
-/// install reserves for itself.
+/// `install --start` prepares the install and the start in one sequence, under the start's budget,
+/// before the install sends anything; every leg draws on it, `--enable` included.
 #[skuld::test]
-fn install_start_prepares_the_start_before_the_install() {
+fn install_start_prepares_one_sequence_for_the_install_and_the_start() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
@@ -3985,6 +3992,7 @@ fn install_start_prepares_the_start_before_the_install() {
             "install",
             "--file",
             manifest.to_str().unwrap(),
+            "--enable",
             "--start",
             "--timeout",
             "5s",
@@ -3996,8 +4004,8 @@ fn install_start_prepares_the_start_before_the_install() {
     let given = Budget::Bounded(Duration::from_secs(5));
     assert_eq!(
         fake.prepared(),
-        vec![(vec![Step::Start], given), (vec![Step::Install], Budget::Unbounded),],
-        "the start's reservation is made before the install's"
+        vec![(vec![Step::Install, Step::Start], given)],
+        "one reservation, made before the install, and no verb reserves again"
     );
     assert_eq!(fake.calls(), vec![("start", "frpc".to_string())]);
 }

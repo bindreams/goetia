@@ -483,7 +483,7 @@ impl Backend for Scm {
             .map_err(|failure| *failure.error)
     }
 
-    fn enable(&self, snapshot: ScmSnapshot) -> Result<()> {
+    fn enable(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.id();
         let (_scm, service) = open_existing(id, "enable", ServiceAccess::CHANGE_CONFIG)?;
         set_start_type(&service, ServiceStartType::AutoStart).map_err(|e| Error::os(format!("enable `{id}`"), e))

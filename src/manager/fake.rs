@@ -875,7 +875,7 @@ impl crate::backend::Backend for Fake {
         }
     }
 
-    fn enable(&self, snapshot: Artifact) -> Result<()> {
+    fn enable(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<()> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.confirm(&snapshot)?.enabled = true;
         Ok(())

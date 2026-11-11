@@ -785,7 +785,7 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
         ("uninstall", |fake, snapshot| {
             Backend::uninstall(fake, snapshot, &mut ())
         }),
-        ("enable", |fake, snapshot| Backend::enable(fake, snapshot)),
+        ("enable", |fake, snapshot| Backend::enable(fake, snapshot, &mut ())),
         ("disable", |fake, snapshot| Backend::disable(fake, snapshot)),
         ("start", |fake, snapshot| {
             Backend::start(fake, snapshot, Budget::DEFAULT, &mut ())

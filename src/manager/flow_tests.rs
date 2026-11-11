@@ -957,3 +957,65 @@ fn a_verb_the_gate_refuses_spends_no_step() {
     sequence.stop(&id, Budget::DEFAULT).unwrap();
     sequence.start(&id, Budget::DEFAULT).unwrap();
 }
+
+/// An install run in a sequence draws on the reservation the sequence made, and makes none of its
+/// own: that is how one gate pass serves the install and the steps after it.
+#[skuld::test]
+fn a_sequence_installs_on_its_own_reservation() {
+    let fake = Fake::new();
+    let spec = mk("frpc");
+    let mut sequence = fake.prepare(&[Step::Install, Step::Start], Budget::DEFAULT).unwrap();
+
+    let outcome = sequence.install(&spec, false).unwrap();
+    sequence.enable(&spec.id).unwrap();
+    sequence.start(&spec.id, Budget::DEFAULT).unwrap();
+
+    assert_eq!(outcome, Outcome::Create);
+    assert_eq!(
+        fake.prepared(),
+        [(vec![Step::Install, Step::Start], Budget::DEFAULT)],
+        "the sequence's reservation is the only one"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(
+    expected = "[Install] was not prepared for, or already ran: it would draw on a reservation not counted for it"
+)]
+fn a_sequence_refuses_an_install_it_was_not_prepared_for() {
+    let fake = Fake::new();
+    let mut sequence = fake.prepare(&[Step::Start], Budget::DEFAULT).unwrap();
+
+    drop(sequence.install(&mk("frpc"), false));
+}
+
+/// `enable` draws nothing, so it spends no step: the sequence still holds each one it was prepared
+/// for, and `enable` runs with none prepared.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn an_enable_in_a_sequence_spends_no_step() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let id = Id::try_from("frpc").unwrap();
+    let mut sequence = fake.prepare(&[Step::Start], Budget::DEFAULT).unwrap();
+
+    sequence.enable(&id).unwrap();
+    sequence.start(&id, Budget::DEFAULT).unwrap();
+
+    let mut none = fake.prepare(&[], Budget::DEFAULT).unwrap();
+    none.enable(&id).unwrap();
+}
+
+/// A single `enable` reserves nothing to spend: it asks for an empty reservation, so a backend that
+/// keeps the version gate's answer in one has somewhere to keep it.
+#[skuld::test]
+fn a_single_enable_reserves_an_empty_reservation() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    let before = fake.prepared().len();
+
+    ServiceManager::enable(&fake, &Id::try_from("frpc").unwrap()).unwrap();
+
+    assert_eq!(fake.prepared()[before..], [(vec![], Budget::Unbounded)]);
+}
