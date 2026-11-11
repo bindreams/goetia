@@ -1100,8 +1100,8 @@ fn real_account_gets_service_logon_right() {
     // the 10s default on a runner — measured at 24,737 ms on a green run, and 14,349 ms when
     // `DEFAULT` turned it into a failure whose message blamed `SeServiceLogonRight` for what was
     // only a slow profile build. A larger fixed number would just move the guess; unbounded says
-    // what is meant. A start that never arrives is bounded by CI's per-binary watchdog — a failure
-    // bound surfaced to a human, not a synchronisation device.
+    // what is meant. A start that never arrives is bounded by nextest's per-test slow-timeout, reported as
+    // TIMEOUT — a failure bound surfaced to a human, not a synchronisation device.
     mgr.start(&target, Budget::Unbounded).unwrap_or_else(|e| {
         panic!("service under a real account failed to start (SeServiceLogonRight likely not granted): {e}")
     });
