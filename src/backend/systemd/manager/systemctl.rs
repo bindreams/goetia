@@ -30,14 +30,14 @@ enum Purpose {
 
 /// `systemctl`, reached through a [`Client`], on the system `host` reads. Every run goes through
 /// [`Systemctl::door`] and [`answered`].
-pub(super) struct Systemctl {
+pub(crate) struct Systemctl {
     client: Box<dyn Client>,
     /// Read at every [`Systemctl::door`], never kept: the evidence is the system as it is at the run.
     host: fn() -> Host,
 }
 
 impl Systemctl {
-    pub(super) fn new(client: Box<dyn Client>, host: fn() -> Host) -> Systemctl {
+    pub(crate) fn new(client: Box<dyn Client>, host: fn() -> Host) -> Systemctl {
         Systemctl { client, host }
     }
 
@@ -309,7 +309,7 @@ enum Chroot {
 /// What goetia reads of this system without asking `systemctl`: a seam, so a test can stand any
 /// system in.
 #[derive(Debug, Clone)]
-pub(super) struct Host {
+pub(crate) struct Host {
     /// `SYSTEMD_OFFLINE`, as goetia itself inherits it. No `systemctl` goetia runs is given it —
     /// [`DENIED`] takes it away — so this reading is the only one it has.
     offline: Option<String>,
@@ -912,4 +912,4 @@ impl Systemctl {
 
 #[cfg(test)]
 #[path = "systemctl_tests.rs"]
-mod systemctl_tests;
+pub(super) mod systemctl_tests;

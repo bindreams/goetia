@@ -104,8 +104,8 @@ impl Systemd {
         Self::with(Systemctl::native())
     }
 
-    /// A manager reaching `systemd` through `systemctl`.
-    fn with(systemctl: Systemctl) -> Self {
+    /// A manager reaching `systemd` through `systemctl`, which tests build over a stated client.
+    pub(crate) fn with(systemctl: Systemctl) -> Self {
         Self { systemctl }
     }
 }

@@ -29,7 +29,7 @@ fn capture(stdout: &str, stderr: &str, complete: bool) -> Capture {
 // The clients =========================================================================================================
 
 /// A system booted with systemd, and not offline: its manager must be asked.
-fn booted() -> Host {
+pub(in crate::backend::systemd::manager) fn booted() -> Host {
     Host {
         offline: None,
         unbooted: false,
@@ -104,7 +104,7 @@ fn gate_held() -> GateScope {
 }
 
 /// The version gate's two probes, passing.
-fn gate_passes() -> Vec<Entry> {
+pub(in crate::backend::systemd::manager) fn gate_passes() -> Vec<Entry> {
     vec![
         reply(&["--version"], exited(0, "systemd 257 (257)\n", "")),
         reply(&["show", "--property=Version", "--value"], exited(0, "257\n", "")),
@@ -112,7 +112,7 @@ fn gate_passes() -> Vec<Entry> {
 }
 
 /// A fake that passes the version gate, and then answers `rest`.
-fn gate_then(rest: impl IntoIterator<Item = Entry>) -> Fake {
+pub(in crate::backend::systemd::manager) fn gate_then(rest: impl IntoIterator<Item = Entry>) -> Fake {
     Fake::new(gate_passes().into_iter().chain(rest))
 }
 
