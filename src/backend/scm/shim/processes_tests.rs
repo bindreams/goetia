@@ -8,10 +8,9 @@ use cosca::Stdio;
 use super::super::sweep::normalise;
 use super::*;
 use crate::backend::scm::kill::system::{has_exited, open_process_with, wait_exit};
+use crate::backend::scm::test_support::SHIM_HEX;
 use crate::backend::scm::wait::Waited;
 use crate::manager::budget::Budget;
-
-const HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 /// A running copy of `ping.exe` named like a shim, in a temp dir that outlives it.
 struct Running {
@@ -23,7 +22,7 @@ struct Running {
 
 fn run_a_copy() -> Running {
     let dir = tempfile::tempdir().unwrap();
-    let exe = dir.path().join(format!("goetia-shim-{HEX}.exe"));
+    let exe = dir.path().join(format!("goetia-shim-{SHIM_HEX}.exe"));
     let system = std::env::var_os("SystemRoot").expect("SystemRoot");
     std::fs::copy(Path::new(&system).join(r"System32\ping.exe"), &exe).unwrap();
     let mut command = cosca::run([exe.as_os_str(), "-t".as_ref(), "127.0.0.1".as_ref()]);

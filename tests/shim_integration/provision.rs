@@ -19,7 +19,7 @@ use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
 use goetia::spec::{DaemonFields, DaemonSpec, User};
-use goetia::testing::{Ace, FakeProvider, command};
+use goetia::testing::{Ace, FakeProvider, command, units_until_nul, wide_null};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -177,15 +177,9 @@ fn sddl_of(descriptor: PSECURITY_DESCRIPTOR) -> String {
         )
     };
     assert_ne!(ok, 0, "write a descriptor as SDDL: {}", std::io::Error::last_os_error());
-    let mut len = 0;
-    // SAFETY: `text` is a NUL-terminated string that stays live until it is freed below.
-    while unsafe { *text.add(len) } != 0 {
-        len += 1;
-    }
-    // SAFETY: the `len` units before the NUL were just read; `text` was allocated by the call
-    // above and is freed once.
+    // SAFETY: `text` is a NUL-terminated string that stays live until it is freed, once, below.
     unsafe {
-        let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+        let sddl = String::from_utf16_lossy(units_until_nul(text));
         LocalFree(text.cast());
         sddl
     }
@@ -193,8 +187,7 @@ fn sddl_of(descriptor: PSECURITY_DESCRIPTOR) -> String {
 
 /// The owner and DACL of the file or folder `path`, as SDDL.
 fn security_of(path: &Path) -> String {
-    use std::os::windows::ffi::OsStrExt as _;
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide = wide_null(path);
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `wide` is NUL-terminated; the out-pointer for the descriptor is a valid lvalue and
     // the others are not asked for.
@@ -219,7 +212,7 @@ fn security_of(path: &Path) -> String {
 
 /// `sddl` as the system writes it, so that two spellings of one descriptor are equal.
 fn normalised(sddl: &str) -> String {
-    let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide = wide_null(sddl);
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `wide` is NUL-terminated; the descriptor out-pointer is valid and the size is not asked for.
     let ok = unsafe {
@@ -756,7 +749,7 @@ const LOCK_NAME: &str = r"Global\goetia-shim";
 
 /// The lock, opened to read its permissions and to wait on it.
 fn open_lock() -> OwnedHandle {
-    let name = support::wide_null(LOCK_NAME);
+    let name = wide_null(LOCK_NAME);
     // SAFETY: `name` is NUL-terminated; the handle is checked, then owned.
     let raw = unsafe { OpenMutexW(SYNCHRONIZE | READ_CONTROL, 0, name.as_ptr()) };
     assert!(
@@ -887,7 +880,7 @@ fn lock_made_by_this_user(dacl: &str) -> OwnedHandle {
         .nth(1)
         .unwrap_or_else(|| panic!("no SID in {whoami}"))
         .to_string();
-    let sddl = support::wide_null(&format!("O:{sid}D:{dacl}"));
+    let sddl = wide_null(format!("O:{sid}D:{dacl}"));
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated; `descriptor` is a valid out-pointer, freed below.
     let converted = unsafe {
@@ -909,7 +902,7 @@ fn lock_made_by_this_user(dacl: &str) -> OwnedHandle {
         lpSecurityDescriptor: descriptor,
         bInheritHandle: 0,
     };
-    let name = support::wide_null(LOCK_NAME);
+    let name = wide_null(LOCK_NAME);
     // SAFETY: `attributes` points at `descriptor`, live for the call; `name` is NUL-terminated.
     let raw = unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) };
     // SAFETY: read straight after the call; `descriptor` is freed once, after its last use.

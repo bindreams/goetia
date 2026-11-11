@@ -21,7 +21,7 @@ use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, OpenMutexW, ReleaseMutex, WaitForSingleObject};
 
 use super::acl::{Descriptor, account_name, is_trusted, kernel_object_owner};
-use crate::backend::scm::manager::identity::wide_null;
+use crate::backend::scm::wide::wide_null;
 use crate::elevation::token_has_administrators;
 use crate::error::{Error, Result};
 

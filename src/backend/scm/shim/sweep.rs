@@ -321,16 +321,15 @@ pub(crate) use system::{normalise, referenced_hosts, sweep_folder};
 
 #[cfg(windows)]
 mod system {
-    use std::ffi::OsString;
     use std::fs;
     use std::io;
-    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::path::{Path, PathBuf};
 
     use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 
     use super::super::acl::{FolderCheck, display_path, lexical};
     use super::super::processes::running_images;
+    use crate::backend::scm::wide::wide_null;
     use windows_service::service_manager::ServiceManagerAccess;
 
     use super::{SweepFailure, image_of, image_references, same_path, unreferenced};
@@ -401,10 +400,7 @@ mod system {
     /// `text` with each `%NAME%` replaced by the variable's value, as the system expands a
     /// `REG_EXPAND_SZ`; a name that is not set stays as written.
     pub(super) fn expand_environment(text: &str) -> String {
-        let source: Vec<u16> = std::ffi::OsStr::new(text)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let source = wide_null(text);
         let mut buf = vec![0u16; 512];
         loop {
             // SAFETY: `source` is NUL-terminated and `buf` is `buf.len()` writable units.
@@ -416,7 +412,7 @@ mod system {
             }
             if needed <= buf.len() {
                 // `needed` counts the NUL.
-                return OsString::from_wide(&buf[..needed - 1]).to_string_lossy().into_owned();
+                return String::from_utf16_lossy(&buf[..needed - 1]);
             }
             buf.resize(needed, 0);
         }

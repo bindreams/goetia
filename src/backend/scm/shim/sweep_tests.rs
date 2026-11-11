@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::backend::scm::test_support::SHIM_HEX;
 
-const HEX_A: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 const HEX_B: &str = "cb7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 fn current(dir: &str, hex: &str) -> PathBuf {
@@ -18,10 +18,10 @@ fn aside(dir: &str, hex: &str) -> PathBuf {
 
 #[skuld::test]
 fn unreferenced_keeps_referenced_case_insensitively() {
-    let files = [current("/p/Goetia", HEX_A), current("/p/Goetia", HEX_B)];
+    let files = [current("/p/Goetia", SHIM_HEX), current("/p/Goetia", HEX_B)];
     let referenced = [PathBuf::from(format!(
         "/P/GOETIA/GOETIA-SHIM-{}.EXE",
-        HEX_A.to_uppercase()
+        SHIM_HEX.to_uppercase()
     ))];
 
     assert_eq!(unreferenced(&files, &referenced), vec![current("/p/Goetia", HEX_B)]);
@@ -29,14 +29,17 @@ fn unreferenced_keeps_referenced_case_insensitively() {
 
 #[skuld::test]
 fn unreferenced_matches_stale_aside_files() {
-    let files = [aside("/p", HEX_A), current("/p", HEX_A)];
+    let files = [aside("/p", SHIM_HEX), current("/p", SHIM_HEX)];
 
     assert_eq!(
         unreferenced(&files, &[]),
-        vec![aside("/p", HEX_A), current("/p", HEX_A)]
+        vec![aside("/p", SHIM_HEX), current("/p", SHIM_HEX)]
     );
     // A renamed-aside file a running process has as its image is as referenced as any other.
-    assert_eq!(unreferenced(&files, &[aside("/p", HEX_A)]), vec![current("/p", HEX_A)]);
+    assert_eq!(
+        unreferenced(&files, &[aside("/p", SHIM_HEX)]),
+        vec![current("/p", SHIM_HEX)]
+    );
 }
 
 #[skuld::test]
@@ -44,19 +47,19 @@ fn unreferenced_ignores_other_files() {
     let files = [
         PathBuf::from("/p/goetia-shim.exe"),
         PathBuf::from("/p/notes.txt"),
-        PathBuf::from(format!("/p/goetia-shim-{HEX_A}.exe.bak")),
-        current("/p", HEX_A),
+        PathBuf::from(format!("/p/goetia-shim-{SHIM_HEX}.exe.bak")),
+        current("/p", SHIM_HEX),
     ];
 
-    assert_eq!(unreferenced(&files, &[]), vec![current("/p", HEX_A)]);
+    assert_eq!(unreferenced(&files, &[]), vec![current("/p", SHIM_HEX)]);
 }
 
 /// A process that could not be opened is known by its file name alone, which references every file of
 /// that name, whatever its folder.
 #[skuld::test]
 fn unreferenced_keeps_every_file_of_a_referenced_bare_name() {
-    let files = [current("/a", HEX_A), current("/b", HEX_A), current("/a", HEX_B)];
-    let referenced = [PathBuf::from(format!("GOETIA-SHIM-{HEX_A}.exe"))];
+    let files = [current("/a", SHIM_HEX), current("/b", SHIM_HEX), current("/a", HEX_B)];
+    let referenced = [PathBuf::from(format!("GOETIA-SHIM-{SHIM_HEX}.exe"))];
 
     assert_eq!(unreferenced(&files, &referenced), vec![current("/a", HEX_B)]);
 }
@@ -115,32 +118,32 @@ fn shim_name(hex: &str) -> String {
 /// not be the one SCM makes, and may have failed.
 #[skuld::test]
 fn an_image_path_with_a_variable_also_references_by_file_name() {
-    let raw = format!(r"%ProgramFiles%\Goetia\{}", shim_name(HEX_A));
-    let expanded = format!(r"C:\Program Files\Goetia\{}", shim_name(HEX_A));
+    let raw = format!(r"%ProgramFiles%\Goetia\{}", shim_name(SHIM_HEX));
+    let expanded = format!(r"C:\Program Files\Goetia\{}", shim_name(SHIM_HEX));
 
     let references = image_references(&raw, &expanded);
 
     assert!(references.contains(&expanded), "{references:?}");
-    assert!(references.contains(&shim_name(HEX_A)), "by name: {references:?}");
+    assert!(references.contains(&shim_name(SHIM_HEX)), "by name: {references:?}");
 }
 
 #[skuld::test]
 fn an_expansion_that_changed_nothing_still_references_by_file_name() {
-    let raw = format!(r"%Unset%\{}", shim_name(HEX_A));
+    let raw = format!(r"%Unset%\{}", shim_name(SHIM_HEX));
 
-    assert!(image_references(&raw, &raw).contains(&shim_name(HEX_A)));
+    assert!(image_references(&raw, &raw).contains(&shim_name(SHIM_HEX)));
 }
 
 #[skuld::test]
 fn an_extensionless_image_path_with_a_variable_references_the_name_with_exe() {
-    let raw = format!(r"%ProgramFiles%\Goetia\goetia-shim-{HEX_A}");
+    let raw = format!(r"%ProgramFiles%\Goetia\goetia-shim-{SHIM_HEX}");
 
-    assert!(image_references(&raw, &raw).contains(&shim_name(HEX_A)));
+    assert!(image_references(&raw, &raw).contains(&shim_name(SHIM_HEX)));
 }
 
 #[skuld::test]
 fn an_image_path_without_a_variable_is_not_a_name() {
-    let path = format!(r"C:\Goetia\{}", shim_name(HEX_A));
+    let path = format!(r"C:\Goetia\{}", shim_name(SHIM_HEX));
 
     assert_eq!(image_references(&path, &path), [path]);
 }
@@ -515,7 +518,7 @@ fn an_unresolvable_default_folder_is_an_error_for_any_other_folder() {
 mod windows {
     use std::ffi::OsString;
     use std::fs::{self, File, OpenOptions};
-    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::os::windows::ffi::OsStringExt as _;
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::path::Path;
 
@@ -525,6 +528,7 @@ mod windows {
     use super::*;
     use crate::backend::scm::shim::acl::acl_tests::windows::junction;
     use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
+    use crate::backend::scm::wide::wide_null;
     use crate::error::Error;
 
     /// No check on the folder.
@@ -573,7 +577,7 @@ mod windows {
 
     /// `path` by its 8.3 names where the volume keeps them, and unchanged where it does not.
     fn short(path: &Path) -> PathBuf {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let wide = wide_null(path);
         let mut buf = vec![0u16; 1024];
         // SAFETY: `wide` is NUL-terminated and `buf` is `buf.len()` writable units.
         let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
@@ -589,7 +593,7 @@ mod windows {
     fn normalise_equates_spellings() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
-        let file = shim_in(dir.path(), HEX_A);
+        let file = shim_in(dir.path(), SHIM_HEX);
         fs::write(&file, b"x").unwrap();
         let link = dir.path().join("link");
         junction(&link, dir.path());
@@ -628,7 +632,7 @@ mod windows {
     fn sweep_reports_every_failure() {
         let dir = tempfile::tempdir().unwrap();
         // Held open without delete sharing: deleting each fails with a sharing violation.
-        let held: Vec<(PathBuf, File)> = [HEX_A, HEX_B, HEX_C]
+        let held: Vec<(PathBuf, File)> = [SHIM_HEX, HEX_B, HEX_C]
             .iter()
             .map(|hex| {
                 let path = shim_in(dir.path(), hex);
@@ -669,7 +673,7 @@ mod windows {
     #[skuld::test]
     fn sweep_folder_keeps_an_explicit_referenced_file() {
         let dir = tempfile::tempdir().unwrap();
-        let (kept, swept) = (shim_in(dir.path(), HEX_A), shim_in(dir.path(), HEX_B));
+        let (kept, swept) = (shim_in(dir.path(), SHIM_HEX), shim_in(dir.path(), HEX_B));
         fs::write(&kept, b"x").unwrap();
         fs::write(&swept, b"x").unwrap();
 
@@ -684,7 +688,7 @@ mod windows {
     #[skuld::test]
     fn sweep_removes_a_folder_a_repair_set_aside() {
         let dir = tempfile::tempdir().unwrap();
-        let aside = dir.path().join(format!("goetia-shim-{HEX_A}.k3j9.stale.exe"));
+        let aside = dir.path().join(format!("goetia-shim-{SHIM_HEX}.k3j9.stale.exe"));
         fs::create_dir(&aside).unwrap();
         fs::write(aside.join("inside"), b"x").unwrap();
 
@@ -737,7 +741,7 @@ mod windows {
     #[skuld::test]
     fn a_folder_the_check_refuses_is_not_swept() {
         let dir = tempfile::tempdir().unwrap();
-        let file = shim_in(dir.path(), HEX_A);
+        let file = shim_in(dir.path(), SHIM_HEX);
         fs::write(&file, b"x").unwrap();
 
         let failure = sweep_folder(dir.path(), &[], &on(), elsewhere)
