@@ -208,7 +208,8 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
             }
         });
 
-        // `daemon-reload` is asked only of an install that wrote; a raced one refuses and asks nothing.
+        // Every install asks the version gate's probes; only one that wrote asks `daemon-reload`, so a
+        // raced one leaves that reply unused.
         let mgr = over(gate_then([reply(&["daemon-reload"], exited(0, "", ""))]));
         let stop = StopRacer(&done);
         let outcome = flow::install(&mgr, &spec, false);
