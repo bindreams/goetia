@@ -224,20 +224,6 @@ mod windows {
     }
 
     #[skuld::test]
-    fn carries_marker_accepts_a_marker_of_any_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = temp_file(&dir, &host_with(&marker_bytes(&other_version(VERSION)), 10, 10));
-        assert!(carries_marker(&path).unwrap());
-    }
-
-    #[skuld::test]
-    fn carries_marker_refuses_a_file_without_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = temp_file(&dir, b"MZ not a host");
-        assert!(!carries_marker(&path).unwrap());
-    }
-
-    #[skuld::test]
     fn verify_reports_a_file_it_cannot_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("absent.exe");

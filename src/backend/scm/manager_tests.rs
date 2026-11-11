@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use super::*;
 use crate::backend::scm::parameters::Stray;
-use crate::backend::scm::test_support::every_reported;
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::Restart;
@@ -1217,40 +1216,5 @@ fn a_stop_failure_on_a_service_marked_by_someone_else_does_not_claim_a_disable()
     assert!(text.contains("goetia daemon kill frpc"), "{text}");
     for stale in ["NOT deleted", "disabled", "goetia daemon enable", "goetia daemon start"] {
         assert!(!text.contains(stale), "`{stale}` is false for a marked service: {text}");
-    }
-}
-
-/// A held shim ends with the code of the report its record decodes to, which is what the shim itself
-/// exits with. A shim whose record is missing or decodes to no report, and anything that is not a
-/// shim, ends with the kill's code: the audit log records a process's exit code, and a forced kill
-/// must not read as a clean exit.
-#[skuld::test]
-fn a_held_process_ends_with_its_reports_code_only_when_it_is_a_shim() {
-    // `Refused` exits with the kill's code, which a shim and a non-shim cannot be told apart by.
-    for reported in every_reported()
-        .into_iter()
-        .filter(|r| r.process_exit_code() != KILLED_EXIT_CODE)
-    {
-        let (win32, specific) = reported.scm_codes();
-        let record = Some(RecordedExit { win32, specific });
-
-        assert_eq!(
-            stop_exit_code(true, record),
-            reported.process_exit_code(),
-            "{reported:?}"
-        );
-        // The image decides, not the pair.
-        assert_eq!(stop_exit_code(false, record), KILLED_EXIT_CODE, "{reported:?}");
-    }
-    assert_eq!(stop_exit_code(true, None), KILLED_EXIT_CODE);
-    assert_eq!(
-        stop_exit_code(true, Some(RecordedExit { win32: 5, specific: 9 })),
-        KILLED_EXIT_CODE
-    );
-    for (win32, specific) in [(0, 0), (5, 0)] {
-        assert_eq!(
-            stop_exit_code(false, Some(RecordedExit { win32, specific })),
-            KILLED_EXIT_CODE
-        );
     }
 }

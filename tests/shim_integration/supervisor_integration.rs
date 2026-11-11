@@ -8,15 +8,14 @@
 
 use std::collections::BTreeMap;
 
-use goetia::backend::scm::exit_status::{RecordedExit, Reported, SHIM_REFUSED};
+use goetia::backend::scm::exit_status::{RecordedExit, SHIM_REFUSED};
 use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonFields, DaemonSpec, Restart};
 use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::KEY_WRITE;
 
 use crate::common::{
-    LogDir, ShimGuard, ShimProcess, UNIT_DIR_EXCLUSIVE, fixture_command, manager, recorded_exit, scm_status,
-    simple_spec,
+    LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, fixture_command, manager, recorded_exit, scm_status, simple_spec,
 };
 use crate::support::registry::{parameters_key, service_key};
 use crate::support::{self, ConnectBack, ELEVATED};
@@ -122,18 +121,9 @@ fn stop_kills_the_whole_process_tree() {
     mgr.start(&spec.id, Budget::DEFAULT).expect("start");
     let child_pid = child_reported.accept_line("the direct child to start and report its pid");
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
-    let shim = ShimProcess::attach(&id);
 
-    // A waiting `stop` returns once SCM confirms `STOPPED`, so the record is final, and ends the shim's
-    // process with that record: the shim's exit code is the one SCM holds, 0 for a clean stop.
+    // `stop` returns once SCM confirms `STOPPED`, so the shim has reported and the record is final.
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-    assert_eq!(
-        shim.wait_for_exit(),
-        Reported::from_record(recorded_exit(&id))
-            .expect("a clean stop's record is a report")
-            .process_exit_code() as u32,
-        "the shim's process exit code differs from the code SCM recorded"
-    );
 
     // The stop reached the whole tree, not only the direct child.
     assert!(

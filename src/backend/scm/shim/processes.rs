@@ -16,15 +16,17 @@ use std::os::windows::ffi::OsStringExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::PathBuf;
 
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
-use windows_sys::Win32::System::Threading::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+use windows_sys::Win32::System::Threading::{
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
+};
 
 use super::embedded::shim_file;
 use super::sweep::normalise;
-use crate::backend::scm::kill::system::{has_exited, image_of, open_process_with};
+use crate::backend::scm::kill::system::{has_exited, open_process_with};
 use crate::error::{Error, Result};
 
 /// What a process is opened with: to read its image and to wait for its exit.
@@ -82,6 +84,27 @@ fn open(pid: u32, name: OsString) -> Option<Seen> {
             Ok(true) => None,
             Ok(false) | Err(_) => Some(Seen::Unnamed(name)),
         },
+    }
+}
+
+/// The path of the executable the process behind `process` was started from.
+fn image_of(process: &OwnedHandle) -> io::Result<PathBuf> {
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let mut len = buf.len() as u32;
+        // SAFETY: `process` is a live handle with `PROCESS_QUERY_LIMITED_INFORMATION`; `buf` is
+        // `len` writable units, and `len` is a valid in-out parameter.
+        let ok = unsafe {
+            QueryFullProcessImageNameW(process.as_raw_handle(), PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+        };
+        if ok != 0 {
+            return Ok(PathBuf::from(OsString::from_wide(&buf[..len as usize])));
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return Err(e);
+        }
+        buf.resize(buf.len() * 2, 0);
     }
 }
 

@@ -98,19 +98,6 @@ impl Reported {
             Reported::Refused => (0, SHIM_REFUSED),
         }
     }
-
-    /// The report whose [`Reported::scm_codes`] are `record`, the inverse of that mapping; `None` for
-    /// a pair no report produces.
-    pub fn from_record(record: RecordedExit) -> Option<Reported> {
-        match (record.win32, record.specific) {
-            (0, 0) => Some(Reported::Clean),
-            (INCOMPLETE_STOP_WIN32, ERROR_CAN_NOT_COMPLETE) => Some(Reported::IncompleteStop),
-            (0, SHIM_REFUSED) => Some(Reported::Refused),
-            (ERROR_SERVICE_SPECIFIC_ERROR, code) if code != 0 => Some(Reported::DaemonExit(code)),
-            (code, 0) if code != 0 && code != ERROR_SERVICE_SPECIFIC_ERROR => Some(Reported::ShimFailure(code)),
-            _ => None,
-        }
-    }
 }
 
 /// The exit codes SCM holds for a service that reached `STOPPED`: what the shim reported, or
@@ -140,14 +127,14 @@ impl RecordedExit {
 
     /// Whether this is [`Reported::Refused`]'s record: the shim started no daemon.
     pub fn is_refusal(self) -> bool {
-        Reported::from_record(self) == Some(Reported::Refused)
+        (self.win32, self.specific) == Reported::Refused.scm_codes()
     }
 
     /// Whether this is [`Reported::IncompleteStop`]'s record: a daemon the shim launched may still
     /// be running. A daemon that itself exits 1003 is
     /// [`ERROR_SERVICE_SPECIFIC_ERROR`] with specific 1003, not this.
     pub fn is_incomplete_stop(self) -> bool {
-        Reported::from_record(self) == Some(Reported::IncompleteStop)
+        (self.win32, self.specific) == Reported::IncompleteStop.scm_codes()
     }
 }
 

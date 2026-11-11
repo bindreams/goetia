@@ -72,36 +72,6 @@ pub enum Waited {
     Expired,
 }
 
-/// How a wait ended, and what SCM had recorded when it reached its target. [`Waited::Expired`] has
-/// no record, and nor has a service found gone, which nothing was read from.
-#[must_use = "an expired wait did not confirm the state; decide what to report rather than discarding it"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WaitEnd {
-    pub waited: Waited,
-    /// The exit record of the status or notification that confirmed the target.
-    pub exit: Option<RecordedExit>,
-}
-
-impl WaitEnd {
-    const EXPIRED: WaitEnd = WaitEnd {
-        waited: Waited::Expired,
-        exit: None,
-    };
-
-    /// A service found gone: stopped, with nothing read.
-    const CONFIRMED_WITHOUT_A_RECORD: WaitEnd = WaitEnd {
-        waited: Waited::Confirmed,
-        exit: None,
-    };
-
-    fn confirmed_by(status: QueriedStatus) -> WaitEnd {
-        WaitEnd {
-            waited: Waited::Confirmed,
-            exit: Some(status.exit),
-        }
-    }
-}
-
 /// What an [`ScmActor::arm`] came to.
 ///
 /// `#[must_use]`, like `Waited`: dropping it reads an expiry as a registration.
@@ -203,7 +173,7 @@ pub trait ScmActor {
 /// fire at once for a `STOPPED` already current, and a service that failed to `STOPPED` just before it
 /// can be running again, by a recovery restart, when the STOP lands; that stale `STOPPED` would confirm
 /// a stop of a running service.
-pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<WaitEnd> {
+pub(crate) fn stop_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
     // Issued whatever is left of the budget: only the *waiting* is bounded.
     control_stop_or_underway(a)?;
     wait_after_stop(a, deadline, " Run `stop` again.", StopSeen::Requested)
@@ -226,23 +196,22 @@ pub(crate) enum EndProcessOutcome<P> {
 /// Ends `process`, the service's process held before its STOP, once SCM has confirmed `STOPPED`: the
 /// one end of a held process, for `stop` and `uninstall` alike. SCM records `STOPPED` before the
 /// process exits (a shim reports it and then exits), so `STOPPED` alone leaves a file the process
-/// runs in use. The process is terminated whatever was recorded: a service's own exe lingers after
-/// `STOPPED`, and an unbounded wait needs the backstop.
+/// runs in use.
 ///
 /// `terminate` ends the process, as the documentation of `SetServiceStatus` allows once
-/// `SERVICE_STOPPED` is reported, and `await_exit` then waits for its exit under `deadline` and says
-/// whether it did. Whatever `terminate` returns, the wait follows: SCM has confirmed the stop, so a failure
+/// `SERVICE_STOPPED` is reported, and `exit` then waits for its exit under `deadline` and says whether
+/// it did. Whatever `terminate` returns, the wait follows: SCM has confirmed the stop, so a failure
 /// to end the process is no failure of the end, and the process may be on its way out by itself. The
-/// failure is kept: `await_exit` is handed it for its notice, and
-/// [`Lingers`](EndProcessOutcome::Lingers) carries it. An `await_exit` that fails is the error.
+/// failure is kept: `exit` is handed it for its notice, and [`Lingers`](EndProcessOutcome::Lingers)
+/// carries it. An `exit` that fails is the error.
 pub(crate) fn end_process<P>(
     process: P,
     deadline: Deadline,
     terminate: impl FnOnce(&P) -> io::Result<()>,
-    await_exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
+    exit: impl FnOnce(&P, Deadline, Option<&io::Error>) -> io::Result<Waited>,
 ) -> io::Result<EndProcessOutcome<P>> {
     let terminate_failed = terminate(&process).err().map(Arc::new);
-    Ok(match await_exit(&process, deadline, terminate_failed.as_deref())? {
+    Ok(match exit(&process, deadline, terminate_failed.as_deref())? {
         Waited::Confirmed => EndProcessOutcome::Exited,
         Waited::Expired => EndProcessOutcome::Lingers {
             process,
@@ -273,9 +242,7 @@ pub(crate) enum StopAndAwaitExitOutcome<P> {
 
 /// [`stop_via_notify`], then, once SCM has confirmed `STOPPED`, the end of `held`, the service's
 /// process as it was before the STOP was sent. `end` is [`end_process`] over the real process, under
-/// the same `deadline`, and is told the exit SCM recorded when it confirmed `STOPPED` (`None` for a
-/// service found gone), which decides the code the process is ended with. The process is ended either
-/// way; one that outlasts the deadline is
+/// the same `deadline`; a process that outlasts it is
 /// [`ProcessExpired`](StopAndAwaitExitOutcome::ProcessExpired), not an unconfirmed stop, and carries
 /// the failed terminate, if any. No process held (none reported, or none that could be opened) is the
 /// stop alone.
@@ -296,7 +263,7 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
     a: &mut A,
     deadline: Deadline,
     held: &mut HoldOutcome<P>,
-    end: impl FnOnce(P, Deadline, Option<RecordedExit>) -> io::Result<EndProcessOutcome<P>>,
+    end: impl FnOnce(P, Deadline) -> io::Result<EndProcessOutcome<P>>,
 ) -> io::Result<StopAndAwaitExitOutcome<P>> {
     if let HoldOutcome::Expired { pid } = *held {
         control_stop_or_underway(a)?;
@@ -310,14 +277,13 @@ pub(crate) fn stop_and_await_exit<A: ScmActor, P>(
         // Why a refused process is not held is the caller's to report: it knows where.
         HoldOutcome::NoProcess | HoldOutcome::Refused(_) | HoldOutcome::Expired { .. } => None,
     };
-    let stopped = stop_via_notify(a, deadline)?;
-    if stopped.waited == Waited::Expired {
+    if stop_via_notify(a, deadline)? == Waited::Expired {
         return Ok(StopAndAwaitExitOutcome::ServiceExpired);
     }
     let Some(process) = process else {
         return Ok(StopAndAwaitExitOutcome::Stopped);
     };
-    Ok(match end(process, deadline, stopped.exit)? {
+    Ok(match end(process, deadline)? {
         EndProcessOutcome::Exited => StopAndAwaitExitOutcome::Stopped,
         EndProcessOutcome::Lingers {
             process,
@@ -473,7 +439,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
     a: &mut A,
     deadline: Deadline,
     mut hold: impl FnMut(&mut A) -> io::Result<()>,
-) -> io::Result<WaitEnd> {
+) -> io::Result<Waited> {
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so a
     // `RUNNING`, `PAUSED` or `STOPPED` service is read from the notification; the status it returns
     // is for the states the mask excludes, `STOP_PENDING` among them, which no notification reports.
@@ -495,7 +461,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
             None => {
                 refused = None;
                 match a.wait_callback(deadline)? {
-                    None => return Ok(WaitEnd::EXPIRED),
+                    None => return Ok(Waited::Expired),
                     Some(observed) => notified_state(observed)
                         .and_then(|state| seen_in(delivered_status(a, state)))
                         .unwrap_or(Seen::Pending),
@@ -503,7 +469,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
             }
         };
         match seen {
-            Seen::Stopped(status) => return Ok(WaitEnd::confirmed_by(status)),
+            Seen::Stopped => return Ok(Waited::Confirmed),
             Seen::Pending => {
                 let status = match decided_or_status(
                     a.arm(WantState::RunningPausedOrStopped, deadline)?,
@@ -547,19 +513,21 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
 
 /// What [`settle_and_stop`] learned, from a notification or from the status an arm returned.
 enum Seen {
-    /// With the exit SCM recorded, in its status.
-    Stopped(QueriedStatus),
+    Stopped,
     /// A pending state.
     Pending,
     /// `RUNNING` or `PAUSED`, named as the errors name it.
-    Settled { state: &'static str, accepts_stop: bool },
+    Settled {
+        state: &'static str,
+        accepts_stop: bool,
+    },
 }
 
 /// The state to act on in `status`, if it is one: the settled states, and `None` for every other,
 /// which is waited for.
 fn seen_in(status: QueriedStatus) -> Option<Seen> {
     match status.state {
-        QueriedState::Stopped => Some(Seen::Stopped(status)),
+        QueriedState::Stopped => Some(Seen::Stopped),
         QueriedState::Running => Some(Seen::Settled {
             state: "RUNNING",
             accepts_stop: status.accepts_stop,
@@ -602,12 +570,7 @@ pub enum StopSeen {
 /// `seen` is what the caller has already seen of the stop: after [`StopSeen::Requested`] the first arm
 /// is `STOPPED` and `STOP_PENDING`, and a first read of anything else waits; after [`StopSeen::Pending`]
 /// the first arm is `STOPPED` alone, and a first read of anything but `STOP_PENDING` or `STOPPED` fails.
-pub fn wait_after_stop<A: ScmActor>(
-    a: &mut A,
-    deadline: Deadline,
-    advice: &str,
-    seen: StopSeen,
-) -> io::Result<WaitEnd> {
+pub fn wait_after_stop<A: ScmActor>(a: &mut A, deadline: Deadline, advice: &str, seen: StopSeen) -> io::Result<Waited> {
     wait_until(
         a,
         match seen {
@@ -663,7 +626,7 @@ pub fn wait_until<A: ScmActor>(
     target: QueriedState,
     deadline: Deadline,
     mut other: impl FnMut(Sighting) -> io::Result<ControlFlow<Waited>>,
-) -> io::Result<WaitEnd> {
+) -> io::Result<Waited> {
     let mut armed = Some(a.arm(first, deadline)?);
     // The states the latest arm registered for.
     let mut mask = first;
@@ -677,7 +640,7 @@ pub fn wait_until<A: ScmActor>(
                 Err(waited) => return Ok(waited),
             },
             None => match a.wait_callback(deadline)? {
-                None => return Ok(WaitEnd::EXPIRED),
+                None => return Ok(Waited::Expired),
                 Some(observed) => match notified_state(observed).filter(|state| mask.states().contains(state)) {
                     // A delivery reports the state at registration, which the service can have left by now.
                     Some(QueriedState::Paused) => Some(a.query_status()?),
@@ -688,14 +651,13 @@ pub fn wait_until<A: ScmActor>(
         };
         if let Some(status) = status {
             if status.state == target {
-                return Ok(WaitEnd::confirmed_by(status));
+                return Ok(Waited::Confirmed);
             }
-            // An answer `other` decided is no sighting of the target, so it carries no record.
             if let ControlFlow::Break(waited) = other(Sighting {
                 status,
                 pending_delivered,
             })? {
-                return Ok(WaitEnd { waited, exit: None });
+                return Ok(waited);
             }
         }
         if after_callback {
@@ -733,13 +695,13 @@ fn delivered_status<A: ScmActor>(a: &A, state: QueriedState) -> QueriedStatus {
 /// so nothing can be waited for and the status read in the arm's place decides: the `wanted` state is
 /// [`Waited::Confirmed`], and any other is the error [`marked_for_deletion`] says. A service that is gone
 /// ([`Armed::Gone`]) is stopped, so it confirms a wait for `STOPPED` and is [`service_gone`] to any other.
-fn decided_or_status(armed: Armed, wanted: QueriedState) -> io::Result<Result<QueriedStatus, WaitEnd>> {
+fn decided_or_status(armed: Armed, wanted: QueriedState) -> io::Result<Result<QueriedStatus, Waited>> {
     match armed {
         Armed::Registered(status) => Ok(Ok(status)),
-        Armed::Expired => Ok(Err(WaitEnd::EXPIRED)),
-        Armed::Unwatchable(status) if status.state == wanted => Ok(Err(WaitEnd::confirmed_by(status))),
+        Armed::Expired => Ok(Err(Waited::Expired)),
+        Armed::Unwatchable(status) if status.state == wanted => Ok(Err(Waited::Confirmed)),
         Armed::Unwatchable(status) => Err(marked_for_deletion(status.state)),
-        Armed::Gone if wanted == QueriedState::Stopped => Ok(Err(WaitEnd::CONFIRMED_WITHOUT_A_RECORD)),
+        Armed::Gone if wanted == QueriedState::Stopped => Ok(Err(Waited::Confirmed)),
         Armed::Gone => Err(service_gone()),
     }
 }
@@ -831,7 +793,6 @@ pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind:
             _ => Ok(ControlFlow::Continue(())),
         },
     )
-    .map(|end| end.waited)
 }
 
 /// What a terminal `Stopped` before `Running` means, from the `exit` record and `wait_hint` it carried:

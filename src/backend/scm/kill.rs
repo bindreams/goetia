@@ -23,11 +23,6 @@ use crate::backend::scm::wait::Waited;
 use crate::error::{Chain, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
-/// The exit code a kill ends the process with: SCM sees a failure, the same as for a crash. It is also
-/// what `stop` and `uninstall` end a held process with when no shim code is known; that code reaches no
-/// one in SCM, whose status is already recorded, and is only what the process exits with.
-pub(crate) const KILLED_EXIT_CODE: i32 = 1;
-
 /// What a kill did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Killed {
@@ -307,21 +302,15 @@ pub use system::SystemKillTarget;
 
 #[cfg(windows)]
 pub(in crate::backend::scm) mod system {
-    use std::ffi::OsString;
     use std::io;
     use std::mem::size_of;
-    use std::os::windows::ffi::OsStringExt as _;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::path::PathBuf;
 
     use windows_service::service::Service;
-    use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    };
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Services::{QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS};
     use windows_sys::Win32::System::Threading::{
-        INFINITE, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+        INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
     use crate::backend::scm::wait::{
@@ -330,7 +319,7 @@ pub(in crate::backend::scm) mod system {
     use crate::manager::budget::{Budget, Deadline};
 
     use super::privilege::DebugPrivilege;
-    use super::{KILLED_EXIT_CODE, KillTarget, ReleaseWatch, Termination};
+    use super::{KillTarget, ReleaseWatch, Termination};
 
     /// The real SCM service; the process is a Win32 handle.
     pub struct SystemKillTarget {
@@ -385,20 +374,10 @@ pub(in crate::backend::scm) mod system {
             self.pid
         }
 
-        /// The path of the executable this process was started from, read through a separate
-        /// query-limited open of its pid, so the hold's own access never widens. This handle keeps
-        /// the pid from being reused meanwhile. Fails when that open or the read does.
-        pub(in crate::backend::scm) fn image(&self) -> io::Result<PathBuf> {
-            let reader = open_process_with(self.pid, PROCESS_QUERY_LIMITED_INFORMATION)?
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-            image_of(&reader)
-        }
-
-        /// Ends the process through this handle, never by pid, with exit code `code`, and does not
-        /// wait for it: a process that has already exited, or is exiting, is success, and
-        /// [`Self::wait_for_exit`] is the wait.
-        pub(in crate::backend::scm) fn terminate(&self, code: i32) -> io::Result<()> {
-            request_termination(&self.handle, code).map(|_| ())
+        /// Ends the process through this handle, never by pid, and does not wait for it: a process
+        /// that has already exited, or is exiting, is success, and [`Self::wait_for_exit`] is the wait.
+        pub(in crate::backend::scm) fn terminate(&self) -> io::Result<()> {
+            request_termination(&self.handle).map(|_| ())
         }
 
         /// Blocks until the process has exited or `deadline` passes. [`wait_exit`] for a caller that
@@ -504,34 +483,12 @@ pub(in crate::backend::scm) mod system {
         Ok(Some(unsafe { OwnedHandle::from_raw_handle(handle) }))
     }
 
-    /// The path of the executable the process behind `process` was started from.
-    pub(in crate::backend::scm) fn image_of(process: &OwnedHandle) -> io::Result<PathBuf> {
-        let mut buf = vec![0u16; 1024];
-        loop {
-            let mut len = buf.len() as u32;
-            // SAFETY: `process` is a live handle with `PROCESS_QUERY_LIMITED_INFORMATION`; `buf` is
-            // `len` writable units, and `len` is a valid in-out parameter.
-            let ok = unsafe {
-                QueryFullProcessImageNameW(process.as_raw_handle(), PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
-            };
-            if ok != 0 {
-                return Ok(PathBuf::from(OsString::from_wide(&buf[..len as usize])));
-            }
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-                return Err(e);
-            }
-            buf.resize(buf.len() * 2, 0);
-        }
-    }
-
-    /// Terminate the process behind `process`, an [`open_process_with`] handle with `PROCESS_TERMINATE`,
-    /// with [`KILLED_EXIT_CODE`].
+    /// Terminate the process behind `process`, an [`open_process_with`] handle with `PROCESS_TERMINATE`.
     ///
     /// `on_wait` runs once, just before blocking on a process that is terminating but has not yet
     /// exited, so a caller can tell a human why nothing returns.
     pub(super) fn terminate_process(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<Termination> {
-        match request_termination(process, KILLED_EXIT_CODE)? {
+        match request_termination(process)? {
             Termination::Terminated => Ok(Termination::Terminated),
             Termination::AlreadyExited => wait_exit_unbounded(process, on_wait).map(|()| Termination::AlreadyExited),
         }
@@ -540,9 +497,10 @@ pub(in crate::backend::scm) mod system {
     /// Ask the process behind `process` to terminate, and do not wait: [`Termination::AlreadyExited`]
     /// is a process that is exiting or has exited, which the caller waits on the handle for as it
     /// needs.
-    fn request_termination(process: &OwnedHandle, code: i32) -> io::Result<Termination> {
+    fn request_termination(process: &OwnedHandle) -> io::Result<Termination> {
+        // Exit code `1`: SCM sees a failure, the same as for a crash.
         // SAFETY: `process` is a live handle with `PROCESS_TERMINATE`.
-        if unsafe { TerminateProcess(process.as_raw_handle(), code as u32) } != 0 {
+        if unsafe { TerminateProcess(process.as_raw_handle(), 1) } != 0 {
             return Ok(Termination::Terminated);
         }
         let e = io::Error::last_os_error();
