@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use super::acl::FolderCheck;
-use super::provider::{HostCommand, ShimProvider};
+use super::provider::{HostCommand, ShimProvider, require_absolute};
 use super::sweep::SweepFailure;
 use crate::error::{Error, Result};
 
@@ -24,13 +24,16 @@ impl StandaloneShim {
 impl ShimProvider for StandaloneShim {
     /// The command as given. A relative `exe` is [`Error::ShimPathRelative`].
     fn preview(&self) -> Result<HostCommand> {
-        if !self.exe.is_absolute() {
-            return Err(Error::ShimPathRelative { path: self.exe.clone() });
-        }
+        require_absolute(&self.exe)?;
         Ok(HostCommand {
             exe: self.exe.clone(),
             args: self.args.clone(),
         })
+    }
+
+    /// None: its `sweep` removes nothing, so the folder of `exe` is not one it sweeps.
+    fn folder(&self) -> Result<Option<PathBuf>> {
+        Ok(None)
     }
 
     /// The same, once the file is confirmed to exist.

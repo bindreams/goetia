@@ -215,10 +215,10 @@ pub(crate) fn second_folder<'a>(
 /// What an uninstall knows of the folder its shim provider sweeps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProviderFolder {
-    /// The manager has no provider: nothing is retried.
+    /// The manager has no provider, or its provider sweeps no folder: nothing is retried.
     None,
-    /// It has one, and which folder it uses is not known (its `preview` failed): its sweep is still
-    /// what the retry runs.
+    /// It has one, and its `folder()` failed, so the folder is not known: nothing is retried. The
+    /// stock providers fail their sweep on the same cause.
     Unknown,
     At(PathBuf),
 }
@@ -240,9 +240,9 @@ impl ProviderFolder {
 ///
 /// The retry, `uninstall` of an id that is no longer installed, sweeps the provider's folder alone:
 /// a file in another folder is removed by the next install or uninstall of a manager whose provider
-/// uses that folder, and with no provider nothing is retried at all. For a provider whose folder is
-/// [`Unknown`](ProviderFolder::Unknown) the text promises the retry for what is in that folder and
-/// for no listed file by name, since none is known to be in it.
+/// uses that folder, and with no provider, or one that sweeps no folder, nothing is retried at all.
+/// For a provider whose folder is [`Unknown`](ProviderFolder::Unknown) nothing is promised either:
+/// its sweep fails for the same cause.
 pub(crate) fn left_behind_text(
     id: impl std::fmt::Display,
     provider: &ProviderFolder,
@@ -261,39 +261,37 @@ pub(crate) fn left_behind_text(
             .join(", ")
     };
 
-    let unknown = *provider == ProviderFolder::Unknown;
+    // Why nothing is retried: the retry runs the provider's sweep, which has no folder to sweep, or
+    // whose folder is not known.
+    let no_retry = match provider {
+        ProviderFolder::None => Some("no shim provider of this program sweeps a folder"),
+        ProviderFolder::Unknown => Some("the folder this program's shim provider uses is not known"),
+        ProviderFolder::At(_) => None,
+    };
     if files.is_empty() {
         let mut said = format!("`{id}` was deleted, but the shim files it used were not cleaned up.");
-        if *provider != ProviderFolder::None {
+        if no_retry.is_none() {
             said.push_str(&format!(
-                " {retry} what is in the folder this program's shim provider uses{}.",
-                if unknown { ", which is not known" } else { "" }
+                " {retry} what is in the folder this program's shim provider uses."
             ));
         }
-        if let Some(folder) = second_folder.filter(|folder| !in_providers(folder)) {
-            // An unknown provider's folder may be this one, which then is retried.
-            let retried = if unknown {
-                "retried by that command only if it is that folder: otherwise"
-            } else {
-                "not retried by that command:"
-            };
-            said.push_str(&format!(
-                " What is in `{}` is {retried} {elsewhere} it.",
+        let tail = match (no_retry, second_folder.filter(|folder| !in_providers(folder))) {
+            (None, None) => None,
+            (None, Some(folder)) => Some(format!(
+                " What is in `{}` is not retried by that command: {elsewhere} it.",
                 folder.display()
-            ));
-        }
+            )),
+            (Some(why), None) => Some(format!(" Nothing is retried, since {why}.")),
+            (Some(why), Some(folder)) => Some(format!(
+                " What is in `{}` is not retried, since {why}: {elsewhere} it.",
+                folder.display()
+            )),
+        };
+        said.extend(tail);
         return said;
     }
     let all: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
     let mut said = format!("`{id}` was deleted, but {} could not be removed.", list(&all));
-    if unknown {
-        // The retry sweeps the provider's folder alone, and these files may not be in it.
-        said.push_str(&format!(
-            " {retry} the ones in the folder this program's shim provider uses, which is not known. A file in \
-             any other folder is not retried by that command: {elsewhere} it."
-        ));
-        return said;
-    }
     let (inside, outside): (Vec<&Path>, Vec<&Path>) = all
         .into_iter()
         .partition(|file| in_providers(file) || file.parent().is_some_and(in_providers));
@@ -306,11 +304,14 @@ pub(crate) fn left_behind_text(
         } else {
             ("are", "them")
         };
-        said.push_str(&format!(
-            " {} {is} not in the folder this program's shim provider uses, so that command does not retry \
-             {them}: {elsewhere} {them}.",
-            list(&outside)
-        ));
+        let why = match no_retry {
+            Some(why) => format!("{} {is} not retried, since {why}", list(&outside)),
+            None => format!(
+                "{} {is} not in the folder this program's shim provider uses, so that command does not retry {them}",
+                list(&outside)
+            ),
+        };
+        said.push_str(&format!(" {why}: {elsewhere} {them}."));
     }
     said
 }
@@ -478,27 +479,39 @@ mod system {
             Err(e) => return Err(Error::os_at("read", dir, e).into()),
         }
         folders.check(dir)?;
-        let swept = sweep_files(dir, referenced);
-        let removed = remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir))));
+        let listing = match fs::read_dir(dir) {
+            Ok(listing) => listing,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::os_at("read", dir, e).into()),
+        };
+        let (swept, listed) = sweep_files(dir, listing, referenced);
+        let removed = if listed {
+            remove_if_empty_default(dir, || Ok(same_path(&normalise(&default_folder()?), &normalise(dir))))
+        } else {
+            Ok(())
+        };
         SweepFailure::all(swept.err().into_iter().chain(removed.err())).map_or(Ok(()), Err)
     }
 
     /// Removes `dir` if it is empty and `is_default` says it is the default folder, which is asked
     /// only of a folder that is empty: where the default folder is matters for nothing else.
     ///
-    /// A folder that cannot be listed is not known to be empty, and the sweep of its files has said
-    /// why it cannot be listed: it stays, without a second report.
+    /// A folder that cannot be listed, or whose first entry cannot be read, is not known to be empty:
+    /// it stays, and the failure is the removal's. A folder whose listing already failed on an entry is
+    /// not passed here: `sweep_folder` has reported it. A folder that is not there has nothing to
+    /// remove.
     pub(super) fn remove_if_empty_default(
         dir: &Path,
         is_default: impl FnOnce() -> Result<bool>,
     ) -> std::result::Result<(), SweepFailure> {
         match fs::read_dir(dir) {
-            Ok(mut listing) => {
-                if listing.next().is_some() {
-                    return Ok(());
-                }
-            }
-            Err(_) => return Ok(()),
+            Ok(mut listing) => match listing.next() {
+                Some(Ok(_)) => return Ok(()),
+                Some(Err(e)) => return Err(Error::os_at("read an entry of", dir, e).into()),
+                None => {}
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::os_at("read", dir, e).into()),
         }
         if !is_default()? {
             return Ok(());
@@ -511,23 +524,25 @@ mod system {
         }
     }
 
-    /// The deletion half of [`sweep_folder`].
-    fn sweep_files(dir: &Path, referenced: &[PathBuf]) -> std::result::Result<(), SweepFailure> {
+    /// The deletion half of [`sweep_folder`], and whether every entry of the listing was read.
+    fn sweep_files(
+        dir: &Path,
+        listing: fs::ReadDir,
+        referenced: &[PathBuf],
+    ) -> (std::result::Result<(), SweepFailure>, bool) {
         let mut failures = Vec::new();
         let mut entries = Vec::new();
-        match fs::read_dir(dir) {
-            Ok(listing) => {
-                for entry in listing {
-                    match entry {
-                        // A name that is no shim file's is dropped by `unreferenced`; a folder that a
-                        // repair set aside whole is a shim file's name too.
-                        Ok(entry) => entries.push((entry.file_name(), entry.file_type().is_ok_and(|t| t.is_dir()))),
-                        Err(e) => failures.push(Error::os_at("read an entry of", dir, e).into()),
-                    }
+        let mut listed = true;
+        for entry in listing {
+            match entry {
+                // A name that is no shim file's is dropped by `unreferenced`; a folder that a
+                // repair set aside whole is a shim file's name too.
+                Ok(entry) => entries.push((entry.file_name(), entry.file_type().is_ok_and(|t| t.is_dir()))),
+                Err(e) => {
+                    listed = false;
+                    failures.push(Error::os_at("read an entry of", dir, e).into());
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(Error::os_at("read", dir, e).into()),
         }
         entries.sort();
 
@@ -549,7 +564,7 @@ mod system {
                 _ => {}
             }
         }
-        SweepFailure::all(failures).map_or(Ok(()), Err)
+        (SweepFailure::all(failures).map_or(Ok(()), Err), listed)
     }
 
     fn delete_failed(path: impl Into<PathBuf>, source: io::Error) -> SweepFailure {

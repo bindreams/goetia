@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::scm::sid::system;
 
 #[skuld::test]
 fn root_resolves_to_an_empty_unused_identity() {
@@ -85,8 +86,7 @@ fn password_var_not_unicode_errs_rather_than_downgrading_to_none() {
 
 #[skuld::test]
 fn a_sid_in_bytes_resolves_to_its_account_name() {
-    // S-1-5-18, LocalSystem.
-    let name = account_name_of_sid(&[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]).expect("S-1-5-18 always resolves");
+    let name = account_name_of_sid(&system()).expect("LocalSystem always resolves");
     assert!(name.contains("SYSTEM"), "{name}");
 }
 

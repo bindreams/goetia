@@ -1,8 +1,9 @@
 use super::*;
 use crate::spec::DaemonFields;
 use crate::spec::test_support::abs;
-use crate::spec::test_support::{plain_fields, program};
+use crate::spec::test_support::program;
 use crate::spec::{Builtin, MAX_SC_ACTION_DELAY};
+use crate::testing::plain_fields;
 
 // Fixtures ============================================================================================================
 

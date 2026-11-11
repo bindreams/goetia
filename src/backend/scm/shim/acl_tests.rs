@@ -2,42 +2,27 @@
 //! Windows-only tests read a temp directory this test created and nothing else.
 
 use super::*;
+use crate::backend::scm::sid::sid_from_parts;
 
 // Access masks, spelled out as `icacls` prints them: (F), (M), (RX).
-const FULL: u32 = 0x1F_01FF;
+pub(super) const FULL: u32 = FILE_ALL_ACCESS;
 const MODIFY: u32 = 0x13_01BF;
-const READ_EXECUTE: u32 = 0x12_00A0;
-const GENERIC_READ_EXECUTE: u32 = 0xA000_0000;
-const GENERIC_ALL: u32 = 0x1000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
+/// `icacls` (RX), which is not `FILE_GENERIC_EXECUTE` alone.
+pub(super) const READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+const GENERIC_READ_EXECUTE: u32 = GENERIC_READ | GENERIC_EXECUTE;
 const FILE_ADD_FILE: u32 = 0x2;
-const FILE_WRITE_DATA: u32 = 0x2;
 const FILE_WRITE_EA: u32 = 0x10;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
-const FILE_APPEND_DATA: u32 = 0x4;
-const FILE_DELETE_CHILD: u32 = 0x40;
-const DELETE: u32 = 0x1_0000;
-const WRITE_DAC: u32 = 0x4_0000;
-const WRITE_OWNER: u32 = 0x8_0000;
 
 // ACE flags.
-const OBJECT_INHERIT: u8 = 0x01;
-const CONTAINER_INHERIT: u8 = 0x02;
-const INHERIT_ONLY: u8 = 0x08;
+pub(super) const OBJECT_INHERIT: u8 = 0x01;
+pub(super) const CONTAINER_INHERIT: u8 = 0x02;
+const INHERIT_ONLY: u8 = INHERIT_ONLY_ACE;
 const OI_CI: u8 = OBJECT_INHERIT | CONTAINER_INHERIT;
 const OI_CI_IO: u8 = OI_CI | INHERIT_ONLY;
 
-fn system() -> Sid {
-    sid_from_parts(5, &[18])
-}
-fn administrators() -> Sid {
-    sid_from_parts(5, &[32, 544])
-}
-fn users() -> Sid {
+pub(super) fn users() -> Sid {
     sid_from_parts(5, &[32, 545])
-}
-fn everyone() -> Sid {
-    sid_from_parts(1, &[0])
 }
 fn creator_owner() -> Sid {
     sid_from_parts(3, &[0])
@@ -48,16 +33,14 @@ fn authenticated_users() -> Sid {
 fn application_packages() -> Sid {
     sid_from_parts(15, &[2, 1])
 }
-fn trusted_installer() -> Sid {
-    sid_from_parts(5, &[80, 956008885, 3418522649, 1831038044, 1853292631, 2271478464])
-}
 
-fn allow(trustee: Sid, mask: u32, flags: u8) -> Ace {
+pub(super) fn allow(trustee: Sid, mask: u32, flags: u8) -> Ace {
     Ace {
         trustee,
         mask,
         flags,
         allow: true,
+        conditional: false,
     }
 }
 fn deny(trustee: Sid, mask: u32, flags: u8) -> Ace {
@@ -66,6 +49,7 @@ fn deny(trustee: Sid, mask: u32, flags: u8) -> Ace {
         mask,
         flags,
         allow: false,
+        conditional: false,
     }
 }
 fn object(path: &str, owner: Sid, dacl: Vec<Ace>) -> ObjectSecurity {
@@ -204,13 +188,13 @@ fn the_stock_host_file_and_its_folders_are_accepted() {
 #[skuld::test]
 fn each_right_that_changes_a_file_is_refused_with_its_own_wording() {
     let cases = [
-        (FILE_WRITE_DATA, "write to"),
-        (FILE_APPEND_DATA, "write to"),
-        (GENERIC_WRITE, "write to"),
-        (MODIFY, "write to"),
-        (WRITE_DAC, "change permissions of"),
-        (WRITE_OWNER, "take ownership of"),
-        (DELETE, "delete or rename"),
+        (FILE_WRITE_DATA, WRITE_TO),
+        (FILE_APPEND_DATA, WRITE_TO),
+        (GENERIC_WRITE, WRITE_TO),
+        (MODIFY, WRITE_TO),
+        (WRITE_DAC, CHANGE_PERMISSIONS_OF),
+        (WRITE_OWNER, TAKE_OWNERSHIP_OF),
+        (DELETE, DELETE_OR_RENAME),
     ];
     for (mask, right) in cases {
         let mut chain = stock_host_chain();
@@ -258,7 +242,7 @@ fn a_file_an_untrusted_account_owns_is_refused_as_owned() {
     let mut chain = stock_host_chain();
     chain[0].owner = users();
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "own");
+    assert_eq!(refusal.right, OWN);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia\goetia-shim.exe"));
 }
 
@@ -266,7 +250,7 @@ fn a_file_an_untrusted_account_owns_is_refused_as_owned() {
 fn a_file_with_a_null_dacl_is_refused() {
     let mut chain = stock_host_chain();
     chain[0].dacl = None;
-    assert_eq!(refused(&chain).right, "do anything to");
+    assert_eq!(refused(&chain).right, DO_ANYTHING_TO);
 }
 
 /// A file inherits what a doctored folder grants, so both are unsafe for one cause: the folder is
@@ -278,7 +262,7 @@ fn an_unsafe_folder_is_reported_before_the_host_file_in_it() {
     chain[1].dacl.as_mut().unwrap().push(allow(users(), WRITE_DAC, 0));
     let refusal = refused(&chain);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia"));
-    assert_eq!(refusal.right, "change permissions of");
+    assert_eq!(refusal.right, CHANGE_PERMISSIONS_OF);
 }
 
 #[skuld::test]
@@ -301,7 +285,7 @@ fn a_file_the_chain_reaches_through_a_link_is_judged_as_a_file() {
     let mut chain = vec![link, target];
     chain.extend(stock_chain());
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "write to");
+    assert_eq!(refusal.right, WRITE_TO);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia\goetia-shim.exe"));
 }
 
@@ -329,10 +313,10 @@ fn trusted_accounts_may_do_anything() {
 #[skuld::test]
 fn each_dangerous_right_is_refused_with_its_own_wording() {
     let cases = [
-        (WRITE_DAC, "change permissions of"),
-        (WRITE_OWNER, "take ownership of"),
-        (DELETE, "delete or rename"),
-        (FILE_DELETE_CHILD, "delete or rename entries in"),
+        (WRITE_DAC, CHANGE_PERMISSIONS_OF),
+        (WRITE_OWNER, TAKE_OWNERSHIP_OF),
+        (DELETE, DELETE_OR_RENAME),
+        (FILE_DELETE_CHILD, DELETE_OR_RENAME_ENTRIES_IN),
     ];
     for (mask, right) in cases {
         let mut chain = stock_chain();
@@ -349,7 +333,7 @@ fn an_untrusted_owner_is_refused_as_owning() {
     let mut chain = stock_chain();
     chain[0].owner = users();
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "own");
+    assert_eq!(refusal.right, OWN);
     assert_eq!(refusal.account, users());
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia"));
 }
@@ -363,7 +347,7 @@ fn generic_all_is_mapped_before_it_is_judged() {
         .unwrap()
         .push(allow(everyone(), GENERIC_ALL, OI_CI));
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "change permissions of");
+    assert_eq!(refusal.right, CHANGE_PERMISSIONS_OF);
     assert_eq!(refusal.account, everyone());
 }
 
@@ -376,7 +360,7 @@ fn delete_child_on_the_parent_names_the_parent() {
         .unwrap()
         .push(allow(users(), FILE_DELETE_CHILD, 0));
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "delete or rename entries in");
+    assert_eq!(refusal.right, DELETE_OR_RENAME_ENTRIES_IN);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files"));
 }
 
@@ -389,7 +373,7 @@ fn delete_child_on_the_target_names_the_target() {
         .unwrap()
         .push(allow(users(), FILE_DELETE_CHILD, 0));
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "delete or rename entries in");
+    assert_eq!(refusal.right, DELETE_OR_RENAME_ENTRIES_IN);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files\Goetia"));
 }
 
@@ -398,7 +382,7 @@ fn a_null_dacl_on_an_ancestor_is_refused_naming_the_ancestor() {
     let mut chain = stock_chain();
     chain[1].dacl = None;
     let refusal = refused(&chain);
-    assert_eq!(refusal.right, "do anything to");
+    assert_eq!(refusal.right, DO_ANYTHING_TO);
     assert_eq!(refusal.path, PathBuf::from(r"C:\Program Files"));
     assert_eq!(refusal.account, everyone());
 }
@@ -409,7 +393,59 @@ fn a_deny_ace_does_not_cancel_an_allow_ace() {
     let dacl = chain[0].dacl.as_mut().unwrap();
     dacl.insert(0, deny(users(), WRITE_DAC, 0));
     dacl.push(allow(users(), WRITE_DAC, 0));
-    assert_eq!(refused(&chain).right, "change permissions of");
+    assert_eq!(refused(&chain).right, CHANGE_PERMISSIONS_OF);
+}
+
+/// A callback entry's condition is not read, so it is judged as if it always applies: an allow
+/// refuses exactly as the plain entry would, and a deny credits nothing, as a plain one does not.
+#[skuld::test]
+fn a_conditional_entry_is_judged_as_a_plain_one() {
+    let conditional = |allow: bool| Ace {
+        allow,
+        conditional: true,
+        ..allow_entry()
+    };
+    let with = |ace: Ace| {
+        let mut chain = stock_host_chain();
+        chain[0].dacl.as_mut().unwrap().push(ace);
+        chain
+    };
+
+    let plain = refused(&with(allow_entry()));
+    assert_eq!(refused(&with(conditional(true))), plain);
+    assert_eq!(plain.right, CHANGE_PERMISSIONS_OF);
+    assert_eq!(plain.account, users());
+    assert!(verdict(&with(conditional(false))).is_ok());
+}
+
+/// An untrusted account's entry granting `WRITE_DAC`.
+fn allow_entry() -> Ace {
+    allow(users(), WRITE_DAC, 0)
+}
+
+/// The library's masks and refusal phrases as literals, which the other tests take from the
+/// library's own constants: a wrong value there changes code and expectation together, but not
+/// this. Masks are as `winnt.h` and `icacls` give them.
+#[skuld::test]
+fn the_masks_and_phrases_are_these_literals() {
+    assert_eq!(FILE_ALL_ACCESS, 0x1F_01FF);
+    assert_eq!(FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, 0x12_00A9);
+    assert_eq!(WRITE_DAC, 0x4_0000);
+    assert_eq!(WRITE_OWNER, 0x8_0000);
+    assert_eq!(DELETE, 0x1_0000);
+    assert_eq!(FILE_WRITE_DATA, 0x2);
+    assert_eq!(FILE_APPEND_DATA, 0x4);
+    assert_eq!(FILE_DELETE_CHILD, 0x40);
+    assert_eq!(INHERIT_ONLY_ACE, 0x08);
+
+    assert_eq!(OWN, "own");
+    assert_eq!(DO_ANYTHING_TO, "do anything to");
+    assert_eq!(BYPASS_ACCESS_CONTROL_ON, "bypass access control on");
+    assert_eq!(CHANGE_PERMISSIONS_OF, "change permissions of");
+    assert_eq!(TAKE_OWNERSHIP_OF, "take ownership of");
+    assert_eq!(DELETE_OR_RENAME, "delete or rename");
+    assert_eq!(DELETE_OR_RENAME_ENTRIES_IN, "delete or rename entries in");
+    assert_eq!(WRITE_TO, "write to");
 }
 
 #[skuld::test]
@@ -427,25 +463,12 @@ fn the_nearest_object_to_the_target_is_reported_first() {
     assert_eq!(refused(&chain).path, PathBuf::from(r"C:\Program Files"));
 }
 
-#[skuld::test]
-fn a_sid_is_written_in_the_standard_string_form() {
-    assert_eq!(sid_string(&administrators()), "S-1-5-32-544");
-    assert_eq!(sid_string(&everyone()), "S-1-1-0");
-    assert_eq!(
-        sid_string(&trusted_installer()),
-        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
-    );
-}
-
-#[skuld::test]
-fn bytes_that_are_not_a_sid_are_written_as_such_not_panicked_on() {
-    assert_eq!(sid_string(&[]), "an invalid SID");
-    assert_eq!(sid_string(&[1, 3, 0, 0, 0, 0, 0, 5, 1, 0]), "an invalid SID");
-}
-
 #[cfg(windows)]
 pub(in crate::backend::scm::shim) mod windows {
-    use super::system::{display_path, identity_of, is_unreadable, parse, read_chain, resolve_target};
+    use super::system::{
+        ObjectId, copy_sid, display_path, identity_of, is_unreadable, kernel_object_dacl, kernel_object_owner, parse,
+        read_chain, resolve_target,
+    };
     use super::*;
     use crate::error::Error;
     use std::io;
@@ -455,6 +478,63 @@ pub(in crate::backend::scm::shim) mod windows {
     }
     fn enabled() -> FolderCheck {
         FolderCheck::new(CheckPermissions::Enable)
+    }
+
+    /// A new folder in `parent`, which everyone has full control of (inherited by what is made in
+    /// it). Returns its final path.
+    fn world_writable_folder(parent: &Path) -> PathBuf {
+        let folder = parent.join("open");
+        Descriptor::from_sddl("D:P(A;OICI;FA;;;WD)")
+            .unwrap()
+            .create_dir(&folder)
+            .unwrap();
+        folder.canonicalize().unwrap()
+    }
+
+    /// An unnamed mutex of this process, with a protected DACL of one entry for Everyone, which
+    /// `kernel_object_owner` and `kernel_object_dacl` read back, each its own part.
+    #[skuld::test]
+    fn a_kernel_objects_owner_and_dacl_are_read_back() {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        let descriptor = Descriptor::from_sddl("D:P(A;;GA;;;WD)").unwrap();
+        let attributes = descriptor.attributes();
+        // SAFETY: `attributes` points at `descriptor`, live for the call; the mutex has no name.
+        let raw = unsafe { CreateMutexW(&attributes, 0, std::ptr::null()) };
+        assert!(!raw.is_null(), "{}", io::Error::last_os_error());
+        // SAFETY: a valid handle `CreateMutexW` just returned and nothing else owns.
+        let mutex = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let name = Path::new("a test mutex");
+
+        let owner = kernel_object_owner(mutex.as_raw_handle(), name).unwrap();
+        let dacl = kernel_object_dacl(mutex.as_raw_handle(), name).unwrap();
+
+        assert!(crate::backend::scm::sid::is_whole_sid(&owner));
+        assert!(dacl.protected);
+        let aces = dacl.aces.expect("the DACL was set");
+        assert_eq!(aces.len(), 1);
+        assert_eq!(aces[0].trustee, everyone());
+        assert!(aces[0].allow);
+        assert!(!aces[0].conditional);
+    }
+
+    /// A volume that keeps no ACLs is refused: no owner or permissions can be read back from it.
+    /// The named-pipe file system is one that does not keep them.
+    #[skuld::test]
+    fn a_volume_that_keeps_no_acls_is_refused() {
+        let refusal = require_acls_under(Path::new(r"\\.\pipe\")).expect_err("the pipe file system keeps no ACLs");
+
+        assert!(
+            matches!(
+                refusal,
+                Error::ShimFolderUnsafe {
+                    right: BYPASS_ACCESS_CONTROL_ON,
+                    ..
+                }
+            ),
+            "{refusal:?}"
+        );
     }
 
     #[skuld::test]
@@ -480,16 +560,18 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(chain[1..].iter().all(|object| object.directory), "{chain:?}");
     }
 
+    /// The folder is judged before the file in it, so a file's check refuses for the folder.
     #[skuld::test]
-    fn a_file_its_creator_owns_is_refused() {
-        // A temp file belongs to the account running this test, which is not a trusted one.
+    fn a_host_file_in_a_folder_everyone_can_write_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().canonicalize().unwrap().join("host.exe");
+        let folder = world_writable_folder(dir.path());
+        let exe = folder.join("host.exe");
         std::fs::write(&exe, b"x").unwrap();
+
         let Err(Error::ShimFolderUnsafe { path, .. }) = enabled().check(&exe) else {
-            panic!("a temp file must be refused");
+            panic!("a file in a folder everyone can write must be refused");
         };
-        assert!(display_path(&exe).starts_with(&path), "{path:?}");
+        assert_eq!(path, display_path(&folder));
     }
 
     #[skuld::test]
@@ -503,7 +585,7 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(chain.iter().all(|object| object.directory));
         for object in &chain {
             assert!(!object.owner.is_empty(), "{}", object.path.display());
-            assert_ne!(sid_string(&object.owner), "an invalid SID", "{}", object.path.display());
+            crate::testing::shown_sid(&object.owner);
         }
     }
 
@@ -667,28 +749,25 @@ pub(in crate::backend::scm::shim) mod windows {
     }
 
     #[skuld::test]
-    fn an_absolute_link_target_has_its_dot_dot_applied() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (real, link) = (root.join("real"), root.join("link"));
-        std::fs::create_dir(&real).unwrap();
-        // `gone` does not exist: only a lexical `..` lands on `real`.
-        symlink(&display_path(&root).join("gone").join("..").join("real"), &link);
-
-        let paths = labels(&read_chain(&link).unwrap());
-        assert!(paths.contains(&display_path(&real)), "{paths:?}");
-    }
-
-    #[skuld::test]
     fn the_file_index_stands_in_when_the_file_id_is_unsupported() {
         let unsupported = || Err(io::Error::from_raw_os_error(87));
-        let index = || Ok((7, [1; 16]));
+        let index = || Ok(ObjectId::Index { volume: 7, index: 1 });
+        let id = ObjectId::Id { volume: 1, id: [2; 16] };
+        assert_eq!(identity_of(Ok(id), || panic!("not needed")).unwrap(), id);
         assert_eq!(
-            identity_of(Ok((1, [2; 16])), || panic!("not needed")).unwrap(),
-            (1, [2; 16])
+            identity_of(unsupported(), index).unwrap(),
+            ObjectId::Index { volume: 7, index: 1 }
         );
-        assert_eq!(identity_of(unsupported(), index).unwrap(), (7, [1; 16]));
         assert!(identity_of(unsupported(), unsupported).is_err());
+    }
+
+    /// A file index and a file ID that spell the same bytes are two identities: an object that the
+    /// walk knows by one form is not taken for another object known by the other.
+    #[skuld::test]
+    fn an_identity_by_file_index_never_equals_one_by_file_id() {
+        let mut id = [0; 16];
+        id[..8].copy_from_slice(&5u64.to_le_bytes());
+        assert_ne!(ObjectId::Index { volume: 3, index: 5 }, ObjectId::Id { volume: 3, id });
     }
 
     #[skuld::test]
@@ -713,15 +792,21 @@ pub(in crate::backend::scm::shim) mod windows {
         assert_eq!(display_path(Path::new(r"\\?\UNC\h\s\a")), Path::new(r"\\h\s\a"));
     }
 
+    /// Either an untrusted owner or Everyone's control of the permissions refuses; which depends on
+    /// who owns the folder.
     #[skuld::test]
-    fn a_folder_its_creator_owns_is_refused() {
-        // A temp directory belongs to the account running this test, which is not a trusted one.
+    fn a_folder_everyone_can_write_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().canonicalize().unwrap();
-        let Err(Error::ShimFolderUnsafe { path, .. }) = enabled().check(&target) else {
-            panic!("a temp directory must be refused");
+        let target = world_writable_folder(dir.path());
+
+        let Err(Error::ShimFolderUnsafe { path, account, right }) = enabled().check(&target) else {
+            panic!("a folder everyone can write must be refused");
         };
-        assert!(display_path(&target).starts_with(&path), "{path:?}");
+        assert_eq!(path, display_path(&target));
+        assert!([OWN, CHANGE_PERMISSIONS_OF].contains(&right), "{right}");
+        if right == CHANGE_PERMISSIONS_OF {
+            assert_eq!(account, account_name(&everyone()));
+        }
     }
 
     /// An in-memory ACL holding one full-control entry of `ace_type` for `trustee`.
@@ -729,7 +814,7 @@ pub(in crate::backend::scm::shim) mod windows {
         use windows_sys::Win32::Security::{ACL, ACL_REVISION, AddAce, InitializeAcl};
         let mut ace = vec![0, 0];
         ace.extend_from_slice(&((8 + trustee.len()) as u16).to_le_bytes());
-        ace.extend_from_slice(&0x1F_01FFu32.to_le_bytes());
+        ace.extend_from_slice(&FULL.to_le_bytes());
         ace.extend_from_slice(trustee);
         let mut acl = vec![0u32; 64];
         let pointer = acl.as_mut_ptr().cast::<ACL>();
@@ -750,7 +835,7 @@ pub(in crate::backend::scm::shim) mod windows {
 
     #[skuld::test]
     fn an_entry_goetia_cannot_read_is_told_from_a_read_that_failed() {
-        let owner = sid_from_parts(5, &[18]);
+        let owner = system();
         // A compound entry (type 4), which goetia does not read.
         let mut acl = acl_with_entry(4, &owner);
         let acl = acl.as_mut_ptr().cast();
@@ -768,7 +853,7 @@ pub(in crate::backend::scm::shim) mod windows {
 
     #[skuld::test]
     fn an_entry_goetia_can_read_is_read() {
-        let owner = sid_from_parts(5, &[18]);
+        let owner = system();
         let mut acl = acl_with_entry(0, &owner);
         let acl = acl.as_mut_ptr().cast();
 
@@ -779,11 +864,48 @@ pub(in crate::backend::scm::shim) mod windows {
         assert_eq!(dacl.unwrap().len(), 1);
     }
 
+    /// A callback entry (types 9 and 10) is read as its plain kind, and told from it.
+    #[skuld::test]
+    fn a_conditional_entry_is_read_as_its_kind_and_marked() {
+        let owner = system();
+        for (ace_type, allow, conditional) in [(0, true, false), (1, false, false), (9, true, true), (10, false, true)]
+        {
+            let mut acl = acl_with_entry(ace_type, &owner);
+            let acl = acl.as_mut_ptr().cast();
+
+            // SAFETY: as above.
+            let (_, dacl) = unsafe { parse(owner.as_ptr() as _, acl, Path::new("f")) }.unwrap();
+
+            let ace = dacl.unwrap().remove(0);
+            assert_eq!((ace.allow, ace.conditional), (allow, conditional), "type {ace_type}");
+        }
+    }
+
+    /// Not a SID: revision 0xFF, which counts no sub-authorities, so nothing past the header is read.
+    const NOT_A_SID: [u8; 16] = {
+        let mut bytes = [0; 16];
+        bytes[0] = 0xFF;
+        bytes
+    };
+
+    /// What is named as unread is what the caller was reading: an owner is not "the permissions".
+    #[skuld::test]
+    fn a_sid_that_is_not_one_is_an_error_naming_what_was_read() {
+        let junk = NOT_A_SID;
+
+        // SAFETY: `junk` is as long as its header counts (no sub-authorities) and live for the call.
+        let owner = unsafe { copy_sid(junk.as_ptr() as _, "read the owner of", Path::new("f")) }.unwrap_err();
+
+        assert!(is_unreadable(&owner), "{owner:?}");
+        assert!(owner.to_string().contains("read the owner of"), "{owner}");
+    }
+
     #[skuld::test]
     fn an_owner_that_is_not_a_sid_is_unreadable_not_a_failed_read() {
-        let junk = [0xFFu8; 16];
+        let junk = NOT_A_SID;
 
-        // SAFETY: `junk` is readable for the call, which only validates it; a null DACL is allowed.
+        // SAFETY: `junk` is as long as its header counts (no sub-authorities) and live for the call;
+        // a null DACL is allowed.
         let unreadable = unsafe { parse(junk.as_ptr() as _, std::ptr::null_mut(), Path::new("f")) }.unwrap_err();
 
         assert!(is_unreadable(&unreadable), "{unreadable:?}");

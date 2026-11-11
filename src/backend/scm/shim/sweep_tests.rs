@@ -337,44 +337,39 @@ fn text(provider: Option<&str>, second_folder: &str, files: &[&str]) -> String {
     left_behind_text("frpc", &provider, Some(Path::new(second_folder)), &files)
 }
 
-/// A provider whose `preview` failed is not the absence of one: its sweep is what the retry runs, so
-/// the text says that, and claims neither that its folder is the retried one nor that it is not.
+/// A provider whose folder is not known is not the absence of one, but nothing is promised retried
+/// either: the text says why, and names no command.
 #[skuld::test]
-fn a_provider_whose_folder_is_not_known_is_retried_for_its_own_folder_only() {
+fn a_provider_whose_folder_is_not_known_is_promised_no_retry() {
     let unknown = |second: Option<&str>, files: &[&str]| {
         let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
         left_behind_text("frpc", &ProviderFolder::Unknown, second.map(Path::new), &files)
     };
 
-    // The retry sweeps the provider's folder alone, which these files may not be in: no file is
-    // promised it.
     assert_eq!(
         unknown(Some("/q/Other"), &["/q/Other/b.exe", "/p/a.exe"]),
-        "`frpc` was deleted, but `/q/Other/b.exe`, `/p/a.exe` could not be removed. Re-run `goetia daemon uninstall \
-         frpc` to retry the ones in the folder this program's shim provider uses, which is not known. A file in any \
-         other folder is not retried by that command: the next install or uninstall of a manager whose provider \
-         uses that folder removes it."
+        "`frpc` was deleted, but `/q/Other/b.exe`, `/p/a.exe` could not be removed. `/q/Other/b.exe`, \
+         `/p/a.exe` are not retried, since the folder this program's shim provider uses is not known: the \
+         next install or uninstall of a manager whose provider uses that folder removes them."
     );
     assert_eq!(
         unknown(None, &["/p/a.exe"]),
-        "`frpc` was deleted, but `/p/a.exe` could not be removed. Re-run `goetia daemon uninstall frpc` to retry the \
-         ones in the folder this program's shim provider uses, which is not known. A file in any other folder is \
-         not retried by that command: the next install or uninstall of a manager whose provider uses that folder \
-         removes it."
+        "`frpc` was deleted, but `/p/a.exe` could not be removed. `/p/a.exe` is not retried, since the folder \
+         this program's shim provider uses is not known: the next install or uninstall of a manager whose \
+         provider uses that folder removes it."
     );
 
-    // No file named: the folder swept besides the provider's is named, and may be the provider's.
+    // No file named.
     assert_eq!(
         unknown(Some("/q/Other"), &[]),
-        "`frpc` was deleted, but the shim files it used were not cleaned up. Re-run `goetia daemon uninstall frpc` \
-         to retry what is in the folder this program's shim provider uses, which is not known. What is in \
-         `/q/Other` is retried by that command only if it is that folder: otherwise the next install or uninstall \
-         of a manager whose provider uses that folder removes it."
+        "`frpc` was deleted, but the shim files it used were not cleaned up. What is in `/q/Other` is not \
+         retried, since the folder this program's shim provider uses is not known: the next install or \
+         uninstall of a manager whose provider uses that folder removes it."
     );
     assert_eq!(
         unknown(None, &[]),
-        "`frpc` was deleted, but the shim files it used were not cleaned up. Re-run `goetia daemon uninstall frpc` \
-         to retry what is in the folder this program's shim provider uses, which is not known."
+        "`frpc` was deleted, but the shim files it used were not cleaned up. Nothing is retried, since the \
+         folder this program's shim provider uses is not known."
     );
 }
 
@@ -407,8 +402,21 @@ fn files_in_both_get_each_their_own_advice() {
 fn with_no_provider_nothing_is_retried() {
     let said = text(None, "/q/Other", &["/q/Other/b.exe"]);
 
-    assert!(said.contains(NEXT), "{said}");
-    assert!(!said.contains(RETRY), "{said}");
+    assert_eq!(
+        said,
+        "`frpc` was deleted, but `/q/Other/b.exe` could not be removed. `/q/Other/b.exe` is not retried, since no shim \
+         provider of this program sweeps a folder: the next install or uninstall of a manager whose provider uses \
+         that folder removes it."
+    );
+}
+
+#[skuld::test]
+fn with_no_provider_and_no_folder_named_nothing_is_retried_and_it_says_so() {
+    assert_eq!(
+        left_behind_text("frpc", &ProviderFolder::None, None, &[]),
+        "`frpc` was deleted, but the shim files it used were not cleaned up. Nothing is retried, since no shim provider of \
+         this program sweeps a folder."
+    );
 }
 
 /// The default folder itself, which is what a failed removal of it names, is the provider's.
@@ -431,9 +439,11 @@ fn a_failure_that_names_no_file_says_where_the_files_may_be() {
     );
 
     let none = text(None, "/q/Other", &[]);
-    assert!(
-        !none.contains(RETRY) && none.contains(NEXT) && none.contains("/q/Other"),
-        "{none}"
+    assert_eq!(
+        none,
+        "`frpc` was deleted, but the shim files it used were not cleaned up. What is in `/q/Other` is not retried, \
+         since no shim provider of this program sweeps a folder: the next install or uninstall of a manager whose \
+         provider uses that folder removes it."
     );
 }
 
@@ -754,6 +764,23 @@ mod windows {
         remove_if_empty_default(&folder, || Ok(true)).unwrap();
         assert!(!folder.exists());
         remove_if_empty_default(&folder, || unreachable!("a folder that is gone is not asked about")).unwrap();
+    }
+
+    /// A folder that cannot be listed is not known to be empty: the failure comes back, and the
+    /// folder is not asked about. One that is not there has nothing to remove.
+    #[skuld::test]
+    fn a_folder_that_cannot_be_listed_is_a_failure_of_the_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_folder = dir.path().join("file.txt");
+        fs::write(&not_a_folder, b"x").unwrap();
+
+        let failure = remove_if_empty_default(&not_a_folder, || unreachable!("a folder not known to be empty"))
+            .expect_err("a file cannot be listed");
+
+        let report = failure.error.report().to_string();
+        assert!(report.contains("file.txt"), "{report}");
+        assert!(failure.not_deleted.is_empty());
+        assert!(not_a_folder.exists());
     }
 
     /// The default folder the caller resolved is the one the sweep removes by, and the one a

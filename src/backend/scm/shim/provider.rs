@@ -1,6 +1,8 @@
 //! What a service host is, and who supplies it: [`HostCommand`] and the Windows-only
 //! [`ShimProvider`].
 
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(windows)]
@@ -8,7 +10,7 @@ use super::acl::FolderCheck;
 #[cfg(windows)]
 use super::sweep::SweepFailure;
 #[cfg(windows)]
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// The command SCM launches for a `type: simple` service: a host built from `goetia::shim::main()`
 /// and the arguments it is started with. The arguments are `String`s because the registry read
@@ -20,6 +22,18 @@ pub struct HostCommand {
     pub args: Vec<String>,
 }
 
+/// Succeeds if `path` is absolute; else [`Error::ShimPathRelative`] naming it.
+#[cfg(windows)]
+pub(crate) fn require_absolute(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(Error::ShimPathRelative {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
 /// Where the service host of a `type: simple` service comes from. `Scm` consults one for such a
 /// service and for no other; the checks on what it returns (the folder check, the marker, the
 /// match with `preview`) are `Scm`'s, so an implementation cannot skip them.
@@ -27,6 +41,11 @@ pub struct HostCommand {
 pub trait ShimProvider: Send + Sync {
     /// What `provide` would return, touching nothing. `--dry-run` and `render` use it.
     fn preview(&self) -> Result<HostCommand>;
+
+    /// The folder its `sweep` covers, or `None` when it sweeps none. Needs neither the host's bytes
+    /// nor a successful `preview`: an uninstall names the folder whatever `preview` says. An error
+    /// when the folder cannot be known (a relative path, a default folder that cannot be located).
+    fn folder(&self) -> Result<Option<PathBuf>>;
 
     /// Under the install lock. Leaves the host ready at the returned path: writes, repairs or
     /// refuses. Idempotent. A provider that writes checks its folder with `folders` first.

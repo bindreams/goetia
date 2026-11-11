@@ -214,7 +214,7 @@ jobs:
 
       - name: Install prek
         # renovate: datasource=pypi depName=prek
-        run: uv tool install prek==0.5.9
+        run: uv tool install prek==0.5.10
 
       # The clippy hooks are skipped here because they already run per-platform
       # in the `test` job above (the `#[cfg]` halves differ per platform, so a

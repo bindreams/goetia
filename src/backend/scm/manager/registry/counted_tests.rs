@@ -5,8 +5,8 @@ use std::io::ErrorKind;
 use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
 use winreg::enums::HKEY_LOCAL_MACHINE;
 
-use crate::backend::test_elevation::{ELEVATED, elevated};
-use crate::backend::test_scratch::ScratchKey;
+use crate::testing::elevation::{ELEVATED, elevated};
+use crate::testing::scratch::ScratchKey;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;

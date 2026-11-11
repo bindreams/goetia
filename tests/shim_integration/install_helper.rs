@@ -33,7 +33,7 @@ pub fn run_if_requested() -> bool {
         kind: Kind::Simple,
         user: User::Name(format!(r".\{account}")),
         logs: Some(PathBuf::from(log)),
-        ..support::spec(id, fixture_command_with_exe(exe, "report", &[port]))
+        ..support::plain_fields(id, fixture_command_with_exe(exe, "report", &[port]))
     })
     .unwrap_or_else(|e| panic!("the helper's spec: {}", e.report()));
     match embedded_manager(None, CheckPermissions::Enable).install(&spec, false) {

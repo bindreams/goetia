@@ -6,7 +6,6 @@
 //! `%ProgramFiles%\Goetia` for their length: each empties it first and removes it after, and
 //! `UNIT_DIR_EXCLUSIVE` keeps them from running beside each other.
 
-use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,18 +19,16 @@ use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
 use goetia::spec::{DaemonFields, DaemonSpec, User};
-use goetia::testing::{FakeProvider, command};
+use goetia::testing::{Ace, FakeProvider, command};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_FILE_OBJECT, SE_KERNEL_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, SYNCHRONIZE};
 use windows_sys::Win32::System::Threading::{
@@ -494,7 +491,7 @@ fn install_refuses_doctored_folder() {
     match mgr.install(&spec, false) {
         Err(Error::ShimFolderUnsafe { path, account, right }) => {
             assert_eq!(path, doctored.folder);
-            assert_eq!(right, "change permissions of");
+            assert_eq!(right, goetia::testing::CHANGE_PERMISSIONS_OF);
             assert!(account.ends_with("Users"), "{account}");
         }
         other => panic!("a folder Users can change the permissions of must be refused, got {other:?}"),
@@ -527,7 +524,7 @@ fn install_refuses_a_host_file_users_can_write_to() {
     match standalone(CheckPermissions::Enable).install(&spec, false) {
         Err(Error::ShimFolderUnsafe { path, account, right }) => {
             assert_eq!(path, host);
-            assert_eq!(right, "write to");
+            assert_eq!(right, goetia::testing::WRITE_TO);
             assert!(account.ends_with("Users"), "{account}");
         }
         other => panic!("a host file Users can write to must be refused, got {other:?}"),
@@ -734,6 +731,10 @@ impl ShimProvider for Gated {
         self.inner.preview()
     }
 
+    fn folder(&self) -> goetia::error::Result<Option<PathBuf>> {
+        self.inner.folder()
+    }
+
     fn provide(&self, folders: &FolderCheck) -> goetia::error::Result<HostCommand> {
         self.events
             .lock()
@@ -826,101 +827,50 @@ fn lock_is_exclusive() {
     assert_ne!(unsafe { ReleaseMutex(lock.as_raw_handle()) }, 0);
 }
 
-/// `ACCESS_ALLOWED_ACE_TYPE`, which `windows-sys` does not export.
-const ACCESS_ALLOWED_ACE_TYPE_VALUE: u8 = 0;
-
-/// The DACL of the kernel object `handle` (open with `READ_CONTROL`), as what it means: whether it
-/// is protected, and each entry as its trustee's SID text, its mask and its type. The kernel stores
-/// a generic right as the object's specific mask, so a text comparison would test the spelling.
-fn dacl_of(handle: HANDLE) -> (bool, Vec<(String, u32, u8)>) {
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    // SAFETY: `handle` is open with `READ_CONTROL`; the out-pointers are valid lvalues, and the
-    // others are not asked for. The descriptor owns `dacl`'s memory until it is freed below.
-    let status = unsafe {
-        GetSecurityInfo(
-            handle,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut dacl,
-            std::ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    assert_eq!(status, 0, "read the permissions of the lock: error {status}");
-    assert!(
-        !dacl.is_null(),
-        "the lock has a NULL DACL, which grants everyone every right"
-    );
-    let mut control = 0u16;
-    let mut revision = 0u32;
-    // SAFETY: `descriptor` is live; the out-pointers are valid lvalues.
-    assert_ne!(
-        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
-        0
-    );
-    let mut entries = Vec::new();
-    // SAFETY: `dacl` points into the live `descriptor`, so its header is readable.
-    let count = unsafe { (*dacl).AceCount };
-    for index in 0..u32::from(count) {
-        let mut ace: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `index` is below the entry count; `ace` is a valid out-pointer.
-        assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
-        // SAFETY: `GetAce` returned an entry inside `dacl`; every type read here begins with the
-        // header, the mask and the trustee's SID.
-        let (kind, mask, sid) = unsafe {
-            let body = ace as *const ACCESS_ALLOWED_ACE;
-            (
-                (*(ace as *const ACE_HEADER)).AceType,
-                (*body).Mask,
-                std::ptr::addr_of!((*body).SidStart) as PSID,
-            )
-        };
-        let mut text: *mut u16 = std::ptr::null_mut();
-        // SAFETY: `sid` is a valid SID inside the entry; `text` is a valid out-pointer.
-        assert_ne!(unsafe { ConvertSidToStringSidW(sid, &mut text) }, 0);
-        let mut len = 0;
-        // SAFETY: `text` is a NUL-terminated string, live until it is freed below.
-        while unsafe { *text.add(len) } != 0 {
-            len += 1;
-        }
-        // SAFETY: the `len` units before the NUL were just read; `text` is freed once.
-        let sid_text = unsafe {
-            let sid_text = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-            LocalFree(text.cast());
-            sid_text
-        };
-        entries.push((sid_text, mask, kind));
-    }
-    // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last read.
-    unsafe { LocalFree(descriptor) };
-    (control & SE_DACL_PROTECTED != 0, entries)
+/// The DACL of the kernel object `handle` (open with `READ_CONTROL`): whether it is protected, and
+/// its entries as the library reads them.
+fn dacl_of(handle: HANDLE) -> (bool, Vec<Ace>) {
+    let dacl = goetia::testing::kernel_object_dacl(handle, Path::new("the lock"))
+        .unwrap_or_else(|e| panic!("read the permissions of the lock: {}", e.report()));
+    let entries = dacl
+        .aces
+        .expect("the lock has a NULL DACL, which grants everyone every right");
+    (dacl.protected, entries)
 }
 
-/// The lock is for SYSTEM and Administrators alone, each with every right the mutex has, in a DACL
-/// that inherits nothing.
+/// The lock is for SYSTEM and Administrators alone, each with a plain allow entry that applies to
+/// the lock itself and grants every right the mutex has, in a DACL that inherits nothing.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn lock_is_for_system_and_administrators_only() {
     probing_the_lock_during_an_install(|lock| {
         let (protected, entries) = dacl_of(lock.as_raw_handle());
 
         assert!(protected, "the lock's DACL must not inherit: {entries:?}");
-        let mut trustees: Vec<&str> = entries.iter().map(|(sid, ..)| sid.as_str()).collect();
+        let mut trustees: Vec<String> = entries
+            .iter()
+            .map(|entry| goetia::testing::shown_sid(&entry.trustee))
+            .collect();
         trustees.sort();
         assert_eq!(
             trustees,
             ["S-1-5-18", "S-1-5-32-544"],
             "SYSTEM and Administrators alone: {entries:?}"
         );
-        for (sid, mask, kind) in &entries {
-            assert_eq!(*kind, ACCESS_ALLOWED_ACE_TYPE_VALUE, "{sid} is allowed, not denied");
+        for entry in &entries {
+            let who = goetia::testing::shown_sid(&entry.trustee);
+            assert!(entry.allow, "{who} is allowed, not denied");
+            assert!(!entry.conditional, "{who}'s entry has a condition: {entry:?}");
+            assert_eq!(
+                entry.flags & INHERIT_ONLY_ACE as u8,
+                0,
+                "{who}'s entry grants nothing to the lock itself: {entry:?}"
+            );
             // The kernel stores a generic right as the object's own mask: all of the mutex's rights.
-            let full = mask & GENERIC_ALL != 0 || mask & MUTEX_ALL_ACCESS == MUTEX_ALL_ACCESS;
+            let full = entry.mask & GENERIC_ALL != 0 || entry.mask & MUTEX_ALL_ACCESS == MUTEX_ALL_ACCESS;
             assert!(
                 full,
-                "{sid} has {mask:#x}, not every right of the mutex ({MUTEX_ALL_ACCESS:#x})"
+                "{who} has {:#x}, not every right of the mutex ({MUTEX_ALL_ACCESS:#x})",
+                entry.mask
             );
         }
     });

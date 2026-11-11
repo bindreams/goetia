@@ -20,6 +20,8 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError};
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+pub(crate) use spares::Kept;
 #[cfg(test)]
 pub(crate) use spares::test_hook;
 pub(crate) use spares::{Reaper, Reservation};

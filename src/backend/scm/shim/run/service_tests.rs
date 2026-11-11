@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
-use crate::spec::test_support::plain_fields;
 use crate::spec::{DaemonFields, Kind, Restart};
+use crate::testing::plain_fields;
 use cosca::Containment;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
