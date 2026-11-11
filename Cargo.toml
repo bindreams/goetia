@@ -17,9 +17,8 @@ exclude = ["/.github", "/.claude", "/CLAUDE.md", "/scripts", "/prek.toml", "/.ed
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
-# Every `cargo doc` and `docs.rs` build fails on these. The `prek.toml` doc hooks' `-D warnings` also
-# fails on any other warn-by-default lint the hooks' toolchain (the 1.88 floor) has. Lints newer
-# rustdoc adds, such as the footnote lints, are in neither: 1.88 does not know them.
+# A `cargo doc` fails on these in the docs it builds. The `prek.toml` doc hooks also build private
+# items' docs, and fail on every other rustdoc warning too (`-D warnings`).
 [lints.rustdoc]
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
