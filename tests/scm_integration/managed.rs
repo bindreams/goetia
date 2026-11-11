@@ -483,7 +483,7 @@ fn uninstall_errors_when_service_will_not_stop() {
 
 /// Measures which code SCM gives a STOP to a RUNNING service that accepts none (the unit tests
 /// script 1052 and 1061 alike): `stop` reads the status either way and returns the "does not accept
-/// STOP" error at once. The call returns or the CI watchdog ends the job; a wait would hang.
+/// STOP" error at once. The call returns or nextest's `ci` profile kills the test; a wait would hang.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting() {
     let mgr = Scm::new();
