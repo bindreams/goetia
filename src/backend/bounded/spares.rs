@@ -40,12 +40,10 @@ impl<T: Send + 'static> Standby<T> {
 /// running: it still exits, and a caller that outlives it must not collect one zombie per expiry.
 /// See [`Reservation`].
 ///
-/// The thread never kills the child, not even after the reap. It [`cosca::Child::detach`]es the
-/// reaped child rather than dropping it, because `Drop` tears a contained tree down, and after the
-/// reap that is the reap-then-recycle hazard [`super::wait_bounded`]'s kill path is ordered to
-/// avoid: macOS's `FdMarker` `killpg`s the root's pgid, which the kernel may by then have handed to
-/// another group. `detach` touches no pid. With nothing to reap — the request exited inside its
-/// budget — the thread ends.
+/// The thread never kills the child, not even after the reap: an expired request is left running.
+/// It [`cosca::Child::detach`]es the reaped child rather than dropping it, because `Drop` tears the
+/// contained tree down, and the request's descendants may still be in it. With nothing to reap, the
+/// request having exited inside its budget, the thread ends.
 #[derive(Debug)]
 pub(crate) struct Reaper(Standby<cosca::Child>);
 
