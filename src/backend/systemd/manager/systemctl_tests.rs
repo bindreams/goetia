@@ -10,6 +10,8 @@
 //! stdout fallback and both truncation messages shipped with no test at all.
 
 use super::*;
+use crate::backend::standby;
+use crate::backend::test_allowance;
 use std::os::unix::process::ExitStatusExt as _;
 use std::time::Duration;
 
@@ -306,10 +308,10 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
 /// never a request out with nothing to watch it.
 #[skuld::test]
 fn a_request_nothing_could_watch_is_never_sent() {
-    type Allowance = fn() -> bounded::test_hook::Allowance;
+    type Allowance = fn() -> test_allowance::Allowance;
     let shortfalls: [(Allowance, &str); 2] = [
-        (|| bounded::test_hook::threads(0), "no thread"),
-        (|| bounded::test_hook::threads(1), "no thread"),
+        (|| standby::test_hook::threads(0), "no thread"),
+        (|| standby::test_hook::threads(1), "no thread"),
     ];
     for (allowance, what) in shortfalls {
         let dir = tempfile::tempdir().unwrap();
@@ -353,8 +355,10 @@ fn a_watched_request_that_may_have_run_is_in_doubt() {
         assert!(msg.contains("may have started before it failed"), "{msg}");
         assert!(msg.contains("may or may not have reached the service manager"), "{msg}");
     };
-    bounded::test_hook::spawn_fails(|| cosca::error::Error::Containment {
-        detail: "forced".into(),
+    bounded::test_hook::spawn_fails(|| {
+        bounded::test_hook::may_have_started(cosca::error::Error::Containment {
+            detail: "forced".into(),
+        })
     });
     may_or_may_not(&spawn().expect_err("injected"));
 

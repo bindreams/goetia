@@ -11,6 +11,8 @@ use super::*;
 use crate::backend::bounded::Fate;
 use crate::backend::client::fake::{Ended, Entry, Fake, RoleKind, Waited, exited, fail, lingering, reply};
 use crate::backend::client::{Client, ClientError, Real};
+use crate::backend::standby;
+use crate::backend::test_allowance;
 use crate::manager::ServiceManager;
 use crate::spec::DaemonFields;
 use crate::spec::{Id, Kind, Restart, User};
@@ -1019,13 +1021,13 @@ fn a_reservation_holds_what_its_steps_count() {
 fn a_reservation_that_cannot_be_made_whole_is_refused() {
     use crate::backend::Backend;
 
-    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    type Allowance = fn(usize) -> test_allowance::Allowance;
     let mgr = Launchd::new();
     for steps in [&[Step::Stop, Step::Start][..], &[Step::Start]] {
         let (reapers, files) = counted(steps);
         for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
             let shortfalls: [(Allowance, usize, &str); 2] = [
-                (bounded::test_hook::threads, reapers - 1, "no thread"),
+                (standby::test_hook::threads, reapers - 1, "no thread"),
                 (bounded::test_hook::temp_files, files - 1, "no temp file"),
             ];
             for (allow, n, what) in shortfalls {
@@ -1186,10 +1188,10 @@ fn a_restart_that_cannot_reserve_sends_nothing() {
     use crate::cli::wait::WaitArgs;
     use crate::cli::{ExitCode, restart};
 
-    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    type Allowance = fn(usize) -> test_allowance::Allowance;
     let (reapers, files) = counted(&[Step::Stop, Step::Start]);
     let shortfalls: [(Allowance, usize); 2] = [
-        (bounded::test_hook::threads, reapers - 1),
+        (standby::test_hook::threads, reapers - 1),
         (bounded::test_hook::temp_files, files - 1),
     ];
     for (allow, n) in shortfalls {
@@ -1220,10 +1222,10 @@ fn a_restart_that_cannot_reserve_sends_nothing() {
 /// the test `Fake`, since the blanket impl is the same for every backend.
 #[skuld::test]
 fn an_install_that_cannot_reserve_sends_nothing_and_names_its_id() {
-    type Allowance = fn(usize) -> bounded::test_hook::Allowance;
+    type Allowance = fn(usize) -> test_allowance::Allowance;
     let (reapers, files) = counted(&[Step::Install]);
     let shortfalls: [(Allowance, usize); 2] = [
-        (bounded::test_hook::threads, reapers - 1),
+        (standby::test_hook::threads, reapers - 1),
         (bounded::test_hook::temp_files, files - 1),
     ];
     for (allow, n) in shortfalls {

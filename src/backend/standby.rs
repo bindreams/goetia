@@ -1,12 +1,19 @@
-//! The thread made before the work it serves exists, parked until it is handed its share.
+//! A thread that serves one share of work: made before the work exists and parked until handed it,
+//! or made at the point of use.
 
 use std::fmt;
 use std::io;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-/// A thread made before the child it serves is spawned, parked until it is handed its share of that
-/// child. Handed nothing — the child was never spawned, or needed nothing of it — it ends.
+/// A thread that serves one share of work, made in one of two ways.
+///
+/// Made before the work it serves ([`Standby::new`], [`Standby::with`]), it is parked until handed
+/// its share with [`Standby::hand`], so a refusal to make it is known before the work starts. Handed
+/// nothing — the child was never spawned, or needed nothing of it — it ends.
+///
+/// Made at the point of use ([`Standby::run_now`]), it is handed its item at once. That can fail, for
+/// want of a thread, and the item then comes back unserved.
 pub(crate) struct Standby<T>(mpsc::Sender<T>);
 
 impl<T> fmt::Debug for Standby<T> {
@@ -40,6 +47,55 @@ impl<T: Send + 'static> Standby<T> {
     /// to, the share comes back.
     pub(crate) fn hand(self, share: T) -> Result<(), T> {
         self.0.send(share).map_err(|mpsc::SendError(share)| share)
+    }
+}
+
+// Unix makes its threads through these; Windows' only constructor is `with`.
+#[cfg_attr(not(unix), allow(dead_code))]
+impl<T: Send + 'static> Standby<T> {
+    /// A standby on a `std::thread`, whose handle is dropped: a failure to make it is `io::Error`,
+    /// and under test the hook may refuse it.
+    pub(crate) fn new(name: &str, serve: impl FnOnce(T) + Send + 'static) -> io::Result<Standby<T>> {
+        #[cfg(test)]
+        test_hook::make()?;
+        let (standby, _thread) = Standby::with(
+            name,
+            |name, run| std::thread::Builder::new().name(name.to_string()).spawn(run),
+            serve,
+        )?;
+        Ok(standby)
+    }
+
+    /// Make a thread now and run `serve` on `item` there, for work with no earlier moment to make
+    /// the thread in. With no thread to be had `item` comes back, still unserved.
+    pub(crate) fn run_now(name: &str, item: T, serve: impl FnOnce(T) + Send + 'static) -> Result<(), T> {
+        match Standby::new(name, serve) {
+            Ok(standby) => standby.hand(item),
+            Err(_) => Err(item),
+        }
+    }
+}
+
+/// Makes thread creation fail on demand, on this thread only, so the paths that must refuse to send
+/// anything when it does are testable.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::cell::Cell;
+    use std::io;
+
+    use crate::backend::test_allowance::{Allowance, spend};
+
+    thread_local! {
+        static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Let this thread make only `n` more threads, until the returned guard drops.
+    pub(crate) fn threads(n: usize) -> Allowance {
+        Allowance::set(&THREADS, n)
+    }
+
+    pub(super) fn make() -> io::Result<()> {
+        spend(&THREADS, "no thread may be made (test hook)")
     }
 }
 
