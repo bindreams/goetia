@@ -56,13 +56,14 @@ define_windows_service!(ffi_service_main, service_main);
 
 /// SCM's arguments to `ServiceMain`: the first is the service's name.
 fn service_main(scm_args: Vec<OsString>) {
-    match service_name(&Log::real(), &scm_args) {
-        Ok(id) => run_service(id),
+    let log = Arc::new(Log::real());
+    match service_name(&log, &scm_args) {
+        Ok(id) => run_service(id, log),
         Err(code) => exit::end_process(code),
     }
 }
 
-/// The service's name: SCM's first argument, which must be there and be UTF-8. Otherwise no spec can
+/// The service's name: SCM's first argument, which must be there, be UTF-8 and not be empty. Otherwise no spec can
 /// be looked up, so the refusal is logged under [`TABLE_NAME`] and its process exit code returned;
 /// no `STOPPED` is reported, because no service is known to report it for.
 fn service_name<'a>(log: &Log, scm_args: &'a [OsString]) -> Result<&'a str, i32> {
@@ -76,8 +77,7 @@ fn service_name<'a>(log: &Log, scm_args: &'a [OsString]) -> Result<&'a str, i32>
         })
 }
 
-fn run_service(id: &str) {
-    let log = Arc::new(Log::real());
+fn run_service(id: &str, log: Arc<Log>) {
     let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
     let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
