@@ -806,7 +806,8 @@ fn assert_no_manager(result: Result<()>, evidence: &str, path: &str) {
 /// gate's own probes included: the fake has no entries, so a single call would fail the test.
 #[skuld::test]
 fn evidence_known_without_asking_refuses_every_path_before_anything_runs() {
-    let hosts: [(fn() -> Host, &str); 5] = [
+    type Shape = fn() -> Host;
+    let hosts: [(Shape, &str); 5] = [
         (offline_one, "`SYSTEMD_OFFLINE=1` is set"),
         (
             unbooted,
