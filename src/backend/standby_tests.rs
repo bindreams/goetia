@@ -49,7 +49,6 @@ fn a_refused_thread_is_the_makers_error_and_serves_nothing() {
 }
 
 /// The item is served on a thread of its own, not the caller's, and the call reports success.
-#[cfg(unix)]
 #[skuld::test]
 fn run_now_serves_the_item_on_a_thread_other_than_the_callers() {
     let (served, seen) = mpsc::channel();
@@ -66,10 +65,9 @@ fn run_now_serves_the_item_on_a_thread_other_than_the_callers() {
 }
 
 /// With no thread to be had the item comes back, unserved: the caller decides what to give up.
-#[cfg(unix)]
 #[skuld::test]
 fn an_item_is_handed_back_when_no_thread_can_serve_it() {
-    let _no_thread = crate::backend::bounded::test_hook::threads(0);
+    let _no_thread = test_hook::threads(0);
 
     let back = Standby::run_now("standby-test", 7, |_| panic!("no thread was made to run this"));
 

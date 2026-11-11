@@ -12,6 +12,7 @@
 use super::*;
 use std::os::unix::process::ExitStatusExt as _;
 use std::time::Duration;
+use crate::backend::standby;
 
 /// A `systemctl` that exited with `code`.
 fn exit(code: i32) -> ExitStatus {
@@ -308,8 +309,8 @@ fn the_bounded_path_issues_the_request_on_a_spent_deadline() {
 fn a_request_nothing_could_watch_is_never_sent() {
     type Allowance = fn() -> bounded::test_hook::Allowance;
     let shortfalls: [(Allowance, &str); 2] = [
-        (|| bounded::test_hook::threads(0), "no thread"),
-        (|| bounded::test_hook::threads(1), "no thread"),
+        (|| standby::test_hook::threads(0), "no thread"),
+        (|| standby::test_hook::threads(1), "no thread"),
     ];
     for (allowance, what) in shortfalls {
         let dir = tempfile::tempdir().unwrap();

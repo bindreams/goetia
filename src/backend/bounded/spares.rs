@@ -173,7 +173,7 @@ impl Kept {
     /// be writing to them.
     pub(crate) fn again(&self) -> io::Result<Reservation> {
         #[cfg(test)]
-        test_hook::make(test_hook::Kind::Reuse)?;
+        test_hook::reuse()?;
         let files = self
             .files
             .iter()
@@ -272,27 +272,29 @@ pub(super) fn listener() -> io::Result<Listener> {
 /// own, whatever reservation it is handed.
 pub(super) fn make_file() -> io::Result<File> {
     #[cfg(test)]
-    test_hook::make(test_hook::Kind::TempFile)?;
+    test_hook::make_file()?;
     tempfile::tempfile()
 }
 
 // test_hook ===========================================================================================================
 
-/// Makes thread or temp-file creation fail on demand, on this thread only, so the paths that must
-/// refuse to send anything when it does are testable.
+/// Makes temp-file creation and reuse fail on demand, on this thread only, and records the spawns
+/// and waits a test scripts, so the paths that must refuse to send anything when a file cannot be
+/// had are testable. Thread creation is [`Standby`]'s hook.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
 
+    pub(crate) use crate::backend::standby::test_hook::Allowance;
+    use crate::backend::standby::test_hook::{Left, spend};
+
     #[derive(Debug, Clone, Copy)]
-    pub(crate) enum Kind {
-        Thread,
+    enum Kind {
         TempFile,
         Reuse,
     }
 
     thread_local! {
-        static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
         static TEMP_FILES: Cell<Option<usize>> = const { Cell::new(None) };
         static REUSES: Cell<Option<usize>> = const { Cell::new(None) };
         static SPAWNS: Cell<usize> = const { Cell::new(0) };
@@ -350,17 +352,11 @@ pub(crate) mod test_hook {
         SPAWN_FAILS.take().map(|error| error())
     }
 
-    fn allowance(kind: Kind) -> &'static std::thread::LocalKey<Cell<Option<usize>>> {
+    fn allowance(kind: Kind) -> &'static Left {
         match kind {
-            Kind::Thread => &THREADS,
             Kind::TempFile => &TEMP_FILES,
             Kind::Reuse => &REUSES,
         }
-    }
-
-    /// Let this thread make only `n` more threads, until the returned guard drops.
-    pub(crate) fn threads(n: usize) -> Allowance {
-        allow(Kind::Thread, n)
     }
 
     /// Let this thread make only `n` more temp files, until the returned guard drops.
@@ -375,32 +371,14 @@ pub(crate) mod test_hook {
     }
 
     fn allow(kind: Kind, n: usize) -> Allowance {
-        allowance(kind).set(Some(n));
-        Allowance(kind)
+        Allowance::set(allowance(kind), n)
     }
 
-    /// See [`threads`] and [`temp_files`].
-    pub(crate) struct Allowance(Kind);
-
-    impl Drop for Allowance {
-        fn drop(&mut self) {
-            allowance(self.0).set(None);
-        }
+    pub(super) fn make_file() -> std::io::Result<()> {
+        spend(allowance(Kind::TempFile), "no temp file may be made (test hook)")
     }
 
-    pub(crate) fn make(kind: Kind) -> std::io::Result<()> {
-        let left = allowance(kind);
-        match left.get() {
-            Some(0) => Err(std::io::Error::other(match kind {
-                Kind::Thread => "no thread may be made (test hook)",
-                Kind::TempFile => "no temp file may be made (test hook)",
-                Kind::Reuse => "no kept file may be reused (test hook)",
-            })),
-            Some(n) => {
-                left.set(Some(n - 1));
-                Ok(())
-            }
-            None => Ok(()),
-        }
+    pub(super) fn reuse() -> std::io::Result<()> {
+        spend(allowance(Kind::Reuse), "no kept file may be reused (test hook)")
     }
 }

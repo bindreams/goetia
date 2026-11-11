@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::manager::budget::Budget;
+use crate::backend::standby;
 
 /// A reservation holding the temp files one child's streams draw.
 fn files() -> Reservation {
@@ -491,13 +492,13 @@ fn a_child_whose_output_nothing_could_take_is_never_run() {
         (
             "announced stdout",
             || Role::AnnouncedRequest(announced),
-            || test_hook::threads(0),
+            || standby::test_hook::threads(0),
             "thread",
         ),
         (
             "announced stderr",
             || Role::AnnouncedRequest(announced),
-            || test_hook::threads(1),
+            || standby::test_hook::threads(1),
             "thread",
         ),
     ];
@@ -686,7 +687,7 @@ fn a_child_takes_its_output_from_the_reservation_it_is_handed() {
 #[skuld::test]
 fn a_reservation_hands_out_what_it_made() {
     let mut reservation = Reservation::make(2, 2).unwrap();
-    let _no_thread = test_hook::threads(0);
+    let _no_thread = standby::test_hook::threads(0);
     let _no_file = test_hook::temp_files(0);
 
     drop((reservation.reaper().unwrap(), reservation.reaper().unwrap()));
@@ -701,8 +702,8 @@ fn a_reservation_hands_out_what_it_made() {
 fn a_reservation_is_made_whole_or_not_at_all() {
     type Case = (&'static str, fn() -> test_hook::Allowance, (usize, usize), &'static str);
     let cases: [Case; 4] = [
-        ("third reaper", || test_hook::threads(2), (3, 0), "no thread"),
-        ("first reaper", || test_hook::threads(0), (1, 2), "no thread"),
+        ("third reaper", || standby::test_hook::threads(2), (3, 0), "no thread"),
+        ("first reaper", || standby::test_hook::threads(0), (1, 2), "no thread"),
         ("second file", || test_hook::temp_files(1), (0, 2), "no temp file"),
         (
             "file after the reapers",
@@ -820,7 +821,7 @@ fn kept_files_serve_a_read_again_and_again_each_starting_empty() {
 #[skuld::test]
 fn an_announced_request_takes_its_threads_from_the_spares() {
     let spares = spare(2).unwrap();
-    let _no_thread = test_hook::threads(0);
+    let _no_thread = standby::test_hook::threads(0);
 
     let finished = wait_bounded(
         spawned(sh("echo 'request issued' >&2"), Role::AnnouncedRequest(announced)),
@@ -846,7 +847,7 @@ fn making_a_listener_on_the_spot_inside_a_reservation_is_loud() {
 #[skuld::test]
 fn a_spare_that_cannot_be_made_whole_spares_nothing() {
     {
-        let _one = test_hook::threads(1);
+        let _one = standby::test_hook::threads(1);
         let e = spare(2).expect_err("a second thread may not be made");
         assert!(e.to_string().contains("no thread may be made"), "{e}");
     }
@@ -861,7 +862,7 @@ fn a_spare_that_cannot_be_made_whole_spares_nothing() {
 #[skuld::test]
 fn spares_are_released_with_their_guard() {
     drop(spare(2).unwrap());
-    let _none = test_hook::threads(0);
+    let _none = standby::test_hook::threads(0);
 
     assert!(spares::listener().is_err(), "a released spare was still handed out");
 }

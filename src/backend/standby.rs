@@ -43,13 +43,14 @@ impl<T: Send + 'static> Standby<T> {
     }
 }
 
-#[cfg(unix)]
+// Unix makes its threads through these; Windows' only caller of `Standby` is `with`.
+#[cfg_attr(not(unix), allow(dead_code))]
 impl<T: Send + 'static> Standby<T> {
     /// A standby on a `std::thread`, whose handle is dropped: a failure to make it is `io::Error`,
     /// and under test the hook may refuse it.
     pub(crate) fn new(name: &str, serve: impl FnOnce(T) + Send + 'static) -> io::Result<Standby<T>> {
         #[cfg(test)]
-        crate::backend::bounded::test_hook::make(crate::backend::bounded::test_hook::Kind::Thread)?;
+        test_hook::make()?;
         let (standby, _thread) = Standby::with(
             name,
             |name, run| std::thread::Builder::new().name(name.to_string()).spawn(run),
@@ -64,6 +65,59 @@ impl<T: Send + 'static> Standby<T> {
         match Standby::new(name, serve) {
             Ok(standby) => standby.hand(item),
             Err(_) => Err(item),
+        }
+    }
+}
+
+/// Makes thread creation fail on demand, on this thread only, so the paths that must refuse to send
+/// anything when it does are testable.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::cell::Cell;
+    use std::io;
+    use std::thread::LocalKey;
+
+    /// How many more of something this thread may make: `None` is no limit.
+    pub(crate) type Left = LocalKey<Cell<Option<usize>>>;
+
+    thread_local! {
+        static THREADS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Let this thread make only `n` more threads, until the returned guard drops.
+    pub(crate) fn threads(n: usize) -> Allowance {
+        Allowance::set(&THREADS, n)
+    }
+
+    pub(super) fn make() -> io::Result<()> {
+        spend(&THREADS, "no thread may be made (test hook)")
+    }
+
+    /// Spend one of `left`, or refuse with `refusal` when none remain.
+    pub(crate) fn spend(left: &'static Left, refusal: &str) -> io::Result<()> {
+        match left.get() {
+            Some(0) => Err(io::Error::other(refusal)),
+            Some(n) => {
+                left.set(Some(n - 1));
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Holds a limit on `left` until it drops, which lifts it.
+    pub(crate) struct Allowance(&'static Left);
+
+    impl Allowance {
+        pub(crate) fn set(left: &'static Left, n: usize) -> Allowance {
+            left.set(Some(n));
+            Allowance(left)
+        }
+    }
+
+    impl Drop for Allowance {
+        fn drop(&mut self) {
+            self.0.set(None);
         }
     }
 }
