@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use skuld::temp_dir;
+use skuld::TempDir;
 
 use super::*;
 use crate::backend::scm::shim::run::logging::Log;
@@ -166,8 +166,11 @@ fn finish_returns_when_the_stopped_report_succeeded() {
 
 /// When SCM cannot be told `STOPPED` the dispatcher is not trusted to return, so `finish` ends the
 /// process itself, with the code it was to report, after it logged why.
+///
+/// The directory is the parent's, made after the child's branch: a child ends itself without
+/// dropping anything, so it creates nothing.
 #[skuld::test]
-fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed(#[fixture(temp_dir)] dir: &Path) {
+fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed() {
     if child_mode().is_some() {
         finish(&logs(), "frpc", Reported::incomplete_stop(), |_| {
             Err(std::io::Error::other("refused"))
@@ -175,10 +178,11 @@ fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed
         std::process::exit(RETURNED);
     }
 
+    let dir = TempDir::new().expect("a temporary directory");
     let code = Children::of("finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed")
-        .exit_logging(0, dir);
+        .exit_logging(0, dir.path());
 
     assert_eq!(code, Some(Reported::incomplete_stop().process_exit_code()));
-    let logged = std::fs::read_to_string(dir.join("frpc.log")).expect("the child's log");
+    let logged = std::fs::read_to_string(dir.path().join("frpc.log")).expect("the child's log");
     assert!(logged.contains("report SERVICE_STOPPED to SCM: refused"), "{logged}");
 }
