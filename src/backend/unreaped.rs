@@ -3,7 +3,7 @@
 use cosca::error::Error;
 
 #[cfg(unix)]
-use crate::backend::bounded::reap_in_background;
+use crate::backend::standby::Standby;
 
 /// `e`, with the child cosca could not end settled so that the caller never waits for it. Dropping an
 /// [`Unreaped`](cosca::Unreaped) waits with no bound for the child to exit, and a spawn error is
@@ -27,7 +27,7 @@ pub(crate) fn release_unreaped(mut e: Error) -> Error {
 fn settle(child: cosca::Unreaped) {
     // The status is dropped: the caller has reported the failure, and the child is settled whatever
     // the wait said.
-    if let Err(child) = reap_in_background(child, |child| drop(child.wait())) {
+    if let Err(child) = Standby::run_now("goetia-reaper", child, |child| drop(child.wait())) {
         child.leak();
     }
 }

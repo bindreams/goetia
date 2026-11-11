@@ -43,6 +43,31 @@ impl<T: Send + 'static> Standby<T> {
     }
 }
 
+#[cfg(unix)]
+impl<T: Send + 'static> Standby<T> {
+    /// A standby on a `std::thread`, whose handle is dropped: a failure to make it is `io::Error`,
+    /// and under test the hook may refuse it.
+    pub(crate) fn new(name: &str, serve: impl FnOnce(T) + Send + 'static) -> io::Result<Standby<T>> {
+        #[cfg(test)]
+        crate::backend::bounded::test_hook::make(crate::backend::bounded::test_hook::Kind::Thread)?;
+        let (standby, _thread) = Standby::with(
+            name,
+            |name, run| std::thread::Builder::new().name(name.to_string()).spawn(run),
+            serve,
+        )?;
+        Ok(standby)
+    }
+
+    /// Make a thread now and run `serve` on `item` there, for work with no earlier moment to make
+    /// the thread in. With no thread to be had `item` comes back, still unserved.
+    pub(crate) fn run_now(name: &str, item: T, serve: impl FnOnce(T) + Send + 'static) -> Result<(), T> {
+        match Standby::new(name, serve) {
+            Ok(standby) => standby.hand(item),
+            Err(_) => Err(item),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "standby_tests.rs"]
 mod standby_tests;

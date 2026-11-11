@@ -10,29 +10,11 @@ use std::fs::File;
 use std::io::{self, Seek as _};
 use std::marker::PhantomData;
 use std::process::ExitStatus;
-use std::thread;
 
 use crossbeam_channel::Receiver;
 
 use super::{Chunk, drain};
 use crate::backend::standby::Standby;
-
-// Standby =============================================================================================================
-
-impl<T: Send + 'static> Standby<T> {
-    /// A standby on a `std::thread`, whose handle is dropped: a failure to make it is `io::Error`,
-    /// and under test the hook may refuse it.
-    fn new(name: &str, serve: impl FnOnce(T) + Send + 'static) -> io::Result<Standby<T>> {
-        #[cfg(test)]
-        test_hook::make(test_hook::Kind::Thread)?;
-        let (standby, _thread) = Standby::with(
-            name,
-            |name, run| thread::Builder::new().name(name.to_string()).spawn(run),
-            serve,
-        )?;
-        Ok(standby)
-    }
-}
 
 // Reaper ==============================================================================================================
 
@@ -74,16 +56,6 @@ impl Reaper {
             debug_assert!(false, "the reaper thread ended before it was handed its child");
             let_go(child); // never killed
         }
-    }
-}
-
-/// Make a thread now, give it `item` and run `serve` on it there: the reaper of a child that was
-/// not announced, such as a failed spawn's. With no thread to be had `item` comes back, still
-/// unserved. A caller that outlives the child must not collect a zombie for each one it leaves.
-pub(crate) fn reap_in_background<T: Send + 'static>(item: T, serve: impl FnOnce(T) + Send + 'static) -> Result<(), T> {
-    match Standby::new("goetia-reaper", serve) {
-        Ok(standby) => standby.hand(item),
-        Err(_) => Err(item),
     }
 }
 
@@ -416,7 +388,7 @@ pub(crate) mod test_hook {
         }
     }
 
-    pub(super) fn make(kind: Kind) -> std::io::Result<()> {
+    pub(crate) fn make(kind: Kind) -> std::io::Result<()> {
         let left = allowance(kind);
         match left.get() {
             Some(0) => Err(std::io::Error::other(match kind {
