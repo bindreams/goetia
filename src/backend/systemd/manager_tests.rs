@@ -14,6 +14,8 @@ use super::dirs::ensure_dir;
 use super::discover::{RawState, raw_state};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
+use crate::backend::standby;
+use crate::backend::test_allowance;
 use crate::manager::ServiceManager;
 use crate::manager::conformance::fresh_id;
 use crate::spec::DaemonFields;
@@ -433,7 +435,7 @@ fn prepared_steps_need_nothing_made_later() {
     let mgr = Systemd::new();
     for (steps, watched) in [(&[Step::Stop, Step::Start][..], 2), (&[Step::Install, Step::Start], 1)] {
         let _prepared = mgr.prepare(steps, Budget::DEFAULT).expect("prepare");
-        let _no_thread = bounded::test_hook::threads(0);
+        let _no_thread = standby::test_hook::threads(0);
         let _no_file = bounded::test_hook::temp_files(0);
         for _ in 0..watched {
             let spawned = bounded::spawn(
@@ -451,10 +453,10 @@ fn prepared_steps_need_nothing_made_later() {
         );
     }
 
-    type Allowance = fn() -> bounded::test_hook::Allowance;
+    type Allowance = fn() -> test_allowance::Allowance;
     let shortfalls: [Allowance; 3] = [
-        || bounded::test_hook::threads(1),
-        || bounded::test_hook::threads(3),
+        || standby::test_hook::threads(1),
+        || standby::test_hook::threads(3),
         || bounded::test_hook::temp_files(0),
     ];
     for (i, allowance) in shortfalls.into_iter().enumerate() {
@@ -473,7 +475,7 @@ fn prepared_steps_need_nothing_made_later() {
 /// for one — a verb that makes no thread must not be refused for want of one.
 #[skuld::test]
 fn a_budget_that_watches_nothing_prepares_nothing() {
-    let _no_thread = bounded::test_hook::threads(0);
+    let _no_thread = standby::test_hook::threads(0);
     let _no_file = bounded::test_hook::temp_files(0);
     for budget in [Budget::Immediate, Budget::Unbounded] {
         assert!(
