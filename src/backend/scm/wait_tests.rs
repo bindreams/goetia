@@ -3457,8 +3457,7 @@ fn an_uninstall_over_an_incomplete_stop_ends_the_held_process_before_failing() {
             Ok(EndProcessOutcome::Exited)
         },
     )
-    .err()
-    .expect("an incomplete stop fails the uninstall");
+    .expect_err("an incomplete stop fails the uninstall");
 
     assert_eq!(*ended.borrow(), vec![7]);
     let said = err.report().to_string();
@@ -3522,8 +3521,7 @@ fn an_uninstall_whose_process_could_not_be_held_fails_with_why() {
         Some(|| -> crate::error::Result<HoldOutcome<u32>> { Err(crate::error::Error::blob("held badly")) }),
         no_end_of,
     )
-    .err()
-    .expect("the hold failed");
+    .expect_err("the hold failed");
 
     assert!(err.report().to_string().contains("held badly"), "{}", err.report());
 }

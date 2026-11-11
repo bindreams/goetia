@@ -658,7 +658,7 @@ pub enum StopSeen {
 /// is `STOPPED` and `STOP_PENDING`, and a first read of anything else waits; after [`StopSeen::Pending`]
 /// the first arm is `STOPPED` alone, and a first read of anything but `STOP_PENDING` or `STOPPED` fails.
 ///
-/// A `STOPPED` is judged by the record it carries when `shim` says it is judged (see [`judged`]).
+/// A `STOPPED` is judged by the record it carries when `shim` says it is judged (see `judged`).
 pub fn wait_after_stop<A: ScmActor>(
     a: &mut A,
     deadline: Deadline,
