@@ -165,9 +165,7 @@ const ENVIRONMENT: [(&str, &str); 3] = [
 ///
 /// Not reached: `DBUS_*`, which a non-root `systemctl` honours with no switch at all (whether a
 /// read's child should lose it too is open), and variables under neither prefix (`PAGER`, `LESS`,
-/// `TERM`, the locale), none of which changes the report. Measurements: the knowledge base's
-/// "systemd - Three SYSTEMD_ switches turn off the chroot report ..." and "systemd - systemctl in a
-/// chroot exits 0 having done nothing ...".
+/// `TERM`, the locale), none of which changes the report.
 const DENIED: [&str; 2] = ["SYSTEMD_", "SYSTEMCTL_"];
 
 /// The inherited names that are removed from a `systemctl`'s environment: every [`DENIED`] one that
