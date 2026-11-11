@@ -168,3 +168,29 @@ fn kickstart_pid_rejects_a_truncated_line() {
     assert_eq!(kickstart_pid("47"), None);
     assert_eq!(kickstart_pid("4766"), None);
 }
+
+// tearing_down ========================================================================================================
+
+/// The measured shape of a job whose `bootout` has returned and whose process has not exited.
+#[skuld::test]
+fn a_sigtermed_job_is_being_torn_down() {
+    assert!(tearing_down(&print_body("SIGTERMed", Some(4242))));
+    assert!(tearing_down(&print_body("SIGTERMed", None)));
+}
+
+/// Any other state, one this code does not recognise included, is a loaded job: a `start` does not
+/// wait on something it cannot identify.
+#[skuld::test]
+fn any_other_state_is_not_a_job_being_torn_down() {
+    for state in [
+        "running",
+        "not running",
+        "exited",
+        "spawn scheduled",
+        "xpcproxy",
+        "someday-new-apple-state",
+    ] {
+        assert!(!tearing_down(&print_body(state, Some(4242))), "{state}");
+    }
+    assert!(!tearing_down("no state line at all\n"));
+}

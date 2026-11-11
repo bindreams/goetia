@@ -40,7 +40,7 @@ fn an_unbounded_budget_is_never_spent() {
 }
 
 /// The stop leg always gets a budget, and a spent bounded one is handed on as the least bound there
-/// is — never `Immediate`, which does not wait, and on launchd runs `bootout` to completion
+/// is — never `Immediate`, which does not wait, and on launchd waits for the job to be gone
 /// unbounded.
 #[skuld::test]
 fn a_stop_leg_whose_bounded_budget_is_spent_still_gets_a_bound() {
