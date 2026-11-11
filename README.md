@@ -773,7 +773,23 @@ Any program that ships a stock shim adds one file, `src/bin/goetia-shim.rs`:
 goetia::stock_shim!();
 ```
 
-and chooses how it reaches the machine.
+and a `build.rs` that hardens it, as goetia hardens its own binaries, so that a
+DLL placed beside the shim is never loaded in its place:
+
+```toml
+[build-dependencies]
+libsearch-guard = "0.1"
+```
+
+```rust
+// build.rs
+fn main() {
+    libsearch_guard::bins();
+}
+```
+
+That covers every `[[bin]]` of the package. The program then chooses how the
+shim reaches the machine.
 
 **Installer places the file.** The installer puts `goetia-shim.exe` in the
 product folder, and the program points goetia at it:
