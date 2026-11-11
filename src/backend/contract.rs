@@ -57,7 +57,14 @@ pub(crate) trait Backend {
     /// anything is written. Run after [`Self::render_for_install`] has succeeded, so it holds or
     /// writes nothing for an install that cannot be rendered. `desired` is that render: what a
     /// backend places for the install (SCM's service host) must be what `desired` names.
-    fn begin_install(&self, spec: &DaemonSpec, desired: &Self::Definition) -> Result<Self::InstallScope>;
+    /// `reservation` is the install's own, which a backend may keep an answer in for the steps that
+    /// follow (systemd's version gate).
+    fn begin_install(
+        &self,
+        spec: &DaemonSpec,
+        desired: &Self::Definition,
+        reservation: &mut Self::Reservation,
+    ) -> Result<Self::InstallScope>;
 
     /// Make ready, all or none, what each of `steps` can draw under `budget`, before the first of
     /// them sends anything: a failure here means nothing was sent. See [`ServiceManager::prepare`].
@@ -133,8 +140,9 @@ pub(crate) trait Backend {
         Ok(())
     }
 
-    /// See [`ServiceManager::enable`].
-    fn enable(&self, snapshot: Self::Snapshot) -> Result<()>;
+    /// See [`ServiceManager::enable`]. Draws nothing from `reservation`; it is handed one to share
+    /// what the steps before it kept there (systemd's version gate).
+    fn enable(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<()>;
 
     /// See [`ServiceManager::disable`].
     fn disable(&self, snapshot: Self::Snapshot) -> Result<()>;
@@ -254,7 +262,9 @@ pub(crate) struct Scan<S> {
 
 impl<B: Backend> ServiceManager for B {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome> {
-        flow::install(self, spec, force)
+        // `install` has no `--timeout` of its own: its calls are unbounded.
+        let mut reservation = flow::reserved(self, &spec.id, &[Step::Install], Budget::Unbounded)?;
+        flow::install(self, spec, force, &mut reservation)
     }
 
     fn preview_install(&self, spec: &DaemonSpec) -> Result<crate::decide::Outcome> {
@@ -269,12 +279,14 @@ impl<B: Backend> ServiceManager for B {
             owned => owned?,
         };
         // `uninstall` has no `--timeout` of its own: its stop is unbounded.
-        let mut reservation = flow::reserved(self, id, Step::Uninstall, Budget::Unbounded)?;
+        let mut reservation = flow::reserved(self, id, &[Step::Uninstall], Budget::Unbounded)?;
         Backend::uninstall(self, snapshot, &mut reservation)
     }
 
     fn enable(&self, id: &Id) -> Result<()> {
-        Backend::enable(self, flow::owned(self, id)?)
+        let snapshot = flow::owned(self, id)?;
+        let mut reservation = flow::reserved(self, id, &[], Budget::Unbounded)?;
+        Backend::enable(self, snapshot, &mut reservation)
     }
 
     fn disable(&self, id: &Id) -> Result<()> {
@@ -283,7 +295,7 @@ impl<B: Backend> ServiceManager for B {
 
     fn start(&self, id: &Id, budget: Budget) -> Result<()> {
         let snapshot = flow::owned(self, id)?;
-        let mut reservation = flow::reserved(self, id, Step::Start, budget)?;
+        let mut reservation = flow::reserved(self, id, &[Step::Start], budget)?;
         Backend::start(self, snapshot, budget, &mut reservation)
     }
 
@@ -302,19 +314,19 @@ impl<B: Backend> ServiceManager for B {
 
     fn request_start_after_stop(&self, id: &Id) -> Result<()> {
         let snapshot = flow::owned(self, id)?;
-        let mut reservation = flow::reserved(self, id, Step::RequestStartAfterStop, Budget::Immediate)?;
+        let mut reservation = flow::reserved(self, id, &[Step::RequestStartAfterStop], Budget::Immediate)?;
         Backend::request_start_after_stop(self, snapshot, &mut reservation)
     }
 
     fn stop(&self, id: &Id, budget: Budget) -> Result<()> {
         let snapshot = flow::owned(self, id)?;
-        let mut reservation = flow::reserved(self, id, Step::Stop, budget)?;
+        let mut reservation = flow::reserved(self, id, &[Step::Stop], budget)?;
         Backend::stop(self, snapshot, budget, &mut reservation)
     }
 
     fn kill(&self, id: &Id) -> Result<()> {
         let snapshot = flow::owned(self, id)?;
-        let mut reservation = flow::reserved(self, id, Step::Kill, Budget::Unbounded)?;
+        let mut reservation = flow::reserved(self, id, &[Step::Kill], Budget::Unbounded)?;
         Backend::kill(self, snapshot, &mut reservation)
     }
 
@@ -355,6 +367,16 @@ impl<B: Backend> Reserved<'_, B> {
 }
 
 impl<B: Backend> Sequence for Reserved<'_, B> {
+    fn install(&mut self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome> {
+        self.spend(&[Step::Install]);
+        flow::install(self.backend, spec, force, &mut self.reservation)
+    }
+
+    fn enable(&mut self, id: &Id) -> Result<()> {
+        let snapshot = flow::owned(self.backend, id)?;
+        Backend::enable(self.backend, snapshot, &mut self.reservation)
+    }
+
     fn stop(&mut self, id: &Id, budget: Budget) -> Result<()> {
         let snapshot = flow::owned(self.backend, id)?;
         self.spend(&[Step::Stop]);

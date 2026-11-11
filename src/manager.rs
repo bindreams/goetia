@@ -260,13 +260,23 @@ pub enum Step {
 /// What [`ServiceManager::prepare`] made ready, and the verbs that draw on it, with the contracts
 /// of the [`ServiceManager`] verbs of the same names. Releases what it did not spend when dropped.
 ///
-/// A verb may be run only for a step that was prepared, and each prepared step once: [`Step::Stop`]
-/// by `stop`, [`Step::Start`] by `start` or, where the start is only requested, by
-/// `request_start_after_stop`. Anything else was not counted for and fails a debug assertion; in a
-/// release build it makes what it needs on the spot, which can fail between legs. A verb the
-/// ownership gate refuses draws nothing, so its step stays unspent.
+/// A verb may be run only for a step that was prepared, and each prepared step once: [`Step::Install`]
+/// by `install`, [`Step::Stop`] by `stop`, [`Step::Start`] by `start` or, where the start is only
+/// requested, by `request_start_after_stop`. Anything else was not counted for and fails a debug
+/// assertion; in a release build it makes what it needs on the spot, which can fail between legs. A
+/// verb the ownership gate refuses draws nothing, so its step stays unspent. `enable` draws nothing
+/// and spends no step.
+///
+/// The steps of one sequence share its reservation, and with it whatever a backend keeps there: the
+/// answer of systemd's version gate, asked once for the install, its `enable` and its start.
 #[must_use = "what was prepared is released as soon as this is dropped"]
 pub trait Sequence {
+    /// See [`ServiceManager::install`].
+    fn install(&mut self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
+
+    /// See [`ServiceManager::enable`].
+    fn enable(&mut self, id: &Id) -> Result<()>;
+
     /// See [`ServiceManager::stop`].
     fn stop(&mut self, id: &Id, budget: Budget) -> Result<()>;
 
