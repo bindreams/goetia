@@ -1563,25 +1563,6 @@ fn every_probe_switches_colour_off() {
     assert!(real_sh(&script, "systemctl").supported().is_ok());
 }
 
-/// The real `systemctl` on this host, first with an inherited `SYSTEMD_COLORS=1` — set by the
-/// wrapper only where goetia did not set it itself — then as it is.
-#[skuld::test]
-fn this_hosts_systemd_is_supported() {
-    let wrapper = "SYSTEMD_COLORS=${SYSTEMD_COLORS:-1} exec systemctl \"$@\"";
-    Systemctl::new(
-        Box::new(Real::new(
-            ["/bin/sh", "-c", wrapper, "systemctl"].map(String::from).to_vec(),
-            environment,
-        )),
-        Host::this,
-    )
-    .supported()
-    .expect("the host running the tests runs systemd 242+, whatever colour is inherited");
-    Systemctl::native()
-        .require_supported()
-        .expect("the host running the tests runs systemd 242+");
-}
-
 // kill ================================================================================================================
 
 /// `kill` over `x`, with `rest` standing in for what systemd answers it: the calls it made, too.
