@@ -1184,11 +1184,12 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
         Ok(()) => Ok(process),
         Err(e) => {
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
-            // An expiry is goetia's own breach, not the doing of whoever marked the service.
-            let state = match (is_incomplete_stop(&e), marked && !expired) {
+            // An expiry or a failed hold is goetia's own doing, not that of whoever marked the service.
+            let ours = expired || hold_failed.is_some();
+            let state = match (is_incomplete_stop(&e), marked && !ours) {
                 (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
                 (false, true) => UninstallFailure::AlreadyMarked,
-                (false, false) => UninstallFailure::Stop { previous },
+                (false, false) => UninstallFailure::Stop { previous, marked },
             };
             let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
             Err(uninstall_failed(id, &state, cause))
@@ -1664,8 +1665,13 @@ enum UninstallFailure {
     Untouched,
     /// The disable that precedes the delete failed. Whether it changed the start type is unknown.
     DisableFailed,
-    /// The stop failed. The service is running and disabled; `previous` is its start type before.
-    Stop { previous: Option<ServiceStartType> },
+    /// The stop failed for a reason of goetia's or the hold's, or for the service's own. Unless
+    /// `marked` (someone else had marked it for deletion) it is running and disabled, with `previous`
+    /// its start type before.
+    Stop {
+        previous: Option<ServiceStartType>,
+        marked: bool,
+    },
     /// The delete failed. The service is stopped and disabled; `previous` is its start type before.
     Delete { previous: Option<ServiceStartType> },
     /// Someone else had marked the service for deletion, so `uninstall` did not delete it. Its wait
@@ -1693,7 +1699,14 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
             "`{id}` was NOT deleted, and the disable that precedes the delete failed, so its start type \
              may have changed. Re-run `goetia daemon uninstall {id}` to retry"
         ),
-        UninstallFailure::Stop { previous } => format!(
+        UninstallFailure::Stop { marked: true, .. } => format!(
+            "`{id}` could not be stopped. It was NOT deleted: it was already marked for deletion, \
+             which `uninstall` does not delete over. Re-run `goetia daemon uninstall {id}` to retry; {kill} first"
+        ),
+        UninstallFailure::Stop {
+            previous,
+            marked: false,
+        } => format!(
             "`{id}` could not be stopped. It was NOT deleted and is now disabled, so \
              `goetia daemon start {id}` fails.{} Re-run `goetia daemon uninstall {id}` to retry; {kill} first",
             previous_start_type(id, *previous)

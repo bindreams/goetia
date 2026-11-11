@@ -3718,6 +3718,42 @@ fn an_uninstall_whose_unbounded_stop_expires_is_a_stop_failure_whether_or_not_it
             !said.contains("marked for deletion by someone else"),
             "marked {marked}: {said}"
         );
+        assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
+    }
+}
+
+/// A hold that fails is goetia's or the hold's doing, never that of whoever marked the service for
+/// deletion: it is told with its cause whether or not the service was marked. Only an uninstall that
+/// disabled the service says it did.
+#[cfg(windows)]
+#[skuld::test]
+fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked() {
+    use crate::backend::scm::manager::uninstall_stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    for marked in [false, true] {
+        let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]);
+
+        let err = uninstall_stop_on(
+            &mut fake,
+            &Id::try_from("frpc").unwrap(),
+            &answer,
+            marked,
+            None,
+            Some(|| -> crate::error::Result<HoldOutcome<u32>> { Err(crate::error::Error::blob("held badly")) }),
+            no_end_of,
+        )
+        .expect_err("the hold failed");
+
+        let said = err.report().to_string();
+        assert!(said.contains("held badly"), "marked {marked}: {said}");
+        assert!(said.contains("could not be stopped"), "marked {marked}: {said}");
+        assert!(
+            !said.contains("marked for deletion by someone else"),
+            "marked {marked}: {said}"
+        );
+        assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
     }
 }
 
