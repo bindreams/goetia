@@ -3417,6 +3417,7 @@ fn a_stop_that_does_not_wait_holds_nothing() {
 
     let [(_, answer), ..] = answers();
     let mut fake = incomplete(FakeScm::new([]));
+    let holds = std::cell::Cell::new(0);
 
     stop_on(
         &mut fake,
@@ -3424,11 +3425,15 @@ fn a_stop_that_does_not_wait_holds_nothing() {
         Budget::Immediate,
         spent(),
         &answer,
-        |_| -> crate::error::Result<HoldOutcome<u32>> { panic!("a stop that does not wait holds no process") },
+        |_| {
+            holds.set(holds.get() + 1);
+            Ok(HoldOutcome::<u32>::NoProcess)
+        },
         no_end,
     )
     .unwrap();
 
+    assert_eq!(holds.get(), 0, "a stop that does not wait holds no process");
     assert_eq!(fake.log, vec!["control_stop"]);
 }
 
@@ -3502,8 +3507,8 @@ fn an_uninstall_over_an_incomplete_stop_ends_the_held_process_before_failing() {
     assert!(said.contains("NOT deleted and is now disabled"), "{said}");
 }
 
-/// An uninstall holds a process only when it is told to, and judges the record by the same answer as
-/// `stop`: a service known not to run a shim finishes its stop whatever it recorded.
+/// An uninstall holds a process only when it is told to, once before its STOP, and judges the record by
+/// the same answer as `stop`: a service known not to run a shim finishes its stop whatever it recorded.
 #[cfg(windows)]
 #[skuld::test]
 fn an_uninstall_holds_only_when_told_to_and_judges_only_what_may_be_a_shim() {
@@ -3512,12 +3517,11 @@ fn an_uninstall_holds_only_when_told_to_and_judges_only_what_may_be_a_shim() {
 
     let id = Id::try_from("frpc").unwrap();
     let (marked, previous) = DISABLED_BY_US;
+    let stop =
+        || incomplete(FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]));
     for (what, answer) in answers() {
-        let mut fake =
-            incomplete(FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]));
-
         let result = uninstall_stop_on(
-            &mut fake,
+            &mut stop(),
             &id,
             &answer,
             marked,
@@ -3534,6 +3538,25 @@ fn an_uninstall_holds_only_when_told_to_and_judges_only_what_may_be_a_shim() {
             ),
             (_, Err(_)) => {}
             (_, Ok(_)) => panic!("{what}: an incomplete stop was a stop"),
+        }
+
+        let holds = std::cell::Cell::new(0);
+        let held = uninstall_stop_on(
+            &mut stop(),
+            &id,
+            &answer,
+            marked,
+            previous,
+            Some(|| {
+                holds.set(holds.get() + 1);
+                Ok(HoldOutcome::Held(7u32))
+            }),
+            |_| Ok(EndProcessOutcome::Exited),
+        );
+
+        assert_eq!(holds.get(), 1, "{what}: held once, before the STOP");
+        if what == "not a shim" {
+            assert!(matches!(held, Ok(HoldOutcome::Held(7))), "{what}: {:?}", held.err());
         }
     }
 }
