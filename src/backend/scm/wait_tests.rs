@@ -3185,7 +3185,7 @@ fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
     }
 }
 
-// start's vocabulary, through what `runs_a_shim` answers ---------------------------------------------------------------
+// start's vocabulary, through what `runs_a_shim` answers --------------------------------------------------------------
 
 /// A service whose blob will not decode is a shim's only when its image says so: a start over an image
 /// of the user's own, or one that could not be read, is judged as strictly as a `type: managed`

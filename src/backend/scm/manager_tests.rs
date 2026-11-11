@@ -552,7 +552,7 @@ fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
     .unwrap()
 }
 
-// start's vocabulary -------------------------------------------------------------------------------------------------
+// start's vocabulary --------------------------------------------------------------------------------------------------
 
 fn blob_of(kind: Kind) -> Blob {
     Blob {
