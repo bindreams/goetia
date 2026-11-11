@@ -4008,6 +4008,10 @@ fn install_start_prepares_one_sequence_for_the_install_and_the_start() {
         "one reservation, made before the install, and no verb reserves again"
     );
     assert_eq!(fake.calls(), vec![("start", "frpc".to_string())]);
+    assert!(
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
+        "--enable reached the manager"
+    );
 }
 
 #[skuld::test]
