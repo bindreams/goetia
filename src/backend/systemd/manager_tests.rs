@@ -17,6 +17,7 @@ use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_sti
 use super::*;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::{bounded, standby};
+use crate::manager::ServiceManager as _;
 use crate::manager::conformance::fresh_id;
 use crate::spec::DaemonFields;
 use crate::spec::Kind;
