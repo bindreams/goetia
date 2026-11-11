@@ -3300,7 +3300,7 @@ fn a_timed_out_start_over_an_unreadable_blob_names_the_blob() {
     let shim = format!(r#""C:\Program Files\Goetia\goetia-shim-{SHIM_HEX}.exe" --service-host"#);
     let corrupt = std::sync::Arc::new(crate::error::Error::blob("corrupt"));
 
-    for image in [shim.as_str(), r"C:inrpc.exe"] {
+    for image in [shim.as_str(), r"C:\bin\frpc.exe"] {
         let answer = shim_answer(Err(&corrupt), || Some(image.to_string()));
         let mut fake = FakeScm::new([None]);
 
