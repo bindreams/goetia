@@ -1,0 +1,7 @@
+# skuld has no per-test timeout by design. The `ci` profile is the failure bound for an attended CI
+# run: a test that exceeds it is killed and reported by name as TIMEOUT. It proves nothing about
+# state; it only gets a human to the hung test.
+[profile.ci]
+# Run every test and report every failure, as the per-binary loop did.
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 5 }
