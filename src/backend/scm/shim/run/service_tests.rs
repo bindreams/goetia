@@ -1229,3 +1229,24 @@ fn a_daemon_whose_root_was_killed_is_dropped() {
     assert!(daemon.dropped(), "the shim leaked a daemon whose root it had killed");
     fake.take_failures();
 }
+
+/// A daemon whose kills were both refused is dropped too, not leaked, and the run reports the
+/// incomplete stop.
+#[skuld::test]
+fn a_daemon_whose_kills_were_refused_is_dropped_and_reported_as_the_incomplete_stop() {
+    let fake = FakeGuard::new();
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Refuses);
+    fake.will_make_thread();
+    fake.will_spawn(daemon.clone());
+
+    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
+
+    assert_eq!(reported, Reported::incomplete_stop());
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert!(!daemon.ended(), "the daemon ended though neither kill worked");
+    assert!(daemon.dropped(), "the shim kept a daemon it had given up on");
+    fake.take_failures();
+}
