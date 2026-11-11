@@ -558,6 +558,12 @@ fn no_end(_: u32, _: Deadline) -> io::Result<EndProcessOutcome<u32>> {
     panic!("a process is ended once SCM has confirmed the stop, and only a held one")
 }
 
+/// [`no_end`] in the shape an uninstall's `end` has, which takes no deadline.
+#[cfg(windows)]
+fn no_end_of(process: u32) -> io::Result<EndProcessOutcome<u32>> {
+    no_end(process, unbounded())
+}
+
 /// [`end_process`] over `terminate` and `exit`, in the shape [`stop_and_await_exit`] takes: the one
 /// function both `stop` and `uninstall` end the process they held with.
 fn ending(
@@ -3160,23 +3166,6 @@ fn ended_by_incomplete_stop(waited: io::Result<Waited>, held: &mut HoldOutcome<u
     (waited, ended.into_inner())
 }
 
-/// The two calls `uninstall_locked` makes over its stop wait: `settle_and_stop` over the shim's record,
-/// and the helper `stop` uses for the process held before the STOP. `uninstall_locked` itself opens
-/// the real SCM and its service, which the scripted one does not reach, so it is not called here.
-#[skuld::test]
-fn an_uninstalls_incomplete_stop_ends_the_held_process_before_failing() {
-    let mut fake =
-        incomplete(FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]));
-    let mut held = HoldOutcome::Held(7u32);
-
-    let settled = super::settle_and_stop(&mut fake, unbounded(), true, |_| Ok(()));
-    let (settled, ended) = ended_by_incomplete_stop(settled, &mut held);
-
-    assert!(is_incomplete_stop(&settled.unwrap_err()));
-    assert_eq!(ended, vec![7]);
-    assert!(matches!(held, HoldOutcome::NoProcess), "{held:?}");
-}
-
 /// Only an incomplete stop ends the process here: a confirmed stop and any other failure leave it to
 /// the caller, which ends it after a confirmed stop (see [`stop_and_await_exit`]) or drops it.
 #[skuld::test]
@@ -3324,6 +3313,219 @@ fn a_start_over_a_decodable_blob_is_read_by_its_kind() {
             (kind, result) => panic!("{kind:?}: unexpected {result:?}"),
         }
     }
+}
+
+// stop and uninstall over the scripted SCM ----------------------------------------------------------------------------
+
+/// The pid of a process held as a number, which is all a stop's error asks of one.
+#[cfg(windows)]
+impl crate::backend::scm::kill::HeldProcess for u32 {
+    fn pid(&self) -> u32 {
+        *self
+    }
+}
+
+/// The answers `runs_a_shim` gives for a service that runs a shim, one known not to, and one that is
+/// not known either way.
+#[cfg(windows)]
+fn answers() -> [(&'static str, crate::backend::scm::manager::ShimAnswer); 3] {
+    use crate::backend::scm::manager::shim_answer;
+    use crate::backend::scm::test_support::blob_of;
+
+    let corrupt = std::sync::Arc::new(crate::error::Error::blob("corrupt"));
+    [
+        ("a shim", shim_answer(Ok(&blob_of(Kind::Simple)), || None)),
+        ("not a shim", shim_answer(Ok(&blob_of(Kind::Managed)), || None)),
+        ("unknown", shim_answer(Err(&corrupt), || None)),
+    ]
+}
+
+/// A `(0, 1003)` record is judged for a service that runs a shim and for one not known not to, and left
+/// alone for one known not to: its own `(0, 1003)` is not the shim's.
+#[cfg(windows)]
+#[skuld::test]
+fn a_stop_judges_the_incomplete_stop_record_of_every_service_not_known_to_run_no_shim() {
+    use crate::backend::scm::manager::stop_on;
+    use crate::spec::Id;
+
+    let id = Id::try_from("frpc").unwrap();
+    for (what, answer) in answers() {
+        let mut fake = incomplete(FakeScm::new([Some(Observed::Stopped)]));
+
+        let result = stop_on(
+            &mut fake,
+            &id,
+            Budget::Unbounded,
+            unbounded(),
+            &answer,
+            |_| Ok(HoldOutcome::<u32>::NoProcess),
+            no_end,
+        );
+
+        match (what, result) {
+            ("not a shim", Ok(())) => {}
+            ("not a shim", Err(e)) => panic!("a service known not to run a shim was judged: {}", e.report()),
+            (_, Err(e)) => assert!(e.report().to_string().contains("`(0, 1003)`"), "{what}: {}", e.report()),
+            (_, Ok(())) => panic!("{what}: an incomplete stop was a stop"),
+        }
+    }
+}
+
+/// A stop that does not wait holds nothing and reads no record: it sends the STOP and returns.
+#[cfg(windows)]
+#[skuld::test]
+fn a_stop_that_does_not_wait_holds_nothing() {
+    use crate::backend::scm::manager::stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    let mut fake = incomplete(FakeScm::new([]));
+
+    stop_on(
+        &mut fake,
+        &Id::try_from("frpc").unwrap(),
+        Budget::Immediate,
+        spent(),
+        &answer,
+        |_| -> crate::error::Result<HoldOutcome<u32>> { panic!("a stop that does not wait holds no process") },
+        no_end,
+    )
+    .unwrap();
+
+    assert_eq!(fake.log, vec!["control_stop"]);
+}
+
+/// A held process that outlasts the stop's budget is the process-wait timeout, naming the pid it held.
+#[cfg(windows)]
+#[skuld::test]
+fn a_held_process_that_outlasts_the_stop_is_a_wait_timeout_naming_its_pid() {
+    use crate::backend::scm::manager::stop_on;
+    use crate::error::Error;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    let budget = Budget::Bounded(std::time::Duration::from_secs(3600));
+    let mut fake = FakeScm::new([Some(Observed::Stopped)]);
+
+    let err = stop_on(
+        &mut fake,
+        &Id::try_from("frpc").unwrap(),
+        budget,
+        budget.start(),
+        &answer,
+        |_| Ok(HoldOutcome::Held(7u32)),
+        |process, _| {
+            Ok(EndProcessOutcome::Lingers {
+                process,
+                terminate_failed: None,
+            })
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, Error::ProcessWaitTimeout { pid: 7, .. }), "{err:?}");
+}
+
+/// What an uninstall that disabled the service found it as: not marked, with this start type before.
+#[cfg(windows)]
+const DISABLED_BY_US: (bool, Option<windows_service::service::ServiceStartType>) =
+    (false, Some(windows_service::service::ServiceStartType::AutoStart));
+
+/// An uninstall whose stop SCM confirmed with the shim's incomplete-stop record ends the process it held
+/// before it fails, and fails saying the service was left stopped, disabled and not deleted.
+#[cfg(windows)]
+#[skuld::test]
+fn an_uninstall_over_an_incomplete_stop_ends_the_held_process_before_failing() {
+    use crate::backend::scm::manager::uninstall_stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    let mut fake =
+        incomplete(FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]));
+    let ended = std::cell::RefCell::new(vec![]);
+    let (marked, previous) = DISABLED_BY_US;
+
+    let err = uninstall_stop_on(
+        &mut fake,
+        &Id::try_from("frpc").unwrap(),
+        &answer,
+        marked,
+        previous,
+        Some(|| Ok(HoldOutcome::Held(7u32))),
+        |process| {
+            ended.borrow_mut().push(process);
+            Ok(EndProcessOutcome::Exited)
+        },
+    )
+    .err()
+    .expect("an incomplete stop fails the uninstall");
+
+    assert_eq!(*ended.borrow(), vec![7]);
+    let said = err.report().to_string();
+    assert!(said.contains("may still be running"), "{said}");
+    assert!(said.contains("NOT deleted and is now disabled"), "{said}");
+}
+
+/// An uninstall holds a process only when it is told to, and judges the record by the same answer as
+/// `stop`: a service known not to run a shim finishes its stop whatever it recorded.
+#[cfg(windows)]
+#[skuld::test]
+fn an_uninstall_holds_only_when_told_to_and_judges_only_what_may_be_a_shim() {
+    use crate::backend::scm::manager::uninstall_stop_on;
+    use crate::spec::Id;
+
+    let id = Id::try_from("frpc").unwrap();
+    let (marked, previous) = DISABLED_BY_US;
+    for (what, answer) in answers() {
+        let mut fake =
+            incomplete(FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]));
+
+        let result = uninstall_stop_on(
+            &mut fake,
+            &id,
+            &answer,
+            marked,
+            previous,
+            None::<fn() -> crate::error::Result<HoldOutcome<u32>>>,
+            no_end_of,
+        );
+
+        match (what, result) {
+            ("not a shim", Ok(HoldOutcome::NoProcess)) => {}
+            ("not a shim", other) => panic!(
+                "a service known not to run a shim was judged or held: {:?}",
+                other.err()
+            ),
+            (_, Err(_)) => {}
+            (_, Ok(_)) => panic!("{what}: an incomplete stop was a stop"),
+        }
+    }
+}
+
+/// A process that could not be held leads the error of an uninstall that fails for it.
+#[cfg(windows)]
+#[skuld::test]
+fn an_uninstall_whose_process_could_not_be_held_fails_with_why() {
+    use crate::backend::scm::manager::uninstall_stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]);
+    let (marked, previous) = DISABLED_BY_US;
+
+    let err = uninstall_stop_on(
+        &mut fake,
+        &Id::try_from("frpc").unwrap(),
+        &answer,
+        marked,
+        previous,
+        Some(|| -> crate::error::Result<HoldOutcome<u32>> { Err(crate::error::Error::blob("held badly")) }),
+        no_end_of,
+    )
+    .err()
+    .expect("the hold failed");
+
+    assert!(err.report().to_string().contains("held badly"), "{}", err.report());
 }
 
 // the incomplete stop's wording ---------------------------------------------------------------------------------------
