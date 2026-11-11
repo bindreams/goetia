@@ -390,6 +390,7 @@ dependencies = [
  "goetia",
  "humantime",
  "libc",
+ "libsearch-guard",
  "memchr",
  "nix",
  "rand",
@@ -514,6 +515,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libsearch-guard"
+version = "0.1.0"
+source = "git+https://github.com/bindreams/libsearch-guard?rev=f44d5243350e533b4cd12e4626d28b43fd662a14#f44d5243350e533b4cd12e4626d28b43fd662a14"
+dependencies = [
+ "object",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -589,6 +598,15 @@ dependencies = [
  "rustc-hash",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "object"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11dbdb66876026054e4ffc8d757d862bdf5df5aebd5c0b95a41f17832a94f7d2"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
