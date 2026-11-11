@@ -2801,7 +2801,7 @@ fn a_registrar_that_keeps_lagging_returns_expired_instead_of_looping() {
     // that can end it — there is deliberately no retry counter. Remove the
     // `deadline.expired()` check and this test does not fail, it HANGS, so
     // prove it bites with `cargo nextest run --profile ci <name>` and expect
-    // it to be reported as TIMEOUT.
+    // TIMEOUT.
     let mut fake = FakeRegistrar::new([], ERROR_SERVICE_NOTIFY_CLIENT_LAGGING);
     assert_eq!(
         register_until_deadline(&mut fake, spent()).unwrap(),

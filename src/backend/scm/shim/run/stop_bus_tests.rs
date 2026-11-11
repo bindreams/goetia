@@ -40,8 +40,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     // `std::thread::scope`, which this test itself would then also have to join): if the teardown
     // inside it ever again happens *after* the call would need to return rather than before — the
     // join deadlock this module's own doc comment on `wait_for_child_or_stop` describes — this
-    // thread simply never sends, and `recv` below blocks forever. nextest's per-test slow-timeout is
-    // the external bound: it kills the test and reports it as TIMEOUT.
+    // thread simply never sends, and `recv` below blocks forever. nextest's `ci` profile bounds it.
     let (tx, rx) = mpsc::channel();
     {
         let child = Arc::clone(&child);

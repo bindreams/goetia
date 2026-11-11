@@ -1,6 +1,7 @@
 # skuld has no per-test timeout by design. The `ci` profile is the failure bound for an attended CI
-# run: a test that exceeds it is killed and reported by name as TIMEOUT. It proves nothing about
-# state; it only gets a human to the hung test. Outside this profile, nothing bounds a hang.
+# run: nextest kills a test after its slow-timeout and reports it by name as TIMEOUT, unless the
+# job's `timeout-minutes` cancels the run first (tests run one at a time). Either only gets a human
+# to the hung test; it proves nothing about state. Outside this profile, nothing bounds a hang.
 [profile.ci]
 # Run every test and report every failure, as the per-binary loop did.
 fail-fast = false

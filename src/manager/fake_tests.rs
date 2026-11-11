@@ -554,7 +554,7 @@ fn a_stalled_stop_is_ok_under_no_budget_and_leaves_the_state_alone() {
 /// smaller number would be a bet on how fast this machine is, which is the
 /// class of assertion this project forbids. A fake that actually slept would
 /// not fail this line — it would never reach it, and nextest's `ci`
-/// profile is what kills it and reports TIMEOUT.
+/// profile bounds it.
 #[skuld::test]
 fn the_fake_never_sleeps() {
     let fake = Fake::new();

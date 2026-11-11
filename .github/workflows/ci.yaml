@@ -97,8 +97,9 @@ jobs:
       - name: Build test binaries
         run: cargo nextest archive --locked --archive-file nextest-archive.tar.zst
 
-      # skuld has no per-test timeout by design. Only the `ci` profile in `.config/nextest.toml`
-      # bounds a test: it kills one that exceeds its slow-timeout and reports it by name as TIMEOUT.
+      # skuld has no per-test timeout by design. A hung test ends one of two ways: nextest's `ci`
+      # profile (`.config/nextest.toml`) kills it after its slow-timeout and reports it by name as
+      # TIMEOUT, or this job's `timeout-minutes` cancels the run first (tests run one at a time).
       # `--no-tests fail` keeps a build that produced no tests from passing.
       # On Windows the archive is extracted under `target/`, not into the runner's `%TEMP%`: a test
       # that runs a service as a fresh local user needs the binary readable by that user, as `target/`
