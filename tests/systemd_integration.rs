@@ -27,5 +27,5 @@ fn main() {
     if support::sentinel::run_if_requested() {
         return;
     }
-    skuld::run_all();
+    goetia::testing::run_all();
 }

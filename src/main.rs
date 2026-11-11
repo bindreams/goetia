@@ -51,5 +51,5 @@ fn main() {
 
 #[cfg(test)]
 fn main() {
-    skuld::run_all();
+    goetia::testing::run_all();
 }
