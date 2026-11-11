@@ -97,25 +97,24 @@ jobs:
       - name: Build test binaries
         run: cargo nextest archive --locked --archive-file nextest-archive.tar.zst
 
-      # skuld has no per-test timeout by design; the `ci` profile in
-      # `.config/nextest.toml` bounds each test and names the one that hangs.
+      # skuld has no per-test timeout by design. Only the `ci` profile in `.config/nextest.toml`
+      # bounds a test: it kills one that exceeds its slow-timeout and reports it by name as TIMEOUT.
       # `--no-tests fail` keeps a build that produced no tests from passing.
-      # The archive is extracted under `target/`, not into the runner's `%TEMP%`: a test that runs
-      # a service as a fresh local user needs the binary readable by that user, as `target/` is.
-      # nextest wants the directory to exist, and `--extract-overwrite` lets a restored cache leave one.
+      # On Windows the archive is extracted under `target/`, not into the runner's `%TEMP%`: a test
+      # that runs a service as a fresh local user needs the binary readable by that user, as `target/`
+      # is. nextest wants the directory to exist, and `--extract-overwrite` lets a restored cache
+      # leave one. On Linux and macOS root extracts into nextest's default temporary directory:
+      # root must not write `target/`, which the next unelevated build and the cache prune need to own.
       - name: Run tests, elevated
         shell: bash
         run: |
           set -euo pipefail
 
           nextest="$(command -v cargo-nextest)"
-          mkdir -p target/nextest-extract
-          args=(
-            nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail
-            --extract-to target/nextest-extract --extract-overwrite
-          )
+          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail)
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            "$nextest" "${args[@]}"
+            mkdir -p target/nextest-extract
+            "$nextest" "${args[@]}" --extract-to target/nextest-extract --extract-overwrite
           else
             # `sudo` resets `PATH`: the binary is resolved before it.
             sudo "$nextest" "${args[@]}"
