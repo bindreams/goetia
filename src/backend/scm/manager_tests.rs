@@ -800,18 +800,6 @@ fn only_a_service_known_not_to_run_a_shim_is_left_unjudged() {
     assert!(!said(ShimKind::NotShim).judges_stop_record());
 }
 
-/// A `StandaloneShim` host is held by `uninstall` like any shim's, though no file of that name is one
-/// it may sweep: what it holds is decided by the answer, and the host that is swept by the file name.
-#[skuld::test]
-fn a_standalone_shims_host_is_held_though_it_is_not_a_file_goetia_sweeps() {
-    let host = r"C:\app\host.exe";
-
-    let said = shim_answer(Ok(&blob_of(Kind::Simple)), no_image);
-
-    assert!(said.judges_stop_record());
-    assert_eq!(shim_host(host), None);
-}
-
 /// Only a service that is gone or marked for deletion refuses the read of its host as a matter of
 /// course; any other failure is not "no shim", and is reported.
 #[skuld::test]

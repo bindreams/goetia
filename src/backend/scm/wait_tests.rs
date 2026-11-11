@@ -3125,8 +3125,9 @@ fn ended_by_incomplete_stop(waited: io::Result<Waited>, held: &mut HoldOutcome<u
     (waited, ended.into_inner())
 }
 
-/// What `uninstall` does with its stop wait: the wait is `settle_and_stop` over the shim's record, and
-/// the process held before the STOP goes through the helper `stop` uses, so it is ended there too.
+/// The two calls `uninstall_locked` makes over its stop wait: `settle_and_stop` over the shim's record,
+/// and the helper `stop` uses for the process held before the STOP. `uninstall_locked` itself opens
+/// the real SCM and its service, which the scripted one does not reach, so it is not called here.
 #[skuld::test]
 fn an_uninstalls_incomplete_stop_ends_the_held_process_before_failing() {
     let mut fake =
