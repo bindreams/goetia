@@ -66,10 +66,14 @@ fn service_main(scm_args: Vec<OsString>) {
 /// be looked up, so the refusal is logged under [`TABLE_NAME`] and its process exit code returned;
 /// no `STOPPED` is reported, because no service is known to report it for.
 fn service_name<'a>(log: &Log, scm_args: &'a [OsString]) -> Result<&'a str, i32> {
-    scm_args.first().and_then(|name| name.to_str()).ok_or_else(|| {
-        log.failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
-        ERROR_BAD_ARGUMENTS as i32
-    })
+    scm_args
+        .first()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            log.failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
+            ERROR_BAD_ARGUMENTS as i32
+        })
 }
 
 fn run_service(id: &str) {

@@ -993,6 +993,21 @@ fn a_name_that_is_not_utf8_is_a_logged_refusal_with_the_bad_arguments_code() {
     );
 }
 
+#[skuld::test]
+fn an_empty_name_is_a_logged_refusal_with_the_bad_arguments_code() {
+    let fake = FakeGuard::new();
+    let args = [OsString::new()];
+
+    let refused = service_name(&fake.log(), &args);
+
+    assert_eq!(refused, Err(ERROR_BAD_ARGUMENTS as i32));
+    assert_one_failure(
+        &fake.take_failures(),
+        TABLE_NAME,
+        r#"SCM passed no usable service name: [""]"#,
+    );
+}
+
 // What the shim does with its read of the spec ------------------------------------------------------------------------
 
 fn undetermined(source: Error) -> Error {
