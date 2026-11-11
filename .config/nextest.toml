@@ -4,4 +4,8 @@
 [profile.ci]
 # Run every test and report every failure, as the per-binary loop did.
 fail-fast = false
+# One test at a time, as under `cargo test`, where skuld's capture mode forces a single test thread
+# in a single binary at a time. The integration suites share one machine-wide service manager and
+# wait on it with fixed deadlines; run in parallel, they miss those deadlines.
+test-threads = 1
 slow-timeout = { period = "60s", terminate-after = 5 }
