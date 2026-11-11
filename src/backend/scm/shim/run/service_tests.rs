@@ -469,18 +469,18 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
 
 /// A daemon whose tree could not be killed must not be reported as a failure SCM restarts: the
 /// restart would start a second copy beside it. The exit is decided, so the bus does not accept a
-/// later stop either.
+/// later stop either. The shim does not keep a daemon it has given up on: once the waiter has
+/// returned the daemon is dropped, though not while a detached waiter still holds it.
 #[skuld::test]
 fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Fails(None))
+        .kill_tree(KillReply::Refuses)
+        .kill(KillReply::Refuses);
     fake.will_make_thread();
-    fake.will_spawn(
-        FakeProcess::new()
-            .wait(WaitReply::Fails(None))
-            .kill_tree(KillReply::Refuses)
-            .kill(KillReply::Refuses),
-    );
+    fake.will_spawn(daemon.clone());
 
     let reported = run_daemon(&spec(), &supervisor, || {});
 
@@ -490,6 +490,8 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
         "the bus accepted a stop over a daemon that may still be running"
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    assert!(!daemon.ended(), "the daemon ended though neither kill worked");
+    assert!(daemon.dropped(), "the shim kept a daemon it had given up on");
     assert_failures(
         &fake.take_failures(),
         ID,
@@ -1227,26 +1229,5 @@ fn a_daemon_whose_root_was_killed_is_dropped() {
     assert_eq!(reported, Reported::incomplete_stop());
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     assert!(daemon.dropped(), "the shim leaked a daemon whose root it had killed");
-    fake.take_failures();
-}
-
-/// A daemon whose kills were both refused is dropped too, not leaked, and the run reports the
-/// incomplete stop.
-#[skuld::test]
-fn a_daemon_whose_kills_were_refused_is_dropped_and_reported_as_the_incomplete_stop() {
-    let fake = FakeGuard::new();
-    let daemon = FakeProcess::new()
-        .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Refuses)
-        .kill(KillReply::Refuses);
-    fake.will_make_thread();
-    fake.will_spawn(daemon.clone());
-
-    let reported = run_daemon(&spec(), &supervisor(&fake), || {});
-
-    assert_eq!(reported, Reported::incomplete_stop());
-    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    assert!(!daemon.ended(), "the daemon ended though neither kill worked");
-    assert!(daemon.dropped(), "the shim kept a daemon it had given up on");
     fake.take_failures();
 }
