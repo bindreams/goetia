@@ -3886,15 +3886,15 @@ fn restart_that_cannot_prepare_sends_nothing() {
     }
 }
 
-/// `install --start` makes ready what the start needs before the install sends anything: when that
-/// fails, nothing is installed and nothing started.
+/// `install --start` makes ready what the install and the start need, as one reservation, before the
+/// install sends anything: when that fails, nothing is installed and nothing started.
 #[skuld::test]
 fn install_start_that_cannot_prepare_installs_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path(), "id: frpc\ncommand: [daemon]\n");
     let fake = Fake::new();
-    // Only the start's reservation fails: the install's own would succeed, and install, if the
-    // start were reserved after it.
+    // The one `[Install, Start]` reservation fails, because it includes `Start`: an install that
+    // reserved for itself first would succeed, and send, before the start's reservation failed.
     fake.seed_prepare_fails(Step::Start);
 
     let (code, out, err) = dispatch_elevated(
