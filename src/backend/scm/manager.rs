@@ -508,7 +508,7 @@ impl Backend for Scm {
     /// it after `SERVICE_STOPPED`) and waits, within the budget, for it to exit, so the file it
     /// runs is free when `stop` returns. A service whose shim recorded an incomplete stop (the daemon's
     /// tree may still be running) is a failed stop, once the process is ended; `uninstall` fails the
-    /// same way, and leaves the service stopped, disabled and not deleted (see [`plan_uninstall`]).
+    /// same way, and leaves the service stopped, disabled and not deleted (see [`uninstall_stop_on`]).
     ///
     /// A process that cannot be opened is not waited for. A `stop` that succeeds has no channel to
     /// say so; one that fails leads its error with it (see [`unwaited`]).
