@@ -7,7 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::fs::File;
-use std::io::{self, PipeReader, Seek as _};
+use std::io::{self, Seek as _};
 use std::marker::PhantomData;
 use std::process::ExitStatus;
 use std::thread;
@@ -65,7 +65,7 @@ impl Reaper {
     ) -> io::Result<Reaper> {
         Standby::new("goetia-reaper", move |child: cosca::Child| {
             let status = wait(&child);
-            child.detach();
+            let_go(child);
             reaped(status);
         })
         .map(Reaper)
@@ -74,8 +74,16 @@ impl Reaper {
     pub(super) fn reap(self, child: cosca::Child) {
         if let Err(child) = self.0.hand(child) {
             debug_assert!(false, "the reaper thread ended before it was handed its child");
-            child.detach(); // never killed
+            let_go(child); // never killed
         }
+    }
+}
+
+/// [`cosca::Child::detach`] it. Only Windows' disarm can be refused, and nothing here runs there:
+/// on a refusal the child would come back armed, and dropping it would kill the tree.
+fn let_go(child: cosca::Child) {
+    if let Err((_armed, e)) = child.detach() {
+        debug_assert!(false, "detach refused off Windows: {e}");
     }
 }
 
@@ -85,7 +93,7 @@ impl Reaper {
 /// one role that must see output before the child exits.
 #[derive(Debug)]
 pub(super) struct Listener {
-    standby: Standby<PipeReader>,
+    standby: Standby<cosca::PipeReader>,
     heard: Receiver<Chunk>,
 }
 
@@ -98,7 +106,7 @@ impl Listener {
 
     /// Start reading `pipe`: what it holds arrives on the returned receiver, which disconnects at its
     /// EOF. `None` — a stream that was not piped — reads as an immediate EOF, never a panic.
-    pub(super) fn listen(self, pipe: Option<PipeReader>) -> Receiver<Chunk> {
+    pub(super) fn listen(self, pipe: Option<cosca::PipeReader>) -> Receiver<Chunk> {
         if let Some(pipe) = pipe {
             let handed = self.standby.hand(pipe);
             debug_assert!(
@@ -329,6 +337,16 @@ pub(crate) mod test_hook {
     /// would.
     pub(crate) fn spawn_fails(error: fn() -> cosca::error::Error) {
         SPAWN_FAILS.set(Some(error));
+    }
+
+    /// What a cosca spawn fails with once its program may have started, `source` being what failed.
+    pub(crate) fn may_have_started(source: cosca::error::Error) -> cosca::error::Error {
+        cosca::error::Error::MayHaveStarted {
+            fate: cosca::error::ChildFate::Reaped,
+            wrapper_elevated: false,
+            source: Box::new(source),
+            unreaped: None,
+        }
     }
 
     /// How many listeners this thread's pool holds now.

@@ -43,8 +43,9 @@ pub(crate) trait Spawned: Send + Sync {
     /// Kill the daemon's whole tree.
     fn kill_tree(&self) -> Result<(), cosca::error::Error>;
 
-    /// Let the daemon go: dropping it no longer kills it.
-    fn detach(self: Box<Self>);
+    /// Let the daemon go: dropping it no longer kills it. When the OS refuses, the daemon is leaked
+    /// instead, neither killed nor waited for: its job closes, killing its tree, with this process.
+    fn detach(self: Box<Self>) -> Result<(), cosca::error::Error>;
 }
 
 /// How a line is reported to the Event Log.
@@ -101,8 +102,12 @@ impl Spawned for cosca::Child {
         cosca::Child::kill_tree(self)
     }
 
-    fn detach(self: Box<Self>) {
-        cosca::Child::detach(*self);
+    fn detach(self: Box<Self>) -> Result<(), cosca::error::Error> {
+        cosca::Child::detach(*self).map_err(|(child, e)| {
+            // Dropping it would kill the tree and wait for it, with no bound where the kill is refused.
+            std::mem::forget(child);
+            e
+        })
     }
 }
 

@@ -30,6 +30,7 @@ pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";
 /// The error a refused kill fails with.
 pub(crate) const KILL_REFUSED: &str = "the kill was refused (fake)";
 /// The error a [`WaitReply::Fails`] with no OS code fails with.
+pub(crate) const DETACH_REFUSED: &str = "the detach was refused (fake)";
 pub(crate) const WAIT_FAILED: &str = "the wait failed (fake)";
 /// The error a failing append fails with.
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
@@ -110,6 +111,7 @@ struct ProcState {
     killed: bool,
     dropped: bool,
     detached: bool,
+    refuses_detach: bool,
 }
 
 fn status(code: i32) -> ExitStatus {
@@ -148,6 +150,7 @@ impl FakeProcess {
                 killed: false,
                 dropped: false,
                 detached: false,
+                refuses_detach: false,
             }),
             ended: Condvar::new(),
         }))
@@ -161,6 +164,11 @@ impl FakeProcess {
     fn with(self, change: impl FnOnce(&mut ProcState)) -> FakeProcess {
         change(&mut lock(&self.0.state));
         self
+    }
+
+    /// Make `detach` fail with [`DETACH_REFUSED`], leaving the process neither detached nor dropped.
+    pub(crate) fn refuses_detach(self) -> FakeProcess {
+        self.with(|state| state.refuses_detach = true)
     }
 
     pub(crate) fn containment(self, containment: Containment) -> FakeProcess {
@@ -267,9 +275,15 @@ impl Spawned for Instance {
         self.kill_with("kill_tree", reply)
     }
 
-    fn detach(mut self: Box<Self>) {
+    fn detach(mut self: Box<Self>) -> Result<(), cosca::error::Error> {
+        // Whether it is let go or leaked, it is not dropped: the real `detach` forgets it on a refusal.
         self.detached = true;
-        lock(&self.proc.state).detached = true;
+        let mut state = lock(&self.proc.state);
+        if state.refuses_detach {
+            return Err(cosca::error::Error::Io(io::Error::other(DETACH_REFUSED)));
+        }
+        state.detached = true;
+        Ok(())
     }
 }
 

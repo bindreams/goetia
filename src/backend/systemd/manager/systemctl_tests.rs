@@ -353,8 +353,10 @@ fn a_watched_request_that_may_have_run_is_in_doubt() {
         assert!(msg.contains("may have started before it failed"), "{msg}");
         assert!(msg.contains("may or may not have reached the service manager"), "{msg}");
     };
-    bounded::test_hook::spawn_fails(|| cosca::error::Error::Containment {
-        detail: "forced".into(),
+    bounded::test_hook::spawn_fails(|| {
+        bounded::test_hook::may_have_started(cosca::error::Error::Containment {
+            detail: "forced".into(),
+        })
     });
     may_or_may_not(&spawn().expect_err("injected"));
 

@@ -108,14 +108,18 @@ fn real_tells_a_spawn_that_failed_before_exec_from_one_that_may_have_run() {
             false,
         ),
         (
-            "SharedChild::new: ECHILD",
-            || std::io::Error::from_raw_os_error(libc::ECHILD).into(),
-            true,
-        ),
-        (
-            "attach",
+            "before the spawn: containment",
             || cosca::error::Error::Containment {
                 detail: "forced".into(),
+            },
+            false,
+        ),
+        (
+            "after exec: the attach",
+            || {
+                bounded::test_hook::may_have_started(cosca::error::Error::Containment {
+                    detail: "forced".into(),
+                })
             },
             true,
         ),

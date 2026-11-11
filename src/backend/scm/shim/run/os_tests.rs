@@ -12,7 +12,7 @@ use std::os::windows::io::OwnedHandle;
 
 use crate::spec::{DaemonFields, DaemonSpec};
 use crate::testing::plain_fields;
-use cosca::identity::{Liveness, Resolved};
+use cosca::identity::Liveness;
 use cosca::{Process, Stdio};
 use skuld::temp_dir;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
@@ -75,7 +75,7 @@ fn kill_tree_ends_a_job_contained_daemon_and_its_grandchild() {
         .read_line(&mut line)
         .expect("the grandchild's pid line");
     let pid: u32 = line.trim().parse().expect("the line is a pid");
-    let Resolved::Found(grandchild) = Process::from_pid(pid) else {
+    let Some(grandchild) = Process::open_pid(pid).expect("open the grandchild") else {
         panic!("the grandchild {pid} is not running");
     };
     assert_eq!(grandchild.is_alive(), Liveness::Alive, "precondition");
@@ -113,11 +113,16 @@ fn detach_leaves_the_daemon_running_after_its_handle_is_gone() {
     cmd.stdin(Stdio::pipe()).expect("pipe the daemon's stdin");
     cmd.stdout(Stdio::pipe()).expect("pipe the daemon's stdout");
     let mut child = cmd.spawn().expect("spawn the daemon");
-    reap.hold_detached(Process::from_id(child.id()));
+    let id = child.id().expect("the OS reported the daemon's identity");
+    reap.hold_detached(
+        Process::open(id)
+            .expect("open the daemon")
+            .expect("the daemon is running"),
+    );
     let mut stdin = child.stdin().expect("the daemon's stdin");
     let mut stdout = BufReader::new(child.stdout().expect("the daemon's stdout"));
 
-    Spawned::detach(Box::new(child));
+    Spawned::detach(Box::new(child)).expect("let the daemon go");
 
     if let Err(e) = stdin.write_all(b"ping\n") {
         panic!("the daemon did not outlive its handle: the write to its stdin failed: {e}");

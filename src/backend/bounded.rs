@@ -160,8 +160,7 @@ pub(crate) enum Role {
     /// A request that never says when the manager has it. The deadline applies from the spawn, but
     /// an expiry leaves the child running rather than killing it, since a kill could land before
     /// the request is out, and its [`Reaper`] reaps it once it exits. The caller gets the child
-    /// back as a [`Left`]. launchd's alone: on Linux, cosca 0.4's cgroup containment kills a
-    /// detached tree when it drops the leaf, so a [`command`] child would not be left running.
+    /// back as a [`Left`]. launchd's alone.
     ///
     /// Its output goes to temp files, never pipes: a pipe goetia stopped reading — on expiry, or by
     /// exiting — kills the writer with `SIGPIPE`, and a file does not.
@@ -230,7 +229,7 @@ impl Ready {
     }
 
     /// The stream, once the child is spawned: a listener is handed the pipe it was made for.
-    fn spawned(self, pipe: Option<io::PipeReader>) -> Stream {
+    fn spawned(self, pipe: Option<cosca::PipeReader>) -> Stream {
         match self {
             Ready::File(file) => Stream::File(file),
             Ready::Listener(listener) => Stream::Heard(listener.listen(pipe)),
@@ -244,7 +243,8 @@ impl Ready {
 pub(crate) enum SpawnError {
     /// Before the child ran: nothing it would have sent was sent.
     NotRun(cosca::error::Error),
-    /// Perhaps after it ran — see [`may_have_run`].
+    /// Perhaps after it ran: cosca's [`MayHaveStarted`](cosca::error::Error::MayHaveStarted), which
+    /// every other error of a spawn says it was not.
     MayHaveRun(cosca::error::Error),
 }
 
@@ -280,7 +280,7 @@ pub(crate) fn spawn(
     })();
     let (stdout, stderr) = prepared.map_err(SpawnError::NotRun)?;
     let mut child = start(cmd).map_err(|e| {
-        if may_have_run(&e) {
+        if e.fate().is_some() {
             SpawnError::MayHaveRun(e)
         } else {
             SpawnError::NotRun(e)
@@ -303,25 +303,6 @@ fn start(cmd: &mut cosca::Command) -> Result<cosca::Child, cosca::error::Error> 
         return Err(e);
     }
     cmd.spawn()
-}
-
-/// Whether a failed `cosca::Command::spawn` may have run the child, as cosca 0.4.0's
-/// `spawn_unelevated` (`src/child/spawn.rs`) fails. Before `exec`: stdio pipes, dups and
-/// `/dev/null`, and `fork` and `exec` themselves, every one an [`std::io::Error`] carrying its OS
-/// error. After `exec`, with the child already running what it was asked to: the identity read —
-/// [`cosca::error::Error::Unassessable`], or an `Io` "vanished" carrying none — and
-/// `SharedChild::new`'s `waitpid(WNOHANG)`, whose `ECHILD` or `EINVAL` carry one. So only an `Io`
-/// with an OS error `waitpid` cannot give is placed before the child ran; everything else may have
-/// run it, conservatively — `exec` too can fail with `EINVAL`, and cosca's other variants
-/// (`Containment` from the attach, and from the `prepare` before the spawn alike) are not placed at
-/// all.
-fn may_have_run(e: &cosca::error::Error) -> bool {
-    match e {
-        cosca::error::Error::Io(io) => !io
-            .raw_os_error()
-            .is_some_and(|n| n != libc::ECHILD && n != libc::EINVAL),
-        _ => true,
-    }
 }
 
 /// The failure to make `what` before a spawn, which is therefore never attempted.

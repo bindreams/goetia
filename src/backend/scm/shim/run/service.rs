@@ -399,8 +399,10 @@ fn require_job_object(
     log.failure(id, &not_job_contained(&spec.command, containment));
     // Dropping the child kills it again and waits for it, with no bound when the kill is refused,
     // so a child that could not be killed is let go: the record must still be reported.
-    if kill_for_stop(child.as_ref(), log, id) == Teardown::Failed {
-        child.detach();
+    if kill_for_stop(child.as_ref(), log, id) == Teardown::Failed
+        && let Err(e) = child.detach()
+    {
+        log.failure(id, &detach_failed(&e));
     }
     Err(Reported::incomplete_stop())
 }
@@ -411,6 +413,10 @@ const NO_EXIT_CODE: &str = "child exited with no reportable exit code";
 
 fn exit_status_unavailable(e: &cosca::error::Error) -> String {
     format!("query child exit status: {e}")
+}
+
+fn detach_failed(e: &cosca::error::Error) -> String {
+    format!("detach: {e}; the daemon was left running, and its job closes, killing its tree, when this process ends")
 }
 
 fn thread_refused(command: &[String], e: &std::io::Error) -> String {
