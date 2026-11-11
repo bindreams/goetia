@@ -1,12 +1,19 @@
-//! The thread made before the work it serves exists, parked until it is handed its share.
+//! A thread that serves one share of work: made before the work exists and parked until handed it,
+//! or made at the point of use.
 
 use std::fmt;
 use std::io;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-/// A thread made before the child it serves is spawned, parked until it is handed its share of that
-/// child. Handed nothing — the child was never spawned, or needed nothing of it — it ends.
+/// A thread that serves one share of work, made in one of two ways.
+///
+/// Made before the work it serves ([`Standby::new`], [`Standby::with`]), it is parked until handed
+/// its share with [`Standby::hand`], so a refusal to make it is known before the work starts. Handed
+/// nothing — the child was never spawned, or needed nothing of it — it ends.
+///
+/// Made at the point of use ([`Standby::run_now`]), it is handed its item at once. That can fail, for
+/// want of a thread, and the item then comes back unserved.
 pub(crate) struct Standby<T>(mpsc::Sender<T>);
 
 impl<T> fmt::Debug for Standby<T> {

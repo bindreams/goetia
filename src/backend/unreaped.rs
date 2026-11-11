@@ -11,9 +11,9 @@ use crate::backend::standby::Standby;
 /// deadline.
 ///
 /// On Unix the child is waited for on a thread of its own, so it is reaped once it exits; with no
-/// thread to be had it is given up, unreaped until this process exits. On Windows it is given up,
-/// which only closes a handle. Its [`fate`](Error::fate) is cosca's: a `Killed` child is not
-/// running, but may still be dying.
+/// thread to be had it is given up, and stays a zombie until this process exits. On Windows it is
+/// given up, which only closes a handle. Its [`fate`](Error::fate) is cosca's: a `Killed` child is
+/// dead or dying.
 pub(crate) fn release_unreaped(mut e: Error) -> Error {
     if let Error::MayHaveStarted { unreaped, .. } = &mut e
         && let Some(child) = unreaped.take()
