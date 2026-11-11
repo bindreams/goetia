@@ -5,7 +5,7 @@ use cosca::error::Error;
 #[cfg(unix)]
 use crate::backend::bounded::reap_in_background;
 
-/// `e`, with the child cosca could not end settled off the caller's thread. Dropping an
+/// `e`, with the child cosca could not end settled so that the caller never waits for it. Dropping an
 /// [`Unreaped`](cosca::Unreaped) waits with no bound for the child to exit, and a spawn error is
 /// dropped where it is reported, so a child whose kill was refused would stall a call past its
 /// deadline.
