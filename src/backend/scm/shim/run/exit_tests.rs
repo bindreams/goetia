@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use skuld::temp_dir;
+
 use super::*;
 use crate::backend::scm::shim::run::logging::Log;
 use crate::backend::scm::shim::run::os::fake::FakeGuard;
@@ -23,32 +25,44 @@ const RETURNED: i32 = 77;
 /// The mode that has a child exit [`RETURNED`] at once.
 const PROBE: &str = "probe";
 
-/// The exit code of a child of this test binary that runs `test` with [`MODE`] set to `mode`: the
-/// tests below end their own process, so each runs itself in one.
+/// The children of this test binary that run one test, which the tests below end their own process
+/// in: each runs itself in one.
 ///
 /// A harness that ran no test exits 0, which is what a clean end exits with. So a probe child comes
-/// first, and the test must have run in it.
-fn exit_of_child(test: &str, mode: impl ToString) -> Option<i32> {
-    exit_of_child_logging(test, mode, Path::new(""))
+/// first, once for the test, and the test must have run in it.
+struct Children<'a> {
+    test: &'a str,
 }
 
-/// [`exit_of_child`], with the child's [`LOGS`] in `logs`.
-fn exit_of_child_logging(test: &str, mode: impl ToString, logs: &Path) -> Option<i32> {
-    let run = |mode: &str| {
-        Command::new(std::env::current_exe().expect("the test binary"))
-            .arg(test)
-            .env(MODE, mode)
-            .env(LOGS, logs)
-            .status()
-            .expect("run the child")
-            .code()
-    };
-    assert_eq!(
-        run(PROBE),
-        Some(RETURNED),
-        "the harness did not run `{test}` in the child"
-    );
-    run(&mode.to_string())
+impl<'a> Children<'a> {
+    fn of(test: &'a str) -> Self {
+        let children = Self { test };
+        assert_eq!(
+            children.run(PROBE, None),
+            Some(RETURNED),
+            "the harness did not run `{test}` in the child"
+        );
+        children
+    }
+
+    /// The exit code of a child that runs the test with [`MODE`] set to `mode`.
+    fn exit(&self, mode: impl ToString) -> Option<i32> {
+        self.run(&mode.to_string(), None)
+    }
+
+    /// [`exit`](Self::exit), with the child's [`LOGS`] in `logs`.
+    fn exit_logging(&self, mode: impl ToString, logs: &Path) -> Option<i32> {
+        self.run(&mode.to_string(), Some(logs))
+    }
+
+    fn run(&self, mode: &str, logs: Option<&Path>) -> Option<i32> {
+        let mut child = Command::new(std::env::current_exe().expect("the test binary"));
+        child.arg(self.test).env(MODE, mode);
+        if let Some(logs) = logs {
+            child.env(LOGS, logs);
+        }
+        child.status().expect("run the child").code()
+    }
 }
 
 /// The channels of a child that is to be read after it ends itself: lines go to real files, and the
@@ -63,11 +77,12 @@ impl Channels for FileChannels {
     fn event_log(&self, _severity: Severity, _line: &str) {}
 }
 
-/// The failure log of a child, in the directory the parent gave it.
+/// The failure log of a child, in the directory the parent gave it: a parent that gave none is a
+/// failure of the test, not a log in the current directory.
 fn logs() -> Log {
     Log::new(
         Arc::new(FileChannels),
-        PathBuf::from(std::env::var_os(LOGS).expect("the logs directory")),
+        PathBuf::from(std::env::var_os(LOGS).expect("the parent gave the child no logs directory")),
     )
 }
 
@@ -97,11 +112,9 @@ fn end_process_ends_the_process_with_exactly_the_code() {
         end_process(code.parse().expect("a code"));
     }
 
+    let children = Children::of("end_process_ends_the_process_with_exactly_the_code");
     for code in [7, 1003, -1073741819, i32::MIN] {
-        assert_eq!(
-            exit_of_child("end_process_ends_the_process_with_exactly_the_code", code),
-            Some(code)
-        );
+        assert_eq!(children.exit(code), Some(code));
     }
 }
 
@@ -114,12 +127,9 @@ fn the_main_thread_ends_the_process_with_the_recorded_code() {
         end_when_dispatched();
     }
 
+    let children = Children::of("the_main_thread_ends_the_process_with_the_recorded_code");
     for (index, reported) in reports().into_iter().enumerate() {
-        assert_eq!(
-            exit_of_child("the_main_thread_ends_the_process_with_the_recorded_code", index),
-            Some(reported.process_exit_code()),
-            "{reported:?}"
-        );
+        assert_eq!(children.exit(index), Some(reported.process_exit_code()), "{reported:?}");
     }
 }
 
@@ -131,7 +141,7 @@ fn the_main_thread_ends_clean_when_no_service_recorded_anything() {
     }
 
     assert_eq!(
-        exit_of_child("the_main_thread_ends_clean_when_no_service_recorded_anything", 0),
+        Children::of("the_main_thread_ends_clean_when_no_service_recorded_anything").exit(0),
         Some(0)
     );
 }
@@ -149,7 +159,7 @@ fn finish_returns_when_the_stopped_report_succeeded() {
     }
 
     assert_eq!(
-        exit_of_child("finish_returns_when_the_stopped_report_succeeded", 0),
+        Children::of("finish_returns_when_the_stopped_report_succeeded").exit(0),
         Some(RETURNED)
     );
 }
@@ -157,7 +167,7 @@ fn finish_returns_when_the_stopped_report_succeeded() {
 /// When SCM cannot be told `STOPPED` the dispatcher is not trusted to return, so `finish` ends the
 /// process itself, with the code it was to report, after it logged why.
 #[skuld::test]
-fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed() {
+fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed(#[fixture(temp_dir)] dir: &Path) {
     if child_mode().is_some() {
         finish(&logs(), "frpc", Reported::incomplete_stop(), |_| {
             Err(std::io::Error::other("refused"))
@@ -165,15 +175,10 @@ fn finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed
         std::process::exit(RETURNED);
     }
 
-    let dir = tempfile::tempdir().expect("a directory for the child's log");
-
-    let code = exit_of_child_logging(
-        "finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed",
-        0,
-        dir.path(),
-    );
+    let code = Children::of("finish_ends_the_process_with_the_reported_code_when_the_stopped_report_failed")
+        .exit_logging(0, dir);
 
     assert_eq!(code, Some(Reported::incomplete_stop().process_exit_code()));
-    let logged = std::fs::read_to_string(dir.path().join("frpc.log")).expect("the child's log");
+    let logged = std::fs::read_to_string(dir.join("frpc.log")).expect("the child's log");
     assert!(logged.contains("report SERVICE_STOPPED to SCM: refused"), "{logged}");
 }
