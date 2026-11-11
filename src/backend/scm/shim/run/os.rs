@@ -19,7 +19,8 @@ mod eventlog;
 
 /// What the supervisor asks the OS for.
 pub(crate) trait Os: Send + Sync {
-    /// Spawn the daemon `cmd` describes. A refusal leaves nothing running.
+    /// Spawn the daemon `cmd` describes. A refusal that says the program may have started
+    /// ([`cosca::error::Error::MayHaveStarted`]) may leave it running: read [`fate`](cosca::error::Error::fate).
     fn spawn(&self, cmd: cosca::Command) -> Result<Box<dyn Spawned>, cosca::error::Error>;
 
     /// Run `f` on a new thread named `name`; the OS may refuse.
@@ -123,10 +124,12 @@ impl Channels for Real {
     }
 }
 
-/// The OS error code behind a `cosca` failure, if it has one.
+/// The OS error code behind a `cosca` failure, if it has one. A failure after `CreateProcess` comes
+/// wrapped in [`cosca::error::Error::MayHaveStarted`]: its source's code is the failure's.
 pub(crate) fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
     match e {
         cosca::error::Error::Io(e) => e.raw_os_error(),
+        cosca::error::Error::MayHaveStarted { source, .. } => os_error_of(source),
         cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(std::io::Error::raw_os_error),
         _ => None,
     }

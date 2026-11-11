@@ -15,6 +15,7 @@ use crate::backend::scm::manager::read_spec_blob;
 use crate::blob::Blob;
 use crate::error::Error;
 use crate::spec::{DaemonSpec, Restart};
+use cosca::error::ChildFate;
 use cosca::{Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
@@ -27,7 +28,9 @@ use windows_sys::Win32::System::Services::{
 use super::super::marker;
 use super::logging::Log;
 use super::os::{Os, Real, Spawned, spawn_error_code};
-use super::stop_bus::{StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree};
+use super::stop_bus::{
+    NOT_RESTARTED, StopBus, Supervisor, Teardown, WaitOutcome, Waiter, kill_for_stop, terminate_exited_tree,
+};
 
 // Entry ===============================================================================================================
 
@@ -361,7 +364,7 @@ fn exit_report(code: Option<i32>) -> Reported {
 /// nothing to wait on it. `build_command` sits between them but never launches anything.
 ///
 /// The `Err` is what the service reports: the OS error of the failure, `ERROR_GEN_FAILURE`, or the
-/// incomplete stop for a daemon no Job Object contains.
+/// incomplete stop for a daemon no Job Object contains or a failed spawn may have left running.
 fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<dyn Spawned>, Waiter), Reported> {
     let log = &*supervisor.log;
     let waiter = match supervisor.waiter(id) {
@@ -373,11 +376,22 @@ fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<d
     };
     match supervisor.os.spawn(build_command(spec, &*supervisor.os, log, id)) {
         Ok(child) => require_job_object(child, spec, log, id).map(|child| (Arc::from(child), waiter)),
+        Err(e) if may_still_run(&e) => {
+            log.failure(id, &spawn_failed_daemon_may_run(&spec.command, &e));
+            Err(Reported::incomplete_stop())
+        }
         Err(e) => {
             log.failure(id, &spawn_failed(&spec.command, &e));
             Err(Reported::shim_failure(spawn_error_code(&e)))
         }
     }
+}
+
+/// Whether a failed spawn may have left the daemon running: its error says so, and cosca did not end
+/// the child. SCM restarts a failed start, so reporting one as such would start a second copy.
+fn may_still_run(e: &cosca::error::Error) -> bool {
+    e.fate()
+        .is_some_and(|fate| !matches!(fate, ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone))
 }
 
 /// The daemon, if a Job Object contains it. `type: simple` is stopped, and restarted after a
@@ -431,6 +445,13 @@ fn not_job_contained(command: &[String], containment: Containment) -> String {
 
 fn spawn_failed(command: &[String], e: &cosca::error::Error) -> String {
     format!("spawn {command:?}: {e}")
+}
+
+fn spawn_failed_daemon_may_run(command: &[String], e: &cosca::error::Error) -> String {
+    format!(
+        "{}; the daemon may still be running{NOT_RESTARTED}",
+        spawn_failed(command, e)
+    )
 }
 
 /// Log [`version_skew_notice`] as a warning: the daemon runs, and each start is a new shim that

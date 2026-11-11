@@ -206,6 +206,31 @@ fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
     );
 }
 
+/// cosca wraps every failure after `CreateProcess` in `MayHaveStarted`; the code SCM is told is the
+/// wrapped failure's.
+#[skuld::test]
+fn the_os_error_of_a_failure_after_the_spawn_is_the_one_of_its_source() {
+    let after_spawn = |source: cosca::error::Error| cosca::error::Error::MayHaveStarted {
+        fate: cosca::error::ChildFate::Unknown,
+        wrapper_elevated: false,
+        source: Box::new(source),
+        unreaped: None,
+    };
+    let denied = || cosca::error::Error::Io(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+
+    assert_eq!(os_error_of(&after_spawn(denied())), Some(ERROR_ACCESS_DENIED as i32));
+    assert_eq!(
+        spawn_error_code(&after_spawn(denied())),
+        Some(ERROR_ACCESS_DENIED as i32)
+    );
+    assert_eq!(
+        os_error_of(&after_spawn(cosca::error::Error::Containment {
+            detail: "attach".to_string()
+        })),
+        None
+    );
+}
+
 #[skuld::test]
 fn a_refused_spawn_without_a_code_that_is_not_found_is_told_to_scm_as_file_not_found() {
     assert_eq!(spawn_error_code(&not_found()), Some(ERROR_FILE_NOT_FOUND as i32));

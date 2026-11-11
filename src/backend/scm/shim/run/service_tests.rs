@@ -13,6 +13,7 @@ use crate::backend::scm::exit_status::{
 use crate::spec::{DaemonFields, Kind, Restart};
 use crate::testing::plain_fields;
 use cosca::Containment;
+use cosca::error::ChildFate;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
 };
@@ -192,6 +193,61 @@ fn the_os_code_of_a_refused_spawn_is_what_launch_reports() {
     // The refusal's text is not the point here; consume the one failure line and the waiter.
     assert_eq!(fake.take_failures().len(), 1);
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+}
+
+/// A spawn that failed after `CreateProcess` succeeded, with the child's `fate` and a source that
+/// carries an OS code.
+fn may_have_started(fate: ChildFate) -> cosca::error::Error {
+    cosca::error::Error::MayHaveStarted {
+        fate,
+        wrapper_elevated: false,
+        source: Box::new(cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32,
+        ))),
+        unreaped: None,
+    }
+}
+
+/// A spawn error whose fate says the daemon may be running must not be a failure SCM restarts, or
+/// its failure action starts a second copy beside the first.
+#[skuld::test]
+fn a_spawn_error_that_may_have_left_the_daemon_running_is_the_incomplete_stop_record() {
+    for fate in [ChildFate::Running { id: None }, ChildFate::Unknown] {
+        let fake = FakeGuard::new();
+        fake.will_make_thread();
+        fake.will_refuse_spawn(may_have_started(fate));
+
+        let launched = launch(&spec(), &supervisor(&fake), ID);
+
+        assert_eq!(launched.as_ref().err(), Some(&Reported::incomplete_stop()), "{fate:?}");
+        let expected = format!(
+            r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}; the daemon may still be running{NOT_RESTARTED}"#,
+            may_have_started(fate)
+        );
+        assert_one_failure(&fake.take_failures(), ID, &expected);
+        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    }
+}
+
+/// A spawn error whose child cosca ended is a restartable failure, and SCM is told the OS code of the
+/// failure inside the `MayHaveStarted`.
+#[skuld::test]
+fn a_spawn_error_that_ended_the_daemon_is_a_restartable_failure_with_the_code_of_its_source() {
+    for fate in [ChildFate::Reaped, ChildFate::Killed, ChildFate::Gone] {
+        let fake = FakeGuard::new();
+        fake.will_make_thread();
+        fake.will_refuse_spawn(may_have_started(fate));
+
+        let launched = launch(&spec(), &supervisor(&fake), ID);
+
+        assert_eq!(
+            launched.as_ref().err(),
+            Some(&Reported::shim_failure(Some(ERROR_ACCESS_DENIED as i32))),
+            "{fate:?}"
+        );
+        assert_eq!(fake.take_failures().len(), 1, "{fate:?}");
+        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    }
 }
 
 #[skuld::test]

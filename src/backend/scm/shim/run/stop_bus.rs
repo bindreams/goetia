@@ -488,7 +488,7 @@ fn kill_tree_failed(e: &cosca::error::Error) -> String {
 }
 
 /// What every report of a daemon that may still be running says SCM is told.
-const NOT_RESTARTED: &str = " — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
+pub(super) const NOT_RESTARTED: &str = " — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
 
 fn fallback_kill_failed(e: &cosca::error::Error) -> String {
     format!("fallback kill: {e}; the daemon was neither killed nor reaped and may still be running{NOT_RESTARTED}")
