@@ -13,6 +13,8 @@ use std::thread::JoinHandle;
 use cosca::Containment;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
+use crate::backend::unreaped::release_unreaped;
+
 mod eventlog;
 
 /// What the supervisor asks the OS for.
@@ -73,7 +75,7 @@ pub(crate) struct Real;
 
 impl Os for Real {
     fn spawn(&self, mut cmd: cosca::Command) -> Result<Box<dyn Spawned>, cosca::error::Error> {
-        Ok(Box::new(cmd.spawn()?))
+        Ok(Box::new(cmd.spawn().map_err(release_unreaped)?))
     }
 
     fn thread(&self, name: &str, f: Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>> {

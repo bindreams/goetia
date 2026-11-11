@@ -19,6 +19,7 @@ pub mod launchd;
 pub mod scm;
 pub(crate) mod standby;
 pub mod systemd;
+mod unreaped;
 
 pub(crate) use contract::{
     Backend, Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed,

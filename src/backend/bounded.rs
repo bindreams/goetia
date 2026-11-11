@@ -28,6 +28,7 @@ pub(crate) use spares::{Reaper, Reservation};
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub(crate) use spares::{Spares, spare};
 
+use crate::backend::unreaped::release_unreaped;
 use crate::error::within;
 use crate::manager::budget::Deadline;
 
@@ -302,7 +303,7 @@ fn start(cmd: &mut cosca::Command) -> Result<cosca::Child, cosca::error::Error> 
     if let Some(e) = test_hook::spawning() {
         return Err(e);
     }
-    cmd.spawn()
+    cmd.spawn().map_err(release_unreaped)
 }
 
 /// The failure to make `what` before a spawn, which is therefore never attempted.
