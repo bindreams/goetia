@@ -5,16 +5,14 @@ use cosca::error::Error;
 #[cfg(unix)]
 use crate::backend::standby::Standby;
 
-/// `e`, with the child cosca could not end settled so that the caller never waits for it. Dropping an
-/// [`Unreaped`](cosca::Unreaped) waits with no bound for the child to exit, and a spawn error is
-/// dropped where it is reported, so a child whose kill was refused would stall a call past its
-/// deadline.
+/// `e`, with the child cosca hands back (one it could not show collected) settled so that the caller
+/// never waits for it. Dropping an [`Unreaped`](cosca::Unreaped) waits with no bound for the child
+/// to exit, and a spawn error is dropped where it is reported.
 ///
 /// On Unix the child is waited for on a thread of its own, so it is reaped once it exits. With no
-/// thread to be had it is given up and runs on unreaped; one that exits before this process stays a
-/// zombie until this process exits. (cosca hands back a still-running child when its kill was
-/// refused, or for an elevation front.) On Windows it is given up, which only closes a handle. Its
-/// [`fate`](Error::fate) is cosca's: a `Killed` child is dead or dying.
+/// thread to be had it is given up unreaped: whenever it exits before this process, it stays a zombie
+/// until this process exits. On Windows it is given up, which only closes a handle. What the child
+/// may be doing is its [`fate`](Error::fate), which is cosca's.
 pub(crate) fn release_unreaped(mut e: Error) -> Error {
     if let Error::MayHaveStarted { unreaped, .. } = &mut e
         && let Some(child) = unreaped.take()

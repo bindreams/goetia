@@ -278,8 +278,8 @@ pub(super) fn make_file() -> io::Result<File> {
 
 // test_hook ===========================================================================================================
 
-/// Test controls, for this thread only: it limits temp files and reuses, counts spawns, injects
-/// spawn and wait failures, and inspects the pool and reservations.
+/// Test controls: per-thread limits on temp files and reuses, a per-thread spawn count, injected
+/// spawn and wait failures, and readers of the pool and of a reservation.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
