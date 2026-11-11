@@ -10,7 +10,10 @@
 //! in-process against the fake.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
+
+#[path = "support/mod.rs"]
+mod support;
 
 fn main() {
     skuld::run_all();
@@ -20,12 +23,16 @@ fn goetia_bin() -> &'static str {
     env!("CARGO_BIN_EXE_goetia")
 }
 
-fn run_cli(args: &[&str], cwd: &Path) -> (i32, String, String) {
-    let output = Command::new(goetia_bin())
+fn spawn_cli(args: &[&str], cwd: &Path) -> Output {
+    Command::new(goetia_bin())
         .args(args)
         .current_dir(cwd)
         .output()
-        .unwrap_or_else(|e| panic!("spawn goetia {args:?}: {e}"));
+        .unwrap_or_else(|e| panic!("spawn goetia {args:?}: {e}"))
+}
+
+fn run_cli(args: &[&str], cwd: &Path) -> (i32, String, String) {
+    let output = spawn_cli(args, cwd);
     let code = output
         .status
         .code()
@@ -71,51 +78,33 @@ stderr:
 /// a genuinely unwired manager reports `native()`'s "no backend" there, as
 /// `unavailable` at exit `1` — the fake would also answer cleanly here, so
 /// this rules out exactly the one wrong wiring this module exists to catch.
-/// Labelled `UNIT_DIR_EXCLUSIVE`: this runs a real `daemon list` over the
-/// host's own artifact directories, and `list`'s exit code is host-wide now,
-/// so a concurrently-running test that seeds an unreadable artifact would
-/// turn this `0` into a `4`. The label is the same cross-process lock the
-/// systemd and launchd integration tests take for that reason.
+/// Holds `UNIT_DIR_EXCLUSIVE` on Linux and macOS: this runs a real `daemon list` over the host's own
+/// artifact directories, so it takes turns with the tests that make them hostile. Holds `SCM_DENIAL`
+/// on Windows: a concurrent service-object denial makes `list` report an `errors` entry, which the
+/// check below refuses. Both are held everywhere; each is inert on the platform with no other
+/// holder.
 ///
-/// `--json` rather than the text form, and the code tied to the document
-/// rather than merely allowed to be `0` or `4`: the exit code is host-wide,
-/// so one vendor artifact this caller cannot read legitimately makes it `4`
-/// — but only *with an entry that accounts for it*. A `4` over an empty
-/// `undetermined` is an exit code nothing in the document explains, which
-/// `matches!(code, 0 | 4)` alone accepted.
-#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+/// `support::list_json` ties the exit code to the `--json` document: `errors`
+/// empty, and `4` exactly when `undetermined` is not.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE, SCM_DENIAL], serial = UNIT_DIR_EXCLUSIVE | SCM_DENIAL)]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn native_backend_answers_list_unelevated() {
     let dir = tempfile::tempdir().unwrap();
 
-    let (code, out, err) = run_cli(&["daemon", "list", "--json"], dir.path());
-
-    let context = format!("stdout:\n{out}\nstderr:\n{err}");
-    let doc: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {context}"));
-    let array = |key: &str| {
-        doc[key]
-            .as_array()
-            .unwrap_or_else(|| panic!("`{key}` must always be present, as an array: {context}"))
-    };
-
-    assert!(
-        array("errors").is_empty(),
-        "a real manager answers `list` on this platform: {context}"
-    );
-    assert_eq!(
-        code,
-        if array("undetermined").is_empty() { 0 } else { 4 },
-        "exit `4` is exactly what an `undetermined` entry reports, and nothing else here reports it: {context}"
-    );
+    support::list_json(|args| spawn_cli(args, dir.path()));
 }
 
-/// Shared with the systemd and launchd integration binaries: any test that
-/// reads or writes the host's real artifact directories takes this, because
-/// `list`'s exit code is host-wide and one unreadable artifact changes it
-/// for every concurrent reader.
+/// Shared with the systemd and launchd integration binaries, by label *name*: any test that reads
+/// or writes the host's real unit or plist directories takes this. A FIFO test makes them hostile
+/// to a concurrent unguarded reader, and a FIFO regression would then hang the suite instead of
+/// failing the one guarded test. Windows has no such hazard; its SCM denials have `SCM_DENIAL`.
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
+
+/// Shared with the SCM and shim integration binaries, by label *name*; see its declaration in
+/// `tests/scm_integration/managed.rs`.
+#[skuld::label]
+const SCM_DENIAL: skuld::Label;
 
 // Pure paths: no elevation, no manager ================================================================================
 
