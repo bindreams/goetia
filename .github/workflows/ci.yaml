@@ -191,7 +191,7 @@ jobs:
 
       # Last, and whatever the tests did, so a doc warning hides no test result. `docs.rs` builds the
       # three OS targets, and links to `#[cfg]`-gated items resolve on one OS and break on another, so
-      # each OS runs them.
+      # each OS runs the doc hooks.
       - name: Rustdoc
         if: ${{ !cancelled() && matrix.toolchain != 'stable' }}
         run: prek run --stage manual --all-files cargo-doc cargo-doc-lib-only cargo-doc-tests

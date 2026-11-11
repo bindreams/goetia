@@ -83,10 +83,8 @@ stages = ["manual"]
 
 [[repos.hooks]]
 id = "cargo-doc-tests"
-name = "cargo doc (test modules)"
-# `cfg(test)` items are documented only under `--cfg test`; the hooks above skip them. `--all-features`
-# would need a built shim (`goetia-shim`), and the test modules need only these two.
-entry = """cargo rustdoc --locked --lib --features cli,testing -- --cfg test --document-private-items -D warnings"""
+name = "cargo doc (tests)"
+entry = "bash .github/scripts/rustdoc-tests.sh -D warnings"
 language = "system"
 types = ["rust"]
 pass_filenames = false
