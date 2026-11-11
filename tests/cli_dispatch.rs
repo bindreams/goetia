@@ -24,7 +24,7 @@ use goetia::spec::{DaemonFields, DaemonSpec, Id, Kind, Restart};
 mod support;
 
 fn main() {
-    skuld::run_all();
+    goetia::testing::run_all();
 }
 
 // Fixtures ============================================================================================================
