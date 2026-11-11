@@ -533,7 +533,15 @@ impl Backend for Scm {
         let stopped = super::wait::stop_and_await_exit(&mut actor, deadline, &mut held, shim, |held, deadline| {
             end_held(&id, held, deadline)
         })
-        .map_err(|e| Error::os(format!("stop `{id}`"), e))
+        .map_err(|e| {
+            let incomplete = is_incomplete_stop(&e);
+            let error = Error::os(format!("stop `{id}`"), e);
+            if incomplete {
+                answer.explain_incomplete_stop(&id, error)
+            } else {
+                error
+            }
+        })
         .and_then(|outcome| match outcome {
             StopAndAwaitExitOutcome::Stopped => Ok(()),
             // The STOP was sent and its effect is not confirmed, as when SCM does not answer in time.
@@ -1083,7 +1091,14 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
                 (false, true) => UninstallFailure::AlreadyMarked,
                 (false, false) => UninstallFailure::Stop { previous },
             };
-            let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
+            let cause = hold_failed.unwrap_or_else(|| {
+                let stop = Error::os(format!("stop `{id}`"), e);
+                if incomplete {
+                    answer.explain_incomplete_stop(id, stop)
+                } else {
+                    stop
+                }
+            });
             return Err(uninstall_failed(id, &state, cause));
         }
     }
@@ -1167,6 +1182,22 @@ impl ShimAnswer {
     /// vocabulary for [`ShimKind::Shim`] alone: see [`start_kind`].
     fn judges_stop_record(&self) -> bool {
         self.kind != ShimKind::NotShim
+    }
+
+    /// `stop`, the incomplete stop of `id`, led by why it was judged as a shim's when the blob would
+    /// not decode: the user is told the service may not run a shim, and why goetia could not tell.
+    /// Unchanged when the blob decoded, or the service is known not to run a shim.
+    fn explain_incomplete_stop(&self, id: &Id, stop: Error) -> Error {
+        match (&self.blob_error, self.judges_stop_record()) {
+            (Some(blob), true) => Error::Step {
+                what: format!(
+                    "`{id}` was judged as a shim's, because its spec blob could not be read ({})",
+                    Chain(blob.as_ref())
+                ),
+                source: Box::new(stop),
+            },
+            _ => stop,
+        }
     }
 }
 

@@ -800,6 +800,36 @@ fn only_a_service_known_not_to_run_a_shim_is_left_unjudged() {
     assert!(!said(ShimKind::NotShim).judges_stop_record());
 }
 
+/// An incomplete stop of a service judged as a shim's over a blob that would not decode says so, and
+/// why: the user is not told of a shim's record for a service that may not run one. Over a blob
+/// that decoded, or a service known not to run a shim, the failure is as it was.
+#[skuld::test]
+fn an_incomplete_stop_names_the_blob_read_error_that_got_the_service_judged() {
+    let id = Id::try_from("frpc").unwrap();
+    let failed = || Error::os("stop `frpc`", std::io::Error::other("incomplete stop"));
+    let corrupt = Some(Arc::new(Error::blob("invalid blob JSON: EOF")));
+
+    for kind in [ShimKind::Unknown, ShimKind::Shim] {
+        let said = ShimAnswer {
+            kind,
+            blob_error: corrupt.clone(),
+        }
+        .explain_incomplete_stop(&id, failed())
+        .report()
+        .to_string();
+        assert!(said.contains("incomplete stop"), "{kind:?}: {said}");
+        assert!(said.contains("judged as a shim's"), "{kind:?}: {said}");
+        assert!(said.contains("invalid blob JSON: EOF"), "{kind:?}: {said}");
+    }
+    for (kind, blob_error) in [(ShimKind::Shim, None), (ShimKind::NotShim, corrupt)] {
+        let said = ShimAnswer { kind, blob_error }
+            .explain_incomplete_stop(&id, failed())
+            .report()
+            .to_string();
+        assert!(!said.contains("blob"), "{kind:?}: {said}");
+    }
+}
+
 /// Only a service that is gone or marked for deletion refuses the read of its host as a matter of
 /// course; any other failure is not "no shim", and is reported.
 #[skuld::test]
