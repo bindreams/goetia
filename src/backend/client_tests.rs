@@ -193,28 +193,28 @@ fn real_to_completion_draws_nothing_from_the_reservation() {
 ///
 /// A test runner may already give the test process `/dev/null` (nextest does), which an inherited
 /// stdin would then match. So the test runs itself again with a pipe on stdin, and the copy asks its
-/// child what it was given. Linux only: it asks `/proc`.
-#[cfg(target_os = "linux")]
+/// child whether its stdin is a pipe: `/dev/null` is not, an inherited stdin would be.
 #[skuld::test]
 fn real_to_completion_gives_the_child_no_stdin() {
+    use std::os::unix::fs::FileTypeExt;
     use std::process::{Command, Stdio};
 
     const PROBE: &str = "GOETIA_CLIENT_STDIN_PROBE";
     const THIS_TEST: &str = "real_to_completion_gives_the_child_no_stdin";
 
     if std::env::var_os(PROBE).is_some() {
-        let own = std::fs::read_link("/proc/self/fd/0").expect("read own stdin");
-        assert!(
-            own.to_string_lossy().starts_with("pipe:"),
-            "stdin is not the probe's pipe: {own:?}"
-        );
-        let Finished::Exited { capture, .. } = sh("readlink /proc/self/fd/0")
+        let own = std::fs::metadata("/dev/stdin").expect("stat own stdin");
+        assert!(own.file_type().is_fifo(), "stdin is not the probe's pipe: {own:?}");
+        let Finished::Exited { capture, .. } = sh("[ -p /dev/fd/0 ] && echo pipe || echo null")
             .run(&[], Wait::ToCompletion, &mut Reservation::default())
             .expect("sh runs")
         else {
             panic!("expired");
         };
-        println!("{PROBE}={}", String::from_utf8_lossy(&capture.stdout).trim());
+        // The leading newline puts the line on its own: the harness may have printed `test ... `
+        // before it.
+        println!("
+{PROBE}={}", String::from_utf8_lossy(&capture.stdout).trim());
         return;
     }
 
@@ -229,8 +229,10 @@ fn real_to_completion_gives_the_child_no_stdin() {
     let stdout = String::from_utf8_lossy(&probe.stdout);
     let stderr = String::from_utf8_lossy(&probe.stderr);
     assert!(
-        stdout.lines().any(|line| line == format!("{PROBE}=/dev/null")),
-        "the child's stdin was not /dev/null ({}):\n{stdout}\n{stderr}",
+        stdout.lines().any(|line| line == format!("{PROBE}=null")),
+        "the child's stdin was not /dev/null ({}):
+{stdout}
+{stderr}",
         probe.status
     );
 }
