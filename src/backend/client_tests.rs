@@ -178,6 +178,24 @@ fn real_runs_to_completion_and_captures() {
     assert!(capture.complete);
 }
 
+/// A child that fills one pipe past its buffer before it writes the other is not blocked by the
+/// stream read second: both captures arrive whole, whichever stream is read first.
+#[skuld::test]
+fn real_to_completion_drains_both_streams_past_a_pipe_buffer() {
+    const SIZE: usize = 100_000;
+    let script = format!("head -c {SIZE} /dev/zero | tr '\\0' e >&2; head -c {SIZE} /dev/zero | tr '\\0' o");
+    let finished = sh(&script)
+        .run(&[], Wait::ToCompletion, &mut Reservation::default())
+        .expect("sh runs");
+    let Finished::Exited { status, capture } = finished else {
+        panic!("a run to completion never expires: {finished:?}");
+    };
+    assert!(status.success(), "{status:?}");
+    assert_eq!(capture.stderr, vec![b'e'; SIZE]);
+    assert_eq!(capture.stdout, vec![b'o'; SIZE]);
+    assert!(capture.complete);
+}
+
 /// What a run to completion needs it makes itself: a reservation holding nothing is enough.
 #[skuld::test]
 fn real_to_completion_draws_nothing_from_the_reservation() {
@@ -314,7 +332,14 @@ fn the_fake_draws_a_calls_files_from_the_reservation() {
     let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drop(short.run(&["print"], query(), &mut reservation));
     }));
-    assert!(drawn.is_err(), "a call past the reservation went unnoticed");
+    // The reservation has nothing to give: it stays empty, whichever way the miscount went. The miscount
+    // itself is a debug assertion, so a release build makes the file on the spot and the call goes on.
+    assert_eq!(bounded::test_hook::left(&reservation), (0, 0));
+    assert_eq!(
+        drawn.is_err(),
+        cfg!(debug_assertions),
+        "a call past the reservation is a miscount in a debug build and is served in a release one"
+    );
 }
 
 /// How a call was waited on is recorded, and a run to completion draws no file.
