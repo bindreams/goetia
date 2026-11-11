@@ -29,6 +29,13 @@ pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
     (state, pid)
 }
 
+/// Whether one `launchctl print` body shows a job whose `bootout` has returned and whose process has
+/// not exited: `state = SIGTERMed` (measured on macOS CI, 2026-11-09). Apple does not guarantee the
+/// format, so any other `state`, one this does not recognise included, is a loaded job.
+pub(crate) fn tearing_down(print_body: &str) -> bool {
+    find_field(print_body, "state").map(str::trim) == Some("SIGTERMed")
+}
+
 /// What a `launchctl print` must show before goetia ends the `kickstart` an expiry left running.
 /// Ended before launchd has the request, the start is lost, so only a reading that cannot be an
 /// older instance of the job counts.
