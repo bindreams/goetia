@@ -278,9 +278,8 @@ pub(super) fn make_file() -> io::Result<File> {
 
 // test_hook ===========================================================================================================
 
-/// Makes temp-file creation and reuse fail on demand, on this thread only, and records the spawns
-/// and waits a test scripts, so the paths that must refuse to send anything when a file cannot be
-/// had are testable. Thread creation is [`Standby`]'s hook.
+/// Test controls, for this thread only: it limits temp files and reuses, counts spawns, injects
+/// spawn and wait failures, and inspects the pool and reservations.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
