@@ -817,10 +817,13 @@ impl Systemctl {
     /// `props` of `unit`, every one of them: systemd answers each property `status_from_unit` asks for
     /// on any unit name, loaded or not (an empty `UnitFileState=` included), so an answer without one
     /// is no answer, and never the state its absence would default to.
-    fn show_properties(&self, unit: &str, props: &[&str], held: &mut Held) -> Result<BTreeMap<String, String>> {
+    fn show_properties(&self, unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
         let joined = props.join(",");
-        let (status, capture) =
-            self.completed(Purpose::Read, &unit_args(&["show", "--property", &joined], unit), held)?;
+        let (status, capture) = self.completed(
+            Purpose::Read,
+            &unit_args(&["show", "--property", &joined], unit),
+            &mut Held::default(),
+        )?;
         if !status.success() {
             return Err(Error::command(
                 format!("systemctl show {unit}"),
@@ -852,8 +855,8 @@ impl Systemctl {
     /// file for the name — is a unit file systemd cannot see, one goetia's own mount namespace holds,
     /// say. Not one merely written and not yet reloaded: the manager picks a unit file up on demand.
     /// What systemd reports for such a name is not that unit's state, and never read as one.
-    pub(super) fn status_from_unit(&self, unit: &str, held: &mut Held) -> Result<Status> {
-        let props = self.show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"], held)?;
+    pub(super) fn status_from_unit(&self, unit: &str) -> Result<Status> {
+        let props = self.show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"])?;
         if props.get("LoadState").map(String::as_str) == Some("not-found") {
             return Err(Error::UnitNotLoaded { unit: unit.to_string() });
         }

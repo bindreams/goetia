@@ -318,7 +318,7 @@ fn enable_and_disable_failures_name_the_verb_the_unit_and_systemd_s_words() {
 fn show_puts_the_unit_after_the_option_terminator() {
     let fake = Fake::new([reply(&["show"], exited(1, "", ""))]);
 
-    let _ = on_booted(fake.clone()).status_from_unit("-h.service", &mut Held::default());
+    let _ = on_booted(fake.clone()).status_from_unit("-h.service");
 
     assert_eq!(
         fake.calls(),
@@ -786,7 +786,7 @@ fn every_path() -> Vec<Way> {
         Way {
             name: "show".to_string(),
             gated: false,
-            run: Box::new(|s: &Systemctl| s.status_from_unit("x.service", &mut Held::default()).map(drop)),
+            run: Box::new(|s: &Systemctl| s.status_from_unit("x.service").map(drop)),
         },
         Way::request("restart", |s: &Systemctl| {
             s.request_restart_impl("x", &mut Held::default())
@@ -982,9 +982,7 @@ fn a_show_answer_without_every_property_is_not_a_state() {
         ("ActiveState=active\n", "MainPID, UnitFileState, LoadState"),
         ("ActiveState=active\nMainPID=42\nUnitFileState=enabled\n", "LoadState"),
     ] {
-        let e = showing(answer)
-            .status_from_unit("x.service", &mut Held::default())
-            .expect_err(answer);
+        let e = showing(answer).status_from_unit("x.service").expect_err(answer);
         let msg = e.to_string();
         assert!(msg.contains(&format!("answered without {missing}")), "{answer}: {msg}");
     }
@@ -999,7 +997,7 @@ fn a_unit_systemd_has_not_loaded_is_not_a_state() {
     for (active, unit_file) in [("inactive", ""), ("active", "enabled")] {
         let answer = format!("ActiveState={active}\nMainPID=0\nUnitFileState={unit_file}\nLoadState=not-found\n");
         let msg = showing(&answer)
-            .status_from_unit("x.service", &mut Held::default())
+            .status_from_unit("x.service")
             .expect_err(&answer)
             .to_string();
         assert!(
@@ -1010,9 +1008,7 @@ fn a_unit_systemd_has_not_loaded_is_not_a_state() {
     }
     for load in ["loaded", "masked", "bad-setting", "error"] {
         let answer = format!("ActiveState=inactive\nMainPID=0\nUnitFileState=\nLoadState={load}\n");
-        let status = showing(&answer)
-            .status_from_unit("x.service", &mut Held::default())
-            .expect(&answer);
+        let status = showing(&answer).status_from_unit("x.service").expect(&answer);
         assert_eq!(status.state, State::Stopped, "{answer}");
     }
 }
@@ -1039,9 +1035,7 @@ fn a_show_answer_with_every_property_is_read() {
             },
         ),
     ] {
-        let status = showing(answer)
-            .status_from_unit("x.service", &mut Held::default())
-            .expect(answer);
+        let status = showing(answer).status_from_unit("x.service").expect(answer);
         assert_eq!(
             (status.state, status.pid, status.enabled),
             (expected.state, expected.pid, expected.enabled),
