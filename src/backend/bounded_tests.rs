@@ -163,7 +163,7 @@ impl Drop for KillOnDrop {
 /// ([`a_heard_stream_is_read_only_until_a_spent_deadline_even_at_its_end`]), so what this test adds
 /// is the descendant: once the read is over, the test asks it, over fd 4, and it answers on fd 3
 /// that its stdout and stderr — the child's, which it inherited — are still pipes. A read that
-/// ignored the deadline never ends here: nextest's `ci` profile bounds it.
+/// ignored the deadline never ends here.
 /// Built without `command()`'s containment, as the test above is: a contained descendant dies with
 /// the child.
 #[skuld::test]

@@ -3,8 +3,6 @@ name = "goetia"
 version = "0.3.0"
 edition = "2024"
 # `skuld` 0.6 (the test harness, also a `testing`-feature dependency) uses `File::lock`, stable in 1.89.
-# Let-chains and `slice::as_chunks` (both stable in 1.88) and `sha2` 0.11, which hashes the stock shim
-# on Windows, need less.
 rust-version = "1.89"
 description = "Install system daemons described in goetia.yaml as native Windows/SCM, macOS/launchd, and Linux/systemd services"
 license = "Apache-2.0"
@@ -62,8 +60,8 @@ cli = ["dep:clap"]
 # release workflow turns it on for the `goetia` binary, whose `stock_shim()` then embeds it rather
 # than reading `goetia-shim.exe` beside it; the library never reads it.
 goetia-shim = []
-# Exports helpers the crate's own tests share; adds items only, gates no behaviour. `skuld` is the
-# `ELEVATED` label's and `testing::run_all`'s (see its doc).
+# Exports helpers the crate's own tests share; adds items only, gates no behaviour.
+# `skuld` is for the `ELEVATED` label and `testing::run_all`.
 testing = ["dep:skuld"]
 
 [dependencies]
@@ -89,8 +87,7 @@ memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "3"
-# Only under `testing`: the `ELEVATED` label of `testing::elevation` and `testing::run_all` (see its
-# doc). The dev-dependency below is the unit tests' own.
+# `skuld` is for the `ELEVATED` label and `testing::run_all`.
 skuld = { version = "0.6", optional = true }
 tempfile = "3"
 thiserror = "2"

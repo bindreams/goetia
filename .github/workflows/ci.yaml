@@ -92,20 +92,15 @@ jobs:
       # archive elevated (sudo on Linux/macOS; the Windows runner is already
       # Administrator). Never `sudo -E cargo test`: `-E` preserves `HOME`,
       # so root would write to `~/.cargo`/`target/` and the next unelevated
-      # build would fail with `EACCES`. `cargo` stays entirely unelevated;
-      # only the prebuilt nextest binary runs as root, once.
+      # build would fail with `EACCES`. `cargo` stays entirely unelevated.
       - name: Build test binaries
         run: cargo nextest archive --locked --archive-file nextest-archive.tar.zst
 
-      # skuld has no per-test timeout by design. A hung test ends one of two ways: nextest's `ci`
-      # profile (`.config/nextest.toml`) kills it after its slow-timeout and reports it by name as
-      # TIMEOUT, or this job's `timeout-minutes` cancels the run first (tests run one at a time).
+      # Hung tests: see the `ci` profile in `.config/nextest.toml`.
       # `--no-tests fail` keeps a build that produced no tests from passing.
       # On Windows the archive is extracted under `target/`, not into the runner account's `%TEMP%`,
       # which other accounts cannot read: `real_account_gets_service_logon_right` runs the extracted
-      # test binary as a fresh local user, and relies on `target/` being readable by it. The tests
-      # that run as a built-in service account (`LocalService`) do not: `target/` is not assumed
-      # readable by those, so they copy the binary to `%ProgramData%` (`WorldReadableExe`).
+      # test binary as a fresh local user, and relies on `target/` being readable by it.
       # nextest wants the directory to exist, and `--extract-overwrite` lets a restored cache
       # leave one. On Linux and macOS root extracts into nextest's default temporary directory:
       # root must not write `target/`, which the next unelevated build and the cache prune need to own.

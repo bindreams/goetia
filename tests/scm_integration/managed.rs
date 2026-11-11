@@ -483,7 +483,7 @@ fn uninstall_errors_when_service_will_not_stop() {
 
 /// Measures which code SCM gives a STOP to a RUNNING service that accepts none (the unit tests
 /// script 1052 and 1061 alike): `stop` reads the status either way and returns the "does not accept
-/// STOP" error at once. The call returns; a wait would hang, bounded by nextest's `ci` profile.
+/// STOP" error at once. The call returns; a wait would hang.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting() {
     let mgr = Scm::new();
@@ -1100,7 +1100,7 @@ fn real_account_gets_service_logon_right() {
     // the 10s default on a runner — measured at 24,737 ms on a green run, and 14,349 ms when
     // `DEFAULT` turned it into a failure whose message blamed `SeServiceLogonRight` for what was
     // only a slow profile build. A larger fixed number would just move the guess; unbounded says
-    // what is meant. A start that never arrives is bounded by nextest's `ci` profile.
+    // what is meant.
     mgr.start(&target, Budget::Unbounded).unwrap_or_else(|e| {
         panic!("service under a real account failed to start (SeServiceLogonRight likely not granted): {e}")
     });

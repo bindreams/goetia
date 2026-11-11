@@ -636,7 +636,7 @@ impl Drop for Unstoppable {
 
 /// A real expiry, deterministically: the stop can never complete, so a bounded `stop` has exactly
 /// one correct answer — `WaitTimeout`, with the stop job left standing in systemd. A backend that
-/// ignored `--timeout` would wait forever here: nextest's `ci` profile bounds it.
+/// ignored `--timeout` would wait forever here.
 #[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
 fn a_stop_that_can_never_complete_times_out_with_the_job_standing() {
     let id = support::random_test_id();
