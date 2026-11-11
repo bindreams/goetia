@@ -2,8 +2,7 @@
 //! library only through its public API, so what both need is exported here, under the `testing`
 //! feature (and under `cfg(test)`, for the unit tests). Not public API: nothing here is stable.
 //!
-//! The `testing` feature depends on `skuld` for the `ELEVATED` label and for [`run_all`], the `main`
-//! of every test binary, `src/main.rs`'s `cfg(test)` one included.
+//! The `testing` feature depends on `skuld` for the `ELEVATED` label and for [`run_all`].
 
 #[cfg(windows)]
 use std::path::PathBuf;
@@ -18,8 +17,10 @@ use crate::spec::{DaemonFields, Id, Kind, Restart, User};
 
 pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
 
-/// Runs every skuld test in the calling binary and exits. The `main` of each skuld test binary calls
-/// this, so no binary opts out of its naming.
+/// Runs every skuld test in the calling binary and exits. It is the `main` of every skuld test
+/// binary: the library's unit tests, each integration test, and `src/main.rs`'s `cfg(test)` one.
+/// The `goetia-shim` bin's test binary keeps libtest's harness. No skuld binary opts out of the
+/// naming below.
 ///
 /// A test is named `module::fn`, and a crate-root test keeps its bare name, so two modules may each
 /// hold a `fn x`: under skuld's default bare names the binary panics at startup on the second.
