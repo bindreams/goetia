@@ -1,7 +1,7 @@
 use windows_sys::Win32::Security::{TOKEN_IMPERSONATE, TOKEN_QUERY};
 
 use super::*;
-use crate::backend::scm::shim::acl::administrators;
+use crate::backend::scm::sid::administrators;
 use crate::elevation::test_support::{ThreadTokenReset, process_token_copy, restricted_token_copy};
 
 /// A token whose Administrators group is disabled has no Administrators, whatever it belongs to:
