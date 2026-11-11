@@ -451,7 +451,10 @@ impl Backend for Scm {
         let id = snapshot.into_id();
         let scm = open_scm_for(&id, "uninstall").map_err(|e| uninstall_failed(&id, &UninstallFailure::Untouched, e))?;
         match uninstall_locked(&scm, &id, &answer, hold)? {
-            Uninstalled::Deleted { process } if shim => self.finish_uninstall(&id, host, process),
+            // A host that is not a shim file has nothing to wait for or sweep, and no cleanup to report.
+            Uninstalled::Deleted { process } if shim && !matches!(host, Ok(None)) => {
+                self.finish_uninstall(&id, host, process)
+            }
             Uninstalled::Deleted { .. } | Uninstalled::Left => Ok(()),
         }
     }
