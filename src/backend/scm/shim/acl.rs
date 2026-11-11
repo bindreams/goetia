@@ -62,7 +62,7 @@ pub(crate) struct ObjectSecurity {
 }
 
 /// An access-control entry that grants or denies a trustee a mask of rights. Ordered field by
-/// field, which is what makes [`is_as_wanted`] independent of the order of entries.
+/// field, which is what makes [`protected::is_as_wanted`] independent of the order of entries.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ace {
@@ -73,7 +73,7 @@ pub struct Ace {
     pub allow: bool,
     /// A callback entry: a condition follows its SID, which is not read, so [`verdict`] treats it
     /// as one that always applies. A conditional entry is not a plain one, but two conditional
-    /// entries that differ only in their condition are the same to [`is_as_wanted`].
+    /// entries that differ only in their condition are the same to [`protected::is_as_wanted`].
     pub conditional: bool,
 }
 
@@ -560,16 +560,21 @@ mod system {
             dacl: std::ptr::null_mut(),
             descriptor: std::ptr::null_mut(),
         };
+        let wants_owner = information & OWNER_SECURITY_INFORMATION != 0;
         let wants_dacl = information & DACL_SECURITY_INFORMATION != 0;
         // SAFETY: `handle` is open with `READ_CONTROL` for the call; the out-pointers are valid
-        // lvalues of `info`, which frees the descriptor `descriptor` receives, and the DACL's is null
-        // when none was asked for.
+        // lvalues of `info`, which frees the descriptor `descriptor` receives, and the owner's and
+        // the DACL's are null when not asked for.
         let status = unsafe {
             GetSecurityInfo(
                 handle,
                 kind,
                 information,
-                &mut info.owner,
+                if wants_owner {
+                    &mut info.owner
+                } else {
+                    std::ptr::null_mut()
+                },
                 std::ptr::null_mut(),
                 if wants_dacl {
                     &mut info.dacl
@@ -726,8 +731,8 @@ mod system {
         Ok(())
     }
 
-    /// What a read of an object's permissions fails with when the object holds something goetia
-    /// cannot read (an entry of a type it does not know, an account that is no SID), as opposed to
+    /// What a read of an object's owner or permissions fails with when the object holds something
+    /// goetia cannot read (an entry of a type it does not know, an account that is no SID), as opposed to
     /// the system failing to answer. Carried as the error's source; see [`is_unreadable`].
     #[derive(Debug)]
     struct Unreadable(String);
@@ -744,8 +749,8 @@ mod system {
         Error::os_at(verb, path, Unreadable(what))
     }
 
-    /// Whether `error` is a read of permissions that failed because the object holds something
-    /// goetia cannot read, which says something about the object; any other failure says nothing.
+    /// Whether `error` is a read of an object's owner or permissions that failed because the object
+    /// holds something goetia cannot read, which says something about the object; any other failure says nothing.
     pub(crate) fn is_unreadable(error: &Error) -> bool {
         matches!(error, Error::Os { source, .. } if source.is::<Unreadable>())
     }
