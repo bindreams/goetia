@@ -56,11 +56,20 @@ define_windows_service!(ffi_service_main, service_main);
 
 /// SCM's arguments to `ServiceMain`: the first is the service's name.
 fn service_main(scm_args: Vec<OsString>) {
-    let Some(id) = scm_args.first().and_then(|name| name.to_str()) else {
-        Log::real().failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
-        exit::end_process(ERROR_BAD_ARGUMENTS as i32);
-    };
-    run_service(id);
+    match service_name(&Log::real(), &scm_args) {
+        Ok(id) => run_service(id),
+        Err(code) => exit::end_process(code),
+    }
+}
+
+/// The service's name: SCM's first argument, which must be there and be UTF-8. Otherwise no spec can
+/// be looked up, so the refusal is logged under [`TABLE_NAME`] and its process exit code returned;
+/// no `STOPPED` is reported, because no service is known to report it for.
+fn service_name<'a>(log: &Log, scm_args: &'a [OsString]) -> Result<&'a str, i32> {
+    scm_args.first().and_then(|name| name.to_str()).ok_or_else(|| {
+        log.failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
+        ERROR_BAD_ARGUMENTS as i32
+    })
 }
 
 fn run_service(id: &str) {
