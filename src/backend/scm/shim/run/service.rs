@@ -12,6 +12,7 @@ use crate::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
 };
 use crate::backend::scm::manager::read_spec_blob;
+use crate::backend::scm::wide::wide_null;
 use crate::blob::Blob;
 use crate::error::Error;
 use crate::spec::{DaemonSpec, Restart};
@@ -56,15 +57,28 @@ define_windows_service!(ffi_service_main, service_main);
 
 /// SCM's arguments to `ServiceMain`: the first is the service's name.
 fn service_main(scm_args: Vec<OsString>) {
-    let Some(id) = scm_args.first().and_then(|name| name.to_str()) else {
-        Log::real().failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
-        exit::end_process(ERROR_BAD_ARGUMENTS as i32);
-    };
-    run_service(id);
+    let log = Arc::new(Log::real());
+    match service_name(&log, &scm_args) {
+        Ok(id) => run_service(id, log),
+        Err(code) => exit::end_process(code),
+    }
 }
 
-fn run_service(id: &str) {
-    let log = Arc::new(Log::real());
+/// The service's name: SCM's first argument, which must be there, be UTF-8 and not be empty. Otherwise no spec can
+/// be looked up, so the refusal is logged under [`TABLE_NAME`] and its process exit code returned;
+/// no `STOPPED` is reported, because no service is known to report it for.
+fn service_name<'a>(log: &Log, scm_args: &'a [OsString]) -> Result<&'a str, i32> {
+    scm_args
+        .first()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            log.failure(TABLE_NAME, &format!("SCM passed no usable service name: {scm_args:?}"));
+            ERROR_BAD_ARGUMENTS as i32
+        })
+}
+
+fn run_service(id: &str, log: Arc<Log>) {
     let supervisor = Supervisor::new(Arc::new(Real), Arc::clone(&log));
     let status_handle = match register_control_handler(id, &supervisor.bus) {
         Ok(h) => h,
@@ -188,7 +202,7 @@ struct StatusHandle(SERVICE_STATUS_HANDLE);
 /// while the registration stays live: SCM can deliver a control after that, which would reach freed
 /// memory. No test catches a revert; `clippy.toml` forbids the call.
 fn register_control_handler(id: &str, stop_bus: &Arc<StopBus>) -> std::io::Result<StatusHandle> {
-    let name = super::os::wide_null(id);
+    let name = wide_null(id);
     // SAFETY: `name` is NUL-terminated and outlives the call; the context is never freed.
     let handle =
         unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(control_handler), leak_handler_context(stop_bus)) };

@@ -667,59 +667,18 @@ fn executable_trailing_backslash_does_not_round_trip_through_argv0() {
     );
 }
 
+/// The real `CommandLineToArgvW`, through the production splitter, as the argv `windows_style_split` models.
 #[cfg(windows)]
-mod real_win32 {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-
-    #[link(name = "shell32")]
-    unsafe extern "system" {
-        fn CommandLineToArgvW(lp_cmd_line: *const u16, p_num_args: *mut i32) -> *mut *mut u16;
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn LocalFree(hmem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
-    }
-
-    /// Splits `cmdline` with the real Win32 `CommandLineToArgvW` — the
-    /// authority `windows_style_split` models. Used only by
-    /// `windows_style_split_matches_real_command_line_to_argv_w`, so the
-    /// hand-rolled splitter is checked against ground truth on the one
-    /// platform where that is possible, rather than exclusively against
-    /// itself.
-    pub fn split(cmdline: &str) -> Vec<String> {
-        let wide = crate::backend::scm::manager::identity::wide_null(cmdline);
-        let mut argc: i32 = 0;
-        // SAFETY: `wide` is a valid null-terminated UTF-16 string that
-        // outlives this call; `argc` is a valid, aligned `i32` out-param.
-        let argv = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut argc) };
-        assert!(!argv.is_null(), "CommandLineToArgvW failed for {cmdline:?}");
-
-        let mut result = Vec::with_capacity(argc.max(0) as usize);
-        for idx in 0..argc as isize {
-            // SAFETY: `argv` points to `argc` valid pointers to
-            // null-terminated UTF-16 strings, per the documented
-            // CommandLineToArgvW contract.
-            let ptr = unsafe { *argv.offset(idx) };
-            let mut len = 0isize;
-            // SAFETY: `ptr` is a valid null-terminated UTF-16 string.
-            while unsafe { *ptr.offset(len) } != 0 {
-                len += 1;
-            }
-            // SAFETY: `ptr[0..len)` are exactly the UTF-16 code units just counted.
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-            result.push(OsString::from_wide(slice).to_string_lossy().into_owned());
-        }
-
-        // SAFETY: `argv` was allocated by `CommandLineToArgvW` and is
-        // freed exactly once, per its documented contract, after every
-        // element has already been copied out above.
-        unsafe {
-            LocalFree(argv as *mut core::ffi::c_void);
-        }
-        result
-    }
+fn real_split(cmdline: &str) -> Vec<String> {
+    let (executable, arguments) = crate::backend::scm::manager::split_command_line(cmdline);
+    // The splitter reports a failed split as no executable.
+    assert!(
+        !executable.as_os_str().is_empty(),
+        "CommandLineToArgvW failed for {cmdline:?}"
+    );
+    std::iter::once(executable.to_string_lossy().into_owned())
+        .chain(arguments)
+        .collect()
 }
 
 #[cfg(windows)]
@@ -747,7 +706,7 @@ fn windows_style_split_matches_real_command_line_to_argv_w() {
     for cmdline in cmdlines {
         assert_eq!(
             windows_style_split(&cmdline),
-            real_win32::split(&cmdline),
+            real_split(&cmdline),
             "windows_style_split disagrees with the real CommandLineToArgvW for {cmdline:?}"
         );
     }

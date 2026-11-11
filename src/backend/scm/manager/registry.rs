@@ -23,6 +23,7 @@ use winreg::types::FromRegValue as _;
 use crate::backend::scm::generate::{FIELDS, field_named};
 pub use crate::backend::scm::parameters::RegistryReadOutcome;
 use crate::backend::scm::parameters::{Parameters, field_named_utf16, shown_name, type_name};
+use crate::backend::scm::wide::wide_null;
 use crate::error::{Error, Result};
 use crate::manager::{Installed, flow};
 
@@ -394,7 +395,7 @@ fn read_environment_in(services: &ServicesRoot<'_>, name: &str) -> Result<Regist
 /// `RegQueryValueExW` for `name` under `key`, whatever its type: the type, with the data in
 /// `buffer` (its contents are replaced, and its allocation is reused across calls).
 fn query_raw_value(key: &RegKey, name: &str, buffer: &mut Vec<u8>) -> std::io::Result<u32> {
-    let wide_name = super::identity::wide_null(name);
+    let wide_name = wide_null(name);
     buffer.clear();
     buffer.resize(INITIAL_VALUE_BYTES.max(buffer.capacity()), 0);
     let (vtype, len) = read_growing(buffer, |data, len, vtype| {

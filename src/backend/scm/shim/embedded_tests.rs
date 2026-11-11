@@ -3,13 +3,12 @@
 //! an elevated token.
 
 use super::*;
-
-const HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+use crate::backend::scm::test_support::SHIM_HEX;
 
 #[skuld::test]
 fn shim_file_matches_only_shim_names() {
-    let current = format!("goetia-shim-{HEX}.exe");
-    let aside = format!("goetia-shim-{HEX}.a1B2c3.stale.exe");
+    let current = format!("goetia-shim-{SHIM_HEX}.exe");
+    let aside = format!("goetia-shim-{SHIM_HEX}.a1B2c3.stale.exe");
 
     assert!(matches!(shim_file(&current), Some(ShimFile::Current)));
     assert!(matches!(shim_file(&aside), Some(ShimFile::StaleAside)));
@@ -23,15 +22,15 @@ fn shim_file_refuses_what_is_not_a_shim_name() {
         "goetia-shim-notes.exe",
         "goetia-shim.exe",
         "goetia.exe",
-        &format!("goetia-shim-{}.exe", &HEX[..63]),
-        &format!("goetia-shim-{HEX}0.exe"),
-        &format!("goetia-shim-{}g.exe", &HEX[..63]),
-        &format!("goetia-shim-{HEX}.exe.bak"),
-        &format!("goetia-shim-{HEX}.stale.exe"),
-        &format!("goetia-shim-{HEX}..stale.exe"),
-        &format!("goetia-shim-{HEX}.x.stale.dll"),
-        &format!("other-goetia-shim-{HEX}.exe"),
-        &format!("goetia-shim-{}\u{e9}.exe", &HEX[..62]),
+        &format!("goetia-shim-{}.exe", &SHIM_HEX[..63]),
+        &format!("goetia-shim-{SHIM_HEX}0.exe"),
+        &format!("goetia-shim-{}g.exe", &SHIM_HEX[..63]),
+        &format!("goetia-shim-{SHIM_HEX}.exe.bak"),
+        &format!("goetia-shim-{SHIM_HEX}.stale.exe"),
+        &format!("goetia-shim-{SHIM_HEX}..stale.exe"),
+        &format!("goetia-shim-{SHIM_HEX}.x.stale.dll"),
+        &format!("other-goetia-shim-{SHIM_HEX}.exe"),
+        &format!("goetia-shim-{}\u{e9}.exe", &SHIM_HEX[..62]),
         "",
     ] {
         assert!(shim_file(name).is_none(), "{name}");
@@ -64,7 +63,7 @@ mod windows {
         assert_eq!(
             provider.preview().unwrap(),
             HostCommand {
-                exe: dir.path().join(format!("goetia-shim-{HEX}.exe")),
+                exe: dir.path().join(format!("goetia-shim-{SHIM_HEX}.exe")),
                 args: vec![],
             }
         );
@@ -104,7 +103,7 @@ mod windows {
     fn the_stale_names_a_fresh_file_is_written_under_are_the_sweeps_to_match() {
         let image = Image::new(b"abc");
 
-        assert_eq!(image.hex(), HEX);
+        assert_eq!(image.hex(), SHIM_HEX);
         let name = image.stale_prefix() + "x1y2z3" + STALE_SUFFIX;
         assert!(matches!(shim_file(&name), Some(ShimFile::StaleAside)), "{name}");
     }
