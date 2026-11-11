@@ -350,10 +350,10 @@ mod system {
 
     // What references a file ------------------------------------------------------------------------------------------
 
-    /// Every executable SCM may start for any service's `ImagePath` (see [`host_candidates`](super::host_candidates)), with
-    /// its environment variables expanded, [`normalise`]d. A
-    /// service marked for deletion references nothing (its record outlives it until a handle
-    /// closes), and one with no `ImagePath` has nothing to start. A service whose entry could not be
+    /// Every executable SCM may start for any service's `ImagePath` (see
+    /// [`host_candidates`](super::host_candidates)), with its environment variables expanded,
+    /// [`normalise`]d. A service marked for deletion references nothing (its record outlives it until
+    /// a handle closes), and one with no `ImagePath` has nothing to start. A service whose entry could not be
     /// read through its registry key or through SCM (see [`image_of`]), or an enumeration that did
     /// not finish, is an error: what the unread entries reference is
     /// unknown, and it must not be taken for nothing.

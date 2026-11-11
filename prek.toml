@@ -59,16 +59,16 @@ pass_filenames = false
 
 # The rustdoc hooks are `manual`: they run when CI and the local lanes ask for them
 # (`prek run --stage manual --all-files cargo-doc ...`), not on every commit. Intra-doc links are
-# denied by `[lints.rustdoc]` in Cargo.toml; `-D warnings` here covers the warnings that are not
-# lints. Each OS runs them, as `docs.rs` documents the three OS targets and `#[cfg]` changes what
-# links resolve.
+# denied by `[lints.rustdoc]` in Cargo.toml; `-D warnings` here adds any warn-by-default rustdoc lint
+# the table does not deny, and any other warning. Each OS runs them, as `docs.rs` documents the three
+# OS targets and `#[cfg]` changes what links resolve.
 
 [[repos.hooks]]
 id = "cargo-doc"
 name = "cargo doc"
 # Private items are documented too, so links inside private docs are checked, and a public doc that
-# links to a private item still fires `private_intra_doc_links`. `--all-features` adds what `cli`
-# and `testing` gate.
+# links to a private item still fires `private_intra_doc_links`. `cli` is a default feature;
+# `--all-features` adds `testing` and `goetia-shim`.
 entry = """cargo doc --locked --no-deps --document-private-items --all-features --config 'build.rustdocflags=["-D", "warnings"]'"""
 language = "system"
 types = ["rust"]
