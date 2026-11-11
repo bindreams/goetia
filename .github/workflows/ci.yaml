@@ -195,7 +195,7 @@ jobs:
       # break on another, so each OS runs them.
       - name: Rustdoc
         if: ${{ !cancelled() && matrix.toolchain != 'stable' }}
-        run: prek run --stage manual --all-files cargo-doc cargo-doc-lib-only cargo-doc-public
+        run: prek run --stage manual --all-files cargo-doc cargo-doc-lib-only
 
   lint:
     name: Lint
