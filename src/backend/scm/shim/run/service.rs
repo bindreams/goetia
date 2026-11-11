@@ -286,8 +286,8 @@ fn stopped_report_failure(e: &std::io::Error) -> String {
 /// `on_running` is called exactly once, after the daemon is spawned and never when launching failed.
 /// A daemon that cannot start is therefore `STOPPED` without ever having been `RUNNING`, with a
 /// non-zero Win32 code or, when no Job Object contains it or cosca cannot say a failed spawn ended
-/// it, the incomplete stop. `start_via_notify` reads both as a failed
-/// start under every restart policy.
+/// it, the incomplete stop. `start_via_notify` reads both as a failed start under every restart
+/// policy.
 fn run_daemon(
     spec: &DaemonSpec,
     supervisor: &Supervisor,

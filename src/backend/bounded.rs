@@ -390,11 +390,10 @@ fn waited_out(
             // root is still a zombie pinning its pid and pgid, so a kill that names the tree
             // by the root's number cannot hit another process on any platform. `Drop` (at the
             // end of this function) runs after the reap, where cosca may skip such a kill. An
-            // uncontained child (the descendant test spawns one) reports `Unsupported`
-            // here, and a contained tree whose member refused SIGKILL
-            // reports `Containment`; the `Result` is discarded either way, so nothing
-            // surfaces it, and a descendant still holding a pipe is exactly what
-            // `collect` reports as `complete == false`.
+            // uncontained child (the descendant test spawns one) reports `Unsupported` here, and a
+            // contained tree whose member refused SIGKILL reports `Containment`; the `Result` is
+            // discarded either way, so nothing surfaces it, and a descendant still holding a pipe
+            // is exactly what `collect` reports as `complete == false`.
             let _tree_teardown = child.kill_tree();
             let reaped = child.wait()?;
             match expiry_disposition(reaped) {
