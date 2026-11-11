@@ -148,11 +148,12 @@ fn real_loses_a_child_and_says_whether_it_announced() {
         ("echo 'request issued' >&2; exit 0", Role::Query, false),
     ] {
         bounded::test_hook::wait_fails(|| std::io::Error::other("the wait failed").into());
+        let mut reservation = Reservation::for_role(&role);
         let wait = Wait::Bounded {
             role,
             deadline: Budget::Unbounded.start(),
         };
-        match sh(script).run(&[], wait, &mut files()) {
+        match sh(script).run(&[], wait, &mut reservation) {
             Err(ClientError::Lost { error, announced }) => {
                 assert_eq!(announced, expected, "{script}");
                 assert!(error.to_string().contains("the wait failed"), "{script}: {error:?}");
@@ -340,6 +341,25 @@ fn the_fake_draws_a_calls_files_from_the_reservation() {
         cfg!(debug_assertions),
         "a call past the reservation is a miscount in a debug build and is served in a release one"
     );
+}
+
+/// An announced request draws its streams' listener threads from the reservation, as the real
+/// client's spawn does: a call leaves the reservation shorter by them.
+#[skuld::test]
+fn the_fake_draws_an_announced_requests_listeners_from_the_reservation() {
+    use fake::{Fake, exited, reply};
+
+    let announced = || Wait::Bounded {
+        role: Role::AnnouncedRequest(|_| true),
+        deadline: Budget::Unbounded.start(),
+    };
+    let mut reservation = Reservation::of_listeners(bounded::STREAMS + 1).unwrap();
+
+    Fake::new([reply(&["start"], exited(0, "", ""))])
+        .run(&["start"], announced(), &mut reservation)
+        .expect("a scripted reply");
+
+    assert_eq!(bounded::test_hook::listeners_left(&reservation), 1);
 }
 
 /// How a call was waited on is recorded, and a run to completion draws no file.

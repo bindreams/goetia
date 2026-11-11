@@ -132,11 +132,11 @@ pub(crate) fn owned<B: Backend>(b: &B, id: &Id) -> Result<B::Snapshot> {
     require_marked(id, b.read(id)?)
 }
 
-/// What a verb run outside a sequence draws on: reserved for its own `step`, as
+/// What a verb run outside a sequence draws on: reserved for its own `steps`, as
 /// [`ServiceManager::prepare`](crate::manager::ServiceManager::prepare) would, and failing as that
 /// verb for `id`.
-pub(crate) fn reserved<B: Backend>(b: &B, id: &Id, step: Step, budget: Budget) -> Result<B::Reservation> {
-    b.reserve(&[step], budget).map_err(|e| match e {
+pub(crate) fn reserved<B: Backend>(b: &B, id: &Id, steps: &[Step], budget: Budget) -> Result<B::Reservation> {
+    b.reserve(steps, budget).map_err(|e| match e {
         Error::Reservation { id: None, source } => Error::Reservation {
             id: Some(id.to_string()),
             source,
@@ -147,14 +147,19 @@ pub(crate) fn reserved<B: Backend>(b: &B, id: &Id, step: Step, budget: Budget) -
 
 // install and preview =================================================================================================
 
-pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Result<Outcome> {
-    // `install` has no `--timeout` of its own: its calls are unbounded.
-    let mut reservation = reserved(b, &spec.id, Step::Install, Budget::Unbounded)?;
+/// `spec` installed, drawing on `reservation`, which the caller made for [`Step::Install`] and which
+/// every retry shares.
+pub(crate) fn install<B: Backend>(
+    b: &B,
+    spec: &DaemonSpec,
+    force: bool,
+    reservation: &mut B::Reservation,
+) -> Result<Outcome> {
     // Rendered once, before the scope: what a backend takes or writes in `begin_install` (SCM's
     // lock and its provider's file) is never taken for an install that cannot be rendered.
     let desired = b.render_for_install(spec)?;
     let desired_text = desired.to_string();
-    let mut scope = b.begin_install(spec, &desired)?;
+    let mut scope = b.begin_install(spec, &desired, reservation)?;
 
     // No cap: `Raced` is a state change the backend detected, not a wait for time to pass.
     loop {
@@ -175,7 +180,7 @@ pub(crate) fn install<B: Backend>(b: &B, spec: &DaemonSpec, force: bool) -> Resu
                     &outcome,
                     found.snapshot.as_ref(),
                     &mut scope,
-                    &mut reservation,
+                    reservation,
                 )? {
                     WriteOutcome::Done => return Ok(outcome),
                     WriteOutcome::Raced => {}
