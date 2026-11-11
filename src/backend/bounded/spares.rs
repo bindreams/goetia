@@ -210,6 +210,19 @@ impl Kept {
     }
 }
 
+#[cfg(test)]
+impl Reservation {
+    /// Exactly what one [`super::spawn`] under `role` draws: its listener threads, or else its temp
+    /// files (a role draws one of the two).
+    pub(crate) fn for_role(role: &super::Role) -> Reservation {
+        match role.listeners() {
+            0 => Reservation::make(0, role.files()),
+            listeners => Reservation::of_listeners(listeners),
+        }
+        .expect("what one spawn draws")
+    }
+}
+
 fn miscounted(what: &str) {
     debug_assert!(
         false,

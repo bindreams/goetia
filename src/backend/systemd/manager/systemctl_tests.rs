@@ -933,10 +933,7 @@ fn a_real_offline_systemctl_is_refused_on_every_path() {
             Budget::Unbounded,
             Budget::Bounded(Duration::from_secs(600)),
         ] {
-            let mut held = Held {
-                draws: Reservation::of_listeners(bounded::STREAMS).unwrap(),
-                ..gate_held()
-            };
+            let mut held = watching();
             let result = offline.run_verb(verb, "goetia-offline-probe.service", budget, budget.start(), &mut held);
             let e = result.expect_err(verb);
             assert!(matches!(e, Error::NoManager { .. }), "{verb} {budget:?}: {e:?}");

@@ -17,10 +17,7 @@ fn files() -> Reservation {
 
 /// `cmd`, spawned under `role`, handed what its streams draw.
 fn spawned(mut cmd: cosca::Command, role: Role) -> Spawned {
-    let mut reservation = match role.listeners() {
-        0 => files(),
-        listeners => Reservation::of_listeners(listeners).unwrap(),
-    };
+    let mut reservation = Reservation::for_role(&role);
     spawn(&mut cmd, role, &mut reservation).unwrap()
 }
 
