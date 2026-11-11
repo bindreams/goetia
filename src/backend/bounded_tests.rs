@@ -657,8 +657,6 @@ fn a_child_takes_its_output_from_the_reservation_it_is_handed() {
     assert_eq!(test_hook::left(&reservation), (0, STREAMS));
 }
 
-/// A reservation hands out what it made: each reaper, listener and file, with nothing made
-/// meanwhile.
 #[skuld::test]
 fn a_reservation_hands_out_what_it_made() {
     let mut reservation = Reservation::make(2, 2).unwrap();
@@ -752,8 +750,7 @@ fn a_draw_past_the_reservation_is_loud() {
 }
 
 /// `Role::files` and `Role::listeners` are what a spawn under that role draws from its reservation,
-/// for every role: the one number the verbs' counts and the test `Fake` read, so none of them can
-/// drift from the real spawn.
+/// for every role.
 #[skuld::test]
 fn a_role_names_what_its_spawn_draws() {
     let roles: [fn() -> Role; 4] = [
@@ -860,6 +857,34 @@ fn an_announced_request_takes_its_threads_from_the_reservation_it_is_handed() {
 
     assert!(matches!(finished, Ok(Finished::Exited { .. })), "{finished:?}");
     assert_eq!(test_hook::listeners_left(&reservation), 0, "the listeners are spent");
+}
+
+/// A reservation one thread short of an announced request's streams makes the missing one on the
+/// spot, and when no thread can be made the request is not spawned: [`SpawnError::NotRun`]. A debug
+/// build stops at the miscount before it gets there ([`Reservation::listener`]), so only a release
+/// build reaches this refusal.
+#[cfg(not(debug_assertions))]
+#[skuld::test]
+fn an_announced_request_short_of_a_listener_thread_is_not_spawned() {
+    let mut reservation = Reservation::of_listeners(STREAMS - 1).unwrap();
+    let _no_thread = standby::test_hook::threads(0);
+    let spawned_before = test_hook::spawns();
+
+    let refused = spawn(
+        &mut sh("echo 'request issued' >&2"),
+        Role::AnnouncedRequest(announced),
+        &mut reservation,
+    );
+
+    match refused {
+        Err(SpawnError::NotRun(e)) => assert!(
+            e.to_string().contains("no thread to read its output could be made"),
+            "{e}"
+        ),
+        Err(SpawnError::MayHaveRun(e)) => panic!("a spawn that never happened may have run: {e}"),
+        Ok(_) => panic!("spawned with no thread to read its output"),
+    }
+    assert_eq!(test_hook::spawns(), spawned_before, "the child was spawned");
 }
 
 /// A reaper whose request exited inside its budget has nothing to reap, and its thread ends: the
