@@ -93,6 +93,10 @@ pub trait ServiceManager {
     /// print`/`bootstrap` have no non-blocking spelling: a `start` with no
     /// budget still probes and, if needed, bootstraps the job to completion
     /// before the plain `kickstart` that declines to wait.
+    /// On macOS a `stop` waits for launchd to remove the job, and a budget that
+    /// does not wait (`Immediate`, a zero bound) does not bound that wait; a
+    /// `start` waits for a job still going away before it loads it. See the
+    /// README's "Waiting for a start or stop".
     ///
     /// An answer from the manager that itself establishes the goal is the
     /// confirmation, whatever is left of the budget: launchd's `print` of a
@@ -136,8 +140,9 @@ pub trait ServiceManager {
     }
 
     /// `daemon restart --timeout 0`'s second step, where there is no
-    /// [`Self::request_restart`]: request a start right after a stop request
-    /// nobody waited for, and return.
+    /// [`Self::request_restart`]: request a start right after a stop under
+    /// `Immediate` (which on macOS has waited for the job's removal), and
+    /// return.
     ///
     /// **Unlike [`Self::start`], not idempotent over a service that is still
     /// up.** A manager answering "already running" here has refused the
@@ -160,8 +165,10 @@ pub trait ServiceManager {
     ///
     /// **Where a platform offers no request-only form,
     /// [`Budget::Immediate`] still performs the full blocking call.**
-    /// `launchctl bootout` has no non-blocking spelling: a `stop` with no
-    /// budget still boots the job out to completion.
+    /// On macOS a `stop` waits for launchd to remove the job, and a budget that
+    /// does not wait (`Immediate`, a zero bound) does not bound that wait; a
+    /// `start` waits for a job still going away before it loads it. See the
+    /// README's "Waiting for a start or stop".
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never

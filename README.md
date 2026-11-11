@@ -847,9 +847,26 @@ share one pair of flags:
 | `--timeout 0`          | Issue the request and return without waiting. |
 | `--no-timeout`         | Wait indefinitely.                            |
 
-On macOS, `stop --timeout 0` is the exception: launchd has no request-only
-stop, so it still runs `launchctl bootout` to completion, and the daemon is
-down when goetia returns.
+On macOS, launchd keeps a job's label until the job's process has exited, and
+goetia does not load a job over one that is still going away. So on macOS:
+
+- `daemon stop`, the stop leg of `daemon restart`, and `daemon uninstall` boot
+  the job out and then wait until launchd no longer has it. `stop` and
+  `restart` stop waiting when `--timeout` runs out; under `--timeout 0` or
+  `--no-timeout`, and for `uninstall`, the wait has no bound.
+- `daemon install` of a new daemon whose label a loaded job already holds boots
+  that job out and waits, without bound, until it is gone.
+- A start (`daemon start`, `restart`, `install --start`) that finds the job
+  still going away waits, without bound, until it is gone, then loads it. This
+  wait counts against `--timeout`.
+- For `restart: always`, a start that does not find the daemon running boots
+  it out, waits without bound until it is gone, and loads it again, except
+  under `--timeout 0`.
+
+These waits normally end within the job's `ExitTimeOut`, after which launchd
+kills it. A wait with no bound can last forever if the job's process never
+exits, for example when its plist sets `ExitTimeOut` to 0 and it ignores
+SIGTERM.
 
 The two flags are mutually exclusive. `install` accepts them only alongside
 `--start`: without it nothing is started, so there is nothing to wait for,
@@ -1062,16 +1079,18 @@ So a timeout during `restart` leaves the daemon in an indeterminate state —
 it may or may not be stopped when you look, and a start may or may not have
 been issued. Which case you are in is in the error message.
 
-`restart --timeout 0` issues the stop and the start and confirms neither,
-which is what it is for. On systemd it is one `systemctl restart --no-block`,
-one job, so no start can overtake the stop, and a restart systemd refuses has
-changed nothing (exit `1`). systemd stops the unit and starts it again, except
-while the unit is still starting: it folds the restart into the start already
-running, so nothing is stopped and the daemon comes up fresh from that start.
-On macOS
-and Windows it is a stop and then a start, and a start refused in that window
-exits `4` rather than `0`: the daemon may be the instance the stop is still
-taking down, may be going down, or may never have moved.
+`restart --timeout 0` issues the stop and the start and, except for the macOS
+stop below, confirms neither, which is what it is for. On systemd it is one
+`systemctl restart --no-block`, one job, so no start can overtake the stop, and
+a restart systemd refuses has changed nothing (exit `1`). systemd stops the
+unit and starts it again, except while the unit is still starting: it folds the
+restart into the start already running, so nothing is stopped and the daemon
+comes up fresh from that start. On macOS and Windows it is a stop and then a
+start. On macOS the stop waits for launchd to remove the job (see the list
+above), so the daemon is down before the start is issued, and only the start
+goes unconfirmed. On Windows a start refused in that window exits `4` rather
+than `0`: the daemon may be the instance the stop is still taking down, may be
+going down, or may never have moved.
 
 **On Windows, `restart --timeout 0` will usually stop the daemon and not
 restart it.** The start arrives while the service is still coming down and is
