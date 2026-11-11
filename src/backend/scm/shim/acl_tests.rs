@@ -396,6 +396,58 @@ fn a_deny_ace_does_not_cancel_an_allow_ace() {
     assert_eq!(refused(&chain).right, CHANGE_PERMISSIONS_OF);
 }
 
+/// A callback entry's condition is not read, so it is judged as if it always applies: an allow
+/// refuses exactly as the plain entry would, and a deny credits nothing, as a plain one does not.
+#[skuld::test]
+fn a_conditional_entry_is_judged_as_a_plain_one() {
+    let conditional = |allow: bool| Ace {
+        allow,
+        conditional: true,
+        ..allow_entry()
+    };
+    let with = |ace: Ace| {
+        let mut chain = stock_host_chain();
+        chain[0].dacl.as_mut().unwrap().push(ace);
+        chain
+    };
+
+    let plain = refused(&with(allow_entry()));
+    assert_eq!(refused(&with(conditional(true))), plain);
+    assert_eq!(plain.right, CHANGE_PERMISSIONS_OF);
+    assert_eq!(plain.account, users());
+    assert!(verdict(&with(conditional(false))).is_ok());
+}
+
+/// An untrusted account's entry granting `WRITE_DAC`.
+fn allow_entry() -> Ace {
+    allow(users(), WRITE_DAC, 0)
+}
+
+/// The library's masks and refusal phrases as literals, which the other tests take from the
+/// library's own constants: a wrong value there changes code and expectation together, but not
+/// this. Masks are as `winnt.h` and `icacls` give them.
+#[skuld::test]
+fn the_masks_and_phrases_are_these_literals() {
+    assert_eq!(FILE_ALL_ACCESS, 0x1F_01FF);
+    assert_eq!(FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, 0x12_00A9);
+    assert_eq!(WRITE_DAC, 0x4_0000);
+    assert_eq!(WRITE_OWNER, 0x8_0000);
+    assert_eq!(DELETE, 0x1_0000);
+    assert_eq!(FILE_WRITE_DATA, 0x2);
+    assert_eq!(FILE_APPEND_DATA, 0x4);
+    assert_eq!(FILE_DELETE_CHILD, 0x40);
+    assert_eq!(INHERIT_ONLY_ACE, 0x08);
+
+    assert_eq!(OWN, "own");
+    assert_eq!(DO_ANYTHING_TO, "do anything to");
+    assert_eq!(BYPASS_ACCESS_CONTROL_ON, "bypass access control on");
+    assert_eq!(CHANGE_PERMISSIONS_OF, "change permissions of");
+    assert_eq!(TAKE_OWNERSHIP_OF, "take ownership of");
+    assert_eq!(DELETE_OR_RENAME, "delete or rename");
+    assert_eq!(DELETE_OR_RENAME_ENTRIES_IN, "delete or rename entries in");
+    assert_eq!(WRITE_TO, "write to");
+}
+
 #[skuld::test]
 fn a_deny_ace_alone_refuses_nothing() {
     let mut chain = stock_chain();
@@ -740,9 +792,8 @@ pub(in crate::backend::scm::shim) mod windows {
         assert_eq!(display_path(Path::new(r"\\?\UNC\h\s\a")), Path::new(r"\\h\s\a"));
     }
 
-    /// An untrusted owner is refused as the owner; a trusted one, for the entry that gives Everyone
-    /// control of the permissions. Which it is depends on who owns the folder, and reading that
-    /// owner would use the code under test, so either is accepted.
+    /// Either an untrusted owner or Everyone's control of the permissions refuses; which depends on
+    /// who owns the folder.
     #[skuld::test]
     fn a_folder_everyone_can_write_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -830,12 +881,19 @@ pub(in crate::backend::scm::shim) mod windows {
         }
     }
 
+    /// Not a SID: revision 0xFF, which counts no sub-authorities, so nothing past the header is read.
+    const NOT_A_SID: [u8; 16] = {
+        let mut bytes = [0; 16];
+        bytes[0] = 0xFF;
+        bytes
+    };
+
     /// What is named as unread is what the caller was reading: an owner is not "the permissions".
     #[skuld::test]
     fn a_sid_that_is_not_one_is_an_error_naming_what_was_read() {
-        let junk = [0xFFu8; 16];
+        let junk = NOT_A_SID;
 
-        // SAFETY: `junk` is readable for the call, which only validates it.
+        // SAFETY: `junk` is as long as its header counts (no sub-authorities) and live for the call.
         let owner = unsafe { copy_sid(junk.as_ptr() as _, "read the owner of", Path::new("f")) }.unwrap_err();
 
         assert!(is_unreadable(&owner), "{owner:?}");
@@ -844,9 +902,10 @@ pub(in crate::backend::scm::shim) mod windows {
 
     #[skuld::test]
     fn an_owner_that_is_not_a_sid_is_unreadable_not_a_failed_read() {
-        let junk = [0xFFu8; 16];
+        let junk = NOT_A_SID;
 
-        // SAFETY: `junk` is readable for the call, which only validates it; a null DACL is allowed.
+        // SAFETY: `junk` is as long as its header counts (no sub-authorities) and live for the call;
+        // a null DACL is allowed.
         let unreadable = unsafe { parse(junk.as_ptr() as _, std::ptr::null_mut(), Path::new("f")) }.unwrap_err();
 
         assert!(is_unreadable(&unreadable), "{unreadable:?}");

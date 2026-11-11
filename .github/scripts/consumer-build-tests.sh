@@ -163,10 +163,9 @@ assert_lock_differs() {
     fi
 }
 
-# `goetia::embed_shim!` names the expanding crate's own `goetia-shim` feature. A consumer that never
-# declared it must still type-check with `unexpected_cfgs` denied. `cargo rustc` passes the flag to
-# the consumer's crate alone, so step (1)'s artifacts for the dependencies are reused (`RUSTFLAGS`
-# would rebuild every one of them).
+# `goetia::embed_shim!` names the expanding crate's own `goetia-shim` feature. `cargo rustc` passes
+# the flag to the consumer's crate alone, so step (1)'s artifacts for the dependencies are reused
+# (`RUSTFLAGS` would rebuild every one of them).
 assert_undeclared_feature_is_quiet() {
     local consumer="$1" dir="$work/undeclared-consumer"
     mkdir -p "$dir/src"

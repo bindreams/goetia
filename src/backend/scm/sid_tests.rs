@@ -84,8 +84,7 @@ mod windows {
         );
     }
 
-    /// `None` for a whole SID would mean `ConvertSidToStringSidW` failing for want of memory, which
-    /// a test cannot make happen; the bytes that are not a SID are the contract's other side.
+    /// A whole SID that Windows refuses to show (out of memory) cannot be made in a test.
     #[skuld::test]
     fn bytes_that_are_not_a_sid_have_no_display_and_a_description() {
         for bytes in [&[][..], &[1, 3, 0, 0, 0, 0, 0, 5, 1, 0]] {

@@ -1,7 +1,6 @@
 //! A security identifier as bytes: how one is built, checked, copied and shown. Plain data, so it
 //! works on every host except what asks Windows: [`try_sid_display`], [`sid_display`] and
-//! [`copy_sid`]. `sid_display`'s two messages, `INVALID` and `UNSHOWABLE`, exist only beside it, on
-//! Windows. Looking an account up by a SID is Windows-only too, in `manager::identity`.
+//! [`copy_sid`]. Looking an account up by a SID is Windows-only too, in `manager::identity`.
 
 /// A security identifier in its binary form, as `LookupAccountNameW` and `GetAce` return it.
 pub(crate) type Sid = Vec<u8>;
@@ -81,8 +80,7 @@ pub(crate) fn try_sid_display(sid: &[u8]) -> Option<String> {
 }
 
 /// [`try_sid_display`], or a description of why there is none. What an error names an account by
-/// when `LookupAccountSidW` has no name for it. A test that needs the SID goes through
-/// `testing::shown_sid`, which never takes the description for one.
+/// when `LookupAccountSidW` has no name for it.
 #[cfg(windows)]
 pub(crate) fn sid_display(sid: &[u8]) -> String {
     try_sid_display(sid).unwrap_or_else(|| if is_whole_sid(sid) { UNSHOWABLE } else { INVALID }.to_string())

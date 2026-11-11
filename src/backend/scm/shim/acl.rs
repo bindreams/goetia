@@ -527,7 +527,7 @@ mod system {
 
     /// What `GetSecurityInfo` returned for one object. Each of the owner and the DACL is there only
     /// when [`security_info`] was asked for it, and null otherwise. They point into a descriptor the
-    /// call allocated and this frees on drop. Read them only while it is live.
+    /// call allocated and this frees on drop.
     struct SecurityInfo {
         owner: PSID,
         dacl: *mut ACL,

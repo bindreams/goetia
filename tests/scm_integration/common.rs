@@ -57,10 +57,8 @@ pub fn conformance_mk(id: &str) -> DaemonSpec {
 
 // Account SID lookup ==================================================================================================
 
-/// The string SID for a local account name (e.g. one this test just created with `net user`), for
-/// `deleted_account_makes_the_service_oursunusable`: it installs `user: {id: <sid>}`, deletes the
-/// account and observes `Ownership::OursUnusable`. The library's own lookup, which drops a leading
-/// `.\`: the names this test passes have none.
+/// The string SID for a local account name (e.g. one just created with `net user`), by the
+/// library's own lookup, which drops a leading `.\`; the names tests pass have none.
 pub fn sid_string_for_account(account_name: &str) -> String {
     let sid = goetia::testing::sid_for_account_name(account_name)
         .unwrap_or_else(|e| panic!("resolve the SID of `{account_name}`: {}", e.report()));

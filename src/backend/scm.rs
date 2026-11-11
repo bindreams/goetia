@@ -10,8 +10,8 @@ pub(crate) mod shim;
 pub(crate) mod sid;
 #[cfg(test)]
 pub(crate) mod test_support;
-// `pub` on Windows for the shim integration tests and the marker-inertness probe
-// (through `tests/support/scm_wait.rs`); crate-private elsewhere.
+// `pub` on Windows for the shim integration tests and the marker-inertness probe; crate-private
+// elsewhere.
 #[cfg(windows)]
 pub mod wait;
 #[cfg(not(windows))]
