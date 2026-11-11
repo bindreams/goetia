@@ -946,6 +946,68 @@ fn a_refusal_is_reported_as_win32_zero_with_its_own_specific_code() {
     );
 }
 
+// The service name SCM passes -----------------------------------------------------------------------------------------
+
+/// A name SCM could pass that is not UTF-8: a lone surrogate, which a Windows service name can hold.
+fn non_utf8_name() -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+    OsString::from_wide(&[u16::from(b'a'), 0xD800])
+}
+
+#[skuld::test]
+fn the_first_scm_argument_is_the_service_name() {
+    let fake = FakeGuard::new();
+    // SCM's later arguments are the service's start parameters: they are not looked at.
+    let args = [OsString::from(ID), non_utf8_name()];
+
+    assert_eq!(service_name(&fake.log(), &args), Ok(ID));
+    assert_eq!(fake.take_failures(), Vec::<String>::new());
+}
+
+#[skuld::test]
+fn no_scm_arguments_is_a_logged_refusal_with_the_bad_arguments_code() {
+    let fake = FakeGuard::new();
+
+    let refused = service_name(&fake.log(), &[]);
+
+    assert_eq!(refused, Err(ERROR_BAD_ARGUMENTS as i32));
+    assert_one_failure(
+        &fake.take_failures(),
+        TABLE_NAME,
+        "SCM passed no usable service name: []",
+    );
+}
+
+#[skuld::test]
+fn a_name_that_is_not_utf8_is_a_logged_refusal_with_the_bad_arguments_code() {
+    let fake = FakeGuard::new();
+    let args = [non_utf8_name(), OsString::from(ID)];
+
+    let refused = service_name(&fake.log(), &args);
+
+    assert_eq!(refused, Err(ERROR_BAD_ARGUMENTS as i32));
+    assert_one_failure(
+        &fake.take_failures(),
+        TABLE_NAME,
+        r#"SCM passed no usable service name: ["a\u{d800}", "goetia-shim-launch-test"]"#,
+    );
+}
+
+#[skuld::test]
+fn an_empty_name_is_a_logged_refusal_with_the_bad_arguments_code() {
+    let fake = FakeGuard::new();
+    let args = [OsString::new()];
+
+    let refused = service_name(&fake.log(), &args);
+
+    assert_eq!(refused, Err(ERROR_BAD_ARGUMENTS as i32));
+    assert_one_failure(
+        &fake.take_failures(),
+        TABLE_NAME,
+        r#"SCM passed no usable service name: [""]"#,
+    );
+}
+
 // What the shim does with its read of the spec ------------------------------------------------------------------------
 
 fn undetermined(source: Error) -> Error {
