@@ -3146,11 +3146,16 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
     );
     let refused = ran(Err(io::Error::other("denied")), Ok(Waited::Expired));
     assert!(
-        refused.contains("had not exited") && refused.contains("denied"),
+        refused.contains("had not exited")
+            && refused.contains("terminating it failed")
+            && refused.contains("denied"),
         "{refused}"
     );
     let failed = ran(Ok(()), Err(io::Error::other("wait failed")));
-    assert!(failed.starts_with(&plain) && failed.contains("wait failed"), "{failed}");
+    assert!(
+        failed.starts_with(&plain) && failed.contains("waiting for it to exit failed") && failed.contains("wait failed"),
+        "{failed}"
+    );
 }
 
 // the process held across an incomplete stop --------------------------------------------------------------------------

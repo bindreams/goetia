@@ -284,8 +284,8 @@ fn take_held<P>(held: &mut HoldOutcome<P>) -> Option<P> {
 /// `waited`, the result of a stop wait. An incomplete stop (see [`judged`]) first has `held`, the
 /// process held before the STOP, ended by `end`, and `held` is left empty: the shim's `KILL_ON_JOB_CLOSE`
 /// job is the last thing that can still kill the daemon's tree. How that went does not change that the
-/// stop failed, but an `end` that failed or left the process running is told in the error. Any other
-/// result, or no process held, is returned as it is.
+/// stop failed, but an `end` whose wait for the exit failed, or that left the process running, is
+/// told in the error. Any other result, or no process held, is returned as it is.
 pub(crate) fn end_on_incomplete_stop<P, T>(
     waited: io::Result<T>,
     held: &mut HoldOutcome<P>,
@@ -304,11 +304,11 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
         Ok(EndProcessOutcome::Exited) => return Err(e),
         Ok(EndProcessOutcome::Lingers { terminate_failed, .. }) => {
             let why = terminate_failed.map_or(String::new(), |failed| {
-                format!(" (ending it failed: {})", Chain(&*failed))
+                format!(" (terminating it failed: {})", Chain(&*failed))
             });
             format!("it had not exited when the wait for it ended{why}")
         }
-        Err(failed) => format!("ending it failed: {}", Chain(&failed)),
+        Err(failed) => format!("waiting for it to exit failed: {}", Chain(&failed)),
     };
     Err(io::Error::other(IncompleteStop {
         failed_start: incomplete.failed_start,
