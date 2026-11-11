@@ -9,13 +9,13 @@
 //! are additionally quoted per systemd's command-line grammar when they
 //! contain whitespace or a quoting-relevant character; `ExecStart=`
 //! further doubles `$` in its arguments (systemd performs `$FOO`/`${FOO}` environment
-//! substitution there, but not in the executable path; it does in argv[0], so a path holding `$`
+//! substitution there, but not in the executable path; it does in `argv[0]`, so a path holding `$`
 //! is written `@<path> <argv[0]>`), and quotes a bare `;` argument (systemd's
 //! command-line separator).
 //!
 //! Backslashes are never refused: a quoted word doubles each, and a raw value ending in an odd
-//! run of them gets a trailing space (see [`raw_value`]). The values no encoding can carry are
-//! refused by [`unit`]: see [`refuse_unrepresentable`].
+//! run of them gets a trailing space (see `raw_value`). The values no encoding can carry are
+//! refused by [`unit()`]: see `refuse_unrepresentable`.
 
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
@@ -35,7 +35,7 @@ use crate::spec::{DaemonSpec, Restart, systemd_defect, systemd_raw_value_defect}
 /// `unit(&extract(&unit(spec, id)).unwrap().unwrap().spec, id)` must be
 /// byte-identical to `unit(spec, id)`.
 ///
-/// Fails with [`Error::Invalid`] for the values [`refuse_unrepresentable`] lists.
+/// Fails with [`Error::Invalid`] for the values `refuse_unrepresentable` lists.
 ///
 /// Emits `Type=exec` (requires systemd 240+, 2018): `systemd.service(5)` recommends it for
 /// long-running services "as it ensures that process setup errors (e.g. errors such as a missing
@@ -139,8 +139,8 @@ fn render_restart(restart: Restart) -> &'static str {
 ///
 /// Arguments are also dollar-doubled, since systemd substitutes `$FOO`/`${FOO}` and collapses
 /// `$$` there. The executable path is not: systemd takes it as written. But it substitutes in
-/// argv[0] too, so a path holding `$` is written as `@<path> <argv[0], dollar-doubled>`, where
-/// `@` makes the next word argv[0] (measured on 242 and 255). A path without `$` is one word.
+/// `argv[0]` too, so a path holding `$` is written as `@<path> <argv[0], dollar-doubled>`, where
+/// `@` makes the next word `argv[0]` (measured on 242 and 255). A path without `$` is one word.
 fn render_exec_start(command: &[String]) -> String {
     let (executable, arguments) = command.split_first().expect("a daemon has a command");
     debug_assert!(

@@ -1,6 +1,6 @@
 //! Pure classification of launchd's live-state vocabulary: the part of `status` that needs no root,
 //! no real launchd, and no macOS. Not `#[cfg]`-gated, so it compiles and its tests run everywhere,
-//! unlike [`manager`](crate::backend::launchd::manager).
+//! unlike `manager`.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use crate::manager::State;

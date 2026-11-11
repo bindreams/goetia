@@ -1,5 +1,5 @@
 //! A one-shot child-process helper: performs exactly one
-//! [`ServiceManager::install`] call for a real (non-`LocalSystem`) account
+//! [`goetia::manager::ServiceManager::install`] call for a real (non-`LocalSystem`) account
 //! and exits.
 //!
 //! `real_account_gets_service_logon_right` needs `GOETIA_SERVICE_PASSWORD`
