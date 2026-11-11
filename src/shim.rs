@@ -38,7 +38,8 @@ macro_rules! stock_shim {
 
 /// The stock shim's bytes for `EmbeddedStockShim::new`: an
 /// `Option<&'static [u8]>` that is `Some(include_bytes!(..))` of the file `GOETIA_SHIM_EXE` names
-/// when the crate it expands in has its own `goetia-shim` feature on, and `None` otherwise.
+/// when the crate it expands in has its own `goetia-shim` feature on, and `None` otherwise (also
+/// when that crate never declared the feature, without an `unexpected_cfgs` warning).
 ///
 /// Expand it in the binary crate, never in a library the shim binary links, with
 /// `GOETIA_SHIM_EXE` the absolute path of the built stock shim (`include_bytes!` would resolve a
@@ -46,16 +47,22 @@ macro_rules! stock_shim {
 #[macro_export]
 macro_rules! embed_shim {
     () => {{
-        #[cfg(feature = "goetia-shim")]
-        {
-            Some(include_bytes!(env!(
-                "GOETIA_SHIM_EXE",
-                "GOETIA_SHIM_EXE must be the absolute path of the built stock shim when the goetia-shim feature is on"
-            )) as &'static [u8])
-        }
-        #[cfg(not(feature = "goetia-shim"))]
-        {
-            None::<&'static [u8]>
-        }
+        // The cfgs name the caller's feature, which rustc's check-cfg does not know in a caller that
+        // never declared it.
+        #[allow(unexpected_cfgs)]
+        let bytes = {
+            #[cfg(feature = "goetia-shim")]
+            {
+                Some(include_bytes!(env!(
+                    "GOETIA_SHIM_EXE",
+                    "GOETIA_SHIM_EXE must be the absolute path of the built stock shim when the goetia-shim feature is on"
+                )) as &'static [u8])
+            }
+            #[cfg(not(feature = "goetia-shim"))]
+            {
+                None::<&'static [u8]>
+            }
+        };
+        bytes
     }};
 }

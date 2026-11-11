@@ -66,6 +66,7 @@ mod stock {
     use super::super::marker::read_retrying;
     use super::super::provider::{ShimProvider, require_absolute};
     use super::super::sweep::{SweepFailure, sweep_folder};
+    use crate::backend::scm::wide::units_until_nul;
     use crate::error::{Error, Result};
     use crate::shim::HostCommand;
 
@@ -243,16 +244,8 @@ mod stock {
         // folder; `path` is a valid out-pointer.
         let hresult = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut path) };
         let found = if hresult >= 0 {
-            let mut len = 0;
-            // SAFETY: on success `path` is a NUL-terminated string that is live until freed below,
-            // and every unit read is before its NUL.
-            while unsafe { *path.add(len) } != 0 {
-                len += 1;
-            }
-            // SAFETY: the `len` units before the NUL were just read.
-            Ok(PathBuf::from(OsString::from_wide(unsafe {
-                std::slice::from_raw_parts(path, len)
-            })))
+            // SAFETY: on success `path` is a NUL-terminated string that is live until freed below.
+            Ok(PathBuf::from(OsString::from_wide(unsafe { units_until_nul(path) })))
         } else {
             Err(locate_error(hresult))
         };

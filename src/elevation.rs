@@ -7,7 +7,7 @@ use std::io;
 
 use windows_sys::Win32::Security::CheckTokenMembership;
 
-use crate::backend::scm::shim::acl::administrators;
+use crate::backend::scm::sid::administrators;
 
 /// Whether the calling thread's token (the process's, for a thread that does not impersonate) has
 /// Administrators enabled, which is what an object owned by Administrators needs of its creator.

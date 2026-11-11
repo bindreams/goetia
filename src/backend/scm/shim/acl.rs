@@ -6,7 +6,8 @@
 //! and of every ancestor up to the volume root, over the path as given and over its final path
 //! (links resolved). [`verdict`]
 //! judges plain data (SIDs as bytes, masks as `u32`) and is unit-tested on every host; reading the
-//! data and `FolderCheck` are Windows-only.
+//! data and `FolderCheck` are Windows-only. What counts as a link, and how other reparse points
+//! are read, is in `FolderCheck::check`.
 //!
 //! What is judged, per object, folders before files and each nearest the target first:
 //! - an untrusted owner refuses (an owner can always change the DACL);
@@ -25,7 +26,14 @@ mod protected;
 use std::path::PathBuf;
 
 #[cfg(windows)]
+use crate::backend::scm::sid::sid_display;
+use crate::backend::scm::sid::{Sid, administrators, everyone, system, trusted_installer};
+
+#[cfg(windows)]
 pub(crate) use protected::{Descriptor, is_as_wanted};
+#[cfg(all(windows, any(test, feature = "testing")))]
+#[doc(hidden)]
+pub use system::{Dacl, kernel_object_dacl};
 #[cfg(windows)]
 pub(crate) use system::{
     display_path, is_unreadable, kernel_object_owner, normalise as lexical, read_object, require_acls_under,
@@ -38,9 +46,6 @@ use std::path::Path;
 use crate::backend::scm::manager::identity;
 #[cfg(windows)]
 use crate::error::{Error, Result};
-
-/// A security identifier in its binary form, as `LookupAccountNameW` and `GetAce` return it.
-pub(crate) type Sid = Vec<u8>;
 
 /// The owner and DACL of one filesystem object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,14 +61,20 @@ pub(crate) struct ObjectSecurity {
     pub(crate) dacl: Option<Vec<Ace>>,
 }
 
-/// An access-control entry that grants or denies a trustee a mask of rights.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Ace {
-    pub(crate) trustee: Sid,
-    pub(crate) mask: u32,
+/// An access-control entry that grants or denies a trustee a mask of rights. Ordered field by
+/// field, which is what makes [`protected::is_as_wanted`] independent of the order of entries.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Ace {
+    pub trustee: Sid,
+    pub mask: u32,
     /// The ACE header's flags, of which only `INHERIT_ONLY_ACE` is read.
-    pub(crate) flags: u8,
-    pub(crate) allow: bool,
+    pub flags: u8,
+    pub allow: bool,
+    /// A callback entry: a condition follows its SID, which is not read, so [`verdict`] treats it
+    /// as one that always applies. A conditional entry is not a plain one, but two conditional
+    /// entries that differ only in their condition are the same to [`protected::is_as_wanted`].
+    pub conditional: bool,
 }
 
 /// The first reason found to refuse a folder or a file.
@@ -95,77 +106,32 @@ const FILE_GENERIC_WRITE: u32 = 0x12_0116;
 const FILE_GENERIC_EXECUTE: u32 = 0x12_00A0;
 const FILE_ALL_ACCESS: u32 = 0x1F_01FF;
 
+// What `Unsafe::right` says: a verb phrase that `{account} can {right} it` completes.
+pub(crate) const OWN: &str = "own";
+const DO_ANYTHING_TO: &str = "do anything to";
+const BYPASS_ACCESS_CONTROL_ON: &str = "bypass access control on";
+pub const CHANGE_PERMISSIONS_OF: &str = "change permissions of";
+const TAKE_OWNERSHIP_OF: &str = "take ownership of";
+const DELETE_OR_RENAME: &str = "delete or rename";
+const DELETE_OR_RENAME_ENTRIES_IN: &str = "delete or rename entries in";
+pub const WRITE_TO: &str = "write to";
+
 /// The rights that let an account replace what is in a folder, in the order they are reported.
 const DIRECTORY_TAMPERING: [(u32, &str); 4] = [
-    (WRITE_DAC, "change permissions of"),
-    (WRITE_OWNER, "take ownership of"),
-    (DELETE, "delete or rename"),
-    (FILE_DELETE_CHILD, "delete or rename entries in"),
+    (WRITE_DAC, CHANGE_PERMISSIONS_OF),
+    (WRITE_OWNER, TAKE_OWNERSHIP_OF),
+    (DELETE, DELETE_OR_RENAME),
+    (FILE_DELETE_CHILD, DELETE_OR_RENAME_ENTRIES_IN),
 ];
 
 /// The rights that let an account change a file's contents, or take it away or hand it over, in the
 /// order they are reported.
 const FILE_TAMPERING: [(u32, &str); 4] = [
-    (FILE_WRITE_DATA | FILE_APPEND_DATA, "write to"),
-    (WRITE_DAC, "change permissions of"),
-    (WRITE_OWNER, "take ownership of"),
-    (DELETE, "delete or rename"),
+    (FILE_WRITE_DATA | FILE_APPEND_DATA, WRITE_TO),
+    (WRITE_DAC, CHANGE_PERMISSIONS_OF),
+    (WRITE_OWNER, TAKE_OWNERSHIP_OF),
+    (DELETE, DELETE_OR_RENAME),
 ];
-
-// SIDs ================================================================================================================
-
-/// The binary SID with `authority` as its identifier authority and `subauthorities` after it.
-pub(crate) fn sid_from_parts(authority: u8, subauthorities: &[u32]) -> Sid {
-    let mut sid = vec![1, subauthorities.len() as u8, 0, 0, 0, 0, 0, authority];
-    for sub in subauthorities {
-        sid.extend_from_slice(&sub.to_le_bytes());
-    }
-    sid
-}
-
-fn system() -> Sid {
-    sid_from_parts(5, &[18])
-}
-
-pub(crate) fn administrators() -> Sid {
-    sid_from_parts(5, &[32, 544])
-}
-
-fn trusted_installer() -> Sid {
-    sid_from_parts(5, &[80, 956008885, 3418522649, 1831038044, 1853292631, 2271478464])
-}
-
-fn everyone() -> Sid {
-    sid_from_parts(1, &[0])
-}
-
-/// `S-1-5-32-544`, or `None` when the bytes are not a SID.
-pub(crate) fn sid_text(sid: &[u8]) -> Option<String> {
-    let (&1, &count) = (sid.first()?, sid.get(1)?) else {
-        return None;
-    };
-    let count = usize::from(count);
-    if count > 15 || sid.len() != 8 + 4 * count {
-        return None;
-    }
-    let authority = sid[2..8].iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
-    let mut text = if authority < 1 << 32 {
-        format!("S-1-{authority}")
-    } else {
-        format!("S-1-{authority:#x}")
-    };
-    for &sub in sid[8..].as_chunks::<4>().0 {
-        text.push('-');
-        text.push_str(&u32::from_le_bytes(sub).to_string());
-    }
-    Some(text)
-}
-
-/// [`sid_text`], or a description of bytes that are not a SID. What an error names an account by
-/// when `LookupAccountSidW` has no name for it.
-pub(crate) fn sid_string(sid: &[u8]) -> String {
-    sid_text(sid).unwrap_or_else(|| "an invalid SID".to_string())
-}
 
 // verdict =============================================================================================================
 
@@ -183,10 +149,10 @@ pub(crate) fn verdict(chain: &[ObjectSecurity]) -> std::result::Result<(), Unsaf
             right,
         };
         if !is_trusted(&object.owner) {
-            return Err(refuse(&object.owner, "own"));
+            return Err(refuse(&object.owner, OWN));
         }
         let Some(dacl) = &object.dacl else {
-            return Err(refuse(&everyone(), "do anything to"));
+            return Err(refuse(&everyone(), DO_ANYTHING_TO));
         };
         let tampering = if object.directory {
             &DIRECTORY_TAMPERING
@@ -259,6 +225,12 @@ impl FolderCheck {
     /// can write to it, change its permissions, take it over or delete it; a link at `path` is read
     /// as itself, and so is what it leads to. An object that cannot be read is an error, never a
     /// pass.
+    ///
+    /// - A "link" is any name-surrogate reparse point (what [`std::fs::FileType::is_symlink`]
+    ///   reports), so WSL and container links count as well as symlinks and junctions.
+    /// - A link whose target `read_link` cannot read is an error, not a pass.
+    /// - Any other reparse point (a cloud-sync placeholder, say) is judged by its own owner and
+    ///   DACL; what a filter driver supplies behind it is not consulted.
     pub fn check(&self, path: &Path) -> Result<()> {
         if self.mode == CheckPermissions::Disable {
             return Ok(());
@@ -282,7 +254,7 @@ impl Unsafe {
 /// The name of the account `sid` is, or the SID's text when no account has it (a deleted one).
 #[cfg(windows)]
 pub(crate) fn account_name(sid: &Sid) -> String {
-    identity::account_name_of_sid(sid).unwrap_or_else(|_| sid_string(sid))
+    identity::account_name_of_sid(sid).unwrap_or_else(|_| sid_display(sid))
 }
 
 // The filesystem ======================================================================================================
@@ -302,8 +274,8 @@ mod system {
         GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
     };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetLengthSid,
-        GetSecurityDescriptorControl, IsValidSid, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
+        OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -311,7 +283,7 @@ mod system {
         GetVolumeInformationByHandleW, READ_CONTROL,
     };
 
-    use super::{Ace, ObjectSecurity, Sid, Unsafe, everyone};
+    use super::{Ace, BYPASS_ACCESS_CONTROL_ON, ObjectSecurity, Sid, Unsafe, everyone};
     use crate::error::{Error, Result};
 
     // The ACE types a file's DACL can hold: allow and deny, plain or conditional. A conditional ACE
@@ -553,9 +525,9 @@ mod system {
             .open(path)
     }
 
-    /// What `GetSecurityInfo` returned for one object: the owner, and the DACL when it was asked for,
-    /// which point into a descriptor the call allocated and this frees on drop. Read them only while
-    /// it is live.
+    /// What `GetSecurityInfo` returned for one object. Each of the owner and the DACL is there only
+    /// when [`security_info`] was asked for it, and null otherwise. They point into a descriptor the
+    /// call allocated and this frees on drop.
     struct SecurityInfo {
         owner: PSID,
         dacl: *mut ACL,
@@ -573,8 +545,9 @@ mod system {
         }
     }
 
-    /// The owner, and the DACL if `information` includes it, of `handle`, an open object of `kind`
-    /// with `READ_CONTROL`. `what` and `label` stand for the call and the object in an error.
+    /// The parts `information` asks for (the owner, the DACL or both) of `handle`, an open object
+    /// of `kind` with `READ_CONTROL`; a part not asked for is null in the result. `what` and `label`
+    /// stand for the call and the object in an error.
     fn security_info(
         handle: HANDLE,
         kind: SE_OBJECT_TYPE,
@@ -587,16 +560,21 @@ mod system {
             dacl: std::ptr::null_mut(),
             descriptor: std::ptr::null_mut(),
         };
+        let wants_owner = information & OWNER_SECURITY_INFORMATION != 0;
         let wants_dacl = information & DACL_SECURITY_INFORMATION != 0;
         // SAFETY: `handle` is open with `READ_CONTROL` for the call; the out-pointers are valid
-        // lvalues of `info`, which frees the descriptor `descriptor` receives, and the DACL's is null
-        // when none was asked for.
+        // lvalues of `info`, which frees the descriptor `descriptor` receives, and the owner's and
+        // the DACL's are null when not asked for.
         let status = unsafe {
             GetSecurityInfo(
                 handle,
                 kind,
                 information,
-                &mut info.owner,
+                if wants_owner {
+                    &mut info.owner
+                } else {
+                    std::ptr::null_mut()
+                },
                 std::ptr::null_mut(),
                 if wants_dacl {
                     &mut info.dacl
@@ -634,7 +612,8 @@ mod system {
     }
 
     /// The owner of the kernel object `handle` (a mutex, say), which must be open with
-    /// `READ_CONTROL`. `name` stands for the object in an error.
+    /// `READ_CONTROL`. The DACL is not read, so what is unreadable in it cannot fail this. `name`
+    /// stands for the object in an error.
     pub(crate) fn kernel_object_owner(handle: HANDLE, name: &Path) -> Result<Sid> {
         let info = security_info(
             handle,
@@ -644,7 +623,37 @@ mod system {
             name,
         )?;
         // SAFETY: `owner` points into `descriptor`, which `info` keeps live.
-        unsafe { copy_sid(info.owner, name) }
+        unsafe { copy_sid(info.owner, "read the owner of", name) }
+    }
+
+    /// A DACL as read.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Dacl {
+        /// Whether it ignores what a parent would have it inherit.
+        pub protected: bool,
+        /// `None` is a NULL DACL, which grants everyone every right.
+        pub aces: Option<Vec<Ace>>,
+    }
+
+    /// The DACL of the kernel object `handle`, which must be open with `READ_CONTROL`. The owner
+    /// is not read. `name` stands for the object in an error.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn kernel_object_dacl(handle: HANDLE, name: &Path) -> Result<Dacl> {
+        let info = security_info(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            "read the permissions of",
+            name,
+        )?;
+        // SAFETY: `descriptor` is live, and `dacl` points into it.
+        let protected = unsafe { is_protected(info.descriptor, name)? };
+        // SAFETY: as above.
+        let aces = unsafe { parse_dacl(info.dacl, name)? };
+        Ok(Dacl { protected, aces })
     }
 
     /// Copies the owner, the DACL and whether it is protected out of a security descriptor of a
@@ -660,6 +669,24 @@ mod system {
         path: PathBuf,
         directory: bool,
     ) -> Result<ObjectSecurity> {
+        // SAFETY: the caller's contract covers `descriptor`.
+        let protected = unsafe { is_protected(descriptor, &path)? };
+        // SAFETY: the caller's contract covers `owner` and `dacl`.
+        let (owner, dacl) = unsafe { parse(owner, dacl, &path)? };
+        Ok(ObjectSecurity {
+            path,
+            owner,
+            protected,
+            directory,
+            dacl,
+        })
+    }
+
+    /// Whether the DACL of `descriptor` is protected.
+    ///
+    /// # Safety
+    /// `descriptor` is a live security descriptor.
+    unsafe fn is_protected(descriptor: *mut c_void, path: &Path) -> Result<bool> {
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
         // SAFETY: the caller's contract covers `descriptor`; the out-pointers are valid lvalues.
@@ -670,15 +697,7 @@ mod system {
                 io::Error::last_os_error(),
             ));
         }
-        // SAFETY: the caller's contract covers `owner` and `dacl`.
-        let (owner, dacl) = unsafe { parse(owner, dacl, &path)? };
-        Ok(ObjectSecurity {
-            path,
-            owner,
-            protected: control & SE_DACL_PROTECTED != 0,
-            directory,
-            dacl,
-        })
+        Ok(control & SE_DACL_PROTECTED != 0)
     }
 
     /// Refuses a volume that keeps no ACLs, where every account can do anything.
@@ -705,15 +724,15 @@ mod system {
             return Err(Unsafe {
                 path: path.to_path_buf(),
                 account: everyone(),
-                right: "bypass access control on",
+                right: BYPASS_ACCESS_CONTROL_ON,
             }
             .into_error());
         }
         Ok(())
     }
 
-    /// What a read of an object's permissions fails with when the object holds something goetia
-    /// cannot read (an entry of a type it does not know, an account that is no SID), as opposed to
+    /// What a read of an object's owner or permissions fails with when the object holds something
+    /// goetia cannot read (an entry of a type it does not know, an account that is no SID), as opposed to
     /// the system failing to answer. Carried as the error's source; see [`is_unreadable`].
     #[derive(Debug)]
     struct Unreadable(String);
@@ -726,12 +745,12 @@ mod system {
 
     impl std::error::Error for Unreadable {}
 
-    fn unreadable(path: &Path, what: String) -> Error {
-        Error::os_at("read the permissions of", path, Unreadable(what))
+    fn unreadable(verb: &str, path: &Path, what: String) -> Error {
+        Error::os_at(verb, path, Unreadable(what))
     }
 
-    /// Whether `error` is a read of permissions that failed because the object holds something
-    /// goetia cannot read, which says something about the object; any other failure says nothing.
+    /// Whether `error` is a read of an object's owner or permissions that failed because the object
+    /// holds something goetia cannot read, which says something about the object; any other failure says nothing.
     pub(crate) fn is_unreadable(error: &Error) -> bool {
         matches!(error, Error::Os { source, .. } if source.is::<Unreadable>())
     }
@@ -752,9 +771,19 @@ mod system {
     /// is live.
     pub(super) unsafe fn parse(owner: PSID, dacl: *mut ACL, path: &Path) -> Result<(Sid, Option<Vec<Ace>>)> {
         // SAFETY: the caller's contract covers `owner`.
-        let owner = unsafe { copy_sid(owner, path)? };
+        let owner = unsafe { copy_sid(owner, "read the permissions of", path)? };
+        // SAFETY: the caller's contract covers `dacl`.
+        let aces = unsafe { parse_dacl(dacl, path)? };
+        Ok((owner, aces))
+    }
+
+    /// Copies the entries out of a DACL, `None` for a NULL one.
+    ///
+    /// # Safety
+    /// `dacl` is what `GetSecurityInfo` returned, and the descriptor it points into is live.
+    unsafe fn parse_dacl(dacl: *mut ACL, path: &Path) -> Result<Option<Vec<Ace>>> {
         if dacl.is_null() {
-            return Ok((owner, None));
+            return Ok(None);
         }
         // SAFETY: `dacl` is non-null and live, so its header is readable.
         let count = unsafe { (*dacl).AceCount };
@@ -779,11 +808,14 @@ mod system {
                     std::ptr::addr_of!((*body).SidStart) as PSID,
                 )
             };
-            let allow = match header.AceType {
-                ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => true,
-                ACCESS_DENIED_ACE_TYPE | ACCESS_DENIED_CALLBACK_ACE_TYPE => false,
+            let (allow, conditional) = match header.AceType {
+                ACCESS_ALLOWED_ACE_TYPE => (true, false),
+                ACCESS_ALLOWED_CALLBACK_ACE_TYPE => (true, true),
+                ACCESS_DENIED_ACE_TYPE => (false, false),
+                ACCESS_DENIED_CALLBACK_ACE_TYPE => (false, true),
                 other => {
                     return Err(unreadable(
+                        "read the permissions of",
                         path,
                         format!("an entry of type {other}, which goetia cannot read"),
                     ));
@@ -791,26 +823,24 @@ mod system {
             };
             aces.push(Ace {
                 // SAFETY: `trustee` points at the SID inside the entry just read.
-                trustee: unsafe { copy_sid(trustee, path)? },
+                trustee: unsafe { copy_sid(trustee, "read the permissions of", path)? },
                 mask,
                 flags: header.AceFlags,
                 allow,
+                conditional,
             });
         }
-        Ok((owner, Some(aces)))
+        Ok(Some(aces))
     }
 
+    /// The bytes of the SID at `sid`, or an error that `verb`s `path` when it is null or not a valid SID.
+    ///
     /// # Safety
-    /// `sid` is null or points at readable memory.
-    unsafe fn copy_sid(sid: PSID, path: &Path) -> Result<Sid> {
-        // SAFETY: `IsValidSid` checks the structure before `GetLengthSid` reads it; a null pointer
-        // is rejected first.
-        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
-            return Err(unreadable(path, "an account that is not a valid SID".to_string()));
-        }
-        // SAFETY: valid per the check above, so `GetLengthSid` bytes are readable from `sid`.
-        let bytes = unsafe { std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize) };
-        Ok(bytes.to_vec())
+    /// As [`sid::copy_sid`](crate::backend::scm::sid::copy_sid).
+    pub(super) unsafe fn copy_sid(sid: PSID, verb: &str, path: &Path) -> Result<Sid> {
+        // SAFETY: the caller's contract is `sid::copy_sid`'s.
+        unsafe { crate::backend::scm::sid::copy_sid(sid) }
+            .ok_or_else(|| unreadable(verb, path, "an account that is not a valid SID".to_string()))
     }
 }
 

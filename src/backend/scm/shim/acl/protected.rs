@@ -10,7 +10,9 @@
 use super::{Ace, ObjectSecurity};
 
 /// Whether `actual` is `wanted`: the same owner, protected the same way, and the same entries in
-/// any order. The path is a label and is not compared. A NULL DACL is never as wanted.
+/// any order. The path is a label and is not compared. A NULL DACL is never as wanted. A callback
+/// entry's condition is not read, so two callback entries that differ only in it are the same;
+/// the stock permissions have none.
 pub(crate) fn is_as_wanted(actual: &ObjectSecurity, wanted: &ObjectSecurity) -> bool {
     let (Some(actual_dacl), Some(wanted_dacl)) = (&actual.dacl, &wanted.dacl) else {
         return false;
@@ -20,7 +22,7 @@ pub(crate) fn is_as_wanted(actual: &ObjectSecurity, wanted: &ObjectSecurity) -> 
 
 fn sorted(aces: &[Ace]) -> Vec<&Ace> {
     let mut sorted: Vec<&Ace> = aces.iter().collect();
-    sorted.sort_by_key(|ace| (&ace.trustee, ace.mask, ace.flags, ace.allow));
+    sorted.sort();
     sorted
 }
 

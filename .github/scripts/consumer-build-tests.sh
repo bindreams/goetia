@@ -6,7 +6,8 @@
 # the stock shim, and that goetia's own build routes do too:
 #
 #   1. a consumer built without the `goetia-shim` feature type-checks with no variable set, and
-#      its `install` reports "built without a stock shim";
+#      its `install` reports "built without a stock shim"; one that never declared the feature
+#      type-checks with `unexpected_cfgs` denied;
 #   2. the same consumer built in two stages (shim first, then the program with the feature and
 #      `GOETIA_SHIM_EXE`) installs, runs and uninstalls a `type: simple` service, leaving no shim;
 #   3. goetia's own two-stage build does the same;
@@ -162,6 +163,30 @@ assert_lock_differs() {
     fi
 }
 
+# `goetia::embed_shim!` names the expanding crate's own `goetia-shim` feature. `cargo rustc` passes
+# the flag to the consumer's crate alone, so step (1)'s artifacts for the dependencies are reused
+# (`RUSTFLAGS` would rebuild every one of them).
+assert_undeclared_feature_is_quiet() {
+    local consumer="$1" dir="$work/undeclared-consumer"
+    mkdir -p "$dir/src"
+    sed -e '/^\[features\]$/d' -e '/^goetia-shim = \[\]$/d' "$consumer/Cargo.toml" > "$dir/Cargo.toml"
+    cp "$consumer/Cargo.lock" "$dir/Cargo.lock"
+    cat > "$dir/src/main.rs" <<'EOF'
+fn main() {
+    let _: Option<&'static [u8]> = goetia::embed_shim!();
+}
+EOF
+    local target_dir
+    target_dir="$(winpath "$consumer/target")"
+    if ! (
+        cd "$dir" &&
+            env -u GOETIA_SHIM_EXE cargo rustc --locked --profile check --target-dir "$target_dir" \
+                -- -D unexpected_cfgs
+    ); then
+        fail "a consumer that never declared the feature failed 'cargo rustc -D unexpected_cfgs' (see the output above)"
+    fi
+}
+
 consumer_routes() {
     local crate_file crate_name version crate_dir consumer dir shim target
     consumer="$work/consumer"
@@ -188,6 +213,9 @@ consumer_routes() {
 
     # (1) No variable, no feature: the consumer type-checks.
     env -u GOETIA_SHIM_EXE cargo check --locked
+
+    # (1b) The same, in a consumer that never declared the feature: no warning.
+    assert_undeclared_feature_is_quiet "$consumer"
 
     # (2) No feature: the program builds, and install says why it has no shim.
     write_manifest "$dir" goetia-ci-consumer
