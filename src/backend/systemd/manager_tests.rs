@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::dirs::ensure_dir;
 use super::discover::{RawState, raw_state};
+use super::systemctl::systemctl_tests::{booted, gate_then};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::*;
+use crate::backend::client::fake::{Fake, exited, reply};
 use crate::backend::standby;
 use crate::backend::test_allowance;
 use crate::manager::ServiceManager;
@@ -62,6 +64,21 @@ impl Drop for QuarantineSweep {
                 ),
             }
         }
+    }
+}
+
+/// A manager over `fake`, on a booted host: nothing here runs a real `systemctl`.
+fn over(fake: Fake) -> Systemd {
+    Systemd::with(Systemctl::new(Box::new(fake), booted))
+}
+
+/// Tells a racer thread to stop when dropped, so a panic in the call it races (the fake refusing an
+/// unstated call) ends the scope instead of leaving the racer looping.
+struct StopRacer<'a>(&'a AtomicBool);
+
+impl Drop for StopRacer<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -191,9 +208,12 @@ fn install_never_corrupts_state_when_something_races_the_first_create() {
             }
         });
 
-        let mgr = Systemd::new();
+        // Every install asks the version gate's probes; only one that wrote asks `daemon-reload`, so a
+        // raced one leaves that reply unused.
+        let mgr = over(gate_then([reply(&["daemon-reload"], exited(0, "", ""))]));
+        let stop = StopRacer(&done);
         let outcome = flow::install(&mgr, &spec, false);
-        done.store(true, Ordering::Release);
+        drop(stop);
         racer.join().expect("racer thread panicked");
 
         let outcome = outcome.expect("install must not error, only refuse or succeed");
@@ -432,7 +452,7 @@ fn a_drop_in_name_that_is_not_a_directory_still_names_its_id() {
 /// short.
 #[skuld::test]
 fn prepared_steps_need_nothing_made_later() {
-    let mgr = Systemd::new();
+    let mgr = over(Fake::new([]));
     for (steps, watched) in [(&[Step::Stop, Step::Start][..], 2), (&[Step::Install, Step::Start], 1)] {
         let _prepared = mgr.prepare(steps, Budget::DEFAULT).expect("prepare");
         let _no_thread = standby::test_hook::threads(0);
@@ -479,7 +499,7 @@ fn a_budget_that_watches_nothing_prepares_nothing() {
     let _no_file = bounded::test_hook::temp_files(0);
     for budget in [Budget::Immediate, Budget::Unbounded] {
         assert!(
-            Systemd::new().prepare(&[Step::Stop, Step::Start], budget).is_ok(),
+            over(Fake::new([])).prepare(&[Step::Stop, Step::Start], budget).is_ok(),
             "{budget:?}"
         );
     }
@@ -494,7 +514,7 @@ fn prepared_steps_share_one_version_gate() {
         asked.set(asked.get() + 1);
         Ok(())
     };
-    let mgr = Systemd::new();
+    let mgr = over(Fake::new([]));
     for budget in [Budget::DEFAULT, Budget::Immediate, Budget::Unbounded] {
         asked.set(0);
         let prepared = mgr.prepare(&[Step::Stop, Step::Start], budget).expect("prepare");

@@ -1,10 +1,11 @@
-//! A service manager's command-line client (`launchctl`) as the backends reach it: one trait,
+//! A service manager's command-line client (`systemctl`, `launchctl`) as the backends reach it: one trait,
 //! [`Client`], real over [`bounded`] and `cosca` ([`Real`]) and, in tests, a table of stated replies
 //! (`fake::Fake`).
 //!
 //! A backend decides what a reply means; the client only runs the program and says how it ended.
 
-use crate::backend::bounded::{self, Finished, Reservation, Role, SpawnError};
+use crate::backend::bounded::{self, Capture, Finished, Reservation, Role, SpawnError};
+use crate::backend::unreaped::release_unreaped;
 use crate::manager::budget::Deadline;
 
 /// A service manager's command-line client.
@@ -15,6 +16,12 @@ pub(crate) trait Client: Send + Sync {
 }
 
 pub(crate) enum Wait {
+    /// To completion: nothing bounds it, so it never expires and draws nothing from the
+    /// reservation, and the child's tree is not contained, since there is no deadline to tear it
+    /// down on.
+    // systemd's alone: `launchctl` is always waited on under a deadline.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    ToCompletion,
     /// Under `deadline`, as [`bounded`] does it for `role`.
     Bounded { role: Role, deadline: Deadline },
 }
@@ -25,7 +32,8 @@ pub(crate) enum ClientError {
     /// Before the client ran: nothing it would have sent was sent.
     #[error("the client was not run")]
     NotRun(#[source] cosca::error::Error),
-    /// Perhaps after it ran: see [`SpawnError::MayHaveRun`].
+    /// Perhaps after it ran: see [`SpawnError::MayHaveRun`]. A run to completion that failed after
+    /// the spawn is this too, since cosca says its program may have started.
     #[error("the client may have run")]
     MayHaveRun(#[source] cosca::error::Error),
     /// After it ran: waiting for it or reading it failed. `announced` as in [`bounded::Lost`].
@@ -46,7 +54,7 @@ impl From<SpawnError> for ClientError {
     }
 }
 
-/// The real client: `program` (`["launchctl"]`) run with `environment` applied to every child.
+/// The real client: `program` (`["systemctl"]`, `["launchctl"]`) run with `environment` applied to every child.
 pub(crate) struct Real {
     program: Vec<String>,
     environment: fn(&mut cosca::Command),
@@ -66,11 +74,14 @@ impl Real {
             .chain(args.iter().copied())
             .collect()
     }
-}
 
-impl Client for Real {
-    fn run(&self, args: &[&str], wait: Wait, reservation: &mut Reservation) -> Result<Finished, ClientError> {
-        let Wait::Bounded { role, deadline } = wait;
+    fn bounded(
+        &self,
+        args: &[&str],
+        role: Role,
+        deadline: Deadline,
+        reservation: &mut Reservation,
+    ) -> Result<Finished, ClientError> {
         let argv = self.argv(args);
         let mut cmd = bounded::command(argv[0], &argv[1..]).map_err(ClientError::NotRun)?;
         (self.environment)(&mut cmd);
@@ -80,10 +91,42 @@ impl Client for Real {
             announced: lost.announced,
         })
     }
+
+    /// Spawn, then read both streams to their end on the calling thread: no thread, no temp file.
+    fn to_completion(&self, args: &[&str]) -> Result<Finished, ClientError> {
+        let mut cmd = cosca::run(self.argv(args));
+        (self.environment)(&mut cmd);
+        of_output(cmd.output())
+    }
+}
+
+/// A run to completion's `output`, as [`Finished`], or why it failed: cosca's
+/// [`MayHaveStarted`](cosca::error::Error::MayHaveStarted), which it returns for a failure after the
+/// spawn, is [`ClientError::MayHaveRun`], and any other failure is [`ClientError::NotRun`].
+fn of_output(output: Result<cosca::Output, cosca::error::Error>) -> Result<Finished, ClientError> {
+    let output = output.map_err(|e| ClientError::from(SpawnError::of_spawn(release_unreaped(e))))?;
+    Ok(Finished::Exited {
+        status: output.status,
+        capture: Capture {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            complete: true,
+        },
+    })
+}
+
+impl Client for Real {
+    fn run(&self, args: &[&str], wait: Wait, reservation: &mut Reservation) -> Result<Finished, ClientError> {
+        match wait {
+            Wait::ToCompletion => self.to_completion(args),
+            Wait::Bounded { role, deadline } => self.bounded(args, role, deadline, reservation),
+        }
+    }
 }
 
 /// A test client: a table of stated replies, with no process behind it.
 #[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod fake {
     use std::collections::VecDeque;
     use std::os::unix::process::ExitStatusExt as _;
@@ -124,19 +167,26 @@ pub(crate) mod fake {
         UncountedQuery,
         AnnouncedRequest,
         Request,
+        /// [`Wait::ToCompletion`], which has no role.
+        ToCompletion,
     }
 
     impl Waited {
         fn of(wait: &Wait) -> Waited {
-            let Wait::Bounded { role, deadline } = wait;
-            Waited {
-                role: match role {
-                    Role::Query => RoleKind::Query,
-                    Role::UncountedQuery => RoleKind::UncountedQuery,
-                    Role::AnnouncedRequest(_) => RoleKind::AnnouncedRequest,
-                    Role::Request(_) => RoleKind::Request,
+            match wait {
+                Wait::ToCompletion => Waited {
+                    role: RoleKind::ToCompletion,
+                    bounded: false,
                 },
-                bounded: deadline.at().is_some(),
+                Wait::Bounded { role, deadline } => Waited {
+                    role: match role {
+                        Role::Query => RoleKind::Query,
+                        Role::UncountedQuery => RoleKind::UncountedQuery,
+                        Role::AnnouncedRequest(_) => RoleKind::AnnouncedRequest,
+                        Role::Request(_) => RoleKind::Request,
+                    },
+                    bounded: deadline.at().is_some(),
+                },
             }
         }
     }
@@ -236,8 +286,11 @@ pub(crate) mod fake {
         /// assertion in every test that drives it.
         fn run(&self, args: &[&str], wait: Wait, reservation: &mut Reservation) -> Result<Finished, ClientError> {
             let waited = Waited::of(&wait);
-            let Wait::Bounded { role, .. } = &wait;
-            for _ in 0..role.files() {
+            let files = match &wait {
+                Wait::ToCompletion => 0,
+                Wait::Bounded { role, .. } => role.files(),
+            };
+            for _ in 0..files {
                 reservation.file().map_err(|e| ClientError::NotRun(e.into()))?;
             }
             let argv: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
