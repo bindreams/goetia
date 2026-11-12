@@ -1,13 +1,15 @@
 //! Pure orchestration tests for [`super::stop_via_notify`]/
 //! [`super::start_via_notify`] against a scripted [`super::ScmActor`] — no
 //! real SCM involved, so these run on every platform and need no elevation.
-//! Expiry is driven by the script, never by the clock: nothing here waits.
+//! Expiry is driven by the script, never by the clock: nothing here waits. A scripted expiry is
+//! reported only under a deadline that has passed ([`spent`]); the fakes assert it.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
 
 use super::*;
 use crate::backend::scm::exit_status::{RecordedExit, Reported};
+use crate::backend::scm::test_support::{spent, unbounded};
 use crate::manager::budget::{Budget, Deadline};
 use crate::spec::Kind;
 
@@ -76,6 +78,10 @@ struct FakeScm {
     refusing: &'static [QueriedState],
     /// The n-th `arm` (1-based) meets a service that is gone: opening its fresh handle failed with 1060.
     gone_at_arm: Option<usize>,
+    /// Whether a refused STOP leaves the service no longer accepting STOP, in the status read after it.
+    withdraws_stop_once_refused: bool,
+    /// Whether a STOP has been refused on a service that [`Self::withdrawing_stop_once_refused`].
+    stop_withdrawn: bool,
 }
 
 /// What a scripted `control_stop` answers.
@@ -118,6 +124,8 @@ impl FakeScm {
             shifts: vec![],
             refusing: &[],
             gone_at_arm: None,
+            withdraws_stop_once_refused: false,
+            stop_withdrawn: false,
         }
     }
 
@@ -225,6 +233,13 @@ impl FakeScm {
         self
     }
 
+    /// A refused STOP leaves the service in its state but no longer accepting STOP: the status read after
+    /// it shows `RUNNING` or `PAUSED` without `SERVICE_ACCEPT_STOP`.
+    fn withdrawing_stop_once_refused(mut self) -> Self {
+        self.withdraws_stop_once_refused = true;
+        self
+    }
+
     /// The `control_stop` calls answer `replies` in order.
     fn stop_replies(mut self, replies: impl IntoIterator<Item = StopReply>) -> Self {
         self.stop_replies = replies.into_iter().collect();
@@ -262,7 +277,8 @@ impl FakeScm {
         self
     }
 
-    /// Every `arm` reports `reports` rather than `Waited::Confirmed`.
+    /// Every `arm` reports `reports` rather than `Waited::Confirmed`. `Waited::Expired` needs a deadline
+    /// that has passed ([`spent`]): `arm` asserts it.
     fn arming(mut self, reports: Waited) -> Self {
         self.what_arm_reports = reports;
         self
@@ -301,7 +317,7 @@ impl FakeScm {
         let state = self.state.unwrap_or(QueriedState::Stopped);
         QueriedStatus {
             state,
-            accepts_stop: matches!(state, QueriedState::Running | QueriedState::Paused),
+            accepts_stop: matches!(state, QueriedState::Running | QueriedState::Paused) && !self.stop_withdrawn,
             exit: self.recorded,
             wait_hint: self.wait_hint,
         }
@@ -351,6 +367,10 @@ impl ScmActor for FakeScm {
         self.fresh_arm = std::mem::take(&mut self.fresh_handle);
         self.at_once = None;
         if self.what_arm_reports == Waited::Expired {
+            assert!(
+                deadline.expired(),
+                "FakeScm: arm reported an expiry before its deadline passed"
+            );
             return Ok(Armed::Expired);
         }
         // The status is read after the registration, so the service can move in between.
@@ -390,7 +410,10 @@ impl ScmActor for FakeScm {
                 Ok(())
             }
             StopReply::NotActive => Ok(()),
-            StopReply::Os(code) => Err(std::io::Error::from_raw_os_error(code)),
+            StopReply::Os(code) => {
+                self.stop_withdrawn = self.withdraws_stop_once_refused;
+                Err(std::io::Error::from_raw_os_error(code))
+            }
         }
     }
     fn start(&mut self) -> std::io::Result<StartReply> {
@@ -427,6 +450,10 @@ impl ScmActor for FakeScm {
             None => {
                 self.assert_something_can_fire();
                 let observed = self.waits.pop_front().expect("script ran dry");
+                assert!(
+                    observed.is_some() || deadline.expired(),
+                    "FakeScm: wait reported an expiry before its deadline passed"
+                );
                 if let Some(observed) = observed {
                     self.state = Some(self.state_of(observed));
                     self.deliveries += 1;
@@ -474,16 +501,6 @@ impl ScmActor for FakeScm {
 fn shim_failed() -> RecordedExit {
     let (win32, specific) = Reported::shim_failure(None).scm_codes();
     RecordedExit { win32, specific }
-}
-
-fn unbounded() -> Deadline {
-    Budget::Unbounded.start()
-}
-
-/// An already-spent deadline. The fake's script is what makes a wait report
-/// expiry; this is only what the state machine is *told* it has left.
-fn spent() -> Deadline {
-    Budget::Immediate.start()
 }
 
 #[skuld::test]
@@ -551,7 +568,7 @@ fn stop_over_a_stop_under_way_still_expires_on_the_deadline() {
     let mut fake = FakeScm::new([None])
         .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
         .queried(QueriedState::StopPending, false);
-    assert_eq!(stop_via_notify(&mut fake, unbounded(), false).unwrap(), Waited::Expired);
+    assert_eq!(stop_via_notify(&mut fake, spent(), false).unwrap(), Waited::Expired);
 }
 
 /// An `end` that nothing may call: the process is not held, or SCM has not confirmed `STOPPED`.
@@ -571,7 +588,16 @@ fn ending(
     terminate: impl FnOnce(&u32) -> io::Result<()>,
     exit: impl FnOnce(&u32, Deadline, Option<&io::Error>) -> io::Result<Waited>,
 ) -> impl FnOnce(u32, Deadline) -> Result<EndProcessOutcome<u32>, ProcessWaitFailure> {
-    move |process, deadline| end_process(process, deadline, terminate, exit)
+    move |process, deadline| {
+        end_process(process, deadline, terminate, |process, by, terminate_failed| {
+            let waited = exit(process, by, terminate_failed);
+            assert!(
+                !matches!(waited, Ok(Waited::Expired)) || by.expired(),
+                "ending: the wait for the process reported an expiry before its deadline passed"
+            );
+            waited
+        })
+    }
 }
 
 /// SCM records `STOPPED` before the service's process exits, so a stop that held the process ends it
@@ -615,7 +641,7 @@ fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
 
     let outcome = stop_and_await_exit(
         &mut fake,
-        unbounded(),
+        spent(),
         &mut HoldOutcome::Held(7u32),
         false,
         ending(|_| Ok(()), |_, _, _| Ok(Waited::Expired)),
@@ -634,7 +660,7 @@ fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
 fn stop_and_await_exit_does_not_end_the_process_when_stopped_was_not_confirmed() {
     let mut fake = FakeScm::new([None]);
 
-    let outcome = stop_and_await_exit(&mut fake, unbounded(), &mut HoldOutcome::Held(7u32), false, no_end);
+    let outcome = stop_and_await_exit(&mut fake, spent(), &mut HoldOutcome::Held(7u32), false, no_end);
 
     assert!(matches!(outcome.unwrap(), StopAndAwaitExitOutcome::ServiceExpired));
 }
@@ -725,10 +751,10 @@ fn end_process_is_done_when_the_process_exits_after_a_failed_terminate() {
 fn end_process_keeps_a_failed_terminate_for_the_wait_and_for_the_expiry() {
     let told = std::cell::RefCell::new(None);
 
-    let outcome = end_process(7u32, unbounded(), terminate_fails, |_, _, terminate_failed| {
+    let outcome = ending(terminate_fails, |_, _, terminate_failed| {
         *told.borrow_mut() = terminate_failed.map(ToString::to_string);
         Ok(Waited::Expired)
-    });
+    })(7u32, spent());
 
     let EndProcessOutcome::Lingers {
         process,
@@ -859,7 +885,7 @@ fn stop_and_await_exit_ends_the_process_as_end_process_does_after_a_failed_termi
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
     let outcome = stop_and_await_exit(
         &mut fake,
-        unbounded(),
+        spent(),
         &mut HoldOutcome::Held(7u32),
         false,
         ending(terminate_fails, |_, _, _| Ok(Waited::Expired)),
@@ -3206,7 +3232,7 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
         let mut fake = incomplete(FakeScm::new([Some(Observed::Stopped)]));
         let err = stop_and_await_exit(
             &mut fake,
-            unbounded(),
+            spent(),
             &mut HoldOutcome::Held(7u32),
             true,
             ending(|_| terminate, |_, _, _| exit),
@@ -3403,7 +3429,7 @@ fn a_timed_out_start_over_an_unreadable_blob_names_the_blob() {
             &mut fake,
             &Id::try_from("frpc").unwrap(),
             Budget::Bounded(std::time::Duration::from_secs(3600)),
-            unbounded(),
+            spent(),
             &answer,
         )
         .unwrap_err();
@@ -3552,15 +3578,10 @@ fn a_held_process_that_outlasts_the_stop_is_a_wait_timeout_naming_its_pid() {
         &mut fake,
         &Id::try_from("frpc").unwrap(),
         budget,
-        budget.start(),
+        spent(),
         &answer,
         |_| Ok(HoldOutcome::Held(7u32)),
-        |process, _| {
-            Ok(EndProcessOutcome::Lingers {
-                process,
-                terminate_failed: None,
-            })
-        },
+        ending(|_| Ok(()), |_, _, _| Ok(Waited::Expired)),
     )
     .unwrap_err();
 
@@ -3690,45 +3711,6 @@ fn an_uninstall_holds_only_when_told_to_and_judges_only_what_may_be_a_shim() {
     }
 }
 
-/// A wait that expires under an uninstall's unbounded deadline is goetia's own invariant breach: a stop
-/// failure whether or not someone else had marked the service, never their doing.
-#[cfg(windows)]
-#[skuld::test]
-fn an_uninstall_whose_unbounded_stop_expires_is_a_stop_failure_whether_or_not_it_was_marked() {
-    use crate::backend::scm::manager::uninstall_stop_on;
-    use crate::spec::Id;
-
-    let [(_, answer), ..] = answers();
-    for marked in [false, true] {
-        let mut fake = FakeScm::new([Some(Observed::Running), None]).stop_replies([StopReply::Ok]);
-
-        let err = uninstall_stop_on(
-            &mut fake,
-            &Id::try_from("frpc").unwrap(),
-            &answer,
-            marked,
-            None,
-            None::<fn() -> crate::error::Result<HoldOutcome<u32>>>,
-            no_end_of,
-        )
-        .expect_err("an expiry with no bound is a failure");
-
-        let said = err.report().to_string();
-        assert!(said.contains("goetia's own error"), "marked {marked}: {said}");
-        assert!(said.contains("could not be stopped"), "marked {marked}: {said}");
-        assert!(
-            !said.contains("marked for deletion by someone else"),
-            "marked {marked}: {said}"
-        );
-        assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
-        assert_eq!(
-            said.contains("already marked for deletion"),
-            marked,
-            "marked {marked}: {said}"
-        );
-    }
-}
-
 /// A hold that fails is goetia's or the hold's doing, never that of whoever marked the service for
 /// deletion: it is told with its cause whether or not the service was marked. Only an uninstall that
 /// disabled the service says it did.
@@ -3766,6 +3748,63 @@ fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked
             marked,
             "marked {marked}: {said}"
         );
+    }
+}
+
+/// A service that took hold of once and then refuses STOP and no longer accepts it fails an uninstall
+/// with the service's own cause, and does not end the process it held. Someone else's marking is said,
+/// with the kill hint, and is not goetia's own failure; an unmarked service is told disabled and not
+/// deleted.
+#[cfg(windows)]
+#[skuld::test]
+fn an_uninstall_over_a_service_that_stops_accepting_stop_is_a_stop_failure_whether_or_not_it_was_marked() {
+    use crate::backend::scm::manager::uninstall_stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    for marked in [false, true] {
+        for held in [true, false] {
+            let cell = format!("marked {marked}, held {held}");
+            let holds = std::cell::Cell::new(0);
+            let mut fake = FakeScm::new([Some(Observed::Running)])
+                .stop_replies([StopReply::Os(INVALID_SERVICE_CONTROL)])
+                .withdrawing_stop_once_refused();
+
+            let err = uninstall_stop_on(
+                &mut fake,
+                &Id::try_from("frpc").unwrap(),
+                &answer,
+                marked,
+                None,
+                held.then_some(|| -> crate::error::Result<HoldOutcome<u32>> {
+                    holds.set(holds.get() + 1);
+                    Ok(HoldOutcome::Held(7))
+                }),
+                no_end_of,
+            )
+            .expect_err("a service that does not accept STOP is not stopped");
+
+            assert_eq!(fake.stop_count(), 1, "{cell}: {:?}", fake.log);
+            assert_eq!(
+                holds.get(),
+                usize::from(held),
+                "{cell}: the hold runs once, before the STOP"
+            );
+            let said = err.report().to_string();
+            assert!(said.contains("does not accept STOP"), "{cell}: {said}");
+            assert!(said.contains("could not be stopped"), "{cell}: {said}");
+            assert!(said.contains("goetia daemon kill frpc"), "{cell}: {said}");
+            assert!(
+                !said.contains("goetia's own"),
+                "the failure is the service's: {cell}: {said}"
+            );
+            assert_eq!(
+                said.contains("marked for deletion by someone else"),
+                marked,
+                "{cell}: {said}"
+            );
+            assert_eq!(said.contains("is now disabled"), !marked, "{cell}: {said}");
+        }
     }
 }
 
@@ -3818,41 +3857,6 @@ fn an_uninstall_whose_hold_of_a_stop_pending_service_failed_says_the_service_is_
             assert!(said.contains("goetia daemon uninstall frpc"), "{said}");
             assert!(said.contains("goetia daemon kill frpc"), "{said}");
         }
-    }
-}
-
-/// A hold that expired cannot be told by an uninstall, whose waits have no bound: it fails, naming the
-/// pid SCM still reported, rather than going on as if it had held a process. A marked service is no
-/// different.
-#[cfg(windows)]
-#[skuld::test]
-fn an_uninstall_whose_hold_expired_fails_naming_the_pid() {
-    use crate::backend::scm::manager::uninstall_stop_on;
-    use crate::spec::Id;
-
-    let [(_, answer), ..] = answers();
-    for marked in [false, true] {
-        let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]);
-
-        let err = uninstall_stop_on(
-            &mut fake,
-            &Id::try_from("frpc").unwrap(),
-            &answer,
-            marked,
-            None,
-            Some(|| Ok(HoldOutcome::<u32>::Expired { pid: 9 })),
-            no_end_of,
-        )
-        .expect_err("an expired hold is not a held process");
-
-        let said = err.report().to_string();
-        assert!(said.contains("process 9"), "marked {marked}: {said}");
-        assert_eq!(
-            said.contains("already marked for deletion"),
-            marked,
-            "marked {marked}: {said}"
-        );
-        assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
     }
 }
 
