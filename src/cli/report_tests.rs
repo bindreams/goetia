@@ -281,11 +281,11 @@ fn emit_returns_the_reports_own_code_when_the_write_succeeds() {
 /// The exact text for `--json`; the human sinks escape.
 #[skuld::test]
 fn a_refused_id_is_reported_as_the_id_was_given() {
-    let id = "a\nb\u{202e}";
+    let id = "a b\u{202e}";
     let e = crate::spec::Id::try_from(id.to_string()).unwrap_err();
     assert_eq!(
         invalid_id(id, e).message,
-        "id `a\nb\u{202e}` does not match the required pattern ^[A-Za-z0-9._-]{1,80}$"
+        "id `a b\u{202e}` does not match the required pattern ^[A-Za-z0-9._-]{1,80}$"
     );
 }
 

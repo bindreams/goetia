@@ -83,14 +83,21 @@ impl TryFrom<String> for Id {
 
     fn try_from(value: String) -> Result<Self, Error> {
         if is_valid_id(&value) {
-            Ok(Id(value))
-        } else {
-            Err(Error::Invalid {
-                daemon: value.clone(),
-                message: format!("id `{value}` does not match the required pattern ^[A-Za-z0-9._-]{{1,80}}$"),
-                source: None,
-            })
+            return Ok(Id(value));
         }
+        // A control character is never echoed raw: this error reaches library callers unescaped.
+        let (daemon, message) = match resolve::control_defect(&value) {
+            Some(defect) => (value.escape_debug().to_string(), format!("field `id` {defect}")),
+            None => (
+                value.clone(),
+                format!("id `{value}` does not match the required pattern ^[A-Za-z0-9._-]{{1,80}}$"),
+            ),
+        };
+        Err(Error::Invalid {
+            daemon,
+            message,
+            source: None,
+        })
     }
 }
 

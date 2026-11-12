@@ -170,10 +170,9 @@ fn a_control_character_in_the_id_is_refused() {
         for &native in HOST_BACKENDS {
             let context = format!("{c:?} as native `{native}`");
             let err = resolve_yaml_as(native, &yaml).expect_err(&context).to_string();
-            assert!(
-                err.contains("id `") && err.contains("does not match"),
-                "{context}: {err}"
-            );
+            // Like every other free-text field, the refusal names the defect and omits the value.
+            assert!(err.contains("field `id` contains a control character"), "{context}: {err}");
+            assert!(!err.contains(c), "{context}: {err:?}");
         }
     }
 }
@@ -375,7 +374,8 @@ fn a_bad_id_is_reported_first_whatever_the_manifest_directory() {
     let dir = base_dir().join("a\nb");
     for (id, expected) in [
         ("${X}", "a daemon id cannot be interpolated"),
-        ("\"a\\nb\"", "does not match the required pattern"),
+        ("\"a b\"", "does not match the required pattern"),
+        ("\"a\\nb\"", "field `id` contains a control character"),
     ] {
         let msg = resolve(parse_manifest(&format!("id: {id}\ncommand: [bin/frpc]\n")), &dir)
             .unwrap_err()

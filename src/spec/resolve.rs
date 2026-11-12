@@ -1140,7 +1140,7 @@ fn reject_control_chars(id: &Id, field: &str, value: &str) -> Result<(), Error> 
 
 /// How `value` breaks the control-character rule, as a predicate to follow the name of what was
 /// checked; `None` if it does not.
-fn control_defect(value: &str) -> Option<String> {
+pub(super) fn control_defect(value: &str) -> Option<String> {
     if value.chars().any(|c| c.is_control()) {
         return Some("contains a control character, which is forbidden".to_string());
     }
