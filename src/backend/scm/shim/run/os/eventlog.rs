@@ -5,10 +5,9 @@ use windows_sys::Win32::System::EventLog::{
 };
 
 use super::Severity;
-use crate::backend::scm::wide::{wide_literal, wide_null_cut};
+use std::os::windows::ffi::OsStrExt as _;
 
-const SOURCE: &str = "Goetia";
-const SOURCE_WIDE: [u16; SOURCE.len() + 1] = wide_literal(SOURCE);
+use windows_sys::core::w;
 
 /// `EventCreate.exe`'s message 1 is `%1` — a verbatim passthrough of the
 /// single insertion string, which is what lets Event Viewer render our
@@ -26,16 +25,18 @@ pub(super) fn report(severity: Severity, message: &str) {
         Severity::Error => EVENTLOG_ERROR_TYPE,
         Severity::Warning => EVENTLOG_WARNING_TYPE,
     };
-    let wide_source = SOURCE_WIDE;
-    // SAFETY: `wide_source` is a valid, null-terminated UTF-16 string,
-    // and `RegisterEventSourceW` does not retain it past this call.
-    let handle = unsafe { RegisterEventSourceW(std::ptr::null(), wide_source.as_ptr()) };
+    // SAFETY: `w!` yields a valid, null-terminated UTF-16 string with static lifetime.
+    let handle = unsafe { RegisterEventSourceW(std::ptr::null(), w!("Goetia")) };
     if handle.is_null() {
         return;
     }
-    // A NUL would end the message early in the Event Log; showing it escaped keeps the rest. With
-    // none left, the cut takes nothing off.
-    let wide_msg = wide_null_cut(message.replace('\0', "\\0"));
+    // A NUL would end the message early in the Event Log; showing it escaped keeps the rest. The
+    // escaped text holds none, so the terminator below is its only NUL. (Not `wide_null`: it
+    // refuses a NUL, and this path reports failures, so it cannot fail itself.)
+    let wide_msg: Vec<u16> = std::ffi::OsStr::new(&message.replace('\0', "\\0"))
+        .encode_wide()
+        .chain([0])
+        .collect();
     let strings = [wide_msg.as_ptr()];
     // SAFETY: `handle` is a live handle just returned by
     // `RegisterEventSourceW`; `strings` holds exactly one valid,

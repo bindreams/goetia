@@ -22,8 +22,9 @@ impl From<InteriorNul> for std::io::Error {
 /// that would have ended it early. For text goetia sends: it is refused, never cut. Text that
 /// Windows hands back is read as Windows reads it, with `wide_null_cut`.
 pub fn wide_null(s: impl AsRef<OsStr>) -> Result<Vec<u16>, InteriorNul> {
-    let mut units = Vec::new();
-    for unit in s.as_ref().encode_wide() {
+    let s = s.as_ref();
+    let mut units = Vec::with_capacity(s.len() + 1);
+    for unit in s.encode_wide() {
         if unit == 0 {
             return Err(InteriorNul { index: units.len() });
         }
@@ -39,28 +40,6 @@ pub fn wide_null(s: impl AsRef<OsStr>) -> Result<Vec<u16>, InteriorNul> {
 pub fn wide_null_cut(s: impl AsRef<OsStr>) -> Vec<u16> {
     let mut units: Vec<u16> = s.as_ref().encode_wide().take_while(|&unit| unit != 0).collect();
     units.push(0);
-    units
-}
-
-/// `s` as a NUL-terminated UTF-16 string, evaluated at compile time. `N` is `s.len() + 1`, so a
-/// constant spells it `const W: [u16; S.len() + 1] = wide_literal(S);`.
-///
-/// `s` must be ASCII and hold no NUL: used in a constant, a literal that does not fails the build,
-/// so no run can meet it.
-///
-/// # Panics
-/// When `s` is not ASCII, holds a NUL, or `N` is not `s.len() + 1`.
-pub const fn wide_literal<const N: usize>(s: &str) -> [u16; N] {
-    let bytes = s.as_bytes();
-    assert!(bytes.len() + 1 == N, "N is not the length of the literal plus one");
-    let mut units = [0u16; N];
-    let mut i = 0;
-    while i < bytes.len() {
-        assert!(bytes[i].is_ascii(), "the literal is not ASCII");
-        assert!(bytes[i] != 0, "the literal holds a NUL");
-        units[i] = bytes[i] as u16;
-        i += 1;
-    }
     units
 }
 

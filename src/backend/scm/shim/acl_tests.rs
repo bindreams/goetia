@@ -917,10 +917,11 @@ pub(in crate::backend::scm::shim) mod windows {
         let cut = Descriptor::from_sddl("D:P(A;;GA;;;WD)\0junk")
             .err()
             .expect("a NUL ends nothing here");
+        assert!(matches!(cut, Error::Os { .. }), "{cut:?}");
         assert!(
-            cut.report().to_string().contains(r"D:P(A;;GA;;;WD)\0junk"),
-            "{}",
-            cut.report()
+            cut.to_string()
+                .starts_with(r"failed to build the permissions from the SDDL `D:P(A;;GA;;;WD)\0junk`"),
+            "{cut}"
         );
 
         let descriptor = Descriptor::from_sddl("D:P(A;;GA;;;WD)").unwrap();

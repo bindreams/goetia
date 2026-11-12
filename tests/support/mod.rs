@@ -34,14 +34,14 @@ use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
 pub use goetia::testing::elevation::{ELEVATED, elevated};
+#[cfg(windows)]
+pub use goetia::testing::wide_null;
 pub use goetia::testing::{cleanup, plain_fields};
 #[cfg(windows)]
 pub use goetia::testing::{
     raw_registry,
     scratch::{self, ScratchKey},
 };
-#[cfg(windows)]
-pub use goetia::testing::{wide_literal, wide_null};
 pub use list_json::{ListJson, assert_own, list_json, may_account_for};
 #[cfg(windows)]
 pub use local_user::LocalUserGuard;

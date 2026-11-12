@@ -16,8 +16,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE,
 };
 use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
-use winreg::types::FromRegValue as _;
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, RegType};
 use winreg::{RegKey, RegValue};
 
 use crate::backend::scm::generate::{FIELDS, field_named};
@@ -561,15 +560,25 @@ pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<
     )
 }
 
-/// The `ImagePath` that `raw` holds, as SCM reads it: it is a C string there, so it ends at the
-/// first NUL. `None` when it is not a string. This is where registry text meets goetia, so what
-/// follows (the sweep's expansion, its comparisons) never sees what SCM ignores.
+/// The `ImagePath` that `raw` holds, as SCM reads it: a C string, so it ends at the first NUL, for a
+/// `REG_MULTI_SZ` as for the other string types. `None` when it is not a string. This is where
+/// registry text meets goetia, so what follows (the sweep's expansion, its comparisons) never sees
+/// what SCM ignores. Decoded here and not by `winreg`, which turns a `REG_MULTI_SZ`'s NULs into
+/// newlines.
 fn image_text(raw: &RegValue) -> Option<String> {
-    let mut text = String::from_reg_value(raw).ok()?;
-    if let Some(end) = text.find('\0') {
-        text.truncate(end);
+    if !matches!(
+        raw.vtype,
+        RegType::REG_SZ | RegType::REG_EXPAND_SZ | RegType::REG_MULTI_SZ
+    ) {
+        return None;
     }
-    Some(text)
+    let units: Vec<u16> = raw
+        .bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    Some(String::from_utf16_lossy(&units))
 }
 
 #[cfg(test)]

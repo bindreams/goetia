@@ -408,8 +408,8 @@ mod system {
             let needed =
                 unsafe { ExpandEnvironmentStringsW(source.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
             if needed == 0 {
-                // Nothing could be expanded: the text as it was names what it names.
-                return text.to_string();
+                // Nothing could be expanded: the text as it was, up to the NUL the system ends it at.
+                return text.split('\0').next().unwrap_or_default().to_string();
             }
             if needed <= buf.len() {
                 // `needed` counts the NUL.

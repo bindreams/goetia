@@ -87,8 +87,8 @@ mod system {
 
         /// A descriptor written as SDDL.
         pub(crate) fn from_sddl(sddl: &str) -> Result<Self> {
-            let wide = wide_null(sddl)
-                .map_err(|e| Error::os(format!("build permissions from the SDDL `{}`", sddl.escape_debug()), e))?;
+            let what = || format!("build the permissions from the SDDL `{}`", sddl.escape_debug());
+            let wide = wide_null(sddl).map_err(|e| Error::os(what(), e))?;
             let mut raw: *mut c_void = std::ptr::null_mut();
             // SAFETY: `wide` is NUL-terminated; `raw` is a valid out-pointer, and the size is not asked for.
             let ok = unsafe {
@@ -100,10 +100,7 @@ mod system {
                 )
             };
             if ok == 0 {
-                return Err(Error::os(
-                    "build the permissions of the shim",
-                    io::Error::last_os_error(),
-                ));
+                return Err(Error::os(what(), io::Error::last_os_error()));
             }
             Ok(Self { raw })
         }
@@ -122,7 +119,7 @@ mod system {
             };
             if got_owner == 0 || got_dacl == 0 {
                 return Err(Error::os(
-                    "read the permissions of the shim",
+                    "read the permissions of a descriptor",
                     io::Error::last_os_error(),
                 ));
             }

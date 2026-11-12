@@ -2,6 +2,7 @@ use super::*;
 
 use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
 use winreg::RegValue;
+use winreg::enums::RegType;
 use winreg::types::ToRegValue as _;
 
 use crate::testing::elevation::{ELEVATED, elevated};
@@ -659,17 +660,34 @@ fn a_parameters_that_is_a_link_is_replaced_by_a_real_key_and_its_target_is_left_
     );
 }
 
+/// A value of `vtype` holding `text` as UTF-16, as the registry stores it.
+fn raw_string(vtype: RegType, text: &str) -> RegValue<'static> {
+    RegValue {
+        bytes: text
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>()
+            .into(),
+        vtype,
+    }
+}
+
 /// SCM starts what precedes a NUL in the `ImagePath`, so that is the image: the sweep must count
-/// the host it names as referenced.
+/// the host it names as referenced. The same for every string type, a `REG_MULTI_SZ` included.
 #[skuld::test]
 fn an_image_is_read_up_to_its_first_nul() {
-    assert_eq!(
-        image_text(&"C:\\a\\host.exe --x\0tail".to_reg_value()).as_deref(),
-        Some(r"C:\a\host.exe --x")
-    );
-    assert_eq!(
-        image_text(&r"C:\a\host.exe".to_reg_value()).as_deref(),
-        Some(r"C:\a\host.exe")
-    );
+    for vtype in [RegType::REG_SZ, RegType::REG_EXPAND_SZ, RegType::REG_MULTI_SZ] {
+        assert_eq!(
+            image_text(&raw_string(vtype, "C:\\a\\host.exe --x\0tail\0\0")).as_deref(),
+            Some(r"C:\a\host.exe --x"),
+            "{vtype:?}"
+        );
+        assert_eq!(
+            image_text(&raw_string(vtype, "C:\\a\\host.exe\0")).as_deref(),
+            Some(r"C:\a\host.exe"),
+            "{vtype:?}"
+        );
+        assert_eq!(image_text(&raw_string(vtype, "")).as_deref(), Some(""), "{vtype:?}");
+    }
     assert_eq!(image_text(&7u32.to_reg_value()), None);
 }

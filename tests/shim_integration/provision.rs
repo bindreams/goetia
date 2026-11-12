@@ -19,7 +19,7 @@ use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
 use goetia::spec::{DaemonFields, DaemonSpec, User};
-use goetia::testing::{Ace, FakeProvider, command, units_until_nul, wide_literal, wide_null};
+use goetia::testing::{Ace, FakeProvider, command, units_until_nul, wide_null};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -746,12 +746,10 @@ impl ShimProvider for Gated {
 
 /// The lock's name.
 const LOCK_NAME: &str = r"Global\goetia-shim";
-/// [`LOCK_NAME`] as the wide string the mutex calls take.
-const LOCK_NAME_WIDE: [u16; LOCK_NAME.len() + 1] = wide_literal(LOCK_NAME);
 
 /// The lock, opened to read its permissions and to wait on it.
 fn open_lock() -> OwnedHandle {
-    let name = LOCK_NAME_WIDE;
+    let name = wide_null(LOCK_NAME).unwrap();
     // SAFETY: `name` is NUL-terminated; the handle is checked, then owned.
     let raw = unsafe { OpenMutexW(SYNCHRONIZE | READ_CONTROL, 0, name.as_ptr()) };
     assert!(
@@ -904,7 +902,7 @@ fn lock_made_by_this_user(dacl: &str) -> OwnedHandle {
         lpSecurityDescriptor: descriptor,
         bInheritHandle: 0,
     };
-    let name = LOCK_NAME_WIDE;
+    let name = wide_null(LOCK_NAME).unwrap();
     // SAFETY: `attributes` points at `descriptor`, live for the call; `name` is NUL-terminated.
     let raw = unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) };
     // SAFETY: read straight after the call; `descriptor` is freed once, after its last use.

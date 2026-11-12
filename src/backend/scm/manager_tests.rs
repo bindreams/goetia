@@ -1504,3 +1504,17 @@ fn a_command_line_with_a_nul_is_split_up_to_it() {
         (PathBuf::from(r"C:\a.exe"), vec!["one".to_string()])
     );
 }
+
+/// `CommandLineToArgvW` answers an empty string with the current executable; a command line with
+/// nothing before its NUL has no executable.
+#[skuld::test]
+fn a_command_line_with_nothing_before_its_nul_has_no_executable() {
+    for cmdline in ["", "\0C:\\a.exe", " \t \0C:\\a.exe", "  "] {
+        assert_eq!(
+            split_command_line(cmdline),
+            (PathBuf::new(), Vec::new()),
+            "{}",
+            cmdline.escape_debug()
+        );
+    }
+}
