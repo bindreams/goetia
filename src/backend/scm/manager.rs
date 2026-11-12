@@ -1123,9 +1123,9 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
 /// The stop of an uninstall, over the actor it disabled the service through: the STOP, or the wait for
 /// one under way, on notifications, with no bound (see [`uninstall_locked`]). A service not known not to
 /// run a shim has its record judged, as `stop` judges it. `hold` takes hold of the service's process
-/// before each STOP and once for a service already `STOP_PENDING`, and `None` holds nothing (it is
-/// unbounded, so it never returns [`HoldOutcome::Expired`]); `end` ends
-/// a held process whose stop was incomplete, as `stop` ends it. `marked` and `previous` are what the
+/// before each STOP and once for a service already `STOP_PENDING`, and `None` holds nothing. A `Some(hold)`
+/// must be unbounded: it never returns [`HoldOutcome::Expired`]. `end` ends a held process whose stop was
+/// incomplete, as `stop` ends it. `marked` and `previous` are what the
 /// disable found, which a failure tells.
 ///
 /// The process held when the service is stopped, for the caller to wait for once it is deleted.
@@ -1544,8 +1544,7 @@ impl Scm {
             HoldOutcome::Refused(reason) => {
                 failures.push(Error::os(format!("open `{id}`'s process to wait for its exit"), reason).into())
             }
-            // `uninstall_stop_on` returns no `Expired`: an uninstall's hold has no bound.
-            HoldOutcome::Expired { .. } => unreachable!("`uninstall_stop_on` never returns an expired hold"),
+            HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
         }
         // Nothing is swept for a host that could not be read.
         if host.is_none() {

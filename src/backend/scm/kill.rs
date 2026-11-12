@@ -87,15 +87,15 @@ pub trait KillTarget {
     /// kill.
     ///
     /// SCM can keep refusing a registration while it catches up with the notifications already
-    /// delivered, and the arm retries until `deadline`: then it is [`ReleaseWatch::Expired`]. An
-    /// implementation returns `Expired` only once `deadline` has passed, so an unbounded deadline
-    /// never yields it (only a fake can break this).
+    /// delivered, and the arm retries until `deadline`: then it is [`ReleaseWatch::Expired`]. Every
+    /// implementation, a fake included, returns `Expired` only after a bounded `deadline` has
+    /// passed: an unbounded deadline never expires.
     fn arm_release(&mut self, deadline: Deadline) -> io::Result<ReleaseWatch>;
 
     /// Block until the registration [`Self::arm_release`] made wakes, or until `deadline`, when
-    /// the registration is still outstanding: the caller cancels it. An implementation returns
-    /// [`Waited::Expired`] only once `deadline` has passed, so an unbounded deadline never yields it
-    /// (only a fake can break this).
+    /// the registration is still outstanding: the caller cancels it. Every implementation, a
+    /// fake included, returns [`Waited::Expired`] only after a bounded `deadline` has passed: an
+    /// unbounded deadline never expires.
     fn await_release(&mut self, deadline: Deadline) -> io::Result<Waited>;
 
     /// Cancel the registration [`Self::arm_release`] made, for a caller that no longer needs it
@@ -258,7 +258,7 @@ fn await_scm_released<T: KillTarget>(target: &mut T, pid: u32, deadline: Deadlin
 fn await_scm_released_unbounded<T: KillTarget>(target: &mut T, pid: u32) -> io::Result<()> {
     match await_scm_released(target, pid, Budget::Unbounded.start())? {
         Waited::Confirmed => Ok(()),
-        Waited::Expired => unreachable!("an unbounded deadline does not expire"),
+        Waited::Expired => unreachable!("an unbounded deadline never expires"),
     }
 }
 
@@ -574,7 +574,7 @@ pub(in crate::backend::scm) mod system {
     fn wait_exit_unbounded(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<()> {
         match wait_exit(process, Budget::Unbounded.start(), on_wait)? {
             Waited::Confirmed => Ok(()),
-            Waited::Expired => unreachable!("an unbounded deadline does not expire"),
+            Waited::Expired => unreachable!("an unbounded deadline never expires"),
         }
     }
 }

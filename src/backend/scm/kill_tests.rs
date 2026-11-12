@@ -15,6 +15,11 @@ fn unbounded() -> Deadline {
     Budget::Unbounded.start()
 }
 
+/// An already-spent deadline: the only kind under which the fake reports an expiry.
+fn spent() -> Deadline {
+    Budget::Immediate.start()
+}
+
 /// The kind of a failed `service_pid`: not `Other`, so a test sees whether a kind is kept.
 const READ_FAILED_KIND: io::ErrorKind = io::ErrorKind::TimedOut;
 
@@ -184,12 +189,16 @@ impl KillTarget for Scripted {
         Ok(())
     }
 
-    fn arm_release(&mut self, _deadline: Deadline) -> io::Result<ReleaseWatch> {
+    fn arm_release(&mut self, deadline: Deadline) -> io::Result<ReleaseWatch> {
         self.log.borrow_mut().push("arm_release".to_string());
         if self.failing_arm {
             return Err(io::Error::other("notifier could not be opened"));
         }
         if self.expiring_arm {
+            assert!(
+                deadline.expired(),
+                "Scripted: arm_release expires only once its deadline has passed; an unbounded or unspent deadline never expires"
+            );
             return Ok(ReleaseWatch::Expired);
         }
         assert!(
@@ -212,10 +221,14 @@ impl KillTarget for Scripted {
         self.armed = false;
     }
 
-    fn await_release(&mut self, _deadline: Deadline) -> io::Result<Waited> {
+    fn await_release(&mut self, deadline: Deadline) -> io::Result<Waited> {
         self.log.borrow_mut().push("await_release".to_string());
         assert!(self.armed, "await_release with no registration to wake");
         if self.expiring_release {
+            assert!(
+                deadline.expired(),
+                "Scripted: await_release expires only once its deadline has passed; an unbounded or unspent deadline never expires"
+            );
             // Still registered: the caller cancels it.
             return Ok(Waited::Expired);
         }
@@ -299,7 +312,7 @@ fn holding_refuses_a_pid_it_cannot_open_while_scm_vouches_for_it() {
 fn a_release_scm_does_not_make_by_the_deadline_expires_the_hold() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Gone], []).expiring_release();
 
-    let error = hold_service_process(&mut target, unbounded()).expect_err("an expired hold");
+    let error = hold_service_process(&mut target, spent()).expect_err("an expired hold");
 
     assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
     assert_eq!(
@@ -319,7 +332,7 @@ fn a_release_scm_does_not_make_by_the_deadline_expires_the_hold() {
 fn an_arm_that_expires_expires_the_hold_with_nothing_to_cancel() {
     let mut target = Scripted::new([Some(100)], [Open::Gone], []).expiring_arm();
 
-    let error = hold_service_process(&mut target, unbounded()).expect_err("an expired hold");
+    let error = hold_service_process(&mut target, spent()).expect_err("an expired hold");
 
     assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "arm_release"]));
@@ -333,7 +346,7 @@ fn an_expired_hold_is_not_let_go_by_hold_if_possible() {
     let mut arm = Scripted::new([Some(100)], [Open::Gone], []).expiring_arm();
 
     for target in [&mut release, &mut arm] {
-        let outcome = hold_if_possible(target, unbounded()).expect("an expiry is an outcome, not a failure");
+        let outcome = hold_if_possible(target, spent()).expect("an expiry is an outcome, not a failure");
         assert!(matches!(outcome, HoldOutcome::Expired { pid: 100 }), "{outcome:?}");
     }
 }
