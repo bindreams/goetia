@@ -87,7 +87,8 @@ mod system {
 
         /// A descriptor written as SDDL.
         pub(crate) fn from_sddl(sddl: &str) -> Result<Self> {
-            let wide = wide_null(sddl);
+            let what = || format!("build the permissions from the SDDL `{}`", sddl.escape_debug());
+            let wide = wide_null(sddl).map_err(|e| Error::os(what(), e))?;
             let mut raw: *mut c_void = std::ptr::null_mut();
             // SAFETY: `wide` is NUL-terminated; `raw` is a valid out-pointer, and the size is not asked for.
             let ok = unsafe {
@@ -99,10 +100,7 @@ mod system {
                 )
             };
             if ok == 0 {
-                return Err(Error::os(
-                    "build the permissions of the shim",
-                    io::Error::last_os_error(),
-                ));
+                return Err(Error::os(what(), io::Error::last_os_error()));
             }
             Ok(Self { raw })
         }
@@ -121,7 +119,7 @@ mod system {
             };
             if got_owner == 0 || got_dacl == 0 {
                 return Err(Error::os(
-                    "read the permissions of the shim",
+                    "read the permissions of a descriptor",
                     io::Error::last_os_error(),
                 ));
             }
@@ -133,7 +131,7 @@ mod system {
         /// Creates `path`, which must not exist, for writing, with this descriptor. The file is
         /// readable by others while it is open, and cannot be renamed or deleted until it is closed.
         pub(crate) fn create_file(&self, path: &Path) -> io::Result<File> {
-            let wide = wide(path)?;
+            let wide = wide_null(path)?;
             let attributes = self.attributes();
             // SAFETY: `wide` is NUL-terminated and `attributes` points at `self.raw`, which is live
             // for the call; no template file.
@@ -157,7 +155,7 @@ mod system {
 
         /// Creates the folder `path`, whose parent exists, with this descriptor.
         pub(crate) fn create_dir(&self, path: &Path) -> io::Result<()> {
-            let wide = wide(path)?;
+            let wide = wide_null(path)?;
             let attributes = self.attributes();
             // SAFETY: `wide` is NUL-terminated and `attributes` points at `self.raw`, which is live
             // for the call.
@@ -185,15 +183,6 @@ mod system {
                 LocalFree(self.raw);
             }
         }
-    }
-
-    /// `path` as NUL-terminated UTF-16; a NUL inside it would end the name early.
-    fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let wide = wide_null(path);
-        if wide[..wide.len() - 1].contains(&0) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "the path holds a NUL"));
-        }
-        Ok(wide)
     }
 }
 

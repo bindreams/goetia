@@ -329,7 +329,7 @@ mod system {
 
     use super::super::acl::{FolderCheck, display_path, lexical};
     use super::super::processes::running_images;
-    use crate::backend::scm::wide::wide_null;
+    use crate::backend::scm::wide::wide_null_cut;
     use windows_service::service_manager::ServiceManagerAccess;
 
     use super::{SweepFailure, image_of, image_references, same_path, unreferenced};
@@ -397,18 +397,23 @@ mod system {
         }
     }
 
+    /// The text of `source`, a NUL-terminated string as `wide_null_cut` makes it, without the NUL.
+    pub(super) fn unexpanded(source: &[u16]) -> String {
+        String::from_utf16_lossy(&source[..source.len() - 1])
+    }
+
     /// `text` with each `%NAME%` replaced by the variable's value, as the system expands a
     /// `REG_EXPAND_SZ`; a name that is not set stays as written.
     pub(super) fn expand_environment(text: &str) -> String {
-        let source = wide_null(text);
+        let source = wide_null_cut(text);
         let mut buf = vec![0u16; 512];
         loop {
             // SAFETY: `source` is NUL-terminated and `buf` is `buf.len()` writable units.
             let needed =
                 unsafe { ExpandEnvironmentStringsW(source.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
             if needed == 0 {
-                // Nothing could be expanded: the text as it was names what it names.
-                return text.to_string();
+                // Nothing could be expanded: the text as it was, up to the NUL the system ends it at.
+                return unexpanded(&source);
             }
             if needed <= buf.len() {
                 // `needed` counts the NUL.

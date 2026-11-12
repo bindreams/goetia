@@ -21,10 +21,11 @@ use windows_sys::Win32::Security::Authentication::Identity::{
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::{LookupAccountNameW, LookupAccountSidW, PSID};
+use windows_sys::core::w;
 
 use crate::backend::Identity;
 use crate::backend::scm::sid::{is_whole_sid, sid_display};
-use crate::backend::scm::wide::wide_null;
+use crate::backend::scm::wide::{units_until_nul, wide_null};
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, User};
 
@@ -99,7 +100,12 @@ fn last_error(context: &str) -> Error {
 /// SID), which is what `ServiceInfo::account_name` needs — SCM has no SID
 /// field.
 fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
-    let wide_sid = wide_null(sid_str);
+    let wide_sid = wide_null(sid_str).map_err(|e| {
+        Error::os(
+            format!("parse `user.id` `{}` as a SID string", sid_str.escape_debug()),
+            e,
+        )
+    })?;
     let mut psid: PSID = std::ptr::null_mut();
     // SAFETY: `wide_sid` is a valid null-terminated wide string; `psid` is a
     // valid out-param. On success, `psid` must be freed with `LocalFree`.
@@ -204,7 +210,8 @@ fn lookup_account_sid(psid: PSID, sid_str: impl FnOnce() -> String) -> Result<St
 /// on its own, so dropping the prefix loses nothing.
 pub(crate) fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     let account_name = account_name.strip_prefix(r".\").unwrap_or(account_name);
-    let wide_name = wide_null(account_name);
+    let wide_name = wide_null(account_name)
+        .map_err(|e| Error::os(format!("resolve SID for account `{}`", account_name.escape_debug()), e))?;
     let mut sid_len: u32 = 0;
     let mut domain_len: u32 = 0;
     let mut use_: i32 = 0;
@@ -288,13 +295,14 @@ pub fn grant_service_logon_right(account_name: &str) -> Result<()> {
         ));
     }
 
-    let right_text = wide_null("SeServiceLogonRight");
-    // `LSA_UNICODE_STRING::Length`/`MaximumLength` are byte counts,
-    // excluding the trailing NUL `wide_null` appended for other APIs' sake.
+    // `LSA_UNICODE_STRING::Length`/`MaximumLength` are byte counts.
+    let right_text = w!("SeServiceLogonRight");
+    // SAFETY: `w!` yields a NUL-terminated static string.
+    let right_len = unsafe { units_until_nul(right_text) }.len();
     let right = LSA_UNICODE_STRING {
-        Length: ((right_text.len() - 1) * 2) as u16,
-        MaximumLength: (right_text.len() * 2) as u16,
-        Buffer: right_text.as_ptr() as *mut u16,
+        Length: (right_len * 2) as u16,
+        MaximumLength: ((right_len + 1) * 2) as u16,
+        Buffer: right_text as *mut u16,
     };
 
     // SAFETY: `policy_handle` was just opened with `POLICY_CREATE_ACCOUNT`;

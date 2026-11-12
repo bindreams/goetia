@@ -15,6 +15,14 @@ use crate::testing::elevation::{ELEVATED, elevated};
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
+#[skuld::test]
+fn the_wide_name_is_the_name() {
+    // SAFETY: `NAME_WIDE` is a NUL-terminated static string.
+    let units = unsafe { crate::backend::scm::wide::units_until_nul(NAME_WIDE) };
+
+    assert_eq!(String::from_utf16(units).unwrap(), NAME);
+}
+
 /// The lock's owner is Administrators, which a token without it enabled (an unelevated one) cannot
 /// give an object: `CreateMutexW` fails with `ERROR_INVALID_OWNER`. That is a need for elevation.
 #[skuld::test]
@@ -129,9 +137,8 @@ fn any_other_code_is_the_os_failure() {
 /// The real lock, opened to wait on it, and so kept in existence for as long as the handle lives: a
 /// named mutex goes with its last handle, and a probe that opens it by name after that fails.
 fn open_lock() -> OwnedHandle {
-    let name = wide_null(NAME);
-    // SAFETY: `name` is NUL-terminated.
-    let raw = unsafe { OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, 0, name.as_ptr()) };
+    // SAFETY: `NAME_WIDE` is NUL-terminated.
+    let raw = unsafe { OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, 0, NAME_WIDE) };
     assert!(!raw.is_null(), "open the lock: {}", io::Error::last_os_error());
     // SAFETY: a valid handle `OpenMutexW` just returned and nothing else owns.
     unsafe { OwnedHandle::from_raw_handle(raw) }
