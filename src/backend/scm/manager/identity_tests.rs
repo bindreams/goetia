@@ -1,5 +1,6 @@
 use super::*;
 use crate::backend::scm::sid::{sid_from_parts, system};
+use crate::elevation::test_support::open_process_token;
 
 #[skuld::test]
 fn root_resolves_to_an_empty_unused_identity() {
@@ -196,11 +197,11 @@ fn a_name_is_quoted_as_written_and_its_backslash_is_not_doubled() {
 // An account that is not a user =======================================================================================
 
 #[skuld::test]
-fn a_name_that_is_no_user_account_is_refused_before_the_password_is_asked_for() {
+fn a_name_that_is_no_user_account_is_refused() {
     // Each names nothing, or something that is not a user: granting the right to it would change who may
-    // log on as a service on the whole host. The refusal is the lookup's, so an install that reaches the
-    // password reads it first: were the password asked for first, a host without `GOETIA_SERVICE_PASSWORD`
-    // would answer `PasswordRequired` here.
+    // log on as a service on the whole host. The names that need a password are also pinned in order,
+    // through `apply`, in `manager_tests.rs`; `apply` skips the check for `""`, `NT SERVICE\` and
+    // `NT AUTHORITY\SYSTEM`, which need none, so they are pinned only here.
     for name in [
         "",
         r"\",
@@ -210,7 +211,9 @@ fn a_name_that_is_no_user_account_is_refused_before_the_password_is_asked_for() 
         "Users",
         r"NT AUTHORITY\SYSTEM",
     ] {
-        let err = service_password_for(name, Some(("user.name", name))).expect_err(name);
+        let err = require_user_account(name, Some(("user.name", name)))
+            .map(|_| ())
+            .expect_err(name);
         assert!(matches!(err, Error::AccountLookup { .. }), "`{name}`: {err:?}");
         assert!(err.to_string().contains("`user.name`"), "`{name}`: {err}");
     }
@@ -218,7 +221,9 @@ fn a_name_that_is_no_user_account_is_refused_before_the_password_is_asked_for() 
 
 #[skuld::test]
 fn a_group_is_refused_saying_it_is_not_a_user() {
-    let err = require_user_account("Administrators", Some(("user.name", "Administrators"))).expect_err("a group");
+    let err = require_user_account("Administrators", Some(("user.name", "Administrators")))
+        .map(|_| ())
+        .expect_err("a group");
     assert_eq!(
         err.to_string(),
         "account lookup failed: `user.name` `Administrators` is not a user account (it is a local group)"
@@ -231,7 +236,9 @@ fn a_sid_that_resolves_to_a_group_is_refused_naming_the_sid_as_written() {
     let account = resolve(&User::Id(AccountId::Sid("S-1-1-0".to_string())))
         .expect("Everyone resolves")
         .user;
-    let err = service_password_for(&account, Some(("user.id", "S-1-1-0"))).expect_err("a group");
+    let err = require_user_account(&account, Some(("user.id", "S-1-1-0")))
+        .map(|_| ())
+        .expect_err("a group");
     assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
     assert_eq!(
         err.to_string(),
@@ -241,7 +248,9 @@ fn a_sid_that_resolves_to_a_group_is_refused_naming_the_sid_as_written() {
 
 #[skuld::test]
 fn a_refused_account_without_a_written_value_is_named_as_it_is() {
-    let err = require_user_account("Administrators", None).expect_err("a group");
+    let err = require_user_account("Administrators", None)
+        .map(|_| ())
+        .expect_err("a group");
     assert_eq!(
         err.to_string(),
         "account lookup failed: account `Administrators` is not a user account (it is a local group)"
@@ -250,20 +259,10 @@ fn a_refused_account_without_a_written_value_is_named_as_it_is() {
 
 /// The user SID of this process's token.
 fn process_user_sid() -> Vec<u8> {
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    let mut raw = std::ptr::null_mut();
-    // SAFETY: a pointer to a local; a returned token is owned below.
-    assert_ne!(
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) },
-        0,
-        "OpenProcessToken: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: a valid handle `OpenProcessToken` just returned and nothing else owns.
-    let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let token = open_process_token(TOKEN_QUERY);
     // 8-byte alignment for `TOKEN_USER`, which the buffer holds.
     let mut buf = vec![0u64; 64];
     let mut needed = 0;
@@ -285,13 +284,12 @@ fn process_user_sid() -> Vec<u8> {
 }
 
 #[skuld::test]
-fn the_account_this_test_runs_as_is_a_user() {
+fn the_account_this_test_runs_as_resolves_back_to_its_own_sid() {
+    // Whatever kind of account this is (a user, or `SYSTEM` on a service host), its name resolves to its SID.
     let sid = process_user_sid();
     let name = account_name_of_sid(&sid).expect("the token user has a name");
-    let (found, kind) = sid_for_account_name(&name, None).expect("the current user resolves by name");
+    let (found, _kind) = sid_for_account_name(&name, None).expect("the current user resolves by name");
     assert_eq!(found, sid);
-    assert_eq!(kind, SidTypeUser);
-    require_user_account(&name, None).expect("the current user is a user account");
 }
 
 // lookup_growing ======================================================================================================
@@ -327,18 +325,36 @@ fn a_lookup_that_needs_more_grows_the_buffers_to_what_it_reported_and_cuts_them_
 fn a_lookup_that_asks_for_no_more_than_it_has_stops_with_an_os_error() {
     use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as MORE;
     // Asking again with the same lengths would change nothing, whether on the first call or a later one.
-    for steps in [vec![(MORE, 0, 0)], vec![(MORE, 5, 3), (MORE, 5, 3)]] {
-        let mut steps = steps.into_iter();
-        let call = move |_first: *mut u16, first_len: &mut u32, _domain: *mut u16, domain_len: &mut u32| {
-            let (_, first, domain) = steps.next().expect("the call ran more often than scripted");
-            *first_len = first;
-            *domain_len = domain;
-            Err(std::io::Error::from_raw_os_error(MORE as i32))
-        };
-        let err = lookup_growing(|| "look up".to_string(), call).expect_err("no progress");
+    let first_call = lookup_growing(|| "look up".to_string(), scripted([(MORE, 0, 0)])).expect_err("no progress");
+    let later_call =
+        lookup_growing(|| "look up".to_string(), scripted([(MORE, 5, 3), (MORE, 5, 3)])).expect_err("no progress");
+    for err in [first_call, later_call] {
         assert!(matches!(err, Error::Os { .. }), "{err:?}");
         assert_eq!(err.to_string(), "failed to look up");
     }
+}
+
+#[skuld::test]
+fn a_lookup_that_grows_one_buffer_and_not_the_other_keeps_the_larger() {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as MORE;
+    // The second answer needs less of the first buffer than it has, and more of the second. Each call
+    // gets the lengths of the buffers it is passed; the first must not shrink between calls.
+    let mut seen = Vec::new();
+    let mut answers = [(MORE, 10, 0), (MORE, 4, 6), (0, 4, 6)].into_iter();
+    let call = |_first: *mut u16, first_len: &mut u32, _domain: *mut u16, domain_len: &mut u32| {
+        seen.push((*first_len, *domain_len));
+        let (status, first, domain) = answers.next().expect("the call ran more often than scripted");
+        *first_len = first;
+        *domain_len = domain;
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(status as i32))
+        }
+    };
+    let (first, domain) = lookup_growing(|| "look up".to_string(), call).expect("it fits at last");
+    assert_eq!((first.len(), domain.len()), (4, 6));
+    assert_eq!(seen, [(0, 0), (10, 0), (10, 6)]);
 }
 
 #[skuld::test]

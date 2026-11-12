@@ -217,11 +217,14 @@ fn lookup_growing<T: Copy + Default>(
                 return Ok((first, domain));
             }
             Err(err) if err.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER as i32) => {
-                if first_len as usize <= first.len() && domain_len as usize <= domain.len() {
+                let (needed_first, needed_domain) = (first_len as usize, domain_len as usize);
+                if needed_first <= first.len() && needed_domain <= domain.len() {
                     return Err(Error::os(action(), err));
                 }
-                first.resize(first_len as usize, T::default());
-                domain.resize(domain_len as usize, 0);
+                // A buffer never shrinks: a lookup that reports a smaller length for one buffer than
+                // it was given still needs the other grown.
+                first.resize(needed_first.max(first.len()), T::default());
+                domain.resize(needed_domain.max(domain.len()), 0);
             }
             Err(err) => return Err(account_error(action(), err)),
         }
@@ -330,17 +333,30 @@ pub(crate) fn sid_for_account_name(account_name: &str, field: Option<&str>) -> R
 
 // user accounts only ==================================================================================================
 
-/// Refuses `account` unless it names a user account. A `SeServiceLogonRight` granted to a group, a
-/// domain or a machine would reach every account in it, and the right is what installing a service
-/// that runs as `account` grants. `written` is the spec field the account came from and the value as
-/// the user wrote it (a `user.id` SID, where `account` is the name it resolved to), for the refusal
-/// to quote; `None` names `account`. It is a lookup of `account`, so it changes nothing.
-pub fn require_user_account(account: &str, written: Option<(&str, &str)>) -> Result<()> {
-    let (_sid, use_) = sid_for_account_name(account, None)?;
-    if use_ == SidTypeUser {
-        return Ok(());
-    }
+/// The SID of an account [`require_user_account`] found to be a user account. Only that function
+/// builds one, so a grant that takes one acts on the SID that was checked, not on a second lookup of
+/// the name.
+pub struct UserSid {
+    sid: Sid,
+    /// The name it was looked up by, for the grant's errors.
+    account: String,
+}
+
+/// Refuses `account` unless it names a user account, and returns the SID it found. A
+/// `SeServiceLogonRight` granted to a group, a domain or a machine would reach every account in it,
+/// and the right is what installing a service that runs as `account` grants. `written` is the spec
+/// field the account came from and the value as the user wrote it (a `user.id` SID, where `account`
+/// is the name it resolved to), for the refusal to quote; `None` names `account`. It is a lookup of
+/// `account`, so it changes nothing.
+pub fn require_user_account(account: &str, written: Option<(&str, &str)>) -> Result<UserSid> {
     let (field, value) = written.map_or((None, account), |(field, value)| (Some(field), value));
+    let (sid, use_) = sid_for_account_name(account, field)?;
+    if use_ == SidTypeUser {
+        return Ok(UserSid {
+            sid,
+            account: account.to_string(),
+        });
+    }
     Err(Error::AccountLookup {
         detail: format!(
             "{} is not a user account (it is {})",
@@ -351,14 +367,10 @@ pub fn require_user_account(account: &str, written: Option<(&str, &str)>) -> Res
     })
 }
 
-/// The password the real account `account` installs with: refuses an account that is not a user
-/// first (see [`require_user_account`]; `written` is its), then requires `GOETIA_SERVICE_PASSWORD`.
-/// The refusal comes first so that a spec naming a group is told what is wrong with the account,
-/// not that it lacks a password it could never use.
-pub fn service_password_for(account: &str, written: Option<(&str, &str)>) -> Result<String> {
-    require_user_account(account, written)?;
-    // Install would otherwise report success and the service would fail every future start with
-    // error 1069 (no `SeServiceLogonRight`). Refuse instead of creating a service that cannot start.
+/// The password the real account `account` installs with. Install would otherwise report success
+/// and the service would fail every future start with error 1069 (no `SeServiceLogonRight`), so a
+/// missing one is refused.
+pub fn service_password_for(account: &str) -> Result<String> {
     service_password()?.ok_or_else(|| Error::PasswordRequired {
         account: account.to_string(),
     })
@@ -376,10 +388,13 @@ fn nt_error(context: &str, status: i32) -> Error {
 /// Grant `account_name` the right to log on as a service
 /// (`SeServiceLogonRight`), via `LsaAddAccountRights`. Idempotent: an
 /// account that already has the right is unaffected, so this is safe to
-/// call again on a later install of the same account. Whether `account_name` is a user account is
-/// decided before, by [`require_user_account`], on the install path's way to the password.
-pub fn grant_service_logon_right(account_name: &str) -> Result<()> {
-    let (sid_buf, _) = sid_for_account_name(account_name, None)?;
+/// call again on a later install of the same account. `user` is the SID [`require_user_account`]
+/// checked; this does no lookup of its own.
+pub fn grant_service_logon_right(user: &UserSid) -> Result<()> {
+    let UserSid {
+        sid: sid_buf,
+        account: account_name,
+    } = user;
 
     let mut policy_handle: isize = 0;
     let object_attributes = LSA_OBJECT_ATTRIBUTES::default();

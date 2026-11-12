@@ -16,6 +16,7 @@ use crate::spec::Restart;
 use crate::spec::{AccountId, DaemonFields, User};
 use crate::testing::plain_fields;
 use crate::testing::{FakeProvider, command};
+use skuld::{EnvGuard, env};
 use windows_sys::Win32::System::Registry::REG_DWORD;
 
 fn dummy_reg(account: Option<&str>) -> ScmRegistration {
@@ -1464,5 +1465,35 @@ fn a_command_line_with_nothing_before_its_nul_has_no_executable() {
             "{}",
             cmdline.escape_debug()
         );
+    }
+}
+
+// apply refuses an account that is no user ===========================================================================
+
+/// `apply` looks the account up, and refuses one that is no user, before it asks for the password: with
+/// `GOETIA_SERVICE_PASSWORD` unset, asking first would answer `PasswordRequired`, and with it set, would go
+/// on to the grant. Both runs are lookups only, and a spec value that is no user never reaches a grant, which
+/// takes the checked SID. The names that need no password (`NT SERVICE\`, `LocalSystem`) skip the check
+/// and are refused by `identity::require_user_account` alone; see `identity_tests.rs`.
+#[skuld::test]
+fn apply_refuses_an_account_that_is_no_user_before_the_password_with_the_variable_set_and_unset(
+    #[fixture(env)] env: &EnvGuard,
+) {
+    for password in [Some("not-a-real-password"), None] {
+        match password {
+            Some(password) => env.set("GOETIA_SERVICE_PASSWORD", password),
+            None => env.remove("GOETIA_SERVICE_PASSWORD"),
+        }
+        for name in [r"\", r".\", "Administrators", "Users", "goetia-no-such-account-7f3a"] {
+            assert!(
+                generate::account_needs_password(Some(name)),
+                "`{name}` needs a password"
+            );
+            let err = apply(&dummy_reg(Some(name)), Some(("user.name", name)), true).expect_err(name);
+            assert!(
+                matches!(err, Error::AccountLookup { .. }),
+                "`{name}` with the password {password:?}: {err:?}"
+            );
+        }
     }
 }

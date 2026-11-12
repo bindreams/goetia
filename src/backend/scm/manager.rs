@@ -59,7 +59,7 @@
 //! `LookupAccountNameW` (which the grant goes through) does not even
 //! resolve the first three by those spellings. Before the password is read, such an account that is not a
 //! user (a group, a domain) is refused: the right would reach every account in it
-//! (`identity::require_user_account`).
+//! (`identity::require_user_account`), and the grant takes the SID that check found.
 //!
 //! **5. Create with `SERVICE_DEMAND_START`, write `Parameters` immediately
 //! after.** Not `SERVICE_DISABLED` (which would block an explicit `start`),
@@ -891,9 +891,11 @@ fn apply(reg: &ScmRegistration, written: Option<(&str, &str)>, create: bool) -> 
         let account = reg.account.as_deref().expect(
             "account_needs_password(None) is always false (LocalSystem), so this branch is only reached for Some",
         );
-        // A real account is refused here if it is not a user, before its password is read.
-        let pw = identity::service_password_for(account, written)?;
-        identity::grant_service_logon_right(account)?;
+        // A real account is refused here if it is not a user, before its password is read, and the
+        // right is granted to the SID that check found.
+        let user = identity::require_user_account(account, written)?;
+        let pw = identity::service_password_for(account)?;
+        identity::grant_service_logon_right(&user)?;
         Some(pw)
     } else {
         None
