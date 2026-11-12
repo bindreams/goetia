@@ -196,7 +196,12 @@ fn lookup_growing<T: Copy + Default>(
     loop {
         let mut first_len = first.len() as u32;
         let mut domain_len = domain.len() as u32;
-        match call(buf_ptr(&mut first), &mut first_len, buf_ptr(&mut domain), &mut domain_len) {
+        match call(
+            buf_ptr(&mut first),
+            &mut first_len,
+            buf_ptr(&mut domain),
+            &mut domain_len,
+        ) {
             Ok(()) => {
                 let (first_len, domain_len) = (first_len as usize, domain_len as usize);
                 if first_len == 0 || first_len > first.len() || domain_len > domain.len() {
@@ -240,7 +245,9 @@ fn lookup_account_sid(psid: PSID, field: Option<&str>, sid_str: impl FnOnce() ->
     let (name, domain) = lookup_growing(action, |name, name_len, domain, domain_len| {
         // SAFETY: each buffer is null with a zero length or has exactly the length passed beside it;
         // the length and `use_` out-params are valid lvalues.
-        win32_status(unsafe { LookupAccountSidW(std::ptr::null(), psid, name, name_len, domain, domain_len, &mut use_) })
+        win32_status(unsafe {
+            LookupAccountSidW(std::ptr::null(), psid, name, name_len, domain, domain_len, &mut use_)
+        })
     })?;
     let name = String::from_utf16_lossy(&name);
     let domain = String::from_utf16_lossy(&domain);
