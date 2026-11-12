@@ -1658,7 +1658,10 @@ enum UninstallFailure {
     /// `previous` is its start type before. `ours` is whether the failure was goetia's own and not the
     /// service's: `true` only when the hold before a STOP failed (see [`uninstall_stop_on`]), `false` for
     /// a failure of the stop itself.
-    Stop { previous: Option<ServiceStartType>, ours: bool },
+    Stop {
+        previous: Option<ServiceStartType>,
+        ours: bool,
+    },
     /// The delete failed. The service is stopped and disabled; `previous` is its start type before.
     Delete { previous: Option<ServiceStartType> },
     /// The stop failed on a service someone else had marked for deletion, so `uninstall` did not delete

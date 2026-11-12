@@ -1465,23 +1465,31 @@ fn settle_and_stop_holds_a_service_found_stop_pending_once_before_waiting() {
 /// is held once, as soon as the read that shows it, before the wait for its `STOPPED`.
 #[skuld::test]
 fn settle_and_stop_holds_a_service_that_turns_stop_pending_mid_wait_once() {
-    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)])
-        .drifting_after(1, QueriedState::StopPending);
+    let mut fake =
+        FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]).drifting_after(1, QueriedState::StopPending);
     assert_eq!(
         super::settle_and_stop(&mut fake, unbounded(), false, holding).unwrap(),
         Waited::Confirmed
     );
     assert_eq!(
         fake.log,
-        ["arm_settle", "wait", "got_pending", "arm_settle", "hold", "wait", "got_stopped"]
+        [
+            "arm_settle",
+            "wait",
+            "got_pending",
+            "arm_settle",
+            "hold",
+            "wait",
+            "got_stopped"
+        ]
     );
 }
 
 /// The hold of a service seen `STOP_PENDING` mid-wait fails as the hold of one found so does: under way.
 #[skuld::test]
 fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_service_that_turned_stop_pending() {
-    let mut fake = FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)])
-        .drifting_after(1, QueriedState::StopPending);
+    let mut fake =
+        FakeScm::new([Some(Observed::Pending), Some(Observed::Stopped)]).drifting_after(1, QueriedState::StopPending);
 
     let SettleError::Hold { error, under_way } =
         super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err()

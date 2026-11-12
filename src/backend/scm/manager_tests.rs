@@ -1119,7 +1119,10 @@ fn a_stop_failure_leaves_the_service_disabled_and_names_the_previous_start_type_
 
 #[skuld::test]
 fn a_stop_failure_with_an_unknown_previous_start_type_omits_it() {
-    let text = uninstall_failure(&UninstallFailure::Stop { previous: None, ours: false });
+    let text = uninstall_failure(&UninstallFailure::Stop {
+        previous: None,
+        ours: false,
+    });
     assert!(text.contains("does not accept STOP"), "{text}");
     assert!(text.contains("NOT deleted"), "{text}");
     assert!(text.contains("disabled"), "{text}");
