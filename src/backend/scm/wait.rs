@@ -846,7 +846,7 @@ pub struct Sighting {
 ///
 /// `target`, in a status or a notification, is [`Waited::Confirmed`]. An arm that expired and a wait
 /// that ran out of `deadline` are [`Waited::Expired`]. A service marked for deletion or gone is decided
-/// as `decided_or_status` says. A notification that is no [`verdict`] (a pending state, a failed delivery, or a
+/// as `decided_or_status` says. A notification that is no `verdict` (a pending state, a failed delivery, or a
 /// state the armed mask excludes) re-arms without asking `other`. A notification of `PAUSED` is replaced by [`ScmActor::query_status`]: the
 /// delivery may report the state at registration, and a paused service may have resumed since. Every
 /// other state, from a status or a notification, goes to
