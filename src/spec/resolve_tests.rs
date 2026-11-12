@@ -103,90 +103,136 @@ env:
     assert!(msg.contains('='), "error should call out the `=`: {msg}");
 }
 
-/// Beyond the four gate tests named explicitly elsewhere: the same directive
-/// injection is possible through `user`'s bare-string form (it lands in
-/// `User=`/`UserName` unescaped, exactly like `name`), so it goes through
-/// the same gate.
-#[skuld::test]
-fn rejects_control_characters_in_user_name() {
-    let yaml = r#"
-id: frpc
-command: ["bin/frpc"]
-user: "evil\nUser=0"
-"#;
-    let err = resolve_yaml(yaml).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("frpc"), "error should name the daemon: {msg}");
-    assert!(msg.contains("user"), "error should name the field: {msg}");
-}
+/// The characters that cut a string short or start a new directive, as the escape a YAML
+/// double-quoted scalar takes for each.
+const CONTROL_CHARACTERS: [(char, &str); 2] = [('\n', r"\n"), ('\0', r"\0")];
 
 #[skuld::test]
-fn rejects_control_characters_in_cwd_and_logs() {
-    let cwd_err = resolve_yaml("id: frpc\ncommand: [bin/frpc]\ncwd: \"evil\\nX=1\"\n").unwrap_err();
-    assert!(cwd_err.to_string().contains("cwd"));
-
-    let logs_err = resolve_yaml("id: frpc\ncommand: [bin/frpc]\nlogs: \"evil\\nX=1\"\n").unwrap_err();
-    assert!(logs_err.to_string().contains("logs"));
-}
-
-#[skuld::test]
-fn a_nul_in_any_authored_string_is_refused_on_every_backend() {
-    // A NUL cuts a string short wherever a backend hands it to the OS as a C string, so
-    // `user: "svc\0x"` would name the account `svc`. Each row puts a NUL (an escaped `\0` in a
-    // double-quoted scalar) in one leaf, in the base and under every backend's override.
-    let bin = "/bin/frpc";
-    let leaves = [
-        ("name", r#"name: "a\0b""#.to_string()),
-        ("command", format!(r#"command: ["{bin}", "a\0b"]"#)),
-        ("command", r#"command: ["\0"]"#.to_string()),
-        ("cwd", r#"cwd: "a\0b""#.to_string()),
-        ("logs", r#"logs: "a\0b""#.to_string()),
-        ("env", r#"env: {K: "a\0b"}"#.to_string()),
-        ("env key", r#"env: {"a\0b": v}"#.to_string()),
-        ("user", r#"user: "svc\0x""#.to_string()),
-        ("user.name", r#"user: {name: "svc\0x"}"#.to_string()),
-        ("user.id", r#"user: {id: "S-1-5-\0"}"#.to_string()),
+fn a_control_character_in_any_authored_string_is_refused_on_every_backend() {
+    // A newline ends one systemd directive and starts another; a NUL cuts a string short wherever
+    // a backend hands it to the OS as a C string, so `user: "svc\0x"` would name the account `svc`.
+    // Each row puts the character in one leaf, in the base and under every backend's override, and
+    // names the exact field the message must blame. `restart`, `restart-delay` and `type` are
+    // refused as values no parser accepts, so their messages echo the value (`echoes`).
+    struct Row {
+        message: &'static str,
+        line: &'static str,
+        echoes: bool,
+    }
+    let row = |message, line| Row {
+        message,
+        line,
+        echoes: false,
+    };
+    let echoing = |message, line| Row {
+        message,
+        line,
+        echoes: true,
+    };
+    let rows = [
+        row("field `name` contains", r#"name: "a{e}b""#),
+        row("field `command` contains", r#"command: ["/bin/frpc", "a{e}b"]"#),
+        row("field `command` contains", r#"command: ["{e}"]"#),
+        row("field `cwd` contains", r#"cwd: "a{e}b""#),
+        row("field `logs` contains", r#"logs: "a{e}b""#),
+        row("field `env[K]` contains", r#"env: {K: "a{e}b"}"#),
+        row("field `env key` contains", r#"env: {"a{e}b": v}"#),
+        row("field `user.name` contains", r#"user: "svc{e}x""#),
+        row("field `user.name` contains", r#"user: {name: "svc{e}x"}"#),
+        row("field `user.id` contains", r#"user: {id: "S-1-5-{e}"}"#),
+        echoing("field `restart` is `", r#"restart: "a{e}b""#),
+        echoing("field `restart-delay` is `", r#"restart-delay: "a{e}b""#),
+        echoing("field `type` is `", r#"type: "a{e}b""#),
     ];
-    for (field, line) in &leaves {
-        // A `command` leaf supplies the command itself.
-        let base = if *field == "command" {
-            "id: frpc\n".to_string()
-        } else {
-            format!("id: frpc\ncommand: [{bin}]\n")
-        };
-        let indented = format!("    {line}\n");
-        let mut manifests = vec![format!("{base}{line}\n")];
-        for backend in BackendKind::ALL {
-            manifests.push(format!("{base}backend-specific:\n  {backend}:\n{indented}"));
-        }
-        for yaml in manifests {
-            let err = resolve_yaml(&yaml).expect_err(&yaml).to_string();
-            assert!(err.contains("control character"), "{field}: {yaml}\n{err}");
-            assert!(err.contains(field), "{field}: {yaml}\n{err}");
-            assert!(!err.contains('\0'), "{field}: {err:?}");
+    for (c, escape) in CONTROL_CHARACTERS {
+        for row in &rows {
+            let line = row.line.replace("{e}", escape);
+            // A `command` leaf supplies the command itself.
+            let base = if line.starts_with("command:") {
+                "id: frpc\n".to_string()
+            } else {
+                "id: frpc\ncommand: [/bin/frpc]\n".to_string()
+            };
+            let mut manifests = vec![format!("{base}{line}\n")];
+            for backend in BackendKind::ALL {
+                manifests.push(format!("{base}backend-specific:\n  {backend}:\n    {line}\n"));
+            }
+            for yaml in &manifests {
+                for &native in HOST_BACKENDS {
+                    let err = resolve_yaml_as(native, yaml).expect_err(yaml).to_string();
+                    let context = format!("{c:?} as native `{native}`: {yaml}\n{err}");
+                    assert!(err.contains("daemon `frpc`"), "{context}");
+                    assert!(err.contains(row.message), "{context}");
+                    if !row.echoes {
+                        assert!(!err.contains(c), "{context}");
+                    }
+                }
+            }
         }
     }
 }
 
 #[skuld::test]
 fn a_nul_in_the_id_is_refused() {
-    let err = resolve_yaml("id: \"fr\\0pc\"\ncommand: [/bin/frpc]\n").unwrap_err();
+    let yaml = r#"
+id: "fr\0pc"
+command: [/bin/frpc]
+"#;
+    assert!(parse_manifest(yaml).id.contains('\0'), "the fixture carries the NUL");
+    let err = resolve_yaml(yaml).unwrap_err();
     assert!(err.to_string().contains("does not match"), "{err}");
 }
 
 #[skuld::test]
-fn a_nul_in_a_user_name_is_refused_when_building_a_daemon_spec_directly() {
-    // The library's other way in: a caller who builds `DaemonFields` without a manifest.
-    let err = DaemonSpec::new(DaemonFields {
-        user: User::Name("svc\0x".to_string()),
-        ..plain_fields("frpc", vec![program("frpc")])
-    })
-    .expect_err("a NUL in `user.name` is refused");
-    assert!(
-        err.to_string()
-            .contains("field `user.name` contains a control character"),
-        "{err}"
-    );
+fn a_nul_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(#[fixture(temp_dir)] dir: &Path) {
+    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value.
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nuser: ${U}\n";
+    write_fixture(dir, yaml, Some("U=svc\0x\n"));
+    for &native in HOST_BACKENDS {
+        let msg = resolve_as(parse_manifest(yaml), dir, Some(native))
+            .expect_err("a NUL in a substituted value is refused")
+            .to_string();
+        assert!(msg.contains("after substituting from .env"), "native `{native}`: {msg}");
+        assert!(
+            msg.contains("field `user.name` contains a control character"),
+            "native `{native}`: {msg}"
+        );
+        assert!(!msg.contains('\0'), "native `{native}`: {msg:?}");
+        assert!(
+            !msg.contains("backend-specific"),
+            "no override wrote it, native `{native}`: {msg}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_control_character_is_refused_when_building_a_daemon_spec_directly() {
+    // The library's other way in (the blob decode path): a caller who builds `DaemonFields`
+    // without a manifest.
+    type Set = fn(&mut DaemonFields, String);
+    let rows: [(&str, Set); 8] = [
+        ("name", |f, v| f.name = v),
+        ("command", |f, v| f.command.push(v)),
+        ("cwd", |f, v| f.cwd = Some(abs(&v))),
+        ("logs", |f, v| f.logs = Some(abs(&v))),
+        ("env[K]", |f, v| {
+            f.env.insert("K".to_string(), v);
+        }),
+        ("env key", |f, v| {
+            f.env.insert(v, "x".to_string());
+        }),
+        ("user.name", |f, v| f.user = User::Name(v)),
+        ("user.id", |f, v| f.user = User::Id(AccountId::Sid(v))),
+    ];
+    for (c, _) in CONTROL_CHARACTERS {
+        for (field, set) in &rows {
+            let mut fields = plain_fields("frpc", vec![program("frpc")]);
+            set(&mut fields, format!("a{c}b"));
+            let err = DaemonSpec::new(fields).expect_err(field).to_string();
+            let expected = format!("field `{field}` contains a control character");
+            assert!(err.contains(&expected), "{c:?} in {field}: {err}");
+        }
+    }
 }
 
 // The rules check what the user wrote ---------------------------------------------------------------------------------
