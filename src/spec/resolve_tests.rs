@@ -129,6 +129,62 @@ fn rejects_control_characters_in_cwd_and_logs() {
     assert!(logs_err.to_string().contains("logs"));
 }
 
+#[skuld::test]
+fn a_nul_in_any_authored_string_is_refused_on_every_backend() {
+    // A NUL cuts a string short wherever a backend hands it to the OS as a C string, so
+    // `user: "svc\0x"` would name the account `svc`. Each row puts a NUL (an escaped `\0` in a
+    // double-quoted scalar) in one leaf, in the base and under every backend's override.
+    let bin = "/bin/frpc";
+    let leaves = [
+        ("name", r#"name: "a\0b""#.to_string()),
+        ("command", format!(r#"command: ["{bin}", "a\0b"]"#)),
+        ("command", r#"command: ["\0"]"#.to_string()),
+        ("cwd", r#"cwd: "a\0b""#.to_string()),
+        ("logs", r#"logs: "a\0b""#.to_string()),
+        ("env", r#"env: {K: "a\0b"}"#.to_string()),
+        ("env key", r#"env: {"a\0b": v}"#.to_string()),
+        ("user", r#"user: "svc\0x""#.to_string()),
+        ("user.name", r#"user: {name: "svc\0x"}"#.to_string()),
+        ("user.id", r#"user: {id: "S-1-5-\0"}"#.to_string()),
+    ];
+    for (field, line) in &leaves {
+        // A `command` leaf supplies the command itself.
+        let base = if *field == "command" {
+            "id: frpc\n".to_string()
+        } else {
+            format!("id: frpc\ncommand: [{bin}]\n")
+        };
+        let indented = format!("    {line}\n");
+        let mut manifests = vec![format!("{base}{line}\n")];
+        for backend in BackendKind::ALL {
+            manifests.push(format!("{base}backend-specific:\n  {backend}:\n{indented}"));
+        }
+        for yaml in manifests {
+            let err = resolve_yaml(&yaml).expect_err(&yaml).to_string();
+            assert!(err.contains("control character"), "{field}: {yaml}\n{err}");
+            assert!(err.contains(field), "{field}: {yaml}\n{err}");
+            assert!(!err.contains('\0'), "{field}: {err:?}");
+        }
+    }
+}
+
+#[skuld::test]
+fn a_nul_in_the_id_is_refused() {
+    let err = resolve_yaml("id: \"fr\\0pc\"\ncommand: [/bin/frpc]\n").unwrap_err();
+    assert!(err.to_string().contains("does not match"), "{err}");
+}
+
+#[skuld::test]
+fn a_nul_in_a_user_name_is_refused_when_building_a_daemon_spec_directly() {
+    // The library's other way in: a caller who builds `DaemonFields` without a manifest.
+    let err = DaemonSpec::new(DaemonFields {
+        user: User::Name("svc\0x".to_string()),
+        ..plain_fields("frpc", vec![program("frpc")])
+    })
+    .expect_err("a NUL in `user.name` is refused");
+    assert!(err.to_string().contains("field `user.name` contains a control character"), "{err}");
+}
+
 // The rules check what the user wrote ---------------------------------------------------------------------------------
 
 #[skuld::test]
