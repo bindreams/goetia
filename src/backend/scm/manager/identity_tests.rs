@@ -49,7 +49,19 @@ fn sid_resolves_a_well_known_sid_to_an_account_name() {
 #[skuld::test]
 fn sid_rejects_a_malformed_sid_string() {
     let err = resolve(&User::Id(AccountId::Sid("not-a-sid".to_string()))).expect_err("not a valid SID string");
-    assert_eq!(err.to_string(), "failed to parse `user.id` `not-a-sid` as a SID string");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "account lookup failed: `user.id` `not-a-sid` is not a valid SID string"
+    );
+    // The OS's own refusal is the cause, printed after the message.
+    assert!(
+        err.report()
+            .to_string()
+            .starts_with("account lookup failed: `user.id` `not-a-sid` is not a valid SID string: "),
+        "{}",
+        err.report()
+    );
 }
 
 // service_password ====================================================================================================
@@ -100,21 +112,19 @@ fn bytes_that_are_not_a_sid_are_an_error_not_a_read_past_them() {
 fn a_nul_in_a_sid_string_is_refused_not_cut_there() {
     // Cut at the NUL, this would resolve `S-1-5-18`.
     let err = account_name_from_sid_string("S-1-5-18\0junk").expect_err("a NUL ends nothing here");
-    assert!(matches!(err, Error::Os { .. }), "{err:?}");
-    assert!(
-        err.to_string()
-            .starts_with(r"failed to parse `user.id` `S-1-5-18\0junk` as a SID string"),
-        "{err}"
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        r"account lookup failed: `user.id` `S-1-5-18\0junk` is not a valid SID string"
     );
 }
 
 #[skuld::test]
 fn a_nul_in_an_account_name_is_refused_not_cut_there() {
     let err = sid_for_account_name("SYSTEM\0junk").expect_err("a NUL ends nothing here");
-    assert!(matches!(err, Error::Os { .. }), "{err:?}");
-    assert!(
-        err.to_string()
-            .starts_with(r"failed to resolve SID for account `SYSTEM\0junk`"),
-        "{err}"
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        r"account lookup failed: `user.name` `SYSTEM\0junk` is not a valid account name"
     );
 }

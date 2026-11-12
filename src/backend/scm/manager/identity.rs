@@ -26,7 +26,7 @@ use windows_sys::core::w;
 use crate::backend::Identity;
 use crate::backend::scm::sid::{is_whole_sid, sid_display};
 use crate::backend::scm::wide::{units_until_nul, wide_null};
-use crate::error::{Error, Result};
+use crate::error::{BoxError, Error, Result};
 use crate::spec::{AccountId, User};
 
 // resolve =============================================================================================================
@@ -93,6 +93,15 @@ fn last_error(context: &str) -> Error {
     Error::os(context, std::io::Error::last_os_error())
 }
 
+/// A spec value the OS refuses to take: `field`'s `value`, which is not a valid `kind`. `cause` is
+/// why, printed after the message by [`Error::report`].
+fn refused_input(field: &str, value: &str, kind: &str, cause: impl Into<BoxError>) -> Error {
+    Error::AccountLookup {
+        detail: format!("`{field}` `{}` is not a valid {kind}", value.escape_debug()),
+        source: Some(cause.into()),
+    }
+}
+
 // SID <-> account name ================================================================================================
 
 /// `ConvertStringSidToSidW` + `LookupAccountSidW`: turn a `user.id` SID
@@ -100,18 +109,18 @@ fn last_error(context: &str) -> Error {
 /// SID), which is what `ServiceInfo::account_name` needs — SCM has no SID
 /// field.
 fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
-    let wide_sid = wide_null(sid_str).map_err(|e| {
-        Error::os(
-            format!("parse `user.id` `{}` as a SID string", sid_str.escape_debug()),
-            e,
-        )
-    })?;
+    let wide_sid = wide_null(sid_str).map_err(|e| refused_input("user.id", sid_str, "SID string", e))?;
     let mut psid: PSID = std::ptr::null_mut();
     // SAFETY: `wide_sid` is a valid null-terminated wide string; `psid` is a
     // valid out-param. On success, `psid` must be freed with `LocalFree`.
     let ok = unsafe { ConvertStringSidToSidW(wide_sid.as_ptr(), &mut psid) };
     if ok == 0 {
-        return Err(last_error(&format!("parse `user.id` `{sid_str}` as a SID string")));
+        return Err(refused_input(
+            "user.id",
+            sid_str,
+            "SID string",
+            std::io::Error::last_os_error(),
+        ));
     }
     let result = lookup_account_sid(psid, || sid_str.to_string());
     // SAFETY: `psid` was allocated by `ConvertStringSidToSidW` above and is
@@ -210,8 +219,7 @@ fn lookup_account_sid(psid: PSID, sid_str: impl FnOnce() -> String) -> Result<St
 /// on its own, so dropping the prefix loses nothing.
 pub(crate) fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     let account_name = account_name.strip_prefix(r".\").unwrap_or(account_name);
-    let wide_name = wide_null(account_name)
-        .map_err(|e| Error::os(format!("resolve SID for account `{}`", account_name.escape_debug()), e))?;
+    let wide_name = wide_null(account_name).map_err(|e| refused_input("user.name", account_name, "account name", e))?;
     let mut sid_len: u32 = 0;
     let mut domain_len: u32 = 0;
     let mut use_: i32 = 0;
