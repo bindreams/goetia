@@ -99,8 +99,10 @@ fn last_error(context: &str) -> Error {
 /// SID), which is what `ServiceInfo::account_name` needs — SCM has no SID
 /// field.
 fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
-    let wide_sid =
-        wide_null(sid_str).map_err(|e| Error::os(format!("parse `user.id` {sid_str:?} as a SID string"), e))?;
+    let wide_sid = wide_null(sid_str).map_err(|e| Error::AccountLookup {
+        detail: format!("`user.id` `{}` is not a SID string", sid_str.escape_debug()),
+        source: Some(Box::new(e)),
+    })?;
     let mut psid: PSID = std::ptr::null_mut();
     // SAFETY: `wide_sid` is a valid null-terminated wide string; `psid` is a
     // valid out-param. On success, `psid` must be freed with `LocalFree`.
@@ -205,8 +207,10 @@ fn lookup_account_sid(psid: PSID, sid_str: impl FnOnce() -> String) -> Result<St
 /// on its own, so dropping the prefix loses nothing.
 pub(crate) fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     let account_name = account_name.strip_prefix(r".\").unwrap_or(account_name);
-    let wide_name =
-        wide_null(account_name).map_err(|e| Error::os(format!("look up the account {account_name:?}"), e))?;
+    let wide_name = wide_null(account_name).map_err(|e| Error::AccountLookup {
+        detail: format!("`{}` is not an account name", account_name.escape_debug()),
+        source: Some(Box::new(e)),
+    })?;
     let mut sid_len: u32 = 0;
     let mut domain_len: u32 = 0;
     let mut use_: i32 = 0;
@@ -256,6 +260,9 @@ pub(crate) fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
 
 // SeServiceLogonRight =================================================================================================
 
+/// The privilege `grant_service_logon_right` grants, as the wide string LSA takes.
+const SERVICE_LOGON_RIGHT: [u16; "SeServiceLogonRight".len() + 1] = wide_literal("SeServiceLogonRight");
+
 fn nt_error(context: &str, status: i32) -> Error {
     // SAFETY: `LsaNtStatusToWinError` takes a plain `NTSTATUS` value and
     // cannot fail.
@@ -290,9 +297,9 @@ pub fn grant_service_logon_right(account_name: &str) -> Result<()> {
         ));
     }
 
-    let right_text = wide_literal("SeServiceLogonRight");
+    let right_text = SERVICE_LOGON_RIGHT;
     // `LSA_UNICODE_STRING::Length`/`MaximumLength` are byte counts,
-    // excluding the trailing NUL `wide_null` appended for other APIs' sake.
+    // excluding the trailing NUL `wide_literal` appended for other APIs' sake.
     let right = LSA_UNICODE_STRING {
         Length: ((right_text.len() - 1) * 2) as u16,
         MaximumLength: (right_text.len() * 2) as u16,

@@ -87,7 +87,8 @@ mod system {
 
         /// A descriptor written as SDDL.
         pub(crate) fn from_sddl(sddl: &str) -> Result<Self> {
-            let wide = wide_null(sddl).map_err(|e| Error::os("build the permissions of the shim", e))?;
+            let wide = wide_null(sddl)
+                .map_err(|e| Error::os(format!("build permissions from the SDDL `{}`", sddl.escape_debug()), e))?;
             let mut raw: *mut c_void = std::ptr::null_mut();
             // SAFETY: `wide` is NUL-terminated; `raw` is a valid out-pointer, and the size is not asked for.
             let ok = unsafe {
@@ -133,7 +134,7 @@ mod system {
         /// Creates `path`, which must not exist, for writing, with this descriptor. The file is
         /// readable by others while it is open, and cannot be renamed or deleted until it is closed.
         pub(crate) fn create_file(&self, path: &Path) -> io::Result<File> {
-            let wide = wide(path)?;
+            let wide = wide_null(path)?;
             let attributes = self.attributes();
             // SAFETY: `wide` is NUL-terminated and `attributes` points at `self.raw`, which is live
             // for the call; no template file.
@@ -157,7 +158,7 @@ mod system {
 
         /// Creates the folder `path`, whose parent exists, with this descriptor.
         pub(crate) fn create_dir(&self, path: &Path) -> io::Result<()> {
-            let wide = wide(path)?;
+            let wide = wide_null(path)?;
             let attributes = self.attributes();
             // SAFETY: `wide` is NUL-terminated and `attributes` points at `self.raw`, which is live
             // for the call.
@@ -185,11 +186,6 @@ mod system {
                 LocalFree(self.raw);
             }
         }
-    }
-
-    /// `path` as NUL-terminated UTF-16; a NUL inside it would end the name early.
-    fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        Ok(wide_null(path)?)
     }
 }
 

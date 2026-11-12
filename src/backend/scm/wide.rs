@@ -19,22 +19,49 @@ impl From<InteriorNul> for std::io::Error {
 }
 
 /// `s` as the NUL-terminated UTF-16 string the wide Win32 calls take, or the position of the NUL
-/// that would have ended it early.
+/// that would have ended it early. For text goetia sends: it is refused, never cut. Text that
+/// Windows hands back is read as Windows reads it, with [`wide_null_cut`].
 pub fn wide_null(s: impl AsRef<OsStr>) -> Result<Vec<u16>, InteriorNul> {
-    let mut units: Vec<u16> = s.as_ref().encode_wide().collect();
-    if let Some(index) = units.iter().position(|&unit| unit == 0) {
-        return Err(InteriorNul { index });
+    let mut units = Vec::new();
+    for unit in s.as_ref().encode_wide() {
+        if unit == 0 {
+            return Err(InteriorNul { index: units.len() });
+        }
+        units.push(unit);
     }
     units.push(0);
     Ok(units)
 }
 
-/// [`wide_null`] for a literal or constant, which the code that wrote it can see holds no NUL.
+/// The text of `s` before its first NUL, as the NUL-terminated UTF-16 string a wide Win32 call
+/// reads it as: for text that came from Windows, which treats it as a C string and so ends it at
+/// the first NUL.
+pub fn wide_null_cut(s: impl AsRef<OsStr>) -> Vec<u16> {
+    let mut units: Vec<u16> = s.as_ref().encode_wide().take_while(|&unit| unit != 0).collect();
+    units.push(0);
+    units
+}
+
+/// `s` as a NUL-terminated UTF-16 string, evaluated at compile time. `N` is `s.len() + 1`, so a
+/// constant spells it `const W: [u16; S.len() + 1] = wide_literal(S);`.
+///
+/// `s` must be ASCII and hold no NUL: used in a constant, a literal that does not fails the build,
+/// so no run can meet it.
 ///
 /// # Panics
-/// When `s` holds a NUL: a literal that does is a defect that the first use shows.
-pub fn wide_literal(s: &'static str) -> Vec<u16> {
-    wide_null(s).unwrap_or_else(|e| panic!("the literal {s:?} holds a NUL: {e}"))
+/// When `s` is not ASCII, holds a NUL, or `N` is not `s.len() + 1`.
+pub const fn wide_literal<const N: usize>(s: &str) -> [u16; N] {
+    let bytes = s.as_bytes();
+    assert!(bytes.len() + 1 == N, "N is not the length of the literal plus one");
+    let mut units = [0u16; N];
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(bytes[i].is_ascii(), "the literal is not ASCII");
+        assert!(bytes[i] != 0, "the literal holds a NUL");
+        units[i] = bytes[i] as u16;
+        i += 1;
+    }
+    units
 }
 
 /// The UTF-16 units of the NUL-terminated string at `ptr`, without the NUL.

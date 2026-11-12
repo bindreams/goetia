@@ -16,7 +16,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE,
 };
 use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
-use winreg::RegKey;
+use winreg::{RegKey, RegValue};
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::types::FromRegValue as _;
 
@@ -549,7 +549,7 @@ pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<
                 }
             }
             match key.get_raw_value(IMAGE_PATH_VALUE) {
-                Ok(raw) => Ok(String::from_reg_value(&raw).ok()),
+                Ok(raw) => Ok(image_text(&raw)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(Stop::mid_read(failure(
                     &format!("read {IMAGE_PATH_VALUE} under"),
@@ -559,6 +559,17 @@ pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<
             }
         },
     )
+}
+
+/// The `ImagePath` that `raw` holds, as SCM reads it: it is a C string there, so it ends at the
+/// first NUL. `None` when it is not a string. This is where registry text meets goetia, so what
+/// follows (the sweep's expansion, its comparisons) never sees what SCM ignores.
+fn image_text(raw: &RegValue) -> Option<String> {
+    let mut text = String::from_reg_value(raw).ok()?;
+    if let Some(end) = text.find('\0') {
+        text.truncate(end);
+    }
+    Some(text)
 }
 
 #[cfg(test)]

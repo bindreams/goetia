@@ -27,6 +27,8 @@ use crate::error::{Error, Result};
 
 /// The mutex's name, which is also what its errors call it.
 const NAME: &str = r"Global\goetia-shim";
+/// [`NAME`] as the wide string the mutex calls take.
+const NAME_WIDE: [u16; NAME.len() + 1] = wide_literal(NAME);
 
 /// Held from [`acquire`](Self::acquire) until it is dropped. Not `Send`: a mutex is released by the
 /// thread that holds it.
@@ -44,7 +46,7 @@ impl InstallLock {
     pub(crate) fn acquire() -> Result<Self> {
         let descriptor = Descriptor::for_lock()?;
         let attributes = descriptor.attributes();
-        let name = wide_literal(NAME);
+        let name = NAME_WIDE;
         // SAFETY: `attributes` points at `descriptor`, which is live for the call; `name` is
         // NUL-terminated; the mutex is not owned by the caller at creation.
         let raw = unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) };
@@ -146,7 +148,7 @@ fn failure(
 /// `READ_CONTROL`, or `None` when it could not be read: the DACL that refused the caller may refuse
 /// that too.
 fn denied_lock_owner() -> Option<String> {
-    let name = wide_literal(NAME);
+    let name = NAME_WIDE;
     // SAFETY: `name` is NUL-terminated.
     let raw = unsafe { OpenMutexW(READ_CONTROL, 0, name.as_ptr()) };
     if raw.is_null() {

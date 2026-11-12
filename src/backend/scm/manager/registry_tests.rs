@@ -658,3 +658,15 @@ fn a_parameters_that_is_a_link_is_replaced_by_a_real_key_and_its_target_is_left_
         "not goetia's"
     );
 }
+
+/// SCM starts what precedes a NUL in the `ImagePath`, so that is the image: the sweep must count
+/// the host it names as referenced.
+#[skuld::test]
+fn an_image_is_read_up_to_its_first_nul() {
+    assert_eq!(
+        image_text(&"C:\\a\\host.exe --x\0tail".to_reg_value()).as_deref(),
+        Some(r"C:\a\host.exe --x")
+    );
+    assert_eq!(image_text(&r"C:\a\host.exe".to_reg_value()).as_deref(), Some(r"C:\a\host.exe"));
+    assert_eq!(image_text(&7u32.to_reg_value()), None);
+}

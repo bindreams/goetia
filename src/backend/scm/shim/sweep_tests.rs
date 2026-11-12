@@ -850,9 +850,11 @@ mod windows {
         assert_eq!(expand_environment(r"C:\a\b.exe"), r"C:\a\b.exe");
     }
 
-    /// Cut at the NUL, only `%SystemRoot%` would be expanded and the rest dropped.
+    /// The system reads the text up to its first NUL, and so does the sweep.
     #[skuld::test]
-    fn text_with_a_nul_is_returned_as_written() {
-        assert_eq!(expand_environment("%SystemRoot%\0tail"), "%SystemRoot%\0tail");
+    fn text_is_expanded_up_to_its_first_nul() {
+        let root = std::env::var("SystemRoot").expect("SystemRoot");
+
+        assert_eq!(expand_environment("%SystemRoot%\\x.exe\0tail"), format!(r"{root}\x.exe"));
     }
 }
