@@ -20,9 +20,11 @@ fn slot() -> Box<LastStatus> {
 
 /// Deliver a notification to `slot` as SCM does: the buffer's `pContext` is the slot.
 fn deliver(slot: &mut LastStatus, notification_status: u32, state: u32) {
-    let mut buf = SERVICE_NOTIFY_2W::default();
-    buf.pContext = (slot as *mut LastStatus).cast();
-    buf.dwNotificationStatus = notification_status;
+    let mut buf = SERVICE_NOTIFY_2W {
+        pContext: (slot as *mut LastStatus).cast(),
+        dwNotificationStatus: notification_status,
+        ..Default::default()
+    };
     buf.ServiceStatus.dwCurrentState = state;
     // SAFETY: `buf` is a live `SERVICE_NOTIFY_2W` whose `pContext` is the live `slot`.
     unsafe { notify_callback((&raw const buf).cast()) };
