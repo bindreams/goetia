@@ -29,7 +29,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::core::w;
 
 use crate::backend::Identity;
-use crate::backend::scm::sid::{Sid, is_whole_sid, sid_display};
+use crate::backend::scm::sid::{Sid, copy_sid, is_whole_sid, sid_display};
 use crate::backend::scm::wide::{units_until_nul, wide_null};
 use crate::error::{BoxError, Error, Result};
 use crate::spec::{AccountId, User};
@@ -77,12 +77,7 @@ pub fn service_password() -> Result<Option<String>> {
     parse_password_var(std::env::var("GOETIA_SERVICE_PASSWORD"))
 }
 
-/// The decision [`service_password`] makes, pulled out as a pure function of
-/// the lookup result so it is unit-testable without mutating the process's
-/// real environment (which — shared mutable state across every concurrently
-/// running `#[skuld::test]` — `std::env::set_var` cannot safely do; see
-/// `tests/scm_integration/install_helper.rs`'s doc comment for the same
-/// reasoning applied at the integration-test level).
+/// The decision [`service_password`] makes, as a pure function of the lookup result.
 fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> Result<Option<String>> {
     match var {
         Ok(v) => Ok(Some(v)),
@@ -136,6 +131,11 @@ fn refused_input(action: String, cause: impl Into<BoxError>) -> Error {
 /// SID), which is what `ServiceInfo::account_name` needs — SCM has no SID
 /// field.
 fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
+    resolve_sid_string(sid_str).map(|(_, name, _)| name)
+}
+
+/// The SID a `user.id` string spells, the account's name, and its `SID_NAME_USE`.
+fn resolve_sid_string(sid_str: &str) -> Result<(Sid, String, i32)> {
     let parse = || format!("parse {} as a SID string", subject(Some("user.id"), "SID", sid_str));
     let wide_sid = wide_null(sid_str).map_err(|e| refused_input(parse(), e))?;
     let mut psid: PSID = std::ptr::null_mut();
@@ -146,13 +146,16 @@ fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
         let err = std::io::Error::last_os_error();
         return Err(account_error(parse(), err));
     }
-    let result = lookup_account_sid(psid, Some("user.id"), || sid_str.to_string());
+    // SAFETY: `ConvertStringSidToSidW` succeeded, so `psid` is a whole SID.
+    let sid = unsafe { copy_sid(psid) };
     // SAFETY: `psid` was allocated by `ConvertStringSidToSidW` above and is
-    // freed exactly once, after every use of it above has completed.
+    // freed exactly once, after its last use above.
     unsafe {
         LocalFree(psid);
     }
-    result
+    let sid = sid.expect("ConvertStringSidToSidW writes a valid SID");
+    let (name, use_) = lookup_account_sid(sid.as_ptr() as PSID, Some("user.id"), || sid_str.to_string())?;
+    Ok((sid, name, use_))
 }
 
 /// The domain-qualified name of the account a binary SID names. An error when the bytes are not
@@ -166,7 +169,7 @@ pub(in crate::backend::scm) fn account_name_of_sid(sid: &[u8]) -> Result<String>
             source: None,
         });
     }
-    lookup_account_sid(sid.as_ptr() as PSID, None, || sid_display(sid))
+    lookup_account_sid(sid.as_ptr() as PSID, None, || sid_display(sid)).map(|(name, _)| name)
 }
 
 /// A pointer to `buf` for a Win32 call that takes its length alongside, null while it is empty:
@@ -240,9 +243,9 @@ fn win32_status(ok: i32) -> std::io::Result<()> {
     }
 }
 
-/// The account `psid` names. `sid_str` writes the SID for an error, and runs only for one; `field`
-/// is the spec field the SID came from, if any.
-fn lookup_account_sid(psid: PSID, field: Option<&str>, sid_str: impl FnOnce() -> String) -> Result<String> {
+/// The account `psid` names, and its `SID_NAME_USE`. `sid_str` writes the SID for an error, and runs
+/// only for one; `field` is the spec field the SID came from, if any.
+fn lookup_account_sid(psid: PSID, field: Option<&str>, sid_str: impl FnOnce() -> String) -> Result<(String, i32)> {
     let action = || format!("resolve account name for {}", subject(field, "SID", &sid_str()));
     let mut use_ = 0;
     let (name, domain) = lookup_growing(action, |name, name_len, domain, domain_len| {
@@ -254,11 +257,12 @@ fn lookup_account_sid(psid: PSID, field: Option<&str>, sid_str: impl FnOnce() ->
     })?;
     let name = String::from_utf16_lossy(&name);
     let domain = String::from_utf16_lossy(&domain);
-    Ok(if domain.is_empty() {
+    let name = if domain.is_empty() {
         name
     } else {
         format!(r"{domain}\{name}")
-    })
+    };
+    Ok((name, use_))
 }
 
 /// The SID `bytes` start with, cut to the length its own sub-authority count gives. `None` when
@@ -334,28 +338,45 @@ pub(crate) fn sid_for_account_name(account_name: &str, field: Option<&str>) -> R
 // user accounts only ==================================================================================================
 
 /// The SID of an account [`require_user_account`] found to be a user account. Only that function
-/// builds one, so a grant that takes one acts on the SID that was checked, not on a second lookup of
-/// the name.
+/// builds one, so a grant that takes one acts on the SID that was checked.
+#[derive(Debug)]
 pub struct UserSid {
     sid: Sid,
-    /// The name it was looked up by, for the grant's errors.
+    /// The name of the account, for the grant's errors.
     account: String,
+}
+
+/// The account of a spec, as the user wrote it.
+#[derive(Clone, Copy, Debug)]
+pub enum Written<'a> {
+    /// `user.name`.
+    Name(&'a str),
+    /// `user.id`, a SID string.
+    Sid(&'a str),
 }
 
 /// Refuses `account` unless it names a user account, and returns the SID it found. A
 /// `SeServiceLogonRight` granted to a group, a domain or a machine would reach every account in it,
-/// and the right is what installing a service that runs as `account` grants. `written` is the spec
-/// field the account came from and the value as the user wrote it (a `user.id` SID, where `account`
-/// is the name it resolved to), for the refusal to quote; `None` names `account`. It is a lookup of
-/// `account`, so it changes nothing.
-pub fn require_user_account(account: &str, written: Option<(&str, &str)>) -> Result<UserSid> {
-    let (field, value) = written.map_or((None, account), |(field, value)| (Some(field), value));
-    let (sid, use_) = sid_for_account_name(account, field)?;
+/// and the right is what installing a service that runs as `account` grants. `written` is what the
+/// user wrote, for the refusal to quote; `None` names `account`. A `user.id` is resolved from the
+/// SID string, so its kind and its SID are those of the SID the user wrote, not of whatever
+/// `account` resolves to by name; any other `account` is looked up by name. Either way it changes
+/// nothing.
+pub fn require_user_account(account: &str, written: Option<Written>) -> Result<UserSid> {
+    let (field, value) = match written {
+        Some(Written::Name(name)) => (Some("user.name"), name),
+        Some(Written::Sid(sid)) => (Some("user.id"), sid),
+        None => (None, account),
+    };
+    let (sid, account, use_) = match written {
+        Some(Written::Sid(sid_str)) => resolve_sid_string(sid_str)?,
+        _ => {
+            let (sid, use_) = sid_for_account_name(account, field)?;
+            (sid, account.to_string(), use_)
+        }
+    };
     if use_ == SidTypeUser {
-        return Ok(UserSid {
-            sid,
-            account: account.to_string(),
-        });
+        return Ok(UserSid { sid, account });
     }
     Err(Error::AccountLookup {
         detail: format!(
@@ -364,15 +385,6 @@ pub fn require_user_account(account: &str, written: Option<(&str, &str)>) -> Res
             name_use_kind(use_)
         ),
         source: None,
-    })
-}
-
-/// The password the real account `account` installs with. Install would otherwise report success
-/// and the service would fail every future start with error 1069 (no `SeServiceLogonRight`), so a
-/// missing one is refused.
-pub fn service_password_for(account: &str) -> Result<String> {
-    service_password()?.ok_or_else(|| Error::PasswordRequired {
-        account: account.to_string(),
     })
 }
 
@@ -385,11 +397,11 @@ fn nt_error(context: &str, status: i32) -> Error {
     Error::os(context, std::io::Error::from_raw_os_error(win32 as i32))
 }
 
-/// Grant `account_name` the right to log on as a service
+/// Grant `user` the right to log on as a service
 /// (`SeServiceLogonRight`), via `LsaAddAccountRights`. Idempotent: an
 /// account that already has the right is unaffected, so this is safe to
-/// call again on a later install of the same account. `user` is the SID [`require_user_account`]
-/// checked; this does no lookup of its own.
+/// call again on a later install of the same account. `user` is the account [`require_user_account`]
+/// checked; the grant does no lookup of its own.
 pub fn grant_service_logon_right(user: &UserSid) -> Result<()> {
     let UserSid {
         sid: sid_buf,

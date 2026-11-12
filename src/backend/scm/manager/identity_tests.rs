@@ -211,9 +211,7 @@ fn a_name_that_is_no_user_account_is_refused() {
         "Users",
         r"NT AUTHORITY\SYSTEM",
     ] {
-        let err = require_user_account(name, Some(("user.name", name)))
-            .map(|_| ())
-            .expect_err(name);
+        let err = require_user_account(name, Some(Written::Name(name))).expect_err(name);
         assert!(matches!(err, Error::AccountLookup { .. }), "`{name}`: {err:?}");
         assert!(err.to_string().contains("`user.name`"), "`{name}`: {err}");
     }
@@ -221,9 +219,7 @@ fn a_name_that_is_no_user_account_is_refused() {
 
 #[skuld::test]
 fn a_group_is_refused_saying_it_is_not_a_user() {
-    let err = require_user_account("Administrators", Some(("user.name", "Administrators")))
-        .map(|_| ())
-        .expect_err("a group");
+    let err = require_user_account("Administrators", Some(Written::Name("Administrators"))).expect_err("a group");
     assert_eq!(
         err.to_string(),
         "account lookup failed: `user.name` `Administrators` is not a user account (it is a local group)"
@@ -236,9 +232,7 @@ fn a_sid_that_resolves_to_a_group_is_refused_naming_the_sid_as_written() {
     let account = resolve(&User::Id(AccountId::Sid("S-1-1-0".to_string())))
         .expect("Everyone resolves")
         .user;
-    let err = require_user_account(&account, Some(("user.id", "S-1-1-0")))
-        .map(|_| ())
-        .expect_err("a group");
+    let err = require_user_account(&account, Some(Written::Sid("S-1-1-0"))).expect_err("a group");
     assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
     assert_eq!(
         err.to_string(),
@@ -248,13 +242,29 @@ fn a_sid_that_resolves_to_a_group_is_refused_naming_the_sid_as_written() {
 
 #[skuld::test]
 fn a_refused_account_without_a_written_value_is_named_as_it_is() {
-    let err = require_user_account("Administrators", None)
-        .map(|_| ())
-        .expect_err("a group");
+    let err = require_user_account("Administrators", None).expect_err("a group");
     assert_eq!(
         err.to_string(),
         "account lookup failed: account `Administrators` is not a user account (it is a local group)"
     );
+}
+
+#[skuld::test]
+fn the_account_this_test_runs_as_is_accepted_if_it_is_a_user_and_refused_if_it_is_not() {
+    // The token's own SID, written as `user.id`: a user account on a developer host, `SYSTEM` (a well-known
+    // group) on a service host. Both are lookups only.
+    let token_sid = process_user_sid();
+    let written = sid_display(&token_sid);
+    let (_, name, kind) = resolve_sid_string(&written).expect("the token user resolves");
+    let result = require_user_account(&name, Some(Written::Sid(&written)));
+    if kind == SidTypeUser {
+        let user = result.expect("a user account is accepted");
+        assert_eq!(user.sid, token_sid);
+        assert_eq!(user.account, name);
+    } else {
+        let err = result.expect_err("not a user account");
+        assert!(err.to_string().contains("is not a user account"), "{err}");
+    }
 }
 
 /// The user SID of this process's token.
@@ -340,17 +350,10 @@ fn a_lookup_that_grows_one_buffer_and_not_the_other_keeps_the_larger() {
     // The second answer needs less of the first buffer than it has, and more of the second. Each call
     // gets the lengths of the buffers it is passed; the first must not shrink between calls.
     let mut seen = Vec::new();
-    let mut answers = [(MORE, 10, 0), (MORE, 4, 6), (0, 4, 6)].into_iter();
-    let call = |_first: *mut u16, first_len: &mut u32, _domain: *mut u16, domain_len: &mut u32| {
+    let mut answers = scripted([(MORE, 10, 0), (MORE, 4, 6), (0, 4, 6)]);
+    let call = |first: *mut u16, first_len: &mut u32, domain: *mut u16, domain_len: &mut u32| {
         seen.push((*first_len, *domain_len));
-        let (status, first, domain) = answers.next().expect("the call ran more often than scripted");
-        *first_len = first;
-        *domain_len = domain;
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::from_raw_os_error(status as i32))
-        }
+        answers(first, first_len, domain, domain_len)
     };
     let (first, domain) = lookup_growing(|| "look up".to_string(), call).expect("it fits at last");
     assert_eq!((first.len(), domain.len()), (4, 6));

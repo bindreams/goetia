@@ -56,10 +56,11 @@
 //! created or changed, for every account [`generate::account_needs_password`]
 //! says needs a password — every other account (`LocalSystem`, a built-in, or an
 //! `NT SERVICE\<id>` virtual account) already holds the right, and
-//! `LookupAccountNameW` (which the grant goes through) does not even
-//! resolve the first three by those spellings. Before the password is read, such an account that is not a
-//! user (a group, a domain) is refused: the right would reach every account in it
-//! (`identity::require_user_account`), and the grant takes the SID that check found.
+//! `LookupAccountNameW` (which `identity::require_user_account` goes through) does not even
+//! resolve the first three by those spellings. The grant does no lookup: first
+//! `identity::require_user_account` refuses such an account that is not a user (a group, a
+//! domain), because the right would reach every account in it, and the grant takes the SID that
+//! check found. Both come before the password is read.
 //!
 //! **5. Create with `SERVICE_DEMAND_START`, write `Parameters` immediately
 //! after.** Not `SERVICE_DISABLED` (which would block an explicit `start`),
@@ -846,10 +847,10 @@ pub(in crate::backend::scm) fn split_command_line(cmdline: &str) -> (PathBuf, Ve
 /// The spec field the account comes from and its value as the user wrote it, for an error about the
 /// account: `user.name` and the name, or `user.id` and the SID string. `None` for `user: root`, which
 /// has no account, and for a numeric UID, which resolves to none.
-fn written_user(user: &User) -> Option<(&'static str, &str)> {
+fn written_user(user: &User) -> Option<identity::Written<'_>> {
     match user {
-        User::Name(name) => Some(("user.name", name)),
-        User::Id(AccountId::Sid(sid)) => Some(("user.id", sid)),
+        User::Name(name) => Some(identity::Written::Name(name)),
+        User::Id(AccountId::Sid(sid)) => Some(identity::Written::Sid(sid)),
         User::Root | User::Id(AccountId::Uid(_)) => None,
     }
 }
@@ -865,13 +866,13 @@ fn written_user(user: &User) -> Option<(&'static str, &str)> {
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the
 /// start type the service has, rather than resetting it; see `service_info`. `written` is what
 /// [`written_user`] says of the account's spec value.
-fn apply(reg: &ScmRegistration, written: Option<(&str, &str)>, create: bool) -> Result<()> {
+fn apply(reg: &ScmRegistration, written: Option<identity::Written>, create: bool) -> Result<()> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
     // is `Some`, yet needs no password at all — see that function's own
-    // doc comment for the exact table. `LookupAccountNameW`, which the
-    // `SeServiceLogonRight` grant goes through, does not resolve
+    // doc comment for the exact table. `LookupAccountNameW`, which
+    // `identity::require_user_account` goes through, does not resolve
     // `LocalSystem`, `LocalService` or `NetworkService` by those spellings
     // at all, and every such account already holds the right.
     //
@@ -892,9 +893,13 @@ fn apply(reg: &ScmRegistration, written: Option<(&str, &str)>, create: bool) -> 
             "account_needs_password(None) is always false (LocalSystem), so this branch is only reached for Some",
         );
         // A real account is refused here if it is not a user, before its password is read, and the
-        // right is granted to the SID that check found.
+        // right is granted to the SID that check found. Without a password, install would report
+        // success and every start would fail with error 1069 (`ERROR_LOGON_FAILURE`), so a missing
+        // one is refused.
         let user = identity::require_user_account(account, written)?;
-        let pw = identity::service_password_for(account)?;
+        let pw = identity::service_password()?.ok_or_else(|| Error::PasswordRequired {
+            account: account.to_string(),
+        })?;
         identity::grant_service_logon_right(&user)?;
         Some(pw)
     } else {
