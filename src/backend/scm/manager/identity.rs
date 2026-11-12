@@ -14,19 +14,24 @@
 //! caller in `manager.rs`), and neither reference repo (`hole`, `wsm`) has
 //! solved this for any other account.
 
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LocalFree};
+use windows_sys::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_INVALID_SID, ERROR_NONE_MAPPED, LocalFree,
+};
 use windows_sys::Win32::Security::Authentication::Identity::{
     LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose, LsaNtStatusToWinError, LsaOpenPolicy,
     POLICY_CREATE_ACCOUNT, POLICY_LOOKUP_NAMES,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
-use windows_sys::Win32::Security::{LookupAccountNameW, LookupAccountSidW, PSID};
+use windows_sys::Win32::Security::{
+    LookupAccountNameW, LookupAccountSidW, PSID, SidTypeAlias, SidTypeComputer, SidTypeDeletedAccount, SidTypeDomain,
+    SidTypeGroup, SidTypeLabel, SidTypeLogonSession, SidTypeUser, SidTypeWellKnownGroup,
+};
 use windows_sys::core::w;
 
 use crate::backend::Identity;
-use crate::backend::scm::sid::{is_whole_sid, sid_display};
+use crate::backend::scm::sid::{Sid, copy_sid, is_whole_sid, sid_display};
 use crate::backend::scm::wide::{units_until_nul, wide_null};
-use crate::error::{Error, Result};
+use crate::error::{BoxError, Error, Result};
 use crate::spec::{AccountId, User};
 
 // resolve =============================================================================================================
@@ -72,12 +77,7 @@ pub fn service_password() -> Result<Option<String>> {
     parse_password_var(std::env::var("GOETIA_SERVICE_PASSWORD"))
 }
 
-/// The decision [`service_password`] makes, pulled out as a pure function of
-/// the lookup result so it is unit-testable without mutating the process's
-/// real environment (which — shared mutable state across every concurrently
-/// running `#[skuld::test]` — `std::env::set_var` cannot safely do; see
-/// `tests/scm_integration/install_helper.rs`'s doc comment for the same
-/// reasoning applied at the integration-test level).
+/// The decision [`service_password`] makes, as a pure function of the lookup result.
 fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> Result<Option<String>> {
     match var {
         Ok(v) => Ok(Some(v)),
@@ -89,8 +89,39 @@ fn parse_password_var(var: std::result::Result<String, std::env::VarError>) -> R
     }
 }
 
-fn last_error(context: &str) -> Error {
-    Error::os(context, std::io::Error::last_os_error())
+/// What an account lookup was handed, for a message: `value` under the spec field it came from,
+/// or under `noun` when it did not come from one (a name `LookupAccountSidW` returned). `value` is
+/// plain; the report escapes it.
+fn subject(field: Option<&str>, noun: &str, value: &str) -> String {
+    match field {
+        Some(field) => format!("`{field}` `{value}`"),
+        None => format!("{noun} `{value}`"),
+    }
+}
+
+/// The failure of a Win32 account lookup that was doing `action`. An input the OS cannot take (no
+/// such account, a SID it does not accept, a string that is not a SID) is an
+/// [`Error::AccountLookup`]; any other code (`ERROR_NOT_ENOUGH_MEMORY`) is an [`Error::Os`].
+fn account_error(action: String, err: std::io::Error) -> Error {
+    let input = [ERROR_NONE_MAPPED, ERROR_INVALID_SID, ERROR_INVALID_PARAMETER]
+        .iter()
+        .any(|&code| err.raw_os_error() == Some(code as i32));
+    if input {
+        Error::AccountLookup {
+            detail: format!("cannot {action}"),
+            source: Some(err.into()),
+        }
+    } else {
+        Error::os(action, err)
+    }
+}
+
+/// The refusal of a spec value that holds a NUL: no Windows call could take it whole.
+fn refused_input(action: String, cause: impl Into<BoxError>) -> Error {
+    Error::AccountLookup {
+        detail: format!("cannot {action}"),
+        source: Some(cause.into()),
+    }
 }
 
 // SID <-> account name ================================================================================================
@@ -100,26 +131,31 @@ fn last_error(context: &str) -> Error {
 /// SID), which is what `ServiceInfo::account_name` needs — SCM has no SID
 /// field.
 fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
-    let wide_sid = wide_null(sid_str).map_err(|e| {
-        Error::os(
-            format!("parse `user.id` `{}` as a SID string", sid_str.escape_debug()),
-            e,
-        )
-    })?;
+    resolve_sid_string(sid_str).map(|(_, name, _)| name)
+}
+
+/// The SID a `user.id` string spells, the account's name, and its `SID_NAME_USE`.
+fn resolve_sid_string(sid_str: &str) -> Result<(Sid, String, i32)> {
+    let parse = || format!("parse {} as a SID string", subject(Some("user.id"), "SID", sid_str));
+    let wide_sid = wide_null(sid_str).map_err(|e| refused_input(parse(), e))?;
     let mut psid: PSID = std::ptr::null_mut();
     // SAFETY: `wide_sid` is a valid null-terminated wide string; `psid` is a
     // valid out-param. On success, `psid` must be freed with `LocalFree`.
     let ok = unsafe { ConvertStringSidToSidW(wide_sid.as_ptr(), &mut psid) };
     if ok == 0 {
-        return Err(last_error(&format!("parse `user.id` `{sid_str}` as a SID string")));
+        let err = std::io::Error::last_os_error();
+        return Err(account_error(parse(), err));
     }
-    let result = lookup_account_sid(psid, || sid_str.to_string());
+    // SAFETY: `ConvertStringSidToSidW` succeeded, so `psid` is a whole SID.
+    let sid = unsafe { copy_sid(psid) };
     // SAFETY: `psid` was allocated by `ConvertStringSidToSidW` above and is
-    // freed exactly once, after every use of it above has completed.
+    // freed exactly once, after its last use above.
     unsafe {
         LocalFree(psid);
     }
-    result
+    let sid = sid.expect("ConvertStringSidToSidW writes a valid SID");
+    let (name, use_) = lookup_account_sid(sid.as_ptr() as PSID, Some("user.id"), || sid_str.to_string())?;
+    Ok((sid, name, use_))
 }
 
 /// The domain-qualified name of the account a binary SID names. An error when the bytes are not
@@ -133,73 +169,135 @@ pub(in crate::backend::scm) fn account_name_of_sid(sid: &[u8]) -> Result<String>
             source: None,
         });
     }
-    lookup_account_sid(sid.as_ptr() as PSID, || sid_display(sid))
+    lookup_account_sid(sid.as_ptr() as PSID, None, || sid_display(sid)).map(|(name, _)| name)
 }
 
-/// The account `psid` names. `sid_str` writes the SID for an error, and runs only for one.
-fn lookup_account_sid(psid: PSID, sid_str: impl FnOnce() -> String) -> Result<String> {
-    let mut name_len: u32 = 0;
-    let mut domain_len: u32 = 0;
-    let mut use_: i32 = 0;
-    // SAFETY: sizing call — every buffer pointer is null, every length
-    // out-param is a valid `u32` lvalue. Expected to fail with
-    // `ERROR_INSUFFICIENT_BUFFER`; any other failure is real.
-    let sizing_ok = unsafe {
-        LookupAccountSidW(
-            std::ptr::null(),
-            psid,
-            std::ptr::null_mut(),
-            &mut name_len,
-            std::ptr::null_mut(),
-            &mut domain_len,
-            &mut use_,
-        )
-    };
-    if sizing_ok != 0 {
-        return Err(Error::AccountLookup {
-            detail: format!(
-                "LookupAccountSidW for `{}` unexpectedly succeeded on a zero-sized buffer",
-                sid_str()
-            ),
-            source: None,
-        });
+/// A pointer to `buf` for a Win32 call that takes its length alongside, null while it is empty:
+/// the first call of a sizing loop passes no buffer and a zero length.
+fn buf_ptr<T>(buf: &mut [T]) -> *mut T {
+    if buf.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        buf.as_mut_ptr()
     }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-        return Err(Error::os(format!("resolve account name for SID `{}`", sid_str()), err));
-    }
+}
 
-    let mut name_buf = vec![0u16; name_len as usize];
-    let mut domain_buf = vec![0u16; domain_len as usize];
-    // SAFETY: buffers are sized exactly to the lengths the sizing call
-    // reported; the length out-params are re-passed as valid lvalues.
-    let ok = unsafe {
-        LookupAccountSidW(
-            std::ptr::null(),
-            psid,
-            name_buf.as_mut_ptr(),
-            &mut name_len,
-            domain_buf.as_mut_ptr(),
+/// Runs a Win32 account lookup that fills two buffers, until it has both. `call` gets each buffer
+/// (null while empty) with its length beside it, which it lowers to what it wrote on success or
+/// raises to what it needs on `ERROR_INSUFFICIENT_BUFFER`; `action` writes what the lookup was
+/// doing, for an error. A lookup that needs more grows the buffers to the lengths it reported, and
+/// one whose lengths did not grow would change nothing, so that is an [`Error::Os`]. A success whose
+/// lengths do not fit the buffers, or whose first buffer is empty, is one too: a lookup always
+/// writes its name or SID. A failure of any other kind goes to [`account_error`]. The buffers come
+/// back cut to the lengths written.
+fn lookup_growing<T: Copy + Default>(
+    action: impl FnOnce() -> String,
+    mut call: impl FnMut(*mut T, &mut u32, *mut u16, &mut u32) -> std::io::Result<()>,
+) -> Result<(Vec<T>, Vec<u16>)> {
+    let mut first: Vec<T> = Vec::new();
+    let mut domain: Vec<u16> = Vec::new();
+    loop {
+        let mut first_len = first.len() as u32;
+        let mut domain_len = domain.len() as u32;
+        match call(
+            buf_ptr(&mut first),
+            &mut first_len,
+            buf_ptr(&mut domain),
             &mut domain_len,
-            &mut use_,
-        )
-    };
-    if ok == 0 {
-        return Err(last_error(&format!("resolve account name for SID `{}`", sid_str())));
+        ) {
+            Ok(()) => {
+                let (first_len, domain_len) = (first_len as usize, domain_len as usize);
+                if first_len == 0 || first_len > first.len() || domain_len > domain.len() {
+                    let reported = format!(
+                        "unexpected lengths {first_len} and {domain_len} for buffers of {} and {}",
+                        first.len(),
+                        domain.len()
+                    );
+                    return Err(Error::os(action(), std::io::Error::other(reported)));
+                }
+                first.truncate(first_len);
+                domain.truncate(domain_len);
+                return Ok((first, domain));
+            }
+            Err(err) if err.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER as i32) => {
+                let (needed_first, needed_domain) = (first_len as usize, domain_len as usize);
+                if needed_first <= first.len() && needed_domain <= domain.len() {
+                    return Err(Error::os(action(), err));
+                }
+                // A buffer never shrinks: a lookup that reports a smaller length for one buffer than
+                // it was given still needs the other grown.
+                first.resize(needed_first.max(first.len()), T::default());
+                domain.resize(needed_domain.max(domain.len()), 0);
+            }
+            Err(err) => return Err(account_error(action(), err)),
+        }
     }
-    let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-    let domain = String::from_utf16_lossy(&domain_buf[..domain_len as usize]);
-    Ok(if domain.is_empty() {
+}
+
+/// The result of a Win32 call whose return value is `0` on failure, with the thread's last error.
+fn win32_status(ok: i32) -> std::io::Result<()> {
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The account `psid` names, and its `SID_NAME_USE`. `sid_str` writes the SID for an error, and runs
+/// only for one; `field` is the spec field the SID came from, if any.
+fn lookup_account_sid(psid: PSID, field: Option<&str>, sid_str: impl FnOnce() -> String) -> Result<(String, i32)> {
+    let action = || format!("resolve account name for {}", subject(field, "SID", &sid_str()));
+    let mut use_ = 0;
+    let (name, domain) = lookup_growing(action, |name, name_len, domain, domain_len| {
+        // SAFETY: each buffer is null with a zero length or has exactly the length passed beside it;
+        // the length and `use_` out-params are valid lvalues.
+        win32_status(unsafe {
+            LookupAccountSidW(std::ptr::null(), psid, name, name_len, domain, domain_len, &mut use_)
+        })
+    })?;
+    let name = String::from_utf16_lossy(&name);
+    let domain = String::from_utf16_lossy(&domain);
+    let name = if domain.is_empty() {
         name
     } else {
         format!(r"{domain}\{name}")
-    })
+    };
+    Ok((name, use_))
+}
+
+/// The SID `bytes` start with, cut to the length its own sub-authority count gives. `None` when
+/// `bytes` is not a whole SID, or is shorter than that.
+fn whole_sid_prefix(mut bytes: Vec<u8>) -> Option<Sid> {
+    let len = 8 + 4 * usize::from(*bytes.get(1)?);
+    if len > bytes.len() {
+        return None;
+    }
+    bytes.truncate(len);
+    is_whole_sid(&bytes).then_some(bytes)
+}
+
+/// What a `SID_NAME_USE` other than a user is, for [`require_user_account`]'s refusal.
+#[allow(non_upper_case_globals)] // windows-sys spells `SID_NAME_USE` values in CamelCase.
+fn name_use_kind(use_: i32) -> &'static str {
+    match use_ {
+        SidTypeGroup => "a group",
+        SidTypeDomain => "a domain",
+        SidTypeAlias => "a local group",
+        SidTypeWellKnownGroup => "a well-known group",
+        SidTypeDeletedAccount => "a deleted account",
+        SidTypeComputer => "a computer",
+        SidTypeLabel => "an integrity label",
+        SidTypeLogonSession => "a logon session",
+        _ => "of no known kind",
+    }
 }
 
 /// `LookupAccountNameW`: the reverse of [`account_name_from_sid_string`],
 /// needed because [`LsaAddAccountRights`] takes a `PSID`, not a name.
-/// Returns the raw SID bytes — the pointer `LsaAddAccountRights` needs is
-/// `sid_buf.as_mut_ptr()`, valid exactly as long as the returned `Vec` is.
+/// Returns the SID bytes — the pointer `LsaAddAccountRights` needs is
+/// `sid.as_ptr()`, valid exactly as long as the returned `Vec` is — and the
+/// `SID_NAME_USE` of what the name names. It refuses nothing by kind: a group
+/// or a domain resolves too.
 ///
 /// Strips a leading `.\` (SCM's shorthand for "an account on this
 /// machine", accepted by `CreateServiceW`/`ChangeServiceConfigW`) before
@@ -208,55 +306,86 @@ fn lookup_account_sid(psid: PSID, sid_str: impl FnOnce() -> String) -> Result<St
 /// user>` fails, the bare name and a fully domain-qualified name both
 /// succeed). A bare local account name resolves against the local machine
 /// on its own, so dropping the prefix loses nothing.
-pub(crate) fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
+///
+/// `field` is the spec field `account_name` came from, if any.
+pub(crate) fn sid_for_account_name(account_name: &str, field: Option<&str>) -> Result<(Sid, i32)> {
+    let subject = subject(field, "account", account_name);
     let account_name = account_name.strip_prefix(r".\").unwrap_or(account_name);
-    let wide_name = wide_null(account_name)
-        .map_err(|e| Error::os(format!("resolve SID for account `{}`", account_name.escape_debug()), e))?;
-    let mut sid_len: u32 = 0;
-    let mut domain_len: u32 = 0;
-    let mut use_: i32 = 0;
-    // SAFETY: sizing call — see `lookup_account_sid`.
-    let sizing_ok = unsafe {
-        LookupAccountNameW(
-            std::ptr::null(),
-            wide_name.as_ptr(),
-            std::ptr::null_mut(),
-            &mut sid_len,
-            std::ptr::null_mut(),
-            &mut domain_len,
-            &mut use_,
-        )
-    };
-    if sizing_ok != 0 {
-        return Err(Error::AccountLookup {
-            detail: format!("LookupAccountNameW for `{account_name}` unexpectedly succeeded on a zero-sized buffer"),
-            source: None,
-        });
-    }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-        return Err(Error::os(format!("resolve SID for account `{account_name}`"), err));
-    }
+    let wide_name = wide_null(account_name).map_err(|e| refused_input(format!("resolve SID for {subject}"), e))?;
+    let action = || format!("resolve SID for {subject}");
+    let mut use_ = 0;
+    let (bytes, _domain) = lookup_growing(action, |sid, sid_len, domain, domain_len| {
+        // SAFETY: `wide_name` is a valid null-terminated wide string; each buffer is null with a zero
+        // length or has exactly the length passed beside it (bytes for the SID, units for the domain);
+        // the length and `use_` out-params are valid lvalues.
+        win32_status(unsafe {
+            LookupAccountNameW(
+                std::ptr::null(),
+                wide_name.as_ptr(),
+                sid as PSID,
+                sid_len,
+                domain,
+                domain_len,
+                &mut use_,
+            )
+        })
+    })?;
+    let sid = whole_sid_prefix(bytes)
+        .ok_or_else(|| Error::os(action(), std::io::Error::other("the SID it wrote is not a whole SID")))?;
+    Ok((sid, use_))
+}
 
-    let mut sid_buf = vec![0u8; sid_len as usize];
-    let mut domain_buf = vec![0u16; domain_len as usize];
-    // SAFETY: `sid_buf` is sized exactly to `sid_len` as a `PSID` out-buffer;
-    // `domain_buf` likewise for the domain name.
-    let ok = unsafe {
-        LookupAccountNameW(
-            std::ptr::null(),
-            wide_name.as_ptr(),
-            sid_buf.as_mut_ptr() as PSID,
-            &mut sid_len,
-            domain_buf.as_mut_ptr(),
-            &mut domain_len,
-            &mut use_,
-        )
+// user accounts only ==================================================================================================
+
+/// The SID of an account [`require_user_account`] found to be a user account. Only that function
+/// builds one, so a grant that takes one acts on the SID that was checked.
+#[derive(Debug)]
+pub struct UserSid {
+    sid: Sid,
+    /// The name of the account, for the grant's errors.
+    account: String,
+}
+
+/// The account of a spec, as the user wrote it.
+#[derive(Clone, Copy, Debug)]
+pub enum Written<'a> {
+    /// `user.name`.
+    Name(&'a str),
+    /// `user.id`, a SID string.
+    Sid(&'a str),
+}
+
+/// Refuses `account` unless it names a user account, and returns the SID it found. A
+/// `SeServiceLogonRight` granted to a group, a domain or a machine would reach every account in it,
+/// and the right is what installing a service that runs as `account` grants. `written` is what the
+/// user wrote, for the refusal to quote; `None` names `account`. A `user.id` is resolved from the
+/// SID string, so its kind and its SID are those of the SID the user wrote, not of whatever
+/// `account` resolves to by name; any other `account` is looked up by name. Either way it changes
+/// nothing.
+pub fn require_user_account(account: &str, written: Option<Written>) -> Result<UserSid> {
+    let (field, value) = match written {
+        Some(Written::Name(name)) => (Some("user.name"), name),
+        Some(Written::Sid(sid)) => (Some("user.id"), sid),
+        None => (None, account),
     };
-    if ok == 0 {
-        return Err(last_error(&format!("resolve SID for account `{account_name}`")));
+    let (sid, account, use_) = match written {
+        Some(Written::Sid(sid_str)) => resolve_sid_string(sid_str)?,
+        _ => {
+            let (sid, use_) = sid_for_account_name(account, field)?;
+            (sid, account.to_string(), use_)
+        }
+    };
+    if use_ == SidTypeUser {
+        return Ok(UserSid { sid, account });
     }
-    Ok(sid_buf)
+    Err(Error::AccountLookup {
+        detail: format!(
+            "{} is not a user account (it is {})",
+            subject(field, "account", value),
+            name_use_kind(use_)
+        ),
+        source: None,
+    })
 }
 
 // SeServiceLogonRight =================================================================================================
@@ -268,12 +397,16 @@ fn nt_error(context: &str, status: i32) -> Error {
     Error::os(context, std::io::Error::from_raw_os_error(win32 as i32))
 }
 
-/// Grant `account_name` the right to log on as a service
+/// Grant `user` the right to log on as a service
 /// (`SeServiceLogonRight`), via `LsaAddAccountRights`. Idempotent: an
 /// account that already has the right is unaffected, so this is safe to
-/// call again on a later install of the same account.
-pub fn grant_service_logon_right(account_name: &str) -> Result<()> {
-    let sid_buf = sid_for_account_name(account_name)?;
+/// call again on a later install of the same account. `user` is the account [`require_user_account`]
+/// checked; the grant does no lookup of its own.
+pub fn grant_service_logon_right(user: &UserSid) -> Result<()> {
+    let UserSid {
+        sid: sid_buf,
+        account: account_name,
+    } = user;
 
     let mut policy_handle: isize = 0;
     let object_attributes = LSA_OBJECT_ATTRIBUTES::default();

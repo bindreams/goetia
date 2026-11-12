@@ -1,5 +1,6 @@
 use super::*;
-use crate::backend::scm::sid::system;
+use crate::backend::scm::sid::{sid_from_parts, system};
+use crate::elevation::test_support::open_process_token;
 
 #[skuld::test]
 fn root_resolves_to_an_empty_unused_identity() {
@@ -49,7 +50,18 @@ fn sid_resolves_a_well_known_sid_to_an_account_name() {
 #[skuld::test]
 fn sid_rejects_a_malformed_sid_string() {
     let err = resolve(&User::Id(AccountId::Sid("not-a-sid".to_string()))).expect_err("not a valid SID string");
-    assert_eq!(err.to_string(), "failed to parse `user.id` `not-a-sid` as a SID string");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "account lookup failed: cannot parse `user.id` `not-a-sid` as a SID string"
+    );
+    assert!(
+        err.report()
+            .to_string()
+            .starts_with("account lookup failed: cannot parse `user.id` `not-a-sid` as a SID string: "),
+        "{}",
+        err.report()
+    );
 }
 
 // service_password ====================================================================================================
@@ -100,21 +112,302 @@ fn bytes_that_are_not_a_sid_are_an_error_not_a_read_past_them() {
 fn a_nul_in_a_sid_string_is_refused_not_cut_there() {
     // Cut at the NUL, this would resolve `S-1-5-18`.
     let err = account_name_from_sid_string("S-1-5-18\0junk").expect_err("a NUL ends nothing here");
-    assert!(matches!(err, Error::Os { .. }), "{err:?}");
-    assert!(
-        err.to_string()
-            .starts_with(r"failed to parse `user.id` `S-1-5-18\0junk` as a SID string"),
-        "{err}"
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "account lookup failed: cannot parse `user.id` `S-1-5-18\0junk` as a SID string"
     );
 }
 
 #[skuld::test]
 fn a_nul_in_an_account_name_is_refused_not_cut_there() {
-    let err = sid_for_account_name("SYSTEM\0junk").expect_err("a NUL ends nothing here");
-    assert!(matches!(err, Error::Os { .. }), "{err:?}");
+    let err = sid_for_account_name("SYSTEM\0junk", Some("user.name")).expect_err("a NUL ends nothing here");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "account lookup failed: cannot resolve SID for `user.name` `SYSTEM\0junk`"
+    );
+}
+
+// A lookup that finds no account ======================================================================================
+
+#[skuld::test]
+fn a_well_formed_sid_no_account_has_is_an_account_lookup_naming_the_field() {
+    let err = account_name_from_sid_string("S-1-5-21-1-2-3-999999").expect_err("no such account");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
     assert!(
         err.to_string()
-            .starts_with(r"failed to resolve SID for account `SYSTEM\0junk`"),
+            .starts_with("account lookup failed: cannot resolve account name for `user.id` `S-1-5-21-1-2-3-999999`"),
         "{err}"
     );
+}
+
+#[skuld::test]
+fn a_binary_sid_no_account_has_is_an_account_lookup_naming_no_field() {
+    let sid = sid_from_parts(5, &[21, 1, 2, 3, 999999]);
+    let err = account_name_of_sid(&sid).expect_err("no such account");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("account lookup failed: cannot resolve account name for SID `S-1-5-21-1-2-3-999999`"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
+fn an_unknown_account_name_is_an_account_lookup_naming_the_field() {
+    let err = sid_for_account_name("goetia-no-such-account-7f3a", Some("user.name")).expect_err("no such account");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("account lookup failed: cannot resolve SID for `user.name` `goetia-no-such-account-7f3a`"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
+fn an_account_name_without_a_field_names_the_account() {
+    let err = sid_for_account_name("goetia-no-such-account-7f3a", None).expect_err("no such account");
+    assert!(
+        err.to_string()
+            .starts_with("account lookup failed: cannot resolve SID for account `goetia-no-such-account-7f3a`"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
+fn a_name_is_quoted_as_written_and_its_backslash_is_not_doubled() {
+    // A backslash then `n` must not read as an escaped newline either.
+    let err = sid_for_account_name(r"GOETIA-NO-SUCH-DOMAIN\nobody", Some("user.name")).expect_err("no such domain");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with(r"account lookup failed: cannot resolve SID for `user.name` `GOETIA-NO-SUCH-DOMAIN\nobody`"),
+        "{err}"
+    );
+    let err = sid_for_account_name(r".\goetia-no-such-account-7f3a", Some("user.name")).expect_err("no such account");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with(r"account lookup failed: cannot resolve SID for `user.name` `.\goetia-no-such-account-7f3a`"),
+        "{err}"
+    );
+}
+
+// An account that is not a user =======================================================================================
+
+#[skuld::test]
+fn a_name_that_is_no_user_account_is_refused() {
+    // Each names nothing, or something that is not a user: granting the right to it would change who may
+    // log on as a service on the whole host. The names that need a password are also pinned in order,
+    // through `apply`, in `manager_tests.rs`; `apply` skips the check for `""`, `NT SERVICE\` and
+    // `NT AUTHORITY\SYSTEM`, which need none, so they are pinned only here.
+    for name in [
+        "",
+        r"\",
+        r".\",
+        r"NT SERVICE\",
+        "Administrators",
+        "Users",
+        r"NT AUTHORITY\SYSTEM",
+    ] {
+        let err = require_user_account(name, Some(Written::Name(name))).expect_err(name);
+        assert!(matches!(err, Error::AccountLookup { .. }), "`{name}`: {err:?}");
+        assert!(err.to_string().contains("`user.name`"), "`{name}`: {err}");
+    }
+}
+
+#[skuld::test]
+fn a_group_is_refused_saying_it_is_not_a_user() {
+    let err = require_user_account("Administrators", Some(Written::Name("Administrators"))).expect_err("a group");
+    assert_eq!(
+        err.to_string(),
+        "account lookup failed: `user.name` `Administrators` is not a user account (it is a local group)"
+    );
+}
+
+#[skuld::test]
+fn a_sid_that_resolves_to_a_group_is_refused_naming_the_sid_as_written() {
+    // `S-1-1-0` resolves to `Everyone`; the refusal quotes what the user wrote.
+    let account = resolve(&User::Id(AccountId::Sid("S-1-1-0".to_string())))
+        .expect("Everyone resolves")
+        .user;
+    let err = require_user_account(&account, Some(Written::Sid("S-1-1-0"))).expect_err("a group");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "account lookup failed: `user.id` `S-1-1-0` is not a user account (it is a well-known group)"
+    );
+}
+
+#[skuld::test]
+fn a_refused_account_without_a_written_value_is_named_as_it_is() {
+    let err = require_user_account("Administrators", None).expect_err("a group");
+    assert_eq!(
+        err.to_string(),
+        "account lookup failed: account `Administrators` is not a user account (it is a local group)"
+    );
+}
+
+#[skuld::test]
+fn the_account_this_test_runs_as_is_accepted_if_it_is_a_user_and_refused_if_it_is_not() {
+    // The token's own SID, written as `user.id`: a user account on a developer host, `SYSTEM` (a well-known
+    // group) on a service host. Both are lookups only.
+    let token_sid = process_user_sid();
+    let written = sid_display(&token_sid);
+    let (_, name, kind) = resolve_sid_string(&written).expect("the token user resolves");
+    let result = require_user_account(&name, Some(Written::Sid(&written)));
+    if kind == SidTypeUser {
+        let user = result.expect("a user account is accepted");
+        assert_eq!(user.sid, token_sid);
+        assert_eq!(user.account, name);
+    } else {
+        let err = result.expect_err("not a user account");
+        assert!(err.to_string().contains("is not a user account"), "{err}");
+    }
+}
+
+/// The user SID of this process's token.
+fn process_user_sid() -> Vec<u8> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+
+    let token = open_process_token(TOKEN_QUERY);
+    // 8-byte alignment for `TOKEN_USER`, which the buffer holds.
+    let mut buf = vec![0u64; 64];
+    let mut needed = 0;
+    // SAFETY: `token` is live with `TOKEN_QUERY`; `buf` is the size passed.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut needed,
+        )
+    };
+    assert_ne!(ok, 0, "GetTokenInformation: {}", std::io::Error::last_os_error());
+    // SAFETY: the call filled the buffer with a `TOKEN_USER`, whose `Sid` points into it.
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: a valid SID in `buf`, which is live.
+    unsafe { crate::backend::scm::sid::copy_sid(sid) }.expect("the token user is a SID")
+}
+
+#[skuld::test]
+fn the_account_this_test_runs_as_resolves_back_to_its_own_sid() {
+    // Whatever kind of account this is (a user, or `SYSTEM` on a service host), its name resolves to its SID.
+    let sid = process_user_sid();
+    let name = account_name_of_sid(&sid).expect("the token user has a name");
+    let (found, _kind) = sid_for_account_name(&name, None).expect("the current user resolves by name");
+    assert_eq!(found, sid);
+}
+
+// lookup_growing ======================================================================================================
+
+/// A lookup call that plays `steps` in order: each sets the two lengths and answers with a status, `0` for success.
+fn scripted<const N: usize>(
+    steps: [(u32, u32, u32); N],
+) -> impl FnMut(*mut u16, &mut u32, *mut u16, &mut u32) -> std::io::Result<()> {
+    let mut steps = steps.into_iter();
+    move |_first, first_len, _domain, domain_len| {
+        let (status, first, domain) = steps.next().expect("the call ran more often than scripted");
+        *first_len = first;
+        *domain_len = domain;
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(status as i32))
+        }
+    }
+}
+
+#[skuld::test]
+fn a_lookup_that_needs_more_grows_the_buffers_to_what_it_reported_and_cuts_them_to_what_it_wrote() {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as MORE;
+    let call = scripted([(MORE, 10, 4), (0, 3, 2)]);
+
+    let (first, domain) = lookup_growing(|| "look up".to_string(), call).expect("the second call fits");
+
+    assert_eq!((first.len(), domain.len()), (3, 2));
+}
+
+#[skuld::test]
+fn a_lookup_that_asks_for_no_more_than_it_has_stops_with_an_os_error() {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as MORE;
+    // Asking again with the same lengths would change nothing, whether on the first call or a later one.
+    let first_call = lookup_growing(|| "look up".to_string(), scripted([(MORE, 0, 0)])).expect_err("no progress");
+    let later_call =
+        lookup_growing(|| "look up".to_string(), scripted([(MORE, 5, 3), (MORE, 5, 3)])).expect_err("no progress");
+    for err in [first_call, later_call] {
+        assert!(matches!(err, Error::Os { .. }), "{err:?}");
+        assert_eq!(err.to_string(), "failed to look up");
+    }
+}
+
+#[skuld::test]
+fn a_lookup_that_grows_one_buffer_and_not_the_other_keeps_the_larger() {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as MORE;
+    // The second answer needs less of the first buffer than it has, and more of the second. Each call
+    // gets the lengths of the buffers it is passed; the first must not shrink between calls.
+    let mut seen = Vec::new();
+    let mut answers = scripted([(MORE, 10, 0), (MORE, 4, 6), (0, 4, 6)]);
+    let call = |first: *mut u16, first_len: &mut u32, domain: *mut u16, domain_len: &mut u32| {
+        seen.push((*first_len, *domain_len));
+        answers(first, first_len, domain, domain_len)
+    };
+    let (first, domain) = lookup_growing(|| "look up".to_string(), call).expect("it fits at last");
+    assert_eq!((first.len(), domain.len()), (4, 6));
+    assert_eq!(seen, [(0, 0), (10, 0), (10, 6)]);
+}
+
+#[skuld::test]
+fn a_success_that_wrote_nothing_or_reports_more_than_it_was_given_is_an_os_error() {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER as MORE;
+    let empty = lookup_growing(|| "look up".to_string(), scripted([(MORE, 4, 2), (0, 0, 0)])).expect_err("empty");
+    let past_first = lookup_growing(|| "look up".to_string(), scripted([(MORE, 4, 2), (0, 5, 0)])).expect_err("past");
+    let past_domain = lookup_growing(|| "look up".to_string(), scripted([(MORE, 4, 2), (0, 4, 3)])).expect_err("past");
+    // Success on the first call, with no buffer: the lengths cannot fit it.
+    let unsized_ = lookup_growing(|| "look up".to_string(), scripted([(0, 1, 0)])).expect_err("past");
+    for err in [empty, past_first, past_domain, unsized_] {
+        assert!(matches!(err, Error::Os { .. }), "{err:?}");
+        assert_eq!(err.to_string(), "failed to look up");
+    }
+}
+
+#[skuld::test]
+fn a_lookup_that_fails_otherwise_goes_to_account_error() {
+    let none_mapped = lookup_growing(|| "look up".to_string(), scripted([(1332, 0, 0)])).expect_err("no account");
+    assert!(matches!(none_mapped, Error::AccountLookup { .. }), "{none_mapped:?}");
+    let other = lookup_growing(|| "look up".to_string(), scripted([(8, 0, 0)])).expect_err("out of memory");
+    assert!(matches!(other, Error::Os { .. }), "{other:?}");
+}
+
+#[skuld::test]
+fn a_sid_is_cut_to_the_length_its_sub_authority_count_gives() {
+    let sid = sid_from_parts(5, &[21, 1, 2]);
+    let mut padded = sid.clone();
+    padded.extend_from_slice(&[0; 9]);
+    assert_eq!(whole_sid_prefix(padded), Some(sid.clone()));
+    assert_eq!(whole_sid_prefix(sid[..sid.len() - 1].to_vec()), None);
+    assert_eq!(whole_sid_prefix(Vec::new()), None);
+    assert_eq!(whole_sid_prefix(vec![1]), None);
+    assert_eq!(whole_sid_prefix(vec![2, 0, 0, 0, 0, 0, 0, 5]), None);
+}
+
+// account_error =======================================================================================================
+
+#[skuld::test]
+fn an_input_code_is_an_account_lookup_and_any_other_code_is_an_os_failure() {
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_PARAMETER, ERROR_INVALID_SID, ERROR_NONE_MAPPED, ERROR_NOT_ENOUGH_MEMORY,
+    };
+    for code in [ERROR_NONE_MAPPED, ERROR_INVALID_SID, ERROR_INVALID_PARAMETER] {
+        let err = account_error("resolve x".to_string(), std::io::Error::from_raw_os_error(code as i32));
+        assert!(matches!(err, Error::AccountLookup { .. }), "{code}: {err:?}");
+    }
+    let err = account_error(
+        "resolve x".to_string(),
+        std::io::Error::from_raw_os_error(ERROR_NOT_ENOUGH_MEMORY as i32),
+    );
+    assert!(matches!(err, Error::Os { .. }), "{err:?}");
 }
