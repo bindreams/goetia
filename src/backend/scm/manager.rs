@@ -112,8 +112,8 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
-    EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, Waited, carried,
-    end_on_incomplete_stop, end_process,
+    EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
+    carried, end_on_incomplete_stop, end_process,
 };
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
@@ -1140,13 +1140,10 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
 ) -> Result<HoldOutcome<P>> {
     // Taken again for each STOP the loop sends, so the one kept is the process that STOP is for.
     let mut process = HoldOutcome::NoProcess;
-    // The holds begun. A hold before a STOP follows an earlier one only when that STOP was refused.
-    let mut holds = 0usize;
     let settled = super::wait::settle_and_stop(actor, Budget::Unbounded.start(), answer.judges_stop_record(), |_| {
         let Some(hold) = hold.as_mut() else {
             return Ok(());
         };
-        holds += 1;
         match hold()? {
             HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
             held => {
@@ -1159,12 +1156,7 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
     let settled = match settled {
         Ok(waited) => Ok(waited),
         Err(SettleError::Other(e)) => Err(e),
-        Err(SettleError::Hold { error, under_way }) => {
-            let stop = match (under_way, holds) {
-                (true, _) => StopSent::UnderWay,
-                (false, 1) => StopSent::None,
-                (false, _) => StopSent::Maybe,
-            };
+        Err(SettleError::Hold { error, stop }) => {
             let state = UninstallFailure::HoldFailed { marked, stop, previous };
             return Err(uninstall_failed(id, &state, error));
         }
@@ -1667,8 +1659,7 @@ enum UninstallFailure {
     AlreadyMarked,
     /// goetia's own hold of the service's process failed (see [`uninstall_stop_on`]); the stop did not
     /// fail. `marked` is whether someone else had marked the service for deletion, which leaves it
-    /// undisabled; otherwise it is disabled, with `previous` its start type before. `stop` is what goetia
-    /// knows of a STOP.
+    /// undisabled; otherwise it is disabled, with `previous` its start type before.
     HoldFailed {
         marked: bool,
         stop: StopSent,
@@ -1681,18 +1672,6 @@ enum UninstallFailure {
         previous: Option<ServiceStartType>,
         marked: bool,
     },
-}
-
-/// What goetia knows about a STOP when its hold failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StopSent {
-    /// The hold was the one before the first STOP: none was sent.
-    None,
-    /// The hold was the one before a STOP sent again, after a STOP refused with 1061: one may have been
-    /// delivered.
-    Maybe,
-    /// The service was found `STOP_PENDING`: goetia sent none.
-    UnderWay,
 }
 
 /// An `uninstall` that failed with `cause`, led by what it left behind. Every state names the retry
@@ -1723,10 +1702,20 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
              so `uninstall` did not delete it. It is removed once it stops and its last handle closes; {kill}"
         ),
         UninstallFailure::HoldFailed { marked, stop, previous } => {
-            let stop = match stop {
+            // `sc.exe stop` of a service already stopping is refused (1061), so it is told to wait.
+            let sent = match stop {
                 StopSent::None => "It sent no STOP.",
                 StopSent::Maybe => "A STOP it sent was refused and may have been delivered; it sent none after that.",
                 StopSent::UnderWay => "The service was already stopping (STOP_PENDING), so it sent no STOP.",
+            };
+            let remedy = match stop {
+                StopSent::None | StopSent::Maybe => format!(
+                    "Re-run `goetia daemon uninstall {id}`; if it fails the same way, stop the service \
+                     (`sc.exe stop {id}`) and re-run"
+                ),
+                StopSent::UnderWay => {
+                    format!("Wait for the service to stop, then re-run `goetia daemon uninstall {id}`")
+                }
             };
             let left = if *marked {
                 "The service is marked for deletion by someone else, so goetia did not disable or delete it; \
@@ -1739,9 +1728,8 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
                 )
             };
             format!(
-                "`{id}`'s uninstall stopped: goetia could not hold its process to wait for its exit. {stop} \
-                 {left} Re-run `goetia daemon uninstall {id}`; if it fails the same way, stop the service \
-                 (`sc.exe stop {id}`) and re-run"
+                "`{id}`'s uninstall stopped: goetia could not hold its process to wait for its exit. {sent} \
+                 {left} {remedy}"
             )
         }
         UninstallFailure::DaemonMayRun { previous, marked } => {

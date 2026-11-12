@@ -1465,14 +1465,14 @@ fn settle_and_stop_holds_a_service_found_stop_pending_once_before_waiting() {
 fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_stop_pending_service() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
 
-    let SettleError::Hold { error, under_way } =
+    let SettleError::Hold { error, stop } =
         super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err()
     else {
         panic!("a failed hold is a hold failure");
     };
 
     assert_eq!(error.to_string(), "no hold");
-    assert!(under_way);
+    assert_eq!(stop, StopSent::UnderWay);
     assert_eq!(fake.log, ["arm_settle"]);
 }
 
@@ -1481,14 +1481,14 @@ fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_stop_pending_service() {
 fn settle_and_stop_sends_no_stop_when_the_callers_step_fails() {
     let mut fake = FakeScm::new([Some(Observed::Running)]);
 
-    let SettleError::Hold { error, under_way } =
+    let SettleError::Hold { error, stop } =
         super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err()
     else {
         panic!("a failed hold is a hold failure");
     };
 
     assert_eq!(error.to_string(), "no hold");
-    assert!(!under_way);
+    assert_eq!(stop, StopSent::None);
     assert_eq!(fake.log, ["arm_settle", "wait", "got_running"]);
 }
 
@@ -3711,10 +3711,7 @@ fn an_uninstall_holds_only_when_told_to_and_judges_only_what_may_be_a_shim() {
     }
 }
 
-/// A hold that fails is goetia's own doing, never that of whoever marked the service for deletion or of
-/// the service's refusal of STOP: one sentence says so, marked or not, and says what goetia knows of a
-/// STOP: none sent (the hold before the first STOP), one that may have been delivered (the hold before a
-/// STOP sent again after a 1061), or none sent to a service found `STOP_PENDING`.
+/// A failed hold is goetia's own doing, never the marker's or the service's refusal of STOP: one sentence says so, marked or not, and says what goetia knows of the STOP.
 #[cfg(windows)]
 #[skuld::test]
 fn an_uninstall_whose_hold_failed_says_what_is_known_of_the_stop_marked_or_not() {
@@ -3722,37 +3719,75 @@ fn an_uninstall_whose_hold_failed_says_what_is_known_of_the_stop_marked_or_not()
     use crate::spec::Id;
     use windows_service::service::ServiceStartType;
 
+    /// What led to the hold that fails.
+    #[derive(Clone, Copy, Debug)]
+    enum Lead {
+        /// The hold before the first STOP.
+        FirstStop,
+        /// A STOP refused with 1061, then the hold before it is sent again.
+        Refused1061,
+        /// A STOP refused with 1052, which was not delivered, then the hold before it is sent again.
+        Refused1052,
+        /// A 1061 and then a 1052, then the hold before a third STOP: the 1061's STOP may still have been delivered.
+        Refused1061Then1052,
+        /// A service found `STOP_PENDING` and held, then seen `RUNNING`: the hold before a STOP that was never sent.
+        StopPendingThenRunning,
+        /// The hold of a service found `STOP_PENDING`.
+        StopPending,
+    }
+
+    // The lead, the hold that fails, the STOPs sent by then, and what the failure says of a STOP.
+    let leads = [
+        (Lead::FirstStop, 1, 0, StopSent::None),
+        (Lead::Refused1061, 2, 1, StopSent::Maybe),
+        (Lead::Refused1052, 2, 1, StopSent::None),
+        (Lead::Refused1061Then1052, 3, 2, StopSent::Maybe),
+        (Lead::StopPendingThenRunning, 2, 0, StopSent::None),
+        (Lead::StopPending, 1, 0, StopSent::UnderWay),
+    ];
+    let scm_for = |lead: Lead| match lead {
+        Lead::FirstStop => FakeScm::new([Some(Observed::Running)]),
+        Lead::Refused1061 => FakeScm::new([Some(Observed::Running)])
+            .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+            .queried(QueriedState::Running, true),
+        Lead::Refused1052 => FakeScm::new([Some(Observed::Running)])
+            .stop_replies([StopReply::Os(ERROR_INVALID_SERVICE_CONTROL)])
+            .queried(QueriedState::Running, true),
+        Lead::Refused1061Then1052 => FakeScm::new([Some(Observed::Running)])
+            .stop_replies([
+                StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL),
+                StopReply::Os(ERROR_INVALID_SERVICE_CONTROL),
+            ])
+            .queried(QueriedState::Running, true)
+            .then_queried(QueriedState::Running, true),
+        Lead::StopPendingThenRunning => FakeScm::new([Some(Observed::Running)]).starting_in(QueriedState::StopPending),
+        Lead::StopPending => FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending),
+    };
+
     let [(_, answer), ..] = answers();
-    let lead = "`frpc`'s uninstall stopped: goetia could not hold its process to wait for its exit.";
-    let remedy = "Re-run `goetia daemon uninstall frpc`; if it fails the same way, stop the service \
-                  (`sc.exe stop frpc`) and re-run: blob: held badly";
+    let lead_sentence = "`frpc`'s uninstall stopped: goetia could not hold its process to wait for its exit.";
     let marked_left = "The service is marked for deletion by someone else, so goetia did not disable or delete \
                        it; it is removed once it stops and its last handle closes.";
-    let disabled = "The service was NOT deleted and is now disabled, so `goetia daemon start frpc` fails. \
-                    Its start type was automatic; `goetia daemon enable frpc` sets it again.";
-    for (stop, fact) in [
-        ("none", "It sent no STOP."),
-        (
-            "maybe",
-            "A STOP it sent was refused and may have been delivered; it sent none after that.",
-        ),
-        (
-            "under way",
-            "The service was already stopping (STOP_PENDING), so it sent no STOP.",
-        ),
-    ] {
-        for marked in [false, true] {
-            let previous = (!marked).then_some(ServiceStartType::AutoStart);
+    let retry = "Re-run `goetia daemon uninstall frpc`; if it fails the same way, stop the service \
+                 (`sc.exe stop frpc`) and re-run";
+    let wait_then_retry = "Wait for the service to stop, then re-run `goetia daemon uninstall frpc`";
+    let not_deleted = "The service was NOT deleted and is now disabled, so `goetia daemon start frpc` fails.";
+    let auto = " Its start type was automatic; `goetia daemon enable frpc` sets it again.";
+    for (lead, fails_on, stops, stop) in leads {
+        let (sent, remedy) = match stop {
+            StopSent::None => ("It sent no STOP.", retry),
+            StopSent::Maybe => (
+                "A STOP it sent was refused and may have been delivered; it sent none after that.",
+                retry,
+            ),
+            StopSent::UnderWay => (
+                "The service was already stopping (STOP_PENDING), so it sent no STOP.",
+                wait_then_retry,
+            ),
+        };
+        for (marked, previous) in [(false, Some(ServiceStartType::AutoStart)), (false, None), (true, None)] {
             let holds = std::cell::Cell::new(0);
-            // The hold for a STOP sent again is the second; every other failing hold is the first.
-            let fails_on = if stop == "maybe" { 2 } else { 1 };
-            let mut fake = match stop {
-                "none" => FakeScm::new([Some(Observed::Running)]),
-                "maybe" => FakeScm::new([Some(Observed::Running)])
-                    .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
-                    .queried(QueriedState::Running, true),
-                _ => FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending),
-            };
+            let mut fake = scm_for(lead);
 
             let err = uninstall_stop_on(
                 &mut fake,
@@ -3772,13 +3807,17 @@ fn an_uninstall_whose_hold_failed_says_what_is_known_of_the_stop_marked_or_not()
             )
             .expect_err("the hold failed");
 
-            let cell = format!("{stop}, marked {marked}: {:?}", fake.log);
+            let cell = format!("{lead:?}, marked {marked}, previous {previous:?}: {:?}", fake.log);
             assert_eq!(holds.get(), fails_on, "{cell}");
-            assert_eq!(fake.stop_count(), usize::from(stop == "maybe"), "{cell}");
-            let left = if marked { marked_left } else { disabled };
+            assert_eq!(fake.stop_count(), stops, "{cell}");
+            let left = match (marked, previous) {
+                (true, _) => marked_left.to_string(),
+                (false, Some(_)) => format!("{not_deleted}{auto}"),
+                (false, None) => not_deleted.to_string(),
+            };
             assert_eq!(
                 err.report().to_string(),
-                format!("{lead} {fact} {left} {remedy}"),
+                format!("{lead_sentence} {sent} {left} {remedy}: blob: held badly"),
                 "{cell}"
             );
         }

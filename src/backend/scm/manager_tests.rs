@@ -1238,8 +1238,7 @@ fn a_denied_service_manager_open_is_named_as_the_managers() {
     assert!(!report.contains("to service"), "{report}");
 }
 
-/// A marked service whose stop failed is told in one sentence that claims no disable and does not say
-/// it was NOT deleted, and sends the person to `kill` for a service that does not accept STOP.
+/// A marked service whose stop failed claims no disable and names `kill`.
 #[skuld::test]
 fn a_stop_failure_on_a_marked_service_names_who_marked_it_and_claims_no_disable() {
     let text = uninstall_failure(&UninstallFailure::AlreadyMarked);
@@ -1257,6 +1256,34 @@ fn a_stop_failure_on_a_marked_service_names_who_marked_it_and_claims_no_disable(
     assert!(!text.contains("changed nothing"), "a STOP may have been sent: {text}");
     for stale in ["NOT deleted", "disabled", "goetia daemon enable", "goetia daemon start"] {
         assert!(!text.contains(stale), "`{stale}` is false for a marked service: {text}");
+    }
+}
+
+/// A failed hold is goetia's own failure, never the service's refusal of STOP or whoever marked it, so
+/// none of the stop-failure texts or `kill` appears, whatever goetia knows of a STOP, marked or not.
+#[skuld::test]
+fn a_failed_hold_blames_neither_the_service_nor_whoever_marked_it_and_names_no_kill() {
+    for stop in [StopSent::None, StopSent::Maybe, StopSent::UnderWay] {
+        for (marked, previous) in [(false, Some(ServiceStartType::AutoStart)), (false, None), (true, None)] {
+            let text = uninstall_failure(&UninstallFailure::HoldFailed { marked, stop, previous });
+            // A marked service is said to be marked by someone else, which is a fact, not a blame.
+            let by_someone = if marked {
+                "by someone else, so `uninstall`"
+            } else {
+                "by someone else"
+            };
+            for stale in ["could not be stopped", by_someone, "goetia daemon kill"] {
+                assert!(
+                    !text.contains(stale),
+                    "`{stale}` is false for a hold failure: {stop:?}, {marked}: {text}"
+                );
+            }
+            assert_eq!(
+                text.contains("sc.exe stop"),
+                stop != StopSent::UnderWay,
+                "`sc.exe stop` of a service already stopping is refused: {stop:?}: {text}"
+            );
+        }
     }
 }
 
