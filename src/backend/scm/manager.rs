@@ -137,7 +137,7 @@ use crate::error::{Chain, Error, Reason, Result, terminating_failed};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, Installed, State, Status, Step};
 use crate::shim::HostCommand;
-use crate::spec::{DaemonSpec, Id, Kind};
+use crate::spec::{DaemonSpec, Id, Kind, User};
 
 // Scm =================================================================================================================
 
@@ -385,14 +385,14 @@ impl Backend for Scm {
 
     fn write(
         &self,
-        _spec: &DaemonSpec,
+        spec: &DaemonSpec,
         definition: &ScmRegistration,
         _outcome: &Outcome,
         snapshot: Option<&ScmSnapshot>,
         _scope: &mut Option<InstallLock>,
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
-        apply(definition, snapshot.is_none())?;
+        apply(definition, user_field(&spec.user), snapshot.is_none())?;
         Ok(WriteOutcome::Done)
     }
 
@@ -841,6 +841,15 @@ pub(in crate::backend::scm) fn split_command_line(cmdline: &str) -> (PathBuf, Ve
 
 // apply (write path) ==================================================================================================
 
+/// The spec field an account name came from, for an error: `user.name` for a name the user wrote, none
+/// for one resolved from a `user.id` (whose own field the resolution already names).
+fn user_field(user: &User) -> Option<&'static str> {
+    match user {
+        User::Name(_) => Some("user.name"),
+        User::Root | User::Id(_) => None,
+    }
+}
+
 /// Write `reg`: the preconditions first (`SeServiceLogonRight` for a real
 /// account, the event source), then the service itself (create or update),
 /// then `Parameters`, `Environment` and the failure actions. A precondition
@@ -850,8 +859,9 @@ pub(in crate::backend::scm) fn split_command_line(cmdline: &str) -> (PathBuf, Ve
 /// create/update immediately, minimizing the window in which a crash leaves a service with no marker; a failure in
 /// the two writes after it leaves a registration the next `install` reads as
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the
-/// start type the service has, rather than resetting it; see `service_info`.
-fn apply(reg: &ScmRegistration, create: bool) -> Result<()> {
+/// start type the service has, rather than resetting it; see `service_info`. `user_field` is the
+/// spec field the account name came from, if any.
+fn apply(reg: &ScmRegistration, user_field: Option<&'static str>, create: bool) -> Result<()> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -886,7 +896,7 @@ fn apply(reg: &ScmRegistration, create: bool) -> Result<()> {
                 account: account.to_string(),
             });
         }
-        identity::grant_service_logon_right(account)?;
+        identity::grant_service_logon_right(account, user_field)?;
         pw
     } else {
         None

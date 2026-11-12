@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::scm::sid::{sid_from_parts, system};
+use crate::backend::scm::sid::{is_whole_sid, sid_from_parts, system};
 
 #[skuld::test]
 fn root_resolves_to_an_empty_unused_identity() {
@@ -54,7 +54,6 @@ fn sid_rejects_a_malformed_sid_string() {
         err.to_string(),
         "account lookup failed: cannot parse `user.id` `not-a-sid` as a SID string"
     );
-    // The OS's own refusal is the cause, printed after the message.
     assert!(
         err.report()
             .to_string()
@@ -179,14 +178,70 @@ fn an_account_name_without_a_field_names_the_account() {
 fn a_name_is_quoted_as_written_and_its_backslash_is_not_doubled() {
     // A backslash then `n` must not read as an escaped newline either.
     let err = sid_for_account_name(r"GOETIA-NO-SUCH-DOMAIN\nobody", Some("user.name")).expect_err("no such domain");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
     assert!(
-        err.to_string().contains(r"`user.name` `GOETIA-NO-SUCH-DOMAIN\nobody`"),
+        err.to_string()
+            .starts_with(r"account lookup failed: cannot resolve SID for `user.name` `GOETIA-NO-SUCH-DOMAIN\nobody`"),
         "{err}"
     );
-    // The leading `.\` is stripped for the lookup, not from what the user wrote.
     let err = sid_for_account_name(r".\goetia-no-such-account-7f3a", Some("user.name")).expect_err("no such account");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
     assert!(
-        err.to_string().contains(r"`user.name` `.\goetia-no-such-account-7f3a`"),
+        err.to_string()
+            .starts_with(r"account lookup failed: cannot resolve SID for `user.name` `.\goetia-no-such-account-7f3a`"),
+        "{err}"
+    );
+}
+
+// An account that is not a user ======================================================================================
+
+#[skuld::test]
+fn a_name_that_is_no_user_account_is_refused_before_any_grant() {
+    // Each names nothing, or something that is not a user: granting the right to it would change who may
+    // log on as a service on the whole host.
+    for name in [
+        "",
+        r"\",
+        r".\",
+        r"NT SERVICE\",
+        "Administrators",
+        "Users",
+        r"NT AUTHORITY\SYSTEM",
+    ] {
+        let err = sid_for_account_name(name, Some("user.name")).expect_err(name);
+        assert!(matches!(err, Error::AccountLookup { .. }), "`{name}`: {err:?}");
+        assert!(err.to_string().contains("`user.name`"), "`{name}`: {err}");
+    }
+}
+
+#[skuld::test]
+fn a_group_is_refused_saying_it_is_not_a_user() {
+    let err = sid_for_account_name("Administrators", Some("user.name")).expect_err("a group");
+    assert_eq!(
+        err.to_string(),
+        "account lookup failed: `user.name` `Administrators` is not a user account (it is a local group)"
+    );
+}
+
+#[skuld::test]
+fn the_account_this_test_runs_as_is_a_user() {
+    let name = std::env::var("USERNAME").expect("Windows sets USERNAME");
+    let sid = sid_for_account_name(&name, Some("user.name")).expect("the current user is a user account");
+    assert!(is_whole_sid(&sid));
+}
+
+#[skuld::test]
+fn the_field_reaches_the_grant_refusal() {
+    // No such account: refused by the lookup, before the policy is opened.
+    let err = grant_service_logon_right("goetia-no-such-account-7f3a", Some("user.name")).expect_err("no such account");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert!(
+        err.to_string().contains("`user.name` `goetia-no-such-account-7f3a`"),
+        "{err}"
+    );
+    let err = grant_service_logon_right("goetia-no-such-account-7f3a", None).expect_err("no such account");
+    assert!(
+        err.to_string().contains("account `goetia-no-such-account-7f3a`"),
         "{err}"
     );
 }
