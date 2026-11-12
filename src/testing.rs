@@ -16,10 +16,12 @@ use crate::spec::{DaemonFields, Id, Kind, Restart, User};
 pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
 
 /// Runs every skuld test in the calling binary and exits; the `main` of every skuld test binary.
+/// A bad `GOETIA_TEST_<GROUP>` variable fails it first, whatever the binary's tests.
 ///
 /// A test is named `module::fn` (a crate-root test keeps its bare name), so two modules may each hold
 /// a `fn x`; under skuld's default bare names the binary panics at startup on the second.
 pub fn run_all() -> ! {
+    groups::validate_environment();
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.run()

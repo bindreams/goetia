@@ -16,7 +16,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::common::{LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, conformance_mk, fixture_command, manager, simple_spec};
 use crate::deny::Denied;
-use crate::support::{self, ELEVATED, Group, scm_group};
+use crate::support::{self, Group, scm_group};
 
 /// The label `tests/scm_integration/managed.rs` declares and documents, shared with it by label
 /// *name*: both binaries drive the one SCM on the host.
@@ -51,7 +51,7 @@ fn hand_edit(id: &str) {
 /// `SCM_DENIAL`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry in every concurrent
 /// `list()`.
-#[skuld::test(labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn simple_passes_conformance(#[fixture(scm_group)] _group: &Group) {
     let logs = LogDir::new();
     let mgr = manager();
@@ -91,7 +91,7 @@ fn simple_passes_conformance(#[fixture(scm_group)] _group: &Group) {
 
 // Step 2: round trip, start/stop/status, uninstall, list ==============================================================
 
-#[skuld::test(labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn install_then_list_round_trips_without_the_source_file(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -117,7 +117,7 @@ fn install_then_list_round_trips_without_the_source_file(#[fixture(scm_group)] _
     assert!(!status.enabled);
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -148,7 +148,7 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(status.state, State::Stopped);
 }
 
-#[skuld::test(labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -169,7 +169,7 @@ fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     );
 }
 
-#[skuld::test(labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_services(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     // A foreign service runs no shim, so it needs no `ShimGuard`.
@@ -189,7 +189,7 @@ fn list_ignores_foreign_services(#[fixture(scm_group)] _group: &Group) {
 /// A host of another version is refused before anything is registered: the copy of the shim has
 /// every occurrence of this crate's version in it replaced by a different one of the same length.
 // Labelled but not serial: it takes the install lock, as every `type: simple` install does.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn install_refuses_host_of_another_version(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -237,7 +237,7 @@ fn install_refuses_host_of_another_version(#[fixture(scm_group)] _group: &Group)
 
 /// A manager with no provider judges a service another provider's host runs: `status` and `list`
 /// regenerate from the installed registration, whose host and arguments stay as they were.
-#[skuld::test(labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
 fn status_through_new_keeps_a_standalone_host(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -274,7 +274,7 @@ fn status_through_new_keeps_a_standalone_host(#[fixture(scm_group)] _group: &Gro
 /// The shim reports `STOP_PENDING`, accepting no controls, from the moment it takes a stop until it
 /// reports `STOPPED`; SCM would otherwise show the service as `RUNNING` throughout the teardown.
 /// Fails if the shim stops reporting `STOP_PENDING`, or reports it with controls still accepted.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn the_shim_reports_stop_pending_then_stopped(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();

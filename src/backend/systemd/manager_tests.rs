@@ -5,7 +5,7 @@
 //! something no interleaving of `install` calls alone can force deterministically.
 //!
 //! Most of these are elevated (they write real files under `/etc/systemd/system`), so they join
-//! the `systemd_group` fixture of `crate::testing::groups` and the `ELEVATED` label.
+//! the `systemd_group` fixture of `crate::testing::groups`.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,6 @@ use crate::spec::Kind;
 use crate::testing::plain_fields;
 
 use crate::testing::cleanup::{DirGuard, FileGuard, remove_or_warn};
-use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::{Group, systemd_group};
 
 /// On drop, removes every `unique_quarantine_path(id)` file the test's scenario left behind.
@@ -92,7 +91,7 @@ fn mk(id: &str) -> DaemonSpec {
 
 // create_unit: a create never clobbers ================================================================================
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn create_does_not_clobber_a_unit_that_appears_after_classification(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
@@ -124,7 +123,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification(#[fixture(sy
 
 // quarantine_if_still_ours: an update never clobbers ==================================================================
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn quarantine_detects_a_swap_that_happened_after_classification(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
@@ -150,7 +149,7 @@ fn quarantine_detects_a_swap_that_happened_after_classification(#[fixture(system
     assert_eq!(on_disk, swapped_text, "the swapped-in file must survive untouched");
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn quarantine_succeeds_when_nothing_raced(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
@@ -188,7 +187,7 @@ fn quarantine_succeeds_when_nothing_raced(#[fixture(systemd_group)] _group: &Gro
 /// legitimate `Create` result the racer arrived too late to actually contest — `create_new` only ever
 /// succeeds once, against whichever of the two genuinely got to the empty path first, which is the
 /// only interleaving a non-clobbering write is about.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_never_corrupts_state_when_something_races_the_first_create(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
@@ -240,7 +239,7 @@ fn install_never_corrupts_state_when_something_races_the_first_create(#[fixture(
 
 // ensure_dir: parent directories ======================================================================================
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn ensure_dir_leaves_a_preexisting_directory_untouched(#[fixture(systemd_group)] _group: &Group) {
     let dir = std::env::temp_dir().join(format!("{}-preexisting", fresh_id("systemd")));
     std::fs::create_dir(&dir).expect("create pre-existing dir");
@@ -257,7 +256,7 @@ fn ensure_dir_leaves_a_preexisting_directory_untouched(#[fixture(systemd_group)]
     );
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write(#[fixture(systemd_group)] _group: &Group) {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -273,7 +272,7 @@ fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write(#[fixture
     assert_eq!(meta.uid(), 0, "owner must be untouched");
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn ensure_dir_refuses_a_preexisting_file(#[fixture(systemd_group)] _group: &Group) {
     let path = std::env::temp_dir().join(format!("{}-a-file", fresh_id("systemd")));
     std::fs::write(&path, b"").expect("create file");
@@ -289,7 +288,7 @@ fn ensure_dir_refuses_a_preexisting_file(#[fixture(systemd_group)] _group: &Grou
 /// `unit_path(id)` in the moment between `quarantine_if_still_ours` emptying it and
 /// `replace_unit_verified`'s own write claiming it. Real threads racing real filesystem calls, same
 /// join discipline as `install_never_corrupts_state_when_something_races_the_first_create`.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn replace_reports_raced_twice_rather_than_guessing_which_file_wins(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
     let path = unit_path(&id);
@@ -343,7 +342,7 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins(#[fixture(sy
 /// the removal, since two full `systemctl` round-trips run in between. Unlike the `install` paths,
 /// this needs no live daemon lifecycle, so it is exercised directly at the
 /// `quarantine_if_still_ours` level rather than through a real `stop`/`disable` cycle.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_file(
     #[fixture(systemd_group)] _group: &Group,
 ) {
@@ -492,7 +491,7 @@ fn a_reserved_sequence_needs_nothing_made_later() {
 
 /// `install --enable --start` is one sequence over one reservation, so install, `enable` and `start`
 /// share one pair of version probes: the gate is asked once for the three.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_enable_and_start_in_one_sequence_probe_the_gate_once(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
     let _cleanup = FileGuard::new(unit_path(&id));

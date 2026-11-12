@@ -24,7 +24,7 @@ use goetia::manager::{self, Budget, Installed, ServiceManager, State};
 use goetia::spec::{DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::cleanup::{DirGuard, FileGuard};
-use crate::support::{self, ConnectBack, ELEVATED, Group, cmd, launchd_group, may_account_for};
+use crate::support::{self, ConnectBack, Group, cmd, launchd_group, may_account_for};
 
 /// Held by every test that reads or seeds hostile state in the shared
 /// [`ENABLED_DIR`]/[`STAGING_DIR`], and by every test that runs `daemon list`
@@ -251,7 +251,7 @@ fn print_job(id: &str) -> cmd::Run {
 /// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen daemons in the shared
 /// [`STAGING_DIR`] for its whole length, so it takes turns with the tests that list or seed hostile
 /// plists there.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn launchd_passes_conformance(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
 
@@ -300,7 +300,7 @@ fn launchd_passes_conformance(#[fixture(launchd_group)] _group: &Group) {
 
 // Round trips and drift ===============================================================================================
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_round_trips_without_a_source_file(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -320,7 +320,7 @@ fn install_round_trips_without_a_source_file(#[fixture(launchd_group)] _group: &
     }
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn hand_edit_is_detected_as_conflict(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -343,7 +343,7 @@ fn hand_edit_is_detected_as_conflict(#[fixture(launchd_group)] _group: &Group) {
 /// The plist directories of a default macOS volume are case-insensitive, so a request for `ID`
 /// reaches the plist installed as `id`. Neither `install` (forced or not) nor `preview_install`
 /// may write over it.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -398,7 +398,7 @@ fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged(#[fixture(
 /// scheduler. This is the end-to-end complement, through the real
 /// `STAGING_DIR`: install must never destroy content that is already
 /// sitting where it is about to write.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn create_does_not_clobber_a_unit_that_appears_after_classification(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -425,7 +425,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification(#[fixture(la
 
 // Verb-by-verb enrollment semantics ===================================================================================
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_does_not_start_the_daemon(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -437,7 +437,7 @@ fn install_does_not_start_the_daemon(#[fixture(launchd_group)] _group: &Group) {
     );
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn start_does_not_enable(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -455,7 +455,7 @@ fn start_does_not_enable(#[fixture(launchd_group)] _group: &Group) {
     );
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn enable_does_not_start(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -474,7 +474,7 @@ fn enable_does_not_start(#[fixture(launchd_group)] _group: &Group) {
     assert!(!is_loaded(spec.id.as_str()), "enable must not load/start the job");
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn disable_returns_the_plist_to_staging(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -518,7 +518,7 @@ fn disable_returns_the_plist_to_staging(#[fixture(launchd_group)] _group: &Group
 
 // Runtime behavior ====================================================================================================
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn start_stop_status_reflect_reality(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -567,7 +567,7 @@ fn reporting(id: &str, restart: Restart, listener: &ConnectBack) -> DaemonSpec {
     DaemonSpec::new(spec).unwrap()
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_killed_always_restart_daemon_comes_back_with_a_new_pid(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let listener = ConnectBack::listen();
@@ -577,7 +577,7 @@ fn a_killed_always_restart_daemon_comes_back_with_a_new_pid(#[fixture(launchd_gr
     support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &listener);
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_killed_never_restart_daemon_stays_down(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let listener = ConnectBack::listen();
@@ -605,7 +605,7 @@ fn a_killed_never_restart_daemon_stays_down(#[fixture(launchd_group)] _group: &G
 /// Both ways a job has no process: never loaded, and loaded then booted out by `stop`. And the
 /// third, which only a job launchd keeps loaded can show: a `restart: never` job that was killed
 /// stays loaded with no process, and a second kill finds nothing to signal.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn killing_a_job_with_no_process_is_not_running(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let listener = ConnectBack::listen();
@@ -627,7 +627,7 @@ fn killing_a_job_with_no_process_is_not_running(#[fixture(launchd_group)] _group
 
 /// launchd cannot update a loaded job, so a changed spec over one is refused with the plist and the
 /// running daemon untouched, and goes through once the job has been stopped.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_refuses_a_changed_spec_while_the_job_is_loaded(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -677,7 +677,7 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded(#[fixture(launchd_grou
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn uninstall_leaves_nothing(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -695,7 +695,7 @@ fn uninstall_leaves_nothing(#[fixture(launchd_group)] _group: &Group) {
     assert!(!is_loaded(&id), "job must not still be loaded after uninstall");
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_plists(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -722,7 +722,7 @@ fn list_ignores_foreign_plists(#[fixture(launchd_group)] _group: &Group) {
 /// A plist goetia wrote for a user who has since been deleted carries goetia's marker, so it is
 /// goetia's, but its spec can no longer be rendered: it is `OursUnusable` in `list` and an error in
 /// `status`.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_reports_a_deleted_user_as_ours_unusable(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -775,7 +775,7 @@ fn list_reports_a_deleted_user_as_ours_unusable(#[fixture(launchd_group)] _group
 ///
 /// Only our id is asserted: `/Library/LaunchDaemons` holds every vendor's
 /// daemons, and one `nobody` cannot open is an unrelated `undetermined` entry.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -791,7 +791,7 @@ fn unelevated_list_works(#[fixture(launchd_group)] _group: &Group) {
 /// `undetermined` — never left out of the document, which says it is not
 /// there — and must *not* be listed as one of goetia's own, since the marker
 /// that would have said so is precisely what went unread.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_reports_a_root_only_plist_as_undetermined(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -820,7 +820,7 @@ fn unelevated_list_reports_a_root_only_plist_as_undetermined(#[fixture(launchd_g
 /// LaunchDaemons` is every vendor's directory; answering `undetermined` here hands a normal macOS
 /// host a standing, unclearable entry and a permanent exit `4` for one vendor plist saved as
 /// UTF-16.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_omits_a_non_utf8_plist_as_foreign(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let readable = sleepy(&support::random_test_id());
@@ -849,7 +849,7 @@ fn list_omits_a_non_utf8_plist_as_foreign(#[fixture(launchd_group)] _group: &Gro
 /// — so treating "not UTF-8" as undetermined would hand a normal macOS host
 /// a standing, unclearable `undetermined` entry and a permanent exit `4` for
 /// a service that is in no way goetia's business.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_stays_clean_on_a_host_carrying_binary_plists(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -870,7 +870,7 @@ fn list_stays_clean_on_a_host_carrying_binary_plists(#[fixture(launchd_group)] _
 /// `goetia daemon diff` answers from — reaching the same verdict as `status` and `list` about one
 /// file. A plist that is not goetia's format is a stranger's artifact at this id, so `install`
 /// refuses it with the remedy `Outcome::RefuseForeign` names, rather than erroring.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -914,7 +914,7 @@ fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign(#[fixture(launchd
 /// concurrently running test that installs anything would lift the denial mid-run. Nothing goetia
 /// does chmods either that parent or [`ENABLED_DIR`], so both denials hold for as long as the guard
 /// does.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn an_unsearchable_plist_directory_is_undetermined_rather_than_absent(#[fixture(launchd_group)] _group: &Group) {
     let id = support::random_test_id();
     // The baseline below claims an unprivileged reader can traverse both directories, so the
@@ -1034,7 +1034,7 @@ impl Drop for ModeGuard {
 /// resolves `user:` to (always a real name, never a numeric uid — see
 /// `resolve_account`'s doc comment): this is the empirical proof that the
 /// resolved account actually runs the job, for the most consequential case.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn root_user_runs_as_uid_zero(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -1065,7 +1065,7 @@ fn root_user_runs_as_uid_zero(#[fixture(launchd_group)] _group: &Group) {
 /// Against the trap — handing `wait_bounded` the `Immediate` budget's own already-expired deadline
 /// — `bootout` is SIGKILLed the instant it is spawned, so this returns a `WaitTimeout` instead of
 /// stopping anything, or trips `budget::timed_out`'s `debug_assert!` outright in a debug build.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_stop_with_no_budget_waits_for_the_job_to_be_gone(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
@@ -1089,7 +1089,7 @@ fn a_stop_with_no_budget_waits_for_the_job_to_be_gone(#[fixture(launchd_group)] 
 ///
 /// The job ignores SIGTERM, so it outlives the first `stop`'s small budget, and its `ExitTimeOut` is
 /// short so that launchd's SIGKILL ends it soon after.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -1168,7 +1168,7 @@ fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone(#[fixtur
 /// which goetia writes as the plist's `ThrottleInterval`, supplies the margin, not the product's
 /// default: whatever the setup costs, the kick cannot be confirmed inside the budget. No
 /// elapsed-time assertion is made: the error variant carries the outcome.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -1245,7 +1245,7 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout(#[fixture(launc
 ///
 /// **No assertion about the resulting state follows**: `Immediate` establishes none, and a
 /// block that asserts state cannot run on a budget that established none.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_start_with_no_budget_is_ok_for_a_restart_always_job(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -1266,7 +1266,7 @@ fn a_start_with_no_budget_is_ok_for_a_restart_always_job(#[fixture(launchd_group
 /// component it created to the daemon's own account — otherwise a non-root daemon whose
 /// `WorkingDirectory` or `StandardOutPath` names a directory only root can
 /// write into fails at launch with an opaque status.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account(#[fixture(launchd_group)] _group: &Group) {
     let nobody_uid: u32 = cmd::run("id", &["-u", "nobody"])
         .stdout
@@ -1334,7 +1334,7 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account(#[fixture
 /// is not something goetia failed to read, it is positively not a plist, and
 /// naming the remedy beats a bare error. That is the same verdict the
 /// systemd backend reaches for a non-regular file at a fragment path.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_over_a_directory_refuses_instead_of_recursing(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
@@ -1363,7 +1363,7 @@ fn install_over_a_directory_refuses_instead_of_recursing(#[fixture(launchd_group
 /// `UNIT_DIR_EXCLUSIVE`: the FIFO sits where a concurrent unprivileged
 /// `daemon list` reads, and a regression would hang that reader, not only
 /// this test's guarded one.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_does_not_hang_on_a_fifo_in_the_plist_directory(#[fixture(launchd_group)] _group: &Group) {
     let id = support::random_test_id();
     let path = enabled_path(&id);
@@ -1416,7 +1416,7 @@ fn without_blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send 
 /// This is not hypothetical: it silently no-op'd `install --start` during a
 /// real migration off hand-written LaunchDaemons, leaving the daemon
 /// stopped while the command reported success.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn start_is_not_fooled_by_a_stale_job_holding_the_label(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();

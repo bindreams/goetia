@@ -8,11 +8,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::support::{self, ELEVATED, Group, ServiceGuard, cmd, systemd_group};
+use crate::support::{self, Group, ServiceGuard, cmd, systemd_group};
 
 // Probes ==============================================================================================================
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn systemd_x_section_is_inert(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -85,7 +85,7 @@ fn systemd_x_section_is_inert(#[fixture(systemd_group)] _group: &Group) {
 /// Without this, `systemd_x_section_is_inert` could pass by reading an empty
 /// journal — proving only that the query found nothing, never that it could
 /// have found something.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn systemd_unknown_non_x_key_does_warn(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);

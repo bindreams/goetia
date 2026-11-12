@@ -41,7 +41,7 @@ use crate::common::{
 };
 use crate::install_helper::INSTALL_AS;
 use crate::support::cleanup::{self, DirGuard};
-use crate::support::{self, ConnectBack, ELEVATED, Group, LocalUserGuard, WorldReadableExe, scm_group};
+use crate::support::{self, ConnectBack, Group, LocalUserGuard, WorldReadableExe, scm_group};
 
 // Folders and files ===================================================================================================
 
@@ -263,7 +263,7 @@ fn assert_stock_folder(path: &Path) {
 
 // Provisioning into a folder the test owns ============================================================================
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn provide_creates_the_file_with_the_protected_dacl(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -283,7 +283,7 @@ fn provide_creates_the_file_with_the_protected_dacl(#[fixture(scm_group)] _group
     assert!(stale_files(&folder).is_empty());
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn provide_is_idempotent(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -302,7 +302,7 @@ fn provide_is_idempotent(#[fixture(scm_group)] _group: &Group) {
     assert!(stale_files(&folder).is_empty());
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn provide_repairs_wrong_bytes(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -323,7 +323,7 @@ fn provide_repairs_wrong_bytes(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(std::fs::read(&aside[0]).unwrap(), b"not the shim");
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn provide_replaces_a_loose_dacl(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -349,7 +349,7 @@ fn provide_replaces_a_loose_dacl(#[fixture(scm_group)] _group: &Group) {
     );
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn provide_repairs_a_file_that_denies_reading(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -378,7 +378,7 @@ fn provide_repairs_a_file_that_denies_reading(#[fixture(scm_group)] _group: &Gro
     );
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn provide_replaces_a_directory_at_the_shim_s_name(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -406,7 +406,7 @@ fn provide_replaces_a_directory_at_the_shim_s_name(#[fixture(scm_group)] _group:
 
 // Provisioning into %ProgramFiles%\Goetia =============================================================================
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_provisions_under_program_files(#[fixture(scm_group)] _group: &Group) {
     let (folder, _folder_guard) = default_folder();
     let logs = LogDir::new();
@@ -428,7 +428,7 @@ fn install_provisions_under_program_files(#[fixture(scm_group)] _group: &Group) 
     mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_repairs_deleted_shim(#[fixture(scm_group)] _group: &Group) {
     let (_folder, _folder_guard) = default_folder();
     let logs = LogDir::new();
@@ -447,7 +447,7 @@ fn install_repairs_deleted_shim(#[fixture(scm_group)] _group: &Group) {
     assert_stock_file(&file);
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_repairs_tampered_shim(#[fixture(scm_group)] _group: &Group) {
     let (folder, _folder_guard) = default_folder();
     let logs = LogDir::new();
@@ -471,7 +471,7 @@ fn install_repairs_tampered_shim(#[fixture(scm_group)] _group: &Group) {
 
 // The folder check ====================================================================================================
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_refuses_doctored_folder(#[fixture(scm_group)] _group: &Group) {
     let logs = LogDir::new();
     let doctored = DoctoredFolder::new(&logs);
@@ -497,7 +497,7 @@ fn install_refuses_doctored_folder(#[fixture(scm_group)] _group: &Group) {
 
 /// A host file `Users` can write to is refused though its folder is goetia's: whoever can write to
 /// it controls what runs as `LocalSystem`.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_refuses_a_host_file_users_can_write_to(#[fixture(scm_group)] _group: &Group) {
     let logs = LogDir::new();
     let (folder, _dir) = default_folder();
@@ -529,7 +529,7 @@ fn install_refuses_a_host_file_users_can_write_to(#[fixture(scm_group)] _group: 
         .expect("with the check off the same host is accepted");
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_checks_the_folder_before_the_marker(#[fixture(scm_group)] _group: &Group) {
     let logs = LogDir::new();
     let doctored = DoctoredFolder::new(&logs);
@@ -553,7 +553,7 @@ fn install_checks_the_folder_before_the_marker(#[fixture(scm_group)] _group: &Gr
     }
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn disable_skips_the_folder_check(#[fixture(scm_group)] _group: &Group) {
     let logs = LogDir::new();
     let doctored = DoctoredFolder::new(&logs);
@@ -595,7 +595,7 @@ fn runs_as(label: &str, mgr: &Scm, install: impl FnOnce(&str, &str, u16)) {
         .unwrap_or_else(|e| panic!("{label}: stop: {}", e.report()));
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn every_account_type_runs_the_shim(#[fixture(scm_group)] _group: &Group) {
     let (_folder, _folder_guard) = default_folder();
     let logs = LogDir::world_writable();
@@ -647,7 +647,7 @@ fn every_account_type_runs_the_shim(#[fixture(scm_group)] _group: &Group) {
 /// or a `preview` and `provide` that disagree) provides a file the registration does not name:
 /// refused as a mismatch, with nothing registered. This install fails before anything is
 /// registered, so nothing needs a guard but the temp dir.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_refuses_a_host_other_than_the_one_rendered(#[fixture(scm_group)] _group: &Group) {
     let dir = DirGuard::new(tempfile::tempdir().expect("tempdir").keep());
     let logs = LogDir::new();
@@ -670,7 +670,7 @@ fn install_refuses_a_host_other_than_the_one_rendered(#[fixture(scm_group)] _gro
     );
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_refuses_a_host_with_no_marker(#[fixture(scm_group)] _group: &Group) {
     let dir = DirGuard::new(tempfile::tempdir().expect("tempdir").keep());
     let logs = LogDir::new();
@@ -689,7 +689,7 @@ fn install_refuses_a_host_with_no_marker(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(*calls.lock().unwrap(), ["preview", "sweep", "provide"]);
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_refuses_a_host_named_by_a_relative_path(#[fixture(scm_group)] _group: &Group) {
     let logs = LogDir::new();
     let spec = simple_spec(&support::random_test_id(), fixture_command("report", &["1"]), &logs);
@@ -803,7 +803,7 @@ fn probing_the_lock_during_an_install(probe: impl FnOnce(&OwnedHandle)) -> Owned
     })
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn lock_is_exclusive(#[fixture(scm_group)] _group: &Group) {
     let lock = probing_the_lock_during_an_install(|lock| {
         // A zero-timeout wait reads whether the mutex is held and waits for nothing.
@@ -833,7 +833,7 @@ fn dacl_of(handle: HANDLE) -> (bool, Vec<Ace>) {
 
 /// The lock is for SYSTEM and Administrators alone, each with a plain allow entry that applies to
 /// the lock itself and grants every right the mutex has, in a DACL that inherits nothing.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn lock_is_for_system_and_administrators_only(#[fixture(scm_group)] _group: &Group) {
     probing_the_lock_during_an_install(|lock| {
         let (protected, entries) = dacl_of(lock.as_raw_handle());
@@ -935,7 +935,7 @@ fn error_of_refused_lock(dacl: &str) -> Error {
 
 /// A mutex of the lock's name that an account other than SYSTEM, Administrators and TrustedInstaller
 /// owns (here, the user the test runs as) is refused before any wait, naming that account.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_lock_someone_else_created_first_is_refused(#[fixture(scm_group)] _group: &Group) {
     match error_of_refused_lock("(A;;GA;;;WD)") {
         Error::ShimLockForeign { account } => assert!(!account.is_empty(), "the refusal names the owner"),
@@ -946,7 +946,7 @@ fn a_lock_someone_else_created_first_is_refused(#[fixture(scm_group)] _group: &G
 /// A lock whose DACL admits SYSTEM alone denies an elevated caller the open: the refusal says access
 /// was denied to a token with Administrators enabled, not that the owner is untrusted, and the owner
 /// is read through `READ_CONTROL`, which an owner always has.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_lock_that_denies_administrators_is_refused_as_inaccessible(#[fixture(scm_group)] _group: &Group) {
     match error_of_refused_lock("(A;;GA;;;SY)") {
         Error::ShimLockDenied { owner } => assert!(
@@ -967,7 +967,7 @@ fn stray_shim_in(folder: &Path) -> PathBuf {
     stray
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_sweeps_what_nothing_references(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let stray = stray_shim_in(&folder);
@@ -985,7 +985,7 @@ fn install_sweeps_what_nothing_references(#[fixture(scm_group)] _group: &Group) 
 
 /// Service B runs a file other than the one the next install provides, as one installed by another
 /// goetia version does: the install keeps it, and the two services run side by side.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn other_versions_shim_is_kept(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -1027,7 +1027,7 @@ fn other_versions_shim_is_kept(#[fixture(scm_group)] _group: &Group) {
 
 // Uninstall ===========================================================================================================
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     let (folder, _folder_guard) = default_folder();
     let logs = LogDir::new();
@@ -1053,7 +1053,7 @@ fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
 
 /// A re-provided service still runs the file it started from. Another service's uninstall leaves
 /// that file alone, and its own waits for its process and then takes both files.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_keeps_a_running_old_shim(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -1094,7 +1094,7 @@ fn uninstall_keeps_a_running_old_shim(#[fixture(scm_group)] _group: &Group) {
 
 /// Two services on one file: uninstalling one returns without waiting for the other, whose process
 /// runs the file, and leaves the file and the process alone.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_of_one_of_two_on_a_file_returns(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -1120,7 +1120,7 @@ fn uninstall_of_one_of_two_on_a_file_returns(#[fixture(scm_group)] _group: &Grou
 
 /// `stop` returns once the service's process has exited, not when SCM first reports `STOPPED`, which
 /// the shim does before it exits.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn stop_returns_after_the_services_process_has_exited(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -1144,7 +1144,7 @@ fn stop_returns_after_the_services_process_has_exited(#[fixture(scm_group)] _gro
 
 /// `stop` and then `uninstall`: the process is already gone, so the uninstall finds the file free and
 /// removes it.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_right_after_stop_leaves_no_file(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -1171,7 +1171,7 @@ fn uninstall_right_after_stop_leaves_no_file(#[fixture(scm_group)] _group: &Grou
 /// while its process is still exiting, and then the uninstall holds no process and does not wait for
 /// it. It succeeds whether or not the file is still in use; a file the process still ran is the next
 /// sweep's, once the process has exited.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_right_after_an_unwaited_stop_succeeds_and_the_next_sweep_takes_the_file(
     #[fixture(scm_group)] _group: &Group,
 ) {
@@ -1200,7 +1200,7 @@ fn uninstall_right_after_an_unwaited_stop_succeeds_and_the_next_sweep_takes_the_
 /// A service B that was updated to another file and not restarted still runs the first. Uninstalling
 /// A, the last service registered with the first file, does not wait for B's process and leaves it
 /// alone; the file is skipped without an error, as B's image references it.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let logs = LogDir::new();
@@ -1233,7 +1233,7 @@ fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file(#[fixtur
 
 /// A service registered in the default folder, by a manager whose provider uses another: its uninstall
 /// sweeps the default folder too.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_sweeps_the_default_folder_when_it_is_not_the_providers(#[fixture(scm_group)] _group: &Group) {
     let (default, _default_guard) = default_folder();
     let (_root, folder) = temp_shim_folder();
@@ -1253,7 +1253,7 @@ fn uninstall_sweeps_the_default_folder_when_it_is_not_the_providers(#[fixture(sc
 
 /// A service registered in a folder that is neither the default nor the provider's, such as a
 /// consumer installer's own: its uninstall leaves the folder alone.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_leaves_a_folder_that_is_neither_the_default_nor_the_providers(#[fixture(scm_group)] _group: &Group) {
     let (_default, _default_guard) = default_folder();
     let (_root, folder) = temp_shim_folder();
@@ -1274,7 +1274,7 @@ fn uninstall_leaves_a_folder_that_is_neither_the_default_nor_the_providers(#[fix
 }
 
 /// `uninstall` of an id that is not installed is the retry of a sweep that failed.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_retry_sweeps(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let stray = stray_shim_in(&folder);
@@ -1290,7 +1290,7 @@ fn uninstall_retry_sweeps(#[fixture(scm_group)] _group: &Group) {
 /// The retry checks the folder as the manager is built to: the provider's sweep takes no setting of
 /// its own. A folder in the temp directory gives its owner's account rights over it, so a manager
 /// that checks refuses it and sweeps nothing.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn uninstall_retry_checks_the_folder_as_the_manager_does(#[fixture(scm_group)] _group: &Group) {
     let (_root, folder) = temp_shim_folder();
     let stray = stray_shim_in(&folder);

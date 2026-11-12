@@ -5,19 +5,21 @@
 //! - `GOETIA_TEST_<GROUP>_CONSENT`: a test in a group that runs fails unless this is exactly `1`
 //!   (unset is `0`); any value but `0` and `1` fails it too. Set it only in a sandbox: a container,
 //!   a VM or CI.
-//! - A consented group on a host that lacks what the group needs (elevation) fails; it never skips.
+//! - A consented group on a host that is not elevated fails; it never skips.
+//! - A bad value of any of these variables fails the whole run at start ([`validate_environment`]).
 //!
 //! A test joins a group by taking its fixture: `#[fixture(scm_group)] _group: &Group`.
 
-/// Proof that the group is enabled, consented to and supported by the host.
-pub struct Group;
+use super::elevation::ELEVATED;
 
-/// A group's variable, what its tests do (for the consent message) and whether they need an
-/// elevated token.
+/// Proof that the group is enabled, consented to and supported by the host. Only a group fixture
+/// builds one.
+pub struct Group(());
+
+/// A group's variable and what its tests do (for the consent message).
 struct Spec {
     env: &'static str,
     what: &'static str,
-    elevated: bool,
 }
 
 const SCM: Spec = Spec {
@@ -25,42 +27,17 @@ const SCM: Spec = Spec {
     what: "install, start, stop and remove real Windows services, write the real registry (service keys and \
            scratch keys under HKLM\\SOFTWARE), create local user accounts, write under %ProgramFiles% and \
            %ProgramData%, take the machine-wide install lock, and read the Windows Event Log",
-    elevated: true,
 };
 
 const SYSTEMD: Spec = Spec {
     env: "GOETIA_TEST_SYSTEMD",
     what: "write unit files and drop-ins under /etc/systemd/system, enable, start, stop and remove real systemd \
            units, and run systemctl as root",
-    elevated: true,
 };
 
 const LAUNCHD: Spec = Spec {
     env: "GOETIA_TEST_LAUNCHD",
     what: "write plists under /Library/LaunchDaemons and bootstrap, kickstart and boot out real launchd jobs as root",
-    elevated: true,
-};
-
-/// The platform's own service manager, read and not written, for a test that runs on every platform:
-/// the platform's group variable, and no elevation.
-const NATIVE_WHAT: &str = "read the real service manager's services and unit or plist files";
-#[cfg(windows)]
-const NATIVE: Spec = Spec {
-    what: NATIVE_WHAT,
-    elevated: false,
-    ..SCM
-};
-#[cfg(target_os = "macos")]
-const NATIVE: Spec = Spec {
-    what: NATIVE_WHAT,
-    elevated: false,
-    ..LAUNCHD
-};
-#[cfg(not(any(windows, target_os = "macos")))]
-const NATIVE: Spec = Spec {
-    what: NATIVE_WHAT,
-    elevated: false,
-    ..SYSTEMD
 };
 
 /// Whether `name` is on, off or unset in the manner of a group variable: `Ok(None)` for unset,
@@ -74,46 +51,70 @@ fn switch(name: &str, var: &impl Fn(&str) -> Option<String>) -> Result<Option<bo
     }
 }
 
+/// The group variable and the consent variable of `group_var`, each read by [`switch`]: an invalid
+/// value of either is an error whatever the other says.
+fn read_group(group_var: &str, var: &impl Fn(&str) -> Option<String>) -> Result<(Option<bool>, Option<bool>), String> {
+    Ok((switch(group_var, var)?, switch(&format!("{group_var}_CONSENT"), var)?))
+}
+
+/// Every variable of every group goetia knows, whether or not this OS has tests in the group.
+/// `Err` names the first invalid one.
+pub(crate) fn validate_all(var: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    [SCM, SYSTEMD, LAUNCHD]
+        .iter()
+        .try_for_each(|spec| read_group(spec.env, &var).map(drop))
+}
+
+/// [`validate_all`] on this process's environment, run by every test binary before it starts.
+pub(crate) fn validate_environment() {
+    if let Err(why) = validate_all(process_var) {
+        eprintln!("error: {why}");
+        std::process::exit(1);
+    }
+}
+
 /// The rule behind every group: `Ok(false)` when `group_var` is `0`, `Ok(true)` when it is on and
 /// consent is given, `Err` for an invalid value of either variable or for missing consent.
 pub(crate) fn check_group(group_var: &str, var: impl Fn(&str) -> Option<String>) -> Result<bool, String> {
-    if switch(group_var, &var)? == Some(false) {
+    let (group, consent) = read_group(group_var, &var)?;
+    if group == Some(false) {
         return Ok(false);
     }
-    let consent = format!("{group_var}_CONSENT");
-    if switch(&consent, &var)? == Some(true) {
+    if consent == Some(true) {
         return Ok(true);
     }
     Err(format!(
         "these tests change real system state and run only in a sandbox (a container, VM or CI); set \
-         {consent}=1 there to consent, or {group_var}=0 to turn the group off"
+         {group_var}_CONSENT=1 there to consent, or {group_var}=0 to turn the group off"
     ))
 }
 
 /// A group's `requires`: `Err` only when `group_var` is `0`. An invalid value is left to fail the
 /// test at setup, not skip it.
 pub(crate) fn require_enabled(group_var: &str, var: impl Fn(&str) -> Option<String>) -> Result<(), String> {
-    if var(group_var).as_deref() == Some("0") {
-        return Err(format!("{group_var}=0"));
+    match switch(group_var, &var) {
+        Ok(Some(false)) => Err(format!("{group_var}=0")),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
-/// A group's setup: [`check_group`]'s rule, then `precondition`, which names what the host lacks.
-/// `what` says what the group's tests do.
+/// A group's setup: [`check_group`]'s rule, then the host must be elevated. `what` says what the
+/// group's tests do.
 pub(crate) fn enter(
     group_var: &str,
     what: &str,
     var: impl Fn(&str) -> Option<String>,
-    precondition: impl FnOnce() -> Result<(), String>,
+    elevated: impl FnOnce() -> bool,
 ) -> Result<Group, String> {
     match check_group(group_var, var) {
         // skuld runs the body of a test whose `requires` failed when ignored tests are included
         // (`--run-ignored only`), so a group that is off refuses here as well.
         Ok(false) => Err(format!("{group_var}=0")),
-        Ok(true) => precondition()
-            .map(|()| Group)
-            .map_err(|lacks| format!("the group {group_var} needs {lacks}; set {group_var}=0 to turn it off")),
+        Ok(true) if elevated() => Ok(Group(())),
+        Ok(true) => Err(format!(
+            "the group {group_var} needs an elevated token (root, or an Administrator shell), which this \
+             host's process lacks; set {group_var}=0 to turn it off"
+        )),
         Err(why) => Err(format!("the group {group_var} runs tests that {what}: {why}")),
     }
 }
@@ -124,27 +125,17 @@ fn process_var(name: &str) -> Option<String> {
     std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
 }
 
-/// The host's token is elevated, where the group needs it.
-fn host_is_elevated(needed: bool) -> Result<(), String> {
-    if !needed || cosca::elevation::is_elevated() {
-        Ok(())
-    } else {
-        Err("an elevated token (root, or an Administrator shell), which this host's process lacks".to_string())
-    }
-}
-
 /// Declares the fixture `$fixture` of the group `$spec`, ignored by `$enabled` when the group is `0`.
+/// Every group needs an elevated token, so its tests carry the [`ELEVATED`] label.
 macro_rules! group {
     ($fixture:ident, $enabled:ident, $spec:expr) => {
         fn $enabled() -> Result<(), String> {
             require_enabled($spec.env, process_var)
         }
 
-        #[skuld::fixture(requires = [$enabled])]
+        #[skuld::fixture(requires = [$enabled], labels = [ELEVATED])]
         pub fn $fixture() -> Result<Group, String> {
-            enter($spec.env, $spec.what, process_var, || {
-                host_is_elevated($spec.elevated)
-            })
+            enter($spec.env, $spec.what, process_var, cosca::elevation::is_elevated)
         }
     };
 }
@@ -152,7 +143,6 @@ macro_rules! group {
 group!(scm_group, scm_enabled, SCM);
 group!(systemd_group, systemd_enabled, SYSTEMD);
 group!(launchd_group, launchd_enabled, LAUNCHD);
-group!(native_group, native_enabled, NATIVE);
 
 #[cfg(test)]
 #[path = "groups_tests.rs"]

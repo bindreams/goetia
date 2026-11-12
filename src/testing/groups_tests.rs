@@ -1,4 +1,4 @@
-use super::{check_group, enter, require_enabled};
+use super::{check_group, enter, require_enabled, validate_all};
 
 const GROUP: &str = "GOETIA_TEST_X";
 const CONSENT: &str = "GOETIA_TEST_X_CONSENT";
@@ -51,12 +51,37 @@ fn consent_is_given_only_by_exactly_1() {
     }
 }
 
-/// Mutant: consent is asked of a group that is off, or an invalid group value is excused by consent.
+/// Mutant: consent is asked of a group that is off, or an invalid value of either variable is
+/// excused by the other (a group that is `0` still has its consent checked).
 #[skuld::test]
-fn a_group_that_is_off_needs_no_consent_and_an_invalid_one_is_an_error_whatever_the_consent() {
-    for consent in [None, Some("0"), Some("1"), Some("yes")] {
+fn a_group_that_is_off_needs_no_consent_but_an_invalid_value_of_either_is_an_error_whatever_the_other() {
+    for consent in [None, Some("0"), Some("1")] {
         assert_eq!(checked(Some("0"), consent), Ok(false), "consent {consent:?}");
-        assert!(checked(Some("yes"), consent).is_err(), "consent {consent:?}");
+    }
+    for other in [None, Some("0"), Some("1"), Some("yes")] {
+        assert!(checked(Some("yes"), other).is_err(), "consent {other:?}");
+        assert!(checked(other, Some("yes")).is_err(), "group {other:?}");
+    }
+}
+
+/// Every known group's variables are checked at harness start, on any OS and whatever the group's
+/// state. Mutant: a group is left out, or an invalid consent is excused by `=0`.
+#[skuld::test]
+fn every_known_groups_variables_are_validated_at_start() {
+    assert!(validate_all(env(&[])).is_ok());
+    assert!(validate_all(env(&[("GOETIA_TEST_SCM", "0"), ("GOETIA_TEST_SYSTEMD_CONSENT", "1")])).is_ok());
+    for group in ["SCM", "SYSTEMD", "LAUNCHD"] {
+        for suffix in ["", "_CONSENT"] {
+            let name = format!("GOETIA_TEST_{group}{suffix}");
+            let why = validate_all(env(&[(&name, "maybe")])).unwrap_err();
+            assert!(why.contains(&name) && why.contains("maybe"), "{name}: {why}");
+        }
+        let off = format!("GOETIA_TEST_{group}");
+        let consent = format!("{off}_CONSENT");
+        assert!(
+            validate_all(env(&[(&off, "0"), (&consent, "maybe")])).is_err(),
+            "{group}"
+        );
     }
 }
 
@@ -71,25 +96,21 @@ fn only_a_group_set_to_0_is_ignored() {
     assert!(why.contains(&format!("{GROUP}=0")), "{why}");
 }
 
-/// A consented group on a host that lacks what the group needs fails, naming the lack; it does not
-/// skip. Mutant: the precondition is checked before consent, or not at all.
+/// A consented group on a host that lacks what the group needs fails; it does not
+/// skip. Mutant: elevation is checked before consent, or not at all.
 #[skuld::test]
 fn a_consented_group_fails_when_the_host_lacks_what_it_needs() {
     let consent = env(&[(CONSENT, "1")]);
 
-    assert!(enter(GROUP, "does a thing", &consent, || Ok(())).is_ok());
-    let why = enter(GROUP, "does a thing", &consent, || {
-        Err("the host has no flux".to_string())
-    })
-    .err()
-    .expect("a host without flux");
-    assert!(why.contains("the host has no flux") && why.contains(GROUP), "{why}");
+    assert!(enter(GROUP, "does a thing", &consent, || true).is_ok());
+    let why = enter(GROUP, "does a thing", &consent, || false)
+        .err()
+        .expect("an unelevated host");
+    assert!(why.contains("elevated") && why.contains(GROUP), "{why}");
 
-    let why = enter(GROUP, "does a thing", env(&[]), || {
-        Err("the host has no flux".to_string())
-    })
-    .err()
-    .expect("no consent");
+    let why = enter(GROUP, "does a thing", env(&[]), || false)
+        .err()
+        .expect("no consent");
     assert!(why.contains(CONSENT) && why.contains("does a thing"), "{why}");
 }
 
@@ -97,7 +118,7 @@ fn a_consented_group_fails_when_the_host_lacks_what_it_needs() {
 /// when ignored tests are included.
 #[skuld::test]
 fn a_group_that_is_off_refuses_its_setup() {
-    let why = enter(GROUP, "does a thing", env(&[(GROUP, "0")]), || Ok(()))
+    let why = enter(GROUP, "does a thing", env(&[(GROUP, "0")]), || true)
         .err()
         .expect("a group that is off");
     assert!(why.contains(&format!("{GROUP}=0")), "{why}");

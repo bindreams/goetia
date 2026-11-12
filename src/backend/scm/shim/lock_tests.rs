@@ -6,7 +6,6 @@ use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::MUTEX_MODIFY_STATE;
 
 use super::*;
-use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::{Group, scm_group};
 
 /// Carried by every test that takes the machine-wide lock `Global\goetia-shim`, which wait for each
@@ -147,7 +146,7 @@ fn open_lock() -> OwnedHandle {
 
 /// A holder that exits without releasing leaves the mutex abandoned, which the next to take it
 /// owns all the same.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_lock_whose_holder_exited_without_releasing_it_is_taken(#[fixture(scm_group)] _group: &Group) {
     // Keeps the mutex in existence once the lock that made it is dropped, and until the test ends.
     let _alive = {

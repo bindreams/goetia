@@ -18,9 +18,9 @@ use crate::common::{
     LogDir, ShimGuard, UNIT_DIR_EXCLUSIVE, fixture_command, manager, recorded_exit, scm_status, simple_spec,
 };
 use crate::support::registry::{parameters_key, service_key};
-use crate::support::{self, ConnectBack, ELEVATED, Group, scm_group};
+use crate::support::{self, ConnectBack, Group, scm_group};
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn shim_runs_child_with_cwd_and_env(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -62,7 +62,7 @@ fn shim_runs_child_with_cwd_and_env(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(reported_env, "probe-value", "child did not see the configured env var");
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn shim_captures_stdout_to_logs_path(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -92,7 +92,7 @@ fn shim_captures_stdout_to_logs_path(#[fixture(scm_group)] _group: &Group) {
     );
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn stop_kills_the_whole_process_tree(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -159,7 +159,7 @@ fn pid_is_alive(pid: &str) -> bool {
     out.ok() && out.stdout.contains(&format!("\"{pid}\""))
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn unreadable_blob_logs_to_fallback_path_and_event_log(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();

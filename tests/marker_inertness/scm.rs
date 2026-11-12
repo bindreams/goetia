@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use winreg::RegKey;
 use winreg::enums::{KEY_READ, KEY_WRITE};
 
-use crate::support::{self, ConnectBack, ELEVATED, Group, ServiceGuard, cmd, registry, scm_group};
+use crate::support::{self, ConnectBack, Group, ServiceGuard, cmd, registry, scm_group};
 use goetia::backend::scm::wait::StopSeen;
 
 /// Byte-exact field names; renaming one changes every installed artifact.
@@ -35,7 +35,7 @@ const FALLBACK: Names = Names {
 
 // Probe ===============================================================================================================
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn scm_parameters_values_survive(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);

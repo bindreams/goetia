@@ -23,7 +23,7 @@ use crate::common::{
 };
 use crate::simple::SCM_DENIAL;
 use crate::support::registry::parameters_key;
-use crate::support::{self, ConnectBack, ELEVATED, Group, scm_group};
+use crate::support::{self, ConnectBack, Group, scm_group};
 
 const ONE_SECOND: Option<Duration> = Some(Duration::from_secs(1));
 
@@ -42,7 +42,7 @@ fn on_failure(id: &str, command: Vec<String>, restart_delay: Option<Duration>, l
 
 // SCM restarts ========================================================================================================
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_restart_after_an_update_runs_the_updated_spec(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -76,7 +76,7 @@ fn a_restart_after_an_update_runs_the_updated_spec(#[fixture(scm_group)] _group:
     new.accept("the restarted daemon of the updated spec to report in");
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_killed_shim_is_restarted_by_scm(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -107,7 +107,7 @@ fn a_killed_shim_is_restarted_by_scm(#[fixture(scm_group)] _group: &Group) {
 
 /// A killed shim is a crash to SCM, which restarts the service whatever the shim reported. The
 /// restarted service runs a new shim, so the daemon comes back as a different process.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_killed_on_failure_simple_daemon_comes_back_with_a_new_pid(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -125,7 +125,7 @@ fn a_killed_on_failure_simple_daemon_comes_back_with_a_new_pid(#[fixture(scm_gro
     support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &started);
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn on_failure_restarts_are_paced_new_shims(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -182,7 +182,7 @@ fn on_failure_restarts_are_paced_new_shims(#[fixture(scm_group)] _group: &Group)
 /// service must be gone when it returns: a restart that had begun must be stopped before the delete,
 /// or the delete would only mark it. The test holds no service handle across the `uninstall`, or the
 /// record would survive it.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn uninstall_leaves_no_restarted_daemon_behind(#[fixture(scm_group)] _group: &Group) {
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -265,13 +265,13 @@ fn recorded_exit_code(child_code: i32) -> ServiceExitCode {
     exit_records(child_code).0
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_clean_daemon_exit_is_recorded_as_win32_zero(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(recorded_exit_code(0), ServiceExitCode::Win32(0));
 }
 
 /// Any daemon exit code, including 3 and 7, is recorded as service-specific.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_daemon_exit_code_is_recorded_as_service_specific_whatever_its_value(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(recorded_exit_code(3), ServiceExitCode::ServiceSpecific(3));
     assert_eq!(recorded_exit_code(7), ServiceExitCode::ServiceSpecific(7));
@@ -279,7 +279,7 @@ fn a_daemon_exit_code_is_recorded_as_service_specific_whatever_its_value(#[fixtu
 
 /// A daemon's code is service-specific whatever its value: an NTSTATUS with the high bit set round
 /// trips, and 1003 from a daemon is `(1066, 1003)`, never the incomplete-stop pair `(0, 1003)`.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_daemon_exit_code_round_trips_through_the_recorded_pair(#[fixture(scm_group)] _group: &Group) {
     for code in [0xC000_0005_u32 as i32, 1003] {
         let (_, recorded) = exit_records(code);
@@ -295,7 +295,7 @@ fn a_daemon_exit_code_round_trips_through_the_recorded_pair(#[fixture(scm_group)
     }
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy(#[fixture(scm_group)] _group: &Group) {
     let missing = vec![r"C:\goetia-test-no-such-dir\no-such-binary.exe".to_string()];
     // A restart delay that cannot elapse during the test, so the record read below is the first
@@ -343,7 +343,7 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy(#[fixture(scm_
 
 /// `start` confirms that the shim launched the daemon, so a daemon that exits at once is a started
 /// service whether the wait sees `RUNNING` or the `STOPPED` after it.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn start_confirms_the_launch_of_a_daemon_that_exits_at_once(#[fixture(scm_group)] _group: &Group) {
     // A delay that cannot elapse during the test, so `on-failure` does not restart the daemon.
     let hour = Some(Duration::from_secs(3600));
@@ -373,7 +373,7 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once(#[fixture(scm_group)
     }
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_commanded_stop_reports_win32_zero(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -433,7 +433,7 @@ fn register_as_earlier_version(id: &str, current_version: &str) {
     support::cmd::run("sc.exe", &["failure", id, "reset=", "0", "actions=", ""]).expect_ok();
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn a_new_shim_runs_a_service_registered_by_an_earlier_version(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -473,7 +473,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version(#[fixture(scm_grou
 /// service do not regenerate from its blob and the scm generator refuses `always`: started,
 /// restarted, stopped and uninstalled. What does regenerate (`install`, `status`, `list`) reports it
 /// as unusable, since a service that cannot be regenerated cannot be compared or vouched for.
-#[skuld::test(labels = [ELEVATED, SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL)]
+#[skuld::test(labels = [SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL)]
 fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();
@@ -534,7 +534,7 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     assert_eq!(query.code, Some(1060), "the service should no longer exist:\n{query}");
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE])]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn reinstalling_an_earlier_version_simple_service_applies_the_recovery_actions(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let logs = LogDir::new();

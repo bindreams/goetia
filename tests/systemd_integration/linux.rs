@@ -20,7 +20,7 @@ use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User};
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
-use crate::support::{self, ELEVATED, Group, ServiceGuard, cmd, may_account_for, systemd_group};
+use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group};
 
 /// Held by every test that reads or seeds hostile state in the shared `/etc/systemd/system`, and by
 /// every test that runs `daemon list` over it. While `list_does_not_hang_on_a_fifo_in_the_unit_directory`
@@ -291,7 +291,7 @@ fn uninstall_via_cli(id: &str) -> (ExitCode, String, String) {
 /// `UNIT_DIR_EXCLUSIVE`: the run installs, forces and uninstalls a dozen units in the shared
 /// `/etc/systemd/system` for its whole length, so it takes turns with the tests that list or seed
 /// hostile units there.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn systemd_passes_conformance(#[fixture(systemd_group)] _group: &Group) {
     let mgr = Systemd::new();
 
@@ -319,7 +319,7 @@ fn systemd_passes_conformance(#[fixture(systemd_group)] _group: &Group) {
 
 // Step 2: scenarios for each correctness property =====================================================================
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn install_then_show_round_trips_without_the_source_file(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -332,7 +332,7 @@ fn install_then_show_round_trips_without_the_source_file(#[fixture(systemd_group
     assert_eq!(found, Some(spec));
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn hand_edit_is_detected_as_conflict(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -365,7 +365,7 @@ fn hand_edit_is_detected_as_conflict(#[fixture(systemd_group)] _group: &Group) {
     );
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn drop_in_override_is_detected_as_drift(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -380,7 +380,7 @@ fn drop_in_override_is_detected_as_drift(#[fixture(systemd_group)] _group: &Grou
     assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn forced_install_over_a_dropin_actually_clears_it(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -403,7 +403,7 @@ fn forced_install_over_a_dropin_actually_clears_it(#[fixture(systemd_group)] _gr
     assert!(matches!(after, Outcome::UpToDate), "{after:?}");
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_refuses_a_stray_dropin_with_no_fragment(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -420,7 +420,7 @@ fn install_refuses_a_stray_dropin_with_no_fragment(#[fixture(systemd_group)] _gr
     assert!(!unit_path(guard.id()).exists(), "no fragment must be written");
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_refuses_over_a_masked_unit(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -439,7 +439,7 @@ fn install_refuses_over_a_masked_unit(#[fixture(systemd_group)] _group: &Group) 
     assert_eq!(fs::read_link(&path).expect("read link"), Path::new("/dev/null"));
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn start_stop_status_reflect_reality(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -472,7 +472,7 @@ fn reporting(id: &str, restart: Restart, listener: &support::ConnectBack) -> Dae
     DaemonSpec::new(spec).unwrap()
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_killed_always_restart_daemon_comes_back_with_a_new_pid(#[fixture(systemd_group)] _group: &Group) {
     let guard = ServiceGuard::new(support::random_test_id());
     let listener = support::ConnectBack::listen();
@@ -483,7 +483,7 @@ fn a_killed_always_restart_daemon_comes_back_with_a_new_pid(#[fixture(systemd_gr
     support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &listener);
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_killed_never_restart_daemon_stays_down(#[fixture(systemd_group)] _group: &Group) {
     let guard = ServiceGuard::new(support::random_test_id());
     let listener = support::ConnectBack::listen();
@@ -513,7 +513,7 @@ fn a_killed_never_restart_daemon_stays_down(#[fixture(systemd_group)] _group: &G
 
 /// An installed unit that was never started is not loaded; one that was stopped is loaded or not
 /// depending on what still refers to it. Both are `NotRunning`, off `systemctl kill`'s own answer.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn killing_a_stopped_unit_is_not_running(#[fixture(systemd_group)] _group: &Group) {
     let guard = ServiceGuard::new(support::random_test_id());
     let spec = mk(guard.id());
@@ -551,7 +551,7 @@ pub(crate) fn active_state_and_job(id: &str) -> (String, String) {
 /// done — but one state is impossible: systemd answers `StartUnit` only once the job is enqueued,
 /// so after `start` returns the unit is never still `inactive` with no job. A `start` that skipped
 /// the request is exactly that.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_start_with_no_budget_reaches_systemd(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -571,7 +571,7 @@ fn a_start_with_no_budget_reaches_systemd(#[fixture(systemd_group)] _group: &Gro
 
 /// The stop mirror of [`a_start_with_no_budget_reaches_systemd`]: after `StopUnit` is answered the
 /// unit is never still `active` with no job.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_stop_with_no_budget_reaches_systemd(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -637,7 +637,7 @@ impl Drop for Unstoppable {
 /// A real expiry, deterministically: the stop can never complete, so a bounded `stop` has exactly
 /// one correct answer — `WaitTimeout`, with the stop job left standing in systemd. A backend that
 /// ignored `--timeout` would wait forever here.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_stop_that_can_never_complete_times_out_with_the_job_standing(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -661,7 +661,7 @@ fn a_stop_that_can_never_complete_times_out_with_the_job_standing(#[fixture(syst
 /// The budget never decides whether the request is sent. A budget spent before `systemctl` even
 /// runs still enqueues the stop, and — the stop being unable to complete — still reports
 /// `WaitTimeout` with the job standing: the same answer whatever is left, so no timing is bet on.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_stop_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -684,7 +684,7 @@ fn a_stop_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _gro
 
 /// The start mirror: whatever a spent budget reports, the start job reached systemd, so the unit is
 /// not still `inactive` with no job — see [`a_start_with_no_budget_reaches_systemd`].
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_start_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -819,7 +819,7 @@ impl Drop for StopHolder {
 /// active, complete as a no-op. With the stop held, the daemon is still its old process and systemd
 /// holds a `restart` job for it — nothing else. Released, a blocking `start` joins that job and
 /// returns once it is done, and the daemon is a new process.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -869,7 +869,7 @@ fn a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait(#[fixture(sy
 /// running. `systemctl stop` answers it "not loaded" (exit `5`) and enqueues nothing — there is
 /// nothing to stop — under every budget. A drop-in that empties `ExecStart=` is the unit it cannot
 /// load.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_stop_of_a_unit_systemd_cannot_load_has_nothing_to_stop(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -906,7 +906,7 @@ fn goetia_coloured(colors: &str, args: &[&str]) -> std::process::Output {
 /// `SYSTEMD_COLORS` forces colour into a pipe, and `systemctl --version` wraps its number in escapes
 /// under it. None of its values may make goetia misread a supported systemd as one it refuses, on
 /// any verb the version gate guards.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_coloured_environment_does_not_fail_the_version_gate(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -935,7 +935,7 @@ fn a_coloured_environment_does_not_fail_the_version_gate(#[fixture(systemd_group
 /// The real `systemctl` on this host passes the version gate: an install asks it before it writes
 /// anything, so one that completes was not refused for the host's systemd. What an inherited
 /// `SYSTEMD_COLORS` does to the gate is `a_coloured_environment_does_not_fail_the_version_gate`'s.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn this_hosts_systemd_is_supported(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -988,7 +988,7 @@ fn goetia_on_systemd(manager: u32, client: u32, args: &[&str]) -> std::process::
 /// install a `Type=exec` unit an older systemd silently runs as `Type=simple`, or fail every start
 /// and stop on an unrecognized option. The running systemd and the client each count: an old one
 /// is refused next to a new other, and named.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn an_older_systemd_is_refused_before_anything_is_written_or_run(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1029,7 +1029,7 @@ fn an_older_systemd_is_refused_before_anything_is_written_or_run(#[fixture(syste
 /// runs: the version gate refuses, naming what `systemctl` said, before anything is written. Its
 /// own mount namespace hides the manager's private socket, and the bus address points at nothing,
 /// so `systemctl show` fails at once while `/run/systemd/system` stays.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_running_systemd_that_cannot_be_asked_is_refused(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1102,7 +1102,7 @@ fn goetia_logging_systemctl(dir: &Path, args: &[&str]) -> std::process::Output {
 /// `restart`'s stop and start, `install --start`'s install, `--enable` and start, `uninstall`'s
 /// stop, `disable` and `daemon-reload`, share one pair of probes, and so one share of the budget.
 /// `enable` and `disable` ask it too: no request is sent before the manager is asked.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn the_version_gate_probes_once_per_daemon_per_verb(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1249,7 +1249,7 @@ fn cap_evidence(unit: &str) -> String {
 /// cosca's threads are not reserved, and one joined (like a goetia listener detached) may still hold
 /// its `TasksMax` slot, so a waited restart's `start` leg can fail after its `stop` was sent. That
 /// race is open: the untouched-daemon assertion on a restart can fail on it.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_verb_short_of_tasks_sends_nothing_and_never_panics(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1347,7 +1347,7 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics(#[fixture(systemd_group)
 /// Asserts only on `start`'s result: by the time it returns, the unit is already
 /// `activating`/`auto-restart`, not `failed` — a follow-up state read would be asserting a race
 /// against systemd's own restart loop.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_unit_whose_executable_does_not_exist_fails_start(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1363,7 +1363,7 @@ fn a_unit_whose_executable_does_not_exist_fails_start(#[fixture(systemd_group)] 
     assert!(result.is_err(), "{result:?}");
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn uninstall_leaves_nothing(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1391,7 +1391,7 @@ fn uninstall_leaves_nothing(#[fixture(systemd_group)] _group: &Group) {
 /// exit `0` and print "nothing to do". `install` on this exact state is
 /// `install_refuses_a_stray_dropin_with_no_fragment`'s `RefuseForeign`, and two verbs must not
 /// describe one filesystem state differently.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_dropin_remains(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id); // removes the drop-in directory
@@ -1412,7 +1412,7 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_dropin_remains(#[fix
 /// The same for the other artifact that outlives the fragment. `systemctl disable` is impossible
 /// once the `[Install]` section is gone, so this link keeps the id enrolled at boot
 /// — the very reason the exit-code table gives for `disable` returning `1` here.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_remains(
     #[fixture(systemd_group)] _group: &Group,
 ) {
@@ -1431,7 +1431,7 @@ fn uninstall_refuses_an_id_whose_fragment_is_gone_but_whose_enablement_link_rema
     assert!(fs::symlink_metadata(&link).is_ok(), "and the link survives, unremoved");
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_refuses_a_stray_enablement_link_with_no_fragment(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1453,7 +1453,7 @@ fn install_refuses_a_stray_enablement_link_with_no_fragment(#[fixture(systemd_gr
 
 /// The read-only verb has to agree too, or `status` calls the id empty while `install` calls it
 /// foreign — the same disagreement one step removed.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn status_does_not_call_an_id_with_a_stray_dropin_not_installed(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1471,7 +1471,7 @@ fn status_does_not_call_an_id_with_a_stray_dropin_not_installed(#[fixture(system
 /// The refusal for an id with no fragment names what is left, so the user has the paths to remove
 /// without hunting for them. (`install` over the same state is `decide`'s generic foreign refusal;
 /// only `status` and the other verbs carry this recovery.)
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn status_of_residue_names_the_leftover_paths(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1492,7 +1492,7 @@ fn status_of_residue_names_the_leftover_paths(#[fixture(systemd_group)] _group: 
 /// A fragment goetia wrote for a spec naming a Windows account (a SID) carries goetia's marker, so
 /// it is goetia's, but the systemd backend cannot render that spec: it is `OursUnusable` in `list`
 /// and an error in `status`.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_reports_a_sid_account_as_ours_unusable(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1542,7 +1542,7 @@ fn list_reports_a_sid_account_as_ours_unusable(#[fixture(systemd_group)] _group:
 /// installed at the id. Reporting `unusable` for it — "goetia owns the id but cannot report on
 /// it", whose published remedy is `uninstall` — would put goetia's name and destructive advice on
 /// what is just as plausibly an administrator's override of a unit shipped elsewhere.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn status_reports_undetermined_for_a_dropin_directory_it_cannot_read(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1578,7 +1578,7 @@ fn status_reports_undetermined_for_a_dropin_directory_it_cannot_read(#[fixture(s
 /// complete. `4`, not the `1` `diff`'s catch-all `Err` arm gives: it was asked a question and could
 /// not determine the answer — the same reasoning that already puts `Outcome::RefuseUnusable` at
 /// `4` there.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn diff_reports_a_dropin_directory_it_cannot_read_as_indeterminate(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1604,7 +1604,7 @@ fn diff_reports_a_dropin_directory_it_cannot_read_as_indeterminate(#[fixture(sys
 /// `ENOTDIR` rather than `EACCES`, so this runs as root without a second uid: a regular file where
 /// `<id>.service.d` has to be fails `read_dir` identically for everyone, and is exactly the shape an
 /// elevated `install` meets when the drop-in directory fails for a reason no privilege fixes.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_refuses_an_unreadable_dropin_over_our_own_fragment(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1638,7 +1638,7 @@ fn install_refuses_an_unreadable_dropin_over_our_own_fragment(#[fixture(systemd_
 
 /// The same state seen by an unprivileged reader, through the CLI: `diff` must refuse it as an id
 /// goetia owns (exit `4`), never report that it cannot tell whether the id is installed.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn diff_refuses_our_own_fragment_with_an_unreadable_dropin(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1667,7 +1667,7 @@ fn diff_refuses_our_own_fragment_with_an_unreadable_dropin(#[fixture(systemd_gro
 /// `lstat` succeeds for an unreadable regular file on directory-search permission alone, so
 /// classifying it from "the open failed and the `lstat` did not" reported `foreign` — "demonstrably
 /// not managed by goetia" — about a file whose contents nobody had looked at.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn status_reports_undetermined_for_a_fragment_it_cannot_read(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1695,7 +1695,7 @@ fn status_reports_undetermined_for_a_fragment_it_cannot_read(#[fixture(systemd_g
 /// `/etc/systemd/system.control` is where `systemctl set-property UNIT PROPERTY=VALUE` writes, and
 /// `systemd.unit(5)`'s System Unit Search Path puts it *above* `/etc/systemd/system`. Leaving it
 /// unscanned reported an id "up to date" while systemd applied a memory cap goetia never wrote.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_control_dropin_is_drift(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1737,7 +1737,7 @@ fn a_control_dropin_is_drift(#[fixture(systemd_group)] _group: &Group) {
 /// The occupancy half of the same omission: with the fragment gone, `residue` found nothing under
 /// the `.control` root, so `uninstall` certified "nothing to do" (exit `0`) for an id systemd still
 /// holds configuration for — while `install` on that same state refuses it as foreign.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn uninstall_refuses_an_id_whose_only_artifact_is_a_control_dropin(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1775,7 +1775,7 @@ fn uninstall_refuses_an_id_whose_only_artifact_is_a_control_dropin(#[fixture(sys
 /// `--force` — the published remedy — rewrites the fragment without touching a directory that
 /// governs unrelated units. The id carries its own random component *before* the truncation point,
 /// so the directory this seeds belongs to this test alone.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_dash_truncated_dropin_is_not_this_ids_conflict(#[fixture(systemd_group)] _group: &Group) {
     let id = format!("{}-leaf", support::random_test_id());
     let guard = ServiceGuard::new(&id);
@@ -1818,7 +1818,7 @@ fn a_dash_truncated_dropin_is_not_this_ids_conflict(#[fixture(systemd_group)] _g
 /// Seeded with an inert `[Unit] Documentation=` rather than the `MemoryMax=` the other drop-in tests
 /// use: for as long as this file exists, systemd really is applying it to every service on the
 /// machine, including the ones other tests are running.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn a_top_level_service_d_dropin_is_not_this_ids_conflict(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1850,7 +1850,7 @@ fn a_top_level_service_d_dropin_is_not_this_ids_conflict(#[fixture(systemd_group
     );
 }
 
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_ignores_foreign_units(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1865,7 +1865,7 @@ fn list_ignores_foreign_units(#[fixture(systemd_group)] _group: &Group) {
 
 /// `list` needs no elevation: an unprivileged run reports an install it can read as ours, not as
 /// `undetermined`. The ids of other daemons on the host are not asserted about.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_works(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1876,7 +1876,7 @@ fn unelevated_list_works(#[fixture(systemd_group)] _group: &Group) {
 
 // Parent directories ==================================================================================================
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1903,7 +1903,7 @@ fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user(#[fixture(s
     }
 }
 
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_accepts_preexisting_dirs_the_target_account_cannot_write(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1939,7 +1939,7 @@ fn install_accepts_preexisting_dirs_the_target_account_cannot_write(#[fixture(sy
 
 /// The mixed case `ensure_dir`'s own doc comment is about: an ancestor that already exists
 /// must never be touched, even when a deeper, freshly-created component under it is.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn install_leaves_a_preexisting_ancestor_directory_untouched(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1983,7 +1983,7 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched(#[fixture(systemd_g
 
 /// Values that end in backslashes are written so that systemd reads each back exactly, and the
 /// directives after them are not swallowed. Read back from the loaded unit, not from the text.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn values_ending_in_backslashes_read_back_from_systemd_exactly(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     // Creation order: see the module doc of `support::service_guard`.
@@ -2057,7 +2057,7 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly(#[fixture(systemd
 /// systemd takes the executable path as written but substitutes `$FOO`/`${FOO}` and collapses `$$`
 /// in `argv[0]`, so a path holding `$` must run the right file and still hand the daemon its own
 /// path as `argv[0]`. The directory also holds a space and a `%`, which quote and double the word.
-#[skuld::test(labels = [ELEVATED])]
+#[skuld::test]
 fn an_executable_path_with_dollars_runs_with_the_path_as_argv0(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let base = std::env::temp_dir().join(format!("{id}-argv0"));
@@ -2102,7 +2102,7 @@ fn an_executable_path_with_dollars_runs_with_the_path_as_argv0(#[fixture(systemd
 /// `LoadCredential=` commonly are 0600) is what it meets. Skipping it certifies "no such daemon" off
 /// a read that never happened — the id may be a stranger's *or* goetia's own, and the listing cannot
 /// tell which. One unreadable unit still must not take down the listing of every other daemon.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_reports_a_unit_it_cannot_read_as_undetermined(#[fixture(systemd_group)] _group: &Group) {
     let readable = support::random_test_id();
     let readable_guard = ServiceGuard::new(&readable);
@@ -2139,7 +2139,7 @@ fn unelevated_list_reports_a_unit_it_cannot_read_as_undetermined(#[fixture(syste
 /// The same denial at the same privilege boundary, over a unit goetia *does* own. The end-to-end
 /// proof that an unelevated `daemon list` on a populated host stops exiting `0` with the daemon
 /// missing from its document.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_list_reports_a_root_only_unit_as_undetermined(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -2171,7 +2171,7 @@ fn unelevated_list_reports_a_root_only_unit_as_undetermined(#[fixture(systemd_gr
 /// Seeded as a *regular file* where the directory belongs: `read_dir` answers `ENOTDIR` for every
 /// uid, root's included, so this holds in an elevated binary rather than only below the privilege
 /// boundary.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_reports_an_id_whose_dropin_it_cannot_read_with_no_fragment_at_all(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let _cleanup = seed_unreadable_dropin_enotdir(&id);
@@ -2223,7 +2223,7 @@ fn list_reports_an_id_whose_dropin_it_cannot_read_with_no_fragment_at_all(#[fixt
 /// — no two tests share a root to clean up. A regular *file* where the directory belongs, so
 /// `read_dir` answers `ENOTDIR`: no privilege dissolves that, which is what leaves the id
 /// unclassifiable to the elevated binary CI runs.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_names_an_id_whose_only_dropin_is_under_another_search_root(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let mgr = Systemd::new();
@@ -2273,7 +2273,7 @@ fn undetermined_for(listed: &[Installed], id: &str) -> Vec<String> {
 /// shipped `0700` for a unit that lives in `/usr/lib`, met by an unelevated `list` — and stated as
 /// the CLI answers it: `show` may never call an id absent on a listing that did not establish
 /// absence.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn unelevated_show_cannot_call_absent_an_id_whose_dropin_it_could_not_read(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -2308,7 +2308,7 @@ fn unelevated_show_cannot_call_absent_an_id_whose_dropin_it_could_not_read(#[fix
 /// The runnable half of the same defect this branch fixes on Windows, where an aggregate entry
 /// standing for one denied service dropped the name it was holding and made `show` answer "could
 /// not be determined" for every id on the host, permanently, over one stranger's ACL.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn a_named_undetermined_entry_blocks_only_its_own_id(#[fixture(systemd_group)] _group: &Group) {
     let denied = support::random_test_id();
     let denied_guard = ServiceGuard::new(&denied);
@@ -2358,7 +2358,7 @@ fn a_named_undetermined_entry_blocks_only_its_own_id(#[fixture(systemd_group)] _
 /// The accepted cost, stated where it is paid: a fragment goetia *did* write and something later
 /// corrupted now reads as a stranger's. Ownership lives in the marker, and the marker is in the
 /// bytes that would not decode.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_omits_a_non_utf8_unit_as_foreign_instead_of_reporting_it(#[fixture(systemd_group)] _group: &Group) {
     let readable = support::random_test_id();
     let readable_guard = ServiceGuard::new(&readable);
@@ -2395,7 +2395,7 @@ fn list_omits_a_non_utf8_unit_as_foreign_instead_of_reporting_it(#[fixture(syste
 /// `open(2)` on a FIFO with `O_RDONLY` blocks until a writer arrives. `list` opens every
 /// `*.service` name in the unit directory, so classifying by type before opening for reading is
 /// what keeps one `mkfifo` from wedging the listing for the whole host.
-#[skuld::test(labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn list_does_not_hang_on_a_fifo_in_the_unit_directory(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let path = unit_path(&id);
