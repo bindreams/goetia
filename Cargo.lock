@@ -517,7 +517,8 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 [[package]]
 name = "libsearch-guard"
 version = "0.1.0"
-source = "git+https://github.com/bindreams/libsearch-guard?rev=f44d5243350e533b4cd12e4626d28b43fd662a14#f44d5243350e533b4cd12e4626d28b43fd662a14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88f4c430d94fa0e7f54937601682fa5e724145b8d637fe1c8bd22116fb072e3f"
 dependencies = [
  "object",
 ]

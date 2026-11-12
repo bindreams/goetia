@@ -165,8 +165,7 @@ windows-sys = { version = "0.61", features = [
 
 [build-dependencies]
 # `build.rs` hardens every `[[bin]]` against loading a DLL from its own folder (Windows MSVC; no-op elsewhere).
-# Becomes `"0.1"` once published.
-libsearch-guard = { git = "https://github.com/bindreams/libsearch-guard", rev = "f44d5243350e533b4cd12e4626d28b43fd662a14" }
+libsearch-guard = "0.1"
 
 [dev-dependencies]
 # Turns on `testing` for the integration tests, which reach the library only through its public API.
@@ -174,8 +173,8 @@ libsearch-guard = { git = "https://github.com/bindreams/libsearch-guard", rev = 
 goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.6"
 rand = "0.10"
-# `verify` only, for `tests/binary_hardening.rs`. Becomes `"0.1"` once published.
-libsearch-guard = { git = "https://github.com/bindreams/libsearch-guard", rev = "f44d5243350e533b4cd12e4626d28b43fd662a14" }
+# `verify` only, for `tests/binary_hardening.rs`.
+libsearch-guard = "0.1"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
