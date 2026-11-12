@@ -1243,7 +1243,7 @@ fn a_denied_service_manager_open_is_named_as_the_managers() {
 #[skuld::test]
 fn a_stop_failure_on_a_marked_service_says_the_same_whoever_failed_and_claims_no_disable() {
     for ours in [false, true] {
-        let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours, under_way: false });
+        let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours });
         assert!(
             text.contains("`frpc` could not be stopped. It was already marked for deletion"),
             "{ours}: {text}"
@@ -1270,10 +1270,7 @@ fn a_stop_failure_on_a_marked_service_says_the_same_whoever_failed_and_claims_no
 /// blames whoever marked it.
 #[skuld::test]
 fn a_marked_service_that_refused_the_stop_names_kill_and_who_marked_it() {
-    let text = uninstall_failure(&UninstallFailure::AlreadyMarked {
-        ours: false,
-        under_way: false,
-    });
+    let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours: false });
     assert!(text.contains("does not accept STOP"), "{text}");
     assert!(text.contains("marked for deletion by someone else"), "{text}");
     assert!(text.contains("goetia daemon kill frpc"), "{text}");
@@ -1283,10 +1280,7 @@ fn a_marked_service_that_refused_the_stop_names_kill_and_who_marked_it() {
 /// doing: the message says so and sends nowhere.
 #[skuld::test]
 fn a_marked_service_whose_stop_goetia_failed_blames_goetia_and_not_whoever_marked_it() {
-    let text = uninstall_failure(&UninstallFailure::AlreadyMarked {
-        ours: true,
-        under_way: false,
-    });
+    let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours: true });
     assert!(text.contains("goetia's own"), "{text}");
     for stale in ["by someone else", "goetia daemon kill"] {
         assert!(
@@ -1329,10 +1323,7 @@ fn a_marked_service_already_stopping_whose_hold_failed_says_so_and_keeps_the_mar
     let cause = Error::os("hold `frpc`'s process", std::io::Error::other("held badly"));
     let Error::Step { what, .. } = uninstall_failed(
         &Id::try_from("frpc").unwrap(),
-        &UninstallFailure::AlreadyMarked {
-            ours: true,
-            under_way: true,
-        },
+        &UninstallFailure::AlreadyMarkedStopUnderWay,
         cause,
     ) else {
         panic!("an uninstall failure is a step");

@@ -549,13 +549,14 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// can say; a STOP that is refused and sent again runs it again), and once, before the wait, for a
 /// service the first arm finds `STOP_PENDING`, which is stopping without a STOP of ours (someone
 /// else's, or a `stop` whose wait ran out) and has its process still. Its error ends the wait, with
-/// no STOP sent: it is returned as a [`HoldFailed`], which says which of the two held.
-pub(crate) fn settle_and_stop<A: ScmActor>(
+/// no STOP sent after it: it is returned as a [`SettleError::Hold`], which says which hold failed (a hold
+/// before a STOP may follow an earlier STOP that was refused).
+pub(crate) fn settle_and_stop<A: ScmActor, E>(
     a: &mut A,
     deadline: Deadline,
     shim: bool,
-    mut hold: impl FnMut(&mut A) -> io::Result<()>,
-) -> io::Result<Waited> {
+    mut hold: impl FnMut(&mut A) -> Result<(), E>,
+) -> Result<Waited, SettleError<E>> {
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so a
     // `RUNNING`, `PAUSED` or `STOPPED` service is read from the notification; the status it returns
     // is for the states the mask excludes, `STOP_PENDING` among them, which no notification reports.
@@ -563,9 +564,9 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
         a.arm(WantState::RunningPausedOrStopped, deadline)?,
         QueriedState::Stopped,
     )? {
-        Err(end) => return judged(end, shim),
+        Err(end) => return Ok(judged(end, shim)?),
         Ok(status) if status.state == QueriedState::StopPending => {
-            hold(a).map_err(|source| HoldFailed::wrap(source, true))?;
+            hold(a).map_err(|error| SettleError::Hold { error, under_way: true })?;
         }
         Ok(_) => {}
     }
@@ -587,29 +588,30 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
             }
         };
         match seen {
-            Seen::Stopped(status) => return judged(WaitEnd::confirmed_by(status), shim),
+            Seen::Stopped(status) => return Ok(judged(WaitEnd::confirmed_by(status), shim)?),
             Seen::Pending => {
                 let status = match decided_or_status(
                     a.arm(WantState::RunningPausedOrStopped, deadline)?,
                     QueriedState::Stopped,
                 )? {
                     Ok(status) => status,
-                    Err(end) => return judged(end, shim),
+                    Err(end) => return Ok(judged(end, shim)?),
                 };
                 read = seen_in(status);
             }
             Seen::Settled { state, accepts_stop } => {
                 if !accepts_stop {
-                    return Err(io::Error::other(format!(
-                        "the service is {state} and does not accept STOP"
-                    )));
+                    return Err(io::Error::other(format!("the service is {state} and does not accept STOP")).into());
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
-                hold(a).map_err(|source| HoldFailed::wrap(source, false))?;
+                hold(a).map_err(|error| SettleError::Hold {
+                    error,
+                    under_way: false,
+                })?;
                 match a.control_stop() {
-                    Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested, shim),
+                    Ok(()) => return Ok(wait_after_stop(a, deadline, "", StopSeen::Requested, shim)?),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
-                        return wait_after_stop(a, deadline, "", StopSeen::Requested, shim);
+                        return Ok(wait_after_stop(a, deadline, "", StopSeen::Requested, shim)?);
                     }
                     Err(e) if is_stop_refusal(&e) => {
                         refused = e.raw_os_error();
@@ -618,54 +620,34 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
                             QueriedState::Stopped,
                         )? {
                             Ok(status) => status,
-                            Err(end) => return judged(end, shim),
+                            Err(end) => return Ok(judged(end, shim)?),
                         };
                         read = seen_in(status);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
         }
     }
 }
 
-/// The failure of [`settle_and_stop`]'s `hold`, which ended its wait with no STOP sent. It displays as the
-/// failure it wraps and passes that failure's source on.
+/// How [`settle_and_stop`] failed.
 #[derive(Debug)]
-pub(crate) struct HoldFailed {
-    pub(crate) source: io::Error,
-    /// Whether the hold was of a service found `STOP_PENDING`, which no STOP of ours was to be sent to,
-    /// and not one before a STOP of ours.
-    pub(crate) under_way: bool,
+pub(crate) enum SettleError<E> {
+    /// The `hold` failed, which ended the wait with no STOP sent after it.
+    Hold {
+        error: E,
+        /// Whether the hold was of a service found `STOP_PENDING`, which no STOP of ours was to be sent
+        /// to, and not one before a STOP of ours. A hold before a STOP may follow an earlier refused STOP.
+        under_way: bool,
+    },
+    /// Anything else: SCM, the wait or the STOP failed.
+    Other(io::Error),
 }
 
-impl HoldFailed {
-    fn wrap(source: io::Error, under_way: bool) -> io::Error {
-        io::Error::other(HoldFailed { source, under_way })
-    }
-
-    /// The failure `e` carries, or `e` if it carries none.
-    pub(crate) fn take(e: io::Error) -> Result<HoldFailed, io::Error> {
-        if carried::<HoldFailed>(&e).is_none() {
-            return Err(e);
-        }
-        let boxed = e.into_inner().expect("an error that carries a source has one");
-        match boxed.downcast::<HoldFailed>() {
-            Ok(held) => Ok(*held),
-            Err(_) => unreachable!("the source was just found to be a `HoldFailed`"),
-        }
-    }
-}
-
-impl std::fmt::Display for HoldFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(f)
-    }
-}
-
-impl std::error::Error for HoldFailed {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.source()
+impl<E> From<io::Error> for SettleError<E> {
+    fn from(e: io::Error) -> Self {
+        SettleError::Other(e)
     }
 }
 

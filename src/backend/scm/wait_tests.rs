@@ -1345,7 +1345,14 @@ fn a_stop_is_issued_even_when_the_arm_after_it_expires() {
 
 /// [`super::settle_and_stop`] for a caller that has nothing to do before the STOP.
 fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
-    super::settle_and_stop(a, deadline, false, |_| Ok(()))
+    flat(super::settle_and_stop(a, deadline, false, |_| Ok::<(), io::Error>(())))
+}
+
+/// `ended` with a failed hold told as the io error it is, for a test whose hold never fails.
+fn flat(ended: Result<Waited, SettleError<io::Error>>) -> io::Result<Waited> {
+    ended.map_err(|e| match e {
+        SettleError::Hold { error, .. } | SettleError::Other(error) => error,
+    })
 }
 
 /// The `hold` of a caller that logs it in the fake's own log, so that its place among the steps is
@@ -1430,11 +1437,14 @@ fn settle_and_stop_holds_a_service_found_stop_pending_once_before_waiting() {
 fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_stop_pending_service() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
 
-    let error =
-        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err();
+    let SettleError::Hold { error, under_way } =
+        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err()
+    else {
+        panic!("a failed hold is a hold failure");
+    };
 
     assert_eq!(error.to_string(), "no hold");
-    assert!(HoldFailed::take(error).unwrap().under_way);
+    assert!(under_way);
     assert_eq!(fake.log, ["arm_settle"]);
 }
 
@@ -1443,11 +1453,14 @@ fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_stop_pending_service() {
 fn settle_and_stop_sends_no_stop_when_the_callers_step_fails() {
     let mut fake = FakeScm::new([Some(Observed::Running)]);
 
-    let error =
-        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err();
+    let SettleError::Hold { error, under_way } =
+        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err()
+    else {
+        panic!("a failed hold is a hold failure");
+    };
 
     assert_eq!(error.to_string(), "no hold");
-    assert!(!HoldFailed::take(error).unwrap().under_way);
+    assert!(!under_way);
     assert_eq!(fake.log, ["arm_settle", "wait", "got_running"]);
 }
 
@@ -3075,7 +3088,12 @@ fn a_shims_stop_with_the_incomplete_stop_record_fails_however_it_was_confirmed()
             assert!(is_judged(ended), "stop_via_notify over {name}");
         }
         if let Some(script) = settle {
-            let ended = super::settle_and_stop(&mut incomplete(script()), unbounded(), true, |_| Ok(()));
+            let ended = flat(super::settle_and_stop(
+                &mut incomplete(script()),
+                unbounded(),
+                true,
+                |_| Ok::<(), io::Error>(()),
+            ));
             assert!(is_judged(ended), "settle_and_stop over {name}");
         }
     }
@@ -3090,7 +3108,12 @@ fn a_stop_of_a_service_that_is_not_a_shims_is_not_judged_by_the_shims_record() {
             assert!(!is_judged(ended), "stop_via_notify over {name}");
         }
         if let Some(script) = settle {
-            let ended = super::settle_and_stop(&mut incomplete(script()), unbounded(), false, |_| Ok(()));
+            let ended = flat(super::settle_and_stop(
+                &mut incomplete(script()),
+                unbounded(),
+                false,
+                |_| Ok::<(), io::Error>(()),
+            ));
             assert!(!is_judged(ended), "settle_and_stop over {name}");
         }
     }
