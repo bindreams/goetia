@@ -1238,103 +1238,53 @@ fn a_denied_service_manager_open_is_named_as_the_managers() {
     assert!(!report.contains("to service"), "{report}");
 }
 
-/// Whoever's failure it was, a marked service that could not be stopped is told in one shared sentence,
-/// claims no disable and does not say it was NOT deleted. Only the cause differs.
+/// A marked service whose stop failed claims no disable and names `kill`.
 #[skuld::test]
-fn a_stop_failure_on_a_marked_service_says_the_same_whoever_failed_and_claims_no_disable() {
-    for ours in [false, true] {
-        let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours });
-        assert!(
-            text.contains("`frpc` could not be stopped. It was already marked for deletion"),
-            "{ours}: {text}"
-        );
-        assert!(text.contains("`uninstall` did not delete it"), "{ours}: {text}");
-        assert!(
-            text.contains("removed once it stops and its last handle closes"),
-            "{ours}: {text}"
-        );
-        assert!(
-            !text.contains("changed nothing"),
-            "a STOP may have been sent: {ours}: {text}"
-        );
-        for stale in ["NOT deleted", "disabled", "goetia daemon enable", "goetia daemon start"] {
-            assert!(
-                !text.contains(stale),
-                "`{stale}` is false for a marked service: {ours}: {text}"
+fn a_stop_failure_on_a_marked_service_names_who_marked_it_and_claims_no_disable() {
+    let text = uninstall_failure(&UninstallFailure::AlreadyMarked);
+    assert!(text.contains("does not accept STOP"), "{text}");
+    assert!(
+        text.contains("`frpc` could not be stopped. It was already marked for deletion by someone else"),
+        "{text}"
+    );
+    assert!(text.contains("`uninstall` did not delete it"), "{text}");
+    assert!(
+        text.contains("removed once it stops and its last handle closes"),
+        "{text}"
+    );
+    assert!(text.contains("goetia daemon kill frpc"), "{text}");
+    assert!(!text.contains("changed nothing"), "a STOP may have been sent: {text}");
+    for stale in ["NOT deleted", "disabled", "goetia daemon enable", "goetia daemon start"] {
+        assert!(!text.contains(stale), "`{stale}` is false for a marked service: {text}");
+    }
+}
+
+/// A failed hold is goetia's own failure, never the service's refusal of STOP or whoever marked it, so
+/// none of the stop-failure texts or `kill` appears, whatever goetia knows of a STOP, marked or not.
+#[skuld::test]
+fn a_failed_hold_blames_neither_the_service_nor_whoever_marked_it_and_names_no_kill() {
+    for stop in [StopSent::None, StopSent::Maybe, StopSent::UnderWay] {
+        for (marked, previous) in [(false, Some(ServiceStartType::AutoStart)), (false, None), (true, None)] {
+            let text = uninstall_failure(&UninstallFailure::HoldFailed { marked, stop, previous });
+            // A marked service is said to be marked by someone else, which is a fact, not a blame.
+            let by_someone = if marked {
+                "by someone else, so `uninstall`"
+            } else {
+                "by someone else"
+            };
+            for stale in ["could not be stopped", by_someone, "goetia daemon kill"] {
+                assert!(
+                    !text.contains(stale),
+                    "`{stale}` is false for a hold failure: {stop:?}, {marked}: {text}"
+                );
+            }
+            assert_eq!(
+                text.contains("sc.exe stop"),
+                stop != StopSent::UnderWay,
+                "`sc.exe stop` of a service already stopping is refused: {stop:?}: {text}"
             );
         }
     }
-}
-
-/// A stop the service refused is the only case that sends the user to `kill`, and the only one that
-/// blames whoever marked it.
-#[skuld::test]
-fn a_marked_service_that_refused_the_stop_names_kill_and_who_marked_it() {
-    let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours: false });
-    assert!(text.contains("does not accept STOP"), "{text}");
-    assert!(text.contains("marked for deletion by someone else"), "{text}");
-    assert!(text.contains("goetia daemon kill frpc"), "{text}");
-}
-
-/// A stop that goetia's own hold or unbounded wait failed is not the service's refusal or the marker's
-/// doing: the message says so and sends nowhere.
-#[skuld::test]
-fn a_marked_service_whose_stop_goetia_failed_blames_goetia_and_not_whoever_marked_it() {
-    let text = uninstall_failure(&UninstallFailure::AlreadyMarked { ours: true });
-    assert!(text.contains("goetia's own"), "{text}");
-    for stale in ["by someone else", "goetia daemon kill"] {
-        assert!(
-            !text.contains(stale),
-            "`{stale}` is false for goetia's own failure: {text}"
-        );
-    }
-}
-
-/// A service already stopping had no STOP of ours, and the hold that failed ended goetia's wait: it is
-/// told as stopping, as goetia's own failure, with the wait, the retry and `kill` for a stop that never
-/// ends.
-#[skuld::test]
-fn an_uninstall_over_a_stop_already_under_way_says_so_and_advises_waiting_then_retrying() {
-    let cause = Error::os("hold `frpc`'s process", std::io::Error::other("held badly"));
-    let Error::Step { what, .. } = uninstall_failed(
-        &Id::try_from("frpc").unwrap(),
-        &UninstallFailure::StopUnderWay {
-            previous: Some(ServiceStartType::AutoStart),
-        },
-        cause,
-    ) else {
-        panic!("an uninstall failure is a step");
-    };
-    assert_eq!(
-        what,
-        "`frpc` is already stopping (STOP_PENDING). `uninstall` could not hold its process, so it ended \
-         its wait for the stop; that failure was goetia's own, not the service's. It was NOT deleted and is \
-         now disabled, so `goetia daemon start frpc` fails. Its start type was automatic; \
-         `goetia daemon enable frpc` sets it again. Once it has stopped, re-run \
-         `goetia daemon uninstall frpc` to retry; if it never stops, run `goetia daemon kill frpc`"
-    );
-}
-
-/// A marked service already stopping whose hold failed keeps the marked contract (goetia's own failure, no
-/// disable claim, no `kill`, no blame on whoever marked it) and says what is true of it: it was already
-/// stopping, `uninstall` sent no STOP and ended its wait.
-#[skuld::test]
-fn a_marked_service_already_stopping_whose_hold_failed_says_so_and_keeps_the_marked_contract() {
-    let cause = Error::os("hold `frpc`'s process", std::io::Error::other("held badly"));
-    let Error::Step { what, .. } = uninstall_failed(
-        &Id::try_from("frpc").unwrap(),
-        &UninstallFailure::AlreadyMarkedStopUnderWay,
-        cause,
-    ) else {
-        panic!("an uninstall failure is a step");
-    };
-    assert_eq!(
-        what,
-        "`frpc` is already stopping (STOP_PENDING), and was already marked for deletion, so `uninstall` \
-         did not delete it. `uninstall` sent no STOP: it could not hold the process, so it ended its wait \
-         for the stop; that failure was goetia's own, not the service's. It is removed once it stops and \
-         its last handle closes"
-    );
 }
 
 /// The service is stopped and the shim could not end the daemon's tree: `kill` does nothing to a stopped

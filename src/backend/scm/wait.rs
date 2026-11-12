@@ -565,7 +565,10 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
     )? {
         Err(end) => return Ok(judged(end, shim)?),
         Ok(status) if status.state == QueriedState::StopPending => {
-            hold(a).map_err(|error| SettleError::Hold { error, under_way: true })?;
+            hold(a).map_err(|error| SettleError::Hold {
+                error,
+                stop: StopSent::UnderWay,
+            })?;
         }
         Ok(_) => {}
     }
@@ -573,6 +576,8 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
     let mut read = None;
     // The code of the refusal the latest STOP got, for the read that follows its re-arm.
     let mut refused = None;
+    // Whether a STOP refused with 1061 may have been delivered. 1052 means it was not.
+    let mut may_have_delivered = false;
     loop {
         let seen = match read.take() {
             Some(seen) => seen,
@@ -605,7 +610,11 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
                 hold(a).map_err(|error| SettleError::Hold {
                     error,
-                    under_way: false,
+                    stop: if may_have_delivered {
+                        StopSent::Maybe
+                    } else {
+                        StopSent::None
+                    },
                 })?;
                 match a.control_stop() {
                     Ok(()) => return Ok(wait_after_stop(a, deadline, "", StopSeen::Requested, shim)?),
@@ -614,6 +623,7 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
                     }
                     Err(e) if is_stop_refusal(&e) => {
                         refused = e.raw_os_error();
+                        may_have_delivered |= refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
                         let status = match decided_or_status(
                             a.arm(WantState::RunningPausedOrStopped, deadline)?,
                             QueriedState::Stopped,
@@ -630,16 +640,22 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
     }
 }
 
+/// What a failed hold of [`settle_and_stop`] says of the STOP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopSent {
+    /// The hold came before any STOP was delivered: none was sent, or the one sent was refused with 1052.
+    None,
+    /// A STOP refused with 1061 may have been delivered; none was sent after it.
+    Maybe,
+    /// The service was found `STOP_PENDING`: goetia sent none.
+    UnderWay,
+}
+
 /// How [`settle_and_stop`] failed.
 #[derive(Debug)]
 pub(crate) enum SettleError<E> {
     /// The `hold` failed.
-    Hold {
-        error: E,
-        /// Whether the hold was of a service found `STOP_PENDING`, which no STOP of ours was to be sent
-        /// to, and not one before a STOP of ours. A hold before a STOP may follow an earlier refused STOP.
-        under_way: bool,
-    },
+    Hold { error: E, stop: StopSent },
     /// Anything else: SCM, the wait or the STOP failed.
     Other(io::Error),
 }
