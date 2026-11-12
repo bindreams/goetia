@@ -317,8 +317,8 @@ pub(crate) mod fake {
             if let Some(action) = entry.action {
                 action();
             }
-            // The deadline a test hands the verb cannot be spent without changing the path under test, so
-            // this is the part of the contract a fake can hold: an unbounded wait never expires.
+            // A fake cannot see the deadline, so it holds only this part of the contract: an unbounded wait
+            // never expires.
             assert!(
                 waited.bounded || !matches!(entry.reply, Ok(Finished::Expired | Finished::Left(_))),
                 "Fake: a call waited on without a bound ({waited:?}) never expires, yet {argv:?} is scripted to"

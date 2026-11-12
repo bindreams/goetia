@@ -54,6 +54,9 @@ pub enum ReleaseWatch {
 }
 
 /// The three things [`kill_service`] needs of the world, so its ordering is testable without one.
+///
+/// `Expired` is returned only after a bounded deadline has passed; an unbounded deadline never
+/// expires.
 pub trait KillTarget {
     /// An opened process. Holding it keeps its pid from being reused; dropping it lets go.
     type Process;
@@ -87,15 +90,11 @@ pub trait KillTarget {
     /// kill.
     ///
     /// SCM can keep refusing a registration while it catches up with the notifications already
-    /// delivered, and the arm retries until `deadline`: then it is [`ReleaseWatch::Expired`]. Every
-    /// implementation, a fake included, returns `Expired` only after a bounded `deadline` has
-    /// passed: an unbounded deadline never expires.
+    /// delivered, and the arm retries until `deadline`: then it is [`ReleaseWatch::Expired`].
     fn arm_release(&mut self, deadline: Deadline) -> io::Result<ReleaseWatch>;
 
     /// Block until the registration [`Self::arm_release`] made wakes, or until `deadline`, when
-    /// the registration is still outstanding: the caller cancels it. Every implementation, a
-    /// fake included, returns [`Waited::Expired`] only after a bounded `deadline` has passed: an
-    /// unbounded deadline never expires.
+    /// the registration is still outstanding: the caller cancels it.
     fn await_release(&mut self, deadline: Deadline) -> io::Result<Waited>;
 
     /// Cancel the registration [`Self::arm_release`] made, for a caller that no longer needs it
@@ -112,7 +111,7 @@ pub trait KillTarget {
 /// exit: the process has exited and SCM no longer reports its pid.
 pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
     loop {
-        let Some((pid, process)) = hold_service_process(target, Budget::Unbounded.start())? else {
+        let Some((pid, process)) = hold_service_process_unbounded(target)? else {
             return Ok(Killed::NotRunning);
         };
         match target.terminate(&process)? {
@@ -259,6 +258,15 @@ fn await_scm_released_unbounded<T: KillTarget>(target: &mut T, pid: u32) -> io::
     match await_scm_released(target, pid, Budget::Unbounded.start())? {
         Waited::Confirmed => Ok(()),
         Waited::Expired => unreachable!("an unbounded deadline never expires"),
+    }
+}
+
+/// [`hold_service_process`] with no bound, for the callers that terminate the process.
+fn hold_service_process_unbounded<T: KillTarget>(target: &mut T) -> io::Result<Option<(u32, T::Process)>> {
+    match hold_service_process(target, Budget::Unbounded.start()) {
+        Err(HoldError::Expired { .. }) => unreachable!("an unbounded deadline never expires"),
+        Err(HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
+        Ok(held) => Ok(held),
     }
 }
 

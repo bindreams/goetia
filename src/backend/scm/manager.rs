@@ -1145,7 +1145,6 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
             return Ok(());
         };
         match hold()? {
-            // Only a bounded hold expires, and the hold of an uninstall is unbounded.
             HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
             held => {
                 process = held;
@@ -1662,7 +1661,8 @@ enum UninstallFailure {
     Delete { previous: Option<ServiceStartType> },
     /// The stop failed on a service someone else had marked for deletion, so `uninstall` did not delete
     /// or disable it. Its wait may already have sent a STOP before it failed. `ours` is whether the
-    /// failure was goetia's own (its hold) and not the service's.
+    /// failure was goetia's own and not the service's: `true` only when the hold before a STOP failed
+    /// (see [`uninstall_stop_on`]), `false` for a failure of the stop itself.
     AlreadyMarked { ours: bool },
     /// The hold of the process of a service found `STOP_PENDING` failed, on a service someone else had
     /// marked for deletion: goetia's own failure, which ended its wait with no STOP of ours sent.

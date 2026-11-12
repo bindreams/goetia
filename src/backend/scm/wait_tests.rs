@@ -78,6 +78,10 @@ struct FakeScm {
     refusing: &'static [QueriedState],
     /// The n-th `arm` (1-based) meets a service that is gone: opening its fresh handle failed with 1060.
     gone_at_arm: Option<usize>,
+    /// Whether a refused STOP leaves the service no longer accepting STOP, in the status read after it.
+    withdraws_stop_once_refused: bool,
+    /// Whether a STOP has been refused on a service that [`Self::withdrawing_stop_once_refused`].
+    stop_withdrawn: bool,
 }
 
 /// What a scripted `control_stop` answers.
@@ -120,6 +124,8 @@ impl FakeScm {
             shifts: vec![],
             refusing: &[],
             gone_at_arm: None,
+            withdraws_stop_once_refused: false,
+            stop_withdrawn: false,
         }
     }
 
@@ -227,6 +233,13 @@ impl FakeScm {
         self
     }
 
+    /// A refused STOP leaves the service in its state but no longer accepting STOP: the status read after
+    /// it shows `RUNNING` or `PAUSED` without `SERVICE_ACCEPT_STOP`.
+    fn withdrawing_stop_once_refused(mut self) -> Self {
+        self.withdraws_stop_once_refused = true;
+        self
+    }
+
     /// The `control_stop` calls answer `replies` in order.
     fn stop_replies(mut self, replies: impl IntoIterator<Item = StopReply>) -> Self {
         self.stop_replies = replies.into_iter().collect();
@@ -304,7 +317,7 @@ impl FakeScm {
         let state = self.state.unwrap_or(QueriedState::Stopped);
         QueriedStatus {
             state,
-            accepts_stop: matches!(state, QueriedState::Running | QueriedState::Paused),
+            accepts_stop: matches!(state, QueriedState::Running | QueriedState::Paused) && !self.stop_withdrawn,
             exit: self.recorded,
             wait_hint: self.wait_hint,
         }
@@ -356,7 +369,7 @@ impl ScmActor for FakeScm {
         if self.what_arm_reports == Waited::Expired {
             assert!(
                 deadline.expired(),
-                "FakeScm: an arm reports an expiry only once its deadline has passed; an unbounded or unspent deadline never expires"
+                "FakeScm: arm reported an expiry before its deadline passed"
             );
             return Ok(Armed::Expired);
         }
@@ -397,7 +410,10 @@ impl ScmActor for FakeScm {
                 Ok(())
             }
             StopReply::NotActive => Ok(()),
-            StopReply::Os(code) => Err(std::io::Error::from_raw_os_error(code)),
+            StopReply::Os(code) => {
+                self.stop_withdrawn = self.withdraws_stop_once_refused;
+                Err(std::io::Error::from_raw_os_error(code))
+            }
         }
     }
     fn start(&mut self) -> std::io::Result<StartReply> {
@@ -436,7 +452,7 @@ impl ScmActor for FakeScm {
                 let observed = self.waits.pop_front().expect("script ran dry");
                 assert!(
                     observed.is_some() || deadline.expired(),
-                    "FakeScm: a wait reports an expiry only once its deadline has passed; an unbounded or unspent deadline never expires"
+                    "FakeScm: wait reported an expiry before its deadline passed"
                 );
                 if let Some(observed) = observed {
                     self.state = Some(self.state_of(observed));
@@ -567,8 +583,7 @@ fn no_end_of(process: u32) -> Result<EndProcessOutcome<u32>, ProcessWaitFailure>
 }
 
 /// [`end_process`] over `terminate` and `exit`, in the shape [`stop_and_await_exit`] takes: the one
-/// function both `stop` and `uninstall` end the process they held with. It is the one builder of
-/// these fakes, so `exit` cannot report an expiry before the deadline it was given has passed.
+/// function both `stop` and `uninstall` end the process they held with.
 fn ending(
     terminate: impl FnOnce(&u32) -> io::Result<()>,
     exit: impl FnOnce(&u32, Deadline, Option<&io::Error>) -> io::Result<Waited>,
@@ -578,7 +593,7 @@ fn ending(
             let waited = exit(process, by, terminate_failed);
             assert!(
                 !matches!(waited, Ok(Waited::Expired)) || by.expired(),
-                "ending: a wait for the process expires only once its deadline has passed; an unbounded or unspent deadline never expires"
+                "ending: the wait for the process reported an expiry before its deadline passed"
             );
             waited
         })
@@ -3736,45 +3751,60 @@ fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked
     }
 }
 
-/// A stop SCM cannot deliver (a service that does not accept STOP) fails an uninstall with the service's
-/// own cause, and does not end the process it held (`no_end_of` fails the test if it is ended). Someone
-/// else's marking is said, with the kill hint, and is not goetia's own failure; an unmarked service is
-/// told disabled and not deleted.
+/// A service that took hold of once and then refuses STOP and no longer accepts it fails an uninstall
+/// with the service's own cause, and does not end the process it held. Someone else's marking is said,
+/// with the kill hint, and is not goetia's own failure; an unmarked service is told disabled and not
+/// deleted.
 #[cfg(windows)]
 #[skuld::test]
-fn an_uninstall_over_a_service_that_does_not_accept_stop_is_a_stop_failure_whether_or_not_it_was_marked() {
+fn an_uninstall_over_a_service_that_stops_accepting_stop_is_a_stop_failure_whether_or_not_it_was_marked() {
     use crate::backend::scm::manager::uninstall_stop_on;
     use crate::spec::Id;
 
     let [(_, answer), ..] = answers();
     for marked in [false, true] {
-        let mut fake = FakeScm::new([Some(Observed::Running)]).accepting([false]);
+        for held in [true, false] {
+            let cell = format!("marked {marked}, held {held}");
+            let holds = std::cell::Cell::new(0);
+            let mut fake = FakeScm::new([Some(Observed::Running)])
+                .stop_replies([StopReply::Os(INVALID_SERVICE_CONTROL)])
+                .withdrawing_stop_once_refused();
 
-        let err = uninstall_stop_on(
-            &mut fake,
-            &Id::try_from("frpc").unwrap(),
-            &answer,
-            marked,
-            None,
-            Some(|| Ok(HoldOutcome::Held(7u32))),
-            no_end_of,
-        )
-        .expect_err("a service that does not accept STOP is not stopped");
+            let err = uninstall_stop_on(
+                &mut fake,
+                &Id::try_from("frpc").unwrap(),
+                &answer,
+                marked,
+                None,
+                held.then_some(|| -> crate::error::Result<HoldOutcome<u32>> {
+                    holds.set(holds.get() + 1);
+                    Ok(HoldOutcome::Held(7))
+                }),
+                no_end_of,
+            )
+            .expect_err("a service that does not accept STOP is not stopped");
 
-        let said = err.report().to_string();
-        assert!(said.contains("does not accept STOP"), "marked {marked}: {said}");
-        assert!(said.contains("could not be stopped"), "marked {marked}: {said}");
-        assert!(said.contains("goetia daemon kill frpc"), "marked {marked}: {said}");
-        assert!(
-            !said.contains("goetia's own"),
-            "the failure is the service's: marked {marked}: {said}"
-        );
-        assert_eq!(
-            said.contains("marked for deletion by someone else"),
-            marked,
-            "marked {marked}: {said}"
-        );
-        assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
+            assert_eq!(fake.stop_count(), 1, "{cell}: {:?}", fake.log);
+            assert_eq!(
+                holds.get(),
+                usize::from(held),
+                "{cell}: the hold runs once, before the STOP"
+            );
+            let said = err.report().to_string();
+            assert!(said.contains("does not accept STOP"), "{cell}: {said}");
+            assert!(said.contains("could not be stopped"), "{cell}: {said}");
+            assert!(said.contains("goetia daemon kill frpc"), "{cell}: {said}");
+            assert!(
+                !said.contains("goetia's own"),
+                "the failure is the service's: {cell}: {said}"
+            );
+            assert_eq!(
+                said.contains("marked for deletion by someone else"),
+                marked,
+                "{cell}: {said}"
+            );
+            assert_eq!(said.contains("is now disabled"), !marked, "{cell}: {said}");
+        }
     }
 }
 

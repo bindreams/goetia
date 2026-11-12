@@ -5,8 +5,7 @@ pub(crate) fn unbounded() -> crate::manager::budget::Deadline {
     crate::manager::budget::Budget::Unbounded.start()
 }
 
-/// An already-spent deadline: the only kind under which a fake reports an expiry. The script is what
-/// makes a wait expire; this is what the code under test is told it has left.
+/// An already-spent deadline: the only kind under which a fake reports an expiry.
 pub(crate) fn spent() -> crate::manager::budget::Deadline {
     crate::manager::budget::Budget::Immediate.start()
 }
