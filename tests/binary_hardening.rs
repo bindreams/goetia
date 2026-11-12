@@ -1,5 +1,4 @@
-//! The built `goetia` and `goetia-shim` do not search their own folder for libraries (`goetia` only with `cli`,
-//! which it requires).
+//! The built `goetia` and `goetia-shim` do not search their own folder for libraries.
 //!
 //! `libsearch_guard::verify` reads the built files. On Windows it checks the effects of `build.rs`'s
 //! `libsearch_guard::bins()` in the PE file (System32-only import loading, no `vcruntime140.dll` import), not

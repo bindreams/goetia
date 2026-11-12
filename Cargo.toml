@@ -164,8 +164,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [build-dependencies]
-# `build.rs` hardens every `[[bin]]` against loading a DLL from its own folder on Windows MSVC; other Windows
-# targets and Cygwin fail the bins' link (the library still builds); a no-op off Windows.
+# Hardens every `[[bin]]` against loading a DLL from its own folder (Windows MSVC); bins fail to link on other
+# Windows targets and Cygwin; no-op elsewhere.
 libsearch-guard = "0.1.1"
 
 [dev-dependencies]
@@ -174,7 +174,6 @@ libsearch-guard = "0.1.1"
 goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.6"
 rand = "0.10"
-# `verify` only, for `tests/binary_hardening.rs`.
 libsearch-guard = "0.1.1"
 
 [target.'cfg(unix)'.dev-dependencies]
