@@ -3711,48 +3711,77 @@ fn an_uninstall_holds_only_when_told_to_and_judges_only_what_may_be_a_shim() {
     }
 }
 
-/// A hold that fails is goetia's or the hold's doing, never that of whoever marked the service for
-/// deletion: it is told with its cause whether or not the service was marked. Only an uninstall that
-/// disabled the service says it did.
+/// A hold that fails is goetia's own doing, never that of whoever marked the service for deletion or of
+/// the service's refusal of STOP: one sentence says so, marked or not, and says what goetia knows of a
+/// STOP: none sent (the hold before the first STOP), one that may have been delivered (the hold before a
+/// STOP sent again after a 1061), or none sent to a service found `STOP_PENDING`.
 #[cfg(windows)]
 #[skuld::test]
-fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked() {
+fn an_uninstall_whose_hold_failed_says_what_is_known_of_the_stop_marked_or_not() {
     use crate::backend::scm::manager::uninstall_stop_on;
     use crate::spec::Id;
+    use windows_service::service::ServiceStartType;
 
     let [(_, answer), ..] = answers();
-    for marked in [false, true] {
-        let mut fake = FakeScm::new([Some(Observed::Running), Some(Observed::Stopped)]).stop_replies([StopReply::Ok]);
+    let lead = "`frpc`'s uninstall stopped: goetia could not hold its process to wait for its exit.";
+    let remedy = "Re-run `goetia daemon uninstall frpc`; if it fails the same way, stop the service \
+                  (`sc.exe stop frpc`) and re-run: blob: held badly";
+    let marked_left = "The service is marked for deletion by someone else, so goetia did not disable or delete \
+                       it; it is removed once it stops and its last handle closes.";
+    let disabled = "The service was NOT deleted and is now disabled, so `goetia daemon start frpc` fails. \
+                    Its start type was automatic; `goetia daemon enable frpc` sets it again.";
+    for (stop, fact) in [
+        ("none", "It sent no STOP."),
+        (
+            "maybe",
+            "A STOP it sent was refused and may have been delivered; it sent none after that.",
+        ),
+        (
+            "under way",
+            "The service was already stopping (STOP_PENDING), so it sent no STOP.",
+        ),
+    ] {
+        for marked in [false, true] {
+            let previous = (!marked).then_some(ServiceStartType::AutoStart);
+            let holds = std::cell::Cell::new(0);
+            // The hold for a STOP sent again is the second; every other failing hold is the first.
+            let fails_on = if stop == "maybe" { 2 } else { 1 };
+            let mut fake = match stop {
+                "none" => FakeScm::new([Some(Observed::Running)]),
+                "maybe" => FakeScm::new([Some(Observed::Running)])
+                    .stop_replies([StopReply::Os(ERROR_SERVICE_CANNOT_ACCEPT_CTRL)])
+                    .queried(QueriedState::Running, true),
+                _ => FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending),
+            };
 
-        let err = uninstall_stop_on(
-            &mut fake,
-            &Id::try_from("frpc").unwrap(),
-            &answer,
-            marked,
-            None,
-            Some(|| -> crate::error::Result<HoldOutcome<u32>> { Err(crate::error::Error::blob("held badly")) }),
-            no_end_of,
-        )
-        .expect_err("the hold failed");
+            let err = uninstall_stop_on(
+                &mut fake,
+                &Id::try_from("frpc").unwrap(),
+                &answer,
+                marked,
+                previous,
+                Some(|| -> crate::error::Result<HoldOutcome<u32>> {
+                    holds.set(holds.get() + 1);
+                    if holds.get() == fails_on {
+                        Err(crate::error::Error::blob("held badly"))
+                    } else {
+                        Ok(HoldOutcome::Held(7))
+                    }
+                }),
+                no_end_of,
+            )
+            .expect_err("the hold failed");
 
-        let said = err.report().to_string();
-        assert!(said.contains("held badly"), "marked {marked}: {said}");
-        assert!(said.contains("could not be stopped"), "marked {marked}: {said}");
-        assert!(
-            !said.contains("marked for deletion by someone else"),
-            "marked {marked}: {said}"
-        );
-        assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
-        assert!(said.contains("goetia's own"), "marked {marked}: {said}");
-        assert!(
-            !said.contains("goetia daemon kill"),
-            "a failed hold is not a service that refuses STOP: marked {marked}: {said}"
-        );
-        assert_eq!(
-            said.contains("already marked for deletion"),
-            marked,
-            "marked {marked}: {said}"
-        );
+            let cell = format!("{stop}, marked {marked}: {:?}", fake.log);
+            assert_eq!(holds.get(), fails_on, "{cell}");
+            assert_eq!(fake.stop_count(), usize::from(stop == "maybe"), "{cell}");
+            let left = if marked { marked_left } else { disabled };
+            assert_eq!(
+                err.report().to_string(),
+                format!("{lead} {fact} {left} {remedy}"),
+                "{cell}"
+            );
+        }
     }
 }
 
@@ -3809,58 +3838,6 @@ fn an_uninstall_over_a_service_that_stops_accepting_stop_is_a_stop_failure_wheth
                 "{cell}: {said}"
             );
             assert_eq!(said.contains("is now disabled"), !marked, "{cell}: {said}");
-        }
-    }
-}
-
-/// A failed hold on a service found `STOP_PENDING` is told as already stopping and goetia's own, marked
-/// or not.
-#[cfg(windows)]
-#[skuld::test]
-fn an_uninstall_whose_hold_of_a_stop_pending_service_failed_says_the_service_is_already_stopping() {
-    use crate::backend::scm::manager::uninstall_stop_on;
-    use crate::spec::Id;
-
-    let [(_, answer), ..] = answers();
-    for marked in [false, true] {
-        let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
-
-        let err = uninstall_stop_on(
-            &mut fake,
-            &Id::try_from("frpc").unwrap(),
-            &answer,
-            marked,
-            None,
-            Some(|| -> crate::error::Result<HoldOutcome<u32>> { Err(crate::error::Error::blob("held badly")) }),
-            no_end_of,
-        )
-        .expect_err("the hold failed");
-
-        let said = err.report().to_string();
-        assert!(said.contains("held badly"), "marked {marked}: {said}");
-        assert!(!fake.log.contains(&"control_stop"), "marked {marked}: {:?}", fake.log);
-        assert!(
-            said.contains("already stopping (STOP_PENDING)"),
-            "marked {marked}: {said}"
-        );
-        assert!(said.contains("goetia's own"), "marked {marked}: {said}");
-        assert!(
-            !said.contains("could not be stopped") && !said.contains("does not accept STOP"),
-            "no STOP was sent: marked {marked}: {said}"
-        );
-        if marked {
-            assert!(said.contains("already marked for deletion"), "{said}");
-            assert!(said.contains("sent no STOP"), "{said}");
-            for stale in ["by someone else", "goetia daemon kill", "is now disabled"] {
-                assert!(
-                    !said.contains(stale),
-                    "`{stale}` is false for goetia's own failure: {said}"
-                );
-            }
-        } else {
-            assert!(said.contains("is now disabled"), "{said}");
-            assert!(said.contains("goetia daemon uninstall frpc"), "{said}");
-            assert!(said.contains("goetia daemon kill frpc"), "{said}");
         }
     }
 }
