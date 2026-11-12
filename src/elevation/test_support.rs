@@ -16,18 +16,23 @@ use windows_sys::Win32::System::Threading::{
 use crate::backend::scm::shim::acl::Descriptor;
 use crate::backend::scm::sid::Sid;
 
-/// This process's token, opened to be copied.
-fn process_token() -> OwnedHandle {
+/// This process's token, opened with `access`.
+pub(crate) fn open_process_token(access: u32) -> OwnedHandle {
     let mut process = std::ptr::null_mut();
     // SAFETY: a pointer to a local; a returned token is owned below.
     assert_ne!(
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut process) },
+        unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut process) },
         0,
         "OpenProcessToken: {}",
         io::Error::last_os_error()
     );
     // SAFETY: a valid handle `OpenProcessToken` just returned and nothing else owns.
     unsafe { OwnedHandle::from_raw_handle(process) }
+}
+
+/// This process's token, opened to be copied.
+fn process_token() -> OwnedHandle {
+    open_process_token(TOKEN_DUPLICATE | TOKEN_QUERY)
 }
 
 /// The permissions of a token copy: every right to Everyone, so to the user the thread impersonates
