@@ -455,6 +455,11 @@ impl ScmActor for FakeScm {
                     "FakeScm: wait reported an expiry before its deadline passed"
                 );
                 if let Some(observed) = observed {
+                    assert!(
+                        self.mask_admits(observed),
+                        "FakeScm: {observed:?} scripted under the mask {:?}, which SCM does not fire it on",
+                        self.mask
+                    );
                     self.state = Some(self.state_of(observed));
                     self.deliveries += 1;
                 }
@@ -1677,14 +1682,6 @@ fn settle_rows() -> Vec<Row> {
                 "got_stopped",
             ],
         },
-        Row {
-            name: "a pending notification that accepts STOP is not stopped",
-            waits: vec![Some(Pending), Some(Stopped)],
-            accepts: vec![true, true],
-            replies: vec![],
-            outcome: Outcome::Confirmed,
-            log: vec!["arm_settle", "wait", "got_pending", "arm_settle", "wait", "got_stopped"],
-        },
     ]
 }
 
@@ -1717,38 +1714,6 @@ fn settle_and_stop_handles_every_scm_interleaving() {
         assert!(fake.bad_stops.is_empty(), "{}: {:?}", row.name, fake.bad_stops);
         assert!(fake.waits.is_empty(), "{}: unconsumed notifications", row.name);
     }
-}
-
-/// A re-arm on the same handle is not delivered for a state already current at the arm, so each
-/// re-arm below is followed by a read that decides before any wait. The fake panics with a lost
-/// wake-up where the code would have waited on a registration that cannot fire.
-#[skuld::test]
-fn settle_and_stop_reads_after_the_re_arm_that_follows_a_pending_notification() {
-    use QueriedState::{Running, Stopped};
-    // Stopped before the re-arm: confirmed by the read.
-    let mut fake = FakeScm::new([Some(Observed::Pending)]).drifting_after(1, Stopped);
-    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(fake.log, vec!["arm_settle", "wait", "got_pending", "arm_settle"]);
-
-    // Running before the re-arm: the STOP is sent as if it had been notified, and the service is
-    // STOPPED by the arm after it.
-    let mut fake = FakeScm::new([Some(Observed::Pending)])
-        .stop_replies([StopReply::Ok])
-        .drifting_after(1, Running)
-        .drifting_after(1, Stopped);
-    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(
-        fake.log,
-        vec![
-            "arm_settle",
-            "wait",
-            "got_pending",
-            "arm_settle",
-            "control_stop",
-            "arm_stopped"
-        ]
-    );
-    assert!(fake.bad_stops.is_empty(), "{:?}", fake.bad_stops);
 }
 
 /// After a 1052 the restart that began may be RUNNING again before the re-arm: the read says so and
@@ -2418,13 +2383,6 @@ fn settle_and_stop_is_confirmed_by_the_status_of_an_arm_refused_on_a_marked_serv
     assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
     assert_eq!(fake.log, vec!["arm_settle"]);
 
-    // The re-arm after a notification outside the mask.
-    let mut fake = FakeScm::new([Some(Observed::Pending)])
-        .drifting_after(1, QueriedState::Stopped)
-        .refusing_arms_in(STOPPED_ONLY);
-    assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(fake.log, vec!["arm_settle", "wait", "got_pending", "arm_settle"]);
-
     // The re-arm after a refused STOP.
     let mut fake = FakeScm::new([Some(Observed::Running)])
         .stop_replies([StopReply::Os(INVALID_SERVICE_CONTROL)])
@@ -2458,7 +2416,8 @@ fn an_arm_refused_on_a_marked_service_that_is_not_where_the_wait_wants_it_is_an_
     let mut start = FakeScm::new([])
         .drifting_after(0, QueriedState::Stopped)
         .refusing_arms_in(STOPPED_ONLY);
-    let mut settle = FakeScm::new([Some(Observed::Pending)])
+    let mut settle = FakeScm::new([Some(Observed::Running)])
+        .stop_replies([StopReply::Os(INVALID_SERVICE_CONTROL)])
         .drifting_after(1, QueriedState::Running)
         .refusing_arms_in(RUNNING_ONLY);
     let errors = [
@@ -2514,9 +2473,14 @@ fn a_stop_wait_reads_a_service_gone_at_an_arm_as_stopped() {
         vec!["control_stop", "arm_stopped", "wait", "got_pending", "arm_stopped_only"]
     );
 
-    let mut fake = FakeScm::new([Some(Observed::Pending)]).gone_at_arm(2);
+    let mut fake = FakeScm::new([Some(Observed::Running)])
+        .stop_replies([StopReply::Os(INVALID_SERVICE_CONTROL)])
+        .gone_at_arm(2);
     assert_eq!(settle_and_stop(&mut fake, unbounded()).unwrap(), Waited::Confirmed);
-    assert_eq!(fake.log, vec!["arm_settle", "wait", "got_pending", "arm_settle"]);
+    assert_eq!(
+        fake.log,
+        vec!["arm_settle", "wait", "got_running", "control_stop", "arm_settle"]
+    );
 }
 
 /// A start is for `RUNNING`: a service that is gone is not that.

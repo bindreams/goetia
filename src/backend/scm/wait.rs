@@ -504,8 +504,9 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// `RUNNING` or `PAUSED` state that accepts it, seen in a notification or in the status an arm returns,
 /// never on an earlier observation.
 ///
-/// Loops over notifications of `RUNNING`, `PAUSED` and `STOPPED`; a pending state is not in the mask,
-/// so SCM does not report one until the service has settled. `STOPPED` ends the loop. On `RUNNING` or
+/// Loops over notifications of `RUNNING`, `PAUSED` and `STOPPED`. A pending state is not in the mask
+/// ([`WantState::RunningPausedOrStopped`]), so SCM reports none until the service has settled; a
+/// notification of one is an error. `STOPPED` ends the loop. On `RUNNING` or
 /// `PAUSED` the STOP is sent; SCM may have changed the state since that notification, and then it
 /// rejects the STOP with 1052 (a restart began) or 1061 (a STOP is already delivered, or the service
 /// was `START_PENDING`). Either way the loop re-arms, and the status the arm returns decides, as a
@@ -559,18 +560,15 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so a
     // `RUNNING`, `PAUSED` or `STOPPED` service is read from the notification; the status it returns
     // is for the states the mask excludes, `STOP_PENDING` among them, which no notification reports.
-    match decided_or_status(
-        a.arm(WantState::RunningPausedOrStopped, deadline)?,
-        QueriedState::Stopped,
-    )? {
-        Err(end) => return Ok(judged(end, shim)?),
-        Ok(status) if status.state == QueriedState::StopPending => {
+    match arm_settle(a, deadline, shim)? {
+        ControlFlow::Break(waited) => return Ok(waited),
+        ControlFlow::Continue(status) if status.state == QueriedState::StopPending => {
             hold(a).map_err(|error| SettleError::Hold {
                 error,
                 stop: StopSent::UnderWay,
             })?;
         }
-        Ok(_) => {}
+        ControlFlow::Continue(_) => {}
     }
     // What the status returned by the latest re-arm showed, when it is a state to act on.
     let mut read = None;
@@ -587,22 +585,16 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
                     None => return Ok(Waited::Expired),
                     Some(observed) => notified_state(observed)
                         .and_then(|state| seen_in(delivered_status(a, state)))
-                        .unwrap_or(Seen::Pending),
+                        .ok_or_else(|| {
+                            io::Error::other(format!(
+                                "SCM notified {observed:?} to a registration for RUNNING, PAUSED and STOPPED only"
+                            ))
+                        })?,
                 }
             }
         };
         match seen {
             Seen::Stopped(status) => return Ok(judged(WaitEnd::confirmed_by(status), shim)?),
-            Seen::Pending => {
-                let status = match decided_or_status(
-                    a.arm(WantState::RunningPausedOrStopped, deadline)?,
-                    QueriedState::Stopped,
-                )? {
-                    Ok(status) => status,
-                    Err(end) => return Ok(judged(end, shim)?),
-                };
-                read = seen_in(status);
-            }
             Seen::Settled { state, accepts_stop } => {
                 if !accepts_stop {
                     return Err(io::Error::other(format!("the service is {state} and does not accept STOP")).into());
@@ -624,19 +616,32 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
                     Err(e) if is_stop_refusal(&e) => {
                         refused = e.raw_os_error();
                         may_have_delivered |= refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
-                        let status = match decided_or_status(
-                            a.arm(WantState::RunningPausedOrStopped, deadline)?,
-                            QueriedState::Stopped,
-                        )? {
-                            Ok(status) => status,
-                            Err(end) => return Ok(judged(end, shim)?),
+                        read = match arm_settle(a, deadline, shim)? {
+                            ControlFlow::Break(waited) => return Ok(waited),
+                            ControlFlow::Continue(status) => seen_in(status),
                         };
-                        read = seen_in(status);
                     }
                     Err(e) => return Err(e.into()),
                 }
             }
         }
+    }
+}
+
+/// Arm for [`WantState::RunningPausedOrStopped`] and decide on the status the arm returns before any
+/// wait ([`decided_or_status`]): `Break` is how [`settle_and_stop`] ends, judged as [`judged`] does,
+/// and `Continue` is the status to act on. Every arm of the settle loop goes through it.
+fn arm_settle<A: ScmActor>(
+    a: &mut A,
+    deadline: Deadline,
+    shim: bool,
+) -> io::Result<ControlFlow<Waited, QueriedStatus>> {
+    match decided_or_status(
+        a.arm(WantState::RunningPausedOrStopped, deadline)?,
+        QueriedState::Stopped,
+    )? {
+        Ok(status) => Ok(ControlFlow::Continue(status)),
+        Err(end) => Ok(ControlFlow::Break(judged(end, shim)?)),
     }
 }
 
@@ -675,8 +680,6 @@ pub(crate) fn carried<T: std::error::Error + 'static>(e: &io::Error) -> Option<&
 enum Seen {
     /// With the status that showed it, whose record is the stop's.
     Stopped(QueriedStatus),
-    /// A pending state.
-    Pending,
     /// `RUNNING` or `PAUSED`, named as the errors name it.
     Settled { state: &'static str, accepts_stop: bool },
 }
