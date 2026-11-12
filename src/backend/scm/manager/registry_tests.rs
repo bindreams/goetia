@@ -727,7 +727,6 @@ fn text_with_a_nul_is_refused_as_invalid_input_and_text_without_one_is_not() {
 fn writing_a_parameters_value_or_service_with_a_nul_is_refused_before_the_registry_is_opened() {
     let service = "goetia-nul-test-absent";
     let value_with_nul = BTreeMap::from([("Marker".to_string(), "a\0b".to_string())]);
-    let field_with_nul = BTreeMap::from([("Mar\0ker".to_string(), "x".to_string())]);
 
     assert!(
         write_parameters(service, &value_with_nul)
