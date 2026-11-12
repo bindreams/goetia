@@ -759,7 +759,13 @@ fn writing_an_environment_line_or_service_with_a_nul_is_refused_before_the_regis
             .to_string()
             .contains("NUL")
     );
-    assert!(write_environment("a\0b", &[]).unwrap_err().to_string().contains("NUL"));
+    assert!(
+        write_environment("a\0b", &[])
+            .unwrap_err()
+            .report()
+            .to_string()
+            .contains("holds a NUL")
+    );
 }
 
 #[skuld::test]
