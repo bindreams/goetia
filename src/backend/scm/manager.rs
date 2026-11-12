@@ -1137,8 +1137,7 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
     mut hold: Option<impl FnMut() -> Result<HoldOutcome<P>>>,
     end: impl FnOnce(P) -> std::result::Result<EndProcessOutcome<P>, ProcessWaitFailure>,
 ) -> Result<HoldOutcome<P>> {
-    // Taken again for each STOP the loop sends, so the one kept is the process that STOP is for, and
-    // once for a service that is already `STOP_PENDING`, which no STOP of ours is sent to.
+    // Taken again for each STOP the loop sends, so the one kept is the process that STOP is for.
     let mut process = HoldOutcome::NoProcess;
     let settled = super::wait::settle_and_stop(actor, Budget::Unbounded.start(), answer.judges_stop_record(), |_| {
         let Some(hold) = hold.as_mut() else {
@@ -1158,8 +1157,7 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
             }
         }
     });
-    // A failed hold ended the wait with no STOP of ours sent after it, and no incomplete stop to end.
-    // It is goetia's own doing, not that of whoever marked the service.
+    // A failed hold is goetia's own doing, not that of whoever marked the service.
     let settled = match settled {
         Ok(waited) => Ok(waited),
         Err(SettleError::Other(e)) => Err(e),
@@ -1682,9 +1680,8 @@ enum UninstallFailure {
     /// The hold of the process of a service found `STOP_PENDING` failed, on a service someone else had
     /// marked for deletion: goetia's own failure, which ended its wait with no STOP of ours sent.
     AlreadyMarkedStopUnderWay,
-    /// The hold of the process of a service found `STOP_PENDING` failed, on a service no one had marked
-    /// for deletion: the failure ended goetia's wait, no STOP of ours was sent, and the service is
-    /// stopping on its own. It is disabled, with `previous` its start type before, and was not deleted.
+    /// As `AlreadyMarkedStopUnderWay`, on a service no one had marked: it is disabled, with `previous`
+    /// its start type before, and was not deleted.
     StopUnderWay { previous: Option<ServiceStartType> },
     /// The service is stopped, and SCM recorded the code the shim uses for failing to end the daemon's
     /// process tree. Unless `marked` (someone else had marked it for deletion) it is disabled, with

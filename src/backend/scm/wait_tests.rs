@@ -1349,7 +1349,7 @@ fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Wai
     flat(super::settle_and_stop(a, deadline, false, |_| Ok::<(), Infallible>(())))
 }
 
-/// `ended` as the io result it is, for a test whose hold cannot fail.
+/// `ended` as the io result it is, for a hold that cannot fail.
 fn flat(ended: Result<Waited, SettleError<Infallible>>) -> io::Result<Waited> {
     ended.map_err(|e| match e {
         SettleError::Hold { error, .. } => match error {},
@@ -3769,10 +3769,8 @@ fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked
     }
 }
 
-/// A service already `STOP_PENDING` when the uninstall finds it is stopping without a STOP of ours, so a
-/// hold that fails there is told as such: already stopping, no STOP sent, goetia's own failure. A service
-/// no one marked is to wait for and re-run, with `kill` for a stop that never ends. A marked one keeps the
-/// contract of any failed hold on one: no disable claim, no `kill` and no blame on whoever marked it.
+/// A failed hold on a service found `STOP_PENDING` is told as already stopping and goetia's own, marked
+/// or not.
 #[cfg(windows)]
 #[skuld::test]
 fn an_uninstall_whose_hold_of_a_stop_pending_service_failed_says_the_service_is_already_stopping() {

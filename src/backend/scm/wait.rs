@@ -549,8 +549,7 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// can say; a STOP that is refused and sent again runs it again), and once, before the wait, for a
 /// service the first arm finds `STOP_PENDING`, which is stopping without a STOP of ours (someone
 /// else's, or a `stop` whose wait ran out) and has its process still. Its error ends the wait, with
-/// no STOP sent after it: it is returned as a [`SettleError::Hold`], which says which hold failed (a hold
-/// before a STOP may follow an earlier STOP that was refused).
+/// no STOP sent after it: it is returned as a [`SettleError::Hold`].
 pub(crate) fn settle_and_stop<A: ScmActor, E>(
     a: &mut A,
     deadline: Deadline,
@@ -634,7 +633,7 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
 /// How [`settle_and_stop`] failed.
 #[derive(Debug)]
 pub(crate) enum SettleError<E> {
-    /// The `hold` failed, which ended the wait with no STOP sent after it.
+    /// The `hold` failed.
     Hold {
         error: E,
         /// Whether the hold was of a service found `STOP_PENDING`, which no STOP of ours was to be sent

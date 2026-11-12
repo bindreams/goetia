@@ -1292,7 +1292,7 @@ fn a_marked_service_whose_stop_goetia_failed_blames_goetia_and_not_whoever_marke
 
 /// A service already stopping had no STOP of ours, and the hold that failed ended goetia's wait: it is
 /// told as stopping, as goetia's own failure, with the wait, the retry and `kill` for a stop that never
-/// ends. Checked as the whole rendered sentence.
+/// ends.
 #[skuld::test]
 fn an_uninstall_over_a_stop_already_under_way_says_so_and_advises_waiting_then_retrying() {
     let cause = Error::os("hold `frpc`'s process", std::io::Error::other("held badly"));
@@ -1317,7 +1317,7 @@ fn an_uninstall_over_a_stop_already_under_way_says_so_and_advises_waiting_then_r
 
 /// A marked service already stopping whose hold failed keeps the marked contract (goetia's own failure, no
 /// disable claim, no `kill`, no blame on whoever marked it) and says what is true of it: it was already
-/// stopping, `uninstall` sent no STOP and ended its wait. Checked as the whole rendered sentence.
+/// stopping, `uninstall` sent no STOP and ended its wait.
 #[skuld::test]
 fn a_marked_service_already_stopping_whose_hold_failed_says_so_and_keeps_the_marked_contract() {
     let cause = Error::os("hold `frpc`'s process", std::io::Error::other("held badly"));
