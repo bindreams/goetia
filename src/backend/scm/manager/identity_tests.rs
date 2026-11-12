@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::scm::sid::system;
+use crate::backend::scm::sid::{sid_from_parts, system};
 
 #[skuld::test]
 fn root_resolves_to_an_empty_unused_identity() {
@@ -52,13 +52,13 @@ fn sid_rejects_a_malformed_sid_string() {
     assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
     assert_eq!(
         err.to_string(),
-        "account lookup failed: `user.id` `not-a-sid` is not a valid SID string"
+        "account lookup failed: cannot parse `user.id` `not-a-sid` as a SID string"
     );
     // The OS's own refusal is the cause, printed after the message.
     assert!(
         err.report()
             .to_string()
-            .starts_with("account lookup failed: `user.id` `not-a-sid` is not a valid SID string: "),
+            .starts_with("account lookup failed: cannot parse `user.id` `not-a-sid` as a SID string: "),
         "{}",
         err.report()
     );
@@ -115,16 +115,96 @@ fn a_nul_in_a_sid_string_is_refused_not_cut_there() {
     assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
     assert_eq!(
         err.to_string(),
-        r"account lookup failed: `user.id` `S-1-5-18\0junk` is not a valid SID string"
+        "account lookup failed: cannot parse `user.id` `S-1-5-18\0junk` as a SID string"
     );
 }
 
 #[skuld::test]
 fn a_nul_in_an_account_name_is_refused_not_cut_there() {
-    let err = sid_for_account_name("SYSTEM\0junk").expect_err("a NUL ends nothing here");
+    let err = sid_for_account_name("SYSTEM\0junk", Some("user.name")).expect_err("a NUL ends nothing here");
     assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
     assert_eq!(
         err.to_string(),
-        r"account lookup failed: `user.name` `SYSTEM\0junk` is not a valid account name"
+        "account lookup failed: cannot resolve SID for `user.name` `SYSTEM\0junk`"
     );
+}
+
+// A lookup that finds no account ======================================================================================
+
+#[skuld::test]
+fn a_well_formed_sid_no_account_has_is_an_account_lookup_naming_the_field() {
+    let err = account_name_from_sid_string("S-1-5-21-1-2-3-999999").expect_err("no such account");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("account lookup failed: cannot resolve account name for `user.id` `S-1-5-21-1-2-3-999999`"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
+fn a_binary_sid_no_account_has_is_an_account_lookup_naming_no_field() {
+    let sid = sid_from_parts(5, &[21, 1, 2, 3, 999999]);
+    let err = account_name_of_sid(&sid).expect_err("no such account");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("account lookup failed: cannot resolve account name for SID `S-1-5-21-1-2-3-999999`"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
+fn an_unknown_account_name_is_an_account_lookup_naming_the_field() {
+    let err = sid_for_account_name("goetia-no-such-account-7f3a", Some("user.name")).expect_err("no such account");
+    assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("account lookup failed: cannot resolve SID for `user.name` `goetia-no-such-account-7f3a`"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
+fn an_account_name_without_a_field_names_the_account() {
+    let err = sid_for_account_name("goetia-no-such-account-7f3a", None).expect_err("no such account");
+    assert!(
+        err.to_string()
+            .starts_with("account lookup failed: cannot resolve SID for account `goetia-no-such-account-7f3a`"),
+        "{err}"
+    );
+}
+
+#[skuld::test]
+fn a_name_is_quoted_as_written_and_its_backslash_is_not_doubled() {
+    // A backslash then `n` must not read as an escaped newline either.
+    let err = sid_for_account_name(r"GOETIA-NO-SUCH-DOMAIN\nobody", Some("user.name")).expect_err("no such domain");
+    assert!(
+        err.to_string().contains(r"`user.name` `GOETIA-NO-SUCH-DOMAIN\nobody`"),
+        "{err}"
+    );
+    // The leading `.\` is stripped for the lookup, not from what the user wrote.
+    let err = sid_for_account_name(r".\goetia-no-such-account-7f3a", Some("user.name")).expect_err("no such account");
+    assert!(
+        err.to_string().contains(r"`user.name` `.\goetia-no-such-account-7f3a`"),
+        "{err}"
+    );
+}
+
+// account_error =======================================================================================================
+
+#[skuld::test]
+fn an_input_code_is_an_account_lookup_and_any_other_code_is_an_os_failure() {
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_PARAMETER, ERROR_INVALID_SID, ERROR_NONE_MAPPED, ERROR_NOT_ENOUGH_MEMORY,
+    };
+    for code in [ERROR_NONE_MAPPED, ERROR_INVALID_SID, ERROR_INVALID_PARAMETER] {
+        let err = account_error("resolve x".to_string(), std::io::Error::from_raw_os_error(code as i32));
+        assert!(matches!(err, Error::AccountLookup { .. }), "{code}: {err:?}");
+    }
+    let err = account_error(
+        "resolve x".to_string(),
+        std::io::Error::from_raw_os_error(ERROR_NOT_ENOUGH_MEMORY as i32),
+    );
+    assert!(matches!(err, Error::Os { .. }), "{err:?}");
 }
