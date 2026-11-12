@@ -111,8 +111,6 @@ const CONTROL_CHARACTERS: [(char, &str); 2] = [('\n', r"\n"), ('\0', r"\0")];
 fn a_control_character_in_a_free_text_field_is_refused_on_every_backend() {
     // A newline ends one systemd directive and starts another; a NUL cuts a string short wherever
     // a backend hands it to the OS as a C string, so `user: "svc\0x"` would name the account `svc`.
-    // Each row puts the character in one leaf, in the base and under every backend's override, and
-    // names the exact field the message must blame.
     let rows: [(&str, &str); 10] = [
         ("name", r#"name: "a{e}b""#),
         ("command", r#"command: ["/bin/frpc", "a{e}b"]"#),
@@ -129,13 +127,12 @@ fn a_control_character_in_a_free_text_field_is_refused_on_every_backend() {
         for (field, row_line) in rows {
             let predicate = format!("field `{field}` contains a control character");
             let line = row_line.replace("{e}", escape);
-            // A `command` leaf supplies the command itself.
+            // A `command` row replaces the base command, so the base omits it.
             let base = if line.starts_with("command:") {
                 "id: frpc\n"
             } else {
                 "id: frpc\ncommand: [/bin/frpc]\n"
             };
-            // The backend whose override carries the character, or none for the base.
             let mut manifests = vec![(None, format!("{base}{line}\n"))];
             for backend in BackendKind::ALL {
                 let yaml = format!("{base}backend-specific:\n  {backend}:\n    {line}\n");
@@ -169,7 +166,7 @@ fn a_control_character_in_the_id_is_refused() {
     for (c, escape) in CONTROL_CHARACTERS {
         let yaml = format!("id: \"fr{escape}pc\"\ncommand: [/bin/frpc]\n");
         assert!(parse_manifest(&yaml).id.contains(c), "the fixture carries {c:?}");
-        // The id is checked before any backend is consulted; every host backend still refuses it.
+        // The id is checked before any backend is consulted.
         for &native in HOST_BACKENDS {
             let context = format!("{c:?} as native `{native}`");
             let err = resolve_yaml_as(native, &yaml).expect_err(&context).to_string();
@@ -184,7 +181,6 @@ fn a_control_character_in_the_id_is_refused() {
 #[skuld::test]
 fn a_nul_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(#[fixture(temp_dir)] dir: &Path) {
     // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value.
-    // Once in the base `user`, once in the native backend's override of it.
     let predicate = "field `user.name` contains a control character";
     let base = "id: frpc\ncommand: [/bin/frpc]\nuser: ${U}\n";
     write_fixture(dir, base, Some("U=svc\0x\n"));
@@ -201,7 +197,6 @@ fn a_nul_that_arrives_through_env_substitution_is_refused_before_any_backend_ver
         );
 
         let overridden = format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    user: ${{U}}\n");
-        // `resolve_as` reads only `.env` from `dir`: the one written above.
         let msg = resolve_as(parse_manifest(&overridden), dir, Some(native))
             .expect_err("a NUL substituted into the native override is refused")
             .to_string();
