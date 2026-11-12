@@ -992,7 +992,7 @@ fn reservation(requests: usize, calls: usize) -> Reservation {
     Reservation::make(requests, calls * Role::COUNTED_FILES).expect("make a reservation")
 }
 
-/// What [`Launchd::reserve`] makes for `steps`.
+/// What [`Backend::reserve`](backend::Backend::reserve) makes for `steps` on [`Launchd`].
 fn reserved(steps: &[Step]) -> Reservation {
     backend::Backend::reserve(&Launchd::new(), steps, Budget::DEFAULT).expect("reserve")
 }
