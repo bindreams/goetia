@@ -54,6 +54,9 @@ pub enum ReleaseWatch {
 }
 
 /// The three things [`kill_service`] needs of the world, so its ordering is testable without one.
+///
+/// `Expired` is returned only after a bounded deadline has passed; an unbounded deadline never
+/// expires.
 pub trait KillTarget {
     /// An opened process. Holding it keeps its pid from being reused; dropping it lets go.
     type Process;
@@ -108,7 +111,7 @@ pub trait KillTarget {
 /// exit: the process has exited and SCM no longer reports its pid.
 pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<Killed> {
     loop {
-        let Some((pid, process)) = hold_service_process(target, Budget::Unbounded.start())? else {
+        let Some((pid, process)) = hold_service_process_unbounded(target)? else {
             return Ok(Killed::NotRunning);
         };
         match target.terminate(&process)? {
@@ -254,7 +257,16 @@ fn await_scm_released<T: KillTarget>(target: &mut T, pid: u32, deadline: Deadlin
 fn await_scm_released_unbounded<T: KillTarget>(target: &mut T, pid: u32) -> io::Result<()> {
     match await_scm_released(target, pid, Budget::Unbounded.start())? {
         Waited::Confirmed => Ok(()),
-        Waited::Expired => unreachable!("an unbounded deadline does not expire"),
+        Waited::Expired => unreachable!("an unbounded deadline never expires"),
+    }
+}
+
+/// [`hold_service_process`] with no bound, for the callers that terminate the process.
+fn hold_service_process_unbounded<T: KillTarget>(target: &mut T) -> io::Result<Option<(u32, T::Process)>> {
+    match hold_service_process(target, Budget::Unbounded.start()) {
+        Err(HoldError::Expired { .. }) => unreachable!("an unbounded deadline never expires"),
+        Err(HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
+        Ok(held) => Ok(held),
     }
 }
 
@@ -570,7 +582,7 @@ pub(in crate::backend::scm) mod system {
     fn wait_exit_unbounded(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<()> {
         match wait_exit(process, Budget::Unbounded.start(), on_wait)? {
             Waited::Confirmed => Ok(()),
-            Waited::Expired => unreachable!("an unbounded deadline does not expire"),
+            Waited::Expired => unreachable!("an unbounded deadline never expires"),
         }
     }
 }
