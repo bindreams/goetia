@@ -1123,7 +1123,8 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
 /// The stop of an uninstall, over the actor it disabled the service through: the STOP, or the wait for
 /// one under way, on notifications, with no bound (see [`uninstall_locked`]). A service not known not to
 /// run a shim has its record judged, as `stop` judges it. `hold` takes hold of the service's process
-/// before each STOP and once for a service already `STOP_PENDING`, and `None` holds nothing; `end` ends
+/// before each STOP and once for a service already `STOP_PENDING`, and `None` holds nothing (it is
+/// unbounded, so it never returns [`HoldOutcome::Expired`]); `end` ends
 /// a held process whose stop was incomplete, as `stop` ends it. `marked` and `previous` are what the
 /// disable found, which a failure tells.
 ///
@@ -1144,13 +1145,8 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
             return Ok(());
         };
         match hold()? {
-            // Only a bounded hold expires, and this one is not: told rather than gone on from.
-            HoldOutcome::Expired { pid } => Err(Error::os(
-                format!("hold `{id}`'s process"),
-                std::io::Error::other(format!(
-                    "the hold expired with SCM still naming process {pid}, though it has no bound: goetia's own error"
-                )),
-            )),
+            // Only a bounded hold expires, and the hold of an uninstall is unbounded.
+            HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
             held => {
                 process = held;
                 Ok(())
@@ -1173,26 +1169,17 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
     };
     // Ends the held shim process before the failure is reported.
     let settled = end_on_incomplete_stop(settled, &mut process, end);
-    // An unbounded deadline never expires. Told as a failure, not dropped, so that a later edit
-    // narrowing the budget does not pass quietly.
-    let mut expired = false;
-    let settled = settled.and_then(|waited| match waited {
-        Waited::Confirmed => Ok(()),
-        Waited::Expired => {
-            expired = true;
-            Err(std::io::Error::other(
-                "the wait for the stop expired though it has no bound: goetia's own error",
-            ))
-        }
+    let settled = settled.map(|waited| match waited {
+        Waited::Confirmed => {}
+        Waited::Expired => unreachable!("an unbounded deadline never expires"),
     });
     match settled {
         Ok(()) => Ok(process),
         Err(e) => {
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
-            // An expiry is goetia's own doing, not that of whoever marked the service.
             let state = match (carried::<IncompleteStop>(&e).is_some(), marked) {
                 (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
-                (false, true) => UninstallFailure::AlreadyMarked { ours: expired },
+                (false, true) => UninstallFailure::AlreadyMarked { ours: false },
                 (false, false) => UninstallFailure::Stop { previous },
             };
             Err(uninstall_failed(id, &state, Error::os(format!("stop `{id}`"), e)))
@@ -1557,7 +1544,8 @@ impl Scm {
             HoldOutcome::Refused(reason) => {
                 failures.push(Error::os(format!("open `{id}`'s process to wait for its exit"), reason).into())
             }
-            HoldOutcome::Expired { .. } => unreachable!("an unbounded deadline never expires"),
+            // `uninstall_stop_on` returns no `Expired`: an uninstall's hold has no bound.
+            HoldOutcome::Expired { .. } => unreachable!("`uninstall_stop_on` never returns an expired hold"),
         }
         // Nothing is swept for a host that could not be read.
         if host.is_none() {

@@ -87,11 +87,15 @@ pub trait KillTarget {
     /// kill.
     ///
     /// SCM can keep refusing a registration while it catches up with the notifications already
-    /// delivered, and the arm retries until `deadline`: then it is [`ReleaseWatch::Expired`].
+    /// delivered, and the arm retries until `deadline`: then it is [`ReleaseWatch::Expired`]. An
+    /// implementation returns `Expired` only once `deadline` has passed, so an unbounded deadline
+    /// never yields it (only a fake can break this).
     fn arm_release(&mut self, deadline: Deadline) -> io::Result<ReleaseWatch>;
 
     /// Block until the registration [`Self::arm_release`] made wakes, or until `deadline`, when
-    /// the registration is still outstanding: the caller cancels it.
+    /// the registration is still outstanding: the caller cancels it. An implementation returns
+    /// [`Waited::Expired`] only once `deadline` has passed, so an unbounded deadline never yields it
+    /// (only a fake can break this).
     fn await_release(&mut self, deadline: Deadline) -> io::Result<Waited>;
 
     /// Cancel the registration [`Self::arm_release`] made, for a caller that no longer needs it
