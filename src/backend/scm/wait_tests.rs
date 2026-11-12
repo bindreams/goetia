@@ -4,6 +4,7 @@
 //! Expiry is driven by the script, never by the clock: nothing here waits.
 
 use std::collections::VecDeque;
+use std::convert::Infallible;
 
 use super::*;
 use crate::backend::scm::exit_status::{RecordedExit, Reported};
@@ -1345,7 +1346,15 @@ fn a_stop_is_issued_even_when_the_arm_after_it_expires() {
 
 /// [`super::settle_and_stop`] for a caller that has nothing to do before the STOP.
 fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
-    super::settle_and_stop(a, deadline, false, |_| Ok(()))
+    flat(super::settle_and_stop(a, deadline, false, |_| Ok::<(), Infallible>(())))
+}
+
+/// `ended` as the io result it is, for a hold that cannot fail.
+fn flat(ended: Result<Waited, SettleError<Infallible>>) -> io::Result<Waited> {
+    ended.map_err(|e| match e {
+        SettleError::Hold { error, .. } => match error {},
+        SettleError::Other(error) => error,
+    })
 }
 
 /// The `hold` of a caller that logs it in the fake's own log, so that its place among the steps is
@@ -1430,10 +1439,14 @@ fn settle_and_stop_holds_a_service_found_stop_pending_once_before_waiting() {
 fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_stop_pending_service() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
 
-    let error =
-        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err();
+    let SettleError::Hold { error, under_way } =
+        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err()
+    else {
+        panic!("a failed hold is a hold failure");
+    };
 
     assert_eq!(error.to_string(), "no hold");
+    assert!(under_way);
     assert_eq!(fake.log, ["arm_settle"]);
 }
 
@@ -1442,10 +1455,14 @@ fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_stop_pending_service() {
 fn settle_and_stop_sends_no_stop_when_the_callers_step_fails() {
     let mut fake = FakeScm::new([Some(Observed::Running)]);
 
-    let error =
-        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err();
+    let SettleError::Hold { error, under_way } =
+        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err()
+    else {
+        panic!("a failed hold is a hold failure");
+    };
 
     assert_eq!(error.to_string(), "no hold");
+    assert!(!under_way);
     assert_eq!(fake.log, ["arm_settle", "wait", "got_running"]);
 }
 
@@ -3055,7 +3072,7 @@ fn is_judged(ended: io::Result<Waited>) -> bool {
             false
         }
         Err(e) => {
-            assert!(is_incomplete_stop(&e), "{e}");
+            assert!(carried::<IncompleteStop>(&e).is_some(), "{e}");
             true
         }
     }
@@ -3073,7 +3090,12 @@ fn a_shims_stop_with_the_incomplete_stop_record_fails_however_it_was_confirmed()
             assert!(is_judged(ended), "stop_via_notify over {name}");
         }
         if let Some(script) = settle {
-            let ended = super::settle_and_stop(&mut incomplete(script()), unbounded(), true, |_| Ok(()));
+            let ended = flat(super::settle_and_stop(
+                &mut incomplete(script()),
+                unbounded(),
+                true,
+                |_| Ok::<(), Infallible>(()),
+            ));
             assert!(is_judged(ended), "settle_and_stop over {name}");
         }
     }
@@ -3088,7 +3110,12 @@ fn a_stop_of_a_service_that_is_not_a_shims_is_not_judged_by_the_shims_record() {
             assert!(!is_judged(ended), "stop_via_notify over {name}");
         }
         if let Some(script) = settle {
-            let ended = super::settle_and_stop(&mut incomplete(script()), unbounded(), false, |_| Ok(()));
+            let ended = flat(super::settle_and_stop(
+                &mut incomplete(script()),
+                unbounded(),
+                false,
+                |_| Ok::<(), Infallible>(()),
+            ));
             assert!(!is_judged(ended), "settle_and_stop over {name}");
         }
     }
@@ -3130,7 +3157,7 @@ fn stop_and_await_exit_fails_over_a_shims_incomplete_stop_record() {
     let err =
         stop_and_await_exit(&mut fake, unbounded(), &mut HoldOutcome::<u32>::NoProcess, true, no_end).unwrap_err();
 
-    assert!(is_incomplete_stop(&err), "{err}");
+    assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
 }
 
 /// The shim process goetia holds is ended before the incomplete stop is returned: its KILL_ON_JOB_CLOSE
@@ -3158,7 +3185,7 @@ fn stop_and_await_exit_ends_the_held_process_of_an_incomplete_stop_before_failin
     )
     .unwrap_err();
 
-    assert!(is_incomplete_stop(&err), "{err}");
+    assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
     assert_eq!(*calls.borrow(), vec![("terminate", 7), ("wait", 7)]);
 }
 
@@ -3185,7 +3212,7 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
             ending(|_| terminate, |_, _, _| exit),
         )
         .unwrap_err();
-        assert!(is_incomplete_stop(&err), "{err}");
+        assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
         err.to_string()
     };
 
@@ -3273,7 +3300,7 @@ fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
 
         let (waited, ended) = ended_by_incomplete_stop(waited, &mut held);
 
-        assert!(is_incomplete_stop(&waited.unwrap_err()));
+        assert!(carried::<IncompleteStop>(&waited.unwrap_err()).is_some());
         assert!(ended.is_empty());
         assert!(
             matches!(held, HoldOutcome::NoProcess | HoldOutcome::Refused(_)),
@@ -3739,6 +3766,58 @@ fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked
             marked,
             "marked {marked}: {said}"
         );
+    }
+}
+
+/// A failed hold on a service found `STOP_PENDING` is told as already stopping and goetia's own, marked
+/// or not.
+#[cfg(windows)]
+#[skuld::test]
+fn an_uninstall_whose_hold_of_a_stop_pending_service_failed_says_the_service_is_already_stopping() {
+    use crate::backend::scm::manager::uninstall_stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    for marked in [false, true] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
+
+        let err = uninstall_stop_on(
+            &mut fake,
+            &Id::try_from("frpc").unwrap(),
+            &answer,
+            marked,
+            None,
+            Some(|| -> crate::error::Result<HoldOutcome<u32>> { Err(crate::error::Error::blob("held badly")) }),
+            no_end_of,
+        )
+        .expect_err("the hold failed");
+
+        let said = err.report().to_string();
+        assert!(said.contains("held badly"), "marked {marked}: {said}");
+        assert!(!fake.log.contains(&"control_stop"), "marked {marked}: {:?}", fake.log);
+        assert!(
+            said.contains("already stopping (STOP_PENDING)"),
+            "marked {marked}: {said}"
+        );
+        assert!(said.contains("goetia's own"), "marked {marked}: {said}");
+        assert!(
+            !said.contains("could not be stopped") && !said.contains("does not accept STOP"),
+            "no STOP was sent: marked {marked}: {said}"
+        );
+        if marked {
+            assert!(said.contains("already marked for deletion"), "{said}");
+            assert!(said.contains("sent no STOP"), "{said}");
+            for stale in ["by someone else", "goetia daemon kill", "is now disabled"] {
+                assert!(
+                    !said.contains(stale),
+                    "`{stale}` is false for goetia's own failure: {said}"
+                );
+            }
+        } else {
+            assert!(said.contains("is now disabled"), "{said}");
+            assert!(said.contains("goetia daemon uninstall frpc"), "{said}");
+            assert!(said.contains("goetia daemon kill frpc"), "{said}");
+        }
     }
 }
 
