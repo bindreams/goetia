@@ -660,7 +660,6 @@ fn a_parameters_that_is_a_link_is_replaced_by_a_real_key_and_its_target_is_left_
     );
 }
 
-/// A value of `vtype` holding `text` as UTF-16, as the registry stores it.
 fn raw_string(vtype: &RegType, text: &str) -> RegValue<'static> {
     RegValue {
         bytes: text
@@ -672,8 +671,6 @@ fn raw_string(vtype: &RegType, text: &str) -> RegValue<'static> {
     }
 }
 
-/// SCM starts what precedes a NUL in the `ImagePath`, so that is the image: the sweep must count
-/// the host it names as referenced. The same for every string type, a `REG_MULTI_SZ` included.
 #[skuld::test]
 fn an_image_is_read_up_to_its_first_nul() {
     for vtype in &[RegType::REG_SZ, RegType::REG_EXPAND_SZ, RegType::REG_MULTI_SZ] {
@@ -690,4 +687,87 @@ fn an_image_is_read_up_to_its_first_nul() {
         assert_eq!(image_text(&raw_string(vtype, "")).as_deref(), Some(""), "{vtype:?}");
     }
     assert_eq!(image_text(&7u32.to_reg_value()), None);
+}
+
+#[skuld::test]
+fn an_image_with_a_trailing_odd_byte_drops_that_byte() {
+    let mut raw = raw_string(&RegType::REG_SZ, "ab");
+    raw.bytes.to_mut().push(b'c');
+
+    assert_eq!(image_text(&raw).as_deref(), Some("ab"));
+}
+
+#[skuld::test]
+fn an_image_with_a_lone_surrogate_reads_it_as_the_replacement_character() {
+    let raw = RegValue {
+        bytes: [u16::from(b'a'), 0xD800, u16::from(b'b')]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<u8>>()
+            .into(),
+        vtype: RegType::REG_SZ,
+    };
+
+    assert_eq!(image_text(&raw).as_deref(), Some("a\u{FFFD}b"));
+}
+
+#[skuld::test]
+fn text_with_a_nul_is_refused_as_invalid_input_and_text_without_one_is_not() {
+    assert!(refuse_nul(["a", "b=c", ""]).is_ok());
+    for texts in [["a\0b"], ["\0"], ["a\0"]] {
+        assert_eq!(refuse_nul(texts).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+    assert_eq!(
+        refuse_nul(["fine", "NAME=va\0lue"]).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+}
+
+#[skuld::test]
+fn writing_a_parameters_field_or_service_with_a_nul_is_refused_before_the_registry_is_opened() {
+    let service = "goetia-nul-test-absent";
+    let value_with_nul = BTreeMap::from([("Marker".to_string(), "a\0b".to_string())]);
+    let field_with_nul = BTreeMap::from([("Mar\0ker".to_string(), "x".to_string())]);
+
+    assert!(
+        write_parameters(service, &value_with_nul)
+            .unwrap_err()
+            .to_string()
+            .contains("NUL")
+    );
+    assert!(
+        write_parameters(service, &field_with_nul)
+            .unwrap_err()
+            .to_string()
+            .contains("NUL")
+    );
+    assert!(
+        write_parameters("a\0b", &BTreeMap::new())
+            .unwrap_err()
+            .to_string()
+            .contains("NUL")
+    );
+}
+
+#[skuld::test]
+fn writing_an_environment_line_or_service_with_a_nul_is_refused_before_the_registry_is_opened() {
+    let service = "goetia-nul-test-absent";
+
+    assert!(
+        write_environment(service, &["A=b\0c".to_string()])
+            .unwrap_err()
+            .to_string()
+            .contains("NUL")
+    );
+    assert!(write_environment("a\0b", &[]).unwrap_err().to_string().contains("NUL"));
+}
+
+#[skuld::test]
+fn reading_a_value_whose_name_holds_a_nul_is_refused_before_the_registry_is_asked() {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let mut buffer = Vec::new();
+
+    let e = query_raw_value(&hklm, "a\0b", &mut buffer).unwrap_err();
+
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
 }

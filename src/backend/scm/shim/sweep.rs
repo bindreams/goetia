@@ -397,10 +397,14 @@ mod system {
         }
     }
 
+    /// The text of `source`, a NUL-terminated string as `wide_null_cut` makes it, without the NUL.
+    pub(super) fn unexpanded(source: &[u16]) -> String {
+        String::from_utf16_lossy(&source[..source.len() - 1])
+    }
+
     /// `text` with each `%NAME%` replaced by the variable's value, as the system expands a
     /// `REG_EXPAND_SZ`; a name that is not set stays as written.
     pub(super) fn expand_environment(text: &str) -> String {
-        // The system reads up to a NUL, here as for the service it is starting.
         let source = wide_null_cut(text);
         let mut buf = vec![0u16; 512];
         loop {
@@ -409,7 +413,7 @@ mod system {
                 unsafe { ExpandEnvironmentStringsW(source.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
             if needed == 0 {
                 // Nothing could be expanded: the text as it was, up to the NUL the system ends it at.
-                return text.split('\0').next().unwrap_or_default().to_string();
+                return unexpanded(&source);
             }
             if needed <= buf.len() {
                 // `needed` counts the NUL.

@@ -295,8 +295,7 @@ pub fn grant_service_logon_right(account_name: &str) -> Result<()> {
         ));
     }
 
-    // `LSA_UNICODE_STRING::Length`/`MaximumLength` are byte counts; `Length` excludes the
-    // terminating NUL that `w!` appends for other APIs' sake.
+    // `LSA_UNICODE_STRING::Length`/`MaximumLength` are byte counts.
     let right_text = w!("SeServiceLogonRight");
     // SAFETY: `w!` yields a NUL-terminated static string.
     let right_len = unsafe { units_until_nul(right_text) }.len();

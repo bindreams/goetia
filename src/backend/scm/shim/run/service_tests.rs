@@ -1293,3 +1293,13 @@ fn a_daemon_whose_root_was_killed_is_dropped() {
     assert!(daemon.dropped(), "the shim leaked a daemon whose root it had killed");
     fake.take_failures();
 }
+
+#[skuld::test]
+fn a_service_id_with_a_nul_is_refused_before_a_handler_is_registered() {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+
+    let e = register_control_handler("a\0b", &supervisor.bus).unwrap_err();
+
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+}

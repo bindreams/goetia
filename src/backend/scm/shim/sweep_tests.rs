@@ -524,11 +524,12 @@ mod windows {
 
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE, GetShortPathNameW};
 
-    use super::system::{expand_environment, remove_if_empty_default};
+    use super::system::{expand_environment, remove_if_empty_default, unexpanded};
     use super::*;
     use crate::backend::scm::shim::acl::acl_tests::windows::junction;
     use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
     use crate::backend::scm::wide::wide_null;
+    use crate::backend::scm::wide::wide_null_cut;
     use crate::error::Error;
 
     /// No check on the folder.
@@ -850,7 +851,6 @@ mod windows {
         assert_eq!(expand_environment(r"C:\a\b.exe"), r"C:\a\b.exe");
     }
 
-    /// The system reads the text up to its first NUL, and so does the sweep.
     #[skuld::test]
     fn text_is_expanded_up_to_its_first_nul() {
         let root = std::env::var("SystemRoot").expect("SystemRoot");
@@ -859,5 +859,12 @@ mod windows {
             expand_environment("%SystemRoot%\\x.exe\0tail"),
             format!(r"{root}\x.exe")
         );
+    }
+
+    #[skuld::test]
+    fn text_the_system_could_not_expand_is_kept_up_to_its_first_nul() {
+        assert_eq!(unexpanded(&wide_null_cut("C:\\a\\b.exe\0tail")), r"C:\a\b.exe");
+        assert_eq!(unexpanded(&wide_null_cut("C:\\a\\b.exe")), r"C:\a\b.exe");
+        assert_eq!(unexpanded(&wide_null_cut("\0tail")), "");
     }
 }

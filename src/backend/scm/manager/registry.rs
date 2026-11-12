@@ -38,6 +38,12 @@ const IMAGE_PATH_VALUE: &str = "ImagePath";
 const DELETE_FLAG_VALUE: &str = "DeleteFlag";
 const PARAMETERS_KEY: &str = "Parameters";
 
+/// Refuses a NUL in any of `texts`, the names and values goetia hands `winreg`. It passes them on as
+/// C strings, so a NUL would cut a name or a value short and split a `REG_MULTI_SZ` entry.
+fn refuse_nul<'a>(texts: impl IntoIterator<Item = &'a str>) -> std::io::Result<()> {
+    texts.into_iter().try_for_each(|text| Ok(wide_null(text).map(drop)?))
+}
+
 fn service_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}")
 }
@@ -302,6 +308,14 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
     );
     let service_path = service_key_path(name);
     let path = parameters_key_path(name);
+    refuse_nul(
+        std::iter::once(name).chain(
+            params
+                .iter()
+                .flat_map(|(field, value)| [field.as_str(), value.as_str()]),
+        ),
+    )
+    .map_err(|e| registry_error("write", &path, e))?;
     let service = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(&service_path, KEY_READ | KEY_WRITE)
         .map_err(|e| registry_error("open", &service_path, e))?;
@@ -472,6 +486,8 @@ fn environment_lines(value: Option<(u32, &[u8])>) -> Vec<String> {
 /// an empty `REG_MULTI_SZ`.
 pub fn write_environment(name: &str, lines: &[String]) -> Result<()> {
     let path = service_key_path(name);
+    refuse_nul(std::iter::once(name).chain(lines.iter().map(String::as_str)))
+        .map_err(|e| registry_error(&format!("write {ENVIRONMENT_VALUE} under"), &path, e))?;
     let key = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(&path, KEY_READ | KEY_WRITE)
         .map_err(|e| registry_error("open", &path, e))?;
@@ -560,11 +576,9 @@ pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<
     )
 }
 
-/// The `ImagePath` that `raw` holds, as SCM reads it: a C string, so it ends at the first NUL, for a
-/// `REG_MULTI_SZ` as for the other string types. `None` when it is not a string. This is where
-/// registry text meets goetia, so what follows (the sweep's expansion, its comparisons) never sees
-/// what SCM ignores. Decoded here and not by `winreg`, which turns a `REG_MULTI_SZ`'s NULs into
-/// newlines.
+/// The `ImagePath` in `raw` as SCM reads it: up to the first NUL, for every string type including
+/// `REG_MULTI_SZ`. `None` when not a string. Decoded here because `winreg` turns a `REG_MULTI_SZ`'s
+/// NULs into newlines.
 fn image_text(raw: &RegValue) -> Option<String> {
     if !matches!(
         raw.vtype,
@@ -607,6 +621,7 @@ pub fn register_event_source() -> Result<()> {
     const TYPES_SUPPORTED: u32 = 7; // ERROR | WARNING | INFORMATION
 
     let message_file = event_message_file(std::env::var("SystemRoot"))?;
+    refuse_nul([message_file.as_str()]).map_err(|e| registry_error("write EventMessageFile under", KEY, e))?;
     let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
         .create_subkey(KEY)
         .map_err(|e| registry_error("create", KEY, e))?;

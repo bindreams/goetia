@@ -15,7 +15,6 @@ use crate::testing::elevation::{ELEVATED, elevated};
 #[skuld::label]
 const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
-/// The wide name is written apart from [`NAME`], which errors quote: they must be one name.
 #[skuld::test]
 fn the_wide_name_is_the_name() {
     // SAFETY: `NAME_WIDE` is a NUL-terminated static string.

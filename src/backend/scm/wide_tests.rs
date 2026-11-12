@@ -39,3 +39,17 @@ fn text_from_windows_is_cut_at_its_first_nul() {
     assert_eq!(wide_null_cut("\0"), [0]);
     assert_eq!(wide_null_cut("ab"), [u16::from(b'a'), u16::from(b'b'), 0]);
 }
+
+#[skuld::test]
+fn an_event_message_is_its_units_and_one_terminator() {
+    assert_eq!(wide_null_escaped("ab"), [u16::from(b'a'), u16::from(b'b'), 0]);
+    assert_eq!(wide_null_escaped(""), [0]);
+}
+
+#[skuld::test]
+fn an_event_message_shows_a_nul_escaped_and_ends_only_at_its_terminator() {
+    let escaped = wide_null_escaped("a\0b\0");
+
+    assert_eq!(escaped, "a\\0b\\0".encode_utf16().chain([0]).collect::<Vec<_>>());
+    assert_eq!(escaped.iter().filter(|&&unit| unit == 0).count(), 1);
+}

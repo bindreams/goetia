@@ -1498,15 +1498,13 @@ fn an_uninstall_reports_an_unread_host_and_sweeps_nothing_for_it() {
 
 #[skuld::test]
 fn a_command_line_with_a_nul_is_split_up_to_it() {
-    // SCM starts, and `CommandLineToArgvW` reads, the text before the NUL.
     assert_eq!(
         split_command_line("C:\\a.exe one\0 two"),
         (PathBuf::from(r"C:\a.exe"), vec!["one".to_string()])
     );
 }
 
-/// `CommandLineToArgvW` answers an empty string with the current executable; a command line with
-/// nothing before its NUL has no executable.
+/// `CommandLineToArgvW` answers an empty string with the current executable.
 #[skuld::test]
 fn a_command_line_with_nothing_before_its_nul_has_no_executable() {
     for cmdline in ["", "\0C:\\a.exe", " \t \0C:\\a.exe", "  "] {

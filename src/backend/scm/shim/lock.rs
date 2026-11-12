@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 
 /// The mutex's name, which is also what its errors call it.
 const NAME: &str = r"Global\goetia-shim";
-/// [`NAME`] as the wide string the mutex calls take; `lock_tests` pins that they agree.
+/// [`NAME`] for the mutex calls.
 const NAME_WIDE: *const u16 = w!(r"Global\goetia-shim");
 
 /// Held from [`acquire`](Self::acquire) until it is dropped. Not `Send`: a mutex is released by the

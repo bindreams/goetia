@@ -801,9 +801,7 @@ fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailu
 pub(in crate::backend::scm) fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
     // A NUL ends the string for SCM and `CommandLineToArgvW` alike: what is split is what SCM runs.
     let wide = wide_null_cut(cmdline);
-    // `CommandLineToArgvW` takes an empty string for "this program's own command line" and returns
-    // the current executable: there is nothing to split before an early NUL, so not asking is the
-    // only way to get no executable.
+    // `CommandLineToArgvW` answers an empty string with the current executable, so an empty prefix is not passed to it.
     if wide[..wide.len() - 1]
         .iter()
         .all(|&unit| unit == u16::from(b' ') || unit == u16::from(b'\t'))

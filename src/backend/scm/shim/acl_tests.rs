@@ -911,9 +911,8 @@ pub(in crate::backend::scm::shim) mod windows {
         assert!(is_unreadable(&unreadable), "{unreadable:?}");
     }
 
-    /// A NUL in SDDL or in a path would end it early, so what is made would not be what was asked for.
     #[skuld::test]
-    fn a_nul_in_sddl_or_in_a_path_is_refused() {
+    fn a_nul_in_sddl_is_refused() {
         let cut = Descriptor::from_sddl("D:P(A;;GA;;;WD)\0junk")
             .err()
             .expect("a NUL ends nothing here");
@@ -923,9 +922,15 @@ pub(in crate::backend::scm::shim) mod windows {
                 .starts_with(r"failed to build the permissions from the SDDL `D:P(A;;GA;;;WD)\0junk`"),
             "{cut}"
         );
+    }
 
+    #[skuld::test]
+    fn a_nul_in_a_path_is_refused_for_a_directory_and_a_file() {
         let descriptor = Descriptor::from_sddl("D:P(A;;GA;;;WD)").unwrap();
-        let e = descriptor.create_dir(Path::new("a\0b")).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+
+        let dir = descriptor.create_dir(Path::new("a\0b")).unwrap_err();
+        assert_eq!(dir.kind(), io::ErrorKind::InvalidInput);
+        let file = descriptor.create_file(Path::new("a\0b")).unwrap_err();
+        assert_eq!(file.kind(), io::ErrorKind::InvalidInput);
     }
 }

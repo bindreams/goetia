@@ -3,8 +3,7 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt as _;
 
-/// Text that holds a NUL, which a wide Win32 call would take for the end of the string and read
-/// only up to.
+/// A NUL that a wide Win32 call would take for the end of the string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the text holds a NUL at position {index}")]
 pub struct InteriorNul {
@@ -18,9 +17,9 @@ impl From<InteriorNul> for std::io::Error {
     }
 }
 
-/// `s` as the NUL-terminated UTF-16 string the wide Win32 calls take, or the position of the NUL
-/// that would have ended it early. For text goetia sends: it is refused, never cut. Text that
-/// Windows hands back is read as Windows reads it, with `wide_null_cut`.
+/// `s` as the NUL-terminated UTF-16 string the wide Win32 calls take. For text goetia sends: an
+/// interior NUL is refused, never cut. The registry layer holds the same rule for what it hands
+/// `winreg` (`refuse_nul`). See `wide_null_cut` for text read from Windows.
 pub fn wide_null(s: impl AsRef<OsStr>) -> Result<Vec<u16>, InteriorNul> {
     let s = s.as_ref();
     let mut units = Vec::with_capacity(s.len() + 1);
@@ -34,13 +33,19 @@ pub fn wide_null(s: impl AsRef<OsStr>) -> Result<Vec<u16>, InteriorNul> {
     Ok(units)
 }
 
-/// The text of `s` before its first NUL, as the NUL-terminated UTF-16 string a wide Win32 call
-/// reads it as: for text that came from Windows, which treats it as a C string and so ends it at
-/// the first NUL.
+/// The text of `s` before its first NUL, NUL-terminated. For text read from Windows, which treats it
+/// as a C string.
 pub fn wide_null_cut(s: impl AsRef<OsStr>) -> Vec<u16> {
     let mut units: Vec<u16> = s.as_ref().encode_wide().take_while(|&unit| unit != 0).collect();
     units.push(0);
     units
+}
+
+/// `message` as NUL-terminated UTF-16 for the Event Log. A NUL would end the message early there, so
+/// it is escaped as `\0`. Not `wide_null`: it refuses a NUL, and this path reports failures, so it
+/// cannot fail itself.
+pub fn wide_null_escaped(message: &str) -> Vec<u16> {
+    message.replace('\0', "\\0").encode_utf16().chain([0]).collect()
 }
 
 /// The UTF-16 units of the NUL-terminated string at `ptr`, without the NUL.

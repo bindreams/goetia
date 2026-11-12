@@ -4,10 +4,10 @@ use windows_sys::Win32::System::EventLog::{
     DeregisterEventSource, EVENTLOG_ERROR_TYPE, EVENTLOG_WARNING_TYPE, RegisterEventSourceW, ReportEventW,
 };
 
-use super::Severity;
-use std::os::windows::ffi::OsStrExt as _;
-
 use windows_sys::core::w;
+
+use super::Severity;
+use crate::backend::scm::wide::wide_null_escaped;
 
 /// `EventCreate.exe`'s message 1 is `%1` — a verbatim passthrough of the
 /// single insertion string, which is what lets Event Viewer render our
@@ -30,13 +30,7 @@ pub(super) fn report(severity: Severity, message: &str) {
     if handle.is_null() {
         return;
     }
-    // A NUL would end the message early in the Event Log; showing it escaped keeps the rest. The
-    // escaped text holds none, so the terminator below is its only NUL. (Not `wide_null`: it
-    // refuses a NUL, and this path reports failures, so it cannot fail itself.)
-    let wide_msg: Vec<u16> = std::ffi::OsStr::new(&message.replace('\0', "\\0"))
-        .encode_wide()
-        .chain([0])
-        .collect();
+    let wide_msg = wide_null_escaped(message);
     let strings = [wide_msg.as_ptr()];
     // SAFETY: `handle` is a live handle just returned by
     // `RegisterEventSourceW`; `strings` holds exactly one valid,
