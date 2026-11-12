@@ -6,7 +6,7 @@
 //!   (unset is `0`); any value but `0` and `1` fails it too. Set it only in a sandbox: a container,
 //!   a VM or CI.
 //! - A consented group on a host that is not elevated fails; it never skips.
-//! - A bad value of any of these variables fails the whole run at start ([`validate_environment`]).
+//! - A bad value of any of these variables fails the whole run at start (`run_all`).
 //!
 //! A test joins a group by taking its fixture: `#[fixture(scm_group)] _group: &Group`.
 
