@@ -163,15 +163,26 @@ windows-sys = { version = "0.61", features = [
     "Wdk_System_Registry",
 ] }
 
+[build-dependencies]
+# Hardens every `[[bin]]` against loading a DLL from its own folder (Windows MSVC); bins fail to link on other
+# Windows targets and Cygwin; no-op elsewhere.
+libsearch-guard = "0.1.1"
+
 [dev-dependencies]
 # Turns on `testing` for the integration tests, which reach the library only through its public API.
 # Without `default-features = false` it would also turn on `cli` in a `--no-default-features` build.
 goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.6"
 rand = "0.10"
+libsearch-guard = "0.1.1"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+[[test]]
+name = "binary_hardening"
+path = "tests/binary_hardening.rs"
+harness = false
 
 [[test]]
 name = "marker_inertness"
