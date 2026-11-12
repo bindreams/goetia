@@ -4,10 +4,10 @@ use windows_sys::Win32::System::EventLog::{
     DeregisterEventSource, EVENTLOG_ERROR_TYPE, EVENTLOG_WARNING_TYPE, RegisterEventSourceW, ReportEventW,
 };
 
-use super::Severity;
-use crate::backend::scm::wide::wide_null;
+use windows_sys::core::w;
 
-const SOURCE: &str = "Goetia";
+use super::Severity;
+use crate::backend::scm::wide::wide_null_escaped;
 
 /// `EventCreate.exe`'s message 1 is `%1` — a verbatim passthrough of the
 /// single insertion string, which is what lets Event Viewer render our
@@ -25,14 +25,12 @@ pub(super) fn report(severity: Severity, message: &str) {
         Severity::Error => EVENTLOG_ERROR_TYPE,
         Severity::Warning => EVENTLOG_WARNING_TYPE,
     };
-    let wide_source = wide_null(SOURCE);
-    // SAFETY: `wide_source` is a valid, null-terminated UTF-16 string,
-    // and `RegisterEventSourceW` does not retain it past this call.
-    let handle = unsafe { RegisterEventSourceW(std::ptr::null(), wide_source.as_ptr()) };
+    // SAFETY: `w!` yields a valid, null-terminated UTF-16 string with static lifetime.
+    let handle = unsafe { RegisterEventSourceW(std::ptr::null(), w!("Goetia")) };
     if handle.is_null() {
         return;
     }
-    let wide_msg = wide_null(message);
+    let wide_msg = wide_null_escaped(message);
     let strings = [wide_msg.as_ptr()];
     // SAFETY: `handle` is a live handle just returned by
     // `RegisterEventSourceW`; `strings` holds exactly one valid,

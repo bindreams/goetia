@@ -16,9 +16,8 @@ use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE,
 };
 use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
-use winreg::RegKey;
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
-use winreg::types::FromRegValue as _;
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, RegType};
+use winreg::{RegKey, RegValue};
 
 use crate::backend::scm::generate::{FIELDS, field_named};
 pub use crate::backend::scm::parameters::RegistryReadOutcome;
@@ -38,6 +37,12 @@ const IMAGE_PATH_VALUE: &str = "ImagePath";
 /// Set by SCM on a service whose deletion waits for its last handle to close.
 const DELETE_FLAG_VALUE: &str = "DeleteFlag";
 const PARAMETERS_KEY: &str = "Parameters";
+
+/// Refuses a NUL in any of `texts`, the names and values goetia hands `winreg`. It passes them on as
+/// C strings, so a NUL would cut a name or a value short and split a `REG_MULTI_SZ` entry.
+fn refuse_nul<'a>(texts: impl IntoIterator<Item = &'a str>) -> std::io::Result<()> {
+    texts.into_iter().try_for_each(|text| Ok(wide_null(text).map(drop)?))
+}
 
 fn service_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}")
@@ -303,6 +308,14 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
     );
     let service_path = service_key_path(name);
     let path = parameters_key_path(name);
+    refuse_nul(
+        std::iter::once(name).chain(
+            params
+                .iter()
+                .flat_map(|(field, value)| [field.as_str(), value.as_str()]),
+        ),
+    )
+    .map_err(|e| registry_error("write", &path, e))?;
     let service = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(&service_path, KEY_READ | KEY_WRITE)
         .map_err(|e| registry_error("open", &service_path, e))?;
@@ -395,7 +408,7 @@ fn read_environment_in(services: &ServicesRoot<'_>, name: &str) -> Result<Regist
 /// `RegQueryValueExW` for `name` under `key`, whatever its type: the type, with the data in
 /// `buffer` (its contents are replaced, and its allocation is reused across calls).
 fn query_raw_value(key: &RegKey, name: &str, buffer: &mut Vec<u8>) -> std::io::Result<u32> {
-    let wide_name = wide_null(name);
+    let wide_name = wide_null(name)?;
     buffer.clear();
     buffer.resize(INITIAL_VALUE_BYTES.max(buffer.capacity()), 0);
     let (vtype, len) = read_growing(buffer, |data, len, vtype| {
@@ -473,6 +486,8 @@ fn environment_lines(value: Option<(u32, &[u8])>) -> Vec<String> {
 /// an empty `REG_MULTI_SZ`.
 pub fn write_environment(name: &str, lines: &[String]) -> Result<()> {
     let path = service_key_path(name);
+    refuse_nul(std::iter::once(name).chain(lines.iter().map(String::as_str)))
+        .map_err(|e| registry_error(&format!("write {ENVIRONMENT_VALUE} under"), &path, e))?;
     let key = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(&path, KEY_READ | KEY_WRITE)
         .map_err(|e| registry_error("open", &path, e))?;
@@ -549,7 +564,7 @@ pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<
                 }
             }
             match key.get_raw_value(IMAGE_PATH_VALUE) {
-                Ok(raw) => Ok(String::from_reg_value(&raw).ok()),
+                Ok(raw) => Ok(image_text(&raw)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(Stop::mid_read(failure(
                     &format!("read {IMAGE_PATH_VALUE} under"),
@@ -559,6 +574,27 @@ pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<
             }
         },
     )
+}
+
+/// The `ImagePath` in `raw` as SCM reads it: up to the first NUL, for every string type including
+/// `REG_MULTI_SZ`. `None` when not a string. Decoded here because `winreg` turns a `REG_MULTI_SZ`'s
+/// NULs into newlines.
+fn image_text(raw: &RegValue) -> Option<String> {
+    if !matches!(
+        raw.vtype,
+        RegType::REG_SZ | RegType::REG_EXPAND_SZ | RegType::REG_MULTI_SZ
+    ) {
+        return None;
+    }
+    let units: Vec<u16> = raw
+        .bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    Some(String::from_utf16_lossy(&units))
 }
 
 #[cfg(test)]
@@ -587,6 +623,7 @@ pub fn register_event_source() -> Result<()> {
     const TYPES_SUPPORTED: u32 = 7; // ERROR | WARNING | INFORMATION
 
     let message_file = event_message_file(std::env::var("SystemRoot"))?;
+    refuse_nul([message_file.as_str()]).map_err(|e| registry_error("write EventMessageFile under", KEY, e))?;
     let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
         .create_subkey(KEY)
         .map_err(|e| registry_error("create", KEY, e))?;

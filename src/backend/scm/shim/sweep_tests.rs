@@ -524,11 +524,12 @@ mod windows {
 
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE, GetShortPathNameW};
 
-    use super::system::{expand_environment, remove_if_empty_default};
+    use super::system::{expand_environment, remove_if_empty_default, unexpanded};
     use super::*;
     use crate::backend::scm::shim::acl::acl_tests::windows::junction;
     use crate::backend::scm::shim::acl::{CheckPermissions, FolderCheck};
     use crate::backend::scm::wide::wide_null;
+    use crate::backend::scm::wide::wide_null_cut;
     use crate::error::Error;
 
     /// No check on the folder.
@@ -577,7 +578,7 @@ mod windows {
 
     /// `path` by its 8.3 names where the volume keeps them, and unchanged where it does not.
     fn short(path: &Path) -> PathBuf {
-        let wide = wide_null(path);
+        let wide = wide_null(path).unwrap();
         let mut buf = vec![0u16; 1024];
         // SAFETY: `wide` is NUL-terminated and `buf` is `buf.len()` writable units.
         let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
@@ -848,5 +849,22 @@ mod windows {
             r"%goetia_no_such_variable%\x.exe"
         );
         assert_eq!(expand_environment(r"C:\a\b.exe"), r"C:\a\b.exe");
+    }
+
+    #[skuld::test]
+    fn text_is_expanded_up_to_its_first_nul() {
+        let root = std::env::var("SystemRoot").expect("SystemRoot");
+
+        assert_eq!(
+            expand_environment("%SystemRoot%\\x.exe\0tail"),
+            format!(r"{root}\x.exe")
+        );
+    }
+
+    #[skuld::test]
+    fn text_the_system_could_not_expand_is_kept_up_to_its_first_nul() {
+        assert_eq!(unexpanded(&wide_null_cut("C:\\a\\b.exe\0tail")), r"C:\a\b.exe");
+        assert_eq!(unexpanded(&wide_null_cut("C:\\a\\b.exe")), r"C:\a\b.exe");
+        assert_eq!(unexpanded(&wide_null_cut("\0tail")), "");
     }
 }
