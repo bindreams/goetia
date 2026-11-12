@@ -193,7 +193,7 @@ fn a_name_is_quoted_as_written_and_its_backslash_is_not_doubled() {
     );
 }
 
-// An account that is not a user ======================================================================================
+// An account that is not a user =======================================================================================
 
 #[skuld::test]
 fn a_name_that_is_no_user_account_is_refused_before_any_grant() {
