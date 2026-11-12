@@ -121,7 +121,8 @@ goetia = "=$version"
 clap = "4"
 $pinned_crate = "=$pinned_version"
 
-# As the README tells a program that ships a stock shim.
+# The build dependency is what the README tells a program that ships a stock shim; the dev
+# dependency runs `verify` on the result.
 [build-dependencies]
 libsearch-guard = "0.1"
 
@@ -133,10 +134,12 @@ goetia = { path = "$crate_dir" }
 EOF
 
     echo 'goetia::stock_shim!();' > "$dir/src/bin/goetia-shim.rs"
-    printf 'fn main() {
+    cat > "$dir/build.rs" <<'EOF'
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     libsearch_guard::bins();
 }
-' > "$dir/build.rs"
+EOF
 
     mkdir -p "$dir/tests"
     cat > "$dir/tests/hardening.rs" <<'EOF'
@@ -263,6 +266,8 @@ consumer_routes() {
     shim="$target/goetia-shim.exe"
     GOETIA_SHIM_EXE="$(winpath "$shim")" cargo build --bin goetia-consumer --features goetia-shim --locked
     assert_previews_shim "$target/goetia-consumer.exe" "$dir" "$shim"
+    # (3b) The program that ships, with the shim embedded, is hardened too.
+    GOETIA_SHIM_EXE="$(winpath "$shim")" cargo test --locked --features goetia-shim --test hardening
     round_trip "$target/goetia-consumer.exe" goetia-ci-consumer "$dir"
 }
 

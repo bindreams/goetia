@@ -785,6 +785,8 @@ libsearch-guard = "0.1"
 ```rust
 // build.rs
 fn main() {
+    // Without this, cargo reruns the script after a change to any file in the package.
+    println!("cargo:rerun-if-changed=build.rs");
     libsearch_guard::bins();
 }
 ```
