@@ -4,6 +4,7 @@
 //! Expiry is driven by the script, never by the clock: nothing here waits.
 
 use std::collections::VecDeque;
+use std::convert::Infallible;
 
 use super::*;
 use crate::backend::scm::exit_status::{RecordedExit, Reported};
@@ -1345,13 +1346,14 @@ fn a_stop_is_issued_even_when_the_arm_after_it_expires() {
 
 /// [`super::settle_and_stop`] for a caller that has nothing to do before the STOP.
 fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
-    flat(super::settle_and_stop(a, deadline, false, |_| Ok::<(), io::Error>(())))
+    flat(super::settle_and_stop(a, deadline, false, |_| Ok::<(), Infallible>(())))
 }
 
-/// `ended` with a failed hold told as the io error it is, for a test whose hold never fails.
-fn flat(ended: Result<Waited, SettleError<io::Error>>) -> io::Result<Waited> {
+/// `ended` as the io result it is, for a test whose hold cannot fail.
+fn flat(ended: Result<Waited, SettleError<Infallible>>) -> io::Result<Waited> {
     ended.map_err(|e| match e {
-        SettleError::Hold { error, .. } | SettleError::Other(error) => error,
+        SettleError::Hold { error, .. } => match error {},
+        SettleError::Other(error) => error,
     })
 }
 
@@ -3092,7 +3094,7 @@ fn a_shims_stop_with_the_incomplete_stop_record_fails_however_it_was_confirmed()
                 &mut incomplete(script()),
                 unbounded(),
                 true,
-                |_| Ok::<(), io::Error>(()),
+                |_| Ok::<(), Infallible>(()),
             ));
             assert!(is_judged(ended), "settle_and_stop over {name}");
         }
@@ -3112,7 +3114,7 @@ fn a_stop_of_a_service_that_is_not_a_shims_is_not_judged_by_the_shims_record() {
                 &mut incomplete(script()),
                 unbounded(),
                 false,
-                |_| Ok::<(), io::Error>(()),
+                |_| Ok::<(), Infallible>(()),
             ));
             assert!(!is_judged(ended), "settle_and_stop over {name}");
         }

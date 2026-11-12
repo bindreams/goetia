@@ -1144,19 +1144,18 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
         let Some(hold) = hold.as_mut() else {
             return Ok(());
         };
-        match hold() {
+        match hold()? {
             // Only a bounded hold expires, and this one is not: told rather than gone on from.
-            Ok(HoldOutcome::Expired { pid }) => Err(Error::os(
+            HoldOutcome::Expired { pid } => Err(Error::os(
                 format!("hold `{id}`'s process"),
                 std::io::Error::other(format!(
                     "the hold expired with SCM still naming process {pid}, though it has no bound: goetia's own error"
                 )),
             )),
-            Ok(held) => {
+            held => {
                 process = held;
                 Ok(())
             }
-            Err(e) => Err(e),
         }
     });
     // A failed hold ended the wait with no STOP of ours sent after it, and no incomplete stop to end.
