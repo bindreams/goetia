@@ -317,7 +317,7 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
     let Err(e) = waited else {
         return waited;
     };
-    let Some(incomplete) = e.get_ref().and_then(|source| source.downcast_ref::<IncompleteStop>()) else {
+    let Some(incomplete) = carried::<IncompleteStop>(&e) else {
         return Err(e);
     };
     let Some(process) = take_held(held) else {
@@ -549,8 +549,7 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// can say; a STOP that is refused and sent again runs it again), and once, before the wait, for a
 /// service the first arm finds `STOP_PENDING`, which is stopping without a STOP of ours (someone
 /// else's, or a `stop` whose wait ran out) and has its process still. Its error ends the wait, with
-/// no STOP sent; for the second of the two it is [`HoldUnderWayFailed`], which says there was none to
-/// send.
+/// no STOP sent: it is returned as a [`HoldFailed`], which says which of the two held.
 pub(crate) fn settle_and_stop<A: ScmActor>(
     a: &mut A,
     deadline: Deadline,
@@ -566,7 +565,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
     )? {
         Err(end) => return judged(end, shim),
         Ok(status) if status.state == QueriedState::StopPending => {
-            hold(a).map_err(|e| io::Error::other(HoldUnderWayFailed(e)))?;
+            hold(a).map_err(|source| HoldFailed::wrap(source, true))?;
         }
         Ok(_) => {}
     }
@@ -606,7 +605,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
                     )));
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
-                hold(a)?;
+                hold(a).map_err(|source| HoldFailed::wrap(source, false))?;
                 match a.control_stop() {
                     Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested, shim),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
@@ -630,22 +629,49 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
     }
 }
 
-/// The failure of [`settle_and_stop`]'s `hold` for a service found `STOP_PENDING`, which no STOP of ours
-/// was to be sent to. It displays as the failure it wraps.
+/// The failure of [`settle_and_stop`]'s `hold`, which ended its wait with no STOP sent. It displays as the
+/// failure it wraps and passes that failure's source on.
 #[derive(Debug)]
-pub(crate) struct HoldUnderWayFailed(io::Error);
+pub(crate) struct HoldFailed {
+    pub(crate) source: io::Error,
+    /// Whether the hold was of a service found `STOP_PENDING`, which no STOP of ours was to be sent to,
+    /// and not one before a STOP of ours.
+    pub(crate) under_way: bool,
+}
 
-impl std::fmt::Display for HoldUnderWayFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+impl HoldFailed {
+    fn wrap(source: io::Error, under_way: bool) -> io::Error {
+        io::Error::other(HoldFailed { source, under_way })
+    }
+
+    /// The failure `e` carries, or `e` if it carries none.
+    pub(crate) fn take(e: io::Error) -> Result<HoldFailed, io::Error> {
+        if carried::<HoldFailed>(&e).is_none() {
+            return Err(e);
+        }
+        let boxed = e.into_inner().expect("an error that carries a source has one");
+        match boxed.downcast::<HoldFailed>() {
+            Ok(held) => Ok(*held),
+            Err(_) => unreachable!("the source was just found to be a `HoldFailed`"),
+        }
     }
 }
 
-impl std::error::Error for HoldUnderWayFailed {}
+impl std::fmt::Display for HoldFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
 
-/// Whether `e` is a [`HoldUnderWayFailed`].
-pub(crate) fn is_hold_under_way_failed(e: &io::Error) -> bool {
-    e.get_ref().is_some_and(|source| source.is::<HoldUnderWayFailed>())
+impl std::error::Error for HoldFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
+/// The `T` that `e` carries as its source, if it does.
+pub(crate) fn carried<T: std::error::Error + 'static>(e: &io::Error) -> Option<&T> {
+    e.get_ref().and_then(|source| source.downcast_ref::<T>())
 }
 
 /// What [`settle_and_stop`] learned, from a notification or from the status an arm returned.
@@ -758,11 +784,6 @@ impl std::fmt::Display for IncompleteStop {
 }
 
 impl std::error::Error for IncompleteStop {}
-
-/// Whether `e` is an [`IncompleteStop`].
-pub(crate) fn is_incomplete_stop(e: &io::Error) -> bool {
-    e.get_ref().is_some_and(|source| source.is::<IncompleteStop>())
-}
 
 /// What a wait for `STOPPED` came to, judged: a confirmed `STOPPED` whose record is the shim's
 /// incomplete-stop one is the failure [`IncompleteStop`] when `shim` says the record is to be judged, and

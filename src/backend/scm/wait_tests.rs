@@ -1434,7 +1434,7 @@ fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_stop_pending_service() {
         super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err();
 
     assert_eq!(error.to_string(), "no hold");
-    assert!(is_hold_under_way_failed(&error), "{error}");
+    assert!(HoldFailed::take(error).unwrap().under_way);
     assert_eq!(fake.log, ["arm_settle"]);
 }
 
@@ -1447,7 +1447,7 @@ fn settle_and_stop_sends_no_stop_when_the_callers_step_fails() {
         super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err();
 
     assert_eq!(error.to_string(), "no hold");
-    assert!(!is_hold_under_way_failed(&error), "{error}");
+    assert!(!HoldFailed::take(error).unwrap().under_way);
     assert_eq!(fake.log, ["arm_settle", "wait", "got_running"]);
 }
 
@@ -3057,7 +3057,7 @@ fn is_judged(ended: io::Result<Waited>) -> bool {
             false
         }
         Err(e) => {
-            assert!(is_incomplete_stop(&e), "{e}");
+            assert!(carried::<IncompleteStop>(&e).is_some(), "{e}");
             true
         }
     }
@@ -3132,7 +3132,7 @@ fn stop_and_await_exit_fails_over_a_shims_incomplete_stop_record() {
     let err =
         stop_and_await_exit(&mut fake, unbounded(), &mut HoldOutcome::<u32>::NoProcess, true, no_end).unwrap_err();
 
-    assert!(is_incomplete_stop(&err), "{err}");
+    assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
 }
 
 /// The shim process goetia holds is ended before the incomplete stop is returned: its KILL_ON_JOB_CLOSE
@@ -3160,7 +3160,7 @@ fn stop_and_await_exit_ends_the_held_process_of_an_incomplete_stop_before_failin
     )
     .unwrap_err();
 
-    assert!(is_incomplete_stop(&err), "{err}");
+    assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
     assert_eq!(*calls.borrow(), vec![("terminate", 7), ("wait", 7)]);
 }
 
@@ -3187,7 +3187,7 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
             ending(|_| terminate, |_, _, _| exit),
         )
         .unwrap_err();
-        assert!(is_incomplete_stop(&err), "{err}");
+        assert!(carried::<IncompleteStop>(&err).is_some(), "{err}");
         err.to_string()
     };
 
@@ -3275,7 +3275,7 @@ fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
 
         let (waited, ended) = ended_by_incomplete_stop(waited, &mut held);
 
-        assert!(is_incomplete_stop(&waited.unwrap_err()));
+        assert!(carried::<IncompleteStop>(&waited.unwrap_err()).is_some());
         assert!(ended.is_empty());
         assert!(
             matches!(held, HoldOutcome::NoProcess | HoldOutcome::Refused(_)),
@@ -3745,10 +3745,9 @@ fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked
 }
 
 /// A service already `STOP_PENDING` when the uninstall finds it is stopping without a STOP of ours, so a
-/// hold that fails there is told as such for a service no one marked: already stopping, goetia's own
-/// failure, to wait for and re-run, with `kill` for a stop that never ends. A marked service keeps the
-/// contract of any failed hold on one: goetia's own failure, no disable claim, no `kill` and no blame on
-/// whoever marked it.
+/// hold that fails there is told as such: already stopping, no STOP sent, goetia's own failure. A service
+/// no one marked is to wait for and re-run, with `kill` for a stop that never ends. A marked one keeps the
+/// contract of any failed hold on one: no disable claim, no `kill` and no blame on whoever marked it.
 #[cfg(windows)]
 #[skuld::test]
 fn an_uninstall_whose_hold_of_a_stop_pending_service_failed_says_the_service_is_already_stopping() {
@@ -3773,31 +3772,28 @@ fn an_uninstall_whose_hold_of_a_stop_pending_service_failed_says_the_service_is_
         let said = err.report().to_string();
         assert!(said.contains("held badly"), "marked {marked}: {said}");
         assert!(!fake.log.contains(&"control_stop"), "marked {marked}: {:?}", fake.log);
+        assert!(
+            said.contains("already stopping (STOP_PENDING)"),
+            "marked {marked}: {said}"
+        );
+        assert!(said.contains("goetia's own"), "marked {marked}: {said}");
+        assert!(
+            !said.contains("could not be stopped") && !said.contains("does not accept STOP"),
+            "no STOP was sent: marked {marked}: {said}"
+        );
         if marked {
-            assert!(said.contains("could not be stopped"), "{said}");
             assert!(said.contains("already marked for deletion"), "{said}");
-            assert!(said.contains("goetia's own"), "{said}");
-            for stale in [
-                "by someone else",
-                "goetia daemon kill",
-                "is now disabled",
-                "already stopping",
-            ] {
+            assert!(said.contains("sent no STOP"), "{said}");
+            for stale in ["by someone else", "goetia daemon kill", "is now disabled"] {
                 assert!(
                     !said.contains(stale),
                     "`{stale}` is false for goetia's own failure: {said}"
                 );
             }
         } else {
-            assert!(said.contains("already stopping (STOP_PENDING)"), "{said}");
-            assert!(said.contains("goetia's own"), "{said}");
             assert!(said.contains("is now disabled"), "{said}");
             assert!(said.contains("goetia daemon uninstall frpc"), "{said}");
             assert!(said.contains("goetia daemon kill frpc"), "{said}");
-            assert!(
-                !said.contains("could not be stopped") && !said.contains("does not accept STOP"),
-                "no STOP was sent: {said}"
-            );
         }
     }
 }
