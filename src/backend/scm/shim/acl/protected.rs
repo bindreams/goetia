@@ -87,7 +87,7 @@ mod system {
 
         /// A descriptor written as SDDL.
         pub(crate) fn from_sddl(sddl: &str) -> Result<Self> {
-            let wide = wide_null(sddl);
+            let wide = wide_null(sddl).map_err(|e| Error::os("build the permissions of the shim", e))?;
             let mut raw: *mut c_void = std::ptr::null_mut();
             // SAFETY: `wide` is NUL-terminated; `raw` is a valid out-pointer, and the size is not asked for.
             let ok = unsafe {
@@ -189,11 +189,7 @@ mod system {
 
     /// `path` as NUL-terminated UTF-16; a NUL inside it would end the name early.
     fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let wide = wide_null(path);
-        if wide[..wide.len() - 1].contains(&0) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "the path holds a NUL"));
-        }
-        Ok(wide)
+        Ok(wide_null(path)?)
     }
 }
 

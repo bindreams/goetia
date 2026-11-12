@@ -799,7 +799,12 @@ fn read_failure_actions(service: &Service, name: &str) -> Result<Option<GenFailu
 /// `CommandLineToArgvW`, the same authority `generate_tests.rs`'s
 /// `windows_style_split` is checked against.
 pub(in crate::backend::scm) fn split_command_line(cmdline: &str) -> (PathBuf, Vec<String>) {
-    let wide = wide_null(cmdline);
+    // A NUL ends the string for SCM and `CommandLineToArgvW` alike, so a command line that holds
+    // one is no command line goetia wrote or SCM would keep whole: it is malformed, like one the
+    // parser refuses.
+    let Ok(wide) = wide_null(cmdline) else {
+        return (PathBuf::new(), Vec::new());
+    };
     let mut argc: i32 = 0;
     // SAFETY: `wide` is a valid null-terminated UTF-16 string that outlives
     // this call; `argc` is a valid, aligned `i32` out-param.

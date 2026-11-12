@@ -129,7 +129,7 @@ fn any_other_code_is_the_os_failure() {
 /// The real lock, opened to wait on it, and so kept in existence for as long as the handle lives: a
 /// named mutex goes with its last handle, and a probe that opens it by name after that fails.
 fn open_lock() -> OwnedHandle {
-    let name = wide_null(NAME);
+    let name = wide_literal(NAME);
     // SAFETY: `name` is NUL-terminated.
     let raw = unsafe { OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, 0, name.as_ptr()) };
     assert!(!raw.is_null(), "open the lock: {}", io::Error::last_os_error());

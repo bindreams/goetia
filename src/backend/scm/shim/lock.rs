@@ -21,7 +21,7 @@ use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, OpenMutexW, ReleaseMutex, WaitForSingleObject};
 
 use super::acl::{Descriptor, account_name, is_trusted, kernel_object_owner};
-use crate::backend::scm::wide::wide_null;
+use crate::backend::scm::wide::wide_literal;
 use crate::elevation::token_has_administrators;
 use crate::error::{Error, Result};
 
@@ -44,7 +44,7 @@ impl InstallLock {
     pub(crate) fn acquire() -> Result<Self> {
         let descriptor = Descriptor::for_lock()?;
         let attributes = descriptor.attributes();
-        let name = wide_null(NAME);
+        let name = wide_literal(NAME);
         // SAFETY: `attributes` points at `descriptor`, which is live for the call; `name` is
         // NUL-terminated; the mutex is not owned by the caller at creation.
         let raw = unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) };
@@ -146,7 +146,7 @@ fn failure(
 /// `READ_CONTROL`, or `None` when it could not be read: the DACL that refused the caller may refuse
 /// that too.
 fn denied_lock_owner() -> Option<String> {
-    let name = wide_null(NAME);
+    let name = wide_literal(NAME);
     // SAFETY: `name` is NUL-terminated.
     let raw = unsafe { OpenMutexW(READ_CONTROL, 0, name.as_ptr()) };
     if raw.is_null() {

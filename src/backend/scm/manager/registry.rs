@@ -395,7 +395,7 @@ fn read_environment_in(services: &ServicesRoot<'_>, name: &str) -> Result<Regist
 /// `RegQueryValueExW` for `name` under `key`, whatever its type: the type, with the data in
 /// `buffer` (its contents are replaced, and its allocation is reused across calls).
 fn query_raw_value(key: &RegKey, name: &str, buffer: &mut Vec<u8>) -> std::io::Result<u32> {
-    let wide_name = wide_null(name);
+    let wide_name = wide_null(name)?;
     buffer.clear();
     buffer.resize(INITIAL_VALUE_BYTES.max(buffer.capacity()), 0);
     let (vtype, len) = read_growing(buffer, |data, len, vtype| {

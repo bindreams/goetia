@@ -24,7 +24,7 @@ use windows_sys::Win32::Security::{LookupAccountNameW, LookupAccountSidW, PSID};
 
 use crate::backend::Identity;
 use crate::backend::scm::sid::{is_whole_sid, sid_display};
-use crate::backend::scm::wide::wide_null;
+use crate::backend::scm::wide::{wide_literal, wide_null};
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, User};
 
@@ -99,7 +99,8 @@ fn last_error(context: &str) -> Error {
 /// SID), which is what `ServiceInfo::account_name` needs — SCM has no SID
 /// field.
 fn account_name_from_sid_string(sid_str: &str) -> Result<String> {
-    let wide_sid = wide_null(sid_str);
+    let wide_sid =
+        wide_null(sid_str).map_err(|e| Error::os(format!("parse `user.id` {sid_str:?} as a SID string"), e))?;
     let mut psid: PSID = std::ptr::null_mut();
     // SAFETY: `wide_sid` is a valid null-terminated wide string; `psid` is a
     // valid out-param. On success, `psid` must be freed with `LocalFree`.
@@ -204,7 +205,8 @@ fn lookup_account_sid(psid: PSID, sid_str: impl FnOnce() -> String) -> Result<St
 /// on its own, so dropping the prefix loses nothing.
 pub(crate) fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     let account_name = account_name.strip_prefix(r".\").unwrap_or(account_name);
-    let wide_name = wide_null(account_name);
+    let wide_name =
+        wide_null(account_name).map_err(|e| Error::os(format!("look up the account {account_name:?}"), e))?;
     let mut sid_len: u32 = 0;
     let mut domain_len: u32 = 0;
     let mut use_: i32 = 0;
@@ -288,7 +290,7 @@ pub fn grant_service_logon_right(account_name: &str) -> Result<()> {
         ));
     }
 
-    let right_text = wide_null("SeServiceLogonRight");
+    let right_text = wide_literal("SeServiceLogonRight");
     // `LSA_UNICODE_STRING::Length`/`MaximumLength` are byte counts,
     // excluding the trailing NUL `wide_null` appended for other APIs' sake.
     let right = LSA_UNICODE_STRING {

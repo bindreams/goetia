@@ -70,7 +70,7 @@ fn key_dacl(deny: Option<&str>, inherit: &str) -> String {
 /// too, and a panic there during an unwind aborts the process, taking the
 /// original assertion message with it.
 fn set_dacl(object: &str, object_type: SE_OBJECT_TYPE, sddl: &str) -> Result<(), String> {
-    let wide_sddl = wide_null(sddl);
+    let wide_sddl = wide_null(sddl).unwrap();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `wide_sddl` is a valid null-terminated UTF-16 string that
     // outlives the call, and `descriptor` is a valid out-param. On success it
@@ -106,7 +106,7 @@ fn set_dacl(object: &str, object_type: SE_OBJECT_TYPE, sddl: &str) -> Result<(),
     };
 
     let status = read.map(|()| {
-        let wide_object = wide_null(object);
+        let wide_object = wide_null(object).unwrap();
         // SAFETY: `wide_object` is a valid null-terminated UTF-16 string;
         // `dacl` points into the still-live `descriptor`; every other pointer
         // is null, so `DACL_SECURITY_INFORMATION` is the only thing written.

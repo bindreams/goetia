@@ -1495,3 +1495,9 @@ fn an_uninstall_reports_an_unread_host_and_sweeps_nothing_for_it() {
 
     scm.after_uninstall(&id, Uninstalled::Left, Err(unread())).unwrap();
 }
+
+#[skuld::test]
+fn a_command_line_with_a_nul_is_not_cut_there() {
+    // Cut at the NUL, this would be `C:\a.exe` with one argument.
+    assert_eq!(split_command_line("C:\\a.exe one\0 two"), (PathBuf::new(), Vec::new()));
+}

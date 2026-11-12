@@ -5,7 +5,7 @@ use windows_sys::Win32::System::EventLog::{
 };
 
 use super::Severity;
-use crate::backend::scm::wide::wide_null;
+use crate::backend::scm::wide::{wide_literal, wide_null};
 
 const SOURCE: &str = "Goetia";
 
@@ -25,14 +25,17 @@ pub(super) fn report(severity: Severity, message: &str) {
         Severity::Error => EVENTLOG_ERROR_TYPE,
         Severity::Warning => EVENTLOG_WARNING_TYPE,
     };
-    let wide_source = wide_null(SOURCE);
+    let wide_source = wide_literal(SOURCE);
     // SAFETY: `wide_source` is a valid, null-terminated UTF-16 string,
     // and `RegisterEventSourceW` does not retain it past this call.
     let handle = unsafe { RegisterEventSourceW(std::ptr::null(), wide_source.as_ptr()) };
     if handle.is_null() {
         return;
     }
-    let wide_msg = wide_null(message);
+    // A NUL would end the message early in the Event Log; showing it escaped keeps the rest.
+    let Ok(wide_msg) = wide_null(message.replace('\0', "\\0")) else {
+        return;
+    };
     let strings = [wide_msg.as_ptr()];
     // SAFETY: `handle` is a live handle just returned by
     // `RegisterEventSourceW`; `strings` holds exactly one valid,

@@ -95,3 +95,16 @@ fn bytes_that_are_not_a_sid_are_an_error_not_a_read_past_them() {
     let err = account_name_of_sid(&[1, 3, 0, 0, 0, 0, 0, 5, 1, 0]).expect_err("truncated");
     assert!(matches!(err, Error::AccountLookup { .. }), "{err:?}");
 }
+
+#[skuld::test]
+fn a_nul_in_a_sid_string_is_refused_not_cut_there() {
+    // Cut at the NUL, this would resolve `S-1-5-18`.
+    let err = account_name_from_sid_string("S-1-5-18\0junk").expect_err("a NUL ends nothing here");
+    assert!(err.to_string().contains("S-1-5-18"), "{err}");
+}
+
+#[skuld::test]
+fn a_nul_in_an_account_name_is_refused_not_cut_there() {
+    let err = sid_for_account_name("SYSTEM\0junk").expect_err("a NUL ends nothing here");
+    assert!(err.to_string().contains("SYSTEM"), "{err}");
+}

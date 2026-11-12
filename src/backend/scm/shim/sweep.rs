@@ -400,7 +400,11 @@ mod system {
     /// `text` with each `%NAME%` replaced by the variable's value, as the system expands a
     /// `REG_EXPAND_SZ`; a name that is not set stays as written.
     pub(super) fn expand_environment(text: &str) -> String {
-        let source = wide_null(text);
+        // A NUL would end the text for the call and expand only what precedes it: treat it as text
+        // that could not be expanded.
+        let Ok(source) = wide_null(text) else {
+            return text.to_string();
+        };
         let mut buf = vec![0u16; 512];
         loop {
             // SAFETY: `source` is NUL-terminated and `buf` is `buf.len()` writable units.

@@ -42,7 +42,7 @@ pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
 #[cfg(windows)]
 pub use crate::backend::scm::shim::acl::{Ace, Dacl, kernel_object_dacl};
 #[cfg(windows)]
-pub use crate::backend::scm::wide::{units_until_nul, wide_null};
+pub use crate::backend::scm::wide::{units_until_nul, wide_literal, wide_null};
 
 pub mod cleanup;
 pub mod elevation;

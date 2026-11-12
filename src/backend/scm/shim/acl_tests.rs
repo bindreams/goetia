@@ -910,4 +910,15 @@ pub(in crate::backend::scm::shim) mod windows {
 
         assert!(is_unreadable(&unreadable), "{unreadable:?}");
     }
+
+    /// A NUL in SDDL or in a path would end it early, so what is made would not be what was asked for.
+    #[skuld::test]
+    fn a_nul_in_sddl_or_in_a_path_is_refused() {
+        let cut = Descriptor::from_sddl("D:P(A;;GA;;;WD)\0junk");
+        assert!(cut.is_err());
+
+        let descriptor = Descriptor::from_sddl("D:P(A;;GA;;;WD)").unwrap();
+        let e = descriptor.create_dir(Path::new("a\0b")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
 }

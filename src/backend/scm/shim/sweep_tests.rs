@@ -577,7 +577,7 @@ mod windows {
 
     /// `path` by its 8.3 names where the volume keeps them, and unchanged where it does not.
     fn short(path: &Path) -> PathBuf {
-        let wide = wide_null(path);
+        let wide = wide_null(path).unwrap();
         let mut buf = vec![0u16; 1024];
         // SAFETY: `wide` is NUL-terminated and `buf` is `buf.len()` writable units.
         let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
@@ -848,5 +848,11 @@ mod windows {
             r"%goetia_no_such_variable%\x.exe"
         );
         assert_eq!(expand_environment(r"C:\a\b.exe"), r"C:\a\b.exe");
+    }
+
+    /// Cut at the NUL, only `%SystemRoot%` would be expanded and the rest dropped.
+    #[skuld::test]
+    fn text_with_a_nul_is_returned_as_written() {
+        assert_eq!(expand_environment("%SystemRoot%\0tail"), "%SystemRoot%\0tail");
     }
 }
