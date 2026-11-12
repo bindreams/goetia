@@ -36,7 +36,7 @@ pub fn shown_sid(sid: &[u8]) -> String {
 /// daemon that runs as it.
 #[cfg(windows)]
 pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
-    crate::backend::scm::manager::sid_for_account_name(account_name, None)
+    crate::backend::scm::manager::sid_for_account_name(account_name, None).map(|(sid, _kind)| sid)
 }
 
 #[cfg(windows)]

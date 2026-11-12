@@ -57,7 +57,9 @@
 //! says needs a password — every other account (`LocalSystem`, a built-in, or an
 //! `NT SERVICE\<id>` virtual account) already holds the right, and
 //! `LookupAccountNameW` (which the grant goes through) does not even
-//! resolve the first three by those spellings.
+//! resolve the first three by those spellings. Before the password is read, such an account that is not a
+//! user (a group, a domain) is refused: the right would reach every account in it
+//! (`identity::require_user_account`).
 //!
 //! **5. Create with `SERVICE_DEMAND_START`, write `Parameters` immediately
 //! after.** Not `SERVICE_DISABLED` (which would block an explicit `start`),
@@ -137,7 +139,7 @@ use crate::error::{Chain, Error, Reason, Result, terminating_failed};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, Installed, State, Status, Step};
 use crate::shim::HostCommand;
-use crate::spec::{DaemonSpec, Id, Kind, User};
+use crate::spec::{AccountId, DaemonSpec, Id, Kind, User};
 
 // Scm =================================================================================================================
 
@@ -392,7 +394,7 @@ impl Backend for Scm {
         _scope: &mut Option<InstallLock>,
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
-        apply(definition, user_field(&spec.user), snapshot.is_none())?;
+        apply(definition, written_user(&spec.user), snapshot.is_none())?;
         Ok(WriteOutcome::Done)
     }
 
@@ -841,12 +843,14 @@ pub(in crate::backend::scm) fn split_command_line(cmdline: &str) -> (PathBuf, Ve
 
 // apply (write path) ==================================================================================================
 
-/// The spec field an account name came from, for an error: `user.name` for a name the user wrote, none
-/// for one resolved from a `user.id` (whose own field the resolution already names).
-fn user_field(user: &User) -> Option<&'static str> {
+/// The spec field the account comes from and its value as the user wrote it, for an error about the
+/// account: `user.name` and the name, or `user.id` and the SID string. `None` for `user: root`, which
+/// has no account, and for a numeric UID, which resolves to none.
+fn written_user(user: &User) -> Option<(&'static str, &str)> {
     match user {
-        User::Name(_) => Some("user.name"),
-        User::Root | User::Id(_) => None,
+        User::Name(name) => Some(("user.name", name)),
+        User::Id(AccountId::Sid(sid)) => Some(("user.id", sid)),
+        User::Root | User::Id(AccountId::Uid(_)) => None,
     }
 }
 
@@ -859,9 +863,9 @@ fn user_field(user: &User) -> Option<&'static str> {
 /// create/update immediately, minimizing the window in which a crash leaves a service with no marker; a failure in
 /// the two writes after it leaves a registration the next `install` reads as
 /// hand-edited (`Conflict`, cleared by `--force`). An update restates the
-/// start type the service has, rather than resetting it; see `service_info`. `user_field` is the
-/// spec field the account name came from, if any.
-fn apply(reg: &ScmRegistration, user_field: Option<&'static str>, create: bool) -> Result<()> {
+/// start type the service has, rather than resetting it; see `service_info`. `written` is what
+/// [`written_user`] says of the account's spec value.
+fn apply(reg: &ScmRegistration, written: Option<(&str, &str)>, create: bool) -> Result<()> {
     // Driven by `generate::account_needs_password`, not merely whether
     // `reg.account` is `Some`: a canonicalised built-in
     // (`NT AUTHORITY\LocalService`) or virtual (`NT SERVICE\<id>`) account
@@ -887,17 +891,10 @@ fn apply(reg: &ScmRegistration, user_field: Option<&'static str>, create: bool) 
         let account = reg.account.as_deref().expect(
             "account_needs_password(None) is always false (LocalSystem), so this branch is only reached for Some",
         );
-        let pw = identity::service_password()?;
-        if pw.is_none() {
-            // Install would otherwise report success and the service would
-            // fail every future start with error 1069 (no `SeServiceLogonRight`).
-            // Refuse instead of creating a service that cannot start.
-            return Err(Error::PasswordRequired {
-                account: account.to_string(),
-            });
-        }
-        identity::grant_service_logon_right(account, user_field)?;
-        pw
+        // A real account is refused here if it is not a user, before its password is read.
+        let pw = identity::service_password_for(account, written)?;
+        identity::grant_service_logon_right(account)?;
+        Some(pw)
     } else {
         None
     };
