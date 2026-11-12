@@ -1663,7 +1663,7 @@ enum UninstallFailure {
     Delete { previous: Option<ServiceStartType> },
     /// The stop failed on a service someone else had marked for deletion, so `uninstall` did not delete
     /// or disable it. Its wait may already have sent a STOP before it failed. `ours` is whether the
-    /// failure was goetia's own (its hold or its unbounded wait) and not the service's.
+    /// failure was goetia's own (its hold) and not the service's.
     AlreadyMarked { ours: bool },
     /// The hold of the process of a service found `STOP_PENDING` failed, on a service someone else had
     /// marked for deletion: goetia's own failure, which ended its wait with no STOP of ours sent.
