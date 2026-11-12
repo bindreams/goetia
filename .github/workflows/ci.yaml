@@ -86,10 +86,7 @@ jobs:
           # renovate: datasource=crate depName=cargo-nextest
           tool: cargo-nextest@0.9.149
 
-      # A plain `cargo test` leaves every elevation-gated test reported by
-      # skuld as *unavailable*, not failed, a silent skip, which this
-      # project forbids. Build unelevated into an archive, then run the
-      # archive elevated (sudo on Linux/macOS; the Windows runner is already
+      # Build unelevated into an archive, then run the archive elevated (sudo on Linux/macOS; the Windows runner is already
       # Administrator). Never `sudo -E cargo test`: `-E` preserves `HOME`,
       # so root would write to `~/.cargo`/`target/` and the next unelevated
       # build would fail with `EACCES`. `cargo` stays entirely unelevated.
@@ -104,8 +101,16 @@ jobs:
       # nextest wants the directory to exist, and `--extract-overwrite` lets a restored cache
       # leave one. On Linux and macOS root extracts into nextest's default temporary directory:
       # root must not write `target/`, which the next unelevated build and the cache prune need to own.
+      #
+      # The runner is a sandbox, so it consents to every test group that changes real system state
+      # (`GOETIA_TEST_<GROUP>_CONSENT`, see the README); a group with no tests on this OS ignores it.
+      # `sudo` drops the variables unless they are named.
       - name: Run tests, elevated
         shell: bash
+        env:
+          GOETIA_TEST_SCM_CONSENT: "1"
+          GOETIA_TEST_SYSTEMD_CONSENT: "1"
+          GOETIA_TEST_LAUNCHD_CONSENT: "1"
         run: |
           set -euo pipefail
 
@@ -116,7 +121,8 @@ jobs:
             "$nextest" "${args[@]}" --extract-to target/nextest-extract --extract-overwrite
           else
             # `sudo` resets `PATH`: the binary is resolved before it.
-            sudo "$nextest" "${args[@]}"
+            sudo --preserve-env=GOETIA_TEST_SCM_CONSENT,GOETIA_TEST_SYSTEMD_CONSENT,GOETIA_TEST_LAUNCHD_CONSENT \
+              "$nextest" "${args[@]}"
           fi
 
       # See `tests/support/mod.rs::record_probe`.

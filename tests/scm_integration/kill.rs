@@ -20,7 +20,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
 use crate::common::fixture_command_with_exe;
-use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard};
+use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group};
 
 /// While alive, the calling thread has `SeDebugPrivilege` disabled (still held, as for an elevated
 /// administrator), and reverts to the process token on drop.
@@ -131,12 +131,12 @@ fn kill_with_the_privilege_disabled(user: User) {
     });
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn kill_works_for_a_local_system_service_without_the_debug_privilege_enabled() {
+#[skuld::test]
+fn kill_works_for_a_local_system_service_without_the_debug_privilege_enabled(#[fixture(scm_group)] _group: &Group) {
     kill_with_the_privilege_disabled(User::Root);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn kill_works_for_a_local_service_service_without_the_debug_privilege_enabled() {
+#[skuld::test]
+fn kill_works_for_a_local_service_service_without_the_debug_privilege_enabled(#[fixture(scm_group)] _group: &Group) {
     kill_with_the_privilege_disabled(User::Name("LocalService".to_string()));
 }
