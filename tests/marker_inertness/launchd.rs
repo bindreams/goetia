@@ -10,12 +10,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
-use crate::support::{self, ConnectBack, ELEVATED, ServiceGuard, cmd};
+use crate::support::{self, ConnectBack, ELEVATED, Group, ServiceGuard, cmd, launchd_group};
 
 // Probes ==============================================================================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn launchd_xml_comment_is_inert() {
+#[skuld::test(labels = [ELEVATED])]
+fn launchd_xml_comment_is_inert(#[fixture(launchd_group)] _group: &Group) {
     let label = support::random_test_id();
     let guard = ServiceGuard::new(&label);
     let blob = support::probe_blob();
@@ -55,8 +55,8 @@ fn launchd_xml_comment_is_inert() {
 /// The control for `launchd_xml_comment_is_inert`: a plist launchd must refuse.
 /// Without it, "bootstrap succeeded and the job is present" carries no
 /// information, because nothing shows the checks can come out the other way.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn launchd_malformed_plist_is_rejected() {
+#[skuld::test(labels = [ELEVATED])]
+fn launchd_malformed_plist_is_rejected(#[fixture(launchd_group)] _group: &Group) {
     let label = support::random_test_id();
     let guard = ServiceGuard::new(&label);
     let text = format!(
@@ -80,8 +80,8 @@ fn launchd_malformed_plist_is_rejected() {
 /// site fails, so an outcome either way is data rather than a build failure.
 /// The result is written to `probe-results/`, which CI uploads — otherwise
 /// "not asserted" quietly becomes "never checked again".
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn launchd_unknown_top_level_keys_are_tolerated() {
+#[skuld::test(labels = [ELEVATED])]
+fn launchd_unknown_top_level_keys_are_tolerated(#[fixture(launchd_group)] _group: &Group) {
     let label = support::random_test_id();
     let guard = ServiceGuard::new(&label);
     let blob = support::probe_blob();
@@ -124,8 +124,8 @@ fn launchd_unknown_top_level_keys_are_tolerated() {
 /// seeded by `Disabled: true` being a *default* that the override database
 /// supersedes. If launchd ignores the key, or if `launchctl enable` does not
 /// survive a plist rewrite, macOS needs a different mechanism entirely.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn launchd_disabled_key_default_applies() {
+#[skuld::test(labels = [ELEVATED])]
+fn launchd_disabled_key_default_applies(#[fixture(launchd_group)] _group: &Group) {
     let label = support::random_test_id();
     let guard = ServiceGuard::new(&label);
 

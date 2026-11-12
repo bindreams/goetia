@@ -49,7 +49,8 @@ mod windows {
     use crate::backend::scm::shim::acl::{CheckPermissions, Descriptor, FolderCheck};
     use crate::error::{Error, Result};
     use crate::shim::{HostCommand, ShimProvider};
-    use crate::testing::elevation::{ELEVATED, elevated};
+    use crate::testing::elevation::ELEVATED;
+    use crate::testing::groups::{Group, scm_group};
 
     fn disabled() -> FolderCheck {
         FolderCheck::new(CheckPermissions::Disable)
@@ -305,8 +306,8 @@ mod windows {
 
     /// The race itself needs a folder to appear between the two steps, which no test can arrange
     /// without a seam: the folder that "appeared" is one already in the list.
-    #[skuld::test(requires = [elevated], labels = [ELEVATED])]
-    fn creating_stops_at_a_folder_that_exists_and_leaves_it_alone() {
+    #[skuld::test(labels = [ELEVATED])]
+    fn creating_stops_at_a_folder_that_exists_and_leaves_it_alone(#[fixture(scm_group)] _group: &Group) {
         let root = tempfile::tempdir().unwrap();
         let (made, taken, after) = (
             root.path().join("made"),
@@ -342,8 +343,8 @@ mod windows {
         file.write_all(bytes).unwrap();
     }
 
-    #[skuld::test(requires = [elevated], labels = [ELEVATED])]
-    fn a_file_with_the_stock_owner_permissions_and_bytes_is_good() {
+    #[skuld::test(labels = [ELEVATED])]
+    fn a_file_with_the_stock_owner_permissions_and_bytes_is_good(#[fixture(scm_group)] _group: &Group) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shim.exe");
         stock_file(&path, b"abc");
@@ -352,8 +353,8 @@ mod windows {
     }
 
     /// The file is stock but for its bytes, so only the hash can make it `Bad`.
-    #[skuld::test(requires = [elevated], labels = [ELEVATED])]
-    fn a_stock_file_with_other_bytes_is_bad() {
+    #[skuld::test(labels = [ELEVATED])]
+    fn a_stock_file_with_other_bytes_is_bad(#[fixture(scm_group)] _group: &Group) {
         let dir = tempfile::tempdir().unwrap();
         let (same, other) = (dir.path().join("same.exe"), dir.path().join("other.exe"));
         stock_file(&same, b"abc");
@@ -365,8 +366,8 @@ mod windows {
 
     /// The bytes are right, so only the owner or the permissions can make it `Bad`: the same bytes
     /// in a stock file are `Good`.
-    #[skuld::test(requires = [elevated], labels = [ELEVATED])]
-    fn a_file_with_the_right_bytes_and_other_permissions_is_bad() {
+    #[skuld::test(labels = [ELEVATED])]
+    fn a_file_with_the_right_bytes_and_other_permissions_is_bad(#[fixture(scm_group)] _group: &Group) {
         let dir = tempfile::tempdir().unwrap();
         let (stock, plain) = (dir.path().join("stock.exe"), dir.path().join("plain.exe"));
         stock_file(&stock, b"abc");

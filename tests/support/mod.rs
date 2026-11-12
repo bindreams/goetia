@@ -33,7 +33,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngExt as _;
 
 pub use connect_back::ConnectBack;
-pub use goetia::testing::elevation::{ELEVATED, elevated};
+pub use goetia::testing::elevation::ELEVATED;
+pub use goetia::testing::groups::{Group, launchd_group, native_group, scm_group, systemd_group};
 #[cfg(windows)]
 pub use goetia::testing::wide_null;
 pub use goetia::testing::{cleanup, plain_fields};

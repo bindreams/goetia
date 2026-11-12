@@ -1527,6 +1527,24 @@ every vendor's, not just goetia's. That is why goetia never claims ownership
 of what it could not read, and why the two are separated by what was
 _established_ rather than by what went wrong.
 
+## Running the tests
+
+Some tests change real system state: they install and remove real services, write the registry,
+`/etc/systemd/system` or `/Library/LaunchDaemons`, and create accounts. They run only in a sandbox
+(a container, a VM or CI), and they are gated by two environment variables per group (`SCM` on
+Windows, `SYSTEMD` on Linux, `LAUNCHD` on macOS):
+
+- `GOETIA_TEST_<GROUP>`: unset or `1` runs the group's tests, `0` skips them, anything else fails them.
+- `GOETIA_TEST_<GROUP>_CONSENT`: a group's test that runs **fails** unless this is exactly `1`.
+  Unset is `0`. Any other value fails it too.
+
+A consented group also needs elevation (root, or an Administrator shell) and fails without it; it
+never skips. On a machine you care about, run everything else with the groups off:
+
+```sh
+GOETIA_TEST_SCM=0 GOETIA_TEST_SYSTEMD=0 GOETIA_TEST_LAUNCHD=0 cargo nextest run
+```
+
 ## License
 
 [Apache-2.0](LICENSE.md)

@@ -19,7 +19,8 @@ use crate::spec::{Id, Kind, Restart, User};
 use crate::testing::plain_fields;
 
 use crate::testing::cleanup::{FileGuard, remove_or_warn};
-use crate::testing::elevation::{ELEVATED, elevated};
+use crate::testing::elevation::ELEVATED;
+use crate::testing::groups::{Group, launchd_group};
 
 fn sample_plist(id: &str) -> String {
     sample_plist_restarting(id, Restart::Never)
@@ -1487,8 +1488,8 @@ impl Plists {
 /// child answers every call in place of `launchctl`, so the real spawn draws too, and the longest
 /// paths — `start`'s corrective cycle among them — are driven deterministically, and no job is ever
 /// loaded.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn every_launchd_verb_path_stays_inside_its_reservation() {
+#[skuld::test(labels = [ELEVATED])]
+fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-reservation-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let id = Id::try_from(name.as_str()).unwrap();
@@ -1790,8 +1791,8 @@ fn an_uninstall_removes_the_plist_only_after_the_old_instance_is_gone() {
 /// A `Create` over a stale job boots it out, and reads the label again after writing. The old instance
 /// still tearing down must not answer that read: it is not the job loaded in between, and reading it
 /// as one would refuse the install and take the plist back out.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_create_over_a_stale_job_still_tearing_down_is_not_in_doubt() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_create_over_a_stale_job_still_tearing_down_is_not_in_doubt(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-create-slow-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2322,8 +2323,8 @@ fn kill_refused_for_any_other_reason_is_a_plain_failure() {
 /// A changed spec over a job launchd has loaded is refused before anything is written, whether or
 /// not the job has a process, and is installed once the job is not loaded. The table answers
 /// `print` only: a `bootout` of the loaded job would be an unscripted call and fail the test.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_changed_spec_is_refused_while_the_job_is_loaded() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_changed_spec_is_refused_while_the_job_is_loaded(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-refuse-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2371,8 +2372,8 @@ fn spec_named(name: &str) -> DaemonSpec {
 /// `install` over an installed plist and over none, and `start`, fail on it instead of acting as if
 /// the job were absent. Each table answers `print` only: a write under a loaded job, a `bootout`
 /// or a `bootstrap` would be an unscripted call, and `assert_spent` would see it.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-unreadable-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2452,8 +2453,8 @@ fn failed_start(name: &str, restart: Restart, calls: &[(&str, Answer)]) -> Error
 
 /// `kickstart -p` named no pid and the bounded read decides: a job read back as `spawn scheduled` is
 /// not established either way (exit `4`), one read back as stopped did not start (exit `1`).
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_kickstart_that_names_no_pid_and_reads_back_unknown_is_unconfirmed() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_kickstart_that_names_no_pid_and_reads_back_unknown_is_unconfirmed(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-nopid-unknown-{:x}", std::process::id());
     let _plists = Plists::new(&name);
 
@@ -2472,8 +2473,8 @@ fn a_kickstart_that_names_no_pid_and_reads_back_unknown_is_unconfirmed() {
     assert!(e.is_indeterminate());
 }
 
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_kickstart_that_names_no_pid_and_reads_back_stopped_did_not_start() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_kickstart_that_names_no_pid_and_reads_back_stopped_did_not_start(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-nopid-stopped-{:x}", std::process::id());
     let _plists = Plists::new(&name);
 
@@ -2506,8 +2507,8 @@ const CORRECTIVE_CYCLE: [(&str, Answer); 9] = [
     ("kickstart", PID),
 ];
 
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_corrective_cycle_that_reads_back_unknown_is_unconfirmed() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_corrective_cycle_that_reads_back_unknown_is_unconfirmed(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-cycle-unknown-{:x}", std::process::id());
     let _plists = Plists::new(&name);
 
@@ -2521,8 +2522,8 @@ fn a_corrective_cycle_that_reads_back_unknown_is_unconfirmed() {
     assert!(e.is_indeterminate());
 }
 
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_corrective_cycle_that_reads_back_stopped_did_not_start() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_corrective_cycle_that_reads_back_stopped_did_not_start(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-cycle-stopped-{:x}", std::process::id());
     let _plists = Plists::new(&name);
 
@@ -2556,8 +2557,8 @@ fn assert_restored_and_rerun_refused(spec: &DaemonSpec, name: &str, installed: &
 /// A job that is not loaded when `install` checks but is loaded once it has written, because someone
 /// else started it between the two, may have read either plist: the install is in doubt
 /// ([`Error::LoadedJobInDoubt`], exit `4`), and the previous plist is put back.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-indoubt-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2590,8 +2591,8 @@ fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt() {
 /// The recheck after the write is a read like the first; one that fails leaves the loaded state
 /// unknown, so the install is in doubt (exit `4`), not a plain failure (exit `1`), and the previous
 /// plist is put back.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
+#[skuld::test(labels = [ELEVATED])]
+fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-recheck-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2625,8 +2626,8 @@ fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt() {
 /// What launchd reads decides the refusal, not the spec: a spec change the plist does not render
 /// (`name` is in the embedded metadata only) is written over a loaded job without a single
 /// `launchctl` call, and the loaded job is as the new plist would have it.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_spec_change_the_plist_does_not_render_is_written_over_a_loaded_job() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_spec_change_the_plist_does_not_render_is_written_over_a_loaded_job(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-samerender-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2689,8 +2690,8 @@ fn restore_failure_of(e: &Error) -> &Error {
 
 /// The put-back writes only over what this install wrote: a concurrent install that wrote after it
 /// owns the path, and a put-back over it would destroy that write.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-putback-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let target = staging_path(&name);
@@ -2715,8 +2716,8 @@ fn a_put_back_does_not_overwrite_a_plist_that_is_no_longer_ours() {
 
 /// A concurrent `enable` moved the plist to `ENABLED_DIR` before the put-back: writing the previous
 /// plist back to staging would leave one in both directories, which `locate` refuses for every verb.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-putback-enabled-{:x}", std::process::id());
     let _plists = Plists::new(&name);
 
@@ -2739,8 +2740,8 @@ fn a_put_back_does_not_recreate_a_plist_that_was_enabled_meanwhile() {
 
 /// A concurrent `uninstall` removed the plist before the put-back: writing the previous one back would
 /// resurrect a daemon that was just uninstalled.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-putback-removed-{:x}", std::process::id());
     let _plists = Plists::new(&name);
 
@@ -2763,8 +2764,10 @@ fn a_put_back_does_not_resurrect_a_plist_that_was_uninstalled_meanwhile() {
 /// A plist from an older release is `Stale`, and `Stale` is refused over a loaded job exactly when
 /// its rendering differs from what would be written: a release that renders the same text only
 /// refreshes the metadata, without asking launchd anything.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_stale_plist_is_refused_over_a_loaded_job_only_when_its_rendering_differs() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_stale_plist_is_refused_over_a_loaded_job_only_when_its_rendering_differs(
+    #[fixture(launchd_group)] _group: &Group,
+) {
     let name = format!("goetia-stale-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2813,8 +2816,8 @@ fn a_stale_plist_is_refused_over_a_loaded_job_only_when_its_rendering_differs() 
 /// A `Create` that fails before it has a plist to write has not stopped the job under its label: the
 /// stale job is booted out only once the plist is staged, so a rerun that fails the same way leaves
 /// the predecessor running.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_create_that_cannot_stage_its_plist_boots_nothing_out() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_create_that_cannot_stage_its_plist_boots_nothing_out(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-unstaged-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let dir = tempfile::tempdir().unwrap();
@@ -2836,8 +2839,8 @@ fn a_create_that_cannot_stage_its_plist_boots_nothing_out() {
 /// A job loaded between a `Create`'s check and its write is the job the plist was written under, which
 /// `start` would find loaded and running: the install is in doubt (exit `4`), the plist it created is
 /// removed, and the rerun is a `Create` again, not `UpToDate`. Reading the job back fails the same way.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_job_loaded_after_a_create_leaves_the_install_in_doubt_with_no_plist() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_job_loaded_after_a_create_leaves_the_install_in_doubt_with_no_plist(#[fixture(launchd_group)] _group: &Group) {
     let name = format!("goetia-create-indoubt-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2891,8 +2894,10 @@ fn a_job_loaded_after_a_create_leaves_the_install_in_doubt_with_no_plist() {
 /// A plist appears at the target while the stale job's `bootout` runs. A request has been sent, so the
 /// install does not go on to re-derive into further `launchctl` calls: it reports that the job was
 /// booted out and what is at the path (exit `4`), and leaves what is there.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls(
+    #[fixture(launchd_group)] _group: &Group,
+) {
     let name = format!("goetia-taken-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2918,8 +2923,10 @@ fn a_plist_taken_after_the_bootout_is_reported_without_further_launchctl_calls()
 /// The same race after a read only: nothing was sent and nothing written, but `install` does not
 /// re-derive into a second pass, whose reads the verb did not reserve. It fails (exit `1`) and says to
 /// run it again, and leaves what is at the path.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_plist_taken_after_a_read_fails_the_install_without_further_launchctl_calls() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_plist_taken_after_a_read_fails_the_install_without_further_launchctl_calls(
+    #[fixture(launchd_group)] _group: &Group,
+) {
     let name = format!("goetia-taken-early-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2941,8 +2948,10 @@ fn a_plist_taken_after_a_read_fails_the_install_without_further_launchctl_calls(
 /// changed spec is being written over it. A call has been made, so `install` does not re-derive: a
 /// second pass is a `Create` over what may be a job loaded meanwhile, which needs more calls than the
 /// verb reserved. It fails (exit `1`) and writes nothing.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_calls(
+    #[fixture(launchd_group)] _group: &Group,
+) {
     let name = format!("goetia-vanished-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let spec = spec_named(&name);
@@ -2970,8 +2979,10 @@ fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_call
 /// `install --dry-run` and `diff` read no job state, and `install --start` over a loaded job with a
 /// changed rendering is refused before it bootstraps anything: the table answers one `print`, so
 /// any other call fails the test.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_starts() {
+#[skuld::test(labels = [ELEVATED])]
+fn dry_run_and_diff_ask_launchd_nothing_and_install_start_is_refused_before_it_starts(
+    #[fixture(launchd_group)] _group: &Group,
+) {
     use crate::cli::wait::WaitArgs;
     use crate::cli::{ExitCode, diff, install};
     use crate::shim::HostCommand;

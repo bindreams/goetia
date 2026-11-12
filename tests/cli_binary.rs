@@ -15,6 +15,8 @@ use std::process::{Command, Output};
 #[path = "support/mod.rs"]
 mod support;
 
+use support::native_group;
+
 fn main() {
     goetia::testing::run_all();
 }
@@ -88,7 +90,7 @@ stderr:
 /// empty, and `4` exactly when `undetermined` is not.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE, SCM_DENIAL], serial = UNIT_DIR_EXCLUSIVE | SCM_DENIAL)]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn native_backend_answers_list_unelevated() {
+fn native_backend_answers_list_unelevated(#[fixture(native_group)] _group: &support::Group) {
     let dir = tempfile::tempdir().unwrap();
 
     support::list_json(|args| spawn_cli(args, dir.path()));

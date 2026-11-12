@@ -5,7 +5,8 @@ use winreg::RegValue;
 use winreg::enums::RegType;
 use winreg::types::ToRegValue as _;
 
-use crate::testing::elevation::{ELEVATED, elevated};
+use crate::testing::elevation::ELEVATED;
+use crate::testing::groups::{Group, scm_group};
 use crate::testing::raw_registry::{create_link, create_raw_key};
 use crate::testing::scratch::ScratchKey;
 
@@ -439,8 +440,8 @@ fn an_event_message_file_needs_a_system_root() {
 /// Writes keys under `HKLM\SOFTWARE`, a scratch key standing for `Services`. The image is read
 /// below the root the scan hands over: a service marked for deletion, one with no key, and one whose
 /// `ImagePath` is not a string start nothing.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_registered_image_is_read_below_the_root_it_is_given() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_registered_image_is_read_below_the_root_it_is_given(#[fixture(scm_group)] _group: &Group) {
     let scratch = ScratchKey::new(&format!("image-{}-root", std::process::id()));
     let root = scratch.create();
     let set_image = |name: &str, image: RegValue| {
@@ -471,8 +472,8 @@ fn a_registered_image_is_read_below_the_root_it_is_given() {
 /// Writes keys under `HKLM\SOFTWARE`. SCM follows a registry link at `Services\<name>`, and so the
 /// sweep reads the target's `ImagePath`: left out of what is referenced, the host the service starts
 /// would be deleted.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_service_key_that_is_a_link_is_read_through_to_its_target() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_is_read_through_to_its_target(#[fixture(scm_group)] _group: &Group) {
     let unique = std::process::id();
     // The target first, so that it is removed last.
     let target = ScratchKey::new(&format!("image-{unique}-link-target"));
@@ -496,8 +497,8 @@ fn a_service_key_that_is_a_link_is_read_through_to_its_target() {
 /// Writes keys under `HKLM\SOFTWARE`. A `Services` key that is marked deleted while the scan holds
 /// it (another handle deleted it) fails the open of a service below it with KEY_DELETED, which the
 /// read settles the service as gone, not as a failure, as it does when its own key is gone.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_root_marked_deleted_under_the_scan_reads_the_service_as_gone() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_root_marked_deleted_under_the_scan_reads_the_service_as_gone(#[fixture(scm_group)] _group: &Group) {
     let scratch = ScratchKey::new(&format!("image-{}-deleted-root", std::process::id()));
     let root = scratch.create();
     let services = ServicesRoot::new(&root);
@@ -522,8 +523,8 @@ fn a_root_marked_deleted_under_the_scan_reads_the_service_as_gone() {
 /// Writes keys under `HKLM\SOFTWARE`. A service key that is a link to a missing key fails the image
 /// read, as it fails the other reads: the registry cannot say the service is gone where SCM may have
 /// one, and the sweep then asks SCM (`image_of`).
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_image_read() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_image_read(#[fixture(scm_group)] _group: &Group) {
     let unique = std::process::id();
     let root_scratch = ScratchKey::new(&format!("image-{unique}-dangling-root"));
     let target = ScratchKey::new(&format!("image-{unique}-dangling-target"));
@@ -542,8 +543,8 @@ fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_image_read() {
 
 /// Writes keys under `HKLM\SOFTWARE`. A service key that is a link to a missing key reads as an
 /// error: neither Foreign nor gone.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_service_key_that_is_a_link_to_a_missing_key_fails_a_parameters_read() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_to_a_missing_key_fails_a_parameters_read(#[fixture(scm_group)] _group: &Group) {
     let unique = std::process::id();
     let root_scratch = ScratchKey::new(&format!("parameters-{unique}-dangling-root"));
     let target = ScratchKey::new(&format!("parameters-{unique}-dangling-target"));
@@ -560,8 +561,8 @@ fn a_service_key_that_is_a_link_to_a_missing_key_fails_a_parameters_read() {
 }
 
 /// Writes keys under `HKLM\SOFTWARE`. `read_environment` on a dangling-link service key is an error.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_environment_read() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_environment_read(#[fixture(scm_group)] _group: &Group) {
     let unique = std::process::id();
     let root_scratch = ScratchKey::new(&format!("environment-{unique}-dangling-root"));
     let target = ScratchKey::new(&format!("environment-{unique}-dangling-target"));
@@ -580,8 +581,8 @@ fn a_service_key_that_is_a_link_to_a_missing_key_fails_an_environment_read() {
 
 /// Writes keys under `HKLM\SOFTWARE`. A service key that is there with no `Parameters` stands without
 /// it, which reads as empty `Parameters`: not goetia's.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_service_key_with_no_parameters_reads_as_empty_parameters() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_service_key_with_no_parameters_reads_as_empty_parameters(#[fixture(scm_group)] _group: &Group) {
     let scratch = ScratchKey::new(&format!("bare-{}-root", std::process::id()));
     let root = scratch.create();
     root.create_subkey("bare").expect("create the service key");
@@ -593,8 +594,8 @@ fn a_service_key_with_no_parameters_reads_as_empty_parameters() {
 }
 
 /// Writes keys under `HKLM\SOFTWARE`. A service whose key is not there is gone.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_service_key_that_is_not_there_is_gone_for_a_parameters_read() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_service_key_that_is_not_there_is_gone_for_a_parameters_read(#[fixture(scm_group)] _group: &Group) {
     let scratch = ScratchKey::new(&format!("absent-{}-root", std::process::id()));
     let root = scratch.create();
     let services = ServicesRoot::new(&root);
@@ -609,8 +610,10 @@ fn a_service_key_that_is_not_there_is_gone_for_a_parameters_read() {
 /// `create_parameters_key` directly, with a scratch key for the service key. Writing through the
 /// link is denied (a link key takes no value but its `SymbolicLinkValue`), and would change a key
 /// goetia does not own: the link is deleted, a real key made, and the target left as it was.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_parameters_that_is_a_link_is_replaced_by_a_real_key_and_its_target_is_left_alone() {
+#[skuld::test(labels = [ELEVATED])]
+fn a_parameters_that_is_a_link_is_replaced_by_a_real_key_and_its_target_is_left_alone(
+    #[fixture(scm_group)] _group: &Group,
+) {
     let unique = std::process::id();
     // The target first, so that it is removed last.
     let target = ScratchKey::new(&format!("parameters-link-target-{unique}"));

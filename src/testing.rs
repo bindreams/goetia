@@ -46,6 +46,7 @@ pub use crate::backend::scm::wide::{units_until_nul, wide_null};
 
 pub mod cleanup;
 pub mod elevation;
+pub mod groups;
 #[cfg(windows)]
 pub mod raw_registry;
 #[cfg(windows)]
