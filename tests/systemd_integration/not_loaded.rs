@@ -9,7 +9,7 @@ use goetia::manager::ServiceManager;
 use goetia::spec::Id;
 
 use crate::linux::{mk, unit_path};
-use crate::support::{self, ELEVATED, ServiceGuard};
+use crate::support::{self, Group, ServiceGuard, systemd_group};
 
 /// `goetia <args>` where goetia finds `unit` installed and the manager does not: in a private mount
 /// namespace whose `/etc/systemd/system` is a tmpfs holding only `unit`. PID 1 does not see it, and
@@ -36,8 +36,8 @@ fn goetia_seeing(unit: &std::path::Path, args: &[&str]) -> std::process::Output 
 /// own, whose live state systemd does not have: `unusable`, exit `4`, as for any live state it
 /// could not read. Never "stopped, not enabled", which is what systemd answers for a name it has no
 /// file for.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_unit_systemd_has_not_loaded_is_never_reported_stopped() {
+#[skuld::test]
+fn a_unit_systemd_has_not_loaded_is_never_reported_stopped(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let mgr = Systemd::new();

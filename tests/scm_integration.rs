@@ -6,7 +6,7 @@
 //!
 //! Every test here registers and removes real Windows services, so it needs
 //! elevation exactly like `tests/marker_inertness.rs`'s `scm.rs` probe (see
-//! `support::elevated`), and shares that module's cleanup discipline via
+//! `support::scm_group`), and shares that module's cleanup discipline via
 //! `support::ServiceGuard`.
 
 #[path = "support/mod.rs"]
