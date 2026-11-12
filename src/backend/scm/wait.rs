@@ -50,13 +50,17 @@ impl WantState {
 /// The service state a `wait_callback` observed. Distinct from [`WantState`]:
 /// a callback can report a state that is neither what the caller wants nor
 /// its opposite. `Running`, `Paused` and `Stopped` are settled; `Pending` is any intermediate
-/// (`StartPending`/`StopPending`).
+/// (`StartPending`/`StopPending`). `Failed` is a delivery that carries no status at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observed {
     Running,
     Paused,
     Stopped,
     Pending,
+    /// SCM delivered the notification with this non-success `dwNotificationStatus`
+    /// (`ERROR_SERVICE_MARKED_FOR_DELETE`, `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING`, ...). Its
+    /// `ServiceStatus` is not valid, so it reports no state.
+    Failed(u32),
 }
 
 /// Whether a wait reached the state it was waiting for, or ran out of
@@ -505,8 +509,10 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// never on an earlier observation.
 ///
 /// Loops over notifications of `RUNNING`, `PAUSED` and `STOPPED`. A pending state is not in the mask
-/// ([`WantState::RunningPausedOrStopped`]), so SCM reports none until the service has settled; a
-/// notification of one is an error. `STOPPED` ends the loop. On `RUNNING` or
+/// ([`WantState::RunningPausedOrStopped`]), so SCM reports none until the service has settled. A
+/// notification that is no [`verdict`] (a failed delivery, which carries no state, or a state outside
+/// the mask) re-arms, and the status the arm returns decides, as after a refused STOP. `STOPPED` ends
+/// the loop. On `RUNNING` or
 /// `PAUSED` the STOP is sent; SCM may have changed the state since that notification, and then it
 /// rejects the STOP with 1052 (a restart began) or 1061 (a STOP is already delivered, or the service
 /// was `START_PENDING`). Either way the loop re-arms, and the status the arm returns decides, as a
@@ -581,15 +587,21 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
             Some(seen) => seen,
             None => {
                 refused = None;
-                match a.wait_callback(deadline)? {
-                    None => return Ok(Waited::Expired),
-                    Some(observed) => notified_state(observed)
-                        .and_then(|state| seen_in(delivered_status(a, state)))
-                        .ok_or_else(|| {
-                            io::Error::other(format!(
-                                "SCM notified {observed:?} to a registration for RUNNING, PAUSED and STOPPED only"
-                            ))
-                        })?,
+                let Some(observed) = a.wait_callback(deadline)? else {
+                    return Ok(Waited::Expired);
+                };
+                match verdict(observed, WantState::RunningPausedOrStopped)
+                    .and_then(|state| seen_in(delivered_status(a, state)))
+                {
+                    Some(seen) => seen,
+                    // No verdict: the arm's read decides, as in `wait_until`.
+                    None => {
+                        read = match rearm_settle(a, deadline, shim)? {
+                            ControlFlow::Break(waited) => return Ok(waited),
+                            ControlFlow::Continue(seen) => seen,
+                        };
+                        continue;
+                    }
                 }
             }
         };
@@ -616,9 +628,9 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
                     Err(e) if is_stop_refusal(&e) => {
                         refused = e.raw_os_error();
                         may_have_delivered |= refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
-                        read = match arm_settle(a, deadline, shim)? {
+                        read = match rearm_settle(a, deadline, shim)? {
                             ControlFlow::Break(waited) => return Ok(waited),
-                            ControlFlow::Continue(status) => seen_in(status),
+                            ControlFlow::Continue(seen) => seen,
                         };
                     }
                     Err(e) => return Err(e.into()),
@@ -643,6 +655,18 @@ fn arm_settle<A: ScmActor>(
         Ok(status) => Ok(ControlFlow::Continue(status)),
         Err(end) => Ok(ControlFlow::Break(judged(end, shim)?)),
     }
+}
+
+/// [`arm_settle`] again, for the loop: the state to act on in what the arm reads, if it is one.
+fn rearm_settle<A: ScmActor>(
+    a: &mut A,
+    deadline: Deadline,
+    shim: bool,
+) -> io::Result<ControlFlow<Waited, Option<Seen>>> {
+    Ok(match arm_settle(a, deadline, shim)? {
+        ControlFlow::Break(waited) => ControlFlow::Break(waited),
+        ControlFlow::Continue(status) => ControlFlow::Continue(seen_in(status)),
+    })
 }
 
 /// What a failed hold of [`settle_and_stop`] says of the STOP.
@@ -822,9 +846,8 @@ pub struct Sighting {
 ///
 /// `target`, in a status or a notification, is [`Waited::Confirmed`]. An arm that expired and a wait
 /// that ran out of `deadline` are [`Waited::Expired`]. A service marked for deletion or gone is decided
-/// as `decided_or_status` says. A notification of a pending state re-arms without asking `other`, and
-/// so does one the armed mask excludes: SCM does not deliver a state its mask excludes; if one arrives
-/// it is treated as pending. A notification of `PAUSED` is replaced by [`ScmActor::query_status`]: the
+/// as `decided_or_status` says. A notification that is no [`verdict`] (a pending state, a failed delivery, or a
+/// state the armed mask excludes) re-arms without asking `other`. A notification of `PAUSED` is replaced by [`ScmActor::query_status`]: the
 /// delivery may report the state at registration, and a paused service may have resumed since. Every
 /// other state, from a status or a notification, goes to
 /// `other` as a [`Sighting`]: `Break` ends the wait with that answer, an error ends it with the error,
@@ -867,7 +890,7 @@ fn wait_until_end<A: ScmActor>(
             },
             None => match a.wait_callback(deadline)? {
                 None => return Ok(WaitEnd::EXPIRED),
-                Some(observed) => match notified_state(observed).filter(|state| mask.states().contains(state)) {
+                Some(observed) => match verdict(observed, mask) {
                     // A delivery reports the state at registration, which the service can have left by now.
                     Some(QueriedState::Paused) => Some(a.query_status()?),
                     Some(state) => Some(delivered_status(a, state)),
@@ -895,14 +918,18 @@ fn wait_until_end<A: ScmActor>(
     }
 }
 
-/// The state a notification reported, or `None` for a pending one.
-fn notified_state(observed: Observed) -> Option<QueriedState> {
-    match observed {
-        Observed::Pending => None,
-        Observed::Running => Some(QueriedState::Running),
-        Observed::Paused => Some(QueriedState::Paused),
-        Observed::Stopped => Some(QueriedState::Stopped),
-    }
+/// What a delivered notification decides, for every wait: the state it reported, when the registration
+/// `armed` admits that state. `None` is no verdict: a pending state, a failed delivery, or a state
+/// the mask excludes. SCM should not deliver the last; if it does, it is no more a verdict than the
+/// others. The wait re-arms and decides on what the arm reads.
+fn verdict(observed: Observed, armed: WantState) -> Option<QueriedState> {
+    let state = match observed {
+        Observed::Pending | Observed::Failed(_) => return None,
+        Observed::Running => QueriedState::Running,
+        Observed::Paused => QueriedState::Paused,
+        Observed::Stopped => QueriedState::Stopped,
+    };
+    armed.states().contains(&state).then_some(state)
 }
 
 /// The status of a notification of `state`, as `a` buffered it: the whole record of that notification,

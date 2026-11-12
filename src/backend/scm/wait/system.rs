@@ -46,6 +46,9 @@ struct LastStatus {
     exit_specific: AtomicU32,
     wait_hint: AtomicU32,
     controls_accepted: AtomicU32,
+    /// The `dwNotificationStatus` of the delivery: 0, or the error SCM delivered it with, in which
+    /// case the other fields are not its status.
+    notification_status: AtomicU32,
     fired: AtomicBool,
 }
 
@@ -83,9 +86,21 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
     if slot.is_null() {
         return;
     }
+    // A delivery with an error status carries no valid `ServiceStatus`: it reports the error alone.
+    let notification_status = unsafe { (*buf).dwNotificationStatus };
+    if notification_status != 0 {
+        unsafe {
+            (*slot)
+                .notification_status
+                .store(notification_status, Ordering::Release);
+            (*slot).fired.store(true, Ordering::Release);
+        }
+        return;
+    }
     let status = unsafe { &(*buf).ServiceStatus };
     let state = status.dwCurrentState;
     unsafe {
+        (*slot).notification_status.store(0, Ordering::Release);
         (*slot).exit_win32.store(status.dwWin32ExitCode, Ordering::Release);
         (*slot)
             .exit_specific
@@ -195,6 +210,7 @@ impl SystemScmActor {
                 exit_specific: AtomicU32::new(0),
                 wait_hint: AtomicU32::new(0),
                 controls_accepted: AtomicU32::new(0),
+                notification_status: AtomicU32::new(0),
                 fired: AtomicBool::new(false),
             }),
             notify: Box::default(),
@@ -421,6 +437,10 @@ impl super::ScmActor for SystemScmActor {
         // and processed (that is what set `fired`) — nothing from this
         // registration remains outstanding. See `close_and_drain`.
         self.registration_outstanding = false;
+        let failed = self.status.notification_status.load(Ordering::Acquire);
+        if failed != 0 {
+            return Ok(Some(Observed::Failed(failed)));
+        }
         let state = self.status.current_state.load(Ordering::Acquire);
         Ok(Some(if state == SERVICE_RUNNING {
             Observed::Running

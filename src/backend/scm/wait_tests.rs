@@ -174,28 +174,24 @@ impl FakeScm {
         self
     }
 
-    /// Whether the notification `observed` is one the latest `arm`'s mask admits. `Pending` is
-    /// either pending state.
+    /// Whether SCM can deliver the notification `observed` under the latest `arm`'s mask: the state it
+    /// reports is in the mask. `Pending` is `STOP_PENDING`, the one pending state a mask names. A failed
+    /// delivery is not gated by the mask.
     fn mask_admits(&self, observed: Observed) -> bool {
-        use QueriedState::{Paused, Running, StartPending, StopPending, Stopped};
-        let admits = |state| self.mask.contains(&state);
-        match observed {
-            Observed::Running => admits(Running),
-            Observed::Paused => admits(Paused),
-            Observed::Stopped => admits(Stopped),
-            Observed::Pending => admits(StartPending) || admits(StopPending),
+        match self.state_of(observed) {
+            Some(state) => self.mask.contains(&state),
+            None => true,
         }
     }
 
-    /// The state `observed` reports. `Pending` is read off the mask, which names one pending state
-    /// when a pending state can be delivered at all.
-    fn state_of(&self, observed: Observed) -> QueriedState {
+    /// The state `observed` reports; `None` for a failed delivery, which reports none.
+    fn state_of(&self, observed: Observed) -> Option<QueriedState> {
         match observed {
-            Observed::Running => QueriedState::Running,
-            Observed::Paused => QueriedState::Paused,
-            Observed::Stopped => QueriedState::Stopped,
-            Observed::Pending if self.mask.contains(&QueriedState::StopPending) => QueriedState::StopPending,
-            Observed::Pending => QueriedState::StartPending,
+            Observed::Running => Some(QueriedState::Running),
+            Observed::Paused => Some(QueriedState::Paused),
+            Observed::Stopped => Some(QueriedState::Stopped),
+            Observed::Pending => Some(QueriedState::StopPending),
+            Observed::Failed(_) => None,
         }
     }
 
@@ -324,7 +320,7 @@ impl FakeScm {
     }
 }
 
-/// The notification of `state`; either pending state is [`Observed::Pending`].
+/// The notification of `state`; a pending state is [`Observed::Pending`].
 fn observed_in(state: QueriedState) -> Observed {
     match state {
         QueriedState::Running => Observed::Running,
@@ -460,7 +456,10 @@ impl ScmActor for FakeScm {
                         "FakeScm: {observed:?} scripted under the mask {:?}, which SCM does not fire it on",
                         self.mask
                     );
-                    self.state = Some(self.state_of(observed));
+                    // A failed delivery reports no state: the service is where it was.
+                    if let Some(state) = self.state_of(observed) {
+                        self.state = Some(state);
+                    }
                     self.deliveries += 1;
                 }
                 observed
@@ -471,6 +470,7 @@ impl ScmActor for FakeScm {
             Some(Observed::Running) => "got_running",
             Some(Observed::Paused) => "got_paused",
             Some(Observed::Pending) => "got_pending",
+            Some(Observed::Failed(_)) => "got_failed",
             None => "got_nothing",
         });
         self.last_accepts = self.accepts.pop_front().unwrap_or(true);
@@ -2418,7 +2418,6 @@ fn an_arm_refused_on_a_marked_service_that_is_not_where_the_wait_wants_it_is_an_
         .refusing_arms_in(STOPPED_ONLY);
     let mut settle = FakeScm::new([Some(Observed::Running)])
         .stop_replies([StopReply::Os(INVALID_SERVICE_CONTROL)])
-        .drifting_after(1, QueriedState::Running)
         .refusing_arms_in(RUNNING_ONLY);
     let errors = [
         ("stop", stop_via_notify(&mut stop, unbounded(), false).unwrap_err()),
@@ -2434,6 +2433,96 @@ fn an_arm_refused_on_a_marked_service_that_is_not_where_the_wait_wants_it_is_an_
             assert!(text.contains(part), "{name}: missing {part:?}: {text}");
         }
     }
+}
+
+/// A notification SCM delivers with an error status carries no state, so no wait takes it for a verdict:
+/// each re-arms and decides on what the arm reads.
+const FAILED_DELIVERIES: [u32; 3] = [ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, 5];
+
+#[skuld::test]
+fn a_failed_delivery_is_re_armed_by_every_wait_and_the_arms_read_decides() {
+    for code in FAILED_DELIVERIES {
+        let mut settle =
+            FakeScm::new([Some(Observed::Failed(code)), Some(Observed::Stopped)]).queried(QueriedState::Running, true);
+        assert_eq!(
+            settle_and_stop(&mut settle, unbounded()).unwrap(),
+            Waited::Confirmed,
+            "{code}"
+        );
+        assert_eq!(
+            settle.log,
+            vec![
+                "arm_settle",
+                "wait",
+                "got_failed",
+                "arm_settle",
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_stopped"
+            ],
+            "settle {code}"
+        );
+        assert!(settle.bad_stops.is_empty(), "{code}: {:?}", settle.bad_stops);
+
+        let mut start = FakeScm::new([Some(Observed::Failed(code)), Some(Observed::Running)]);
+        assert_eq!(
+            start_via_notify(&mut start, unbounded(), Kind::Simple).unwrap(),
+            Waited::Confirmed,
+            "{code}"
+        );
+        assert_eq!(
+            start.log,
+            vec![
+                "start",
+                "arm_settle",
+                "wait",
+                "got_failed",
+                "arm_settle",
+                "wait",
+                "got_running"
+            ],
+            "start {code}"
+        );
+
+        let mut stop = FakeScm::new([Some(Observed::Failed(code)), Some(Observed::Stopped)]);
+        assert_eq!(
+            stop_via_notify(&mut stop, unbounded(), false).unwrap(),
+            Waited::Confirmed,
+            "{code}"
+        );
+        assert_eq!(
+            stop.log,
+            vec![
+                "control_stop",
+                "arm_stopped",
+                "wait",
+                "got_failed",
+                "arm_stopped_only",
+                "wait",
+                "got_stopped"
+            ],
+            "stop {code}"
+        );
+    }
+}
+
+/// An uninstall racing `sc delete`: the delivery fails with 1072 and the re-arm is refused (or finds the
+/// service gone), so the status read in its place says it is stopped.
+#[skuld::test]
+fn settle_and_stop_is_confirmed_when_a_failed_delivery_is_followed_by_an_arm_on_a_marked_or_deleted_service() {
+    let mut marked = FakeScm::new([Some(Observed::Failed(ERROR_SERVICE_MARKED_FOR_DELETE))])
+        .queried(QueriedState::Running, true)
+        .drifting_after(1, QueriedState::Stopped)
+        .refusing_arms_in(STOPPED_ONLY);
+    assert_eq!(settle_and_stop(&mut marked, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(marked.log, vec!["arm_settle", "wait", "got_failed", "arm_settle"]);
+
+    let mut gone = FakeScm::new([Some(Observed::Failed(ERROR_SERVICE_MARKED_FOR_DELETE))])
+        .queried(QueriedState::Running, true)
+        .gone_at_arm(2);
+    assert_eq!(settle_and_stop(&mut gone, unbounded()).unwrap(), Waited::Confirmed);
+    assert_eq!(gone.log, vec!["arm_settle", "wait", "got_failed", "arm_settle"]);
 }
 
 /// A start wants `RUNNING`: a marked service read as that is started.
