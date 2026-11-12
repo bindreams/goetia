@@ -730,7 +730,8 @@ Where the bytes come from depends on the build:
 
 - The `goetia.exe` of a release embeds the shim, and the archive ships
   `goetia.exe` alone: a lone copy installs `type: simple` daemons.
-- `cargo install goetia` installs `goetia.exe` and `goetia-shim.exe`, and
+- `cargo install goetia` (an MSVC toolchain; other Windows targets fail to link)
+  installs `goetia.exe` and `goetia-shim.exe`, and
   `goetia.exe` reads the one beside it. If that file is missing, `install` and
   `install --dry-run` fail naming its path.
 
@@ -773,7 +774,31 @@ Any program that ships a stock shim adds one file, `src/bin/goetia-shim.rs`:
 goetia::stock_shim!();
 ```
 
-and chooses how it reaches the machine.
+and a `build.rs` that hardens it, as goetia hardens its own binaries: its imports
+and its `LoadLibrary` calls without flags search System32 only, not the shim's
+folder (Windows MSVC; on other Windows targets and Cygwin the package's bins, and
+so its integration tests and benches, fail to link, while the library still builds):
+
+```toml
+[build-dependencies]
+libsearch-guard = "0.1.1"
+```
+
+```rust
+// build.rs
+fn main() {
+    // Without this, cargo reruns the script after a change to any file in the package.
+    println!("cargo:rerun-if-changed=build.rs");
+    libsearch_guard::bins();
+}
+```
+
+That covers every `[[bin]]` of the package, the program itself included: once
+hardened, a DLL it ships beside itself must be loaded with explicit flags, and its
+VC runtime is linked statically. The
+[libsearch-guard README](https://github.com/bindreams/libsearch-guard#readme)
+lists what runs before the guard and how to load a sidecar DLL. The program then
+chooses how the shim reaches the machine.
 
 **Installer places the file.** The installer puts `goetia-shim.exe` in the
 product folder, and the program points goetia at it:
