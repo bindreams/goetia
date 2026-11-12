@@ -6,19 +6,11 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use super::*;
+use crate::backend::scm::test_support::{spent, unbounded};
 use crate::backend::scm::wait::Waited;
-use crate::manager::budget::{Budget, Deadline};
+use crate::manager::budget::Deadline;
 
 type Log = Rc<RefCell<Vec<String>>>;
-
-fn unbounded() -> Deadline {
-    Budget::Unbounded.start()
-}
-
-/// An already-spent deadline: the only kind under which the fake reports an expiry.
-fn spent() -> Deadline {
-    Budget::Immediate.start()
-}
 
 /// The kind of a failed `service_pid`: not `Other`, so a test sees whether a kind is kept.
 const READ_FAILED_KIND: io::ErrorKind = io::ErrorKind::TimedOut;

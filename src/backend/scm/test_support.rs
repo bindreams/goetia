@@ -1,5 +1,16 @@
 //! Fixtures shared by the SCM unit tests: byte layouts of registry string values, and a service's blob.
 
+/// A deadline that never passes: a wait under it never expires.
+pub(crate) fn unbounded() -> crate::manager::budget::Deadline {
+    crate::manager::budget::Budget::Unbounded.start()
+}
+
+/// An already-spent deadline: the only kind under which a fake reports an expiry. The script is what
+/// makes a wait expire; this is what the code under test is told it has left.
+pub(crate) fn spent() -> crate::manager::budget::Deadline {
+    crate::manager::budget::Budget::Immediate.start()
+}
+
 /// The bytes goetia stores for a string value: UTF-16LE and one closing NUL.
 pub(crate) fn sz(text: &str) -> Vec<u8> {
     units_bytes(&text.encode_utf16().chain([0]).collect::<Vec<_>>())

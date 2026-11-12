@@ -1,13 +1,15 @@
 //! Pure orchestration tests for [`super::stop_via_notify`]/
 //! [`super::start_via_notify`] against a scripted [`super::ScmActor`] — no
 //! real SCM involved, so these run on every platform and need no elevation.
-//! Expiry is driven by the script, never by the clock: nothing here waits.
+//! Expiry is driven by the script, never by the clock: nothing here waits. A scripted expiry is
+//! reported only under a deadline that has passed ([`spent`]); the fakes assert it.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
 
 use super::*;
 use crate::backend::scm::exit_status::{RecordedExit, Reported};
+use crate::backend::scm::test_support::{spent, unbounded};
 use crate::manager::budget::{Budget, Deadline};
 use crate::spec::Kind;
 
@@ -262,7 +264,8 @@ impl FakeScm {
         self
     }
 
-    /// Every `arm` reports `reports` rather than `Waited::Confirmed`.
+    /// Every `arm` reports `reports` rather than `Waited::Confirmed`. `Waited::Expired` needs a deadline
+    /// that has passed ([`spent`]): `arm` asserts it.
     fn arming(mut self, reports: Waited) -> Self {
         self.what_arm_reports = reports;
         self
@@ -482,16 +485,6 @@ impl ScmActor for FakeScm {
 fn shim_failed() -> RecordedExit {
     let (win32, specific) = Reported::shim_failure(None).scm_codes();
     RecordedExit { win32, specific }
-}
-
-fn unbounded() -> Deadline {
-    Budget::Unbounded.start()
-}
-
-/// An already-spent deadline. The fake's script is what makes a wait report
-/// expiry; this is only what the state machine is *told* it has left.
-fn spent() -> Deadline {
-    Budget::Immediate.start()
 }
 
 #[skuld::test]
@@ -3570,15 +3563,10 @@ fn a_held_process_that_outlasts_the_stop_is_a_wait_timeout_naming_its_pid() {
         &mut fake,
         &Id::try_from("frpc").unwrap(),
         budget,
-        budget.start(),
+        spent(),
         &answer,
         |_| Ok(HoldOutcome::Held(7u32)),
-        |process, _| {
-            Ok(EndProcessOutcome::Lingers {
-                process,
-                terminate_failed: None,
-            })
-        },
+        ending(|_| Ok(()), |_, _, _| Ok(Waited::Expired)),
     )
     .unwrap_err();
 
@@ -3749,8 +3737,9 @@ fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked
 }
 
 /// A stop SCM cannot deliver (a service that does not accept STOP) fails an uninstall with the service's
-/// own cause. Someone else's marking is said, with the kill hint, and is not goetia's own failure; an
-/// unmarked service is told disabled and not deleted.
+/// own cause, and does not end the process it held (`no_end_of` fails the test if it is ended). Someone
+/// else's marking is said, with the kill hint, and is not goetia's own failure; an unmarked service is
+/// told disabled and not deleted.
 #[cfg(windows)]
 #[skuld::test]
 fn an_uninstall_over_a_service_that_does_not_accept_stop_is_a_stop_failure_whether_or_not_it_was_marked() {
@@ -3767,7 +3756,7 @@ fn an_uninstall_over_a_service_that_does_not_accept_stop_is_a_stop_failure_wheth
             &answer,
             marked,
             None,
-            None::<fn() -> crate::error::Result<HoldOutcome<u32>>>,
+            Some(|| Ok(HoldOutcome::Held(7u32))),
             no_end_of,
         )
         .expect_err("a service that does not accept STOP is not stopped");
