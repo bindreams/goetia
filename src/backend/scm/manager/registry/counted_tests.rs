@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use windows_sys::Win32::Foundation::ERROR_KEY_DELETED;
 use winreg::enums::HKEY_LOCAL_MACHINE;
 
-use crate::testing::elevation::{ELEVATED, elevated};
+use crate::testing::groups::{Group, scm_group};
 use crate::testing::scratch::ScratchKey;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
@@ -115,8 +115,8 @@ fn units(text: &str) -> Vec<u16> {
 /// Writes keys under `HKLM\SOFTWARE`. KEY_DELETED at the open of `name` itself says that the held
 /// parent was marked deleted, which loses the delete's target: an error. A child that is not found
 /// is done.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_child_of_a_parent_marked_deleted_is_an_error_and_a_child_not_found_is_done() {
+#[skuld::test]
+fn a_child_of_a_parent_marked_deleted_is_an_error_and_a_child_not_found_is_done(#[fixture(scm_group)] _group: &Group) {
     let scratch = ScratchKey::new(&format!("counted-{}-parent", std::process::id()));
     let parent = scratch.create();
 
@@ -136,8 +136,8 @@ fn a_child_of_a_parent_marked_deleted_is_an_error_and_a_child_not_found_is_done(
 /// the top of `delete_tree`; the branch that opens a grandchild of a key deleted meanwhile needs an
 /// interleaving between the walk's listing and its open, which the real registry cannot be made to
 /// give without a hook in the walk.
-#[skuld::test(requires = [elevated], labels = [ELEVATED])]
-fn a_key_marked_deleted_while_the_walk_holds_it_is_done_at_its_listing() {
+#[skuld::test]
+fn a_key_marked_deleted_while_the_walk_holds_it_is_done_at_its_listing(#[fixture(scm_group)] _group: &Group) {
     let scratch = ScratchKey::new(&format!("counted-{}-listing", std::process::id()));
     let parent = scratch.create();
     let (top, _) = parent.create_subkey("Top").expect("create Top");

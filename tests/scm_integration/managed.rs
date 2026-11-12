@@ -23,7 +23,7 @@ use crate::support::raw_registry::{create_link, create_raw_key, set_raw_value};
 use crate::support::registry::{
     create_parameters_key, parameters_key, service_key, try_parameters_key, try_service_key,
 };
-use crate::support::{self, ConnectBack, ELEVATED, ScratchKey, ServiceGuard};
+use crate::support::{self, ConnectBack, Group, ScratchKey, ServiceGuard, scm_group};
 
 /// Held by every test that denies an elevated reader something under
 /// `HKLM\SYSTEM\CurrentControlSet\Services` (the `Parameters` key or a service object), by every
@@ -89,8 +89,8 @@ fn hand_edit(id: &str) {
 /// `SCM_DENIAL`: seeding `UNDETERMINED_ID` denies an elevated reader one service's
 /// `Parameters` for the length of the run, which puts an `Undetermined` entry naming that id in
 /// every concurrent `list()` (a nameless aggregate if another service is unreadable too).
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn scm_passes_conformance() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn scm_passes_conformance(#[fixture(scm_group)] _group: &Group) {
     let _foreign_guard = ServiceGuard::new(conformance::FOREIGN_ID);
     seed_foreign(conformance::FOREIGN_ID);
 
@@ -114,8 +114,8 @@ fn scm_passes_conformance() {
 
 // Step 2: round trip, conflict, start/stop/status, uninstall, list ====================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn install_then_list_round_trips_without_the_source_file() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn install_then_list_round_trips_without_the_source_file(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -150,8 +150,8 @@ fn install_then_list_round_trips_without_the_source_file() {
 
 /// SCM matches service names case-insensitively, so a request for `ID` reaches the service
 /// installed as `id`. Neither `install` (forced or not) nor `preview_install` may write over it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let upper = id.to_uppercase();
@@ -191,8 +191,8 @@ fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged() {
 /// always sends a real `dwStartType`. An update that restated the create default instead would undo
 /// `enable` here, silently. `enable` rather than `disable` is the one to pin: a fresh service is
 /// already demand-start, so a service reset to the default would still read as disabled.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn an_update_keeps_the_start_type_enable_set() {
+#[skuld::test]
+fn an_update_keeps_the_start_type_enable_set(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -216,8 +216,8 @@ fn an_update_keeps_the_start_type_enable_set() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn sc_config_binpath_change_is_detected_as_conflict() {
+#[skuld::test]
+fn sc_config_binpath_change_is_detected_as_conflict(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -241,8 +241,8 @@ fn sc_config_binpath_change_is_detected_as_conflict() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn start_stop_status_reflect_reality() {
+#[skuld::test]
+fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -283,8 +283,8 @@ fn reporting(id: &str, restart: Restart, started: &ConnectBack, stopped: &Connec
     .unwrap()
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_killed_on_failure_daemon_comes_back_with_a_new_pid() {
+#[skuld::test]
+fn a_killed_on_failure_daemon_comes_back_with_a_new_pid(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -295,8 +295,8 @@ fn a_killed_on_failure_daemon_comes_back_with_a_new_pid() {
     support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &started);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_killed_never_restart_daemon_stays_down() {
+#[skuld::test]
+fn a_killed_never_restart_daemon_stays_down(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -320,8 +320,8 @@ fn a_killed_never_restart_daemon_stays_down() {
 /// `kill` returns once SCM has recorded the exit, so for a service that never restarts the first
 /// `status` after it reads not-running and has no pid. The shared `a_killed_daemon_that_never_restarts_stays_down` waits for that state
 /// instead; this is the contract it hides.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn kill_returns_once_scm_has_recorded_the_exit() {
+#[skuld::test]
+fn kill_returns_once_scm_has_recorded_the_exit(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -341,8 +341,8 @@ fn kill_returns_once_scm_has_recorded_the_exit() {
     assert_eq!(status.pid, None, "a killed daemon has no process ({status:?})");
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn killing_a_stopped_service_is_not_running() {
+#[skuld::test]
+fn killing_a_stopped_service_is_not_running(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -360,8 +360,8 @@ fn killing_a_stopped_service_is_not_running() {
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn uninstall_leaves_nothing() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -380,8 +380,8 @@ fn uninstall_leaves_nothing() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn list_ignores_foreign_services() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn list_ignores_foreign_services(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     seed_foreign(guard.id());
@@ -396,8 +396,8 @@ fn list_ignores_foreign_services() {
 
 // Step 3: uninstall then immediate reinstall ==========================================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn uninstall_then_immediate_reinstall_succeeds() {
+#[skuld::test]
+fn uninstall_then_immediate_reinstall_succeeds(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -425,8 +425,8 @@ fn uninstall_then_immediate_reinstall_succeeds() {
 
 // Step 4: uninstall reports a service that will not stop, leaves it disabled, and is re-runnable ======================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn uninstall_errors_when_service_will_not_stop() {
+#[skuld::test]
+fn uninstall_errors_when_service_will_not_stop(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -484,8 +484,8 @@ fn uninstall_errors_when_service_will_not_stop() {
 /// Measures which code SCM gives a STOP to a RUNNING service that accepts none (the unit tests
 /// script 1052 and 1061 alike): `stop` reads the status either way and returns the "does not accept
 /// STOP" error at once. The call returns; a wait would hang.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting() {
+#[skuld::test]
+fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -517,8 +517,8 @@ fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting() {
 
 // Step 5: an install interrupted before the metadata write is recoverable =============================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn interrupted_install_is_recoverable() {
+#[skuld::test]
+fn interrupted_install_is_recoverable(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -558,8 +558,8 @@ fn interrupted_install_is_recoverable() {
 
 // Step 6: env on type: managed (spec §8 must-verify #5) ===============================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn managed_kind_environment_availability() {
+#[skuld::test]
+fn managed_kind_environment_availability(#[fixture(scm_group)] _group: &Group) {
     const VAR: &str = "GOETIA_SCM_ENV_PROBE";
     const VALUE: &str = "goetia-managed-env-probe-value";
 
@@ -637,8 +637,8 @@ fn install_with_environment(mgr: &Scm, id: &str) -> DaemonSpec {
     spec
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_hand_edited_environment_is_a_conflict() {
+#[skuld::test]
+fn a_hand_edited_environment_is_a_conflict(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -653,8 +653,8 @@ fn a_hand_edited_environment_is_a_conflict() {
     assert_eq!(environment_of(&id), Some(vec![INSTALLED_ENVIRONMENT.to_string()]));
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_deleted_environment_is_a_conflict() {
+#[skuld::test]
+fn a_deleted_environment_is_a_conflict(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -669,8 +669,8 @@ fn a_deleted_environment_is_a_conflict() {
 }
 
 /// Failure actions are compared too, and `sc.exe` is how they are edited by hand.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn reset_failure_actions_are_a_conflict() {
+#[skuld::test]
+fn reset_failure_actions_are_a_conflict(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -690,8 +690,8 @@ fn reset_failure_actions_are_a_conflict() {
 }
 
 /// A wrong-typed `Environment` is a hand edit too: a `Conflict` that `--force` clears, not an error.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_wrong_typed_environment_is_a_conflict() {
+#[skuld::test]
+fn a_wrong_typed_environment_is_a_conflict(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -707,8 +707,8 @@ fn a_wrong_typed_environment_is_a_conflict() {
 }
 
 /// The registry stores any type number; `winreg` cannot read one above `REG_QWORD` (11).
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
+#[skuld::test]
+fn an_environment_of_an_unknown_registry_type_is_a_conflict(#[fixture(scm_group)] _group: &Group) {
     const UNKNOWN_TYPE: u32 = 12;
 
     let mgr = Scm::new();
@@ -730,8 +730,8 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict() {
 /// service's `Environment` is empty on both sides, whatever its spec's `env` says. It is registered
 /// but never started, so the shim is only provided and checked, never run: its manager has a provider,
 /// which `Scm::new()` has not.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn install_twice_is_up_to_date_for_both_kinds() {
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn install_twice_is_up_to_date_for_both_kinds(#[fixture(scm_group)] _group: &Group) {
     for kind in [Kind::Managed, Kind::Simple] {
         let mgr = match kind {
             Kind::Managed => Scm::new(),
@@ -764,8 +764,8 @@ fn install_twice_is_up_to_date_for_both_kinds() {
 
 /// goetia owns `Parameters` whole: `install --force` removes a stray value and a subkey, and a
 /// marker stored in another case is still ours, so the service reads as unchanged afterwards.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn force_install_removes_strays_from_parameters_and_keeps_the_service_ours() {
+#[skuld::test]
+fn force_install_removes_strays_from_parameters_and_keeps_the_service_ours(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -800,8 +800,8 @@ fn force_install_removes_strays_from_parameters_and_keeps_the_service_ours() {
 
 /// A stray subkey, or a value that is not a string, is the only difference from what goetia wrote:
 /// it is still a `Conflict`, and `install --force` removes it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes() {
+#[skuld::test]
+fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -831,8 +831,8 @@ fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes() {
 
 /// `RegDeleteTreeW` follows a registry link: a stray link under `Parameters` would have its target
 /// wiped. `--force` deletes the link itself and leaves the target as it was.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn force_install_deletes_a_stray_registry_link_and_leaves_its_target() {
+#[skuld::test]
+fn force_install_deletes_a_stray_registry_link_and_leaves_its_target(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     // Declared first, so that it is removed last.
@@ -861,8 +861,10 @@ fn force_install_deletes_a_stray_registry_link_and_leaves_its_target() {
 /// its target: so a service whose `Parameters` was replaced by a link to a key holding goetia's four
 /// values is no longer goetia's. `list` omits it, `status` and `install`, forced or not, refuse it as
 /// foreign, and the target and the link are as they were.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_target_and_link_alone() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_target_and_link_alone(
+    #[fixture(scm_group)] _group: &Group,
+) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     // Declared first, so that it is removed last.
@@ -933,8 +935,8 @@ fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_t
 
 /// `RegDeleteTreeW` below the top level stops at a NUL, so a stray subkey holding a child named
 /// `a\0b` would stay. `--force` removes the whole subtree.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn force_install_removes_a_stray_subkey_holding_a_child_whose_name_has_a_nul() {
+#[skuld::test]
+fn force_install_removes_a_stray_subkey_holding_a_child_whose_name_has_a_nul(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -956,8 +958,8 @@ fn force_install_removes_a_stray_subkey_holding_a_child_whose_name_has_a_nul() {
 
 /// What `winreg` cannot enumerate must still be drift that `install --force` removes: a goetia field
 /// stored as `REG_EXPAND_SZ`, a value of a type above `REG_QWORD`, and a name that is not valid UTF-16.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn force_install_removes_strays_that_winreg_cannot_enumerate() {
+#[skuld::test]
+fn force_install_removes_strays_that_winreg_cannot_enumerate(#[fixture(scm_group)] _group: &Group) {
     const REG_SZ: u32 = 1;
     const REG_EXPAND_SZ: u32 = 2;
     const CUSTOM_TYPE: u32 = 0x20;
@@ -1006,8 +1008,8 @@ fn force_install_removes_strays_that_winreg_cannot_enumerate() {
 
 /// `RegDeleteValueW` stops at a NUL, so a stray `Marker\0x` would delete goetia's `Marker` or stay.
 /// `--force` removes it by its whole name and leaves goetia's four values as they were.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn force_install_removes_a_stray_whose_name_holds_a_nul_and_keeps_marker() {
+#[skuld::test]
+fn force_install_removes_a_stray_whose_name_holds_a_nul_and_keeps_marker(#[fixture(scm_group)] _group: &Group) {
     const REG_SZ: u32 = 1;
     let mgr = Scm::new();
     let id = support::random_test_id();
@@ -1035,8 +1037,10 @@ fn force_install_removes_a_stray_whose_name_holds_a_nul_and_keeps_marker() {
 }
 
 /// The key is rewritten, never replaced: a handle opened before `--force` reads the new values after.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn force_install_rewrites_parameters_in_place_so_a_handle_held_across_it_still_reads() {
+#[skuld::test]
+fn force_install_rewrites_parameters_in_place_so_a_handle_held_across_it_still_reads(
+    #[fixture(scm_group)] _group: &Group,
+) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1058,8 +1062,8 @@ fn force_install_rewrites_parameters_in_place_so_a_handle_held_across_it_still_r
 
 // Step 7: a real account gets SeServiceLogonRight =====================================================================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn real_account_gets_service_logon_right() {
+#[skuld::test]
+fn real_account_gets_service_logon_right(#[fixture(scm_group)] _group: &Group) {
     // Windows local (SAM) account names are capped at 20 characters.
     let suffix = format!("{:08x}", rand::random::<u32>());
     let account = format!("gt{suffix}");
@@ -1120,8 +1124,8 @@ fn real_account_gets_service_logon_right() {
 /// not delete this as redundant with `local_service_account_installs_and_
 /// round_trips` below, which never goes through `LookupAccountSidW` at
 /// all.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_well_known_sid_resolves_without_a_name_lookup() {
+#[skuld::test]
+fn a_well_known_sid_resolves_without_a_name_lookup(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1142,8 +1146,8 @@ fn a_well_known_sid_resolves_without_a_name_lookup() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn local_service_account_installs_and_round_trips() {
+#[skuld::test]
+fn local_service_account_installs_and_round_trips(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1169,8 +1173,8 @@ fn local_service_account_installs_and_round_trips() {
     assert!(matches!(second, Outcome::UpToDate), "{second:?}");
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_local_service_daemon_actually_runs() {
+#[skuld::test]
+fn a_local_service_daemon_actually_runs(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1204,8 +1208,8 @@ fn a_local_service_daemon_actually_runs() {
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP under LocalService");
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn local_system_by_name_installs_like_root() {
+#[skuld::test]
+fn local_system_by_name_installs_like_root(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1245,8 +1249,8 @@ fn local_system_by_name_installs_like_root() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_builtin_account_is_never_given_a_stale_password() {
+#[skuld::test]
+fn a_builtin_account_is_never_given_a_stale_password(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
 
@@ -1302,8 +1306,8 @@ fn missing_account() -> String {
     format!("gtnone{:08x}", rand::random::<u32>())
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_failed_precondition_creates_no_service() {
+#[skuld::test]
+fn a_failed_precondition_creates_no_service(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let account = missing_account();
@@ -1323,8 +1327,8 @@ fn a_failed_precondition_creates_no_service() {
     );
 }
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_failed_precondition_leaves_an_installed_service_unchanged() {
+#[skuld::test]
+fn a_failed_precondition_leaves_an_installed_service_unchanged(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1347,8 +1351,8 @@ fn a_failed_precondition_leaves_an_installed_service_unchanged() {
 
 // Round-tripping restart: on-failure (the Some(fa) branch of apply_failure_actions/read_failure_actions) ==============
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn restart_on_failure_round_trips_failure_actions() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn restart_on_failure_round_trips_failure_actions(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1382,8 +1386,8 @@ fn restart_on_failure_round_trips_failure_actions() {
 
 // Ownership::OursUnusable: a blob that decodes but whose account can no longer be resolved ============================
 
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn deleted_account_makes_the_service_oursunusable() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn deleted_account_makes_the_service_oursunusable(#[fixture(scm_group)] _group: &Group) {
     let suffix = format!("{:08x}", rand::random::<u32>());
     let account = format!("gt{suffix}");
     // <=14 chars: longer passwords make `net user ... /add` prompt
@@ -1441,8 +1445,8 @@ fn deleted_account_makes_the_service_oursunusable() {
 
 /// The generator refuses to regenerate a blob that says `restart: always`: an install over it is
 /// unusable, not a silent rewrite.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn install_refuses_an_always_blob_as_unusable() {
+#[skuld::test]
+fn install_refuses_an_always_blob_as_unusable(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1481,8 +1485,8 @@ fn install_refuses_an_always_blob_as_unusable() {
 ///
 /// `no_aggregate_entry_is_emitted_for_a_zero_count` already covers the code-only half (an aggregate
 /// emitted unconditionally); what this uniquely pins is the claim about the runner.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial)]
-fn an_elevated_list_leaves_nothing_undetermined() {
+#[skuld::test(labels = [SCM_DENIAL], serial)]
+fn an_elevated_list_leaves_nothing_undetermined(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1513,8 +1517,8 @@ fn an_elevated_list_leaves_nothing_undetermined() {
 /// was never read, so goetia established neither that it owns the id nor that it does not — and
 /// `Kind::Unusable` would put goetia's name and `uninstall`'s advice on what may be a stranger's
 /// service.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn status_of_a_service_whose_parameters_deny_reading_is_undetermined(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1551,8 +1555,8 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined() {
 /// open counts as standing. An explicit `Deny` ACE stops the elevated reader the same way (see
 /// `deny.rs`), so this stands in for an unelevated `list`, which this suite has no way to run. A
 /// goetia service with the same denial is still listed as its own, which shows that the scan reached it.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial)]
-fn list_reads_a_service_whose_own_key_denies_the_reader_as_standing() {
+#[skuld::test(labels = [SCM_DENIAL], serial)]
+fn list_reads_a_service_whose_own_key_denies_the_reader_as_standing(#[fixture(scm_group)] _group: &Group) {
     #[derive(Clone, Copy, Debug)]
     enum Seed {
         /// No `Parameters` key.
@@ -1623,8 +1627,8 @@ fn list_reads_a_service_whose_own_key_denies_the_reader_as_standing() {
 /// `registry::read_parameters` built: the key, the operation and the Win32 message. `list` used to
 /// match `Err(_)` and hand the entry a static sentence instead, which says nothing of a real Win32
 /// failure.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn list_reports_a_denied_parameters_read_with_the_cause_it_established() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn list_reports_a_denied_parameters_read_with_the_cause_it_established(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1721,8 +1725,10 @@ fn services_key() -> winreg::RegKey {
 ///
 /// `SCM_DENIAL`: the unreadable service puts an `Undetermined` entry naming it in every concurrent
 /// `list()`.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn a_service_key_that_is_a_link_to_a_missing_key_is_undetermined_for_list_and_status() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn a_service_key_that_is_a_link_to_a_missing_key_is_undetermined_for_list_and_status(
+    #[fixture(scm_group)] _group: &Group,
+) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1768,8 +1774,10 @@ fn a_service_key_that_is_a_link_to_a_missing_key_is_undetermined_for_list_and_st
 ///
 /// `SCM_DENIAL`: `status` here is `Undetermined`, and the service is a stranger to concurrent
 /// `list()` assertions.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn a_service_scm_holds_whose_key_is_gone_is_undetermined_for_status_and_not_listed() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn a_service_scm_holds_whose_key_is_gone_is_undetermined_for_status_and_not_listed(
+    #[fixture(scm_group)] _group: &Group,
+) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
@@ -1811,8 +1819,8 @@ fn a_service_scm_holds_whose_key_is_gone_is_undetermined_for_status_and_not_list
 /// opens the service object first, so a DACL denying `SERVICE_QUERY_CONFIG`/`SERVICE_QUERY_STATUS`
 /// stops goetia before it ever looks at the metadata. Fixing `read_parameters` alone would leave
 /// this path — and therefore `status` and `install` — still claiming ownership it never proved.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, SCM_DENIAL], serial = SCM_DENIAL)]
-fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
+#[skuld::test(labels = [SCM_DENIAL], serial = SCM_DENIAL)]
+fn status_of_a_service_whose_object_denies_querying_is_undetermined(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1853,8 +1861,10 @@ fn status_of_a_service_whose_object_denies_querying_is_undetermined() {
 ///
 /// Writes a real service's DACL, so it runs only on CI. `Denied` drops before `ServiceGuard`,
 /// restoring the DACL before the delete.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn enable_and_disable_of_a_service_that_denies_changing_its_config_fail_as_the_verb() {
+#[skuld::test]
+fn enable_and_disable_of_a_service_that_denies_changing_its_config_fail_as_the_verb(
+    #[fixture(scm_group)] _group: &Group,
+) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
@@ -1899,8 +1909,10 @@ fn enable_and_disable_of_a_service_that_denies_changing_its_config_fail_as_the_v
 /// there is `read`'s `Undetermined`.
 ///
 /// Writes a real service's DACL, so it runs only on CI.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn uninstall_of_a_service_that_denies_a_step_fails_as_the_verb_and_leaves_it_installed() {
+#[skuld::test]
+fn uninstall_of_a_service_that_denies_a_step_fails_as_the_verb_and_leaves_it_installed(
+    #[fixture(scm_group)] _group: &Group,
+) {
     type Case = (&'static str, fn(&str) -> Denied, &'static str);
     let cases: [Case; 2] = [
         (

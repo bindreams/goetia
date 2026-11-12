@@ -14,7 +14,7 @@ use goetia::spec::Id;
 use crate::linux::{
     UNIT_DIR_EXCLUSIVE, active_state_and_job, main_pid, mk, unit_path, wants_symlink, world_readable_manifest,
 };
-use crate::support::{self, ELEVATED, ServiceGuard};
+use crate::support::{self, Group, ServiceGuard, systemd_group};
 
 /// How a host shows that no systemd manager can be asked, each the way goetia must find it out.
 #[derive(Debug, Clone, Copy)]
@@ -243,8 +243,8 @@ fn installed(guard: &ServiceGuard) -> Id {
 }
 
 /// `install` writes nothing, `--start` or not: it is refused before the unit is written.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn an_install_where_no_manager_can_be_asked_writes_nothing() {
+#[skuld::test]
+fn an_install_where_no_manager_can_be_asked_writes_nothing(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let (_dir, manifest) = world_readable_manifest(guard.id());
@@ -263,8 +263,8 @@ fn an_install_where_no_manager_can_be_asked_writes_nothing() {
 
 /// `start`, `stop` and `restart` send nothing, under every budget: the unit stays where it was,
 /// with no job, and a restart leaves the same main process running.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_start_stop_or_restart_where_no_manager_can_be_asked_sends_nothing() {
+#[skuld::test]
+fn a_start_stop_or_restart_where_no_manager_can_be_asked_sends_nothing(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let mgr = Systemd::new();
@@ -293,8 +293,8 @@ fn a_start_stop_or_restart_where_no_manager_can_be_asked_sends_nothing() {
 
 /// `enable` and `disable` act on unit files where no manager runs, and say nothing: goetia refuses
 /// both before either touches the boot-enablement link.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn enable_or_disable_where_no_manager_can_be_asked_leaves_the_link_alone() {
+#[skuld::test]
+fn enable_or_disable_where_no_manager_can_be_asked_leaves_the_link_alone(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let mgr = Systemd::new();
@@ -313,8 +313,8 @@ fn enable_or_disable_where_no_manager_can_be_asked_leaves_the_link_alone() {
 }
 
 /// `uninstall` removes nothing and stops nothing: it is refused at its first step, the stop.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn an_uninstall_where_no_manager_can_be_asked_removes_nothing() {
+#[skuld::test]
+fn an_uninstall_where_no_manager_can_be_asked_removes_nothing(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let daemon = installed(&guard);
@@ -338,8 +338,8 @@ fn an_uninstall_where_no_manager_can_be_asked_removes_nothing() {
 ///
 /// `UNIT_DIR_EXCLUSIVE`: `status` for every daemon and `list` scan the host's unit directory before
 /// they are refused.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED, UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_live_state_read_where_no_manager_can_be_asked_is_refused() {
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_live_state_read_where_no_manager_can_be_asked_is_refused(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let mgr = Systemd::new();
@@ -373,8 +373,8 @@ fn a_live_state_read_where_no_manager_can_be_asked_is_refused() {
 
 /// The verbs that never reach the manager answer from files alone, as they always did:
 /// `install --dry-run`, `diff`, and `show --file`.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn the_verbs_that_never_reach_the_manager_are_untouched() {
+#[skuld::test]
+fn the_verbs_that_never_reach_the_manager_are_untouched(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let (_dir, manifest) = world_readable_manifest(guard.id());
@@ -474,8 +474,8 @@ fn in_a_chroot(root: &Path, manifest: &Path, unit: &str, user: &str, shape: &str
 /// "Running in chroot" — and writes nothing into the chroot, and asks the host's manager nothing.
 /// The daemon's unit is installed on the host, and copied into the chroot for every verb but
 /// `install`.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn every_verb_in_a_real_chroot_is_refused_before_anything_runs() {
+#[skuld::test]
+fn every_verb_in_a_real_chroot_is_refused_before_anything_runs(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
@@ -531,8 +531,8 @@ fn every_verb_in_a_real_chroot_is_refused_before_anything_runs() {
 /// a tmpfs root's mount is another, and a directory that is no mount has none at `/` — which
 /// goetia's own table shows even where a `hidepid=2` `/proc` hides PID 1's. The daemon's unit is
 /// goetia's, in the chroot only.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs() {
+#[skuld::test]
+fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
@@ -573,8 +573,8 @@ fn an_unelevated_state_read_in_a_real_chroot_is_refused_before_anything_runs() {
 /// is what refuses, in its own words: the version gate's `show` says it ignored the question. A
 /// `systemctl` that could not be run there would be `failed to run` instead, and the chroot
 /// unnamed.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_chroot_without_proc_is_refused_by_systemctl_s_own_report() {
+#[skuld::test]
+fn a_chroot_without_proc_is_refused_by_systemctl_s_own_report(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
@@ -613,8 +613,8 @@ fn a_chroot_without_proc_is_refused_by_systemctl_s_own_report() {
 /// is: `/run/systemd/system` is missing there too, but systemd did boot this machine, and the
 /// chroot is the more specific cause. Elevated `/proc/1/root` shows it, and unelevated the mount
 /// tables do.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_chroot_without_run_is_refused_as_a_chroot() {
+#[skuld::test]
+fn a_chroot_without_run_is_refused_as_a_chroot(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let (_manifest_dir, manifest) = world_readable_manifest(guard.id());
@@ -651,8 +651,10 @@ fn a_chroot_without_run_is_refused_as_a_chroot() {
 /// honours [`SILENCERS`] and [`unlistable`] — all of which goetia carries in its own environment
 /// here. A child that kept them looks away, exits `0` having announced no job, and goetia reports a
 /// start that never happened.
-#[skuld::test(requires = [support::elevated], labels = [ELEVATED])]
-fn a_watched_request_a_systemctl_ignored_is_refused_whatever_the_environment_said() {
+#[skuld::test]
+fn a_watched_request_a_systemctl_ignored_is_refused_whatever_the_environment_said(
+    #[fixture(systemd_group)] _group: &Group,
+) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let _daemon = installed(&guard);

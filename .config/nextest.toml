@@ -8,7 +8,7 @@ fail-fast = false
 # with fixed deadlines; run in parallel, they miss those deadlines.
 test-threads = 1
 slow-timeout = { period = "60s", terminate-after = 5 }
-# Name every skipped test (a skuld `requires` that does not hold, such as elevation) in the log:
+# Name every skipped test (a skuld `requires` that does not hold, such as a test group set to `0`) in the log:
 # this project forbids a silent skip.
 status-level = "skip"
 final-status-level = "skip"
