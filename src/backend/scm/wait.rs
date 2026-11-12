@@ -547,8 +547,9 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// process can be waited for after `STOPPED`: just before each STOP is sent, once the state it is
 /// sent on has settled (a start in flight at the disable replaces the process, which no earlier read
 /// can say; a STOP that is refused and sent again runs it again), and once, before the wait, for a
-/// service the first arm finds `STOP_PENDING`, which is stopping without a STOP of ours (someone
-/// else's, or a `stop` whose wait ran out) and has its process still. Its error ends the wait, with
+/// service an arm first reads `STOP_PENDING`, which is stopping without a STOP of ours (someone
+/// else's, or a `stop` whose wait ran out) and has its process still, whether the first arm finds it
+/// so or a service that was starting turns so while the loop waits. Its error ends the wait, with
 /// no STOP sent after it: it is returned as a [`SettleError::Hold`].
 pub(crate) fn settle_and_stop<A: ScmActor, E>(
     a: &mut A,
@@ -559,15 +560,14 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so a
     // `RUNNING`, `PAUSED` or `STOPPED` service is read from the notification; the status it returns
     // is for the states the mask excludes, `STOP_PENDING` among them, which no notification reports.
+    // Whether the process of a service seen `STOP_PENDING` is held: once, however often a read shows it.
+    let mut stop_pending_held = false;
     match decided_or_status(
         a.arm(WantState::RunningPausedOrStopped, deadline)?,
         QueriedState::Stopped,
     )? {
         Err(end) => return Ok(judged(end, shim)?),
-        Ok(status) if status.state == QueriedState::StopPending => {
-            hold(a).map_err(|error| SettleError::Hold { error, under_way: true })?;
-        }
-        Ok(_) => {}
+        Ok(status) => hold_if_stop_pending(a, status.state, &mut stop_pending_held, &mut hold)?,
     }
     // What the status returned by the latest re-arm showed, when it is a state to act on.
     let mut read = None;
@@ -596,6 +596,7 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
                     Ok(status) => status,
                     Err(end) => return Ok(judged(end, shim)?),
                 };
+                hold_if_stop_pending(a, status.state, &mut stop_pending_held, &mut hold)?;
                 read = seen_in(status);
             }
             Seen::Settled { state, accepts_stop } => {
@@ -621,6 +622,7 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
                             Ok(status) => status,
                             Err(end) => return Ok(judged(end, shim)?),
                         };
+                        hold_if_stop_pending(a, status.state, &mut stop_pending_held, &mut hold)?;
                         read = seen_in(status);
                     }
                     Err(e) => return Err(e.into()),
@@ -628,6 +630,21 @@ pub(crate) fn settle_and_stop<A: ScmActor, E>(
             }
         }
     }
+}
+
+/// Takes hold of the process of a service whose `state`, read by an arm, is `STOP_PENDING`: it is
+/// stopping without a STOP of ours, and has its process still. Once per [`settle_and_stop`] (`held`),
+/// whichever read shows it first. Its failure is [`SettleError::Hold`], under way.
+fn hold_if_stop_pending<A: ScmActor, E>(
+    a: &mut A,
+    state: QueriedState,
+    held: &mut bool,
+    hold: &mut impl FnMut(&mut A) -> Result<(), E>,
+) -> Result<(), SettleError<E>> {
+    if state != QueriedState::StopPending || std::mem::replace(held, true) {
+        return Ok(());
+    }
+    hold(a).map_err(|error| SettleError::Hold { error, under_way: true })
 }
 
 /// How [`settle_and_stop`] failed.

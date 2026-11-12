@@ -1101,6 +1101,7 @@ fn a_stop_failure_leaves_the_service_disabled_and_names_the_previous_start_type_
     ] {
         let text = uninstall_failure(&UninstallFailure::Stop {
             previous: Some(previous),
+            ours: false,
         });
         assert!(text.contains("does not accept STOP"), "{previous:?}: {text}");
         assert!(text.contains("NOT deleted"), "{previous:?}: {text}");
@@ -1118,7 +1119,7 @@ fn a_stop_failure_leaves_the_service_disabled_and_names_the_previous_start_type_
 
 #[skuld::test]
 fn a_stop_failure_with_an_unknown_previous_start_type_omits_it() {
-    let text = uninstall_failure(&UninstallFailure::Stop { previous: None });
+    let text = uninstall_failure(&UninstallFailure::Stop { previous: None, ours: false });
     assert!(text.contains("does not accept STOP"), "{text}");
     assert!(text.contains("NOT deleted"), "{text}");
     assert!(text.contains("disabled"), "{text}");
@@ -1129,12 +1130,31 @@ fn a_stop_failure_with_an_unknown_previous_start_type_omits_it() {
     }
 }
 
+/// A hold that failed before a STOP is goetia's own failure: it does not blame the service's refusal
+/// of STOP or send the person to `goetia daemon kill`, which is for a service that does not accept STOP.
+#[skuld::test]
+fn a_hold_failure_before_a_stop_of_an_unmarked_service_says_it_was_goetias_own() {
+    let text = uninstall_failure(&UninstallFailure::Stop {
+        previous: Some(ServiceStartType::AutoStart),
+        ours: true,
+    });
+    assert_eq!(
+        text,
+        "`frpc` could not be stopped: `uninstall` could not hold its process before a STOP, so it sent no STOP \
+         after that; the failure was goetia's own, not the service's. It is still running, was NOT deleted and \
+         is now disabled, so `goetia daemon start frpc` fails. Its start type was automatic; \
+         `goetia daemon enable frpc` sets it again. Re-run `goetia daemon uninstall frpc` to retry: \
+         failed to stop `frpc`: does not accept STOP"
+    );
+}
+
 /// A retry reads the `disabled` an earlier `uninstall` left, which is not the original type.
 #[skuld::test]
 fn a_previous_start_type_of_disabled_is_not_presented_as_the_original() {
     for text in [
         uninstall_failure(&UninstallFailure::Stop {
             previous: Some(ServiceStartType::Disabled),
+            ours: false,
         }),
         uninstall_failure(&UninstallFailure::Delete {
             previous: Some(ServiceStartType::Disabled),
