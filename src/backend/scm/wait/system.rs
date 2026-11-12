@@ -46,6 +46,9 @@ struct LastStatus {
     exit_specific: AtomicU32,
     wait_hint: AtomicU32,
     controls_accepted: AtomicU32,
+    /// The `dwNotificationStatus` of the delivery: 0, or the error SCM delivered it with, in which
+    /// case the other fields are not its status.
+    notification_status: AtomicU32,
     fired: AtomicBool,
 }
 
@@ -83,9 +86,21 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
     if slot.is_null() {
         return;
     }
+    // A delivery with an error status carries no valid `ServiceStatus`: it reports the error alone.
+    let notification_status = unsafe { (*buf).dwNotificationStatus };
+    if notification_status != 0 {
+        unsafe {
+            (*slot)
+                .notification_status
+                .store(notification_status, Ordering::Release);
+            (*slot).fired.store(true, Ordering::Release);
+        }
+        return;
+    }
     let status = unsafe { &(*buf).ServiceStatus };
     let state = status.dwCurrentState;
     unsafe {
+        (*slot).notification_status.store(0, Ordering::Release);
         (*slot).exit_win32.store(status.dwWin32ExitCode, Ordering::Release);
         (*slot)
             .exit_specific
@@ -96,6 +111,24 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
             .store(status.dwControlsAccepted, Ordering::Release);
         (*slot).current_state.store(state, Ordering::Release);
         (*slot).fired.store(true, Ordering::Release);
+    }
+}
+
+/// What the delivery `notify_callback` stored in `status` reported.
+fn observed(status: &LastStatus) -> Observed {
+    let failed = status.notification_status.load(Ordering::Acquire);
+    if failed != 0 {
+        return Observed::Failed(failed);
+    }
+    let state = status.current_state.load(Ordering::Acquire);
+    if state == SERVICE_RUNNING {
+        Observed::Running
+    } else if state == SERVICE_PAUSED {
+        Observed::Paused
+    } else if state == SERVICE_STOPPED {
+        Observed::Stopped
+    } else {
+        Observed::Pending
     }
 }
 
@@ -195,6 +228,7 @@ impl SystemScmActor {
                 exit_specific: AtomicU32::new(0),
                 wait_hint: AtomicU32::new(0),
                 controls_accepted: AtomicU32::new(0),
+                notification_status: AtomicU32::new(0),
                 fired: AtomicBool::new(false),
             }),
             notify: Box::default(),
@@ -421,16 +455,7 @@ impl super::ScmActor for SystemScmActor {
         // and processed (that is what set `fired`) — nothing from this
         // registration remains outstanding. See `close_and_drain`.
         self.registration_outstanding = false;
-        let state = self.status.current_state.load(Ordering::Acquire);
-        Ok(Some(if state == SERVICE_RUNNING {
-            Observed::Running
-        } else if state == SERVICE_PAUSED {
-            Observed::Paused
-        } else if state == SERVICE_STOPPED {
-            Observed::Stopped
-        } else {
-            Observed::Pending
-        }))
+        Ok(Some(observed(&self.status)))
     }
 
     fn delivered_exit(&self) -> RecordedExit {
@@ -466,3 +491,7 @@ impl super::ScmActor for SystemScmActor {
         self.status.controls_accepted.load(Ordering::Acquire)
     }
 }
+
+#[cfg(test)]
+#[path = "system_tests.rs"]
+mod system_tests;
