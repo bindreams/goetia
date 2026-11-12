@@ -1053,7 +1053,7 @@ fn run_sc(args: &[&str]) -> Result<()> {
 /// can meet 1060 at the first open.
 ///
 /// With `hold`, the service's process is held once it is disabled: just before each STOP, once the
-/// state has settled, or once for a service seen `STOP_PENDING`, with no STOP of ours. It is
+/// state has settled, or at once for a service already `STOP_PENDING`, with no STOP of ours. It is
 /// handed back in [`Uninstalled::Deleted`] for the caller to wait for: SCM records `STOPPED`
 /// before the process exits, and reports no pid after it. It may be running an older file than the
 /// one registered (an `Update` it has not restarted into), which no read of the registry shows. A
@@ -1123,7 +1123,7 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
 /// The stop of an uninstall, over the actor it disabled the service through: the STOP, or the wait for
 /// one under way, on notifications, with no bound (see [`uninstall_locked`]). A service not known not to
 /// run a shim has its record judged, as `stop` judges it. `hold` takes hold of the service's process
-/// before each STOP and once for a service seen `STOP_PENDING`, and `None` holds nothing. A
+/// before each STOP and once for a service already `STOP_PENDING`, and `None` holds nothing. A
 /// `Some(hold)` must be unbounded: it never returns [`HoldOutcome::Expired`]. `end` ends a held process
 /// whose stop was incomplete, as `stop` ends it. `marked` and `previous` are what the disable found,
 /// which a failure tells.
@@ -1654,7 +1654,7 @@ enum UninstallFailure {
     Untouched,
     /// The disable that precedes the delete failed. Whether it changed the start type is unknown.
     DisableFailed,
-    /// The stop failed on a service no one had marked for deletion. It is running and disabled;
+    /// The stop failed on a service no one had marked for deletion. It is disabled;
     /// `previous` is its start type before. `ours` is whether the failure was goetia's own and not the
     /// service's: `true` only when the hold before a STOP failed (see [`uninstall_stop_on`]), `false` for
     /// a failure of the stop itself.
@@ -1699,8 +1699,8 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
         ),
         UninstallFailure::Stop { previous, ours: true } => format!(
             "`{id}` could not be stopped: `uninstall` could not hold its process before a STOP, so it sent no \
-             STOP after that; the failure was goetia's own, not the service's. It is still running, was NOT \
-             deleted and is now disabled, so `goetia daemon start {id}` fails.{} Re-run \
+             STOP after that; the failure was goetia's own, not the service's. `uninstall` did not stop it. \
+             It was NOT deleted and is now disabled, so `goetia daemon start {id}` fails.{} Re-run \
              `goetia daemon uninstall {id}` to retry",
             previous_start_type(id, *previous)
         ),

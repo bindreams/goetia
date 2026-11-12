@@ -1081,13 +1081,16 @@ fn an_unconfirmed_stop_names_the_process_scm_still_named_and_is_a_wait_timeout()
 // uninstall's failures ================================================================================================
 
 fn uninstall_failure(state: &UninstallFailure) -> String {
-    uninstall_failed(
-        &Id::try_from("frpc").unwrap(),
+    uninstall_failure_of(
         state,
         Error::os("stop `frpc`", std::io::Error::other("does not accept STOP")),
     )
-    .report()
-    .to_string()
+}
+
+fn uninstall_failure_of(state: &UninstallFailure, cause: Error) -> String {
+    uninstall_failed(&Id::try_from("frpc").unwrap(), state, cause)
+        .report()
+        .to_string()
 }
 
 #[skuld::test]
@@ -1134,20 +1137,33 @@ fn a_stop_failure_with_an_unknown_previous_start_type_omits_it() {
 }
 
 /// A hold that failed before a STOP is goetia's own failure: it does not blame the service's refusal
-/// of STOP or send the person to `goetia daemon kill`, which is for a service that does not accept STOP.
+/// of STOP or send the person to `goetia daemon kill`, which takes the same hold. It does not say the
+/// service is still running: the hold runs on a paused service too, and a STOP refused earlier may have
+/// been delivered.
 #[skuld::test]
 fn a_hold_failure_before_a_stop_of_an_unmarked_service_says_it_was_goetias_own() {
-    let text = uninstall_failure(&UninstallFailure::Stop {
-        previous: Some(ServiceStartType::AutoStart),
-        ours: true,
-    });
+    let cause = Error::Step {
+        what: "`frpc`'s process could not be held to wait for its exit".to_string(),
+        source: Box::new(Error::os(
+            "hold `frpc`'s process to wait for its exit",
+            std::io::Error::other("no hold"),
+        )),
+    };
+    let text = uninstall_failure_of(
+        &UninstallFailure::Stop {
+            previous: Some(ServiceStartType::AutoStart),
+            ours: true,
+        },
+        cause,
+    );
     assert_eq!(
         text,
         "`frpc` could not be stopped: `uninstall` could not hold its process before a STOP, so it sent no STOP \
-         after that; the failure was goetia's own, not the service's. It is still running, was NOT deleted and \
-         is now disabled, so `goetia daemon start frpc` fails. Its start type was automatic; \
+         after that; the failure was goetia's own, not the service's. `uninstall` did not stop it. It was NOT \
+         deleted and is now disabled, so `goetia daemon start frpc` fails. Its start type was automatic; \
          `goetia daemon enable frpc` sets it again. Re-run `goetia daemon uninstall frpc` to retry: \
-         failed to stop `frpc`: does not accept STOP"
+         `frpc`'s process could not be held to wait for its exit: failed to hold `frpc`'s process to wait for \
+         its exit: no hold"
     );
 }
 
