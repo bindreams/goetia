@@ -2317,9 +2317,8 @@ fn an_empty_command_is_rejected_like_a_missing_one() {
 
 #[skuld::test]
 fn an_empty_user_name_is_rejected_on_every_backend() {
-    // Guards the seam: `resolve_shape` must carry `reject_blank` across from
-    // `resolve_one`. See `reject_blank`'s doc comment (`resolve.rs`) for why
-    // an empty account name is dangerous rather than merely odd.
+    // Guards the seam: `resolve_shape` must run `reject_blank` on the user. See `reject_blank`'s
+    // doc comment (`resolve.rs`) for why an empty account name is dangerous rather than merely odd.
     assert!(resolve_yaml("id: frpc\ncommand: [/bin/frpc]\nuser: \"\"\n").is_err());
     assert!(resolve_yaml("id: frpc\ncommand: [/bin/frpc]\nuser:\n  id: \"\"\n").is_err());
 }
