@@ -182,7 +182,11 @@ fn a_nul_in_a_user_name_is_refused_when_building_a_daemon_spec_directly() {
         ..plain_fields("frpc", vec![program("frpc")])
     })
     .expect_err("a NUL in `user.name` is refused");
-    assert!(err.to_string().contains("field `user.name` contains a control character"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("field `user.name` contains a control character"),
+        "{err}"
+    );
 }
 
 // The rules check what the user wrote ---------------------------------------------------------------------------------
