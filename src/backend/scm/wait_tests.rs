@@ -351,6 +351,10 @@ impl ScmActor for FakeScm {
         self.fresh_arm = std::mem::take(&mut self.fresh_handle);
         self.at_once = None;
         if self.what_arm_reports == Waited::Expired {
+            assert!(
+                deadline.expired(),
+                "FakeScm: an arm reports an expiry only once its deadline has passed; an unbounded or unspent deadline never expires"
+            );
             return Ok(Armed::Expired);
         }
         // The status is read after the registration, so the service can move in between.
@@ -570,12 +574,22 @@ fn no_end_of(process: u32) -> Result<EndProcessOutcome<u32>, ProcessWaitFailure>
 }
 
 /// [`end_process`] over `terminate` and `exit`, in the shape [`stop_and_await_exit`] takes: the one
-/// function both `stop` and `uninstall` end the process they held with.
+/// function both `stop` and `uninstall` end the process they held with. It is the one builder of
+/// these fakes, so `exit` cannot report an expiry before the deadline it was given has passed.
 fn ending(
     terminate: impl FnOnce(&u32) -> io::Result<()>,
     exit: impl FnOnce(&u32, Deadline, Option<&io::Error>) -> io::Result<Waited>,
 ) -> impl FnOnce(u32, Deadline) -> Result<EndProcessOutcome<u32>, ProcessWaitFailure> {
-    move |process, deadline| end_process(process, deadline, terminate, exit)
+    move |process, deadline| {
+        end_process(process, deadline, terminate, |process, by, terminate_failed| {
+            let waited = exit(process, by, terminate_failed);
+            assert!(
+                !matches!(waited, Ok(Waited::Expired)) || by.expired(),
+                "ending: a wait for the process expires only once its deadline has passed; an unbounded or unspent deadline never expires"
+            );
+            waited
+        })
+    }
 }
 
 /// SCM records `STOPPED` before the service's process exits, so a stop that held the process ends it
@@ -619,7 +633,7 @@ fn stop_and_await_exit_names_the_process_that_outlasts_the_deadline() {
 
     let outcome = stop_and_await_exit(
         &mut fake,
-        unbounded(),
+        spent(),
         &mut HoldOutcome::Held(7u32),
         false,
         ending(|_| Ok(()), |_, _, _| Ok(Waited::Expired)),
@@ -729,10 +743,10 @@ fn end_process_is_done_when_the_process_exits_after_a_failed_terminate() {
 fn end_process_keeps_a_failed_terminate_for_the_wait_and_for_the_expiry() {
     let told = std::cell::RefCell::new(None);
 
-    let outcome = end_process(7u32, unbounded(), terminate_fails, |_, _, terminate_failed| {
+    let outcome = ending(terminate_fails, |_, _, terminate_failed| {
         *told.borrow_mut() = terminate_failed.map(ToString::to_string);
         Ok(Waited::Expired)
-    });
+    })(7u32, spent());
 
     let EndProcessOutcome::Lingers {
         process,
@@ -863,7 +877,7 @@ fn stop_and_await_exit_ends_the_process_as_end_process_does_after_a_failed_termi
     let mut fake = FakeScm::new([Some(Observed::Stopped)]);
     let outcome = stop_and_await_exit(
         &mut fake,
-        unbounded(),
+        spent(),
         &mut HoldOutcome::Held(7u32),
         false,
         ending(terminate_fails, |_, _, _| Ok(Waited::Expired)),
@@ -3210,7 +3224,7 @@ fn an_incomplete_stop_says_when_the_held_process_was_not_ended() {
         let mut fake = incomplete(FakeScm::new([Some(Observed::Stopped)]));
         let err = stop_and_await_exit(
             &mut fake,
-            unbounded(),
+            spent(),
             &mut HoldOutcome::Held(7u32),
             true,
             ending(|_| terminate, |_, _, _| exit),
