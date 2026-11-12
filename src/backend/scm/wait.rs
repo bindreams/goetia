@@ -549,12 +549,13 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// can say; a STOP that is refused and sent again runs it again), and once, before the wait, for a
 /// service the first arm finds `STOP_PENDING`, which is stopping without a STOP of ours (someone
 /// else's, or a `stop` whose wait ran out) and has its process still. Its error ends the wait, with
-/// no STOP sent. [`HoldKind`] tells it which of the two it is run for.
+/// no STOP sent; for the second of the two it is [`HoldUnderWayFailed`], which says there was none to
+/// send.
 pub(crate) fn settle_and_stop<A: ScmActor>(
     a: &mut A,
     deadline: Deadline,
     shim: bool,
-    mut hold: impl FnMut(&mut A, HoldKind) -> io::Result<()>,
+    mut hold: impl FnMut(&mut A) -> io::Result<()>,
 ) -> io::Result<Waited> {
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so a
     // `RUNNING`, `PAUSED` or `STOPPED` service is read from the notification; the status it returns
@@ -564,7 +565,9 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
         QueriedState::Stopped,
     )? {
         Err(end) => return judged(end, shim),
-        Ok(status) if status.state == QueriedState::StopPending => hold(a, HoldKind::StopUnderWay)?,
+        Ok(status) if status.state == QueriedState::StopPending => {
+            hold(a).map_err(|e| io::Error::other(HoldUnderWayFailed(e)))?;
+        }
         Ok(_) => {}
     }
     // What the status returned by the latest re-arm showed, when it is a state to act on.
@@ -603,7 +606,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
                     )));
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
-                hold(a, HoldKind::BeforeStop)?;
+                hold(a)?;
                 match a.control_stop() {
                     Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested, shim),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
@@ -627,13 +630,22 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
     }
 }
 
-/// Which of its two moments [`settle_and_stop`] runs its `hold` at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HoldKind {
-    /// The service was found `STOP_PENDING`: no STOP of ours is sent to it.
-    StopUnderWay,
-    /// Just before a STOP of ours.
-    BeforeStop,
+/// The failure of [`settle_and_stop`]'s `hold` for a service found `STOP_PENDING`, which no STOP of ours
+/// was to be sent to. It displays as the failure it wraps.
+#[derive(Debug)]
+pub(crate) struct HoldUnderWayFailed(io::Error);
+
+impl std::fmt::Display for HoldUnderWayFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for HoldUnderWayFailed {}
+
+/// Whether `e` is a [`HoldUnderWayFailed`].
+pub(crate) fn is_hold_under_way_failed(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|source| source.is::<HoldUnderWayFailed>())
 }
 
 /// What [`settle_and_stop`] learned, from a notification or from the status an arm returned.

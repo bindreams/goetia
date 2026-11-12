@@ -1290,49 +1290,25 @@ fn a_marked_service_whose_stop_goetia_failed_blames_goetia_and_not_whoever_marke
     }
 }
 
-/// A service already stopping had no STOP of ours: it is told as stopping, with the wait, the retry and
-/// `kill` for a stop that never ends, and a marked one claims no disable.
+/// A service already stopping had no STOP of ours, and the hold that failed ended goetia's wait: it is
+/// told as stopping, as goetia's own failure, with the wait, the retry and `kill` for a stop that never
+/// ends. Checked as the whole rendered sentence.
 #[skuld::test]
 fn an_uninstall_over_a_stop_already_under_way_says_so_and_advises_waiting_then_retrying() {
-    let text = uninstall_failure(&UninstallFailure::StopUnderWay {
-        previous: Some(ServiceStartType::AutoStart),
-        marked: false,
-    });
-    assert!(text.contains("already stopping (STOP_PENDING)"), "{text}");
-    assert!(text.contains("sent no STOP"), "{text}");
-    assert!(text.contains("NOT deleted and is now disabled"), "{text}");
-    assert!(text.contains("goetia daemon enable frpc"), "{text}");
-    assert!(
-        text.contains("Once it has stopped, re-run `goetia daemon uninstall frpc`"),
-        "{text}"
+    let cause = Error::os("hold `frpc`'s process", std::io::Error::other("held badly"));
+    let Error::Step { what, .. } = uninstall_failed(
+        &Id::try_from("frpc").unwrap(),
+        &UninstallFailure::StopUnderWay {
+            previous: Some(ServiceStartType::AutoStart),
+        },
+        cause,
+    ) else {
+        panic!("an uninstall failure is a step");
+    };
+    assert_eq!(
+        what,
+        "`frpc` is already stopping (STOP_PENDING). `uninstall` could not hold its process, so it ended          its wait for the stop; that failure was goetia's own, not the service's. It was NOT deleted and is          now disabled, so `goetia daemon start frpc` fails. Its start type was automatic;          `goetia daemon enable frpc` sets it again. Once it has stopped, re-run          `goetia daemon uninstall frpc` to retry; if it never stops, run `goetia daemon kill frpc`"
     );
-    assert!(
-        text.contains("if it never stops, run `goetia daemon kill frpc`"),
-        "{text}"
-    );
-    assert!(!text.contains("could not be stopped"), "no STOP was sent: {text}");
-
-    let marked = uninstall_failure(&UninstallFailure::StopUnderWay {
-        previous: None,
-        marked: true,
-    });
-    assert!(marked.contains("already stopping (STOP_PENDING)"), "{marked}");
-    assert!(
-        marked.contains("already marked for deletion by someone else"),
-        "{marked}"
-    );
-    assert!(marked.contains("goetia daemon kill frpc"), "{marked}");
-    for stale in [
-        "NOT deleted",
-        "disabled",
-        "goetia daemon uninstall",
-        "could not be stopped",
-    ] {
-        assert!(
-            !marked.contains(stale),
-            "`{stale}` is false for a marked service: {marked}"
-        );
-    }
 }
 
 /// The service is stopped and the shim could not end the daemon's tree: `kill` does nothing to a stopped
