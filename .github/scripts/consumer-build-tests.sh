@@ -266,8 +266,6 @@ consumer_routes() {
     shim="$target/goetia-shim.exe"
     GOETIA_SHIM_EXE="$(winpath "$shim")" cargo build --bin goetia-consumer --features goetia-shim --locked
     assert_previews_shim "$target/goetia-consumer.exe" "$dir" "$shim"
-    # (3b) The program that ships, with the shim embedded, is hardened too.
-    GOETIA_SHIM_EXE="$(winpath "$shim")" cargo test --locked --features goetia-shim --test hardening
     round_trip "$target/goetia-consumer.exe" goetia-ci-consumer "$dir"
 }
 

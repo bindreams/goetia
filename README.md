@@ -730,7 +730,8 @@ Where the bytes come from depends on the build:
 
 - The `goetia.exe` of a release embeds the shim, and the archive ships
   `goetia.exe` alone: a lone copy installs `type: simple` daemons.
-- `cargo install goetia` installs `goetia.exe` and `goetia-shim.exe`, and
+- `cargo install goetia` (an MSVC toolchain; other Windows targets fail to link)
+  installs `goetia.exe` and `goetia-shim.exe`, and
   `goetia.exe` reads the one beside it. If that file is missing, `install` and
   `install --dry-run` fail naming its path.
 
@@ -775,8 +776,8 @@ goetia::stock_shim!();
 
 and a `build.rs` that hardens it, as goetia hardens its own binaries: its imports
 and its `LoadLibrary` calls without flags search System32 only, not the shim's
-folder (Windows MSVC; on other Windows targets the bins fail to link, while the
-library still builds):
+folder (Windows MSVC; on other Windows targets and Cygwin the package's bins, and
+so its integration tests and benches, fail to link, while the library still builds):
 
 ```toml
 [build-dependencies]

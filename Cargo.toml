@@ -164,7 +164,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [build-dependencies]
-# `build.rs` hardens every `[[bin]]` against loading a DLL from its own folder (Windows MSVC; no-op elsewhere).
+# `build.rs` hardens every `[[bin]]` against loading a DLL from its own folder on Windows MSVC; other Windows
+# targets and Cygwin fail the bins' link (the library still builds); a no-op off Windows.
 libsearch-guard = "0.1.1"
 
 [dev-dependencies]
