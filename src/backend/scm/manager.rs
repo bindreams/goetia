@@ -112,8 +112,8 @@ use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 use self::registry::RegistryReadOutcome;
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
-    EndProcessOutcome, ProcessWaitFailure, StopAndAwaitExitOutcome, Waited, end_on_incomplete_stop, end_process,
-    is_incomplete_stop,
+    EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, Waited, carried,
+    end_on_incomplete_stop, end_process,
 };
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
@@ -1123,8 +1123,9 @@ fn uninstall_locked(scm: &WinServiceManager, id: &Id, answer: &ShimAnswer, hold:
 /// The stop of an uninstall, over the actor it disabled the service through: the STOP, or the wait for
 /// one under way, on notifications, with no bound (see [`uninstall_locked`]). A service not known not to
 /// run a shim has its record judged, as `stop` judges it. `hold` takes hold of the service's process
-/// before each STOP, and `None` holds nothing; `end` ends a held process whose stop was incomplete, as
-/// `stop` ends it. `marked` and `previous` are what the disable found, which a failure tells.
+/// before each STOP and once for a service already `STOP_PENDING`, and `None` holds nothing; `end` ends
+/// a held process whose stop was incomplete, as `stop` ends it. `marked` and `previous` are what the
+/// disable found, which a failure tells.
 ///
 /// The process held when the service is stopped, for the caller to wait for once it is deleted.
 pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
@@ -1136,35 +1137,40 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
     mut hold: Option<impl FnMut() -> Result<HoldOutcome<P>>>,
     end: impl FnOnce(P) -> std::result::Result<EndProcessOutcome<P>, ProcessWaitFailure>,
 ) -> Result<HoldOutcome<P>> {
-    // Taken again for each STOP the loop sends, so the one kept is the process that STOP is for, and
-    // once for a service that is already `STOP_PENDING`, which no STOP of ours is sent to.
+    // Taken again for each STOP the loop sends, so the one kept is the process that STOP is for.
     let mut process = HoldOutcome::NoProcess;
-    let mut hold_failed = None;
     let settled = super::wait::settle_and_stop(actor, Budget::Unbounded.start(), answer.judges_stop_record(), |_| {
         let Some(hold) = hold.as_mut() else {
             return Ok(());
         };
-        match hold() {
+        match hold()? {
             // Only a bounded hold expires, and this one is not: told rather than gone on from.
-            Ok(HoldOutcome::Expired { pid }) => {
-                hold_failed = Some(Error::os(
-                    format!("hold `{id}`'s process"),
-                    std::io::Error::other(format!(
-                        "the hold expired with SCM still naming process {pid}, though it has no bound: goetia's own error"
-                    )),
-                ));
-                Err(std::io::Error::other("the service's process could not be held"))
-            }
-            Ok(held) => {
+            HoldOutcome::Expired { pid } => Err(Error::os(
+                format!("hold `{id}`'s process"),
+                std::io::Error::other(format!(
+                    "the hold expired with SCM still naming process {pid}, though it has no bound: goetia's own error"
+                )),
+            )),
+            held => {
                 process = held;
                 Ok(())
             }
-            Err(e) => {
-                hold_failed = Some(e);
-                Err(std::io::Error::other("the service's process could not be held"))
-            }
         }
     });
+    // A failed hold is goetia's own doing, not that of whoever marked the service.
+    let settled = match settled {
+        Ok(waited) => Ok(waited),
+        Err(SettleError::Other(e)) => Err(e),
+        Err(SettleError::Hold { error, under_way }) => {
+            let state = match (marked, under_way) {
+                (true, true) => UninstallFailure::AlreadyMarkedStopUnderWay,
+                (true, false) => UninstallFailure::AlreadyMarked { ours: true },
+                (false, true) => UninstallFailure::StopUnderWay { previous },
+                (false, false) => UninstallFailure::Stop { previous },
+            };
+            return Err(uninstall_failed(id, &state, error));
+        }
+    };
     // Ends the held shim process before the failure is reported.
     let settled = end_on_incomplete_stop(settled, &mut process, end);
     // An unbounded deadline never expires. Told as a failure, not dropped, so that a later edit
@@ -1183,15 +1189,13 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
         Ok(()) => Ok(process),
         Err(e) => {
             // A stop the shim could not complete is a stopped service, which a re-run reads the same.
-            // An expiry or a failed hold is goetia's own doing, not that of whoever marked the service.
-            let ours = expired || hold_failed.is_some();
-            let state = match (is_incomplete_stop(&e), marked) {
+            // An expiry is goetia's own doing, not that of whoever marked the service.
+            let state = match (carried::<IncompleteStop>(&e).is_some(), marked) {
                 (true, _) => UninstallFailure::DaemonMayRun { previous, marked },
-                (false, true) => UninstallFailure::AlreadyMarked { ours },
+                (false, true) => UninstallFailure::AlreadyMarked { ours: expired },
                 (false, false) => UninstallFailure::Stop { previous },
             };
-            let cause = hold_failed.unwrap_or_else(|| Error::os(format!("stop `{id}`"), e));
-            Err(uninstall_failed(id, &state, cause))
+            Err(uninstall_failed(id, &state, Error::os(format!("stop `{id}`"), e)))
         }
     }
 }
@@ -1673,6 +1677,12 @@ enum UninstallFailure {
     /// or disable it. Its wait may already have sent a STOP before it failed. `ours` is whether the
     /// failure was goetia's own (its hold or its unbounded wait) and not the service's.
     AlreadyMarked { ours: bool },
+    /// The hold of the process of a service found `STOP_PENDING` failed, on a service someone else had
+    /// marked for deletion: goetia's own failure, which ended its wait with no STOP of ours sent.
+    AlreadyMarkedStopUnderWay,
+    /// As `AlreadyMarkedStopUnderWay`, on a service no one had marked: it is disabled, with `previous`
+    /// its start type before, and was not deleted.
+    StopUnderWay { previous: Option<ServiceStartType> },
     /// The service is stopped, and SCM recorded the code the shim uses for failing to end the daemon's
     /// process tree. Unless `marked` (someone else had marked it for deletion) it is disabled, with
     /// `previous` its start type before, and was not deleted.
@@ -1705,6 +1715,12 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
              `goetia daemon uninstall {id}` to retry",
             previous_start_type(id, *previous)
         ),
+        UninstallFailure::AlreadyMarkedStopUnderWay => format!(
+            "`{id}` is already stopping (STOP_PENDING), and was already marked for deletion, so `uninstall` \
+             did not delete it. `uninstall` sent no STOP: it could not hold the process, so it ended its wait \
+             for the stop; that failure was goetia's own, not the service's. It is removed once it stops and \
+             its last handle closes"
+        ),
         UninstallFailure::AlreadyMarked { ours } => {
             let (by, tail) = if *ours {
                 (
@@ -1719,6 +1735,13 @@ fn uninstall_failed(id: &Id, state: &UninstallFailure, cause: Error) -> Error {
                  so `uninstall` did not delete it. It is removed once it stops and its last handle closes{tail}"
             )
         }
+        UninstallFailure::StopUnderWay { previous } => format!(
+            "`{id}` is already stopping (STOP_PENDING). `uninstall` could not hold its process, so it ended \
+             its wait for the stop; that failure was goetia's own, not the service's. It was NOT deleted and is \
+             now disabled, so `goetia daemon start {id}` fails.{} Once it has stopped, re-run \
+             `goetia daemon uninstall {id}` to retry; if it never stops, run `goetia daemon kill {id}`",
+            previous_start_type(id, *previous)
+        ),
         UninstallFailure::DaemonMayRun { previous, marked } => {
             let left = if *marked {
                 "It was already marked for deletion by someone else, so `uninstall` did not delete it; \

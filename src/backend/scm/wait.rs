@@ -317,7 +317,7 @@ pub(crate) fn end_on_incomplete_stop<P, T>(
     let Err(e) = waited else {
         return waited;
     };
-    let Some(incomplete) = e.get_ref().and_then(|source| source.downcast_ref::<IncompleteStop>()) else {
+    let Some(incomplete) = carried::<IncompleteStop>(&e) else {
         return Err(e);
     };
     let Some(process) = take_held(held) else {
@@ -549,13 +549,13 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// can say; a STOP that is refused and sent again runs it again), and once, before the wait, for a
 /// service the first arm finds `STOP_PENDING`, which is stopping without a STOP of ours (someone
 /// else's, or a `stop` whose wait ran out) and has its process still. Its error ends the wait, with
-/// no STOP sent.
-pub(crate) fn settle_and_stop<A: ScmActor>(
+/// no STOP sent after it: it is returned as a [`SettleError::Hold`].
+pub(crate) fn settle_and_stop<A: ScmActor, E>(
     a: &mut A,
     deadline: Deadline,
     shim: bool,
-    mut hold: impl FnMut(&mut A) -> io::Result<()>,
-) -> io::Result<Waited> {
+    mut hold: impl FnMut(&mut A) -> Result<(), E>,
+) -> Result<Waited, SettleError<E>> {
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so a
     // `RUNNING`, `PAUSED` or `STOPPED` service is read from the notification; the status it returns
     // is for the states the mask excludes, `STOP_PENDING` among them, which no notification reports.
@@ -563,8 +563,10 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
         a.arm(WantState::RunningPausedOrStopped, deadline)?,
         QueriedState::Stopped,
     )? {
-        Err(end) => return judged(end, shim),
-        Ok(status) if status.state == QueriedState::StopPending => hold(a)?,
+        Err(end) => return Ok(judged(end, shim)?),
+        Ok(status) if status.state == QueriedState::StopPending => {
+            hold(a).map_err(|error| SettleError::Hold { error, under_way: true })?;
+        }
         Ok(_) => {}
     }
     // What the status returned by the latest re-arm showed, when it is a state to act on.
@@ -585,29 +587,30 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
             }
         };
         match seen {
-            Seen::Stopped(status) => return judged(WaitEnd::confirmed_by(status), shim),
+            Seen::Stopped(status) => return Ok(judged(WaitEnd::confirmed_by(status), shim)?),
             Seen::Pending => {
                 let status = match decided_or_status(
                     a.arm(WantState::RunningPausedOrStopped, deadline)?,
                     QueriedState::Stopped,
                 )? {
                     Ok(status) => status,
-                    Err(end) => return judged(end, shim),
+                    Err(end) => return Ok(judged(end, shim)?),
                 };
                 read = seen_in(status);
             }
             Seen::Settled { state, accepts_stop } => {
                 if !accepts_stop {
-                    return Err(io::Error::other(format!(
-                        "the service is {state} and does not accept STOP"
-                    )));
+                    return Err(io::Error::other(format!("the service is {state} and does not accept STOP")).into());
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
-                hold(a)?;
+                hold(a).map_err(|error| SettleError::Hold {
+                    error,
+                    under_way: false,
+                })?;
                 match a.control_stop() {
-                    Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested, shim),
+                    Ok(()) => return Ok(wait_after_stop(a, deadline, "", StopSeen::Requested, shim)?),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
-                        return wait_after_stop(a, deadline, "", StopSeen::Requested, shim);
+                        return Ok(wait_after_stop(a, deadline, "", StopSeen::Requested, shim)?);
                     }
                     Err(e) if is_stop_refusal(&e) => {
                         refused = e.raw_os_error();
@@ -616,15 +619,40 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
                             QueriedState::Stopped,
                         )? {
                             Ok(status) => status,
-                            Err(end) => return judged(end, shim),
+                            Err(end) => return Ok(judged(end, shim)?),
                         };
                         read = seen_in(status);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
         }
     }
+}
+
+/// How [`settle_and_stop`] failed.
+#[derive(Debug)]
+pub(crate) enum SettleError<E> {
+    /// The `hold` failed.
+    Hold {
+        error: E,
+        /// Whether the hold was of a service found `STOP_PENDING`, which no STOP of ours was to be sent
+        /// to, and not one before a STOP of ours. A hold before a STOP may follow an earlier refused STOP.
+        under_way: bool,
+    },
+    /// Anything else: SCM, the wait or the STOP failed.
+    Other(io::Error),
+}
+
+impl<E> From<io::Error> for SettleError<E> {
+    fn from(e: io::Error) -> Self {
+        SettleError::Other(e)
+    }
+}
+
+/// The `T` that `e` carries as its source, if it does.
+pub(crate) fn carried<T: std::error::Error + 'static>(e: &io::Error) -> Option<&T> {
+    e.get_ref().and_then(|source| source.downcast_ref::<T>())
 }
 
 /// What [`settle_and_stop`] learned, from a notification or from the status an arm returned.
@@ -737,11 +765,6 @@ impl std::fmt::Display for IncompleteStop {
 }
 
 impl std::error::Error for IncompleteStop {}
-
-/// Whether `e` is an [`IncompleteStop`].
-pub(crate) fn is_incomplete_stop(e: &io::Error) -> bool {
-    e.get_ref().is_some_and(|source| source.is::<IncompleteStop>())
-}
 
 /// What a wait for `STOPPED` came to, judged: a confirmed `STOPPED` whose record is the shim's
 /// incomplete-stop one is the failure [`IncompleteStop`] when `shim` says the record is to be judged, and
