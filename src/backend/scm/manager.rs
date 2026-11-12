@@ -1141,36 +1141,31 @@ pub(super) fn uninstall_stop_on<A: super::wait::ScmActor, P>(
     // once for a service that is already `STOP_PENDING`, which no STOP of ours is sent to.
     let mut process = HoldOutcome::NoProcess;
     let mut hold_failed = None;
-    let settled = super::wait::settle_and_stop(
-        actor,
-        Budget::Unbounded.start(),
-        answer.judges_stop_record(),
-        |_| {
-            let Some(hold) = hold.as_mut() else {
-                return Ok(());
-            };
-            match hold() {
-                // Only a bounded hold expires, and this one is not: told rather than gone on from.
-                Ok(HoldOutcome::Expired { pid }) => {
-                    hold_failed = Some(Error::os(
-                        format!("hold `{id}`'s process"),
-                        std::io::Error::other(format!(
-                            "the hold expired with SCM still naming process {pid}, though it has no bound: goetia's own error"
-                        )),
-                    ));
-                    Err(std::io::Error::other("the service's process could not be held"))
-                }
-                Ok(held) => {
-                    process = held;
-                    Ok(())
-                }
-                Err(e) => {
-                    hold_failed = Some(e);
-                    Err(std::io::Error::other("the service's process could not be held"))
-                }
+    let settled = super::wait::settle_and_stop(actor, Budget::Unbounded.start(), answer.judges_stop_record(), |_| {
+        let Some(hold) = hold.as_mut() else {
+            return Ok(());
+        };
+        match hold() {
+            // Only a bounded hold expires, and this one is not: told rather than gone on from.
+            Ok(HoldOutcome::Expired { pid }) => {
+                hold_failed = Some(Error::os(
+                    format!("hold `{id}`'s process"),
+                    std::io::Error::other(format!(
+                        "the hold expired with SCM still naming process {pid}, though it has no bound: goetia's own error"
+                    )),
+                ));
+                Err(std::io::Error::other("the service's process could not be held"))
             }
-        },
-    );
+            Ok(held) => {
+                process = held;
+                Ok(())
+            }
+            Err(e) => {
+                hold_failed = Some(e);
+                Err(std::io::Error::other("the service's process could not be held"))
+            }
+        }
+    });
     // Ends the held shim process before the failure is reported.
     let settled = end_on_incomplete_stop(settled, &mut process, end);
     // An unbounded deadline never expires. Told as a failure, not dropped, so that a later edit

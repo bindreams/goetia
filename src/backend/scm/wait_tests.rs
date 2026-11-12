@@ -3777,8 +3777,16 @@ fn an_uninstall_whose_hold_of_a_stop_pending_service_failed_says_the_service_is_
             assert!(said.contains("could not be stopped"), "{said}");
             assert!(said.contains("already marked for deletion"), "{said}");
             assert!(said.contains("goetia's own"), "{said}");
-            for stale in ["by someone else", "goetia daemon kill", "is now disabled", "already stopping"] {
-                assert!(!said.contains(stale), "`{stale}` is false for goetia's own failure: {said}");
+            for stale in [
+                "by someone else",
+                "goetia daemon kill",
+                "is now disabled",
+                "already stopping",
+            ] {
+                assert!(
+                    !said.contains(stale),
+                    "`{stale}` is false for goetia's own failure: {said}"
+                );
             }
         } else {
             assert!(said.contains("already stopping (STOP_PENDING)"), "{said}");

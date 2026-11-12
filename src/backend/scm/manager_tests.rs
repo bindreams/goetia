@@ -1307,7 +1307,11 @@ fn an_uninstall_over_a_stop_already_under_way_says_so_and_advises_waiting_then_r
     };
     assert_eq!(
         what,
-        "`frpc` is already stopping (STOP_PENDING). `uninstall` could not hold its process, so it ended          its wait for the stop; that failure was goetia's own, not the service's. It was NOT deleted and is          now disabled, so `goetia daemon start frpc` fails. Its start type was automatic;          `goetia daemon enable frpc` sets it again. Once it has stopped, re-run          `goetia daemon uninstall frpc` to retry; if it never stops, run `goetia daemon kill frpc`"
+        "`frpc` is already stopping (STOP_PENDING). `uninstall` could not hold its process, so it ended \
+         its wait for the stop; that failure was goetia's own, not the service's. It was NOT deleted and is \
+         now disabled, so `goetia daemon start frpc` fails. Its start type was automatic; \
+         `goetia daemon enable frpc` sets it again. Once it has stopped, re-run \
+         `goetia daemon uninstall frpc` to retry; if it never stops, run `goetia daemon kill frpc`"
     );
 }
 
