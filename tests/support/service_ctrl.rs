@@ -24,7 +24,7 @@ pub struct StatusHandle(SERVICE_STATUS_HANDLE);
 
 /// Register the handler for `name`. A `Some` sender is signalled on `STOP`.
 pub fn register(name: &str, stop: Option<Sender<()>>) -> StatusHandle {
-    let name = super::wide_null(name);
+    let name = super::wide_null(name).unwrap();
     let context: *mut HandlerContext = Box::into_raw(Box::new(HandlerContext { stop }));
     // SAFETY: `name` is NUL-terminated and outlives the call; the context is never freed.
     let handle = unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(handler), context.cast()) };
