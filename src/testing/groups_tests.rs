@@ -16,7 +16,6 @@ fn checked(group: Option<&str>, consent: Option<&str>) -> Result<bool, String> {
     check_group(GROUP, env(&vars))
 }
 
-/// Mutant: an unset group variable disables the group, or an invalid one is read as on or off.
 #[skuld::test]
 fn the_group_variable_is_on_unset_or_1_off_for_0_and_an_error_otherwise() {
     for group in [None, Some("1")] {
@@ -32,7 +31,6 @@ fn the_group_variable_is_on_unset_or_1_off_for_0_and_an_error_otherwise() {
     }
 }
 
-/// Mutant: consent defaults to given, or any set value counts.
 #[skuld::test]
 fn consent_is_given_only_by_exactly_1() {
     for consent in [None, Some("0")] {
@@ -51,8 +49,6 @@ fn consent_is_given_only_by_exactly_1() {
     }
 }
 
-/// Mutant: consent is asked of a group that is off, or an invalid value of either variable is
-/// excused by the other (a group that is `0` still has its consent checked).
 #[skuld::test]
 fn a_group_that_is_off_needs_no_consent_but_an_invalid_value_of_either_is_an_error_whatever_the_other() {
     for consent in [None, Some("0"), Some("1")] {
@@ -65,7 +61,7 @@ fn a_group_that_is_off_needs_no_consent_but_an_invalid_value_of_either_is_an_err
 }
 
 /// Every known group's variables are checked at harness start, on any OS and whatever the group's
-/// state. Mutant: a group is left out, or an invalid consent is excused by `=0`.
+/// state.
 #[skuld::test]
 fn every_known_groups_variables_are_validated_at_start() {
     assert!(validate_all(env(&[])).is_ok());
@@ -85,8 +81,7 @@ fn every_known_groups_variables_are_validated_at_start() {
     }
 }
 
-/// The `requires` of a group: only `=0` makes skuld ignore a test. Mutant: an invalid value or missing
-/// consent is ignored too, which would skip the test silently instead of failing it.
+/// The `requires` of a group: only `=0` makes skuld ignore a test.
 #[skuld::test]
 fn only_a_group_set_to_0_is_ignored() {
     assert!(require_enabled(GROUP, env(&[])).is_ok());
@@ -97,7 +92,7 @@ fn only_a_group_set_to_0_is_ignored() {
 }
 
 /// A consented group on a host that lacks what the group needs fails; it does not
-/// skip. Mutant: elevation is checked before consent, or not at all.
+/// skip.
 #[skuld::test]
 fn a_consented_group_fails_when_the_host_lacks_what_it_needs() {
     let consent = env(&[(CONSENT, "1")]);
@@ -114,8 +109,7 @@ fn a_consented_group_fails_when_the_host_lacks_what_it_needs() {
     assert!(why.contains(CONSENT) && why.contains("does a thing"), "{why}");
 }
 
-/// A group that is off refuses at setup too: skuld runs the body of a test whose `requires` failed
-/// when ignored tests are included.
+/// A group that is off refuses at setup too.
 #[skuld::test]
 fn a_group_that_is_off_refuses_its_setup() {
     let why = enter(GROUP, "does a thing", env(&[(GROUP, "0")]), || true)

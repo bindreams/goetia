@@ -6,14 +6,12 @@
 //!   (unset is `0`); any value but `0` and `1` fails it too. Set it only in a sandbox: a container,
 //!   a VM or CI.
 //! - A consented group on a host that is not elevated fails; it never skips.
-//! - A bad value of any of these variables fails the whole run at start (`run_all`).
 //!
 //! A test joins a group by taking its fixture: `#[fixture(scm_group)] _group: &Group`.
 
 use super::elevation::ELEVATED;
 
-/// Proof that the group is enabled, consented to and supported by the host. Only a group fixture
-/// builds one.
+/// Witness that a group fixture passed; only the group fixtures build one.
 pub struct Group(());
 
 /// A group's variable and what its tests do (for the consent message).
@@ -40,8 +38,7 @@ const LAUNCHD: Spec = Spec {
     what: "write plists under /Library/LaunchDaemons and bootstrap, kickstart and boot out real launchd jobs as root",
 };
 
-/// Whether `name` is on, off or unset in the manner of a group variable: `Ok(None)` for unset,
-/// `Ok(Some(flag))` for `1` and `0`, `Err` naming the variable and the value for any other.
+/// Reads a group variable: `Ok(None)` if unset, `Ok(Some(flag))` for `1`/`0`, `Err` naming the variable and value otherwise.
 fn switch(name: &str, var: &impl Fn(&str) -> Option<String>) -> Result<Option<bool>, String> {
     match var(name).as_deref() {
         None => Ok(None),
@@ -65,7 +62,7 @@ pub(crate) fn validate_all(var: impl Fn(&str) -> Option<String>) -> Result<(), S
         .try_for_each(|spec| read_group(spec.env, &var).map(drop))
 }
 
-/// [`validate_all`] on this process's environment, run by every test binary before it starts.
+/// [`validate_all`] on this process's environment.
 pub(crate) fn validate_environment() {
     if let Err(why) = validate_all(process_var) {
         eprintln!("error: {why}");

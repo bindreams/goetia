@@ -86,9 +86,7 @@ jobs:
           # renovate: datasource=crate depName=cargo-nextest
           tool: cargo-nextest@0.9.149
 
-      # A plain `cargo test` fails every test of a group that is not consented to,
-      # and of a consented one without elevation (see the README). Build unelevated
-      # into an archive, then run the archive elevated (sudo on Linux/macOS; the Windows runner is already
+      # Build unelevated into an archive, then run the archive elevated (sudo on Linux/macOS; the Windows runner is already
       # Administrator). Never `sudo -E cargo test`: `-E` preserves `HOME`,
       # so root would write to `~/.cargo`/`target/` and the next unelevated
       # build would fail with `EACCES`. `cargo` stays entirely unelevated.
