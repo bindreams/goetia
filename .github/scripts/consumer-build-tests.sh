@@ -11,7 +11,8 @@
 #   2. the same consumer built in two stages (shim first, then the program with the feature and
 #      `GOETIA_SHIM_EXE`) installs, runs and uninstalls a `type: simple` service, leaving no shim;
 #   3. goetia's own two-stage build does the same;
-#   4. `cargo install` goetia previews the shim installed beside it (the sibling route).
+#   4. `cargo install` goetia previews the shim installed beside it (the sibling route);
+#   5. the consumer's bins pass `libsearch_guard::verify` after the README's `build.rs`.
 #
 # The consumer's lockfile is resolved once online and pins one dependency below goetia's own
 # lock, so it differs from goetia's. Everything after that builds offline.
@@ -120,11 +121,35 @@ goetia = "=$version"
 clap = "4"
 $pinned_crate = "=$pinned_version"
 
+# As the README tells a program that ships a stock shim.
+[build-dependencies]
+libsearch-guard = "0.1"
+
+[dev-dependencies]
+libsearch-guard = "0.1"
+
 [patch.crates-io]
 goetia = { path = "$crate_dir" }
 EOF
 
     echo 'goetia::stock_shim!();' > "$dir/src/bin/goetia-shim.rs"
+    printf 'fn main() {
+    libsearch_guard::bins();
+}
+' > "$dir/build.rs"
+
+    mkdir -p "$dir/tests"
+    cat > "$dir/tests/hardening.rs" <<'EOF'
+#[test]
+fn the_shim_is_hardened() {
+    libsearch_guard::verify(env!("CARGO_BIN_EXE_goetia-shim")).unwrap();
+}
+
+#[test]
+fn the_program_is_hardened() {
+    libsearch_guard::verify(env!("CARGO_BIN_EXE_goetia-consumer")).unwrap();
+}
+EOF
 
     # goetia's `src/main.rs`, with the provider fixed to the embedded one: a consumer has no
     # sibling to fall back on.
@@ -229,6 +254,9 @@ consumer_routes() {
         echo "$out"
         fail "the dry run did not report 'built without a stock shim'"
     fi
+
+    # (2b) The README's build.rs hardened both of the consumer's bins.
+    env -u GOETIA_SHIM_EXE cargo test --locked --test hardening
 
     # (3) Two stages: the shim, then the program with the feature and the shim's absolute path.
     cargo build --bin goetia-shim --locked

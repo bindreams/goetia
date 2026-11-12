@@ -183,6 +183,7 @@ libc = "0.2"
 name = "binary_hardening"
 path = "tests/binary_hardening.rs"
 harness = false
+required-features = ["cli"]
 
 [[test]]
 name = "marker_inertness"

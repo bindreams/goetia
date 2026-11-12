@@ -1,8 +1,8 @@
 //! The built `goetia` and `goetia-shim` do not search their own folder for libraries.
 //!
-//! `libsearch_guard::verify` reads the built files: on Windows it checks that `build.rs`'s
-//! `libsearch_guard::bins()` landed (System32-only loading, no `vcruntime140.dll` import); on Linux and
-//! macOS, that the binary carries no RPATH/RUNPATH or `@rpath` search relative to itself.
+//! `libsearch_guard::verify` reads the built files: on Windows it checks the link arguments of `build.rs`'s
+//! `libsearch_guard::bins()` (System32-only import loading, no `vcruntime140.dll` import), not its pre-`main`
+//! initializer; on Linux and macOS, that the binary carries no RPATH/RUNPATH or `@rpath` search relative to itself.
 
 fn main() {
     goetia::testing::run_all();

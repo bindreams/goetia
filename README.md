@@ -773,8 +773,9 @@ Any program that ships a stock shim adds one file, `src/bin/goetia-shim.rs`:
 goetia::stock_shim!();
 ```
 
-and a `build.rs` that hardens it, as goetia hardens its own binaries, so that a
-DLL placed beside the shim is never loaded in its place:
+and a `build.rs` that hardens it, as goetia hardens its own binaries: its imports
+and its `LoadLibrary` calls without flags search System32 only, not the shim's
+folder (Windows MSVC; the build fails on other Windows targets):
 
 ```toml
 [build-dependencies]
@@ -788,8 +789,12 @@ fn main() {
 }
 ```
 
-That covers every `[[bin]]` of the package. The program then chooses how the
-shim reaches the machine.
+That covers every `[[bin]]` of the package, the program itself included: once
+hardened, a DLL it ships beside itself must be loaded with explicit flags, and its
+VC runtime is linked statically. The
+[libsearch-guard README](https://github.com/bindreams/libsearch-guard#readme)
+lists what runs before the guard and how to load a sidecar DLL. The program then
+chooses how the shim reaches the machine.
 
 **Installer places the file.** The installer puts `goetia-shim.exe` in the
 product folder, and the program points goetia at it:
