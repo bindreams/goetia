@@ -732,20 +732,23 @@ fn writing_a_parameters_field_or_service_with_a_nul_is_refused_before_the_regist
     assert!(
         write_parameters(service, &value_with_nul)
             .unwrap_err()
+            .report()
             .to_string()
-            .contains("NUL")
+            .contains("holds a NUL")
     );
     assert!(
         write_parameters(service, &field_with_nul)
             .unwrap_err()
+            .report()
             .to_string()
-            .contains("NUL")
+            .contains("holds a NUL")
     );
     assert!(
         write_parameters("a\0b", &BTreeMap::new())
             .unwrap_err()
+            .report()
             .to_string()
-            .contains("NUL")
+            .contains("holds a NUL")
     );
 }
 
@@ -756,8 +759,9 @@ fn writing_an_environment_line_or_service_with_a_nul_is_refused_before_the_regis
     assert!(
         write_environment(service, &["A=b\0c".to_string()])
             .unwrap_err()
+            .report()
             .to_string()
-            .contains("NUL")
+            .contains("holds a NUL")
     );
     assert!(
         write_environment("a\0b", &[])
