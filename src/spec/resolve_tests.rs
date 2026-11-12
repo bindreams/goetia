@@ -171,7 +171,10 @@ fn a_control_character_in_the_id_is_refused() {
             let context = format!("{c:?} as native `{native}`");
             let err = resolve_yaml_as(native, &yaml).expect_err(&context).to_string();
             // Like every other free-text field, the refusal names the defect and omits the value.
-            assert!(err.contains("field `id` contains a control character"), "{context}: {err}");
+            assert!(
+                err.contains("field `id` contains a control character"),
+                "{context}: {err}"
+            );
             assert!(!err.contains(c), "{context}: {err:?}");
         }
     }
