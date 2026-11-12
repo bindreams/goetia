@@ -108,63 +108,56 @@ env:
 const CONTROL_CHARACTERS: [(char, &str); 2] = [('\n', r"\n"), ('\0', r"\0")];
 
 #[skuld::test]
-fn a_control_character_in_any_authored_string_is_refused_on_every_backend() {
+fn a_control_character_in_a_free_text_field_is_refused_on_every_backend() {
     // A newline ends one systemd directive and starts another; a NUL cuts a string short wherever
     // a backend hands it to the OS as a C string, so `user: "svc\0x"` would name the account `svc`.
     // Each row puts the character in one leaf, in the base and under every backend's override, and
-    // names the exact field the message must blame. `restart`, `restart-delay` and `type` are
-    // refused as values no parser accepts, so their messages echo the value (`echoes`).
-    struct Row {
-        message: &'static str,
-        line: &'static str,
-        echoes: bool,
-    }
-    let row = |message, line| Row {
-        message,
-        line,
-        echoes: false,
-    };
-    let echoing = |message, line| Row {
-        message,
-        line,
-        echoes: true,
-    };
-    let rows = [
-        row("field `name` contains", r#"name: "a{e}b""#),
-        row("field `command` contains", r#"command: ["/bin/frpc", "a{e}b"]"#),
-        row("field `command` contains", r#"command: ["{e}"]"#),
-        row("field `cwd` contains", r#"cwd: "a{e}b""#),
-        row("field `logs` contains", r#"logs: "a{e}b""#),
-        row("field `env[K]` contains", r#"env: {K: "a{e}b"}"#),
-        row("field `env key` contains", r#"env: {"a{e}b": v}"#),
-        row("field `user.name` contains", r#"user: "svc{e}x""#),
-        row("field `user.name` contains", r#"user: {name: "svc{e}x"}"#),
-        row("field `user.id` contains", r#"user: {id: "S-1-5-{e}"}"#),
-        echoing("field `restart` is `", r#"restart: "a{e}b""#),
-        echoing("field `restart-delay` is `", r#"restart-delay: "a{e}b""#),
-        echoing("field `type` is `", r#"type: "a{e}b""#),
+    // names the exact field the message must blame.
+    let rows: [(&str, &str); 10] = [
+        ("name", r#"name: "a{e}b""#),
+        ("command", r#"command: ["/bin/frpc", "a{e}b"]"#),
+        ("command", r#"command: ["{e}"]"#),
+        ("cwd", r#"cwd: "a{e}b""#),
+        ("logs", r#"logs: "a{e}b""#),
+        ("env[K]", r#"env: {K: "a{e}b"}"#),
+        ("env key", r#"env: {"a{e}b": v}"#),
+        ("user.name", r#"user: "svc{e}x""#),
+        ("user.name", r#"user: {name: "svc{e}x"}"#),
+        ("user.id", r#"user: {id: "S-1-5-{e}"}"#),
     ];
     for (c, escape) in CONTROL_CHARACTERS {
-        for row in &rows {
-            let line = row.line.replace("{e}", escape);
+        for (field, row_line) in rows {
+            let line = row_line.replace("{e}", escape);
             // A `command` leaf supplies the command itself.
             let base = if line.starts_with("command:") {
-                "id: frpc\n".to_string()
+                "id: frpc\n"
             } else {
-                "id: frpc\ncommand: [/bin/frpc]\n".to_string()
+                "id: frpc\ncommand: [/bin/frpc]\n"
             };
-            let mut manifests = vec![format!("{base}{line}\n")];
+            // The backend whose override carries the character, or none for the base.
+            let mut manifests = vec![(None, format!("{base}{line}\n"))];
             for backend in BackendKind::ALL {
-                manifests.push(format!("{base}backend-specific:\n  {backend}:\n    {line}\n"));
+                let yaml = format!("{base}backend-specific:\n  {backend}:\n    {line}\n");
+                manifests.push((Some(backend), yaml));
             }
-            for yaml in &manifests {
+            for (overridden, yaml) in &manifests {
                 for &native in HOST_BACKENDS {
-                    let err = resolve_yaml_as(native, yaml).expect_err(yaml).to_string();
-                    let context = format!("{c:?} as native `{native}`: {yaml}\n{err}");
+                    let context = format!("{c:?} as native `{native}`: {yaml}");
+                    let err = match resolve_yaml_as(native, yaml) {
+                        Ok(_) => panic!("resolved, but should be refused: {context}"),
+                        Err(err) => err.to_string(),
+                    };
+                    let context = format!("{context}\n{err}");
                     assert!(err.contains("daemon `frpc`"), "{context}");
-                    assert!(err.contains(row.message), "{context}");
-                    if !row.echoes {
-                        assert!(!err.contains(c), "{context}");
+                    let predicate = format!("field `{field}` contains a control character");
+                    assert!(err.contains(&predicate), "{context}");
+                    assert!(!err.contains(c), "{context}");
+                    match overridden {
+                        Some(backend) => {
+                            let prefix = format!("backend-specific.{backend}: ");
+                            assert!(err.contains(&prefix), "{context}");
+                        }
+                        None => assert!(!err.contains("backend-specific"), "{context}"),
                     }
                 }
             }
@@ -173,35 +166,52 @@ fn a_control_character_in_any_authored_string_is_refused_on_every_backend() {
 }
 
 #[skuld::test]
-fn a_nul_in_the_id_is_refused() {
-    let yaml = r#"
-id: "fr\0pc"
-command: [/bin/frpc]
-"#;
-    assert!(parse_manifest(yaml).id.contains('\0'), "the fixture carries the NUL");
-    let err = resolve_yaml(yaml).unwrap_err();
-    assert!(err.to_string().contains("does not match"), "{err}");
+fn a_control_character_in_the_id_is_refused() {
+    for (c, escape) in CONTROL_CHARACTERS {
+        for &native in HOST_BACKENDS {
+            let yaml = format!("id: \"fr{escape}pc\"\ncommand: [/bin/frpc]\n");
+            assert!(parse_manifest(&yaml).id.contains(c), "the fixture carries {c:?}");
+            let err = match resolve_yaml_as(native, &yaml) {
+                Ok(_) => panic!("resolved, but should be refused: {c:?} as native `{native}`"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("does not match"),
+                "{c:?} as native `{native}`: {err}"
+            );
+        }
+    }
 }
 
 #[skuld::test]
 fn a_nul_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(#[fixture(temp_dir)] dir: &Path) {
     // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value.
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\nuser: ${U}\n";
-    write_fixture(dir, yaml, Some("U=svc\0x\n"));
+    // Once in the base `user`, once in the native backend's override of it.
+    let predicate = "field `user.name` contains a control character";
+    let base = "id: frpc\ncommand: [/bin/frpc]\nuser: ${U}\n";
+    write_fixture(dir, base, Some("U=svc\0x\n"));
     for &native in HOST_BACKENDS {
-        let msg = resolve_as(parse_manifest(yaml), dir, Some(native))
+        let msg = resolve_as(parse_manifest(base), dir, Some(native))
             .expect_err("a NUL in a substituted value is refused")
             .to_string();
         assert!(msg.contains("after substituting from .env"), "native `{native}`: {msg}");
-        assert!(
-            msg.contains("field `user.name` contains a control character"),
-            "native `{native}`: {msg}"
-        );
+        assert!(msg.contains(predicate), "native `{native}`: {msg}");
         assert!(!msg.contains('\0'), "native `{native}`: {msg:?}");
         assert!(
             !msg.contains("backend-specific"),
             "no override wrote it, native `{native}`: {msg}"
         );
+
+        let overridden = format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    user: ${{U}}\n");
+        write_fixture(dir, &overridden, None);
+        let msg = resolve_as(parse_manifest(&overridden), dir, Some(native))
+            .expect_err("a NUL substituted into the native override is refused")
+            .to_string();
+        assert!(msg.contains("after substituting from .env"), "native `{native}`: {msg}");
+        assert!(msg.contains(predicate), "native `{native}`: {msg}");
+        assert!(!msg.contains('\0'), "native `{native}`: {msg:?}");
+        let prefix = format!("backend-specific.{native}: ");
+        assert!(msg.contains(&prefix), "native `{native}`: {msg}");
     }
 }
 
