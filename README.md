@@ -775,11 +775,12 @@ goetia::stock_shim!();
 
 and a `build.rs` that hardens it, as goetia hardens its own binaries: its imports
 and its `LoadLibrary` calls without flags search System32 only, not the shim's
-folder (Windows MSVC; the build fails on other Windows targets):
+folder (Windows MSVC; on other Windows targets the bins fail to link, while the
+library still builds):
 
 ```toml
 [build-dependencies]
-libsearch-guard = "0.1"
+libsearch-guard = "0.1.1"
 ```
 
 ```rust
