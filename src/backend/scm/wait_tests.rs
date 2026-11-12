@@ -2435,8 +2435,7 @@ fn an_arm_refused_on_a_marked_service_that_is_not_where_the_wait_wants_it_is_an_
     }
 }
 
-/// A notification SCM delivers with an error status carries no state, so no wait takes it for a verdict:
-/// each re-arms and decides on what the arm reads.
+/// Non-success `dwNotificationStatus` codes a delivery can carry.
 const FAILED_DELIVERIES: [u32; 3] = [ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, 5];
 
 #[skuld::test]
@@ -2505,6 +2504,33 @@ fn a_failed_delivery_is_re_armed_by_every_wait_and_the_arms_read_decides() {
             "stop {code}"
         );
     }
+}
+
+/// A failed delivery is not a notification that reported a state, so the re-arm after it reading `RUNNING`
+/// is the service still starting its stop, not one that came back: the stop keeps waiting.
+#[skuld::test]
+fn a_stop_whose_first_notification_failed_keeps_waiting_when_the_re_arm_reads_running() {
+    let mut fake = FakeScm::new([
+        Some(Observed::Failed(ERROR_SERVICE_MARKED_FOR_DELETE)),
+        Some(Observed::Stopped),
+    ])
+    .drifting_after(1, QueriedState::Running);
+    assert_eq!(
+        stop_via_notify(&mut fake, unbounded(), false).unwrap(),
+        Waited::Confirmed
+    );
+    assert_eq!(
+        fake.log,
+        vec![
+            "control_stop",
+            "arm_stopped",
+            "wait",
+            "got_failed",
+            "arm_stopped_only",
+            "wait",
+            "got_stopped"
+        ]
+    );
 }
 
 /// An uninstall racing `sc delete`: the delivery fails with 1072 and the re-arm is refused (or finds the

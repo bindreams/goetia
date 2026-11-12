@@ -114,6 +114,24 @@ unsafe extern "system" fn notify_callback(pparameter: *const c_void) {
     }
 }
 
+/// What the delivery `notify_callback` stored in `status` reported.
+fn observed(status: &LastStatus) -> Observed {
+    let failed = status.notification_status.load(Ordering::Acquire);
+    if failed != 0 {
+        return Observed::Failed(failed);
+    }
+    let state = status.current_state.load(Ordering::Acquire);
+    if state == SERVICE_RUNNING {
+        Observed::Running
+    } else if state == SERVICE_PAUSED {
+        Observed::Paused
+    } else if state == SERVICE_STOPPED {
+        Observed::Stopped
+    } else {
+        Observed::Pending
+    }
+}
+
 /// The `NotifyServiceStatusChangeW` mask for `want`: the bits of [`WantState::states`].
 fn want_to_mask(want: WantState) -> SERVICE_NOTIFY {
     want.states().iter().fold(0, |mask, state| mask | notify_bit(*state))
@@ -437,20 +455,7 @@ impl super::ScmActor for SystemScmActor {
         // and processed (that is what set `fired`) — nothing from this
         // registration remains outstanding. See `close_and_drain`.
         self.registration_outstanding = false;
-        let failed = self.status.notification_status.load(Ordering::Acquire);
-        if failed != 0 {
-            return Ok(Some(Observed::Failed(failed)));
-        }
-        let state = self.status.current_state.load(Ordering::Acquire);
-        Ok(Some(if state == SERVICE_RUNNING {
-            Observed::Running
-        } else if state == SERVICE_PAUSED {
-            Observed::Paused
-        } else if state == SERVICE_STOPPED {
-            Observed::Stopped
-        } else {
-            Observed::Pending
-        }))
+        Ok(Some(observed(&self.status)))
     }
 
     fn delivered_exit(&self) -> RecordedExit {
@@ -486,3 +491,7 @@ impl super::ScmActor for SystemScmActor {
         self.status.controls_accepted.load(Ordering::Acquire)
     }
 }
+
+#[cfg(test)]
+#[path = "system_tests.rs"]
+mod system_tests;
