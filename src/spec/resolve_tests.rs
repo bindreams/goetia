@@ -103,30 +103,137 @@ env:
     assert!(msg.contains('='), "error should call out the `=`: {msg}");
 }
 
-/// Beyond the four gate tests named explicitly elsewhere: the same directive
-/// injection is possible through `user`'s bare-string form (it lands in
-/// `User=`/`UserName` unescaped, exactly like `name`), so it goes through
-/// the same gate.
+/// The characters that cut a string short or start a new directive, as the escape a YAML
+/// double-quoted scalar takes for each.
+const CONTROL_CHARACTERS: [(char, &str); 2] = [('\n', r"\n"), ('\0', r"\0")];
+
 #[skuld::test]
-fn rejects_control_characters_in_user_name() {
-    let yaml = r#"
-id: frpc
-command: ["bin/frpc"]
-user: "evil\nUser=0"
-"#;
-    let err = resolve_yaml(yaml).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("frpc"), "error should name the daemon: {msg}");
-    assert!(msg.contains("user"), "error should name the field: {msg}");
+fn a_control_character_in_a_free_text_field_is_refused_on_every_backend() {
+    // A newline ends one systemd directive and starts another; a NUL cuts a string short wherever
+    // a backend hands it to the OS as a C string, so `user: "svc\0x"` would name the account `svc`.
+    let rows: [(&str, &str); 10] = [
+        ("name", r#"name: "a{e}b""#),
+        ("command", r#"command: ["/bin/frpc", "a{e}b"]"#),
+        ("command", r#"command: ["{e}"]"#),
+        ("cwd", r#"cwd: "a{e}b""#),
+        ("logs", r#"logs: "a{e}b""#),
+        ("env[K]", r#"env: {K: "a{e}b"}"#),
+        ("env key", r#"env: {"a{e}b": v}"#),
+        ("user.name", r#"user: "svc{e}x""#),
+        ("user.name", r#"user: {name: "svc{e}x"}"#),
+        ("user.id", r#"user: {id: "S-1-5-{e}"}"#),
+    ];
+    for (c, escape) in CONTROL_CHARACTERS {
+        for (field, row_line) in rows {
+            let predicate = format!("field `{field}` contains a control character");
+            let line = row_line.replace("{e}", escape);
+            // A `command` row replaces the base command, so the base omits it.
+            let base = if line.starts_with("command:") {
+                "id: frpc\n"
+            } else {
+                "id: frpc\ncommand: [/bin/frpc]\n"
+            };
+            let mut manifests = vec![(None, format!("{base}{line}\n"))];
+            for backend in BackendKind::ALL {
+                let yaml = format!("{base}backend-specific:\n  {backend}:\n    {line}\n");
+                manifests.push((Some(backend), yaml));
+            }
+            for (overridden, yaml) in &manifests {
+                for &native in HOST_BACKENDS {
+                    let context = format!("{c:?} as native `{native}`: {yaml}");
+                    let err = resolve_yaml_as(native, yaml).expect_err(&context).to_string();
+                    let context = format!("{context}\n{err}");
+                    assert!(err.contains("daemon `frpc`"), "{context}");
+                    assert!(!err.contains(c), "{context}");
+                    match overridden {
+                        Some(backend) => {
+                            let blamed = format!("backend-specific.{backend}: {predicate}");
+                            assert!(err.contains(&blamed), "{context}");
+                        }
+                        None => {
+                            assert!(err.contains(&predicate), "{context}");
+                            assert!(!err.contains("backend-specific"), "{context}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[skuld::test]
-fn rejects_control_characters_in_cwd_and_logs() {
-    let cwd_err = resolve_yaml("id: frpc\ncommand: [bin/frpc]\ncwd: \"evil\\nX=1\"\n").unwrap_err();
-    assert!(cwd_err.to_string().contains("cwd"));
+fn a_control_character_in_the_id_is_refused() {
+    for (c, escape) in CONTROL_CHARACTERS {
+        let yaml = format!("id: \"fr{escape}pc\"\ncommand: [/bin/frpc]\n");
+        assert!(parse_manifest(&yaml).id.contains(c), "the fixture carries {c:?}");
+        // The id is checked before any backend is consulted.
+        for &native in HOST_BACKENDS {
+            let context = format!("{c:?} as native `{native}`");
+            let err = resolve_yaml_as(native, &yaml).expect_err(&context).to_string();
+            assert!(
+                err.contains("id `") && err.contains("does not match"),
+                "{context}: {err}"
+            );
+        }
+    }
+}
 
-    let logs_err = resolve_yaml("id: frpc\ncommand: [bin/frpc]\nlogs: \"evil\\nX=1\"\n").unwrap_err();
-    assert!(logs_err.to_string().contains("logs"));
+#[skuld::test]
+fn a_nul_that_arrives_through_env_substitution_is_refused_before_any_backend_verdict(#[fixture(temp_dir)] dir: &Path) {
+    // `.env` is read after the manifest, so the step-5 gate is the only one that sees this value.
+    let predicate = "field `user.name` contains a control character";
+    let base = "id: frpc\ncommand: [/bin/frpc]\nuser: ${U}\n";
+    write_fixture(dir, base, Some("U=svc\0x\n"));
+    for &native in HOST_BACKENDS {
+        let msg = resolve_as(parse_manifest(base), dir, Some(native))
+            .expect_err("a NUL in a substituted value is refused")
+            .to_string();
+        assert!(msg.contains("after substituting from .env"), "native `{native}`: {msg}");
+        assert!(msg.contains(predicate), "native `{native}`: {msg}");
+        assert!(!msg.contains('\0'), "native `{native}`: {msg:?}");
+        assert!(
+            !msg.contains("backend-specific"),
+            "no override wrote it, native `{native}`: {msg}"
+        );
+
+        let overridden = format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    user: ${{U}}\n");
+        let msg = resolve_as(parse_manifest(&overridden), dir, Some(native))
+            .expect_err("a NUL substituted into the native override is refused")
+            .to_string();
+        let blamed = format!("backend-specific.{native}: after substituting from .env: {predicate}");
+        assert!(msg.contains(&blamed), "native `{native}`: {msg}");
+        assert!(!msg.contains('\0'), "native `{native}`: {msg:?}");
+    }
+}
+
+#[skuld::test]
+fn a_control_character_is_refused_when_building_a_daemon_spec_directly() {
+    // The library's other way in (the blob decode path): a caller who builds `DaemonFields`
+    // without a manifest.
+    type Set = fn(&mut DaemonFields, String);
+    let rows: [(&str, Set); 8] = [
+        ("name", |f, v| f.name = v),
+        ("command", |f, v| f.command.push(v)),
+        ("cwd", |f, v| f.cwd = Some(abs(&v))),
+        ("logs", |f, v| f.logs = Some(abs(&v))),
+        ("env[K]", |f, v| {
+            f.env.insert("K".to_string(), v);
+        }),
+        ("env key", |f, v| {
+            f.env.insert(v, "x".to_string());
+        }),
+        ("user.name", |f, v| f.user = User::Name(v)),
+        ("user.id", |f, v| f.user = User::Id(AccountId::Sid(v))),
+    ];
+    for (c, _) in CONTROL_CHARACTERS {
+        for (field, set) in &rows {
+            let mut fields = plain_fields("frpc", vec![program("frpc")]);
+            set(&mut fields, format!("a{c}b"));
+            let err = DaemonSpec::new(fields).expect_err(field).to_string();
+            let expected = format!("field `{field}` contains a control character");
+            assert!(err.contains(&expected), "{c:?} in {field}: {err}");
+        }
+    }
 }
 
 // The rules check what the user wrote ---------------------------------------------------------------------------------
@@ -2261,9 +2368,8 @@ fn an_empty_command_is_rejected_like_a_missing_one() {
 
 #[skuld::test]
 fn an_empty_user_name_is_rejected_on_every_backend() {
-    // Guards the seam: `resolve_shape` must carry `reject_blank` across from
-    // `resolve_one`. See `reject_blank`'s doc comment (`resolve.rs`) for why
-    // an empty account name is dangerous rather than merely odd.
+    // Guards the seam: `resolve_shape` must run `reject_blank` on the user. See `reject_blank`'s
+    // doc comment (`resolve.rs`) for why an empty account name is dangerous rather than merely odd.
     assert!(resolve_yaml("id: frpc\ncommand: [/bin/frpc]\nuser: \"\"\n").is_err());
     assert!(resolve_yaml("id: frpc\ncommand: [/bin/frpc]\nuser:\n  id: \"\"\n").is_err());
 }
