@@ -855,6 +855,9 @@ mod windows {
     fn text_is_expanded_up_to_its_first_nul() {
         let root = std::env::var("SystemRoot").expect("SystemRoot");
 
-        assert_eq!(expand_environment("%SystemRoot%\\x.exe\0tail"), format!(r"{root}\x.exe"));
+        assert_eq!(
+            expand_environment("%SystemRoot%\\x.exe\0tail"),
+            format!(r"{root}\x.exe")
+        );
     }
 }

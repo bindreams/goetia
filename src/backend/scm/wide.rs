@@ -20,7 +20,7 @@ impl From<InteriorNul> for std::io::Error {
 
 /// `s` as the NUL-terminated UTF-16 string the wide Win32 calls take, or the position of the NUL
 /// that would have ended it early. For text goetia sends: it is refused, never cut. Text that
-/// Windows hands back is read as Windows reads it, with [`wide_null_cut`].
+/// Windows hands back is read as Windows reads it, with `wide_null_cut`.
 pub fn wide_null(s: impl AsRef<OsStr>) -> Result<Vec<u16>, InteriorNul> {
     let mut units = Vec::new();
     for unit in s.as_ref().encode_wide() {

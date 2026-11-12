@@ -917,7 +917,11 @@ pub(in crate::backend::scm::shim) mod windows {
         let cut = Descriptor::from_sddl("D:P(A;;GA;;;WD)\0junk")
             .err()
             .expect("a NUL ends nothing here");
-        assert!(cut.report().to_string().contains(r"D:P(A;;GA;;;WD)\0junk"), "{}", cut.report());
+        assert!(
+            cut.report().to_string().contains(r"D:P(A;;GA;;;WD)\0junk"),
+            "{}",
+            cut.report()
+        );
 
         let descriptor = Descriptor::from_sddl("D:P(A;;GA;;;WD)").unwrap();
         let e = descriptor.create_dir(Path::new("a\0b")).unwrap_err();

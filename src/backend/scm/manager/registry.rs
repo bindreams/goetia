@@ -16,9 +16,9 @@ use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE,
 };
 use windows_sys::Win32::System::Registry::{REG_MULTI_SZ, RegEnumValueW, RegQueryValueExW};
-use winreg::{RegKey, RegValue};
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 use winreg::types::FromRegValue as _;
+use winreg::{RegKey, RegValue};
 
 use crate::backend::scm::generate::{FIELDS, field_named};
 pub use crate::backend::scm::parameters::RegistryReadOutcome;
