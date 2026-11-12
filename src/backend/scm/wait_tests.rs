@@ -1345,12 +1345,12 @@ fn a_stop_is_issued_even_when_the_arm_after_it_expires() {
 
 /// [`super::settle_and_stop`] for a caller that has nothing to do before the STOP.
 fn settle_and_stop<A: ScmActor>(a: &mut A, deadline: Deadline) -> io::Result<Waited> {
-    super::settle_and_stop(a, deadline, false, |_| Ok(()))
+    super::settle_and_stop(a, deadline, false, |_, _| Ok(()))
 }
 
 /// The `hold` of a caller that logs it in the fake's own log, so that its place among the steps is
 /// what the log says.
-fn holding(fake: &mut FakeScm) -> io::Result<()> {
+fn holding(fake: &mut FakeScm, _: HoldKind) -> io::Result<()> {
     fake.log.push("hold");
     Ok(())
 }
@@ -1431,7 +1431,7 @@ fn settle_and_stop_ends_with_the_error_of_a_hold_of_a_stop_pending_service() {
     let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
 
     let error =
-        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err();
+        super::settle_and_stop(&mut fake, unbounded(), false, |_, _| Err(io::Error::other("no hold"))).unwrap_err();
 
     assert_eq!(error.to_string(), "no hold");
     assert_eq!(fake.log, ["arm_settle"]);
@@ -1443,7 +1443,7 @@ fn settle_and_stop_sends_no_stop_when_the_callers_step_fails() {
     let mut fake = FakeScm::new([Some(Observed::Running)]);
 
     let error =
-        super::settle_and_stop(&mut fake, unbounded(), false, |_| Err(io::Error::other("no hold"))).unwrap_err();
+        super::settle_and_stop(&mut fake, unbounded(), false, |_, _| Err(io::Error::other("no hold"))).unwrap_err();
 
     assert_eq!(error.to_string(), "no hold");
     assert_eq!(fake.log, ["arm_settle", "wait", "got_running"]);
@@ -3073,7 +3073,7 @@ fn a_shims_stop_with_the_incomplete_stop_record_fails_however_it_was_confirmed()
             assert!(is_judged(ended), "stop_via_notify over {name}");
         }
         if let Some(script) = settle {
-            let ended = super::settle_and_stop(&mut incomplete(script()), unbounded(), true, |_| Ok(()));
+            let ended = super::settle_and_stop(&mut incomplete(script()), unbounded(), true, |_, _| Ok(()));
             assert!(is_judged(ended), "settle_and_stop over {name}");
         }
     }
@@ -3088,7 +3088,7 @@ fn a_stop_of_a_service_that_is_not_a_shims_is_not_judged_by_the_shims_record() {
             assert!(!is_judged(ended), "stop_via_notify over {name}");
         }
         if let Some(script) = settle {
-            let ended = super::settle_and_stop(&mut incomplete(script()), unbounded(), false, |_| Ok(()));
+            let ended = super::settle_and_stop(&mut incomplete(script()), unbounded(), false, |_, _| Ok(()));
             assert!(!is_judged(ended), "settle_and_stop over {name}");
         }
     }
@@ -3739,6 +3739,48 @@ fn an_uninstall_whose_hold_failed_is_a_stop_failure_whether_or_not_it_was_marked
             marked,
             "marked {marked}: {said}"
         );
+    }
+}
+
+/// A service already `STOP_PENDING` when the uninstall finds it is stopping without a STOP of ours, so a
+/// hold that fails there is not told as a failed stop: the service is already stopping, and the advice
+/// is to wait for it and re-run, with `kill` for a stop that never ends. Marked or not.
+#[cfg(windows)]
+#[skuld::test]
+fn an_uninstall_whose_hold_of_a_stop_pending_service_failed_says_the_service_is_already_stopping() {
+    use crate::backend::scm::manager::uninstall_stop_on;
+    use crate::spec::Id;
+
+    let [(_, answer), ..] = answers();
+    for marked in [false, true] {
+        let mut fake = FakeScm::new([Some(Observed::Stopped)]).starting_in(QueriedState::StopPending);
+
+        let err = uninstall_stop_on(
+            &mut fake,
+            &Id::try_from("frpc").unwrap(),
+            &answer,
+            marked,
+            None,
+            Some(|| -> crate::error::Result<HoldOutcome<u32>> { Err(crate::error::Error::blob("held badly")) }),
+            no_end_of,
+        )
+        .expect_err("the hold failed");
+
+        let said = err.report().to_string();
+        assert!(said.contains("held badly"), "marked {marked}: {said}");
+        assert!(said.contains("already stopping"), "marked {marked}: {said}");
+        assert!(said.contains("goetia daemon kill frpc"), "marked {marked}: {said}");
+        assert!(
+            !said.contains("could not be stopped") && !said.contains("does not accept STOP"),
+            "no STOP was sent: marked {marked}: {said}"
+        );
+        assert_eq!(said.contains("is now disabled"), !marked, "marked {marked}: {said}");
+        assert_eq!(
+            said.contains("goetia daemon uninstall frpc"),
+            !marked,
+            "marked {marked}: {said}"
+        );
+        assert!(!fake.log.contains(&"control_stop"), "marked {marked}: {:?}", fake.log);
     }
 }
 

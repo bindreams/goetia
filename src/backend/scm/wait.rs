@@ -549,12 +549,12 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 /// can say; a STOP that is refused and sent again runs it again), and once, before the wait, for a
 /// service the first arm finds `STOP_PENDING`, which is stopping without a STOP of ours (someone
 /// else's, or a `stop` whose wait ran out) and has its process still. Its error ends the wait, with
-/// no STOP sent.
+/// no STOP sent. [`HoldKind`] tells it which of the two it is run for.
 pub(crate) fn settle_and_stop<A: ScmActor>(
     a: &mut A,
     deadline: Deadline,
     shim: bool,
-    mut hold: impl FnMut(&mut A) -> io::Result<()>,
+    mut hold: impl FnMut(&mut A, HoldKind) -> io::Result<()>,
 ) -> io::Result<Waited> {
     // The first arm on a fresh actor fires at once for a current state in its mask (P20, P27), so a
     // `RUNNING`, `PAUSED` or `STOPPED` service is read from the notification; the status it returns
@@ -564,7 +564,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
         QueriedState::Stopped,
     )? {
         Err(end) => return judged(end, shim),
-        Ok(status) if status.state == QueriedState::StopPending => hold(a)?,
+        Ok(status) if status.state == QueriedState::StopPending => hold(a, HoldKind::StopUnderWay)?,
         Ok(_) => {}
     }
     // What the status returned by the latest re-arm showed, when it is a state to act on.
@@ -603,7 +603,7 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
                     )));
                 }
                 let resend = refused == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL);
-                hold(a)?;
+                hold(a, HoldKind::BeforeStop)?;
                 match a.control_stop() {
                     Ok(()) => return wait_after_stop(a, deadline, "", StopSeen::Requested, shim),
                     Err(e) if resend && e.raw_os_error() == Some(ERROR_SERVICE_CANNOT_ACCEPT_CTRL) => {
@@ -625,6 +625,15 @@ pub(crate) fn settle_and_stop<A: ScmActor>(
             }
         }
     }
+}
+
+/// Which of its two moments [`settle_and_stop`] runs its `hold` at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HoldKind {
+    /// The service was found `STOP_PENDING`: no STOP of ours is sent to it.
+    StopUnderWay,
+    /// Just before a STOP of ours.
+    BeforeStop,
 }
 
 /// What [`settle_and_stop`] learned, from a notification or from the status an arm returned.
