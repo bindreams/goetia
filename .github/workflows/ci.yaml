@@ -72,7 +72,7 @@ jobs:
       - name: Install prek
         if: matrix.toolchain != 'stable'
         # renovate: datasource=pypi depName=prek
-        run: uv tool install prek==0.5.9
+        run: uv tool install prek==0.5.10
 
       # Clippy is defined in prek.toml: the default build (with the `testing` feature, which the
       # self dev-dependency turns on) and the library-only build.
