@@ -1299,7 +1299,9 @@ fn a_service_id_with_a_nul_is_refused_before_a_handler_is_registered() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
 
-    let e = register_control_handler("a\0b", &supervisor.bus).unwrap_err();
+    let e = register_control_handler("a\0b", &supervisor.bus)
+        .err()
+        .expect("a NUL in the id is refused");
 
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
 }
