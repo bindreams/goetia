@@ -1468,7 +1468,7 @@ fn a_command_line_with_nothing_before_its_nul_has_no_executable() {
     }
 }
 
-// apply refuses an account that is no user ===========================================================================
+// apply refuses an account that is no user ============================================================================
 
 /// `apply` looks the account up, and refuses one that is no user, before it asks for the password: with
 /// `GOETIA_SERVICE_PASSWORD` unset, asking first would answer `PasswordRequired`, and with it set, would go
