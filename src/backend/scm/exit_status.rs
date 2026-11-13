@@ -120,7 +120,9 @@ impl RecordedExit {
     ///
     /// This reads the Win32 code alone, so it also accepts the record of a host that exits before
     /// connecting to SCM: `(0, 0)` with wait hint 2000 (P25 c/d), the same as a failed SCM start
-    /// (P10). Callers must rule that out first; `stopped_before_running` (in `wait.rs`) does.
+    /// (P10). Callers must rule that out first. `stopped_before_running` (in `wait.rs`) does for a
+    /// joined start (`failed_scm_start`); goetia's own start never reaches that wait, because
+    /// `StartServiceW` fails with 1053 first. See `stopped_before_running`.
     pub fn daemon_ran(self) -> bool {
         !self.is_refusal() && (self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR)
     }
