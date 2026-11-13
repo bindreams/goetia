@@ -179,16 +179,6 @@ impl Scm {
     fn provider(&self) -> Result<&dyn ShimProvider> {
         self.shim.as_deref().ok_or(Error::NoShimProvider)
     }
-
-    /// The host `spec` would be installed with, as the provider previews it: `Some` for `type: simple`
-    /// only, which has a host.
-    fn host_of(&self, spec: &DaemonSpec) -> Result<Option<HostCommand>> {
-        let DaemonSpec::Service(s) = spec;
-        match s.protocol {
-            Protocol::Plain => Ok(Some(self.provider()?.preview()?)),
-            Protocol::Native => Ok(None),
-        }
-    }
 }
 
 impl Default for Scm {
@@ -339,30 +329,29 @@ impl Backend for Scm {
 
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
-        generate::registration(spec, &identity, self.host_of(spec)?.as_ref())
+        generate::registration(spec, &identity, &|| self.provider()?.preview())
     }
 
     /// Keeps the host command a `type: simple` service is installed with, so that a host another
     /// provider (a moved folder, another goetia version, a standalone host) put there is the same
-    /// spec, and no provider is consulted. `type: managed` has no host.
+    /// spec, and no provider is consulted. `type: managed` has no host, so its snapshot's config is
+    /// never read.
     fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
-        let DaemonSpec::Service(s) = spec;
-        if s.protocol == Protocol::Native {
-            return self.render(spec);
-        }
         let identity = identity::resolve(&spec.common().user)?;
-        let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
-            id: snapshot.id().as_str().to_string(),
-            source: Box::new(e),
-        })?;
-        let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
-        generate::registration(spec, &identity, Some(&HostCommand { exe, args }))
+        generate::registration(spec, &identity, &|| {
+            let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
+                id: snapshot.id().as_str().to_string(),
+                source: Box::new(e),
+            })?;
+            let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
+            Ok(HostCommand { exe, args })
+        })
     }
 
     /// The host is previewed once, for the check and the registration alike.
     fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
-        generate::install_registration(spec, &identity, self.host_of(spec)?.as_ref())
+        generate::install_registration(spec, &identity, &|| self.provider()?.preview())
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither

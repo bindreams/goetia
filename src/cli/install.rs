@@ -218,15 +218,10 @@ fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>) -
     {
         // The SCM generator's warning (a too-large `restart-delay`) fires at
         // resolve time, from `BackendKind::Scm.warn`, before this runs.
-        // Asked only for a `type: simple` daemon: a managed one runs no host, and a provider that
-        // cannot name one must not fail its preview. The real host, so the preview refuses a path
-        // the install would.
-        let crate::spec::DaemonSpec::Service(service) = spec;
-        let command = match service.protocol {
-            crate::spec::Protocol::Plain => Some(host()?),
-            crate::spec::Protocol::Native => None,
-        };
-        let registration = crate::backend::scm::generate::install_registration(spec, &identity, command.as_ref())?;
+        // The generator asks `host` only for a `type: simple` daemon: a managed one runs no host, and a
+        // provider that cannot name one must not fail its preview. The real host, so the preview refuses
+        // a path the install would.
+        let registration = crate::backend::scm::generate::install_registration(spec, &identity, host)?;
         Ok(registration.to_string())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

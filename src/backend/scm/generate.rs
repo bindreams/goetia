@@ -140,23 +140,46 @@ pub struct FailureActions {
 /// fire at resolve time, from `BackendKind::Scm.warn`, when scm is the native backend.
 ///
 /// `id` is the account already resolved by the effectful install path (see
-/// [`Identity`]) — this function does no lookup of its own. `host` is
-/// only used for `Protocol::Plain`, where the host (not the spec's own command)
-/// is what SCM launches, with the host's own arguments, and is not judged here: see
-/// [`install_registration`]. `None` for a simple spec is [`Error::NoShimProvider`].
+/// [`Identity`]) — this function does no lookup of its own. `host` is called at most once, and
+/// only for `Protocol::Plain`, where the host (not the spec's own command) is what SCM launches,
+/// with the host's own arguments; it is not judged here: see [`install_registration`]. Its error is
+/// this function's.
 ///
 /// Refuses, with [`Error::Invalid`]:
 ///
 /// - a `type: managed` `command[0]` the registration writer would rewrite;
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
 ///   could only run on-failure semantics.
-pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
+pub fn registration(
+    spec: &DaemonSpec,
+    id: &Identity,
+    host: &dyn Fn() -> Result<HostCommand, Error>,
+) -> Result<ScmRegistration, Error> {
+    let host = resolve_host(spec, host)?;
+    build(spec, id, host.as_ref())
+}
+
+/// The host `spec` is installed with: asked for once, and only for a `Protocol::Plain` service, the
+/// one kind that has a host.
+fn resolve_host(
+    spec: &DaemonSpec,
+    host: &dyn Fn() -> Result<HostCommand, Error>,
+) -> Result<Option<HostCommand>, Error> {
+    let DaemonSpec::Service(s) = spec;
+    match s.protocol {
+        Protocol::Plain => host().map(Some),
+        Protocol::Native => Ok(None),
+    }
+}
+
+/// [`registration`] for a `host` already resolved by [`resolve_host`].
+fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
     let DaemonSpec::Service(s) = spec;
     let (executable, arguments) = match s.protocol {
         // SCM only ever launches the host, which learns the service's name from SCM and spawns the
         // daemon once. The spec's own command never appears here.
         Protocol::Plain => {
-            let host = host.ok_or(Error::NoShimProvider)?;
+            let host = host.expect("a plain service's host is resolved before it is built");
             (host.exe.clone(), host.args.clone())
         }
         Protocol::Native => {
@@ -250,15 +273,14 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>
 pub fn install_registration(
     spec: &DaemonSpec,
     id: &Identity,
-    host: Option<&HostCommand>,
+    host: &dyn Fn() -> Result<HostCommand, Error>,
 ) -> Result<ScmRegistration, Error> {
     let DaemonSpec::Service(s) = spec;
-    if s.protocol == Protocol::Plain
-        && let Some(host) = host
-    {
+    let host = resolve_host(spec, host)?;
+    if let Some(host) = &host {
         refuse_unwritable_executable(s, &host.exe)?;
     }
-    registration(spec, id, host)
+    build(spec, id, host.as_ref())
 }
 
 /// What makes `windows-service` wrap an argument in quotes (an empty one is wrapped too), each with

@@ -421,14 +421,12 @@ fn a_version_difference_wins_over_a_difference_in_recovery_actions() {
     use crate::backend::scm::generate::{ScmRegistration, registration};
 
     let spec = spec_fixture();
-    let reg_now = registration(
-        &spec,
-        &Identity { user: "svc".to_owned() },
-        Some(&crate::shim::HostCommand {
+    let reg_now = registration(&spec, &Identity { user: "svc".to_owned() }, &|| {
+        Ok(crate::shim::HostCommand {
             exe: PathBuf::from("goetia-shim.exe"),
             args: vec![],
-        }),
-    )
+        })
+    })
     .unwrap();
     assert!(
         reg_now.failure_actions.is_some(),
