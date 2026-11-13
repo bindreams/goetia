@@ -180,30 +180,27 @@ fn resolve_host(
 /// [`registration`] for a `host` already resolved by [`resolve_host`].
 fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
     let DaemonSpec::Service(s) = spec;
-    // SCM applies `Environment` to the process it launches: the daemon for `Protocol::Native`, the shim
-    // for `Protocol::Plain`.
-    let (executable, arguments, environment) = match s.protocol {
-        Protocol::Native => {
-            let mut argv = s.common.command.iter();
-            let executable = PathBuf::from(
-                argv.next()
-                    .expect("DaemonFields::command is non-empty: spec::resolve rejects an empty command"),
-            );
-            refuse_unwritable_executable(&s.common.id, "`command[0]`", &executable)?;
-            (
-                executable,
-                argv.cloned().collect(),
-                format_environment_lines(&s.common.env),
-            )
-        }
+    // SCM applies `Environment` to the process it launches: the daemon for a native service, the shim
+    // for a hosted one.
+    let (executable, arguments, environment) = match host {
         // SCM only ever launches the host, which learns the service's name from SCM and spawns the
         // daemon once. The spec's own command never appears here. The shim already applies `spec.env`
         // to the daemon it spawns, and an `env:` key that collides with one the shim or `cosca` reads
         // (`__COSCA_GROUP_ROOT`) would corrupt the shim's own containment, so no `Environment` is
         // registered.
-        Protocol::Plain => {
-            let host = host.expect("a plain service's host is resolved before it is built");
-            (host.exe.clone(), host.args.clone(), Vec::new())
+        Some(host) => (host.exe.clone(), host.args.clone(), Vec::new()),
+        None => {
+            let mut argv = s.common.command.iter();
+            let executable = PathBuf::from(
+                argv.next()
+                    .expect("DaemonFields::command is non-empty: spec::resolve rejects an empty command"),
+            );
+            refuse_unwritable_executable(&s.common.id, ExecutablePath::Command0, &executable)?;
+            (
+                executable,
+                argv.cloned().collect(),
+                format_environment_lines(&s.common.env),
+            )
         }
     };
 
@@ -280,7 +277,7 @@ pub fn install_registration(
     let DaemonSpec::Service(s) = spec;
     let host = resolve_host(spec, host)?;
     if let Some(host) = &host {
-        refuse_unwritable_executable(&s.common.id, "the service host path", &host.exe)?;
+        refuse_unwritable_executable(&s.common.id, ExecutablePath::ServiceHost, &host.exe)?;
     }
     build(spec, id, host.as_ref())
 }
@@ -295,6 +292,24 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
     ('\u{000B}', "a vertical tab"),
 ];
 
+/// Which path [`refuse_unwritable_executable`] judges, as its message names it.
+#[derive(Clone, Copy)]
+enum ExecutablePath {
+    /// `command[0]` of a `type: managed` daemon.
+    Command0,
+    /// The service host's path for a `type: simple` daemon, which no manifest sets.
+    ServiceHost,
+}
+
+impl ExecutablePath {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Command0 => "`command[0]`",
+            Self::ServiceHost => "the service host path",
+        }
+    }
+}
+
 /// Refuse an `executable` that `windows-service` would write as a different path.
 ///
 /// Its writer wraps the path in quotes when it is empty or holds a [`WRITER_QUOTE_TRIGGERS`]
@@ -303,9 +318,8 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
 /// holding a `"`, or ending in any backslashes, registers as another path. An unquoted path is
 /// written as is.
 ///
-/// `what` names the path in the message: `command[0]` for a `type: managed` daemon, the service host's
-/// path for a `type: simple` one, which no manifest sets.
-fn refuse_unwritable_executable(daemon: &Id, what: &str, executable: &Path) -> Result<(), Error> {
+/// `which` names the path in the message.
+fn refuse_unwritable_executable(daemon: &Id, which: ExecutablePath, executable: &Path) -> Result<(), Error> {
     let text = executable.to_string_lossy();
     // A `"` is refused whatever else quotes the path. An empty path is quoted too, but it ends in no
     // backslash.
@@ -326,7 +340,10 @@ fn refuse_unwritable_executable(daemon: &Id, what: &str, executable: &Path) -> R
     };
     Err(Error::Invalid {
         daemon: daemon.to_string(),
-        message: format!("{what} {text:?} cannot be written into the service registration: {reason}"),
+        message: format!(
+            "{} {text:?} cannot be written into the service registration: {reason}",
+            which.label()
+        ),
         source: None,
     })
 }

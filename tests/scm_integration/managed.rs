@@ -56,7 +56,13 @@ fn id_of(s: &str) -> Id {
 
 /// A fresh, installed `type: managed` service at `id`, with no ports wired up.
 fn install_native(mgr: &Scm, id: &str) -> DaemonSpec {
-    let spec = conformance_mk(id);
+    // The command is `conformance_mk`'s; the protocol is stated here, not inherited from it.
+    let DaemonSpec::Service(s) = conformance_mk(id);
+    let fields = ServiceFields {
+        protocol: Protocol::Native,
+        ..s.into_fields()
+    };
+    let spec = DaemonSpec::from(ServiceSpec::new(fields).expect("a valid spec"));
     mgr.install(&spec, false).expect("install");
     spec
 }
