@@ -247,7 +247,7 @@ pub enum Error {
         expected: String,
     },
 
-    /// A `type: simple` service needs a service host and the manager was built without a shim
+    /// A `protocol: plain` service needs a service host and the manager was built without a shim
     /// provider. No OS call failed.
     #[error("no shim provider configured")]
     NoShimProvider,
@@ -623,7 +623,7 @@ pub enum Error {
         source: Option<BoxError>,
     },
 
-    /// A `start` was judged as a `type: managed` service's, because the service's spec blob could not
+    /// A `start` was judged as a `protocol: native` service's, because the service's spec blob could not
     /// be read, and then failed. `blob` is the unreadable blob's error, printed in the message;
     /// `source` is the failed start.
     #[error("{}", start_as_managed_message(blob))]
@@ -1230,7 +1230,7 @@ pub(crate) fn terminating_failed<'a>(
 /// The message of [`Error::StartAsManaged`]: `blob` is the unreadable blob's error.
 fn start_as_managed_message(blob: &Error) -> Sentence<'_> {
     Sentence {
-        before: "its spec blob could not be read, so the start was judged as a `type: managed` service's (".into(),
+        before: "its spec blob could not be read, so the start was judged as a `protocol: native` service's (".into(),
         error: Some(blob),
         error_is_cause: true,
         after: ")".into(),

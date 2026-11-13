@@ -426,7 +426,7 @@ fn may_still_run(e: &cosca::error::Error) -> bool {
         .is_some_and(|fate| !matches!(fate, ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone))
 }
 
-/// The daemon, if a Job Object contains it. `type: simple` is stopped, and restarted after a
+/// The daemon, if a Job Object contains it. `protocol: plain` is stopped, and restarted after a
 /// failure, only by terminating its whole tree, which `cosca` can guarantee only with a job: when
 /// assigning the job fails it falls back to a process-tree walk that cannot say whether a
 /// descendant was killed. Any other containment is a start failure: the daemon is killed, but
@@ -462,7 +462,7 @@ fn thread_refused(command: &[String], e: &std::io::Error) -> String {
 
 fn not_job_contained(command: &[String], containment: Containment) -> String {
     format!(
-        "the daemon {command:?} was contained by {containment}, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"
+        "the daemon {command:?} was contained by {containment}, not a job object: `protocol: plain` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"
     )
 }
 

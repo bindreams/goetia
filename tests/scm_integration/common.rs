@@ -22,7 +22,7 @@ pub fn fixture_command_with_exe(exe: &str, id: &str, start_port: u16, stop_port:
     ]
 }
 
-/// The argv `type: managed` should run: this test binary itself, dispatched
+/// The argv `protocol: native` should run: this test binary itself, dispatched
 /// into `fixture::service_main` — see `fixture.rs`'s module doc comment.
 pub fn fixture_command(id: &str, start_port: u16, stop_port: u16, mode: &str) -> Vec<String> {
     fixture_command_with_exe(&support::current_exe_str(), id, start_port, stop_port, mode)

@@ -32,7 +32,7 @@ path = "src/main.rs"
 harness = false
 required-features = ["cli"]
 
-# The stock shim: the Windows service host `type: simple` daemons run under.
+# The stock shim: the Windows service host `protocol: plain` daemons run under.
 # `goetia::stock_shim!()` expands to its `fn main`, so this target is one line
 # and builds on every target (the library's `shim::main` reduces to an
 # "only on Windows" exit elsewhere), so `CARGO_BIN_EXE_goetia-shim` resolves

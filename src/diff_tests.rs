@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
+
+use skuld::temp_dir;
 
 use super::*;
 use crate::spec::test_support::{abs, program};
@@ -205,4 +208,32 @@ fn identical_inputs_produce_empty_diff() {
         "",
         "identical artifact text should produce no diff"
     );
+}
+
+/// `spec` rendered by [`render_yaml`] and read back as a manifest in `dir`.
+fn resolved_from_rendering(spec: &DaemonSpec, dir: &Path) -> DaemonSpec {
+    std::fs::write(dir.join("goetia.yaml"), render_yaml(spec)).expect("the manifest is writable");
+    crate::spec::load(dir).expect("a rendered spec is a manifest").0
+}
+
+#[skuld::test]
+fn render_yaml_resolves_back_to_the_service(#[fixture(temp_dir)] dir: &Path) {
+    for protocol in [Protocol::Plain, Protocol::Native] {
+        let mut fields = service_fields(spec_fixture());
+        fields.protocol = protocol;
+        fields.restart_delay = Some(Duration::from_secs(2));
+        let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
+
+        assert_eq!(resolved_from_rendering(&spec, dir), spec, "{protocol:?}");
+    }
+}
+
+#[skuld::test]
+fn render_yaml_resolves_back_to_the_task(#[fixture(temp_dir)] dir: &Path) {
+    // A schedule without `H`: its values do not depend on the host, which `load` reads.
+    for schedule in [Some("30 3 * * 1-5"), Some("*/15 0,12 1 * *"), None] {
+        let spec = task_fixture(schedule);
+
+        assert_eq!(resolved_from_rendering(&spec, dir), spec, "{schedule:?}");
+    }
 }

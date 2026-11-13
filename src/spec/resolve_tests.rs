@@ -6,7 +6,9 @@ use skuld::temp_dir;
 use super::*;
 use crate::spec::test_support::{HOST_BACKENDS, abs, program};
 use crate::spec::vars::Vars;
-use crate::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, interpolate};
+use crate::spec::{
+    DaemonFields, DaemonSpec, HashSeed, Schedule, ServiceFields, ServiceSpec, TaskFields, interpolate, schedule,
+};
 use crate::testing::{base_fields, service_fields};
 
 // `Path::new("/opt/rt").is_absolute()` is `false` on Windows, and
@@ -518,19 +520,19 @@ fn a_manifest_directory_defect_is_not_blamed_on_the_env_file() {
     assert!(!msg.contains(".env") && !msg.contains("substituting"), "{msg}");
 }
 
-/// `type: simple$$` substitutes to `simple$`, which holds a `$` and no reference: the shape phase
+/// `protocol: plain$$` substitutes to `plain$`, which holds a `$` and no reference: the shape phase
 /// judges it, with `command`, rather than leaving it to completeness.
 #[skuld::test]
 fn a_substituted_enum_with_a_dollar_left_is_judged_in_the_shape_phase() {
     let msg = resolve_yaml(
         "id: frpc
-type: 'simple$$'
+protocol: 'plain$$'
 ",
     )
     .unwrap_err()
     .to_string();
     assert!(
-        msg.contains("field `type` is `simple$`"),
+        msg.contains("`protocol` must be `plain` or `native`, not `plain$`"),
         "an absent `command` is completeness's to report, after the shape phase: {msg}"
     );
     assert!(!msg.contains(".env"), "`$$` is not `.env`'s: {msg}");
@@ -540,20 +542,20 @@ type: 'simple$$'
 
 #[skuld::test]
 fn a_defect_in_a_value_a_reference_supplied_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
-    write_fixture(dir, "id: frpc\ntype: ${T}\n", Some("T=simple$\n"));
+    write_fixture(dir, "id: frpc\nprotocol: ${T}\n", Some("T=plain$\n"));
     let msg = load(dir).unwrap_err().to_string();
     assert!(
-        msg.contains("after substituting from .env: field `type` is `simple$`"),
+        msg.contains("after substituting from .env: `protocol` must be `plain` or `native`, not `plain$`"),
         "{msg}"
     );
 }
 
 #[skuld::test]
 fn a_defect_in_a_field_no_reference_touched_is_not_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
-    // `name` is substituted; the `type` defect is in a field that holds only a `$$` escape.
-    write_fixture(dir, "id: frpc\nname: ${N}\ntype: 'simple$$'\n", Some("N=frpc\n"));
+    // `name` is substituted; the `protocol` defect is in a field that holds only a `$$` escape.
+    write_fixture(dir, "id: frpc\nname: ${N}\nprotocol: 'plain$$'\n", Some("N=frpc\n"));
     let msg = load(dir).unwrap_err().to_string();
-    assert!(msg.contains("field `type` is `simple$`"), "{msg}");
+    assert!(msg.contains("not `plain$`"), "{msg}");
     assert!(!msg.contains(".env"), "{msg}");
 }
 
@@ -601,10 +603,10 @@ fn a_defect_in_a_value_that_overrides_a_default_is_attributed_to_env(#[fixture(t
 /// `.env` supplied the value, whatever it looks like: here it equals the reference that asked for it.
 #[skuld::test]
 fn a_defect_in_a_value_equal_to_its_reference_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
-    write_fixture(dir, "id: frpc\ntype: ${T}\n", Some("T=${T}\n"));
+    write_fixture(dir, "id: frpc\nprotocol: ${T}\n", Some("T=${T}\n"));
     let msg = load(dir).unwrap_err().to_string();
     assert!(
-        msg.contains("after substituting from .env: field `type` is `${T}`"),
+        msg.contains("after substituting from .env: `protocol` must be `plain` or `native`, not `${T}`"),
         "{msg}"
     );
 }
@@ -612,9 +614,9 @@ fn a_defect_in_a_value_equal_to_its_reference_is_attributed_to_env(#[fixture(tem
 /// The `$` is the manifest's `$$` and the rest is a default: no reference read `.env`.
 #[skuld::test]
 fn a_defect_in_a_default_followed_by_an_escape_is_not_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
-    write_fixture(dir, "id: frpc\ntype: '${T:-simple}$$'\n", None);
+    write_fixture(dir, "id: frpc\nprotocol: '${T:-plain}$$'\n", None);
     let msg = load(dir).unwrap_err().to_string();
-    assert!(msg.contains("field `type` is `simple$`"), "{msg}");
+    assert!(msg.contains("not `plain$`"), "{msg}");
     assert!(!msg.contains(".env"), "{msg}");
 }
 
@@ -690,7 +692,7 @@ fn a_path_a_substitution_may_make_absolute_is_not_judged_against_the_manifest_di
         format!("command: ['{abs}']\nlogs: ${{D}}"),
     ] {
         let raw = parse_manifest(&format!("id: frpc\n{body}\n"));
-        resolve_shape(&id, raw, &dir, Substitution::Pending, None)
+        resolve_shape(&id, raw, &dir, Substitution::Pending, None, "host")
             .unwrap_or_else(|e| panic!("`{body}`: {}", Error::from(e)));
     }
 }
@@ -892,7 +894,7 @@ fn resolve_defaults_user_to_root() {
 }
 
 #[skuld::test]
-fn resolve_defaults_kind_to_simple() {
+fn resolve_defaults_protocol_to_plain() {
     let (spec, _) = resolve_yaml("id: frpc\ncommand: [bin/frpc]\n").unwrap();
     assert_eq!(service_fields(spec.clone()).protocol, Protocol::Plain);
 }
@@ -915,7 +917,7 @@ fn resolve_rejects_empty_command() {
     assert!(err.to_string().contains("command"));
 }
 
-// Field parsing (restart, type, restart-delay) ========================================================================
+// Field parsing (restart, protocol, restart-delay) ========================================================================
 
 #[skuld::test]
 fn resolve_parses_each_restart_policy() {
@@ -931,11 +933,11 @@ fn resolve_parses_each_restart_policy() {
 }
 
 #[skuld::test]
-fn resolve_parses_each_type() {
-    for (raw, expected) in [("simple", Protocol::Plain), ("managed", Protocol::Native)] {
-        let yaml = format!("id: frpc\ncommand: [bin/frpc]\ntype: {raw}\n");
-        let (spec, _) = resolve_yaml(&yaml).unwrap_or_else(|e| panic!("`type: {raw}` should resolve: {e}"));
-        assert_eq!(service_fields(spec.clone()).protocol, expected, "type: {raw}");
+fn resolve_parses_each_protocol() {
+    for (raw, expected) in [("plain", Protocol::Plain), ("native", Protocol::Native)] {
+        let yaml = format!("id: frpc\ncommand: [bin/frpc]\nprotocol: {raw}\n");
+        let (spec, _) = resolve_yaml(&yaml).unwrap_or_else(|e| panic!("`protocol: {raw}` should resolve: {e}"));
+        assert_eq!(service_fields(spec.clone()).protocol, expected, "protocol: {raw}");
     }
 }
 
@@ -950,12 +952,12 @@ fn an_unknown_restart_policy_names_the_daemon_and_the_valid_values() {
 }
 
 #[skuld::test]
-fn an_unknown_type_names_the_daemon_and_the_valid_values() {
-    let yaml = "id: frpc\ncommand: [bin/frpc]\ntype: complicated\n";
+fn an_unknown_protocol_names_the_daemon_and_the_valid_values() {
+    let yaml = "id: frpc\ncommand: [bin/frpc]\nprotocol: complicated\n";
     let err = resolve_yaml(yaml).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "daemon `frpc`: field `type` is `complicated`; expected one of `simple`, `managed`"
+        "daemon `frpc`: `protocol` must be `plain` or `native`, not `complicated`"
     );
 }
 
@@ -974,6 +976,263 @@ fn a_malformed_restart_delay_names_the_daemon_and_shows_an_example() {
     );
 }
 
+// `type`, `protocol` and `schedule` ===================================================================================
+
+const TYPE_IS_NOW: &str = "`type` is `service` or `task`";
+
+fn task_fields(spec: DaemonSpec) -> TaskFields {
+    let DaemonSpec::Task(task) = spec else {
+        panic!("expected a task, got {spec:?}");
+    };
+    task.into_fields()
+}
+
+/// The error of `base` with `override_line` written under each backend's `backend-specific` in turn.
+fn refused_per_backend(base: &str, override_line: &str) -> Vec<(BackendKind, String)> {
+    BackendKind::ALL
+        .into_iter()
+        .map(|backend| {
+            let yaml = format!("{base}backend-specific:\n  {backend}:\n    {override_line}\n");
+            let msg = resolve_yaml(&yaml)
+                .expect_err(&format!("`{override_line}` under {backend} must be refused"))
+                .to_string();
+            (backend, msg)
+        })
+        .collect()
+}
+
+#[skuld::test]
+fn type_simple_names_protocol_plain() {
+    let said = format!("`type: simple` is now `protocol: plain`; {TYPE_IS_NOW}");
+    let msg = resolve_yaml("id: frpc\ncommand: [bin/frpc]\ntype: simple\n")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(msg, format!("daemon `frpc`: {said}"));
+    for (backend, msg) in refused_per_backend("id: frpc\ncommand: [bin/frpc]\n", "type: simple") {
+        assert_eq!(msg, format!("daemon `frpc`: backend-specific.{backend}: {said}"));
+    }
+}
+
+#[skuld::test]
+fn type_managed_names_protocol_native() {
+    let said = format!("`type: managed` is now `protocol: native`; {TYPE_IS_NOW}");
+    let msg = resolve_yaml("id: frpc\ncommand: [bin/frpc]\ntype: managed\n")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(msg, format!("daemon `frpc`: {said}"));
+    for (backend, msg) in refused_per_backend("id: frpc\ncommand: [bin/frpc]\n", "type: managed") {
+        assert_eq!(msg, format!("daemon `frpc`: backend-specific.{backend}: {said}"));
+    }
+}
+
+#[skuld::test]
+fn any_other_type_is_named_in_the_refusal() {
+    let msg = resolve_yaml("id: frpc\ncommand: [bin/frpc]\ntype: complicated\n")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        msg,
+        "daemon `frpc`: `type` must be `service` or `task`, not `complicated`"
+    );
+}
+
+#[skuld::test]
+fn type_in_an_override_is_refused() {
+    // Whatever the value: a valid type, one the base also has, and a reference alike.
+    for value in ["task", "service", "${T}"] {
+        for (backend, msg) in refused_per_backend("id: frpc\ncommand: [bin/frpc]\n", &format!("type: '{value}'")) {
+            assert_eq!(
+                msg,
+                format!("daemon `frpc`: backend-specific.{backend}: `type` cannot be set per backend"),
+                "type: {value}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn protocol_native_resolves() {
+    let (spec, _) = resolve_yaml("id: frpc\ncommand: [bin/frpc]\nprotocol: native\n").unwrap();
+    assert_eq!(service_fields(spec).protocol, Protocol::Native);
+}
+
+#[skuld::test]
+fn default_is_a_plain_service() {
+    for yaml in [
+        "id: frpc\ncommand: [bin/frpc]\n",
+        "id: frpc\ncommand: [bin/frpc]\ntype: service\n",
+    ] {
+        let (spec, _) = resolve_yaml(yaml).unwrap();
+        let fields = service_fields(spec);
+        assert_eq!(fields.protocol, Protocol::Plain, "{yaml}");
+        assert_eq!(fields.restart, Restart::Never, "{yaml}");
+    }
+}
+
+#[skuld::test]
+fn task_with_schedule_resolves() {
+    let yaml = "id: nightly\ncommand: [bin/backup]\ntype: task\nschedule: '*/15 3 * * 1-5'\n";
+    let (spec, warnings) = resolve_yaml(yaml).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let task = task_fields(spec);
+    let schedule = task.schedule.expect("the manifest wrote a schedule");
+    assert_eq!(schedule.text(), "*/15 3 * * 1-5");
+    assert_eq!(task.common.id.as_str(), "nightly");
+}
+
+#[skuld::test]
+fn a_hashed_schedule_is_seeded_by_this_host_and_the_id() {
+    let yaml = "id: nightly\ncommand: [bin/backup]\ntype: task\nschedule: 'H H * * *'\n";
+    let (spec, _) = resolve_yaml(yaml).unwrap();
+    let id = Id::try_from("nightly").unwrap();
+    let hostname = schedule::this_hostname();
+    let expected = Schedule::parse(
+        "H H * * *",
+        &HashSeed {
+            hostname: &hostname,
+            id: &id,
+        },
+    )
+    .unwrap();
+    assert_eq!(task_fields(spec).schedule, Some(expected));
+}
+
+#[skuld::test]
+fn task_without_schedule_resolves() {
+    let (spec, _) = resolve_yaml("id: nightly\ncommand: [bin/backup]\ntype: task\n").unwrap();
+    assert_eq!(task_fields(spec).schedule, None);
+}
+
+#[skuld::test]
+fn each_service_field_on_a_task_is_refused() {
+    let task = "id: frpc\ncommand: [bin/frpc]\ntype: task\n";
+    for (field, line) in [
+        ("restart", "restart: never"),
+        ("restart-delay", "restart-delay: 5s"),
+        ("protocol", "protocol: plain"),
+    ] {
+        let said = format!("`{field}` applies only to a service; this daemon is `type: task`");
+        let msg = resolve_yaml(&format!("{task}{line}\n")).unwrap_err().to_string();
+        assert_eq!(msg, format!("daemon `frpc`: {said}"), "base `{line}`");
+        // An override of a backend that is not this host's native one is judged too: the sweep runs every backend.
+        for (backend, msg) in refused_per_backend(task, line) {
+            assert_eq!(
+                msg,
+                format!("daemon `frpc`: backend-specific.{backend}: {said}"),
+                "`{line}` under {backend}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn a_service_field_on_a_task_is_refused_before_its_value_is_judged() {
+    let msg = resolve_yaml("id: frpc\ncommand: [bin/frpc]\ntype: task\nrestart: sometimes\n")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        msg,
+        "daemon `frpc`: `restart` applies only to a service; this daemon is `type: task`"
+    );
+}
+
+#[skuld::test]
+fn schedule_on_a_service_is_refused() {
+    let said = "`schedule` applies only to a task; this daemon is `type: service`";
+    for service in [
+        "id: frpc\ncommand: [bin/frpc]\n",
+        "id: frpc\ncommand: [bin/frpc]\ntype: service\n",
+    ] {
+        let msg = resolve_yaml(&format!("{service}schedule: '0 3 * * *'\n"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(msg, format!("daemon `frpc`: {said}"), "{service}");
+        for (backend, msg) in refused_per_backend(service, "schedule: '0 3 * * *'") {
+            assert_eq!(
+                msg,
+                format!("daemon `frpc`: backend-specific.{backend}: {said}"),
+                "under {backend}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn schedule_substitutes_like_restart(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
+        "id: nightly\ncommand: [/bin/backup]\ntype: task\nschedule: ${WHEN}\n",
+        Some("WHEN=30 3 * * *\n"),
+    );
+    let (spec, _) = load(&dir.join("goetia.yaml")).expect("resolves");
+    assert_eq!(task_fields(spec).schedule.unwrap().text(), "30 3 * * *");
+}
+
+#[skuld::test]
+fn a_task_whose_type_is_substituted_is_judged_when_the_type_is_known(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
+        "id: nightly\ncommand: [/bin/backup]\ntype: ${T}\nschedule: ${WHEN}\n",
+        Some("T=task\nWHEN=30 3 * * *\n"),
+    );
+    let (spec, _) = load(&dir.join("goetia.yaml")).expect("resolves");
+    assert_eq!(task_fields(spec).schedule.unwrap().text(), "30 3 * * *");
+
+    write_fixture(
+        dir,
+        "id: nightly\ncommand: [/bin/backup]\ntype: ${T}\nrestart: always\n",
+        Some("T=task\n"),
+    );
+    let msg = load(&dir.join("goetia.yaml")).unwrap_err().to_string();
+    assert_eq!(
+        msg,
+        "daemon `nightly`: `restart` applies only to a service; this daemon is `type: task`"
+    );
+
+    write_fixture(
+        dir,
+        "id: nightly\ncommand: [/bin/backup]\ntype: ${T}\nschedule: '30 3 * * *'\n",
+        Some("T=service\n"),
+    );
+    let msg = load(&dir.join("goetia.yaml")).unwrap_err().to_string();
+    assert_eq!(
+        msg,
+        "daemon `nightly`: `schedule` applies only to a task; this daemon is `type: service`"
+    );
+}
+
+#[skuld::test]
+fn a_bad_substituted_type_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "id: frpc\ncommand: [/bin/frpc]\ntype: ${T}\n", Some("T=simple\n"));
+    let msg = load(&dir.join("goetia.yaml")).unwrap_err().to_string();
+    assert_eq!(
+        msg,
+        format!("daemon `frpc`: after substituting from .env: `type: simple` is now `protocol: plain`; {TYPE_IS_NOW}")
+    );
+}
+
+#[skuld::test]
+fn a_bad_substituted_schedule_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
+        "id: nightly\ncommand: [/bin/backup]\ntype: task\nschedule: ${WHEN}\n",
+        Some("WHEN=61 * * * *\n"),
+    );
+    let msg = load(&dir.join("goetia.yaml")).unwrap_err().to_string();
+    assert!(
+        msg.starts_with("daemon `nightly`: after substituting from .env: schedule minute field"),
+        "{msg}"
+    );
+}
+
+#[skuld::test]
+fn bad_schedule_names_the_field() {
+    let msg = resolve_yaml("id: nightly\ncommand: [bin/backup]\ntype: task\nschedule: '0 24 * * *'\n")
+        .unwrap_err()
+        .to_string();
+    assert!(msg.starts_with("daemon `nightly`: schedule hour field"), "{msg}");
+}
+
 // Warnings ============================================================================================================
 
 #[cfg(windows)]
@@ -984,7 +1243,7 @@ id: svc
 command: ["bin/svc.exe"]
 cwd: "."
 logs: "logs/svc.log"
-type: managed
+protocol: native
 "#;
     let (spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("accepted with a warning, not rejected");
     assert_eq!(service_fields(spec.clone()).protocol, Protocol::Native);
@@ -1001,7 +1260,7 @@ id: svc
 command: ["bin/svc.exe"]
 cwd: "."
 logs: "logs/svc.log"
-type: managed
+protocol: native
 "#;
     let (_spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("accepted with a warning, not rejected");
     assert_eq!(warnings.len(), 1);
@@ -1017,7 +1276,7 @@ id: svc
 command: ["bin/svc.exe"]
 cwd: "."
 logs: "logs/svc.log"
-type: simple
+protocol: plain
 "#;
     let (_spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).unwrap();
     assert!(warnings.is_empty());
@@ -2173,8 +2432,8 @@ fn a_base_drive_relative_path_warns_once() {
 #[cfg(windows)]
 #[skuld::test]
 fn windows_divergence_warning_follows_the_scm_merged_spec() {
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\ntype: managed\ncwd: .\nbackend-specific:\n  \
-                scm:\n    type: simple\n";
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nprotocol: native\ncwd: .\nbackend-specific:\n  \
+                scm:\n    protocol: plain\n";
     let (_spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     assert!(warnings.is_empty(), "{warnings:?}");
 }
@@ -2182,8 +2441,8 @@ fn windows_divergence_warning_follows_the_scm_merged_spec() {
 #[cfg(windows)]
 #[skuld::test]
 fn windows_divergence_warning_fires_for_an_scm_only_managed_type() {
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\ntype: simple\ncwd: .\nbackend-specific:\n  \
-                scm:\n    type: managed\n";
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nprotocol: plain\ncwd: .\nbackend-specific:\n  \
+                scm:\n    protocol: native\n";
     let (_spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
 }
@@ -2205,7 +2464,7 @@ fn native_pass_alone_emits_every_native_advisory() {
         // `warn_on_sub_second_restart_delay`
         (BackendKind::Launchd, "restart-delay: 500ms", "ThrottleInterval"),
         // `warn_on_windows_divergences`
-        (BackendKind::Scm, "type: managed\ncwd: .", "silently unavailable"),
+        (BackendKind::Scm, "protocol: native\ncwd: .", "silently unavailable"),
         // `warn_on_over_long_restart_delay`: the clamp, then the rounding.
         (
             BackendKind::Scm,
@@ -2232,20 +2491,20 @@ fn native_pass_alone_emits_every_native_advisory() {
 #[skuld::test]
 fn a_templated_base_field_keeps_the_native_advisories_it_had_as_a_literal(#[fixture(temp_dir)] dir: &Path) {
     // The native advisories read the substituted native spec, so moving a
-    // base `type`/`restart`/`restart-delay` into `.env` must not delete a
+    // base `protocol`/`restart`/`restart-delay` into `.env` must not delete a
     // warning about the value that is installed either way. The two
     // manifests resolve to the same spec, so they owe the same advisories.
-    write_fixture(dir, "", Some("KIND=managed\nRESTART=on-failure\nDELAY=500500us\n"));
+    write_fixture(dir, "", Some("KIND=native\nRESTART=on-failure\nDELAY=500500us\n"));
     let fields = |kind: &str, restart: &str, delay: &str| {
         format!(
-            "id: frpc\ncommand: [/bin/frpc]\ncwd: .\ntype: {kind}\n\
+            "id: frpc\ncommand: [/bin/frpc]\ncwd: .\nprotocol: {kind}\n\
              restart: {restart}\nrestart-delay: {delay}\n"
         )
     };
     let owed = [(BackendKind::Launchd, 1), (BackendKind::Scm, 2)];
     for (native, expected) in owed.into_iter().filter(|(native, _)| HOST_BACKENDS.contains(native)) {
         let (_spec, from_literal) = resolve_as(
-            parse_manifest(&fields("managed", "on-failure", "500500us")),
+            parse_manifest(&fields("native", "on-failure", "500500us")),
             dir,
             Some(native),
         )
@@ -2312,7 +2571,7 @@ fn a_host_with_no_native_backend_resolves_the_base_spec_alone() {
     assert_eq!(spec.common().name, "base");
 
     // No backend is native, so no backend's advisories are this host's to give.
-    let advisory = "id: frpc\ncommand: [/bin/frpc]\ncwd: .\ntype: managed\n\
+    let advisory = "id: frpc\ncommand: [/bin/frpc]\ncwd: .\nprotocol: native\n\
                     restart: on-failure\nrestart-delay: 60d\n";
     let (_spec, warnings) = resolve_as(parse_manifest(advisory), &base_dir(), None).expect("resolves");
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -2482,7 +2741,7 @@ fn a_base_named_system_account_resolves_under_every_backend() {
 #[skuld::test]
 fn an_over_long_restart_delay_warns_when_scm_is_native() {
     // `restart: on-failure` is load-bearing: the advisory is unreachable for `Restart::Never`.
-    let yaml = "id: frpc\ncommand: [/bin/frpc]\ntype: managed\nrestart: on-failure\nrestart-delay: 100d\n";
+    let yaml = "id: frpc\ncommand: [/bin/frpc]\nprotocol: native\nrestart: on-failure\nrestart-delay: 100d\n";
     let (_spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("resolves, with a warning");
     assert!(
         warnings.iter().any(|w| w.message.contains("restart-delay")),
@@ -2495,7 +2754,7 @@ fn an_over_long_restart_delay_warns_when_scm_is_native() {
 fn over_long_restart_delay_warns_for_simple_too() {
     let yaml = "id: frpc
 command: [/bin/frpc]
-type: simple
+protocol: plain
 restart: on-failure
 restart-delay: 100d
 ";
@@ -2577,7 +2836,7 @@ fn a_base_value_must_pass_the_shape_gate_even_when_every_backend_overrides_it() 
     assert!(err.to_string().contains("control character"), "{err}");
 }
 
-// The `$`-skip rule for `restart`/`type`/`restart-delay` ==============================================================
+// The `$`-skip rule for `restart`/`protocol`/`restart-delay` ==============================================================
 
 #[skuld::test]
 fn a_templated_restart_resolves(#[fixture(temp_dir)] dir: &Path) {
@@ -2591,8 +2850,12 @@ fn a_templated_restart_resolves(#[fixture(temp_dir)] dir: &Path) {
 }
 
 #[skuld::test]
-fn a_templated_type_resolves(#[fixture(temp_dir)] dir: &Path) {
-    write_fixture(dir, "id: frpc\ncommand: [/bin/frpc]\ntype: ${T}\n", Some("T=managed\n"));
+fn a_templated_protocol_resolves(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(
+        dir,
+        "id: frpc\ncommand: [/bin/frpc]\nprotocol: ${T}\n",
+        Some("T=native\n"),
+    );
     let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
     assert_eq!(service_fields(spec.clone()).protocol, Protocol::Native);
 }
@@ -2725,11 +2988,11 @@ restart: always
 
 #[skuld::test]
 fn a_host_warns_only_about_its_native_backend() {
-    // One manifest that trips every advisory: `type: managed` with a `cwd` (SCM divergence), `on-failure` with
+    // One manifest that trips every advisory: `protocol: native` with a `cwd` (SCM divergence), `on-failure` with
     // a delay that is neither whole seconds (launchd) nor whole milliseconds (SCM).
     let yaml = "id: frpc
 command: [/bin/frpc]
-type: managed
+protocol: native
 cwd: .
 restart: on-failure
 restart-delay: 500500us

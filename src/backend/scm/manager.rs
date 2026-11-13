@@ -9,14 +9,14 @@
 //!
 //! ## The five traps this module addresses
 //!
-//! **1. Ownership has only one proof for `type: managed`.** `type: simple`'s
+//! **1. Ownership has only one proof for `protocol: native`.** `protocol: plain`'s
 //! `ImagePath` (the service host's command, written atomically by `CreateServiceW`)
-//! is a second proof of ownership independent of `Parameters`; `type: managed`'s
+//! is a second proof of ownership independent of `Parameters`; `protocol: native`'s
 //! `ImagePath` is just the daemon's own command, indistinguishable from any
 //! other service that happens to run the same executable, so it cannot serve
 //! that role. This means the crash window between `CreateServiceW` and the
 //! `Parameters` write (see point 5) has no in-tool escape route for
-//! `type: managed` the way it does for `type: simple`: `read` classifies
+//! `protocol: native` the way it does for `protocol: plain`: `read` classifies
 //! such an orphan as foreign (no marker at all), and the next
 //! `install` refuses with [`crate::decide::foreign_recovery`]'s named command — the
 //! real Windows analogue of `sc.exe delete <id>` (or Services MMC), which is
@@ -71,9 +71,9 @@
 //! `SERVICE_DEMAND_START` after the fact, via `ChangeServiceConfigW` with
 //! `SERVICE_NO_CHANGE` on every other field (see `set_start_type`).
 //!
-//! ## `env` on `type: managed` (spec §8 must-verify #5)
+//! ## `env` on `protocol: native` (spec §8 must-verify #5)
 //!
-//! Per-service environment variables **are** supported for `type: managed`,
+//! Per-service environment variables **are** supported for `protocol: native`,
 //! via the documented (if obscure) `Services\<name>\Environment`
 //! `REG_MULTI_SZ` value — a list of `NAME=value` lines SCM adds to the
 //! environment of the service process at launch. It is part of
@@ -145,7 +145,7 @@ use crate::spec::{AccountId, DaemonSpec, Id, Protocol, User};
 // Scm =================================================================================================================
 
 /// The Windows service manager. Holds no state of its own — every operation opens exactly the
-/// SCM/registry handles it needs and closes them again — only the source of `type: simple`
+/// SCM/registry handles it needs and closes them again — only the source of `protocol: plain`
 /// services' host and the check on the folder it lives in.
 pub struct Scm {
     /// `None` for [`Scm::new`]: no host to provide, and no files of the manager's own to sweep.
@@ -154,7 +154,7 @@ pub struct Scm {
 }
 
 impl Scm {
-    /// A manager with no shim provider: `type: managed` services work, a `type: simple` one cannot
+    /// A manager with no shim provider: `protocol: native` services work, a `protocol: plain` one cannot
     /// be installed or previewed ([`Error::NoShimProvider`]), and `status` and `list` judge what is
     /// installed without one.
     pub fn new() -> Self {
@@ -164,7 +164,7 @@ impl Scm {
         }
     }
 
-    /// A manager whose `type: simple` services run the host `provider` supplies. `check` says
+    /// A manager whose `protocol: plain` services run the host `provider` supplies. `check` says
     /// whether the folder of what `provider` returns is checked for permissions that would let
     /// another account replace it. It also decides which folders `provider`'s sweep may list and
     /// delete in: a sweep checks the folder with it too.
@@ -191,7 +191,7 @@ impl Default for Scm {
 pub(crate) struct ScmSnapshot {
     id: Id,
     blob: Decoded,
-    /// Its `Parameters` values, which hold the only proof of ownership `type: managed` has.
+    /// Its `Parameters` values, which hold the only proof of ownership `protocol: native` has.
     parameters: Parameters,
     /// The one object every query of this snapshot asks, so that a service deleted and recreated
     /// meanwhile cannot answer part of them: the one `read` opened to classify it, or, for what
@@ -278,12 +278,12 @@ impl ScmSnapshot {
 impl Backend for Scm {
     type Definition = ScmRegistration;
     type Snapshot = ScmSnapshot;
-    /// The install lock, which `type: simple` holds until its install ends: what places, repairs
+    /// The install lock, which `protocol: plain` holds until its install ends: what places, repairs
     /// and deletes shim files, for this process and every other, takes it.
     type InstallScope = Option<InstallLock>;
     type Reservation = ();
 
-    /// For `type: simple`: the install flow has rendered the definition already, so every refusal
+    /// For `protocol: plain`: the install flow has rendered the definition already, so every refusal
     /// `render_for_install` can make (the previewed host's path, an account, `restart: always`)
     /// has come before the lock is taken or the provider writes. The lock is taken and the files
     /// nothing references are swept (by the provider, in a folder that exists and passes the folder check: see
@@ -293,7 +293,7 @@ impl Backend for Scm {
     /// would otherwise register a file that was never placed), an absolute path that passes the
     /// folder check (which walks it and its ancestors), to a file carrying this library's marker. A
     /// sweep that cannot read what is referenced or cannot delete a file does not fail the install:
-    /// the file is not what the install needs, and the next sweep finds it. `type: managed` has no
+    /// the file is not what the install needs, and the next sweep finds it. `protocol: native` has no
     /// host, so nothing is held or checked: its preconditions are `apply`'s, before any write.
     fn begin_install(
         &self,
@@ -331,9 +331,9 @@ impl Backend for Scm {
         generate::registration(spec, &identity, &|| self.provider()?.preview())
     }
 
-    /// Keeps the host command a `type: simple` service is installed with, so that a host another
+    /// Keeps the host command a `protocol: plain` service is installed with, so that a host another
     /// provider (a moved folder, another goetia version, a standalone host) put there is the same
-    /// spec, and no provider is consulted. `type: managed` has no host, so its snapshot's config is
+    /// spec, and no provider is consulted. `protocol: native` has no host, so its snapshot's config is
     /// never read.
     fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
         let identity = identity::resolve(&spec.common().user)?;
@@ -538,7 +538,7 @@ impl Backend for Scm {
 
     /// See [`super::kill::kill_service`] for how the process is chosen safely. Exit code `1`
     /// (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery actions, as for a
-    /// crash. For `type: simple` the process is `goetia-shim`, whose Job Object takes the daemon's
+    /// crash. For `protocol: plain` the process is `goetia-shim`, whose Job Object takes the daemon's
     /// tree with it.
     fn kill(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.into_id();
@@ -576,7 +576,7 @@ fn held_service<T>(id: &str, read: RegistryReadOutcome<T>) -> Result<T> {
 }
 
 /// What the `Parameters` of a service goetia could open say about its ownership. No marker is
-/// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `type: managed`
+/// foreign, with the stock remedy: nothing but deleting the orphan recovers it, since `protocol: native`
 /// has no second proof of ownership.
 fn read_marker(parameters: Parameters, service: Option<Service>) -> ReadOutcome<Unnamed<Opened>> {
     let blob = match generate::extract(&parameters.fields, &parameters.strays) {
@@ -685,7 +685,7 @@ pub(super) fn stop_on<A: super::wait::ScmActor, P: HeldProcess>(
 
 /// The kind `start_via_notify` reads a `Stopped`-before-`Running` by, and why the blob could not say:
 /// the shim's vocabulary for a [`ShimKind::Shim`], and for anything else, a service not known to run
-/// a shim, as strict as `type: managed`. A service whose blob would not decode says why when its start
+/// a shim, as strict as `protocol: native`. A service whose blob would not decode says why when its start
 /// fails, whichever kind it was judged as.
 fn start_kind(answer: &ShimAnswer) -> (Protocol, Option<Arc<Error>>) {
     let kind = match answer.kind {
@@ -1225,7 +1225,7 @@ impl<L> UninstallPlan<L> {
     }
 }
 
-/// Whether an uninstall takes the install lock: for a blob that is `type: simple` and for one that will
+/// Whether an uninstall takes the install lock: for a blob that is `protocol: plain` and for one that will
 /// not decode, whose service may run a shim whatever its image says.
 fn takes_install_lock(blob: std::result::Result<&Blob, &Arc<Error>>) -> bool {
     blob.map_or(true, |blob| generate::hosted(&blob.spec))
@@ -1302,7 +1302,7 @@ fn runs_a_shim(snapshot: &ScmSnapshot) -> ShimAnswer {
     })
 }
 
-/// The blob's `type: simple` when it decodes: a `StandaloneShim` host is a shim whatever its file is
+/// The blob's `protocol: plain` when it decodes: a `StandaloneShim` host is a shim whatever its file is
 /// called. Otherwise the registered `image`'s file name: a shim host is one, an exe of the user's own is
 /// not, and an image that could not be read (`None`) leaves it [`Unknown`](ShimKind::Unknown).
 pub(super) fn shim_answer(
@@ -2046,7 +2046,7 @@ mod manager_tests;
 /// **One entry, not one per service.** Most services on a Windows box carry an
 /// ACL that denies a non-elevated read of their `Parameters`, so an entry each
 /// would bury `goetia daemon list` under hundreds of them, about services that
-/// were never goetia's. Nor is there a sound pre-filter: a `type: managed`
+/// were never goetia's. Nor is there a sound pre-filter: a `protocol: native`
 /// service's `ImagePath` is the user's own binary, so the marker under
 /// `Parameters` is the only thing that tells goetia's apart — and it is the
 /// unread thing. Aggregating belongs in the backend because only the backend

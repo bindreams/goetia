@@ -10,8 +10,8 @@ fn parse(yaml: &str) -> Result<RawSpec, yaml_serde::Error> {
     RawSpec::parse(yaml)
 }
 
-/// The nine overridable field names, byte-exact with `OverrideWire`'s serde names.
-const OVERRIDABLE_FIELDS: [&str; 9] = [
+/// The eleven field names an override may write, byte-exact with `OverrideWire`'s serde names.
+const OVERRIDABLE_FIELDS: [&str; 11] = [
     "name",
     "command",
     "cwd",
@@ -21,6 +21,8 @@ const OVERRIDABLE_FIELDS: [&str; 9] = [
     "restart-delay",
     "logs",
     "type",
+    "protocol",
+    "schedule",
 ];
 
 #[skuld::test]
@@ -209,7 +211,9 @@ backend-specific:
     restart: always
     restart-delay: 2s
     logs: /var/log/frpc.log
-    type: managed
+    type: task
+    protocol: native
+    schedule: 30 3 * * *
 ";
     let manifest = parse(yaml).expect("valid manifest should parse");
     let scm = &manifest.backend_specific[&BackendKind::Scm];
@@ -222,7 +226,9 @@ backend-specific:
     assert!(scm.restart.is_some());
     assert!(scm.restart_delay.is_some());
     assert!(scm.logs.is_some());
-    assert!(scm.kind.is_some());
+    assert!(scm.daemon_type.is_some());
+    assert!(scm.protocol.is_some());
+    assert!(scm.schedule.is_some());
 }
 
 #[skuld::test]
@@ -697,7 +703,7 @@ user:
 restart: always
 restart-delay: 2s
 logs: /var/log/frpc.log
-type: simple
+protocol: plain
 backend-specific:
   scm:
     user: svc-frpc

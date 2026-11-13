@@ -47,8 +47,6 @@ pub struct HashSeed<'a> {
 }
 
 /// The host name that seeds `H`, read lossily as UTF-8.
-// Read by the manifest resolver in a later change.
-#[cfg_attr(not(test), expect(dead_code, reason = "first read by the manifest resolver"))]
 pub fn this_hostname() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }

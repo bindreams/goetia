@@ -273,8 +273,8 @@ pub enum Restart {
 /// Whether Goetia runs the command directly (via `goetia-shim` on Windows)
 /// or the command is itself expected to behave as a native service.
 ///
-/// Parsed from its authored kebab-case string (`simple`, `managed`) by `resolve::parse_protocol`.
-/// Not a derived `Deserialize`: its raw field (`RawSpec::kind`, authored as `type:`) is an
+/// Parsed from its authored kebab-case string (`plain`, `native`) by `resolve::parse_protocol`.
+/// Not a derived `Deserialize`: its raw field (`RawSpec::protocol`, authored as `protocol:`) is an
 /// `Option<String>`, and a value holding `$` is left unparsed at resolve time while substitution is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {

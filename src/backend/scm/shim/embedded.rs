@@ -88,7 +88,7 @@ mod stock {
 
     impl EmbeddedStockShim {
         /// `dir` is where the file goes (an absolute path; a relative one is refused when used), or
-        /// `None` for `%ProgramFiles%\Goetia`, which is looked up only when a `type: simple`
+        /// `None` for `%ProgramFiles%\Goetia`, which is looked up only when a `protocol: plain`
         /// install or its preview needs it.
         pub fn new(bytes: Option<&'static [u8]>, dir: Option<PathBuf>) -> Self {
             Self {

@@ -1,4 +1,4 @@
-//! `type: managed` integration tests against a real SCM. See the module doc
+//! `protocol: native` integration tests against a real SCM. See the module doc
 //! comment on `goetia::backend::scm::manager` for the five traps these
 //! cover, and `fixture.rs` for the daemon process every spec here runs.
 
@@ -44,7 +44,7 @@ use crate::support::{self, ConnectBack, Group, ScratchKey, ServiceGuard, scm_gro
 #[skuld::label]
 const SCM_DENIAL: skuld::Label;
 
-/// Held by every test here that takes the machine-wide install lock (a `type: simple` install),
+/// Held by every test here that takes the machine-wide install lock (a `protocol: plain` install),
 /// which the lock tests in `src/backend/scm/shim/lock_tests.rs` and `tests/shim_integration` poll
 /// for who holds it. Shared with both by label *name*.
 #[skuld::label]
@@ -54,7 +54,7 @@ fn id_of(s: &str) -> Id {
     Id::try_from(s).expect("random_test_id/short local ids are valid Ids")
 }
 
-/// A fresh, installed `type: managed` service at `id`, with no ports wired up.
+/// A fresh, installed `protocol: native` service at `id`, with no ports wired up.
 fn install_native(mgr: &Scm, id: &str) -> DaemonSpec {
     // The command is `conformance_mk`'s; the protocol is stated here, not inherited from it.
     let fields = ServiceFields {
@@ -295,7 +295,7 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(status.common().state, State::Running);
     assert!(
         status.common().pid.is_some(),
-        "type: managed reports the daemon's own pid, not a shim's"
+        "protocol: native reports the daemon's own pid, not a shim's"
     );
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
@@ -579,7 +579,7 @@ fn interrupted_install_is_recoverable(#[fixture(scm_group)] _group: &Group) {
     )
     .expect_ok();
 
-    // `type: managed` has no second ownership proof (see the module doc
+    // `protocol: native` has no second ownership proof (see the module doc
     // comment on `manager`): the orphan is indistinguishable from a
     // stranger's service, so `install` must refuse rather than adopt it —
     // with or without `--force`, which never overrides a foreign refusal.
@@ -600,7 +600,7 @@ fn interrupted_install_is_recoverable(#[fixture(scm_group)] _group: &Group) {
     assert!(matches!(recovered, Outcome::Create), "{recovered:?}");
 }
 
-// Step 6: env on type: managed (spec §8 must-verify #5) ===============================================================
+// Step 6: env on protocol: native (spec §8 must-verify #5) ===============================================================
 
 #[skuld::test]
 fn managed_kind_environment_availability(#[fixture(scm_group)] _group: &Group) {
@@ -641,7 +641,7 @@ fn managed_kind_environment_availability(#[fixture(scm_group)] _group: &Group) {
     );
     assert_eq!(
         reported, VALUE,
-        "type: managed env support (design spec §8 must-verify #5): the daemon process did not see its \
+        "protocol: native env support (design spec §8 must-verify #5): the daemon process did not see its \
          configured environment variable"
     );
 }
@@ -673,7 +673,7 @@ fn assert_conflict_cleared_by_force(mgr: &Scm, spec: &DaemonSpec) -> String {
 
 const INSTALLED_ENVIRONMENT: &str = "GOETIA_TEST_KEY=value";
 
-/// An installed `type: managed` service whose spec sets one environment variable.
+/// An installed `protocol: native` service whose spec sets one environment variable.
 fn install_with_environment(mgr: &Scm, id: &str) -> DaemonSpec {
     let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
     let spec = ServiceSpec::new({
@@ -779,7 +779,7 @@ fn an_environment_of_an_unknown_registry_type_is_a_conflict(#[fixture(scm_group)
 }
 
 /// An `UpToDate` install writes nothing, so a second install of either kind must compare equal on
-/// everything the first wrote: failure actions, `Environment`, `Parameters`. A `type: simple`
+/// everything the first wrote: failure actions, `Environment`, `Parameters`. A `protocol: plain`
 /// service's `Environment` is empty on both sides, whatever its spec's `env` says. It is registered
 /// but never started, so the shim is only provided and checked, never run: its manager has a provider,
 /// which `Scm::new()` has not.

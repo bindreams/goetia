@@ -17,7 +17,11 @@ pub(super) enum Field {
     User,
     Restart,
     RestartDelay,
-    Kind,
+    /// `type`: `service` or `task`.
+    Type,
+    /// `protocol`: `plain` or `native`.
+    Protocol,
+    Schedule,
 }
 
 impl Field {
@@ -35,7 +39,9 @@ impl Field {
             Field::User => "user".to_string(),
             Field::Restart => "restart".to_string(),
             Field::RestartDelay => "restart-delay".to_string(),
-            Field::Kind => "type".to_string(),
+            Field::Type => "type".to_string(),
+            Field::Protocol => "protocol".to_string(),
+            Field::Schedule => "schedule".to_string(),
         }
     }
 }

@@ -148,7 +148,7 @@ fn dispatch_with<M: ServiceManager + Clone + 'static>(
 
 /// The `host` a subcommand that installs through a manager, or needs no shim, must never call.
 fn no_host() -> goetia::Result<HostCommand> {
-    panic!("only a Windows `install --dry-run` of a `type: simple` daemon asks for the host command")
+    panic!("only a Windows `install --dry-run` of a `protocol: plain` daemon asks for the host command")
 }
 
 /// A host command for a dry-run that may ask for one (`dispatch_with` hands it in); on Linux and
@@ -1680,7 +1680,7 @@ fn diff_exits_one_for_a_service_installed_under_another_id() {
 #[cfg(target_os = "macos")]
 const NATIVE_ADVISORY_FIELDS: &str = "restart-delay: 500ms\n";
 #[cfg(windows)]
-const NATIVE_ADVISORY_FIELDS: &str = "type: managed\nrestart: on-failure\nrestart-delay: 60d\n";
+const NATIVE_ADVISORY_FIELDS: &str = "protocol: native\nrestart: on-failure\nrestart-delay: 60d\n";
 
 /// `--dry-run`'s preview must not silently drop a `Warning`. The native
 /// backend's advisory fires at resolve time, from `BackendKind::warn`,
@@ -1752,11 +1752,11 @@ fn dry_run_reports_a_refused_daemon() {
     }
 }
 
-/// A `type: managed` daemon runs no shim, so its preview must not ask for the host command.
+/// A `protocol: native` daemon runs no shim, so its preview must not ask for the host command.
 #[skuld::test]
 fn dry_run_of_managed_never_calls_host() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\ntype: managed\n");
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\nprotocol: native\n");
 
     let (code, out, err) = dispatch_get_manager(
         &[
@@ -1776,13 +1776,13 @@ fn dry_run_of_managed_never_calls_host() {
     assert!(out.contains("# frpc\n"), "stdout:\n{out}");
 }
 
-/// The Windows preview of a `type: simple` daemon shows the command the host closure supplies, not
+/// The Windows preview of a `protocol: plain` daemon shows the command the host closure supplies, not
 /// a placeholder.
 #[cfg(windows)]
 #[skuld::test]
 fn dry_run_shows_the_host_preview() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\ntype: simple\n");
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
     let host = || -> goetia::Result<HostCommand> {
         Ok(HostCommand {
             exe: PathBuf::from(r"C:\hosts\the-host-under-test.exe"),
@@ -1815,7 +1815,7 @@ fn dry_run_shows_the_host_preview() {
 #[skuld::test]
 fn dry_run_reports_a_host_error() {
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\ntype: simple\n");
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
     let host = || -> goetia::Result<HostCommand> { Err(goetia::Error::NoShimProvider) };
 
     let (code, out, err) = dispatch_get_manager(

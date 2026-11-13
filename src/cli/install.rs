@@ -169,7 +169,7 @@ fn report_outcome(id: &Id, outcome: &Outcome, out: &mut dyn Write, err: &mut dyn
 // --dry-run never touches a manager or writes anything. It still reads the manifest and `.env` (resolving the spec),
 // and it canonicalizes the process's current directory when `-f` is relative. A drive-relative path (`C:bin`) in the
 // manifest is resolved against the process's per-drive current directory, which `std::path::absolute` reads. The
-// preview step itself, on Windows, asks the shim provider for the host command (`host`) of a `type: simple` daemon,
+// preview step itself, on Windows, asks the shim provider for the host command (`host`) of a `protocol: plain` daemon,
 // and reads no account or file. A real install resolves `spec.user` to a platform account name (see
 // `backend::Identity`) with an effectful lookup (a Windows SID needs `LookupAccountSid`; a launchd numeric UID needs
 // one too); a preview does not, so this is a literal, lookup-free rendering that may differ from a real install's
@@ -199,7 +199,7 @@ fn preview_root_account() -> String {
 /// The generated artifact for `spec`, or the generator's refusal of it: scm refuses `restart: always` and
 /// an executable path its registration writer rewrites; systemd refuses the values `refuse_unrepresentable` lists.
 ///
-/// Writes nothing; on Windows a `type: simple` daemon's preview asks `host` for the host command.
+/// Writes nothing; on Windows a `protocol: plain` daemon's preview asks `host` for the host command.
 /// `host` is called only by that preview, whose artifact names it.
 fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>) -> Result<String> {
     let identity = preview_identity(&spec.common().user);

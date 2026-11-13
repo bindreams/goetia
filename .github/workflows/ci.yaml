@@ -232,7 +232,7 @@ jobs:
 
   # A library consumer of the *packaged* crate ships the stock shim, and goetia's own two-stage and
   # `cargo install` builds do too. Windows only, and elevated like the `test` job's runner: the round
-  # trips install a `type: simple` service. See `.github/scripts/consumer-build-tests.sh`.
+  # trips install a `protocol: plain` service. See `.github/scripts/consumer-build-tests.sh`.
   consumer-build:
     name: Consumer build (windows-latest)
     needs: rust-version

@@ -35,7 +35,7 @@
 //! `windows_style_split_matches_real_command_line_to_argv_w` (which pins the
 //! `argv[0]` rule against the real Win32 API) and
 //! `executable_trailing_backslash_does_not_round_trip_through_argv0` (which
-//! documents the writer's behaviour). `executable` is a `HostCommand`'s `exe` or, for a `type: managed`
+//! documents the writer's behaviour). `executable` is a `HostCommand`'s `exe` or, for a `protocol: native`
 //! daemon, `command[0]`; one the writer would rewrite is refused, see `refuse_unwritable_executable`:
 //! a `command[0]` by [`registration`], and a host's path by [`install_registration`], which `install` and
 //! `diff` call.
@@ -147,7 +147,7 @@ pub struct FailureActions {
 ///
 /// Refuses, with [`Error::Invalid`]:
 ///
-/// - a `type: managed` `command[0]` the registration writer would rewrite;
+/// - a `protocol: native` `command[0]` the registration writer would rewrite;
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
 ///   could only run on-failure semantics.
 pub fn registration(
@@ -280,11 +280,11 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
     })
 }
 
-/// [`registration`], for an install or its preview: also refuses a `type: simple` daemon when the
+/// [`registration`], for an install or its preview: also refuses a `protocol: plain` daemon when the
 /// host's path would be written as another path. The path is the host's, not the daemon's, so this is
 /// the install's refusal and not the rendering's: `list` and `status` render every daemon, and must
 /// not report one as having an unusable embedded spec because of where goetia itself is installed.
-/// A `type: managed` daemon never runs the host, so its path is not judged.
+/// A `protocol: native` daemon never runs the host, so its path is not judged.
 pub fn install_registration(
     spec: &DaemonSpec,
     id: &Identity,
@@ -311,9 +311,9 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
 /// Which path [`refuse_unwritable_executable`] judges, as its message names it.
 #[derive(Clone, Copy)]
 enum ExecutablePath {
-    /// `command[0]` of a `type: managed` daemon.
+    /// `command[0]` of a `protocol: native` daemon.
     Command0,
-    /// The service host's path for a `type: simple` daemon, which no manifest sets.
+    /// The service host's path for a `protocol: plain` daemon, which no manifest sets.
     ServiceHost,
 }
 
