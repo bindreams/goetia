@@ -224,7 +224,8 @@ pub enum Restart {
 /// Whether Goetia runs the command directly (via `goetia-shim` on Windows)
 /// or the command is itself expected to behave as a native service.
 ///
-/// Parsed from its authored kebab-case string (`simple`, `managed`) by `resolve::parse_protocol`.
+/// Parsed from its authored kebab-case string (`simple`, `managed`) by `resolve::parse_protocol`;
+/// see [`Restart`]'s doc comment for why this is not a derived `Deserialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Plain,

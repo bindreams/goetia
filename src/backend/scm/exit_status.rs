@@ -120,7 +120,7 @@ impl RecordedExit {
     ///
     /// This reads the Win32 code alone, so it also accepts the record of a host that exits before
     /// connecting to SCM: `(0, 0)` with wait hint 2000 (P25 c/d), the same as a failed SCM start
-    /// (P10). Callers must rule that out first; `start_via_notify` does, see there.
+    /// (P10). Callers must rule that out first; `stopped_before_running` (in `wait.rs`) does, see there.
     pub fn daemon_ran(self) -> bool {
         !self.is_refusal() && (self.win32 == 0 || self.win32 == ERROR_SERVICE_SPECIFIC_ERROR)
     }
