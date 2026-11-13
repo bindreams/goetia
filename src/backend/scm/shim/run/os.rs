@@ -12,6 +12,7 @@ use cosca::Containment;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
 use crate::backend::unreaped::release_unreaped;
+use crate::error::os_error_in;
 
 mod eventlog;
 
@@ -41,7 +42,8 @@ pub(crate) trait Spawned: Send + Sync {
     /// Kill the daemon alone, not its descendants.
     fn kill(&self) -> Result<(), cosca::error::Error>;
 
-    /// Kill the daemon's whole tree.
+    /// Send the kill to the daemon's whole tree (`cosca`'s `send_kill_tree`). `Ok` says every member
+    /// was reached, not that any has exited, and the call never waits for one.
     fn kill_tree(&self) -> Result<(), cosca::error::Error>;
 }
 
@@ -96,7 +98,7 @@ impl Spawned for cosca::Child {
     }
 
     fn kill_tree(&self) -> Result<(), cosca::error::Error> {
-        cosca::Child::kill_tree(self)
+        cosca::Child::send_kill_tree(self)
     }
 }
 
@@ -110,32 +112,18 @@ impl Channels for Real {
     }
 }
 
-/// The OS error code behind a `cosca` failure, if it has one: the first `io::Error` with a code on
-/// its `source()` chain, below whatever context `cosca` added (a failure after `CreateProcess` comes
-/// as [`cosca::error::Error::MayHaveStarted`], a failed kill as `Containment` or `Unassessable`).
-pub(crate) fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
-    let mut layer: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(error) = layer {
-        if let Some(code) = error.downcast_ref::<io::Error>().and_then(io::Error::raw_os_error) {
-            return Some(code);
-        }
-        layer = error.source();
-    }
-    None
-}
-
-/// The OS error code SCM is told for a refused spawn: [`os_error_of`], and `ERROR_FILE_NOT_FOUND`
-/// for a `NotFound` without a code. The shim passes only argv, so `std` searches `PATH` for a bare
-/// program name before `CreateProcessW` is called, and its miss is `NotFound` with no code (a
-/// missing absolute path fails in `CreateProcessW`, with the code). Nothing else on the spawn path
-/// makes a code-less `NotFound`.
+/// The OS error code SCM is told for a refused spawn: the first one on the error's `source()`
+/// chain ([`os_error_in`]; a failure after `CreateProcess` comes as
+/// [`cosca::error::Error::MayHaveStarted`], below which the chain goes on), and
+/// `ERROR_FILE_NOT_FOUND` for a `NotFound` with no code anywhere. The shim passes only argv, so
+/// `std` searches `PATH` for a bare program name before `CreateProcessW` is called, and its miss is
+/// `NotFound` with no code (a missing absolute path fails in `CreateProcessW`, with the code).
+/// Nothing else on the spawn path makes a code-less `NotFound`.
 pub(crate) fn spawn_error_code(e: &cosca::error::Error) -> Option<i32> {
-    match e {
-        cosca::error::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound && io.raw_os_error().is_none() => {
-            Some(ERROR_FILE_NOT_FOUND as i32)
-        }
-        _ => os_error_of(e),
-    }
+    os_error_in(e).or_else(|| match e {
+        cosca::error::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Some(ERROR_FILE_NOT_FOUND as i32),
+        _ => None,
+    })
 }
 
 /// Open `path` for append, creating parent directories first.

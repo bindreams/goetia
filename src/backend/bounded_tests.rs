@@ -257,7 +257,7 @@ fn a_contained_childs_descendant_dies_with_it() {
     // NOTE_EXIT on macOS), with no timeout to choose: it returns when the
     // descendant dies, and hangs if the descendant is not in the child's
     // contained tree (e.g. `command()` without `.contain()`) — then neither
-    // `kill_tree` nor `Drop` can reach it.
+    // `send_kill_tree` nor `Drop` can reach it.
     descendant.wait().unwrap();
 }
 

@@ -314,3 +314,21 @@ fn display_of_a_sentence_variant_and_its_report_agree_on_the_words() {
     let (display, report) = (loaded.to_string(), loaded.report().to_string());
     assert_eq!(report.replacen(": diagnostic", "", 1), display);
 }
+
+/// A `cosca` error says one layer in its `Display`; its own `Report` is the way to print it whole,
+/// so a goetia error that holds one prints what `Report` prints, below its own words.
+#[skuld::test]
+fn a_cosca_error_below_a_goetia_error_is_written_as_cosca_reports_it() {
+    let cosca_error = || cosca::error::Error::MayHaveStarted {
+        fate: cosca::error::ChildFate::Unknown,
+        wrapper_elevated: false,
+        detail: Some("the pipe broke".to_string()),
+        source: Arc::new(cosca::error::Error::Io(std::io::Error::other("no pipe"))),
+        unreaped: None,
+        cleanup: None,
+    };
+    let expected = cosca::error::Report::new(&cosca_error()).to_string();
+    let text = Error::spawn("tool", cosca_error()).report().to_string();
+
+    assert_eq!(text, format!("failed to run `tool`: {expected}"));
+}

@@ -22,8 +22,9 @@ use cosca::error::Report;
 use crate::backend::scm::exit_status::Reported;
 
 use super::logging::Log;
-use super::os::{Os, Spawned, os_error_of};
+use super::os::{Os, Spawned};
 use crate::backend::standby::Standby;
+use crate::error::os_error_in;
 
 /// How the run ends, decided once under the [`StopBus`] mutex: a stop accepted before the exit is
 /// decided wins over any failure; an exit decided first is reported whatever stop follows. SCM
@@ -126,7 +127,7 @@ impl Waiter {
                 // Notified on `Err` too: nothing else wakes `wait_while` in the no-stop case.
                 let failure = child.wait().err().map(|e| {
                     log.failure(&id, &wait_failed(&e));
-                    os_error_of(&e)
+                    os_error_in(&e)
                 });
                 bus.report_done(failure);
                 report.armed = false;
@@ -351,9 +352,9 @@ impl Supervisor {
     /// **A stop whose tree kill failed** is [`WaitOutcome::TreeMayRun`] too, even when the direct
     /// child's fallback worked: its descendants may still run.
     ///
-    /// **No drain after `kill_tree`.** `cosca`'s Job Object `hard_kill` closes the job handle as
-    /// part of terminating it, so `wait_tree` afterwards always fails with "the job handle was
-    /// already closed". "Terminated" means the kill succeeded. Windows does not document
+    /// **No drain after `kill_tree`.** [`Spawned::kill_tree`] only sends the kill (`cosca`'s
+    /// `send_kill_tree`), so the call neither waits for a member nor can hang on one that cannot be
+    /// observed. "Terminated" means the kill succeeded. Windows does not document
     /// `TerminateJobObject` as synchronous with member teardown, so members may still be exiting
     /// (and holding a port or a lock file) when STOPPED is reported.
     pub fn wait_for_child_or_stop(

@@ -139,26 +139,26 @@ fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir:
 #[skuld::test]
 fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
     assert_eq!(
-        os_error_of(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+        os_error_in(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(
             ERROR_ACCESS_DENIED as i32
         ))),
         Some(ERROR_ACCESS_DENIED as i32)
     );
     // A failure without a code has none, whatever its kind.
-    assert_eq!(os_error_of(&not_found()), None);
+    assert_eq!(os_error_in(&not_found()), None);
     assert_eq!(
-        os_error_of(&cosca::error::Error::Unassessable {
+        os_error_in(&cosca::error::Error::Unassessable {
             detail: "query".to_string(),
             source: Some(Arc::new(not_found())),
         }),
         None
     );
     assert_eq!(
-        os_error_of(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
+        os_error_in(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
         None
     );
     assert_eq!(
-        os_error_of(&cosca::error::Error::Containment {
+        os_error_in(&cosca::error::Error::Containment {
             detail: "attach".to_string(),
             source: None,
         }),
@@ -180,13 +180,13 @@ fn the_os_error_of_a_failure_after_the_spawn_is_the_one_of_its_source() {
     };
     let denied = || cosca::error::Error::Io(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
 
-    assert_eq!(os_error_of(&after_spawn(denied())), Some(ERROR_ACCESS_DENIED as i32));
+    assert_eq!(os_error_in(&after_spawn(denied())), Some(ERROR_ACCESS_DENIED as i32));
     assert_eq!(
         spawn_error_code(&after_spawn(denied())),
         Some(ERROR_ACCESS_DENIED as i32)
     );
     assert_eq!(
-        os_error_of(&after_spawn(cosca::error::Error::Containment {
+        os_error_in(&after_spawn(cosca::error::Error::Containment {
             detail: "attach".to_string(),
             source: None,
         })),
@@ -213,10 +213,10 @@ fn the_os_error_of_a_failure_is_found_at_any_depth_of_its_causes() {
     };
 
     // A failed `Job` kill: a `Containment` over the OS error.
-    assert_eq!(os_error_of(&containment(denied())), Some(ERROR_ACCESS_DENIED as i32));
+    assert_eq!(os_error_in(&containment(denied())), Some(ERROR_ACCESS_DENIED as i32));
     // Three layers down, below a code-less layer of another variant.
     assert_eq!(
-        os_error_of(&unassessable(not_killed(containment(denied())))),
+        os_error_in(&unassessable(not_killed(containment(denied())))),
         Some(ERROR_ACCESS_DENIED as i32)
     );
     // A spawn failure over the same chain.
@@ -228,16 +228,28 @@ fn the_os_error_of_a_failure_is_found_at_any_depth_of_its_causes() {
         unreaped: None,
         cleanup: None,
     };
-    assert_eq!(os_error_of(&after_spawn), Some(ERROR_ACCESS_DENIED as i32));
-    // The first error with a code, not the last: the layer above a deeper code is not skipped.
+    assert_eq!(os_error_in(&after_spawn), Some(ERROR_ACCESS_DENIED as i32));
+    // A code-less layer above the code does not hide it.
     assert_eq!(
-        os_error_of(&containment(cosca::error::Error::Io(
+        os_error_in(&containment(cosca::error::Error::Io(
             std::io::Error::from_raw_os_error(ERROR_PATH_NOT_FOUND as i32)
         ))),
         Some(ERROR_PATH_NOT_FOUND as i32)
     );
     // A chain with no code anywhere has none.
-    assert_eq!(os_error_of(&unassessable(containment(not_found()))), None);
+    assert_eq!(os_error_in(&unassessable(containment(not_found()))), None);
+}
+
+/// `cosca` adds context to an `io::Error` with `within`, which keeps its kind and drops its code
+/// from the layer: a `NotFound` with no code of its own, over the error that has one.
+#[skuld::test]
+fn a_code_on_the_chain_wins_over_a_code_less_not_found_above_it() {
+    let wrapped = cosca::error::Error::Io(crate::error::within(
+        "resolve the program",
+        std::io::Error::from_raw_os_error(ERROR_PATH_NOT_FOUND as i32),
+    ));
+
+    assert_eq!(spawn_error_code(&wrapped), Some(ERROR_PATH_NOT_FOUND as i32));
 }
 
 #[skuld::test]

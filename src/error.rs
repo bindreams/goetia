@@ -16,6 +16,8 @@ pub use reason::Reason;
 pub(crate) use report::Chain;
 #[cfg(feature = "cli")]
 pub(crate) use report::Sink;
+#[cfg(windows)]
+pub(crate) use report::os_error_in;
 pub(crate) use within::within;
 
 use report::Report;

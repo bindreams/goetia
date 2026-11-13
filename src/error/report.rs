@@ -112,11 +112,17 @@ impl fmt::Display for Chain<'_> {
 /// Writes `e` and its causes, collecting the remedies met on the way into `remedies`, outermost
 /// first and each once: a [`Both`](Error::Both)'s halves can carry the same one. An error `e` sets
 /// inside its own sentence (see [`Error::sentence`]) is written there, with its remedies collected.
+///
+/// A `cosca` error and everything below it is written by [`cosca::error::Report`]: its `Display` is
+/// one layer, and a `source()` walk shows only the first member of a list and never a `cleanup`.
 pub(super) fn write_chain<'a>(
     e: &'a (dyn std::error::Error + 'static),
     out: &mut Sink,
     remedies: &mut Vec<&'a str>,
 ) -> fmt::Result {
+    if e.is::<cosca::error::Error>() {
+        return write!(out, "{}", cosca::error::Report::new(e));
+    }
     // A `#[source]` of type `Box<Error>` reaches here as the box.
     let ours = e
         .downcast_ref::<Error>()
@@ -152,7 +158,7 @@ pub(super) fn write_chain<'a>(
 /// The first OS error code in `e`: its own, then its source's, then that of what it embeds. A
 /// [`Both`](Error::Both) is searched first half first; [`Error::Kept`] is searched as the error it
 /// holds.
-pub(super) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
+pub(crate) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
     if let Some(code) = e
         .downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error)

@@ -27,14 +27,27 @@ use crate::backend::scm::shim::run::logging::Log;
 
 /// The message of the usual refused thread: `io::Error::other(NO_THREAD)`.
 pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";
-/// The error a refused kill fails with.
-pub(crate) const KILL_REFUSED: &str = "the kill was refused (fake)";
-/// The error a [`WaitReply::Fails`] with no OS code fails with.
-pub(crate) const WAIT_FAILED: &str = "the wait failed (fake)";
+const KILL_REFUSED: &str = "the kill was refused (fake)";
+const WAIT_FAILED: &str = "the wait failed (fake)";
 /// The error a failing append fails with.
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
 /// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
+/// The error a [`KillReply::Refuses`] fails with.
+pub(crate) fn kill_refused() -> cosca::error::Error {
+    cosca::error::Error::Io(io::Error::other(KILL_REFUSED))
+}
+
+/// The error a [`WaitReply::Fails`] with no OS code fails with.
+pub(crate) fn wait_failed() -> cosca::error::Error {
+    cosca::error::Error::Io(io::Error::other(WAIT_FAILED))
+}
+
+/// The error a [`WaitReply::Fails`] with OS code `code` fails with.
+pub(crate) fn wait_failed_with_code(code: i32) -> cosca::error::Error {
+    cosca::error::Error::Io(io::Error::from_raw_os_error(code))
+}
+
 /// The default log directory of [`Fake::log`]. The `Fake` writes no file there.
 const FAKE_LOGS: &str = "fake-logs";
 
@@ -226,7 +239,7 @@ impl Instance {
                 self.proc.end(status(1));
                 Ok(())
             }
-            Some(KillReply::Refuses) => Err(cosca::error::Error::Io(io::Error::other(KILL_REFUSED))),
+            Some(KillReply::Refuses) => Err(kill_refused()),
             Some(KillReply::Panics) => panic!("the {what} panicked (fake)"),
         }
     }
@@ -243,8 +256,8 @@ impl Spawned for Instance {
             None => self.unstated("wait"),
             Some(WaitReply::Exits(code)) => Ok(self.proc.end(status(code))),
             Some(WaitReply::Blocks) => Ok(self.proc.wait_ended()),
-            Some(WaitReply::Fails(Some(code))) => Err(cosca::error::Error::Io(io::Error::from_raw_os_error(code))),
-            Some(WaitReply::Fails(None)) => Err(cosca::error::Error::Io(io::Error::other(WAIT_FAILED))),
+            Some(WaitReply::Fails(Some(code))) => Err(wait_failed_with_code(code)),
+            Some(WaitReply::Fails(None)) => Err(wait_failed()),
             Some(WaitReply::Panics) => panic!("the wait panicked (fake)"),
         }
     }
