@@ -277,12 +277,17 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
         // One entry's failure must not take down the listing of every other daemon, except that
         // no manager to ask is every entry's.
         match b.live_status(snapshot) {
-            Ok(status) => out.push(Installed::Ours {
-                spec: blob.spec.clone(),
-                state: status.state,
-                pid: status.pid,
-                enabled: status.enabled,
-            }),
+            Ok(status) => {
+                debug_assert_eq!(
+                    blob.spec.kind(),
+                    status.kind(),
+                    "a backend answered another kind's status"
+                );
+                out.push(Installed::Ours {
+                    spec: blob.spec.clone(),
+                    status,
+                });
+            }
             Err(e) => match e.cause() {
                 Error::NoManager { .. } => return Err(e),
                 // The query completed and found the service gone: absence is established.

@@ -77,7 +77,7 @@ use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Occupant, PutBackFound, Reason, Result};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, Installed, State, Status, Step, flow};
+use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
 
 /// Where `install` writes a plist that is not enabled at boot. launchd never scans this directory,
@@ -1293,11 +1293,11 @@ impl backend::Backend for Launchd {
             Role::UncountedQuery,
             &mut Reservation::default(),
         )?;
-        Ok(Status {
+        Ok(Status::Service(DaemonStatus {
             state,
             pid,
             enabled: snapshot.location.enabled,
-        })
+        }))
     }
 
     fn scan(&self) -> Scan<Plist> {

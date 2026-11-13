@@ -424,7 +424,10 @@ fn install_provisions_under_program_files(#[fixture(scm_group)] _group: &Group) 
     assert_stock_file(&file);
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the daemon to report in under the shim placed in Program Files");
-    assert_eq!(mgr.status(&spec.common().id).expect("status").state, State::Running);
+    assert_eq!(
+        mgr.status(&spec.common().id).expect("status").common().state,
+        State::Running
+    );
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 }
 
@@ -590,7 +593,11 @@ fn runs_as(label: &str, mgr: &Scm, install: impl FnOnce(&str, &str, u16)) {
     mgr.start(&id, Budget::Unbounded)
         .unwrap_or_else(|e| panic!("{label}: start: {}", e.report()));
     started.accept(&format!("the daemon to report in as {label}"));
-    assert_eq!(mgr.status(&id).expect("status").state, State::Running, "{label}");
+    assert_eq!(
+        mgr.status(&id).expect("status").common().state,
+        State::Running,
+        "{label}"
+    );
     mgr.stop(&id, Budget::DEFAULT)
         .unwrap_or_else(|e| panic!("{label}: stop: {}", e.report()));
 }
@@ -1126,7 +1133,10 @@ fn uninstall_of_one_of_two_on_a_file_returns(#[fixture(scm_group)] _group: &Grou
 
     assert!(shim_in(&folder).is_file(), "B still runs the file");
     assert!(!running.has_exited(), "B keeps running");
-    assert_eq!(mgr.status(&b_spec.common().id).expect("status").state, State::Running);
+    assert_eq!(
+        mgr.status(&b_spec.common().id).expect("status").common().state,
+        State::Running
+    );
 }
 
 /// `stop` returns once the service's process has exited, not when SCM first reports `STOPPED`, which

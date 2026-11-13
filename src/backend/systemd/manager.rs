@@ -192,7 +192,9 @@ impl Backend for Systemd {
 
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
         // A read: it draws nothing and asks no gate.
-        self.systemctl.status_from_unit(&unit_name(snapshot.id().as_str()))
+        self.systemctl
+            .status_from_unit(&unit_name(snapshot.id().as_str()))
+            .map(Status::Service)
     }
 
     /// Each id the unit directories name, read as `read` would. An id whose read did not complete

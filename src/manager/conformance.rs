@@ -160,7 +160,7 @@ fn install_does_not_start(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonS
         .status(&spec.common().id)
         .expect("status of a just-installed service");
     assert_ne!(
-        status.state,
+        status.common().state,
         State::Running,
         "install must not start the service (id {})",
         spec.common().id
@@ -175,7 +175,7 @@ fn install_does_not_enable(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Daemon
         .status(&spec.common().id)
         .expect("status of a just-installed service");
     assert!(
-        !status.enabled,
+        !status.common().enabled,
         "install must not enable the service at boot (id {})",
         spec.common().id
     );
@@ -186,7 +186,10 @@ fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) ->
     mgr.install(&spec, false).expect("install");
     mgr.enable(&spec.common().id).expect("enable");
     assert!(
-        mgr.status(&spec.common().id).expect("status after enable").enabled,
+        mgr.status(&spec.common().id)
+            .expect("status after enable")
+            .common()
+            .enabled,
         "enable must actually enable (id {})",
         spec.common().id
     );
@@ -206,7 +209,10 @@ fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) ->
     );
 
     assert!(
-        mgr.status(&spec.common().id).expect("status after reinstall").enabled,
+        mgr.status(&spec.common().id)
+            .expect("status after reinstall")
+            .common()
+            .enabled,
         "reinstall must not change boot-enablement (id {})",
         spec.common().id
     );
@@ -319,7 +325,10 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
         .expect("stop on a never-started service must be Ok, not an error");
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     assert_eq!(
-        mgr.status(&spec.common().id).expect("status after start").state,
+        mgr.status(&spec.common().id)
+            .expect("status after start")
+            .common()
+            .state,
         State::Running,
         "a start under a budget returns only once the service manager reports the service \
          running, so this ONE status() read must already say so — no retry and no second chance, \
@@ -331,7 +340,7 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
         .expect("start on an already-running service must be Ok, not an error");
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
     assert_ne!(
-        mgr.status(&spec.common().id).expect("status after stop").state,
+        mgr.status(&spec.common().id).expect("status after stop").common().state,
         State::Running,
         "a stop under a budget mirrors it: one status() read, already settled (id {})",
         spec.common().id
@@ -404,6 +413,7 @@ fn starting_with_no_budget_is_accepted_and_establishes_nothing(
     assert_eq!(
         mgr.status(&spec.common().id)
             .expect("status after a start that waited")
+            .common()
             .state,
         State::Running,
         "id {}",
@@ -437,6 +447,7 @@ fn a_start_request_after_a_confirmed_stop_is_accepted(
     assert_eq!(
         mgr.status(&spec.common().id)
             .expect("status after a start that waited")
+            .common()
             .state,
         State::Running,
         "id {}",
@@ -456,7 +467,10 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     assert_eq!(
-        mgr.status(&spec.common().id).expect("status after start").state,
+        mgr.status(&spec.common().id)
+            .expect("status after start")
+            .common()
+            .state,
         State::Running,
         "id {}",
         spec.common().id
@@ -587,7 +601,7 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
 /// `Ours`, not just `id`: an enumeration that drops one it could read is
 /// indistinguishable from one where that daemon does not exist.
 fn assert_list_is_complete_and_pid_agrees(mgr: &dyn ServiceManager, id: &Id, installed: &[Id]) {
-    let status_pid = mgr.status(id).expect("status").pid;
+    let status_pid = mgr.status(id).expect("status").common().pid;
     let listed = mgr.list().expect("list");
     for other in installed {
         assert!(
@@ -600,7 +614,7 @@ fn assert_list_is_complete_and_pid_agrees(mgr: &dyn ServiceManager, id: &Id, ins
     let list_pid = listed
         .iter()
         .find_map(|entry| match entry {
-            Installed::Ours { spec, pid, .. } if spec.common().id == *id => Some(*pid),
+            Installed::Ours { spec, status } if spec.common().id == *id => Some(status.common().pid),
             _ => None,
         })
         .unwrap_or_else(|| panic!("id {id} must appear in list()"));

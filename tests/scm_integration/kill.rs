@@ -129,7 +129,7 @@ fn kill_with_the_privilege_disabled(user: User) {
 
     support::kill::until(|| {
         matches!(
-            mgr.status(&spec.common().id).expect("status").state,
+            mgr.status(&spec.common().id).expect("status").common().state,
             State::Stopped | State::Failed
         )
     });

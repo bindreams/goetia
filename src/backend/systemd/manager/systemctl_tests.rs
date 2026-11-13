@@ -1017,7 +1017,7 @@ fn a_show_answer_with_every_property_is_read() {
     for (answer, expected) in [
         (
             "ActiveState=active\nMainPID=42\nUnitFileState=enabled\nLoadState=loaded\n",
-            Status {
+            DaemonStatus {
                 state: State::Running,
                 pid: Some(42),
                 enabled: true,
@@ -1025,7 +1025,7 @@ fn a_show_answer_with_every_property_is_read() {
         ),
         (
             "MainPID=0\nLoadState=loaded\nActiveState=inactive\nUnitFileState=\n",
-            Status {
+            DaemonStatus {
                 state: State::Stopped,
                 pid: None,
                 enabled: false,

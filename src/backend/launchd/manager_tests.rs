@@ -1555,7 +1555,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     // `status` counts nothing and is handed no reservation: it makes its own files, over a real child
     // too, and trips no assertion.
     let (mgr, script) = over_sh(&[("print", RUNNING)]);
-    assert_eq!(mgr.status(&id).expect("status").state, State::Running);
+    assert_eq!(mgr.status(&id).expect("status").common().state, State::Running);
     script.assert_driven("status");
 
     let (mgr, script) = over_sh(&BOOTOUT);

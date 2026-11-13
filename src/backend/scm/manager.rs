@@ -138,7 +138,7 @@ use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Chain, Error, Reason, Result, terminating_failed};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, Installed, State, Status, Step};
+use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
 use crate::shim::HostCommand;
 use crate::spec::{AccountId, DaemonSpec, Id, Protocol, User};
 
@@ -406,7 +406,7 @@ impl Backend for Scm {
         let id = snapshot.id();
         let enabled = snapshot.config()?.start_type == ServiceStartType::AutoStart;
         let (state, pid) = query_live(snapshot.service()?, id.as_str())?;
-        Ok(Status { state, pid, enabled })
+        Ok(Status::Service(DaemonStatus { state, pid, enabled }))
     }
 
     /// Read directly from the registry rather than `windows-service`'s enumeration API:

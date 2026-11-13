@@ -505,7 +505,7 @@ fn disable_returns_the_plist_to_staging(#[fixture(launchd_group)] _group: &Group
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     assert_eq!(
-        mgr.status(&spec.common().id).unwrap().state,
+        mgr.status(&spec.common().id).unwrap().common().state,
         State::Running,
         "precondition: actually running"
     );
@@ -524,7 +524,7 @@ fn disable_returns_the_plist_to_staging(#[fixture(launchd_group)] _group: &Group
     // running" — a currently-loaded job must survive the plist moving back
     // to staging untouched.
     assert_eq!(
-        mgr.status(&spec.common().id).unwrap().state,
+        mgr.status(&spec.common().id).unwrap().common().state,
         State::Running,
         "disable must not stop a job that was loaded"
     );
@@ -553,16 +553,16 @@ fn start_stop_status_reflect_reality(#[fixture(launchd_group)] _group: &Group) {
     );
     let _guard = Guard::install(&mgr, &spec);
 
-    assert_eq!(mgr.status(&spec.common().id).unwrap().state, State::Stopped);
+    assert_eq!(mgr.status(&spec.common().id).unwrap().common().state, State::Stopped);
 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     let running = mgr.status(&spec.common().id).unwrap();
-    assert_eq!(running.state, State::Running);
-    assert!(running.pid.is_some(), "a running job should report a pid");
+    assert_eq!(running.common().state, State::Running);
+    assert!(running.common().pid.is_some(), "a running job should report a pid");
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
-    assert_ne!(mgr.status(&spec.common().id).unwrap().state, State::Running);
+    assert_ne!(mgr.status(&spec.common().id).unwrap().common().state, State::Running);
 }
 
 // kill ================================================================================================================
@@ -632,7 +632,7 @@ fn killing_a_job_with_no_process_is_not_running(#[fixture(launchd_group)] _group
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     mgr.kill(&spec.common().id).expect("kill");
-    support::kill::until(|| mgr.status(&spec.common().id).expect("status").state != State::Running);
+    support::kill::until(|| mgr.status(&spec.common().id).expect("status").common().state != State::Running);
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
@@ -678,7 +678,7 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded(#[fixture(launchd_grou
         "a refused install must leave the plist as it was"
     );
     assert_eq!(
-        mgr.status(&spec.common().id).unwrap().state,
+        mgr.status(&spec.common().id).unwrap().common().state,
         State::Running,
         "a refused install must not stop the daemon"
     );
@@ -1097,7 +1097,7 @@ fn a_stop_with_no_budget_waits_for_the_job_to_be_gone(#[fixture(launchd_group)] 
         .expect("a stop with no budget still waits for the job to be gone, and completes");
 
     assert_eq!(
-        mgr.status(&spec.common().id).expect("status after stop").state,
+        mgr.status(&spec.common().id).expect("status after stop").common().state,
         State::Stopped,
         "launchd no longer has the job, so it reads as stopped"
     );
@@ -1482,7 +1482,7 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label(#[fixture(launchd_group)
 
     let status = mgr.status(&spec.common().id).expect("status");
     assert_eq!(
-        status.state,
+        status.common().state,
         State::Running,
         "our daemon must be running after start; a stale job holding the label must not          be mistaken for it"
     );

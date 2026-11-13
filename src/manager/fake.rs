@@ -18,7 +18,7 @@ use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Reason, Result};
 use crate::manager::budget;
 use crate::manager::flow;
-use crate::manager::{Budget, Installed, ServiceManager, State, Status, Step};
+use crate::manager::{Budget, DaemonStatus, Installed, ServiceManager, State, Status, Step};
 use crate::spec::{DaemonFields, DaemonSpec, Id, ServiceFields, ServiceSpec, User};
 
 /// The fake's own artifact marker, deliberately not any real backend's
@@ -829,11 +829,11 @@ impl crate::backend::Backend for Fake {
                 id: id.as_str().to_string(),
             });
         }
-        Ok(Status {
+        Ok(Status::Service(DaemonStatus {
             state: snapshot.entry.state,
             pid: pid_for(snapshot.entry.state),
             enabled: snapshot.entry.enabled,
-        })
+        }))
     }
 
     /// Aggregates first, then the opaque ids last-to-first: `ServiceManager::list` promises no

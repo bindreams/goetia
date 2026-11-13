@@ -451,13 +451,13 @@ fn start_stop_status_reflect_reality(#[fixture(systemd_group)] _group: &Group) {
 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     let status = mgr.status(&spec.common().id).expect("status after start");
-    assert_eq!(status.state, State::Running, "{status:?}");
-    assert!(status.pid.is_some(), "{status:?}");
+    assert_eq!(status.common().state, State::Running, "{status:?}");
+    assert!(status.common().pid.is_some(), "{status:?}");
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
     let status = mgr.status(&spec.common().id).expect("status after stop");
-    assert_ne!(status.state, State::Running, "{status:?}");
-    assert!(status.pid.is_none(), "{status:?}");
+    assert_ne!(status.common().state, State::Running, "{status:?}");
+    assert!(status.common().pid.is_none(), "{status:?}");
 }
 
 // kill ================================================================================================================

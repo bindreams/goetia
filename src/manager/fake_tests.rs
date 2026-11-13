@@ -64,13 +64,14 @@ fn list_reports_the_same_pid_as_status() {
     let entry = listed
         .iter()
         .find_map(|e| match e {
-            Installed::Ours { spec: s, pid, .. } if s.common().id == spec.common().id => Some(*pid),
+            Installed::Ours { spec: s, status } if s.common().id == spec.common().id => Some(status.common().pid),
             _ => None,
         })
         .expect("just-installed entry must be present and readable");
-    assert!(status.pid.is_some(), "a running daemon must report a pid");
+    assert!(status.common().pid.is_some(), "a running daemon must report a pid");
     assert_eq!(
-        entry, status.pid,
+        entry,
+        status.common().pid,
         "list's pid must agree with status's pid while running"
     );
 
@@ -80,13 +81,14 @@ fn list_reports_the_same_pid_as_status() {
     let entry = listed
         .iter()
         .find_map(|e| match e {
-            Installed::Ours { spec: s, pid, .. } if s.common().id == spec.common().id => Some(*pid),
+            Installed::Ours { spec: s, status } if s.common().id == spec.common().id => Some(status.common().pid),
             _ => None,
         })
         .expect("just-stopped entry must be present and readable");
-    assert!(status.pid.is_none(), "a stopped daemon must report no pid");
+    assert!(status.common().pid.is_none(), "a stopped daemon must report no pid");
     assert_eq!(
-        entry, status.pid,
+        entry,
+        status.common().pid,
         "list's pid must agree with status's pid once stopped"
     );
 }
@@ -485,7 +487,7 @@ fn a_stalled_start_times_out_under_a_bounded_budget() {
         other => panic!("a stalled start under a bounded budget must time out, got {other:?}"),
     }
     assert_ne!(
-        fake.status(&spec.common().id).unwrap().state,
+        fake.status(&spec.common().id).unwrap().common().state,
         State::Running,
         "a start that timed out must not have fabricated the confirmation"
     );
@@ -507,7 +509,7 @@ fn a_stalled_stop_times_out_under_a_bounded_budget() {
         other => panic!("a stalled stop under a bounded budget must time out, got {other:?}"),
     }
     assert_eq!(
-        fake.status(&spec.common().id).unwrap().state,
+        fake.status(&spec.common().id).unwrap().common().state,
         State::Running,
         "a stop that timed out must not have fabricated the confirmation"
     );
@@ -526,7 +528,7 @@ fn a_stalled_start_is_ok_under_no_budget_and_leaves_the_state_alone() {
         fake.start(&spec.common().id, budget)
             .unwrap_or_else(|e| panic!("{budget:?} establishes nothing, so it cannot fail: {e}"));
         assert_ne!(
-            fake.status(&spec.common().id).unwrap().state,
+            fake.status(&spec.common().id).unwrap().common().state,
             State::Running,
             "{budget:?} confirmed nothing, so it must not have changed the state"
         );
@@ -545,7 +547,7 @@ fn a_stalled_stop_is_ok_under_no_budget_and_leaves_the_state_alone() {
         fake.stop(&spec.common().id, budget)
             .unwrap_or_else(|e| panic!("{budget:?} establishes nothing, so it cannot fail: {e}"));
         assert_eq!(
-            fake.status(&spec.common().id).unwrap().state,
+            fake.status(&spec.common().id).unwrap().common().state,
             State::Running,
             "{budget:?} confirmed nothing, so it must not have changed the state"
         );
@@ -624,7 +626,7 @@ fn an_unstalled_entry_starts_under_every_budget_that_waits() {
             .unwrap_or_else(|e| panic!("{budget:?}: {e}"));
 
         assert_eq!(
-            fake.status(&spec.common().id).unwrap().state,
+            fake.status(&spec.common().id).unwrap().common().state,
             State::Running,
             "{budget:?}"
         );
@@ -648,7 +650,7 @@ fn an_unstalled_entry_is_left_alone_under_a_budget_that_does_not_wait() {
             .unwrap_or_else(|e| panic!("{budget:?} accepts the request: {e}"));
 
         assert_eq!(
-            fake.status(&spec.common().id).unwrap().state,
+            fake.status(&spec.common().id).unwrap().common().state,
             State::Stopped,
             "{budget:?} confirmed nothing, so it must not have changed the state"
         );
@@ -673,7 +675,7 @@ fn a_running_entry_is_left_alone_by_a_stop_under_a_budget_that_does_not_wait() {
             .unwrap_or_else(|e| panic!("{budget:?} accepts the request: {e}"));
 
         assert_eq!(
-            fake.status(&spec.common().id).unwrap().state,
+            fake.status(&spec.common().id).unwrap().common().state,
             State::Running,
             "{budget:?} confirmed nothing, so it must not have changed the state"
         );
@@ -714,7 +716,7 @@ fn a_start_request_over_a_stopped_entry_is_accepted_and_settles_nothing() {
 
     fake.request_start_after_stop(&spec.common().id).unwrap();
 
-    assert_eq!(fake.status(&spec.common().id).unwrap().state, State::Stopped);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Stopped);
 }
 
 // kill ================================================================================================================
@@ -728,8 +730,8 @@ fn kill_ends_a_running_service_as_a_failure() {
 
     fake.kill(&spec.common().id).unwrap();
 
-    assert_eq!(fake.status(&spec.common().id).unwrap().state, State::Failed);
-    assert_eq!(fake.status(&spec.common().id).unwrap().pid, None);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Failed);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().pid, None);
 }
 
 #[skuld::test]
@@ -745,7 +747,7 @@ fn kill_of_a_service_that_is_not_running_says_so() {
         "{result:?}"
     );
     assert_eq!(
-        fake.status(&spec.common().id).unwrap().state,
+        fake.status(&spec.common().id).unwrap().common().state,
         State::Stopped,
         "nothing changed"
     );
@@ -871,8 +873,12 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
             )),
             _ => {
                 let status = fake.status(&spec.common().id).unwrap();
-                assert_eq!(status.state, State::Stopped, "no verb acted on what replaced it");
-                assert!(!status.enabled, "no verb acted on what replaced it");
+                assert_eq!(
+                    status.common().state,
+                    State::Stopped,
+                    "no verb acted on what replaced it"
+                );
+                assert!(!status.common().enabled, "no verb acted on what replaced it");
                 assert_eq!(fake.preview_install(&other).unwrap(), Outcome::UpToDate);
             }
         }

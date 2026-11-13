@@ -699,8 +699,8 @@ fn install_start_and_enable_flags_reach_the_manager() {
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     let status = fake.status(&Id::try_from("frpc").unwrap()).unwrap();
-    assert_eq!(status.state, State::Running, "--start must reach the manager");
-    assert!(status.enabled, "--enable must reach the manager");
+    assert_eq!(status.common().state, State::Running, "--start must reach the manager");
+    assert!(status.common().enabled, "--enable must reach the manager");
 }
 
 /// Unlike `list`/`status`/`show`/`diff` (whose `run` functions do not even
@@ -748,8 +748,8 @@ fn install_without_flags_does_not_start_or_enable() {
 
     assert_eq!(code, 0);
     let status = fake.status(&Id::try_from("frpc").unwrap()).unwrap();
-    assert_ne!(status.state, State::Running);
-    assert!(!status.enabled);
+    assert_ne!(status.common().state, State::Running);
+    assert!(!status.common().enabled);
 }
 
 // show ================================================================================================================
@@ -1282,7 +1282,7 @@ fn start_reaches_the_manager() {
 
     assert_eq!(code, 0);
     assert_eq!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().state,
         State::Running
     );
 }
@@ -1298,7 +1298,7 @@ fn stop_reaches_the_manager() {
 
     assert_eq!(code, 0);
     assert_ne!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().state,
         State::Running
     );
 }
@@ -1324,7 +1324,7 @@ stderr:
         "frpc: kill delivered
 "
     );
-    assert_eq!(fake.status(&spec.common().id).unwrap().state, State::Failed);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Failed);
 }
 
 #[skuld::test]
@@ -1392,7 +1392,7 @@ fn kill_needs_elevation_and_asks_nothing_of_the_manager_without_it() {
 
     assert_eq!(code, 1);
     assert!(err.contains("requires elevation"), "{err}");
-    assert_eq!(fake.status(&spec.common().id).unwrap().state, State::Running);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Running);
 }
 
 /// Every id is tried, and the exit code combines what each contributed: killing the running one is
@@ -1420,7 +1420,7 @@ stderr:
 "
     );
     assert!(err.contains("beta"), "{err}");
-    assert_eq!(fake.status(&running.common().id).unwrap().state, State::Failed);
+    assert_eq!(fake.status(&running.common().id).unwrap().common().state, State::Failed);
 }
 
 /// `kill` waits for nothing, so it has no wait flags to accept and ignore.
@@ -1457,7 +1457,7 @@ fn restart_reaches_the_manager() {
 
     assert_eq!(code, 0);
     assert_eq!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().state,
         State::Running
     );
 }
@@ -1470,7 +1470,7 @@ fn enable_reaches_the_manager() {
     let (code, _out, _err) = dispatch_elevated(&["goetia", "daemon", "enable", "frpc"], &fake);
 
     assert_eq!(code, 0);
-    assert!(fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled);
+    assert!(fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled);
 }
 
 #[skuld::test]
@@ -1483,7 +1483,7 @@ fn disable_reaches_the_manager() {
     let (code, _out, _err) = dispatch_elevated(&["goetia", "daemon", "disable", "frpc"], &fake);
 
     assert_eq!(code, 0);
-    assert!(!fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled);
+    assert!(!fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled);
 }
 
 #[skuld::test]
@@ -2142,7 +2142,7 @@ fn enable_with_an_invalid_id_touches_nothing() {
     assert_eq!(code, 1);
     assert!(err.contains("not/a/valid/id"), "{err}");
     assert!(
-        !fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
+        !fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled,
         "frpc must not have been enabled: an earlier valid id must not run ahead of a later invalid one"
     );
 }
@@ -2161,7 +2161,7 @@ fn enable_aggregates_across_multiple_ids() {
     assert!(out.contains("frpc: enabled"), "{out}");
     assert!(err.contains("never-installed"), "{err}");
     assert!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled,
         "frpc must still have been enabled despite the other id failing"
     );
 }
@@ -3883,7 +3883,7 @@ fn restart_that_cannot_prepare_sends_nothing() {
         assert!(err.contains("so none was sent"), "{err}");
         assert_eq!(fake.calls(), vec![], "{budget:?}: nothing may be sent");
         assert_eq!(
-            fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
+            fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().state,
             State::Running
         );
     }
@@ -4012,7 +4012,7 @@ fn install_start_prepares_one_sequence_for_the_install_and_the_start() {
     );
     assert_eq!(fake.calls(), vec![("start", "frpc".to_string())]);
     assert!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled,
         "--enable reached the manager"
     );
 }

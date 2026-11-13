@@ -151,8 +151,8 @@ fn install_then_list_round_trips_without_the_source_file(#[fixture(scm_group)] _
     assert_eq!(found, spec, "round-tripped spec must equal the original exactly");
 
     let status = mgr.status(&spec.common().id).expect("status");
-    assert_eq!(status.state, State::Stopped);
-    assert!(!status.enabled);
+    assert_eq!(status.common().state, State::Stopped);
+    assert!(!status.common().enabled);
 }
 
 /// SCM matches service names case-insensitively, so a request for `ID` reaches the service
@@ -216,7 +216,12 @@ fn an_update_keeps_the_start_type_enable_set(#[fixture(scm_group)] _group: &Grou
         .unwrap();
     mgr.install(&spec, false).expect("install");
     mgr.enable(&spec.common().id).expect("enable");
-    assert!(mgr.status(&spec.common().id).expect("status after enable").enabled);
+    assert!(
+        mgr.status(&spec.common().id)
+            .expect("status after enable")
+            .common()
+            .enabled
+    );
 
     let changed = ServiceSpec::new({
         let base = support::plain_fields(&id, command);
@@ -234,7 +239,10 @@ fn an_update_keeps_the_start_type_enable_set(#[fixture(scm_group)] _group: &Grou
     assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
 
     assert!(
-        mgr.status(&spec.common().id).expect("status after the update").enabled,
+        mgr.status(&spec.common().id)
+            .expect("status after the update")
+            .common()
+            .enabled,
         "the update must not reset the start type `enable` set"
     );
 }
@@ -284,16 +292,16 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the fixture to report SERVICE_RUNNING");
     let status = mgr.status(&spec.common().id).expect("status while running");
-    assert_eq!(status.state, State::Running);
+    assert_eq!(status.common().state, State::Running);
     assert!(
-        status.pid.is_some(),
+        status.common().pid.is_some(),
         "type: managed reports the daemon's own pid, not a shim's"
     );
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP");
     let status = mgr.status(&spec.common().id).expect("status after stop");
-    assert_eq!(status.state, State::Stopped);
+    assert_eq!(status.common().state, State::Stopped);
 }
 
 // kill ================================================================================================================
@@ -362,10 +370,10 @@ fn kill_returns_once_scm_has_recorded_the_exit(#[fixture(scm_group)] _group: &Gr
 
     let status = mgr.status(&spec.common().id).expect("status straight after the kill");
     assert!(
-        matches!(status.state, State::Stopped | State::Failed),
+        matches!(status.common().state, State::Stopped | State::Failed),
         "kill returned before SCM recorded the exit ({status:?})"
     );
-    assert_eq!(status.pid, None, "a killed daemon has no process ({status:?})");
+    assert_eq!(status.common().pid, None, "a killed daemon has no process ({status:?})");
 }
 
 #[skuld::test]
@@ -495,7 +503,7 @@ fn uninstall_errors_when_service_will_not_stop(#[fixture(scm_group)] _group: &Gr
     let status = mgr
         .status(&spec.common().id)
         .expect("status: the service must still exist");
-    assert_eq!(status.state, State::Running);
+    assert_eq!(status.common().state, State::Running);
     let config = support::cmd::run("sc.exe", &["qc", &id]).expect_ok();
     assert!(
         config.stdout.contains("DISABLED"),
@@ -1164,7 +1172,7 @@ fn real_account_gets_service_logon_right(#[fixture(scm_group)] _group: &Group) {
         panic!("service under a real account failed to start (SeServiceLogonRight likely not granted): {e}")
     });
     let status = mgr.status(&target).expect("status");
-    assert_eq!(status.state, State::Running);
+    assert_eq!(status.common().state, State::Running);
     let _ = mgr.stop(&target, Budget::DEFAULT);
 }
 
@@ -1279,7 +1287,7 @@ fn a_local_service_daemon_actually_runs(#[fixture(scm_group)] _group: &Group) {
         .expect("start as LocalService");
     started.accept("the fixture to report SERVICE_RUNNING under LocalService");
     let status = mgr.status(&spec.common().id).expect("status while running");
-    assert_eq!(status.state, State::Running);
+    assert_eq!(status.common().state, State::Running);
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
     stopped.accept("the fixture to handle SERVICE_CONTROL_STOP under LocalService");
@@ -1368,7 +1376,7 @@ fn a_builtin_account_is_never_given_a_stale_password(#[fixture(scm_group)] _grou
         panic!("service under LocalService failed to start (a stale password likely reached CreateServiceW): {e}")
     });
     let status = mgr.status(&target).expect("status");
-    assert_eq!(status.state, State::Running);
+    assert_eq!(status.common().state, State::Running);
     let _ = mgr.stop(&target, Budget::DEFAULT);
 }
 

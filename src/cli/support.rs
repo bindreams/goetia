@@ -7,7 +7,7 @@ use std::path::Path;
 
 use super::ExitCode;
 use crate::error::{Error, Reason, Result, Sink, escape};
-use crate::manager::{Installed, ServiceManager, State};
+use crate::manager::{Installed, ServiceManager, State, Status};
 use crate::spec::{DaemonSpec, Id, Warning};
 
 /// Load and resolve a manifest, printing every [`Warning`] it produced to
@@ -70,14 +70,6 @@ pub(crate) fn parse_id(s: &str) -> Result<crate::spec::Id> {
     crate::spec::Id::try_from(s.to_string())
 }
 
-/// One decoded [`Installed::Ours`] entry, as held by [`InstalledIndex`].
-pub(crate) struct InstalledEntry {
-    pub spec: DaemonSpec,
-    pub state: State,
-    pub pid: Option<u32>,
-    pub enabled: bool,
-}
-
 /// One [`Installed::Undetermined`] entry, as held by [`InstalledIndex`].
 pub(crate) struct UndeterminedEntry {
     /// `None` for an entry standing for more than one id — see
@@ -87,11 +79,11 @@ pub(crate) struct UndeterminedEntry {
     pub reason: Reason,
 }
 
-/// [`ServiceManager::list`]'s entries, indexed by id: spec/state/pid/enabled
+/// [`ServiceManager::list`]'s entries, indexed by id: spec and status
 /// for what decoded cleanly, plus which names exist but did not. Shared by
 /// `list`, `status`, `show` and `diff`.
 pub(crate) struct InstalledIndex {
-    pub ours: BTreeMap<String, InstalledEntry>,
+    pub ours: BTreeMap<String, (DaemonSpec, Status)>,
     pub unusable: BTreeMap<String, Reason>,
     /// What goetia could not classify at all: named entries first, sorted
     /// by name, then any aggregate. Not a map: an aggregate carries no name
@@ -121,21 +113,8 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
     let mut undetermined = Vec::new();
     for entry in installed {
         match entry {
-            Installed::Ours {
-                spec,
-                state,
-                pid,
-                enabled,
-            } => {
-                ours.insert(
-                    spec.common().id.as_str().to_string(),
-                    InstalledEntry {
-                        spec,
-                        state,
-                        pid,
-                        enabled,
-                    },
-                );
+            Installed::Ours { spec, status } => {
+                ours.insert(spec.common().id.as_str().to_string(), (spec, status));
             }
             Installed::OursUnusable { name, reason } => {
                 unusable.insert(name, reason);
