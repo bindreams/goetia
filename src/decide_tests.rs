@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use super::*;
 use crate::blob::{self, Blob};
 use crate::spec::test_support::{abs, program};
-use crate::spec::{DaemonFields, DaemonSpec, Kind, Restart};
-use crate::testing::plain_fields;
+use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
+use crate::testing::{plain_fields, service_fields};
 
 // Fixtures ============================================================================================================
 
@@ -21,18 +21,25 @@ fn unclearable() -> ExternalConfig {
     }
 }
 
-// `DaemonSpec` is built through `DaemonSpec::new`, never `resolve()`. The paths are absolute
+// `DaemonSpec` is built through `ServiceSpec::new`, never `resolve()`. The paths are absolute
 // because `new` requires it; no assertion reads them, so their platform spelling does not matter
 // (see `diff_tests.rs`).
 fn spec_fixture() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        name: "FRP tunnel client".to_owned(),
-        cwd: Some(abs("app")),
-        restart: Restart::OnFailure,
-        logs: Some(abs("frpc.log")),
-        kind: Kind::Simple,
-        ..plain_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()])
+    ServiceSpec::new({
+        let base = plain_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()]);
+        ServiceFields {
+            common: DaemonFields {
+                name: "FRP tunnel client".to_owned(),
+                cwd: Some(abs("app")),
+                logs: Some(abs("frpc.log")),
+                ..base.common
+            },
+            restart: Restart::OnFailure,
+            protocol: Protocol::Plain,
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -95,9 +102,9 @@ fn identical_is_up_to_date() {
 #[skuld::test]
 fn spec_change_updates() {
     let embedded = spec_fixture();
-    let mut new_spec = spec_fixture().into_fields();
+    let mut new_spec = service_fields(spec_fixture());
     new_spec.restart = Restart::Always;
-    let new_spec = DaemonSpec::new(new_spec).unwrap();
+    let new_spec = ServiceSpec::new(new_spec).map(DaemonSpec::from).unwrap();
     let regenerated = "ARTIFACT FROM EMBEDDED SPEC";
     let found = ours(&embedded, RUNNING_VERSION, regenerated, regenerated);
 
@@ -173,9 +180,9 @@ fn hand_edit_with_force_updates() {
 #[skuld::test]
 fn spec_change_with_hand_edit_conflicts() {
     let embedded = spec_fixture();
-    let mut new_spec = spec_fixture().into_fields();
+    let mut new_spec = service_fields(spec_fixture());
     new_spec.restart = Restart::Always;
-    let new_spec = DaemonSpec::new(new_spec).unwrap();
+    let new_spec = ServiceSpec::new(new_spec).map(DaemonSpec::from).unwrap();
     let regenerated = "ARTIFACT FROM EMBEDDED SPEC\n";
     // Hand-edited on top of the old (embedded-spec) artifact: differs from
     // both `regenerated` and `desired`.
@@ -206,9 +213,9 @@ fn spec_change_with_hand_edit_conflicts() {
 #[skuld::test]
 fn spec_change_with_hand_edit_and_force_updates() {
     let embedded = spec_fixture();
-    let mut new_spec = spec_fixture().into_fields();
+    let mut new_spec = service_fields(spec_fixture());
     new_spec.restart = Restart::Always;
-    let new_spec = DaemonSpec::new(new_spec).unwrap();
+    let new_spec = ServiceSpec::new(new_spec).map(DaemonSpec::from).unwrap();
     let regenerated = "ARTIFACT FROM EMBEDDED SPEC\n";
     let on_disk = "ARTIFACT FROM EMBEDDED SPEC\nMemoryMax=8G\n";
     let found = ours(&embedded, RUNNING_VERSION, regenerated, on_disk);
@@ -254,10 +261,14 @@ fn foreign_refuses_even_with_force() {
 
 #[skuld::test]
 fn other_daemon_refuses_even_with_force() {
-    let spec = DaemonSpec::new(DaemonFields {
-        id: Id::try_from("FRPC").unwrap(),
-        ..spec_fixture().into_fields()
+    let spec = ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id: Id::try_from("FRPC").unwrap(),
+            ..service_fields(spec_fixture()).common
+        },
+        ..service_fields(spec_fixture())
     })
+    .map(DaemonSpec::from)
     .unwrap();
     let installed = Id::try_from("frpc").unwrap();
 

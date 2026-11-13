@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use goetia::backend::scm::exit_status::RecordedExit;
 use goetia::backend::scm::manager::Scm;
 use goetia::shim::{CheckPermissions, EmbeddedStockShim};
-use goetia::spec::{DaemonFields, DaemonSpec, Kind};
+use goetia::spec::{DaemonFields, DaemonSpec, Protocol, ServiceFields, ServiceSpec};
 use windows_service::service::{ServiceAccess, ServiceState, ServiceStatus};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
@@ -214,11 +214,18 @@ impl LogDir {
 /// [`support::plain_fields`] with `type: simple`, logging to a path in `logs` (a dir the test owns) rather
 /// than the `%ProgramData%` default.
 pub fn simple_spec(id: &str, command: Vec<String>, logs: &LogDir) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        kind: Kind::Simple,
-        logs: Some(logs.path_for(id)),
-        ..support::plain_fields(id, command)
+    ServiceSpec::new({
+        let base = support::plain_fields(id, command);
+        ServiceFields {
+            common: DaemonFields {
+                logs: Some(logs.path_for(id)),
+                ..base.common
+            },
+            protocol: Protocol::Plain,
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 

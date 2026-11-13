@@ -12,10 +12,9 @@ use crate::backend::scm::parameters::Stray;
 use crate::backend::scm::test_support::{SHIM_HEX, blob_of};
 use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
-use crate::spec::Restart;
-use crate::spec::{AccountId, DaemonFields, User};
-use crate::testing::plain_fields;
+use crate::spec::{AccountId, DaemonFields, DaemonSpec, Restart, ServiceFields, ServiceSpec, User};
 use crate::testing::{FakeProvider, command};
+use crate::testing::{plain_fields, service_fields};
 use skuld::{EnvGuard, env};
 use windows_sys::Win32::System::Registry::REG_DWORD;
 
@@ -499,7 +498,7 @@ fn a_service_scm_holds_with_a_registry_read_is_that_read() {
 /// was read, so `installed` compares what `read` saw.
 #[skuld::test]
 fn read_marker_sorts_parameters_into_foreign_and_marked() {
-    let spec = blob_of(Kind::Managed).spec;
+    let spec = blob_of(Protocol::Native).spec;
     let ours = Parameters {
         fields: BTreeMap::from([
             ("Marker".to_string(), crate::blob::MARKER.to_string()),
@@ -546,10 +545,11 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
 // Install refuses `restart: always` ===================================================================================
 
 fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
+    ServiceSpec::new(ServiceFields {
         restart,
         ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -567,13 +567,13 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
         )
     };
 
-    let plain = failed_start(&id, e(), Kind::Managed, None).report().to_string();
+    let plain = failed_start(&id, e(), Protocol::Native, None).report().to_string();
     assert!(!plain.contains("blob"), "{plain}");
 
     let strict = failed_start(
         &id,
         e(),
-        Kind::Managed,
+        Protocol::Native,
         Some(Arc::new(Error::blob("invalid blob JSON: EOF"))),
     )
     .report()
@@ -587,10 +587,11 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
 /// any other.
 #[skuld::test]
 fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::Always,
-        ..blob_of(Kind::Simple).spec.into_fields()
+        ..service_fields(blob_of(Protocol::Plain).spec)
     })
+    .map(DaemonSpec::from)
     .unwrap();
     // Hand-write the blob: `registration` refuses `always`.
     let parameters = BTreeMap::from([
@@ -604,7 +605,7 @@ fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
         .expect("the blob decodes")
         .expect("the blob is ours");
 
-    assert_eq!(blob.spec.restart, Restart::Always);
+    assert_eq!(service_fields(blob.spec.clone()).restart, Restart::Always);
     assert_eq!(shim_answer(Ok(&blob), no_image).kind, ShimKind::Shim);
 }
 
@@ -629,15 +630,15 @@ fn install_and_preview_install_refuse_restart_always() {
 
 // The shim provider ---------------------------------------------------------------------------------------------------
 
-fn simple_fields() -> DaemonFields {
-    DaemonFields {
-        kind: Kind::Simple,
+fn simple_fields() -> ServiceFields {
+    ServiceFields {
+        protocol: Protocol::Plain,
         ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
     }
 }
 
 fn simple_daemon() -> DaemonSpec {
-    DaemonSpec::new(simple_fields()).unwrap()
+    ServiceSpec::new(simple_fields()).map(DaemonSpec::from).unwrap()
 }
 
 #[skuld::test]
@@ -755,7 +756,7 @@ fn no_image() -> Option<String> {
 /// registered over one. It has no decode error to carry.
 #[skuld::test]
 fn a_decodable_blob_decides_whether_a_service_runs_a_shim() {
-    for (kind, answer) in [(Kind::Simple, ShimKind::Shim), (Kind::Managed, ShimKind::NotShim)] {
+    for (kind, answer) in [(Protocol::Plain, ShimKind::Shim), (Protocol::Native, ShimKind::NotShim)] {
         let said = shim_answer(Ok(&blob_of(kind)), no_image);
         assert_eq!(said.kind, answer, "{kind:?}");
         assert!(said.blob_error.is_none(), "{kind:?}");
@@ -981,7 +982,7 @@ fn a_refused_simple_install_never_reaches_the_provider() {
     let refused = [
         (
             "restart: always",
-            DaemonFields {
+            ServiceFields {
                 restart: Restart::Always,
                 ..simple_fields()
             },
@@ -989,8 +990,11 @@ fn a_refused_simple_install_never_reaches_the_provider() {
         ),
         (
             "an account that does not resolve",
-            DaemonFields {
-                user: User::Id(AccountId::Uid(1000)),
+            ServiceFields {
+                common: DaemonFields {
+                    user: User::Id(AccountId::Uid(1000)),
+                    ..simple_fields().common
+                },
                 ..simple_fields()
             },
             command(r"C:\app\app.exe"),
@@ -1006,7 +1010,7 @@ fn a_refused_simple_install_never_reaches_the_provider() {
         let mgr = Scm::with_shim(provider, CheckPermissions::Disable);
 
         let err = mgr
-            .install(&DaemonSpec::new(fields).unwrap(), false)
+            .install(&ServiceSpec::new(fields).map(DaemonSpec::from).unwrap(), false)
             .map(|_| ())
             .expect_err(what);
 
@@ -1030,7 +1034,7 @@ fn snapshot_with_config(spec: &DaemonSpec, command_line: &str) -> ScmSnapshot {
         version: crate::version().to_string(),
         spec: spec.clone(),
     };
-    let snapshot = ScmSnapshot::new(spec.id.clone(), Ok(blob), (Parameters::default(), None));
+    let snapshot = ScmSnapshot::new(spec.common().id.clone(), Ok(blob), (Parameters::default(), None));
     let config = windows_service::service::ServiceConfig {
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::OnDemand,
@@ -1358,7 +1362,7 @@ fn shim_image() -> Result<String> {
 #[skuld::test]
 fn an_uninstall_takes_the_install_lock_before_it_reads_the_image() {
     let corrupt = Arc::new(Error::blob("corrupt"));
-    for (what, blob) in [("simple", Ok(blob_of(Kind::Simple))), ("undecodable", Err(corrupt))] {
+    for (what, blob) in [("simple", Ok(blob_of(Protocol::Plain))), ("undecodable", Err(corrupt))] {
         let (asked, plan) = planned(blob.as_ref(), shim_image);
 
         assert!(plan.unwrap().lock.is_some(), "{what}");
@@ -1366,7 +1370,7 @@ fn an_uninstall_takes_the_install_lock_before_it_reads_the_image() {
         assert!(asked.contains(&"image"), "{what}: the host is read: {asked:?}");
     }
 
-    let (asked, plan) = planned(Ok(&blob_of(Kind::Managed)), shim_image);
+    let (asked, plan) = planned(Ok(&blob_of(Protocol::Native)), shim_image);
 
     assert!(plan.unwrap().lock.is_none());
     assert!(
@@ -1379,7 +1383,7 @@ fn an_uninstall_takes_the_install_lock_before_it_reads_the_image() {
 /// host that is not a shim file by name is neither held nor reported, and nothing of it is swept.
 #[skuld::test]
 fn an_uninstall_holds_the_process_of_a_shim_file_alone() {
-    let blob = blob_of(Kind::Simple);
+    let blob = blob_of(Protocol::Plain);
     let unread = || -> Result<String> { Err(Error::os("query configuration", std::io::Error::other("denied"))) };
     let user_exe = || -> Result<String> { Ok(r"C:\bin\frpc.exe".to_string()) };
 
@@ -1407,7 +1411,7 @@ fn an_uninstall_holds_the_process_of_a_shim_file_alone() {
 fn a_host_that_is_gone_is_not_an_unread_one() {
     let gone = || -> Result<String> { Err(Error::NotInstalled { id: "frpc".to_string() }) };
 
-    let (_, plan) = planned(Ok(&blob_of(Kind::Simple)), gone);
+    let (_, plan) = planned(Ok(&blob_of(Protocol::Plain)), gone);
 
     assert!(matches!(plan.unwrap().host, Ok(None)));
 }

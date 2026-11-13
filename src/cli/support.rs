@@ -128,7 +128,7 @@ pub(crate) fn partition_installed(installed: Vec<Installed>) -> InstalledIndex {
                 enabled,
             } => {
                 ours.insert(
-                    spec.id.as_str().to_string(),
+                    spec.common().id.as_str().to_string(),
                     InstalledEntry {
                         spec,
                         state,

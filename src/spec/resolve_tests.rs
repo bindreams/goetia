@@ -4,10 +4,10 @@ use std::time::Duration;
 use skuld::temp_dir;
 
 use super::*;
-use crate::spec::interpolate;
 use crate::spec::test_support::{HOST_BACKENDS, abs, program};
 use crate::spec::vars::Vars;
-use crate::testing::plain_fields;
+use crate::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, interpolate};
+use crate::testing::{plain_fields, service_fields};
 
 // `Path::new("/opt/rt").is_absolute()` is `false` on Windows, and
 // `PathBuf::from(r"C:\base").join("/opt/rt")` yields `C:/opt/rt` — so every
@@ -208,28 +208,31 @@ fn a_nul_that_arrives_through_env_substitution_is_refused_before_any_backend_ver
 
 #[skuld::test]
 fn a_control_character_is_refused_when_building_a_daemon_spec_directly() {
-    // The library's other way in (the blob decode path): a caller who builds `DaemonFields`
+    // The library's other way in (the blob decode path): a caller who builds `ServiceFields`
     // without a manifest.
-    type Set = fn(&mut DaemonFields, String);
+    type Set = fn(&mut ServiceFields, String);
     let rows: [(&str, Set); 8] = [
-        ("name", |f, v| f.name = v),
-        ("command", |f, v| f.command.push(v)),
-        ("cwd", |f, v| f.cwd = Some(abs(&v))),
-        ("logs", |f, v| f.logs = Some(abs(&v))),
+        ("name", |f, v| f.common.name = v),
+        ("command", |f, v| f.common.command.push(v)),
+        ("cwd", |f, v| f.common.cwd = Some(abs(&v))),
+        ("logs", |f, v| f.common.logs = Some(abs(&v))),
         ("env[K]", |f, v| {
-            f.env.insert("K".to_string(), v);
+            f.common.env.insert("K".to_string(), v);
         }),
         ("env key", |f, v| {
-            f.env.insert(v, "x".to_string());
+            f.common.env.insert(v, "x".to_string());
         }),
-        ("user.name", |f, v| f.user = User::Name(v)),
-        ("user.id", |f, v| f.user = User::Id(AccountId::Sid(v))),
+        ("user.name", |f, v| f.common.user = User::Name(v)),
+        ("user.id", |f, v| f.common.user = User::Id(AccountId::Sid(v))),
     ];
     for (c, _) in CONTROL_CHARACTERS {
         for (field, set) in &rows {
             let mut fields = plain_fields("frpc", vec![program("frpc")]);
             set(&mut fields, format!("a{c}b"));
-            let err = DaemonSpec::new(fields).expect_err(field).to_string();
+            let err = ServiceSpec::new(fields)
+                .map(DaemonSpec::from)
+                .expect_err(field)
+                .to_string();
             let expected = format!("field `{field}` contains a control character");
             assert!(err.contains(&expected), "{c:?} in {field}: {err}");
         }
@@ -309,7 +312,7 @@ fn a_non_utf8_manifest_directory_is_fine_when_every_path_is_absolute() {
     let dir = PathBuf::from(OsStr::from_bytes(b"/srv/caf\xe9/"));
     let yaml = "id: frpc\ncommand: [/opt/frpc]\ncwd: /opt\nlogs: /var/log/frpc.log\n";
     let (spec, _) = resolve(parse_manifest(yaml), &dir).expect("no field is joined to the directory");
-    assert_eq!(spec.cwd, Some(PathBuf::from("/opt")));
+    assert_eq!(spec.common().cwd, Some(PathBuf::from("/opt")));
 }
 
 #[skuld::test]
@@ -457,11 +460,11 @@ fn a_drive_root_cwd_resolves() {
     let abs = base_dir().join("frpc").to_string_lossy().into_owned();
     let written = format!("id: frpc\ncommand: ['{abs}']\ncwd: 'C:\\'\n");
     let (spec, _) = resolve(parse_manifest(&written), &base_dir()).expect("`C:\\` resolves");
-    assert_eq!(spec.cwd, Some(PathBuf::from(r"C:\")));
+    assert_eq!(spec.common().cwd, Some(PathBuf::from(r"C:\")));
 
     let dotted = "id: frpc\ncommand: [bin/frpc.exe]\ncwd: .\n";
     let (spec, _) = resolve(parse_manifest(dotted), Path::new(r"C:\")).expect("`.` in `C:\\` resolves");
-    assert_eq!(spec.cwd, Some(PathBuf::from(r"C:\")));
+    assert_eq!(spec.common().cwd, Some(PathBuf::from(r"C:\")));
 }
 
 // A substituted path is judged as it is -------------------------------------------------------------------------------
@@ -676,7 +679,7 @@ fn a_pending_value_with_a_dollar_raises_nothing() {
 
 #[skuld::test]
 fn a_path_a_substitution_may_make_absolute_is_not_judged_against_the_manifest_directory() {
-    // `${D}` is absolute if `.env` says so; the shape phase cannot know, and `DaemonSpec::new`
+    // `${D}` is absolute if `.env` says so; the shape phase cannot know, and `ServiceSpec::new`
     // judges the final value.
     let id = Id::try_from("frpc").unwrap();
     let dir = base_dir().join("a\nb");
@@ -699,7 +702,7 @@ fn a_root_relative_path_uses_only_the_directorys_drive() {
     let dir = base_dir().join("a\nb");
     let yaml = "id: frpc\ncommand: ['C:\\bin\\x.exe']\ncwd: '\\data'\n";
     let (spec, _) = resolve(parse_manifest(yaml), &dir).expect("the directory does not appear in the result");
-    assert_eq!(spec.cwd, Some(PathBuf::from(r"C:\data")));
+    assert_eq!(spec.common().cwd, Some(PathBuf::from(r"C:\data")));
 }
 
 /// A root-relative path joined with a share directory keeps the share, so the share's defect is the
@@ -782,7 +785,7 @@ fn a_manifest_directory_is_joined_whole_to_a_relative_path_only() {
 fn a_drive_root_manifest_directory_joins_cleanly() {
     let (spec, _) = resolve(parse_manifest("id: frpc\ncommand: [bin/frpc.exe]\n"), Path::new(r"C:\"))
         .expect("`C:\\` joined with `bin` is `C:\\bin`");
-    assert_eq!(spec.command[0], r"C:\bin\frpc.exe");
+    assert_eq!(spec.common().command[0], r"C:\bin\frpc.exe");
 }
 
 // Contract violations =================================================================================================
@@ -790,10 +793,17 @@ fn a_drive_root_manifest_directory_joins_cleanly() {
 #[skuld::test]
 fn a_contract_violation_names_the_daemon_once() {
     let id = Id::try_from("frpc").unwrap();
-    let cause = DaemonSpec::new(DaemonFields {
-        name: "a\nb".to_string(),
-        ..plain_fields("frpc", vec![program("frpc")])
+    let cause = ServiceSpec::new({
+        let base = plain_fields("frpc", vec![program("frpc")]);
+        ServiceFields {
+            common: DaemonFields {
+                name: "a\nb".to_string(),
+                ..base.common
+            },
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .expect_err("a newline in `name` is refused");
 
     let printed = contract_violation_from(&id, "the resolved daemon failed its own field rules", cause)
@@ -835,7 +845,7 @@ fn a_manifest_directory_ending_in_a_backslash_is_accepted() {
     // Not as a systemd host: it refuses a backslash in the executable path.
     let yaml = "id: frpc\ncommand: [bin/frpc]\ncwd: .\n";
     let (spec, _) = resolve_as(parse_manifest(yaml), &dir, Some(BackendKind::Launchd)).expect("resolves");
-    assert_eq!(spec.cwd, Some(dir));
+    assert_eq!(spec.common().cwd, Some(dir));
 }
 
 // Resolution ==========================================================================================================
@@ -851,11 +861,11 @@ logs: "logs/frpc.log"
     let (spec, _warnings) = resolve_yaml(yaml).expect("valid manifest should resolve");
 
     let expected_command0 = base_dir().join("bin").join("frpc.exe").to_string_lossy().into_owned();
-    assert_eq!(spec.command[0], expected_command0);
-    assert_eq!(spec.command[1], "-c", "later argv entries are untouched");
+    assert_eq!(spec.common().command[0], expected_command0);
+    assert_eq!(spec.common().command[1], "-c", "later argv entries are untouched");
     // `cwd: .` normalizes to the base dir itself, not `<base>/.`.
-    assert_eq!(spec.cwd, Some(base_dir()));
-    assert_eq!(spec.logs, Some(base_dir().join("logs").join("frpc.log")));
+    assert_eq!(spec.common().cwd, Some(base_dir()));
+    assert_eq!(spec.common().logs, Some(base_dir().join("logs").join("frpc.log")));
 }
 
 #[skuld::test]
@@ -866,37 +876,37 @@ fn resolve_leaves_an_already_absolute_command_alone() {
     // (`\b` is backspace) rather than a literal backslash.
     let yaml = format!("id: frpc\ncommand: ['{absolute}']\n");
     let (spec, _warnings) = resolve_yaml(&yaml).expect("valid manifest should resolve");
-    assert_eq!(spec.command[0], absolute);
+    assert_eq!(spec.common().command[0], absolute);
 }
 
 #[skuld::test]
 fn resolve_defaults_name_to_id() {
     let (spec, _) = resolve_yaml("id: frpc\ncommand: [bin/frpc]\n").unwrap();
-    assert_eq!(spec.name, "frpc");
+    assert_eq!(spec.common().name, "frpc");
 }
 
 #[skuld::test]
 fn resolve_defaults_user_to_root() {
     let (spec, _) = resolve_yaml("id: frpc\ncommand: [bin/frpc]\n").unwrap();
-    assert_eq!(spec.user, User::Root);
+    assert_eq!(spec.common().user, User::Root);
 }
 
 #[skuld::test]
 fn resolve_defaults_kind_to_simple() {
     let (spec, _) = resolve_yaml("id: frpc\ncommand: [bin/frpc]\n").unwrap();
-    assert_eq!(spec.kind, Kind::Simple);
+    assert_eq!(service_fields(spec.clone()).protocol, Protocol::Plain);
 }
 
 #[skuld::test]
 fn resolve_defaults_restart_to_never() {
     let (spec, _) = resolve_yaml("id: frpc\ncommand: [bin/frpc]\n").unwrap();
-    assert_eq!(spec.restart, Restart::Never);
+    assert_eq!(service_fields(spec.clone()).restart, Restart::Never);
 }
 
 #[skuld::test]
 fn resolve_defaults_restart_delay_to_none() {
     let (spec, _) = resolve_yaml("id: frpc\ncommand: [bin/frpc]\n").unwrap();
-    assert_eq!(spec.restart_delay, None);
+    assert_eq!(service_fields(spec.clone()).restart_delay, None);
 }
 
 #[skuld::test]
@@ -916,16 +926,16 @@ fn resolve_parses_each_restart_policy() {
     ] {
         let yaml = format!("id: frpc\ncommand: [/bin/frpc]\nrestart: {raw}\n");
         let (spec, _) = resolve_yaml(&yaml).unwrap_or_else(|e| panic!("`restart: {raw}` should resolve: {e}"));
-        assert_eq!(spec.restart, expected, "restart: {raw}");
+        assert_eq!(service_fields(spec.clone()).restart, expected, "restart: {raw}");
     }
 }
 
 #[skuld::test]
 fn resolve_parses_each_type() {
-    for (raw, expected) in [("simple", Kind::Simple), ("managed", Kind::Managed)] {
+    for (raw, expected) in [("simple", Protocol::Plain), ("managed", Protocol::Native)] {
         let yaml = format!("id: frpc\ncommand: [bin/frpc]\ntype: {raw}\n");
         let (spec, _) = resolve_yaml(&yaml).unwrap_or_else(|e| panic!("`type: {raw}` should resolve: {e}"));
-        assert_eq!(spec.kind, expected, "type: {raw}");
+        assert_eq!(service_fields(spec.clone()).protocol, expected, "type: {raw}");
     }
 }
 
@@ -977,7 +987,7 @@ logs: "logs/svc.log"
 type: managed
 "#;
     let (spec, warnings) = resolve_yaml_as(BackendKind::Scm, yaml).expect("accepted with a warning, not rejected");
-    assert_eq!(spec.kind, Kind::Managed);
+    assert_eq!(service_fields(spec.clone()).protocol, Protocol::Native);
     assert_eq!(warnings.len(), 1);
     assert_eq!(warnings[0].id.as_ref().map(Id::as_str), Some("svc"));
     assert!(warnings[0].message.contains("cwd") || warnings[0].message.contains("logs"));
@@ -1034,7 +1044,7 @@ backend-specific:
         } else {
             Restart::Always
         };
-        assert_eq!(spec.restart, expected, "native {native}");
+        assert_eq!(service_fields(spec.clone()).restart, expected, "native {native}");
         assert!(warnings.is_empty(), "native {native}: {warnings:?}");
     }
 }
@@ -1054,7 +1064,7 @@ backend-specific:
         } else {
             Restart::Never
         };
-        assert_eq!(spec.restart, expected, "native {native}");
+        assert_eq!(service_fields(spec.clone()).restart, expected, "native {native}");
     }
 }
 
@@ -1069,7 +1079,7 @@ restart: ${R}
     for &native in HOST_BACKENDS {
         let (spec, _warnings) =
             resolve_as(parse_manifest(yaml), dir, Some(native)).unwrap_or_else(|e| panic!("native {native}: {e}"));
-        assert_eq!(spec.restart, Restart::Always, "native {native}");
+        assert_eq!(service_fields(spec.clone()).restart, Restart::Always, "native {native}");
     }
 }
 
@@ -1085,7 +1095,10 @@ restart-delay: "1.5s"
 
     // The blob keeps the authored value unrounded, so generation stays
     // deterministic; only `backend::launchd::generate` rounds up.
-    assert_eq!(spec.restart_delay, Some(Duration::from_millis(1500)));
+    assert_eq!(
+        service_fields(spec.clone()).restart_delay,
+        Some(Duration::from_millis(1500))
+    );
     assert_eq!(warnings.len(), 1);
     assert!(
         warnings[0].message.contains('2'),
@@ -1103,7 +1116,7 @@ command: ["bin/frpc"]
 restart-delay: "2s"
 "#;
     let (spec, warnings) = resolve_yaml_as(BackendKind::Launchd, yaml).unwrap();
-    assert_eq!(spec.restart_delay, Some(Duration::from_secs(2)));
+    assert_eq!(service_fields(spec.clone()).restart_delay, Some(Duration::from_secs(2)));
     assert!(warnings.is_empty());
 }
 
@@ -1114,7 +1127,10 @@ restart-delay: "2s"
 fn a_sub_second_restart_delay_still_warns() {
     let yaml = "id: frpc\ncommand: [bin/frpc]\nrestart-delay: 500ms\n";
     let (spec, warnings) = resolve_yaml_as(BackendKind::Launchd, yaml).expect("accepted with a warning, not rejected");
-    assert_eq!(spec.restart_delay, Some(Duration::from_millis(500)));
+    assert_eq!(
+        service_fields(spec.clone()).restart_delay,
+        Some(Duration::from_millis(500))
+    );
     assert_eq!(warnings.len(), 1);
     // Not just "some warning fired": pin that it is *this* warning, not an
     // unrelated one (e.g. a Windows-divergence warning) that happens to be
@@ -1131,7 +1147,7 @@ fn a_sub_second_restart_delay_still_warns() {
 fn a_whole_second_restart_delay_still_does_not_warn() {
     let yaml = "id: frpc\ncommand: [bin/frpc]\nrestart-delay: 3s\n";
     let (spec, warnings) = resolve_yaml_as(BackendKind::Launchd, yaml).unwrap();
-    assert_eq!(spec.restart_delay, Some(Duration::from_secs(3)));
+    assert_eq!(service_fields(spec.clone()).restart_delay, Some(Duration::from_secs(3)));
     assert!(warnings.is_empty());
 }
 
@@ -1143,11 +1159,11 @@ fn load_reads_a_file_path(#[fixture(temp_dir)] dir: &Path) {
     std::fs::write(&manifest_path, "id: frpc\ncommand: [bin/frpc]\n").unwrap();
 
     let (spec, _warnings) = load(&manifest_path).expect("file path should load");
-    assert_eq!(spec.id.as_str(), "frpc");
+    assert_eq!(spec.common().id.as_str(), "frpc");
     // Relative paths resolve against the manifest's own directory, not the
     // process's current directory.
     let expected = dir.join("bin").join("frpc").to_string_lossy().into_owned();
-    assert_eq!(spec.command[0], expected);
+    assert_eq!(spec.common().command[0], expected);
 }
 
 #[skuld::test]
@@ -1155,7 +1171,7 @@ fn load_reads_a_directory_containing_goetia_yaml(#[fixture(temp_dir)] dir: &Path
     std::fs::write(dir.join("goetia.yaml"), "id: frpc\ncommand: [bin/frpc]\n").unwrap();
 
     let (spec, _warnings) = load(dir).expect("directory should load");
-    assert_eq!(spec.id.as_str(), "frpc");
+    assert_eq!(spec.common().id.as_str(), "frpc");
 }
 
 #[skuld::test]
@@ -1187,7 +1203,7 @@ fn accepts_trailing_backslashes_in_name() {
     // Keeping a line-ending backslash from continuing the line is the systemd generator's job.
     for name in ["FRP client\\", "FRP client\\\\", "FRP client\\\\\\"] {
         let (spec, _) = resolve_with_name(name).unwrap_or_else(|e| panic!("{name:?}: {e}"));
-        assert_eq!(spec.name, name);
+        assert_eq!(spec.common().name, name);
     }
 }
 
@@ -1195,14 +1211,14 @@ fn accepts_trailing_backslashes_in_name() {
 fn accepts_trailing_backslashes_in_env_value() {
     for value in ["C:\\opt\\rt\\", "C:\\opt\\rt\\\\"] {
         let (spec, _) = resolve_with_env_value(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
-        assert_eq!(spec.env["FOO"], value);
+        assert_eq!(spec.common().env["FOO"], value);
     }
 }
 
 #[skuld::test]
 fn accepts_interior_backslashes() {
     let (spec, _) = resolve_with_env_value("C:\\opt\\rt").expect("interior backslashes are fine");
-    assert_eq!(spec.env["FOO"], "C:\\opt\\rt");
+    assert_eq!(spec.common().env["FOO"], "C:\\opt\\rt");
 }
 
 #[skuld::test]
@@ -1247,7 +1263,10 @@ fn huge_restart_delay_saturates_instead_of_overflowing() {
     let (spec, warnings) =
         resolve_yaml_as(BackendKind::Launchd, &yaml).expect("a near-`Duration::MAX` delay is accepted, with a warning");
 
-    assert_eq!(spec.restart_delay, Some(Duration::new(u64::MAX, 1)));
+    assert_eq!(
+        service_fields(spec.clone()).restart_delay,
+        Some(Duration::new(u64::MAX, 1))
+    );
     let [warning] = warnings.as_slice() else {
         panic!("expected exactly one warning, got {warnings:?}");
     };
@@ -1279,9 +1298,9 @@ fn relative_base_dir_still_yields_absolute_paths() {
     // against the same canonical, prefix-stripped form `absolutize` itself
     // produces rather than the raw `current_dir()` value.
     let cwd = canonical_cwd();
-    assert_eq!(spec.command[0], cwd.join("bin").join("frpc").to_string_lossy());
-    assert_eq!(spec.cwd.as_deref(), Some(cwd.as_path()));
-    assert_eq!(spec.logs, Some(cwd.join("logs").join("frpc.log")));
+    assert_eq!(spec.common().command[0], cwd.join("bin").join("frpc").to_string_lossy());
+    assert_eq!(spec.common().cwd.as_deref(), Some(cwd.as_path()));
+    assert_eq!(spec.common().logs, Some(cwd.join("logs").join("frpc.log")));
 }
 
 #[skuld::test]
@@ -1358,7 +1377,7 @@ fn normalize_preserves_parent_dir_components() {
     let yaml = "id: frpc\ncommand: [bin/frpc]\ncwd: ../sibling\n";
     // No backend named: systemd refuses a `..`, and the property is not systemd's.
     let (spec, _) = resolve_as(parse_manifest(yaml), &base_dir(), None).expect("resolves");
-    let cwd = spec.cwd.as_deref().expect("cwd is set");
+    let cwd = spec.common().cwd.as_deref().expect("cwd is set");
 
     assert!(
         cwd.components().any(|c| matches!(c, std::path::Component::ParentDir)),
@@ -1442,7 +1461,7 @@ fn accepts_a_whitespace_only_cwd() {
     // No backend named: systemd refuses a path that ends in whitespace.
     let (spec, _warnings) = resolve_as(parse_manifest(yaml), &base_dir(), None)
         .expect("a whitespace-only path is not empty and has no unsafe default");
-    assert_eq!(spec.cwd, Some(base_dir().join("  ")));
+    assert_eq!(spec.common().cwd, Some(base_dir().join("  ")));
 }
 
 #[skuld::test]
@@ -1470,7 +1489,7 @@ fn accepts_an_empty_env_value() {
     // direction from `rejects_an_empty_env_key`.
     let yaml = "id: frpc\ncommand: [/bin/frpc]\nenv:\n  FOO: \"\"\n";
     let (spec, _warnings) = resolve_yaml(yaml).expect("an empty env value is an ordinary assignment");
-    assert_eq!(spec.env.get("FOO"), Some(&String::new()));
+    assert_eq!(spec.common().env.get("FOO"), Some(&String::new()));
 }
 
 #[skuld::test]
@@ -1480,7 +1499,7 @@ fn accepts_an_empty_name() {
     // and friends.
     let yaml = "id: frpc\nname: \"\"\ncommand: [/bin/frpc]\n";
     let (spec, _warnings) = resolve_yaml(yaml).expect("an empty name is a harmless empty Description=");
-    assert_eq!(spec.name, "");
+    assert_eq!(spec.common().name, "");
 }
 
 // Drive-relative paths ================================================================================================
@@ -1501,9 +1520,9 @@ fn drive_relative_path_resolves_against_the_drives_current_directory_and_warns()
     let yaml = "id: frpc\ncommand: [\"C:bin/frpc.exe\"]\n";
     let (spec, warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("drive-relative command resolves");
 
-    assert!(Path::new(&spec.command[0]).is_absolute());
+    assert!(Path::new(&spec.common().command[0]).is_absolute());
     assert_ne!(
-        spec.command[0],
+        spec.common().command[0],
         base_dir().join("bin").join("frpc.exe").to_string_lossy(),
         "a drive-relative path must anchor to the process's cwd on that drive, not to base_dir"
     );
@@ -1529,7 +1548,10 @@ fn a_colon_bearing_name_is_an_ordinary_relative_filename() {
     // joined against `base_dir` exactly like any other, with no warning.
     let yaml = "id: frpc\ncommand: [\"C:bin/frpc.exe\"]\n";
     let (spec, warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves as an ordinary filename");
-    assert_eq!(spec.command[0], base_dir().join("C:bin/frpc.exe").to_string_lossy());
+    assert_eq!(
+        spec.common().command[0],
+        base_dir().join("C:bin/frpc.exe").to_string_lossy()
+    );
     assert!(warnings.is_empty());
 }
 
@@ -1540,7 +1562,7 @@ fn a_manifest_relative_path_beside_a_drive_relative_one_still_anchors_to_the_man
     // ordinary relative `cwd` sitting next to a drive-relative `command`.
     let yaml = "id: frpc\ncommand: [\"C:bin/frpc.exe\"]\ncwd: data\n";
     let (spec, _warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("resolves");
-    assert_eq!(spec.cwd, Some(base_dir().join("data")));
+    assert_eq!(spec.common().cwd, Some(base_dir().join("data")));
 }
 
 #[cfg(windows)]
@@ -1555,7 +1577,7 @@ fn drive_relative_resolution_collapses_dot_dot_the_windows_way() {
 command: ['C:a\..\b']
 ";
     let (spec, warnings) = resolve(parse_manifest(yaml), &base_dir()).expect("drive-relative path resolves");
-    let resolved = Path::new(&spec.command[0]);
+    let resolved = Path::new(&spec.common().command[0]);
 
     assert!(
         !resolved
@@ -1618,7 +1640,8 @@ command: ['\\?\C:']
     let (spec, warnings) = resolve(parse_manifest(yaml), &base_dir())
         .expect("a VerbatimDisk prefix carries an implicit root and resolves");
     assert_eq!(
-        spec.command[0], r"\\?\C:",
+        spec.common().command[0],
+        r"\\?\C:",
         "a verbatim prefix must pass through resolve unchanged"
     );
     assert!(
@@ -1653,7 +1676,7 @@ fn a_dollar_inside_a_substituted_value_survives_resolve_unchanged(#[fixture(temp
     );
     let manifest = dir.join("goetia.yaml");
     let (spec, _warnings) = load(&manifest).expect("a literal `$` in a .env value is legal");
-    assert_eq!(spec.env.get("PASSWORD").map(String::as_str), Some("abc$def"));
+    assert_eq!(spec.common().env.get("PASSWORD").map(String::as_str), Some("abc$def"));
 }
 
 #[skuld::test]
@@ -1685,7 +1708,7 @@ fn resolve_reads_the_env_file_beside_its_base_dir(#[fixture(temp_dir)] dir: &Pat
     let yaml = "id: frpc\nname: ${NAME}\ncommand: [/bin/frpc]\n";
 
     let (spec, _warnings) = resolve(parse_manifest(yaml), dir).expect("manifest should resolve");
-    assert_eq!(spec.name, "Frpc Tunnel");
+    assert_eq!(spec.common().name, "Frpc Tunnel");
 }
 
 #[skuld::test]
@@ -1699,7 +1722,7 @@ fn resolve_does_not_read_the_env_file_when_the_manifest_has_no_dollar(#[fixture(
     let yaml = "id: frpc\ncommand: [/bin/frpc]\n";
 
     let (spec, _warnings) = resolve(parse_manifest(yaml), dir).expect("a dollarless manifest should resolve");
-    assert_eq!(spec.id.as_str(), "frpc");
+    assert_eq!(spec.common().id.as_str(), "frpc");
 }
 
 #[skuld::test]
@@ -1711,7 +1734,7 @@ fn load_substitutes_from_the_env_file_beside_the_manifest(#[fixture(temp_dir)] d
     );
 
     let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("manifest should load");
-    assert_eq!(spec.name, "Frpc Tunnel");
+    assert_eq!(spec.common().name, "Frpc Tunnel");
 }
 
 #[skuld::test]
@@ -1725,7 +1748,7 @@ fn load_substitutes_when_the_path_names_a_directory(#[fixture(temp_dir)] dir: &P
     );
 
     let (spec, _warnings) = load(dir).expect("directory should load");
-    assert_eq!(spec.name, "Frpc Tunnel");
+    assert_eq!(spec.common().name, "Frpc Tunnel");
 }
 
 #[skuld::test]
@@ -1756,7 +1779,7 @@ fn load_does_not_read_the_env_file_when_the_manifest_has_no_dollar(#[fixture(tem
     std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
 
     let (spec, _warnings) = load(dir).expect("a dollarless manifest should not read .env");
-    assert_eq!(spec.id.as_str(), "frpc");
+    assert_eq!(spec.common().id.as_str(), "frpc");
 }
 
 #[skuld::test]
@@ -1771,7 +1794,7 @@ fn an_unreadable_env_file_fails_only_a_manifest_whose_native_spec_needs_it(#[fix
     );
     let (spec, warnings) = resolve(parse_manifest(&overridden), dir)
         .expect("an unreadable `.env` must not fail a manifest whose native spec has no `$`");
-    assert_eq!(spec.restart_delay, Some(Duration::from_secs(1)));
+    assert_eq!(service_fields(spec.clone()).restart_delay, Some(Duration::from_secs(1)));
     assert!(warnings.is_empty(), "{warnings:?}");
 
     let bare = "id: frpc\ncommand: [/bin/frpc]\nrestart-delay: ${DELAY}\n";
@@ -1804,7 +1827,7 @@ fn a_dollar_in_a_comment_is_ignored(#[fixture(temp_dir)] dir: &Path) {
     std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
 
     let (spec, _warnings) = load(dir).expect("a commented-out reference should not read .env");
-    assert_eq!(spec.id.as_str(), "frpc");
+    assert_eq!(spec.common().id.as_str(), "frpc");
 }
 
 #[skuld::test]
@@ -1819,8 +1842,8 @@ fn load_preserves_authored_scalar_text_alongside_interpolation(#[fixture(temp_di
 
     // No backend named: systemd refuses the key `1.50`, which no systemd unit can carry.
     let (spec, _warnings) = resolve_as(parse_manifest(yaml), dir, None).expect("manifest should load");
-    let env = &spec.env;
-    assert_eq!(spec.name, "+5");
+    let env = &spec.common().env;
+    assert_eq!(spec.common().name, "+5");
     assert_eq!(env["A"], "0.10");
     assert_eq!(env["B"], "1e3");
     assert_eq!(env["C"], "0x10");
@@ -2053,7 +2076,7 @@ fn resolve_applies_the_native_backends_override() {
          user: bindreams\n"
     );
     let (spec, _warnings) = resolve_yaml(&yaml).expect("resolves");
-    assert_eq!(spec.user, User::Name("bindreams".to_string()));
+    assert_eq!(spec.common().user, User::Name("bindreams".to_string()));
 }
 
 #[skuld::test]
@@ -2065,7 +2088,7 @@ fn resolve_ignores_a_non_native_backends_override() {
     );
     let (spec, _warnings) = resolve_yaml(&yaml).expect("resolves");
     assert_eq!(
-        spec.user,
+        spec.common().user,
         User::Root,
         "a non-native override must not change the resolved spec"
     );
@@ -2286,7 +2309,7 @@ fn a_host_with_no_native_backend_resolves_the_base_spec_alone() {
                 systemd:\n    name: from-systemd\n  launchd:\n    name: from-launchd\n  \
                 scm:\n    name: from-scm\n";
     let (spec, _warnings) = resolve_as(parse_manifest(yaml), &base_dir(), None).expect("resolves");
-    assert_eq!(spec.name, "base");
+    assert_eq!(spec.common().name, "base");
 
     // No backend is native, so no backend's advisories are this host's to give.
     let advisory = "id: frpc\ncommand: [/bin/frpc]\ncwd: .\ntype: managed\n\
@@ -2331,7 +2354,7 @@ fn a_command_only_under_the_native_backend_installs() {
     let native = BackendKind::native().expect("native() is Some on every CI platform");
     let yaml = format!("id: frpc\nbackend-specific:\n  {native}:\n    command: [/bin/frpc]\n");
     let (spec, _warnings) = resolve_yaml(&yaml).expect("resolves");
-    assert!(!spec.command.is_empty());
+    assert!(!spec.common().command.is_empty());
 }
 
 #[skuld::test]
@@ -2427,7 +2450,7 @@ fn a_base_uid_resolves_on_every_host() {
     // every host" is the claim.
     let yaml = "id: frpc\ncommand: [/bin/frpc]\nuser:\n  id: 1000\n";
     let (spec, _warnings) = resolve_yaml(yaml).expect("a base numeric uid must resolve on every host");
-    assert_eq!(spec.user, User::Id(AccountId::Uid(1000)));
+    assert_eq!(spec.common().user, User::Id(AccountId::Uid(1000)));
 }
 
 #[skuld::test]
@@ -2539,7 +2562,7 @@ fn a_bare_dollar_in_an_env_value_survives_a_substituted_pass(#[fixture(temp_dir)
         Some("S=ab$cd\n"),
     );
     let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
-    assert_eq!(spec.env["X"], "ab$cd");
+    assert_eq!(spec.common().env["X"], "ab$cd");
 }
 
 #[skuld::test]
@@ -2564,14 +2587,14 @@ fn a_templated_restart_resolves(#[fixture(temp_dir)] dir: &Path) {
         Some("R=on-failure\n"),
     );
     let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
-    assert_eq!(spec.restart, Restart::OnFailure);
+    assert_eq!(service_fields(spec.clone()).restart, Restart::OnFailure);
 }
 
 #[skuld::test]
 fn a_templated_type_resolves(#[fixture(temp_dir)] dir: &Path) {
     write_fixture(dir, "id: frpc\ncommand: [/bin/frpc]\ntype: ${T}\n", Some("T=managed\n"));
     let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
-    assert_eq!(spec.kind, Kind::Managed);
+    assert_eq!(service_fields(spec.clone()).protocol, Protocol::Native);
 }
 
 #[skuld::test]
@@ -2582,7 +2605,7 @@ fn a_templated_restart_delay_resolves(#[fixture(temp_dir)] dir: &Path) {
         Some("D=2s\n"),
     );
     let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
-    assert_eq!(spec.restart_delay, Some(Duration::from_secs(2)));
+    assert_eq!(service_fields(spec.clone()).restart_delay, Some(Duration::from_secs(2)));
 }
 
 #[skuld::test]
@@ -2591,7 +2614,7 @@ fn a_templated_restart_in_the_native_override_resolves(#[fixture(temp_dir)] dir:
     let yaml = format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    restart: ${{R}}\n");
     write_fixture(dir, &yaml, Some("R=on-failure\n"));
     let (spec, _warnings) = load(&dir.join("goetia.yaml")).expect("resolves");
-    assert_eq!(spec.restart, Restart::OnFailure);
+    assert_eq!(service_fields(spec.clone()).restart, Restart::OnFailure);
 }
 
 #[skuld::test]
@@ -2631,7 +2654,7 @@ fn a_variable_used_only_in_a_non_native_override_does_not_read_the_env_file(#[fi
     std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
     let (spec, _warnings) =
         load(&dir.join("goetia.yaml")).expect("must not read .env for a value it will never substitute");
-    assert_eq!(spec.id.as_str(), "frpc");
+    assert_eq!(spec.common().id.as_str(), "frpc");
 }
 
 // The rules that reject `$` outright ==================================================================================
@@ -2692,7 +2715,11 @@ restart: always
 ";
     for &native in HOST_BACKENDS {
         let (spec, _warnings) = resolve_yaml_as(native, yaml).unwrap_or_else(|e| panic!("native `{native}`: {e}"));
-        assert_eq!(spec.restart, Restart::Always, "native `{native}`");
+        assert_eq!(
+            service_fields(spec.clone()).restart,
+            Restart::Always,
+            "native `{native}`"
+        );
     }
 }
 
@@ -2968,7 +2995,7 @@ backend-specific:
         let (spec, _) = resolve_as(parse_manifest(&yaml), Path::new("../app"), Some(BackendKind::Systemd))
             .expect("`-f ../app` resolves without a `..`");
         let expected = canonical_cwd().parent().expect("parent").join("app");
-        assert_eq!(spec.cwd, Some(expected));
+        assert_eq!(spec.common().cwd, Some(expected));
     }
 
     #[skuld::test]

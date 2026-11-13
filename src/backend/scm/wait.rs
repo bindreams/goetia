@@ -20,7 +20,7 @@ use crate::backend::scm::exit_status::{ERROR_SERVICE_DOES_NOT_EXIST, RecordedExi
 use crate::backend::scm::kill::HoldOutcome;
 use crate::error::{Chain, terminating_failed};
 use crate::manager::budget::Deadline;
-use crate::spec::Kind;
+use crate::spec::Protocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WantState {
@@ -1023,7 +1023,7 @@ const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be 
 /// `Running` is the SCM's own answer that the goal is reached, so it is the
 /// confirmation, whatever is left of the deadline — as launchd's `print` of a
 /// running job is. Nothing is armed for it.
-pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Kind) -> io::Result<Waited> {
+pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind: Protocol) -> io::Result<Waited> {
     // Issued whatever is left of the budget: only the *waiting* is bounded, and a service left
     // unstarted because goetia ran out of budget would be the worst of both answers.
     let reply = a.start()?;
@@ -1059,27 +1059,32 @@ pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind:
 /// exec. That holds for the daemon's own exit. A shim failure after the launch (a failed wait, an
 /// unreadable exit status) is recorded as a shim failure, so the answer still depends on which the
 /// wait sees first: a failed start for Stopped, a start for Running.
-fn stopped_before_running(kind: Kind, joined_a_start: bool, exit: RecordedExit, wait_hint: u32) -> io::Result<Waited> {
+fn stopped_before_running(
+    kind: Protocol,
+    joined_a_start: bool,
+    exit: RecordedExit,
+    wait_hint: u32,
+) -> io::Result<Waited> {
     // An `AlreadyRunning` over `START_PENDING` joined a start that was not ours: SCM's own recovery
     // start. When that fails SCM reports `STOPPED (0, 0)` with a wait hint (P10), which the shim never
     // sets; no shim connected to SCM. Only `type: simple` has a shim: a managed host may leave a hint
     // itself, and it did run. This test runs before `daemon_ran`, which `(0, 0)` would satisfy.
     let failed_scm_start =
-        kind == Kind::Simple && joined_a_start && (exit.win32, exit.specific) == (0, 0) && wait_hint != 0;
+        kind == Protocol::Plain && joined_a_start && (exit.win32, exit.specific) == (0, 0) && wait_hint != 0;
     if failed_scm_start {
         return Err(io::Error::other(
             "service stopped before reaching Running (failed start): the shim never connected to SCM, so no daemon ran",
         ));
     }
     // The shim's `(0, SHIM_REFUSED)` says it started no daemon, though its Win32 code is 0.
-    if kind == Kind::Simple && exit.is_refusal() {
+    if kind == Protocol::Plain && exit.is_refusal() {
         return Err(io::Error::other(format!(
             "service stopped with goetia-shim's refusal record (Win32 0, service-specific {SHIM_REFUSED}; failed start): the shim refused to start the daemon, so no daemon ran; see the shim's log"
         )));
     }
     // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
     // to confirm. The notification may follow a `RUNNING` the wait never saw.
-    if kind == Kind::Simple && exit.is_incomplete_stop() {
+    if kind == Protocol::Plain && exit.is_incomplete_stop() {
         return Err(io::Error::other(IncompleteStop {
             failed_start: true,
             process: None,
@@ -1089,7 +1094,7 @@ fn stopped_before_running(kind: Kind, joined_a_start: bool, exit: RecordedExit, 
     // records `(0, 0)` with a wait hint (P25 c/d), and that is either our own start
     // failing with `StartServiceW` 1053, which never reaches this wait, or a joined
     // start, caught by `failed_scm_start` above.
-    if kind == Kind::Simple && exit.daemon_ran() {
+    if kind == Protocol::Plain && exit.daemon_ran() {
         return Ok(Waited::Confirmed);
     }
     Err(io::Error::other(format!(

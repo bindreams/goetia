@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
 
-use crate::spec::{DaemonFields, DaemonSpec};
+use crate::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec};
 use crate::testing::plain_fields;
 use cosca::identity::Liveness;
 use cosca::{Process, Stdio};
@@ -219,19 +219,26 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
     let cwd = dir.join(CWD_LEAF);
     std::fs::create_dir(&cwd).expect("the daemon's working directory");
     let logs = dir.join("daemon.log");
-    // `DaemonSpec::new` wants an absolute program; `ComSpec` is the path of `cmd.exe`.
+    // `ServiceSpec::new` wants an absolute program; `ComSpec` is the path of `cmd.exe`.
     let comspec = std::env::var("ComSpec").expect("ComSpec names cmd.exe");
     let command = [
         comspec.as_str(),
         "/c",
         "echo %CD%& echo %GOETIA_TEST_VAR%& echo to-stderr>&2",
     ];
-    let spec = DaemonSpec::new(DaemonFields {
-        cwd: Some(cwd.clone()),
-        env: BTreeMap::from([("GOETIA_TEST_VAR".to_string(), "from-spec".to_string())]),
-        logs: Some(logs.clone()),
-        ..plain_fields(ID, command.map(str::to_string).to_vec())
+    let spec = ServiceSpec::new({
+        let base = plain_fields(ID, command.map(str::to_string).to_vec());
+        ServiceFields {
+            common: DaemonFields {
+                cwd: Some(cwd.clone()),
+                env: BTreeMap::from([("GOETIA_TEST_VAR".to_string(), "from-spec".to_string())]),
+                logs: Some(logs.clone()),
+                ..base.common
+            },
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap();
     let fake = FakeGuard::new();
     let mut reap = Reap::default();

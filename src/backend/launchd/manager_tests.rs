@@ -14,9 +14,8 @@ use crate::backend::client::{Client, ClientError, Real};
 use crate::backend::standby;
 use crate::backend::test_allowance;
 use crate::manager::ServiceManager;
-use crate::spec::DaemonFields;
-use crate::spec::{Id, Kind, Restart, User};
-use crate::testing::plain_fields;
+use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
+use crate::testing::{plain_fields, service_fields};
 
 use crate::testing::cleanup::{FileGuard, remove_or_warn};
 use crate::testing::groups::{Group, launchd_group};
@@ -26,11 +25,12 @@ fn sample_plist(id: &str) -> String {
 }
 
 fn sample_plist_restarting(id: &str, restart: Restart) -> String {
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart,
-        kind: Kind::Simple,
+        protocol: Protocol::Plain,
         ..plain_fields(id, vec!["/bin/true".to_string()])
     })
+    .map(DaemonSpec::from)
     .unwrap();
     generate::plist(
         &spec,
@@ -940,7 +940,7 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
             enabled: false,
         },
         text: on_disk,
-        ..marked_plist(&spec.id)
+        ..marked_plist(&spec.common().id)
     };
     let stale = Outcome::Stale {
         from_version: "0.0.1".to_string(),
@@ -1492,11 +1492,12 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     let name = format!("goetia-reservation-{:x}", std::process::id());
     let _plists = Plists::new(&name);
     let id = Id::try_from(name.as_str()).unwrap();
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::Always,
-        kind: Kind::Simple,
+        protocol: Protocol::Plain,
         ..plain_fields(&name, vec!["/bin/sleep".to_string(), "300".to_string()])
     })
+    .map(DaemonSpec::from)
     .unwrap();
     let exhausted = |reservation: &Reservation| {
         assert_eq!(
@@ -1523,9 +1524,9 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     mgr.stop(&id, Budget::DEFAULT).expect("stop");
     script.assert_driven("stop");
 
-    let mut fields = spec.into_fields();
-    fields.command.push("updated".to_string());
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(spec);
+    fields.common.command.push("updated".to_string());
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     let (mgr, script) = over_sh(&[("print", NOT_LOADED), ("print", NOT_LOADED)]);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
     script.assert_driven("install, updating a job that is not loaded");
@@ -2333,9 +2334,9 @@ fn a_changed_spec_is_refused_while_the_job_is_loaded(#[fixture(launchd_group)] _
     script.assert_spent("the first install");
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
 
-    let mut fields = spec.into_fields();
-    fields.command.push("updated".to_string());
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(spec);
+    fields.common.command.push("updated".to_string());
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     for loaded in [RUNNING, NOT_RUNNING] {
         let (mgr, script) = scripted(&[("print", loaded)]);
         let refused = mgr.install(&spec, false).expect_err("a changed spec over a loaded job");
@@ -2360,10 +2361,11 @@ fn a_changed_spec_is_refused_while_the_job_is_loaded(#[fixture(launchd_group)] _
 /// The spec the tests below install, under a name of their own: the tests run on parallel threads of
 /// one process, so each needs plists no other writes.
 fn spec_named(name: &str) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        kind: Kind::Simple,
+    ServiceSpec::new(ServiceFields {
+        protocol: Protocol::Plain,
         ..plain_fields(name, vec!["/bin/sleep".to_string(), "300".to_string()])
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -2404,20 +2406,24 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded(#[fixtu
     script.assert_spent("create over a loaded job");
 
     let (mgr, script) = scripted(&[("print", UNREADABLE)]);
-    let e = mgr.start(&spec.id, Budget::DEFAULT).expect_err("an unreadable print");
+    let e = mgr
+        .start(&spec.common().id, Budget::DEFAULT)
+        .expect_err("an unreadable print");
     assert!(names_print(&e), "{e:?}");
     script.assert_spent("start, unreadable first read");
 
     let (mgr, script) = scripted(&[("print", NOT_LOADED), ("bootstrap", REFUSED), ("print", UNREADABLE)]);
-    let e = mgr.start(&spec.id, Budget::DEFAULT).expect_err("an unreadable print");
+    let e = mgr
+        .start(&spec.common().id, Budget::DEFAULT)
+        .expect_err("an unreadable print");
     assert!(names_print(&e), "{e:?}");
     script.assert_spent("start, unreadable read after a refused bootstrap");
 
     // `Update`: the refusal check. The plist exists from the rerun above.
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
-    let mut fields = spec.into_fields();
-    fields.command.push("updated".to_string());
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(spec);
+    fields.common.command.push("updated".to_string());
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     let (mgr, script) = scripted(&[("print", UNREADABLE)]);
     let e = mgr.install(&spec, false).expect_err("an unreadable print");
     assert!(names_print(&e), "{e:?}");
@@ -2432,10 +2438,11 @@ fn a_print_that_fails_otherwise_is_an_error_not_a_job_that_is_not_loaded(#[fixtu
 /// Installs a job named `name` with `restart` (no job loaded), then runs a waited `start` over the
 /// fake `calls` and returns the error it failed with, having made every call scripted.
 fn failed_start(name: &str, restart: Restart, calls: &[(&str, Answer)]) -> Error {
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart,
-        ..spec_named(name).into_fields()
+        ..service_fields(spec_named(name))
     })
+    .map(DaemonSpec::from)
     .unwrap();
 
     let (mgr, script) = scripted(&CREATED);
@@ -2444,7 +2451,7 @@ fn failed_start(name: &str, restart: Restart, calls: &[(&str, Answer)]) -> Error
 
     let (mgr, script) = scripted(calls);
     let e = mgr
-        .start(&spec.id, Budget::DEFAULT)
+        .start(&spec.common().id, Budget::DEFAULT)
         .expect_err("a start that never read Running");
     script.assert_spent("start");
     e
@@ -2567,9 +2574,9 @@ fn a_job_loaded_between_the_check_and_the_write_leaves_the_install_in_doubt(#[fi
     script.assert_spent("the first install");
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
 
-    let mut fields = spec.into_fields();
-    fields.command.push("updated".to_string());
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(spec);
+    fields.common.command.push("updated".to_string());
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     let (mgr, script) = scripted(&[("print", NOT_LOADED), ("print", RUNNING)]);
     let e = mgr.install(&spec, false).expect_err("loaded after the write");
     assert!(
@@ -2601,9 +2608,9 @@ fn an_unreadable_recheck_after_the_write_leaves_the_install_in_doubt(#[fixture(l
     script.assert_spent("the first install");
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
 
-    let mut fields = spec.into_fields();
-    fields.command.push("updated".to_string());
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(spec);
+    fields.common.command.push("updated".to_string());
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     let (mgr, script) = scripted(&[("print", NOT_LOADED), ("print", UNREADABLE)]);
     let e = mgr.install(&spec, false).expect_err("an unreadable recheck");
     assert!(
@@ -2636,9 +2643,9 @@ fn a_spec_change_the_plist_does_not_render_is_written_over_a_loaded_job(#[fixtur
     script.assert_spent("the first install");
     let installed = std::fs::read_to_string(staging_path(&name)).unwrap();
 
-    let mut fields = spec.into_fields();
-    fields.name = "another name".to_string();
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(spec);
+    fields.common.name = "another name".to_string();
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     let (mgr, script) = scripted(&[]);
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })));
     script.assert_spent("an install whose rendering is unchanged asks launchd nothing");
@@ -2660,9 +2667,9 @@ fn install_loaded_after_write(name: &str, during: impl FnOnce() + Send + 'static
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     script.assert_spent("the first install");
 
-    let mut fields = spec.into_fields();
-    fields.command.push("updated".to_string());
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(spec);
+    fields.common.command.push("updated".to_string());
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     let changed = generate::plist(
         &spec,
         &Identity {
@@ -2822,10 +2829,17 @@ fn a_create_that_cannot_stage_its_plist_boots_nothing_out(#[fixture(launchd_grou
     let dir = tempfile::tempdir().unwrap();
     let blocker = dir.path().join("not-a-directory");
     std::fs::write(&blocker, "").unwrap();
-    let spec = DaemonSpec::new(DaemonFields {
-        cwd: Some(blocker.join("cwd")),
-        ..spec_named(&name).into_fields()
+    let spec = ServiceSpec::new({
+        let base = service_fields(spec_named(&name));
+        ServiceFields {
+            common: DaemonFields {
+                cwd: Some(blocker.join("cwd")),
+                ..base.common
+            },
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap();
 
     let (mgr, script) = scripted(&[]);
@@ -2960,9 +2974,9 @@ fn a_plist_removed_after_a_read_fails_the_install_without_further_launchctl_call
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     script.assert_spent("the first install");
 
-    let mut fields = spec.into_fields();
-    fields.command.push("updated".to_string());
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(spec);
+    fields.common.command.push("updated".to_string());
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     let vanished = target.clone();
     let script = Fake::new([answer("print", NOT_LOADED).then(move || std::fs::remove_file(vanished).unwrap())]);
     let mgr = launchd_over(script.clone());

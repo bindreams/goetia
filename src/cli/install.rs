@@ -63,7 +63,7 @@ pub fn run(
     };
 
     if args.dry_run {
-        let _ = writeln!(out, "# {}", spec.id);
+        let _ = writeln!(out, "# {}", spec.common().id);
         return match preview_artifact(&spec, host) {
             Ok(artifact) => {
                 let _ = write!(out, "{artifact}");
@@ -98,13 +98,13 @@ pub fn run(
     let mut sequence = match mgr.prepare(steps, budget) {
         Ok(sequence) => sequence,
         Err(e) => {
-            print_error(err, Some(spec.id.as_str()), "", &e);
+            print_error(err, Some(spec.common().id.as_str()), "", &e);
             return ExitCode::of(&e);
         }
     };
     match sequence.install(&spec, args.force) {
         Ok(outcome) => {
-            match report_outcome(&spec.id, &outcome, out, err) {
+            match report_outcome(&spec.common().id, &outcome, out, err) {
                 ExitCode::Success => codes.push(ExitCode::Success),
                 // Nothing was (re)written: neither flag below has anything to
                 // act on.
@@ -114,20 +114,20 @@ pub fn run(
                 }
             }
             if args.enable
-                && let Err(e) = sequence.enable(&spec.id)
+                && let Err(e) = sequence.enable(&spec.common().id)
             {
-                print_error(err, Some(spec.id.as_str()), "enable: ", &e);
+                print_error(err, Some(spec.common().id.as_str()), "enable: ", &e);
                 codes.push(ExitCode::of(&e));
             }
             if args.start
-                && let Err(e) = sequence.start(&spec.id, args.wait.budget())
+                && let Err(e) = sequence.start(&spec.common().id, args.wait.budget())
             {
-                print_error(err, Some(spec.id.as_str()), "start: ", &e);
+                print_error(err, Some(spec.common().id.as_str()), "start: ", &e);
                 codes.push(ExitCode::of(&e));
             }
         }
         Err(e) => {
-            print_error(err, Some(spec.id.as_str()), "", &e);
+            print_error(err, Some(spec.common().id.as_str()), "", &e);
             codes.push(ExitCode::of(&e));
         }
     }
@@ -202,7 +202,7 @@ fn preview_root_account() -> String {
 /// Writes nothing; on Windows a `type: simple` daemon's preview asks `host` for the host command.
 /// `host` is called only by that preview, whose artifact names it.
 fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>) -> Result<String> {
-    let identity = preview_identity(&spec.user);
+    let identity = preview_identity(&spec.common().user);
 
     #[cfg(target_os = "linux")]
     {
@@ -221,9 +221,10 @@ fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>) -
         // Asked only for a `type: simple` daemon: a managed one runs no host, and a provider that
         // cannot name one must not fail its preview. The real host, so the preview refuses a path
         // the install would.
-        let command = match spec.kind {
-            crate::spec::Kind::Simple => Some(host()?),
-            crate::spec::Kind::Managed => None,
+        let crate::spec::DaemonSpec::Service(service) = spec;
+        let command = match service.protocol {
+            crate::spec::Protocol::Plain => Some(host()?),
+            crate::spec::Protocol::Native => None,
         };
         let registration = crate::backend::scm::generate::install_registration(spec, &identity, command.as_ref())?;
         Ok(registration.to_string())

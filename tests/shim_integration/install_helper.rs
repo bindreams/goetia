@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use goetia::manager::ServiceManager as _;
 use goetia::shim::CheckPermissions;
-use goetia::spec::{DaemonFields, DaemonSpec, Kind, User};
+use goetia::spec::{DaemonFields, DaemonSpec, Protocol, ServiceFields, ServiceSpec, User};
 
 use crate::common::{embedded_manager, fixture_command_with_exe};
 use crate::support;
@@ -29,12 +29,19 @@ pub fn run_if_requested() -> bool {
         eprintln!("usage: {INSTALL_AS} <id> <account> <daemon-exe> <log-path> <port>");
         std::process::exit(2);
     };
-    let spec = DaemonSpec::new(DaemonFields {
-        kind: Kind::Simple,
-        user: User::Name(format!(r".\{account}")),
-        logs: Some(PathBuf::from(log)),
-        ..support::plain_fields(id, fixture_command_with_exe(exe, "report", &[port]))
+    let spec = ServiceSpec::new({
+        let base = support::plain_fields(id, fixture_command_with_exe(exe, "report", &[port]));
+        ServiceFields {
+            common: DaemonFields {
+                user: User::Name(format!(r".\{account}")),
+                logs: Some(PathBuf::from(log)),
+                ..base.common
+            },
+            protocol: Protocol::Plain,
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap_or_else(|e| panic!("the helper's spec: {}", e.report()));
     match embedded_manager(None, CheckPermissions::Enable).install(&spec, false) {
         Ok(outcome) => {

@@ -468,10 +468,10 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a
 /// missing `WorkingDirectory` refuses the job outright.
 fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account) -> Result<()> {
-    if let Some(cwd) = &spec.cwd {
+    if let Some(cwd) = &spec.common().cwd {
         ensure_dir_owned_by(cwd, account)?;
     }
-    if let Some(logs) = &spec.logs
+    if let Some(logs) = &spec.common().logs
         && let Some(parent) = logs.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1161,7 +1161,7 @@ impl backend::Backend for Launchd {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
-        let account = resolve_account(&spec.user)?;
+        let account = resolve_account(&spec.common().user)?;
         Ok(generate::plist(spec, &account.identity()))
     }
 
@@ -1197,7 +1197,7 @@ impl backend::Backend for Launchd {
     ) -> Result<WriteOutcome> {
         // Resolved again: `render` kept only the plist, which names the account, and launchd
         // resolves that name at launch too.
-        let account = resolve_account(&spec.user)?;
+        let account = resolve_account(&spec.common().user)?;
         let deadline = Budget::Unbounded.start();
 
         match outcome {
@@ -1210,33 +1210,45 @@ impl backend::Backend for Launchd {
                 // Staging comes first, so a failure there stops nothing. A read or `bootout` that fails
                 // leaves no plist, so a rerun is a `Create` again and reaches the stale job; after a
                 // plist is written the rerun would read `UpToDate` and never look.
-                let target = staging_path(spec.id.as_str());
+                let target = staging_path(spec.common().id.as_str());
                 prepare_parent_dirs(spec, &account)?;
                 let staged = staged_tempfile(target.parent().expect("plist path always has a parent"), desired)?;
-                let loaded = never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?);
+                let loaded = never_expires(self.launchctl.is_loaded(
+                    spec.common().id.as_str(),
+                    deadline,
+                    reservation,
+                )?);
                 if loaded {
-                    never_expires(self.launchctl.bootout(spec.id.as_str(), deadline, reservation)?);
+                    never_expires(
+                        self.launchctl
+                            .bootout(spec.common().id.as_str(), deadline, reservation)?,
+                    );
                 }
                 match persist_new(staged, &target)? {
                     PersistOutcome::Written => {}
                     // Something now exists where `read` saw nothing, and `is_loaded` has been called.
                     PersistOutcome::Raced => {
                         return Err(if loaded {
-                            refuse::slot_taken_after_bootout(&spec.id, &target, describe_at(&target))
+                            refuse::slot_taken_after_bootout(&spec.common().id, &target, describe_at(&target))
                         } else {
-                            refuse::changed_during_install(&spec.id, &target)
+                            refuse::changed_during_install(&spec.common().id, &target)
                         });
                     }
                 }
-                self.recheck_after_write(&spec.id, deadline, &target, desired, None, reservation)?;
+                self.recheck_after_write(&spec.common().id, deadline, &target, desired, None, reservation)?;
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
                 let snapshot = snapshot.expect("an id `decide` chose to update was read as marked");
                 let previous = snapshot.text.as_str();
                 // `Stale` is checked too: a release can change what the generator renders.
                 let changes_job = refuse::changes_loaded_job(previous, desired);
-                if changes_job && never_expires(self.launchctl.is_loaded(spec.id.as_str(), deadline, reservation)?) {
-                    return Err(refuse::loaded_refusal(&spec.id));
+                if changes_job
+                    && never_expires(
+                        self.launchctl
+                            .is_loaded(spec.common().id.as_str(), deadline, reservation)?,
+                    )
+                {
+                    return Err(refuse::loaded_refusal(&spec.common().id));
                 }
                 prepare_parent_dirs(spec, &account)?;
                 let target = snapshot.location.path.as_path();
@@ -1249,14 +1261,21 @@ impl backend::Backend for Launchd {
                 if !still_present(target)? {
                     return if changes_job {
                         // `is_loaded` has been called.
-                        Err(refuse::changed_during_install(&spec.id, target))
+                        Err(refuse::changed_during_install(&spec.common().id, target))
                     } else {
                         Ok(WriteOutcome::Raced)
                     };
                 }
                 write_existing(target, desired)?;
                 if changes_job {
-                    self.recheck_after_write(&spec.id, deadline, target, desired, Some(previous), reservation)?;
+                    self.recheck_after_write(
+                        &spec.common().id,
+                        deadline,
+                        target,
+                        desired,
+                        Some(previous),
+                        reservation,
+                    )?;
                 }
             }
             other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
@@ -1328,6 +1347,7 @@ impl backend::Backend for Launchd {
         let Plist { id, blob, location, .. } = snapshot;
         let id = &id;
         let blob = blob.map_err(Error::Kept)?;
+        let DaemonSpec::Service(service) = &blob.spec;
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
         // Issuing the request is unbounded: the budget bounds waiting for launchd's answer, never
         // whether the request is sent, so a spent budget still reaches launchd.
@@ -1401,7 +1421,7 @@ impl backend::Backend for Launchd {
                         return Err(if deadline.expired() {
                             timed_out()
                         } else {
-                            not_started(id, state, blob.spec.restart == Restart::Always)
+                            not_started(id, state, service.restart == Restart::Always)
                         });
                     }
                 }
@@ -1425,7 +1445,7 @@ impl backend::Backend for Launchd {
         // for none (`--timeout 0`, whose `Ok(())` means only that the request was accepted) sees
         // `spawn scheduled`, which `state::classify` folds into `Unknown`.
         if budget.waits()
-            && blob.spec.restart == Restart::Always
+            && service.restart == Restart::Always
             && self.launchctl.live_state(id.as_str(), issuing, reservation)?.0 != State::Running
         {
             // One corrective cycle, not a retry loop: tear the stale job down by label, wait until

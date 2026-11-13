@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::error::Result;
 #[cfg(windows)]
 use crate::shim::{FolderCheck, HostCommand, ShimProvider, SweepFailure};
-use crate::spec::{DaemonFields, Id, Kind, Restart, User};
+use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, User};
 
 pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
 
@@ -55,20 +55,29 @@ pub mod raw_registry;
 pub mod scratch;
 
 /// A plain root, `restart: never`, `type: managed` daemon named `id`; panics on an invalid `Id`.
-/// Vary fields with struct-update syntax, then `DaemonSpec::new`.
-pub fn plain_fields(id: &str, command: Vec<String>) -> DaemonFields {
-    DaemonFields {
-        id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),
-        name: id.to_string(),
-        command,
-        cwd: None,
-        env: std::collections::BTreeMap::new(),
-        user: User::Root,
+/// Vary fields with struct-update syntax, then `ServiceSpec::new`.
+pub fn plain_fields(id: &str, command: Vec<String>) -> ServiceFields {
+    ServiceFields {
+        common: DaemonFields {
+            id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),
+            name: id.to_string(),
+            command,
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            user: User::Root,
+            logs: None,
+        },
         restart: Restart::Never,
         restart_delay: None,
-        logs: None,
-        kind: Kind::Managed,
+        protocol: Protocol::Native,
     }
+}
+
+/// The fields of the service `spec`, to vary with struct-update syntax and check again with
+/// `ServiceSpec::new`.
+pub fn service_fields(spec: DaemonSpec) -> ServiceFields {
+    let DaemonSpec::Service(service) = spec;
+    service.into_fields()
 }
 
 /// A [`ShimProvider`] that records the calls it gets (`"preview"`, `"provide"`, `"sweep"`, in

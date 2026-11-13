@@ -3,8 +3,8 @@
 //!
 //! `RawSpec -> DaemonSpec` (see `resolve`) is the crate's parse-don't-validate
 //! boundary. A [`DaemonSpec`] has passed every field rule, so nothing
-//! downstream re-derives them; only [`DaemonSpec::new`] makes one, from the
-//! plain-data [`DaemonFields`]. [`load`] and `blob::decode` go through it.
+//! downstream re-derives them; only [`ServiceSpec::new`] makes a [`ServiceSpec`], from the
+//! plain-data [`ServiceFields`]. [`load`] and `blob::decode` go through it.
 //!
 //! A daemon may also carry a `backend-specific:` block overriding its
 //! fields per [`BackendKind`]; see `overrides`'s module doc for the
@@ -112,9 +112,8 @@ impl std::str::FromStr for Id {
 
 // DaemonSpec ==========================================================================================================
 
-/// What a daemon is, before goetia checks it: plain data a consumer fills in and passes to
-/// [`DaemonSpec::new`]. It has no methods, so nothing reaches a [`DaemonSpec`] through `Deref`
-/// that is not a field.
+/// The fields every kind of daemon has, before goetia checks them: plain data. It has no methods,
+/// so nothing reaches a [`ServiceSpec`] through `Deref` that is not a field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonFields {
     pub id: Id,
@@ -123,13 +122,20 @@ pub struct DaemonFields {
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub user: User,
-    pub restart: Restart,
-    pub restart_delay: Option<Duration>,
     pub logs: Option<PathBuf>,
-    pub kind: Kind,
 }
 
-/// A daemon goetia has checked: it passed every field rule. Only [`DaemonSpec::new`] makes one;
+/// What a service is, before goetia checks it: plain data a consumer fills in and passes to
+/// [`ServiceSpec::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceFields {
+    pub common: DaemonFields,
+    pub restart: Restart,
+    pub restart_delay: Option<Duration>,
+    pub protocol: Protocol,
+}
+
+/// A service goetia has checked: it passed every field rule. Only [`ServiceSpec::new`] makes one;
 /// fields read through `Deref`, there is no `DerefMut`.
 ///
 /// A generator may rely on all of these:
@@ -140,28 +146,67 @@ pub struct DaemonFields {
 /// - `cwd` and `logs` are valid UTF-8;
 /// - every `env` key is non-empty and has no `=`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DaemonSpec(DaemonFields);
+pub struct ServiceSpec(ServiceFields);
 
-impl DaemonSpec {
+impl ServiceSpec {
     /// Check `fields` against the field rules and wrap them. Fails with [`Error::Invalid`] naming
     /// the field.
-    pub fn new(fields: DaemonFields) -> Result<DaemonSpec, Error> {
-        resolve::check_fields(&fields)?;
-        Ok(DaemonSpec(fields))
+    ///
+    /// Migrating from the flat `DaemonFields { .., restart, restart_delay, kind }`: put the
+    /// per-service fields in [`ServiceFields`], `kind` becomes `protocol`, and `.into()` the result
+    /// for a [`DaemonSpec`].
+    pub fn new(fields: ServiceFields) -> Result<ServiceSpec, Error> {
+        resolve::check_fields(&fields.common)?;
+        Ok(ServiceSpec(fields))
     }
 
-    /// Give the fields back, to build a variant and check it with [`DaemonSpec::new`].
-    pub fn into_fields(self) -> DaemonFields {
+    /// Give the fields back, to build a variant and check it with [`ServiceSpec::new`].
+    pub fn into_fields(self) -> ServiceFields {
         self.0
     }
 }
 
-impl std::ops::Deref for DaemonSpec {
-    type Target = DaemonFields;
+impl std::ops::Deref for ServiceSpec {
+    type Target = ServiceFields;
 
-    fn deref(&self) -> &DaemonFields {
+    fn deref(&self) -> &ServiceFields {
         &self.0
     }
+}
+
+/// A daemon goetia has checked, of one of the kinds goetia installs. No `Deref`: read the fields
+/// every kind has with [`DaemonSpec::common`], and match the variant for the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonSpec {
+    Service(ServiceSpec),
+}
+
+impl DaemonSpec {
+    /// The fields every kind of daemon has.
+    pub fn common(&self) -> &DaemonFields {
+        match self {
+            DaemonSpec::Service(service) => &service.common,
+        }
+    }
+
+    /// Which kind of daemon this is.
+    pub fn kind(&self) -> DaemonKind {
+        match self {
+            DaemonSpec::Service(_) => DaemonKind::Service,
+        }
+    }
+}
+
+impl From<ServiceSpec> for DaemonSpec {
+    fn from(service: ServiceSpec) -> Self {
+        DaemonSpec::Service(service)
+    }
+}
+
+/// The kinds of daemon goetia installs, as [`DaemonSpec::kind`] reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonKind {
+    Service,
 }
 
 /// Restart policy. Corresponds to systemd's `Restart=`, launchd's
@@ -184,12 +229,12 @@ pub enum Restart {
 /// Whether Goetia runs the command directly (via `goetia-shim` on Windows)
 /// or the command is itself expected to behave as a native service.
 ///
-/// Parsed from its authored kebab-case string by `resolve::parse_kind`; see
-/// [`Restart`]'s doc comment for why this is not a derived `Deserialize`.
+/// Parsed from its authored kebab-case string (`simple`, `managed`) by `resolve::parse_protocol`;
+/// see [`Restart`]'s doc comment for why this is not a derived `Deserialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Simple,
-    Managed,
+pub enum Protocol {
+    Plain,
+    Native,
 }
 
 /// A non-fatal parse/resolve-time advisory: a property was accepted but

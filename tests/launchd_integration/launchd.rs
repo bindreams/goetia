@@ -21,7 +21,8 @@ use goetia::backend::launchd::generate;
 use goetia::backend::launchd::manager::{ENABLED_DIR, Launchd, STAGING_DIR};
 use goetia::decide::Outcome;
 use goetia::manager::{self, Budget, Installed, ServiceManager, State};
-use goetia::spec::{DaemonFields, DaemonSpec, Id, Kind, Restart, User};
+use goetia::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
+use goetia::testing::service_fields;
 
 use crate::support::cleanup::{DirGuard, FileGuard};
 use crate::support::{self, ConnectBack, Group, cmd, launchd_group, may_account_for};
@@ -45,10 +46,11 @@ const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 /// [`support::plain_fields`] as a `simple` daemon: every spec this suite installs is one.
 fn base_spec(id: &str, command: Vec<String>) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        kind: Kind::Simple,
+    ServiceSpec::new(ServiceFields {
+        protocol: Protocol::Plain,
         ..support::plain_fields(id, command)
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -156,7 +158,7 @@ struct Guard(Id);
 
 impl Guard {
     fn install(mgr: &Launchd, spec: &DaemonSpec) -> Self {
-        let guard = Self(spec.id.clone());
+        let guard = Self(spec.common().id.clone());
         mgr.install(spec, false).expect("seed install");
         guard
     }
@@ -271,7 +273,7 @@ fn launchd_passes_conformance(#[fixture(launchd_group)] _group: &Group) {
     // produce. Guarded here so a panic before `run` leaves nothing behind;
     // `run` uninstalls it too, which makes the guard's removal a no-op.
     let spec = sleepy(manager::conformance::HAND_EDITED_ID);
-    let _hand_edited_cleanup = Guard(spec.id.clone());
+    let _hand_edited_cleanup = Guard(spec.common().id.clone());
     mgr.install(&spec, false).expect("seed install");
     let path = staging_path(manager::conformance::HAND_EDITED_ID);
     let mut text = std::fs::read_to_string(&path).expect("read seeded artifact");
@@ -313,7 +315,7 @@ fn install_round_trips_without_a_source_file(#[fixture(launchd_group)] _group: &
     let listed = mgr.list().expect("list");
     let found = listed
         .into_iter()
-        .find(|entry| matches!(entry, Installed::Ours { spec: s, .. } if s.id == spec.id));
+        .find(|entry| matches!(entry, Installed::Ours { spec: s, .. } if s.common().id == spec.common().id));
     match found {
         Some(Installed::Ours { spec: got, .. }) => assert_eq!(got, spec),
         other => panic!("expected the installed spec back from list(), got {other:?}"),
@@ -326,7 +328,7 @@ fn hand_edit_is_detected_as_conflict(#[fixture(launchd_group)] _group: &Group) {
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
-    let path = staging_path(spec.id.as_str());
+    let path = staging_path(spec.common().id.as_str());
     let mut text = std::fs::read_to_string(&path).unwrap();
     text.push_str("<!-- a hand-added directive -->\n");
     write_plist(&path, &text);
@@ -348,7 +350,7 @@ fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged(#[fixture(
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
-    let upper = spec.id.as_str().to_uppercase();
+    let upper = spec.common().id.as_str().to_uppercase();
     let _upper_guard = Guard(Id::try_from(upper.as_str()).expect("an uppercased valid id is valid"));
     assert!(
         staging_path(&upper).exists(),
@@ -357,15 +359,22 @@ fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged(#[fixture(
         staging_path(&upper).display()
     );
 
-    let requested = DaemonSpec::new(DaemonFields {
-        id: Id::try_from(upper.as_str()).unwrap(),
-        ..spec.clone().into_fields()
+    let requested = ServiceSpec::new({
+        let base = service_fields(spec.clone());
+        ServiceFields {
+            common: DaemonFields {
+                id: Id::try_from(upper.as_str()).unwrap(),
+                ..base.common
+            },
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap();
     let expected = Outcome::RefuseOtherDaemon {
-        installed: spec.id.clone(),
+        installed: spec.common().id.clone(),
     };
-    let before = std::fs::read(staging_path(spec.id.as_str())).unwrap();
+    let before = std::fs::read(staging_path(spec.common().id.as_str())).unwrap();
 
     assert_eq!(mgr.preview_install(&requested).expect("preview_install"), expected);
     for force in [false, true] {
@@ -377,12 +386,12 @@ fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged(#[fixture(
     }
 
     assert_eq!(
-        std::fs::read(staging_path(spec.id.as_str())).unwrap(),
+        std::fs::read(staging_path(spec.common().id.as_str())).unwrap(),
         before,
         "the installed plist must not be written over"
     );
     match mgr.list().expect("list").into_iter().find(
-        |entry| matches!(entry, Installed::Ours { spec: s, .. } if s.id.as_str().eq_ignore_ascii_case(spec.id.as_str())),
+        |entry| matches!(entry, Installed::Ours { spec: s, .. } if s.common().id.as_str().eq_ignore_ascii_case(spec.common().id.as_str())),
     ) {
         Some(Installed::Ours { spec: got, .. }) => assert_eq!(got, spec),
         other => panic!("expected the installed spec back from list(), got {other:?}"),
@@ -432,7 +441,7 @@ fn install_does_not_start_the_daemon(#[fixture(launchd_group)] _group: &Group) {
     let _guard = Guard::install(&mgr, &spec);
 
     assert!(
-        !is_loaded(spec.id.as_str()),
+        !is_loaded(spec.common().id.as_str()),
         "install must not load the job at all — it must not appear in `launchctl print system`"
     );
 }
@@ -443,14 +452,14 @@ fn start_does_not_enable(#[fixture(launchd_group)] _group: &Group) {
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     assert!(
-        staging_path(spec.id.as_str()).exists(),
+        staging_path(spec.common().id.as_str()).exists(),
         "plist must still be in staging after start"
     );
     assert!(
-        !enabled_path(spec.id.as_str()).exists(),
+        !enabled_path(spec.common().id.as_str()).exists(),
         "plist must not have moved into LaunchDaemons after a plain start"
     );
 }
@@ -461,17 +470,20 @@ fn enable_does_not_start(#[fixture(launchd_group)] _group: &Group) {
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
 
-    mgr.enable(&spec.id).expect("enable");
+    mgr.enable(&spec.common().id).expect("enable");
 
     assert!(
-        enabled_path(spec.id.as_str()).exists(),
+        enabled_path(spec.common().id.as_str()).exists(),
         "plist must have moved into LaunchDaemons"
     );
     assert!(
-        !staging_path(spec.id.as_str()).exists(),
+        !staging_path(spec.common().id.as_str()).exists(),
         "plist must not remain in staging"
     );
-    assert!(!is_loaded(spec.id.as_str()), "enable must not load/start the job");
+    assert!(
+        !is_loaded(spec.common().id.as_str()),
+        "enable must not load/start the job"
+    );
 }
 
 #[skuld::test]
@@ -489,31 +501,34 @@ fn disable_returns_the_plist_to_staging(#[fixture(launchd_group)] _group: &Group
     );
     let _guard = Guard::install(&mgr, &spec);
 
-    mgr.enable(&spec.id).expect("enable");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.enable(&spec.common().id).expect("enable");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     assert_eq!(
-        mgr.status(&spec.id).unwrap().state,
+        mgr.status(&spec.common().id).unwrap().state,
         State::Running,
         "precondition: actually running"
     );
 
-    mgr.disable(&spec.id).expect("disable");
+    mgr.disable(&spec.common().id).expect("disable");
 
-    assert!(staging_path(spec.id.as_str()).exists(), "plist must be back in staging");
     assert!(
-        !enabled_path(spec.id.as_str()).exists(),
+        staging_path(spec.common().id.as_str()).exists(),
+        "plist must be back in staging"
+    );
+    assert!(
+        !enabled_path(spec.common().id.as_str()).exists(),
         "plist must no longer be in LaunchDaemons"
     );
     // `ServiceManager::disable`'s contract is "does not stop it if
     // running" — a currently-loaded job must survive the plist moving back
     // to staging untouched.
     assert_eq!(
-        mgr.status(&spec.id).unwrap().state,
+        mgr.status(&spec.common().id).unwrap().state,
         State::Running,
         "disable must not stop a job that was loaded"
     );
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 }
 
 // Runtime behavior ====================================================================================================
@@ -538,33 +553,32 @@ fn start_stop_status_reflect_reality(#[fixture(launchd_group)] _group: &Group) {
     );
     let _guard = Guard::install(&mgr, &spec);
 
-    assert_eq!(mgr.status(&spec.id).unwrap().state, State::Stopped);
+    assert_eq!(mgr.status(&spec.common().id).unwrap().state, State::Stopped);
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
-    let running = mgr.status(&spec.id).unwrap();
+    let running = mgr.status(&spec.common().id).unwrap();
     assert_eq!(running.state, State::Running);
     assert!(running.pid.is_some(), "a running job should report a pid");
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-    assert_ne!(mgr.status(&spec.id).unwrap().state, State::Running);
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    assert_ne!(mgr.status(&spec.common().id).unwrap().state, State::Running);
 }
 
 // kill ================================================================================================================
 
 /// The test binary as a daemon that reports in on every start, under `restart`.
 fn reporting(id: &str, restart: Restart, listener: &ConnectBack) -> DaemonSpec {
-    let mut spec = base_spec(
+    let mut spec = service_fields(base_spec(
         id,
         vec![
             support::current_exe_str(),
             support::sentinel::RUN_UNTIL_KILLED.to_string(),
             listener.port().to_string(),
         ],
-    )
-    .into_fields();
+    ));
     spec.restart = restart;
-    DaemonSpec::new(spec).unwrap()
+    ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
 }
 
 #[skuld::test]
@@ -574,7 +588,7 @@ fn a_killed_always_restart_daemon_comes_back_with_a_new_pid(#[fixture(launchd_gr
     let spec = reporting(&support::random_test_id(), Restart::Always, &listener);
     let _guard = Guard::install(&mgr, &spec);
 
-    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &listener);
+    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.common().id, &listener);
 }
 
 #[skuld::test]
@@ -584,8 +598,8 @@ fn a_killed_never_restart_daemon_stays_down(#[fixture(launchd_group)] _group: &G
     let spec = reporting(&support::random_test_id(), Restart::Never, &listener);
     let _guard = Guard::install(&mgr, &spec);
 
-    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener, &|| {
-        let id = spec.id.as_str();
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.common().id, &listener, &|| {
+        let id = spec.common().id.as_str();
         let plist = [enabled_path(id), staging_path(id)]
             .into_iter()
             .find_map(|path| std::fs::read_to_string(path).ok())
@@ -613,16 +627,16 @@ fn killing_a_job_with_no_process_is_not_running(#[fixture(launchd_group)] _group
     let _guard = Guard::install(&mgr, &spec);
     let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Launchd::new())) };
 
-    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
-    mgr.kill(&spec.id).expect("kill");
-    support::kill::until(|| mgr.status(&spec.id).expect("status").state != State::Running);
-    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+    mgr.kill(&spec.common().id).expect("kill");
+    support::kill::until(|| mgr.status(&spec.common().id).expect("status").state != State::Running);
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 }
 
 /// launchd cannot update a loaded job, so a changed spec over one is refused with the plist and the
@@ -641,13 +655,16 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded(#[fixture(launchd_grou
         ],
     );
     let _guard = Guard::install(&mgr, &installed_spec);
-    mgr.start(&installed_spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&installed_spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     let installed = std::fs::read_to_string(staging_path(&id)).unwrap();
 
-    let mut fields = installed_spec.into_fields();
-    fields.env.insert("GOETIA_TEST_REVISION".to_string(), "2".to_string());
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(installed_spec);
+    fields
+        .common
+        .env
+        .insert("GOETIA_TEST_REVISION".to_string(), "2".to_string());
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
     let refused = mgr
         .install(&spec, false)
         .expect_err("a changed spec over a loaded job must be refused");
@@ -661,20 +678,21 @@ fn install_refuses_a_changed_spec_while_the_job_is_loaded(#[fixture(launchd_grou
         "a refused install must leave the plist as it was"
     );
     assert_eq!(
-        mgr.status(&spec.id).unwrap().state,
+        mgr.status(&spec.common().id).unwrap().state,
         State::Running,
         "a refused install must not stop the daemon"
     );
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
     assert!(
         matches!(mgr.install(&spec, false), Ok(Outcome::Update { .. })),
         "the same install must go through once the job is not loaded"
     );
     assert_ne!(std::fs::read_to_string(staging_path(&id)).unwrap(), installed);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start the updated daemon");
+    mgr.start(&spec.common().id, Budget::DEFAULT)
+        .expect("start the updated daemon");
     listener.accept("the updated daemon to report in");
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 }
 
 #[skuld::test]
@@ -686,9 +704,9 @@ fn uninstall_leaves_nothing(#[fixture(launchd_group)] _group: &Group) {
     // a harmless, already-gone no-op — see its `Drop` impl — so this still
     // doubles as the panic-safety net every other test gets.
     let _guard = Guard::install(&mgr, &spec);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
-    mgr.uninstall(&spec.id).expect("uninstall");
+    mgr.uninstall(&spec.common().id).expect("uninstall");
 
     assert!(!staging_path(&id).exists(), "no plist should remain in staging");
     assert!(!enabled_path(&id).exists(), "no plist should remain in LaunchDaemons");
@@ -708,7 +726,7 @@ fn list_ignores_foreign_plists(#[fixture(launchd_group)] _group: &Group) {
     assert!(
         !listed
             .iter()
-            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
+            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.common().id.as_str() == id)),
         "a foreign plist must not be reported as Ours"
     );
     assert!(
@@ -727,9 +745,9 @@ fn list_reports_a_deleted_user_as_ours_unusable(#[fixture(launchd_group)] _group
     let mgr = Launchd::new();
     let id = support::random_test_id();
     let user = "goetia-no-such-user-xyz";
-    let mut spec = sleepy(&id).into_fields();
-    spec.user = User::Name(user.to_string());
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(sleepy(&id));
+    spec.common.user = User::Name(user.to_string());
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let path = staging_path(&id);
     let _cleanup = FileGuard::new(path.clone());
     ensure_staging_dir();
@@ -783,7 +801,7 @@ fn unelevated_list_works(#[fixture(launchd_group)] _group: &Group) {
 
     // `install` writes an 0644 plist under world-searchable directories, so an unprivileged caller
     // reads it.
-    support::list_json(run_unelevated).assert_own(&[spec.id.as_str()]);
+    support::list_json(run_unelevated).assert_own(&[spec.common().id.as_str()]);
 }
 
 /// The motivating defect, end to end and at the privilege boundary that
@@ -796,14 +814,17 @@ fn unelevated_list_reports_a_root_only_plist_as_undetermined(#[fixture(launchd_g
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
-    std::fs::set_permissions(staging_path(spec.id.as_str()), std::fs::Permissions::from_mode(0o600))
-        .expect("chmod 0600");
+    std::fs::set_permissions(
+        staging_path(spec.common().id.as_str()),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod 0600");
 
     let listed = support::list_json(run_unelevated);
 
     // Root opens this plist, decodes its marker and lists it under `daemons`, so a run whose reader
     // was not in fact unprivileged fails here instead of passing vacuously.
-    let id = Some(spec.id.as_str().to_string());
+    let id = Some(spec.common().id.as_str().to_string());
     assert!(listed.ids("undetermined").contains(&id), "{}", listed.context);
     assert!(
         !listed.ids("daemons").contains(&id),
@@ -840,7 +861,7 @@ fn list_omits_a_non_utf8_plist_as_foreign(#[fixture(launchd_group)] _group: &Gro
         "bytes that are not goetia's format leave the id neither claimed nor undetermined: \
          {listed:?}"
     );
-    support::assert_own(&listed, &[readable.id.as_str()]);
+    support::assert_own(&listed, &[readable.common().id.as_str()]);
 }
 
 /// The macOS-wide regression the binary-plist rule prevents. `/Library/
@@ -888,7 +909,7 @@ fn preview_install_over_a_non_utf8_plist_refuses_it_as_foreign(#[fixture(launchd
 
     // Never `NotInstalled`: something is demonstrably there.
     let status = mgr
-        .status(&spec.id)
+        .status(&spec.common().id)
         .expect_err("status must reach the same verdict as diff about one file");
     assert!(matches!(status, goetia::Error::Foreign { .. }), "{status:?}");
 }
@@ -1048,7 +1069,7 @@ fn root_user_runs_as_uid_zero(#[fixture(launchd_group)] _group: &Group) {
         ],
     );
     let _guard = Guard::install(&mgr, &spec);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     let reported_uid = listener.accept_value("the daemon to report its uid");
     assert_eq!(
@@ -1070,13 +1091,13 @@ fn a_stop_with_no_budget_waits_for_the_job_to_be_gone(#[fixture(launchd_group)] 
     let mgr = Launchd::new();
     let spec = sleepy(&support::random_test_id());
     let _guard = Guard::install(&mgr, &spec);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
-    mgr.stop(&spec.id, Budget::Immediate)
+    mgr.stop(&spec.common().id, Budget::Immediate)
         .expect("a stop with no budget still waits for the job to be gone, and completes");
 
     assert_eq!(
-        mgr.status(&spec.id).expect("status after stop").state,
+        mgr.status(&spec.common().id).expect("status after stop").state,
         State::Stopped,
         "launchd no longer has the job, so it reads as stopped"
     );
@@ -1117,11 +1138,11 @@ fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone(#[fixtur
         &plist[end..]
     );
     write_plist(&staged, &plist);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the job to be up with SIGTERM ignored");
 
     let first = mgr
-        .stop(&spec.id, Budget::Bounded(Duration::from_millis(500)))
+        .stop(&spec.common().id, Budget::Bounded(Duration::from_millis(500)))
         .expect_err("a job that ignores SIGTERM outlives the budget");
     assert!(
         matches!(first, goetia::Error::WaitTimeout { awaited: "stopped", .. }),
@@ -1136,7 +1157,7 @@ fn a_second_stop_over_a_job_already_going_away_succeeds_once_it_is_gone(#[fixtur
         print_field(&before.stdout, "pid = ")
     );
 
-    mgr.stop(&spec.id, Budget::Unbounded)
+    mgr.stop(&spec.common().id, Budget::Unbounded)
         .expect("the second stop returns Ok once the job is gone");
     assert!(!is_loaded(&id), "the job is still loaded after the second stop");
 }
@@ -1175,22 +1196,21 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout(#[fixture(launc
     // Reports each run and exits at once, so `restart: always` puts launchd into the respawn loop it
     // throttles.
     let listener = ConnectBack::listen();
-    let mut spec = base_spec(
+    let mut spec = service_fields(base_spec(
         &id,
         vec![
             support::current_exe_str(),
             support::sentinel::CONNECT_BACK.to_string(),
             listener.port().to_string(),
         ],
-    )
-    .into_fields();
+    ));
     spec.restart = Restart::Always;
     spec.restart_delay = Some(Duration::from_secs(3600));
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     // Registered before the job is loaded: its `uninstall` boots the job out.
     let _guard = Guard::install(&mgr, &spec);
     // Declared after `_guard`, so the leftover kick is killed before the uninstall's `bootout`.
-    let _kickstart = KickstartGuard(spec.id.clone());
+    let _kickstart = KickstartGuard(spec.common().id.clone());
 
     // Load the job without `start`: `RunAtLoad` runs it.
     cmd::run(
@@ -1209,7 +1229,7 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout(#[fixture(launc
             && print_field(&printed, "pid = ").is_none()
     });
 
-    let err = mgr.start(&spec.id, Budget::DEFAULT).expect_err(
+    let err = mgr.start(&spec.common().id, Budget::DEFAULT).expect_err(
         "start succeeded on a throttled job: check whether kickstart -p honoured ThrottleInterval (restart_delay)",
     );
 
@@ -1221,7 +1241,7 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout(#[fixture(launc
 
     // A `kickstart` that is gone was ended, and ending it keeps the start: the job still holds it. One
     // still running asserts nothing: goetia left it on doubt, or its kill is not yet reaped.
-    if !kickstart_is_running(&spec.id) {
+    if !kickstart_is_running(&spec.common().id) {
         let printed = print_job(&id).stdout;
         let state = print_field(&printed, "state = ");
         let holds_start = match state {
@@ -1249,14 +1269,14 @@ fn a_bounded_start_of_a_crash_looping_job_reports_a_wait_timeout(#[fixture(launc
 fn a_start_with_no_budget_is_ok_for_a_restart_always_job(#[fixture(launchd_group)] _group: &Group) {
     let mgr = Launchd::new();
     let id = support::random_test_id();
-    let mut spec = sleepy(&id).into_fields();
+    let mut spec = service_fields(sleepy(&id));
     spec.restart = Restart::Always;
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let _guard = Guard::install(&mgr, &spec);
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 
-    mgr.start(&spec.id, Budget::Immediate)
+    mgr.start(&spec.common().id, Budget::Immediate)
         .expect("a start with no budget issues the request and returns Ok");
 }
 
@@ -1286,11 +1306,11 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account(#[fixture
     let _cleanup_cwd = DirGuard::new(cwd.clone());
     let _cleanup_logs_parent = DirGuard::new(logs.parent().unwrap().to_path_buf());
 
-    let mut spec = base_spec(&id, vec!["/bin/true".to_string()]).into_fields();
-    spec.user = User::Name("nobody".to_string());
-    spec.cwd = Some(cwd.clone());
-    spec.logs = Some(logs.clone());
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(base_spec(&id, vec!["/bin/true".to_string()]));
+    spec.common.user = User::Name("nobody".to_string());
+    spec.common.cwd = Some(cwd.clone());
+    spec.common.logs = Some(logs.clone());
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let _guard = Guard::install(&mgr, &spec);
 
     for (dir, what) in [(cwd.as_path(), "cwd"), (logs.parent().unwrap(), "logs' parent")] {
@@ -1422,9 +1442,9 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label(#[fixture(launchd_group)
     let id = support::random_test_id();
 
     // Ours: `restart: always`, so launchd guarantees it runs once loaded.
-    let mut spec = sleepy(&id).into_fields();
+    let mut spec = service_fields(sleepy(&id));
     spec.restart = Restart::Always;
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
 
     // The decoy takes the label *before* install, which is the real
     // sequence: a predecessor job is still loaded when Goetia installs over
@@ -1457,10 +1477,10 @@ fn start_is_not_fooled_by_a_stale_job_holding_the_label(#[fixture(launchd_group)
 
     // The decoy now holds the label and is running, which is exactly the
     // state that used to make `start` a no-op.
-    mgr.start(&spec.id, Budget::DEFAULT)
+    mgr.start(&spec.common().id, Budget::DEFAULT)
         .expect("start must recover the label, not report a false success");
 
-    let status = mgr.status(&spec.id).expect("status");
+    let status = mgr.status(&spec.common().id).expect("status");
     assert_eq!(
         status.state,
         State::Running,

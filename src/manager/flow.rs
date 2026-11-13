@@ -75,10 +75,10 @@ fn judge<B: Backend>(b: &B, snapshot: &B::Snapshot) -> (Ownership, ExternalConfi
     };
     // A manager that matches ids case-insensitively finds `frpc`'s service for `FRPC`. Nothing else
     // is read: writing would replace that daemon's service.
-    if blob.spec.id != *id {
+    if blob.spec.common().id != *id {
         return (
             Ownership::OtherDaemon {
-                installed: blob.spec.id.clone(),
+                installed: blob.spec.common().id.clone(),
             },
             ExternalConfig::Absent,
         );
@@ -163,7 +163,7 @@ pub(crate) fn install<B: Backend>(
 
     // No cap: `Raced` is a state change the backend detected, not a wait for time to pass.
     loop {
-        let found = classify(b, b.read(&spec.id)?);
+        let found = classify(b, b.read(&spec.common().id)?);
         let outcome = decide::decide(
             &found.ownership,
             &desired_text,
@@ -199,7 +199,7 @@ pub(crate) fn install<B: Backend>(
 /// to let a user decide about.
 pub(crate) fn preview<B: Backend>(b: &B, spec: &DaemonSpec) -> Result<Outcome> {
     let desired = b.render_for_install(spec)?.to_string();
-    let found = classify(b, b.read(&spec.id)?);
+    let found = classify(b, b.read(&spec.common().id)?);
     Ok(decide::decide(
         &found.ownership,
         &desired,

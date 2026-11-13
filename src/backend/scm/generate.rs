@@ -50,7 +50,7 @@ use crate::backend::scm::parameters::{Stray, field_named_utf16, is_string_type, 
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
-use crate::spec::{DaemonSpec, Kind, Restart, User, scm_restart_delay, windows_builtin};
+use crate::spec::{DaemonSpec, Protocol, Restart, ServiceSpec, User, scm_restart_delay, windows_builtin};
 
 // Metadata field names ================================================================================================
 
@@ -103,7 +103,7 @@ pub struct ScmRegistration {
     pub account: Option<String>,
     pub failure_actions: Option<FailureActions>,
     /// The `Services\<name>\Environment` `REG_MULTI_SZ` lines, as written and as read back: raw,
-    /// so a hand-reordered or malformed value compares as it stands. Empty for `Kind::Simple`
+    /// so a hand-reordered or malformed value compares as it stands. Empty for `Protocol::Plain`
     /// — see [`registration`].
     pub environment: Vec<String>,
     /// The `Services\<name>\Parameters` values, including the metadata blob
@@ -141,7 +141,7 @@ pub struct FailureActions {
 ///
 /// `id` is the account already resolved by the effectful install path (see
 /// [`Identity`]) — this function does no lookup of its own. `host` is
-/// only used for `Kind::Simple`, where the host (not the spec's own command)
+/// only used for `Protocol::Plain`, where the host (not the spec's own command)
 /// is what SCM launches, with the host's own arguments, and is not judged here: see
 /// [`install_registration`]. `None` for a simple spec is [`Error::NoShimProvider`].
 ///
@@ -151,15 +151,16 @@ pub struct FailureActions {
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
 ///   could only run on-failure semantics.
 pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
-    let (executable, arguments) = match spec.kind {
+    let DaemonSpec::Service(s) = spec;
+    let (executable, arguments) = match s.protocol {
         // SCM only ever launches the host, which learns the service's name from SCM and spawns the
         // daemon once. The spec's own command never appears here.
-        Kind::Simple => {
+        Protocol::Plain => {
             let host = host.ok_or(Error::NoShimProvider)?;
             (host.exe.clone(), host.args.clone())
         }
-        Kind::Managed => {
-            let mut argv = spec.command.iter();
+        Protocol::Native => {
+            let mut argv = s.common.command.iter();
             let executable = PathBuf::from(
                 argv.next()
                     .expect("DaemonSpec::command is non-empty: spec::resolve rejects an empty command"),
@@ -168,15 +169,15 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>
         }
     };
 
-    if spec.kind == Kind::Managed {
-        refuse_unwritable_executable(spec, &executable)?;
+    if s.protocol == Protocol::Native {
+        refuse_unwritable_executable(s, &executable)?;
     }
 
     // SCM does every restart, for both kinds: the shim spawns the daemon once and reports its exit.
-    let failure_actions = match spec.restart {
+    let failure_actions = match s.restart {
         Restart::Never => None,
         Restart::OnFailure => {
-            let delay = spec.restart_delay.unwrap_or(DEFAULT_RESTART_DELAY);
+            let delay = s.restart_delay.unwrap_or(DEFAULT_RESTART_DELAY);
             Some(FailureActions {
                 delay: scm_restart_delay(delay),
                 reset_period: FAILURE_RESET_PERIOD,
@@ -185,7 +186,7 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>
         }
         Restart::Always => {
             return Err(Error::Invalid {
-                daemon: spec.id.to_string(),
+                daemon: s.common.id.to_string(),
                 message: "`restart: always` cannot be honoured by the scm backend: SCM recovery actions never fire \
                           after a clean exit. To keep `always` on systemd and launchd, set \
                           `backend-specific: scm: { restart: on-failure }`"
@@ -208,18 +209,18 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>
     // deliberately `Some(LocalSystem)` (`None`) too — see its doc comment
     // — so this arm keeps that row unreachable from an authored spec
     // rather than merely coincidentally correct.
-    let account = match &spec.user {
+    let account = match &s.common.user {
         User::Root => None,
         _ => canonical_account(&id.user),
     };
 
-    // SCM applies `Environment` to the process it launches: the daemon for `Kind::Managed`, the shim
-    // for `Kind::Simple`. The shim already applies `spec.env` to the daemon it spawns, and an `env:`
+    // SCM applies `Environment` to the process it launches: the daemon for `Protocol::Native`, the shim
+    // for `Protocol::Plain`. The shim already applies `spec.env` to the daemon it spawns, and an `env:`
     // key that collides with one the shim or `cosca` reads (`__COSCA_GROUP_ROOT`) would corrupt the
-    // shim's own containment, so `Kind::Simple` registers none.
-    let environment = match spec.kind {
-        Kind::Managed => format_environment_lines(&spec.env),
-        Kind::Simple => Vec::new(),
+    // shim's own containment, so `Protocol::Plain` registers none.
+    let environment = match s.protocol {
+        Protocol::Native => format_environment_lines(&s.common.env),
+        Protocol::Plain => Vec::new(),
     };
 
     let mut parameters = BTreeMap::new();
@@ -229,8 +230,8 @@ pub fn registration(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>
     parameters.insert(FIELD_SPEC.to_string(), blob::encode(spec));
 
     Ok(ScmRegistration {
-        name: spec.id.as_str().to_string(),
-        display_name: spec.name.clone(),
+        name: s.common.id.as_str().to_string(),
+        display_name: s.common.name.clone(),
         executable,
         arguments,
         account,
@@ -251,10 +252,11 @@ pub fn install_registration(
     id: &Identity,
     host: Option<&HostCommand>,
 ) -> Result<ScmRegistration, Error> {
-    if spec.kind == Kind::Simple
+    let DaemonSpec::Service(s) = spec;
+    if s.protocol == Protocol::Plain
         && let Some(host) = host
     {
-        refuse_unwritable_executable(spec, &host.exe)?;
+        refuse_unwritable_executable(s, &host.exe)?;
     }
     registration(spec, id, host)
 }
@@ -279,7 +281,7 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
 ///
 /// A `type: managed` executable is `command[0]`; a `type: simple` one is the service host's path,
 /// which no manifest sets, so its message names that path and not `command[0]`.
-fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<(), Error> {
+fn refuse_unwritable_executable(service: &ServiceSpec, executable: &Path) -> Result<(), Error> {
     let text = executable.to_string_lossy();
     // A `"` is refused whatever else quotes the path. An empty path is quoted too, but it ends in no
     // backslash.
@@ -298,14 +300,14 @@ fn refuse_unwritable_executable(spec: &DaemonSpec, executable: &Path) -> Result<
     } else {
         return Ok(());
     };
-    let message = match spec.kind {
-        Kind::Managed => format!("`command[0]` {text:?} cannot be written into the service registration: {reason}"),
-        Kind::Simple => {
+    let message = match service.protocol {
+        Protocol::Native => format!("`command[0]` {text:?} cannot be written into the service registration: {reason}"),
+        Protocol::Plain => {
             format!("the service host path {text:?} cannot be written into the service registration: {reason}")
         }
     };
     Err(Error::Invalid {
-        daemon: spec.id.to_string(),
+        daemon: service.common.id.to_string(),
         message,
         source: None,
     })

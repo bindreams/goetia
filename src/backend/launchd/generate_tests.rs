@@ -3,32 +3,34 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::*;
-use crate::spec::DaemonFields;
 use crate::spec::test_support::program;
-use crate::spec::{Id, Kind, User};
-use crate::testing::plain_fields;
+use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
+use crate::testing::{plain_fields, service_fields};
 
 // Fixtures ============================================================================================================
 //
-// `DaemonSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds one
+// `ServiceSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds one
 // for the host.
 
 fn full_spec() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        id: Id::try_from("frpc").unwrap(),
-        name: "Frpc Tunnel".to_string(),
-        command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
-        cwd: Some(abs("opt/frpc")),
-        env: BTreeMap::from([
-            ("RUST_LOG".to_string(), "info".to_string()),
-            ("URL".to_string(), "http://x/a%20b".to_string()),
-        ]),
-        user: User::Name("svc-frpc".to_string()),
+    ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id: Id::try_from("frpc").unwrap(),
+            name: "Frpc Tunnel".to_string(),
+            command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
+            cwd: Some(abs("opt/frpc")),
+            env: BTreeMap::from([
+                ("RUST_LOG".to_string(), "info".to_string()),
+                ("URL".to_string(), "http://x/a%20b".to_string()),
+            ]),
+            user: User::Name("svc-frpc".to_string()),
+            logs: Some(abs("var/log/frpc.log")),
+        },
         restart: Restart::Always,
         restart_delay: Some(Duration::new(2, 500_000_000)),
-        logs: Some(abs("var/log/frpc.log")),
-        kind: Kind::Managed,
+        protocol: Protocol::Native,
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -39,10 +41,11 @@ fn full_identity() -> Identity {
 }
 
 fn minimal_spec() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        kind: Kind::Simple,
+    ServiceSpec::new(ServiceFields {
+        protocol: Protocol::Plain,
         ..plain_fields("frpc", vec![program("frpc")])
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -53,10 +56,11 @@ fn minimal_identity() -> Identity {
 }
 
 fn spec_with_restart(restart: Restart) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
+    ServiceSpec::new(ServiceFields {
         restart,
-        ..minimal_spec().into_fields()
+        ..service_fields(minimal_spec())
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -346,12 +350,12 @@ fn extract_tolerates_crlf_line_endings_in_the_metadata_comment() {
 
 #[skuld::test]
 fn xml_special_characters_are_escaped() {
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec![program("frpc"), "a&b<c>d".to_string()];
-    spec.env = BTreeMap::from([("K&L<M>N".to_string(), "x&y<z>w".to_string())]);
-    spec.cwd = Some(abs("opt/a&b<c>d"));
-    spec.logs = Some(abs("var/log/a&b<c>d"));
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(minimal_spec());
+    spec.common.command = vec![program("frpc"), "a&b<c>d".to_string()];
+    spec.common.env = BTreeMap::from([("K&L<M>N".to_string(), "x&y<z>w".to_string())]);
+    spec.common.cwd = Some(abs("opt/a&b<c>d"));
+    spec.common.logs = Some(abs("var/log/a&b<c>d"));
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
 
     let text = plist(
         &spec,
@@ -445,11 +449,12 @@ fn throttle_interval_rounds_up() {
     ];
 
     for (delay, expected) in cases {
-        let spec = DaemonSpec::new(DaemonFields {
+        let spec = ServiceSpec::new(ServiceFields {
             restart: Restart::Always,
             restart_delay: Some(delay),
-            ..minimal_spec().into_fields()
+            ..service_fields(minimal_spec())
         })
+        .map(DaemonSpec::from)
         .unwrap();
         let text = plist(&spec, &minimal_identity());
         let needle = format!("<key>ThrottleInterval</key>\n\t<integer>{expected}</integer>\n");
@@ -466,11 +471,12 @@ fn throttle_interval_rounding_does_not_overflow_at_the_duration_boundary() {
     // `Duration::MAX`, whose `subsec_nanos()` is 999_999_999): rounding up
     // with a plain `+ 1` would overflow, wrapping to 0 in release — the
     // exact "disables throttling" failure the rounding exists to prevent.
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::Always,
         restart_delay: Some(Duration::MAX),
-        ..minimal_spec().into_fields()
+        ..service_fields(minimal_spec())
     })
+    .map(DaemonSpec::from)
     .unwrap();
     let text = plist(&spec, &minimal_identity());
     let needle = format!("<key>ThrottleInterval</key>\n\t<integer>{}</integer>\n", u64::MAX);
@@ -482,11 +488,12 @@ fn throttle_interval_rounding_does_not_overflow_at_the_duration_boundary() {
 
 #[skuld::test]
 fn throttle_interval_omitted_without_restart_delay() {
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::Always,
         restart_delay: None,
-        ..minimal_spec().into_fields()
+        ..service_fields(minimal_spec())
     })
+    .map(DaemonSpec::from)
     .unwrap();
     let text = plist(&spec, &minimal_identity());
     assert!(
@@ -500,11 +507,12 @@ fn throttle_interval_omitted_when_restart_is_never() {
     // A `restart_delay` with `restart: never` has nothing to throttle: never
     // installs a KeepAlive at all, so an emitted ThrottleInterval would be
     // meaningless.
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::Never,
         restart_delay: Some(Duration::from_secs(2)),
-        ..minimal_spec().into_fields()
+        ..service_fields(minimal_spec())
     })
+    .map(DaemonSpec::from)
     .unwrap();
     let text = plist(&spec, &minimal_identity());
     assert!(
@@ -571,10 +579,14 @@ fn without_metadata_drops_the_whole_comment_and_keeps_the_rest() {
 #[skuld::test]
 fn without_metadata_makes_a_spec_change_the_plist_does_not_render_vanish() {
     // `name` is in the blob and nowhere in the plist.
-    let renamed = DaemonSpec::new(DaemonFields {
-        name: "another name".to_string(),
-        ..minimal_spec().into_fields()
+    let renamed = ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            name: "another name".to_string(),
+            ..service_fields(minimal_spec()).common
+        },
+        ..service_fields(minimal_spec())
     })
+    .map(DaemonSpec::from)
     .unwrap();
     let before = plist(&minimal_spec(), &minimal_identity());
     let after = plist(&renamed, &minimal_identity());
@@ -602,10 +614,14 @@ fn without_metadata_keeps_what_launchd_reads() {
         },
     );
     let other_command = plist(
-        &DaemonSpec::new(DaemonFields {
-            command: vec![program("frpc"), "--verbose".to_string()],
-            ..minimal_spec().into_fields()
+        &ServiceSpec::new(ServiceFields {
+            common: DaemonFields {
+                command: vec![program("frpc"), "--verbose".to_string()],
+                ..service_fields(minimal_spec()).common
+            },
+            ..service_fields(minimal_spec())
         })
+        .map(DaemonSpec::from)
         .unwrap(),
         &minimal_identity(),
     );

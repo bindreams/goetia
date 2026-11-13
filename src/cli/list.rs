@@ -49,7 +49,7 @@ fn print_text(index: &InstalledIndex, out: &mut dyn Write, err: &mut dyn Write) 
         let _ = writeln!(
             out,
             "{id}\t{}\t{}\tenabled={}",
-            entry.spec.name,
+            entry.spec.common().name,
             state_str(entry.state),
             entry.enabled
         );

@@ -164,7 +164,7 @@ fn print_specs<'a>(specs: impl Iterator<Item = &'a DaemonSpec>, out: &mut dyn Wr
         if i > 0 {
             let _ = writeln!(out);
         }
-        let _ = writeln!(out, "# {}", spec.id);
+        let _ = writeln!(out, "# {}", spec.common().id);
         let _ = write!(out, "{}", crate::diff::render_yaml(spec));
     }
 }

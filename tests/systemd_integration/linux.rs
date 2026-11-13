@@ -17,7 +17,8 @@ use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
-use goetia::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User};
+use goetia::spec::{AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
+use goetia::testing::service_fields;
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
 use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group};
@@ -33,11 +34,12 @@ pub(crate) const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 /// A minimal, real, long-running daemon: `sleep infinity` exists on every coreutils Ubuntu ships.
 pub(crate) fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
+    ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
-        kind: Kind::Simple,
+        protocol: Protocol::Plain,
         ..support::plain_fields(id, vec!["/bin/sleep".to_string(), "infinity".to_string()])
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -185,7 +187,7 @@ fn load_from_temp_manifest(id: &str) -> DaemonSpec {
 
 fn find_ours(installed: Vec<Installed>, id: &str) -> Option<DaemonSpec> {
     installed.into_iter().find_map(|entry| match entry {
-        Installed::Ours { spec, .. } if spec.id.as_str() == id => Some(spec),
+        Installed::Ours { spec, .. } if spec.common().id.as_str() == id => Some(spec),
         _ => None,
     })
 }
@@ -447,13 +449,13 @@ fn start_stop_status_reflect_reality(#[fixture(systemd_group)] _group: &Group) {
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
-    let status = mgr.status(&spec.id).expect("status after start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    let status = mgr.status(&spec.common().id).expect("status after start");
     assert_eq!(status.state, State::Running, "{status:?}");
     assert!(status.pid.is_some(), "{status:?}");
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-    let status = mgr.status(&spec.id).expect("status after stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    let status = mgr.status(&spec.common().id).expect("status after stop");
     assert_ne!(status.state, State::Running, "{status:?}");
     assert!(status.pid.is_none(), "{status:?}");
 }
@@ -462,14 +464,14 @@ fn start_stop_status_reflect_reality(#[fixture(systemd_group)] _group: &Group) {
 
 /// The test binary as a daemon that reports in on every start, under `restart`.
 fn reporting(id: &str, restart: Restart, listener: &support::ConnectBack) -> DaemonSpec {
-    let mut spec = mk(id).into_fields();
-    spec.command = vec![
+    let mut spec = service_fields(mk(id));
+    spec.common.command = vec![
         support::current_exe_str(),
         support::sentinel::RUN_UNTIL_KILLED.to_string(),
         listener.port().to_string(),
     ];
     spec.restart = restart;
-    DaemonSpec::new(spec).unwrap()
+    ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
 }
 
 #[skuld::test]
@@ -480,7 +482,7 @@ fn a_killed_always_restart_daemon_comes_back_with_a_new_pid(#[fixture(systemd_gr
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &listener);
+    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.common().id, &listener);
 }
 
 #[skuld::test]
@@ -491,8 +493,8 @@ fn a_killed_never_restart_daemon_stays_down(#[fixture(systemd_group)] _group: &G
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let unit = format!("{}.service", spec.id);
-    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.id, &listener, &|| {
+    let unit = format!("{}.service", spec.common().id);
+    support::kill::a_killed_daemon_that_never_restarts_stays_down(&mgr, &spec.common().id, &listener, &|| {
         let shown = cmd::run(
             "systemctl",
             &["show", "--property=Restart,NRestarts,SubState", "--", &unit],
@@ -521,11 +523,11 @@ fn killing_a_stopped_unit_is_not_running(#[fixture(systemd_group)] _group: &Grou
     mgr.install(&spec, false).expect("install");
     let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
 
-    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.id);
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 }
 
 /// `ActiveState` and `Job` as `systemctl show` reports them: the job is empty when none is queued.
@@ -559,7 +561,7 @@ fn a_start_with_no_budget_reaches_systemd(#[fixture(systemd_group)] _group: &Gro
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    mgr.start(&spec.id, Budget::Immediate)
+    mgr.start(&spec.common().id, Budget::Immediate)
         .expect("a start with no budget issues the request and returns");
 
     let (state, job) = active_state_and_job(guard.id());
@@ -578,9 +580,9 @@ fn a_stop_with_no_budget_reaches_systemd(#[fixture(systemd_group)] _group: &Grou
     let spec = mk(guard.id());
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
-    mgr.stop(&spec.id, Budget::Immediate)
+    mgr.stop(&spec.common().id, Budget::Immediate)
         .expect("a stop with no budget issues the request and returns");
 
     let (state, job) = active_state_and_job(guard.id());
@@ -593,13 +595,13 @@ fn a_stop_with_no_budget_reaches_systemd(#[fixture(systemd_group)] _group: &Grou
 /// A daemon that can never stop: it ignores `SIGTERM`, and a drop-in removes the `SIGKILL` systemd
 /// would otherwise escalate to. [`Unstoppable`]'s `Drop` is what ends it.
 fn unstoppable(id: &str) -> DaemonSpec {
-    let mut spec = mk(id).into_fields();
-    spec.command = vec![
+    let mut spec = service_fields(mk(id));
+    spec.common.command = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
         "trap '' TERM; exec /bin/sleep infinity".to_string(),
     ];
-    DaemonSpec::new(spec).unwrap()
+    ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
 }
 
 /// Ends an [`unstoppable`] unit: `SIGKILL` lets the stop job it is stuck in complete, a blocking
@@ -611,11 +613,11 @@ struct Unstoppable(String);
 impl Unstoppable {
     fn install(mgr: &Systemd, spec: &DaemonSpec) -> Self {
         mgr.install(spec, false).expect("install");
-        let dir = dropin_dir(spec.id.as_str());
+        let dir = dropin_dir(spec.common().id.as_str());
         fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
         fs::write(dir.join("stop.conf"), "[Service]\nTimeoutStopSec=infinity\n").expect("write drop-in");
         cmd::run("systemctl", &["daemon-reload"]).expect_ok();
-        Unstoppable(spec.id.as_str().to_string())
+        Unstoppable(spec.common().id.as_str().to_string())
     }
 }
 
@@ -644,10 +646,10 @@ fn a_stop_that_can_never_complete_times_out_with_the_job_standing(#[fixture(syst
     let spec = unstoppable(guard.id());
     let mgr = Systemd::new();
     let _unstoppable = Unstoppable::install(&mgr, &spec);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     let err = mgr
-        .stop(&spec.id, Budget::Bounded(Duration::from_secs(1)))
+        .stop(&spec.common().id, Budget::Bounded(Duration::from_secs(1)))
         .expect_err("a stop that can never complete must not report stopped");
 
     assert!(
@@ -668,10 +670,10 @@ fn a_stop_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _gro
     let spec = unstoppable(guard.id());
     let mgr = Systemd::new();
     let _unstoppable = Unstoppable::install(&mgr, &spec);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     let err = mgr
-        .stop(&spec.id, Budget::Bounded(Duration::from_nanos(1)))
+        .stop(&spec.common().id, Budget::Bounded(Duration::from_nanos(1)))
         .expect_err("a stop that can never complete must not report stopped");
 
     assert!(
@@ -692,7 +694,7 @@ fn a_start_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _gr
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let result = mgr.start(&spec.id, Budget::Bounded(Duration::from_nanos(1)));
+    let result = mgr.start(&spec.common().id, Budget::Bounded(Duration::from_nanos(1)));
 
     assert!(
         matches!(
@@ -826,7 +828,7 @@ fn a_restart_with_no_budget_restarts_behind_a_stop_that_has_to_wait(#[fixture(sy
     let spec = mk(guard.id());
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     let before = main_pid(guard.id());
     let mut holder = StopHolder::start(guard.id());
     let args = goetia::cli::restart::Args {
@@ -1351,14 +1353,14 @@ fn a_verb_short_of_tasks_sends_nothing_and_never_panics(#[fixture(systemd_group)
 fn a_unit_whose_executable_does_not_exist_fails_start(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let mut spec = mk(guard.id()).into_fields();
-    spec.command = vec!["/nonexistent/goetia-test-executable".to_string()];
+    let mut spec = service_fields(mk(guard.id()));
+    spec.common.command = vec!["/nonexistent/goetia-test-executable".to_string()];
     spec.restart = Restart::Always;
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let result = mgr.start(&spec.id, Budget::DEFAULT);
+    let result = mgr.start(&spec.common().id, Budget::DEFAULT);
 
     assert!(result.is_err(), "{result:?}");
 }
@@ -1370,11 +1372,11 @@ fn uninstall_leaves_nothing(#[fixture(systemd_group)] _group: &Group) {
     let spec = mk(&id);
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
-    mgr.enable(&spec.id).expect("enable");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.enable(&spec.common().id).expect("enable");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     write_dropin(&id);
 
-    mgr.uninstall(&spec.id).expect("uninstall");
+    mgr.uninstall(&spec.common().id).expect("uninstall");
 
     assert!(!unit_path(&id).exists(), "fragment must be gone");
     assert!(!dropin_dir(&id).exists(), "drop-in directory must be gone");
@@ -1496,9 +1498,9 @@ fn status_of_residue_names_the_leftover_paths(#[fixture(systemd_group)] _group: 
 fn list_reports_a_sid_account_as_ours_unusable(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let mut spec = mk(guard.id()).into_fields();
-    spec.user = User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string()));
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(mk(guard.id()));
+    spec.common.user = User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string()));
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let text = generate::unit(&spec, &Identity { user: "0".to_string() }).unwrap();
     fs::write(unit_path(guard.id()), text).expect("seed a unit whose spec names a SID");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
@@ -1885,11 +1887,11 @@ fn install_creates_and_owns_fresh_cwd_and_logs_dirs_for_a_named_user(#[fixture(s
     let logs = base.join("logs").join("out.log");
     let _rm = DirGuard::new(base.clone());
 
-    let mut spec = mk(guard.id()).into_fields();
-    spec.user = User::Name("nobody".to_string());
-    spec.cwd = Some(cwd.clone());
-    spec.logs = Some(logs.clone());
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(mk(guard.id()));
+    spec.common.user = User::Name("nobody".to_string());
+    spec.common.cwd = Some(cwd.clone());
+    spec.common.logs = Some(logs.clone());
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -1916,11 +1918,11 @@ fn install_accepts_preexisting_dirs_the_target_account_cannot_write(#[fixture(sy
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     }
 
-    let mut spec = mk(guard.id()).into_fields();
-    spec.user = User::Name("nobody".to_string());
-    spec.cwd = Some(cwd.clone());
-    spec.logs = Some(log_dir.join("out.log"));
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(mk(guard.id()));
+    spec.common.user = User::Name("nobody".to_string());
+    spec.common.cwd = Some(cwd.clone());
+    spec.common.logs = Some(log_dir.join("out.log"));
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -1950,10 +1952,10 @@ fn install_leaves_a_preexisting_ancestor_directory_untouched(#[fixture(systemd_g
     let base_meta_before = fs::metadata(&base).expect("stat base before");
 
     let cwd = base.join("work");
-    let mut spec = mk(guard.id()).into_fields();
-    spec.user = User::Name("nobody".to_string());
-    spec.cwd = Some(cwd.clone());
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(mk(guard.id()));
+    spec.common.user = User::Name("nobody".to_string());
+    spec.common.cwd = Some(cwd.clone());
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -1993,10 +1995,10 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly(#[fixture(systemd
     let cwd = PathBuf::from(format!("{}/work\\", base.display()));
     let logs = PathBuf::from(format!("{}/log\\\\\\", base.display()));
 
-    let mut spec = mk(guard.id()).into_fields();
-    spec.name = "Backslash name\\".to_string();
+    let mut spec = service_fields(mk(guard.id()));
+    spec.common.name = "Backslash name\\".to_string();
     // The shell ignores the arguments after the script, so the unit starts and stays up.
-    spec.command = vec![
+    spec.common.command = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
         "exec sleep infinity".to_string(),
@@ -2004,13 +2006,13 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly(#[fixture(systemd
         "a\\\\b".to_string(),
         " a ".to_string(),
     ];
-    spec.cwd = Some(cwd.clone());
-    spec.logs = Some(logs);
-    spec.env = std::collections::BTreeMap::from([
+    spec.common.cwd = Some(cwd.clone());
+    spec.common.logs = Some(logs);
+    spec.common.env = std::collections::BTreeMap::from([
         ("K".to_string(), "C:\\".to_string()),
         ("L".to_string(), " v ".to_string()),
     ]);
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
 
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
@@ -2039,7 +2041,7 @@ fn values_ending_in_backslashes_read_back_from_systemd_exactly(#[fixture(systemd
     // `show` does not print the `append:` path, so start the unit: systemd creates the file at
     // exactly that path before it execs, in the working directory it could enter only if it read
     // that one back exactly too.
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     let mut entries: Vec<_> = fs::read_dir(&base)
         .unwrap_or_else(|e| panic!("read {}: {e}", base.display()))
         .map(|entry| entry.expect("entry").file_name())
@@ -2069,20 +2071,20 @@ fn an_executable_path_with_dollars_runs_with_the_path_as_argv0(#[fixture(systemd
     std::os::unix::fs::symlink("/bin/sh", &executable).expect("symlink");
     let out = base.join("cmdline");
 
-    let mut spec = mk(guard.id()).into_fields();
+    let mut spec = service_fields(mk(guard.id()));
     // `mk` restarts on failure: a failing script would restart forever and `start --wait` never return.
     spec.restart = Restart::Never;
     // The shell lists its own argv, one per line, into the file named by its last argument. The
     // trailing `:` stops dash from exec'ing `tr` in the shell's place (it does that to the last
     // command of `-c`), which would make `/proc/$$/cmdline` read `tr`'s argv.
-    spec.command = vec![
+    spec.common.command = vec![
         executable.to_str().unwrap().to_string(),
         "-c".to_string(),
         "tr '\\000' '\\n' < /proc/$$/cmdline > \"$1\"; :".to_string(),
         "sh".to_string(),
         out.to_str().unwrap().to_string(),
     ];
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
 
     Systemd::new().install(&spec, false).expect("install");
     // Blocks until the shell has exited, so the file is complete.
@@ -2192,7 +2194,7 @@ fn list_reports_an_id_whose_dropin_it_cannot_read_with_no_fragment_at_all(#[fixt
     assert!(
         !listed
             .iter()
-            .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == id)),
+            .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.common().id.as_str() == id)),
         "nothing was read, so nothing may be claimed: {listed:?}"
     );
 

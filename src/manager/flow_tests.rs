@@ -4,15 +4,23 @@ use crate::error::Error;
 use crate::manager::fake::fake_tests::mk;
 use crate::manager::fake::{Fake, generate};
 use crate::manager::{Budget, Installed, ServiceManager, Step};
-use crate::spec::{DaemonFields, DaemonSpec, Id, User};
+use crate::spec::{DaemonFields, DaemonSpec, Id, ServiceFields, ServiceSpec, User};
+use crate::testing::service_fields;
 
 // Fixtures ============================================================================================================
 
 fn mk_as(id: &str, user: &str) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        user: User::Name(user.to_string()),
-        ..mk(id).into_fields()
+    ServiceSpec::new({
+        let base = service_fields(mk(id));
+        ServiceFields {
+            common: DaemonFields {
+                user: User::Name(user.to_string()),
+                ..base.common
+            },
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -272,7 +280,7 @@ fn status_and_list_use_regenerate() {
     let listed = fake.list().unwrap();
 
     assert!(
-        matches!(listed.as_slice(), [Installed::Ours { spec, .. }] if spec.id.as_str() == "frpc"),
+        matches!(listed.as_slice(), [Installed::Ours { spec, .. }] if spec.common().id.as_str() == "frpc"),
         "{listed:?}"
     );
 }
@@ -477,7 +485,7 @@ fn list_reports_a_failed_live_status_as_ours_unusable() {
     assert!(
         listed
             .iter()
-            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.id.as_str() == "other")),
+            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.common().id.as_str() == "other")),
         "{listed:?}"
     );
     match fake.status(&Id::try_from("frpc").unwrap()) {
@@ -512,7 +520,7 @@ fn list_reports_a_name_that_is_not_an_id_without_querying_it() {
     assert!(
         listed
             .iter()
-            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.id.as_str() == "other")),
+            .any(|e| matches!(e, Installed::Ours { spec, .. } if spec.common().id.as_str() == "other")),
         "{listed:?}"
     );
 }
@@ -550,7 +558,7 @@ fn list_omits_an_entry_that_vanished_before_its_live_query() {
 
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert!(
-        matches!(&listed[0], Installed::Ours { spec, .. } if spec.id.as_str() == "other"),
+        matches!(&listed[0], Installed::Ours { spec, .. } if spec.common().id.as_str() == "other"),
         "{listed:?}"
     );
 }
@@ -823,7 +831,7 @@ fn single_verbs<'a>(
 #[skuld::test]
 fn a_single_verb_reserves_for_its_own_step() {
     let spec = mk("frpc");
-    let id = spec.id.clone();
+    let id = spec.common().id.clone();
     let fake = Fake::new();
     let mgr: &dyn ServiceManager = &fake;
     for (verb, step, budget, run) in single_verbs(mgr, &id, &spec) {
@@ -842,7 +850,7 @@ fn a_single_verb_reserves_for_its_own_step() {
 #[skuld::test]
 fn a_single_verb_that_cannot_reserve_sends_nothing_and_names_its_id() {
     let spec = mk("frpc");
-    let id = spec.id.clone();
+    let id = spec.common().id.clone();
     let fake = Fake::new();
     fake.install(&spec, false).unwrap();
     let (calls, writes) = (fake.calls(), fake.writes());
@@ -967,8 +975,8 @@ fn a_sequence_installs_on_its_own_reservation() {
     let mut sequence = fake.prepare(&[Step::Install, Step::Start], Budget::DEFAULT).unwrap();
 
     let outcome = sequence.install(&spec, false).unwrap();
-    sequence.enable(&spec.id).unwrap();
-    sequence.start(&spec.id, Budget::DEFAULT).unwrap();
+    sequence.enable(&spec.common().id).unwrap();
+    sequence.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
     assert_eq!(outcome, Outcome::Create);
     assert_eq!(

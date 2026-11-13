@@ -140,7 +140,7 @@ impl Backend for Systemd {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
-        generate::unit(spec, &identity_for(&spec.user)?)
+        generate::unit(spec, &identity_for(&spec.common().user)?)
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Fragment>> {
@@ -160,7 +160,7 @@ impl Backend for Systemd {
         _scope: &mut (),
         reservation: &mut Held,
     ) -> Result<WriteOutcome> {
-        let id = spec.id.as_str();
+        let id = spec.common().id.as_str();
         dirs::ensure_parent_dirs(spec)?;
         match outcome {
             Outcome::Create => match create_unit(id, definition)? {

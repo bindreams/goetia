@@ -21,7 +21,7 @@
 
 use goetia::backend::scm::manager::Scm;
 use goetia::manager::ServiceManager as _;
-use goetia::spec::{AccountId, DaemonFields, DaemonSpec, User};
+use goetia::spec::{AccountId, DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, User};
 
 use crate::{common, support};
 
@@ -38,10 +38,14 @@ pub fn run_if_requested() -> bool {
         Some(sid) => User::Id(AccountId::Sid(sid.clone())),
         None => User::Name(account),
     };
-    let spec = DaemonSpec::new(DaemonFields {
-        user,
-        ..support::plain_fields(&id, common::fixture_command(&id, 1, 1, "plain"))
+    let spec = ServiceSpec::new({
+        let base = support::plain_fields(&id, common::fixture_command(&id, 1, 1, "plain"));
+        ServiceFields {
+            common: DaemonFields { user, ..base.common },
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap();
 
     match Scm::new().install(&spec, false) {
