@@ -61,7 +61,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Op {
     Spawn,
-    KillTree,
+    SendKillTree,
     OpenLog,
 }
 
@@ -73,17 +73,17 @@ pub(crate) enum WaitReply {
     /// Block until the process is ended, by a successful kill or [`FakeProcess::end`], and return
     /// its status.
     Blocks,
-    /// Fail, with this OS error code or, with none, [`WAIT_FAILED`].
+    /// Fail, with this OS error code ([`wait_failed_with_code`]) or, with none, [`wait_failed`].
     Fails(Option<i32>),
     /// Panic, ending the waiter thread without it reporting the child done.
     Panics,
 }
 
-/// What a [`Spawned::kill`] or [`Spawned::kill_tree`] does.
+/// What a [`Spawned::kill`] or [`Spawned::send_kill_tree`] does.
 pub(crate) enum KillReply {
     /// Succeed. The process is ended.
     Ends,
-    /// Fail with [`KILL_REFUSED`]. The process is not ended.
+    /// Fail with [`kill_refused`]. The process is not ended.
     Refuses,
     Panics,
 }
@@ -166,7 +166,7 @@ impl FakeProcess {
 
     /// A daemon that runs until a tree kill ends it: the common case of a stop.
     pub(crate) fn running() -> FakeProcess {
-        FakeProcess::new().wait(WaitReply::Blocks).kill_tree(KillReply::Ends)
+        FakeProcess::new().wait(WaitReply::Blocks).send_kill_tree(KillReply::Ends)
     }
 
     fn with(self, change: impl FnOnce(&mut ProcState)) -> FakeProcess {
@@ -193,7 +193,7 @@ impl FakeProcess {
         self.with(|state| state.kills.push_back(reply))
     }
 
-    pub(crate) fn kill_tree(self, reply: KillReply) -> FakeProcess {
+    pub(crate) fn send_kill_tree(self, reply: KillReply) -> FakeProcess {
         self.with(|state| state.tree_kills.push_back(reply))
     }
 
@@ -267,10 +267,10 @@ impl Spawned for Instance {
         self.kill_with("kill", reply)
     }
 
-    fn kill_tree(&self) -> Result<(), cosca::error::Error> {
-        self.fake.count(Op::KillTree);
+    fn send_kill_tree(&self) -> Result<(), cosca::error::Error> {
+        self.fake.count(Op::SendKillTree);
         let reply = lock(&self.proc.state).tree_kills.pop_front();
-        self.kill_with("kill_tree", reply)
+        self.kill_with("send_kill_tree", reply)
     }
 }
 
@@ -541,7 +541,7 @@ impl Fake {
             for (what, left) in [
                 ("wait", state.waits.len()),
                 ("kill", state.kills.len()),
-                ("kill_tree", state.tree_kills.len()),
+                ("send_kill_tree", state.tree_kills.len()),
             ] {
                 if left > 0 {
                     problems.push(format!("process {n}: {left} stated {what} replies never used"));

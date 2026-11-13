@@ -355,10 +355,11 @@ fn run_daemon(
 /// restarts must not either. If the tree cannot be terminated, SCM must not restart and the service
 /// must not read as cleanly stopped: the incomplete stop.
 ///
-/// "Terminated" is `kill_tree` succeeding on the Job Object `launch` requires, which means
-/// `TerminateJobObject` succeeded. Windows does not document that as synchronous with the members'
-/// teardown, so they may still be exiting when STOPPED is reported, and a restarted daemon can
-/// briefly overlap them or find a resource they held (a port) and fail like any other start.
+/// "Terminated" is `send_kill_tree` succeeding on the Job Object `launch` requires: the kill was
+/// sent (`TerminateJobObject` succeeded) and nothing waited for the members. Windows does not
+/// document that as synchronous with the members' teardown, so they may still be exiting when
+/// STOPPED is reported, and a restarted daemon can briefly overlap them or find a resource they
+/// held (a port) and fail like any other start.
 fn end_tree_before_report(settled: Reported, child: &dyn Spawned, log: &Log, id: &str) -> Reported {
     if terminate_exited_tree(child, log, id) {
         settled

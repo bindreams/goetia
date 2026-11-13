@@ -67,7 +67,7 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
     // The daemon must actually be dead by now (the whole point of the call returning `Stopping`
-    // only after `kill_tree` confirms it), not merely have unblocked the wait.
+    // only after `send_kill_tree` confirms it), not merely have unblocked the wait.
     assert!(
         daemon.killed(),
         "the daemon was not killed though wait_for_child_or_stop returned Stopping"
@@ -81,14 +81,14 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
 /// carries: the daemon really is still running when it returns, so `DaemonMayRun` is not
 /// `Stopping` under another name.
 ///
-/// It also pins that both refused kills are logged, `kill_tree`'s first. The detached waiter must
+/// It also pins that both refused kills are logged, `send_kill_tree`'s first. The detached waiter must
 /// have finished logging before the lines are read, hence the wait on its end.
 #[skuld::test]
 fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_kill() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Blocks)
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Refuses);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
@@ -151,7 +151,7 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
 #[skuld::test]
 fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down() {
     let fake = FakeGuard::new();
-    let daemon = FakeProcess::new().wait(WaitReply::Blocks).kill_tree(KillReply::Panics);
+    let daemon = FakeProcess::new().wait(WaitReply::Blocks).send_kill_tree(KillReply::Panics);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     // Requested before the call, so it reaches the kill — and the panic — without blocking first:
@@ -260,7 +260,7 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Ends);
+        .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
@@ -285,7 +285,7 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Refuses);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
@@ -301,7 +301,7 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
 #[skuld::test]
 fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     let fake = FakeGuard::new();
-    let daemon = FakeProcess::new().wait(WaitReply::Panics).kill_tree(KillReply::Ends);
+    let daemon = FakeProcess::new().wait(WaitReply::Panics).send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
@@ -315,14 +315,14 @@ fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     assert_eq!(fake.waiter_end(0), WaiterEnd::Panicked);
 }
 
-/// `kill_tree` fails but the direct-child fallback works: the child is dead and reaped, so the call
+/// `send_kill_tree` fails but the direct-child fallback works: the child is dead and reaped, so the call
 /// joins the waiter, but its descendants may run, as after a failed wait whose tree kill failed.
 #[skuld::test]
-fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_running() {
+fn a_stop_whose_send_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_running() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Blocks)
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
@@ -348,7 +348,7 @@ fn a_stop_whose_kill_tree_fails_kills_the_child_and_reports_the_daemon_possibly_
 #[skuld::test]
 fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
     let fake = FakeGuard::new();
-    let daemon = FakeProcess::new().wait(WaitReply::Panics).kill_tree(KillReply::Ends);
+    let daemon = FakeProcess::new().wait(WaitReply::Panics).send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
@@ -368,7 +368,7 @@ fn a_failed_background_wait_carries_its_os_error() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(Some(5)))
-        .kill_tree(KillReply::Ends);
+        .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});
@@ -392,7 +392,7 @@ fn a_stop_wins_over_a_failed_background_wait() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Ends);
+        .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
@@ -415,7 +415,7 @@ fn a_failed_background_wait_whose_tree_kill_failed_is_not_a_restartable_failure(
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
@@ -434,7 +434,7 @@ fn a_failed_wait_over_an_unkillable_daemon_refuses_a_later_stop() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Refuses);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
@@ -455,7 +455,7 @@ fn a_failed_wait_whose_tree_kill_was_refused_refuses_a_later_stop() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
@@ -512,7 +512,7 @@ fn a_repeated_stop_is_accepted_again() {
     assert!(bus.request_stop());
 }
 
-/// The lines of a failed wait whose `kill_tree` was refused and whose direct-child kill worked.
+/// The lines of a failed wait whose `send_kill_tree` was refused and whose direct-child kill worked.
 fn tree_unkilled_failures() -> [String; 3] {
     [
         format!("background wait on child: {}", Report::new(&wait_failed())),
@@ -521,10 +521,10 @@ fn tree_unkilled_failures() -> [String; 3] {
     ]
 }
 
-/// The line logged when `kill_tree` failed and only the direct child was killed.
+/// The line logged when `send_kill_tree` failed and only the direct child was killed.
 const TREE_UNKILLED: &str = "the daemon's descendants were not killed: only the direct child was killed; the daemon may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
 
-/// The lines of a failed wait whose `kill_tree` and direct-child kill were both refused.
+/// The lines of a failed wait whose `send_kill_tree` and direct-child kill were both refused.
 fn unkillable_failures() -> [String; 3] {
     [
         format!("background wait on child: {}", Report::new(&wait_failed())),

@@ -35,10 +35,10 @@ pub(crate) fn assert_failures(lines: &[String], id: &str, expected: &[String]) {
     assert_eq!(lines, expected);
 }
 
-/// The line logged when `kill_tree` is refused and the direct child's kill is tried next.
+/// The line logged when `send_kill_tree` is refused and the direct child's kill is tried next.
 pub(crate) fn tree_refused_failure() -> String {
     format!(
-        "kill_tree: {}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)",
+        "send_kill_tree: {}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)",
         cosca::error::Report::new(&kill_refused())
     )
 }

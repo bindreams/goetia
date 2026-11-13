@@ -44,7 +44,7 @@ pub(crate) trait Spawned: Send + Sync {
 
     /// Send the kill to the daemon's whole tree (`cosca`'s `send_kill_tree`). `Ok` says every member
     /// was reached, not that any has exited, and the call never waits for one.
-    fn kill_tree(&self) -> Result<(), cosca::error::Error>;
+    fn send_kill_tree(&self) -> Result<(), cosca::error::Error>;
 }
 
 /// How a line is reported to the Event Log.
@@ -97,7 +97,7 @@ impl Spawned for cosca::Child {
         cosca::Child::kill(self)
     }
 
-    fn kill_tree(&self) -> Result<(), cosca::error::Error> {
+    fn send_kill_tree(&self) -> Result<(), cosca::error::Error> {
         cosca::Child::send_kill_tree(self)
     }
 }

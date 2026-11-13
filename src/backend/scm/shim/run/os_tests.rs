@@ -38,7 +38,7 @@ impl Reap {
 
 impl Drop for Reap {
     fn drop(&mut self) {
-        if let Some(Err(e)) = self.child.as_ref().map(|child| child.kill_tree()) {
+        if let Some(Err(e)) = self.child.as_ref().map(|child| child.send_kill_tree()) {
             eprintln!("Reap: left a daemon running: {e}");
         }
     }
@@ -52,10 +52,10 @@ fn powershell(script: &str) -> cosca::Command {
 
 // Spawned -------------------------------------------------------------------------------------------------------------
 
-/// The grandchild is the part `kill` cannot reach: only the Job Object `kill_tree` terminates holds
+/// The grandchild is the part `kill` cannot reach: only the Job Object `send_kill_tree` terminates holds
 /// it. Its pid arrives on the daemon's stdout, which is the event the test waits for.
 #[skuld::test]
-fn kill_tree_ends_a_job_contained_daemon_and_its_grandchild() {
+fn send_kill_tree_ends_a_job_contained_daemon_and_its_grandchild() {
     let (reader, writer) = std::io::pipe().expect("a pipe for the grandchild's pid");
     let mut cmd = powershell("& powershell -NoProfile -NonInteractive -Command '$PID; Start-Sleep -Seconds 300'");
     cmd.stdout(Stdio::from_file(File::from(OwnedHandle::from(writer))))
@@ -72,13 +72,13 @@ fn kill_tree_ends_a_job_contained_daemon_and_its_grandchild() {
     };
     assert_eq!(grandchild.is_alive(), Liveness::Alive, "precondition");
 
-    daemon.kill_tree().expect("kill the tree");
+    daemon.send_kill_tree().expect("kill the tree");
 
     grandchild.wait().expect("the grandchild ends once the tree is killed");
     daemon.wait().expect("the daemon ends once the tree is killed");
 }
 
-/// The direct-child kill, which `kill_tree` ends in: the daemon ends, and `wait` returns.
+/// The direct-child kill, which `send_kill_tree` ends in: the daemon ends, and `wait` returns.
 #[skuld::test]
 fn kill_ends_a_real_daemon() {
     let mut reap = Reap::default();
@@ -136,112 +136,27 @@ fn a_spawn_of_a_missing_binary_is_refused_as_not_found(#[fixture(temp_dir)] dir:
 
 // Error codes ---------------------------------------------------------------------------------------------------------
 
-#[skuld::test]
-fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
-    assert_eq!(
-        os_error_in(&cosca::error::Error::Io(std::io::Error::from_raw_os_error(
-            ERROR_ACCESS_DENIED as i32
-        ))),
-        Some(ERROR_ACCESS_DENIED as i32)
-    );
-    // A failure without a code has none, whatever its kind.
-    assert_eq!(os_error_in(&not_found()), None);
-    assert_eq!(
-        os_error_in(&cosca::error::Error::Unassessable {
-            detail: "query".to_string(),
-            source: Some(Arc::new(not_found())),
-        }),
-        None
-    );
-    assert_eq!(
-        os_error_in(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
-        None
-    );
-    assert_eq!(
-        os_error_in(&cosca::error::Error::Containment {
-            detail: "attach".to_string(),
-            source: None,
-        }),
-        None
-    );
-}
-
 /// cosca wraps every failure after `CreateProcess` in `MayHaveStarted`; the code SCM is told is the
 /// wrapped failure's.
 #[skuld::test]
-fn the_os_error_of_a_failure_after_the_spawn_is_the_one_of_its_source() {
-    let after_spawn = |source: cosca::error::Error| cosca::error::Error::MayHaveStarted {
-        fate: cosca::error::ChildFate::Unknown,
-        wrapper_elevated: false,
-        detail: None,
-        source: Arc::new(source),
-        unreaped: None,
-        cleanup: None,
-    };
-    let denied = || cosca::error::Error::Io(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
-
-    assert_eq!(os_error_in(&after_spawn(denied())), Some(ERROR_ACCESS_DENIED as i32));
-    assert_eq!(
-        spawn_error_code(&after_spawn(denied())),
-        Some(ERROR_ACCESS_DENIED as i32)
-    );
-    assert_eq!(
-        os_error_in(&after_spawn(cosca::error::Error::Containment {
-            detail: "attach".to_string(),
-            source: None,
-        })),
-        None
-    );
-}
-
-/// cosca keeps the OS error at the bottom of the `source()` chain, below however many layers a call
-/// added; the code SCM is told is that error's, whichever layers lie above it.
-#[skuld::test]
-fn the_os_error_of_a_failure_is_found_at_any_depth_of_its_causes() {
-    let denied = || cosca::error::Error::Io(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
-    let containment = |source| cosca::error::Error::Containment {
-        detail: "kill".to_string(),
-        source: Some(Arc::new(source)),
-    };
-    let unassessable = |source| cosca::error::Error::Unassessable {
-        detail: "kill".to_string(),
-        source: Some(Arc::new(source)),
-    };
-    let not_killed = |source| cosca::error::Error::MemberNotKilled {
-        pid: 1,
-        source: Arc::new(source),
-    };
-
-    // A failed `Job` kill: a `Containment` over the OS error.
-    assert_eq!(os_error_in(&containment(denied())), Some(ERROR_ACCESS_DENIED as i32));
-    // Three layers down, below a code-less layer of another variant.
-    assert_eq!(
-        os_error_in(&unassessable(not_killed(containment(denied())))),
-        Some(ERROR_ACCESS_DENIED as i32)
-    );
-    // A spawn failure over the same chain.
+fn a_failure_after_the_spawn_is_told_to_scm_with_the_code_of_its_source() {
     let after_spawn = cosca::error::Error::MayHaveStarted {
         fate: cosca::error::ChildFate::Unknown,
         wrapper_elevated: false,
         detail: None,
-        source: Arc::new(unassessable(denied())),
+        source: Arc::new(cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32,
+        ))),
         unreaped: None,
         cleanup: None,
     };
-    assert_eq!(os_error_in(&after_spawn), Some(ERROR_ACCESS_DENIED as i32));
-    // A code-less layer above the code does not hide it.
-    assert_eq!(
-        os_error_in(&containment(cosca::error::Error::Io(
-            std::io::Error::from_raw_os_error(ERROR_PATH_NOT_FOUND as i32)
-        ))),
-        Some(ERROR_PATH_NOT_FOUND as i32)
-    );
-    // A chain with no code anywhere has none.
-    assert_eq!(os_error_in(&unassessable(containment(not_found()))), None);
+
+    assert_eq!(spawn_error_code(&after_spawn), Some(ERROR_ACCESS_DENIED as i32));
 }
 
-/// `cosca` adds context to an `io::Error` with `within`, which keeps its kind and drops its code
-/// from the layer: a `NotFound` with no code of its own, over the error that has one.
+/// `crate::error::within` adds context to an `io::Error` as `cosca` does: the kind is kept and the
+/// code is not on the layer, so this is a `NotFound` with no code of its own, over the error that
+/// has one.
 #[skuld::test]
 fn a_code_on_the_chain_wins_over_a_code_less_not_found_above_it() {
     let wrapped = cosca::error::Error::Io(crate::error::within(
