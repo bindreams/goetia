@@ -1064,6 +1064,23 @@ fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "no provider is consulted");
 }
 
+/// A native service has no host to recover from the installed command line, so `regenerate` never
+/// reads the service's configuration: the snapshot here has none, and none could be queried.
+#[skuld::test]
+fn regenerate_of_a_native_service_never_reads_its_config() {
+    let spec = daemon_spec(Restart::Never);
+    let blob = Blob {
+        schema: 1,
+        version: crate::version().to_string(),
+        spec: spec.clone(),
+    };
+    let snapshot = ScmSnapshot::new(spec.common().id.clone(), Ok(blob), (Parameters::default(), None));
+
+    let reg = Scm::new().regenerate(&spec, &snapshot);
+
+    assert!(reg.is_ok(), "{reg:?}");
+}
+
 /// A stop whose hold expired and whose STOP was sent is the wait that ran out, led by the process SCM
 /// still named.
 #[skuld::test]

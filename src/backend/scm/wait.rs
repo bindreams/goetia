@@ -1068,9 +1068,8 @@ fn stopped_before_running(
     match kind {
         Protocol::Plain => {
             // An `AlreadyRunning` over `START_PENDING` joined a start that was not ours: SCM's own
-            // recovery start. When that fails SCM reports `STOPPED (0, 0)` with a wait hint (P10), which
-            // the shim never sets; no shim connected to SCM. This test runs before `daemon_ran`, which
-            // `(0, 0)` would satisfy.
+            // recovery start. When that fails SCM reports `STOPPED (0, 0)` with a wait hint, which
+            // the shim never sets. Must precede `daemon_ran`, which `(0, 0)` would satisfy.
             let failed_scm_start = joined_a_start && (exit.win32, exit.specific) == (0, 0) && wait_hint != 0;
             if failed_scm_start {
                 return Err(io::Error::other(
@@ -1091,10 +1090,9 @@ fn stopped_before_running(
                     process: None,
                 }));
             }
-            // `daemon_ran` is safe to ask here: a host that exits before it connects also
-            // records `(0, 0)` with a wait hint (P25 c/d), and that is either our own start
-            // failing with `StartServiceW` 1053, which never reaches this wait, or a joined
-            // start, caught by `failed_scm_start` above.
+            // `daemon_ran` is safe here: a host that exits before it connects also records `(0, 0)`
+            // with a wait hint; that is either our own start failing with `StartServiceW` 1053, which
+            // never reaches this wait, or a joined start, caught by `failed_scm_start` above.
             if exit.daemon_ran() {
                 return Ok(Waited::Confirmed);
             }

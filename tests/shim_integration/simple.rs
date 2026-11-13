@@ -133,7 +133,7 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(status.common().state, State::Running);
     let pid = status.common().pid.expect("type: simple reports the shim's own pid");
 
-    // `DaemonStatus.pid`'s own doc comment (`src/manager.rs`) promises this is
+    // `DaemonStatus.pid`'s own doc comment promises this is
     // `goetia-shim.exe`'s pid, not the daemon's — SCM knows no
     // other process for this service. Confirm it names the shim, not the
     // fixture.

@@ -218,9 +218,8 @@ fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>) -
     {
         // The SCM generator's warning (a too-large `restart-delay`) fires at
         // resolve time, from `BackendKind::Scm.warn`, before this runs.
-        // The generator asks `host` only for a `type: simple` daemon: a managed one runs no host, and a
-        // provider that cannot name one must not fail its preview. The real host, so the preview refuses
-        // a path the install would.
+        // `host` is the real one, so the preview refuses a path the install would; the generator asks
+        // it only for hosted services.
         let registration = crate::backend::scm::generate::install_registration(spec, &identity, host)?;
         Ok(registration.to_string())
     }

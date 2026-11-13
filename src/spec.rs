@@ -150,10 +150,6 @@ pub struct ServiceSpec(ServiceFields);
 impl ServiceSpec {
     /// Check `fields` against the field rules and wrap them. Fails with [`Error::Invalid`] naming
     /// the field.
-    ///
-    /// Migrating from the flat `DaemonFields { .., restart, restart_delay, kind }`: put the
-    /// per-service fields in [`ServiceFields`], `kind` becomes `protocol`, and `.into()` the result
-    /// for a [`DaemonSpec`].
     pub fn new(fields: ServiceFields) -> Result<ServiceSpec, Error> {
         resolve::check_fields(&fields.common)?;
         Ok(ServiceSpec(fields))
@@ -228,8 +224,7 @@ pub enum Restart {
 /// Whether Goetia runs the command directly (via `goetia-shim` on Windows)
 /// or the command is itself expected to behave as a native service.
 ///
-/// Parsed from its authored kebab-case string (`simple`, `managed`) by `resolve::parse_protocol`;
-/// see [`Restart`]'s doc comment for why this is not a derived `Deserialize`.
+/// Parsed from its authored kebab-case string (`simple`, `managed`) by `resolve::parse_protocol`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Plain,

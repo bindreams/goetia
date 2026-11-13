@@ -189,10 +189,9 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
     // for a hosted one.
     let (executable, arguments, environment) = match host {
         // SCM only ever launches the host, which learns the service's name from SCM and spawns the
-        // daemon once. The spec's own command never appears here. The shim already applies `spec.env`
-        // to the daemon it spawns, and an `env:` key that collides with one the shim or `cosca` reads
-        // (`__COSCA_GROUP_ROOT`) would corrupt the shim's own containment, so no `Environment` is
-        // registered.
+        // daemon once. The shim applies `spec.env` to the daemon itself; an `env:` key colliding with
+        // one the shim or `cosca` reads (`__COSCA_GROUP_ROOT`) would corrupt its containment, so no
+        // `Environment` is registered.
         Some(host) => (host.exe.clone(), host.args.clone(), Vec::new()),
         None => {
             let mut argv = s.common.command.iter();
