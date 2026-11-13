@@ -61,6 +61,9 @@ fn parses_every_vixie_form() {
         (0, "5,5", set(&[5])),
         (0, "0-59/1", range(0, 59)),
         (0, "*/60", set(&[0])),
+        (0, "*/100", set(&[0])),
+        (0, "*/300", set(&[0])),
+        (0, "*/99999999999", set(&[0])),
         (1, "*", range(0, 23)),
         (1, "23", set(&[23])),
         (1, "*/6", set(&[0, 6, 12, 18])),
@@ -124,13 +127,6 @@ fn refuses_each_unsupported_form_naming_its_field() {
         (0, "1-5/0"),
         (0, "H/0"),
         (0, "H(1-5)/0"),
-        // a step larger than the field's range
-        (0, "*/61"),
-        (0, "*/300"),
-        (0, "*/99999999999"),
-        (0, "H/61"),
-        (1, "*/25"),
-        (4, "*/8"),
         // empty list terms
         (0, ""),
         (0, "1,,2"),
@@ -219,6 +215,8 @@ fn h_matches_the_golden_vectors() {
     assert_eq!(minute("nightly", "H * * * *"), set(&[13]));
     assert_eq!(minute("backup", "H * * * *"), set(&[23]));
     assert_eq!(minute("nightly", "H/15 * * * *"), set(&[13, 28, 43, 58]));
+    // A step past the field's range leaves one value, the pick.
+    assert_eq!(minute("nightly", "H/61 * * * *"), set(&[13]));
     assert_eq!(parse("* H * * *").fields()[1].values, set(&[2]));
 }
 

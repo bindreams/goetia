@@ -153,13 +153,6 @@ struct FieldKind {
     bare_hi: u8,
 }
 
-impl FieldKind {
-    /// How many values the field holds, which no step may exceed.
-    fn size(&self) -> usize {
-        usize::from(self.max - self.min) + 1
-    }
-}
-
 const KINDS: [FieldKind; FIELD_COUNT] = [
     FieldKind {
         name: "minute",
@@ -280,7 +273,8 @@ fn unsupported() -> String {
     format!("is not supported; {GRAMMAR}")
 }
 
-/// Digits only; a number too large for `u8` saturates to 255, which every range and step refuses.
+/// Digits only; a number too large for `u8` saturates to 255, which every value range refuses and which, as a
+/// step, yields the first value only, as in Vixie cron.
 fn digits(text: &str) -> Option<u8> {
     (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())).then(|| text.parse().unwrap_or(u8::MAX))
 }
@@ -300,9 +294,6 @@ fn parse_term(kind: &FieldKind, term: &str) -> Result<Term, String> {
         None => None,
         Some(None) => return Err(unsupported()),
         Some(Some(0)) => return Err("has a step of 0".to_owned()),
-        Some(Some(step)) if usize::from(step) > kind.size() => {
-            return Err(format!("has a step larger than the field's {} values", kind.size()));
-        }
         Some(Some(step)) => Some(step),
     };
 
