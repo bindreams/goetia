@@ -1,16 +1,23 @@
 use super::*;
 use crate::backend::Identity;
 use crate::spec::test_support::program;
-use crate::spec::{DaemonFields, DaemonSpec, Kind, Restart};
-use crate::testing::plain_fields;
+use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
+use crate::testing::{base_fields, service_fields};
 
 fn spec_fixture() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        name: "FRP tunnel client".to_owned(),
-        restart: Restart::Always,
-        kind: Kind::Simple,
-        ..plain_fields("frpc", vec![program("frpc")])
+    ServiceSpec::new({
+        let base = base_fields("frpc", vec![program("frpc")]);
+        ServiceFields {
+            common: DaemonFields {
+                name: "FRP tunnel client".to_owned(),
+                ..base.common
+            },
+            restart: Restart::Always,
+            protocol: Protocol::Plain,
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -24,17 +31,24 @@ fn rendered(spec: &DaemonSpec, user: &str) -> String {
 }
 
 fn changed(spec: &DaemonSpec) -> DaemonSpec {
-    let mut changed = spec.clone().into_fields();
-    changed.command.push("--verbose".to_owned());
-    DaemonSpec::new(changed).unwrap()
+    let mut changed = service_fields(spec.clone());
+    changed.common.command.push("--verbose".to_owned());
+    ServiceSpec::new(changed).map(DaemonSpec::from).unwrap()
 }
 
 /// A spec change the plist does not render: `name` is in the embedded blob only.
 fn renamed(spec: &DaemonSpec) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        name: "another name".to_owned(),
-        ..spec.clone().into_fields()
+    ServiceSpec::new({
+        let base = service_fields(spec.clone());
+        ServiceFields {
+            common: DaemonFields {
+                name: "another name".to_owned(),
+                ..base.common
+            },
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 

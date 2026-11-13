@@ -6,7 +6,7 @@ use crate::spec::field::Field;
 use crate::spec::interpolate::Substitution;
 use crate::spec::overrides::Supplied;
 use crate::spec::test_support::{abs, assert_no_run_of_spaces};
-use crate::spec::{AccountId, Id, Kind, Restart, User};
+use crate::spec::{AccountId, Id, Protocol, Restart, User};
 
 fn parse(yaml: &str) -> Result<BackendKind, yaml_serde::Error> {
     yaml_serde::from_str(yaml)
@@ -65,7 +65,7 @@ fn native_backend_agrees_with_the_platforms_that_have_a_service_manager() {
 
 // Fixtures ============================================================================================================
 
-/// A `ShapedSpec` with every field at an unremarkable default: `Kind` and
+/// A `ShapedSpec` with every field at an unremarkable default: `Protocol` and
 /// `Restart` absent, no `cwd`/`logs`, no `restart_delay`. Tests override the
 /// one or two fields they care about.
 fn shaped_spec() -> ShapedSpec {
@@ -88,7 +88,7 @@ fn shaped_spec() -> ShapedSpec {
 #[skuld::test]
 fn each_backend_emits_only_its_own_warnings() {
     let mut spec = shaped_spec();
-    spec.kind = Shaped::Parsed(Kind::Managed);
+    spec.kind = Shaped::Parsed(Protocol::Native);
     spec.cwd = Some(abs("data"));
     spec.restart_delay = Shaped::Parsed(Duration::from_millis(500));
 
@@ -110,7 +110,7 @@ fn each_backend_emits_only_its_own_warnings() {
 #[skuld::test]
 fn an_over_long_delay_warns_from_the_scm_arm() {
     let mut spec = shaped_spec();
-    spec.kind = Shaped::Parsed(Kind::Managed);
+    spec.kind = Shaped::Parsed(Protocol::Native);
     spec.restart = Shaped::Parsed(Restart::OnFailure);
     spec.restart_delay = Shaped::Parsed(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
 
@@ -132,7 +132,7 @@ fn the_scm_delay_advisory_is_gated_on_restart_alone() {
     let over_long = MAX_SC_ACTION_DELAY + Duration::from_millis(1);
 
     let mut simple = shaped_spec();
-    simple.kind = Shaped::Parsed(Kind::Simple);
+    simple.kind = Shaped::Parsed(Protocol::Plain);
     simple.restart = Shaped::Parsed(Restart::OnFailure);
     simple.restart_delay = Shaped::Parsed(over_long);
     let mut warnings = Vec::new();
@@ -140,11 +140,11 @@ fn the_scm_delay_advisory_is_gated_on_restart_alone() {
     assert_eq!(
         warnings.len(),
         1,
-        "Kind::Simple clamps like managed, so it warns: {warnings:?}"
+        "Protocol::Plain clamps like managed, so it warns: {warnings:?}"
     );
 
     let mut never_restarts = shaped_spec();
-    never_restarts.kind = Shaped::Parsed(Kind::Managed);
+    never_restarts.kind = Shaped::Parsed(Protocol::Native);
     never_restarts.restart = Shaped::Parsed(Restart::Never);
     never_restarts.restart_delay = Shaped::Parsed(over_long);
     let mut warnings = Vec::new();
@@ -155,7 +155,7 @@ fn the_scm_delay_advisory_is_gated_on_restart_alone() {
 #[skuld::test]
 fn a_sub_millisecond_delay_warns_from_the_scm_arm_with_the_rounded_value() {
     let mut spec = shaped_spec();
-    spec.kind = Shaped::Parsed(Kind::Managed);
+    spec.kind = Shaped::Parsed(Protocol::Native);
     spec.restart = Shaped::Parsed(Restart::OnFailure);
     spec.restart_delay = Shaped::Parsed(Duration::from_micros(1500));
 

@@ -18,7 +18,7 @@ pub(crate) mod flow;
 pub use budget::Budget;
 
 use crate::error::{Error, Reason, Result};
-use crate::spec::{DaemonSpec, Id};
+use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 // ServiceManager ======================================================================================================
 
@@ -205,7 +205,8 @@ pub trait ServiceManager {
     /// [`Error::NotRunning`]: crate::Error::NotRunning
     fn kill(&self, id: &Id) -> Result<()>;
 
-    /// The live state of one installed service. `Err` for an id whose blob
+    /// The live state of one installed service: `state`, `pid` and `enabled` are read through
+    /// [`Status::common`]. `Err` for an id whose blob
     /// will not decode, never a plausible-looking `Status` for state it
     /// cannot determine (see `Installed::OursUnusable`, which exists for the
     /// same reason on the `list` side); [`Error::Undetermined`] for an id whose
@@ -295,11 +296,9 @@ pub enum Installed {
     /// A Goetia-marked service whose blob decoded successfully.
     Ours {
         spec: DaemonSpec,
-        state: State,
-        /// The number [`ServiceManager::status`] would report for this id
-        /// at this moment; see `Backend::live_status`.
-        pid: Option<u32>,
-        enabled: bool,
+        /// What [`ServiceManager::status`] would report for this id at this moment; see
+        /// `Backend::live_status`. Of the same kind as `spec`.
+        status: Status,
     },
     /// Ours by marker, but goetia cannot report on it. `reason` is why: goetia's own words, the
     /// error under them, or both. The causes are listed on [`Ownership::OursUnusable`]. One such
@@ -370,10 +369,34 @@ impl Installed {
     }
 }
 
-/// The live state of one installed service, as [`ServiceManager::status`]
-/// reports it.
+/// The live state of one installed daemon, as [`ServiceManager::status`] reports it. Mirrors
+/// [`DaemonSpec`]: one variant per [`DaemonKind`], each carrying that kind's status.
+///
+/// Read what every kind has through [`Status::common`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Status {
+pub enum Status {
+    Service(DaemonStatus),
+}
+
+impl Status {
+    /// The fields every kind reports.
+    pub fn common(&self) -> &DaemonStatus {
+        match self {
+            Status::Service(status) => status,
+        }
+    }
+
+    /// Which kind of daemon this is the status of.
+    pub fn kind(&self) -> DaemonKind {
+        match self {
+            Status::Service(_) => DaemonKind::Service,
+        }
+    }
+}
+
+/// The status fields every kind of daemon reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonStatus {
     pub state: State,
     /// For `type: simple` on Windows this is `goetia-shim.exe`'s pid, not the
     /// daemon's: SCM knows no other process for that service.

@@ -56,12 +56,12 @@ pub fn run(
     let outcome = match mgr.preview_install(&spec) {
         Ok(outcome) => outcome,
         Err(e) => {
-            print_error(err, Some(spec.id.as_str()), "", &e);
+            print_error(err, Some(spec.common().id.as_str()), "", &e);
             return ExitCode::of(&e);
         }
     };
     let lines = Lines {
-        id: &spec.id,
+        id: &spec.common().id,
         mood: Mood::Would,
     };
     let settled = match lines.refusal(&outcome, out, err) {
@@ -70,18 +70,18 @@ pub fn run(
     };
     match settled {
         NotRefused::Create => {
-            let _ = writeln!(out, "{}: not installed (would be created)", spec.id);
+            let _ = writeln!(out, "{}: not installed (would be created)", spec.common().id);
         }
         NotRefused::UpToDate => {
-            let _ = writeln!(out, "{}: up to date", spec.id);
+            let _ = writeln!(out, "{}: up to date", spec.common().id);
             return ExitCode::Success;
         }
         NotRefused::Update { spec_diff } => {
-            let _ = writeln!(out, "{}:", spec.id);
+            let _ = writeln!(out, "{}:", spec.common().id);
             let _ = write!(out, "{spec_diff}");
         }
         NotRefused::Stale { from_version } => {
-            print_line(out, None, Some(spec.id.as_str()), |sink| {
+            print_line(out, None, Some(spec.common().id.as_str()), |sink| {
                 write!(sink, "would be regenerated (built by goetia {from_version})")
             });
         }

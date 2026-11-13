@@ -19,9 +19,8 @@ use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::{bounded, standby};
 use crate::manager::ServiceManager as _;
 use crate::manager::conformance::fresh_id;
-use crate::spec::DaemonFields;
-use crate::spec::Kind;
-use crate::testing::plain_fields;
+use crate::spec::{DaemonSpec, Protocol, ServiceFields, ServiceSpec};
+use crate::testing::base_fields;
 
 use crate::testing::cleanup::{DirGuard, FileGuard, remove_or_warn};
 use crate::testing::groups::{Group, systemd_group};
@@ -82,10 +81,11 @@ impl Drop for StopRacer<'_> {
 }
 
 fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        kind: Kind::Simple,
-        ..plain_fields(id, vec!["/bin/true".to_string()])
+    ServiceSpec::new(ServiceFields {
+        protocol: Protocol::Plain,
+        ..base_fields(id, vec!["/bin/true".to_string()])
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -507,8 +507,8 @@ fn install_enable_and_start_in_one_sequence_probe_the_gate_once(#[fixture(system
         .prepare(&[Step::Install, Step::Start], Budget::DEFAULT)
         .expect("prepare");
     sequence.install(&spec, false).expect("install");
-    sequence.enable(&spec.id).expect("enable");
-    sequence.start(&spec.id, Budget::DEFAULT).expect("start");
+    sequence.enable(&spec.common().id).expect("enable");
+    sequence.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     fake.assert_spent("the sequence");
     let probes = fake

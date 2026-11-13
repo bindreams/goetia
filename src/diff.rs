@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use similar::{ChangeTag, TextDiff};
 use yaml_serde::{Mapping, Value};
 
-use crate::spec::{AccountId, DaemonSpec, Kind, Restart, User};
+use crate::spec::{AccountId, DaemonSpec, Protocol, Restart, User};
 
 /// Renders the artifact-level diff shown on `Conflict`/exit code 5: a
 /// unified text diff between the artifact installed on disk (`was`) and
@@ -49,25 +49,26 @@ pub fn spec_diff(was: &DaemonSpec, now: &DaemonSpec) -> String {
 /// names. Backs `goetia daemon show` and the `before`/`after` sides of
 /// [`spec_diff`].
 pub fn render_yaml(spec: &DaemonSpec) -> String {
+    let DaemonSpec::Service(s) = spec;
     let mut fields: Vec<(&'static str, Value)> = vec![
         (
             "command",
-            Value::Sequence(spec.command.iter().cloned().map(Value::from).collect()),
+            Value::Sequence(s.common.command.iter().cloned().map(Value::from).collect()),
         ),
-        ("env", Value::Mapping(env_value(&spec.env))),
-        ("id", Value::from(spec.id.as_str().to_owned())),
-        ("name", Value::from(spec.name.clone())),
-        ("restart", Value::from(restart_key(spec.restart))),
-        ("type", Value::from(kind_key(spec.kind))),
-        ("user", user_value(&spec.user)),
+        ("env", Value::Mapping(env_value(&s.common.env))),
+        ("id", Value::from(s.common.id.as_str().to_owned())),
+        ("name", Value::from(s.common.name.clone())),
+        ("restart", Value::from(restart_key(s.restart))),
+        ("type", Value::from(kind_key(s.protocol))),
+        ("user", user_value(&s.common.user)),
     ];
-    if let Some(cwd) = &spec.cwd {
+    if let Some(cwd) = &s.common.cwd {
         fields.push(("cwd", Value::from(cwd.display().to_string())));
     }
-    if let Some(logs) = &spec.logs {
+    if let Some(logs) = &s.common.logs {
         fields.push(("logs", Value::from(logs.display().to_string())));
     }
-    if let Some(delay) = spec.restart_delay {
+    if let Some(delay) = s.restart_delay {
         fields.push((
             "restart-delay",
             Value::from(humantime::format_duration(delay).to_string()),
@@ -105,10 +106,10 @@ fn restart_key(restart: Restart) -> &'static str {
     }
 }
 
-fn kind_key(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Simple => "simple",
-        Kind::Managed => "managed",
+fn kind_key(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Plain => "simple",
+        Protocol::Native => "managed",
     }
 }
 

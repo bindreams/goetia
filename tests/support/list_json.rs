@@ -50,7 +50,7 @@ impl ListJson {
 /// establish (see [`Installed::Undetermined`]'s null-name rule).
 pub fn may_account_for(listed: &[Installed], id: &str) -> bool {
     listed.iter().any(|entry| match entry {
-        Installed::Ours { spec, .. } => spec.id.as_str() == id,
+        Installed::Ours { spec, .. } => spec.common().id.as_str() == id,
         Installed::OursUnusable { name, .. } => name == id,
         Installed::Undetermined { name, .. } => name.is_none() || name.as_deref() == Some(id),
     })
@@ -64,7 +64,7 @@ pub fn assert_own(installed: &[Installed], ids: &[&str]) {
         assert!(
             installed
                 .iter()
-                .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == *id)),
+                .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.common().id.as_str() == *id)),
             "{id:?} must be listed as ours: {installed:?}"
         );
         assert!(

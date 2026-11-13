@@ -18,8 +18,8 @@ use goetia::manager::{Budget, ServiceManager as _, State};
 use goetia::shim::{
     CheckPermissions, EmbeddedStockShim, FolderCheck, HostCommand, ShimProvider, StandaloneShim, SweepFailure,
 };
-use goetia::spec::{DaemonFields, DaemonSpec, User};
-use goetia::testing::{Ace, FakeProvider, command, units_until_nul, wide_null};
+use goetia::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, User};
+use goetia::testing::{Ace, FakeProvider, command, service_fields, units_until_nul, wide_null};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GENERIC_ALL, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -422,10 +422,13 @@ fn install_provisions_under_program_files(#[fixture(scm_group)] _group: &Group) 
     assert_eq!(file.parent(), Some(folder.as_path()));
     assert_eq!(std::fs::read(&file).unwrap(), shim_bytes());
     assert_stock_file(&file);
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the daemon to report in under the shim placed in Program Files");
-    assert_eq!(mgr.status(&spec.id).expect("status").state, State::Running);
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    assert_eq!(
+        mgr.status(&spec.common().id).expect("status").common().state,
+        State::Running
+    );
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
@@ -590,7 +593,11 @@ fn runs_as(label: &str, mgr: &Scm, install: impl FnOnce(&str, &str, u16)) {
     mgr.start(&id, Budget::Unbounded)
         .unwrap_or_else(|e| panic!("{label}: start: {}", e.report()));
     started.accept(&format!("the daemon to report in as {label}"));
-    assert_eq!(mgr.status(&id).expect("status").state, State::Running, "{label}");
+    assert_eq!(
+        mgr.status(&id).expect("status").common().state,
+        State::Running,
+        "{label}"
+    );
     mgr.stop(&id, Budget::DEFAULT)
         .unwrap_or_else(|e| panic!("{label}: stop: {}", e.report()));
 }
@@ -603,10 +610,21 @@ fn every_account_type_runs_the_shim(#[fixture(scm_group)] _group: &Group) {
 
     let as_user = |label: &str, user: fn(&str) -> User| {
         runs_as(label, &mgr, |id, exe, port| {
-            let spec = DaemonSpec::new(DaemonFields {
-                user: user(id),
-                ..simple_spec(id, fixture_command_with_exe(exe, "report", &[&port.to_string()]), &logs).into_fields()
+            let spec = ServiceSpec::new({
+                let base = service_fields(simple_spec(
+                    id,
+                    fixture_command_with_exe(exe, "report", &[&port.to_string()]),
+                    &logs,
+                ));
+                ServiceFields {
+                    common: DaemonFields {
+                        user: user(id),
+                        ..base.common
+                    },
+                    ..base
+                }
             })
+            .map(DaemonSpec::from)
             .unwrap();
             mgr.install(&spec, false)
                 .unwrap_or_else(|e| panic!("{label}: install: {}", e.report()));
@@ -665,7 +683,7 @@ fn install_refuses_a_host_other_than_the_one_rendered(#[fixture(scm_group)] _gro
     }
     assert_eq!(*calls.lock().unwrap(), ["preview", "sweep", "provide"]);
     assert!(
-        matches!(mgr.status(&spec.id), Err(Error::NotInstalled { .. })),
+        matches!(mgr.status(&spec.common().id), Err(Error::NotInstalled { .. })),
         "a refused install registered the service"
     );
 }
@@ -1016,8 +1034,8 @@ fn other_versions_shim_is_kept(#[fixture(scm_group)] _group: &Group) {
     mgr.install(&a_spec, false).expect("install A");
 
     assert!(theirs.is_file(), "the file a registered service runs is not swept");
-    mgr.start(&b_spec.id, Budget::DEFAULT).expect("start B");
-    mgr.start(&a_spec.id, Budget::DEFAULT).expect("start A");
+    mgr.start(&b_spec.common().id, Budget::DEFAULT).expect("start B");
+    mgr.start(&a_spec.common().id, Budget::DEFAULT).expect("start A");
     b_started.accept("B to report in from the other file");
     a_started.accept("A to report in from the file the install provided");
     // B's host is not the one this goetia provides, so installing it again changes it back.
@@ -1037,18 +1055,18 @@ fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     let mgr = embedded_manager(None, CheckPermissions::Enable);
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the daemon to report in under the shim in Program Files");
 
     // The shim is running its own file, which cannot be deleted while it does.
-    mgr.uninstall(&spec.id).expect("uninstall");
+    mgr.uninstall(&spec.common().id).expect("uninstall");
 
     assert!(
         !folder.exists(),
         "no shim file and no default folder is left: {:?}",
         std::fs::read_dir(&folder).map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
     );
-    assert!(matches!(mgr.status(&spec.id), Err(Error::NotInstalled { .. })));
+    assert!(matches!(mgr.status(&spec.common().id), Err(Error::NotInstalled { .. })));
 }
 
 /// A re-provided service still runs the file it started from. Another service's uninstall leaves
@@ -1068,7 +1086,7 @@ fn uninstall_keeps_a_running_old_shim(#[fixture(scm_group)] _group: &Group) {
     let a_spec = simple_spec(&a_id, fixture_command("report", &[&started.port().to_string()]), &logs);
     first.install(&a_spec, false).expect("install A on the first file");
     let old = shim_in(&folder);
-    first.start(&a_spec.id, Budget::DEFAULT).expect("start A");
+    first.start(&a_spec.common().id, Budget::DEFAULT).expect("start A");
     started.accept("A to report in");
     let running = ShimProcess::attach(&a_id);
 
@@ -1083,11 +1101,11 @@ fn uninstall_keeps_a_running_old_shim(#[fixture(scm_group)] _group: &Group) {
     let b_spec = simple_spec(&b_id, fixture_command("report", &["1"]), &logs);
     second.install(&b_spec, false).expect("install B on the second file");
 
-    second.uninstall(&b_spec.id).expect("uninstall B");
+    second.uninstall(&b_spec.common().id).expect("uninstall B");
 
     assert!(old.is_file(), "the file A's process runs is kept");
     assert!(new.is_file(), "the file A is registered with is kept");
-    second.uninstall(&a_spec.id).expect("uninstall A");
+    second.uninstall(&a_spec.common().id).expect("uninstall A");
     assert!(running.has_exited(), "uninstall returns once A's process is gone");
     assert!(!old.exists() && !new.exists(), "nothing references either file now");
 }
@@ -1106,16 +1124,19 @@ fn uninstall_of_one_of_two_on_a_file_returns(#[fixture(scm_group)] _group: &Grou
     let b_spec = simple_spec(&b_id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&a_spec, false).expect("install A");
     mgr.install(&b_spec, false).expect("install B");
-    mgr.start(&b_spec.id, Budget::DEFAULT).expect("start B");
+    mgr.start(&b_spec.common().id, Budget::DEFAULT).expect("start B");
     started.accept("B to report in");
     let running = ShimProcess::attach(&b_id);
 
-    mgr.uninstall(&a_spec.id)
+    mgr.uninstall(&a_spec.common().id)
         .expect("uninstall A, which does not wait for B");
 
     assert!(shim_in(&folder).is_file(), "B still runs the file");
     assert!(!running.has_exited(), "B keeps running");
-    assert_eq!(mgr.status(&b_spec.id).expect("status").state, State::Running);
+    assert_eq!(
+        mgr.status(&b_spec.common().id).expect("status").common().state,
+        State::Running
+    );
 }
 
 /// `stop` returns once the service's process has exited, not when SCM first reports `STOPPED`, which
@@ -1130,11 +1151,11 @@ fn stop_returns_after_the_services_process_has_exited(#[fixture(scm_group)] _gro
     let mgr = embedded_manager(Some(folder), CheckPermissions::Disable);
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the service to report in");
     let running = ShimProcess::attach(&id);
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 
     assert!(
         running.has_exited(),
@@ -1154,12 +1175,12 @@ fn uninstall_right_after_stop_leaves_no_file(#[fixture(scm_group)] _group: &Grou
     let mgr = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the service to report in");
     let file = shim_in(&folder);
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 
-    mgr.uninstall(&spec.id).expect("uninstall");
+    mgr.uninstall(&spec.common().id).expect("uninstall");
 
     assert!(
         !file.exists(),
@@ -1183,16 +1204,17 @@ fn uninstall_right_after_an_unwaited_stop_succeeds_and_the_next_sweep_takes_the_
     let mgr = embedded_manager(Some(folder.clone()), CheckPermissions::Disable);
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the service to report in");
     let running = ShimProcess::attach(&id);
     let file = shim_in(&folder);
-    mgr.stop(&spec.id, Budget::Immediate).expect("request the stop");
+    mgr.stop(&spec.common().id, Budget::Immediate)
+        .expect("request the stop");
 
-    mgr.uninstall(&spec.id).expect("uninstall");
+    mgr.uninstall(&spec.common().id).expect("uninstall");
 
     running.wait_for_exit();
-    let retry = mgr.uninstall(&spec.id);
+    let retry = mgr.uninstall(&spec.common().id);
     assert!(matches!(retry, Err(Error::NotInstalled { .. })), "{retry:?}");
     assert!(!file.exists(), "the sweep after the process exited removes it");
 }
@@ -1217,14 +1239,14 @@ fn uninstall_does_not_wait_for_an_updated_service_still_on_the_old_file(#[fixtur
     first.install(&a_spec, false).expect("install A on the first file");
     first.install(&b_spec, false).expect("install B on the first file");
     let old = shim_in(&folder);
-    first.start(&b_spec.id, Budget::DEFAULT).expect("start B");
+    first.start(&b_spec.common().id, Budget::DEFAULT).expect("start B");
     started.accept("B to report in");
     let running = ShimProcess::attach(&b_id);
     let moved = second.install(&b_spec, false).expect("install B on the second file");
     assert!(matches!(moved, Outcome::Update { .. }), "{moved:?}");
 
     second
-        .uninstall(&a_spec.id)
+        .uninstall(&a_spec.common().id)
         .expect("uninstall A, which does not wait for B");
 
     assert!(old.is_file(), "B's process still runs the first file");
@@ -1246,7 +1268,7 @@ fn uninstall_sweeps_the_default_folder_when_it_is_not_the_providers(#[fixture(sc
     theirs.install(&spec, false).expect("install in the default folder");
     assert!(default.is_dir());
 
-    ours.uninstall(&spec.id).expect("uninstall");
+    ours.uninstall(&spec.common().id).expect("uninstall");
 
     assert!(!default.exists(), "the default folder is swept, and removed once empty");
 }
@@ -1265,7 +1287,7 @@ fn uninstall_leaves_a_folder_that_is_neither_the_default_nor_the_providers(#[fix
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     theirs.install(&spec, false).expect("install under the other folder");
 
-    ours.uninstall(&spec.id).expect("uninstall");
+    ours.uninstall(&spec.common().id).expect("uninstall");
 
     assert!(
         shim_in(&folder).is_file(),

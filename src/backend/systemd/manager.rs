@@ -140,7 +140,7 @@ impl Backend for Systemd {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
-        generate::unit(spec, &identity_for(&spec.user)?)
+        generate::unit(spec, &identity_for(&spec.common().user)?)
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Fragment>> {
@@ -160,7 +160,7 @@ impl Backend for Systemd {
         _scope: &mut (),
         reservation: &mut Held,
     ) -> Result<WriteOutcome> {
-        let id = spec.id.as_str();
+        let id = spec.common().id.as_str();
         dirs::ensure_parent_dirs(spec)?;
         match outcome {
             Outcome::Create => match create_unit(id, definition)? {
@@ -192,7 +192,9 @@ impl Backend for Systemd {
 
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
         // A read: it draws nothing and asks no gate.
-        self.systemctl.status_from_unit(&unit_name(snapshot.id().as_str()))
+        self.systemctl
+            .status_from_unit(&unit_name(snapshot.id().as_str()))
+            .map(Status::Service)
     }
 
     /// Each id the unit directories name, read as `read` would. An id whose read did not complete

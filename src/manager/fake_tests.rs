@@ -4,17 +4,18 @@ use super::*;
 use crate::manager::Budget;
 use crate::manager::conformance;
 use crate::spec::test_support::program;
-use crate::spec::{Id, Kind, Restart};
-use crate::testing::plain_fields;
+use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
+use crate::testing::{base_fields, service_fields};
 
 // Fixtures ============================================================================================================
 
 pub(crate) fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
+    ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
-        kind: Kind::Simple,
-        ..plain_fields(id, vec![program("daemon")])
+        protocol: Protocol::Plain,
+        ..base_fields(id, vec![program("daemon")])
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -56,36 +57,38 @@ fn list_reports_the_same_pid_as_status() {
     let fake = Fake::new();
     let spec = mk("pid-agreement");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
-    let status = fake.status(&spec.id).unwrap();
+    let status = fake.status(&spec.common().id).unwrap();
     let listed = fake.list().unwrap();
     let entry = listed
         .iter()
         .find_map(|e| match e {
-            Installed::Ours { spec: s, pid, .. } if s.id == spec.id => Some(*pid),
+            Installed::Ours { spec: s, status } if s.common().id == spec.common().id => Some(status.common().pid),
             _ => None,
         })
         .expect("just-installed entry must be present and readable");
-    assert!(status.pid.is_some(), "a running daemon must report a pid");
+    assert!(status.common().pid.is_some(), "a running daemon must report a pid");
     assert_eq!(
-        entry, status.pid,
+        entry,
+        status.common().pid,
         "list's pid must agree with status's pid while running"
     );
 
-    fake.stop(&spec.id, Budget::DEFAULT).unwrap();
-    let status = fake.status(&spec.id).unwrap();
+    fake.stop(&spec.common().id, Budget::DEFAULT).unwrap();
+    let status = fake.status(&spec.common().id).unwrap();
     let listed = fake.list().unwrap();
     let entry = listed
         .iter()
         .find_map(|e| match e {
-            Installed::Ours { spec: s, pid, .. } if s.id == spec.id => Some(*pid),
+            Installed::Ours { spec: s, status } if s.common().id == spec.common().id => Some(status.common().pid),
             _ => None,
         })
         .expect("just-stopped entry must be present and readable");
-    assert!(status.pid.is_none(), "a stopped daemon must report no pid");
+    assert!(status.common().pid.is_none(), "a stopped daemon must report no pid");
     assert_eq!(
-        entry, status.pid,
+        entry,
+        status.common().pid,
         "list's pid must agree with status's pid once stopped"
     );
 }
@@ -107,7 +110,7 @@ fn list_reports_unusable_entries_without_erroring() {
     );
     let readable = listed
         .iter()
-        .find(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id.as_str() == "readable"));
+        .find(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.common().id.as_str() == "readable"));
     assert!(
         readable.is_some(),
         "one bad entry must not take down the rest of list(): {listed:?}"
@@ -120,10 +123,13 @@ fn uninstall_removes_entry() {
     let spec = mk("removable");
     fake.install(&spec, false).unwrap();
 
-    fake.uninstall(&spec.id).unwrap();
+    fake.uninstall(&spec.common().id).unwrap();
 
     assert!(fake.list().unwrap().is_empty());
-    assert!(fake.status(&spec.id).is_err(), "status after uninstall must error");
+    assert!(
+        fake.status(&spec.common().id).is_err(),
+        "status after uninstall must error"
+    );
 }
 
 #[skuld::test]
@@ -252,14 +258,14 @@ fn absence_over_a_residual_artifact_is_not_not_installed() {
 fn install_and_uninstall_agree_about_a_residual_artifact() {
     let fake = Fake::new();
     let spec = mk("leftover");
-    fake.seed_residual_artifact(spec.id.as_str());
+    fake.seed_residual_artifact(spec.common().id.as_str());
 
     let outcome = fake
         .install(&spec, false)
         .expect("install classifies rather than errors");
     assert!(matches!(outcome, Outcome::RefuseForeign { .. }), "{outcome:?}");
     assert!(
-        matches!(fake.uninstall(&spec.id), Err(Error::Foreign { .. })),
+        matches!(fake.uninstall(&spec.common().id), Err(Error::Foreign { .. })),
         "uninstall must not call the id empty when install calls it foreign"
     );
 
@@ -288,12 +294,12 @@ fn list_omits_an_id_that_has_only_a_residual_artifact() {
 /// other six.
 fn every_verb(fake: &Fake, spec: &DaemonSpec) -> Vec<(&'static str, Result<()>)> {
     vec![
-        ("status", fake.status(&spec.id).map(drop)),
-        ("uninstall", fake.uninstall(&spec.id)),
-        ("enable", fake.enable(&spec.id)),
-        ("disable", fake.disable(&spec.id)),
-        ("start", fake.start(&spec.id, Budget::DEFAULT)),
-        ("stop", fake.stop(&spec.id, Budget::DEFAULT)),
+        ("status", fake.status(&spec.common().id).map(drop)),
+        ("uninstall", fake.uninstall(&spec.common().id)),
+        ("enable", fake.enable(&spec.common().id)),
+        ("disable", fake.disable(&spec.common().id)),
+        ("start", fake.start(&spec.common().id, Budget::DEFAULT)),
+        ("stop", fake.stop(&spec.common().id, Budget::DEFAULT)),
         ("install", fake.install(spec, false).map(drop)),
         ("preview_install", fake.preview_install(spec).map(drop)),
     ]
@@ -346,7 +352,7 @@ fn an_opaque_entry_is_never_omitted_from_list() {
 fn every_verb_refuses_an_opaque_id_as_undetermined() {
     let fake = Fake::new();
     let spec = mk("opaque");
-    fake.seed_opaque(spec.id.as_str());
+    fake.seed_opaque(spec.common().id.as_str());
 
     for (verb, result) in every_verb(&fake, &spec) {
         match result {
@@ -366,7 +372,7 @@ fn an_opaque_id_shadows_an_entry_at_the_same_id() {
     let fake = Fake::new();
     let spec = mk("shadowed");
     fake.install(&spec, false).unwrap();
-    fake.seed_opaque(spec.id.as_str());
+    fake.seed_opaque(spec.common().id.as_str());
 
     for (verb, result) in every_verb(&fake, &spec) {
         assert!(
@@ -388,7 +394,7 @@ fn an_opaque_id_is_listed_once_and_not_as_ours() {
     let fake = Fake::new();
     let spec = mk("shadowed");
     fake.install(&spec, false).unwrap();
-    fake.seed_opaque(spec.id.as_str());
+    fake.seed_opaque(spec.common().id.as_str());
 
     let listed = fake.list().unwrap();
 
@@ -442,11 +448,11 @@ fn the_fake_records_the_calls_it_was_asked_to_make() {
     fake.install(&first, false).unwrap();
     fake.install(&second, false).unwrap();
 
-    fake.start(&first.id, Budget::DEFAULT).unwrap();
+    fake.start(&first.common().id, Budget::DEFAULT).unwrap();
     // Already running: idempotent, changes nothing, and is still recorded.
-    fake.start(&first.id, Budget::DEFAULT).unwrap();
-    fake.stop(&first.id, Budget::DEFAULT).unwrap();
-    fake.start(&second.id, Budget::DEFAULT).unwrap();
+    fake.start(&first.common().id, Budget::DEFAULT).unwrap();
+    fake.stop(&first.common().id, Budget::DEFAULT).unwrap();
+    fake.start(&second.common().id, Budget::DEFAULT).unwrap();
 
     assert_eq!(
         fake.calls(),
@@ -469,9 +475,9 @@ fn a_stalled_start_times_out_under_a_bounded_budget() {
     let fake = Fake::new();
     let spec = mk("stalls");
     fake.install(&spec, false).unwrap();
-    fake.seed_start_stalls(spec.id.as_str());
+    fake.seed_start_stalls(spec.common().id.as_str());
 
-    let result = fake.start(&spec.id, Budget::Bounded(Duration::from_secs(10)));
+    let result = fake.start(&spec.common().id, Budget::Bounded(Duration::from_secs(10)));
 
     match result.as_ref().map_err(Error::cause) {
         Err(Error::WaitTimeout { id, awaited, .. }) => {
@@ -481,7 +487,7 @@ fn a_stalled_start_times_out_under_a_bounded_budget() {
         other => panic!("a stalled start under a bounded budget must time out, got {other:?}"),
     }
     assert_ne!(
-        fake.status(&spec.id).unwrap().state,
+        fake.status(&spec.common().id).unwrap().common().state,
         State::Running,
         "a start that timed out must not have fabricated the confirmation"
     );
@@ -492,10 +498,10 @@ fn a_stalled_stop_times_out_under_a_bounded_budget() {
     let fake = Fake::new();
     let spec = mk("stalls");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
-    fake.seed_stop_stalls(spec.id.as_str());
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
+    fake.seed_stop_stalls(spec.common().id.as_str());
 
-    match fake.stop(&spec.id, Budget::Bounded(Duration::from_secs(10))) {
+    match fake.stop(&spec.common().id, Budget::Bounded(Duration::from_secs(10))) {
         Err(Error::WaitTimeout { id, awaited, .. }) => {
             assert_eq!(id, "stalls");
             assert_eq!(awaited, "stopped");
@@ -503,7 +509,7 @@ fn a_stalled_stop_times_out_under_a_bounded_budget() {
         other => panic!("a stalled stop under a bounded budget must time out, got {other:?}"),
     }
     assert_eq!(
-        fake.status(&spec.id).unwrap().state,
+        fake.status(&spec.common().id).unwrap().common().state,
         State::Running,
         "a stop that timed out must not have fabricated the confirmation"
     );
@@ -516,13 +522,13 @@ fn a_stalled_start_is_ok_under_no_budget_and_leaves_the_state_alone() {
     let fake = Fake::new();
     let spec = mk("stalls");
     fake.install(&spec, false).unwrap();
-    fake.seed_start_stalls(spec.id.as_str());
+    fake.seed_start_stalls(spec.common().id.as_str());
 
     for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
-        fake.start(&spec.id, budget)
+        fake.start(&spec.common().id, budget)
             .unwrap_or_else(|e| panic!("{budget:?} establishes nothing, so it cannot fail: {e}"));
         assert_ne!(
-            fake.status(&spec.id).unwrap().state,
+            fake.status(&spec.common().id).unwrap().common().state,
             State::Running,
             "{budget:?} confirmed nothing, so it must not have changed the state"
         );
@@ -534,14 +540,14 @@ fn a_stalled_stop_is_ok_under_no_budget_and_leaves_the_state_alone() {
     let fake = Fake::new();
     let spec = mk("stalls");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
-    fake.seed_stop_stalls(spec.id.as_str());
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
+    fake.seed_stop_stalls(spec.common().id.as_str());
 
     for budget in [Budget::Immediate, Budget::Bounded(Duration::ZERO)] {
-        fake.stop(&spec.id, budget)
+        fake.stop(&spec.common().id, budget)
             .unwrap_or_else(|e| panic!("{budget:?} establishes nothing, so it cannot fail: {e}"));
         assert_eq!(
-            fake.status(&spec.id).unwrap().state,
+            fake.status(&spec.common().id).unwrap().common().state,
             State::Running,
             "{budget:?} confirmed nothing, so it must not have changed the state"
         );
@@ -559,11 +565,11 @@ fn the_fake_never_sleeps() {
     let fake = Fake::new();
     let spec = mk("stalls");
     fake.install(&spec, false).unwrap();
-    fake.seed_start_stalls(spec.id.as_str());
+    fake.seed_start_stalls(spec.common().id.as_str());
     let budget = Duration::from_secs(3600);
 
     let before = std::time::Instant::now();
-    let result = fake.start(&spec.id, Budget::Bounded(budget));
+    let result = fake.start(&spec.common().id, Budget::Bounded(budget));
     let elapsed = before.elapsed();
 
     assert!(
@@ -589,9 +595,9 @@ fn a_stalled_start_under_an_unbounded_budget_refuses_rather_than_pretending() {
     let fake = Fake::new();
     let spec = mk("stalls");
     fake.install(&spec, false).unwrap();
-    fake.seed_start_stalls(spec.id.as_str());
+    fake.seed_start_stalls(spec.common().id.as_str());
 
-    let _ = fake.start(&spec.id, Budget::Unbounded);
+    let _ = fake.start(&spec.common().id, Budget::Unbounded);
 }
 
 #[skuld::test]
@@ -600,10 +606,10 @@ fn a_stalled_stop_under_an_unbounded_budget_refuses_rather_than_pretending() {
     let fake = Fake::new();
     let spec = mk("stalls");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
-    fake.seed_stop_stalls(spec.id.as_str());
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
+    fake.seed_stop_stalls(spec.common().id.as_str());
 
-    let _ = fake.stop(&spec.id, Budget::Unbounded);
+    let _ = fake.stop(&spec.common().id, Budget::Unbounded);
 }
 
 /// An un-stalled entry reaches `Running` under every budget that waits,
@@ -616,10 +622,14 @@ fn an_unstalled_entry_starts_under_every_budget_that_waits() {
         let spec = mk("healthy");
         fake.install(&spec, false).unwrap();
 
-        fake.start(&spec.id, budget)
+        fake.start(&spec.common().id, budget)
             .unwrap_or_else(|e| panic!("{budget:?}: {e}"));
 
-        assert_eq!(fake.status(&spec.id).unwrap().state, State::Running, "{budget:?}");
+        assert_eq!(
+            fake.status(&spec.common().id).unwrap().common().state,
+            State::Running,
+            "{budget:?}"
+        );
     }
 }
 
@@ -636,11 +646,11 @@ fn an_unstalled_entry_is_left_alone_under_a_budget_that_does_not_wait() {
         let spec = mk("healthy");
         fake.install(&spec, false).unwrap();
 
-        fake.start(&spec.id, budget)
+        fake.start(&spec.common().id, budget)
             .unwrap_or_else(|e| panic!("{budget:?} accepts the request: {e}"));
 
         assert_eq!(
-            fake.status(&spec.id).unwrap().state,
+            fake.status(&spec.common().id).unwrap().common().state,
             State::Stopped,
             "{budget:?} confirmed nothing, so it must not have changed the state"
         );
@@ -659,13 +669,13 @@ fn a_running_entry_is_left_alone_by_a_stop_under_a_budget_that_does_not_wait() {
         let fake = Fake::new();
         let spec = mk("healthy");
         fake.install(&spec, false).unwrap();
-        fake.start(&spec.id, Budget::DEFAULT).unwrap();
+        fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
-        fake.stop(&spec.id, budget)
+        fake.stop(&spec.common().id, budget)
             .unwrap_or_else(|e| panic!("{budget:?} accepts the request: {e}"));
 
         assert_eq!(
-            fake.status(&spec.id).unwrap().state,
+            fake.status(&spec.common().id).unwrap().common().state,
             State::Running,
             "{budget:?} confirmed nothing, so it must not have changed the state"
         );
@@ -682,10 +692,10 @@ fn a_start_request_after_an_unconfirmed_stop_is_refused_while_still_running() {
     let fake = Fake::new();
     let spec = mk("healthy");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
-    fake.stop(&spec.id, Budget::Immediate).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
+    fake.stop(&spec.common().id, Budget::Immediate).unwrap();
 
-    assert!(fake.request_start_after_stop(&spec.id).is_err());
+    assert!(fake.request_start_after_stop(&spec.common().id).is_err());
     assert_eq!(
         fake.calls(),
         vec![
@@ -704,9 +714,9 @@ fn a_start_request_over_a_stopped_entry_is_accepted_and_settles_nothing() {
     let spec = mk("healthy");
     fake.install(&spec, false).unwrap();
 
-    fake.request_start_after_stop(&spec.id).unwrap();
+    fake.request_start_after_stop(&spec.common().id).unwrap();
 
-    assert_eq!(fake.status(&spec.id).unwrap().state, State::Stopped);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Stopped);
 }
 
 // kill ================================================================================================================
@@ -716,12 +726,12 @@ fn kill_ends_a_running_service_as_a_failure() {
     let fake = Fake::new();
     let spec = mk("killed");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
-    fake.kill(&spec.id).unwrap();
+    fake.kill(&spec.common().id).unwrap();
 
-    assert_eq!(fake.status(&spec.id).unwrap().state, State::Failed);
-    assert_eq!(fake.status(&spec.id).unwrap().pid, None);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Failed);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().pid, None);
 }
 
 #[skuld::test]
@@ -730,13 +740,17 @@ fn kill_of_a_service_that_is_not_running_says_so() {
     let spec = mk("idle");
     fake.install(&spec, false).unwrap();
 
-    let result = fake.kill(&spec.id);
+    let result = fake.kill(&spec.common().id);
 
     assert!(
         matches!(&result, Err(Error::NotRunning { id }) if id == "idle"),
         "{result:?}"
     );
-    assert_eq!(fake.status(&spec.id).unwrap().state, State::Stopped, "nothing changed");
+    assert_eq!(
+        fake.status(&spec.common().id).unwrap().common().state,
+        State::Stopped,
+        "nothing changed"
+    );
 }
 
 #[skuld::test]
@@ -754,7 +768,7 @@ fn kill_is_recorded_once_gated_even_when_it_fails() {
     let spec = mk("idle");
     fake.install(&spec, false).unwrap();
 
-    let result = fake.kill(&spec.id);
+    let result = fake.kill(&spec.common().id);
 
     assert!(matches!(result, Err(Error::NotRunning { .. })), "{result:?}");
     assert_eq!(fake.calls(), [("kill", "idle".to_string())]);
@@ -765,10 +779,10 @@ fn kill_is_refused_where_no_manager_can_be_asked() {
     let fake = Fake::new();
     let spec = mk("offline");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
     fake.seed_no_manager();
 
-    let result = fake.kill(&spec.id);
+    let result = fake.kill(&spec.common().id);
 
     assert!(matches!(result, Err(Error::NoManager { .. })), "{result:?}");
 }
@@ -805,10 +819,17 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
         }),
     ];
     let spec = mk("frpc");
-    let other = DaemonSpec::new(DaemonFields {
-        name: "another artifact".to_string(),
-        ..mk("frpc").into_fields()
+    let other = ServiceSpec::new({
+        let base = service_fields(mk("frpc"));
+        ServiceFields {
+            common: DaemonFields {
+                name: "another artifact".to_string(),
+                ..base.common
+            },
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap();
 
     for stale in ["gone", "foreign", "another artifact of goetia's"] {
@@ -817,13 +838,13 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
         fake.install(&spec, false).unwrap();
         let snapshots: Vec<Artifact> = verbs
             .iter()
-            .map(|_| match Backend::read(&fake, &spec.id).unwrap() {
+            .map(|_| match Backend::read(&fake, &spec.common().id).unwrap() {
                 ReadOutcome::Marked(snapshot) => snapshot,
                 _ => panic!("installed, so marked"),
             })
             .collect();
         match stale {
-            "gone" => ServiceManager::uninstall(&fake, &spec.id).unwrap(),
+            "gone" => ServiceManager::uninstall(&fake, &spec.common().id).unwrap(),
             "foreign" => fake.seed_foreign("frpc", "someone else's\n"),
             _ => fake.seed_foreign("frpc", generate(&other)),
         }
@@ -842,15 +863,22 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
         }
 
         match stale {
-            "gone" => assert!(matches!(Backend::read(&fake, &spec.id), Ok(ReadOutcome::Absent))),
+            "gone" => assert!(matches!(
+                Backend::read(&fake, &spec.common().id),
+                Ok(ReadOutcome::Absent)
+            )),
             "foreign" => assert!(matches!(
-                Backend::read(&fake, &spec.id),
+                Backend::read(&fake, &spec.common().id),
                 Ok(ReadOutcome::Foreign { .. })
             )),
             _ => {
-                let status = fake.status(&spec.id).unwrap();
-                assert_eq!(status.state, State::Stopped, "no verb acted on what replaced it");
-                assert!(!status.enabled, "no verb acted on what replaced it");
+                let status = fake.status(&spec.common().id).unwrap();
+                assert_eq!(
+                    status.common().state,
+                    State::Stopped,
+                    "no verb acted on what replaced it"
+                );
+                assert!(!status.common().enabled, "no verb acted on what replaced it");
                 assert_eq!(fake.preview_install(&other).unwrap(), Outcome::UpToDate);
             }
         }

@@ -45,7 +45,7 @@ use super::interpolate::Substitution;
 use super::overrides::Supplied;
 use super::resolve::{FieldValues, Refused, dir_join, directory_is_to_blame, invalid};
 use super::vars::is_valid_name;
-use super::{AccountId, DaemonSpec, Id, Kind, Restart, User, Warning};
+use super::{AccountId, DaemonFields, Id, Protocol, Restart, User, Warning};
 use crate::error::Error;
 
 /// One of the three service-manager backends a `backend-specific:` entry
@@ -153,7 +153,7 @@ pub(crate) struct ShapedSpec {
     pub(crate) restart: Shaped<Restart>,
     pub(crate) restart_delay: Shaped<Duration>,
     pub(crate) logs: Option<PathBuf>,
-    pub(crate) kind: Shaped<Kind>,
+    pub(crate) kind: Shaped<Protocol>,
 }
 
 // Advisories and rejections ===========================================================================================
@@ -245,12 +245,12 @@ impl BackendKind {
 // by the generator, which a `DaemonSpec` from a blob reaches without resolve. One predicate per rule,
 // measured on 242 and 255.
 
-/// The first value of `spec` that systemd cannot carry, the generator's check.
+/// The first value of `common` that systemd cannot carry, the generator's check.
 ///
 /// - `command[0]`, `cwd` and `logs`: see [`systemd_path_field_defect`].
 /// - Then the others: see [`systemd_value_defect`].
-pub(crate) fn systemd_defect(spec: &DaemonSpec) -> Option<String> {
-    let values = FieldValues::from(spec);
+pub(crate) fn systemd_defect(common: &DaemonFields) -> Option<String> {
+    let values = FieldValues::from(common);
     [Field::Command(0), Field::Cwd, Field::Logs]
         .iter()
         .find_map(|field| {
@@ -436,7 +436,7 @@ pub(crate) fn systemd_raw_value_defect(directive: &str, value: &str) -> Option<S
 /// the contract. An absent `type` defaults to `Simple`, which warns about
 /// nothing.
 fn warn_on_windows_divergences(spec: &ShapedSpec, out: &mut Vec<Warning>) {
-    if spec.kind.parsed() != Some(Kind::Managed) {
+    if spec.kind.parsed() != Some(Protocol::Native) {
         return;
     }
     if spec.cwd.is_some() || spec.logs.is_some() {

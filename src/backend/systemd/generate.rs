@@ -20,7 +20,7 @@
 use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Restart, systemd_defect, systemd_raw_value_defect};
+use crate::spec::{DaemonFields, DaemonSpec, Restart, systemd_defect, systemd_raw_value_defect};
 
 // Generation ==========================================================================================================
 
@@ -51,12 +51,13 @@ use crate::spec::{DaemonSpec, Restart, systemd_defect, systemd_raw_value_defect}
 /// silently" from "conflict, demand `--force`" apart, and it runs before either `desired` or
 /// `regenerated` is even compared.
 pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
-    refuse_unrepresentable(spec, id)?;
+    let DaemonSpec::Service(s) = spec;
+    refuse_unrepresentable(&s.common, id)?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
-    out.push_str(&format!("Description={}\n", raw_value(&spec.name)));
-    if spec.restart != Restart::Never {
+    out.push_str(&format!("Description={}\n", raw_value(&s.common.name)));
+    if s.restart != Restart::Never {
         // systemd's defaults (`DefaultStartLimitIntervalSec=10s`,
         // `StartLimitBurst=5`) put a unit permanently into `failed` after
         // five restarts in ten seconds: `restart: always` would mean
@@ -68,19 +69,19 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
 
     out.push_str("[Service]\n");
     out.push_str("Type=exec\n");
-    out.push_str(&format!("ExecStart={}\n", render_exec_start(&spec.command)));
-    if let Some(cwd) = &spec.cwd {
+    out.push_str(&format!("ExecStart={}\n", render_exec_start(&s.common.command)));
+    if let Some(cwd) = &s.common.cwd {
         out.push_str(&format!("WorkingDirectory={}\n", raw_value(&cwd.display().to_string())));
     }
-    for (key, value) in &spec.env {
+    for (key, value) in &s.common.env {
         out.push_str(&format!("Environment={}\n", render_environment(key, value)));
     }
     out.push_str(&format!("User={}\n", raw_value(&id.user)));
-    out.push_str(&format!("Restart={}\n", render_restart(spec.restart)));
-    if let Some(delay) = spec.restart_delay {
+    out.push_str(&format!("Restart={}\n", render_restart(s.restart)));
+    if let Some(delay) = s.restart_delay {
         out.push_str(&format!("RestartSec={}\n", delay.as_secs_f64()));
     }
-    if let Some(logs) = &spec.logs {
+    if let Some(logs) = &s.common.logs {
         let target = format!("append:{}", raw_value(&logs.display().to_string()));
         out.push_str(&format!("StandardOutput={target}\n"));
         out.push_str(&format!("StandardError={target}\n"));
@@ -104,11 +105,11 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
 /// with its measurement, and which `resolve` runs too, since a `DaemonSpec` can come from a blob that
 /// never passed it) and the `User=` identity. The list is what is refused, not everything systemd
 /// cannot carry.
-fn refuse_unrepresentable(spec: &DaemonSpec, id: &Identity) -> Result<(), Error> {
-    let defect = systemd_defect(spec).or_else(|| systemd_raw_value_defect("User=", &id.user));
+fn refuse_unrepresentable(common: &DaemonFields, id: &Identity) -> Result<(), Error> {
+    let defect = systemd_defect(common).or_else(|| systemd_raw_value_defect("User=", &id.user));
     match defect {
         Some(message) => Err(Error::Invalid {
-            daemon: spec.id.to_string(),
+            daemon: common.id.to_string(),
             message,
             source: None,
         }),
@@ -134,7 +135,7 @@ fn render_restart(restart: Restart) -> &'static str {
 /// or wherever an unquoted word would take on a meaning of its own: a bare `;` (systemd's
 /// command-line separator).
 ///
-/// `command[0]` is an absolute path (`DaemonSpec::new`), so it never starts with a command-prefix
+/// `command[0]` is an absolute path (`ServiceSpec::new`), so it never starts with a command-prefix
 /// character (`-@:+!`), which quoting would not make literal.
 ///
 /// Arguments are also dollar-doubled, since systemd substitutes `$FOO`/`${FOO}` and collapses
@@ -145,7 +146,7 @@ fn render_exec_start(command: &[String]) -> String {
     let (executable, arguments) = command.split_first().expect("a daemon has a command");
     debug_assert!(
         !executable.starts_with(COMMAND_PREFIXES),
-        "`command[0]` {executable:?} is not an absolute path, which `DaemonSpec::new` guarantees"
+        "`command[0]` {executable:?} is not an absolute path, which `ServiceSpec::new` guarantees"
     );
     let mut words = Vec::with_capacity(command.len() + 1);
     if executable.contains('$') {

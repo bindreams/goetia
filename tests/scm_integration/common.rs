@@ -1,6 +1,6 @@
 //! Shared `DaemonSpec` construction for the SCM integration tests.
 
-use goetia::spec::DaemonSpec;
+use goetia::spec::{DaemonSpec, ServiceSpec};
 use windows_service::service::ServiceAccess;
 use windows_service::service_manager::{ServiceManager as WinServiceManager, ServiceManagerAccess};
 
@@ -52,7 +52,9 @@ pub fn query_account_name(id: &str) -> Option<String> {
 /// listens (see `fixture.rs`'s `connect`), and no conformance scenario reads
 /// the report.
 pub fn conformance_mk(id: &str) -> DaemonSpec {
-    DaemonSpec::new(support::plain_fields(id, fixture_command(id, 1, 1, "plain"))).unwrap()
+    ServiceSpec::new(support::base_fields(id, fixture_command(id, 1, 1, "plain")))
+        .map(DaemonSpec::from)
+        .unwrap()
 }
 
 // Account SID lookup ==================================================================================================
