@@ -77,7 +77,9 @@ pub fn base_fields(id: &str, command: Vec<String>) -> ServiceFields {
 /// The fields of the service `spec`, to vary with struct-update syntax and check again with
 /// `ServiceSpec::new`.
 pub fn service_fields(spec: DaemonSpec) -> ServiceFields {
-    let DaemonSpec::Service(service) = spec;
+    let DaemonSpec::Service(service) = spec else {
+        panic!("`service_fields` is given a service: the test helpers build services");
+    };
     service.into_fields()
 }
 

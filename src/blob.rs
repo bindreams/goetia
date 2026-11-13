@@ -12,7 +12,7 @@
 //!   `encode` therefore serializes through an explicit key-sorting pass
 //!   (`canonicalize`) rather than relying on any particular JSON map's
 //!   default iteration order — that would only be *incidentally* sorted,
-//!   not canonically so — and a dedicated `WireSpec`/`WireEnvelope` pair
+//!   not canonically so — and a dedicated `WireService`/`WireTask`/`WireEnvelope` set
 //!   with `#[serde(rename = ...)]` on every field keeps the wire names
 //!   stable even when `DaemonSpec`'s Rust field names change.
 //! - **Version, distinct from schema.** `SCHEMA` changes only when the
@@ -21,7 +21,7 @@
 //!   by one byte reports the installed service as stale-and-regeneratable
 //!   (see `decide::Outcome::Stale`) rather than as a user hand-edit.
 //!
-//! `decode` builds the `DaemonSpec` through `ServiceSpec::new`, so the deserialized
+//! `decode` builds the `DaemonSpec` through `ServiceSpec::new` or `TaskSpec::new`, so the deserialized
 //! content passes every field rule: a tampered or bit-rotted artifact can
 //! carry structurally valid JSON that violates them.
 
@@ -31,11 +31,15 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::spec::{AccountId, DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
+use crate::spec::{
+    AccountId, CronField, DaemonFields, DaemonSpec, Id, Protocol, Restart, Schedule, ServiceFields, ServiceSpec,
+    TaskFields, TaskSpec, User,
+};
 
 // Constants ===========================================================================================================
 
@@ -110,7 +114,7 @@ fn canonical_json(schema: u32, version: &str, spec: &DaemonSpec) -> String {
     let envelope = WireEnvelope {
         schema,
         version: version.to_string(),
-        spec: WireSpec::from(spec),
+        spec: WireDaemon::from(spec),
     };
     let value = serde_json::to_value(&envelope).expect("WireEnvelope's Serialize impl cannot fail");
     serde_json::to_string(&canonicalize(value)).expect("a canonicalized Value's Serialize impl cannot fail")
@@ -146,13 +150,100 @@ struct WireEnvelope {
     #[serde(rename = "schema")]
     schema: u32,
     #[serde(rename = "spec")]
-    spec: WireSpec,
+    spec: WireDaemon,
     #[serde(rename = "version")]
     version: String,
 }
 
+/// The spec object of either kind. A task's carries a `type` member and a service's never does (a
+/// service's own `kind` is its protocol), so the member's presence picks the struct, and each struct
+/// refuses the other's members.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum WireDaemon {
+    Service(WireService),
+    Task(WireTask),
+}
+
+impl<'de> Deserialize<'de> for WireDaemon {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let wire = if value.get("type").is_some() {
+            serde_json::from_value(value).map(WireDaemon::Task)
+        } else {
+            serde_json::from_value(value).map(WireDaemon::Service)
+        };
+        wire.map_err(D::Error::custom)
+    }
+}
+
+impl From<WireService> for WireDaemon {
+    fn from(service: WireService) -> Self {
+        WireDaemon::Service(service)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct WireSpec {
+#[serde(deny_unknown_fields)]
+struct WireTask {
+    #[serde(rename = "id")]
+    id: String,
+    #[serde(rename = "name")]
+    name: String,
+    #[serde(rename = "command")]
+    command: Vec<String>,
+    #[serde(rename = "cwd")]
+    cwd: Option<String>,
+    #[serde(rename = "env")]
+    env: BTreeMap<String, String>,
+    #[serde(rename = "user")]
+    user: WireUser,
+    #[serde(rename = "logs")]
+    logs: Option<String>,
+    #[serde(rename = "type")]
+    kind: WireTaskType,
+    #[serde(rename = "schedule")]
+    schedule: Option<WireSchedule>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum WireTaskType {
+    #[serde(rename = "task")]
+    Task,
+}
+
+/// A schedule's text and its five resolved fields. The day rule is not stored: it follows from the
+/// fields' `restricted` flags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireSchedule {
+    #[serde(rename = "text")]
+    text: String,
+    #[serde(rename = "minute")]
+    minute: WireCronField,
+    #[serde(rename = "hour")]
+    hour: WireCronField,
+    #[serde(rename = "day_of_month")]
+    day_of_month: WireCronField,
+    #[serde(rename = "month")]
+    month: WireCronField,
+    #[serde(rename = "day_of_week")]
+    day_of_week: WireCronField,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireCronField {
+    /// Sorted.
+    #[serde(rename = "values")]
+    values: Vec<u8>,
+    #[serde(rename = "restricted")]
+    restricted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireService {
     #[serde(rename = "id")]
     id: String,
     #[serde(rename = "name")]
@@ -228,10 +319,66 @@ struct WireDuration {
 
 // DaemonSpec <-> wire =================================================================================================
 
-impl From<&DaemonSpec> for WireSpec {
+impl From<&DaemonSpec> for WireDaemon {
     fn from(spec: &DaemonSpec) -> Self {
-        let DaemonSpec::Service(s) = spec;
-        WireSpec {
+        match spec {
+            DaemonSpec::Service(service) => WireDaemon::Service(WireService::from(service)),
+            DaemonSpec::Task(task) => WireDaemon::Task(WireTask::from(task)),
+        }
+    }
+}
+
+impl From<&TaskSpec> for WireTask {
+    fn from(t: &TaskSpec) -> Self {
+        WireTask {
+            id: t.common.id.as_str().to_string(),
+            name: t.common.name.clone(),
+            command: t.common.command.clone(),
+            cwd: t.common.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            env: t.common.env.clone(),
+            user: WireUser::from(&t.common.user),
+            logs: t.common.logs.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            kind: WireTaskType::Task,
+            schedule: t.schedule.as_ref().map(WireSchedule::from),
+        }
+    }
+}
+
+impl From<&Schedule> for WireSchedule {
+    fn from(schedule: &Schedule) -> Self {
+        let [minute, hour, day_of_month, month, day_of_week] = schedule.fields().each_ref().map(WireCronField::from);
+        WireSchedule {
+            text: schedule.text().to_owned(),
+            minute,
+            hour,
+            day_of_month,
+            month,
+            day_of_week,
+        }
+    }
+}
+
+impl From<&CronField> for WireCronField {
+    fn from(field: &CronField) -> Self {
+        WireCronField {
+            values: field.values.iter().copied().collect(),
+            restricted: field.restricted,
+        }
+    }
+}
+
+impl From<WireCronField> for CronField {
+    fn from(field: WireCronField) -> Self {
+        CronField {
+            values: field.values.into_iter().collect(),
+            restricted: field.restricted,
+        }
+    }
+}
+
+impl From<&ServiceSpec> for WireService {
+    fn from(s: &ServiceSpec) -> Self {
+        WireService {
             id: s.common.id.as_str().to_string(),
             name: s.common.name.clone(),
             command: s.common.command.clone(),
@@ -279,17 +426,17 @@ impl From<Protocol> for WireKind {
     }
 }
 
-/// Rebuild a `DaemonSpec` from wire data. `ServiceSpec::new` re-runs every field rule — see the
-/// module doc comment for why a structurally valid `WireSpec` cannot be trusted as-is.
-fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
-    let id = Id::try_from(wire.id)?;
+/// Rebuild a `DaemonSpec` from wire data. `ServiceSpec::new` and `TaskSpec::new` re-run every field
+/// rule — see the module doc comment for why a structurally valid wire spec cannot be trusted as-is.
+fn daemon_spec_from_wire(wire: WireDaemon) -> Result<DaemonSpec, Error> {
+    match wire {
+        WireDaemon::Service(service) => service_from_wire(service).map(DaemonSpec::from),
+        WireDaemon::Task(task) => task_from_wire(task).map(DaemonSpec::from),
+    }
+}
 
-    let user = match wire.user {
-        WireUser::Root => User::Root,
-        WireUser::Name { name } => User::Name(name),
-        WireUser::Uid { uid } => User::Id(AccountId::Uid(uid)),
-        WireUser::Sid { sid } => User::Id(AccountId::Sid(sid)),
-    };
+fn service_from_wire(wire: WireService) -> Result<ServiceSpec, Error> {
+    let id = Id::try_from(wire.id)?;
 
     let restart = match wire.restart {
         WireRestart::Never => Restart::Never,
@@ -309,7 +456,7 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
             command: wire.command,
             cwd: wire.cwd.map(PathBuf::from),
             env: wire.env,
-            user,
+            user: wire.user.into(),
             logs: wire.logs.map(PathBuf::from),
         },
         restart,
@@ -320,7 +467,51 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
     if let Some(delay) = &wire.restart_delay {
         check_nanos(&spec.common.id, delay)?;
     }
-    Ok(spec.into())
+    Ok(spec)
+}
+
+/// The schedule is rebuilt before the field rules run, so a blob with both defects reports the
+/// schedule's.
+fn task_from_wire(wire: WireTask) -> Result<TaskSpec, Error> {
+    let id = Id::try_from(wire.id)?;
+    let schedule = wire
+        .schedule
+        .map(|schedule| {
+            let WireSchedule {
+                text,
+                minute,
+                hour,
+                day_of_month,
+                month,
+                day_of_week,
+            } = schedule;
+            let fields = [minute, hour, day_of_month, month, day_of_week].map(CronField::from);
+            Schedule::from_parts(&id, text, fields)
+        })
+        .transpose()?;
+    TaskSpec::new(TaskFields {
+        common: DaemonFields {
+            id,
+            name: wire.name,
+            command: wire.command,
+            cwd: wire.cwd.map(PathBuf::from),
+            env: wire.env,
+            user: wire.user.into(),
+            logs: wire.logs.map(PathBuf::from),
+        },
+        schedule,
+    })
+}
+
+impl From<WireUser> for User {
+    fn from(user: WireUser) -> Self {
+        match user {
+            WireUser::Root => User::Root,
+            WireUser::Name { name } => User::Name(name),
+            WireUser::Uid { uid } => User::Id(AccountId::Uid(uid)),
+            WireUser::Sid { sid } => User::Id(AccountId::Sid(sid)),
+        }
+    }
 }
 
 /// Saturates rather than panic on `nanos >= 1e9`; [`check_nanos`] refuses that value right after.

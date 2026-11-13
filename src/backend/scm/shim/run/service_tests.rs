@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
-use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
+use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec, TaskFields, TaskSpec};
 use crate::testing::{base_fields, service_fields};
 use cosca::Containment;
 use cosca::error::ChildFate;
@@ -1068,6 +1068,30 @@ fn a_spec_that_was_read_is_the_one_to_run() {
     let read = spec_read(ID, Ok(Some(blob))).expect("a read spec is run");
 
     assert_eq!(read.spec, spec());
+}
+
+/// A task's blob is refused before any daemon runs, so SCM does not restart it.
+#[skuld::test]
+fn service_mode_refuses_a_task_blob() {
+    let task = TaskSpec::new(TaskFields {
+        common: base_fields(ID, vec![POWERSHELL.to_string()]).common,
+        schedule: None,
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    let blob = crate::blob::Blob {
+        schema: crate::blob::SCHEMA,
+        version: crate::version().to_string(),
+        spec: task,
+    };
+
+    let stop = spec_read(ID, Ok(Some(blob))).expect_err("a task's blob is not run");
+
+    assert_eq!(stop.reported, Reported::Refused);
+    assert_eq!(
+        stop.message,
+        "this is a task's blob; the service host runs only services"
+    );
 }
 
 /// A read that did not complete says nothing about the record, so the shim fails restartably (SCM

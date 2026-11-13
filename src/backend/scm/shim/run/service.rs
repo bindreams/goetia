@@ -115,8 +115,8 @@ struct SpecStop {
     reported: Reported,
 }
 
-/// The shim refuses ([`Reported::Refused`]) only when the service is gone, has no goetia marker or
-/// has an undecodable spec; every other error is a restartable failure carrying the OS error the
+/// The shim refuses ([`Reported::Refused`]) only when the service is gone, has no goetia marker, has an
+/// undecodable spec or holds a task; every other error is a restartable failure carrying the OS error the
 /// read met, or `ERROR_INVALID_DATA`.
 fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob, SpecStop> {
     let refused = |message: String| SpecStop {
@@ -124,6 +124,11 @@ fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob,
         reported: Reported::Refused,
     };
     let e = match read {
+        Ok(Some(blob)) if matches!(blob.spec, DaemonSpec::Task(_)) => {
+            return Err(refused(
+                "this is a task's blob; the service host runs only services".to_string(),
+            ));
+        }
         Ok(Some(blob)) => return Ok(blob),
         Ok(None) => {
             return Err(refused(format!(
@@ -485,7 +490,9 @@ fn log_version_skew(log: &Log, id: &str, spec: &DaemonSpec, registered_by: &str,
 /// they existed (or by a version that set different ones) keeps running under this shim without
 /// restarts until `goetia daemon install` is run again.
 fn version_skew_notice(id: &str, spec: &DaemonSpec, registered_by: &str, running: &str) -> Option<String> {
-    let DaemonSpec::Service(s) = spec;
+    let DaemonSpec::Service(s) = spec else {
+        return None;
+    };
     if registered_by == running || s.restart == Restart::Never {
         return None;
     }

@@ -75,7 +75,8 @@ pub enum DayRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
     text: String,
-    fields: [CronField; FIELD_COUNT],
+    // Boxed so a `DaemonSpec`, which embeds one, stays no larger than its variants need.
+    fields: Box<[CronField; FIELD_COUNT]>,
 }
 
 impl Schedule {
@@ -93,7 +94,7 @@ impl Schedule {
         });
         Ok(Schedule {
             text: text.to_owned(),
-            fields,
+            fields: Box::new(fields),
         })
     }
 
@@ -123,14 +124,16 @@ impl Schedule {
     /// values spaced by its step) inside it, and every value is some term's. Every value lies in
     /// the field's range and `restricted` is the text's. Anything else is [`Error::Invalid`] for
     /// `id`, naming the field.
-    #[cfg_attr(not(test), expect(dead_code, reason = "first read by the blob decoder"))]
     pub(crate) fn from_parts(id: &Id, text: String, fields: [CronField; FIELD_COUNT]) -> Result<Schedule, Error> {
         let structure = structure(&text).map_err(|message| invalid(id, &message))?;
         for ((kind, parsed), field) in KINDS.iter().zip(&structure).zip(&fields) {
             check(kind, parsed, field)
                 .map_err(|reason| invalid(id, &format!("schedule {} field: {reason}", kind.name)))?;
         }
-        Ok(Schedule { text, fields })
+        Ok(Schedule {
+            text,
+            fields: Box::new(fields),
+        })
     }
 }
 

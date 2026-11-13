@@ -38,6 +38,7 @@ fn sample_plist_restarting(id: &str, restart: Restart) -> String {
             user: "root".to_string(),
         },
     )
+    .unwrap()
 }
 
 // persist_new / write_existing ========================================================================================
@@ -2675,7 +2676,8 @@ fn install_loaded_after_write(name: &str, during: impl FnOnce() + Send + 'static
         &Identity {
             user: "root".to_string(),
         },
-    );
+    )
+    .unwrap();
     let script = Fake::new([answer("print", NOT_LOADED), answer("print", RUNNING).then(during)]);
     let mgr = launchd_over(script.clone());
     let e = mgr.install(&spec, false).expect_err("loaded after the write");

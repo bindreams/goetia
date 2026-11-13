@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use super::*;
 use crate::spec::test_support::{abs, program};
-use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
+use crate::spec::{
+    DaemonFields, DaemonSpec, HashSeed, Protocol, Restart, Schedule, ServiceFields, ServiceSpec, TaskFields, TaskSpec,
+};
 use crate::testing::{base_fields, service_fields};
 
 // The paths are absolute because `ServiceSpec::new` requires it; no assertion reads them, so their
@@ -116,6 +118,10 @@ fn render_yaml_uses_source_key_names() {
     );
     assert!(rendered.contains("type:"), "expected source key `type`: {rendered}");
     assert!(
+        rendered.contains("protocol:"),
+        "expected source key `protocol`: {rendered}"
+    );
+    assert!(
         !rendered.contains("restart_delay"),
         "should not leak the Rust field name `restart_delay`: {rendered}"
     );
@@ -123,6 +129,69 @@ fn render_yaml_uses_source_key_names() {
         !rendered.contains("kind:"),
         "should not leak the Rust field name `kind`: {rendered}"
     );
+}
+
+fn task_fixture(schedule: Option<&str>) -> DaemonSpec {
+    let base = base_fields("nightly", vec![program("backup")]);
+    let schedule = schedule.map(|text| {
+        let seed = HashSeed {
+            hostname: "build-host",
+            id: &base.common.id,
+        };
+        Schedule::parse(text, &seed).unwrap()
+    });
+    TaskSpec::new(TaskFields {
+        common: base.common,
+        schedule,
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+fn rendered_keys(spec: &DaemonSpec) -> yaml_serde::Mapping {
+    yaml_serde::from_str(&render_yaml(spec)).expect("render_yaml output should parse as YAML")
+}
+
+#[skuld::test]
+fn a_service_renders_its_type_and_protocol() {
+    for (protocol, key) in [(Protocol::Plain, "plain"), (Protocol::Native, "native")] {
+        let mut fields = service_fields(spec_fixture());
+        fields.protocol = protocol;
+        let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
+
+        let keys = rendered_keys(&spec);
+
+        assert_eq!(keys["type"].as_str(), Some("service"));
+        assert_eq!(keys["protocol"].as_str(), Some(key));
+        assert!(!keys.contains_key("schedule"));
+    }
+}
+
+#[skuld::test]
+fn a_task_renders_its_type_and_schedule_and_no_service_keys() {
+    let keys = rendered_keys(&task_fixture(Some("30 3 * * *")));
+
+    assert_eq!(keys["type"].as_str(), Some("task"));
+    assert_eq!(keys["schedule"].as_str(), Some("30 3 * * *"));
+    for service_key in ["protocol", "restart", "restart-delay"] {
+        assert!(!keys.contains_key(service_key), "{service_key}");
+    }
+}
+
+#[skuld::test]
+fn a_task_without_a_schedule_renders_none() {
+    let keys = rendered_keys(&task_fixture(None));
+
+    assert_eq!(keys["type"].as_str(), Some("task"));
+    assert!(!keys.contains_key("schedule"));
+}
+
+#[skuld::test]
+fn spec_diff_shows_a_changed_schedule() {
+    let diff = spec_diff(&task_fixture(Some("30 3 * * *")), &task_fixture(Some("0 4 * * *")));
+
+    assert!(diff.contains("-schedule: 30 3 * * *"), "{diff}");
+    assert!(diff.contains("+schedule: 0 4 * * *"), "{diff}");
 }
 
 #[skuld::test]

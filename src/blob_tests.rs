@@ -4,6 +4,7 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::*;
+use crate::spec::HashSeed;
 use crate::spec::test_support::{abs, program};
 use crate::testing::service_fields;
 
@@ -75,8 +76,8 @@ fn golden_spec() -> DaemonSpec {
     .unwrap()
 }
 
-fn base_wire_spec() -> WireSpec {
-    WireSpec {
+fn base_wire_spec() -> WireService {
+    WireService {
         id: "frpc".to_string(),
         name: "frpc".to_string(),
         command: vec![program("frpc")],
@@ -119,6 +120,132 @@ fn encode_decode_round_trips() {
         let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
         let blob = decode(&encode(&spec)).expect("an encoded valid spec should decode");
         assert_eq!(blob.spec.common().user, user);
+    }
+}
+
+// Tasks ===============================================================================================================
+
+const GOLDEN_HOST: &str = "build-host";
+
+fn task_with(schedule: Option<&str>) -> DaemonSpec {
+    let id = Id::try_from("nightly").unwrap();
+    let schedule = schedule.map(|text| {
+        Schedule::parse(
+            text,
+            &HashSeed {
+                hostname: GOLDEN_HOST,
+                id: &id,
+            },
+        )
+        .unwrap()
+    });
+    TaskSpec::new(TaskFields {
+        common: DaemonFields {
+            id,
+            name: "Nightly".to_string(),
+            command: vec![program("backup")],
+            cwd: None,
+            env: BTreeMap::new(),
+            user: User::Root,
+            logs: None,
+        },
+        schedule,
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+/// `encoded` with its spec object edited by `edit`, and nothing else changed.
+fn tampered(encoded: &str, edit: impl FnOnce(&mut serde_json::Map<String, Value>)) -> String {
+    let mut value: Value = serde_json::from_slice(&BASE64.decode(encoded).unwrap()).unwrap();
+    edit(value["spec"].as_object_mut().unwrap());
+    BASE64.encode(serde_json::to_vec(&value).unwrap())
+}
+
+#[skuld::test]
+fn task_blob_golden() {
+    let program = serde_json::to_string(&program("backup")).unwrap();
+    let expected = format!(
+        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[3]}},"minute":{{"restricted":true,"values":[30]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"30 3 * * *"}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
+    );
+    let spec = task_with(Some("30 3 * * *"));
+
+    assert_eq!(encode_with_version(&spec, "0.1.0"), BASE64.encode(expected));
+    assert_eq!(decode(&encode(&spec)).unwrap().spec, spec);
+}
+
+#[skuld::test]
+fn task_blob_without_schedule_round_trips() {
+    let spec = task_with(None);
+    let blob = decode(&encode(&spec)).unwrap();
+
+    assert_eq!(blob.spec, spec);
+    let json: Value = serde_json::from_slice(&BASE64.decode(encode(&spec)).unwrap()).unwrap();
+    assert_eq!(json["spec"]["schedule"], Value::Null);
+}
+
+#[skuld::test]
+fn task_blob_with_restart_is_refused() {
+    let encoded = tampered(&encode(&task_with(None)), |spec| {
+        spec.insert("restart".to_string(), Value::from("never"));
+    });
+
+    let err = decode(&encoded).unwrap_err();
+
+    assert!(matches!(err, Error::Blob { .. }), "{err:?}");
+}
+
+#[skuld::test]
+fn service_blob_with_schedule_is_refused() {
+    let encoded = tampered(&encode(&minimal_spec()), |spec| {
+        spec.insert("schedule".to_string(), Value::Null);
+    });
+
+    let err = decode(&encoded).unwrap_err();
+
+    assert!(matches!(err, Error::Blob { .. }), "{err:?}");
+}
+
+#[skuld::test]
+fn blob_without_type_is_a_service() {
+    let program = serde_json::to_string(&program("frpc")).unwrap();
+    let json = format!(
+        r#"{{"schema":1,"spec":{{"command":[{program},"-c","frpc.toml"],"cwd":null,"env":{{"RUST_LOG":"info","URL":"http://x/a%20b"}},"id":"frpc","kind":"managed","logs":null,"name":"Frpc Tunnel","restart":"always","restart_delay":{{"nanos":500000000,"secs":2}},"user":{{"kind":"name","name":"svc-frpc"}}}},"version":"0.1.0"}}"#
+    );
+
+    let blob = decode(&BASE64.encode(json)).unwrap();
+
+    assert_eq!(blob.spec, golden_spec());
+    assert!(matches!(blob.spec, DaemonSpec::Service(_)));
+}
+
+#[skuld::test]
+fn a_task_blob_with_an_unknown_type_or_a_missing_field_is_refused() {
+    let unknown = tampered(&encode(&task_with(None)), |spec| {
+        spec.insert("type".to_string(), Value::from("job"));
+    });
+    let missing = tampered(&encode(&task_with(None)), |spec| {
+        spec.remove("command");
+    });
+
+    for encoded in [unknown, missing] {
+        let err = decode(&encoded).unwrap_err();
+        assert!(matches!(err, Error::Blob { .. }), "{err:?}");
+    }
+}
+
+#[skuld::test]
+fn a_task_blob_with_a_content_defect_is_invalid() {
+    let bad_field = tampered(&encode(&task_with(None)), |spec| {
+        spec.insert("command".to_string(), Value::Array(vec![]));
+    });
+    let bad_schedule = tampered(&encode(&task_with(Some("30 3 * * *"))), |spec| {
+        spec["schedule"]["minute"]["values"] = Value::from(vec![60]);
+    });
+
+    for encoded in [bad_field, bad_schedule] {
+        let err = decode(&encoded).unwrap_err();
+        assert!(matches!(err, Error::Invalid { .. }), "{err:?}");
     }
 }
 
@@ -196,7 +323,7 @@ fn decode_rejects_unknown_schema() {
     let envelope = WireEnvelope {
         schema: 2,
         version: "0.1.0".to_string(),
-        spec: base_wire_spec(),
+        spec: base_wire_spec().into(),
     };
     let err = decode(&encode_wire_envelope(&envelope)).expect_err("an unknown schema must be rejected");
     let message = err.to_string();
@@ -210,59 +337,59 @@ fn decode_rejects_unknown_schema() {
 #[skuld::test]
 #[allow(clippy::type_complexity)]
 fn decode_rejects_invariant_violations() {
-    let cases: Vec<(&str, Box<dyn Fn(&mut WireSpec)>, &str)> = vec![
+    let cases: Vec<(&str, Box<dyn Fn(&mut WireService)>, &str)> = vec![
         (
             "empty command",
-            Box::new(|s: &mut WireSpec| s.command = vec![]),
+            Box::new(|s: &mut WireService| s.command = vec![]),
             "command",
         ),
         (
             "relative command[0]",
-            Box::new(|s: &mut WireSpec| s.command = vec!["frpc".to_string()]),
+            Box::new(|s: &mut WireService| s.command = vec!["frpc".to_string()]),
             "command[0]",
         ),
         (
             "relative cwd",
-            Box::new(|s: &mut WireSpec| s.cwd = Some("relative/dir".to_string())),
+            Box::new(|s: &mut WireService| s.cwd = Some("relative/dir".to_string())),
             "cwd",
         ),
         (
             "relative logs",
-            Box::new(|s: &mut WireSpec| s.logs = Some("relative/logs".to_string())),
+            Box::new(|s: &mut WireService| s.logs = Some("relative/logs".to_string())),
             "logs",
         ),
         (
             "control character in name",
-            Box::new(|s: &mut WireSpec| s.name = "bad\u{1}name".to_string()),
+            Box::new(|s: &mut WireService| s.name = "bad\u{1}name".to_string()),
             "name",
         ),
         (
             "control character in a command argument",
-            Box::new(|s: &mut WireSpec| s.command = vec!["bad\u{1}arg".to_string()]),
+            Box::new(|s: &mut WireService| s.command = vec!["bad\u{1}arg".to_string()]),
             "command",
         ),
         (
             "invalid id pattern",
-            Box::new(|s: &mut WireSpec| s.id = "bad/id".to_string()),
+            Box::new(|s: &mut WireService| s.id = "bad/id".to_string()),
             "pattern",
         ),
         (
             "env key containing `=`",
-            Box::new(|s: &mut WireSpec| {
+            Box::new(|s: &mut WireService| {
                 s.env.insert("KEY=1".to_string(), "v".to_string());
             }),
             "=",
         ),
         (
             "control character in an env value",
-            Box::new(|s: &mut WireSpec| {
+            Box::new(|s: &mut WireService| {
                 s.env.insert("KEY".to_string(), "bad\u{1}value".to_string());
             }),
             "env",
         ),
         (
             "control character in user.name",
-            Box::new(|s: &mut WireSpec| {
+            Box::new(|s: &mut WireService| {
                 s.user = WireUser::Name {
                     name: "bad\u{1}name".to_string(),
                 }
@@ -271,7 +398,7 @@ fn decode_rejects_invariant_violations() {
         ),
         (
             "control character in user.id (sid)",
-            Box::new(|s: &mut WireSpec| {
+            Box::new(|s: &mut WireService| {
                 s.user = WireUser::Sid {
                     sid: "bad\u{1}sid".to_string(),
                 }
@@ -280,7 +407,7 @@ fn decode_rejects_invariant_violations() {
         ),
         (
             "restart_delay nanos out of range",
-            Box::new(|s: &mut WireSpec| {
+            Box::new(|s: &mut WireService| {
                 s.restart_delay = Some(WireDuration {
                     secs: 1,
                     nanos: 2_000_000_000,
@@ -290,7 +417,7 @@ fn decode_rejects_invariant_violations() {
         ),
         (
             "restart_delay that would overflow `Duration::new`",
-            Box::new(|s: &mut WireSpec| {
+            Box::new(|s: &mut WireService| {
                 s.restart_delay = Some(WireDuration {
                     secs: u64::MAX,
                     nanos: u32::MAX,
@@ -306,7 +433,7 @@ fn decode_rejects_invariant_violations() {
         let envelope = WireEnvelope {
             schema: SCHEMA,
             version: "0.1.0".to_string(),
-            spec: wire,
+            spec: wire.into(),
         };
         let err = decode(&encode_wire_envelope(&envelope)).unwrap_err();
         assert!(matches!(err, Error::Invalid { .. }), "case `{label}`: {err:?}");
@@ -331,7 +458,7 @@ name"
     let envelope = WireEnvelope {
         schema: SCHEMA,
         version: "0.1.0".to_string(),
-        spec: wire,
+        spec: wire.into(),
     };
     let message = decode(&encode_wire_envelope(&envelope)).unwrap_err().to_string();
     assert!(message.contains("field `name`"), "{message}");
@@ -348,7 +475,7 @@ fn decode_rejects_an_empty_user_name() {
     let envelope = WireEnvelope {
         schema: SCHEMA,
         version: "0.1.0".to_string(),
-        spec: wire,
+        spec: wire.into(),
     };
     let err = decode(&encode_wire_envelope(&envelope)).expect_err("an empty user.name must be rejected");
     let message = err.to_string();
@@ -367,7 +494,7 @@ fn decode_rejects_a_whitespace_only_user_name() {
     let envelope = WireEnvelope {
         schema: SCHEMA,
         version: "0.1.0".to_string(),
-        spec: wire,
+        spec: wire.into(),
     };
     let err = decode(&encode_wire_envelope(&envelope)).expect_err("a whitespace-only user.name must be rejected");
     let message = err.to_string();
@@ -382,7 +509,7 @@ fn decode_rejects_a_whitespace_only_user_id() {
     let envelope = WireEnvelope {
         schema: SCHEMA,
         version: "0.1.0".to_string(),
-        spec: wire,
+        spec: wire.into(),
     };
     let err = decode(&encode_wire_envelope(&envelope)).expect_err("a whitespace-only user.id must be rejected");
     let message = err.to_string();
@@ -397,7 +524,7 @@ fn decode_rejects_an_empty_command_executable() {
     let envelope = WireEnvelope {
         schema: SCHEMA,
         version: "0.1.0".to_string(),
-        spec: wire,
+        spec: wire.into(),
     };
     let err = decode(&encode_wire_envelope(&envelope)).expect_err("an empty command[0] must be rejected");
     let message = err.to_string();

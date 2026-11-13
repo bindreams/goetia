@@ -45,12 +45,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::backend::Identity;
 use crate::backend::scm::parameters::{Stray, field_named_utf16, is_string_type, type_name};
+use crate::backend::{Identity, cannot_run_tasks};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
-use crate::spec::{DaemonSpec, Id, Protocol, Restart, User, scm_restart_delay, windows_builtin};
+use crate::spec::{DaemonSpec, Id, Protocol, Restart, ServiceSpec, User, scm_restart_delay, windows_builtin};
 
 // Metadata field names ================================================================================================
 
@@ -155,17 +155,29 @@ pub fn registration(
     id: &Identity,
     host: &dyn Fn() -> Result<HostCommand, Error>,
 ) -> Result<ScmRegistration, Error> {
+    refuse_task(spec)?;
     let host = resolve_host(spec, host)?;
     build(spec, id, host.as_ref())
 }
 
-/// Whether `spec` runs under the shim host: a `Protocol::Plain` service, whose command is not what SCM
-/// launches. A `Protocol::Native` service is its own executable, with no host.
+/// The service in `spec`; a task is refused until the Windows service manager runs tasks. Asked
+/// before the host is, so a task never reaches the host's own failures.
+fn refuse_task(spec: &DaemonSpec) -> Result<&ServiceSpec, Error> {
+    match spec {
+        DaemonSpec::Service(service) => Ok(service),
+        DaemonSpec::Task(_) => Err(cannot_run_tasks("the Windows service manager", &spec.common().id)),
+    }
+}
+
+/// Whether `spec` runs under the shim host: a `Protocol::Plain` service or a task, whose command is not
+/// what SCM launches. A `Protocol::Native` service is its own executable, with no host.
 pub(crate) fn hosted(spec: &DaemonSpec) -> bool {
-    let DaemonSpec::Service(s) = spec;
-    match s.protocol {
-        Protocol::Plain => true,
-        Protocol::Native => false,
+    match spec {
+        DaemonSpec::Service(s) => match s.protocol {
+            Protocol::Plain => true,
+            Protocol::Native => false,
+        },
+        DaemonSpec::Task(_) => true,
     }
 }
 
@@ -184,7 +196,7 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
         hosted(spec),
         "a hosted spec's host is resolved before it is built, and only a hosted spec's"
     );
-    let DaemonSpec::Service(s) = spec;
+    let s = refuse_task(spec)?;
     // SCM applies `Environment` to the process it launches: the daemon for a native service, the shim
     // for a hosted one.
     let (executable, arguments, environment) = match host {
@@ -278,7 +290,7 @@ pub fn install_registration(
     id: &Identity,
     host: &dyn Fn() -> Result<HostCommand, Error>,
 ) -> Result<ScmRegistration, Error> {
-    let DaemonSpec::Service(s) = spec;
+    let s = refuse_task(spec)?;
     let host = resolve_host(spec, host)?;
     if let Some(host) = &host {
         refuse_unwritable_executable(&s.common.id, ExecutablePath::ServiceHost, &host.exe)?;

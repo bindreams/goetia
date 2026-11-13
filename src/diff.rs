@@ -12,8 +12,8 @@
 //!
 //! [`spec_diff`] instead compares two resolved specs, rendered through
 //! [`render_yaml`] as canonical key-sorted YAML using the same key names
-//! `goetia.yaml` uses — `restart-delay`, not `restart_delay`; `type`, not
-//! `kind` — because it also backs `goetia daemon show`, and someone who
+//! `goetia.yaml` uses — `restart-delay`, not `restart_delay`; `type` and
+//! `protocol`, not `kind` — because it also backs `goetia daemon show`, and someone who
 //! wrote YAML should be shown YAML they recognize.
 //!
 //! `DaemonSpec` deliberately does not derive `Serialize` — the metadata
@@ -49,30 +49,41 @@ pub fn spec_diff(was: &DaemonSpec, now: &DaemonSpec) -> String {
 /// names. Backs `goetia daemon show` and the `before`/`after` sides of
 /// [`spec_diff`].
 pub fn render_yaml(spec: &DaemonSpec) -> String {
-    let DaemonSpec::Service(s) = spec;
+    let common = spec.common();
     let mut fields: Vec<(&'static str, Value)> = vec![
         (
             "command",
-            Value::Sequence(s.common.command.iter().cloned().map(Value::from).collect()),
+            Value::Sequence(common.command.iter().cloned().map(Value::from).collect()),
         ),
-        ("env", Value::Mapping(env_value(&s.common.env))),
-        ("id", Value::from(s.common.id.as_str().to_owned())),
-        ("name", Value::from(s.common.name.clone())),
-        ("restart", Value::from(restart_key(s.restart))),
-        ("type", Value::from(kind_key(s.protocol))),
-        ("user", user_value(&s.common.user)),
+        ("env", Value::Mapping(env_value(&common.env))),
+        ("id", Value::from(common.id.as_str().to_owned())),
+        ("name", Value::from(common.name.clone())),
+        ("user", user_value(&common.user)),
     ];
-    if let Some(cwd) = &s.common.cwd {
+    if let Some(cwd) = &common.cwd {
         fields.push(("cwd", Value::from(cwd.display().to_string())));
     }
-    if let Some(logs) = &s.common.logs {
+    if let Some(logs) = &common.logs {
         fields.push(("logs", Value::from(logs.display().to_string())));
     }
-    if let Some(delay) = s.restart_delay {
-        fields.push((
-            "restart-delay",
-            Value::from(humantime::format_duration(delay).to_string()),
-        ));
+    match spec {
+        DaemonSpec::Service(s) => {
+            fields.push(("type", Value::from("service")));
+            fields.push(("protocol", Value::from(kind_key(s.protocol))));
+            fields.push(("restart", Value::from(restart_key(s.restart))));
+            if let Some(delay) = s.restart_delay {
+                fields.push((
+                    "restart-delay",
+                    Value::from(humantime::format_duration(delay).to_string()),
+                ));
+            }
+        }
+        DaemonSpec::Task(t) => {
+            fields.push(("type", Value::from("task")));
+            if let Some(schedule) = &t.schedule {
+                fields.push(("schedule", Value::from(schedule.text().to_owned())));
+            }
+        }
     }
 
     // Sorted explicitly rather than relying on incidental container
@@ -108,8 +119,8 @@ fn restart_key(restart: Restart) -> &'static str {
 
 fn kind_key(protocol: Protocol) -> &'static str {
     match protocol {
-        Protocol::Plain => "simple",
-        Protocol::Native => "managed",
+        Protocol::Plain => "plain",
+        Protocol::Native => "native",
     }
 }
 
