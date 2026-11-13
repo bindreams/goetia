@@ -909,12 +909,6 @@ impl<'a> From<&'a DaemonFields> for FieldValues<'a> {
     }
 }
 
-impl<'a> From<&'a DaemonSpec> for FieldValues<'a> {
-    fn from(spec: &'a DaemonSpec) -> Self {
-        FieldValues::from(spec.common())
-    }
-}
-
 impl<'a> From<&'a ShapedSpec> for FieldValues<'a> {
     fn from(spec: &'a ShapedSpec) -> Self {
         FieldValues {

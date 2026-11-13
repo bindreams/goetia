@@ -11,7 +11,7 @@ use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
-use crate::testing::{plain_fields, service_fields};
+use crate::testing::{native_fields, service_fields};
 use cosca::Containment;
 use cosca::error::ChildFate;
 use windows_sys::Win32::Foundation::{
@@ -54,7 +54,7 @@ fn spec() -> DaemonSpec {
         "Start-Sleep -Seconds 300",
     ];
     ServiceSpec::new({
-        let base = plain_fields(ID, command.map(str::to_string).to_vec());
+        let base = native_fields(ID, command.map(str::to_string).to_vec());
         ServiceFields {
             common: DaemonFields {
                 name: "goetia-shim launch test".to_string(),

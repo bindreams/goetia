@@ -14,7 +14,7 @@ use crate::manager::ServiceManager;
 use crate::shim::{CheckPermissions, HostCommand, SweepFailure};
 use crate::spec::{AccountId, DaemonFields, DaemonSpec, Restart, ServiceFields, ServiceSpec, User};
 use crate::testing::{FakeProvider, command};
-use crate::testing::{plain_fields, service_fields};
+use crate::testing::{native_fields, service_fields};
 use skuld::{EnvGuard, env};
 use windows_sys::Win32::System::Registry::REG_DWORD;
 
@@ -547,7 +547,7 @@ fn read_marker_sorts_parameters_into_foreign_and_marked() {
 fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
     ServiceSpec::new(ServiceFields {
         restart,
-        ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+        ..native_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -633,7 +633,7 @@ fn install_and_preview_install_refuse_restart_always() {
 fn simple_fields() -> ServiceFields {
     ServiceFields {
         protocol: Protocol::Plain,
-        ..plain_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
+        ..native_fields("frpc", vec![r"C:\bin\frpc.exe".to_string()])
     }
 }
 

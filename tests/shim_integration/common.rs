@@ -211,11 +211,11 @@ impl LogDir {
     }
 }
 
-/// [`support::plain_fields`] with `type: simple`, logging to a path in `logs` (a dir the test owns) rather
+/// [`support::native_fields`] with `type: simple`, logging to a path in `logs` (a dir the test owns) rather
 /// than the `%ProgramData%` default.
 pub fn simple_spec(id: &str, command: Vec<String>, logs: &LogDir) -> DaemonSpec {
     ServiceSpec::new({
-        let base = support::plain_fields(id, command);
+        let base = support::native_fields(id, command);
         ServiceFields {
             common: DaemonFields {
                 logs: Some(logs.path_for(id)),

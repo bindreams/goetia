@@ -15,7 +15,7 @@ use crate::backend::standby;
 use crate::backend::test_allowance;
 use crate::manager::ServiceManager;
 use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
-use crate::testing::{plain_fields, service_fields};
+use crate::testing::{native_fields, service_fields};
 
 use crate::testing::cleanup::{FileGuard, remove_or_warn};
 use crate::testing::groups::{Group, launchd_group};
@@ -28,7 +28,7 @@ fn sample_plist_restarting(id: &str, restart: Restart) -> String {
     let spec = ServiceSpec::new(ServiceFields {
         restart,
         protocol: Protocol::Plain,
-        ..plain_fields(id, vec!["/bin/true".to_string()])
+        ..native_fields(id, vec!["/bin/true".to_string()])
     })
     .map(DaemonSpec::from)
     .unwrap();
@@ -1495,7 +1495,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::Always,
         protocol: Protocol::Plain,
-        ..plain_fields(&name, vec!["/bin/sleep".to_string(), "300".to_string()])
+        ..native_fields(&name, vec!["/bin/sleep".to_string(), "300".to_string()])
     })
     .map(DaemonSpec::from)
     .unwrap();
@@ -2363,7 +2363,7 @@ fn a_changed_spec_is_refused_while_the_job_is_loaded(#[fixture(launchd_group)] _
 fn spec_named(name: &str) -> DaemonSpec {
     ServiceSpec::new(ServiceFields {
         protocol: Protocol::Plain,
-        ..plain_fields(name, vec!["/bin/sleep".to_string(), "300".to_string()])
+        ..native_fields(name, vec!["/bin/sleep".to_string(), "300".to_string()])
     })
     .map(DaemonSpec::from)
     .unwrap()

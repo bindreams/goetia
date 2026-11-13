@@ -1,9 +1,9 @@
 use super::test_support::{abs, non_utf8_absolute_path};
 use super::*;
-use crate::testing::plain_fields;
+use crate::testing::native_fields;
 
 fn fields() -> ServiceFields {
-    let base = plain_fields("frpc", vec![abs("bin/frpc").to_string_lossy().into_owned()]);
+    let base = native_fields("frpc", vec![abs("bin/frpc").to_string_lossy().into_owned()]);
     ServiceFields {
         common: DaemonFields {
             cwd: Some(abs("opt/frpc")),

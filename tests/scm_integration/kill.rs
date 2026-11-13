@@ -105,7 +105,7 @@ fn kill_with_the_privilege_disabled(user: User) {
     let exe = support::WorldReadableExe::new(&id);
     let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
     let spec = ServiceSpec::new({
-        let base = support::plain_fields(
+        let base = support::native_fields(
             &id,
             fixture_command_with_exe(&exe.path_str(), &id, started.port(), stopped.port(), "plain"),
         );

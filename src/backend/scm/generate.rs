@@ -159,17 +159,19 @@ pub fn registration(
     build(spec, id, host.as_ref())
 }
 
-/// The host `spec` is installed with: asked for once, and only for a `Protocol::Plain` service, the
-/// one kind that has a host.
+/// Whether `spec` runs under the shim host: a `Protocol::Plain` service, whose command is not what SCM
+/// launches. A `Protocol::Native` service is its own executable, with no host.
+pub(crate) fn hosted(spec: &DaemonSpec) -> bool {
+    let DaemonSpec::Service(s) = spec;
+    s.protocol == Protocol::Plain
+}
+
+/// The host `spec` is installed with: asked for once, and only for a [`hosted`] service.
 fn resolve_host(
     spec: &DaemonSpec,
     host: &dyn Fn() -> Result<HostCommand, Error>,
 ) -> Result<Option<HostCommand>, Error> {
-    let DaemonSpec::Service(s) = spec;
-    match s.protocol {
-        Protocol::Plain => host().map(Some),
-        Protocol::Native => Ok(None),
-    }
+    if hosted(spec) { host().map(Some) } else { Ok(None) }
 }
 
 /// [`registration`] for a `host` already resolved by [`resolve_host`].
@@ -186,7 +188,7 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
             let mut argv = s.common.command.iter();
             let executable = PathBuf::from(
                 argv.next()
-                    .expect("DaemonSpec::command is non-empty: spec::resolve rejects an empty command"),
+                    .expect("DaemonFields::command is non-empty: spec::resolve rejects an empty command"),
             );
             (executable, argv.cloned().collect())
         }

@@ -2,13 +2,13 @@ use super::*;
 use crate::spec::test_support::abs;
 use crate::spec::test_support::program;
 use crate::spec::{Builtin, DaemonFields, DaemonSpec, MAX_SC_ACTION_DELAY, ServiceFields, ServiceSpec};
-use crate::testing::{plain_fields, service_fields};
+use crate::testing::{native_fields, service_fields};
 
 // Fixtures ============================================================================================================
 
 fn managed_spec() -> DaemonSpec {
     ServiceSpec::new({
-        let base = plain_fields(
+        let base = native_fields(
             "frpc",
             vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
         );
@@ -28,7 +28,10 @@ fn managed_spec() -> DaemonSpec {
 
 fn simple_spec() -> DaemonSpec {
     ServiceSpec::new({
-        let base = plain_fields(
+        // The command is deliberately not named `frpc` (the id): `simple_kind_executable_is_shim`
+        // asserts `frpc-agent` is absent from `arguments`, which would pass vacuously if it equalled
+        // the id (always present as the shim's sole argument).
+        let base = native_fields(
             "frpc",
             vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
         );
@@ -883,7 +886,7 @@ fn registration_refuses_restart_always() {
 
 #[cfg(windows)]
 fn managed_with_executable(executable: &str) -> DaemonSpec {
-    ServiceSpec::new(plain_fields("frpc", vec![executable.to_string(), "arg".to_string()]))
+    ServiceSpec::new(native_fields("frpc", vec![executable.to_string(), "arg".to_string()]))
         .map(DaemonSpec::from)
         .unwrap()
 }

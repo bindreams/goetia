@@ -112,8 +112,7 @@ impl std::str::FromStr for Id {
 
 // DaemonSpec ==========================================================================================================
 
-/// The fields every kind of daemon has, before goetia checks them: plain data. It has no methods,
-/// so nothing reaches a [`ServiceSpec`] through `Deref` that is not a field.
+/// The fields every kind of daemon has, before goetia checks them: plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonFields {
     pub id: Id,
@@ -126,7 +125,7 @@ pub struct DaemonFields {
 }
 
 /// What a service is, before goetia checks it: plain data a consumer fills in and passes to
-/// [`ServiceSpec::new`].
+/// [`ServiceSpec::new`]. It has no methods, so `Deref` from a [`ServiceSpec`] exposes only fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceFields {
     pub common: DaemonFields,

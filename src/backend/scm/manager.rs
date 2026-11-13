@@ -301,8 +301,7 @@ impl Backend for Scm {
         desired: &ScmRegistration,
         _reservation: &mut (),
     ) -> Result<Option<InstallLock>> {
-        let DaemonSpec::Service(s) = spec;
-        if s.protocol != Protocol::Plain {
+        if !generate::hosted(spec) {
             return Ok(None);
         }
         let shim = self.provider()?;
@@ -1226,16 +1225,10 @@ impl<L> UninstallPlan<L> {
     }
 }
 
-/// Whether `spec` is `type: managed`: its command is the service itself, with no shim host.
-fn is_native(spec: &DaemonSpec) -> bool {
-    let DaemonSpec::Service(s) = spec;
-    s.protocol == Protocol::Native
-}
-
 /// Whether an uninstall takes the install lock: for a blob that is `type: simple` and for one that will
 /// not decode, whose service may run a shim whatever its image says.
 fn takes_install_lock(blob: std::result::Result<&Blob, &Arc<Error>>) -> bool {
-    !matches!(blob, Ok(blob) if is_native(&blob.spec))
+    !matches!(blob, Ok(blob) if !generate::hosted(&blob.spec))
 }
 
 /// `acquire` the lock if the blob says the service may run a shim, and only then read the service's
@@ -1318,7 +1311,7 @@ pub(super) fn shim_answer(
 ) -> ShimAnswer {
     match blob {
         Ok(blob) => ShimAnswer {
-            kind: if !is_native(&blob.spec) {
+            kind: if generate::hosted(&blob.spec) {
                 ShimKind::Shim
             } else {
                 ShimKind::NotShim

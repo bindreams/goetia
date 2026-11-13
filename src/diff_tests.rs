@@ -4,13 +4,13 @@ use std::time::Duration;
 use super::*;
 use crate::spec::test_support::{abs, program};
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
-use crate::testing::{plain_fields, service_fields};
+use crate::testing::{native_fields, service_fields};
 
 // The paths are absolute because `ServiceSpec::new` requires it; no assertion reads them, so their
 // platform spelling does not matter.
 fn spec_fixture() -> DaemonSpec {
     ServiceSpec::new({
-        let base = plain_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()]);
+        let base = native_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()]);
         ServiceFields {
             common: DaemonFields {
                 name: "FRP tunnel client".to_owned(),

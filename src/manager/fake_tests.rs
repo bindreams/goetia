@@ -5,7 +5,7 @@ use crate::manager::Budget;
 use crate::manager::conformance;
 use crate::spec::test_support::program;
 use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
-use crate::testing::{plain_fields, service_fields};
+use crate::testing::{native_fields, service_fields};
 
 // Fixtures ============================================================================================================
 
@@ -13,7 +13,7 @@ pub(crate) fn mk(id: &str) -> DaemonSpec {
     ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
         protocol: Protocol::Plain,
-        ..plain_fields(id, vec![program("daemon")])
+        ..native_fields(id, vec![program("daemon")])
     })
     .map(DaemonSpec::from)
     .unwrap()
