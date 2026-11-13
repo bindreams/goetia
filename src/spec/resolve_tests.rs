@@ -7,7 +7,7 @@ use super::*;
 use crate::spec::test_support::{HOST_BACKENDS, abs, program};
 use crate::spec::vars::Vars;
 use crate::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, interpolate};
-use crate::testing::{native_fields, service_fields};
+use crate::testing::{base_fields, service_fields};
 
 // `Path::new("/opt/rt").is_absolute()` is `false` on Windows, and
 // `PathBuf::from(r"C:\base").join("/opt/rt")` yields `C:/opt/rt` — so every
@@ -227,7 +227,7 @@ fn a_control_character_is_refused_when_building_a_daemon_spec_directly() {
     ];
     for (c, _) in CONTROL_CHARACTERS {
         for (field, set) in &rows {
-            let mut fields = native_fields("frpc", vec![program("frpc")]);
+            let mut fields = base_fields("frpc", vec![program("frpc")]);
             set(&mut fields, format!("a{c}b"));
             let err = ServiceSpec::new(fields)
                 .map(DaemonSpec::from)
@@ -794,7 +794,7 @@ fn a_drive_root_manifest_directory_joins_cleanly() {
 fn a_contract_violation_names_the_daemon_once() {
     let id = Id::try_from("frpc").unwrap();
     let cause = ServiceSpec::new({
-        let base = native_fields("frpc", vec![program("frpc")]);
+        let base = base_fields("frpc", vec![program("frpc")]);
         ServiceFields {
             common: DaemonFields {
                 name: "a\nb".to_string(),

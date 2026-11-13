@@ -2,11 +2,11 @@ use super::*;
 use crate::backend::Identity;
 use crate::spec::test_support::program;
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
-use crate::testing::{native_fields, service_fields};
+use crate::testing::{base_fields, service_fields};
 
 fn spec_fixture() -> DaemonSpec {
     ServiceSpec::new({
-        let base = native_fields("frpc", vec![program("frpc")]);
+        let base = base_fields("frpc", vec![program("frpc")]);
         ServiceFields {
             common: DaemonFields {
                 name: "FRP tunnel client".to_owned(),

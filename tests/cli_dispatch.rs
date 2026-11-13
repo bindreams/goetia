@@ -34,7 +34,7 @@ fn mk(id: &str) -> DaemonSpec {
     ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
         protocol: Protocol::Plain,
-        ..support::native_fields(
+        ..support::base_fields(
             id,
             vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
         )

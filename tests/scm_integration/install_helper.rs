@@ -39,7 +39,7 @@ pub fn run_if_requested() -> bool {
         None => User::Name(account),
     };
     let spec = ServiceSpec::new({
-        let base = support::native_fields(&id, common::fixture_command(&id, 1, 1, "plain"));
+        let base = support::base_fields(&id, common::fixture_command(&id, 1, 1, "plain"));
         ServiceFields {
             common: DaemonFields { user, ..base.common },
             ..base

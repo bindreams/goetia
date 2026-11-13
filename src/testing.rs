@@ -54,9 +54,9 @@ pub mod raw_registry;
 #[cfg(windows)]
 pub mod scratch;
 
-/// A root, `restart: never`, `type: managed` daemon named `id`; panics on an invalid `Id`.
+/// A root, `restart: never`, `type: managed` base daemon named `id`; panics on an invalid `Id`.
 /// Vary fields with struct-update syntax, then `ServiceSpec::new`.
-pub fn native_fields(id: &str, command: Vec<String>) -> ServiceFields {
+pub fn base_fields(id: &str, command: Vec<String>) -> ServiceFields {
     ServiceFields {
         common: DaemonFields {
             id: Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not a valid Id: {e}")),

@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::*;
 use crate::spec::test_support::program;
 use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
-use crate::testing::{native_fields, service_fields};
+use crate::testing::{base_fields, service_fields};
 
 // Fixtures ============================================================================================================
 //
@@ -43,7 +43,7 @@ fn full_identity() -> Identity {
 fn minimal_spec() -> DaemonSpec {
     ServiceSpec::new(ServiceFields {
         protocol: Protocol::Plain,
-        ..native_fields("frpc", vec![program("frpc")])
+        ..base_fields("frpc", vec![program("frpc")])
     })
     .map(DaemonSpec::from)
     .unwrap()

@@ -11,7 +11,7 @@ use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
 
 use crate::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec};
-use crate::testing::native_fields;
+use crate::testing::base_fields;
 use cosca::identity::Liveness;
 use cosca::{Process, Stdio};
 use skuld::temp_dir;
@@ -227,7 +227,7 @@ fn build_command_makes_a_job_contained_daemon_with_its_cwd_env_and_log(#[fixture
         "echo %CD%& echo %GOETIA_TEST_VAR%& echo to-stderr>&2",
     ];
     let spec = ServiceSpec::new({
-        let base = native_fields(ID, command.map(str::to_string).to_vec());
+        let base = base_fields(ID, command.map(str::to_string).to_vec());
         ServiceFields {
             common: DaemonFields {
                 cwd: Some(cwd.clone()),

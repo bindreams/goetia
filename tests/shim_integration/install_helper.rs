@@ -30,7 +30,7 @@ pub fn run_if_requested() -> bool {
         std::process::exit(2);
     };
     let spec = ServiceSpec::new({
-        let base = support::native_fields(id, fixture_command_with_exe(exe, "report", &[port]));
+        let base = support::base_fields(id, fixture_command_with_exe(exe, "report", &[port]));
         ServiceFields {
             common: DaemonFields {
                 user: User::Name(format!(r".\{account}")),

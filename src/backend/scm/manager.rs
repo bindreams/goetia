@@ -1228,7 +1228,7 @@ impl<L> UninstallPlan<L> {
 /// Whether an uninstall takes the install lock: for a blob that is `type: simple` and for one that will
 /// not decode, whose service may run a shim whatever its image says.
 fn takes_install_lock(blob: std::result::Result<&Blob, &Arc<Error>>) -> bool {
-    !matches!(blob, Ok(blob) if !generate::hosted(&blob.spec))
+    blob.map_or(true, |blob| generate::hosted(&blob.spec))
 }
 
 /// `acquire` the lock if the blob says the service may run a shim, and only then read the service's

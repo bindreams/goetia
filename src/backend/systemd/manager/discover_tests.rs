@@ -13,7 +13,7 @@
 use std::io;
 
 use super::*;
-use crate::testing::native_fields;
+use crate::testing::base_fields;
 
 /// `ENOTDIR`: a regular file where a directory component has to be. Not `NotFound`, not
 /// `PermissionDenied`, and identical for root and everyone else — which is what makes it the right
@@ -457,7 +457,7 @@ fn a_socket_swapped_in_is_classified_not_a_failed_read() {
 fn unit_text() -> String {
     let spec = crate::spec::ServiceSpec::new(crate::spec::ServiceFields {
         protocol: crate::spec::Protocol::Plain,
-        ..native_fields("x", vec!["/bin/true".to_string()])
+        ..base_fields("x", vec!["/bin/true".to_string()])
     })
     .map(crate::spec::DaemonSpec::from)
     .unwrap();

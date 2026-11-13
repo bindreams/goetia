@@ -37,7 +37,7 @@ pub(crate) fn mk(id: &str) -> DaemonSpec {
     ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
         protocol: Protocol::Plain,
-        ..support::native_fields(id, vec!["/bin/sleep".to_string(), "infinity".to_string()])
+        ..support::base_fields(id, vec!["/bin/sleep".to_string(), "infinity".to_string()])
     })
     .map(DaemonSpec::from)
     .unwrap()

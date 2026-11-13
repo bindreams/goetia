@@ -194,7 +194,7 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
         }
     };
 
-    if s.protocol == Protocol::Native {
+    if !hosted(spec) {
         refuse_unwritable_executable(s, &executable)?;
     }
 

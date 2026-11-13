@@ -4,7 +4,7 @@ use super::*;
 use crate::blob::{self, Blob};
 use crate::spec::test_support::{abs, program};
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
-use crate::testing::{native_fields, service_fields};
+use crate::testing::{base_fields, service_fields};
 
 // Fixtures ============================================================================================================
 
@@ -26,7 +26,7 @@ fn unclearable() -> ExternalConfig {
 // (see `diff_tests.rs`).
 fn spec_fixture() -> DaemonSpec {
     ServiceSpec::new({
-        let base = native_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()]);
+        let base = base_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()]);
         ServiceFields {
             common: DaemonFields {
                 name: "FRP tunnel client".to_owned(),

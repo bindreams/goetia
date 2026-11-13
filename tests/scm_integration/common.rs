@@ -52,7 +52,7 @@ pub fn query_account_name(id: &str) -> Option<String> {
 /// listens (see `fixture.rs`'s `connect`), and no conformance scenario reads
 /// the report.
 pub fn conformance_mk(id: &str) -> DaemonSpec {
-    ServiceSpec::new(support::native_fields(id, fixture_command(id, 1, 1, "plain")))
+    ServiceSpec::new(support::base_fields(id, fixture_command(id, 1, 1, "plain")))
         .map(DaemonSpec::from)
         .unwrap()
 }

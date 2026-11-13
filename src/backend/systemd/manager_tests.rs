@@ -20,7 +20,7 @@ use crate::backend::{bounded, standby};
 use crate::manager::ServiceManager as _;
 use crate::manager::conformance::fresh_id;
 use crate::spec::{DaemonSpec, Protocol, ServiceFields, ServiceSpec};
-use crate::testing::native_fields;
+use crate::testing::base_fields;
 
 use crate::testing::cleanup::{DirGuard, FileGuard, remove_or_warn};
 use crate::testing::groups::{Group, systemd_group};
@@ -83,7 +83,7 @@ impl Drop for StopRacer<'_> {
 fn mk(id: &str) -> DaemonSpec {
     ServiceSpec::new(ServiceFields {
         protocol: Protocol::Plain,
-        ..native_fields(id, vec!["/bin/true".to_string()])
+        ..base_fields(id, vec!["/bin/true".to_string()])
     })
     .map(DaemonSpec::from)
     .unwrap()

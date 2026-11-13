@@ -27,7 +27,7 @@ pub(crate) const SHIM_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177
 #[cfg(windows)]
 pub(crate) fn blob_of(protocol: crate::spec::Protocol) -> crate::blob::Blob {
     use crate::spec::{DaemonSpec, ServiceFields, ServiceSpec};
-    use crate::testing::native_fields;
+    use crate::testing::base_fields;
 
     crate::blob::Blob {
         schema: 1,
@@ -35,7 +35,7 @@ pub(crate) fn blob_of(protocol: crate::spec::Protocol) -> crate::blob::Blob {
         spec: DaemonSpec::from(
             ServiceSpec::new(ServiceFields {
                 protocol,
-                ..native_fields("frpc", vec![crate::spec::test_support::program("frpc")])
+                ..base_fields("frpc", vec![crate::spec::test_support::program("frpc")])
             })
             .unwrap(),
         ),

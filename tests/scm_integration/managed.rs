@@ -55,8 +55,8 @@ fn id_of(s: &str) -> Id {
 }
 
 /// A fresh, installed `type: managed` service at `id`, with no ports wired up.
-fn install_plain(mgr: &Scm, id: &str) -> DaemonSpec {
-    let spec = ServiceSpec::new(support::native_fields(id, fixture_command(id, 1, 1, "plain")))
+fn install_native(mgr: &Scm, id: &str) -> DaemonSpec {
+    let spec = ServiceSpec::new(support::base_fields(id, fixture_command(id, 1, 1, "plain")))
         .map(DaemonSpec::from)
         .unwrap();
     mgr.install(&spec, false).expect("install");
@@ -126,7 +126,7 @@ fn install_then_list_round_trips_without_the_source_file(#[fixture(scm_group)] _
     let mut env = BTreeMap::new();
     env.insert("GOETIA_TEST_KEY".to_string(), "value".to_string());
     let spec = ServiceSpec::new({
-        let base = support::native_fields(&id, fixture_command(&id, 1, 1, "plain"));
+        let base = support::base_fields(&id, fixture_command(&id, 1, 1, "plain"));
         ServiceFields {
             common: DaemonFields { env, ..base.common },
             ..base
@@ -164,7 +164,7 @@ fn a_differently_cased_id_is_refused_and_leaves_the_service_unchanged(#[fixture(
     let upper = id.to_uppercase();
     let _guard = ServiceGuard::new(&id);
     let _upper_guard = ServiceGuard::new(&upper);
-    let installed = install_plain(&mgr, &id);
+    let installed = install_native(&mgr, &id);
 
     let requested = ServiceSpec::new({
         let base = service_fields(installed.clone());
@@ -211,7 +211,7 @@ fn an_update_keeps_the_start_type_enable_set(#[fixture(scm_group)] _group: &Grou
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let command = fixture_command(&id, 1, 1, "plain");
-    let spec = ServiceSpec::new(support::native_fields(&id, command.clone()))
+    let spec = ServiceSpec::new(support::base_fields(&id, command.clone()))
         .map(DaemonSpec::from)
         .unwrap();
     mgr.install(&spec, false).expect("install");
@@ -224,7 +224,7 @@ fn an_update_keeps_the_start_type_enable_set(#[fixture(scm_group)] _group: &Grou
     );
 
     let changed = ServiceSpec::new({
-        let base = support::native_fields(&id, command);
+        let base = support::base_fields(&id, command);
         ServiceFields {
             common: DaemonFields {
                 env: BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]),
@@ -252,7 +252,7 @@ fn sc_config_binpath_change_is_detected_as_conflict(#[fixture(scm_group)] _group
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = ServiceSpec::new(support::native_fields(&id, fixture_command(&id, 1, 1, "plain")))
+    let spec = ServiceSpec::new(support::base_fields(&id, fixture_command(&id, 1, 1, "plain")))
         .map(DaemonSpec::from)
         .unwrap();
     mgr.install(&spec, false).expect("install");
@@ -281,7 +281,7 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
     let stopped = ConnectBack::listen();
-    let spec = ServiceSpec::new(support::native_fields(
+    let spec = ServiceSpec::new(support::base_fields(
         &id,
         fixture_command(&id, started.port(), stopped.port(), "plain"),
     ))
@@ -312,7 +312,7 @@ fn reporting(id: &str, restart: Restart, started: &ConnectBack, stopped: &Connec
     ServiceSpec::new(ServiceFields {
         restart,
         restart_delay: Some(Duration::from_secs(1)),
-        ..support::native_fields(id, fixture_command(id, started.port(), stopped.port(), "plain"))
+        ..support::base_fields(id, fixture_command(id, started.port(), stopped.port(), "plain"))
     })
     .map(DaemonSpec::from)
     .unwrap()
@@ -400,7 +400,7 @@ fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = ServiceSpec::new(support::native_fields(&id, fixture_command(&id, 1, 1, "plain")))
+    let spec = ServiceSpec::new(support::base_fields(&id, fixture_command(&id, 1, 1, "plain")))
         .map(DaemonSpec::from)
         .unwrap();
     mgr.install(&spec, false).expect("install");
@@ -440,7 +440,7 @@ fn uninstall_then_immediate_reinstall_succeeds(#[fixture(scm_group)] _group: &Gr
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
     let stopped = ConnectBack::listen();
-    let spec = ServiceSpec::new(support::native_fields(
+    let spec = ServiceSpec::new(support::base_fields(
         &id,
         fixture_command(&id, started.port(), stopped.port(), "plain"),
     ))
@@ -473,7 +473,7 @@ fn uninstall_errors_when_service_will_not_stop(#[fixture(scm_group)] _group: &Gr
     // `controls_accepted`, so the service reads RUNNING without accepting
     // STOP, and `uninstall` fails at once (a state it can see), not on a
     // wait that has to time out (this project forbids time-based sync).
-    let spec = ServiceSpec::new(support::native_fields(
+    let spec = ServiceSpec::new(support::base_fields(
         &id,
         fixture_command(&id, started.port(), 1, "refuse-stop"),
     ))
@@ -533,7 +533,7 @@ fn stop_of_a_service_that_accepts_no_stop_says_so_without_waiting(#[fixture(scm_
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let started = ConnectBack::listen();
-    let spec = ServiceSpec::new(support::native_fields(
+    let spec = ServiceSpec::new(support::base_fields(
         &id,
         fixture_command(&id, started.port(), 1, "refuse-stop"),
     ))
@@ -567,7 +567,7 @@ fn interrupted_install_is_recoverable(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let spec = ServiceSpec::new(support::native_fields(&id, fixture_command(&id, 1, 1, "plain")))
+    let spec = ServiceSpec::new(support::base_fields(&id, fixture_command(&id, 1, 1, "plain")))
         .map(DaemonSpec::from)
         .unwrap();
 
@@ -618,7 +618,7 @@ fn managed_kind_environment_availability(#[fixture(scm_group)] _group: &Group) {
     let mut env = BTreeMap::new();
     env.insert(VAR.to_string(), VALUE.to_string());
     let spec = ServiceSpec::new({
-        let base = support::native_fields(&id, fixture_command(&id, started.port(), 1, &format!("env:{VAR}")));
+        let base = support::base_fields(&id, fixture_command(&id, started.port(), 1, &format!("env:{VAR}")));
         ServiceFields {
             common: DaemonFields { env, ..base.common },
             ..base
@@ -680,7 +680,7 @@ const INSTALLED_ENVIRONMENT: &str = "GOETIA_TEST_KEY=value";
 fn install_with_environment(mgr: &Scm, id: &str) -> DaemonSpec {
     let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
     let spec = ServiceSpec::new({
-        let base = support::native_fields(id, fixture_command(id, 1, 1, "plain"));
+        let base = support::base_fields(id, fixture_command(id, 1, 1, "plain"));
         ServiceFields {
             common: DaemonFields { env, ..base.common },
             ..base
@@ -732,7 +732,7 @@ fn reset_failure_actions_are_a_conflict(#[fixture(scm_group)] _group: &Group) {
     let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
         restart_delay: Some(Duration::from_secs(3)),
-        ..support::native_fields(&id, fixture_command(&id, 1, 1, "plain"))
+        ..support::base_fields(&id, fixture_command(&id, 1, 1, "plain"))
     })
     .map(DaemonSpec::from)
     .unwrap();
@@ -797,7 +797,7 @@ fn install_twice_is_up_to_date_for_both_kinds(#[fixture(scm_group)] _group: &Gro
         let _guard = ServiceGuard::new(&id);
         let env = BTreeMap::from([("GOETIA_TEST_KEY".to_string(), "value".to_string())]);
         let spec = ServiceSpec::new({
-            let base = support::native_fields(&id, fixture_command(&id, 1, 1, "plain"));
+            let base = support::base_fields(&id, fixture_command(&id, 1, 1, "plain"));
             ServiceFields {
                 common: DaemonFields { env, ..base.common },
                 protocol: kind,
@@ -828,7 +828,7 @@ fn force_install_removes_strays_from_parameters_and_keeps_the_service_ours(#[fix
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
 
     let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
     let marker: String = parameters.get_value("Marker").expect("read Marker");
@@ -865,7 +865,7 @@ fn a_stray_subkey_or_non_string_value_alone_is_a_conflict_that_force_removes(#[f
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
 
     let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
     let (subkey, _) = parameters.create_subkey("Sub").expect("create Sub");
@@ -899,7 +899,7 @@ fn force_install_deletes_a_stray_registry_link_and_leaves_its_target(#[fixture(s
     // Declared first, so that it is removed last.
     let target = ScratchKey::new(&format!("link-target-{id}"));
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
     let target_key = target.create();
     target_key.set_value("Keep", &"x").expect("write Keep");
     target_key.create_subkey("Child").expect("create Child");
@@ -931,7 +931,7 @@ fn a_parameters_that_is_a_link_to_goetias_values_is_foreign_and_install_leaves_t
     // Declared first, so that it is removed last.
     let target = ScratchKey::new(&format!("link-target-{id}"));
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
     let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
 
     // The target holds goetia's four values, copied from the installed `Parameters`, and a `Keep`.
@@ -1001,7 +1001,7 @@ fn force_install_removes_a_stray_subkey_holding_a_child_whose_name_has_a_nul(#[f
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
     let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
     let (sub, _) = parameters.create_subkey("Sub").expect("create Sub");
     let nul_named: Vec<u16> = "a\0b".encode_utf16().collect();
@@ -1027,7 +1027,7 @@ fn force_install_removes_strays_that_winreg_cannot_enumerate(#[fixture(scm_group
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
     let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
     let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
     // UTF-16LE with the closing NUL, as a string value is stored.
@@ -1077,7 +1077,7 @@ fn force_install_removes_a_stray_whose_name_holds_a_nul_and_keeps_marker(#[fixtu
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
     let parameters = parameters_key(&id, KEY_READ | KEY_WRITE);
     let marker: String = parameters.get_value("Marker").expect("read Marker");
     let units: Vec<u16> = "Marker\0x".encode_utf16().collect();
@@ -1107,7 +1107,7 @@ fn force_install_rewrites_parameters_in_place_so_a_handle_held_across_it_still_r
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
     let held = parameters_key(&id, KEY_READ | KEY_WRITE);
     held.set_value("Stray", &"x").expect("write Stray");
 
@@ -1193,7 +1193,7 @@ fn a_well_known_sid_resolves_without_a_name_lookup(#[fixture(scm_group)] _group:
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = ServiceSpec::new({
-        let base = support::native_fields(&id, fixture_command(&id, 1, 1, "plain"));
+        let base = support::base_fields(&id, fixture_command(&id, 1, 1, "plain"));
         ServiceFields {
             common: DaemonFields {
                 user: User::Id(AccountId::Sid("S-1-5-19".to_string())),
@@ -1222,7 +1222,7 @@ fn local_service_account_installs_and_round_trips(#[fixture(scm_group)] _group: 
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let spec = ServiceSpec::new({
-        let base = support::native_fields(&id, fixture_command(&id, 1, 1, "plain"));
+        let base = support::base_fields(&id, fixture_command(&id, 1, 1, "plain"));
         ServiceFields {
             common: DaemonFields {
                 user: User::Name("LocalService".to_string()),
@@ -1261,7 +1261,7 @@ fn a_local_service_daemon_actually_runs(#[fixture(scm_group)] _group: &Group) {
     let started = ConnectBack::listen();
     let stopped = ConnectBack::listen();
     let spec = ServiceSpec::new({
-        let base = support::native_fields(
+        let base = support::base_fields(
             &id,
             common::fixture_command_with_exe(&exe.path_str(), &id, started.port(), stopped.port(), "plain"),
         );
@@ -1299,7 +1299,7 @@ fn local_system_by_name_installs_like_root(#[fixture(scm_group)] _group: &Group)
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let by_name = ServiceSpec::new({
-        let base = support::native_fields(&id, fixture_command(&id, 1, 1, "plain"));
+        let base = support::base_fields(&id, fixture_command(&id, 1, 1, "plain"));
         ServiceFields {
             common: DaemonFields {
                 user: User::Name("LocalSystem".to_string()),
@@ -1322,12 +1322,9 @@ fn local_system_by_name_installs_like_root(#[fixture(scm_group)] _group: &Group)
     // account `User::Root` produces.
     let root_id = support::random_test_id();
     let _root_guard = ServiceGuard::new(&root_id);
-    let by_root = ServiceSpec::new(support::native_fields(
-        &root_id,
-        fixture_command(&root_id, 1, 1, "plain"),
-    ))
-    .map(DaemonSpec::from)
-    .unwrap();
+    let by_root = ServiceSpec::new(support::base_fields(&root_id, fixture_command(&root_id, 1, 1, "plain")))
+        .map(DaemonSpec::from)
+        .unwrap();
     mgr.install(&by_root, false).expect("install as User::Root");
 
     let by_name_account = common::query_account_name(&id);
@@ -1425,7 +1422,7 @@ fn a_failed_precondition_leaves_an_installed_service_unchanged(#[fixture(scm_gro
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
     let account_before = common::query_account_name(&id);
 
     let account = missing_account();
@@ -1452,7 +1449,7 @@ fn restart_on_failure_round_trips_failure_actions(#[fixture(scm_group)] _group: 
     let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
         restart_delay: Some(Duration::from_secs(3)),
-        ..support::native_fields(&id, fixture_command(&id, 1, 1, "plain"))
+        ..support::base_fields(&id, fixture_command(&id, 1, 1, "plain"))
     })
     .map(DaemonSpec::from)
     .unwrap();
@@ -1547,7 +1544,7 @@ fn install_refuses_an_always_blob_as_unusable(#[fixture(scm_group)] _group: &Gro
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, &id);
+    let spec = install_native(&mgr, &id);
 
     let always = ServiceSpec::new(ServiceFields {
         restart: Restart::Always,
@@ -1588,7 +1585,7 @@ fn an_elevated_list_leaves_nothing_undetermined(#[fixture(scm_group)] _group: &G
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    install_plain(&mgr, guard.id());
+    install_native(&mgr, guard.id());
 
     let listed = mgr.list().expect("list");
 
@@ -1620,7 +1617,7 @@ fn status_of_a_service_whose_parameters_deny_reading_is_undetermined(#[fixture(s
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, guard.id());
+    let spec = install_native(&mgr, guard.id());
     mgr.status(&spec.common().id)
         .expect("status before the denial: the marker reads back fine");
 
@@ -1674,7 +1671,7 @@ fn list_reads_a_service_whose_own_key_denies_the_reader_as_standing(#[fixture(sc
                 create_parameters_key(&id);
             }
             Seed::Goetias => {
-                install_plain(&mgr, guard.id());
+                install_native(&mgr, guard.id());
             }
         }
 
@@ -1730,7 +1727,7 @@ fn list_reports_a_denied_parameters_read_with_the_cause_it_established(#[fixture
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    install_plain(&mgr, guard.id());
+    install_native(&mgr, guard.id());
 
     // Non-vacuity: before the denial this service is one of goetia's own, decoded and listed.
     assert!(
@@ -1922,7 +1919,7 @@ fn status_of_a_service_whose_object_denies_querying_is_undetermined(#[fixture(sc
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, guard.id());
+    let spec = install_native(&mgr, guard.id());
 
     let _denied = Denied::service_query(&id);
 
@@ -1966,7 +1963,7 @@ fn enable_and_disable_of_a_service_that_denies_changing_its_config_fail_as_the_v
     let mgr = Scm::new();
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
-    let spec = install_plain(&mgr, guard.id());
+    let spec = install_native(&mgr, guard.id());
 
     let _denied = Denied::service_change_config(&id);
 
@@ -2028,7 +2025,7 @@ fn uninstall_of_a_service_that_denies_a_step_fails_as_the_verb_and_leaves_it_ins
         let mgr = Scm::new();
         let id = support::random_test_id();
         let guard = ServiceGuard::new(&id);
-        let spec = install_plain(&mgr, guard.id());
+        let spec = install_native(&mgr, guard.id());
 
         let _denied = deny(&id);
 

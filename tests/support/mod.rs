@@ -36,7 +36,7 @@ pub use connect_back::ConnectBack;
 pub use goetia::testing::groups::{Group, launchd_group, scm_group, systemd_group};
 #[cfg(windows)]
 pub use goetia::testing::wide_null;
-pub use goetia::testing::{cleanup, native_fields};
+pub use goetia::testing::{base_fields, cleanup};
 #[cfg(windows)]
 pub use goetia::testing::{
     raw_registry,
