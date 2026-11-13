@@ -54,7 +54,8 @@ pub mod raw_registry;
 #[cfg(windows)]
 pub mod scratch;
 
-/// A root, `restart: never`, `type: managed` base daemon named `id`; panics on an invalid `Id`.
+/// A root, `restart: never` base daemon named `id`; the protocol defaults to `Protocol::Native`
+/// (`type: managed`). Panics on an invalid `Id`.
 /// Vary fields with struct-update syntax, then `ServiceSpec::new`.
 pub fn base_fields(id: &str, command: Vec<String>) -> ServiceFields {
     ServiceFields {

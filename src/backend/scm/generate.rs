@@ -50,7 +50,7 @@ use crate::backend::scm::parameters::{Stray, field_named_utf16, is_string_type, 
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
-use crate::spec::{DaemonSpec, Protocol, Restart, ServiceSpec, User, scm_restart_delay, windows_builtin};
+use crate::spec::{DaemonSpec, Id, Protocol, Restart, User, scm_restart_delay, windows_builtin};
 
 // Metadata field names ================================================================================================
 
@@ -163,7 +163,10 @@ pub fn registration(
 /// launches. A `Protocol::Native` service is its own executable, with no host.
 pub(crate) fn hosted(spec: &DaemonSpec) -> bool {
     let DaemonSpec::Service(s) = spec;
-    s.protocol == Protocol::Plain
+    match s.protocol {
+        Protocol::Plain => true,
+        Protocol::Native => false,
+    }
 }
 
 /// The host `spec` is installed with: asked for once, and only for a [`hosted`] service.
@@ -177,26 +180,32 @@ fn resolve_host(
 /// [`registration`] for a `host` already resolved by [`resolve_host`].
 fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
     let DaemonSpec::Service(s) = spec;
-    let (executable, arguments) = match s.protocol {
-        // SCM only ever launches the host, which learns the service's name from SCM and spawns the
-        // daemon once. The spec's own command never appears here.
-        Protocol::Plain => {
-            let host = host.expect("a plain service's host is resolved before it is built");
-            (host.exe.clone(), host.args.clone())
-        }
+    // SCM applies `Environment` to the process it launches: the daemon for `Protocol::Native`, the shim
+    // for `Protocol::Plain`.
+    let (executable, arguments, environment) = match s.protocol {
         Protocol::Native => {
             let mut argv = s.common.command.iter();
             let executable = PathBuf::from(
                 argv.next()
                     .expect("DaemonFields::command is non-empty: spec::resolve rejects an empty command"),
             );
-            (executable, argv.cloned().collect())
+            refuse_unwritable_executable(&s.common.id, "`command[0]`", &executable)?;
+            (
+                executable,
+                argv.cloned().collect(),
+                format_environment_lines(&s.common.env),
+            )
+        }
+        // SCM only ever launches the host, which learns the service's name from SCM and spawns the
+        // daemon once. The spec's own command never appears here. The shim already applies `spec.env`
+        // to the daemon it spawns, and an `env:` key that collides with one the shim or `cosca` reads
+        // (`__COSCA_GROUP_ROOT`) would corrupt the shim's own containment, so no `Environment` is
+        // registered.
+        Protocol::Plain => {
+            let host = host.expect("a plain service's host is resolved before it is built");
+            (host.exe.clone(), host.args.clone(), Vec::new())
         }
     };
-
-    if !hosted(spec) {
-        refuse_unwritable_executable(s, &executable)?;
-    }
 
     // SCM does every restart, for both kinds: the shim spawns the daemon once and reports its exit.
     let failure_actions = match s.restart {
@@ -239,15 +248,6 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
         _ => canonical_account(&id.user),
     };
 
-    // SCM applies `Environment` to the process it launches: the daemon for `Protocol::Native`, the shim
-    // for `Protocol::Plain`. The shim already applies `spec.env` to the daemon it spawns, and an `env:`
-    // key that collides with one the shim or `cosca` reads (`__COSCA_GROUP_ROOT`) would corrupt the
-    // shim's own containment, so `Protocol::Plain` registers none.
-    let environment = match s.protocol {
-        Protocol::Native => format_environment_lines(&s.common.env),
-        Protocol::Plain => Vec::new(),
-    };
-
     let mut parameters = BTreeMap::new();
     parameters.insert(FIELD_MARKER.to_string(), blob::MARKER.to_string());
     parameters.insert(FIELD_SCHEMA.to_string(), blob::SCHEMA.to_string());
@@ -280,7 +280,7 @@ pub fn install_registration(
     let DaemonSpec::Service(s) = spec;
     let host = resolve_host(spec, host)?;
     if let Some(host) = &host {
-        refuse_unwritable_executable(s, &host.exe)?;
+        refuse_unwritable_executable(&s.common.id, "the service host path", &host.exe)?;
     }
     build(spec, id, host.as_ref())
 }
@@ -303,9 +303,9 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
 /// holding a `"`, or ending in any backslashes, registers as another path. An unquoted path is
 /// written as is.
 ///
-/// A `type: managed` executable is `command[0]`; a `type: simple` one is the service host's path,
-/// which no manifest sets, so its message names that path and not `command[0]`.
-fn refuse_unwritable_executable(service: &ServiceSpec, executable: &Path) -> Result<(), Error> {
+/// `what` names the path in the message: `command[0]` for a `type: managed` daemon, the service host's
+/// path for a `type: simple` one, which no manifest sets.
+fn refuse_unwritable_executable(daemon: &Id, what: &str, executable: &Path) -> Result<(), Error> {
     let text = executable.to_string_lossy();
     // A `"` is refused whatever else quotes the path. An empty path is quoted too, but it ends in no
     // backslash.
@@ -324,15 +324,9 @@ fn refuse_unwritable_executable(service: &ServiceSpec, executable: &Path) -> Res
     } else {
         return Ok(());
     };
-    let message = match service.protocol {
-        Protocol::Native => format!("`command[0]` {text:?} cannot be written into the service registration: {reason}"),
-        Protocol::Plain => {
-            format!("the service host path {text:?} cannot be written into the service registration: {reason}")
-        }
-    };
     Err(Error::Invalid {
-        daemon: service.common.id.to_string(),
-        message,
+        daemon: daemon.to_string(),
+        message: format!("{what} {text:?} cannot be written into the service registration: {reason}"),
         source: None,
     })
 }

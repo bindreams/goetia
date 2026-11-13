@@ -56,9 +56,7 @@ fn id_of(s: &str) -> Id {
 
 /// A fresh, installed `type: managed` service at `id`, with no ports wired up.
 fn install_native(mgr: &Scm, id: &str) -> DaemonSpec {
-    let spec = ServiceSpec::new(support::base_fields(id, fixture_command(id, 1, 1, "plain")))
-        .map(DaemonSpec::from)
-        .unwrap();
+    let spec = conformance_mk(id);
     mgr.install(&spec, false).expect("install");
     spec
 }
@@ -252,10 +250,7 @@ fn sc_config_binpath_change_is_detected_as_conflict(#[fixture(scm_group)] _group
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = ServiceSpec::new(support::base_fields(&id, fixture_command(&id, 1, 1, "plain")))
-        .map(DaemonSpec::from)
-        .unwrap();
-    mgr.install(&spec, false).expect("install");
+    let spec = install_native(&mgr, &id);
 
     hand_edit(&id);
 
@@ -400,10 +395,7 @@ fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
-    let spec = ServiceSpec::new(support::base_fields(&id, fixture_command(&id, 1, 1, "plain")))
-        .map(DaemonSpec::from)
-        .unwrap();
-    mgr.install(&spec, false).expect("install");
+    let spec = install_native(&mgr, &id);
 
     mgr.uninstall(&spec.common().id).expect("uninstall");
 

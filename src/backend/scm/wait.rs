@@ -1065,37 +1065,42 @@ fn stopped_before_running(
     exit: RecordedExit,
     wait_hint: u32,
 ) -> io::Result<Waited> {
-    // An `AlreadyRunning` over `START_PENDING` joined a start that was not ours: SCM's own recovery
-    // start. When that fails SCM reports `STOPPED (0, 0)` with a wait hint (P10), which the shim never
-    // sets; no shim connected to SCM. Only `type: simple` has a shim: a managed host may leave a hint
-    // itself, and it did run. This test runs before `daemon_ran`, which `(0, 0)` would satisfy.
-    let failed_scm_start =
-        kind == Protocol::Plain && joined_a_start && (exit.win32, exit.specific) == (0, 0) && wait_hint != 0;
-    if failed_scm_start {
-        return Err(io::Error::other(
-            "service stopped before reaching Running (failed start): the shim never connected to SCM, so no daemon ran",
-        ));
-    }
-    // The shim's `(0, SHIM_REFUSED)` says it started no daemon, though its Win32 code is 0.
-    if kind == Protocol::Plain && exit.is_refusal() {
-        return Err(io::Error::other(format!(
-            "service stopped with goetia-shim's refusal record (Win32 0, service-specific {SHIM_REFUSED}; failed start): the shim refused to start the daemon, so no daemon ran; see the shim's log"
-        )));
-    }
-    // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
-    // to confirm. The notification may follow a `RUNNING` the wait never saw.
-    if kind == Protocol::Plain && exit.is_incomplete_stop() {
-        return Err(io::Error::other(IncompleteStop {
-            failed_start: true,
-            process: None,
-        }));
-    }
-    // `daemon_ran` is safe to ask here: a host that exits before it connects also
-    // records `(0, 0)` with a wait hint (P25 c/d), and that is either our own start
-    // failing with `StartServiceW` 1053, which never reaches this wait, or a joined
-    // start, caught by `failed_scm_start` above.
-    if kind == Protocol::Plain && exit.daemon_ran() {
-        return Ok(Waited::Confirmed);
+    match kind {
+        Protocol::Plain => {
+            // An `AlreadyRunning` over `START_PENDING` joined a start that was not ours: SCM's own
+            // recovery start. When that fails SCM reports `STOPPED (0, 0)` with a wait hint (P10), which
+            // the shim never sets; no shim connected to SCM. Only `type: simple` has a shim: a managed
+            // host may leave a hint itself, and it did run. This test runs before `daemon_ran`, which
+            // `(0, 0)` would satisfy.
+            let failed_scm_start = joined_a_start && (exit.win32, exit.specific) == (0, 0) && wait_hint != 0;
+            if failed_scm_start {
+                return Err(io::Error::other(
+                    "service stopped before reaching Running (failed start): the shim never connected to SCM, so no daemon ran",
+                ));
+            }
+            // The shim's `(0, SHIM_REFUSED)` says it started no daemon, though its Win32 code is 0.
+            if exit.is_refusal() {
+                return Err(io::Error::other(format!(
+                    "service stopped with goetia-shim's refusal record (Win32 0, service-specific {SHIM_REFUSED}; failed start): the shim refused to start the daemon, so no daemon ran; see the shim's log"
+                )));
+            }
+            // The shim's `(0, 1003)` says it could not show the daemon's tree gone: not a launch
+            // to confirm. The notification may follow a `RUNNING` the wait never saw.
+            if exit.is_incomplete_stop() {
+                return Err(io::Error::other(IncompleteStop {
+                    failed_start: true,
+                    process: None,
+                }));
+            }
+            // `daemon_ran` is safe to ask here: a host that exits before it connects also
+            // records `(0, 0)` with a wait hint (P25 c/d), and that is either our own start
+            // failing with `StartServiceW` 1053, which never reaches this wait, or a joined
+            // start, caught by `failed_scm_start` above.
+            if exit.daemon_ran() {
+                return Ok(Waited::Confirmed);
+            }
+        }
+        Protocol::Native => {}
     }
     Err(io::Error::other(format!(
         "service stopped before reaching Running (failed start): it recorded {exit}"
