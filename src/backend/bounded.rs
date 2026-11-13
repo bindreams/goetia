@@ -272,7 +272,7 @@ impl SpawnError {
 impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpawnError::NotRun(e) | SpawnError::MayHaveRun(e) => e.fmt(f),
+            SpawnError::NotRun(e) | SpawnError::MayHaveRun(e) => write!(f, "{}", cosca::error::Report::new(e)),
         }
     }
 }

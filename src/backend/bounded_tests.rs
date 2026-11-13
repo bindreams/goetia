@@ -334,7 +334,12 @@ fn a_lost_wait_says_whether_the_request_was_announced() {
         test_hook::wait_fails(|| io::Error::other("the wait failed").into());
         let lost = wait_bounded(child, Budget::Unbounded.start()).expect_err(script);
         assert_eq!(lost.announced, expected, "{script}");
-        assert!(lost.error.to_string().contains("the wait failed"), "{script}: {lost:?}");
+        assert!(
+            cosca::error::Report::new(&lost.error)
+                .to_string()
+                .contains("the wait failed"),
+            "{script}: {lost:?}"
+        );
     }
 }
 

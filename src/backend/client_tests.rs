@@ -158,7 +158,12 @@ fn real_loses_a_child_and_says_whether_it_announced() {
         match sh(script).run(&[], wait, &mut reservation) {
             Err(ClientError::Lost { error, announced }) => {
                 assert_eq!(announced, expected, "{script}");
-                assert!(error.to_string().contains("the wait failed"), "{script}: {error:?}");
+                assert!(
+                    cosca::error::Report::new(&error)
+                        .to_string()
+                        .contains("the wait failed"),
+                    "{script}: {error:?}"
+                );
             }
             other => panic!("{script}: expected the child to be lost: {other:?}"),
         }
