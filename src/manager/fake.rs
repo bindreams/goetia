@@ -18,8 +18,8 @@ use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Reason, Result};
 use crate::manager::budget;
 use crate::manager::flow;
-use crate::manager::{Budget, Installed, ServiceManager, State, Status, Step};
-use crate::spec::{DaemonFields, DaemonSpec, Id, User};
+use crate::manager::{Budget, DaemonStatus, Installed, ServiceManager, State, Status, Step};
+use crate::spec::{DaemonFields, DaemonSpec, Id, ServiceFields, ServiceSpec, User};
 
 /// The fake's own artifact marker, deliberately not any real backend's
 /// `Marker`/`Schema`/`Version`/`Spec` field names: no real manager reads it.
@@ -159,7 +159,7 @@ impl Store {
 
     /// [`Fake::seed_unresolvable_account`]'s refusal of `spec`, if seeded.
     fn resolve_account(&self, spec: &DaemonSpec) -> Result<()> {
-        if let User::Name(user) = &spec.user
+        if let User::Name(user) = &spec.common().user
             && self.unresolvable.contains(user)
         {
             return Err(Error::AccountLookup {
@@ -270,20 +270,23 @@ impl Fake {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
-        let spec = DaemonSpec::new(DaemonFields {
-            id: Id::try_from(id).expect("seed_invalid_content needs a valid id"),
-            name: id.to_string(),
-            command: vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
-            cwd: None,
-            env: std::collections::BTreeMap::new(),
-            user: crate::spec::User::Root,
+        let spec = ServiceSpec::new(ServiceFields {
+            common: DaemonFields {
+                id: Id::try_from(id).expect("seed_invalid_content needs a valid id"),
+                name: id.to_string(),
+                command: vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+                user: crate::spec::User::Root,
+                logs: None,
+            },
             restart: crate::spec::Restart::OnFailure,
             // Replaced with the out-of-range value below; present so the field is on the wire.
             restart_delay: Some(std::time::Duration::from_secs(1)),
-            logs: None,
-            kind: crate::spec::Kind::Simple,
+            protocol: crate::spec::Protocol::Plain,
         })
-        .expect("a valid spec");
+        .expect("a valid spec")
+        .into();
         let encoded = blob::encode(&spec);
         let bytes = BASE64.decode(&encoded).expect("blob::encode emits valid base64");
         let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("blob::encode emits valid JSON");
@@ -300,7 +303,7 @@ impl Fake {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         let entry = state
             .entries
-            .get_mut(spec.id.as_str())
+            .get_mut(spec.common().id.as_str())
             .expect("just installed by the line above");
         entry.text.push_str(extra_line);
         if !entry.text.ends_with('\n') {
@@ -324,7 +327,7 @@ impl Fake {
         envelope["version"] = serde_json::json!(version);
         let tampered = BASE64.encode(serde_json::to_vec(&envelope).expect("a Value re-serializes"));
 
-        self.seed_foreign(spec.id.as_str(), format!("{FAKE_MARKER}\nSpec: {tampered}\n"));
+        self.seed_foreign(spec.common().id.as_str(), format!("{FAKE_MARKER}\nSpec: {tampered}\n"));
     }
 
     /// Test-only seeding: leave `id` with no artifact of its own, but with a
@@ -693,8 +696,8 @@ impl crate::backend::Backend for Fake {
     /// An opaque id, then no manager. Before `read`, which has no way to say a manager is missing.
     fn begin_install(&self, spec: &DaemonSpec, _desired: &String, _reservation: &mut ()) -> Result<()> {
         let state = self.state.lock().expect("Fake mutex poisoned");
-        if state.opaque.contains(spec.id.as_str()) {
-            return Err(Store::undetermined(&spec.id));
+        if state.opaque.contains(spec.common().id.as_str()) {
+            return Err(Store::undetermined(&spec.common().id));
         }
         state.manager()
     }
@@ -735,11 +738,11 @@ impl crate::backend::Backend for Fake {
 
     fn render_for_install(&self, spec: &DaemonSpec) -> Result<String> {
         let definition = self.render(spec)?;
-        if let User::Name(user) = &spec.user {
+        if let User::Name(user) = &spec.common().user {
             let state = self.state.lock().expect("Fake mutex poisoned");
             if state.unfit_for_install.contains(user) {
                 return Err(Error::Invalid {
-                    daemon: spec.id.to_string(),
+                    daemon: spec.common().id.to_string(),
                     message: "unfit for install (seeded)".to_string(),
                     source: None,
                 });
@@ -781,9 +784,9 @@ impl crate::backend::Backend for Fake {
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
         let mut state = self.state.lock().expect("Fake mutex poisoned");
-        if let Some(text) = state.interlopers.remove(spec.id.as_str()) {
+        if let Some(text) = state.interlopers.remove(spec.common().id.as_str()) {
             state.entries.insert(
-                spec.id.as_str().to_string(),
+                spec.common().id.as_str().to_string(),
                 Entry {
                     text,
                     enabled: false,
@@ -792,19 +795,19 @@ impl crate::backend::Backend for Fake {
             );
         }
         state.writes += 1;
-        if let Some(left) = state.write_races.get_mut(spec.id.as_str())
+        if let Some(left) = state.write_races.get_mut(spec.common().id.as_str())
             && *left > 0
         {
             *left -= 1;
             return Ok(WriteOutcome::Raced);
         }
-        let current = state.entries.get(spec.id.as_str());
+        let current = state.entries.get(spec.common().id.as_str());
         if current.map(|e| &e.text) != snapshot.map(|s| &s.entry.text) {
             return Ok(WriteOutcome::Raced);
         }
         let (enabled, run_state) = current.map(|e| (e.enabled, e.state)).unwrap_or((false, State::Stopped));
         state.entries.insert(
-            spec.id.as_str().to_string(),
+            spec.common().id.as_str().to_string(),
             Entry {
                 text: definition.clone(),
                 enabled,
@@ -826,11 +829,11 @@ impl crate::backend::Backend for Fake {
                 id: id.as_str().to_string(),
             });
         }
-        Ok(Status {
+        Ok(Status::Service(DaemonStatus {
             state: snapshot.entry.state,
             pid: pid_for(snapshot.entry.state),
             enabled: snapshot.entry.enabled,
-        })
+        }))
     }
 
     /// Aggregates first, then the opaque ids last-to-first: `ServiceManager::list` promises no

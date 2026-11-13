@@ -18,7 +18,8 @@ use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
 use goetia::manager::{Budget, Installed, Sequence, ServiceManager, State, Status, Step};
 use goetia::shim::HostCommand;
-use goetia::spec::{DaemonFields, DaemonSpec, Id, Kind, Restart};
+use goetia::spec::{DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
+use goetia::testing::service_fields;
 
 #[path = "support/mod.rs"]
 mod support;
@@ -30,14 +31,15 @@ fn main() {
 // Fixtures ============================================================================================================
 
 fn mk(id: &str) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
+    ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
-        kind: Kind::Simple,
-        ..support::plain_fields(
+        protocol: Protocol::Plain,
+        ..support::base_fields(
             id,
             vec![std::env::temp_dir().join("daemon").to_string_lossy().into_owned()],
         )
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -62,9 +64,9 @@ fn absent_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
 /// change with no hand-edit.
 fn update_fixture(dir: &Path, id: &str) -> (Fake, PathBuf) {
     let fake = Fake::new();
-    let mut old = mk(id).into_fields();
+    let mut old = service_fields(mk(id));
     old.restart = Restart::Never;
-    let old = DaemonSpec::new(old).unwrap();
+    let old = ServiceSpec::new(old).map(DaemonSpec::from).unwrap();
     fake.install(&old, false).unwrap();
     let manifest = write_manifest(dir, &format!("id: {id}\ncommand: [daemon]\nrestart: on-failure\n"));
     (fake, manifest)
@@ -376,14 +378,14 @@ impl ServiceManager for FlakyManager {
         self.inner.install(spec, force)
     }
     fn preview_install(&self, spec: &DaemonSpec) -> goetia::Result<goetia::decide::Outcome> {
-        if self.fail_preview_for.as_deref() == Some(spec.id.as_str()) {
-            return Err(injected_failure(&spec.id));
+        if self.fail_preview_for.as_deref() == Some(spec.common().id.as_str()) {
+            return Err(injected_failure(&spec.common().id));
         }
-        if self.undetermined_preview_for.as_deref() == Some(spec.id.as_str()) {
-            return Err(injected_indeterminacy(&spec.id));
+        if self.undetermined_preview_for.as_deref() == Some(spec.common().id.as_str()) {
+            return Err(injected_indeterminacy(&spec.common().id));
         }
-        if self.wait_timeout_preview_for.as_deref() == Some(spec.id.as_str()) {
-            return Err(injected_wait_timeout(&spec.id));
+        if self.wait_timeout_preview_for.as_deref() == Some(spec.common().id.as_str()) {
+            return Err(injected_wait_timeout(&spec.common().id));
         }
         if let Some(recovery) = &self.unclearable_conflict {
             return Ok(unclearable_conflict(recovery));
@@ -449,7 +451,8 @@ impl ServiceManager for FlakyManager {
         }
         let mut installed = self.inner.list()?;
         for entry in &mut installed {
-            if matches!(entry, Installed::Ours { spec, .. } if Some(spec.id.as_str()) == self.unqueryable.as_deref()) {
+            if matches!(entry, Installed::Ours { spec, .. } if Some(spec.common().id.as_str()) == self.unqueryable.as_deref())
+            {
                 *entry = Installed::OursUnusable {
                     name: self.unqueryable.clone().expect("matched against Some just above"),
                     reason: goetia::Reason::failed(unqueryable_failure()),
@@ -458,7 +461,7 @@ impl ServiceManager for FlakyManager {
         }
         if let Some(hidden) = &self.hidden_from_list {
             installed.retain(|entry| match entry {
-                Installed::Ours { spec, .. } => spec.id.as_str() != hidden,
+                Installed::Ours { spec, .. } => spec.common().id.as_str() != hidden,
                 Installed::OursUnusable { name, .. } => name != hidden,
                 // A `None` name stands for ids this entry could not
                 // separate, so it says nothing about `hidden` and is kept.
@@ -486,7 +489,7 @@ fn installed_ids(fake: &Fake) -> Vec<String> {
         .unwrap()
         .into_iter()
         .map(|entry| match entry {
-            Installed::Ours { spec, .. } => spec.id.as_str().to_string(),
+            Installed::Ours { spec, .. } => spec.common().id.as_str().to_string(),
             // Present, and goetia's — only its blob would not decode. Three
             // callers read `is_empty()` as "nothing is installed", and
             // dropping this made that flatly false rather than merely
@@ -696,8 +699,8 @@ fn install_start_and_enable_flags_reach_the_manager() {
 
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     let status = fake.status(&Id::try_from("frpc").unwrap()).unwrap();
-    assert_eq!(status.state, State::Running, "--start must reach the manager");
-    assert!(status.enabled, "--enable must reach the manager");
+    assert_eq!(status.common().state, State::Running, "--start must reach the manager");
+    assert!(status.common().enabled, "--enable must reach the manager");
 }
 
 /// Unlike `list`/`status`/`show`/`diff` (whose `run` functions do not even
@@ -745,8 +748,8 @@ fn install_without_flags_does_not_start_or_enable() {
 
     assert_eq!(code, 0);
     let status = fake.status(&Id::try_from("frpc").unwrap()).unwrap();
-    assert_ne!(status.state, State::Running);
-    assert!(!status.enabled);
+    assert_ne!(status.common().state, State::Running);
+    assert!(!status.common().enabled);
 }
 
 // show ================================================================================================================
@@ -1279,7 +1282,7 @@ fn start_reaches_the_manager() {
 
     assert_eq!(code, 0);
     assert_eq!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().state,
         State::Running
     );
 }
@@ -1289,13 +1292,13 @@ fn stop_reaches_the_manager() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
     let (code, _out, _err) = dispatch_elevated(&["goetia", "daemon", "stop", "frpc"], &fake);
 
     assert_eq!(code, 0);
     assert_ne!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().state,
         State::Running
     );
 }
@@ -1305,7 +1308,7 @@ fn kill_reaches_the_manager() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "kill", "frpc"], &fake);
 
@@ -1321,7 +1324,7 @@ stderr:
         "frpc: kill delivered
 "
     );
-    assert_eq!(fake.status(&spec.id).unwrap().state, State::Failed);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Failed);
 }
 
 #[skuld::test]
@@ -1383,13 +1386,13 @@ fn kill_needs_elevation_and_asks_nothing_of_the_manager_without_it() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
     let (code, _out, err) = dispatch_with(&["goetia", "daemon", "kill", "frpc"], &fake, &|| false);
 
     assert_eq!(code, 1);
     assert!(err.contains("requires elevation"), "{err}");
-    assert_eq!(fake.status(&spec.id).unwrap().state, State::Running);
+    assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Running);
 }
 
 /// Every id is tried, and the exit code combines what each contributed: killing the running one is
@@ -1399,7 +1402,7 @@ fn kill_tries_every_id_and_reports_the_worst() {
     let fake = Fake::new();
     let running = mk("alpha");
     fake.install(&running, false).unwrap();
-    fake.start(&running.id, Budget::DEFAULT).unwrap();
+    fake.start(&running.common().id, Budget::DEFAULT).unwrap();
     fake.install(&mk("beta"), false).unwrap();
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "kill", "alpha", "beta"], &fake);
@@ -1417,7 +1420,7 @@ stderr:
 "
     );
     assert!(err.contains("beta"), "{err}");
-    assert_eq!(fake.status(&running.id).unwrap().state, State::Failed);
+    assert_eq!(fake.status(&running.common().id).unwrap().common().state, State::Failed);
 }
 
 /// `kill` waits for nothing, so it has no wait flags to accept and ignore.
@@ -1454,7 +1457,7 @@ fn restart_reaches_the_manager() {
 
     assert_eq!(code, 0);
     assert_eq!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().state,
         State::Running
     );
 }
@@ -1467,7 +1470,7 @@ fn enable_reaches_the_manager() {
     let (code, _out, _err) = dispatch_elevated(&["goetia", "daemon", "enable", "frpc"], &fake);
 
     assert_eq!(code, 0);
-    assert!(fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled);
+    assert!(fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled);
 }
 
 #[skuld::test]
@@ -1475,12 +1478,12 @@ fn disable_reaches_the_manager() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.enable(&spec.id).unwrap();
+    fake.enable(&spec.common().id).unwrap();
 
     let (code, _out, _err) = dispatch_elevated(&["goetia", "daemon", "disable", "frpc"], &fake);
 
     assert_eq!(code, 0);
-    assert!(!fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled);
+    assert!(!fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled);
 }
 
 #[skuld::test]
@@ -1488,7 +1491,7 @@ fn status_reaches_the_manager() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "daemon", "status", "frpc"], &fake);
 
@@ -1504,7 +1507,7 @@ fn status_with_no_ids_prints_the_pid_like_the_per_id_form() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
 
     let (_, per_id, _) = dispatch_read_only(&["goetia", "daemon", "status", "frpc"], &fake);
     let (_, no_ids, _) = dispatch_read_only(&["goetia", "daemon", "status"], &fake);
@@ -1552,9 +1555,9 @@ fn list_reaches_the_manager() {
 #[skuld::test]
 fn a_service_installed_with_restart_always_stays_operable() {
     let fake = Fake::new();
-    let mut spec = mk("frpc").into_fields();
+    let mut spec = service_fields(mk("frpc"));
     spec.restart = Restart::Always;
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     fake.install(&spec, false).unwrap();
 
     for verb in ["status", "list"] {
@@ -2139,7 +2142,7 @@ fn enable_with_an_invalid_id_touches_nothing() {
     assert_eq!(code, 1);
     assert!(err.contains("not/a/valid/id"), "{err}");
     assert!(
-        !fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
+        !fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled,
         "frpc must not have been enabled: an earlier valid id must not run ahead of a later invalid one"
     );
 }
@@ -2158,7 +2161,7 @@ fn enable_aggregates_across_multiple_ids() {
     assert!(out.contains("frpc: enabled"), "{out}");
     assert!(err.contains("never-installed"), "{err}");
     assert!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled,
         "frpc must still have been enabled despite the other id failing"
     );
 }
@@ -2497,8 +2500,8 @@ fn status_json_reports_state_enabled_and_pid_for_a_named_id() {
     let fake = Fake::new();
     let spec = mk("frpc");
     fake.install(&spec, false).unwrap();
-    fake.start(&spec.id, Budget::DEFAULT).unwrap();
-    fake.enable(&spec.id).unwrap();
+    fake.start(&spec.common().id, Budget::DEFAULT).unwrap();
+    fake.enable(&spec.common().id).unwrap();
 
     let (code, out, _err) = dispatch_read_only(&["goetia", "--json", "daemon", "status", "frpc"], &fake);
 
@@ -3880,7 +3883,7 @@ fn restart_that_cannot_prepare_sends_nothing() {
         assert!(err.contains("so none was sent"), "{err}");
         assert_eq!(fake.calls(), vec![], "{budget:?}: nothing may be sent");
         assert_eq!(
-            fake.status(&Id::try_from("frpc").unwrap()).unwrap().state,
+            fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().state,
             State::Running
         );
     }
@@ -4009,7 +4012,7 @@ fn install_start_prepares_one_sequence_for_the_install_and_the_start() {
     );
     assert_eq!(fake.calls(), vec![("start", "frpc".to_string())]);
     assert!(
-        fake.status(&Id::try_from("frpc").unwrap()).unwrap().enabled,
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().enabled,
         "--enable reached the manager"
     );
 }

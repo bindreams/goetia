@@ -1,9 +1,9 @@
 //! The effectful SCM backend (`#[cfg(windows)]`).
 //!
-//! Handles both `Kind::Simple` (under the host the manager's
+//! Handles both `Protocol::Plain` (under the host the manager's
 //! [`ShimProvider`] supplies, which runs `shim::run`) and
-//! `Kind::Managed`; `generate::registration` builds the `ImagePath`/blob
-//! for both. `Kind::Simple`'s own integration tests live in
+//! `Protocol::Native`; `generate::registration` builds the `ImagePath`/blob
+//! for both. `Protocol::Plain`'s own integration tests live in
 //! `tests/shim_integration.rs`, not `tests/scm_integration.rs`, because they
 //! need `CARGO_BIN_EXE_goetia-shim`.
 //!
@@ -138,9 +138,9 @@ use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Chain, Error, Reason, Result, terminating_failed};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, Installed, State, Status, Step};
+use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step};
 use crate::shim::HostCommand;
-use crate::spec::{AccountId, DaemonSpec, Id, Kind, User};
+use crate::spec::{AccountId, DaemonSpec, Id, Protocol, User};
 
 // Scm =================================================================================================================
 
@@ -178,15 +178,6 @@ impl Scm {
     /// The provider, or [`Error::NoShimProvider`] for a manager built without one.
     fn provider(&self) -> Result<&dyn ShimProvider> {
         self.shim.as_deref().ok_or(Error::NoShimProvider)
-    }
-
-    /// The host `spec` would be installed with, as the provider previews it: `Some` for `type: simple`
-    /// only, which has a host.
-    fn host_of(&self, spec: &DaemonSpec) -> Result<Option<HostCommand>> {
-        match spec.kind {
-            Kind::Simple => Ok(Some(self.provider()?.preview()?)),
-            Kind::Managed => Ok(None),
-        }
     }
 }
 
@@ -310,7 +301,7 @@ impl Backend for Scm {
         desired: &ScmRegistration,
         _reservation: &mut (),
     ) -> Result<Option<InstallLock>> {
-        if spec.kind != Kind::Simple {
+        if !generate::hosted(spec) {
             return Ok(None);
         }
         let shim = self.provider()?;
@@ -336,30 +327,30 @@ impl Backend for Scm {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
-        let identity = identity::resolve(&spec.user)?;
-        generate::registration(spec, &identity, self.host_of(spec)?.as_ref())
+        let identity = identity::resolve(&spec.common().user)?;
+        generate::registration(spec, &identity, &|| self.provider()?.preview())
     }
 
     /// Keeps the host command a `type: simple` service is installed with, so that a host another
     /// provider (a moved folder, another goetia version, a standalone host) put there is the same
-    /// spec, and no provider is consulted. `type: managed` has no host.
+    /// spec, and no provider is consulted. `type: managed` has no host, so its snapshot's config is
+    /// never read.
     fn regenerate(&self, spec: &DaemonSpec, snapshot: &ScmSnapshot) -> Result<ScmRegistration> {
-        if spec.kind == Kind::Managed {
-            return self.render(spec);
-        }
-        let identity = identity::resolve(&spec.user)?;
-        let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
-            id: snapshot.id().as_str().to_string(),
-            source: Box::new(e),
-        })?;
-        let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
-        generate::registration(spec, &identity, Some(&HostCommand { exe, args }))
+        let identity = identity::resolve(&spec.common().user)?;
+        generate::registration(spec, &identity, &|| {
+            let config = snapshot.config().map_err(|e| Error::InstalledUnreadable {
+                id: snapshot.id().as_str().to_string(),
+                source: Box::new(e),
+            })?;
+            let (exe, args) = split_command_line(&config.executable_path.to_string_lossy());
+            Ok(HostCommand { exe, args })
+        })
     }
 
     /// The host is previewed once, for the check and the registration alike.
     fn render_for_install(&self, spec: &DaemonSpec) -> Result<ScmRegistration> {
-        let identity = identity::resolve(&spec.user)?;
-        generate::install_registration(spec, &identity, self.host_of(spec)?.as_ref())
+        let identity = identity::resolve(&spec.common().user)?;
+        generate::install_registration(spec, &identity, &|| self.provider()?.preview())
     }
 
     /// Upstream of the marker, so a service that will not open leaves `id` undetermined: neither
@@ -395,7 +386,7 @@ impl Backend for Scm {
         _scope: &mut Option<InstallLock>,
         _reservation: &mut (),
     ) -> Result<WriteOutcome> {
-        apply(definition, written_user(&spec.user), snapshot.is_none())?;
+        apply(definition, written_user(&spec.common().user), snapshot.is_none())?;
         Ok(WriteOutcome::Done)
     }
 
@@ -403,7 +394,7 @@ impl Backend for Scm {
         let id = snapshot.id();
         let enabled = snapshot.config()?.start_type == ServiceStartType::AutoStart;
         let (state, pid) = query_live(snapshot.service()?, id.as_str())?;
-        Ok(Status { state, pid, enabled })
+        Ok(Status::Service(DaemonStatus { state, pid, enabled }))
     }
 
     /// Read directly from the registry rather than `windows-service`'s enumeration API:
@@ -696,10 +687,10 @@ pub(super) fn stop_on<A: super::wait::ScmActor, P: HeldProcess>(
 /// the shim's vocabulary for a [`ShimKind::Shim`], and for anything else, a service not known to run
 /// a shim, as strict as `type: managed`. A service whose blob would not decode says why when its start
 /// fails, whichever kind it was judged as.
-fn start_kind(answer: &ShimAnswer) -> (Kind, Option<Arc<Error>>) {
+fn start_kind(answer: &ShimAnswer) -> (Protocol, Option<Arc<Error>>) {
     let kind = match answer.kind {
-        ShimKind::Shim => Kind::Simple,
-        ShimKind::NotShim | ShimKind::Unknown => Kind::Managed,
+        ShimKind::Shim => Protocol::Plain,
+        ShimKind::NotShim | ShimKind::Unknown => Protocol::Native,
     };
     (kind, answer.blob_error.clone())
 }
@@ -707,14 +698,14 @@ fn start_kind(answer: &ShimAnswer) -> (Kind, Option<Arc<Error>>) {
 /// `failed`, a `start` that did not succeed (a failed wait or a timeout). When the blob was unreadable
 /// the start was judged without it, as `kind` says, and the error says why: neither is what a service
 /// whose blob reads would have been told.
-fn failed_start(id: &Id, failed: Error, kind: Kind, unreadable: Option<Arc<Error>>) -> Error {
+fn failed_start(id: &Id, failed: Error, kind: Protocol, unreadable: Option<Arc<Error>>) -> Error {
     match (kind, unreadable) {
         (_, None) => failed,
-        (Kind::Managed, Some(blob)) => Error::StartAsManaged {
+        (Protocol::Native, Some(blob)) => Error::StartAsManaged {
             blob,
             source: Box::new(failed),
         },
-        (Kind::Simple, Some(blob)) => Error::Step {
+        (Protocol::Plain, Some(blob)) => Error::Step {
             what: format!(
                 "`{id}`'s spec blob could not be read, so the start was judged as a goetia shim's, by the \
                  registered image ({})",
@@ -1237,7 +1228,7 @@ impl<L> UninstallPlan<L> {
 /// Whether an uninstall takes the install lock: for a blob that is `type: simple` and for one that will
 /// not decode, whose service may run a shim whatever its image says.
 fn takes_install_lock(blob: std::result::Result<&Blob, &Arc<Error>>) -> bool {
-    !matches!(blob, Ok(blob) if blob.spec.kind != Kind::Simple)
+    blob.map_or(true, |blob| generate::hosted(&blob.spec))
 }
 
 /// `acquire` the lock if the blob says the service may run a shim, and only then read the service's
@@ -1320,7 +1311,7 @@ pub(super) fn shim_answer(
 ) -> ShimAnswer {
     match blob {
         Ok(blob) => ShimAnswer {
-            kind: if blob.spec.kind == Kind::Simple {
+            kind: if generate::hosted(&blob.spec) {
                 ShimKind::Shim
             } else {
                 ShimKind::NotShim

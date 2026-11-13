@@ -2,23 +2,29 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::*;
-use crate::spec::DaemonFields;
 use crate::spec::test_support::{abs, program};
-use crate::spec::{Kind, Restart};
-use crate::testing::plain_fields;
+use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
+use crate::testing::{base_fields, service_fields};
 
-// The paths are absolute because `DaemonSpec::new` requires it; no assertion reads them, so their
+// The paths are absolute because `ServiceSpec::new` requires it; no assertion reads them, so their
 // platform spelling does not matter.
 fn spec_fixture() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        name: "FRP tunnel client".to_owned(),
-        cwd: Some(abs("app")),
-        env: BTreeMap::from([("FRP_LOG_LEVEL".to_owned(), "info".to_owned())]),
-        restart: Restart::OnFailure,
-        logs: Some(abs("frpc.log")),
-        kind: Kind::Simple,
-        ..plain_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()])
+    ServiceSpec::new({
+        let base = base_fields("frpc", vec![program("frpc"), "-c".to_owned(), "frpc.toml".to_owned()]);
+        ServiceFields {
+            common: DaemonFields {
+                name: "FRP tunnel client".to_owned(),
+                cwd: Some(abs("app")),
+                env: BTreeMap::from([("FRP_LOG_LEVEL".to_owned(), "info".to_owned())]),
+                logs: Some(abs("frpc.log")),
+                ..base.common
+            },
+            restart: Restart::OnFailure,
+            protocol: Protocol::Plain,
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -62,9 +68,9 @@ WantedBy=multi-user.target
 #[skuld::test]
 fn spec_diff_names_source_keys() {
     let was = spec_fixture();
-    let mut now = spec_fixture().into_fields();
+    let mut now = service_fields(spec_fixture());
     now.restart_delay = Some(Duration::from_secs(2));
-    let now = DaemonSpec::new(now).unwrap();
+    let now = ServiceSpec::new(now).map(DaemonSpec::from).unwrap();
 
     let diff = spec_diff(&was, &now);
 
@@ -98,9 +104,9 @@ fn render_yaml_is_key_sorted_and_deterministic() {
 
 #[skuld::test]
 fn render_yaml_uses_source_key_names() {
-    let mut spec = spec_fixture().into_fields();
+    let mut spec = service_fields(spec_fixture());
     spec.restart_delay = Some(Duration::from_secs(2));
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
 
     let rendered = render_yaml(&spec);
 

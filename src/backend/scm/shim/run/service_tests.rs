@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
-use crate::spec::{DaemonFields, Kind, Restart};
-use crate::testing::plain_fields;
+use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
+use crate::testing::{base_fields, service_fields};
 use cosca::Containment;
 use cosca::error::ChildFate;
 use windows_sys::Win32::Foundation::{
@@ -40,7 +40,7 @@ fn run_daemon(spec: &DaemonSpec, supervisor: &Supervisor, on_running: impl FnOnc
 /// Where [`spec`]'s daemon logs. The `Fake` opens nothing there.
 const DAEMON_LOG: &str = r"C:\goetia-shim-test\daemon.log";
 
-/// The program of [`spec`]'s command, absolute as `DaemonSpec::new` requires. Forward slashes, so the
+/// The program of [`spec`]'s command, absolute as `ServiceSpec::new` requires. Forward slashes, so the
 /// `Debug` text of the command that the expected messages below spell out has no escapes.
 const POWERSHELL: &str = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
 
@@ -54,13 +54,20 @@ fn spec() -> DaemonSpec {
         "-Command",
         "Start-Sleep -Seconds 300",
     ];
-    DaemonSpec::new(DaemonFields {
-        name: "goetia-shim launch test".to_string(),
-        restart: Restart::Always,
-        logs: Some(PathBuf::from(DAEMON_LOG)),
-        kind: Kind::Simple,
-        ..plain_fields(ID, command.map(str::to_string).to_vec())
+    ServiceSpec::new({
+        let base = base_fields(ID, command.map(str::to_string).to_vec());
+        ServiceFields {
+            common: DaemonFields {
+                name: "goetia-shim launch test".to_string(),
+                logs: Some(PathBuf::from(DAEMON_LOG)),
+                ..base.common
+            },
+            restart: Restart::Always,
+            protocol: Protocol::Plain,
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -366,11 +373,12 @@ fn a_daemon_that_exits_nonzero_is_one_pass() {
     fake.will_make_thread();
     fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Ends));
     // The shim ignores the restart policy: no respawn.
-    let daemon = DaemonSpec::new(DaemonFields {
+    let daemon = ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
         restart_delay: None,
-        ..spec().into_fields()
+        ..service_fields(spec())
     })
+    .map(DaemonSpec::from)
     .unwrap();
 
     let reported = run_daemon(&daemon, &supervisor(&fake), || {});
@@ -1153,10 +1161,11 @@ fn a_stopped_report_is_stopped_and_accepts_no_control() {
 // Services registered by an earlier version ---------------------------------------------------------------------------
 
 fn spec_restarting(restart: Restart) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
+    ServiceSpec::new(ServiceFields {
         restart,
-        ..spec().into_fields()
+        ..service_fields(spec())
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 

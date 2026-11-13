@@ -26,14 +26,18 @@ pub fn a_killed_daemon_comes_back_with_a_new_pid(mgr: &dyn ServiceManager, id: &
     mgr.start(id, Budget::DEFAULT).expect("start");
     started.accept("the daemon to report in after start");
     let before = mgr.status(id).expect("status before the kill");
-    assert_eq!(before.state, State::Running, "precondition: running ({before:?})");
-    let old_pid = before.pid.expect("a running daemon reports a pid");
+    assert_eq!(
+        before.common().state,
+        State::Running,
+        "precondition: running ({before:?})"
+    );
+    let old_pid = before.common().pid.expect("a running daemon reports a pid");
 
     mgr.kill(id).expect("kill");
 
     started.accept("the daemon to be restarted by the manager after the kill");
     let after = mgr.status(id).expect("status after the restart");
-    let new_pid = after.pid.expect("the restarted daemon reports a pid");
+    let new_pid = after.common().pid.expect("the restarted daemon reports a pid");
     assert_ne!(
         new_pid, old_pid,
         "the manager restarted the daemon as a new process ({after:?})"
@@ -53,15 +57,23 @@ pub fn a_killed_daemon_that_never_restarts_stays_down(
 ) {
     mgr.start(id, Budget::DEFAULT).expect("start");
     started.accept("the daemon to report in after start");
-    assert_eq!(mgr.status(id).expect("status before the kill").state, State::Running);
+    assert_eq!(
+        mgr.status(id).expect("status before the kill").common().state,
+        State::Running
+    );
 
     mgr.kill(id).expect("kill");
 
     // Settled: the manager has recorded the process gone and, under this policy, has nothing left to
     // do. Anything earlier could still be a restart that has not happened yet.
-    until(|| matches!(mgr.status(id).expect("status").state, State::Stopped | State::Failed));
+    until(|| {
+        matches!(
+            mgr.status(id).expect("status").common().state,
+            State::Stopped | State::Failed
+        )
+    });
     let status = mgr.status(id).expect("status after the kill");
-    assert_eq!(status.pid, None, "a killed daemon has no process ({status:?})");
+    assert_eq!(status.common().pid, None, "a killed daemon has no process ({status:?})");
     no_restart_configured();
 }
 

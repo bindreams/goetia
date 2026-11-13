@@ -13,7 +13,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use goetia::backend::scm::exit_status::{ERROR_SERVICE_SPECIFIC_ERROR, RecordedExit};
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Installed, ServiceManager as _, Step};
-use goetia::spec::{DaemonFields, DaemonSpec, Restart};
+use goetia::spec::{DaemonSpec, Restart, ServiceFields, ServiceSpec};
+use goetia::testing::service_fields;
 use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::{KEY_READ, KEY_WRITE};
 
@@ -32,11 +33,12 @@ const ONE_SECOND: Option<Duration> = Some(Duration::from_secs(1));
 const EARLIER_VERSION: &str = "0.0.0";
 
 fn on_failure(id: &str, command: Vec<String>, restart_delay: Option<Duration>, logs: &LogDir) -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
+    ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
         restart_delay,
-        ..simple_spec(id, command, logs).into_fields()
+        ..service_fields(simple_spec(id, command, logs))
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -58,7 +60,7 @@ fn a_restart_after_an_update_runs_the_updated_spec(#[fixture(scm_group)] _group:
         &logs,
     );
     mgr.install(&before, false).expect("install");
-    mgr.start(&before.id, Budget::DEFAULT).expect("start");
+    mgr.start(&before.common().id, Budget::DEFAULT).expect("start");
     let old_daemon = old.accept_line("the first daemon to report its pid");
 
     let after = on_failure(
@@ -91,7 +93,7 @@ fn a_killed_shim_is_restarted_by_scm(#[fixture(scm_group)] _group: &Group) {
         &logs,
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     reported.accept("the first daemon to report in");
     // Held for the rest of the test, so the new shim cannot be given the same pid.
     let first_shim = ShimProcess::attach(&id);
@@ -122,7 +124,7 @@ fn a_killed_on_failure_simple_daemon_comes_back_with_a_new_pid(#[fixture(scm_gro
     );
     mgr.install(&spec, false).expect("install");
 
-    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.id, &started);
+    support::kill::a_killed_daemon_comes_back_with_a_new_pid(&mgr, &spec.common().id, &started);
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
@@ -141,7 +143,7 @@ fn on_failure_restarts_are_paced_new_shims(#[fixture(scm_group)] _group: &Group)
         &logs,
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     // Held until the end, so no shim can be given the pid of an earlier one.
     let mut shims: Vec<ShimProcess> = Vec::new();
@@ -173,7 +175,7 @@ fn on_failure_restarts_are_paced_new_shims(#[fixture(scm_group)] _group: &Group)
         }
     }
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
     drop(running);
 }
 
@@ -200,10 +202,10 @@ fn uninstall_leaves_no_restarted_daemon_behind(#[fixture(scm_group)] _group: &Gr
         &logs,
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon to have run");
 
-    mgr.uninstall(&spec.id).expect("uninstall");
+    mgr.uninstall(&spec.common().id).expect("uninstall");
 
     let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).expect("connect to SCM");
     match scm.open_service(&id, ServiceAccess::QUERY_STATUS) {
@@ -245,7 +247,7 @@ fn exit_records(child_code: i32) -> (ServiceExitCode, RecordedExit) {
         &logs,
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     let stream = reported.accept_stream("the fixture to connect and wait for the test to close its end");
     let shim = ShimProcess::attach(&id);
 
@@ -307,16 +309,17 @@ fn a_daemon_that_cannot_be_spawned_fails_start_under_every_policy(#[fixture(scm_
     for (restart, restart_delay) in [(Restart::Never, None), (Restart::OnFailure, hour)] {
         let id = support::random_test_id();
         let _guard = ShimGuard::new(&id);
-        let spec = DaemonSpec::new(DaemonFields {
+        let spec = ServiceSpec::new(ServiceFields {
             restart,
             restart_delay,
-            ..simple_spec(&id, missing.clone(), &logs).into_fields()
+            ..service_fields(simple_spec(&id, missing.clone(), &logs))
         })
+        .map(DaemonSpec::from)
         .unwrap();
         mgr.install(&spec, false).expect("install");
 
         let err = mgr
-            .start(&spec.id, Budget::DEFAULT)
+            .start(&spec.common().id, Budget::DEFAULT)
             .expect_err("a daemon that cannot be spawned must fail the start");
         assert!(err.report().to_string().contains("failed start"), "{restart:?}: {err}");
 
@@ -354,20 +357,20 @@ fn start_confirms_the_launch_of_a_daemon_that_exits_at_once(#[fixture(scm_group)
         let id = support::random_test_id();
         let _guard = ShimGuard::new(&id);
         let reported = ConnectBack::listen();
-        let spec = DaemonSpec::new(DaemonFields {
+        let spec = ServiceSpec::new(ServiceFields {
             restart,
             restart_delay: hour,
-            ..simple_spec(
+            ..service_fields(simple_spec(
                 &id,
                 fixture_command("exit", &[&reported.port().to_string(), &code.to_string()]),
                 &logs,
-            )
-            .into_fields()
+            ))
         })
+        .map(DaemonSpec::from)
         .unwrap();
         mgr.install(&spec, false).expect("install");
 
-        mgr.start(&spec.id, Budget::DEFAULT)
+        mgr.start(&spec.common().id, Budget::DEFAULT)
             .unwrap_or_else(|e| panic!("{restart:?}, exit {code}: a launched daemon must make start succeed: {e}"));
         reported.accept("the daemon to have run");
     }
@@ -389,10 +392,10 @@ fn a_commanded_stop_reports_win32_zero(#[fixture(scm_group)] _group: &Group) {
         &logs,
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon to report in");
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 
     let stopped = scm_status(&id);
     assert_eq!(stopped.current_state, ServiceState::Stopped, "{stopped:?}");
@@ -450,7 +453,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version(#[fixture(scm_grou
     mgr.install(&spec, false).expect("install");
     register_as_earlier_version(&id, goetia::version());
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon of a service registered by an earlier version to report in");
 
     // The shim logs the notice, once it has read the spec, into the daemon's log and before it
@@ -466,7 +469,7 @@ fn a_new_shim_runs_a_service_registered_by_an_earlier_version(#[fixture(scm_grou
         "the shim did not log the version-skew notice into the daemon's log:\n{logged}"
     );
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 }
 
 /// A service whose blob says `restart: always` must stay operable, because the verbs that act on a
@@ -490,11 +493,11 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     mgr.install(&spec, false).expect("install");
     replace_in_blob(&id, r#""restart":"on-failure""#, r#""restart":"always""#);
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     reported.accept("the daemon of a service whose blob says always to report in");
 
     let status = mgr
-        .status(&spec.id)
+        .status(&spec.common().id)
         .expect_err("status regenerates the spec, which scm refuses");
     assert!(
         matches!(&status, goetia::Error::Step { .. }) && status.report().to_string().contains("restart: always"),
@@ -502,7 +505,7 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     );
     let listed = mgr.list().expect("list");
     let entry = listed.iter().find(|entry| match entry {
-        Installed::Ours { spec: s, .. } => s.id == spec.id,
+        Installed::Ours { spec: s, .. } => s.common().id == spec.common().id,
         Installed::OursUnusable { name, .. } => name == &id,
         Installed::Undetermined { name, .. } => name.as_deref() == Some(id.as_str()),
     });
@@ -521,14 +524,16 @@ fn a_service_whose_blob_says_always_can_still_be_started_stopped_and_uninstalled
     let mut sequence = mgr
         .prepare(&[Step::Stop, Step::Start], Budget::DEFAULT)
         .expect("prepare a restart");
-    sequence.stop(&spec.id, Budget::DEFAULT).expect("stop for the restart");
     sequence
-        .start(&spec.id, Budget::DEFAULT)
+        .stop(&spec.common().id, Budget::DEFAULT)
+        .expect("stop for the restart");
+    sequence
+        .start(&spec.common().id, Budget::DEFAULT)
         .expect("start for the restart");
     reported.accept("the daemon of the restarted service to report in");
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-    mgr.uninstall(&spec.id).expect("uninstall");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    mgr.uninstall(&spec.common().id).expect("uninstall");
 
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert_eq!(query.code, Some(1060), "the service should no longer exist:\n{query}");

@@ -96,7 +96,7 @@ fn run_service(id: &str, log: Arc<Log>) {
         }
     };
 
-    log.set_daemon_log(log.daemon_log_path(id, blob.spec.logs.as_deref()));
+    log.set_daemon_log(log.daemon_log_path(id, blob.spec.common().logs.as_deref()));
     log_version_skew(&log, id, &blob.spec, &blob.version, crate::version());
     let reported = run_daemon(
         &blob.spec,
@@ -388,7 +388,7 @@ fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<d
     let waiter = match supervisor.waiter(id) {
         Ok(waiter) => waiter,
         Err(e) => {
-            log.failure(id, &thread_refused(&spec.command, &e));
+            log.failure(id, &thread_refused(&spec.common().command, &e));
             return Err(Reported::shim_failure(e.raw_os_error()));
         }
     };
@@ -402,12 +402,12 @@ fn launch(spec: &DaemonSpec, supervisor: &Supervisor, id: &str) -> Result<(Arc<d
             }
         },
         Err(e) if may_still_run(&e) => {
-            log.failure(id, &spawn_failed_daemon_may_run(&spec.command, &e));
+            log.failure(id, &spawn_failed_daemon_may_run(&spec.common().command, &e));
             waiter.stand_down();
             Err(Reported::incomplete_stop())
         }
         Err(e) => {
-            log.failure(id, &spawn_failed(&spec.command, &e));
+            log.failure(id, &spawn_failed(&spec.common().command, &e));
             waiter.stand_down();
             Err(Reported::shim_failure(spawn_error_code(&e)))
         }
@@ -437,7 +437,7 @@ fn require_job_object(
     if containment == Containment::JobObject {
         return Ok(child);
     }
-    log.failure(id, &not_job_contained(&spec.command, containment));
+    log.failure(id, &not_job_contained(&spec.common().command, containment));
     // Dropping the child tries the kill again, and a refusal is not waited on.
     kill_for_stop(child.as_ref(), log, id);
     Err(Reported::incomplete_stop())
@@ -485,10 +485,11 @@ fn log_version_skew(log: &Log, id: &str, spec: &DaemonSpec, registered_by: &str,
 /// they existed (or by a version that set different ones) keeps running under this shim without
 /// restarts until `goetia daemon install` is run again.
 fn version_skew_notice(id: &str, spec: &DaemonSpec, registered_by: &str, running: &str) -> Option<String> {
-    if registered_by == running || spec.restart == Restart::Never {
+    let DaemonSpec::Service(s) = spec;
+    if registered_by == running || s.restart == Restart::Never {
         return None;
     }
-    let remedy = if spec.restart == Restart::Always {
+    let remedy = if s.restart == Restart::Always {
         format!(
             "After setting `backend-specific: scm: {{ restart: on-failure }}` in the manifest, run `goetia daemon uninstall {id}` and `goetia daemon install` to apply them: `restart: always` is not supported for scm, so `install` refuses this service as it is"
         )
@@ -497,7 +498,7 @@ fn version_skew_notice(id: &str, spec: &DaemonSpec, registered_by: &str, running
     };
     Some(format!(
         "daemon {:?} was registered by goetia {registered_by} and this goetia-shim is {running}: its SCM recovery actions may be missing, so it may not restart after a failure. {remedy}",
-        spec.name
+        s.common.name
     ))
 }
 
@@ -522,14 +523,14 @@ fn stdio_set<T, E: std::error::Error + 'static>(log: &Log, id: &str, assigned: R
 /// containment, and stdout+stderr merged into the daemon's log file, which `os` opens. `log`
 /// names that file when the spec does not, and reports a failed open or redirect.
 pub(crate) fn build_command(spec: &DaemonSpec, os: &dyn Os, log: &Log, id: &str) -> cosca::Command {
-    let mut cmd = cosca::run(spec.command.iter().cloned());
-    if let Some(cwd) = &spec.cwd {
+    let mut cmd = cosca::run(spec.common().command.iter().cloned());
+    if let Some(cwd) = &spec.common().cwd {
         cmd.current_dir(cwd.clone());
     }
-    cmd.envs(spec.env.clone());
+    cmd.envs(spec.common().env.clone());
     cmd.contain();
 
-    let log_path = log.daemon_log_path(id, spec.logs.as_deref());
+    let log_path = log.daemon_log_path(id, spec.common().logs.as_deref());
     match os.open_log(&log_path) {
         Ok(file) => {
             // Merges are resolved in a second pass at spawn time (`cosca`'s
