@@ -1,7 +1,6 @@
 //! Printing an [`Error`]: its chain of causes, then each remedy found along it.
 
 use std::fmt::{self, Write as _};
-use std::sync::Arc;
 
 use super::escape::{write_escaped, write_escaped_keeping_layout};
 use super::{Error, Sentence};
@@ -110,11 +109,6 @@ impl fmt::Display for Chain<'_> {
     }
 }
 
-/// Whether `e` is a `cosca` error, held directly or as the `Arc` or `Box` a holder keeps its cause as.
-fn is_cosca_layer(e: &(dyn std::error::Error + 'static)) -> bool {
-    e.is::<cosca::error::Error>() || e.is::<Arc<cosca::error::Error>>() || e.is::<Box<cosca::error::Error>>()
-}
-
 /// Writes `e` and its causes, collecting the remedies met on the way into `remedies`, outermost
 /// first and each once: a [`Both`](Error::Both)'s halves can carry the same one. An error `e` sets
 /// inside its own sentence (see [`Error::sentence`]) is written there, with its remedies collected.
@@ -126,7 +120,7 @@ pub(super) fn write_chain<'a>(
     out: &mut Sink,
     remedies: &mut Vec<&'a str>,
 ) -> fmt::Result {
-    if is_cosca_layer(e) {
+    if e.is::<cosca::error::Error>() {
         return write!(out, "{}", cosca::error::Report::new(e));
     }
     // A `#[source]` of type `Box<Error>` reaches here as the box.

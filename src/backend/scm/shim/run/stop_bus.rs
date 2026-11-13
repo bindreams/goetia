@@ -498,7 +498,7 @@ const WAITER_PANICKED: &str = "the thread waiting on the child panicked";
 fn send_kill_tree_failed(e: &cosca::error::Error) -> String {
     let e = Report::new(e);
     format!(
-        "send_kill_tree: {e}; falling back to killing the direct child only (its own descendants, if any, \
+        "terminating the daemon's process tree failed: {e}; falling back to killing the direct child only (its own descendants, if any, \
          cannot be reached without a containment mechanism)"
     )
 }
@@ -519,7 +519,9 @@ fn tree_unkilled() -> String {
 
 fn exited_tree_unkilled(e: &cosca::error::Error) -> String {
     let e = Report::new(e);
-    format!("send_kill_tree after the daemon ended: {e}; its descendants may still be running{NOT_RESTARTED}")
+    format!(
+        "terminating the process tree after the daemon ended failed: {e}; its descendants may still be running{NOT_RESTARTED}"
+    )
 }
 
 #[cfg(test)]

@@ -66,8 +66,8 @@ fn wait_for_child_or_stop_does_not_deadlock_on_stop() {
         "a clean stop reported a failure"
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    // The daemon must actually be dead by now (the whole point of the call returning `Stopping`
-    // only after `send_kill_tree` confirms it), not merely have unblocked the wait.
+    // The daemon must actually be dead by now (the call returns `Stopping` only after joining the
+    // waiter on the root, which returns when the root ends), not merely have unblocked the wait.
     assert!(
         daemon.killed(),
         "the daemon was not killed though wait_for_child_or_stop returned Stopping"

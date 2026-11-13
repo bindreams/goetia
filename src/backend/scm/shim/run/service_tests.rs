@@ -93,7 +93,7 @@ const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPower
 /// The line logged when the daemon's tree cannot be terminated after the daemon ended.
 fn exited_tree_unkilled() -> String {
     format!(
-        "send_kill_tree after the daemon ended: {}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
+        "terminating the process tree after the daemon ended failed: {}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
         Report::new(&kill_refused())
     )
 }

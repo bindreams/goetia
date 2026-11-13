@@ -333,24 +333,6 @@ fn a_cosca_error_below_a_goetia_error_is_written_as_cosca_reports_it() {
     assert_eq!(text, format!("failed to run `tool`: {expected}"));
 }
 
-/// `cosca` holds the errors beneath its own in an `Arc`, and a `#[source]` can hold one in a `Box`:
-/// the layer is the pointer, and it is still a `cosca` error, which `cosca`'s `Report` writes whole.
-/// (A test of the text cannot show it: what `Report` adds, the members of a list and a `cleanup`,
-/// is built only inside `cosca`.)
-#[skuld::test]
-fn a_cosca_error_held_in_an_arc_or_a_box_is_a_cosca_layer() {
-    let cosca_error = || cosca::error::Error::Io(std::io::Error::other("no pipe"));
-
-    assert!(is_cosca_layer(&cosca_error()), "bare");
-    assert!(is_cosca_layer(&Arc::new(cosca_error())), "in an Arc");
-    assert!(is_cosca_layer(&Box::new(cosca_error())), "in a Box");
-    assert!(!is_cosca_layer(&std::io::Error::other("no pipe")), "an io::Error");
-    assert!(
-        !is_cosca_layer(&Arc::new(std::io::Error::other("no pipe"))),
-        "an Arc of one"
-    );
-}
-
 // os_error_in ---------------------------------------------------------------------------------------------------------
 
 /// `ERROR_ACCESS_DENIED` and `ERROR_PATH_NOT_FOUND`: the code is only carried, never looked up.

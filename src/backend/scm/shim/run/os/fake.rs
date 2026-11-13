@@ -118,7 +118,7 @@ struct ProcState {
     containment: Containment,
     waits: VecDeque<WaitReply>,
     kills: VecDeque<KillReply>,
-    tree_kills: VecDeque<KillReply>,
+    send_kill_tree_replies: VecDeque<KillReply>,
     exit: Option<ExitStatus>,
     killed: bool,
     dropped: bool,
@@ -155,7 +155,7 @@ impl FakeProcess {
                 containment: Containment::JobObject,
                 waits: VecDeque::new(),
                 kills: VecDeque::new(),
-                tree_kills: VecDeque::new(),
+                send_kill_tree_replies: VecDeque::new(),
                 exit: None,
                 killed: false,
                 dropped: false,
@@ -196,7 +196,7 @@ impl FakeProcess {
     }
 
     pub(crate) fn send_kill_tree(self, reply: KillReply) -> FakeProcess {
-        self.with(|state| state.tree_kills.push_back(reply))
+        self.with(|state| state.send_kill_tree_replies.push_back(reply))
     }
 
     /// End the process by hand, as it would end on its own: the part of a test that does what the
@@ -271,7 +271,7 @@ impl Spawned for Instance {
 
     fn send_kill_tree(&self) -> Result<(), cosca::error::Error> {
         self.fake.count(Op::SendKillTree);
-        let reply = lock(&self.proc.state).tree_kills.pop_front();
+        let reply = lock(&self.proc.state).send_kill_tree_replies.pop_front();
         self.kill_with("send_kill_tree", reply)
     }
 }
@@ -543,7 +543,7 @@ impl Fake {
             for (what, left) in [
                 ("wait", state.waits.len()),
                 ("kill", state.kills.len()),
-                ("send_kill_tree", state.tree_kills.len()),
+                ("send_kill_tree", state.send_kill_tree_replies.len()),
             ] {
                 if left > 0 {
                     problems.push(format!("process {n}: {left} stated {what} replies never used"));
