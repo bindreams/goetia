@@ -17,6 +17,7 @@ mod no_null;
 mod overrides;
 mod raw;
 mod resolve;
+mod schedule;
 mod user;
 mod vars;
 
@@ -25,6 +26,7 @@ pub(crate) mod test_support;
 
 pub use backend::BackendKind;
 pub use resolve::load;
+pub use schedule::{CronField, DayRule, HashSeed, Schedule};
 pub use user::{AccountId, User};
 
 // Read by `crate::backend::scm::generate` and `crate::backend::systemd::generate`, which cannot see through the
