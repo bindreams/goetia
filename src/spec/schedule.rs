@@ -117,11 +117,12 @@ impl Schedule {
 
     /// Rebuilds a schedule from `text` and the fields stored with it, needing no host name.
     ///
-    /// A field must be a set the text's terms can give: an `H`-free field equals the text's
-    /// values, and an `H` term contributes one pick (a single value, or values spaced by its
-    /// step). The seed is not known, so the `H` terms of one field are not required to agree on
-    /// it. Every value lies in the field's range and `restricted` is the text's. Anything else
-    /// is [`Error::Invalid`] for `id`, naming the field.
+    /// A field must be a set the text's terms can give. An `H`-free field equals the text's
+    /// values. The seed is not known, so an `H` field is checked for coverage and not
+    /// re-derived: it holds every fixed term's values, each `H` term has a pick (one value, or
+    /// values spaced by its step) inside it, and every value is some term's. Every value lies in
+    /// the field's range and `restricted` is the text's. Anything else is [`Error::Invalid`] for
+    /// `id`, naming the field.
     #[cfg_attr(not(test), expect(dead_code, reason = "first read by the blob decoder"))]
     pub(crate) fn from_parts(id: &Id, text: String, fields: [CronField; FIELD_COUNT]) -> Result<Schedule, Error> {
         let structure = structure(&text).map_err(|message| invalid(id, &message))?;
@@ -250,6 +251,9 @@ fn structure(text: &str) -> Result<Vec<ParsedField>, String> {
         let terms = word
             .split(',')
             .map(|term| {
+                if term.is_empty() {
+                    return Err(format!("schedule {} field: an empty term", kind.name));
+                }
                 parse_term(kind, term).map_err(|reason| format!("schedule {} field: `{term}` {reason}", kind.name))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -279,9 +283,6 @@ fn bounds(text: &str) -> Option<(u8, u8)> {
 }
 
 fn parse_term(kind: &FieldKind, term: &str) -> Result<Term, String> {
-    if term.is_empty() {
-        return Err("is an empty term".to_owned());
-    }
     let (base, step) = match term.split_once('/') {
         Some((base, step)) => (base, Some(step)),
         None => (term, None),
@@ -358,8 +359,10 @@ fn field_hash(seed: &HashSeed, position: usize) -> u64 {
 
 /// Whether `field` is a set `parsed`'s terms can give. The reason does not name the field.
 ///
-/// Each `H` term may pick any of its candidates; the terms of one field are not required to
-/// agree on the seed, because the seed is not known here.
+/// The seed is not known here, so this checks coverage, in time linear in the number of terms:
+/// every value is one some term can give, every fixed term's values are present, and every `H`
+/// term has a pick (one value, or values spaced by its step) wholly inside the field. An
+/// `H`-free field is therefore exactly the text's values.
 fn check(kind: &FieldKind, parsed: &ParsedField, field: &CronField) -> Result<(), String> {
     if field.restricted != parsed.restricted {
         return Err(format!(
@@ -370,22 +373,27 @@ fn check(kind: &FieldKind, parsed: &ParsedField, field: &CronField) -> Result<()
     if let Some(value) = field.values.iter().find(|v| !(kind.min..=kind.max).contains(v)) {
         return Err(format!("{value} is out of range {}-{}", kind.min, kind.max));
     }
-    // Every union of one pick per term that stays inside `field.values`.
-    let mut reachable = BTreeSet::from([BTreeSet::new()]);
+    // The values of every pick that fits inside `field.values`.
+    let mut given = BTreeSet::new();
     for term in &parsed.terms {
-        let picks: Vec<BTreeSet<u8>> = (0..term.modulus())
+        let mut fits = false;
+        for pick in (0..term.modulus())
             .map(|seed| term.values(seed))
             .filter(|pick| pick.is_subset(&field.values))
-            .collect();
-        reachable = reachable
-            .iter()
-            .flat_map(|union| picks.iter().map(move |pick| union.union(pick).copied().collect()))
-            .collect();
+        {
+            fits = true;
+            given.extend(pick);
+        }
+        if !fits {
+            return Err(match term {
+                Term::Fixed(values) => format!("lacks {values:?}, which the text names"),
+                Term::Hashed { lo, hi, .. } => format!("holds nothing `H` could pick over {lo}-{hi}"),
+            });
+        }
     }
-    if reachable.contains(&field.values) {
-        Ok(())
-    } else {
-        Err(format!("holds {:?}, which the text cannot give", field.values))
+    match field.values.difference(&given).next() {
+        None => Ok(()),
+        Some(value) => Err(format!("holds {value}, which no term in the text can give")),
     }
 }
 

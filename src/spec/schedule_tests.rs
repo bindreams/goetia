@@ -395,7 +395,7 @@ fn from_parts_refuses_a_set_the_text_cannot_give() {
         ("H/15 * * * *", 0, field(&[13, 29], true)),
         ("H/15 * * * *", 0, field(&[13, 28, 43], true)),
         ("H/15 * * * *", 0, field(&[13, 28, 43, 58, 59], true)),
-        ("H(10-12)/20 * * * *", 0, field(&[10, 11], true)),
+        ("H(10-12)/2 * * * *", 0, field(&[10, 11], true)),
         // the fixed terms of a list stay
         ("5,H(10-20) * * * *", 0, field(&[12], true)),
         ("5,H(10-20) * * * *", 0, field(&[5], true)),
@@ -444,6 +444,28 @@ fn from_parts_accepts_any_set_an_h_term_can_give() {
     for (text, index, values) in table {
         rebuild(text, index, field(&values, true)).unwrap_or_else(|e| panic!("{text:?} {values:?}: {e}"));
     }
+}
+
+#[skuld::test]
+fn from_parts_with_many_h_terms_is_linear() {
+    // Decoding a field must not enumerate combinations of picks; this has to complete.
+    let text = format!("{} * * * *", ["H"; 20].join(","));
+    let full = field(&(0..=59).collect::<Vec<u8>>(), true);
+    rebuild(&text, 0, full).unwrap();
+    let missing = field(&(0..=58).collect::<Vec<u8>>(), true);
+    // Coverage, not exact derivation: every H term still has a pick inside this set.
+    rebuild(&text, 0, missing).unwrap();
+    let empty = field(&[], true);
+    rebuild(&text, 0, empty).unwrap_err();
+}
+
+#[skuld::test]
+fn an_empty_term_is_worded_without_blank_quotes() {
+    let (_, message) = refusal(parse_for("nightly", HOST, "1,,2 * * * *").unwrap_err());
+    assert!(
+        message.contains("an empty term") && !message.contains("``"),
+        "{message}"
+    );
 }
 
 #[skuld::test]
