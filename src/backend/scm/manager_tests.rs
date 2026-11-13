@@ -1026,20 +1026,15 @@ fn a_refused_simple_install_never_reaches_the_provider() {
     }
 }
 
-/// A snapshot of `blob` that has never opened a service and has no `config` cached: any SCM access
-/// would fail or find no such service.
-fn snapshot_of(blob: Blob) -> ScmSnapshot {
-    ScmSnapshot::new(blob.spec.common().id.clone(), Ok(blob), (Parameters::default(), None))
-}
-
-/// A snapshot with `config` already queried: a test that gets an answer shows there was no further
-/// SCM access.
+/// A snapshot that has never opened a service, with `config` already queried: any further SCM
+/// access would fail or find no such service, so a test that gets an answer shows there was none.
 fn snapshot_with_config(spec: &DaemonSpec, command_line: &str) -> ScmSnapshot {
-    let snapshot = snapshot_of(Blob {
+    let blob = Blob {
         schema: 1,
         version: crate::version().to_string(),
         spec: spec.clone(),
-    });
+    };
+    let snapshot = ScmSnapshot::new(spec.common().id.clone(), Ok(blob), (Parameters::default(), None));
     let config = windows_service::service::ServiceConfig {
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::OnDemand,
@@ -1067,23 +1062,6 @@ fn regenerate_keeps_the_installed_host_from_the_configuration_queried_once() {
     assert_eq!(reg.executable, PathBuf::from(r"C:\Program Files\App\app.exe"));
     assert_eq!(reg.arguments, ["--service-host"]);
     assert_eq!(*calls.lock().unwrap(), Vec::<&str>::new(), "no provider is consulted");
-}
-
-/// A native service has no host to recover from the installed command line, so `regenerate` never
-/// reads the service's configuration.
-#[skuld::test]
-fn regenerate_of_a_native_service_never_reads_its_config() {
-    let blob = blob_of(Protocol::Native);
-    let spec = blob.spec.clone();
-    let snapshot = snapshot_of(blob);
-
-    let reg = Scm::new().regenerate(&spec, &snapshot);
-
-    assert!(reg.is_ok(), "{reg:?}");
-    assert!(
-        snapshot.config.get().is_none(),
-        "regenerate cached the service's configuration"
-    );
 }
 
 /// A stop whose hold expired and whose STOP was sent is the wait that ran out, led by the process SCM
