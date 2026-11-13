@@ -10,7 +10,7 @@ use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::backend::systemd::SYSTEMD_FLOOR;
 use crate::error::{Error, Result, VersionReading};
 use crate::manager::budget::{self, Deadline};
-use crate::manager::{Budget, State, Status, Step};
+use crate::manager::{Budget, DaemonStatus, State, Step};
 
 // Held ================================================================================================================
 
@@ -855,7 +855,7 @@ impl Systemctl {
     /// file for the name — is a unit file systemd cannot see, one goetia's own mount namespace holds,
     /// say. Not one merely written and not yet reloaded: the manager picks a unit file up on demand.
     /// What systemd reports for such a name is not that unit's state, and never read as one.
-    pub(super) fn status_from_unit(&self, unit: &str) -> Result<Status> {
+    pub(super) fn status_from_unit(&self, unit: &str) -> Result<DaemonStatus> {
         let props = self.show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"])?;
         if props.get("LoadState").map(String::as_str) == Some("not-found") {
             return Err(Error::UnitNotLoaded { unit: unit.to_string() });
@@ -872,7 +872,7 @@ impl Systemctl {
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|&p| p != 0);
         let enabled = props.get("UnitFileState").is_some_and(|s| s == "enabled");
-        Ok(Status { state, pid, enabled })
+        Ok(DaemonStatus { state, pid, enabled })
     }
 }
 

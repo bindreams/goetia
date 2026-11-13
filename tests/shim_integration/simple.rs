@@ -106,15 +106,15 @@ fn install_then_list_round_trips_without_the_source_file(#[fixture(scm_group)] _
     let found = installed
         .into_iter()
         .find_map(|entry| match entry {
-            Installed::Ours { spec: s, .. } if s.id.as_str() == id => Some(s),
+            Installed::Ours { spec: s, .. } if s.common().id.as_str() == id => Some(s),
             _ => None,
         })
         .unwrap_or_else(|| panic!("{id} did not appear in list"));
     assert_eq!(found, spec, "round-tripped spec must equal the original exactly");
 
-    let status = mgr.status(&spec.id).expect("status");
-    assert_eq!(status.state, State::Stopped);
-    assert!(!status.enabled);
+    let status = mgr.status(&spec.common().id).expect("status");
+    assert_eq!(status.common().state, State::Stopped);
+    assert!(!status.common().enabled);
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
@@ -127,13 +127,13 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the fixture (spawned by the shim) to report running");
-    let status = mgr.status(&spec.id).expect("status while running");
-    assert_eq!(status.state, State::Running);
-    let pid = status.pid.expect("type: simple reports the shim's own pid");
+    let status = mgr.status(&spec.common().id).expect("status while running");
+    assert_eq!(status.common().state, State::Running);
+    let pid = status.common().pid.expect("type: simple reports the shim's own pid");
 
-    // `Status.pid`'s own doc comment (`src/manager.rs`) promises this is
+    // `DaemonStatus.pid`'s own doc comment promises this is
     // `goetia-shim.exe`'s pid, not the daemon's — SCM knows no
     // other process for this service. Confirm it names the shim, not the
     // fixture.
@@ -143,9 +143,9 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
         "pid {pid} reported by status() is not goetia-shim.exe:\n{tasklist}"
     );
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-    let status = mgr.status(&spec.id).expect("status after stop");
-    assert_eq!(status.state, State::Stopped);
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    let status = mgr.status(&spec.common().id).expect("status after stop");
+    assert_eq!(status.common().state, State::Stopped);
 }
 
 #[skuld::test(labels = [SCM_DENIAL, UNIT_DIR_EXCLUSIVE], serial = SCM_DENIAL | UNIT_DIR_EXCLUSIVE)]
@@ -157,7 +157,7 @@ fn uninstall_leaves_nothing(#[fixture(scm_group)] _group: &Group) {
     let spec = simple_spec(&id, fixture_command("report", &["1"]), &logs);
     mgr.install(&spec, false).expect("install");
 
-    mgr.uninstall(&spec.id).expect("uninstall");
+    mgr.uninstall(&spec.common().id).expect("uninstall");
 
     let query = support::cmd::run("sc.exe", &["query", &id]);
     assert!(!query.ok(), "service should no longer exist:\n{query}");
@@ -255,14 +255,14 @@ fn status_through_new_keeps_a_standalone_host(#[fixture(scm_group)] _group: &Gro
     assert!(installed.contains("--probe"), "{installed}");
 
     let bare = Scm::new();
-    bare.status(&spec.id)
+    bare.status(&spec.common().id)
         .expect("status through a manager with no provider");
     let listed = bare.list().expect("list through a manager with no provider");
 
     assert!(
         listed
             .iter()
-            .any(|entry| matches!(entry, Installed::Ours { spec: s, .. } if s.id.as_str() == id)),
+            .any(|entry| matches!(entry, Installed::Ours { spec: s, .. } if s.common().id.as_str() == id)),
         "{id} must be listed as ours: {listed:?}"
     );
     let after = support::cmd::run("sc.exe", &["qc", &id]).expect_ok().stdout;
@@ -283,7 +283,7 @@ fn the_shim_reports_stop_pending_then_stopped(#[fixture(scm_group)] _group: &Gro
     let started = support::ConnectBack::listen();
     let spec = simple_spec(&id, fixture_command("report", &[&started.port().to_string()]), &logs);
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     started.accept("the fixture (spawned by the shim) to report running");
 
     let scm = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)

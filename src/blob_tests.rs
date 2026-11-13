@@ -5,41 +5,48 @@ use serde::{Deserialize, Deserializer};
 
 use super::*;
 use crate::spec::test_support::{abs, program};
+use crate::testing::service_fields;
 
 // Fixtures ============================================================================================================
 
 fn full_spec() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        id: Id::try_from("frpc").unwrap(),
-        name: "Frpc Tunnel".to_string(),
-        command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
-        cwd: Some(abs("opt/frpc")),
-        env: BTreeMap::from([
-            ("RUST_LOG".to_string(), "info".to_string()),
-            ("URL".to_string(), "http://x/a%20b".to_string()),
-        ]),
-        user: User::Name("svc-frpc".to_string()),
+    ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id: Id::try_from("frpc").unwrap(),
+            name: "Frpc Tunnel".to_string(),
+            command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
+            cwd: Some(abs("opt/frpc")),
+            env: BTreeMap::from([
+                ("RUST_LOG".to_string(), "info".to_string()),
+                ("URL".to_string(), "http://x/a%20b".to_string()),
+            ]),
+            user: User::Name("svc-frpc".to_string()),
+            logs: Some(abs("var/log/frpc.log")),
+        },
         restart: Restart::Always,
         restart_delay: Some(Duration::new(2, 500_000_000)),
-        logs: Some(abs("var/log/frpc.log")),
-        kind: Kind::Managed,
+        protocol: Protocol::Native,
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
 fn minimal_spec() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        id: Id::try_from("frpc").unwrap(),
-        name: "frpc".to_string(),
-        command: vec![program("frpc")],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
+    ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id: Id::try_from("frpc").unwrap(),
+            name: "frpc".to_string(),
+            command: vec![program("frpc")],
+            cwd: None,
+            env: BTreeMap::new(),
+            user: User::Root,
+            logs: None,
+        },
         restart: Restart::Never,
         restart_delay: None,
-        logs: None,
-        kind: Kind::Simple,
+        protocol: Protocol::Plain,
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -47,21 +54,24 @@ fn minimal_spec() -> DaemonSpec {
 /// `command[0]` (`PathBuf`'s `Display`/`to_string_lossy` differs by separator). Used only by
 /// `blob_wire_names_are_pinned`, which splices that program into the expected JSON.
 fn golden_spec() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        id: Id::try_from("frpc").unwrap(),
-        name: "Frpc Tunnel".to_string(),
-        command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
-        cwd: None,
-        env: BTreeMap::from([
-            ("RUST_LOG".to_string(), "info".to_string()),
-            ("URL".to_string(), "http://x/a%20b".to_string()),
-        ]),
-        user: User::Name("svc-frpc".to_string()),
+    ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id: Id::try_from("frpc").unwrap(),
+            name: "Frpc Tunnel".to_string(),
+            command: vec![program("frpc"), "-c".to_string(), "frpc.toml".to_string()],
+            cwd: None,
+            env: BTreeMap::from([
+                ("RUST_LOG".to_string(), "info".to_string()),
+                ("URL".to_string(), "http://x/a%20b".to_string()),
+            ]),
+            user: User::Name("svc-frpc".to_string()),
+            logs: None,
+        },
         restart: Restart::Always,
         restart_delay: Some(Duration::new(2, 500_000_000)),
-        logs: None,
-        kind: Kind::Managed,
+        protocol: Protocol::Native,
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -104,11 +114,11 @@ fn encode_decode_round_trips() {
         )),
     ];
     for user in users {
-        let mut spec = minimal_spec().into_fields();
-        spec.user = user.clone();
-        let spec = DaemonSpec::new(spec).unwrap();
+        let mut spec = service_fields(minimal_spec());
+        spec.common.user = user.clone();
+        let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
         let blob = decode(&encode(&spec)).expect("an encoded valid spec should decode");
-        assert_eq!(blob.spec.user, user);
+        assert_eq!(blob.spec.common().user, user);
     }
 }
 
@@ -161,10 +171,14 @@ fn the_blob_alphabet_is_standard_and_padded() {
     // three lengths are encoded to reach every padding.
     let encoded: Vec<String> = (0..3)
         .map(|extra| {
-            let spec = DaemonSpec::new(DaemonFields {
-                name: format!("\u{0FFF}a\u{0FFF}a\u{0FFF}{}", "z".repeat(extra)),
-                ..minimal_spec().into_fields()
+            let spec = ServiceSpec::new(ServiceFields {
+                common: DaemonFields {
+                    name: format!("\u{0FFF}a\u{0FFF}a\u{0FFF}{}", "z".repeat(extra)),
+                    ..service_fields(minimal_spec()).common
+                },
+                ..service_fields(minimal_spec())
             })
+            .map(DaemonSpec::from)
             .unwrap();
             encode(&spec)
         })

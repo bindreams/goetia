@@ -7,7 +7,7 @@
 //! most C0 control characters at all, not even as entities. Every user-supplied
 //! string that ends up in a generated artifact — `name`, `command`, `cwd`,
 //! `logs`, every `env` key and value, and `user`'s `name`/`id` — is
-//! rejected here if it contains one, by the `check_*` rules that `DaemonSpec::new` also runs.
+//! rejected here if it contains one, by the `check_*` rules that `ServiceSpec::new` also runs.
 //!
 //! **Why `command[0]` is absolutized here and `command[1..]` is not.**
 //! No launcher resolves a path *inside* an argument, so a relative path in
@@ -57,7 +57,7 @@ use super::overrides::Supplied;
 use super::raw::RawSpec;
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
-use super::{DaemonFields, DaemonSpec, Id, Kind, Restart, Warning};
+use super::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, Warning};
 use crate::error::Error;
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
@@ -373,7 +373,7 @@ fn resolve_shape(
         substitution,
         parse_restart_delay,
     )?;
-    let kind = shape(id, Field::Kind, raw.kind, substitution, parse_kind)?;
+    let kind = shape(id, Field::Kind, raw.kind, substitution, parse_protocol)?;
 
     Ok((
         ShapedSpec {
@@ -433,24 +433,27 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
 
     let restart = settled(&id, "restart", restart)?.unwrap_or(Restart::Never);
     let restart_delay = settled(&id, "restart-delay", restart_delay)?;
-    let kind = settled(&id, "type", kind)?.unwrap_or(Kind::Simple);
+    let protocol = settled(&id, "type", kind)?.unwrap_or(Protocol::Plain);
 
     // The rules already ran on these values and on every path resolved (`command[0]` included, by
     // `resolve_shape`), so `new` is what makes the result a `DaemonSpec`, not a check: it cannot
     // refuse a manifest.
     let daemon = id.clone();
-    DaemonSpec::new(DaemonFields {
-        id,
-        name,
-        command,
-        cwd,
-        env,
-        user,
+    ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id,
+            name,
+            command,
+            cwd,
+            env,
+            user,
+            logs,
+        },
         restart,
         restart_delay,
-        logs,
-        kind,
+        protocol,
     })
+    .map(DaemonSpec::from)
     .map_err(|err| contract_violation_from(&daemon, "the resolved daemon failed its own field rules", err))
 }
 
@@ -538,12 +541,12 @@ pub(crate) fn parse_restart(id: &Id, raw: &str) -> Result<Restart, Error> {
     }
 }
 
-/// Parse an authored `type:` string into a [`Kind`]. `pub(crate)`: see
+/// Parse an authored `type:` string into a [`Protocol`]. `pub(crate)`: see
 /// [`parse_restart`].
-pub(crate) fn parse_kind(id: &Id, raw: &str) -> Result<Kind, Error> {
+pub(crate) fn parse_protocol(id: &Id, raw: &str) -> Result<Protocol, Error> {
     match raw {
-        "simple" => Ok(Kind::Simple),
-        "managed" => Ok(Kind::Managed),
+        "simple" => Ok(Protocol::Plain),
+        "managed" => Ok(Protocol::Native),
         other => Err(invalid(
             id,
             &format!("field `type` is `{other}`; expected one of `simple`, `managed`"),
@@ -871,7 +874,7 @@ fn normalize(path: &Path) -> PathBuf {
     }
 }
 
-/// The field rules over a finished daemon, for [`DaemonSpec::new`].
+/// The field rules over a finished daemon, for [`ServiceSpec::new`].
 pub(super) fn check_fields(fields: &DaemonFields) -> Result<(), Error> {
     let verdicts = check_field_values(&fields.id, &FieldValues::from(fields), Phase::Final);
     for verdict in verdicts {
@@ -903,12 +906,6 @@ impl<'a> From<&'a DaemonFields> for FieldValues<'a> {
             env: &fields.env,
             user: &fields.user,
         }
-    }
-}
-
-impl<'a> From<&'a DaemonSpec> for FieldValues<'a> {
-    fn from(spec: &'a DaemonSpec) -> Self {
-        FieldValues::from(&**spec)
     }
 }
 

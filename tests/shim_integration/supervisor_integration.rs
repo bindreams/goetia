@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 
 use goetia::backend::scm::exit_status::{RecordedExit, SHIM_REFUSED};
 use goetia::manager::{Budget, ServiceManager as _};
-use goetia::spec::{DaemonFields, DaemonSpec, Restart};
+use goetia::spec::{DaemonFields, DaemonSpec, Restart, ServiceFields, ServiceSpec};
+use goetia::testing::service_fields;
 use windows_service::service::{ServiceExitCode, ServiceState};
 use winreg::enums::KEY_WRITE;
 
@@ -30,22 +31,28 @@ fn shim_runs_child_with_cwd_and_env(#[fixture(scm_group)] _group: &Group) {
 
     let mut env = BTreeMap::new();
     env.insert("GOETIA_SHIM_ENV_PROBE".to_string(), "probe-value".to_string());
-    let spec = DaemonSpec::new(DaemonFields {
-        cwd: Some(logs.path().to_path_buf()),
-        env,
-        ..simple_spec(
+    let spec = ServiceSpec::new({
+        let base = service_fields(simple_spec(
             &id,
             fixture_command("cwd-env", &[&reported.port().to_string(), "GOETIA_SHIM_ENV_PROBE"]),
             &logs,
-        )
-        .into_fields()
+        ));
+        ServiceFields {
+            common: DaemonFields {
+                cwd: Some(logs.path().to_path_buf()),
+                env,
+                ..base.common
+            },
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap();
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
 
     let line = reported.accept_line("the fixture to report its cwd and env");
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 
     let (cwd_part, env_part) = line
         .split_once(';')
@@ -78,9 +85,9 @@ fn shim_captures_stdout_to_logs_path(#[fixture(scm_group)] _group: &Group) {
         &logs,
     );
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     reported.accept("the fixture to finish writing its log lines");
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 
     let contents =
         std::fs::read_to_string(&log_path).unwrap_or_else(|e| panic!("read captured log {}: {e}", log_path.display()));
@@ -101,9 +108,9 @@ fn stop_kills_the_whole_process_tree(#[fixture(scm_group)] _group: &Group) {
     let child_reported = ConnectBack::listen();
     let grandchild_reported = ConnectBack::listen();
 
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
-        ..simple_spec(
+        ..service_fields(simple_spec(
             &id,
             fixture_command(
                 "spawn-grandchild",
@@ -113,17 +120,17 @@ fn stop_kills_the_whole_process_tree(#[fixture(scm_group)] _group: &Group) {
                 ],
             ),
             &logs,
-        )
-        .into_fields()
+        ))
     })
+    .map(DaemonSpec::from)
     .unwrap();
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     let child_pid = child_reported.accept_line("the direct child to start and report its pid");
     let grandchild_pid = grandchild_reported.accept_line("the grandchild to start and report its pid");
 
     // `stop` returns once SCM confirms `STOPPED`, so the shim has reported and the record is final.
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 
     // The stop reached the whole tree, not only the direct child.
     assert!(
@@ -177,7 +184,7 @@ fn unreadable_blob_logs_to_fallback_path_and_event_log(#[fixture(scm_group)] _gr
     corrupt_spec_value(&id);
 
     let err = mgr
-        .start(&spec.id, Budget::DEFAULT)
+        .start(&spec.common().id, Budget::DEFAULT)
         .expect_err("a shim that cannot decode its own metadata blob must fail to start, not hang");
     let text = err.report().to_string();
     assert!(

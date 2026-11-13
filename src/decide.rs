@@ -212,7 +212,7 @@ pub fn decide(
         Ownership::Absent => Outcome::Create,
 
         Ownership::Foreign => Outcome::RefuseForeign {
-            recovery: foreign_recovery(new_spec.id.as_str()),
+            recovery: foreign_recovery(new_spec.common().id.as_str()),
         },
 
         Ownership::OtherDaemon { installed } => Outcome::RefuseOtherDaemon {

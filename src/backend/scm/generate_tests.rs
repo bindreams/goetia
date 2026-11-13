@@ -1,39 +1,48 @@
 use super::*;
-use crate::spec::DaemonFields;
 use crate::spec::test_support::abs;
 use crate::spec::test_support::program;
-use crate::spec::{Builtin, MAX_SC_ACTION_DELAY};
-use crate::testing::plain_fields;
+use crate::spec::{Builtin, DaemonFields, DaemonSpec, MAX_SC_ACTION_DELAY, ServiceFields, ServiceSpec};
+use crate::testing::{base_fields, service_fields};
 
 // Fixtures ============================================================================================================
 
 fn managed_spec() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        name: "FRP tunnel client".to_string(),
-        restart: Restart::OnFailure,
-        restart_delay: Some(Duration::from_secs(5)),
-        ..plain_fields(
+    ServiceSpec::new({
+        let base = base_fields(
             "frpc",
             vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
-        )
+        );
+        ServiceFields {
+            common: DaemonFields {
+                name: "FRP tunnel client".to_string(),
+                ..base.common
+            },
+            restart: Restart::OnFailure,
+            restart_delay: Some(Duration::from_secs(5)),
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
 fn simple_spec() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        name: "FRP tunnel client".to_string(),
-        restart: Restart::OnFailure,
-        kind: Kind::Simple,
-        // The command is deliberately not named `frpc` (the id) — `simple_kind_executable_is_shim`
-        // asserts `frpc-agent` is absent from `arguments`, which would be
-        // vacuously true if it happened to equal the id (also `frpc`, and
-        // always present as the shim's sole argument).
-        ..plain_fields(
+    ServiceSpec::new({
+        let base = base_fields(
             "frpc",
             vec![program("frpc-agent"), "-c".to_string(), "frpc.toml".to_string()],
-        )
+        );
+        ServiceFields {
+            common: DaemonFields {
+                name: "FRP tunnel client".to_string(),
+                ..base.common
+            },
+            restart: Restart::OnFailure,
+            protocol: Protocol::Plain,
+            ..base
+        }
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -59,7 +68,12 @@ fn host_at(exe: impl Into<PathBuf>) -> HostCommand {
 }
 
 fn build(spec: &DaemonSpec) -> ScmRegistration {
-    registration(spec, &identity(), Some(&host())).unwrap()
+    registration(spec, &identity(), &|| Ok(host())).unwrap()
+}
+
+/// The `host` argument of a service that has no host: asking for one is a failure.
+fn no_host() -> Result<HostCommand, Error> {
+    panic!("a managed service never asks for a host")
 }
 
 // executable/arguments per Kind =======================================================================================
@@ -76,15 +90,34 @@ fn simple_kind_executable_is_shim() {
         "the host's arguments, verbatim: no id is appended"
     );
     assert!(
-        !reg.arguments.contains(&spec.command[0]),
+        !reg.arguments.contains(&spec.common().command[0]),
         "the spec's own command must not appear in arguments: {:?}",
         reg.arguments
     );
 }
 
 #[skuld::test]
-fn simple_kind_without_a_host_has_no_provider() {
-    let err = registration(&simple_spec(), &identity(), None).expect_err("a simple service needs a host");
+fn native_registration_never_asks_for_a_host() {
+    let spec = managed_spec();
+    registration(&spec, &identity(), &no_host).unwrap();
+    install_registration(&spec, &identity(), &no_host).unwrap();
+}
+
+#[skuld::test]
+fn plain_install_registration_asks_for_the_host_once() {
+    let asked = std::cell::Cell::new(0);
+    install_registration(&simple_spec(), &identity(), &|| {
+        asked.set(asked.get() + 1);
+        Ok(host())
+    })
+    .unwrap();
+    assert_eq!(asked.get(), 1, "the check and the registration share one host");
+}
+
+#[skuld::test]
+fn plain_registration_reports_the_hosts_error() {
+    let err = registration(&simple_spec(), &identity(), &|| Err(Error::NoShimProvider))
+        .expect_err("a simple service needs a host");
     assert!(matches!(err, Error::NoShimProvider), "{err:?}");
 }
 
@@ -92,8 +125,8 @@ fn simple_kind_without_a_host_has_no_provider() {
 fn managed_kind_ignores_the_host() {
     let spec = managed_spec();
     assert_eq!(
-        registration(&spec, &identity(), None).unwrap().to_string(),
-        registration(&spec, &identity(), Some(&host())).unwrap().to_string()
+        registration(&spec, &identity(), &no_host).unwrap().to_string(),
+        registration(&spec, &identity(), &|| Ok(host())).unwrap().to_string()
     );
 }
 
@@ -102,18 +135,18 @@ fn managed_kind_executable_is_own_command() {
     let spec = managed_spec();
     let reg = build(&spec);
 
-    assert_eq!(reg.executable, PathBuf::from(&spec.command[0]));
-    assert_eq!(reg.arguments, spec.command[1..].to_vec());
+    assert_eq!(reg.executable, PathBuf::from(&spec.common().command[0]));
+    assert_eq!(reg.arguments, spec.common().command[1..].to_vec());
 }
 
 // Environment =========================================================================================================
 
 #[skuld::test]
 fn managed_kind_renders_its_environment_lines() {
-    let mut spec = managed_spec().into_fields();
-    spec.env.insert("B".to_string(), "2".to_string());
-    spec.env.insert("A".to_string(), "1".to_string());
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(managed_spec());
+    spec.common.env.insert("B".to_string(), "2".to_string());
+    spec.common.env.insert("A".to_string(), "1".to_string());
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let reg = build(&spec);
 
     assert_eq!(reg.environment, ["A=1", "B=2"]);
@@ -126,10 +159,10 @@ fn managed_kind_renders_its_environment_lines() {
 #[skuld::test]
 fn simple_kind_renders_no_environment() {
     // SCM applies `Environment` to the shim, not the daemon (the shim applies `spec.env` itself), so
-    // the registration carries none for `Kind::Simple`.
-    let mut spec = simple_spec().into_fields();
-    spec.env.insert("A".to_string(), "1".to_string());
-    let spec = DaemonSpec::new(spec).unwrap();
+    // the registration carries none for `Protocol::Plain`.
+    let mut spec = service_fields(simple_spec());
+    spec.common.env.insert("A".to_string(), "1".to_string());
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let reg = build(&spec);
 
     assert!(reg.environment.is_empty(), "{:?}", reg.environment);
@@ -168,9 +201,9 @@ fn format_environment_lines_preserves_equals_signs_in_the_value() {
 
 #[skuld::test]
 fn root_user_maps_to_local_system() {
-    let mut spec = managed_spec().into_fields();
-    spec.user = User::Root;
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(managed_spec());
+    spec.common.user = User::Root;
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let reg = build(&spec);
 
     assert_eq!(reg.account, None, "User::Root must map to None (LocalSystem)");
@@ -178,11 +211,11 @@ fn root_user_maps_to_local_system() {
 
 #[skuld::test]
 fn named_user_account_uses_resolved_identity() {
-    let mut spec = managed_spec().into_fields();
-    spec.user = User::Name("bindreams".to_string());
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(managed_spec());
+    spec.common.user = User::Name("bindreams".to_string());
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let id = identity();
-    let reg = registration(&spec, &id, Some(&host())).unwrap();
+    let reg = registration(&spec, &id, &|| Ok(host())).unwrap();
 
     assert_eq!(
         reg.account,
@@ -291,29 +324,29 @@ fn every_canonical_builtin_needs_no_password() {
 
 #[skuld::test]
 fn registration_canonicalizes_a_builtin_account() {
-    let mut spec = managed_spec().into_fields();
-    spec.user = User::Name("LocalService".to_string());
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(managed_spec());
+    spec.common.user = User::Name("LocalService".to_string());
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let id = Identity {
         user: "LocalService".to_string(),
     };
-    let reg = registration(&spec, &id, Some(&host())).unwrap();
+    let reg = registration(&spec, &id, &|| Ok(host())).unwrap();
 
     assert_eq!(reg.account, Some(r"NT AUTHORITY\LocalService".to_string()));
 }
 
 #[skuld::test]
 fn registration_for_root_uses_the_default_account_with_an_empty_identity() {
-    let mut spec = managed_spec().into_fields();
-    spec.user = User::Root;
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(managed_spec());
+    spec.common.user = User::Root;
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     // The value `identity::resolve` actually returns for `User::Root`, not
     // a hand-written non-empty one — `root_user_maps_to_local_system`
     // (above) uses `identity()`'s non-empty fixture and so cannot catch
     // the empty-string path an unguarded `canonical_account` would map to
     // `Some("")` (see `windows_builtin("")`'s doc comment).
     let id = Identity { user: String::new() };
-    let reg = registration(&spec, &id, Some(&host())).unwrap();
+    let reg = registration(&spec, &id, &|| Ok(host())).unwrap();
 
     assert_eq!(reg.account, None);
 }
@@ -716,10 +749,10 @@ fn windows_style_split_matches_real_command_line_to_argv_w() {
 
 #[skuld::test]
 fn simple_kind_maps_restart_to_failure_actions_like_managed() {
-    let mut spec = simple_spec().into_fields();
+    let mut spec = service_fields(simple_spec());
     spec.restart = Restart::OnFailure;
     spec.restart_delay = Some(Duration::from_secs(42));
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let fa = build(&spec)
         .failure_actions
         .expect("restart: on-failure must configure recovery actions: SCM does every restart for a simple daemon");
@@ -730,20 +763,21 @@ fn simple_kind_maps_restart_to_failure_actions_like_managed() {
         "without the flag, a clean non-zero report never restarts"
     );
 
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart: Restart::Never,
-        ..spec.into_fields()
+        ..service_fields(spec)
     })
+    .map(DaemonSpec::from)
     .unwrap();
     assert_eq!(build(&spec).failure_actions, None);
 }
 
 #[skuld::test]
 fn simple_kind_default_restart_delay_when_unset() {
-    let mut spec = simple_spec().into_fields();
+    let mut spec = service_fields(simple_spec());
     spec.restart = Restart::OnFailure;
     spec.restart_delay = None;
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
 
     let fa = build(&spec).failure_actions.expect("recovery actions");
     assert_eq!(fa.delay, DEFAULT_RESTART_DELAY);
@@ -753,14 +787,14 @@ fn simple_kind_default_restart_delay_when_unset() {
 fn the_two_kinds_get_the_same_failure_actions_for_every_restart_value() {
     for restart in [Restart::Never, Restart::OnFailure] {
         for restart_delay in [None, Some(Duration::from_secs(42))] {
-            let mut simple = simple_spec().into_fields();
+            let mut simple = service_fields(simple_spec());
             simple.restart = restart;
             simple.restart_delay = restart_delay;
-            let simple = DaemonSpec::new(simple).unwrap();
-            let mut managed = managed_spec().into_fields();
+            let simple = ServiceSpec::new(simple).map(DaemonSpec::from).unwrap();
+            let mut managed = service_fields(managed_spec());
             managed.restart = restart;
             managed.restart_delay = restart_delay;
-            let managed = DaemonSpec::new(managed).unwrap();
+            let managed = ServiceSpec::new(managed).map(DaemonSpec::from).unwrap();
 
             assert_eq!(
                 build(&simple).failure_actions,
@@ -785,9 +819,9 @@ fn managed_kind_sets_on_non_crash_failures() {
 
 #[skuld::test]
 fn managed_kind_maps_restart_delay_to_action_delay() {
-    let mut spec = managed_spec().into_fields();
+    let mut spec = service_fields(managed_spec());
     spec.restart_delay = Some(Duration::from_secs(42));
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let reg = build(&spec);
 
     let fa = reg
@@ -798,9 +832,9 @@ fn managed_kind_maps_restart_delay_to_action_delay() {
 
 #[skuld::test]
 fn managed_kind_default_restart_delay_when_unset() {
-    let mut spec = managed_spec().into_fields();
+    let mut spec = service_fields(managed_spec());
     spec.restart_delay = None;
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let reg = build(&spec);
 
     let fa = reg
@@ -811,9 +845,9 @@ fn managed_kind_default_restart_delay_when_unset() {
 
 #[skuld::test]
 fn managed_kind_with_restart_never_has_no_failure_actions() {
-    let mut spec = managed_spec().into_fields();
+    let mut spec = service_fields(managed_spec());
     spec.restart = Restart::Never;
-    let spec = DaemonSpec::new(spec).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let reg = build(&spec);
 
     assert_eq!(
@@ -825,12 +859,13 @@ fn managed_kind_with_restart_never_has_no_failure_actions() {
 #[skuld::test]
 fn registration_refuses_restart_always() {
     for spec in [managed_spec(), simple_spec()] {
-        let spec = DaemonSpec::new(DaemonFields {
+        let spec = ServiceSpec::new(ServiceFields {
             restart: Restart::Always,
-            ..spec.into_fields()
+            ..service_fields(spec)
         })
+        .map(DaemonSpec::from)
         .unwrap();
-        let err = registration(&spec, &identity(), Some(&host())).expect_err("`restart: always` must be refused");
+        let err = registration(&spec, &identity(), &|| Ok(host())).expect_err("`restart: always` must be refused");
 
         assert!(
             matches!(&err, Error::Invalid { daemon, .. } if daemon.as_str() == "frpc"),
@@ -844,11 +879,13 @@ fn registration_refuses_restart_always() {
 
 // The executable must survive the `windows-service` writer ============================================================
 
-// These executables are Windows paths, which `DaemonSpec::new` accepts only on a Windows host.
+// These executables are Windows paths, which `ServiceSpec::new` accepts only on a Windows host.
 
 #[cfg(windows)]
 fn managed_with_executable(executable: &str) -> DaemonSpec {
-    DaemonSpec::new(plain_fields("frpc", vec![executable.to_string(), "arg".to_string()])).unwrap()
+    ServiceSpec::new(base_fields("frpc", vec![executable.to_string(), "arg".to_string()]))
+        .map(DaemonSpec::from)
+        .unwrap()
 }
 
 /// Executables whose `argv[0]` the writer reads back exactly, and ones it does not.
@@ -875,7 +912,7 @@ const EXECUTABLES_THE_WRITER_MANGLES: &[&str] = &[
 fn managed_refuses_an_executable_the_writer_would_mangle() {
     for executable in EXECUTABLES_THE_WRITER_MANGLES {
         let spec = managed_with_executable(executable);
-        let err = registration(&spec, &identity(), None).expect_err(&format!(
+        let err = registration(&spec, &identity(), &no_host).expect_err(&format!(
             "{executable:?} is rewritten by the writer and must be refused"
         ));
 
@@ -906,7 +943,7 @@ fn the_refusal_names_the_character_that_forced_the_quoting() {
         (r"C:\a b\", "space", "double quote"),
     ];
     for (executable, named, not_named) in cases {
-        let err = registration(&managed_with_executable(executable), &identity(), None)
+        let err = registration(&managed_with_executable(executable), &identity(), &no_host)
             .expect_err(&format!("{executable:?} must be refused"));
         let text = err.to_string();
         assert!(text.contains(named), "{executable:?} should name a {named}: {text}");
@@ -923,7 +960,7 @@ fn the_refusal_names_the_character_that_forced_the_quoting() {
         ("C:\\a\u{b}b\\", "vertical tab", "space"),
     ];
     for (shim, named, not_named) in shim_cases {
-        let err = install_registration(&simple_spec(), &identity(), Some(&host_at(shim)))
+        let err = install_registration(&simple_spec(), &identity(), &|| Ok(host_at(shim)))
             .expect_err(&format!("{shim:?} must be refused"));
         let text = err.to_string();
         assert!(text.contains(named), "{shim:?} should name a {named}: {text}");
@@ -939,7 +976,7 @@ fn the_refusal_names_the_character_that_forced_the_quoting() {
 fn managed_accepts_an_executable_the_writer_keeps() {
     for executable in EXECUTABLES_THE_WRITER_KEEPS {
         let spec = managed_with_executable(executable);
-        registration(&spec, &identity(), None).unwrap_or_else(|e| panic!("{executable:?}: {e}"));
+        registration(&spec, &identity(), &no_host).unwrap_or_else(|e| panic!("{executable:?}: {e}"));
     }
 }
 
@@ -953,7 +990,7 @@ fn executable_refusal_matches_what_the_writer_loses() {
         .chain(EXECUTABLES_THE_WRITER_MANGLES)
     {
         let read_back = windows_style_split(&windows_style_command_line(executable, &["arg"]));
-        let refused = registration(&managed_with_executable(executable), &identity(), None).is_err();
+        let refused = registration(&managed_with_executable(executable), &identity(), &no_host).is_err();
         assert_eq!(
             refused,
             read_back[0] != *executable,
@@ -968,7 +1005,7 @@ fn executable_refusal_matches_what_the_writer_loses() {
 #[skuld::test]
 fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     let shim = PathBuf::from(r"C:\Program Files\Goetia\");
-    let err = install_registration(&simple_spec(), &identity(), Some(&host_at(&shim)))
+    let err = install_registration(&simple_spec(), &identity(), &|| Ok(host_at(&shim)))
         .expect_err("a mangled shim path must be refused");
     let text = err.to_string();
     assert!(text.contains("service registration"), "{text}");
@@ -986,14 +1023,14 @@ fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     assert!(!text.contains("goetia-shim"), "{text}");
     assert!(!text.contains("command[0]"), "{text}");
 
-    install_registration(&simple_spec(), &identity(), Some(&host())).unwrap();
+    install_registration(&simple_spec(), &identity(), &|| Ok(host())).unwrap();
 }
 
 /// Rendering a `type: simple` daemon never fails for the shim path, whatever it is.
 #[skuld::test]
 fn rendering_a_simple_daemon_does_not_judge_the_shim_path() {
     for shim in [r"C:\Program Files\Goetia\", r#"C:\a"b\x"#] {
-        registration(&simple_spec(), &identity(), Some(&host_at(shim))).unwrap_or_else(|e| panic!("{shim:?}: {e}"));
+        registration(&simple_spec(), &identity(), &|| Ok(host_at(shim))).unwrap_or_else(|e| panic!("{shim:?}: {e}"));
     }
 }
 
@@ -1001,19 +1038,17 @@ fn rendering_a_simple_daemon_does_not_judge_the_shim_path() {
 #[skuld::test]
 fn an_accepted_shim_path_gives_the_registration_itself() {
     let host = host();
-    let installed = install_registration(&simple_spec(), &identity(), Some(&host)).unwrap();
-    let rendered = registration(&simple_spec(), &identity(), Some(&host)).unwrap();
+    let installed = install_registration(&simple_spec(), &identity(), &|| Ok(host.clone())).unwrap();
+    let rendered = registration(&simple_spec(), &identity(), &|| Ok(host.clone())).unwrap();
     assert_eq!(installed.to_string(), rendered.to_string());
 }
 
 /// A `type: managed` daemon has no shim: its own `command[0]` is what is judged, at rendering.
 #[skuld::test]
 fn a_managed_daemon_is_not_held_to_the_shim_path() {
-    install_registration(
-        &managed_spec(),
-        &identity(),
-        Some(&host_at(r"C:\Program Files\Goetia\")),
-    )
+    install_registration(&managed_spec(), &identity(), &|| {
+        Ok(host_at(r"C:\Program Files\Goetia\"))
+    })
     .unwrap();
 }
 
@@ -1021,12 +1056,13 @@ fn a_managed_daemon_is_not_held_to_the_shim_path() {
 fn registration_accepts_never_and_on_failure() {
     for restart in [Restart::Never, Restart::OnFailure] {
         for spec in [managed_spec(), simple_spec()] {
-            let spec = DaemonSpec::new(DaemonFields {
+            let spec = ServiceSpec::new(ServiceFields {
                 restart,
-                ..spec.into_fields()
+                ..service_fields(spec)
             })
+            .map(DaemonSpec::from)
             .unwrap();
-            registration(&spec, &identity(), Some(&host())).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
+            registration(&spec, &identity(), &|| Ok(host())).unwrap_or_else(|e| panic!("{restart:?}: {e}"));
         }
     }
 }
@@ -1035,12 +1071,13 @@ fn registration_accepts_never_and_on_failure() {
 fn managed_kind_clamps_absurdly_long_restart_delay() {
     // One millisecond past what a DWORD of milliseconds (SC_ACTION.Delay)
     // can express.
-    let spec = DaemonSpec::new(DaemonFields {
+    let spec = ServiceSpec::new(ServiceFields {
         restart_delay: Some(MAX_SC_ACTION_DELAY + Duration::from_millis(1)),
-        ..managed_spec().into_fields()
+        ..service_fields(managed_spec())
     })
+    .map(DaemonSpec::from)
     .unwrap();
-    let reg = registration(&spec, &identity(), Some(&host())).unwrap();
+    let reg = registration(&spec, &identity(), &|| Ok(host())).unwrap();
 
     let fa = reg
         .failure_actions
@@ -1064,9 +1101,9 @@ fn a_sub_millisecond_restart_delay_rounds_up_to_the_whole_millisecond_scm_stores
         (Duration::from_millis(7), 7),
         (Duration::ZERO, 0),
     ] {
-        let mut spec = managed_spec().into_fields();
+        let mut spec = service_fields(managed_spec());
         spec.restart_delay = Some(delay);
-        let spec = DaemonSpec::new(spec).unwrap();
+        let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
         let reg = build(&spec);
         let fa = reg.failure_actions.expect("on-failure configures recovery actions");
         assert_eq!(fa.delay, Duration::from_millis(stored_ms), "delay {delay:?}");
@@ -1092,9 +1129,9 @@ fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
         MAX_SC_ACTION_DELAY + Duration::from_nanos(1),
         Duration::MAX,
     ] {
-        let mut spec = managed_spec().into_fields();
+        let mut spec = service_fields(managed_spec());
         spec.restart_delay = Some(delay);
-        let spec = DaemonSpec::new(spec).unwrap();
+        let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
         let fa = build(&spec).failure_actions.expect("recovery actions");
         assert_eq!(fa.delay, MAX_SC_ACTION_DELAY, "delay {delay:?}");
     }
@@ -1102,10 +1139,10 @@ fn rounding_a_restart_delay_up_never_passes_the_scm_maximum() {
 
 #[skuld::test]
 fn managed_kind_restart_delay_within_bound_does_not_clamp() {
-    let mut spec = managed_spec().into_fields();
+    let mut spec = service_fields(managed_spec());
     spec.restart_delay = Some(Duration::from_secs(42));
-    let spec = DaemonSpec::new(spec).unwrap();
-    let reg = registration(&spec, &identity(), Some(&host())).unwrap();
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
+    let reg = registration(&spec, &identity(), &|| Ok(host())).unwrap();
 
     let fa = reg
         .failure_actions
@@ -1138,9 +1175,9 @@ fn display_is_the_generation_invariant() {
     let id = identity();
     let host = host();
 
-    let original = registration(&spec, &id, Some(&host)).unwrap();
+    let original = registration(&spec, &id, &|| Ok(host.clone())).unwrap();
     let recovered_spec = extract(&original.parameters, &[]).unwrap().unwrap().spec;
-    let regenerated = registration(&recovered_spec, &id, Some(&host)).unwrap();
+    let regenerated = registration(&recovered_spec, &id, &|| Ok(host.clone())).unwrap();
 
     assert_eq!(
         original.to_string(),
