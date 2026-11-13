@@ -190,7 +190,7 @@ const KINDS: [FieldKind; FIELD_COUNT] = [
     },
 ];
 
-// The structural pass ---------------------------------------------------------------------------
+// The structural pass -------------------------------------------------------------------------------------------------
 
 /// One comma-separated term, before any seed.
 #[derive(Debug)]
@@ -343,7 +343,7 @@ fn check_bounds(kind: &FieldKind, lo: u8, hi: u8, max: u8) -> Result<(), String>
     Ok(())
 }
 
-// The resolving pass ------------------------------------------------------------------------------
+// The resolving pass --------------------------------------------------------------------------------------------------
 
 fn field_hash(seed: &HashSeed, position: usize) -> u64 {
     let mut hasher = Sha256::new();
@@ -356,7 +356,7 @@ fn field_hash(seed: &HashSeed, position: usize) -> u64 {
     u64::from_be_bytes(digest[..8].try_into().expect("a SHA-256 digest is 32 bytes"))
 }
 
-// Decoding ---------------------------------------------------------------------------------------
+// Decoding ------------------------------------------------------------------------------------------------------------
 
 /// Whether `field` is a set `parsed`'s terms can give. The reason does not name the field.
 ///

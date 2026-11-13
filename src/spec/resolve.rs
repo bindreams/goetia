@@ -469,8 +469,10 @@ fn refuse_fields_of_the_other_type(
         .find(|(field, written)| *written && of_the_other_type(field))
     {
         let path = field.path();
+        // Blamed on `type`, not on the service field: it is the `type`'s text, which `.env` may have
+        // supplied, that makes the field foreign. Whether the field was written is the manifest's own.
         return Err(Refused::at(
-            field.clone(),
+            Field::Type,
             invalid(
                 id,
                 &format!("`{path}` applies only to {applies_only_to}; this daemon is `type: {this_daemon}`"),
@@ -666,7 +668,7 @@ pub(crate) fn parse_type(id: &Id, raw: &str) -> Result<DaemonKind, Error> {
     }
 }
 
-/// The refusal of `protocol: plain` and `protocol: native`, which became `protocol: plain` and `protocol: native`.
+/// The refusal of `type: simple` and `type: managed`, which became `protocol: plain` and `protocol: native`.
 fn renamed_type(id: &Id, raw: &str) -> Option<Error> {
     let protocol = match raw {
         "simple" => "plain",

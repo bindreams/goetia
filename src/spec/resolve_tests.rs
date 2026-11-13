@@ -917,7 +917,7 @@ fn resolve_rejects_empty_command() {
     assert!(err.to_string().contains("command"));
 }
 
-// Field parsing (restart, protocol, restart-delay) ========================================================================
+// Field parsing (restart, protocol, restart-delay) ====================================================================
 
 #[skuld::test]
 fn resolve_parses_each_restart_policy() {
@@ -1186,7 +1186,7 @@ fn a_task_whose_type_is_substituted_is_judged_when_the_type_is_known(#[fixture(t
     let msg = load(&dir.join("goetia.yaml")).unwrap_err().to_string();
     assert_eq!(
         msg,
-        "daemon `nightly`: `restart` applies only to a service; this daemon is `type: task`"
+        "daemon `nightly`: after substituting from .env: `restart` applies only to a service; this daemon is `type: task`"
     );
 
     write_fixture(
@@ -1197,8 +1197,41 @@ fn a_task_whose_type_is_substituted_is_judged_when_the_type_is_known(#[fixture(t
     let msg = load(&dir.join("goetia.yaml")).unwrap_err().to_string();
     assert_eq!(
         msg,
-        "daemon `nightly`: `schedule` applies only to a task; this daemon is `type: service`"
+        "daemon `nightly`: after substituting from .env: `schedule` applies only to a task; this daemon is `type: service`"
     );
+}
+
+#[skuld::test]
+fn a_refusal_the_substituted_type_caused_is_attributed_to_env(#[fixture(temp_dir)] dir: &Path) {
+    for (t, field, said) in [
+        (
+            "task",
+            "restart: always",
+            "`restart` applies only to a service; this daemon is `type: task`",
+        ),
+        (
+            "service",
+            "schedule: '30 3 * * *'",
+            "`schedule` applies only to a task; this daemon is `type: service`",
+        ),
+    ] {
+        write_fixture(
+            dir,
+            &format!(
+                "id: nightly
+command: [/bin/backup]
+type: ${{T}}
+{field}
+"
+            ),
+            Some(&format!(
+                "T={t}
+"
+            )),
+        );
+        let msg = load(&dir.join("goetia.yaml")).unwrap_err().to_string();
+        assert_eq!(msg, format!("daemon `nightly`: after substituting from .env: {said}"));
+    }
 }
 
 #[skuld::test]
@@ -2836,7 +2869,7 @@ fn a_base_value_must_pass_the_shape_gate_even_when_every_backend_overrides_it() 
     assert!(err.to_string().contains("control character"), "{err}");
 }
 
-// The `$`-skip rule for `restart`/`protocol`/`restart-delay` ==============================================================
+// The `$`-skip rule for `restart`/`protocol`/`restart-delay` ==========================================================
 
 #[skuld::test]
 fn a_templated_restart_resolves(#[fixture(temp_dir)] dir: &Path) {

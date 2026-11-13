@@ -168,7 +168,8 @@ with Jenkins's `H`. Each field is a comma list of terms: `*`, `n`, `a-b`,
 a hash of the host name, the id and the field's position, so that tasks do not
 all fire at minute 0. As in Vixie cron, when day-of-month or day-of-week
 starts with `*` both must match; otherwise either may, and a field starting
-with `H` counts as restricted. A task without a `schedule` is started only by
+with `H` counts as restricted. A schedule that starts with `*` must be quoted in
+YAML: `schedule: "*/15 * * * *"`. A task without a `schedule` is started only by
 hand. No backend installs a task yet: each refuses one.
 
 `-f` takes a manifest file, or a directory holding `goetia.yaml`. Several
@@ -526,7 +527,7 @@ is refused by `install` and `diff` as an unusable artifact, until you run
 fails for it and `list` reports it as `unusable`, because both render the
 embedded copy of the spec and SCM now refuses it. `start`, `stop`, `restart`
 and `uninstall` do not render it and keep working. What changes while it runs
-depends on its `type`. A `protocol: plain` service is no longer restarted when
+depends on its `protocol`. A `protocol: plain` service is no longer restarted when
 the command exits, because the new `goetia-shim` leaves every restart to SCM
 and the service has no recovery actions. A `protocol: native` service is unchanged:
 it already had on-failure recovery actions, keeps them, and was never restarted

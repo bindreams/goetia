@@ -600,7 +600,7 @@ fn interrupted_install_is_recoverable(#[fixture(scm_group)] _group: &Group) {
     assert!(matches!(recovered, Outcome::Create), "{recovered:?}");
 }
 
-// Step 6: env on protocol: native (spec §8 must-verify #5) ===============================================================
+// Step 6: env on protocol: native (spec §8 must-verify #5) ============================================================
 
 #[skuld::test]
 fn managed_kind_environment_availability(#[fixture(scm_group)] _group: &Group) {
