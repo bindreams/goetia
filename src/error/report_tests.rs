@@ -315,8 +315,7 @@ fn display_of_a_sentence_variant_and_its_report_agree_on_the_words() {
     assert_eq!(report.replacen(": diagnostic", "", 1), display);
 }
 
-/// A `cosca` error says one layer in its `Display`; its own `Report` is the way to print it whole,
-/// so a goetia error that holds one prints what `Report` prints, below its own words.
+/// A goetia error holding a `cosca` error prints it as `cosca::error::Report` does.
 #[skuld::test]
 fn a_cosca_error_below_a_goetia_error_is_written_as_cosca_reports_it() {
     let cosca_error = || cosca::error::Error::MayHaveStarted {
@@ -335,7 +334,7 @@ fn a_cosca_error_below_a_goetia_error_is_written_as_cosca_reports_it() {
 
 // os_error_in ---------------------------------------------------------------------------------------------------------
 
-/// `ERROR_ACCESS_DENIED` and `ERROR_PATH_NOT_FOUND`: the code is only carried, never looked up.
+/// `ERROR_ACCESS_DENIED` and `ERROR_PATH_NOT_FOUND`.
 const DENIED: i32 = 5;
 const PATH_NOT_FOUND: i32 = 3;
 
@@ -412,14 +411,11 @@ fn the_os_error_of_a_failure_is_found_at_any_depth_of_its_causes() {
         source: Arc::new(source),
     };
 
-    // A failed `Job` kill: a `Containment` over the OS error.
     assert_eq!(os_error_in(&containment(io_with_code(DENIED))), Some(DENIED));
-    // Three layers down, below a code-less layer of another variant.
     assert_eq!(
         os_error_in(&unassessable(not_killed(containment(io_with_code(DENIED))))),
         Some(DENIED)
     );
-    // A spawn failure over the same chain.
     let after_spawn = cosca::error::Error::MayHaveStarted {
         fate: cosca::error::ChildFate::Unknown,
         wrapper_elevated: false,

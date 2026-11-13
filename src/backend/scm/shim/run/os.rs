@@ -42,8 +42,8 @@ pub(crate) trait Spawned: Send + Sync {
     /// Kill the daemon alone, not its descendants.
     fn kill(&self) -> Result<(), cosca::error::Error>;
 
-    /// Send the kill to the daemon's whole tree (`cosca`'s `send_kill_tree`). `Ok` says every member
-    /// was reached, not that any has exited, and the call never waits for one.
+    /// Send the kill to the daemon's whole tree. `Ok` means every member was reached, not that any has
+    /// exited.
     fn send_kill_tree(&self) -> Result<(), cosca::error::Error>;
 }
 
@@ -113,9 +113,8 @@ impl Channels for Real {
 }
 
 /// The OS error code SCM is told for a refused spawn: the first one on the error's `source()`
-/// chain ([`os_error_in`]; a failure after `CreateProcess` comes as
-/// [`cosca::error::Error::MayHaveStarted`], below which the chain goes on), and
-/// `ERROR_FILE_NOT_FOUND` for a `NotFound` with no code anywhere. The shim passes only argv, so
+/// chain ([`os_error_in`]), and `ERROR_FILE_NOT_FOUND` for a `NotFound` with no code anywhere. The
+/// shim passes only argv, so
 /// `std` searches `PATH` for a bare program name before `CreateProcessW` is called, and its miss is
 /// `NotFound` with no code (a missing absolute path fails in `CreateProcessW`, with the code).
 /// Nothing else on the spawn path makes a code-less `NotFound`.

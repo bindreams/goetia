@@ -39,7 +39,7 @@ impl Reap {
 impl Drop for Reap {
     fn drop(&mut self) {
         if let Some(Err(e)) = self.child.as_ref().map(|child| child.send_kill_tree()) {
-            eprintln!("Reap: left a daemon running: {e}");
+            eprintln!("Reap: left a daemon running: {}", cosca::error::Report::new(&e));
         }
     }
 }
@@ -154,9 +154,8 @@ fn a_failure_after_the_spawn_is_told_to_scm_with_the_code_of_its_source() {
     assert_eq!(spawn_error_code(&after_spawn), Some(ERROR_ACCESS_DENIED as i32));
 }
 
-/// `crate::error::within` adds context to an `io::Error` as `cosca` does: the kind is kept and the
-/// code is not on the layer, so this is a `NotFound` with no code of its own, over the error that
-/// has one.
+/// `within` keeps the kind but not the code on its layer: a `NotFound` with no code of its own, over
+/// one that has it.
 #[skuld::test]
 fn a_code_on_the_chain_wins_over_a_code_less_not_found_above_it() {
     let wrapped = cosca::error::Error::Io(crate::error::within(

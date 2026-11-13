@@ -113,8 +113,8 @@ impl fmt::Display for Chain<'_> {
 /// first and each once: a [`Both`](Error::Both)'s halves can carry the same one. An error `e` sets
 /// inside its own sentence (see [`Error::sentence`]) is written there, with its remedies collected.
 ///
-/// A `cosca` error and everything below it is written by [`cosca::error::Report`]: its `Display` is
-/// one layer, and a `source()` walk shows only the first member of a list and never a `cleanup`.
+/// A `cosca` error and everything below it is written by [`cosca::error::Report`], since a `source()`
+/// walk shows only the first member of a list and never a `cleanup`.
 pub(super) fn write_chain<'a>(
     e: &'a (dyn std::error::Error + 'static),
     out: &mut Sink,
@@ -157,7 +157,9 @@ pub(super) fn write_chain<'a>(
 
 /// The first OS error code in `e`: its own, then its source's, then that of what it embeds. A
 /// [`Both`](Error::Both) is searched first half first; [`Error::Kept`] is searched as the error it
-/// holds.
+/// holds. A `cosca` error's `source()` gives only the first member of a list, so its other members
+/// are searched after the chain, and the `cleanup` of a
+/// [`MayHaveStarted`](cosca::error::Error::MayHaveStarted) last.
 pub(crate) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
     if let Some(code) = e
         .downcast_ref::<std::io::Error>()
@@ -173,10 +175,34 @@ pub(crate) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> 
         Some(Error::Kept(kept)) => return os_error_in(kept.as_ref()),
         _ => {}
     }
-    e.source().and_then(os_error_in).or_else(|| {
-        let sentence = ours.and_then(Error::sentence)?;
-        os_error_in(sentence.error.filter(|_| sentence.error_is_cause)?)
-    })
+    e.source()
+        .and_then(os_error_in)
+        .or_else(|| {
+            e.downcast_ref::<cosca::error::Error>()
+                .and_then(os_error_in_later_members)
+        })
+        .or_else(|| {
+            let sentence = ours.and_then(Error::sentence)?;
+            os_error_in(sentence.error.filter(|_| sentence.error_is_cause)?)
+        })
+}
+
+/// The first OS error code in the members `e.source()` leaves out: a list's after the first, a
+/// [`MembersLeft`](cosca::error::Error::MembersLeft)'s `others`, and a spawn's `cleanup`.
+fn os_error_in_later_members(e: &cosca::error::Error) -> Option<i32> {
+    use cosca::error::Error as Cosca;
+    let in_members =
+        |members: &cosca::error::Failures| members.iter().skip(1).find_map(|member| os_error_in(&**member));
+    match e {
+        Cosca::Several(list) => in_members(list),
+        Cosca::MembersLeft { members, others } => {
+            in_members(members).or_else(|| others.as_deref().and_then(|others| os_error_in(others)))
+        }
+        Cosca::MayHaveStarted { cleanup, .. } => cleanup
+            .as_ref()
+            .and_then(|cleanup| cleanup.iter().find_map(|member| os_error_in(&**member))),
+        _ => None,
+    }
 }
 
 /// Writes `sentence`: its error is written as any error is, so its remedies are collected into

@@ -884,11 +884,16 @@ fn an_announced_request_short_of_a_listener_thread_is_not_spawned() {
     );
 
     match refused {
-        Err(SpawnError::NotRun(e)) => assert!(
-            e.to_string().contains("no thread to read its output could be made"),
-            "{e}"
-        ),
-        Err(SpawnError::MayHaveRun(e)) => panic!("a spawn that never happened may have run: {e}"),
+        Err(SpawnError::NotRun(e)) => {
+            let e = cosca::error::Report::new(&e).to_string();
+            assert!(e.contains("no thread to read its output could be made"), "{e}");
+        }
+        Err(SpawnError::MayHaveRun(e)) => {
+            panic!(
+                "a spawn that never happened may have run: {}",
+                cosca::error::Report::new(&e)
+            )
+        }
         Ok(_) => panic!("spawned with no thread to read its output"),
     }
     assert_eq!(test_hook::spawns(), spawned_before, "the child was spawned");

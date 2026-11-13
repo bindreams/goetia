@@ -62,14 +62,14 @@ pub(crate) struct StopBus {
 
 pub enum WaitOutcome {
     ChildExited,
-    /// The waiter's `child.wait()` failed, so whether the daemon ended was unknown. `send_kill_tree`
-    /// sent the kill to the tree, so the shim may report a restartable failure. `os_error` is the
+    /// The waiter's `child.wait()` failed, so whether the daemon ended was unknown. The tree kill was
+    /// sent, so the shim may report a restartable failure. `os_error` is the
     /// failure's OS error code. When the kill could not be sent the outcome is
     /// [`WaitOutcome::DaemonMayRun`] or [`WaitOutcome::TreeMayRun`] instead.
     WaitFailed {
         os_error: Option<i32>,
     },
-    /// A stop was requested, and `send_kill_tree` sent the kill to the daemon's tree.
+    /// A stop was requested, and the tree kill was sent.
     Stopping,
     /// The daemon may still be running: `send_kill_tree` and the direct-child fallback both failed, after
     /// a stop or a failed wait. See [`Supervisor::wait_for_child_or_stop`] for why this is a return
@@ -306,8 +306,9 @@ impl Supervisor {
     ///
     /// **`send_kill_tree` can itself fail to kill anything** — a refused job termination, or a refused
     /// handle kill, since `send_kill_tree` ends in the same direct-handle kill the fallback below
-    /// re-issues. A refusal is `Err(Io)`, or `Err(Elevation)` where it was an elevated child. (The
-    /// daemon always has a Job Object: `service::launch` refuses any other containment, so
+    /// re-issues. A refused `TerminateJobObject` is a `Containment` over the `Io` that holds the OS
+    /// code, so the code sits down the `source()` chain and nothing should match on the top variant.
+    /// (The daemon always has a Job Object: `service::launch` refuses any other containment, so
     /// `Unsupported` does not arrive here.)
     /// That is exactly the same deadlock at one remove: if nothing kills the
     /// child, the background thread's `wait()` still never returns.
@@ -352,12 +353,11 @@ impl Supervisor {
     /// **A stop whose tree kill failed** is [`WaitOutcome::TreeMayRun`] too, even when the direct
     /// child's fallback worked: its descendants may still run.
     ///
-    /// **No drain after `send_kill_tree`.** [`Spawned::send_kill_tree`] only sends the kill (`cosca`'s
-    /// `send_kill_tree`) and never waits for a member. `cosca`'s waiting call has no deadline here, and
-    /// a member that does not exit (stuck in a driver call) would hold it, and so the stop, for as
-    /// long as that member lives. The kill having been sent is all this reports. Windows does not
-    /// document `TerminateJobObject` as synchronous with member teardown, so members may still be
-    /// exiting (and holding a port or a lock file) when STOPPED is reported.
+    /// **No drain after `send_kill_tree`.** It only sends the kill and never waits for a member:
+    /// cosca's waiting call has no deadline, so a member stuck in a driver call would hold the stop
+    /// for as long as it lives. Windows does not document `TerminateJobObject` as synchronous with
+    /// member teardown, so members may still be exiting (holding a port or lock file) when STOPPED
+    /// is reported.
     pub fn wait_for_child_or_stop(
         &self,
         waiter: Waiter,
@@ -464,7 +464,7 @@ pub(super) enum Teardown {
 
 /// Terminate the tree of a daemon that has already exited and is about to be reported `STOPPED`,
 /// so that a restart or `start` never runs beside a tree nobody told to end. `true` is `send_kill_tree`
-/// succeeding: the kill was sent, which is not proof the members have finished exiting. `false` (logged) means the
+/// succeeding. `false` (logged) means the
 /// tree may still be running and the stop must be reported as incomplete.
 pub(super) fn terminate_exited_tree(child: &dyn Spawned, log: &Log, id: &str) -> bool {
     let Err(e) = child.send_kill_tree() else { return true };

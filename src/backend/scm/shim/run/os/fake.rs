@@ -33,17 +33,14 @@ const WAIT_FAILED: &str = "the wait failed (fake)";
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
 /// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
-/// The error a [`KillReply::Refuses`] fails with.
 pub(crate) fn kill_refused() -> cosca::error::Error {
     cosca::error::Error::Io(io::Error::other(KILL_REFUSED))
 }
 
-/// The error a [`WaitReply::Fails`] with no OS code fails with.
 pub(crate) fn wait_failed() -> cosca::error::Error {
     cosca::error::Error::Io(io::Error::other(WAIT_FAILED))
 }
 
-/// The error a [`WaitReply::Fails`] with OS code `code` fails with.
 pub(crate) fn wait_failed_with_code(code: i32) -> cosca::error::Error {
     cosca::error::Error::Io(io::Error::from_raw_os_error(code))
 }
