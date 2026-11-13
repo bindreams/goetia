@@ -112,9 +112,7 @@ impl fmt::Display for Chain<'_> {
 
 /// Whether `e` is a `cosca` error, held directly or as the `Arc` or `Box` a holder keeps its cause as.
 fn is_cosca_layer(e: &(dyn std::error::Error + 'static)) -> bool {
-    e.is::<cosca::error::Error>()
-        || e.is::<Arc<cosca::error::Error>>()
-        || e.is::<Box<cosca::error::Error>>()
+    e.is::<cosca::error::Error>() || e.is::<Arc<cosca::error::Error>>() || e.is::<Box<cosca::error::Error>>()
 }
 
 /// Writes `e` and its causes, collecting the remedies met on the way into `remedies`, outermost

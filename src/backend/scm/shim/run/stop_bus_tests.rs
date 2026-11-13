@@ -151,7 +151,9 @@ fn wait_for_child_or_stop_returns_rather_than_waiting_on_a_daemon_it_could_not_k
 #[skuld::test]
 fn a_panic_on_the_stop_path_leaves_the_waiter_detached_and_the_daemon_untorn_down() {
     let fake = FakeGuard::new();
-    let daemon = FakeProcess::new().wait(WaitReply::Blocks).send_kill_tree(KillReply::Panics);
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Blocks)
+        .send_kill_tree(KillReply::Panics);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     // Requested before the call, so it reaches the kill — and the panic — without blocking first:
@@ -301,7 +303,9 @@ fn a_failed_background_wait_over_an_unkillable_daemon_is_the_unkillable_outcome(
 #[skuld::test]
 fn a_panicked_waiter_is_logged_when_the_stop_path_joins_it() {
     let fake = FakeGuard::new();
-    let daemon = FakeProcess::new().wait(WaitReply::Panics).send_kill_tree(KillReply::Ends);
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Panics)
+        .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
     supervisor.bus.request_stop();
 
@@ -348,7 +352,9 @@ fn a_stop_whose_send_kill_tree_fails_kills_the_child_and_reports_the_daemon_poss
 #[skuld::test]
 fn a_panicked_waiter_is_a_wait_failure_with_no_stop_requested() {
     let fake = FakeGuard::new();
-    let daemon = FakeProcess::new().wait(WaitReply::Panics).send_kill_tree(KillReply::Ends);
+    let daemon = FakeProcess::new()
+        .wait(WaitReply::Panics)
+        .send_kill_tree(KillReply::Ends);
     let (supervisor, waiter, child) = launched(&fake, &daemon);
 
     let outcome = supervisor.wait_for_child_or_stop(waiter, &child, ID, || {});

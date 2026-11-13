@@ -892,7 +892,11 @@ fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
     let supervisor = supervisor(&fake);
     // The accepted stop is what the pass acts on, so the exit status is never read: one wait.
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().wait(WaitReply::Exits(7)).send_kill_tree(KillReply::Ends));
+    fake.will_spawn(
+        FakeProcess::new()
+            .wait(WaitReply::Exits(7))
+            .send_kill_tree(KillReply::Ends),
+    );
 
     let reported = run_daemon(&spec(), &supervisor, || {
         assert_eq!(handle_control(&supervisor.bus, SERVICE_CONTROL_STOP), NO_ERROR)

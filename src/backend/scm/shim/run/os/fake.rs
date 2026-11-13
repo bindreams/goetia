@@ -166,7 +166,9 @@ impl FakeProcess {
 
     /// A daemon that runs until a tree kill ends it: the common case of a stop.
     pub(crate) fn running() -> FakeProcess {
-        FakeProcess::new().wait(WaitReply::Blocks).send_kill_tree(KillReply::Ends)
+        FakeProcess::new()
+            .wait(WaitReply::Blocks)
+            .send_kill_tree(KillReply::Ends)
     }
 
     fn with(self, change: impl FnOnce(&mut ProcState)) -> FakeProcess {

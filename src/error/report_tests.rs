@@ -345,7 +345,10 @@ fn a_cosca_error_held_in_an_arc_or_a_box_is_a_cosca_layer() {
     assert!(is_cosca_layer(&Arc::new(cosca_error())), "in an Arc");
     assert!(is_cosca_layer(&Box::new(cosca_error())), "in a Box");
     assert!(!is_cosca_layer(&std::io::Error::other("no pipe")), "an io::Error");
-    assert!(!is_cosca_layer(&Arc::new(std::io::Error::other("no pipe"))), "an Arc of one");
+    assert!(
+        !is_cosca_layer(&Arc::new(std::io::Error::other("no pipe"))),
+        "an Arc of one"
+    );
 }
 
 // os_error_in ---------------------------------------------------------------------------------------------------------
@@ -445,7 +448,10 @@ fn the_os_error_of_a_failure_is_found_at_any_depth_of_its_causes() {
     };
     assert_eq!(os_error_in(&after_spawn), Some(DENIED));
     // A code-less layer above the code does not hide it.
-    assert_eq!(os_error_in(&containment(io_with_code(PATH_NOT_FOUND))), Some(PATH_NOT_FOUND));
+    assert_eq!(
+        os_error_in(&containment(io_with_code(PATH_NOT_FOUND))),
+        Some(PATH_NOT_FOUND)
+    );
     // A chain with no code anywhere has none.
     assert_eq!(os_error_in(&unassessable(containment(code_less()))), None);
 }
