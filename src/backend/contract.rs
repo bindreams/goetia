@@ -263,7 +263,7 @@ pub(crate) struct Scan<S> {
 impl<B: Backend> ServiceManager for B {
     fn install(&self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome> {
         // `install` has no `--timeout` of its own: its calls are unbounded.
-        let mut reservation = flow::reserved(self, &spec.id, &[Step::Install], Budget::Unbounded)?;
+        let mut reservation = flow::reserved(self, &spec.common().id, &[Step::Install], Budget::Unbounded)?;
         flow::install(self, spec, force, &mut reservation)
     }
 

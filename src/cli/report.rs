@@ -226,16 +226,7 @@ impl serde::Serialize for Kind {
 /// [`Installed::OursUnusable`]: crate::manager::Installed::OursUnusable
 pub(crate) fn from_index(index: &InstalledIndex) -> Report {
     Report {
-        daemons: index
-            .ours
-            .iter()
-            .map(|(id, entry)| DaemonReport {
-                id: id.clone(),
-                state: state_str(entry.state),
-                enabled: entry.enabled,
-                pid: entry.pid,
-            })
-            .collect(),
+        daemons: index.ours.iter().map(|(id, (_, status))| daemon(id, status)).collect(),
         errors: index
             .unusable
             .iter()
@@ -267,9 +258,9 @@ pub(crate) fn from_index(index: &InstalledIndex) -> Report {
 pub(crate) fn daemon(id: &str, status: &Status) -> DaemonReport {
     DaemonReport {
         id: id.to_string(),
-        state: state_str(status.state),
-        enabled: status.enabled,
-        pid: status.pid,
+        state: state_str(status.common().state),
+        enabled: status.common().enabled,
+        pid: status.common().pid,
     }
 }
 

@@ -45,13 +45,13 @@ pub fn run(
 fn print_text(index: &InstalledIndex, out: &mut dyn Write, err: &mut dyn Write) {
     print_unusable_warnings(&index.unusable, err);
     print_undetermined_warnings(&index.undetermined, err);
-    for (id, entry) in &index.ours {
+    for (id, (spec, status)) in &index.ours {
         let _ = writeln!(
             out,
             "{id}\t{}\t{}\tenabled={}",
-            entry.spec.name,
-            state_str(entry.state),
-            entry.enabled
+            spec.common().name,
+            state_str(status.common().state),
+            status.common().enabled
         );
     }
 }

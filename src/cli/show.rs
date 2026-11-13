@@ -133,8 +133,8 @@ fn show_from_installed(
     for id in &wanted {
         // The id comes from outside, so these one-line messages write it through the strict writer.
         // A reason prints as the report does: a child's stderr in it keeps its layout.
-        if let Some(entry) = index.ours.get(id) {
-            specs.push(entry.spec.clone());
+        if let Some((spec, _)) = index.ours.get(id) {
+            specs.push(spec.clone());
         } else if index.unusable.contains_key(id) {
             print_line(err, Some("error"), None, |sink| {
                 write!(sink, "daemon `{id}` is installed but unusable")
@@ -164,7 +164,7 @@ fn print_specs<'a>(specs: impl Iterator<Item = &'a DaemonSpec>, out: &mut dyn Wr
         if i > 0 {
             let _ = writeln!(out);
         }
-        let _ = writeln!(out, "# {}", spec.id);
+        let _ = writeln!(out, "# {}", spec.common().id);
         let _ = write!(out, "{}", crate::diff::render_yaml(spec));
     }
 }

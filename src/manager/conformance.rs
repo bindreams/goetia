@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Budget, Installed, ServiceManager, State};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Id};
+use crate::spec::{DaemonSpec, Id, ServiceSpec};
 
 /// See the module doc comment. Reserved: no other scenario uses this id.
 pub const FOREIGN_ID: &str = "goetia-conformance-foreign";
@@ -132,7 +132,7 @@ pub(crate) fn fresh_id(label: &str) -> String {
 /// `install` that fails after writing is still uninstalled.
 fn fresh_spec(mk: &dyn Fn(&str) -> DaemonSpec, label: &str, cleanup: &mut Vec<Id>) -> DaemonSpec {
     let spec = mk(&fresh_id(label));
-    cleanup.push(spec.id.clone());
+    cleanup.push(spec.common().id.clone());
     spec
 }
 
@@ -156,12 +156,14 @@ fn install_does_not_start(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonS
     let spec = fresh_spec(mk, "no-start", cleanup);
     mgr.install(&spec, false).expect("install");
 
-    let status = mgr.status(&spec.id).expect("status of a just-installed service");
+    let status = mgr
+        .status(&spec.common().id)
+        .expect("status of a just-installed service");
     assert_ne!(
-        status.state,
+        status.common().state,
         State::Running,
         "install must not start the service (id {})",
-        spec.id
+        spec.common().id
     );
 }
 
@@ -169,30 +171,37 @@ fn install_does_not_enable(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> Daemon
     let spec = fresh_spec(mk, "no-enable", cleanup);
     mgr.install(&spec, false).expect("install");
 
-    let status = mgr.status(&spec.id).expect("status of a just-installed service");
+    let status = mgr
+        .status(&spec.common().id)
+        .expect("status of a just-installed service");
     assert!(
-        !status.enabled,
+        !status.common().enabled,
         "install must not enable the service at boot (id {})",
-        spec.id
+        spec.common().id
     );
 }
 
 fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec, cleanup: &mut Vec<Id>) {
     let spec = fresh_spec(mk, "preserve-enable", cleanup);
     mgr.install(&spec, false).expect("install");
-    mgr.enable(&spec.id).expect("enable");
+    mgr.enable(&spec.common().id).expect("enable");
     assert!(
-        mgr.status(&spec.id).expect("status after enable").enabled,
+        mgr.status(&spec.common().id)
+            .expect("status after enable")
+            .common()
+            .enabled,
         "enable must actually enable (id {})",
-        spec.id
+        spec.common().id
     );
 
     // A routine config update must not undo a deliberate enable (or disable).
-    let mut fields = mk(spec.id.as_str()).into_fields();
+    let DaemonSpec::Service(service) = mk(spec.common().id.as_str());
+    let mut fields = service.into_fields();
     fields
+        .common
         .env
         .insert("GOETIA_CONFORMANCE_CHANGED".to_string(), "1".to_string());
-    let changed = DaemonSpec::new(fields).expect("the conformance spec plus one env var is valid");
+    let changed = DaemonSpec::from(ServiceSpec::new(fields).expect("the conformance spec plus one env var is valid"));
     let outcome = mgr.install(&changed, false).expect("reinstall over a changed spec");
     assert!(
         matches!(outcome, crate::decide::Outcome::Update { .. }),
@@ -200,9 +209,12 @@ fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) ->
     );
 
     assert!(
-        mgr.status(&spec.id).expect("status after reinstall").enabled,
+        mgr.status(&spec.common().id)
+            .expect("status after reinstall")
+            .common()
+            .enabled,
         "reinstall must not change boot-enablement (id {})",
-        spec.id
+        spec.common().id
     );
 }
 
@@ -231,31 +243,43 @@ fn refuses_foreign_even_with_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -
 fn foreign_refuses_every_verb(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(FOREIGN_ID);
 
-    assert!(mgr.uninstall(&spec.id).is_err(), "uninstall must refuse a foreign id");
-    assert!(mgr.enable(&spec.id).is_err(), "enable must refuse a foreign id");
-    assert!(mgr.disable(&spec.id).is_err(), "disable must refuse a foreign id");
     assert!(
-        mgr.start(&spec.id, Budget::DEFAULT).is_err(),
+        mgr.uninstall(&spec.common().id).is_err(),
+        "uninstall must refuse a foreign id"
+    );
+    assert!(
+        mgr.enable(&spec.common().id).is_err(),
+        "enable must refuse a foreign id"
+    );
+    assert!(
+        mgr.disable(&spec.common().id).is_err(),
+        "disable must refuse a foreign id"
+    );
+    assert!(
+        mgr.start(&spec.common().id, Budget::DEFAULT).is_err(),
         "start must refuse a foreign id"
     );
     assert!(
-        mgr.stop(&spec.id, Budget::DEFAULT).is_err(),
+        mgr.stop(&spec.common().id, Budget::DEFAULT).is_err(),
         "stop must refuse a foreign id"
     );
     assert!(
-        mgr.request_start_after_stop(&spec.id).is_err(),
+        mgr.request_start_after_stop(&spec.common().id).is_err(),
         "request_start_after_stop must refuse a foreign id"
     );
-    let killed = mgr.kill(&spec.id);
+    let killed = mgr.kill(&spec.common().id);
     assert!(
-        matches!(killed.as_ref().err().map(Error::cause), Some(Error::Foreign { id, .. }) if id == spec.id.as_str()),
+        matches!(killed.as_ref().err().map(Error::cause), Some(Error::Foreign { id, .. }) if id == spec.common().id.as_str()),
         "kill must refuse a foreign id as Foreign, not as NotRunning or anything else: {killed:?}"
     );
     assert!(
-        mgr.request_restart(&spec.id).is_none_or(|r| r.is_err()),
+        mgr.request_restart(&spec.common().id).is_none_or(|r| r.is_err()),
         "request_restart must refuse a foreign id"
     );
-    assert!(mgr.status(&spec.id).is_err(), "status must refuse a foreign id");
+    assert!(
+        mgr.status(&spec.common().id).is_err(),
+        "status must refuse a foreign id"
+    );
 }
 
 /// The caller must have installed `mk(HAND_EDITED_ID)` and hand-edited the
@@ -297,29 +321,32 @@ fn start_and_stop_are_idempotent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> 
     let spec = fresh_spec(mk, "idempotent-start-stop", cleanup);
     mgr.install(&spec, false).expect("install");
 
-    mgr.stop(&spec.id, Budget::DEFAULT)
+    mgr.stop(&spec.common().id, Budget::DEFAULT)
         .expect("stop on a never-started service must be Ok, not an error");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     assert_eq!(
-        mgr.status(&spec.id).expect("status after start").state,
+        mgr.status(&spec.common().id)
+            .expect("status after start")
+            .common()
+            .state,
         State::Running,
         "a start under a budget returns only once the service manager reports the service \
          running, so this ONE status() read must already say so — no retry and no second chance, \
          which is the whole difference the wait makes (id {})",
-        spec.id
+        spec.common().id
     );
 
-    mgr.start(&spec.id, Budget::DEFAULT)
+    mgr.start(&spec.common().id, Budget::DEFAULT)
         .expect("start on an already-running service must be Ok, not an error");
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
     assert_ne!(
-        mgr.status(&spec.id).expect("status after stop").state,
+        mgr.status(&spec.common().id).expect("status after stop").common().state,
         State::Running,
         "a stop under a budget mirrors it: one status() read, already settled (id {})",
-        spec.id
+        spec.common().id
     );
 
-    mgr.stop(&spec.id, Budget::DEFAULT)
+    mgr.stop(&spec.common().id, Budget::DEFAULT)
         .expect("stop on an already-stopped service must be Ok, not an error");
 }
 
@@ -333,17 +360,17 @@ fn kill_of_a_service_that_is_not_running_says_so(
     let spec = fresh_spec(mk, "kill-not-running", cleanup);
     mgr.install(&spec, false).expect("install");
 
-    let never_started = mgr.kill(&spec.id);
+    let never_started = mgr.kill(&spec.common().id);
     assert!(
-        matches!(never_started.as_ref().err().map(Error::cause), Some(Error::NotRunning { id }) if id == spec.id.as_str()),
+        matches!(never_started.as_ref().err().map(Error::cause), Some(Error::NotRunning { id }) if id == spec.common().id.as_str()),
         "kill of a never-started service must be NotRunning, got {never_started:?}"
     );
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-    let stopped = mgr.kill(&spec.id);
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    let stopped = mgr.kill(&spec.common().id);
     assert!(
-        matches!(stopped.as_ref().err().map(Error::cause), Some(Error::NotRunning { id }) if id == spec.id.as_str()),
+        matches!(stopped.as_ref().err().map(Error::cause), Some(Error::NotRunning { id }) if id == spec.common().id.as_str()),
         "kill of a stopped service must be NotRunning, got {stopped:?}"
     );
 }
@@ -378,16 +405,19 @@ fn starting_with_no_budget_is_accepted_and_establishes_nothing(
     let spec = fresh_spec(mk, "no-budget-start", cleanup);
     mgr.install(&spec, false).expect("install");
 
-    mgr.start(&spec.id, Budget::Immediate)
+    mgr.start(&spec.common().id, Budget::Immediate)
         .expect("a start with no budget issues the request and returns Ok");
 
-    mgr.start(&spec.id, Budget::DEFAULT)
+    mgr.start(&spec.common().id, Budget::DEFAULT)
         .expect("a start that waits must still reach the service manager");
     assert_eq!(
-        mgr.status(&spec.id).expect("status after a start that waited").state,
+        mgr.status(&spec.common().id)
+            .expect("status after a start that waited")
+            .common()
+            .state,
         State::Running,
         "id {}",
-        spec.id
+        spec.common().id
     );
 }
 
@@ -406,19 +436,22 @@ fn a_start_request_after_a_confirmed_stop_is_accepted(
 ) {
     let spec = fresh_spec(mk, "start-after-stop", cleanup);
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
 
-    mgr.request_start_after_stop(&spec.id)
+    mgr.request_start_after_stop(&spec.common().id)
         .expect("a start request over a confirmed stop must be accepted");
 
-    mgr.start(&spec.id, Budget::DEFAULT)
+    mgr.start(&spec.common().id, Budget::DEFAULT)
         .expect("a start that waits must still reach the service manager");
     assert_eq!(
-        mgr.status(&spec.id).expect("status after a start that waited").state,
+        mgr.status(&spec.common().id)
+            .expect("status after a start that waited")
+            .common()
+            .state,
         State::Running,
         "id {}",
-        spec.id
+        spec.common().id
     );
 }
 
@@ -430,19 +463,22 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
     let spec = fresh_spec(mk, "pid-agreement", cleanup);
     mgr.install(&spec, false).expect("install");
 
-    assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
+    assert_list_is_complete_and_pid_agrees(mgr, &spec.common().id, cleanup);
 
-    mgr.start(&spec.id, Budget::DEFAULT).expect("start");
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     assert_eq!(
-        mgr.status(&spec.id).expect("status after start").state,
+        mgr.status(&spec.common().id)
+            .expect("status after start")
+            .common()
+            .state,
         State::Running,
         "id {}",
-        spec.id
+        spec.common().id
     );
-    assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
+    assert_list_is_complete_and_pid_agrees(mgr, &spec.common().id, cleanup);
 
-    mgr.stop(&spec.id, Budget::DEFAULT).expect("stop");
-    assert_list_is_complete_and_pid_agrees(mgr, &spec.id, cleanup);
+    mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");
+    assert_list_is_complete_and_pid_agrees(mgr, &spec.common().id, cleanup);
 }
 
 /// The silent-skip regression [`Installed::Undetermined`] exists to prevent:
@@ -490,7 +526,7 @@ fn list_and_status_agree_on_pid(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> D
 /// nothing.
 pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     let spec = mk(UNDETERMINED_ID);
-    let id = &spec.id;
+    let id = &spec.common().id;
 
     let listed = mgr
         .list()
@@ -505,7 +541,7 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
     );
     assert!(
         !listed.iter().any(|entry| match entry {
-            Installed::Ours { spec, .. } => spec.id == *id,
+            Installed::Ours { spec, .. } => spec.common().id == *id,
             Installed::OursUnusable { name, .. } => name == id.as_str(),
             Installed::Undetermined { .. } => false,
         }),
@@ -565,20 +601,20 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
 /// `Ours`, not just `id`: an enumeration that drops one it could read is
 /// indistinguishable from one where that daemon does not exist.
 fn assert_list_is_complete_and_pid_agrees(mgr: &dyn ServiceManager, id: &Id, installed: &[Id]) {
-    let status_pid = mgr.status(id).expect("status").pid;
+    let status_pid = mgr.status(id).expect("status").common().pid;
     let listed = mgr.list().expect("list");
     for other in installed {
         assert!(
             listed
                 .iter()
-                .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.id == *other)),
+                .any(|entry| matches!(entry, Installed::Ours { spec, .. } if spec.common().id == *other)),
             "id {other} was installed through mgr and must appear in list() as Ours: {listed:?}"
         );
     }
     let list_pid = listed
         .iter()
         .find_map(|entry| match entry {
-            Installed::Ours { spec, pid, .. } if spec.id == *id => Some(*pid),
+            Installed::Ours { spec, status } if spec.common().id == *id => Some(status.common().pid),
             _ => None,
         })
         .unwrap_or_else(|| panic!("id {id} must appear in list()"));

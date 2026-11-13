@@ -1,16 +1,16 @@
 use crate::spec::test_support::abs;
+use crate::testing::service_fields;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
 use crate::decide::{ExternalConfig, Outcome, Ownership, decide};
-use crate::spec::DaemonFields;
-use crate::spec::{Id, Kind, User};
+use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
 
 // Fixtures ============================================================================================================
 //
-// `DaemonSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds the
+// `ServiceSpec::new` requires absolute `command[0]`, `cwd` and `logs`, which is platform-defined; `abs` builds the
 // `cwd` and `logs` for the host, and `PROGRAM` is the `command[0]`.
 
 /// The program every fixture runs. Forward slashes keep a Windows path free of the backslashes that
@@ -18,21 +18,24 @@ use crate::spec::{Id, Kind, User};
 const PROGRAM: &str = if cfg!(windows) { "C:/bin/frpc" } else { "/bin/frpc" };
 
 fn full_spec() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        id: Id::try_from("frpc").unwrap(),
-        name: "Frpc Tunnel".to_string(),
-        command: vec![PROGRAM.to_string(), "-c".to_string(), "frpc.toml".to_string()],
-        cwd: Some(abs("opt/frpc")),
-        env: BTreeMap::from([
-            ("RUST_LOG".to_string(), "info".to_string()),
-            ("URL".to_string(), "http://x/a%20b".to_string()),
-        ]),
-        user: User::Name("svc-frpc".to_string()),
+    ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id: Id::try_from("frpc").unwrap(),
+            name: "Frpc Tunnel".to_string(),
+            command: vec![PROGRAM.to_string(), "-c".to_string(), "frpc.toml".to_string()],
+            cwd: Some(abs("opt/frpc")),
+            env: BTreeMap::from([
+                ("RUST_LOG".to_string(), "info".to_string()),
+                ("URL".to_string(), "http://x/a%20b".to_string()),
+            ]),
+            user: User::Name("svc-frpc".to_string()),
+            logs: Some(abs("var/log/frpc.log")),
+        },
         restart: Restart::Always,
         restart_delay: Some(Duration::new(2, 500_000_000)),
-        logs: Some(abs("var/log/frpc.log")),
-        kind: Kind::Managed,
+        protocol: Protocol::Native,
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -43,18 +46,21 @@ fn full_identity() -> Identity {
 }
 
 fn minimal_spec() -> DaemonSpec {
-    DaemonSpec::new(DaemonFields {
-        id: Id::try_from("frpc").unwrap(),
-        name: "frpc".to_string(),
-        command: vec![PROGRAM.to_string()],
-        cwd: None,
-        env: BTreeMap::new(),
-        user: User::Root,
+    ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id: Id::try_from("frpc").unwrap(),
+            name: "frpc".to_string(),
+            command: vec![PROGRAM.to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            user: User::Root,
+            logs: None,
+        },
         restart: Restart::Never,
         restart_delay: None,
-        logs: None,
-        kind: Kind::Simple,
+        protocol: Protocol::Plain,
     })
+    .map(DaemonSpec::from)
     .unwrap()
 }
 
@@ -324,7 +330,7 @@ fn extract_finds_the_section_when_it_is_not_the_last_in_the_file() {
 // Escaping ============================================================================================================
 
 // The rendering tests below call `render_exec_start` on literal words: a Unix path would not survive
-// `DaemonSpec::new` on every host.
+// `ServiceSpec::new` on every host.
 
 fn words(words: &[&str]) -> Vec<String> {
     words.iter().map(|word| word.to_string()).collect()
@@ -348,9 +354,9 @@ fn argv_with_a_backslash_is_quoted_and_doubled() {
 
 #[skuld::test]
 fn argv_with_spaces_and_quotes_round_trips() {
-    let mut spec = minimal_spec().into_fields();
-    spec.command = vec![format!("{PROGRAM} bar"), "--title=say \"hi\"".to_string()];
-    let spec = DaemonSpec::new(spec).unwrap();
+    let mut spec = service_fields(minimal_spec());
+    spec.common.command = vec![format!("{PROGRAM} bar"), "--title=say \"hi\"".to_string()];
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let id = minimal_identity();
 
     let text = unit(&spec, &id).unwrap();
@@ -359,7 +365,7 @@ fn argv_with_spaces_and_quotes_round_trips() {
     // blob carries the real argv independently, so it must round-trip
     // exactly regardless of how ExecStart= had to be quoted.
     let recovered = extract(&text).unwrap().unwrap().spec;
-    assert_eq!(recovered.command, spec.command);
+    assert_eq!(recovered.common().command, spec.common().command);
 }
 
 #[skuld::test]
@@ -396,7 +402,7 @@ fn an_executable_path_with_a_dollar_is_written_literally_and_argv0_separately() 
         ("$", "@{p}$ {p}$$ $$X"),
     ] {
         let executable = format!("{PROGRAM}{suffix}");
-        let spec = with_fields(|f| f.command = vec![executable.clone(), "$X".to_string()]);
+        let spec = with_fields(|f| f.common.command = vec![executable.clone(), "$X".to_string()]);
         let text = unit(&spec, &minimal_identity()).unwrap();
         assert_eq!(
             line_of(&text, "ExecStart="),
@@ -420,7 +426,7 @@ fn an_executable_path_without_a_dollar_gets_no_separate_argv0() {
 #[skuld::test]
 fn a_prefix_character_inside_the_executable_is_written_unchanged() {
     // Only a leading one is a command prefix.
-    let spec = with_fields(|f| f.command = vec![format!("{PROGRAM}-b@c:d+e!f")]);
+    let spec = with_fields(|f| f.common.command = vec![format!("{PROGRAM}-b@c:d+e!f")]);
     let text = unit(&spec, &minimal_identity()).unwrap();
     assert_eq!(line_of(&text, "ExecStart="), format!("ExecStart={PROGRAM}-b@c:d+e!f"));
 }
@@ -436,18 +442,21 @@ fn argv_command_prefix_character_on_a_later_argument_is_not_quoted() {
 
 #[skuld::test]
 fn percent_is_doubled_in_every_value() {
-    let spec = DaemonSpec::new(DaemonFields {
-        id: Id::try_from("frpc").unwrap(),
-        name: "100% Uptime".to_string(),
-        command: vec![format!("{PROGRAM}%1"), "arg%2 with space".to_string()],
-        cwd: Some(abs("opt/a%b")),
-        env: BTreeMap::from([("KEY".to_string(), "v%alue".to_string())]),
-        user: User::Name("ignored-by-generate".to_string()),
+    let spec = ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id: Id::try_from("frpc").unwrap(),
+            name: "100% Uptime".to_string(),
+            command: vec![format!("{PROGRAM}%1"), "arg%2 with space".to_string()],
+            cwd: Some(abs("opt/a%b")),
+            env: BTreeMap::from([("KEY".to_string(), "v%alue".to_string())]),
+            user: User::Name("ignored-by-generate".to_string()),
+            logs: Some(abs("var/log/a%b.log")),
+        },
         restart: Restart::OnFailure,
         restart_delay: None,
-        logs: Some(abs("var/log/a%b.log")),
-        kind: Kind::Simple,
+        protocol: Protocol::Plain,
     })
+    .map(DaemonSpec::from)
     .unwrap();
     let id = Identity {
         user: "u%ser".to_string(),
@@ -472,10 +481,10 @@ fn percent_is_doubled_in_every_value() {
 
 // Backslashes =========================================================================================================
 
-fn with_fields(change: impl FnOnce(&mut DaemonFields)) -> DaemonSpec {
-    let mut fields = minimal_spec().into_fields();
+fn with_fields(change: impl FnOnce(&mut ServiceFields)) -> DaemonSpec {
+    let mut fields = service_fields(minimal_spec());
     change(&mut fields);
-    DaemonSpec::new(fields).unwrap()
+    ServiceSpec::new(fields).map(DaemonSpec::from).unwrap()
 }
 
 /// The first line of `text` that starts with `key`.
@@ -498,7 +507,7 @@ fn a_raw_value_ending_in_an_odd_run_of_backslashes_gets_a_trailing_space() {
         (r"a\\b", r"a\\b"),
         (r"a\nb", r"a\nb"),
     ] {
-        let spec = with_fields(|f| f.name = name.to_string());
+        let spec = with_fields(|f| f.common.name = name.to_string());
         let text = unit(&spec, &minimal_identity()).unwrap();
         assert_eq!(
             line_of(&text, "Description="),
@@ -512,7 +521,7 @@ fn a_raw_value_ending_in_an_odd_run_of_backslashes_gets_a_trailing_space() {
 fn a_working_directory_ending_in_backslashes_is_written_so_systemd_reads_it_back() {
     for (suffix, guard) in [(r"\", " "), (r"\\", ""), (r"\\\", " "), (r"\b", ""), (r"\\b", "")] {
         let cwd = format!("{}{suffix}", abs("opt/x").display());
-        let spec = with_fields(|f| f.cwd = Some(PathBuf::from(&cwd)));
+        let spec = with_fields(|f| f.common.cwd = Some(PathBuf::from(&cwd)));
         let text = unit(&spec, &minimal_identity()).unwrap();
         assert_eq!(
             line_of(&text, "WorkingDirectory="),
@@ -526,7 +535,7 @@ fn a_working_directory_ending_in_backslashes_is_written_so_systemd_reads_it_back
 fn a_log_path_ending_in_backslashes_is_written_so_systemd_reads_it_back() {
     for (suffix, guard) in [(r"\", " "), (r"\\", ""), (r"\\\", " "), (r"\b", ""), (r"\\b", "")] {
         let logs = format!("{}{suffix}", abs("var/log/x").display());
-        let spec = with_fields(|f| f.logs = Some(PathBuf::from(&logs)));
+        let spec = with_fields(|f| f.common.logs = Some(PathBuf::from(&logs)));
         let text = unit(&spec, &minimal_identity()).unwrap();
         for key in ["StandardOutput=", "StandardError="] {
             assert_eq!(
@@ -549,7 +558,7 @@ fn a_user_ending_in_backslashes_is_written_so_systemd_reads_it_back() {
 #[skuld::test]
 fn an_argument_with_backslashes_is_quoted_with_each_backslash_doubled() {
     let spec = with_fields(|f| {
-        f.command = vec![
+        f.common.command = vec![
             PROGRAM.to_string(),
             r"C:\".to_string(),
             r"C:\\".to_string(),
@@ -568,7 +577,7 @@ fn an_argument_with_backslashes_is_quoted_with_each_backslash_doubled() {
 #[skuld::test]
 fn an_environment_value_with_backslashes_is_quoted_with_each_backslash_doubled() {
     let spec = with_fields(|f| {
-        f.env = BTreeMap::from([
+        f.common.env = BTreeMap::from([
             ("A".to_string(), r"C:\".to_string()),
             ("B".to_string(), r"C:\\".to_string()),
             ("C".to_string(), r"C:\\\".to_string()),
@@ -594,11 +603,11 @@ fn no_directive_ends_in_a_line_continuation_and_the_unit_stays_in_order() {
     // `User=` and run the daemon as root.
     for tail in [r"\", r"\\", r"\\\", r"\\\\"] {
         let spec = with_fields(|f| {
-            f.name = format!("n{tail}");
-            f.command = vec![PROGRAM.to_string(), format!("a{tail}")];
-            f.cwd = Some(PathBuf::from(format!("{}{tail}", abs("opt/x").display())));
-            f.logs = Some(PathBuf::from(format!("{}{tail}", abs("var/log/x").display())));
-            f.env = BTreeMap::from([("K".to_string(), format!("v{tail}"))]);
+            f.common.name = format!("n{tail}");
+            f.common.command = vec![PROGRAM.to_string(), format!("a{tail}")];
+            f.common.cwd = Some(PathBuf::from(format!("{}{tail}", abs("opt/x").display())));
+            f.common.logs = Some(PathBuf::from(format!("{}{tail}", abs("var/log/x").display())));
+            f.common.env = BTreeMap::from([("K".to_string(), format!("v{tail}"))]);
         });
         let id = Identity {
             user: format!("u{tail}"),
@@ -642,7 +651,7 @@ fn an_executable_path_with_a_backslash_or_quote_is_refused_because_systemd_refus
     // Refused: no encoding carries it (see `refuse_unrepresentable`).
     for suffix in [r"\y", r"\", r"\\", "\"y", "'y"] {
         let executable = format!("{PROGRAM}{suffix}");
-        let spec = with_fields(|f| f.command = vec![executable.clone()]);
+        let spec = with_fields(|f| f.common.command = vec![executable.clone()]);
         let err = unit(&spec, &minimal_identity()).unwrap_err();
         let Error::Invalid { daemon, message, .. } = &err else {
             panic!("{executable:?}: expected Error::Invalid, got {err:?}");
@@ -660,7 +669,7 @@ fn an_executable_path_with_a_backslash_or_quote_is_refused_because_systemd_refus
 #[skuld::test]
 fn a_later_argument_may_hold_a_backslash_or_quote() {
     let spec = with_fields(|f| {
-        f.command = vec![
+        f.common.command = vec![
             PROGRAM.to_string(),
             r"a\b".to_string(),
             "a\"b".to_string(),
@@ -693,7 +702,7 @@ fn an_environment_name_systemd_would_drop_is_refused() {
         "\u{43a}\u{43b}\u{44e}\u{447}",
         "-K",
     ] {
-        let spec = with_fields(|f| f.env = BTreeMap::from([(key.to_string(), "v".to_string())]));
+        let spec = with_fields(|f| f.common.env = BTreeMap::from([(key.to_string(), "v".to_string())]));
         let err = unit(&spec, &minimal_identity()).unwrap_err();
         let Error::Invalid { daemon, message, .. } = &err else {
             panic!("{key:?}: expected Error::Invalid, got {err:?}");
@@ -708,7 +717,7 @@ fn an_environment_name_systemd_would_drop_is_refused() {
 #[skuld::test]
 fn an_environment_name_systemd_accepts_is_written_and_read_back() {
     for key in ["K", "k", "_K", "K1", "K_1", "_", "__COSCA_X", "kEy_9"] {
-        let spec = with_fields(|f| f.env = BTreeMap::from([(key.to_string(), "v".to_string())]));
+        let spec = with_fields(|f| f.common.env = BTreeMap::from([(key.to_string(), "v".to_string())]));
         let text = unit(&spec, &minimal_identity()).unwrap();
         assert_eq!(
             line_of(&text, "Environment="),
@@ -736,7 +745,7 @@ fn assert_refused_as_stripped(result: Result<String, Error>, what: &str, value: 
 #[skuld::test]
 fn a_description_with_leading_or_trailing_whitespace_is_refused() {
     for name in [" a", "a ", " a ", "  a", "a  ", " "] {
-        let spec = with_fields(|f| f.name = name.to_string());
+        let spec = with_fields(|f| f.common.name = name.to_string());
         assert_refused_as_stripped(unit(&spec, &minimal_identity()), "Description=", name);
     }
 }
@@ -753,7 +762,7 @@ fn a_user_with_leading_or_trailing_whitespace_is_refused() {
 fn a_working_directory_ending_in_whitespace_is_refused() {
     for tail in [" ", "  ", r"\ "] {
         let cwd = format!("{}{tail}", abs("opt/x").display());
-        let spec = with_fields(|f| f.cwd = Some(PathBuf::from(&cwd)));
+        let spec = with_fields(|f| f.common.cwd = Some(PathBuf::from(&cwd)));
         assert_refused_as_stripped(unit(&spec, &minimal_identity()), "WorkingDirectory=", &cwd);
     }
 }
@@ -762,14 +771,14 @@ fn a_working_directory_ending_in_whitespace_is_refused() {
 fn a_log_path_ending_in_whitespace_is_refused() {
     for tail in [" ", "  ", r"\ "] {
         let logs = format!("{}{tail}", abs("var/log/x").display());
-        let spec = with_fields(|f| f.logs = Some(PathBuf::from(&logs)));
+        let spec = with_fields(|f| f.common.logs = Some(PathBuf::from(&logs)));
         assert_refused_as_stripped(unit(&spec, &minimal_identity()), "StandardOutput=", &logs);
     }
 }
 
 #[skuld::test]
 fn an_executable_path_ending_in_whitespace_is_refused_because_systemd_does_not_run_it() {
-    let spec = with_fields(|f| f.command = vec![format!("{PROGRAM} ")]);
+    let spec = with_fields(|f| f.common.command = vec![format!("{PROGRAM} ")]);
     let err = unit(&spec, &minimal_identity()).unwrap_err();
     let Error::Invalid { daemon, message, .. } = &err else {
         panic!("expected Error::Invalid, got {err:?}");
@@ -785,7 +794,7 @@ fn an_executable_path_ending_in_whitespace_is_refused_because_systemd_does_not_r
 fn whitespace_systemd_keeps_is_written_unchanged() {
     // Interior whitespace, and edge whitespace systemd does not strip, in every raw directive.
     for value in ["a b", "a  b", "a\u{a0}", "\u{3000}a", "a\u{2003}"] {
-        let spec = with_fields(|f| f.name = value.to_string());
+        let spec = with_fields(|f| f.common.name = value.to_string());
         let text = unit(&spec, &minimal_identity()).unwrap();
         assert_eq!(
             line_of(&text, "Description="),
@@ -794,8 +803,8 @@ fn whitespace_systemd_keeps_is_written_unchanged() {
         );
     }
     let spec = with_fields(|f| {
-        f.cwd = Some(PathBuf::from(format!("{}/a b/c", abs("opt/x").display())));
-        f.command = vec![format!("{PROGRAM} b")];
+        f.common.cwd = Some(PathBuf::from(format!("{}/a b/c", abs("opt/x").display())));
+        f.common.command = vec![format!("{PROGRAM} b")];
     });
     assert!(unit(&spec, &minimal_identity()).is_ok());
 
@@ -803,7 +812,7 @@ fn whitespace_systemd_keeps_is_written_unchanged() {
     // quoted. (A tab never gets here: it is a control character.)
     for tail in ["\u{a0}", "\u{3000}"] {
         let executable = format!("{PROGRAM}{tail}");
-        let spec = with_fields(|f| f.command = vec![executable.clone()]);
+        let spec = with_fields(|f| f.common.command = vec![executable.clone()]);
         let text = unit(&spec, &minimal_identity()).unwrap();
         assert_eq!(
             line_of(&text, "ExecStart="),
@@ -816,14 +825,14 @@ fn whitespace_systemd_keeps_is_written_unchanged() {
 #[skuld::test]
 fn an_argument_and_an_environment_value_with_edge_whitespace_are_quoted_whole() {
     let spec = with_fields(|f| {
-        f.command = vec![
+        f.common.command = vec![
             PROGRAM.to_string(),
             " a".to_string(),
             "a ".to_string(),
             " a ".to_string(),
             " ".to_string(),
         ];
-        f.env = BTreeMap::from([
+        f.common.env = BTreeMap::from([
             ("K".to_string(), " v ".to_string()),
             ("L".to_string(), "v ".to_string()),
         ]);
@@ -843,8 +852,8 @@ fn an_argument_and_an_environment_value_with_edge_whitespace_are_quoted_whole() 
 fn a_parent_dir_in_a_working_directory_or_log_path_is_refused_because_systemd_refuses_it() {
     let with_parent = |p: &str| PathBuf::from(format!("{}/../x", abs(p).display()));
     let cases = [
-        ("`cwd`", with_fields(|f| f.cwd = Some(with_parent("opt/x")))),
-        ("`logs`", with_fields(|f| f.logs = Some(with_parent("var/log")))),
+        ("`cwd`", with_fields(|f| f.common.cwd = Some(with_parent("opt/x")))),
+        ("`logs`", with_fields(|f| f.common.logs = Some(with_parent("var/log")))),
     ];
     for (field, spec) in cases {
         let err = unit(&spec, &minimal_identity()).unwrap_err();
@@ -869,9 +878,9 @@ fn start_limit_disabled_when_restart_enabled() {
         (Restart::OnFailure, true),
         (Restart::Always, true),
     ] {
-        let mut spec = minimal_spec().into_fields();
+        let mut spec = service_fields(minimal_spec());
         spec.restart = restart;
-        let spec = DaemonSpec::new(spec).unwrap();
+        let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
         let text = unit(&spec, &minimal_identity()).unwrap();
 
         assert_eq!(
@@ -898,12 +907,12 @@ fn manifest_dollar_escape_survives_into_exec_start() {
     .expect("fixture manifest should be writable");
 
     let (spec, _warnings) = crate::spec::load(dir.path()).expect("manifest should load");
-    assert_eq!(spec.command[1], "$ARGS");
+    assert_eq!(spec.common().command[1], "$ARGS");
 
     // On a Windows host `resolve` makes `command[0]` a `C:\...` path, which systemd cannot load.
-    let mut fields = spec.into_fields();
-    fields.command[0] = PROGRAM.to_string();
-    let spec = DaemonSpec::new(fields).unwrap();
+    let mut fields = service_fields(spec);
+    fields.common.command[0] = PROGRAM.to_string();
+    let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
 
     let text = unit(&spec, &minimal_identity()).unwrap();
     let exec_start = text.lines().find(|l| l.starts_with("ExecStart=")).unwrap();

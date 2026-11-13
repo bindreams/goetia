@@ -145,7 +145,7 @@ restart: null
 
 #[skuld::test]
 fn an_explicit_null_type_is_rejected() {
-    // See `an_explicit_null_restart_is_rejected`: `type` is the `Kind` half.
+    // See `an_explicit_null_restart_is_rejected`: `type` is the `Protocol` half.
     let yaml = "
 id: frpc
 command: [bin/frpc]

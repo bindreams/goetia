@@ -23,19 +23,21 @@ pub(crate) fn units_bytes(units: &[u16]) -> Vec<u8> {
 /// The hash in the file name of a shim host, as a provider places one: SHA-256 of `b"abc"`.
 pub(crate) const SHIM_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
-/// A service's blob of `kind`, as `install` writes it for the plain daemon `frpc`.
+/// A service's blob of `protocol`, as `install` writes it for the daemon `frpc`.
 #[cfg(windows)]
-pub(crate) fn blob_of(kind: crate::spec::Kind) -> crate::blob::Blob {
-    use crate::spec::{DaemonFields, DaemonSpec};
-    use crate::testing::plain_fields;
+pub(crate) fn blob_of(protocol: crate::spec::Protocol) -> crate::blob::Blob {
+    use crate::spec::{DaemonSpec, ServiceFields, ServiceSpec};
+    use crate::testing::base_fields;
 
     crate::blob::Blob {
         schema: 1,
         version: "0.1.0".to_string(),
-        spec: DaemonSpec::new(DaemonFields {
-            kind,
-            ..plain_fields("frpc", vec![crate::spec::test_support::program("frpc")])
-        })
-        .unwrap(),
+        spec: DaemonSpec::from(
+            ServiceSpec::new(ServiceFields {
+                protocol,
+                ..base_fields("frpc", vec![crate::spec::test_support::program("frpc")])
+            })
+            .unwrap(),
+        ),
     }
 }

@@ -21,7 +21,7 @@
 //!   by one byte reports the installed service as stale-and-regeneratable
 //!   (see `decide::Outcome::Stale`) rather than as a user hand-edit.
 //!
-//! `decode` builds the `DaemonSpec` through `DaemonSpec::new`, so the deserialized
+//! `decode` builds the `DaemonSpec` through `ServiceSpec::new`, so the deserialized
 //! content passes every field rule: a tampered or bit-rotted artifact can
 //! carry structurally valid JSON that violates them.
 
@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::spec::{AccountId, DaemonFields, DaemonSpec, Id, Kind, Restart, User};
+use crate::spec::{AccountId, DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
 
 // Constants ===========================================================================================================
 
@@ -230,20 +230,21 @@ struct WireDuration {
 
 impl From<&DaemonSpec> for WireSpec {
     fn from(spec: &DaemonSpec) -> Self {
+        let DaemonSpec::Service(s) = spec;
         WireSpec {
-            id: spec.id.as_str().to_string(),
-            name: spec.name.clone(),
-            command: spec.command.clone(),
-            cwd: spec.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
-            env: spec.env.clone(),
-            user: WireUser::from(&spec.user),
-            restart: WireRestart::from(spec.restart),
-            restart_delay: spec.restart_delay.map(|d| WireDuration {
+            id: s.common.id.as_str().to_string(),
+            name: s.common.name.clone(),
+            command: s.common.command.clone(),
+            cwd: s.common.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            env: s.common.env.clone(),
+            user: WireUser::from(&s.common.user),
+            restart: WireRestart::from(s.restart),
+            restart_delay: s.restart_delay.map(|d| WireDuration {
                 nanos: d.subsec_nanos(),
                 secs: d.as_secs(),
             }),
-            logs: spec.logs.as_ref().map(|p| p.to_string_lossy().into_owned()),
-            kind: WireKind::from(spec.kind),
+            logs: s.common.logs.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            kind: WireKind::from(s.protocol),
         }
     }
 }
@@ -269,16 +270,16 @@ impl From<Restart> for WireRestart {
     }
 }
 
-impl From<Kind> for WireKind {
-    fn from(kind: Kind) -> Self {
-        match kind {
-            Kind::Simple => WireKind::Simple,
-            Kind::Managed => WireKind::Managed,
+impl From<Protocol> for WireKind {
+    fn from(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::Plain => WireKind::Simple,
+            Protocol::Native => WireKind::Managed,
         }
     }
 }
 
-/// Rebuild a `DaemonSpec` from wire data. `DaemonSpec::new` re-runs every field rule — see the
+/// Rebuild a `DaemonSpec` from wire data. `ServiceSpec::new` re-runs every field rule — see the
 /// module doc comment for why a structurally valid `WireSpec` cannot be trusted as-is.
 fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
     let id = Id::try_from(wire.id)?;
@@ -296,28 +297,30 @@ fn daemon_spec_from_wire(wire: WireSpec) -> Result<DaemonSpec, Error> {
         WireRestart::Always => Restart::Always,
     };
 
-    let kind = match wire.kind {
-        WireKind::Simple => Kind::Simple,
-        WireKind::Managed => Kind::Managed,
+    let protocol = match wire.kind {
+        WireKind::Simple => Protocol::Plain,
+        WireKind::Managed => Protocol::Native,
     };
 
-    let spec = DaemonSpec::new(DaemonFields {
-        id,
-        name: wire.name,
-        command: wire.command,
-        cwd: wire.cwd.map(PathBuf::from),
-        env: wire.env,
-        user,
+    let spec = ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            id,
+            name: wire.name,
+            command: wire.command,
+            cwd: wire.cwd.map(PathBuf::from),
+            env: wire.env,
+            user,
+            logs: wire.logs.map(PathBuf::from),
+        },
         restart,
         restart_delay: wire.restart_delay.as_ref().map(duration_from_wire),
-        logs: wire.logs.map(PathBuf::from),
-        kind,
+        protocol,
     })?;
     // After the field rules: a blob with several defects reports the first in field order.
     if let Some(delay) = &wire.restart_delay {
-        check_nanos(&spec.id, delay)?;
+        check_nanos(&spec.common.id, delay)?;
     }
-    Ok(spec)
+    Ok(spec.into())
 }
 
 /// Saturates rather than panic on `nanos >= 1e9`; [`check_nanos`] refuses that value right after.
