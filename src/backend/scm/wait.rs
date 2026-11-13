@@ -1099,6 +1099,8 @@ fn stopped_before_running(
                 return Ok(Waited::Confirmed);
             }
         }
+        // A managed service is its own process and may set a wait hint itself, so `(0, 0)` after a hint
+        // means it ran: only the shim's records identify a failed start.
         Protocol::Native => {}
     }
     Err(io::Error::other(format!(

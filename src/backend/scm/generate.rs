@@ -103,7 +103,7 @@ pub struct ScmRegistration {
     pub account: Option<String>,
     pub failure_actions: Option<FailureActions>,
     /// The `Services\<name>\Environment` `REG_MULTI_SZ` lines, as written and as read back: raw,
-    /// so a hand-reordered or malformed value compares as it stands. Empty for `Protocol::Plain`
+    /// so a hand-reordered or malformed value compares as it stands. Empty for a `hosted` service
     /// — see [`registration`].
     pub environment: Vec<String>,
     /// The `Services\<name>\Parameters` values, including the metadata blob
@@ -141,7 +141,7 @@ pub struct FailureActions {
 ///
 /// `id` is the account already resolved by the effectful install path (see
 /// [`Identity`]) — this function does no lookup of its own. `host` is called at most once, and
-/// only for `Protocol::Plain`, where the host (not the spec's own command) is what SCM launches,
+/// only for a `hosted` service, where the host (not the spec's own command) is what SCM launches,
 /// with the host's own arguments; it is not judged here: see [`install_registration`]. Its error is
 /// this function's.
 ///
@@ -179,6 +179,11 @@ fn resolve_host(
 
 /// [`registration`] for a `host` already resolved by [`resolve_host`].
 fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result<ScmRegistration, Error> {
+    debug_assert_eq!(
+        host.is_some(),
+        hosted(spec),
+        "a hosted spec's host is resolved before it is built, and only a hosted spec's"
+    );
     let DaemonSpec::Service(s) = spec;
     // SCM applies `Environment` to the process it launches: the daemon for a native service, the shim
     // for a hosted one.
