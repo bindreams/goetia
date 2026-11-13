@@ -6,6 +6,7 @@
 //! is told.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
@@ -74,7 +75,7 @@ fn no_thread_failure() -> String {
 fn spawn_failure() -> String {
     format!(
         r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}"#,
-        not_found()
+        cosca::error::Report::new(&not_found())
     )
 }
 
@@ -82,7 +83,7 @@ fn spawn_failure() -> String {
 const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
 
 /// The line logged when the daemon's tree cannot be terminated after the daemon ended.
-const EXITED_TREE_UNKILLED: &str = "kill_tree after the daemon ended: the kill was refused (fake); its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
+const EXITED_TREE_UNKILLED: &str = "kill_tree after the daemon ended: an I/O operation failed: the kill was refused (fake); its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
 
 #[skuld::test]
 fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
@@ -200,10 +201,12 @@ fn may_have_started(fate: ChildFate) -> cosca::error::Error {
     cosca::error::Error::MayHaveStarted {
         fate,
         wrapper_elevated: false,
-        source: Box::new(cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+        detail: None,
+        source: Arc::new(cosca::error::Error::Io(std::io::Error::from_raw_os_error(
             ERROR_ACCESS_DENIED as i32,
         ))),
         unreaped: None,
+        cleanup: None,
     }
 }
 
@@ -221,7 +224,7 @@ fn a_spawn_error_that_may_have_left_the_daemon_running_is_the_incomplete_stop_re
         assert_eq!(launched.as_ref().err(), Some(&Reported::incomplete_stop()), "{fate:?}");
         let expected = format!(
             r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}; the daemon may still be running{NOT_RESTARTED}"#,
-            may_have_started(fate)
+            cosca::error::Report::new(&may_have_started(fate))
         );
         assert_one_failure(&fake.take_failures(), ID, &expected);
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
@@ -441,7 +444,10 @@ fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", std::io::Error::from_raw_os_error(5)),
+        &format!(
+            "background wait on child: an I/O operation failed: {}",
+            std::io::Error::from_raw_os_error(5)
+        ),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -462,7 +468,7 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {WAIT_FAILED}"),
+        &format!("background wait on child: an I/O operation failed: {WAIT_FAILED}"),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -496,7 +502,7 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
         &fake.take_failures(),
         ID,
         &[
-            format!("background wait on child: {WAIT_FAILED}"),
+            format!("background wait on child: an I/O operation failed: {WAIT_FAILED}"),
             tree_refused_failure(),
             fallback_refused_failure(),
         ],
@@ -662,7 +668,10 @@ fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", std::io::Error::from_raw_os_error(5)),
+        &format!(
+            "background wait on child: an I/O operation failed: {}",
+            std::io::Error::from_raw_os_error(5)
+        ),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -814,7 +823,7 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("query child exit status: {WAIT_FAILED}"),
+        &format!("query child exit status: an I/O operation failed: {WAIT_FAILED}"),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead as _, BufReader};
 use std::os::windows::io::OwnedHandle;
+use std::sync::Arc;
 
 use crate::spec::{DaemonFields, DaemonSpec};
 use crate::testing::plain_fields;
@@ -148,7 +149,7 @@ fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
     assert_eq!(
         os_error_of(&cosca::error::Error::Unassessable {
             detail: "query".to_string(),
-            source: Some(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            source: Some(Arc::new(not_found())),
         }),
         None
     );
@@ -158,7 +159,8 @@ fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
     );
     assert_eq!(
         os_error_of(&cosca::error::Error::Containment {
-            detail: "attach".to_string()
+            detail: "attach".to_string(),
+            source: None,
         }),
         None
     );
@@ -171,8 +173,10 @@ fn the_os_error_of_a_failure_after_the_spawn_is_the_one_of_its_source() {
     let after_spawn = |source: cosca::error::Error| cosca::error::Error::MayHaveStarted {
         fate: cosca::error::ChildFate::Unknown,
         wrapper_elevated: false,
-        source: Box::new(source),
+        detail: None,
+        source: Arc::new(source),
         unreaped: None,
+        cleanup: None,
     };
     let denied = || cosca::error::Error::Io(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
 
@@ -183,10 +187,57 @@ fn the_os_error_of_a_failure_after_the_spawn_is_the_one_of_its_source() {
     );
     assert_eq!(
         os_error_of(&after_spawn(cosca::error::Error::Containment {
-            detail: "attach".to_string()
+            detail: "attach".to_string(),
+            source: None,
         })),
         None
     );
+}
+
+/// cosca keeps the OS error at the bottom of the `source()` chain, below however many layers a call
+/// added; the code SCM is told is that error's, whichever layers lie above it.
+#[skuld::test]
+fn the_os_error_of_a_failure_is_found_at_any_depth_of_its_causes() {
+    let denied = || cosca::error::Error::Io(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let containment = |source| cosca::error::Error::Containment {
+        detail: "kill".to_string(),
+        source: Some(Arc::new(source)),
+    };
+    let unassessable = |source| cosca::error::Error::Unassessable {
+        detail: "kill".to_string(),
+        source: Some(Arc::new(source)),
+    };
+    let not_killed = |source| cosca::error::Error::MemberNotKilled {
+        pid: 1,
+        source: Arc::new(source),
+    };
+
+    // A failed `Job` kill: a `Containment` over the OS error.
+    assert_eq!(os_error_of(&containment(denied())), Some(ERROR_ACCESS_DENIED as i32));
+    // Three layers down, below a code-less layer of another variant.
+    assert_eq!(
+        os_error_of(&unassessable(not_killed(containment(denied())))),
+        Some(ERROR_ACCESS_DENIED as i32)
+    );
+    // A spawn failure over the same chain.
+    let after_spawn = cosca::error::Error::MayHaveStarted {
+        fate: cosca::error::ChildFate::Unknown,
+        wrapper_elevated: false,
+        detail: None,
+        source: Arc::new(unassessable(denied())),
+        unreaped: None,
+        cleanup: None,
+    };
+    assert_eq!(os_error_of(&after_spawn), Some(ERROR_ACCESS_DENIED as i32));
+    // The first error with a code, not the last: the layer above a deeper code is not skipped.
+    assert_eq!(
+        os_error_of(&containment(cosca::error::Error::Io(
+            std::io::Error::from_raw_os_error(ERROR_PATH_NOT_FOUND as i32)
+        ))),
+        Some(ERROR_PATH_NOT_FOUND as i32)
+    );
+    // A chain with no code anywhere has none.
+    assert_eq!(os_error_of(&unassessable(containment(not_found()))), None);
 }
 
 #[skuld::test]

@@ -38,13 +38,13 @@ pub(crate) fn assert_failures(lines: &[String], id: &str, expected: &[String]) {
 /// The line logged when `kill_tree` is refused and the direct child's kill is tried next.
 pub(crate) fn tree_refused_failure() -> String {
     format!(
-        "kill_tree: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
+        "kill_tree: an I/O operation failed: {KILL_REFUSED}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)"
     )
 }
 
 /// The line logged when the direct child's kill is refused too.
 pub(crate) fn fallback_refused_failure() -> String {
     format!(
-        "fallback kill: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
+        "fallback kill: an I/O operation failed: {KILL_REFUSED}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure"
     )
 }

@@ -16,7 +16,7 @@ use crate::backend::scm::wide::wide_null;
 use crate::blob::Blob;
 use crate::error::Error;
 use crate::spec::{DaemonSpec, Restart};
-use cosca::error::ChildFate;
+use cosca::error::{ChildFate, Report};
 use cosca::{Containment, Fd, Stdio};
 use windows_service::{define_windows_service, service_dispatcher};
 use windows_sys::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
@@ -448,7 +448,7 @@ fn require_job_object(
 const NO_EXIT_CODE: &str = "child exited with no reportable exit code";
 
 fn exit_status_unavailable(e: &cosca::error::Error) -> String {
-    format!("query child exit status: {e}")
+    format!("query child exit status: {}", Report::new(e))
 }
 
 fn thread_refused(command: &[String], e: &std::io::Error) -> String {
@@ -462,7 +462,7 @@ fn not_job_contained(command: &[String], containment: Containment) -> String {
 }
 
 fn spawn_failed(command: &[String], e: &cosca::error::Error) -> String {
-    format!("spawn {command:?}: {e}")
+    format!("spawn {command:?}: {}", Report::new(e))
 }
 
 fn spawn_failed_daemon_may_run(command: &[String], e: &cosca::error::Error) -> String {
@@ -510,8 +510,9 @@ fn log_open_failed(path: &std::path::Path, e: &std::io::Error) -> String {
 
 /// A stdio assignment `build_command` expects never to fail: asserted in debug builds, logged in
 /// release, where the daemon then runs with that stream unredirected.
-fn stdio_set<T, E: std::fmt::Display>(log: &Log, id: &str, assigned: Result<T, E>) {
+fn stdio_set<T, E: std::error::Error + 'static>(log: &Log, id: &str, assigned: Result<T, E>) {
     if let Err(e) = assigned {
+        let e = Report::new(&e);
         debug_assert!(false, "a stdio assignment build_command expects to succeed failed: {e}");
         log.failure(id, &format!("redirect the daemon's output: {e}"));
     }

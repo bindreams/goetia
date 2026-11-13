@@ -110,15 +110,18 @@ impl Channels for Real {
     }
 }
 
-/// The OS error code behind a `cosca` failure, if it has one. A failure after `CreateProcess` comes
-/// wrapped in [`cosca::error::Error::MayHaveStarted`]: its source's code is the failure's.
+/// The OS error code behind a `cosca` failure, if it has one: the first `io::Error` with a code on
+/// its `source()` chain, below whatever context `cosca` added (a failure after `CreateProcess` comes
+/// as [`cosca::error::Error::MayHaveStarted`], a failed kill as `Containment` or `Unassessable`).
 pub(crate) fn os_error_of(e: &cosca::error::Error) -> Option<i32> {
-    match e {
-        cosca::error::Error::Io(e) => e.raw_os_error(),
-        cosca::error::Error::MayHaveStarted { source, .. } => os_error_of(source),
-        cosca::error::Error::Unassessable { source, .. } => source.as_ref().and_then(std::io::Error::raw_os_error),
-        _ => None,
+    let mut layer: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(error) = layer {
+        if let Some(code) = error.downcast_ref::<io::Error>().and_then(io::Error::raw_os_error) {
+            return Some(code);
+        }
+        layer = error.source();
     }
+    None
 }
 
 /// The OS error code SCM is told for a refused spawn: [`os_error_of`], and `ERROR_FILE_NOT_FOUND`

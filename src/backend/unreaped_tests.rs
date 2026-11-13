@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use cosca::error::{ChildFate, Error};
 
 use super::*;
@@ -9,25 +11,33 @@ use super::*;
 /// The release changes nothing of an error that holds no child.
 #[skuld::test]
 fn an_error_holding_no_child_comes_back_whole() {
-    let source = || Box::new(Error::Io(std::io::Error::other("the attach failed")));
+    let source = || Arc::new(Error::Io(std::io::Error::other("the attach failed")));
     let released = release_unreaped(Error::MayHaveStarted {
         fate: ChildFate::Running { id: None },
         wrapper_elevated: true,
+        detail: None,
         source: source(),
         unreaped: None,
+        cleanup: None,
     });
     match released {
         Error::MayHaveStarted {
             fate: ChildFate::Running { id: None },
             wrapper_elevated: true,
+            detail: None,
             source: kept,
             unreaped: None,
-        } => assert_eq!(kept.to_string(), source().to_string()),
+            cleanup: None,
+        } => assert_eq!(
+            cosca::error::Report::new(&*kept).to_string(),
+            cosca::error::Report::new(&*source()).to_string()
+        ),
         other => panic!("changed by the release: {other:?}"),
     }
 
     let bare = release_unreaped(Error::Containment {
         detail: "forced".into(),
+        source: None,
     });
     assert!(matches!(bare, Error::Containment { .. }), "{bare:?}");
 }

@@ -592,6 +592,7 @@ fn a_failed_spawn_is_not_run_unless_cosca_says_it_may_have_started() {
             "before the spawn: containment",
             || cosca::error::Error::Containment {
                 detail: "forced".into(),
+                source: None,
             },
             false,
         ),
@@ -613,6 +614,7 @@ fn a_failed_spawn_is_not_run_unless_cosca_says_it_may_have_started() {
             || {
                 test_hook::may_have_started(cosca::error::Error::Containment {
                     detail: "forced".into(),
+                    source: None,
                 })
             },
             true,

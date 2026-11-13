@@ -17,6 +17,8 @@
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
+use cosca::error::Report;
+
 use crate::backend::scm::exit_status::Reported;
 
 use super::logging::Log;
@@ -485,12 +487,14 @@ pub(super) fn kill_for_stop(child: &dyn Spawned, log: &Log, id: &str) -> Teardow
 // Failure reports -----------------------------------------------------------------------------------------------------
 
 fn wait_failed(e: &cosca::error::Error) -> String {
+    let e = Report::new(e);
     format!("background wait on child: {e}")
 }
 
 const WAITER_PANICKED: &str = "the thread waiting on the child panicked";
 
 fn kill_tree_failed(e: &cosca::error::Error) -> String {
+    let e = Report::new(e);
     format!(
         "kill_tree: {e}; falling back to killing the direct child only (its own descendants, if any, \
          cannot be reached without a containment mechanism)"
@@ -501,6 +505,7 @@ fn kill_tree_failed(e: &cosca::error::Error) -> String {
 pub(super) const NOT_RESTARTED: &str = " — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
 
 fn fallback_kill_failed(e: &cosca::error::Error) -> String {
+    let e = Report::new(e);
     format!("fallback kill: {e}; the daemon was neither killed nor reaped and may still be running{NOT_RESTARTED}")
 }
 
@@ -511,6 +516,7 @@ fn tree_unkilled() -> String {
 }
 
 fn exited_tree_unkilled(e: &cosca::error::Error) -> String {
+    let e = Report::new(e);
     format!("kill_tree after the daemon ended: {e}; its descendants may still be running{NOT_RESTARTED}")
 }
 

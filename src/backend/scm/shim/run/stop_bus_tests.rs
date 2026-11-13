@@ -273,7 +273,7 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {WAIT_FAILED}"),
+        &format!("background wait on child: an I/O operation failed: {WAIT_FAILED}"),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -382,7 +382,10 @@ fn a_failed_background_wait_carries_its_os_error() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", io::Error::from_raw_os_error(5)),
+        &format!(
+            "background wait on child: an I/O operation failed: {}",
+            io::Error::from_raw_os_error(5)
+        ),
     );
 }
 
@@ -404,7 +407,7 @@ fn a_stop_wins_over_a_failed_background_wait() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {WAIT_FAILED}"),
+        &format!("background wait on child: an I/O operation failed: {WAIT_FAILED}"),
     );
 }
 
@@ -515,7 +518,7 @@ fn a_repeated_stop_is_accepted_again() {
 /// The lines of a failed wait whose `kill_tree` was refused and whose direct-child kill worked.
 fn tree_unkilled_failures() -> [String; 3] {
     [
-        format!("background wait on child: {WAIT_FAILED}"),
+        format!("background wait on child: an I/O operation failed: {WAIT_FAILED}"),
         tree_refused_failure(),
         TREE_UNKILLED.to_string(),
     ]
@@ -527,7 +530,7 @@ const TREE_UNKILLED: &str = "the daemon's descendants were not killed: only the 
 /// The lines of a failed wait whose `kill_tree` and direct-child kill were both refused.
 fn unkillable_failures() -> [String; 3] {
     [
-        format!("background wait on child: {WAIT_FAILED}"),
+        format!("background wait on child: an I/O operation failed: {WAIT_FAILED}"),
         tree_refused_failure(),
         fallback_refused_failure(),
     ]

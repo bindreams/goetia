@@ -111,6 +111,7 @@ fn real_tells_a_spawn_that_failed_before_exec_from_one_that_may_have_run() {
             "before the spawn: containment",
             || cosca::error::Error::Containment {
                 detail: "forced".into(),
+                source: None,
             },
             false,
         ),
@@ -119,6 +120,7 @@ fn real_tells_a_spawn_that_failed_before_exec_from_one_that_may_have_run() {
             || {
                 bounded::test_hook::may_have_started(cosca::error::Error::Containment {
                     detail: "forced".into(),
+                    source: None,
                 })
             },
             true,
@@ -290,6 +292,7 @@ fn real_to_completion_tells_a_failure_after_the_spawn_from_one_before_it() {
         cosca::error::Error::from(std::io::Error::from_raw_os_error(libc::EAGAIN)),
         cosca::error::Error::Containment {
             detail: "forced".into(),
+            source: None,
         },
     ] {
         let described = format!("{before:?}");

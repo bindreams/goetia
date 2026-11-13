@@ -34,7 +34,7 @@ use crate::manager::budget::Deadline;
 
 /// `program` with `args`: stdin from `/dev/null`, and the process tree **contained**, so a
 /// descendant that inherited a pipe dies with the child instead of holding its write end open:
-/// [`wait_bounded`] tears the contained tree down with `kill_tree` on expiry, and by dropping the
+/// [`wait_bounded`] tears the contained tree down with `send_kill_tree` on expiry, and by dropping the
 /// child on every path. Where its output goes is [`spawn`]'s to decide, by [`Role`].
 pub(crate) fn command(program: &str, args: &[&str]) -> Result<cosca::Command, cosca::error::Error> {
     let mut cmd = cosca::run(std::iter::once(program).chain(args.iter().copied()));
@@ -392,7 +392,10 @@ fn waited_out(
                 if fate == Fate::Kill
                     && let Err(e) = child.kill()
                 {
-                    eprintln!("warning: could not kill a request left running, which runs on: {e}");
+                    eprintln!(
+                        "warning: could not kill a request left running, which runs on: {}",
+                        cosca::error::Report::new(&e)
+                    );
                 }
                 reaper.reap(child);
             })));
@@ -408,7 +411,7 @@ fn waited_out(
             // contained tree whose member refused SIGKILL reports `Containment`; the `Result` is
             // discarded either way, so nothing surfaces it, and a descendant still holding a pipe
             // is exactly what `collect` reports as `complete == false`.
-            let _tree_teardown = child.kill_tree();
+            let _tree_teardown = child.send_kill_tree();
             let reaped = child.wait()?;
             match expiry_disposition(reaped) {
                 Disposition::WeKilledIt => return Ok(Finished::Expired),
