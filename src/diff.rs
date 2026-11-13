@@ -96,10 +96,56 @@ pub fn render_yaml(spec: &DaemonSpec) -> String {
         .map(|(key, value)| (Value::from(key), value))
         .collect();
 
-    yaml_serde::to_string(&Value::Mapping(mapping)).expect("a resolved DaemonSpec always renders to valid YAML")
+    let rendered =
+        yaml_serde::to_string(&Value::Mapping(mapping)).expect("a resolved DaemonSpec always renders to valid YAML");
+    match resolution_comment(spec) {
+        Some(comment) => annotate_schedule(&rendered, &comment),
+        None => rendered,
+    }
 }
 
 // rendering helpers ===================================================================================================
+
+/// What an `H` in a task's schedule resolved to: each field that has an `H` as its sorted comma
+/// list, the others as written. Specs compare by the resolved values, so the text alone would
+/// render two different specs alike. `None` for a schedule without `H`, which the text already
+/// says in full.
+fn resolution_comment(spec: &DaemonSpec) -> Option<String> {
+    let DaemonSpec::Task(task) = spec else {
+        return None;
+    };
+    let schedule = task.schedule.as_ref().filter(|s| s.text().contains('H'))?;
+    let fields: Vec<String> = schedule
+        .text()
+        .split_whitespace()
+        .zip(schedule.fields())
+        .map(|(word, field)| {
+            if word.contains('H') {
+                field.values.iter().map(u8::to_string).collect::<Vec<_>>().join(",")
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect();
+    Some(format!("resolves to: {}", fields.join(" ")))
+}
+
+/// Appends `# comment` to the first line of the `schedule:` entry, where a YAML comment is valid
+/// after a plain, quoted or block scalar's header alike.
+fn annotate_schedule(rendered: &str, comment: &str) -> String {
+    let mut out = String::with_capacity(rendered.len() + comment.len() + 4);
+    let mut annotated = false;
+    for line in rendered.split_inclusive('\n') {
+        if !annotated && line.starts_with("schedule:") {
+            annotated = true;
+            let (body, ending) = line.strip_suffix('\n').map_or((line, ""), |body| (body, "\n"));
+            out.push_str(&format!("{body}  # {comment}{ending}"));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
 
 /// `env`'s keys are already sorted (`DaemonSpec::env` is a `BTreeMap`), so
 /// this preserves that order rather than re-deriving it.

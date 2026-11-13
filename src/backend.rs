@@ -44,9 +44,5 @@ pub struct Identity {
 /// What a generator answers for a task until its backend's task support lands. `backend` is how the
 /// message names the backend.
 pub(crate) fn cannot_run_tasks(backend: &str, id: &crate::spec::Id) -> crate::error::Error {
-    crate::error::Error::Invalid {
-        daemon: id.as_str().to_string(),
-        message: format!("{backend} cannot run tasks yet"),
-        source: None,
-    }
+    crate::spec::invalid(id, &format!("{backend} cannot run tasks yet"))
 }

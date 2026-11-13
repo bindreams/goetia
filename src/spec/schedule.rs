@@ -116,12 +116,13 @@ impl Schedule {
 
     /// Rebuilds a schedule from `text` and the fields stored with it, needing no host name.
     ///
-    /// A field must be a set the text's terms can give. An `H`-free field equals the text's
-    /// values. The seed is not known, so an `H` field is checked for coverage and not
-    /// re-derived: it holds every fixed term's values, each `H` term has a pick (one value, or
-    /// values spaced by its step) inside it, and every value is some term's. Every value lies in
-    /// the field's range and `restricted` is the text's. Anything else is [`Error::Invalid`] for
-    /// `id`, naming the field.
+    /// Checks each field against the text's terms. An `H`-free field equals the text's values.
+    /// The seed is not known, so an `H` field is checked for coverage and not re-derived: it
+    /// holds every fixed term's values, each `H` term has at least one pick (one value, or
+    /// values spaced by its step) wholly inside it, and every value belongs to some such pick or
+    /// fixed term. A field may therefore hold more than one pick of one `H` term. Every value
+    /// lies in the field's range and `restricted` is the text's. Anything else is
+    /// [`Error::Invalid`] for `id`, naming the field.
     pub(crate) fn from_parts(id: &Id, text: String, fields: [CronField; FIELD_COUNT]) -> Result<Schedule, Error> {
         let structure = structure(&text).map_err(|message| invalid(id, &message))?;
         for ((kind, parsed), field) in KINDS.iter().zip(&structure).zip(&fields) {
@@ -150,6 +151,13 @@ struct FieldKind {
     input_max: u8,
     /// The top of the range bare `H` hashes over.
     bare_hi: u8,
+}
+
+impl FieldKind {
+    /// How many values the field holds, which no step may exceed.
+    fn size(&self) -> usize {
+        usize::from(self.max - self.min) + 1
+    }
 }
 
 const KINDS: [FieldKind; FIELD_COUNT] = [
@@ -272,7 +280,7 @@ fn unsupported() -> String {
     format!("is not supported; {GRAMMAR}")
 }
 
-/// Digits only; a number too large for `u8` saturates, which every range refuses.
+/// Digits only; a number too large for `u8` saturates to 255, which every range and step refuses.
 fn digits(text: &str) -> Option<u8> {
     (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())).then(|| text.parse().unwrap_or(u8::MAX))
 }
@@ -292,6 +300,9 @@ fn parse_term(kind: &FieldKind, term: &str) -> Result<Term, String> {
         None => None,
         Some(None) => return Err(unsupported()),
         Some(Some(0)) => return Err("has a step of 0".to_owned()),
+        Some(Some(step)) if usize::from(step) > kind.size() => {
+            return Err(format!("has a step larger than the field's {} values", kind.size()));
+        }
         Some(Some(step)) => Some(step),
     };
 

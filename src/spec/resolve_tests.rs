@@ -1051,6 +1051,21 @@ fn type_in_an_override_is_refused() {
 }
 
 #[skuld::test]
+fn a_base_error_outranks_a_type_in_an_override() {
+    let yaml = "id: frpc
+command: [bin/frpc]
+restart: sometimes
+backend-specific:
+  scm:
+    type: task
+";
+    assert_eq!(
+        resolve_yaml(yaml).unwrap_err().to_string(),
+        "daemon `frpc`: field `restart` is `sometimes`; expected one of `never`, `on-failure`, `always`"
+    );
+}
+
+#[skuld::test]
 fn protocol_native_resolves() {
     let (spec, _) = resolve_yaml("id: frpc\ncommand: [bin/frpc]\nprotocol: native\n").unwrap();
     assert_eq!(service_fields(spec).protocol, Protocol::Native);

@@ -110,10 +110,6 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     interpolate::reject_interpolated_id(&raw.id)?;
     let id = Id::try_from(raw.id.clone())?;
 
-    // `type` is the daemon's own, never a backend's: refused by name before any pass, so that no
-    // override is merged with one.
-    refuse_type_overrides(&id, &raw)?;
-
     // Step 2: the `.env` gate, computed from the merged native spec of step 5, the one
     // substitution runs on. Anything else either misses a `${VAR}` written only in the native
     // override, or lets an unrelated or unreadable `.env` break a host whose native backend has
@@ -136,6 +132,10 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     let base = raw.without_overrides();
     interpolate::check_spec_grammar(&base)?;
     resolve_shape(&id, base, base_dir, Substitution::Pending, None, &hostname)?;
+
+    // `type` is the daemon's own, never a backend's: refused by name after the base pass, whose
+    // errors win, and before the sweep, so that no override is merged with one.
+    refuse_type_overrides(&id, &raw)?;
 
     // Step 4: the all-backends sweep, errors only: every backend's merged spec is checked as
     // authored, and `BackendKind::error` judges the fields its override supplied. A non-native
@@ -1368,8 +1368,8 @@ fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<(), Error> 
     Ok(())
 }
 
-/// `pub(super)`: `spec::backend` builds the same `Error::Invalid` for `BackendKind::error`.
-pub(super) fn invalid(id: &Id, message: &str) -> Error {
+/// `pub(crate)`: `spec::backend` and `crate::backend` build the same `Error::Invalid`.
+pub(crate) fn invalid(id: &Id, message: &str) -> Error {
     Error::Invalid {
         daemon: id.as_str().to_string(),
         message: message.to_string(),

@@ -135,10 +135,15 @@ fn render_yaml_uses_source_key_names() {
 }
 
 fn task_fixture(schedule: Option<&str>) -> DaemonSpec {
+    task_fixture_on("build-host", schedule)
+}
+
+/// A task whose `H` resolves for `hostname`.
+fn task_fixture_on(hostname: &str, schedule: Option<&str>) -> DaemonSpec {
     let base = base_fields("nightly", vec![program("backup")]);
     let schedule = schedule.map(|text| {
         let seed = HashSeed {
-            hostname: "build-host",
+            hostname,
             id: &base.common.id,
         };
         Schedule::parse(text, &seed).unwrap()
@@ -195,6 +200,19 @@ fn spec_diff_shows_a_changed_schedule() {
 
     assert!(diff.contains("-schedule: 30 3 * * *"), "{diff}");
     assert!(diff.contains("+schedule: 0 4 * * *"), "{diff}");
+}
+
+#[skuld::test]
+fn render_yaml_shows_what_h_resolved_to() {
+    let (a, b) = (
+        task_fixture_on("build-host", Some("H 3 * * *")),
+        task_fixture_on("other-host", Some("H 3 * * *")),
+    );
+    assert_ne!(a, b, "the host names must resolve `H` differently");
+    let (was, now) = (render_yaml(&a), render_yaml(&b));
+    assert!(was.contains("schedule: H 3 * * *  # resolves to: 13 3 * * *"), "{was}");
+    assert_ne!(was, now);
+    assert_ne!(spec_diff(&a, &b), "");
 }
 
 #[skuld::test]

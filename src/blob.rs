@@ -44,8 +44,10 @@ use crate::spec::{
 // Constants ===========================================================================================================
 
 /// The envelope shape `encode`/`decode` agree on. Bumped only when the
-/// JSON structure itself changes, never for a change in generator output
-/// — that is what `version` is for.
+/// JSON structure itself changes for blobs already written, never for a
+/// change in generator output — that is what `version` is for. An additive
+/// variant that leaves existing blobs' structure unchanged (the task
+/// variant) does not bump it, so installed blobs stay readable.
 pub const SCHEMA: u32 = 1;
 
 /// The literal value every generated artifact's marker carries, byte-exact
