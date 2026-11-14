@@ -32,9 +32,9 @@ const DELETE: u32 = 0x0001_0000;
 /// A key or value name, or a path of key names, as UTF-16 with no terminator.
 ///
 /// Every function here takes its names as a `Name`, and `ntdll` reads them as counted strings: the
-/// length is stated, so a NUL in a name is part of it, not its end. A NUL-terminated buffer
-/// (`wide_null`) is not a `Name`: its terminator would be a unit of the name, and the wrong key
-/// would open.
+/// length is stated, so a NUL in a name is part of it, not its end. [`Name::new`] adds no
+/// terminator; [`Name::from_units`] takes units as the registry returned them and checks nothing,
+/// so a terminated buffer (`wide_null`) passed to it would name a different key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Name(Vec<u16>);
 

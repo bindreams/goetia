@@ -118,10 +118,10 @@ fn read_settled<T>(
 /// Whether `Services\<name>` exists below `services`, an open `Services` key, asked only after a
 /// read met a missing key.
 ///
-/// The key is opened as SCM reads it, through a registry link (see [`stands`]). `key` is `name` as
-/// the caller already holds it for its own open.
-fn service_stands_in(services: &ServicesRoot<'_>, name: &str, key: &Name) -> std::result::Result<bool, Failure> {
-    let open = |links| counted::open_child(services.0, key, KEY_READ, links).map(drop);
+/// The key is opened as SCM reads it, through a registry link (see [`stands`]).
+fn service_stands_in(services: &ServicesRoot<'_>, name: &str) -> std::result::Result<bool, Failure> {
+    let key = Name::new(name);
+    let open = |links| counted::open_child(services.0, &key, KEY_READ, links).map(drop);
     stands(open(LinkHandling::Followed), || open(LinkHandling::Itself))
         .map_err(|source| failure("open", &service_key_path(name), source))
 }
@@ -172,9 +172,8 @@ pub fn read_parameters(name: &str) -> Result<RegistryReadOutcome<Parameters>> {
 /// [`read_parameters`] below a `Services` key that is already open, as a scan holds one.
 pub fn read_parameters_in(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Parameters>> {
     let path = parameters_key_path(name);
-    let service = Name::new(name);
     read_settled(
-        || service_stands_in(services, name, &service),
+        || service_stands_in(services, name),
         |f| registry_undetermined(name, &f.op, &f.path, f.source),
         || {
             let (relative, access) = parameters_read_request(name);
@@ -388,7 +387,7 @@ fn read_environment_in(services: &ServicesRoot<'_>, name: &str) -> Result<Regist
     let path = service_key_path(name);
     let service = Name::new(name);
     read_settled(
-        || service_stands_in(services, name, &service),
+        || service_stands_in(services, name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
             let key = counted::open_child(services.0, &service, KEY_READ, LinkHandling::Followed)
@@ -548,7 +547,7 @@ pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<
     let path = service_key_path(name);
     let service = Name::new(name);
     read_settled(
-        || service_stands_in(services, name, &service),
+        || service_stands_in(services, name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
             let key = counted::open_child(services.0, &service, KEY_READ, LinkHandling::Followed)

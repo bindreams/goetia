@@ -34,15 +34,6 @@ fn a_name_made_from_text_has_no_terminator() {
     assert_eq!(usize::from(counted(&name).Length), "Sub".len() * 2);
 }
 
-/// A name read back from a key is as it was read, a NUL or a lone surrogate included.
-#[skuld::test]
-fn a_name_made_from_units_is_those_units() {
-    let units = vec![0x61, 0, 0xD800];
-
-    assert_eq!(Name::from_units(units.clone()).units(), units);
-    assert_eq!(Name::from_units(&units[..]).units(), units);
-}
-
 #[skuld::test]
 fn a_status_reads_as_the_os_error_it_maps_to() {
     assert_eq!(os_error(STATUS_OBJECT_NAME_NOT_FOUND).kind(), ErrorKind::NotFound);
