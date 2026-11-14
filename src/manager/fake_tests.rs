@@ -3,9 +3,10 @@ use std::time::Duration;
 use super::*;
 use crate::manager::Budget;
 use crate::manager::conformance;
+use crate::manager::{Exit, TaskStatus};
 use crate::spec::test_support::program;
 use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
-use crate::testing::{base_fields, service_fields};
+use crate::testing::{base_fields, service_fields, task};
 
 // Fixtures ============================================================================================================
 
@@ -32,6 +33,15 @@ fn fake_passes_conformance() {
     fake.seed_opaque(conformance::UNDETERMINED_ID);
 
     conformance::run(&fake, &mk);
+}
+
+#[skuld::test]
+fn fake_passes_task_conformance() {
+    let fake = Fake::new();
+
+    conformance::run_tasks(&fake, &|id, schedule| {
+        task(id, vec![crate::spec::test_support::program("job")], schedule)
+    });
 }
 
 // Behavior the conformance scenarios do not exercise ==================================================================
@@ -241,7 +251,7 @@ fn absence_over_a_residual_artifact_is_not_not_installed() {
         ("uninstall", fake.uninstall(&id)),
         ("enable", fake.enable(&id)),
         ("disable", fake.disable(&id)),
-        ("start", fake.start(&id, Budget::DEFAULT)),
+        ("start", fake.start(&id, Budget::DEFAULT).map(drop)),
         ("stop", fake.stop(&id, Budget::DEFAULT)),
         ("status", fake.status(&id).map(drop)),
     ] {
@@ -298,7 +308,7 @@ fn every_verb(fake: &Fake, spec: &DaemonSpec) -> Vec<(&'static str, Result<()>)>
         ("uninstall", fake.uninstall(&spec.common().id)),
         ("enable", fake.enable(&spec.common().id)),
         ("disable", fake.disable(&spec.common().id)),
-        ("start", fake.start(&spec.common().id, Budget::DEFAULT)),
+        ("start", fake.start(&spec.common().id, Budget::DEFAULT).map(drop)),
         ("stop", fake.stop(&spec.common().id, Budget::DEFAULT)),
         ("install", fake.install(spec, false).map(drop)),
         ("preview_install", fake.preview_install(spec).map(drop)),
@@ -883,4 +893,102 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
             }
         }
     }
+}
+
+// Tasks ===============================================================================================================
+
+fn a_task(id: &str) -> DaemonSpec {
+    task(id, vec![crate::spec::test_support::program("job")], Some("0 3 * * *"))
+}
+
+fn task_status(fake: &Fake, id: &str) -> TaskStatus {
+    match fake.status(&Id::try_from(id).unwrap()).unwrap() {
+        Status::Task(status) => status,
+        other => panic!("a task reports a task status, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn a_task_installs_idle_and_reports_a_task_status() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    let status = task_status(&fake, "nightly");
+    assert_eq!(
+        status.common.state,
+        State::Idle,
+        "an installed task is idle, not stopped"
+    );
+    assert_eq!(status.common.pid, None);
+    assert!(!status.common.enabled);
+    assert_eq!(
+        (status.last_result, status.last_run, status.next_run),
+        (None, None, None)
+    );
+
+    fake.enable(&Id::try_from("nightly").unwrap()).unwrap();
+    assert!(task_status(&fake, "nightly").common.enabled);
+}
+
+#[skuld::test]
+fn a_task_start_then_stop_goes_running_then_idle() {
+    let fake = Fake::new();
+    let id = Id::try_from("nightly").unwrap();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    fake.start(&id, Budget::Immediate).unwrap();
+    let running = task_status(&fake, "nightly");
+    assert_eq!(running.common.state, State::Running);
+    assert!(running.common.pid.is_some(), "a running task has a pid");
+
+    fake.stop(&id, Budget::DEFAULT).unwrap();
+    let idle = task_status(&fake, "nightly");
+    assert_eq!(
+        idle.common.state,
+        State::Idle,
+        "stopping a task ends its run and leaves it idle"
+    );
+    assert_eq!(idle.common.pid, None);
+}
+
+#[skuld::test]
+fn list_reports_a_task_with_a_task_status() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_task_status("nightly", Some(Exit::Code(0)), None, None);
+
+    let listed = fake.list().unwrap();
+    let [Installed::Ours { spec, status }] = listed.as_slice() else {
+        panic!("one installed task is listed as ours: {listed:?}");
+    };
+    assert_eq!(spec.kind(), crate::spec::DaemonKind::Task);
+    assert_eq!(status, &Status::Task(task_status(&fake, "nightly")));
+    assert_eq!(task_status(&fake, "nightly").last_result, Some(Exit::Code(0)));
+}
+
+#[skuld::test]
+fn a_task_start_is_running_under_any_budget() {
+    for budget in [Budget::Immediate, Budget::DEFAULT] {
+        let fake = Fake::new();
+        fake.install(&a_task("nightly"), false).unwrap();
+        fake.seed_start_stalls("nightly");
+
+        fake.start(&Id::try_from("nightly").unwrap(), budget).unwrap();
+
+        assert_eq!(task_status(&fake, "nightly").common.state, State::Running, "{budget:?}");
+    }
+}
+
+#[skuld::test]
+fn a_service_retyped_to_a_task_never_reports_a_failed_state() {
+    let fake = Fake::new();
+    let id = Id::try_from("nightly").unwrap();
+    fake.install(&mk("nightly"), false).unwrap();
+    fake.seed_state("nightly", State::Failed);
+
+    fake.install(&a_task("nightly"), true).unwrap();
+
+    assert_eq!(task_status(&fake, "nightly").common.state, State::Idle);
+    fake.install(&mk("nightly"), true).unwrap();
+    assert_eq!(fake.status(&id).unwrap().common().state, State::Stopped);
 }

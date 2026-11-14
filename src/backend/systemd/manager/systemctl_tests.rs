@@ -50,7 +50,7 @@ fn offline_yes() -> Host {
 }
 
 /// A host with no `/run/systemd/system`.
-fn unbooted() -> Host {
+pub(in crate::backend::systemd::manager) fn unbooted() -> Host {
     Host {
         unbooted: true,
         ..booted()
@@ -793,6 +793,25 @@ fn every_path() -> Vec<Way> {
             s.request_restart_impl("x", &mut Held::default())
         }),
         Way::request("kill", |s: &Systemctl| s.kill_impl("x", &mut Held::default())),
+        Way::request("enable timer", |s: &Systemctl| {
+            s.enable_timer("x", &mut Held::default())
+        }),
+        Way::request("disable timer", |s: &Systemctl| {
+            s.disable_timer("x", &mut Held::default())
+        }),
+        Way::request("start job", |s: &Systemctl| {
+            s.start_job("x", &mut Held::default()).map(drop)
+        }),
+        Way {
+            name: "show task".to_string(),
+            gated: false,
+            run: Box::new(|s: &Systemctl| s.task_state("x.service").map(drop)),
+        },
+        Way {
+            name: "show timer".to_string(),
+            gated: false,
+            run: Box::new(|s: &Systemctl| s.timer_enabled("x").map(drop)),
+        },
     ];
     for budget in [
         Budget::Immediate,
@@ -1040,6 +1059,174 @@ fn a_show_answer_with_every_property_is_read() {
             "{answer}"
         );
     }
+}
+
+// A task's job and timer ==============================================================================================
+
+#[skuld::test]
+fn the_job_number_is_read_from_the_announcement() {
+    for (stderr, number) in [
+        ("Enqueued anchor job 91 probe-t.service/start.\n", Some(91)),
+        (
+            "Enqueued anchor job 7 x.service/start.\nJob for x.service finished.\n",
+            Some(7),
+        ),
+        (
+            "Enqueued anchor job 12345678901 x.service/start.\n",
+            Some(12_345_678_901),
+        ),
+        ("Enqueued anchor job  x.service/start.\n", None),
+        ("Enqueued auxiliary job 4 x.service/start.\n", None),
+        ("", None),
+    ] {
+        assert_eq!(job_number(stderr.as_bytes()), number, "{stderr:?}");
+    }
+}
+
+/// A task's start never waits, whatever it is given: the request is `--no-block`, run to
+/// completion with no listener or deadline, and answers the job's number.
+#[skuld::test]
+fn start_job_asks_for_the_run_and_answers_the_job_number() {
+    let fake = Fake::new([reply(
+        &["start"],
+        exited(0, "", "Enqueued anchor job 91 x.service/start.\n"),
+    )]);
+
+    let job = on_booted(fake.clone())
+        .start_job("x", &mut gate_held())
+        .expect("start_job");
+
+    assert_eq!(job, 91);
+    assert_eq!(
+        fake.calls(),
+        [["start", "--no-block", "--show-transaction", "--", "x.service"]]
+    );
+    assert_eq!(
+        fake.waits(),
+        [Waited {
+            role: RoleKind::ToCompletion,
+            bounded: false
+        }]
+    );
+}
+
+#[skuld::test]
+fn start_job_refuses_an_exit_that_enqueued_nothing_and_a_failed_start() {
+    let none = Fake::new([reply(&["start"], exited(0, "", ""))]);
+    let e = on_booted(none)
+        .start_job("x", &mut gate_held())
+        .expect_err("no job was announced");
+    assert!(matches!(e, Error::NotEnqueued { .. }), "{e:?}");
+
+    let failed = Fake::new([reply(&["start"], exited(1, "", "Unit x.service not found.\n"))]);
+    let msg = on_booted(failed)
+        .start_job("x", &mut gate_held())
+        .expect_err("a failed start")
+        .report()
+        .to_string();
+    assert!(msg.contains("Unit x.service not found."), "{msg}");
+}
+
+#[skuld::test]
+fn the_timer_is_enabled_and_disabled_now_and_named_after_the_terminator() {
+    type Verb = fn(&Systemctl, &str, &mut Held) -> Result<()>;
+    for (verb, run) in [
+        ("enable", Systemctl::enable_timer as Verb),
+        ("disable", Systemctl::disable_timer as Verb),
+    ] {
+        let fake = Fake::new([reply(&[verb], exited(0, "", ""))]);
+
+        run(&on_booted(fake.clone()), "-h", &mut gate_held()).expect(verb);
+
+        assert_eq!(fake.calls(), [[verb, "--now", "--", "-h.timer"]]);
+    }
+}
+
+#[skuld::test]
+fn a_timer_verb_that_failed_names_the_verb_the_timer_and_systemd_s_words() {
+    let fake = gate_then([reply(&["enable"], exited(1, "", "Access denied\n"))]);
+
+    let msg = on_booted(fake)
+        .enable_timer("x", &mut Held::default())
+        .expect_err("enable")
+        .report()
+        .to_string();
+
+    assert!(msg.contains("`systemctl enable --now x.timer` failed"), "{msg}");
+    assert!(msg.contains("Access denied"), "{msg}");
+}
+
+/// Decision 15: a run in flight is `Running` in any of its three states, and a job between runs is
+/// `Idle` whether its last run succeeded (`inactive`) or failed (`failed`): a failed run is a
+/// result, not a state. Anything else systemd says is `Unknown`, and never a state it made up.
+#[skuld::test]
+fn task_state_table() {
+    for (active, state) in [
+        ("active", State::Running),
+        ("activating", State::Running),
+        ("deactivating", State::Running),
+        ("inactive", State::Idle),
+        ("failed", State::Idle),
+        ("reloading", State::Unknown),
+        ("maintenance", State::Unknown),
+        ("", State::Unknown),
+    ] {
+        let answer = format!("ActiveState={active}\nMainPID=0\nInvocationID=\nLoadState=loaded\n");
+        assert_eq!(
+            showing(&answer).task_state("x.service").expect(active),
+            TaskJob {
+                state,
+                pid: None,
+                invocation: None
+            },
+            "{active:?}"
+        );
+    }
+    let answer = "ActiveState=active\nMainPID=42\nInvocationID=0123abcd\nLoadState=loaded\n";
+    assert_eq!(
+        showing(answer).task_state("x.service").expect("a pid"),
+        TaskJob {
+            state: State::Running,
+            pid: Some(42),
+            invocation: Some("0123abcd".to_string())
+        }
+    );
+}
+
+#[skuld::test]
+fn a_task_job_systemd_has_not_loaded_is_not_a_state() {
+    let answer = "ActiveState=inactive\nMainPID=0\nInvocationID=\nLoadState=not-found\n";
+    let e = showing(answer).task_state("x.service").expect_err(answer);
+    assert!(matches!(e, Error::UnitNotLoaded { .. }), "{e:?}");
+}
+
+#[skuld::test]
+fn a_timer_is_enabled_when_its_unit_file_state_says_so() {
+    for (state, enabled) in [
+        ("enabled", true),
+        ("disabled", false),
+        ("static", false),
+        ("masked", false),
+        ("", false),
+    ] {
+        let answer = format!("UnitFileState={state}\nLoadState=loaded\n");
+        assert_eq!(showing(&answer).timer_enabled("x").expect(state), enabled, "{state:?}");
+    }
+}
+
+#[skuld::test]
+fn the_timer_is_asked_about_by_its_own_name() {
+    let fake = Fake::new([reply(
+        &["show"],
+        exited(0, "UnitFileState=enabled\nLoadState=loaded\n", ""),
+    )]);
+
+    on_booted(fake.clone()).timer_enabled("x").expect("timer_enabled");
+
+    assert_eq!(
+        fake.calls(),
+        [["show", "--property", "UnitFileState,LoadState", "--", "x.timer"]]
+    );
 }
 
 // supported ===========================================================================================================

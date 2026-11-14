@@ -52,6 +52,11 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             found: Occupant::File,
         },
         Error::StartUnconfirmed { id: id() },
+        Error::RunStateUnknown { id: id() },
+        Error::RunUnrecorded {
+            id: id(),
+            reason: String::new(),
+        },
     ];
     for e in &in_doubt {
         assert!(e.is_indeterminate(), "{e:?}");
@@ -85,6 +90,12 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             recovery: String::new(),
         },
         Error::NotRunning { id: id() },
+        Error::NotATask { id: id() },
+        Error::AlreadyRunning { id: id() },
+        Error::RunNotStarted {
+            id: id(),
+            reason: String::new(),
+        },
         Error::NoManager {
             evidence: String::new(),
         },
@@ -1150,4 +1161,46 @@ fn the_os_error_of_an_embedded_error_is_found() {
 
     assert_eq!(embedded.raw_os_error(), Some(8));
     assert_eq!(blob_unreadable.raw_os_error(), Some(9));
+}
+
+#[skuld::test]
+fn error_messages_and_exit_class() {
+    let id = || "nightly".to_string();
+    let cases = [
+        (
+            Error::NotATask { id: id() },
+            "`nightly` is a service, not a task: `run` applies only to a task",
+            false,
+        ),
+        (
+            Error::AlreadyRunning { id: id() },
+            "`nightly` is already running: `run` needs an idle task (`goetia daemon stop nightly` ends the run in flight)",
+            false,
+        ),
+        (
+            Error::RunStateUnknown { id: id() },
+            "the manager does not say whether `nightly` is running, so `run` did not start it",
+            true,
+        ),
+        (
+            Error::RunNotStarted {
+                id: id(),
+                reason: "the unit is masked".to_string(),
+            },
+            "`nightly` did not run: the unit is masked",
+            false,
+        ),
+        (
+            Error::RunUnrecorded {
+                id: id(),
+                reason: "the journal has no exit".to_string(),
+            },
+            "the run of `nightly` ended without recording its exit status: the journal has no exit",
+            true,
+        ),
+    ];
+    for (error, message, indeterminate) in cases {
+        assert_eq!(error.to_string(), message);
+        assert_eq!(error.is_indeterminate(), indeterminate, "{error:?}");
+    }
 }

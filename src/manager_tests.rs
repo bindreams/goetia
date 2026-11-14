@@ -79,3 +79,22 @@ fn a_scan_that_stopped_early_reports_an_aggregate_that_claims_no_cause() {
         "the cause was never established, so it may not be named: {reason}"
     );
 }
+
+#[skuld::test]
+fn task_status_common_and_kind() {
+    let common = DaemonStatus {
+        state: State::Idle,
+        pid: None,
+        enabled: true,
+    };
+    let task = Status::Task(TaskStatus {
+        common: common.clone(),
+        last_result: Some(Exit::Code(3)),
+        last_run: None,
+        next_run: None,
+    });
+
+    assert_eq!(task.common(), &common);
+    assert_eq!(task.kind(), DaemonKind::Task);
+    assert_eq!(Status::Service(common).kind(), DaemonKind::Service);
+}

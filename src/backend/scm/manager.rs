@@ -282,6 +282,7 @@ impl Backend for Scm {
     /// and deletes shim files, for this process and every other, takes it.
     type InstallScope = Option<InstallLock>;
     type Reservation = ();
+    type Run = std::convert::Infallible;
 
     /// For `protocol: plain`: the install flow has rendered the definition already, so every refusal
     /// `render_for_install` can make (the previewed host's path, an account, `restart: always`)
@@ -550,6 +551,14 @@ impl Backend for Scm {
                 id: id.as_str().to_string(),
             }),
         }
+    }
+
+    /// Interim: SCM installs no task yet, so no id reaches here as one.
+    fn begin_run(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<std::convert::Infallible> {
+        Err(crate::backend::cannot_run_tasks(
+            "the Windows service manager",
+            &snapshot.into_id(),
+        ))
     }
 }
 

@@ -38,23 +38,22 @@ impl Drop for ServiceGuard {
     }
 }
 
-/// Removes the fragment, its drop-in directory (a leftover one would poison the
-/// next install of the same id) and the `multi-user.target.wants` symlink a
-/// test that enabled the unit leaves.
+/// Stops the timer and the unit, then removes both fragments, their drop-in directories (a leftover
+/// one would poison the next install of the same id) and the `*.target.wants` symlinks a test that
+/// enabled either leaves. The timer goes first, so nothing starts the unit again.
 #[cfg(target_os = "linux")]
 fn cleanup(id: &str) -> Vec<String> {
     let mut problems = Vec::new();
-    let unit = format!("{id}.service");
-    let path = std::path::PathBuf::from(SYSTEMD_UNIT_DIR).join(&unit);
+    let dir = std::path::PathBuf::from(SYSTEMD_UNIT_DIR);
 
     // Exit 5 is "unit not loaded", the one benign outcome.
-    problems.extend(cmd::run_cleanup("systemctl", &[&["stop", &unit]], &[5]));
-    problems.extend(remove_path_retrying(&path, false));
-    problems.extend(remove_path_retrying(&path.with_file_name(format!("{unit}.d")), true));
-    let wants = std::path::PathBuf::from(SYSTEMD_UNIT_DIR)
-        .join("multi-user.target.wants")
-        .join(&unit);
-    problems.extend(remove_path_retrying(&wants, false));
+    for (suffix, wants_dir) in [("timer", "timers.target.wants"), ("service", "multi-user.target.wants")] {
+        let unit = format!("{id}.{suffix}");
+        problems.extend(cmd::run_cleanup("systemctl", &[&["stop", &unit]], &[5]));
+        problems.extend(remove_path_retrying(&dir.join(&unit), false));
+        problems.extend(remove_path_retrying(&dir.join(format!("{unit}.d")), true));
+        problems.extend(remove_path_retrying(&dir.join(wants_dir).join(&unit), false));
+    }
     problems.extend(cmd::run_cleanup("systemctl", &[&["daemon-reload"]], &[]));
     problems
 }

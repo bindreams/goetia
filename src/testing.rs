@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use crate::error::Result;
 #[cfg(windows)]
 use crate::shim::{FolderCheck, HostCommand, ShimProvider, SweepFailure};
-use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, User};
+use crate::spec::{
+    DaemonFields, DaemonSpec, HashSeed, Id, Protocol, Restart, Schedule, ServiceFields, TaskFields, TaskSpec, User,
+};
 
 pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
 
@@ -82,6 +84,23 @@ pub fn service_fields(spec: DaemonSpec) -> ServiceFields {
         panic!("`service_fields` is given a service: the test helpers build services");
     };
     service.into_fields()
+}
+
+/// A task named `id`, run as root, that starts `command` on `schedule` (`None`: nothing starts it).
+/// `schedule` is parsed with a fixed [`HashSeed`], so an `H` resolves alike on every host. Panics on
+/// an invalid `Id`, schedule or field.
+pub fn task(id: &str, command: Vec<String>, schedule: Option<&str>) -> DaemonSpec {
+    let common = base_fields(id, command).common;
+    let schedule = schedule.map(|text| {
+        let seed = HashSeed {
+            hostname: "testing",
+            id: &common.id,
+        };
+        Schedule::parse(text, &seed).unwrap_or_else(|e| panic!("`{text}` is not a valid schedule: {e}"))
+    });
+    TaskSpec::new(TaskFields { common, schedule })
+        .unwrap_or_else(|e| panic!("`{id}` is not a valid task: {e}"))
+        .into()
 }
 
 /// A [`ShimProvider`] that records the calls it gets (`"preview"`, `"provide"`, `"sweep"`, in
