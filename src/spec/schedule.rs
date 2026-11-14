@@ -112,15 +112,16 @@ impl Schedule {
     /// Rebuilds a schedule from `text` and its stored `fields`, needing no host name.
     ///
     /// A blob's values are what goetia resolved at install; decode does not re-derive them from
-    /// the text. A field without an `H` term is fully the text's, so it must equal what the text
-    /// gives. A field with an `H` term takes its values from the blob: they must be non-empty and
-    /// inside the field's range, and its `restricted` must be the text's. Every refusal is
-    /// [`Error::Invalid`] for `id`, naming the field.
+    /// the text. A stored field is accepted when it is non-empty, its `restricted` is the text's,
+    /// it holds every value the text's fixed (non-`H`) terms give, and each of its values is one
+    /// that some term of the field could give (an `H` term: any pick it could make). The rule does
+    /// not count picks, so a field with `H` may hold more values than `H` made. A field without an
+    /// `H` term is therefore exactly what its text gives. Every refusal is [`Error::Invalid`] for
+    /// `id`, naming the field.
     pub(crate) fn from_parts(id: &Id, text: String, fields: [CronField; FIELD_COUNT]) -> Result<Schedule, Error> {
         let structure = structure(&text).map_err(|message| invalid(id, &message))?;
         for ((kind, parsed), field) in KINDS.iter().zip(&structure).zip(&fields) {
-            check(kind, parsed, field)
-                .map_err(|reason| invalid(id, &format!("schedule {} field: {reason}", kind.name)))?;
+            check(parsed, field).map_err(|reason| invalid(id, &format!("schedule {} field: {reason}", kind.name)))?;
         }
         Ok(Schedule {
             text,
@@ -184,6 +185,11 @@ const KINDS: [FieldKind; FIELD_COUNT] = [
     },
 ];
 
+/// The name of the field at `position`, as messages spell it.
+pub(crate) fn field_name(position: usize) -> &'static str {
+    KINDS[position].name
+}
+
 // The structural pass -------------------------------------------------------------------------------------------------
 
 /// One comma-separated term, before any seed.
@@ -194,6 +200,18 @@ enum Term {
 }
 
 impl Term {
+    /// Every value this term can give: the fixed values, or the union of the picks over every hash.
+    fn possible(&self) -> BTreeSet<u8> {
+        match self {
+            Term::Fixed(values) => values.clone(),
+            Term::Hashed { lo, hi, step } => {
+                let len = u64::from(hi - lo) + 1;
+                let picks = step.map_or(len, |step| len.min(u64::from(step)));
+                (0..picks).flat_map(|hash| self.values(hash)).collect()
+            }
+        }
+    }
+
     /// The values `hash` picks from this term.
     fn values(&self, hash: u64) -> BTreeSet<u8> {
         match self {
@@ -222,10 +240,6 @@ struct ParsedField {
 }
 
 impl ParsedField {
-    fn has_hash(&self) -> bool {
-        self.terms.iter().any(|term| matches!(term, Term::Hashed { .. }))
-    }
-
     /// The field `hash` resolves this one to.
     fn resolve(&self, hash: u64) -> CronField {
         CronField {
@@ -357,21 +371,10 @@ fn field_hash(seed: &HashSeed, position: usize) -> u64 {
 
 // Decoding ------------------------------------------------------------------------------------------------------------
 
-/// Whether `field` is one `parse` could have given for `parsed`'s text. A field without an `H`
-/// term must equal the text's terms exactly. A field with one needs the text's `restricted` and
-/// values that are non-empty and in the field's range; its values are not re-derived. The reason
-/// does not name the field.
-fn check(kind: &FieldKind, parsed: &ParsedField, field: &CronField) -> Result<(), String> {
-    if !parsed.has_hash() {
-        let expected = parsed.resolve(0);
-        if *field != expected {
-            return Err(format!(
-                "holds {:?} (restricted: {}), but its text gives {:?} (restricted: {})",
-                field.values, field.restricted, expected.values, expected.restricted
-            ));
-        }
-        return Ok(());
-    }
+/// Whether `field` is one `parse` could have given for `parsed`'s text: non-empty, the text's
+/// `restricted`, every fixed term's values present, and nothing no term could give. Picks are not
+/// counted and `H` is not re-derived. The reason does not name the field.
+fn check(parsed: &ParsedField, field: &CronField) -> Result<(), String> {
     if field.restricted != parsed.restricted {
         return Err(format!(
             "is restricted: {}, but its text gives {}",
@@ -381,11 +384,16 @@ fn check(kind: &FieldKind, parsed: &ParsedField, field: &CronField) -> Result<()
     if field.values.is_empty() {
         return Err("matches no value".to_owned());
     }
-    if let Some(value) = field.values.iter().find(|value| !(kind.min..=kind.max).contains(value)) {
-        return Err(format!(
-            "holds {value}, which is out of range {}-{}",
-            kind.min, kind.max
-        ));
+    let fixed = parsed.terms.iter().filter_map(|term| match term {
+        Term::Fixed(values) => Some(values),
+        Term::Hashed { .. } => None,
+    });
+    if let Some(missing) = fixed.flatten().find(|value| !field.values.contains(value)) {
+        return Err(format!("lacks {missing}, which its text gives"));
+    }
+    let possible: BTreeSet<u8> = parsed.terms.iter().flat_map(Term::possible).collect();
+    if let Some(value) = field.values.iter().find(|value| !possible.contains(value)) {
+        return Err(format!("holds {value}, which its text cannot give"));
     }
     Ok(())
 }

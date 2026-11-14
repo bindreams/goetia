@@ -355,27 +355,17 @@ fn decode_rejects_unknown_schema() {
 }
 
 #[skuld::test]
-fn an_unknown_schema_is_refused_before_its_spec_is_read() {
-    // A later schema may add members to a service: that must read as "unsupported schema".
-    let mut value: Value = serde_json::from_slice(&BASE64.decode(encode(&minimal_spec())).unwrap()).unwrap();
-    value["schema"] = Value::from(SCHEMA + 1);
-    value["spec"]["added_later"] = Value::from(true);
-
-    let err = decode(&BASE64.encode(serde_json::to_vec(&value).unwrap())).unwrap_err();
-
-    assert!(err.to_string().contains("unsupported blob schema"), "{err}");
-}
-
-#[skuld::test]
 fn an_unknown_schema_is_refused_whatever_else_the_envelope_holds() {
-    // A later schema may reshape any member: the schema alone decides.
-    for edit in [
-        (|value: &mut Value| value["version"] = Value::from(serde_json::Map::new())) as fn(&mut Value),
+    // A later schema may reshape or add to any member: the schema alone decides.
+    let edits: [fn(&mut Value); 3] = [
+        |value| value["spec"]["added_later"] = Value::from(true),
+        |value| value["version"] = Value::from(serde_json::Map::new()),
         |value| {
             let spec = value.as_object_mut().unwrap().remove("spec").unwrap();
             value["payload"] = spec;
         },
-    ] {
+    ];
+    for edit in edits {
         let mut value: Value = serde_json::from_slice(&BASE64.decode(encode(&minimal_spec())).unwrap()).unwrap();
         value["schema"] = Value::from(SCHEMA + 1);
         edit(&mut value);
@@ -383,6 +373,37 @@ fn an_unknown_schema_is_refused_whatever_else_the_envelope_holds() {
         let err = decode(&BASE64.encode(serde_json::to_vec(&value).unwrap())).unwrap_err();
 
         assert!(err.to_string().contains("unsupported blob schema"), "{err}");
+    }
+}
+
+#[skuld::test]
+fn an_envelope_with_an_extra_member_is_refused() {
+    let mut value: Value = serde_json::from_slice(&BASE64.decode(encode(&minimal_spec())).unwrap()).unwrap();
+    value["extra"] = Value::from(true);
+
+    let err = decode(&BASE64.encode(serde_json::to_vec(&value).unwrap())).unwrap_err();
+
+    assert!(matches!(err, Error::Blob { .. }), "{err:?}");
+}
+
+#[skuld::test]
+fn a_task_blob_field_whose_values_are_not_strictly_ascending_is_invalid() {
+    // Each would equal the right field once read as a set: only the order and the repeat are wrong.
+    for (text, values) in [
+        ("30 3 * * *", vec![30, 30]),
+        ("*/15 * * * *", vec![30, 0, 15, 45]),
+        ("*/15 * * * *", vec![0, 15, 15, 30, 45]),
+    ] {
+        let encoded = tampered(&encode(&task_with(Some(text))), |spec| {
+            spec["schedule"]["minute"]["values"] = Value::from(values.clone());
+        });
+
+        let err = decode(&encoded).unwrap_err();
+
+        match err {
+            Error::Invalid { message, .. } => assert!(message.contains("minute"), "{message}"),
+            other => panic!("{text:?} {values:?}: expected Error::Invalid, got {other:?}"),
+        }
     }
 }
 

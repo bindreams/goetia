@@ -38,7 +38,7 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::spec::{
     AccountId, CronField, DaemonFields, DaemonSpec, Id, Protocol, Restart, Schedule, ServiceFields, ServiceSpec,
-    TaskFields, TaskSpec, User,
+    TaskFields, TaskSpec, User, field_name,
 };
 
 // Constants ===========================================================================================================
@@ -88,19 +88,19 @@ pub fn decode(encoded: &str) -> Result<Blob, Error> {
     let bytes = BASE64
         .decode(encoded)
         .map_err(|source| Error::blob_from("invalid base64", source))?;
-    // The schema is read alone first: a later schema may reshape any other member.
-    let found: SchemaOnly =
+    let value: Value =
         serde_json::from_slice(&bytes).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
-    if found.schema != SCHEMA {
+    // The schema is read before the rest: a later schema may reshape or add to any other member.
+    if let Some(found) = value.get("schema").and_then(Value::as_u64)
+        && found != u64::from(SCHEMA)
+    {
         return Err(Error::blob(format!(
             "unsupported blob schema {found} (this build of goetia understands schema {supported})",
-            found = found.schema,
             supported = SCHEMA,
         )));
     }
-
     let envelope: WireEnvelope =
-        serde_json::from_slice(&bytes).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
+        serde_json::from_value(value).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
     let spec = daemon_spec_from_wire(envelope.spec)?;
 
     Ok(Blob {
@@ -150,6 +150,7 @@ fn canonicalize(value: Value) -> Value {
 // already-written artifact's bytes.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireEnvelope {
     #[serde(rename = "schema")]
     schema: u32,
@@ -157,13 +158,6 @@ struct WireEnvelope {
     spec: WireDaemon,
     #[serde(rename = "version")]
     version: String,
-}
-
-/// The envelope's `schema` member alone; every other member is ignored.
-#[derive(Deserialize)]
-struct SchemaOnly {
-    #[serde(rename = "schema")]
-    schema: u32,
 }
 
 /// The spec object of either kind. A task's carries a `type` member and a service's never does (a
@@ -382,12 +376,24 @@ impl From<&CronField> for WireCronField {
     }
 }
 
-impl From<WireCronField> for CronField {
-    fn from(field: WireCronField) -> Self {
-        CronField {
-            values: field.values.into_iter().collect(),
-            restricted: field.restricted,
+impl WireCronField {
+    /// Refuses `values` that are not strictly ascending: the wire form is sorted and repeat-free.
+    fn into_field(self, id: &Id, position: usize) -> Result<CronField, Error> {
+        if !self.values.is_sorted_by(|a, b| a < b) {
+            return Err(Error::Invalid {
+                daemon: id.as_str().to_string(),
+                message: format!(
+                    "schedule {} field: values {:?} are not strictly ascending",
+                    field_name(position),
+                    self.values
+                ),
+                source: None,
+            });
         }
+        Ok(CronField {
+            values: self.values.into_iter().collect(),
+            restricted: self.restricted,
+        })
     }
 }
 
@@ -500,7 +506,11 @@ fn task_from_wire(wire: WireTask) -> Result<TaskSpec, Error> {
                 month,
                 day_of_week,
             } = *schedule;
-            let fields = [minute, hour, day_of_month, month, day_of_week].map(CronField::from);
+            let mut fields = Vec::with_capacity(5);
+            for (position, field) in [minute, hour, day_of_month, month, day_of_week].into_iter().enumerate() {
+                fields.push(field.into_field(&id, position)?);
+            }
+            let fields = fields.try_into().expect("a schedule has five fields");
             Schedule::from_parts(&id, text, fields)
         })
         .transpose()?;

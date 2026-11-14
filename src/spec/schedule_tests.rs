@@ -412,11 +412,16 @@ fn from_parts_refuses_what_parse_cannot_give() {
         ("* * * * *", 4, (0..=7).collect(), false),
         ("* * * * *", 0, vec![60], false),
         ("* * * * *", 3, vec![0], false),
-        // an H field matches something, within the field's range
+        // a field with an H term has every fixed term's values, and only values some term could give
+        ("5,H(10-20) * * * *", 0, vec![6, 21], true),
+        ("5,H(10-20) * * * *", 0, vec![21], true),
+        ("5,H(10-20) * * * *", 0, vec![5, 9], true),
+        ("H(10-20) * * * *", 0, vec![21], true),
+        ("H(10-12)/20 * * * *", 0, vec![13], true),
         ("H * * * *", 0, vec![], true),
         ("H * * * *", 0, vec![13, 60], true),
-        ("H * * * *", 0, vec![60], true),
         ("* * H * *", 2, vec![0], true),
+        ("* * H * *", 2, vec![30], true),
         ("* * * H *", 3, vec![13], true),
         ("* * * * H", 4, vec![7], true),
         // the restricted flag is the text's
@@ -441,12 +446,15 @@ fn from_parts_refuses_what_parse_cannot_give() {
 
 #[skuld::test]
 fn from_parts_keeps_the_values_an_h_field_is_given() {
-    // A decode does not re-derive `H`: another host or id resolved these.
+    // A decode does not re-derive which pick `H` made: any values the field's terms could give are
+    // kept, however many.
     for (text, index, values) in [
         ("H * * * *", 0, vec![14]),
-        ("H(10-20) * * * *", 0, vec![21]),
+        ("H * * * *", 0, vec![13, 14]),
+        ("H(10-20) * * * *", 0, vec![15]),
         ("H/15 * * * *", 0, vec![13, 28, 43, 58]),
-        ("5,H(10-20) * * * *", 0, vec![6, 21]),
+        ("5,H(10-20) * * * *", 0, vec![5, 20]),
+        ("5,H(10-20) * * * *", 0, vec![5, 12, 20]),
         ("* * H * *", 2, vec![9]),
     ] {
         let rebuilt = rebuild(text, index, field(&values, true)).unwrap_or_else(|e| panic!("{text:?}: {e}"));
