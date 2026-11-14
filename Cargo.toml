@@ -70,9 +70,10 @@ clap = { version = "4.6.6", features = ["derive"], optional = true }
 # The shim's process-tree containment, spawn, and waiting: `.contain()` is a
 # Windows Job Object with `KILL_ON_JOB_CLOSE`, and `wait()`/`wait_tree()` are
 # real, event-driven kernel waits — see `src/backend/scm/shim/run/service.rs`. Also the
-# Unix backends' bounded subprocess wait (`backend::bounded`): `Child::wait_deadline`
-# and `Child::send_kill_tree` bound and reap the `systemctl`/`launchctl` calls
-# `daemon start --timeout` waits on. 0.x with an explicitly unstable API.
+# Unix backends' bounded subprocess wait (`backend::bounded`) of the `systemctl`/`launchctl` calls
+# `daemon start --timeout` waits on: `Child::wait_deadline` bounds the wait, `Child::kill` and
+# `Child::send_kill_tree` end the child and its tree on expiry, `Child::wait` reaps it, and dropping
+# the `Child` tears its contained tree down. 0.x with an explicitly unstable API.
 cosca = "0.8"
 # `backend::bounded::collect`'s reader channel: `Receiver::len()` is a
 # race-free snapshot of what is already queued, which is what lets `collect`

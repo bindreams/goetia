@@ -33,8 +33,12 @@ const WAIT_FAILED: &str = "the wait failed (fake)";
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
 /// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
+/// The refusal of a tree kill as the Windows `Job` reports it: a `Containment` over the OS error.
 pub(crate) fn kill_refused() -> cosca::error::Error {
-    cosca::error::Error::Io(io::Error::other(KILL_REFUSED))
+    cosca::error::Error::Containment {
+        detail: "TerminateJobObject could not terminate the job".to_owned(),
+        source: Some(Arc::new(cosca::error::Error::Io(io::Error::other(KILL_REFUSED)))),
+    }
 }
 
 pub(crate) fn wait_failed() -> cosca::error::Error {
