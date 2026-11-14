@@ -12,7 +12,6 @@ use super::super::task::task_tests::{ID, Tree, marked, plists_of, task_spec};
 use super::super::watch::{test_hook, watch_tests::Held};
 use super::*;
 use crate::backend::Backend as _;
-use crate::backend::RunHandle as _;
 use crate::backend::bounded;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::spec::{DaemonSpec, TaskFields, TaskSpec};
