@@ -27,14 +27,34 @@ use crate::backend::scm::shim::run::logging::Log;
 
 /// The message of the usual refused thread: `io::Error::other(NO_THREAD)`.
 pub(crate) const NO_THREAD: &str = "no thread may be made (fake)";
-/// The error a refused kill fails with.
-pub(crate) const KILL_REFUSED: &str = "the kill was refused (fake)";
-/// The error a [`WaitReply::Fails`] with no OS code fails with.
-pub(crate) const WAIT_FAILED: &str = "the wait failed (fake)";
+const KILL_REFUSED: &str = "the kill was refused (fake)";
+const WAIT_FAILED: &str = "the wait failed (fake)";
 /// The error a failing append fails with.
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
 /// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
+/// A refused [`Spawned::kill`].
+pub(crate) fn kill_refused() -> cosca::error::Error {
+    cosca::error::Error::Io(io::Error::other(KILL_REFUSED))
+}
+
+/// A refused [`Spawned::send_kill_tree`]: a `Containment` over [`kill_refused`], so a report that
+/// prints only the top layer fails the tests.
+pub(crate) fn tree_kill_refused() -> cosca::error::Error {
+    cosca::error::Error::Containment {
+        detail: "TerminateJobObject could not terminate the job".to_owned(),
+        source: Some(Arc::new(kill_refused())),
+    }
+}
+
+pub(crate) fn wait_failed() -> cosca::error::Error {
+    cosca::error::Error::Io(io::Error::other(WAIT_FAILED))
+}
+
+pub(crate) fn wait_failed_with_code(code: i32) -> cosca::error::Error {
+    cosca::error::Error::Io(io::Error::from_raw_os_error(code))
+}
+
 /// The default log directory of [`Fake::log`]. The `Fake` writes no file there.
 const FAKE_LOGS: &str = "fake-logs";
 
@@ -48,7 +68,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Op {
     Spawn,
-    KillTree,
+    SendKillTree,
     OpenLog,
 }
 
@@ -60,17 +80,18 @@ pub(crate) enum WaitReply {
     /// Block until the process is ended, by a successful kill or [`FakeProcess::end`], and return
     /// its status.
     Blocks,
-    /// Fail, with this OS error code or, with none, [`WAIT_FAILED`].
+    /// Fail, with this OS error code ([`wait_failed_with_code`]) or, with none, [`wait_failed`].
     Fails(Option<i32>),
     /// Panic, ending the waiter thread without it reporting the child done.
     Panics,
 }
 
-/// What a [`Spawned::kill`] or [`Spawned::kill_tree`] does.
+/// What a [`Spawned::kill`] or [`Spawned::send_kill_tree`] does.
 pub(crate) enum KillReply {
     /// Succeed. The process is ended.
     Ends,
-    /// Fail with [`KILL_REFUSED`]. The process is not ended.
+    /// Fail with [`kill_refused`] for a kill, [`tree_kill_refused`] for a tree kill. The process is
+    /// not ended.
     Refuses,
     Panics,
 }
@@ -105,7 +126,7 @@ struct ProcState {
     containment: Containment,
     waits: VecDeque<WaitReply>,
     kills: VecDeque<KillReply>,
-    tree_kills: VecDeque<KillReply>,
+    send_kill_tree_replies: VecDeque<KillReply>,
     exit: Option<ExitStatus>,
     killed: bool,
     dropped: bool,
@@ -142,7 +163,7 @@ impl FakeProcess {
                 containment: Containment::JobObject,
                 waits: VecDeque::new(),
                 kills: VecDeque::new(),
-                tree_kills: VecDeque::new(),
+                send_kill_tree_replies: VecDeque::new(),
                 exit: None,
                 killed: false,
                 dropped: false,
@@ -153,7 +174,9 @@ impl FakeProcess {
 
     /// A daemon that runs until a tree kill ends it: the common case of a stop.
     pub(crate) fn running() -> FakeProcess {
-        FakeProcess::new().wait(WaitReply::Blocks).kill_tree(KillReply::Ends)
+        FakeProcess::new()
+            .wait(WaitReply::Blocks)
+            .send_kill_tree(KillReply::Ends)
     }
 
     fn with(self, change: impl FnOnce(&mut ProcState)) -> FakeProcess {
@@ -180,8 +203,8 @@ impl FakeProcess {
         self.with(|state| state.kills.push_back(reply))
     }
 
-    pub(crate) fn kill_tree(self, reply: KillReply) -> FakeProcess {
-        self.with(|state| state.tree_kills.push_back(reply))
+    pub(crate) fn send_kill_tree(self, reply: KillReply) -> FakeProcess {
+        self.with(|state| state.send_kill_tree_replies.push_back(reply))
     }
 
     /// End the process by hand, as it would end on its own: the part of a test that does what the
@@ -218,7 +241,12 @@ impl Instance {
         panic!("unstated call: {what} on a process");
     }
 
-    fn kill_with(&self, what: &str, reply: Option<KillReply>) -> Result<(), cosca::error::Error> {
+    fn kill_with(
+        &self,
+        what: &str,
+        refused: fn() -> cosca::error::Error,
+        reply: Option<KillReply>,
+    ) -> Result<(), cosca::error::Error> {
         match reply {
             None => self.unstated(what),
             Some(KillReply::Ends) => {
@@ -226,7 +254,7 @@ impl Instance {
                 self.proc.end(status(1));
                 Ok(())
             }
-            Some(KillReply::Refuses) => Err(cosca::error::Error::Io(io::Error::other(KILL_REFUSED))),
+            Some(KillReply::Refuses) => Err(refused()),
             Some(KillReply::Panics) => panic!("the {what} panicked (fake)"),
         }
     }
@@ -243,21 +271,21 @@ impl Spawned for Instance {
             None => self.unstated("wait"),
             Some(WaitReply::Exits(code)) => Ok(self.proc.end(status(code))),
             Some(WaitReply::Blocks) => Ok(self.proc.wait_ended()),
-            Some(WaitReply::Fails(Some(code))) => Err(cosca::error::Error::Io(io::Error::from_raw_os_error(code))),
-            Some(WaitReply::Fails(None)) => Err(cosca::error::Error::Io(io::Error::other(WAIT_FAILED))),
+            Some(WaitReply::Fails(Some(code))) => Err(wait_failed_with_code(code)),
+            Some(WaitReply::Fails(None)) => Err(wait_failed()),
             Some(WaitReply::Panics) => panic!("the wait panicked (fake)"),
         }
     }
 
     fn kill(&self) -> Result<(), cosca::error::Error> {
         let reply = lock(&self.proc.state).kills.pop_front();
-        self.kill_with("kill", reply)
+        self.kill_with("kill", kill_refused, reply)
     }
 
-    fn kill_tree(&self) -> Result<(), cosca::error::Error> {
-        self.fake.count(Op::KillTree);
-        let reply = lock(&self.proc.state).tree_kills.pop_front();
-        self.kill_with("kill_tree", reply)
+    fn send_kill_tree(&self) -> Result<(), cosca::error::Error> {
+        self.fake.count(Op::SendKillTree);
+        let reply = lock(&self.proc.state).send_kill_tree_replies.pop_front();
+        self.kill_with("send_kill_tree", tree_kill_refused, reply)
     }
 }
 
@@ -528,7 +556,7 @@ impl Fake {
             for (what, left) in [
                 ("wait", state.waits.len()),
                 ("kill", state.kills.len()),
-                ("kill_tree", state.tree_kills.len()),
+                ("send_kill_tree", state.send_kill_tree_replies.len()),
             ] {
                 if left > 0 {
                     problems.push(format!("process {n}: {left} stated {what} replies never used"));

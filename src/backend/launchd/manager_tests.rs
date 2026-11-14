@@ -1258,6 +1258,7 @@ fn a_launchctl_request_that_may_have_run_is_in_doubt() {
     fn forced() -> cosca::error::Error {
         cosca::error::Error::Containment {
             detail: "forced".into(),
+            source: None,
         }
     }
     let failing = |error: ClientError| Launchctl::new(Box::new(Fake::new([fail(&["bootout"], error)])));
