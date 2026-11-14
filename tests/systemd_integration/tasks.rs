@@ -4,7 +4,8 @@
 //! The installing, arming, retyping and uninstalling of an idle task is `linux.rs`'s ("Tasks"); this
 //! file adds the runs. A task that has to be caught in flight is [`Held`]: it announces itself and waits
 //! on a FIFO, so a test waits on the program, never on a time. The Linux lane runs one test at a time;
-//! a test that changes journald's configuration takes `JOURNALD_CONFIG` for the runs that do not.
+//! the tests that change journald's configuration share the `JOURNALD_CONFIG` label, so that no two of
+//! them overlap where tests run in parallel.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Write};
@@ -293,7 +294,8 @@ fn journalctl_children() -> Vec<u32> {
 }
 
 /// Both ends of a schedule's next minute across a window: a timer armed anywhere in `[before, after]`
-/// reads one of them.
+/// reads one of them. `after` is taken once `next_run` has been read, so that a read that comes after
+/// the timer fired (its next run then the occurrence after) is still inside the window.
 fn expected_next_runs(text: &str, id: &Id, before: SystemTime, after: SystemTime) -> [SystemTime; 2] {
     let seed = HashSeed {
         hostname: "testing",
@@ -360,9 +362,10 @@ fn next_run_agrees_with_the_cron(#[fixture(systemd_group)] _group: &Group) {
             .expect("install");
         let before = SystemTime::now();
         mgr.enable(&id_of(&id)).expect("enable");
+        let status = task_status(&mgr, &id_of(&id));
         let after = SystemTime::now();
 
-        assert_next_run(&task_status(&mgr, &id_of(&id)), text, &id_of(&id), before, after);
+        assert_next_run(&status, text, &id_of(&id), before, after);
     }
 }
 
@@ -382,10 +385,10 @@ fn install_over_a_task_with_a_changed_schedule_rearms_it(#[fixture(systemd_group
     let outcome = mgr
         .install(&task(&id, command, Some("0 5 * * *")), false)
         .expect("install a new schedule");
+    let status = task_status(&mgr, &task_id);
     let after = SystemTime::now();
 
     assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
-    let status = task_status(&mgr, &task_id);
     assert!(status.common.enabled, "{status:?}");
     assert_next_run(&status, "0 5 * * *", &task_id, before, after);
 }
