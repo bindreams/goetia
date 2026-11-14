@@ -14,7 +14,7 @@ use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::{Backend as _, InstalledService as _};
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::manager::Step;
-use crate::spec::TaskSpec;
+use crate::spec::{TaskSpec, User};
 use crate::testing::task;
 
 // Fixtures ============================================================================================================
@@ -385,6 +385,86 @@ fn a_failure_after_the_timer_went_out_names_the_timer_and_says_to_rerun() {
     assert!(matches!(e.cause(), Error::Command { .. }), "{e:?}");
     fake.assert_spent("the install stopped at the failed bootout");
     assert_eq!(text_at(&tree, true, ID), old.job);
+}
+
+/// An uninstall that fails after the timer went out says so as an uninstall: the remedy is to run it
+/// again, and re-running install would be the wrong one.
+#[skuld::test]
+fn a_failed_uninstall_after_the_timer_went_out_says_to_rerun_uninstall() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+        reply(&["bootout", &job_label()], exited(5, "", "boom")),
+    ]);
+
+    let e = uninstall(&tree, &fake).expect_err("the job's bootout failed");
+
+    let text = e.to_string();
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert!(
+        text.contains(&timer_name()) && text.contains("uninstall failed"),
+        "{text}"
+    );
+    assert!(
+        text.contains("re-run uninstall") && !text.contains("re-run install"),
+        "{text}"
+    );
+    assert!(matches!(e.cause(), Error::Command { .. }), "{e:?}");
+    assert!(
+        exists(&tree, true, ID) && exists(&tree, true, &timer_name()),
+        "nothing was removed"
+    );
+}
+
+/// A timer label with no plist is not a timer of ours that is waiting to be loaded again: a later
+/// failure is told as itself.
+#[skuld::test]
+fn a_stray_timer_label_does_not_make_a_later_failure_say_the_timer_is_unloaded() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(None), true);
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, IDLE),
+        reply(&["bootout", &job_label()], exited(5, "", "boom")),
+    ]);
+
+    let e = rewrite(&tree, &fake, &task(ID, vec!["/bin/false".into()], None)).expect_err("the job's bootout failed");
+
+    assert!(matches!(e, Error::Command { .. }), "{e:?}");
+}
+
+/// An update that changes nothing still makes the directories the spec names, as it always did.
+#[skuld::test]
+fn an_update_with_nothing_to_change_still_makes_the_specs_directories() {
+    let tree = Tree::new();
+    let cwd = tree.dir(false).join("kept-cwd");
+    let user = nix::unistd::User::from_uid(nix::unistd::getuid())
+        .unwrap()
+        .expect("the current user has an account")
+        .name;
+    let DaemonSpec::Task(task) = task_spec(Some(SCHEDULE)) else {
+        unreachable!("`task_spec` builds a task");
+    };
+    let mut fields = task.into_fields();
+    fields.common.cwd = Some(cwd.clone());
+    fields.common.user = User::Name(user);
+    let spec = DaemonSpec::from(TaskSpec::new(fields).unwrap());
+    let rendered = manager(&Fake::new([])).render(&spec).unwrap();
+    tree.put(false, ID, &rendered.job);
+    tree.put(false, &timer_name(), rendered.timer.as_deref().unwrap());
+    let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
+
+    rewrite(&tree, &fake, &spec).expect("an update with nothing to change");
+
+    fake.assert_spent("only the two reads");
+    assert!(cwd.is_dir(), "the directory the spec names was made");
 }
 
 /// A timer label launchd holds with no plist of ours (removed by hand, or a stranger's) is booted out

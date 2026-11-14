@@ -164,7 +164,9 @@ impl Launchd {
                     timer: timer.or(new_timer_path),
                     staged_job,
                     staged_timer,
+                    verb: Verb::Install,
                     timer_out: false,
+                    stray_out: false,
                     // After a refusal, as the service path has it: a refused update creates nothing.
                     prepare: Some((spec, &account)),
                 }
@@ -188,7 +190,9 @@ impl Launchd {
             timer: snapshot.timer.as_ref().map(path_of),
             staged_job: None,
             staged_timer: None,
+            verb: Verb::Uninstall,
             timer_out: false,
+            stray_out: false,
             prepare: None,
         }
         .run(&uninstall_plan(&old), reservation)?;
@@ -252,16 +256,35 @@ struct Executor<'a> {
     /// The linted files a `Replace` or a `Create` puts in place, staged before the first request.
     staged_job: Option<NamedTempFile>,
     staged_timer: Option<NamedTempFile>,
-    /// Whether this plan booted the timer out and has not loaded it again or removed it: an error
-    /// then says the timer is not loaded, and a refusal loads it again first.
+    /// Which verb the plan is, for what an error says to run again.
+    verb: Verb,
+    /// Whether this plan booted out a timer that has a plist and has not loaded it again or removed
+    /// it: an error then says the timer is not loaded, and a refusal loads it again first.
     timer_out: bool,
+    /// Whether this plan booted out a timer label that has no plist of ours (a stranger's, or a file
+    /// removed by hand): a refusal says there is nothing to load it from.
+    stray_out: bool,
     /// The directories the spec names (`cwd`, the parent of `logs`), made before the first action that
     /// changes anything a refusal could leave untouched.
     prepare: Option<(&'a DaemonSpec, &'a Account)>,
 }
 
+/// The verb a plan belongs to.
+#[derive(Clone, Copy)]
+enum Verb {
+    Install,
+    Uninstall,
+}
+
 impl Executor<'_> {
     fn run(&mut self, plan: &[Action], reservation: &mut Reservation) -> Result<WriteOutcome> {
+        // A plan with no action has no refusal to come before: the directories are made, as an
+        // install that changes nothing has always made them.
+        if plan.is_empty()
+            && let Some((spec, account)) = self.prepare.take()
+        {
+            prepare_parent_dirs(spec, account)?;
+        }
         for &action in plan {
             match self.perform(action, reservation) {
                 Ok(Some(refusal)) => return Ok(refusal),
@@ -286,7 +309,11 @@ impl Executor<'_> {
         match action {
             Action::BootoutTimer => {
                 never_expires(launchctl.bootout(&timer_label, deadline, reservation)?);
-                self.timer_out = true;
+                if self.old.timer.is_some() {
+                    self.timer_out = true;
+                } else {
+                    self.stray_out = true;
+                }
             }
             Action::CheckJobIdle => {
                 // A service is refused while launchd has it at all (one that has exited is still
@@ -415,13 +442,9 @@ impl Executor<'_> {
     /// label launchd held with no plist of ours (a stranger's, or a file removed by hand) has nothing to
     /// load it from, and the refusal says so.
     fn refuse(&mut self, refusal: Error, reservation: &mut Reservation) -> Error {
-        if !std::mem::take(&mut self.timer_out) {
-            return refusal;
-        }
-        let id = self.id;
-        let label = timer_label(id.as_str());
-        // Before any file changes, the timer's path is where it was read, if it was read.
-        let Some(timer) = self.timer.as_deref().filter(|_| self.old.timer.is_some()) else {
+        let (ours, stray) = (std::mem::take(&mut self.timer_out), std::mem::take(&mut self.stray_out));
+        let label = timer_label(self.id.as_str());
+        if stray {
             return Error::Step {
                 what: format!(
                     "launchd held `{label}`, which has no plist of goetia's to load it from, so it was booted \
@@ -429,6 +452,10 @@ impl Executor<'_> {
                 ),
                 source: Box::new(refusal),
             };
+        }
+        // Before any file changes, the timer's path is where it was read.
+        let Some(timer) = self.timer.as_deref().filter(|_| ours) else {
+            return refusal;
         };
         match self
             .launchd
@@ -446,15 +473,22 @@ impl Executor<'_> {
         }
     }
 
-    /// `error`, which ended the install after the timer was booted out and before it was loaded again
-    /// or removed: the timer is not loaded, and a re-run of install loads it.
+    /// `error`, which ended the verb after the timer was booted out and before it was loaded again or
+    /// removed: the timer is not loaded, and running the verb again finishes it.
     fn timer_stranded(&self, error: Error) -> Error {
         let (id, label) = (self.id, timer_label(self.id.as_str()));
-        Error::Step {
-            what: format!(
+        let what = match self.verb {
+            Verb::Install => format!(
                 "`{id}`'s timer (`{label}`) was booted out and this install failed before loading it again, so it \
                  is not loaded: re-run install"
             ),
+            Verb::Uninstall => format!(
+                "`{id}`'s timer (`{label}`) was booted out and this uninstall failed before the timer's plist was \
+                 removed, so it is not loaded: re-run uninstall"
+            ),
+        };
+        Error::Step {
+            what,
             source: Box::new(error),
         }
     }
