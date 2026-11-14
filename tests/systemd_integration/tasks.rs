@@ -256,6 +256,42 @@ fn counted(count: u32) -> Vec<u8> {
     (1..=count).flat_map(|n| format!("{n}\n").into_bytes()).collect()
 }
 
+/// The stdout lines of `id`'s newest run, as the journal stores them: the entries of the stream the
+/// unit's newest stdout entry is in (a run has one `_STREAM_ID`, and a run is over when `run` has
+/// returned). `run` shows the journal as stored, which journald can store with a line twice across
+/// a file rotation (systemd/systemd#29016), so this, and not `seq`'s text, is what `run` is compared with.
+fn newest_stream_text(id: &str) -> Vec<u8> {
+    let unit = format!("_SYSTEMD_UNIT={}", unit_of(id));
+    let newest = journal(&[&unit, "_TRANSPORT=stdout", "-r", "-n", "1"]);
+    let stream = field(newest.first().expect("a run wrote a stdout line"), "_STREAM_ID")
+        .expect("a stdout entry has a stream")
+        .to_string();
+    journal(&[&format!("_STREAM_ID={stream}")])
+        .iter()
+        .flat_map(|entry| {
+            let message = field(entry, "MESSAGE").expect("a line of the run is text");
+            format!("{message}\n").into_bytes()
+        })
+        .collect()
+}
+
+/// Panics unless `got` holds every line of `want`, in order. Lines of its own besides are fine: the
+/// journal's duplicates are not `run`'s to remove.
+fn assert_holds_in_order(run: usize, got: &[u8], want: &[u8]) {
+    let mut wanted = want.split_inclusive(|&b| b == b'\n').peekable();
+    for line in got.split_inclusive(|&b| b == b'\n') {
+        if wanted.peek() == Some(&line) {
+            wanted.next();
+        }
+    }
+    let missing = wanted.next();
+    assert!(
+        missing.is_none(),
+        "run {run}: the journal lacks {:?} (and what follows it)",
+        missing.map(String::from_utf8_lossy)
+    );
+}
+
 /// A diff small enough to read: the first line where `got` and `want` differ.
 fn assert_same_text(run: usize, got: &[u8], want: &[u8]) {
     if got == want {
@@ -842,7 +878,9 @@ fn run_returns_every_line_of_a_chatty_run(#[fixture(systemd_group)] _group: &Gro
         let (exit, out) = run_task(&mgr, &task_id);
 
         assert_eq!(exit, Exit::Code(0));
-        assert_same_text(n, &out, &want);
+        let journaled = newest_stream_text(&id);
+        assert_same_text(n, &out, &journaled);
+        assert_holds_in_order(n, &journaled, &want);
     }
 }
 
@@ -875,7 +913,8 @@ fn a_line_of_5000_bytes_and_a_control_byte_arrive_whole(#[fixture(systemd_group)
 }
 
 /// A run starts right behind a chatty one (the first run's lines can still be on their way to the
-/// journal) and shows none of its lines.
+/// journal) and shows none of its lines: what it shows is its own stream in the journal, which holds
+/// `second-run` and nothing of the first run's.
 #[skuld::test(labels = [JOURNALD_CONFIG], serial = JOURNALD_CONFIG)]
 fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(systemd_group)] _group: &Group) {
     let _journald = JournaldConf::unlimited();
@@ -894,11 +933,19 @@ fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(systemd_group)] _gr
 
     for n in 1..=20 {
         let (_, out) = run_task(&mgr, &task_id);
-        assert_same_text(n, &out, &first);
+        let journaled = newest_stream_text(&id);
+        assert_same_text(n, &out, &journaled);
+        assert_holds_in_order(n, &journaled, &first);
 
         let (exit, out) = run_task(&mgr, &task_id);
         assert_eq!(exit, Exit::Code(0));
-        assert_same_text(n, &out, b"second-run\n");
+        let journaled = newest_stream_text(&id);
+        assert_same_text(n, &out, &journaled);
+        assert_holds_in_order(n, &journaled, b"second-run\n");
+        assert!(
+            journaled.split_inclusive(|&b| b == b'\n').all(|line| line == b"second-run\n"),
+            "run {n}: the second run's stream holds a line of another run"
+        );
     }
 }
 
