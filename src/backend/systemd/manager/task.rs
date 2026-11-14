@@ -154,10 +154,10 @@ impl Systemd {
         if let CreateOutcome::Raced = create_unit(id, UnitKind::Service, &units.service)? {
             return Ok(WriteOutcome::Raced);
         }
-        if let Some(timer) = &units.timer {
-            if let CreateOutcome::Raced = create_unit(id, UnitKind::Timer, timer)? {
-                return Ok(WriteOutcome::Raced);
-            }
+        if let Some(timer) = &units.timer
+            && let CreateOutcome::Raced = create_unit(id, UnitKind::Timer, timer)?
+        {
+            return Ok(WriteOutcome::Raced);
         }
         self.systemctl.daemon_reload_or_report(id, held)?;
         Ok(WriteOutcome::Done)

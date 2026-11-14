@@ -1,7 +1,7 @@
 //! The effectful half of the systemd backend: writes `/etc/systemd/system/<id>.service` (and, for a
 //! task with a schedule, `<id>.timer`) and talks to `systemctl`, `busctl` and `journalctl`.
 //!
-//! A service is one artifact. A task is two, kept as one by [`task`]; the obligations below are
+//! A service is one artifact. A task is two, kept as one by the `task` module; the obligations below are
 //! stated for the service, and hold for each of a task's two files.
 //!
 //! Seven correctness obligations a systemd unit-file backend must uphold, each with its own test (see
@@ -169,7 +169,7 @@ impl Backend for Systemd {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<Units> {
-        Ok(generate::units(spec, &identity_for(&spec.common().user)?)?)
+        generate::units(spec, &identity_for(&spec.common().user)?)
     }
 
     /// The units as `snapshot` holds them, unmodified: see [`task::regenerate`].

@@ -307,6 +307,8 @@ pub(super) fn raw_state(id: &str) -> Result<RawState> {
 // read / installed ====================================================================================================
 
 /// What a unit file at `<id>.service` or `<id>.timer` is, as far as the marker says.
+// `Marked` holds a whole `Blob`, as `ReadOutcome::Marked` does through its snapshot; same call.
+#[allow(clippy::large_enum_variant)]
 enum Artifact {
     Absent,
     /// Not goetia's: no marker, not a regular file, or not UTF-8 (see [`RawState::NotOurs`]).

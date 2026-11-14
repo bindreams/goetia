@@ -18,7 +18,7 @@ use crate::backend::bounded;
 use crate::error::{Error, Result};
 use crate::manager::Exit;
 
-/// "Starting <unit>...": the manager began a run. Carries the run's `INVOCATION_ID` and the job's
+/// "Starting `<unit>`...": the manager began a run. Carries the run's `INVOCATION_ID` and the job's
 /// `JOB_ID`.
 pub(super) const STARTING: &str = "7d4958e842da4a758f6c1cdc7b36dcc5";
 
