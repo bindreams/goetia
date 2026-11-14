@@ -172,11 +172,10 @@ fn task_blob_golden() {
 
 #[skuld::test]
 fn task_blob_with_h_golden() {
-    // `build-host`, `nightly`: minute hash mod 60 = 13, hour hash mod 24 = 2 (the vectors in the spec); the
-    // blob stores each hash reduced by its field's moduli, here 60 and 24.
+    // `build-host`, `nightly`: `H H` resolves to minute 13, hour 2 (the vectors in the spec).
     let program = serde_json::to_string(&program("backup")).unwrap();
     let expected = format!(
-        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"hash":2,"restricted":true,"values":[2]}},"minute":{{"hash":13,"restricted":true,"values":[13]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"H H * * *"}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
+        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"restricted":true,"values":[2]}},"minute":{{"restricted":true,"values":[13]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"H H * * *"}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
     );
     let spec = task_with(Some("H H * * *"));
 
@@ -193,27 +192,6 @@ fn equal_picks_encode_to_equal_bytes() {
     );
     assert_eq!(a, b);
     assert_eq!(encode(&a), encode(&b));
-}
-
-#[skuld::test]
-fn a_task_blob_h_field_whose_values_its_hash_does_not_give_is_invalid() {
-    let wrong_values = tampered(&encode(&task_with(Some("H H * * *"))), |spec| {
-        spec["schedule"]["minute"]["values"] = Value::from(vec![14]);
-    });
-    let wrong_hash = tampered(&encode(&task_with(Some("H H * * *"))), |spec| {
-        spec["schedule"]["minute"]["hash"] = Value::from(1);
-    });
-    let missing_hash = tampered(&encode(&task_with(Some("H H * * *"))), |spec| {
-        spec["schedule"]["minute"].as_object_mut().unwrap().remove("hash");
-    });
-    let spurious_hash = tampered(&encode(&task_with(Some("H H * * *"))), |spec| {
-        spec["schedule"]["month"]["hash"] = Value::from(1);
-    });
-
-    for encoded in [wrong_values, wrong_hash, missing_hash, spurious_hash] {
-        let err = decode(&encoded).unwrap_err();
-        assert!(matches!(err, Error::Invalid { .. }), "{err:?}");
-    }
 }
 
 #[skuld::test]

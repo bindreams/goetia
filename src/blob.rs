@@ -256,9 +256,6 @@ struct WireCronField {
     values: Vec<u8>,
     #[serde(rename = "restricted")]
     restricted: bool,
-    /// What `H` resolved this field by; absent for a field with no `H` term.
-    #[serde(rename = "hash", default, skip_serializing_if = "Option::is_none")]
-    hash: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,9 +366,8 @@ impl From<&TaskSpec> for WireTask {
 
 impl From<&Schedule> for WireSchedule {
     fn from(schedule: &Schedule) -> Self {
-        let hashes = schedule.hashes();
         let [minute, hour, day_of_month, month, day_of_week] =
-            std::array::from_fn(|i| WireCronField::new(&schedule.fields()[i], hashes[i]));
+            std::array::from_fn(|i| WireCronField::from(&schedule.fields()[i]));
         WireSchedule {
             text: schedule.text().to_owned(),
             minute,
@@ -383,21 +379,21 @@ impl From<&Schedule> for WireSchedule {
     }
 }
 
-impl WireCronField {
-    fn new(field: &CronField, hash: Option<u64>) -> Self {
+impl From<&CronField> for WireCronField {
+    fn from(field: &CronField) -> Self {
         WireCronField {
             values: field.values.iter().copied().collect(),
             restricted: field.restricted,
-            hash,
         }
     }
+}
 
-    fn into_stored(self) -> (CronField, Option<u64>) {
-        let field = CronField {
-            values: self.values.into_iter().collect(),
-            restricted: self.restricted,
-        };
-        (field, self.hash)
+impl From<WireCronField> for CronField {
+    fn from(field: WireCronField) -> Self {
+        CronField {
+            values: field.values.into_iter().collect(),
+            restricted: field.restricted,
+        }
     }
 }
 
@@ -510,7 +506,7 @@ fn task_from_wire(wire: WireTask) -> Result<TaskSpec, Error> {
                 month,
                 day_of_week,
             } = *schedule;
-            let fields = [minute, hour, day_of_month, month, day_of_week].map(WireCronField::into_stored);
+            let fields = [minute, hour, day_of_month, month, day_of_week].map(CronField::from);
             Schedule::from_parts(&id, text, fields)
         })
         .transpose()?;

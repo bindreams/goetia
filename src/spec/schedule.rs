@@ -70,29 +70,12 @@ pub enum DayRule {
     Or,
 }
 
-/// A parsed schedule: its text and the five resolved fields.
-#[derive(Debug, Clone)]
+/// A parsed schedule: its text and the five resolved fields. Equal when both are.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
     text: String,
     // Boxed: keeps `DaemonSpec`'s variants close in size.
-    resolved: Box<Resolved>,
-}
-
-/// Compares the text and the resolved fields, never the hashes: they only let a decode verify the
-/// stored values, and two hashes that pick alike are the same schedule.
-impl PartialEq for Schedule {
-    fn eq(&self, other: &Self) -> bool {
-        self.text == other.text && self.resolved.fields == other.resolved.fields
-    }
-}
-
-impl Eq for Schedule {}
-
-#[derive(Debug, Clone)]
-struct Resolved {
-    fields: [CronField; FIELD_COUNT],
-    /// The hash each field with an `H` term was resolved by; none for an `H`-free field.
-    hashes: [Option<u64>; FIELD_COUNT],
+    fields: Box<[CronField; FIELD_COUNT]>,
 }
 
 impl Schedule {
@@ -100,18 +83,10 @@ impl Schedule {
     /// `seed.id`, naming the field.
     pub fn parse(text: &str, seed: &HashSeed) -> Result<Schedule, Error> {
         let structure = structure(text).map_err(|message| invalid(seed.id, &message))?;
-        // The hash is stored reduced by `hash_modulus`, so equal picks give equal bytes.
-        let hashes = std::array::from_fn(|position| {
-            let field = &structure[position];
-            field.has_hash().then(|| {
-                let hash = field_hash(seed, position);
-                field.hash_modulus().map_or(hash, |modulus| hash % modulus)
-            })
-        });
-        let fields = std::array::from_fn(|position| structure[position].resolve(hashes[position].unwrap_or(0)));
+        let fields = std::array::from_fn(|position| structure[position].resolve(field_hash(seed, position)));
         Ok(Schedule {
             text: text.to_owned(),
-            resolved: Box::new(Resolved { fields, hashes }),
+            fields: Box::new(fields),
         })
     }
 
@@ -122,12 +97,7 @@ impl Schedule {
 
     /// Minute, hour, day-of-month, month, day-of-week.
     pub fn fields(&self) -> &[CronField; FIELD_COUNT] {
-        &self.resolved.fields
-    }
-
-    /// The hash behind each field, in the order of [`Schedule::fields`]; none for an `H`-free field.
-    pub(crate) fn hashes(&self) -> &[Option<u64>; FIELD_COUNT] {
-        &self.resolved.hashes
+        &self.fields
     }
 
     pub fn day_rule(&self) -> DayRule {
@@ -139,27 +109,21 @@ impl Schedule {
         }
     }
 
-    /// Rebuilds a schedule from `text` and each field with its stored hash, needing no host name.
+    /// Rebuilds a schedule from `text` and its stored `fields`, needing no host name.
     ///
-    /// Each field is recomputed from the text's terms and its hash (none for an `H`-free field)
-    /// and must equal the stored one exactly. A field with `H` and no hash, a hash on an
-    /// `H`-free field, or a hash its field's moduli would reduce (so a blob has one encoding) is
-    /// refused. Every refusal is [`Error::Invalid`] for `id`, naming the field.
-    pub(crate) fn from_parts(
-        id: &Id,
-        text: String,
-        stored: [(CronField, Option<u64>); FIELD_COUNT],
-    ) -> Result<Schedule, Error> {
+    /// A blob's values are what goetia resolved at install; decode does not re-derive them from
+    /// the text. It checks that the text parses, that each field's `restricted` is the text's, and
+    /// that each field's values are non-empty and inside the field's range. Every refusal is
+    /// [`Error::Invalid`] for `id`, naming the field.
+    pub(crate) fn from_parts(id: &Id, text: String, fields: [CronField; FIELD_COUNT]) -> Result<Schedule, Error> {
         let structure = structure(&text).map_err(|message| invalid(id, &message))?;
-        for ((kind, parsed), (field, hash)) in KINDS.iter().zip(&structure).zip(&stored) {
-            check(parsed, field, *hash)
+        for ((kind, parsed), field) in KINDS.iter().zip(&structure).zip(&fields) {
+            check(kind, parsed, field)
                 .map_err(|reason| invalid(id, &format!("schedule {} field: {reason}", kind.name)))?;
         }
-        let fields = stored.each_ref().map(|(field, _)| field.clone());
-        let hashes = stored.map(|(_, hash)| hash);
         Ok(Schedule {
             text,
-            resolved: Box::new(Resolved { fields, hashes }),
+            fields: Box::new(fields),
         })
     }
 }
@@ -229,17 +193,6 @@ enum Term {
 }
 
 impl Term {
-    /// The number of different picks: `hash` matters here only modulo this. `None` for a fixed term.
-    fn modulus(&self) -> Option<u64> {
-        match self {
-            Term::Fixed(_) => None,
-            Term::Hashed { lo, hi, step } => {
-                let len = u64::from(hi - lo) + 1;
-                Some(step.map_or(len, |step| len.min(u64::from(step))))
-            }
-        }
-    }
-
     /// The values `hash` picks from this term.
     fn values(&self, hash: u64) -> BTreeSet<u8> {
         match self {
@@ -268,25 +221,6 @@ struct ParsedField {
 }
 
 impl ParsedField {
-    fn has_hash(&self) -> bool {
-        self.terms.iter().any(|term| matches!(term, Term::Hashed { .. }))
-    }
-
-    /// The least common multiple of the `H` terms' moduli: every term's pick depends only on the
-    /// hash modulo it, so on the hash modulo this. `None` when there is no `H` term, or when it
-    /// does not fit `u64`, in which case no reduction applies.
-    fn hash_modulus(&self) -> Option<u64> {
-        let mut lcm: u128 = 1;
-        for modulus in self.terms.iter().filter_map(Term::modulus) {
-            let modulus = u128::from(modulus);
-            lcm = lcm / gcd(lcm, modulus) * modulus;
-            if lcm > u128::from(u64::MAX) {
-                return None;
-            }
-        }
-        (lcm > 1 || self.has_hash()).then(|| u64::try_from(lcm).expect("checked against u64::MAX"))
-    }
-
     /// The field `hash` resolves this one to.
     fn resolve(&self, hash: u64) -> CronField {
         CronField {
@@ -294,10 +228,6 @@ impl ParsedField {
             restricted: self.restricted,
         }
     }
-}
-
-fn gcd(a: u128, b: u128) -> u128 {
-    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// Splits `text` into its five fields and reads each field's terms. Messages name the field.
@@ -422,24 +352,22 @@ fn field_hash(seed: &HashSeed, position: usize) -> u64 {
 
 // Decoding ------------------------------------------------------------------------------------------------------------
 
-/// Whether `field` is exactly what `parsed`'s terms give for `hash`. The reason does not name the
-/// field.
-fn check(parsed: &ParsedField, field: &CronField, hash: Option<u64>) -> Result<(), String> {
-    match (parsed.has_hash(), hash) {
-        (true, None) => return Err("has an `H` term but no hash".to_owned()),
-        (false, Some(_)) => return Err("has a hash but no `H` term".to_owned()),
-        _ => {}
-    }
-    if let (Some(hash), Some(modulus)) = (hash, parsed.hash_modulus())
-        && hash >= modulus
-    {
-        return Err(format!("has hash {hash}, which is not reduced below {modulus}"));
-    }
-    let expected = parsed.resolve(hash.unwrap_or(0));
-    if *field != expected {
+/// Whether `field` is one `parse` could have given for `parsed`'s text: the text's `restricted`, and
+/// values that are non-empty and in the field's range. The reason does not name the field.
+fn check(kind: &FieldKind, parsed: &ParsedField, field: &CronField) -> Result<(), String> {
+    if field.restricted != parsed.restricted {
         return Err(format!(
-            "holds {:?} (restricted: {}), but its text and hash give {:?} (restricted: {})",
-            field.values, field.restricted, expected.values, expected.restricted
+            "is restricted: {}, but its text gives {}",
+            field.restricted, parsed.restricted
+        ));
+    }
+    if field.values.is_empty() {
+        return Err("matches no value".to_owned());
+    }
+    if let Some(value) = field.values.iter().find(|value| !(kind.min..=kind.max).contains(value)) {
+        return Err(format!(
+            "holds {value}, which is out of range {}-{}",
+            kind.min, kind.max
         ));
     }
     Ok(())

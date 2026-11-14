@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::{CronField, DayRule, HashSeed, Schedule, field_hash};
+use super::{CronField, DayRule, HashSeed, Schedule};
 use crate::error::Error;
 use crate::spec::Id;
 
@@ -350,9 +350,9 @@ const ROUND_TRIP_LINES: &[&str] = &[
     "H(10-12)/20 * * * *",
 ];
 
-/// The stored form of `schedule`: each field with its hash.
-fn parts(schedule: &Schedule) -> [(CronField, Option<u64>); 5] {
-    std::array::from_fn(|i| (schedule.fields()[i].clone(), schedule.hashes()[i]))
+/// The stored form of `schedule`: its resolved fields.
+fn parts(schedule: &Schedule) -> [CronField; 5] {
+    schedule.fields().clone()
 }
 
 #[skuld::test]
@@ -369,7 +369,7 @@ fn from_parts_round_trips_parse() {
 }
 
 #[skuld::test]
-fn schedules_with_the_same_picks_are_equal_whatever_the_hash() {
+fn schedules_with_the_same_picks_are_equal_whatever_the_host() {
     // `host0` and `host1` hash differently and both pick 0 of `H(0-1)`.
     let (a, b) = (
         parse_for("nightly", "host0", "H(0-1) * * * *").unwrap(),
@@ -382,13 +382,6 @@ fn schedules_with_the_same_picks_are_equal_whatever_the_hash() {
     assert_ne!(a, other_pick);
 }
 
-#[skuld::test]
-fn only_h_fields_carry_a_hash() {
-    let parsed = parse("H 3 H(1-5),7 * 1");
-    let hashed: Vec<bool> = parsed.hashes().iter().map(Option::is_some).collect();
-    assert_eq!(hashed, [true, false, true, false, false]);
-}
-
 fn field(values: &[u8], restricted: bool) -> CronField {
     CronField {
         values: set(values),
@@ -396,68 +389,41 @@ fn field(values: &[u8], restricted: bool) -> CronField {
     }
 }
 
-/// `text` as parsed for `nightly` on `build-host`, with field `index` swapped for `replacement`
-/// and `hash`, then handed to `from_parts`.
-fn rebuild(text: &str, index: usize, replacement: CronField, hash: Option<u64>) -> Result<Schedule, Error> {
+/// `text` as parsed for `nightly` on `build-host`, with field `index` swapped for `replacement`,
+/// then handed to `from_parts`.
+fn rebuild(text: &str, index: usize, replacement: CronField) -> Result<Schedule, Error> {
     let mut stored = parts(&parse(text));
-    stored[index] = (replacement, hash);
+    stored[index] = replacement;
     Schedule::from_parts(&id("nightly"), text.to_owned(), stored)
-}
-
-/// The hash `parse` stored for field `index` of `text`.
-fn stored_hash(text: &str, index: usize) -> Option<u64> {
-    parse(text).hashes()[index]
 }
 
 #[skuld::test]
 fn from_parts_refuses_what_parse_cannot_give() {
-    // The `H` pick of `H * * * *` is minute 13, with its hash.
-    let hash = stored_hash("H * * * *", 0);
-    // (text, field index, replacement values, restricted, hash)
-    type Row = (&'static str, usize, Vec<u8>, bool, Option<u64>);
+    // (text, field index, replacement values, restricted)
+    type Row = (&'static str, usize, Vec<u8>, bool);
     let table: Vec<Row> = vec![
-        // an H-free field is exactly what the text gives
-        ("5 * * * *", 0, vec![6], true, None),
-        ("5 * * * *", 0, vec![5, 6], true, None),
-        ("5 * * * *", 0, vec![], true, None),
-        ("*/15 * * * *", 0, vec![0, 15, 30], true, None),
-        ("* * * * *", 1, vec![0, 1], false, None),
-        // an H field is exactly the pick of its hash
-        ("H * * * *", 0, vec![], true, hash),
-        ("H * * * *", 0, vec![14], true, hash),
-        ("H * * * *", 0, vec![13, 14], true, hash),
-        ("H * * * *", 0, (0..=59).collect(), true, hash),
-        ("H(10-20) * * * *", 0, vec![21], true, hash),
-        ("H/15 * * * *", 0, vec![13, 28, 43], true, hash),
-        ("H/15 * * * *", 0, vec![13, 28, 43, 58, 59], true, hash),
-        ("H(10-12)/2 * * * *", 0, vec![10, 11], true, hash),
-        ("H,H * * * *", 0, vec![3, 40], true, hash),
-        ("5,H(10-20) * * * *", 0, vec![12], true, hash),
-        ("5,H(10-20) * * * *", 0, vec![5], true, hash),
-        // a hash its field's moduli would reduce: one blob, one encoding
-        ("H * * * *", 0, vec![13], true, hash.map(|h| h + 60)),
-        ("H(0-1) * * * *", 0, vec![0], true, Some(2)),
-        // a hash that picks otherwise
-        ("H * * * *", 0, vec![13], true, Some(1)),
-        // an H field needs its hash, an H-free one has none
-        ("H * * * *", 0, vec![13], true, None),
-        ("5 * * * *", 0, vec![5], true, Some(1)),
-        ("* * * * *", 0, (0..=59).collect(), false, Some(1)),
+        // a field matches something
+        ("5 * * * *", 0, vec![], true),
+        ("H * * * *", 0, vec![], true),
+        ("* * * * *", 1, vec![], false),
         // a value outside the field's range
-        ("* * * * *", 4, (0..=7).collect(), false, None),
-        ("* * * * *", 0, vec![60], false, None),
-        ("* * * * *", 3, vec![0], false, None),
+        ("* * * * *", 4, (0..=7).collect(), false),
+        ("* * * * *", 0, vec![60], false),
+        ("* * * * *", 3, vec![0], false),
+        ("* * * * *", 2, vec![0], false),
+        ("H * * * *", 0, vec![13, 60], true),
         // the restricted flag is the text's
-        ("5 * * * *", 0, vec![5], false, None),
-        ("* * * * *", 0, (0..=59).collect(), true, None),
+        ("5 * * * *", 0, vec![5], false),
+        ("H * * * *", 0, vec![13], false),
+        ("* * * * *", 0, (0..=59).collect(), true),
     ];
-    for (text, index, values, restricted, hash) in table {
+    for (text, index, values, restricted) in table {
         let replacement = CronField {
             values: values.iter().copied().collect(),
             restricted,
         };
-        let case = format!("{text:?} {index} {replacement:?} {hash:?}");
-        let (daemon, message) = refusal(rebuild(text, index, replacement, hash).expect_err(&case));
+        let case = format!("{text:?} {index} {replacement:?}");
+        let (daemon, message) = refusal(rebuild(text, index, replacement).expect_err(&case));
         assert_eq!(daemon, "nightly");
         assert!(
             message.contains(FIELD_NAMES[index]),
@@ -467,77 +433,18 @@ fn from_parts_refuses_what_parse_cannot_give() {
 }
 
 #[skuld::test]
-fn a_stored_hash_is_reduced_by_its_fields_moduli() {
-    let seed_id = id("nightly");
-    let seed = HashSeed {
-        hostname: HOST,
-        id: &seed_id,
-    };
-    let hashes = |text: &str| *parse(text).hashes();
-    // Bare `H`: minute 60, hour 24; `H(0-1)`: 2; the least common multiple of 2 and 3 for a list.
-    assert_eq!(
-        hashes("H H * * *"),
-        [
-            Some(field_hash(&seed, 0) % 60),
-            Some(field_hash(&seed, 1) % 24),
-            None,
-            None,
-            None
-        ]
-    );
-    assert_eq!(hashes("H(0-1) * * * *")[0], Some(field_hash(&seed, 0) % 2));
-    assert_eq!(hashes("H(0-1),H(0-2) * * * *")[0], Some(field_hash(&seed, 0) % 6));
-    assert_eq!(hashes("H(0-3)/2,H(0-5)/4 * * * *")[0], Some(field_hash(&seed, 0) % 4));
-}
-
-#[skuld::test]
-fn a_hash_is_stored_whole_when_its_moduli_overflow_u64() {
-    // 59, 58, ... 23: their least common multiple is above `u64::MAX`.
-    let terms: Vec<String> = [59, 58, 57, 55, 53, 49, 47, 43, 41, 37, 31, 23]
-        .iter()
-        .map(|m| format!("H(0-{})", m - 1))
-        .collect();
-    let text = format!("{} * * * *", terms.join(","));
-    let seed_id = id("nightly");
-    let seed = HashSeed {
-        hostname: HOST,
-        id: &seed_id,
-    };
-    let parsed = parse(&text);
-    assert_eq!(parsed.hashes()[0], Some(field_hash(&seed, 0)));
-    let rebuilt = Schedule::from_parts(&seed_id, text, parts(&parsed)).unwrap();
-    assert_eq!(rebuilt, parsed);
-}
-
-#[skuld::test]
-fn from_parts_decodes_a_foreign_hosts_picks_by_their_hash() {
-    // Another host or id hashed elsewhere; the stored hash is all decode needs.
-    for (text, index) in [
-        ("H * * * *", 0),
-        ("H(10-20) * * * *", 0),
-        ("H/15 * * * *", 0),
-        ("5,H(10-20) * * * *", 0),
-        ("* * H * *", 2),
-        ("* * * * H", 4),
+fn from_parts_keeps_the_values_it_is_given() {
+    // A decode does not re-derive values from the text: another host or id resolved these.
+    for (text, index, values) in [
+        ("H * * * *", 0, vec![14]),
+        ("H(10-20) * * * *", 0, vec![21]),
+        ("H/15 * * * *", 0, vec![13, 28, 43, 58]),
+        ("5 * * * *", 0, vec![6]),
+        ("* * H * *", 2, vec![9]),
     ] {
-        for host in ["other", "a-third-host"] {
-            let foreign = parse_for("nightly", host, text).unwrap();
-            let (field, hash) = parts(&foreign)[index].clone();
-            let rebuilt = rebuild(text, index, field, hash).unwrap_or_else(|e| panic!("{text:?} {host}: {e}"));
-            assert_eq!(rebuilt.fields()[index], foreign.fields()[index]);
-        }
-    }
-}
-
-#[skuld::test]
-fn from_parts_with_many_h_terms_is_exact() {
-    let text = format!("{} * * * *", ["H"; 60].join(","));
-    let schedule = parse(&text);
-    let (right, hash) = parts(&schedule)[0].clone();
-    assert_eq!(right.values.len(), 1);
-    rebuild(&text, 0, right, hash).unwrap();
-    for values in [vec![], (0..=58).collect(), (0..=59).collect()] {
-        rebuild(&text, 0, field(&values, true), hash).unwrap_err();
+        let restricted = !text.split(' ').nth(index).unwrap().starts_with('*');
+        let rebuilt = rebuild(text, index, field(&values, restricted)).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+        assert_eq!(rebuilt.fields()[index].values, set(&values), "{text:?}");
     }
 }
 
