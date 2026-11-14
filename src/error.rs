@@ -772,8 +772,8 @@ impl Error {
         }
     }
 
-    /// The first OS error code this error carries, anywhere in it; the search order is
-    /// `report::os_error_in`'s.
+    /// The first OS error code this error carries, searched as `report::os_error_in` does (which
+    /// names what it does not search).
     pub fn raw_os_error(&self) -> Option<i32> {
         report::os_error_in(self)
     }
