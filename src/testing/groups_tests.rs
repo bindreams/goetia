@@ -118,26 +118,40 @@ fn a_group_that_is_off_refuses_its_setup() {
     assert!(why.contains(&format!("{GROUP}=0")), "{why}");
 }
 
+const MISSING: &str = "this token does not hold SeDebugPrivilege; run elevated";
+
 /// A test that needs something the host may lack, and changes no system state, has a switch and no
-/// consent: it runs by default and fails, naming the missing thing, where the host lacks it.
+/// consent: it runs by default and fails, naming the missing thing and the switch, where the host
+/// lacks it.
 #[skuld::test]
 fn a_test_that_needs_a_dependency_fails_where_the_host_lacks_it() {
-    let missing = || Err("this token does not hold SeDebugPrivilege".to_string());
-
     for vars in [env(&[]), env(&[(GROUP, "1")])] {
-        assert!(need(GROUP, &vars, || Ok(())).is_ok());
+        assert!(need(GROUP, &vars, MISSING, || Ok(true)).is_ok());
+        let why = need(GROUP, &vars, MISSING, || Ok(false)).unwrap_err();
+        assert!(why.contains(MISSING) && why.contains(&format!("{GROUP}=0")), "{why}");
     }
-    let why = need(GROUP, env(&[]), missing).unwrap_err();
+}
+
+/// A probe that fails says nothing about the dependency: the failure is reported as the probe's, with
+/// the switch, and does not claim the dependency is missing.
+#[skuld::test]
+fn a_failed_probe_is_reported_as_a_failed_probe_not_a_missing_dependency() {
+    let why = need(GROUP, env(&[]), MISSING, || {
+        Err("OpenProcessToken: access denied".to_string())
+    })
+    .unwrap_err();
+
     assert!(
-        why.contains("SeDebugPrivilege") && why.contains(&format!("{GROUP}=0")),
+        why.contains("OpenProcessToken: access denied") && why.contains(&format!("{GROUP}=0")),
         "{why}"
     );
+    assert!(!why.contains(MISSING), "{why}");
 }
 
 /// The opt-out refuses at setup, so `--run-ignored only` does not run what the switch turned off.
 #[skuld::test]
 fn a_dependency_test_that_is_switched_off_refuses_without_probing_the_host() {
-    let why = need(GROUP, env(&[(GROUP, "0")]), || {
+    let why = need(GROUP, env(&[(GROUP, "0")]), MISSING, || {
         panic!("the host is probed though the switch is off")
     })
     .unwrap_err();
@@ -146,8 +160,11 @@ fn a_dependency_test_that_is_switched_off_refuses_without_probing_the_host() {
 }
 
 #[skuld::test]
-fn a_dependency_switch_with_an_invalid_value_fails_the_test() {
-    let why = need(GROUP, env(&[(GROUP, "yes")]), || Ok(())).unwrap_err();
+fn a_dependency_switch_with_an_invalid_value_fails_the_test_without_probing_the_host() {
+    let why = need(GROUP, env(&[(GROUP, "yes")]), MISSING, || {
+        panic!("the host is probed though the switch is invalid")
+    })
+    .unwrap_err();
 
     assert!(why.contains(GROUP) && why.contains("\"yes\""), "{why}");
 }

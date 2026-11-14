@@ -45,7 +45,7 @@ const LAUNCHD: Spec = Spec {
     what: "write plists under /Library/LaunchDaemons and bootstrap, kickstart and boot out real launchd jobs as root",
 };
 
-/// Reads a group variable: `Ok(None)` if unset, `Ok(Some(flag))` for `1`/`0`, `Err` naming the variable and value otherwise.
+/// Reads a test variable (a group's, its consent's, or a [`need`] switch): `Ok(None)` if unset, `Ok(Some(flag))` for `1`/`0`, `Err` naming the variable and value otherwise.
 fn switch(name: &str, var: &impl Fn(&str) -> Option<String>) -> Result<Option<bool>, String> {
     match var(name).as_deref() {
         None => Ok(None),
@@ -61,8 +61,8 @@ fn read_group(group_var: &str, var: &impl Fn(&str) -> Option<String>) -> Result<
     Ok((switch(group_var, var)?, switch(&format!("{group_var}_CONSENT"), var)?))
 }
 
-/// Every variable of every group goetia knows, whether or not this OS has tests in the group.
-/// `Err` names the first invalid one.
+/// Every variable of every group goetia knows, and the [`DEBUG_PRIVILEGE`] switch, whether or not
+/// this OS has tests that use them. `Err` names the first invalid one.
 pub(crate) fn validate_all(var: impl Fn(&str) -> Option<String>) -> Result<(), String> {
     [SCM, SYSTEMD, LAUNCHD]
         .iter()
@@ -125,18 +125,28 @@ pub(crate) fn enter(
 }
 
 /// The setup of a test that needs something the host may lack, where `switch_var` is its switch and
-/// `holds` says whether the host has the dependency (`Err` names what is missing). The test runs
-/// unless the switch is `0`, and fails, naming the dependency and the switch, where `holds` fails:
-/// it never skips on a missing dependency. No consent: such a test changes no system state.
-pub fn need(
+/// `holds` probes the host: `Ok(true)` has the dependency, `Ok(false)` lacks it, `Err` is a probe that
+/// failed. The test runs unless the switch is `0`, and fails where the host lacks the dependency
+/// (`missing` says what is missing and how to provide it) or the probe fails, naming the switch in
+/// both: it never skips on a missing dependency. No consent: such a test changes no system state.
+// Only unit tests call it: the Windows privilege tests and its own.
+#[cfg_attr(not(test), allow(dead_code, reason = "only unit tests call it"))]
+pub(crate) fn need(
     switch_var: &str,
     var: impl Fn(&str) -> Option<String>,
-    holds: impl FnOnce() -> Result<(), String>,
+    missing: &str,
+    holds: impl FnOnce() -> Result<bool, String>,
 ) -> Result<(), String> {
-    match switch(switch_var, &var)? {
-        // As in `enter`: skuld runs the body of an ignored test under `--run-ignored only`.
-        Some(false) => Err(format!("{switch_var}=0")),
-        _ => holds().map_err(|missing| format!("{missing}; provide it, or set {switch_var}=0 to opt out")),
+    switch(switch_var, &var)?;
+    // As in `enter`: skuld runs the body of an ignored test under `--run-ignored only`.
+    require_enabled(switch_var, &var)?;
+    match holds() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("{missing}; or set {switch_var}=0 to opt out")),
+        Err(probe) => Err(format!(
+            "{probe}; the check failed, so this does not show the dependency is missing; set {switch_var}=0 to \
+             ignore these tests"
+        )),
     }
 }
 

@@ -1541,10 +1541,10 @@ Windows, `SYSTEMD` on Linux, `LAUNCHD` on macOS):
 A consented group also needs elevation (root, or an Administrator shell) and fails without it. On a machine you care about, run everything else with the groups off:
 
 ```sh
-GOETIA_TEST_SCM=0 GOETIA_TEST_SYSTEMD=0 GOETIA_TEST_LAUNCHD=0 cargo nextest run
+GOETIA_TEST_SCM=0 GOETIA_TEST_SYSTEMD=0 GOETIA_TEST_LAUNCHD=0 GOETIA_TEST_DEBUG_PRIVILEGE=0 cargo nextest run
 ```
 
-On Windows, two tests need a token that holds `SeDebugPrivilege` (an elevated Administrator's) but change no
+On Windows, the tests that need SeDebugPrivilege need a token that holds `SeDebugPrivilege` (an elevated Administrator's) but change no
 system state, so they have a switch and no consent: `GOETIA_TEST_DEBUG_PRIVILEGE` unset or `1` runs them, and
 they **fail** on a token without the privilege; `0` ignores them. Set it to `0` in an unelevated shell.
 

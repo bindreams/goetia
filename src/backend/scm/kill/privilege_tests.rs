@@ -14,6 +14,7 @@ use windows_sys::Win32::Security::{
 
 use super::{DebugPrivilege, enable_in, restore_notice};
 use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
+use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::{DEBUG_PRIVILEGE, need, process_var, require_enabled};
 
 fn debug_privilege_tests_on() -> Result<(), String> {
@@ -21,20 +22,22 @@ fn debug_privilege_tests_on() -> Result<(), String> {
 }
 
 /// Fixture of the tests that need a token holding `SeDebugPrivilege` (an elevated administrator's):
-/// they fail without one, and `GOETIA_TEST_DEBUG_PRIVILEGE=0` ignores them.
-#[skuld::fixture(requires = [debug_privilege_tests_on])]
+/// they fail without one, and `GOETIA_TEST_DEBUG_PRIVILEGE=0` ignores them. They carry the
+/// [`ELEVATED`] label.
+#[skuld::fixture(requires = [debug_privilege_tests_on], labels = [ELEVATED])]
 fn debug_privilege() -> Result<(), String> {
-    need(DEBUG_PRIVILEGE, process_var, holds_debug_privilege)
+    need(
+        DEBUG_PRIVILEGE,
+        process_var,
+        "this token does not hold SeDebugPrivilege; run elevated (an elevated Administrator's token does)",
+        holds_debug_privilege,
+    )
 }
 
-/// The process token holds `SeDebugPrivilege`, enabled or not.
-fn holds_debug_privilege() -> Result<(), String> {
+/// Whether the process token holds `SeDebugPrivilege`, enabled or not; `Err` if the probe fails.
+fn holds_debug_privilege() -> Result<bool, String> {
     let copy = process_token_copy(TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY);
-    match enable_in(copy.as_raw_handle()) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err("this token does not hold SeDebugPrivilege (an elevated administrator's does)".to_string()),
-        Err(e) => Err(format!("could not probe the token for SeDebugPrivilege: {e}")),
-    }
+    enable_in(copy.as_raw_handle()).map_err(|e| format!("could not probe the token for SeDebugPrivilege: {e}"))
 }
 
 /// The calling thread's own token, if it has one, opened to be queried.
