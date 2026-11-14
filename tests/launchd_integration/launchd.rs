@@ -751,7 +751,10 @@ fn list_reports_a_deleted_user_as_ours_unusable(#[fixture(launchd_group)] _group
     let path = staging_path(&id);
     let _cleanup = FileGuard::new(path.clone());
     ensure_staging_dir();
-    write_plist(&path, &generate::plist(&spec, &Identity { user: user.to_string() }).unwrap());
+    write_plist(
+        &path,
+        &generate::plist(&spec, &Identity { user: user.to_string() }).unwrap(),
+    );
     let cannot_render = mgr
         .preview_install(&spec)
         .expect_err("a spec naming a deleted user cannot be rendered")
