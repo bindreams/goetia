@@ -372,16 +372,22 @@ impl JournalOutput {
         // Closed when the live read is over, which releases the thread that waits for the run's end.
         let (finished, watching) = crossbeam_channel::bounded::<()>(0);
         let (done, watcher_done) = crossbeam_channel::bounded::<()>(0);
-        let handed = watcher.hand(Watch {
-            ended: ended.clone(),
-            finished: watching,
-            stop: follower.stop(),
-            done,
-        });
-        debug_assert!(
-            handed.is_ok(),
-            "the output's watcher thread ended before it was handed its share"
-        );
+        // Nothing but the watcher wakes a read blocked on the follower, so with no watcher there is
+        // no read: the follower is dropped on this return, which ends its `journalctl`.
+        if watcher
+            .hand(Watch {
+                ended: ended.clone(),
+                finished: watching,
+                stop: follower.stop(),
+                done,
+            })
+            .is_err()
+        {
+            return Err(Error::os(
+                "follow the run's output",
+                std::io::Error::other("the thread that ends the read when the run ends is gone"),
+            ));
+        }
 
         let mut selection = Selection::new(&invocation);
         let live = live(&mut selection, follower.as_mut(), out);

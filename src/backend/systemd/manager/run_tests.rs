@@ -505,6 +505,35 @@ fn shown_after_an_end(journal: &JournalFake, exit_recorded: bool) -> (Result<()>
     (result, out)
 }
 
+/// A watcher thread that cannot be handed its share (it ended first) would leave the live read
+/// blocked on a follower nothing stops, so the stream refuses to read, with an error, and ends the
+/// follower it made.
+#[skuld::test]
+fn a_watcher_that_cannot_be_handed_its_share_is_an_error_and_the_read_does_not_block() {
+    let journal = JournalFake::new(Vec::new()).follows(vec![marker("c2", "s1", "inv")]);
+    let (watcher, thread) = Standby::<Watch>::with(
+        "goetia run output",
+        // A thread that ends without ever waiting for its share.
+        |_name, _run| Ok(std::thread::spawn(|| {})),
+        watch,
+    )
+    .expect("a thread");
+    thread.join().expect("the thread ended");
+    let output = JournalOutput {
+        watcher,
+        ..output_over(Arc::new(journal.clone()))
+    };
+    let (end, ended) = crossbeam_channel::bounded::<()>(0);
+    let mut out = Vec::new();
+
+    let result = output.stream(&mut out, &ended, &AtomicBool::new(false));
+
+    drop(end);
+    let e = result.expect_err("nothing would stop the read");
+    assert!(e.report().to_string().contains("is gone"), "{}", e.report());
+    assert_eq!(out, b"");
+}
+
 /// The run's output is the lines of the marker's stream, the marker not among them, and another
 /// stream's lines are never shown, whether they come first or between the run's own.
 /// The manager's entries (a run's Starting entry, its exit) are read from the system journal alone.
