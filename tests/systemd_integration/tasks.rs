@@ -273,8 +273,14 @@ fn newest_stream_text(id: &str) -> Vec<u8> {
         .map(|entry| field(entry, "MESSAGE").expect("a line of the run is text").to_string())
         .collect();
     let (marker, output) = lines.split_first().expect("a stream has its marker");
-    assert!(marker.starts_with("goetia-run "), "the stream starts with the marker: {marker}");
-    output.iter().flat_map(|line| format!("{line}\n").into_bytes()).collect()
+    assert!(
+        marker.starts_with("goetia-run "),
+        "the stream starts with the marker: {marker}"
+    );
+    output
+        .iter()
+        .flat_map(|line| format!("{line}\n").into_bytes())
+        .collect()
 }
 
 /// Panics unless `got` holds every line of `want`, in order. Lines of its own besides are fine: the
@@ -958,7 +964,9 @@ fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(systemd_group)] _gr
         assert_same_text(n, &out, &journaled);
         assert_holds_in_order(n, &journaled, b"second-run\n");
         assert!(
-            journaled.split_inclusive(|&b| b == b'\n').all(|line| line == b"second-run\n"),
+            journaled
+                .split_inclusive(|&b| b == b'\n')
+                .all(|line| line == b"second-run\n"),
             "run {n}: the second run's stream holds a line of another run"
         );
     }
