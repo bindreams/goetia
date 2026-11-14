@@ -8,11 +8,18 @@
 //! - A consented group on a host that is not elevated fails; it never skips.
 //!
 //! A test joins a group by taking its fixture: `#[fixture(scm_group)] _group: &Group`.
+//!
+//! A test that changes no system state but needs something a host may lack (a privilege) has a
+//! switch and no consent: `GOETIA_TEST_DEBUG_PRIVILEGE` unset or `1` runs it, and it fails where the
+//! host lacks the dependency; `0` ignores it. See [`need`].
 
 use super::elevation::ELEVATED;
 
 /// Witness that a group fixture passed; only the group fixtures build one.
 pub struct Group(());
+
+/// The switch of the tests that need `SeDebugPrivilege`, which an unelevated Windows host lacks.
+pub(crate) const DEBUG_PRIVILEGE: &str = "GOETIA_TEST_DEBUG_PRIVILEGE";
 
 /// A group's variable and what its tests do (for the consent message).
 struct Spec {
@@ -59,7 +66,8 @@ fn read_group(group_var: &str, var: &impl Fn(&str) -> Option<String>) -> Result<
 pub(crate) fn validate_all(var: impl Fn(&str) -> Option<String>) -> Result<(), String> {
     [SCM, SYSTEMD, LAUNCHD]
         .iter()
-        .try_for_each(|spec| read_group(spec.env, &var).map(drop))
+        .try_for_each(|spec| read_group(spec.env, &var).map(drop))?;
+    switch(DEBUG_PRIVILEGE, &var).map(drop)
 }
 
 /// [`validate_all`] on this process's environment.
@@ -116,9 +124,25 @@ pub(crate) fn enter(
     }
 }
 
+/// The setup of a test that needs something the host may lack, where `switch_var` is its switch and
+/// `holds` says whether the host has the dependency (`Err` names what is missing). The test runs
+/// unless the switch is `0`, and fails, naming the dependency and the switch, where `holds` fails:
+/// it never skips on a missing dependency. No consent: such a test changes no system state.
+pub fn need(
+    switch_var: &str,
+    var: impl Fn(&str) -> Option<String>,
+    holds: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    match switch(switch_var, &var)? {
+        // As in `enter`: skuld runs the body of an ignored test under `--run-ignored only`.
+        Some(false) => Err(format!("{switch_var}=0")),
+        _ => holds().map_err(|missing| format!("{missing}; provide it, or set {switch_var}=0 to opt out")),
+    }
+}
+
 /// The environment of this process. A value that is not Unicode is lossily decoded, so it is an
 /// invalid value rather than an unset one.
-fn process_var(name: &str) -> Option<String> {
+pub(crate) fn process_var(name: &str) -> Option<String> {
     std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
 }
 

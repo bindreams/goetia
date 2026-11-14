@@ -1,4 +1,4 @@
-use super::{check_group, enter, require_enabled, validate_all};
+use super::{DEBUG_PRIVILEGE, check_group, enter, need, require_enabled, validate_all};
 
 const GROUP: &str = "GOETIA_TEST_X";
 const CONSENT: &str = "GOETIA_TEST_X_CONSENT";
@@ -116,4 +116,46 @@ fn a_group_that_is_off_refuses_its_setup() {
         .err()
         .expect("a group that is off");
     assert!(why.contains(&format!("{GROUP}=0")), "{why}");
+}
+
+/// A test that needs something the host may lack, and changes no system state, has a switch and no
+/// consent: it runs by default and fails, naming the missing thing, where the host lacks it.
+#[skuld::test]
+fn a_test_that_needs_a_dependency_fails_where_the_host_lacks_it() {
+    let missing = || Err("this token does not hold SeDebugPrivilege".to_string());
+
+    for vars in [env(&[]), env(&[(GROUP, "1")])] {
+        assert!(need(GROUP, &vars, || Ok(())).is_ok());
+    }
+    let why = need(GROUP, env(&[]), missing).unwrap_err();
+    assert!(
+        why.contains("SeDebugPrivilege") && why.contains(&format!("{GROUP}=0")),
+        "{why}"
+    );
+}
+
+/// The opt-out refuses at setup, so `--run-ignored only` does not run what the switch turned off.
+#[skuld::test]
+fn a_dependency_test_that_is_switched_off_refuses_without_probing_the_host() {
+    let why = need(GROUP, env(&[(GROUP, "0")]), || {
+        panic!("the host is probed though the switch is off")
+    })
+    .unwrap_err();
+
+    assert!(why.contains(&format!("{GROUP}=0")), "{why}");
+}
+
+#[skuld::test]
+fn a_dependency_switch_with_an_invalid_value_fails_the_test() {
+    let why = need(GROUP, env(&[(GROUP, "yes")]), || Ok(())).unwrap_err();
+
+    assert!(why.contains(GROUP) && why.contains("\"yes\""), "{why}");
+}
+
+#[skuld::test]
+fn the_debug_privilege_switch_is_validated_at_start() {
+    assert!(validate_all(env(&[(DEBUG_PRIVILEGE, "0")])).is_ok());
+    assert!(validate_all(env(&[(DEBUG_PRIVILEGE, "1")])).is_ok());
+    let why = validate_all(env(&[(DEBUG_PRIVILEGE, "maybe")])).unwrap_err();
+    assert!(why.contains(DEBUG_PRIVILEGE) && why.contains("maybe"), "{why}");
 }
