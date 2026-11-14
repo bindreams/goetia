@@ -229,7 +229,7 @@ fn strictly_after() {
 /// A TZif (version 1) file whose zone has the offsets `offsets` (seconds east of UTC, none in DST), the
 /// first holding until the first of `transitions` (Unix second, index into `offsets`).
 fn tzif(offsets: &[i32], transitions: &[(i32, u8)]) -> Vec<u8> {
-    let abbreviations: Vec<u8> = offsets.iter().flat_map(|_| *b"X ").collect();
+    let abbreviations: Vec<u8> = offsets.iter().flat_map(|_| *b"X\0").collect();
     let mut bytes = b"TZif".to_vec();
     bytes.extend([0; 16]); // the version, and the reserved bytes
     // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
@@ -259,7 +259,7 @@ fn back_across_midnight() -> TimeZone {
 }
 
 /// The date a repeated minute reads is not always `after`'s own, and a later date is not always a later
-/// instant: the walk looks at the day before `after`'s date, and past the first date that has a fire.
+/// instant: the walk looks before `after`'s date, and past the first date that has a fire.
 #[skuld::test]
 fn a_fold_across_midnight_fires_on_the_date_it_reads_again() {
     let zone = back_across_midnight();
@@ -277,6 +277,20 @@ fn a_fold_across_midnight_fires_on_the_date_it_reads_again() {
         assert_is_next(&schedule, &zone, after, fire);
         assert_eq!(timestamp(fire), expected.parse::<Timestamp>().unwrap(), "{text}");
     }
+}
+
+/// An offset that falls by more than a day (UTC+25:00 to UTC-25:00, the widest jiff holds: no real zone
+/// does it) reads dates in an order the walk must not assume: here 2026-06-11 comes before 2026-06-09.
+#[skuld::test]
+fn an_offset_that_falls_by_more_than_a_day_still_gives_the_first_instant() {
+    let at = i32::try_from(timestamp(instant("2026-06-10T05:30:00Z")).as_second()).unwrap();
+    let zone = TimeZone::tzif("synthetic", &tzif(&[90_000, -90_000], &[(at, 1)])).unwrap();
+    let schedule = schedule("0 6 9,11 * *");
+    // 2026-06-10T06:30 in the first pass. 06:00 on the 11th is read at 05:00Z, before the 9th is read again.
+    let after = instant("2026-06-09T05:30:00Z");
+    let fire = next_fire(&schedule, after, &zone).unwrap();
+    assert_is_next(&schedule, &zone, after, fire);
+    assert_eq!(timestamp(fire), "2026-06-10T05:00:00Z".parse::<Timestamp>().unwrap());
 }
 
 #[skuld::test]

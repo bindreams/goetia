@@ -8,15 +8,18 @@
 use std::path::Path;
 use std::time::SystemTime;
 
+use jiff::SignedDuration;
 use jiff::Timestamp;
 use jiff::civil::Date;
-use jiff::tz::{AmbiguousOffset, TimeZone};
+use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
 
 use super::{CronField, DayRule, Schedule};
 use crate::error::{Error, Result};
 
-/// Days in the Gregorian cycle: dates, and the weekdays on them, repeat exactly after it.
-const GREGORIAN_CYCLE_DAYS: u32 = 146_097;
+/// Dates the walk looks at. It starts at most two days before `after`'s UTC date (`next_fire`), and from
+/// three days after that date every instant reads a date after `after` whatever the offset, so a Gregorian
+/// cycle of dates (146,097: dates and their weekdays repeat exactly after it) from there decides.
+const SCAN_DAYS: u32 = 146_097 + 5;
 
 /// The first instant strictly after `after`, on a whole minute, whose reading in `zone` the
 /// schedule names.
@@ -26,23 +29,30 @@ const GREGORIAN_CYCLE_DAYS: u32 = 146_097;
 /// not as "never".
 pub(crate) fn next_fire(schedule: &Schedule, after: SystemTime, zone: &TimeZone) -> Option<SystemTime> {
     let after = Timestamp::try_from(after).ok()?;
-    // From the day before `after`'s own date: a fall-back across midnight reads that date again.
-    let mut date = after.to_zoned(zone.clone()).date().yesterday().ok()?;
-    // Then `after`'s own date and a cycle's worth after it, whose first date a fire earlier that day
-    // may not satisfy.
-    for _ in 0..=GREGORIAN_CYCLE_DAYS + 1 {
-        if let Some(fire) = fire_on(schedule, zone, date, after) {
-            // The next date can read an earlier instant than this one (a fall-back across midnight),
-            // and no date after it can.
-            let tomorrow = date
-                .tomorrow()
-                .ok()
-                .and_then(|date| fire_on(schedule, zone, date, after));
-            return Some(tomorrow.map_or(fire, |tomorrow| fire.min(tomorrow)).into());
+    // A date's readings lie within an offset's span (`Offset::MAX`, 25:59:59, either way) of its UTC day.
+    // The walk starts at the first date that can still read an instant after `after`, and goes on past a
+    // fire while a later date can still read an earlier one: dates are not read in order where an offset
+    // falls (a fall-back across midnight, or by more than a day), so nothing narrower is exact.
+    let span = SignedDuration::from_secs(i64::from(Offset::MAX.seconds()));
+    let mut date = after.checked_sub(span).ok()?.to_zoned(TimeZone::UTC).date();
+    let mut best: Option<Timestamp> = None;
+    for _ in 0..SCAN_DAYS {
+        if let Some(best) = best {
+            // The earliest instant `date` can be read at is its midnight at the largest offset.
+            if Offset::MAX
+                .to_timestamp(date.at(0, 0, 0, 0))
+                .is_ok_and(|earliest| earliest >= best)
+            {
+                break;
+            }
         }
-        date = date.tomorrow().ok()?;
+        if let Some(fire) = fire_on(schedule, zone, date, after) {
+            best = Some(best.map_or(fire, |best| best.min(fire)));
+        }
+        let Ok(tomorrow) = date.tomorrow() else { break };
+        date = tomorrow;
     }
-    None
+    best.map(Into::into)
 }
 
 /// The first instant after `after` at which `zone` reads a minute the schedule names on `date`.
