@@ -193,11 +193,10 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
     push(timer_differs, Action::ReplaceTimer);
     // An enabled task is loaded (`enable` loads it), so whatever launchd does not hold afterwards is
     // loaded, whether this plan booted it out or an earlier install that failed did.
-    push(armed && !(old.job_loaded && !job_out), Action::BootstrapJob);
-    push(
-        armed && new.timer.is_some() && !(old.timer_loaded && !timer_out),
-        Action::BootstrapTimer,
-    );
+    let job_held = old.job_loaded && !job_out;
+    let timer_held = old.timer_loaded && !timer_out;
+    push(armed && !job_held, Action::BootstrapJob);
+    push(armed && new.timer.is_some() && !timer_held, Action::BootstrapTimer);
     plan
 }
 
