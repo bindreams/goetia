@@ -52,12 +52,14 @@ fn parameters_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}\{PARAMETERS_KEY}")
 }
 
+/// Counted, like every name `counted` takes: a NUL in it is part of the name.
 fn parameters_key_name() -> Vec<u16> {
     PARAMETERS_KEY.encode_utf16().collect()
 }
 
 /// What a read asks `Services` for: `Parameters` of `name` as a path below it, for one open that
 /// passes the service key without opening it, and the access to open it with, which is a read's.
+/// The path is counted (`counted::open_child`): a NUL in `name` is part of it, not its end.
 fn parameters_read_request(name: &str) -> (Vec<u16>, u32) {
     (format!(r"{name}\{PARAMETERS_KEY}").encode_utf16().collect(), KEY_READ)
 }
@@ -119,6 +121,7 @@ fn read_settled<T>(
 ///
 /// The key is opened as SCM reads it, through a registry link (see [`stands`]).
 fn service_stands_in(services: &ServicesRoot<'_>, name: &str) -> std::result::Result<bool, Failure> {
+    // Counted (`NtOpenKey`'s `UNICODE_STRING`): a NUL in `name` is part of it, not its end.
     let wide: Vec<u16> = name.encode_utf16().collect();
     let open = |links| counted::open_child(services.0, &wide, KEY_READ, links).map(drop);
     stands(open(LinkHandling::Followed), || open(LinkHandling::Itself))
@@ -384,6 +387,7 @@ pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> 
 /// [`read_environment`] below a `Services` key that is already open.
 fn read_environment_in(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
     let path = service_key_path(name);
+    // Counted (`NtOpenKey`'s `UNICODE_STRING`): a NUL in `name` is part of it, not its end.
     let wide: Vec<u16> = name.encode_utf16().collect();
     read_settled(
         || service_stands_in(services, name),
@@ -544,6 +548,7 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
 /// registry link is read through it, as SCM reads it.
 pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Option<String>>> {
     let path = service_key_path(name);
+    // Counted (`NtOpenKey`'s `UNICODE_STRING`): a NUL in `name` is part of it, not its end.
     let wide: Vec<u16> = name.encode_utf16().collect();
     read_settled(
         || service_stands_in(services, name),
