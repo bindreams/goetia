@@ -10,7 +10,7 @@ fn at(micros: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_micros(micros)
 }
 
-/// "Starting <unit>...", written at `micros`.
+/// "Starting `<unit>`...", written at `micros`.
 fn starting(invocation: &str, micros: u64) -> Entry {
     Entry::of(&[
         ("MESSAGE_ID", STARTING),

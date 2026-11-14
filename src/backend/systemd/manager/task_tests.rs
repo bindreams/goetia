@@ -713,7 +713,7 @@ fn a_timer_without_its_job_is_ours_unusable_and_uninstall_removes_it(#[fixture(s
     let mgr = over(&fake);
 
     let snapshot = marked(&mgr, &id);
-    let why = snapshot.blob().err().expect("no job, so no usable blob").to_string();
+    let why = snapshot.blob().expect_err("no job, so no usable blob").to_string();
     assert!(why.contains("the timer's job is missing"), "{why}");
     assert!(matches!(flow::preview(&mgr, &spec), Ok(Outcome::RefuseUnusable { .. })));
 
@@ -1230,7 +1230,7 @@ fn scan_lists_a_task_once_and_a_timer_only_id_as_unusable(#[fixture(systemd_grou
     }
     match of(&alone).as_slice() {
         [ScanEntry::Read(ReadOutcome::Marked(snapshot))] => {
-            let why = snapshot.blob().err().expect("unusable").to_string();
+            let why = snapshot.blob().expect_err("unusable").to_string();
             assert!(why.contains("the timer's job is missing"), "{why}");
         }
         _ => panic!("a timer alone is one marked entry whose job is missing"),
@@ -1317,7 +1317,7 @@ fn a_task_status_is_read_from_the_job_the_timer_and_the_journal() {
         Some(UNIX_EPOCH + Duration::from_micros(1_700_000_000_000_000))
     );
     assert_eq!(status.last_result, Some(Exit::Code(3)));
-    assert_eq!(journal.asked(), [[format!("UNIT=x.service")]]);
+    assert_eq!(journal.asked(), [["UNIT=x.service".to_string()]]);
     assert_eq!(
         systemctl.calls(),
         [

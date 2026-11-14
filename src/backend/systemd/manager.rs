@@ -128,7 +128,7 @@ impl Systemd {
 
     /// A manager over stated `systemctl`, `busctl` and journal.
     #[cfg(test)]
-    pub(crate) fn with_seams(systemctl: Systemctl, busctl: Busctl, journal: Box<dyn Journal>) -> Self {
+    fn with_seams(systemctl: Systemctl, busctl: Busctl, journal: Box<dyn Journal>) -> Self {
         Self {
             systemctl,
             busctl,

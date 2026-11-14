@@ -641,7 +641,7 @@ fn a_timer_without_its_job_is_marked_and_unusable() {
         ReadOutcome::Marked(Unnamed { blob, body }) => {
             assert!(body.service.is_none());
             assert_eq!(body.timer.expect("the timer").text, timer);
-            let why = blob.err().expect("no job, so no blob").to_string();
+            let why = blob.expect_err("no job, so no blob").to_string();
             assert!(why.contains("the timer's job is missing"), "{why}");
         }
         _ => panic!("a timer of goetia's is ours, even with no job"),
