@@ -927,7 +927,7 @@ fn a_task_start_then_stop_goes_running_then_idle() {
     let id = Id::try_from("nightly").unwrap();
     fake.install(&a_task("nightly"), false).unwrap();
 
-    fake.start(&id, Budget::DEFAULT).unwrap();
+    fake.start(&id, Budget::Immediate).unwrap();
     let running = task_status(&fake, "nightly");
     assert_eq!(running.common.state, State::Running);
     assert!(running.common.pid.is_some(), "a running task has a pid");
@@ -969,4 +969,49 @@ fn list_reports_a_task_with_a_task_status() {
     assert_eq!(spec.kind(), crate::spec::DaemonKind::Task);
     assert_eq!(status, &Status::Task(task_status(&fake, "nightly")));
     assert_eq!(task_status(&fake, "nightly").last_result, Some(Exit::Code(0)));
+}
+
+#[skuld::test]
+fn a_task_start_is_running_under_any_budget() {
+    for budget in [Budget::Immediate, Budget::DEFAULT] {
+        let fake = Fake::new();
+        fake.install(&a_task("nightly"), false).unwrap();
+        fake.seed_start_stalls("nightly");
+
+        fake.start(&Id::try_from("nightly").unwrap(), budget).unwrap();
+
+        assert_eq!(task_status(&fake, "nightly").common.state, State::Running, "{budget:?}");
+    }
+}
+
+#[skuld::test]
+fn a_service_retyped_to_a_task_never_reports_a_failed_state() {
+    let fake = Fake::new();
+    let id = Id::try_from("nightly").unwrap();
+    fake.install(&mk("nightly"), false).unwrap();
+    fake.seed_state("nightly", State::Failed);
+
+    fake.install(&a_task("nightly"), true).unwrap();
+
+    assert_eq!(task_status(&fake, "nightly").common.state, State::Idle);
+    fake.install(&mk("nightly"), true).unwrap();
+    assert_eq!(fake.status(&id).unwrap().common().state, State::Stopped);
+}
+
+#[skuld::test]
+fn kill_of_a_running_task_goes_idle_with_a_killed_result_and_keeps_last_run() {
+    let fake = Fake::new();
+    let id = Id::try_from("nightly").unwrap();
+    let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_task_status("nightly", Some(Exit::Code(0)), Some(last), None);
+    fake.start(&id, Budget::Immediate).unwrap();
+
+    fake.kill(&id).unwrap();
+
+    let status = task_status(&fake, "nightly");
+    assert_eq!(status.common.state, State::Idle);
+    assert_eq!(status.common.pid, None);
+    assert_eq!(status.last_result, Some(Exit::Signal(9)));
+    assert_eq!(status.last_run, Some(last));
 }

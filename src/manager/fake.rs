@@ -856,11 +856,13 @@ impl crate::backend::Backend for Fake {
             current
                 .map(|e| (e.enabled, e.state, e.runs))
                 .unwrap_or((false, State::Stopped, Runs::default()));
-        // A run in flight survives an update; a daemon at rest rests as its new kind does.
-        let run_state = if matches!(run_state, State::Idle | State::Stopped) {
-            at_rest(spec.kind())
-        } else {
-            run_state
+        // A run in flight survives an update, and so does an unknown state. Anything else rests as
+        // the new kind does: a task is never `Failed`, a failed run being its `last_result`, but a
+        // service keeps the failure it was seeded with.
+        let run_state = match (spec.kind(), run_state) {
+            (_, State::Running | State::Unknown) => run_state,
+            (DaemonKind::Service, State::Failed) => State::Failed,
+            _ => at_rest(spec.kind()),
         };
         state.entries.insert(
             spec.common().id.as_str().to_string(),
@@ -967,6 +969,11 @@ impl crate::backend::Backend for Fake {
         in_doubt(&state, id)?;
         let stalls = state.start_stalls.contains(id.as_str());
         let entry = state.confirm(&snapshot)?;
+        // A task's start requests a run and reads no budget: nothing to stall, nothing to wait for.
+        if snapshot.kind() == DaemonKind::Task {
+            entry.state = State::Running;
+            return Ok(());
+        }
         if stalls {
             // No confirmation is coming, so the state is left as it was on every branch `stalled` takes.
             return stalled(id, "running", budget);
