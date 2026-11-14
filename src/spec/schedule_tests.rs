@@ -350,9 +350,12 @@ const ROUND_TRIP_LINES: &[&str] = &[
     "H(10-12)/20 * * * *",
 ];
 
-/// The stored form of `schedule`: its resolved fields.
-fn parts(schedule: &Schedule) -> [CronField; 5] {
-    schedule.fields().clone()
+/// The stored form of `schedule`: each field's values in ascending order, and its `restricted`.
+fn parts(schedule: &Schedule) -> [(Vec<u8>, bool); 5] {
+    schedule
+        .fields()
+        .each_ref()
+        .map(|field| (field.values.iter().copied().collect(), field.restricted))
 }
 
 #[skuld::test]
@@ -393,7 +396,7 @@ fn field(values: &[u8], restricted: bool) -> CronField {
 /// then handed to `from_parts`.
 fn rebuild(text: &str, index: usize, replacement: CronField) -> Result<Schedule, Error> {
     let mut stored = parts(&parse(text));
-    stored[index] = replacement;
+    stored[index] = (replacement.values.into_iter().collect(), replacement.restricted);
     Schedule::from_parts(&id("nightly"), text.to_owned(), stored)
 }
 
@@ -459,6 +462,25 @@ fn from_parts_keeps_the_values_an_h_field_is_given() {
     ] {
         let rebuilt = rebuild(text, index, field(&values, true)).unwrap_or_else(|e| panic!("{text:?}: {e}"));
         assert_eq!(rebuilt.fields()[index].values, set(&values), "{text:?}");
+    }
+}
+
+#[skuld::test]
+fn from_parts_refuses_values_that_are_not_strictly_ascending() {
+    // Each would equal the right field read as a set: only the order or the repeat is wrong.
+    for (text, values) in [
+        ("30 * * * *", vec![30, 30]),
+        ("*/15 * * * *", vec![30, 0, 15, 45]),
+        ("*/15 * * * *", vec![0, 15, 15, 30, 45]),
+    ] {
+        let mut stored = parts(&parse(text));
+        stored[0].0 = values.clone();
+        let (daemon, message) = refusal(Schedule::from_parts(&id("nightly"), text.to_owned(), stored).expect_err(text));
+        assert_eq!(daemon, "nightly");
+        assert!(
+            message.contains("minute") && message.contains("ascending"),
+            "{text:?} {values:?}: {message}"
+        );
     }
 }
 

@@ -38,7 +38,7 @@ use serde_json::Value;
 use crate::error::Error;
 use crate::spec::{
     AccountId, CronField, DaemonFields, DaemonSpec, Id, Protocol, Restart, Schedule, ServiceFields, ServiceSpec,
-    TaskFields, TaskSpec, User, field_name,
+    TaskFields, TaskSpec, User, invalid,
 };
 
 // Constants ===========================================================================================================
@@ -377,23 +377,9 @@ impl From<&CronField> for WireCronField {
 }
 
 impl WireCronField {
-    /// Refuses `values` that are not strictly ascending: the wire form is sorted and repeat-free.
-    fn into_field(self, id: &Id, position: usize) -> Result<CronField, Error> {
-        if !self.values.is_sorted_by(|a, b| a < b) {
-            return Err(Error::Invalid {
-                daemon: id.as_str().to_string(),
-                message: format!(
-                    "schedule {} field: values {:?} are not strictly ascending",
-                    field_name(position),
-                    self.values
-                ),
-                source: None,
-            });
-        }
-        Ok(CronField {
-            values: self.values.into_iter().collect(),
-            restricted: self.restricted,
-        })
+    /// The values and `restricted` as `Schedule::from_parts` takes them.
+    fn into_stored(self) -> (Vec<u8>, bool) {
+        (self.values, self.restricted)
     }
 }
 
@@ -506,11 +492,7 @@ fn task_from_wire(wire: WireTask) -> Result<TaskSpec, Error> {
                 month,
                 day_of_week,
             } = *schedule;
-            let mut fields = Vec::with_capacity(5);
-            for (position, field) in [minute, hour, day_of_month, month, day_of_week].into_iter().enumerate() {
-                fields.push(field.into_field(&id, position)?);
-            }
-            let fields = fields.try_into().expect("a schedule has five fields");
+            let fields = [minute, hour, day_of_month, month, day_of_week].map(WireCronField::into_stored);
             Schedule::from_parts(&id, text, fields)
         })
         .transpose()?;
@@ -547,14 +529,13 @@ fn duration_from_wire(wire: &WireDuration) -> Duration {
 /// `nanos >= 1e9` is `Error::Invalid` (content), not `Error::Blob` (envelope).
 fn check_nanos(id: &Id, wire: &WireDuration) -> Result<(), Error> {
     if wire.nanos >= 1_000_000_000 {
-        return Err(Error::Invalid {
-            daemon: id.as_str().to_string(),
-            message: format!(
+        return Err(invalid(
+            id,
+            &format!(
                 "restart_delay nanos {n} is not a valid sub-second fraction (must be < 1_000_000_000)",
                 n = wire.nanos
             ),
-            source: None,
-        });
+        ));
     }
     Ok(())
 }

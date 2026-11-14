@@ -27,7 +27,6 @@ pub(crate) mod test_support;
 pub use backend::BackendKind;
 pub(crate) use resolve::invalid;
 pub use resolve::load;
-pub(crate) use schedule::field_name;
 pub use schedule::{CronField, DayRule, HashSeed, Schedule};
 pub use user::{AccountId, User};
 

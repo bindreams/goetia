@@ -109,19 +109,31 @@ impl Schedule {
         }
     }
 
-    /// Rebuilds a schedule from `text` and its stored `fields`, needing no host name.
+    /// Rebuilds a schedule from `text` and each stored field's values and `restricted`, needing no
+    /// host name.
     ///
     /// A blob's values are what goetia resolved at install; decode does not re-derive them from
-    /// the text. A stored field is accepted when it is non-empty, its `restricted` is the text's,
-    /// it holds every value the text's fixed (non-`H`) terms give, and each of its values is one
-    /// that some term of the field could give (an `H` term: any pick it could make). The rule does
-    /// not count picks, so a field with `H` may hold more values than `H` made. A field without an
-    /// `H` term is therefore exactly what its text gives. Every refusal is [`Error::Invalid`] for
-    /// `id`, naming the field.
-    pub(crate) fn from_parts(id: &Id, text: String, fields: [CronField; FIELD_COUNT]) -> Result<Schedule, Error> {
+    /// the text. Each field's values must be strictly ascending (the stored form is sorted and
+    /// repeat-free). A stored field is then accepted when it is non-empty, its `restricted` is
+    /// the text's, it holds every value the text's fixed (non-`H`) terms give, and each of its
+    /// values is one some term of the field could give (an `H` term: any value in its range). Picks
+    /// are not counted, so an `H` term's contribution may be absent or partial: `5,H(10-20)`
+    /// stored as `[5]` decodes. A field without an `H` term is exactly what its text gives. Every
+    /// refusal is [`Error::Invalid`] for `id`, naming the field.
+    pub(crate) fn from_parts(id: &Id, text: String, stored: [(Vec<u8>, bool); FIELD_COUNT]) -> Result<Schedule, Error> {
         let structure = structure(&text).map_err(|message| invalid(id, &message))?;
+        let refuse = |kind: &FieldKind, reason: String| invalid(id, &format!("schedule {} field: {reason}", kind.name));
+        for (kind, (values, _)) in KINDS.iter().zip(&stored) {
+            if !values.is_sorted_by(|a, b| a < b) {
+                return Err(refuse(kind, format!("values {values:?} are not strictly ascending")));
+            }
+        }
+        let fields = stored.map(|(values, restricted)| CronField {
+            values: values.into_iter().collect(),
+            restricted,
+        });
         for ((kind, parsed), field) in KINDS.iter().zip(&structure).zip(&fields) {
-            check(parsed, field).map_err(|reason| invalid(id, &format!("schedule {} field: {reason}", kind.name)))?;
+            check(parsed, field).map_err(|reason| refuse(kind, reason))?;
         }
         Ok(Schedule {
             text,
@@ -185,11 +197,6 @@ const KINDS: [FieldKind; FIELD_COUNT] = [
     },
 ];
 
-/// The name of the field at `position`, as messages spell it.
-pub(crate) fn field_name(position: usize) -> &'static str {
-    KINDS[position].name
-}
-
 // The structural pass -------------------------------------------------------------------------------------------------
 
 /// One comma-separated term, before any seed.
@@ -200,15 +207,12 @@ enum Term {
 }
 
 impl Term {
-    /// Every value this term can give: the fixed values, or the union of the picks over every hash.
+    /// Every value this term can give. For an `H` term that is its whole range: a value `v` is
+    /// reached by the offset `(v - lo) % step`, which is below `min(step, len)`.
     fn possible(&self) -> BTreeSet<u8> {
         match self {
             Term::Fixed(values) => values.clone(),
-            Term::Hashed { lo, hi, step } => {
-                let len = u64::from(hi - lo) + 1;
-                let picks = step.map_or(len, |step| len.min(u64::from(step)));
-                (0..picks).flat_map(|hash| self.values(hash)).collect()
-            }
+            Term::Hashed { lo, hi, .. } => (*lo..=*hi).collect(),
         }
     }
 
@@ -371,9 +375,10 @@ fn field_hash(seed: &HashSeed, position: usize) -> u64 {
 
 // Decoding ------------------------------------------------------------------------------------------------------------
 
-/// Whether `field` is one `parse` could have given for `parsed`'s text: non-empty, the text's
-/// `restricted`, every fixed term's values present, and nothing no term could give. Picks are not
-/// counted and `H` is not re-derived. The reason does not name the field.
+/// Whether `field` is non-empty, has the text's `restricted`, holds every value the text's fixed
+/// terms give, and holds only values some term could give. Picks are not counted and `H` is not
+/// re-derived, so an `H` term's contribution may be absent or partial. The reason does not name the
+/// field.
 fn check(parsed: &ParsedField, field: &CronField) -> Result<(), String> {
     if field.restricted != parsed.restricted {
         return Err(format!(
