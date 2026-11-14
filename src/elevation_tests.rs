@@ -19,7 +19,7 @@ fn a_token_with_administrators_disabled_does_not_have_them() {
 #[skuld::test]
 fn the_process_token_answers_as_its_copy_does() {
     let process = token_has_administrators().unwrap();
-    let copy = process_token_copy(TOKEN_QUERY | TOKEN_IMPERSONATE);
+    let copy = process_token_copy(TOKEN_QUERY | TOKEN_IMPERSONATE).unwrap();
     let _reset = ThreadTokenReset::impersonate(&copy);
 
     assert_eq!(token_has_administrators().unwrap(), process);
