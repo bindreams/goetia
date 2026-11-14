@@ -327,7 +327,7 @@ fn classify(bytes: Vec<u8>) -> ClassifyOutcome {
 }
 
 /// Read the artifact `locate` found for `id`, for the callers that look for a marker in it
-/// ([`task::read_at`]).
+/// (`task::read_at`).
 ///
 /// An absent path is [`Error::NotInstalled`]: the plist was there when `locate` stat'd it, so an
 /// uninstall completed in between, and absence is the truth. Every read that did not complete is
