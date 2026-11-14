@@ -88,9 +88,7 @@ humantime = "2"
 memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# `EmbeddedStockShim` names the stock shim by the SHA-256 of its bytes and verifies a file
-# of that name against it; `spec::schedule` hashes the host name, daemon id and field position
-# into `H`.
+# `EmbeddedStockShim` (SHA-256 of the stock shim's bytes) and `spec::schedule` (`H`).
 sha2 = "0.11.1"
 similar = "3"
 # `skuld` is for the `ELEVATED` label and `testing::run_all`.

@@ -52,7 +52,7 @@ pub(super) struct RawOverride {
     pub restart: Option<String>,
     pub restart_delay: Option<String>,
     pub logs: Option<String>,
-    /// `type:`, which no override may set: it is read only to refuse it by name.
+    /// `type:`, which no override may set.
     pub daemon_type: Option<String>,
     pub protocol: Option<String>,
     pub schedule: Option<String>,
@@ -177,6 +177,8 @@ impl RawSpec {
             env.extend(ovr_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
 
+        // `type` is the daemon's own: `resolve` refuses an override's before any merge.
+        debug_assert!(ovr.daemon_type.is_none(), "a `type` override reached the merge");
         let merged = RawSpec {
             id: self.id.clone(),
             name: ovr.name.clone().or_else(|| self.name.clone()),
@@ -187,7 +189,7 @@ impl RawSpec {
             restart: ovr.restart.clone().or_else(|| self.restart.clone()),
             restart_delay: ovr.restart_delay.clone().or_else(|| self.restart_delay.clone()),
             logs: ovr.logs.clone().or_else(|| self.logs.clone()),
-            daemon_type: ovr.daemon_type.clone().or_else(|| self.daemon_type.clone()),
+            daemon_type: self.daemon_type.clone(),
             protocol: ovr.protocol.clone().or_else(|| self.protocol.clone()),
             schedule: ovr.schedule.clone().or_else(|| self.schedule.clone()),
             backend_specific: BackendOverrides::new(),

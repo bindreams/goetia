@@ -215,6 +215,40 @@ fn render_yaml_shows_what_h_resolved_to() {
     assert_ne!(spec_diff(&a, &b), "");
 }
 
+/// (schedule text, its `schedule:` line for `nightly` on `build-host`)
+const H_SCHEDULES: &[(&str, &str)] = &[
+    // yaml quotes a text that starts with `*`
+    ("*/5 H * * *", "schedule: '*/5 H * * *'  # resolves to: */5 2 * * *"),
+    ("H H H H H", "schedule: H H H H H  # resolves to: 13 2 28 2 0"),
+    (
+        "H(0-29)/10 * * * *",
+        "schedule: H(0-29)/10 * * * *  # resolves to: 3,13,23 * * * *",
+    ),
+    (
+        "H,5 H(0-11) * * H(1-5)",
+        "schedule: H,5 H(0-11) * * H(1-5)  # resolves to: 5,13 2 * * 4",
+    ),
+];
+
+#[skuld::test]
+fn the_h_resolution_is_the_comment_of_the_schedule_line() {
+    for (text, line) in H_SCHEDULES {
+        let rendered = render_yaml(&task_fixture(Some(text)));
+        assert!(rendered.lines().any(|l| l == *line), "{text:?}: {rendered}");
+    }
+}
+
+#[skuld::test]
+fn an_annotated_schedule_resolves_back_to_the_task(#[fixture(temp_dir)] dir: &Path) {
+    // `load` seeds `H` from this host's name.
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    for (text, _) in H_SCHEDULES {
+        let spec = task_fixture_on(&host, Some(text));
+
+        assert_eq!(resolved_from_rendering(&spec, dir), spec, "{text:?}");
+    }
+}
+
 #[skuld::test]
 fn identical_inputs_produce_empty_diff() {
     let spec = spec_fixture();

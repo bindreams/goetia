@@ -110,10 +110,8 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     interpolate::reject_interpolated_id(&raw.id)?;
     let id = Id::try_from(raw.id.clone())?;
 
-    // `type` is the daemon's own, never a backend's: refused by name before any merge. This is
-    // the one exception to "base errors win" (step 3): an error the forbidden override itself
-    // causes (a `type: ${T}` that needs an unreadable `.env`, a `type: task` that leaves a service
-    // field on a task) must not hide the refusal of the override.
+    // `type` is the daemon's own, never a backend's: refused by name before any merge, and ahead
+    // of "base errors win" (step 3), so an error the override itself causes cannot hide the refusal.
     refuse_type_overrides(&id, &raw)?;
 
     // Step 2: the `.env` gate, computed from the merged native spec of step 5, the one
@@ -471,8 +469,7 @@ fn refuse_fields_of_the_other_type(
         .find(|(field, written)| *written && of_the_other_type(field))
     {
         let path = field.path();
-        // Blamed on `type`, not on the service field: it is the `type`'s text, which `.env` may have
-        // supplied, that makes the field foreign. Whether the field was written is the manifest's own.
+        // Blamed on `type`: its text, which `.env` may have supplied, is what makes the field foreign.
         return Err(Refused::at(
             Field::Type,
             invalid(

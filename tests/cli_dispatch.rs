@@ -790,6 +790,38 @@ fn show_from_file_and_from_installed_agree() {
     assert!(out_file.contains("frpc"), "{out_file}");
 }
 
+/// `show -f` renders a task manifest: its `type`, its schedule as written and, for an `H`, what
+/// this host resolves it to.
+#[skuld::test]
+fn show_from_file_renders_a_scheduled_task() {
+    let dir = tempfile::tempdir().unwrap();
+    write_manifest(
+        dir.path(),
+        "id: nightly
+command: [backup]
+type: task
+schedule: H 3 * * *
+",
+    );
+
+    let (code, out, err) = dispatch_read_only(
+        &["goetia", "daemon", "show", "-f", dir.path().to_str().unwrap()],
+        &Fake::new(),
+    );
+
+    assert_eq!(code, 0, "{err}");
+    assert!(out.lines().any(|l| l == "type: task"), "{out}");
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("schedule:"))
+        .unwrap_or_else(|| panic!("no schedule line in {out}"));
+    let comment = line
+        .strip_prefix("schedule: H 3 * * *  # resolves to: ")
+        .unwrap_or_else(|| panic!("{line}"));
+    let minute = comment.strip_suffix(" 3 * * *").unwrap_or_else(|| panic!("{line}"));
+    assert!(minute.parse::<u8>().is_ok_and(|m| m < 60), "{line}");
+}
+
 /// `show` without `-f` only ever consults `list()` — never `status(&id)`
 /// directly, unlike `status` itself — so a daemon this privilege level
 /// cannot enumerate is one `show` cannot render even though a direct query

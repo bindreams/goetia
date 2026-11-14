@@ -491,6 +491,8 @@ fn log_version_skew(log: &Log, id: &str, spec: &DaemonSpec, registered_by: &str,
 /// restarts until `goetia daemon install` is run again.
 fn version_skew_notice(id: &str, spec: &DaemonSpec, registered_by: &str, running: &str) -> Option<String> {
     let DaemonSpec::Service(s) = spec else {
+        // `spec_read` refuses a task's blob before this runs.
+        debug_assert!(false, "a task reached the service host's version-skew notice");
         return None;
     };
     if registered_by == running || s.restart == Restart::Never {

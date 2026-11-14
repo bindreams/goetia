@@ -1119,6 +1119,56 @@ fn a_hashed_schedule_is_seeded_by_this_host_and_the_id() {
 }
 
 #[skuld::test]
+fn a_native_schedule_override_replaces_the_base_schedule() {
+    let id = Id::try_from("nightly").unwrap();
+    let hostname = schedule::this_hostname();
+    let expected = Schedule::parse(
+        "*/10 H * * *",
+        &HashSeed {
+            hostname: &hostname,
+            id: &id,
+        },
+    )
+    .unwrap();
+    for &native in HOST_BACKENDS {
+        let yaml = format!(
+            "id: nightly
+command: [bin/backup]
+type: task
+schedule: '0 3 * * *'
+backend-specific:
+  {native}:
+    schedule: '*/10 H * * *'
+"
+        );
+        let (spec, _) = resolve_yaml_as(native, &yaml).unwrap();
+        let schedule = task_fields(spec).schedule.expect("the override wrote a schedule");
+        assert_eq!(schedule.text(), "*/10 H * * *", "{native}");
+        assert_eq!(schedule, expected, "{native}");
+    }
+}
+
+#[skuld::test]
+fn a_malformed_non_native_schedule_override_is_refused_naming_its_backend() {
+    let non_native = non_native_backend();
+    let yaml = format!(
+        "id: nightly
+command: [bin/backup]
+type: task
+schedule: '0 3 * * *'
+backend-specific:
+  {non_native}:
+    schedule: '0 24 * * *'
+"
+    );
+    let msg = resolve_yaml(&yaml).unwrap_err().to_string();
+    assert_eq!(
+        msg,
+        format!("daemon `nightly`: backend-specific.{non_native}: schedule hour field: `24` is out of range 0-23")
+    );
+}
+
+#[skuld::test]
 fn task_without_schedule_resolves() {
     let (spec, _) = resolve_yaml("id: nightly\ncommand: [bin/backup]\ntype: task\n").unwrap();
     assert_eq!(task_fields(spec).schedule, None);

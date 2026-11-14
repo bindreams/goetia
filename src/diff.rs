@@ -108,8 +108,7 @@ pub fn render_yaml(spec: &DaemonSpec) -> String {
 
 /// What an `H` in a task's schedule resolved to: each field that has an `H` as its sorted comma
 /// list, the others as written. Specs compare by the resolved values, so the text alone would
-/// render two different specs alike. `None` for a schedule without `H`, which the text already
-/// says in full.
+/// render two different specs alike.
 fn resolution_comment(spec: &DaemonSpec) -> Option<String> {
     let DaemonSpec::Task(task) = spec else {
         return None;
@@ -144,6 +143,10 @@ fn annotate_schedule(rendered: &str, comment: &str) -> String {
             out.push_str(line);
         }
     }
+    debug_assert!(
+        annotated,
+        "a schedule's comment is due but no `schedule:` line was rendered"
+    );
     out
 }
 
