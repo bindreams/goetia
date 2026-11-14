@@ -77,15 +77,22 @@ fn drawn(draws: &mut Reservation) -> Result<File> {
         .map_err(|e| Error::os("make a file for `journalctl`'s diagnostics", e))
 }
 
+/// What the manager's entries are all written by: PID 1, the one writer of them a unit cannot be.
+/// `journalctl -u` carries the same match; a bare `UNIT=` does not, and a unit's own process can write
+/// an entry with any `MESSAGE_ID` and `UNIT`.
+const FROM_PID_1: &str = "_PID=1";
+
 /// `COMMON`, then `--system` for the [`Scope::Manager`] (the one place the scope is spelled), then
-/// `options`, then `matches`.
+/// `options`, then `matches`, then [`FROM_PID_1`] for the [`Scope::Manager`].
 fn arguments(scope: Scope, options: &[String], matches: &[Match]) -> Vec<String> {
+    let manager = scope == Scope::Manager;
     COMMON
         .iter()
         .map(|argument| argument.to_string())
-        .chain((scope == Scope::Manager).then(|| "--system".to_string()))
+        .chain(manager.then(|| "--system".to_string()))
         .chain(options.iter().cloned())
         .chain(matches.iter().map(Match::argument))
+        .chain(manager.then(|| FROM_PID_1.to_string()))
         .collect()
 }
 

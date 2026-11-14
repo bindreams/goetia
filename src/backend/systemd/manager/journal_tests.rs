@@ -243,7 +243,7 @@ fn a_query_asks_for_all_of_every_field_as_json_newest_first() {
     assert_eq!(all.len(), 1);
     assert_eq!(
         all[0].get("ARGS"),
-        Some("-a -o json --no-pager --system -r UNIT=x.service")
+        Some("-a -o json --no-pager --system -r UNIT=x.service _PID=1")
     );
 }
 
@@ -275,7 +275,7 @@ fn a_journalctl_that_fails_is_the_error_with_its_words() {
     let msg = e.report().to_string();
     assert!(msg.contains("Failed to open journal"), "{msg}");
     assert!(
-        msg.contains("journalctl -a -o json --no-pager --system -r UNIT=x.service"),
+        msg.contains("journalctl -a -o json --no-pager --system -r UNIT=x.service _PID=1"),
         "{msg}"
     );
 }
@@ -403,43 +403,45 @@ fn a_follow_starts_from_the_beginning_or_after_its_cursor_and_job_numbers_are_bo
 
     assert_eq!(
         from_the_start,
-        "-a -o json --no-pager --system -f -n all UNIT=x.service"
+        "-a -o json --no-pager --system -f -n all UNIT=x.service _PID=1"
     );
     assert_eq!(
         after,
-        "-a -o json --no-pager --system -f -n all --after-cursor=s=1;i=2 UNIT=x.service"
+        "-a -o json --no-pager --system -f -n all --after-cursor=s=1;i=2 UNIT=x.service _PID=1"
     );
     assert_eq!(
         job,
-        "-a -o json --no-pager --system -f -n all -b UNIT=x.service JOB_ID=7"
+        "-a -o json --no-pager --system -f -n all -b UNIT=x.service JOB_ID=7 _PID=1"
     );
 }
 
-/// Which queries carry `--system`: the manager's (newest first, and the follows that find a run's
-/// Starting and exit entries) do; a unit's own output (a follow and a read after a cursor of the
-/// `Output` scope) does not, since a unit that runs as a regular uid writes it to a user journal.
+/// Which queries carry `--system` and the trusted `_PID=1` match: the manager's (newest first, and the
+/// follows that find a run's Starting and exit entries) do, since only PID 1 writes what they read and
+/// a unit's own lines can forge a manager entry's fields; a unit's own output (a follow and a read
+/// after a cursor of the `Output` scope) does not, since a unit that runs as a regular uid writes it
+/// to a user journal, and it is not PID 1's.
 #[skuld::test]
-fn only_the_managers_queries_read_the_system_journal_alone() {
+fn only_the_managers_queries_read_the_system_journal_alone_and_from_pid_1() {
     let journal = sh(ECHO);
     let unit = [Match::new("UNIT", "x.service")];
     let cursor = Cursor::of("c");
-    let has_system = |args: String| args.split(' ').any(|argument| argument == "--system");
+    let has = |args: &str, wanted: &str| args.split(' ').any(|argument| argument == wanted);
 
-    assert!(
-        has_system(args_of(entries_of(&journal).expect("entries"))),
-        "newest first"
-    );
-    for (scope, system) in [(Scope::Manager, true), (Scope::Output, false)] {
+    let newest = args_of(entries_of(&journal).expect("entries"));
+    assert!(has(&newest, "--system") && has(&newest, "_PID=1"), "newest first: {newest}");
+    for (scope, manager) in [(Scope::Manager, true), (Scope::Output, false)] {
         let follow = args_of(first_of(
             journal.follow(scope, &unit, Some(&cursor), &mut one()).expect("follow"),
         ));
-        assert_eq!(has_system(follow.clone()), system, "follow {scope:?}: {follow}");
+        assert_eq!(has(&follow, "--system"), manager, "follow {scope:?}: {follow}");
+        assert_eq!(has(&follow, "_PID=1"), manager, "follow {scope:?}: {follow}");
         let read = args_of(
             journal
                 .read_after(scope, &unit, &cursor, &mut one())
                 .expect("read_after"),
         );
-        assert_eq!(has_system(read.clone()), system, "read_after {scope:?}: {read}");
+        assert_eq!(has(&read, "--system"), manager, "read_after {scope:?}: {read}");
+        assert_eq!(has(&read, "_PID=1"), manager, "read_after {scope:?}: {read}");
     }
 }
 
