@@ -235,6 +235,8 @@ fn single(failures: Vec<Error>) -> Error {
 pub(super) struct TaskPrint {
     pub(super) state: State,
     pub(super) pid: Option<u32>,
+    /// A start launchd has accepted and not yet forked (`spawn scheduled`): `Running`, with no pid.
+    pub(super) queued: bool,
     pub(super) last_result: Option<Exit>,
 }
 
@@ -253,16 +255,18 @@ impl Launchctl {
             return Ok(TaskPrint {
                 state: State::Unknown,
                 pid: None,
+                queued: false,
                 last_result: None,
             });
         };
         let (state, pid) = super::classified(status, &capture, DaemonKind::Task);
-        let last_result = (status.success() && capture.complete)
-            .then(|| state::last_result(&String::from_utf8_lossy(&capture.stdout)))
-            .flatten();
+        let whole = status.success() && capture.complete;
+        let body = String::from_utf8_lossy(&capture.stdout);
+        let last_result = whole.then(|| state::last_result(&body)).flatten();
         Ok(TaskPrint {
             state,
             pid,
+            queued: whole && state::spawn_scheduled(&body),
             last_result,
         })
     }

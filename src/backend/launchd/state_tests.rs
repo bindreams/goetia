@@ -326,3 +326,45 @@ fn started_suspended_is_none_where_print_does_not_say() {
     );
     assert_eq!(started_suspended("\tstarted suspended = maybe\n"), None);
 }
+
+// spawn_scheduled -----------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn spawn_scheduled_is_the_state_line_alone() {
+    assert!(spawn_scheduled(&task_print(
+        "spawn scheduled",
+        None,
+        "last exit code = 0",
+        None
+    )));
+    for state in [
+        "running",
+        "not running",
+        "exited",
+        "xpcproxy",
+        "someday-new-apple-state",
+    ] {
+        assert!(
+            !spawn_scheduled(&task_print(state, None, "last exit code = 0", None)),
+            "{state}"
+        );
+    }
+    assert!(!spawn_scheduled(""));
+}
+
+// exit_of -------------------------------------------------------------------------------------------------------------
+
+/// A kqueue `NOTE_EXITSTATUS` event's data is a `wait(2)` status: the exit code is its second byte, and a
+/// signal the low seven bits, with bit 7 for a core dump.
+#[skuld::test]
+fn exit_of_decodes_exited_and_signalled() {
+    assert_eq!(exit_of(768), Exit::Code(3));
+    assert_eq!(exit_of(0), Exit::Code(0));
+    assert_eq!(exit_of(255 << 8), Exit::Code(255));
+    assert_eq!(exit_of(15), Exit::Signal(15));
+    assert_eq!(
+        exit_of(9 | 0x80),
+        Exit::Signal(9),
+        "a core dump is the signal that caused it"
+    );
+}

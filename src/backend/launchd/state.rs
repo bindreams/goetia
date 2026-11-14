@@ -36,10 +36,26 @@ pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
 pub(crate) fn classify_task(print_body: &str) -> (State, Option<u32>) {
     match classify(print_body) {
         (State::Stopped, pid) => (State::Idle, pid),
-        (State::Unknown, pid) if find_field(print_body, "state").map(str::trim) == Some("spawn scheduled") => {
-            (State::Running, pid)
-        }
+        (State::Unknown, pid) if spawn_scheduled(print_body) => (State::Running, pid),
         other => other,
+    }
+}
+
+/// Whether one `launchctl print` body shows a start launchd has accepted and not yet forked
+/// (`state = spawn scheduled`, no pid).
+pub(crate) fn spawn_scheduled(print_body: &str) -> bool {
+    find_field(print_body, "state").map(str::trim) == Some("spawn scheduled")
+}
+
+/// How a process ended, from the `wait(2)` status a kqueue `NOTE_EXITSTATUS` event carries: the exit
+/// code (its second byte) for a process that exited, else the signal (its low seven bits; bit 7 says a
+/// core was dumped) that killed it.
+// Nothing on macOS calls it until `begin_run`'s `Run::wait` does, which removes this `allow`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn exit_of(raw_status: i32) -> Exit {
+    match raw_status & 0x7f {
+        0 => Exit::Code((raw_status >> 8) & 0xff),
+        signal => Exit::Signal(signal),
     }
 }
 
@@ -102,7 +118,7 @@ impl Evidence {
     /// Whether one `launchctl print` body shows it. Any other reading, an unrecognised or missing
     /// `state` included, is no evidence that launchd has the request.
     pub(crate) fn shown_by(self, print_body: &str) -> bool {
-        let queued = find_field(print_body, "state").map(str::trim) == Some("spawn scheduled");
+        let queued = spawn_scheduled(print_body);
         match self {
             Evidence::Queued => queued,
             Evidence::QueuedOrRunning => queued || classify(print_body).0 == State::Running,

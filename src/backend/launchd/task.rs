@@ -104,6 +104,13 @@ pub(crate) enum Action {
     /// Move the job's plist from the enabled directory to staging, so that a retyped daemon does not
     /// start at boot as the other kind.
     MoveJobToStaging,
+    /// Move the job's plist from staging to the enabled directory, refusing to replace what is there.
+    MoveJobToEnabled,
+    MoveTimerToEnabled,
+    MoveTimerToStaging,
+    /// Create the timer's plist in the enabled directory, for a job that has none, refusing to replace
+    /// what is at that name.
+    CreateTimerEnabled,
     ReplaceJob,
     ReplaceTimer,
     RemoveTimer,
@@ -133,6 +140,9 @@ pub(crate) struct Old {
     /// fire between this read and the bootout could start one.
     pub(crate) job_loaded: bool,
     pub(crate) timer_loaded: bool,
+    /// Whether the job's metadata names a schedule, so the task has a timer or should: what `enable`
+    /// creates a missing timer for. `false` where the metadata will not decode.
+    pub(crate) scheduled: bool,
 }
 
 impl Old {
@@ -215,6 +225,57 @@ pub(crate) fn uninstall_plan(old: &Old) -> Vec<Action> {
     push(old.job_loaded, Action::BootoutJob);
     push(old.timer.is_some(), Action::RemoveTimer);
     push(old.job.is_some(), Action::RemoveJob);
+    plan
+}
+
+/// What `enable` does: the job to the enabled directory and loaded, then the timer likewise (created
+/// there where a scheduled task has none). Each step is taken only where it is not already done, so
+/// running the verb again finishes what a crash left, whatever `enabled` says: a timer that moved and
+/// was not loaded is loaded, and nothing else is touched. A job launchd holds already (a `start` loaded
+/// it from staging) is not loaded again.
+pub(crate) fn enable_plan(old: &Old) -> Vec<Action> {
+    let mut plan = Vec::new();
+    let mut push = |condition: bool, action: Action| {
+        if condition {
+            plan.push(action);
+        }
+    };
+    push(
+        old.job.as_ref().is_some_and(|job| !job.enabled),
+        Action::MoveJobToEnabled,
+    );
+    push(old.job.is_some() && !old.job_loaded, Action::BootstrapJob);
+    push(
+        old.timer.as_ref().is_some_and(|timer| !timer.enabled),
+        Action::MoveTimerToEnabled,
+    );
+    push(old.timer.is_none() && old.scheduled, Action::CreateTimerEnabled);
+    push(
+        !old.timer_loaded && (old.timer.is_some() || old.scheduled),
+        Action::BootstrapTimer,
+    );
+    plan
+}
+
+/// What `disable` does: boot the timer out (waiting for it, so no fire starts a run from here on), move
+/// it to staging, then move the job there. The job is never booted out: a run in flight goes on. A crash
+/// after the timer moved leaves only the job to move, and no boot-out.
+pub(crate) fn disable_plan(old: &Old) -> Vec<Action> {
+    let mut plan = Vec::new();
+    let mut push = |condition: bool, action: Action| {
+        if condition {
+            plan.push(action);
+        }
+    };
+    push(old.timer_loaded, Action::BootoutTimer);
+    push(
+        old.timer.as_ref().is_some_and(|timer| timer.enabled),
+        Action::MoveTimerToStaging,
+    );
+    push(
+        old.job.as_ref().is_some_and(|job| job.enabled),
+        Action::MoveJobToStaging,
+    );
     plan
 }
 

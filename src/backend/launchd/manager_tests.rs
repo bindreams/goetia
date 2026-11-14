@@ -1055,17 +1055,17 @@ fn reserved(steps: &[Step]) -> Reservation {
 
 /// `reserve` makes what the steps count, and nothing else: the reapers and files of their longest
 /// paths, summed over a sequence. The numbers are written out so that changing a count is deliberate.
-/// `install` and `uninstall` hold a task's counts, the larger (see `needs`).
+/// `install`, `uninstall` and `stop` hold a task's counts, the larger (see `needs`).
 #[skuld::test]
 fn a_reservation_holds_what_its_steps_count() {
     let cases: [(&[Step], (usize, usize)); 7] = [
         (&[Step::Install], (4, 18)),
         (&[Step::Start], (5, 26)),
-        (&[Step::Stop], (1, 4)),
+        (&[Step::Stop], (1, 6)),
         (&[Step::Kill], (1, 2)),
         (&[Step::Uninstall], (2, 12)),
         (&[Step::RequestStartAfterStop], (5, 26)),
-        (&[Step::Stop, Step::Start], (6, 30)),
+        (&[Step::Stop, Step::Start], (6, 32)),
     ];
     for (steps, held) in cases {
         assert_eq!(bounded::test_hook::left(&reserved(steps)), held, "{steps:?}");
@@ -1138,7 +1138,7 @@ fn drawings() -> [Drawing; 5] {
             step: Step::Stop,
             restart: Restart::Never,
             calls: &BOOTOUT,
-            drew: (STOP_REQUESTS, STOP_CALLS),
+            drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| Backend::stop(mgr, plist, Budget::DEFAULT, reservation),
         },
         Drawing {
@@ -1153,7 +1153,7 @@ fn drawings() -> [Drawing; 5] {
             step: Step::Uninstall,
             restart: Restart::Never,
             calls: &BOOTOUT,
-            drew: (STOP_REQUESTS, STOP_CALLS),
+            drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, reservation) {
                 Err(Error::Os { what, source, .. })
                     if what == "remove"
@@ -1432,7 +1432,7 @@ const INSTALL_LONGEST: [(&str, Answer); SERVICE_INSTALL_CALLS] =
 const CREATED: [(&str, Answer); 2] = [("print", NOT_LOADED), ("print", NOT_LOADED)];
 
 /// `stop`'s and `uninstall`'s calls: the `bootout` and the wait for the job to be gone.
-const BOOTOUT: [(&str, Answer); STOP_CALLS] = [("bootout", DONE), GONE];
+const BOOTOUT: [(&str, Answer); SERVICE_STOP_CALLS] = [("bootout", DONE), GONE];
 
 /// One scripted call: `verb` answers `answer`.
 fn answer(verb: &str, (code, stdout, stderr): Answer) -> Entry {
@@ -1628,7 +1628,7 @@ fn launchctl_replying(verb: &str, finished: Finished) -> (Launchctl, Fake) {
 
 /// A call that changes the job goes out as a request, and one that only reads goes out as a query:
 /// the role is what decides whether an expiry leaves the child running or kills it. `status` and
-/// `list` read as an uncounted query. (`kill_job`'s role is pinned with its argv, below.)
+/// `list` read as an uncounted query. (`signal`'s role is pinned with its argv, below.)
 #[skuld::test]
 fn launchctl_sends_requests_as_requests_and_reads_as_queries() {
     let id = never_installed();
@@ -1722,8 +1722,6 @@ fn launchctl_calls_that_expire_report_the_expiry() {
     fake.assert_spent("an expired kickstart is followed by one print");
     let booted_out = left("bootout").bootout(id, deadline, &mut held);
     assert!(booted_out.expect("an expiry is not a failure").is_none());
-    let killed = left("kill").kill_job(id, deadline, &mut held);
-    assert!(killed.expect("an expiry is not a failure").is_none());
 
     for role in [Role::Query, Role::UncountedQuery] {
         let live = expired("print").read_live_state(id, deadline, role, &mut held);
@@ -2312,13 +2310,42 @@ fn a_kickstart_that_outlasts_the_budget_is_left_running_when_the_print_fails() {
 
 // kill ================================================================================================================
 
-/// `kill_job` over `id`, with `answer` standing in for what `launchctl kill` says.
-fn kill_answered(answer: Answer) -> (Result<Option<()>>, Fake) {
+/// `kill` of a service over `id`, with `answer` standing in for what `launchctl kill` says: unchanged
+/// by the one `signal` that a task's `stop` and `kill` share.
+fn kill_answered(answer: Answer) -> (Result<()>, Fake) {
     let script = table(&[("kill", answer)]);
-    let launchctl = Launchctl::new(Box::new(script.clone()));
+    let mgr = launchd_over(script.clone());
     let mut held = reserved(&[Step::Kill]);
-    let result = launchctl.kill_job(never_installed().as_str(), Budget::Unbounded.start(), &mut held);
+    let result = backend::Backend::kill(&mgr, marked_plist(&never_installed()), &mut held);
     (result, script)
+}
+
+/// `signal` says what launchctl answered and names no verb's error: exit `0` is sent, and `3` and `113`,
+/// the two ways launchd says the job has no process, are `NoProcess`. The signal is the caller's.
+#[skuld::test]
+fn signal_maps_exit_3_and_113_to_no_process_and_0_to_sent() {
+    let id = never_installed();
+    let cases = [
+        (DONE, SignalOutcome::Sent),
+        ((3, "", ""), SignalOutcome::NoProcess),
+        (NOT_LOADED, SignalOutcome::NoProcess),
+    ];
+    for (answer, expected) in cases {
+        let script = table(&[("kill", answer)]);
+        let launchctl = Launchctl::new(Box::new(script.clone()));
+        let mut held = reserved(&[Step::Kill]);
+
+        let outcome = launchctl.signal(id.as_str(), "SIGTERM", &mut held);
+
+        assert_eq!(outcome.expect("an outcome"), expected, "{answer:?}");
+        assert_eq!(script.calls(), [["kill", "SIGTERM", format!("system/{id}").as_str()]]);
+    }
+    let script = table(&[("kill", (1, "", "Operation not permitted\n"))]);
+    let launchctl = Launchctl::new(Box::new(script));
+    let e = launchctl
+        .signal(id.as_str(), "SIGTERM", &mut reserved(&[Step::Kill]))
+        .expect_err("refused");
+    assert!(matches!(&e, Error::Command { .. }), "{e:?}");
 }
 
 /// SIGKILL to the job by label, in the system domain; the signal is named so a failure of the job
@@ -2328,7 +2355,7 @@ fn kill_sends_sigkill_to_the_job_in_the_system_domain() {
     let id = never_installed();
     let (result, script) = kill_answered(DONE);
 
-    assert!(matches!(result, Ok(Some(()))), "{result:?}");
+    assert!(matches!(result, Ok(())), "{result:?}");
     assert_eq!(script.calls(), [["kill", "SIGKILL", format!("system/{id}").as_str()]]);
     assert_eq!(
         script.waits(),
@@ -2367,6 +2394,91 @@ fn kill_refused_for_any_other_reason_is_a_plain_failure() {
         matches!(&e, Error::Command { stderr, .. } if stderr.contains("Operation not permitted")),
         "{e:?}"
     );
+}
+
+// wait_print ==========================================================================================================
+
+/// A wait for `until` over `calls`, which it makes as one call's files kept once, and the table.
+fn waiting(until: Until, deadline: Deadline, calls: &[(&str, Answer)]) -> (Result<Option<()>>, Fake) {
+    let script = table(calls);
+    let launchctl = Launchctl::new(Box::new(script.clone()));
+    let kept = reservation(0, 1)
+        .keep(Role::COUNTED_FILES)
+        .expect("keep a call's files");
+    let result = launchctl.wait_print(never_installed().as_str(), deadline, &kept, until);
+    (result, script)
+}
+
+/// A task's `stop` waits for a start launchd has accepted to fork: a process, or the state leaving
+/// `spawn scheduled`, or a label launchd does not hold, ends the wait, and a start still queued does not.
+#[skuld::test]
+fn wait_print_until_a_process_appears_or_the_state_leaves_spawn_scheduled() {
+    let forever = Budget::Unbounded.start();
+    let cases: [(&str, [(&str, Answer); 3]); 3] = [
+        (
+            "a process",
+            [
+                ("print", SPAWN_SCHEDULED),
+                ("print", SPAWN_SCHEDULED),
+                ("print", RUNNING),
+            ],
+        ),
+        (
+            "a state that is not queued",
+            [
+                ("print", SPAWN_SCHEDULED),
+                ("print", SPAWN_SCHEDULED),
+                ("print", NOT_RUNNING),
+            ],
+        ),
+        (
+            "a label launchd does not hold",
+            [
+                ("print", SPAWN_SCHEDULED),
+                ("print", SPAWN_SCHEDULED),
+                ("print", NOT_LOADED),
+            ],
+        ),
+    ];
+    for (what, calls) in cases {
+        let (result, script) = waiting(Until::ProcessOrNotScheduled, forever, &calls);
+
+        assert!(matches!(result, Ok(Some(()))), "{what}: {result:?}");
+        script.assert_spent(&format!("two reads of a queued start, then {what}"));
+    }
+}
+
+/// A deadline already spent still gets one last read, so a condition reached in the last interval is
+/// reported, and one that is not is an expiry.
+#[skuld::test]
+fn wait_print_reads_once_more_under_a_spent_deadline() {
+    let spent = Budget::Immediate.start();
+
+    let (queued, script) = waiting(Until::ProcessOrNotScheduled, spent, &[("print", SPAWN_SCHEDULED)]);
+    assert!(matches!(queued, Ok(None)), "{queued:?}");
+    script.assert_spent("one read");
+
+    let (forked, script) = waiting(Until::ProcessOrNotScheduled, spent, &[("print", RUNNING)]);
+    assert!(matches!(forked, Ok(Some(()))), "{forked:?}");
+    script.assert_spent("one read");
+}
+
+/// What `bootout` and `start` wait for, as before the wait was general: the label no longer loaded,
+/// whatever its state.
+#[skuld::test]
+fn wait_print_until_unloaded_is_the_wait_for_the_label_to_go() {
+    let forever = Budget::Unbounded.start();
+
+    let (result, script) = waiting(
+        Until::Unloaded,
+        forever,
+        &[("print", RUNNING), ("print", SIGTERMED), ("print", NOT_LOADED)],
+    );
+
+    assert!(matches!(result, Ok(Some(()))), "{result:?}");
+    script.assert_spent("it waited past a process and a job tearing down");
+    let (still_loaded, _) = waiting(Until::Unloaded, Budget::Immediate.start(), &[("print", NOT_RUNNING)]);
+    assert!(matches!(still_loaded, Ok(None)), "{still_loaded:?}");
 }
 
 // A changed spec over a loaded job ====================================================================================

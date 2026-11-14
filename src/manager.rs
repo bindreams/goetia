@@ -201,7 +201,10 @@ pub trait ServiceManager {
     /// README's "Waiting for a start or stop".
     ///
     /// **A task's stop ends the run in flight and leaves its schedule armed;** the task is then
-    /// [`State::Idle`].
+    /// [`State::Idle`]. On macOS, a task's `stop` sends SIGTERM only and waits until the run ends
+    /// (bounded by `budget`); a task that ignores SIGTERM keeps running, and `kill` ends it. `stop` also
+    /// ends a run that begins while it is stopping. On macOS, a task's `stop` with no budget also waits for
+    /// a start launchd has accepted to begin, so it can end it.
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never

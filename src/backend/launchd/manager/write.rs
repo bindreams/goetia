@@ -1,8 +1,9 @@
-//! A task's `install` and `uninstall`: the job's plist and the timer's, changed together.
+//! A task's `install`, `uninstall`, `enable` and `disable`: the job's plist and the timer's, changed
+//! together.
 //!
 //! What to do is decided purely, in [`crate::backend::launchd::task`] (`update_plan`,
-//! `uninstall_plan`), from what is on disk and what launchd holds; [`Executor`] performs the plan's
-//! actions in order. An update first reads which labels launchd holds (two `print`s, which decide what
+//! `uninstall_plan`, `enable_plan`, `disable_plan`), from what is on disk and what launchd holds;
+//! [`Executor`] performs the plan's actions in order. An update first reads which labels launchd holds (two `print`s, which decide what
 //! to stage); then both plists are staged and linted before the first request that changes anything,
 //! so a malformed one stops the install before anything changed. A crash anywhere leaves a state of
 //! the read table, and running the verb again finishes it.
@@ -19,11 +20,11 @@ use super::{
     persist_new, persist_new_unraced, persist_over, prepare_parent_dirs, read_artifact, resolve_account,
     staged_tempfile, still_present,
 };
-use crate::backend::WriteOutcome;
 use crate::backend::bounded::Reservation;
 use crate::backend::launchd::generate::{self, Plists, timer_label};
 use crate::backend::launchd::refuse;
-use crate::backend::launchd::task::{Action, Old, OnDisk, uninstall_plan, update_plan};
+use crate::backend::launchd::task::{Action, Old, OnDisk, disable_plan, enable_plan, uninstall_plan, update_plan};
+use crate::backend::{Backend as _, WriteOutcome};
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
 use crate::manager::Budget;
@@ -160,6 +161,7 @@ impl Launchd {
                     id,
                     old: &old,
                     staging,
+                    enabled: Path::new(dirs[1].0),
                     job: Some(job),
                     timer: timer.or(new_timer_path),
                     staged_job,
@@ -186,6 +188,7 @@ impl Launchd {
             id: &snapshot.id,
             old: &old,
             staging: Path::new(super::STAGING_DIR),
+            enabled: Path::new(super::ENABLED_DIR),
             job: snapshot.job.as_ref().map(path_of),
             timer: snapshot.timer.as_ref().map(path_of),
             staged_job: None,
@@ -197,6 +200,82 @@ impl Launchd {
         }
         .run(&uninstall_plan(&old), reservation)?;
         debug_assert!(matches!(executed, WriteOutcome::Done), "an uninstall refuses nothing");
+        Ok(())
+    }
+
+    /// `enable` of a task over `dirs`: see `enable_plan`. It reads which labels launchd holds and does
+    /// what is left, whatever `enabled` says, so that running it again finishes a crash. A timer that a
+    /// scheduled task has none of is rendered from the job's metadata, staged and linted before the
+    /// first request, and created where the job goes, refusing to replace a stranger's file there
+    /// ([`Error::Foreign`]). `reservation` is the verb's own.
+    pub(super) fn enable_task(&self, dirs: Dirs, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
+        let id = &snapshot.id;
+        let job = snapshot.job()?.location.path.clone();
+        let enabled = Path::new(dirs[1].0);
+        let old = self.old_of(&snapshot, reservation)?;
+        let plan = enable_plan(&old);
+        let mut timer = snapshot.timer.as_ref().map(path_of);
+        let mut staged_timer = None;
+        if plan.contains(&Action::CreateTimerEnabled) {
+            let blob = snapshot
+                .blob
+                .as_ref()
+                .expect("a timer is created for a job whose metadata decodes");
+            let text = self
+                .render(&blob.spec)?
+                .timer
+                .expect("a task with a schedule renders a timer");
+            staged_timer = Some(staged_tempfile(enabled, &text)?);
+            timer = Some(plist_in(enabled, &timer_label(id.as_str())));
+        }
+        let executed = Executor {
+            launchd: self,
+            id,
+            old: &old,
+            staging: Path::new(dirs[0].0),
+            enabled,
+            job: Some(job),
+            timer,
+            staged_job: None,
+            staged_timer,
+            verb: Verb::Enable,
+            timer_out: false,
+            stray_out: false,
+            prepare: None,
+        }
+        .run(&plan, reservation)?;
+        match executed {
+            WriteOutcome::Done => Ok(()),
+            WriteOutcome::Refused(Outcome::RefuseForeign { recovery }) => Err(Error::Foreign {
+                id: id.to_string(),
+                recovery,
+            }),
+            other => unreachable!("an enable is refused only for a stranger's timer, got {other:?}"),
+        }
+    }
+
+    /// `disable` of a task over `dirs`: see `disable_plan`. The timer is booted out (and waited for)
+    /// before it moves, and the job is never booted out. `reservation` is the verb's own.
+    pub(super) fn disable_task(&self, dirs: Dirs, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
+        let job = snapshot.job()?.location.path.clone();
+        let old = self.old_of(&snapshot, reservation)?;
+        let executed = Executor {
+            launchd: self,
+            id: &snapshot.id,
+            old: &old,
+            staging: Path::new(dirs[0].0),
+            enabled: Path::new(dirs[1].0),
+            job: Some(job),
+            timer: snapshot.timer.as_ref().map(path_of),
+            staged_job: None,
+            staged_timer: None,
+            verb: Verb::Disable,
+            timer_out: false,
+            stray_out: false,
+            prepare: None,
+        }
+        .run(&disable_plan(&old), reservation)?;
+        debug_assert!(matches!(executed, WriteOutcome::Done), "a disable refuses nothing");
         Ok(())
     }
 
@@ -221,6 +300,10 @@ impl Launchd {
             timer: snapshot.timer.as_ref().map(on_disk),
             job_loaded,
             timer_loaded,
+            scheduled: matches!(
+                &snapshot.blob,
+                Ok(blob) if matches!(&blob.spec, DaemonSpec::Task(task) if task.schedule.is_some())
+            ),
         })
     }
 }
@@ -250,6 +333,7 @@ struct Executor<'a> {
     id: &'a Id,
     old: &'a Old,
     staging: &'a Path,
+    enabled: &'a Path,
     /// Where the job's plist is now, and the timer's: a plan's moves and creations update them.
     job: Option<PathBuf>,
     timer: Option<PathBuf>,
@@ -274,6 +358,8 @@ struct Executor<'a> {
 enum Verb {
     Install,
     Uninstall,
+    Enable,
+    Disable,
 }
 
 impl Executor<'_> {
@@ -356,7 +442,7 @@ impl Executor<'_> {
                     }
                 }
             }
-            Action::CreateTimerFirst => {
+            Action::CreateTimerFirst | Action::CreateTimerEnabled => {
                 let target = self.timer.clone().expect("the executor knows where a new timer goes");
                 let staged = self
                     .staged_timer
@@ -376,6 +462,25 @@ impl Executor<'_> {
                 ensure_dir(self.staging)?;
                 move_no_clobber(&from, &to)?;
                 self.job = Some(to);
+            }
+            Action::MoveJobToEnabled => {
+                let from = self.job.take().expect("a job moved is where it was read");
+                let to = plist_in(self.enabled, id);
+                move_no_clobber(&from, &to)?;
+                self.job = Some(to);
+            }
+            Action::MoveTimerToEnabled => {
+                let from = self.timer.take().expect("a timer moved is where it was read");
+                let to = plist_in(self.enabled, &timer_label);
+                move_no_clobber(&from, &to)?;
+                self.timer = Some(to);
+            }
+            Action::MoveTimerToStaging => {
+                let from = self.timer.take().expect("a timer moved is where it was read");
+                let to = plist_in(self.staging, &timer_label);
+                ensure_dir(self.staging)?;
+                move_no_clobber(&from, &to)?;
+                self.timer = Some(to);
             }
             Action::ReplaceJob => {
                 let staged = self
@@ -421,18 +526,27 @@ impl Executor<'_> {
         Ok(None)
     }
 
-    /// Load `label` from `path`, after the plists were replaced: a failure says what is left to do.
+    /// Load `label` from `path`, after the plists were replaced or moved: a failure says what is left to
+    /// do.
     fn load(&self, path: &Path, label: &str, reservation: &mut Reservation) -> Result<()> {
         let id = self.id;
+        let what = match self.verb {
+            Verb::Install => format!(
+                "the plists of `{id}` were replaced, but launchd could not load `{label}`: run `goetia daemon \
+                 enable {id}` to load what is missing"
+            ),
+            Verb::Enable => format!(
+                "enabling `{id}` stopped because launchd could not load `{label}`: run `goetia daemon enable {id}` \
+                 again to finish"
+            ),
+            Verb::Uninstall | Verb::Disable => unreachable!("neither an uninstall nor a disable loads anything"),
+        };
         self.launchd
             .launchctl
             .bootstrap(path, Budget::Unbounded.start(), reservation)
             .map(never_expires)
             .map_err(|source| Error::Step {
-                what: format!(
-                    "the plists of `{id}` were replaced, but launchd could not load `{label}`: run `goetia daemon \
-                     enable {id}` to load what is missing"
-                ),
+                what,
                 source: Box::new(source),
             })
     }
@@ -486,6 +600,11 @@ impl Executor<'_> {
                 "`{id}`'s timer (`{label}`) was booted out and this uninstall failed before the timer's plist was \
                  removed, so it is not loaded: re-run uninstall"
             ),
+            Verb::Disable => format!(
+                "`{id}`'s timer (`{label}`) was booted out and this disable failed before the plists were moved to \
+                 staging, so the task is disarmed but not fully disabled: re-run disable"
+            ),
+            Verb::Enable => unreachable!("an enable boots nothing out"),
         };
         Error::Step {
             what,

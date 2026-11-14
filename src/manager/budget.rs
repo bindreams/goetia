@@ -83,14 +83,17 @@ fn budget_for_at(deadline: Deadline, now: Instant) -> Budget {
 /// `awaited` is `"running"` or `"stopped"`, and nothing else.
 ///
 /// Takes the `Budget` because a backend holds that, not the original
-/// duration, and because only a **non-zero** `Bounded` budget can expire:
-/// `Immediate` and `Bounded(ZERO)` never waited (see [`Budget::waits`]), and
-/// `Unbounded` never ends. Reaching here with any of those is a backend
-/// reporting an expiry that cannot have happened, hence the `debug_assert!`.
+/// duration, and because only a `Bounded` budget can expire: `Immediate`
+/// never waited, and `Unbounded` never ends. Reaching here with either is a
+/// backend reporting an expiry that cannot have happened, hence the
+/// `debug_assert!`. A zero-length bound is a bound: a backend that still waits
+/// for something under it (a launchd task's `stop`, which waits for a queued
+/// start's pid whatever the budget) reports its expiry here, though
+/// [`Budget::waits`] folds it into `Immediate` for the callers that branch on it.
 pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Error {
     debug_assert!(
-        matches!(budget, Budget::Bounded(d) if d > Duration::ZERO),
-        "only a non-zero Bounded budget can expire, got {budget:?}"
+        matches!(budget, Budget::Bounded(_)),
+        "only a Bounded budget can expire, got {budget:?}"
     );
     debug_assert!(
         matches!(awaited, "running" | "stopped"),

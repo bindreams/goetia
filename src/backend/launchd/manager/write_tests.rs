@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use super::super::manager_tests::launchd_over;
 use super::super::task::task_tests::{ID, Tree, marked, plists_of, service_spec, task_spec};
-use super::super::{INSTALL_CALLS, INSTALL_REQUESTS};
+use super::super::{
+    INSTALL_CALLS, INSTALL_REQUESTS, TASK_DISABLE_CALLS, TASK_DISABLE_REQUESTS, TASK_ENABLE_CALLS, TASK_ENABLE_REQUESTS,
+};
 use super::*;
 use crate::backend::bounded;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
@@ -856,6 +858,316 @@ fn uninstall_of_a_running_armed_task_ends_the_run() {
     assert!(!exists(&tree, true, ID) && !exists(&tree, true, &timer_name()));
 }
 
+// enable and disable ==================================================================================================
+
+/// The reservation `enable` and `disable` make for themselves, at their counts.
+fn enable_reservation() -> Reservation {
+    Reservation::make(TASK_ENABLE_REQUESTS, TASK_ENABLE_CALLS * Role::COUNTED_FILES).expect("make a reservation")
+}
+
+fn disable_reservation() -> Reservation {
+    Reservation::make(TASK_DISABLE_REQUESTS, TASK_DISABLE_CALLS * Role::COUNTED_FILES).expect("make a reservation")
+}
+
+fn enable(tree: &Tree, fake: &Fake) -> Result<()> {
+    manager(fake).enable_task(tree.dirs(), marked(tree.read()), &mut enable_reservation())
+}
+
+fn disable(tree: &Tree, fake: &Fake) -> Result<()> {
+    manager(fake).disable_task(tree.dirs(), marked(tree.read()), &mut disable_reservation())
+}
+
+/// The two reads that open an enable or a disable: whether launchd holds the job's label, and the timer's.
+fn held_reads(job: bool, timer: bool) -> Vec<Entry> {
+    let code = |held: bool| if held { LOADED } else { UNLOADED };
+    vec![
+        print(job_label(), code(job), ""),
+        print(timer_target(), code(timer), ""),
+    ]
+}
+
+/// The targets of every `bootout` the fake was asked for, in order.
+fn booted_out(fake: &Fake) -> Vec<String> {
+    fake.calls()
+        .into_iter()
+        .filter(|call| call[0] == "bootout")
+        .map(|call| call[1].clone())
+        .collect()
+}
+
+/// The job goes to the enabled directory and is loaded before the timer moves, so a crash between the
+/// two never leaves a timer that fires at a job launchd does not hold.
+#[skuld::test]
+fn enable_moves_the_job_then_bootstraps_it_then_the_timer() {
+    let tree = Tree::new();
+    let spec = task_spec(Some(SCHEDULE));
+    installed(&tree, &spec, false);
+    let (job_in, timer_in) = (at(&tree, true, ID), at(&tree, true, &timer_name()));
+    let (job_there, timer_staged) = (job_in.clone(), at(&tree, false, &timer_name()));
+    let timer_there = timer_in.clone();
+    let fake = Fake::new(held_reads(false, false).into_iter().chain([
+        bootstrap(&job_in).then(move || {
+            assert!(
+                job_there.exists() && timer_staged.exists(),
+                "the job is in place when it is loaded, and the timer is not yet"
+            );
+        }),
+        bootstrap(&timer_in).then(move || assert!(timer_there.exists(), "the timer is in place when it is loaded")),
+    ]));
+
+    enable(&tree, &fake).expect("an enable");
+
+    fake.assert_spent("both reads, the job's bootstrap, then the timer's");
+    let plists = plists_of(&spec);
+    assert_eq!(text_at(&tree, true, ID), plists.job);
+    assert_eq!(text_at(&tree, true, &timer_name()), plists.timer.unwrap());
+    assert!(!exists(&tree, false, ID) && !exists(&tree, false, &timer_name()));
+}
+
+/// An enable that moved the job and was stopped before the timer moved: the job is in place and loaded,
+/// and what is left is the timer.
+#[skuld::test]
+fn enable_is_finished_by_running_it_again() {
+    let tree = Tree::new();
+    let plists = plists_of(&task_spec(Some(SCHEDULE)));
+    tree.put(true, ID, &plists.job);
+    tree.put(false, &timer_name(), plists.timer.as_ref().unwrap());
+    let fake = Fake::new(held_reads(true, true));
+
+    enable(&tree, &fake).expect("an enable, finished");
+
+    fake.assert_spent("both labels are loaded, so nothing is sent but the reads");
+    assert_eq!(text_at(&tree, true, ID), plists.job, "the job is untouched");
+    assert_eq!(text_at(&tree, true, &timer_name()), plists.timer.unwrap());
+    assert!(!exists(&tree, false, &timer_name()));
+}
+
+/// An enable that moved the timer and did not load it (both files in the enabled directory, the timer
+/// not loaded): `enabled` reads true, and only the timer's load is left. An early return on `enabled`
+/// would never finish it.
+#[skuld::test]
+fn enable_finishes_a_crash_that_moved_the_timer_but_did_not_load_it() {
+    let tree = Tree::new();
+    let plists = installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let timer_in = at(&tree, true, &timer_name());
+    let fake = Fake::new(held_reads(true, false).into_iter().chain([bootstrap(&timer_in)]));
+
+    enable(&tree, &fake).expect("an enable, finished");
+
+    fake.assert_spent("the timer is loaded, and the job left alone");
+    assert_eq!(text_at(&tree, true, ID), plists.job);
+}
+
+/// A job with no timer (the crash after an install's job) gets its timer where the job goes, rendered
+/// from the job's own metadata, and loaded.
+#[skuld::test]
+fn enable_creates_a_missing_timer_in_launchdaemons() {
+    let tree = Tree::new();
+    let plists = plists_of(&task_spec(Some(SCHEDULE)));
+    tree.put(false, ID, &plists.job);
+    let (job_in, timer_in) = (at(&tree, true, ID), at(&tree, true, &timer_name()));
+    let fake = Fake::new(
+        held_reads(false, false)
+            .into_iter()
+            .chain([bootstrap(&job_in), bootstrap(&timer_in)]),
+    );
+
+    enable(&tree, &fake).expect("an enable");
+
+    fake.assert_spent("both reads and both bootstraps");
+    assert_eq!(text_at(&tree, true, &timer_name()), plists.timer.unwrap());
+    assert!(
+        !exists(&tree, false, &timer_name()),
+        "created where the job is, not in staging"
+    );
+    let left: Vec<_> = std::fs::read_dir(tree.dir(true)).unwrap().collect();
+    assert_eq!(left.len(), 2, "no temporary file is left behind: {left:?}");
+}
+
+/// A stranger's file that appears at the timer's name after `read` ends the enable as foreign, with the
+/// recovery that names the path, and the timer is not loaded.
+#[skuld::test]
+fn a_stranger_at_the_new_timers_name_is_foreign() {
+    let tree = Tree::new();
+    let plists = plists_of(&task_spec(Some(SCHEDULE)));
+    tree.put(false, ID, &plists.job);
+    let (job_in, theirs) = (at(&tree, true, ID), at(&tree, true, &timer_name()));
+    let fake = Fake::new([
+        print(job_label(), UNLOADED, ""),
+        print(timer_target(), UNLOADED, "").then(move || std::fs::write(theirs, "a stranger's file\n").unwrap()),
+        bootstrap(&job_in),
+    ]);
+
+    let e = enable(&tree, &fake).expect_err("the timer's name was taken");
+
+    assert!(
+        matches!(&e, Error::Foreign { id, recovery } if id == ID && recovery.contains(&timer_name())),
+        "{e:?}"
+    );
+    fake.assert_spent("the job was loaded, and the timer was not");
+    assert_eq!(text_at(&tree, true, &timer_name()), "a stranger's file\n");
+}
+
+/// A task that is in place and loaded is enabled already: nothing is sent but the reads.
+#[skuld::test]
+fn enable_of_a_loaded_task_is_ok() {
+    let tree = Tree::new();
+    let plists = installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let fake = Fake::new(held_reads(true, true));
+
+    enable(&tree, &fake).expect("an enable of an enabled task");
+
+    fake.assert_spent("nothing is sent but the two reads");
+    assert_eq!(text_at(&tree, true, ID), plists.job);
+}
+
+/// A load that fails says the enable stopped, and to run it again.
+#[skuld::test]
+fn a_failed_load_says_to_run_enable_again() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), false);
+    let job_in = at(&tree, true, ID);
+    let refused = reply(
+        &["bootstrap", "system", job_in.to_str().unwrap()],
+        exited(5, "", "Bootstrap failed: 5: Input/output error\n"),
+    );
+    let fake = Fake::new(held_reads(false, false).into_iter().chain([refused]));
+
+    let e = enable(&tree, &fake).expect_err("launchd refused the load");
+
+    assert!(
+        matches!(&e, Error::Step { what, .. } if what.contains(&format!("goetia daemon enable {ID}"))),
+        "{e:?}"
+    );
+}
+
+/// The timer goes out first, and is waited for, so that no fire starts a run from here on; then it moves,
+/// then the job. The job is never booted out.
+#[skuld::test]
+fn disable_boots_out_the_timer_before_moving_it_and_never_boots_out_the_job() {
+    let tree = Tree::new();
+    let spec = task_spec(Some(SCHEDULE));
+    installed(&tree, &spec, true);
+    let (out_there, gone_there) = (at(&tree, true, &timer_name()), at(&tree, true, &timer_name()));
+    let fake = Fake::new(
+        held_reads(true, true).into_iter().chain([
+            bootout(timer_target()).then(move || assert!(out_there.exists(), "the timer goes out where it is")),
+            print(timer_target(), UNLOADED, "")
+                .then(move || assert!(gone_there.exists(), "and moves after launchd let go")),
+        ]),
+    );
+
+    disable(&tree, &fake).expect("a disable");
+
+    fake.assert_spent("both reads, the timer's bootout, and the wait for it");
+    assert_eq!(booted_out(&fake), [timer_target()], "the job is not booted out");
+    let plists = plists_of(&spec);
+    assert_eq!(text_at(&tree, false, ID), plists.job);
+    assert_eq!(text_at(&tree, false, &timer_name()), plists.timer.unwrap());
+    assert!(!exists(&tree, true, ID) && !exists(&tree, true, &timer_name()));
+}
+
+/// A disable that moved the timer and was stopped before the job moved: the job moves, and nothing is
+/// booted out. An early return on `enabled` (the timer's directory: staging) would never finish it.
+#[skuld::test]
+fn disable_finishes_a_crash_that_moved_the_timer_but_not_the_job() {
+    let tree = Tree::new();
+    let plists = plists_of(&task_spec(Some(SCHEDULE)));
+    tree.put(true, ID, &plists.job);
+    tree.put(false, &timer_name(), plists.timer.as_ref().unwrap());
+    let fake = Fake::new(held_reads(true, false));
+
+    disable(&tree, &fake).expect("a disable, finished");
+
+    fake.assert_spent("nothing is sent but the reads");
+    assert!(booted_out(&fake).is_empty());
+    assert_eq!(text_at(&tree, false, ID), plists.job);
+    assert!(!exists(&tree, true, ID));
+}
+
+/// A run in flight goes on: the job is neither booted out nor signalled, and its plist moves.
+#[skuld::test]
+fn disable_with_a_run_in_flight_leaves_it_running() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let fake = Fake::new([
+        print(job_label(), LOADED, BUSY),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+    ]);
+
+    disable(&tree, &fake).expect("a disable over a run");
+
+    fake.assert_spent("the reads, and the timer's bootout and wait");
+    assert_eq!(booted_out(&fake), [timer_target()]);
+    assert!(fake.calls().iter().all(|call| call[0] != "kill"), "no signal is sent");
+    assert!(exists(&tree, false, ID) && !exists(&tree, true, ID));
+}
+
+/// A failure after the timer went out says so, and to run disable again.
+#[skuld::test]
+fn a_disable_that_fails_after_the_timer_went_out_says_to_run_it_again() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let taken = at(&tree, false, ID);
+    let fake = Fake::new(held_reads(true, true).into_iter().chain([
+        bootout(timer_target()).then(move || std::fs::write(taken, "in the way\n").unwrap()),
+        print(timer_target(), UNLOADED, ""),
+    ]));
+
+    let e = disable(&tree, &fake).expect_err("the job's name in staging is taken");
+
+    assert!(
+        matches!(&e, Error::Step { what, .. } if what.contains("this disable failed") && what.contains("re-run disable")),
+        "{e:?}"
+    );
+    assert!(matches!(e.cause(), Error::AlreadyExists { .. }), "{e:?}");
+}
+
+/// The reservation of a task's `enable` and `disable` is made before the first request: one that cannot
+/// be made sends nothing, and fails as the verb of its id.
+#[skuld::test]
+fn a_task_enable_and_disable_that_cannot_reserve_send_nothing() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), false);
+    let fake = Fake::new([]);
+    let mgr = manager(&fake);
+    let _short = bounded::test_hook::temp_files(0);
+
+    let enabled = mgr.enable(marked(tree.read()), &mut Reservation::default());
+    let disabled = mgr.disable(marked(tree.read()));
+
+    for (what, result) in [("enable", enabled), ("disable", disabled)] {
+        let e = result.expect_err(what);
+        assert!(
+            matches!(&e, Error::Reservation { id: Some(id), .. } if id == ID),
+            "{what}: {e:?}"
+        );
+    }
+    assert_eq!(fake.calls(), Vec::<Vec<String>>::new(), "nothing may be sent");
+}
+
+/// A service's `enable` and `disable` are the move of its plist, and send nothing to launchd: here its
+/// plist is where each verb wants it, so they do nothing at all.
+#[skuld::test]
+fn a_service_enable_and_disable_are_unchanged() {
+    let fake = Fake::new([]);
+    let mgr = manager(&fake);
+    let service = plists_of(&service_spec());
+
+    let enabled = Tree::new();
+    enabled.put(true, ID, &service.job);
+    mgr.enable(marked(enabled.read()), &mut Reservation::default())
+        .expect("an enable of an enabled service");
+    let staged = Tree::new();
+    staged.put(false, ID, &service.job);
+    mgr.disable(marked(staged.read()))
+        .expect("a disable of a staged service");
+
+    assert_eq!(fake.calls(), Vec::<Vec<String>>::new());
+}
+
 // Reservation =========================================================================================================
 
 /// What a path left of its reservation: its `needs` count, less what it drew.
@@ -911,6 +1223,69 @@ fn the_verbs_draw_no_more_than_they_reserved() {
         (0, 0),
         "an uninstall's longest path spends its reservation"
     );
+
+    // An enable's longest path: both plists staged and nothing loaded, so both are loaded in turn.
+    let enabling = |tree: &Tree, reservation: &mut Reservation| {
+        let (job_in, timer_in) = (at(tree, true, ID), at(tree, true, &timer_name()));
+        let fake = Fake::new(
+            held_reads(false, false)
+                .into_iter()
+                .chain([bootstrap(&job_in), bootstrap(&timer_in)]),
+        );
+        manager(&fake).enable_task(tree.dirs(), marked(tree.read()), reservation)
+    };
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), false);
+    let mut held = enable_reservation();
+    enabling(&tree, &mut held).expect("an enable");
+    assert_eq!(left(&held), (0, 0), "an enable's longest path spends its reservation");
+
+    // A disable's: the timer is loaded, so it is booted out and waited for.
+    let disabling = |tree: &Tree, reservation: &mut Reservation| {
+        let fake = Fake::new(
+            held_reads(true, true)
+                .into_iter()
+                .chain([bootout(timer_target()), print(timer_target(), UNLOADED, "")]),
+        );
+        manager(&fake).disable_task(tree.dirs(), marked(tree.read()), reservation)
+    };
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let mut held = disable_reservation();
+    disabling(&tree, &mut held).expect("a disable");
+    assert_eq!(left(&held), (0, 0), "a disable's longest path spends its reservation");
+
+    // One reaper or one file short of either fails at the draw.
+    for (what, requests, calls) in [
+        ("reaper", TASK_ENABLE_REQUESTS - 1, TASK_ENABLE_CALLS * files),
+        ("temp file", TASK_ENABLE_REQUESTS, TASK_ENABLE_CALLS * files - 1),
+    ] {
+        let tree = Tree::new();
+        installed(&tree, &task_spec(Some(SCHEDULE)), false);
+        let mut short = Reservation::make(requests, calls).expect("make a reservation");
+        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(enabling(&tree, &mut short))));
+        let payload = drawn.expect_err(&format!("an enable a {what} short went unnoticed"));
+        let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            message.contains(&format!("a {what} was drawn past the reservation")),
+            "{message}"
+        );
+    }
+    for (what, requests, calls) in [
+        ("reaper", TASK_DISABLE_REQUESTS - 1, TASK_DISABLE_CALLS * files),
+        ("temp file", TASK_DISABLE_REQUESTS, TASK_DISABLE_CALLS * files - 1),
+    ] {
+        let tree = Tree::new();
+        installed(&tree, &task_spec(Some(SCHEDULE)), true);
+        let mut short = Reservation::make(requests, calls).expect("make a reservation");
+        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(disabling(&tree, &mut short))));
+        let payload = drawn.expect_err(&format!("a disable a {what} short went unnoticed"));
+        let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            message.contains(&format!("a {what} was drawn past the reservation")),
+            "{message}"
+        );
+    }
 
     // One reaper or one file short of the longest path fails at the draw.
     for (what, requests, calls) in [

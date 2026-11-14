@@ -36,8 +36,10 @@
 //!   running one, and launchd holds a bootstrapped job by label, whichever directory its plist is
 //!   in, so moving the file leaves it running.
 //! - A task is two plists, the job `<id>.plist` and its timer `<id>@timer.plist`; reading and
-//!   `status` treat them as one id (see `task`), and `install` and `uninstall` change both, in the
-//!   order the plans of `launchd::task` give (see `write`).
+//!   `status` treat them as one id (see `task`), and `install`, `uninstall`, `enable` and `disable`
+//!   change both, in the order the plans of `launchd::task` give (see `write`). A task's `start` loads
+//!   its job and kicks it, and its `stop` sends SIGTERM to the run in flight and never boots the job
+//!   out (see `verbs`).
 //! - Reading (`list`, and every verb's ownership check) scans both directories, never `launchctl
 //!   print`, whose format Apple does not guarantee. `status`'s live run state is the one exception,
 //!   since no file says whether a job is running. It reads `launchctl print` leniently: a shape it
@@ -88,6 +90,8 @@ pub use super::{ENABLED_DIR, STAGING_DIR};
 use task::{Artifact, Assembled, Body};
 
 mod task;
+mod verbs;
+mod watch;
 mod write;
 
 pub struct Launchd {
@@ -378,6 +382,18 @@ impl Plist {
 
     fn is_task(&self) -> bool {
         matches!(&self.blob, Ok(blob) if blob.spec.kind() == DaemonKind::Task)
+    }
+
+    /// The kind the verbs that start, stop, kill, enable and disable treat the id as: what the job's
+    /// metadata names, and, where it will not decode, a task if a goetia timer sits beside the job. A
+    /// service whose metadata is damaged must keep working as one, and a task's timer is what says it
+    /// is not.
+    fn kind(&self) -> DaemonKind {
+        match &self.blob {
+            Ok(blob) => blob.spec.kind(),
+            Err(_) if self.timer.is_some() => DaemonKind::Task,
+            Err(_) => DaemonKind::Service,
+        }
     }
 
     /// Whether `install` and `uninstall` act on a job and a timer: a task, and any id with a timer of
@@ -811,6 +827,42 @@ enum Printed {
     Present(bounded::Capture),
 }
 
+/// What [`Launchctl::wait_print`] waits for.
+#[derive(Clone, Copy)]
+enum Until {
+    /// launchd no longer has the label.
+    Unloaded,
+    /// A task's job has a process, or no longer shows `state = spawn scheduled`: a start launchd has
+    /// accepted has forked, or has not happened and will not. `kickstart` returns before the fork, and
+    /// `launchctl kill` of a job in that state signals nothing, so a `stop` waits for this first.
+    ProcessOrNotScheduled,
+}
+
+impl Until {
+    fn reached(self, printed: &Printed) -> bool {
+        match (self, printed) {
+            // Not found: not loaded, so no process and no start.
+            (_, Printed::Absent) => true,
+            (Until::Unloaded, Printed::Present(_)) => false,
+            // A body that is not whole says nothing: the read is made again.
+            (Until::ProcessOrNotScheduled, Printed::Present(capture)) => {
+                capture.complete && {
+                    let body = String::from_utf8_lossy(&capture.stdout);
+                    state::has_process(&body).is_some() || !state::spawn_scheduled(&body)
+                }
+            }
+        }
+    }
+}
+
+/// What `launchctl kill` answered.
+#[derive(Debug, PartialEq, Eq)]
+enum SignalOutcome {
+    Sent,
+    /// The job has no process to signal: it is not loaded (113), or loaded with none (3).
+    NoProcess,
+}
+
 /// The files of one more read over `kept`, for a read repeated as often as it takes. A failure is a
 /// read that could not be made, never a job that is gone.
 fn reread(id: &str, kept: &Kept) -> Result<Reservation> {
@@ -998,20 +1050,20 @@ impl Launchctl {
         if !(status.success() || is_not_found(status.code())) {
             return Err(command_failed(&args, status, &capture.stderr));
         }
-        self.wait_unloaded(id, deadline, &kept)
+        self.wait_print(id, deadline, &kept, Until::Unloaded)
     }
 
-    /// Reads until launchd no longer has `id` loaded. `Ok(None)` iff `deadline` expired first.
+    /// Reads `print` of `id` until it shows `until`. `Ok(None)` iff `deadline` expired first.
     ///
-    /// Every read re-checks the real condition; [`UNLOAD_POLL`] only paces them. How many reads a job's
-    /// exit takes is not known when the verb reserves, so the wait is one call, its files taken once by
-    /// the caller as `kept`: no read can fail for want of a file once the request is out. A read that
-    /// fails is an `Err`, never a job that is gone.
+    /// Every read re-checks the real condition; [`UNLOAD_POLL`] only paces them. How many reads the
+    /// wait takes is not known when the verb reserves (a job's exit, a start launchd has accepted), so
+    /// the wait is one call, its files taken once by the caller as `kept`: no read can fail for want of
+    /// a file once the request is out. A read that fails is an `Err`, never a condition reached.
     ///
     /// A deadline already spent still gets one last read, under [`HELD_READ_BOUND`] (`print` answers
-    /// in milliseconds), so a job that went in the last interval is reported gone; no read is made
+    /// in milliseconds), so a condition reached in the last interval is reported; no read is made
     /// under a spent deadline, which would be killed at once.
-    fn wait_unloaded(&self, id: &str, deadline: Deadline, kept: &Kept) -> Result<Option<()>> {
+    fn wait_print(&self, id: &str, deadline: Deadline, kept: &Kept, until: Until) -> Result<Option<()>> {
         loop {
             let spent = deadline.expired();
             let read_deadline = if spent {
@@ -1019,33 +1071,76 @@ impl Launchctl {
             } else {
                 deadline
             };
-            match self.is_loaded(id, read_deadline, &mut reread(id, kept)?)? {
-                Some(false) => return Ok(Some(())),
-                Some(true) if !spent => {}
-                Some(true) | None => return Ok(None),
+            match self.print(id, read_deadline, &mut reread(id, kept)?)? {
+                Some(printed) if until.reached(&printed) => return Ok(Some(())),
+                Some(_) if !spent => {}
+                Some(_) | None => return Ok(None),
             }
             let pause = deadline.remaining().map_or(UNLOAD_POLL, |left| left.min(UNLOAD_POLL));
             std::thread::sleep(pause);
         }
     }
 
-    /// `launchctl kill SIGKILL` on the job, never a pid; what happens next is the plist's `KeepAlive`.
-    /// The [`is_not_found`] codes mean the job has no process: [`Error::NotRunning`]. `Ok(None)` iff
-    /// the deadline expired.
-    fn kill_job(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<()>> {
+    /// `launchctl kill <signal>` on the job `id`, never a pid: launchd signals what runs under the label
+    /// now, so a pid that was reused cannot be hit. What happens next is the plist's `KeepAlive`.
+    /// Unbounded: `kill` returns as soon as launchd has the signal sent. [`SignalOutcome::NoProcess`]
+    /// is the [`is_not_found`] codes, which say the job has no process to signal; what that means is the
+    /// verb's to say.
+    fn signal(&self, id: &str, signal: &str, reservation: &mut Reservation) -> Result<SignalOutcome> {
         let target = target(id);
-        let args = ["kill", "SIGKILL", target.as_str()];
+        let args = ["kill", signal, target.as_str()];
         let role = request(reservation)?;
-        let Finished::Exited { status, capture } = self.run(&args, deadline, role, reservation)? else {
-            return Ok(None);
+        let Finished::Exited { status, capture } = self.run(&args, Budget::Unbounded.start(), role, reservation)?
+        else {
+            unreachable!("a call under an unbounded deadline never expires");
         };
         if status.success() {
-            Ok(Some(()))
+            Ok(SignalOutcome::Sent)
         } else if is_not_found(status.code()) {
-            Err(Error::NotRunning { id: id.to_string() })
+            Ok(SignalOutcome::NoProcess)
         } else {
             Err(command_failed(&args, status, &capture.stderr))
         }
+    }
+
+    /// Loads the job `id` from `path`, unless launchd holds it already: what `start` of a service and of
+    /// a task do first. A job being torn down (after a `stop` that timed out, or another program's
+    /// `launchctl bootout`) answers for the label and would pass for a loaded job, so `bootstrap` would
+    /// be skipped and the job gone once it exits: it is waited out, then loaded. That wait is part of
+    /// sending the request, so it is under no budget.
+    ///
+    /// Draws a kept call's files (the read and the wait share them), the `bootstrap`, and, where that is
+    /// refused, one more read.
+    fn load_job(&self, id: &str, path: &Path, reservation: &mut Reservation) -> Result<()> {
+        // Under a deadline that never expires, so the capture is whole.
+        let issuing = Budget::Unbounded.start();
+        // Taken before anything is sent, so a `Reservation` error means nothing was.
+        let kept = reservation
+            .keep(Role::COUNTED_FILES)
+            .map_err(|source| Error::Reservation { id: None, source })?;
+        // The one read of the label that parses `print`'s body, for the one question its exit code
+        // cannot answer: whether the job is being torn down.
+        let mut held = reread(id, &kept)?;
+        let loaded = match never_expires(self.print(id, issuing, &mut held)?) {
+            Printed::Absent => false,
+            Printed::Present(capture) => {
+                debug_assert!(capture.complete, "a read under an unbounded deadline is whole");
+                if state::tearing_down(&String::from_utf8_lossy(&capture.stdout)) {
+                    never_expires(self.wait_print(id, issuing, &kept, Until::Unloaded)?);
+                    false
+                } else {
+                    true
+                }
+            }
+        };
+        if !loaded && let Err(e) = self.bootstrap(path, issuing, reservation).map(never_expires) {
+            // A concurrent `start` may have loaded it since the check; propagate the error only
+            // if the job is not loaded now either.
+            if !never_expires(self.is_loaded(id, issuing, reservation)?) {
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// Live state, read from `launchctl print`'s body (see the module doc). An unrecognized shape
@@ -1107,16 +1202,21 @@ const SERVICE_INSTALL_REQUESTS: usize = 1;
 const TASK_INSTALL_REQUESTS: usize = 4;
 const INSTALL_REQUESTS: usize = max(SERVICE_INSTALL_REQUESTS, TASK_INSTALL_REQUESTS);
 const START_REQUESTS: usize = 5;
+/// A service's `stop` is a `bootout`; a task's, one pass of its loop, is a SIGTERM.
 const STOP_REQUESTS: usize = 1;
 /// A task's `uninstall`: the timer's `bootout` and the job's.
 const TASK_UNINSTALL_REQUESTS: usize = 2;
 const UNINSTALL_REQUESTS: usize = max(STOP_REQUESTS, TASK_UNINSTALL_REQUESTS);
 const KILL_REQUESTS: usize = 1;
+/// A task's `enable` makes its own reservation: the `bootstrap` of the job and of the timer.
+const TASK_ENABLE_REQUESTS: usize = 2;
+/// A task's `disable` makes its own: the timer's `bootout`.
+const TASK_DISABLE_REQUESTS: usize = 1;
 
 /// Most `launchctl` calls per verb, reads included: each draws its role's temp files from the same
 /// reservation. A service's `install` adds two `is_loaded`s; `start` one `is_loaded` and five
 /// `live_state`s. The `print` after an expired `kickstart` is not counted: the verb ends there, in
-/// place of its last read. A wait ([`Launchctl::wait_unloaded`]) is one call however many reads it
+/// place of its last read. A wait ([`Launchctl::wait_print`]) is one call however many reads it
 /// makes: one after each `bootout`. `start` has one more: its first read of the label and the wait
 /// that may follow it share one set of files.
 const SERVICE_INSTALL_CALLS: usize = SERVICE_INSTALL_REQUESTS + 2 + 1;
@@ -1126,23 +1226,33 @@ const SERVICE_INSTALL_CALLS: usize = SERVICE_INSTALL_REQUESTS + 2 + 1;
 const TASK_INSTALL_CALLS: usize = 2 + (1 + 1) + 1 + (1 + 1) + 2;
 const INSTALL_CALLS: usize = max(SERVICE_INSTALL_CALLS, TASK_INSTALL_CALLS);
 const START_CALLS: usize = START_REQUESTS + 6 + 2;
-const STOP_CALLS: usize = STOP_REQUESTS + 1;
+/// A service's `stop`: the `bootout` and its wait.
+const SERVICE_STOP_CALLS: usize = STOP_REQUESTS + 1;
+/// One pass of a task's `stop`, the longest: the read of the job, the read that confirms the pid, and
+/// the SIGTERM. A pass that waits for a queued start's pid is shorter: the read, and the wait.
+const TASK_STOP_CALLS: usize = 3;
+const STOP_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_STOP_CALLS);
 /// A task's `uninstall`: the two reads of which labels launchd holds, then both `bootout`s and their
 /// waits.
 const TASK_UNINSTALL_CALLS: usize = 2 + (1 + 1) + (1 + 1);
-const UNINSTALL_CALLS: usize = max(STOP_CALLS, TASK_UNINSTALL_CALLS);
+const UNINSTALL_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_UNINSTALL_CALLS);
 const KILL_CALLS: usize = KILL_REQUESTS;
+/// A task's `enable`: the two reads of which labels launchd holds, and both `bootstrap`s.
+const TASK_ENABLE_CALLS: usize = 2 + 2;
+/// A task's `disable`: the same two reads, the timer's `bootout` and its wait.
+const TASK_DISABLE_CALLS: usize = 2 + (1 + 1);
 
 const fn max(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
 
-/// The most `step` draws, as `(requests, calls)`: for `install` and `uninstall`, the larger of a
-/// service's and a task's. A draw past it is a miscount, caught by the assertion in [`Reservation`] in
-/// every test that runs the verb.
+/// The most `step` draws, as `(requests, calls)`: for `install`, `uninstall` and `stop`, the larger of a
+/// service's and a task's (a task's `stop` is counted per pass: a later pass reserves again). A draw
+/// past it is a miscount, caught by the assertion in [`Reservation`] in every test that runs the verb.
 ///
 /// `request_start_after_stop` is `start` under a budget that does not wait: it draws no more than
-/// `start` does, and so is counted as it is.
+/// `start` does, and so is counted as it is. A task's `start` is a `bootstrap` and a `kickstart`, which
+/// the service's longest path covers.
 fn needs(step: Step) -> (usize, usize) {
     match step {
         Step::Install => (INSTALL_REQUESTS, INSTALL_CALLS),
@@ -1151,6 +1261,16 @@ fn needs(step: Step) -> (usize, usize) {
         Step::Uninstall => (UNINSTALL_REQUESTS, UNINSTALL_CALLS),
         Step::Kill => (KILL_REQUESTS, KILL_CALLS),
     }
+}
+
+/// What a verb that makes its own reservation (a task's `enable` and `disable`, which are handed none
+/// that counts them) draws: `requests` reapers and the files of `calls` calls. All or none, so a failure
+/// here sends nothing.
+fn own_reservation(id: &Id, requests: usize, calls: usize) -> Result<Reservation> {
+    Reservation::make(requests, calls * Role::COUNTED_FILES).map_err(|source| Error::Reservation {
+        id: Some(id.to_string()),
+        source,
+    })
 }
 
 /// The reapers and temp files `steps` draw, summed: what `Launchd::reserve` makes.
@@ -1423,8 +1543,13 @@ impl backend::Backend for Launchd {
         fs::remove_file(&location.path).map_err(|e| Error::os_at("remove", &location.path, e))
     }
 
-    /// Interim: a task's job alone, until the two-plist `enable` lands.
+    /// A task is enabled as two plists, loaded (see `write`); a service's is the move of its plist.
+    /// A task's `enable` makes its own reservation, since the one it is handed counts nothing.
     fn enable(&self, snapshot: Plist, _reservation: &mut Reservation) -> Result<()> {
+        if snapshot.kind() == DaemonKind::Task {
+            let mut own = own_reservation(&snapshot.id, TASK_ENABLE_REQUESTS, TASK_ENABLE_CALLS)?;
+            return self.enable_task(DIRS, snapshot, &mut own);
+        }
         let location = &snapshot.job()?.location;
 
         if location.enabled {
@@ -1437,10 +1562,15 @@ impl backend::Backend for Launchd {
     /// Does not stop the job if it is loaded, as [`ServiceManager::disable`] requires: launchd
     /// holds a bootstrapped job by label, whichever directory its plist is in.
     ///
-    /// Interim: a task's job alone, until the two-plist `disable` lands.
+    /// A task's `disable` boots out the timer and moves both plists to staging, and leaves the job
+    /// loaded (see `write`); it makes its own reservation, being handed none.
     ///
     /// [`ServiceManager::disable`]: crate::manager::ServiceManager::disable
     fn disable(&self, snapshot: Plist) -> Result<()> {
+        if snapshot.kind() == DaemonKind::Task {
+            let mut own = own_reservation(&snapshot.id, TASK_DISABLE_REQUESTS, TASK_DISABLE_CALLS)?;
+            return self.disable_task(DIRS, snapshot, &mut own);
+        }
         let location = &snapshot.job()?.location;
 
         if !location.enabled {
@@ -1452,6 +1582,10 @@ impl backend::Backend for Launchd {
     }
 
     fn start(&self, snapshot: Plist, budget: Budget, reservation: &mut Reservation) -> Result<()> {
+        // A task's start requests a run and returns: no budget, and no wait for the pid.
+        if snapshot.kind() == DaemonKind::Task {
+            return self.start_task(snapshot, reservation);
+        }
         // First, so the wait is counted from the verb's entry (see `verb_deadline`).
         let deadline = verb_deadline(budget);
         let path = snapshot.job()?.location.path.clone();
@@ -1459,45 +1593,16 @@ impl backend::Backend for Launchd {
         let id = &id;
         let blob = blob.map_err(Error::Kept)?;
         let DaemonSpec::Service(service) = &blob.spec else {
-            return Err(backend::cannot_run_tasks("launchd", id));
+            unreachable!("a daemon whose metadata decodes as a task is started by `start_task`");
         };
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
         // Issuing the request is unbounded: the budget bounds waiting for launchd's answer, never
         // whether the request is sent, so a spent budget still reaches launchd.
         let issuing = Budget::Unbounded.start();
 
-        // Taken before anything is sent, so a `Reservation` error means nothing was.
-        let kept = reservation
-            .keep(Role::COUNTED_FILES)
-            .map_err(|source| Error::Reservation { id: None, source })?;
-        // The one read of the label that parses `print`'s body, for the one question its exit code
-        // cannot answer: whether the job is being torn down. Under `issuing`, which never expires,
-        // so the capture is whole (a deadline is all that cuts one short).
-        let mut held = reread(id.as_str(), &kept)?;
-        let loaded = match never_expires(self.launchctl.print(id.as_str(), issuing, &mut held)?) {
-            Printed::Absent => false,
-            Printed::Present(capture) => {
-                debug_assert!(capture.complete, "a read under an unbounded deadline is whole");
-                if state::tearing_down(&String::from_utf8_lossy(&capture.stdout)) {
-                    // A job being torn down (after a `stop` that timed out, or another program's
-                    // `launchctl bootout`) answers for the label and would pass for a loaded job, so
-                    // `bootstrap` would be skipped and the job gone once it exits. Waiting it out is
-                    // part of sending the request, like the corrective cycle's: under `issuing`, so
-                    // no budget leaves the old job loaded with `bootstrap` unsent.
-                    never_expires(self.launchctl.wait_unloaded(id.as_str(), issuing, &kept)?);
-                    false
-                } else {
-                    true
-                }
-            }
-        };
-        if !loaded && let Err(e) = self.launchctl.bootstrap(&path, issuing, reservation).map(never_expires) {
-            // A concurrent `start` may have loaded it since the check; propagate the error only
-            // if the job is not loaded now either.
-            if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing, reservation)?) {
-                return Err(e);
-            }
-        }
+        // Waiting out a job being torn down is part of sending the request, like the corrective
+        // cycle's: under no budget, so none leaves the old job loaded with `bootstrap` unsent.
+        self.launchctl.load_job(id.as_str(), &path, reservation)?;
         // `kickstart` launches a job with no `KeepAlive`/`RunAtLoad` (`restart: never`); `bootstrap`
         // alone only loads it. Other policies are already started by `RunAtLoad`. `start` on a
         // running service must be `Ok` without restarting it, and launchd does not document that a
@@ -1590,7 +1695,12 @@ impl backend::Backend for Launchd {
         backend::Backend::start(self, snapshot, Budget::Immediate, reservation)
     }
 
+    /// A task is never booted out: its `stop` sends SIGTERM to the run in flight and waits for it (see
+    /// `stop_task`). A service is booted out, whatever the label holds.
     fn stop(&self, snapshot: Plist, budget: Budget, reservation: &mut Reservation) -> Result<()> {
+        if snapshot.kind() == DaemonKind::Task {
+            return self.stop_task(snapshot.id(), budget, reservation);
+        }
         // First, so the wait is counted from the verb's entry. A budget that does not wait gets an
         // unbounded deadline (see `verb_deadline`); under a bounded one an expiry leaves the
         // `bootout` running, so the request still goes out.
@@ -1601,13 +1711,14 @@ impl backend::Backend for Launchd {
             .ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
     }
 
+    /// SIGKILL to the job by label, for a service and a task alike: a job with no process is
+    /// [`Error::NotRunning`], classified off the kill's own answer.
     fn kill(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
         let id = snapshot.id();
-        never_expires(
-            self.launchctl
-                .kill_job(id.as_str(), Budget::Unbounded.start(), reservation)?,
-        );
-        Ok(())
+        match self.launchctl.signal(id.as_str(), "SIGKILL", reservation)? {
+            SignalOutcome::Sent => Ok(()),
+            SignalOutcome::NoProcess => Err(Error::NotRunning { id: id.to_string() }),
+        }
     }
 
     /// Interim: launchd installs no task yet, so no id reaches here as one.

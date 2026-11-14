@@ -229,6 +229,7 @@ fn installed(spec: &DaemonSpec, enabled: bool, held: Held) -> Old {
         timer: plists.timer.map(on_disk),
         job_loaded: held.job,
         timer_loaded: held.timer,
+        scheduled: matches!(spec, DaemonSpec::Task(task) if task.schedule.is_some()),
     }
 }
 
@@ -488,4 +489,143 @@ fn a_task_is_enabled_where_its_timer_is() {
     assert!(old.enabled(), "the timer's directory decides");
     old.timer = None;
     assert!(!old.enabled(), "no timer: the job's");
+}
+
+// enable_plan and disable_plan ========================================================================================
+
+const TIMER: Held = Held {
+    job: false,
+    timer: true,
+};
+
+/// A scheduled task with its job in the enabled directory or staging, its timer in the enabled one
+/// (`Some(true)`), in staging (`Some(false)`) or not at all (`None`), and `held` loaded.
+fn placed(job_enabled: bool, timer_enabled: Option<bool>, held: Held) -> Old {
+    let mut old = installed(&scheduled("a", "30 3 * * *"), job_enabled, held);
+    match timer_enabled {
+        Some(enabled) => old.timer.as_mut().expect("a scheduled task has a timer").enabled = enabled,
+        None => old.timer = None,
+    }
+    old
+}
+
+/// One row per placement of the two files and loaded state of the two labels, in Decision 12's order:
+/// the job to the enabled directory and loaded, then the timer likewise. The crash states are the ones
+/// an early return on `enabled` would never finish.
+#[skuld::test]
+fn enable_plan_table() {
+    let cases: Vec<(&str, Old, Vec<Action>)> = vec![
+        (
+            "everything staged, nothing loaded",
+            placed(false, Some(false), NOTHING),
+            vec![MoveJobToEnabled, BootstrapJob, MoveTimerToEnabled, BootstrapTimer],
+        ),
+        (
+            "enable run again: the job is in place and both are loaded, so only the timer moves",
+            placed(true, Some(false), BOTH),
+            vec![MoveTimerToEnabled],
+        ),
+        (
+            "a crash that moved the timer but did not load it: the timer is loaded, the job untouched",
+            placed(true, Some(true), JOB),
+            vec![BootstrapTimer],
+        ),
+        (
+            "both in place, nothing loaded (a crash before either load, or a restart that loads neither)",
+            placed(true, Some(true), NOTHING),
+            vec![BootstrapJob, BootstrapTimer],
+        ),
+        (
+            "everything in place and loaded: nothing to do",
+            placed(true, Some(true), BOTH),
+            vec![],
+        ),
+        (
+            "the job was loaded from staging by a start: it is moved and not loaded again",
+            placed(false, Some(false), JOB),
+            vec![MoveJobToEnabled, MoveTimerToEnabled, BootstrapTimer],
+        ),
+        (
+            "a timer loaded from staging is moved and not loaded again",
+            placed(true, Some(false), Held { job: true, timer: true }),
+            vec![MoveTimerToEnabled],
+        ),
+        (
+            "a job without its timer, staged: the timer is created where the job goes",
+            placed(false, None, NOTHING),
+            vec![MoveJobToEnabled, BootstrapJob, CreateTimerEnabled, BootstrapTimer],
+        ),
+        (
+            "a job without its timer, in place and loaded: the timer is created and loaded",
+            placed(true, None, JOB),
+            vec![CreateTimerEnabled, BootstrapTimer],
+        ),
+        (
+            "a task with no schedule has no timer to create",
+            Old {
+                scheduled: false,
+                ..placed(false, None, NOTHING)
+            },
+            vec![MoveJobToEnabled, BootstrapJob],
+        ),
+        (
+            "a timer label alone loaded, its file in place: it is loaded already",
+            placed(true, Some(true), TIMER),
+            vec![BootstrapJob],
+        ),
+    ];
+    for (what, old, expected) in cases {
+        assert_eq!(enable_plan(&old), expected, "{what}");
+    }
+}
+
+/// `disable` boots out the timer, waiting for it, before it moves it, then moves the job, and never boots
+/// the job out: a run in flight goes on.
+#[skuld::test]
+fn disable_plan_table() {
+    let cases: Vec<(&str, Old, Vec<Action>)> = vec![
+        (
+            "everything in place and loaded: the timer goes out and to staging, then the job moves",
+            placed(true, Some(true), BOTH),
+            vec![BootoutTimer, MoveTimerToStaging, MoveJobToStaging],
+        ),
+        (
+            "a crash that moved the timer but not the job: the job moves and nothing is booted out",
+            placed(true, Some(false), JOB),
+            vec![MoveJobToStaging],
+        ),
+        (
+            "a crash after the timer went out and before it moved",
+            placed(true, Some(true), JOB),
+            vec![MoveTimerToStaging, MoveJobToStaging],
+        ),
+        (
+            "everything staged: nothing to do",
+            placed(false, Some(false), NOTHING),
+            vec![],
+        ),
+        (
+            "everything staged, the job loaded with a run in flight: it is left alone",
+            placed(false, Some(false), JOB),
+            vec![],
+        ),
+        (
+            "a job without its timer: only the job moves",
+            placed(true, None, JOB),
+            vec![MoveJobToStaging],
+        ),
+        (
+            "a timer label launchd holds with no timer file: it goes out all the same",
+            placed(true, None, BOTH),
+            vec![BootoutTimer, MoveJobToStaging],
+        ),
+        (
+            "a timer loaded from staging goes out and stays there",
+            placed(false, Some(false), BOTH),
+            vec![BootoutTimer],
+        ),
+    ];
+    for (what, old, expected) in cases {
+        assert_eq!(disable_plan(&old), expected, "{what}");
+    }
 }
