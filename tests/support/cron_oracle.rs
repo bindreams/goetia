@@ -1,7 +1,7 @@
-//! A brute-force reading of a cron schedule: the first minute after a moment that the schedule's
-//! resolved fields name, found by looking at every minute in turn with libc's local time and
-//! `goetia::testing::cron_matches`. It shares nothing with a backend's rendering of the schedule, so a
-//! backend's `next_run` is checked against it.
+//! A brute-force reading of a cron schedule: the first minute after a moment (or the latest at or before
+//! it) that the schedule's resolved fields name, found by looking at every minute in turn with libc's
+//! local time and `goetia::testing::cron_matches`. It shares nothing with a backend's rendering of the
+//! schedule, so a backend's `next_run` is checked against it.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +19,17 @@ pub fn next_minute_after(schedule: &Schedule, after: SystemTime) -> SystemTime {
     let mut minute = (secs / MINUTE + 1) * MINUTE;
     while !names(schedule, minute) {
         minute += MINUTE;
+    }
+    UNIX_EPOCH + Duration::from_secs(minute)
+}
+
+/// The latest whole minute at or before `at` that `schedule` names: the mirror of
+/// [`next_minute_after`], and the minute containing `at` counts. The search ends at a match.
+pub fn latest_minute_at_or_before(schedule: &Schedule, at: SystemTime) -> SystemTime {
+    let secs = at.duration_since(UNIX_EPOCH).expect("a time after the epoch").as_secs();
+    let mut minute = secs / MINUTE * MINUTE;
+    while !names(schedule, minute) {
+        minute -= MINUTE;
     }
     UNIX_EPOCH + Duration::from_secs(minute)
 }

@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::Error;
 use goetia::backend::systemd::manager::Systemd;
@@ -337,16 +337,28 @@ fn journalctl_children() -> Vec<u32> {
         .collect()
 }
 
-/// Both ends of a schedule's next minute across a window: a timer armed anywhere in `[before, after]`
-/// reads one of them. `after` is taken once `next_run` has been read, so that a read that comes after
-/// the timer fired (its next run then the occurrence after) is still inside the window.
-fn expected_next_runs(text: &str, id: &Id, before: SystemTime, after: SystemTime) -> [SystemTime; 2] {
+/// What a schedule's `next_run` may read for a timer armed anywhere in `[before, after]`: the next
+/// minute after `before`, the next after `after` (`after` is taken once `next_run` has been read, so a
+/// read that comes after the timer fired is still inside the window), and the latest minute at or
+/// before `before`.
+///
+/// The last is for a lane whose wall clock steps back: systemd computes `NextElapseUSecRealtime` from
+/// its own clock read, which may lie before `before` by less than one cron period (the one assumption:
+/// a step is minutes, not days). If the step crosses a fire time P, systemd correctly reports P, which
+/// is not after `before`. Accepting it loses nothing here. goetia reads the property and does not
+/// compute it. A timer that never fired reads none or the epoch for a wrong property, and a
+/// rendering bug yields a future time from another calendar; both are still caught.
+fn expected_next_runs(text: &str, id: &Id, before: SystemTime, after: SystemTime) -> [SystemTime; 3] {
     let seed = HashSeed {
         hostname: "testing",
         id,
     };
     let schedule = Schedule::parse(text, &seed).expect("a schedule");
-    [before, after].map(|at| cron_oracle::next_minute_after(&schedule, at))
+    [
+        cron_oracle::latest_minute_at_or_before(&schedule, before),
+        cron_oracle::next_minute_after(&schedule, before),
+        cron_oracle::next_minute_after(&schedule, after),
+    ]
 }
 
 fn assert_next_run(status: &TaskStatus, text: &str, id: &Id, before: SystemTime, after: SystemTime) {
@@ -355,6 +367,52 @@ fn assert_next_run(status: &TaskStatus, text: &str, id: &Id, before: SystemTime,
         status.next_run.is_some_and(|next| expected.contains(&next)),
         "`{text}`: next_run {:?}, the cron says {expected:?}",
         status.next_run
+    );
+}
+
+/// The local-time wall clock `year-month-day hour:minute` as a time, as the oracle reads it.
+fn local_time(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> SystemTime {
+    // SAFETY: an all-zero `tm` is a valid value.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_isdst = -1;
+    // SAFETY: `tm` is valid for the call.
+    let secs = unsafe { libc::mktime(&mut tm) };
+    UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).expect("a time after the epoch"))
+}
+
+fn parse_schedule(text: &str) -> Schedule {
+    let id = id_of("oracle-walk");
+    let seed = HashSeed {
+        hostname: "testing",
+        id: &id,
+    };
+    Schedule::parse(text, &seed).expect("a schedule")
+}
+
+/// A minute that matches at `before` is its own latest match, whether `before` is on it or inside it.
+#[skuld::test]
+fn the_latest_minute_at_or_before_includes_the_minute_of_before() {
+    let schedule = parse_schedule("* * * * *");
+    let minute = local_time(2026, 5, 20, 9, 41);
+
+    for before in [minute, minute + Duration::from_secs(25)] {
+        assert_eq!(cron_oracle::latest_minute_at_or_before(&schedule, before), minute);
+    }
+}
+
+/// The walk back crosses months: the 31st at midnight, looked for from mid-April, is 31 March.
+#[skuld::test]
+fn the_latest_minute_at_or_before_walks_back_across_months() {
+    let schedule = parse_schedule("0 0 31 * *");
+
+    assert_eq!(
+        cron_oracle::latest_minute_at_or_before(&schedule, local_time(2026, 4, 15, 12, 0)),
+        local_time(2026, 3, 31, 0, 0)
     );
 }
 
