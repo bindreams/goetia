@@ -39,7 +39,7 @@ pub(crate) fn kill_refused() -> cosca::error::Error {
 }
 
 /// A refused [`Spawned::send_kill_tree`]: a `Containment` over [`kill_refused`], so a report that
-/// prints only the top layer fails the tests.
+/// prints only the top layer fails the tests. Like every fake refusal it carries no OS code.
 pub(crate) fn tree_kill_refused() -> cosca::error::Error {
     cosca::error::Error::Containment {
         detail: "TerminateJobObject could not terminate the job".to_owned(),
