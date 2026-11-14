@@ -12,7 +12,7 @@
 //! substitution there, but not in the executable path; it does in `argv[0]`, so a path holding `$`
 //! is written `@<path> <argv[0]>`), and quotes a bare `;` argument (systemd's
 //! command-line separator). A task's `ExecStart=` runs its command through `sh` instead, so its path
-//! is one more argument ([`render_task_exec_start`]); a control character in a word is written as an
+//! is one more argument (`render_task_exec_start`); a control character in a word is written as an
 //! escape.
 //!
 //! Backslashes are never refused: a quoted word doubles each, and a raw value ending in an odd
@@ -148,7 +148,7 @@ fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
 /// one: no `Restart=`. No `RemainAfterExit=`, so a finished run is `inactive`. No `[Install]`: the
 /// timer, not boot, starts it.
 ///
-/// Its command runs through `sh`, which prints the run's marker first ([`render_task_exec_start`]).
+/// Its command runs through `sh`, which prints the run's marker first (`render_task_exec_start`).
 /// No `LogRateLimit*` line: a per-unit limit does not lift journald's (measured), so it would only
 /// look like a guarantee.
 fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
