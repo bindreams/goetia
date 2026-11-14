@@ -1,7 +1,8 @@
 //! A token that does not hold `SeDebugPrivilege` must come out as "not enabled", never as an error,
 //! so the open that follows speaks for itself. The tests that need a token holding the privilege
-//! (an elevated administrator's, usually) fail without one, naming it; `GOETIA_TEST_DEBUG_PRIVILEGE=0` opts
-//! them out. The elevated `kill` tests in `tests/scm_integration` pin the whole path.
+//! (an elevated administrator's, usually) fail without one, naming it;
+//! `GOETIA_TEST_DEBUG_PRIVILEGE=0` opts them out. The elevated `kill` tests in
+//! `tests/scm_integration` pin the whole path.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
