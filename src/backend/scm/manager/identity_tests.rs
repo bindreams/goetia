@@ -272,7 +272,7 @@ fn process_user_sid() -> Vec<u8> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 
-    let token = open_process_token(TOKEN_QUERY);
+    let token = open_process_token(TOKEN_QUERY).expect("the process token");
     // 8-byte alignment for `TOKEN_USER`, which the buffer holds.
     let mut buf = vec![0u64; 64];
     let mut needed = 0;

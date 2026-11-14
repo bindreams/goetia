@@ -1,5 +1,6 @@
 //! Tokens for tests that act as an unelevated user, and a guard that ends the impersonation. Used by
-//! this module's tests and by `backend::scm::kill::privilege`'s.
+//! this module's tests, `backend::scm::kill::privilege` (its tests and the `SeDebugPrivilege` probe)
+//! and `backend::scm::manager::identity_tests`.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -15,23 +16,21 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::backend::scm::shim::acl::Descriptor;
 use crate::backend::scm::sid::Sid;
+use crate::error::within;
 
 /// This process's token, opened with `access`.
-pub(crate) fn open_process_token(access: u32) -> OwnedHandle {
+pub(crate) fn open_process_token(access: u32) -> io::Result<OwnedHandle> {
     let mut process = std::ptr::null_mut();
     // SAFETY: a pointer to a local; a returned token is owned below.
-    assert_ne!(
-        unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut process) },
-        0,
-        "OpenProcessToken: {}",
-        io::Error::last_os_error()
-    );
+    if unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut process) } == 0 {
+        return Err(within("OpenProcessToken", io::Error::last_os_error()));
+    }
     // SAFETY: a valid handle `OpenProcessToken` just returned and nothing else owns.
-    unsafe { OwnedHandle::from_raw_handle(process) }
+    Ok(unsafe { OwnedHandle::from_raw_handle(process) })
 }
 
 /// This process's token, opened to be copied.
-fn process_token() -> OwnedHandle {
+fn process_token() -> io::Result<OwnedHandle> {
     open_process_token(TOKEN_DUPLICATE | TOKEN_QUERY)
 }
 
@@ -45,34 +44,33 @@ const TOKEN_COPY: &str = "D:(A;;GA;;;WD)";
 
 /// An impersonation copy of `source`, opened with `access`, that the thread impersonating it can open
 /// on any host (see [`TOKEN_COPY`]).
-fn impersonation_copy(source: &OwnedHandle, access: u32) -> OwnedHandle {
-    let permissions = Descriptor::from_sddl(TOKEN_COPY).expect("the permissions of a token copy");
+fn impersonation_copy(source: &OwnedHandle, access: u32) -> io::Result<OwnedHandle> {
+    let permissions = Descriptor::from_sddl(TOKEN_COPY)
+        .map_err(|e| within("the permissions of a token copy", io::Error::other(e)))?;
     let attributes = permissions.attributes();
     let mut copy = std::ptr::null_mut();
     // SAFETY: `source` is a live token handle with `TOKEN_DUPLICATE`; `attributes` points at
     // `permissions`, which is live for the call; `copy` is a local.
-    assert_ne!(
-        unsafe {
-            DuplicateTokenEx(
-                source.as_raw_handle(),
-                access,
-                &attributes,
-                SecurityImpersonation,
-                TokenImpersonation,
-                &mut copy,
-            )
-        },
-        0,
-        "DuplicateTokenEx: {}",
-        io::Error::last_os_error()
-    );
+    let ok = unsafe {
+        DuplicateTokenEx(
+            source.as_raw_handle(),
+            access,
+            &attributes,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut copy,
+        )
+    };
+    if ok == 0 {
+        return Err(within("DuplicateTokenEx", io::Error::last_os_error()));
+    }
     // SAFETY: a valid handle `DuplicateTokenEx` just returned and nothing else owns.
-    unsafe { OwnedHandle::from_raw_handle(copy) }
+    Ok(unsafe { OwnedHandle::from_raw_handle(copy) })
 }
 
 /// An impersonation copy of this process's token, which holds whatever privileges the process does.
-pub(crate) fn process_token_copy(access: u32) -> OwnedHandle {
-    impersonation_copy(&process_token(), access)
+pub(crate) fn process_token_copy(access: u32) -> io::Result<OwnedHandle> {
+    impersonation_copy(&process_token()?, access)
 }
 
 /// An impersonation copy of this process's token, opened with `access`, restricted by `flags` (as
@@ -86,7 +84,7 @@ pub(crate) fn restricted_token_copy(flags: u32, disable: &mut [Sid], access: u32
             Attributes: 0,
         })
         .collect();
-    let process = process_token();
+    let process = process_token().expect("the process token");
     let mut restricted = std::ptr::null_mut();
     // SAFETY: `process` is a live token handle with `TOKEN_DUPLICATE`; `disabled` points at SIDs
     // that live for the call, and is passed as NULL when empty; `restricted` is a local.
@@ -115,7 +113,7 @@ pub(crate) fn restricted_token_copy(flags: u32, disable: &mut [Sid], access: u32
     // SAFETY: a valid handle `CreateRestrictedToken` just returned and nothing else owns.
     let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
     // The restricted token's own handle does not carry the rights `access` asks for.
-    impersonation_copy(&restricted, access)
+    impersonation_copy(&restricted, access).expect("a copy of the restricted token")
 }
 
 /// A copy of this process's token with every privilege removed, as an unelevated user has.
