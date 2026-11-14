@@ -1070,7 +1070,7 @@ fn a_timer_changed_since_it_was_read_is_a_race(#[fixture(systemd_group)] _group:
     );
 }
 
-// A timer the id has none of =========================================================================================
+// A timer the id has none of ==========================================================================================
 
 /// A drop-in of the timer's own, at the id of a task that has no timer.
 fn seed_timer_dropin(id: &str) -> PathBuf {

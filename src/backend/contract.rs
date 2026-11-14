@@ -296,6 +296,8 @@ pub(crate) enum WriteOutcome {
     Raced,
     /// The write found, before changing anything, that something at the id is not the daemon's to
     /// replace, which `read` could not see: `install` ends with this refusal, and re-reads nothing.
+    // systemd's alone, so far.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Refused(crate::decide::Outcome),
 }
 
