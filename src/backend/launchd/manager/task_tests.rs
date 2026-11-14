@@ -269,10 +269,74 @@ fn a_binary_plist_at_the_timer_path_is_foreign() {
     let recovery = foreign(tree.read()).expect("the timer's recovery");
     assert!(recovery.contains(&timer_stem()), "{recovery}");
 
+    // `read` and the verbs say it is foreign; `list` must not lose a task goetia installed, so the
+    // scan reports it as goetia's and unusable, naming the timer's file.
     let scan = tree.scan();
+    assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+    match scan.reported.as_slice() {
+        [entry @ Installed::OursUnusable { name, .. }] => {
+            assert_eq!(name, ID);
+            let reason = entry.unusable_reason().expect("a reason");
+            assert!(reason.contains(&timer_stem()), "{reason}");
+        }
+        other => panic!("one unusable entry expected, got {other:?}"),
+    }
+}
+
+/// A timer file that is a stranger's, beside no job of goetia's, is nothing of goetia's: foreign, and
+/// not listed.
+#[skuld::test]
+fn a_foreign_timer_with_no_job_is_not_goetias_to_list() {
+    let tree = Tree::new();
+    tree.put(true, &timer_stem(), "<plist/>");
+
+    let scan = tree.scan();
+
     assert!(scan.reported.is_empty(), "{:?}", scan.reported);
     assert!(
         matches!(scan.entries.as_slice(), [(name, ScanEntry::Read(ReadOutcome::Foreign { .. }))] if name == ID),
+        "{} entries",
+        scan.entries.len()
+    );
+}
+
+/// A task goetia installed whose timer's name a stranger's file now holds is listed as unusable, in
+/// either directory, with the timer's path in the reason.
+#[skuld::test]
+fn a_task_whose_timer_is_a_strangers_is_listed_unusable() {
+    let task = plists_of(&task_spec(Some("30 3 * * *")));
+    for enabled in [false, true] {
+        let tree = Tree::new();
+        tree.put(false, ID, &task.job);
+        tree.put(enabled, &timer_stem(), "<plist/>");
+
+        let scan = tree.scan();
+
+        assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+        match scan.reported.as_slice() {
+            [entry @ Installed::OursUnusable { name, .. }] => {
+                assert_eq!(name, ID);
+                let path = tree.dir(enabled).join(format!("{}.plist", timer_stem()));
+                let reason = entry.unusable_reason().expect("a reason");
+                assert!(reason.contains(&*path.to_string_lossy()), "{reason}");
+            }
+            other => panic!("one unusable entry expected, got {other:?}"),
+        }
+    }
+}
+
+/// A service beside a stranger's timer-named file is listed as the service it is.
+#[skuld::test]
+fn a_service_beside_a_strangers_timer_is_listed() {
+    let tree = Tree::new();
+    tree.put(false, ID, plists_of(&service_spec()).job);
+    tree.put(false, &timer_stem(), "<plist/>");
+
+    let scan = tree.scan();
+
+    assert!(scan.reported.is_empty(), "{:?}", scan.reported);
+    assert!(
+        matches!(scan.entries.as_slice(), [(name, ScanEntry::Read(ReadOutcome::Marked(_)))] if name == ID),
         "{} entries",
         scan.entries.len()
     );
@@ -559,8 +623,8 @@ fn a_disarmed_task_has_no_next_run() {
     assert_eq!(status.next_run, None);
 }
 
-/// A time zone that cannot be read fails the status, which needs it, and not `task_state`, which `run`
-/// reads before it asks for a run.
+/// `next_run` fails when the time zone it needs cannot be read, and `task_state` makes the one `print`
+/// and nothing else. That `live_status` returns `next_run`'s failure is not shown here.
 #[skuld::test]
 fn a_failing_zone_read_fails_status_but_not_task_state() {
     let timer = timer_of(&task_spec(Some("30 3 * * *")));

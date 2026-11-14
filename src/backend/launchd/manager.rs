@@ -1403,11 +1403,10 @@ impl backend::Backend for Launchd {
     fn start(&self, snapshot: Plist, budget: Budget, reservation: &mut Reservation) -> Result<()> {
         // First, so the wait is counted from the verb's entry (see `verb_deadline`).
         let deadline = verb_deadline(budget);
-        let Plist { id, blob, job, .. } = snapshot;
+        let path = snapshot.job()?.location.path.clone();
+        let Plist { id, blob, .. } = snapshot;
         let id = &id;
         let blob = blob.map_err(Error::Kept)?;
-        // A snapshot whose metadata decoded has a job (see `Plist`).
-        let Artifact { location, .. } = job.expect("a snapshot whose metadata decoded has a job");
         let DaemonSpec::Service(service) = &blob.spec else {
             return Err(backend::cannot_run_tasks("launchd", id));
         };
@@ -1441,12 +1440,7 @@ impl backend::Backend for Launchd {
                 }
             }
         };
-        if !loaded
-            && let Err(e) = self
-                .launchctl
-                .bootstrap(&location.path, issuing, reservation)
-                .map(never_expires)
-        {
+        if !loaded && let Err(e) = self.launchctl.bootstrap(&path, issuing, reservation).map(never_expires) {
             // A concurrent `start` may have loaded it since the check; propagate the error only
             // if the job is not loaded now either.
             if !never_expires(self.launchctl.is_loaded(id.as_str(), issuing, reservation)?) {
@@ -1520,7 +1514,7 @@ impl backend::Backend for Launchd {
             // for as long as launchd takes to remove the job: bounded by `deadline`, it could end
             // with the old job still loaded, `bootstrap` unsent and the daemon left unloaded.
             never_expires(self.launchctl.bootout(id.as_str(), issuing, reservation)?);
-            never_expires(self.launchctl.bootstrap(&location.path, issuing, reservation)?);
+            never_expires(self.launchctl.bootstrap(&path, issuing, reservation)?);
             if self.launchctl.live_state(id.as_str(), issuing, reservation)?.0 != State::Running {
                 // Queued only: see `Evidence`.
                 self.launchctl
@@ -1633,6 +1627,10 @@ fn scan_in(dirs: Dirs) -> Scan<Plist> {
             Ok(Assembled::Unusable { reason, .. }) => reported.push(Installed::OursUnusable {
                 name: id,
                 reason: Reason::said(reason),
+            }),
+            Ok(Assembled::ForeignTimer { recovery }) => reported.push(Installed::OursUnusable {
+                name: id,
+                reason: Reason::said(recovery),
             }),
         }
     }

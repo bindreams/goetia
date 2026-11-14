@@ -916,12 +916,9 @@ fn an_unmarked_plist_in_both_directories_is_not_reported() {
 
     let scan = scanned(staging.path(), enabled.path());
 
-    // `list` omits a foreign entry, so what is observable is that nothing is reported and nothing
-    // is an entry `list` would show.
+    // One foreign entry, as for a single foreign plist; `list` omits it.
     assert!(
-        scan.entries
-            .iter()
-            .all(|(_, entry)| matches!(entry, ScanEntry::Read(ReadOutcome::Foreign { .. }))),
+        matches!(scan.entries.as_slice(), [(name, ScanEntry::Read(ReadOutcome::Foreign { .. }))] if name == "theirs"),
         "{} entries",
         scan.entries.len()
     );

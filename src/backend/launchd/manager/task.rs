@@ -137,6 +137,10 @@ pub(super) enum Assembled {
     /// Goetia's, and not usable (see [`Classified::Unusable`]): `read` makes it a snapshot whose blob is
     /// the reason, which `uninstall` can still act on; `scan` reports the reason.
     Unusable { reason: &'static str, body: Body },
+    /// A task goetia installed, whose timer's name a stranger's file holds. `read` and the verbs call
+    /// the id foreign, with `recovery`; `scan` reports it as goetia's and unusable, for `list` is not
+    /// to lose a task that is installed and may be running.
+    ForeignTimer { recovery: String },
 }
 
 /// What the job at `job` and the timer at `timer()` (asked only where it can change the answer, so
@@ -175,9 +179,16 @@ pub(super) fn assemble(
     Ok(match class {
         Classified::Absent => Assembled::Read(ReadOutcome::Absent),
         Classified::Foreign { timer: false } => Assembled::Read(ReadOutcome::Foreign { recovery: None }),
-        Classified::Foreign { timer: true } => Assembled::Read(ReadOutcome::Foreign {
-            recovery: Some(foreign_timer_recovery(&timer.paths)),
-        }),
+        Classified::Foreign { timer: true } => {
+            let recovery = foreign_timer_recovery(&timer.paths);
+            if matches!(job.slot, Slot::Marked(_)) {
+                Assembled::ForeignTimer { recovery }
+            } else {
+                Assembled::Read(ReadOutcome::Foreign {
+                    recovery: Some(recovery),
+                })
+            }
+        }
         Classified::Marked => {
             let Slot::Marked(blob) = job.slot else {
                 unreachable!("`classify` answers `Marked` for a marked job only");
@@ -204,6 +215,9 @@ pub(super) fn read_in(dirs: super::Dirs, id: &Id) -> Result<ReadOutcome<Plist>> 
     let assembled = assemble(name, locations(name)?, || locations(&timer_label(name))).map_err(single)?;
     Ok(match assembled {
         Assembled::Read(found) => found.named(id, Plist::new),
+        Assembled::ForeignTimer { recovery } => ReadOutcome::Foreign {
+            recovery: Some(recovery),
+        },
         Assembled::Unusable { reason, body } => {
             ReadOutcome::Marked(Plist::new(id.clone(), Err(Arc::new(Error::blob(reason))), body))
         }
