@@ -196,12 +196,29 @@ pub(crate) trait RunHandle: Send + 'static {
 pub(crate) enum OutputSource {
     /// A file the run appends to, from byte `offset`: its length as it was before the run was
     /// requested, so an earlier run's output is not shown. A file that is not there is empty.
-    LogFile { path: PathBuf, offset: u64 },
+    ///
+    /// `marker` is `Some` for a backend whose every run writes a [`Marker`] line first (so that runs
+    /// that share the file are told apart); `None` for one that does not, whose file is shown as it is.
+    LogFile {
+        path: PathBuf,
+        offset: u64,
+        marker: Option<Marker>,
+    },
     /// The lines the task's unit wrote to the system journal.
     #[cfg(target_os = "linux")]
     Journal(crate::backend::systemd::manager::JournalOutput),
     /// The task has no `logs` file, and the manager keeps no output of it that goetia reads.
     None,
+}
+
+/// The line a run writes first to the stream it shares with other runs, by which its own lines are told
+/// from theirs.
+pub(crate) struct Marker {
+    /// What every run's marker line starts with, before a space: a line that starts so, after this
+    /// run's marker, is another run's, and ends this run's output.
+    pub(crate) prefix: &'static str,
+    /// This run's marker line, without its newline.
+    pub(crate) line: String,
 }
 
 /// What a backend whose tasks are not built yet answers [`Backend::begin_run`] with.

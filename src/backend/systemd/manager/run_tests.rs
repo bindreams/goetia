@@ -300,7 +300,11 @@ fn logged_task(path: &Path) -> DaemonSpec {
 
 fn log_source(run: &Run) -> (std::path::PathBuf, u64) {
     match run.output() {
-        OutputSource::LogFile { path, offset } => (path, offset),
+        OutputSource::LogFile { path, offset, marker } => {
+            let marker = marker.expect("a systemd task's runs write a marker to the file too");
+            assert_eq!((marker.prefix, marker.line.as_str()), ("goetia-run", "goetia-run inv"));
+            (path, offset)
+        }
         _ => panic!("a task with `logs` shows its log file"),
     }
 }

@@ -1148,6 +1148,7 @@ impl RunHandle for FakeRun {
             Some((path, offset)) => OutputSource::LogFile {
                 path: path.clone(),
                 offset: *offset,
+                marker: None,
             },
             None => OutputSource::None,
         }

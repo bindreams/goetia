@@ -24,6 +24,9 @@
 //!   output's follower is stopped, the journal is synced, and the rest of the stream is read.
 //! - journald's rate limit can drop the marker. Then, and only after the terminal entry, the sync
 //!   and one more read of the unit's lines, the run shows a note, and its exit is still the run's.
+//! - A task with a `logs` file writes the marker there too, as the first line of each run. The file
+//!   is shown from the length it had before the request, from our marker to the next run's
+//!   ([`OutputSource::LogFile`]'s `marker`), so a run a timer starts right after ours is not shown.
 
 use std::cell::Cell;
 use std::io::Write;
@@ -39,7 +42,7 @@ use super::{Systemd, UnitKind, unit_name};
 use crate::backend::bounded::Reservation;
 use crate::backend::standby::Standby;
 use crate::backend::systemd::generate::RUN_MARKER;
-use crate::backend::{InstalledService as _, OutputSource, RunHandle};
+use crate::backend::{InstalledService as _, Marker, OutputSource, RunHandle};
 use crate::error::{Error, Result};
 use crate::manager::{Exit, output};
 use crate::spec::Id;
@@ -245,12 +248,21 @@ pub(crate) struct Run {
     journal: Arc<dyn Journal>,
 }
 
+/// The marker line the run of `invocation` writes first, which its `sh` wrapper prints.
+fn run_marker(invocation: &str) -> Marker {
+    Marker {
+        prefix: RUN_MARKER,
+        line: format!("{RUN_MARKER} {invocation}"),
+    }
+}
+
 impl RunHandle for Run {
     fn output(&self) -> OutputSource {
         match &self.logs {
             Some((path, offset)) => OutputSource::LogFile {
                 path: path.clone(),
                 offset: *offset,
+                marker: Some(run_marker(&self.invocation)),
             },
             None => {
                 let OutputSpares { draws, watcher } = self
@@ -383,7 +395,7 @@ struct Selection {
 impl Selection {
     fn new(invocation: &str) -> Selection {
         Selection {
-            marker: format!("{RUN_MARKER} {invocation}").into_bytes(),
+            marker: run_marker(invocation).line.into_bytes(),
             found: None,
         }
     }
