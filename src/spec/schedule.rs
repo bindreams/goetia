@@ -100,7 +100,14 @@ impl Schedule {
     /// `seed.id`, naming the field.
     pub fn parse(text: &str, seed: &HashSeed) -> Result<Schedule, Error> {
         let structure = structure(text).map_err(|message| invalid(seed.id, &message))?;
-        let hashes = std::array::from_fn(|position| structure[position].has_hash().then(|| field_hash(seed, position)));
+        // The hash is stored reduced by `hash_modulus`, so equal picks give equal bytes.
+        let hashes = std::array::from_fn(|position| {
+            let field = &structure[position];
+            field.has_hash().then(|| {
+                let hash = field_hash(seed, position);
+                field.hash_modulus().map_or(hash, |modulus| hash % modulus)
+            })
+        });
         let fields = std::array::from_fn(|position| structure[position].resolve(hashes[position].unwrap_or(0)));
         Ok(Schedule {
             text: text.to_owned(),
@@ -135,8 +142,9 @@ impl Schedule {
     /// Rebuilds a schedule from `text` and each field with its stored hash, needing no host name.
     ///
     /// Each field is recomputed from the text's terms and its hash (none for an `H`-free field)
-    /// and must equal the stored one exactly. A field with `H` and no hash, or a hash on an
-    /// `H`-free field, is refused. Every refusal is [`Error::Invalid`] for `id`, naming the field.
+    /// and must equal the stored one exactly. A field with `H` and no hash, a hash on an
+    /// `H`-free field, or a hash its field's moduli would reduce (so a blob has one encoding) is
+    /// refused. Every refusal is [`Error::Invalid`] for `id`, naming the field.
     pub(crate) fn from_parts(
         id: &Id,
         text: String,
@@ -221,6 +229,17 @@ enum Term {
 }
 
 impl Term {
+    /// The number of different picks: `hash` matters here only modulo this. `None` for a fixed term.
+    fn modulus(&self) -> Option<u64> {
+        match self {
+            Term::Fixed(_) => None,
+            Term::Hashed { lo, hi, step } => {
+                let len = u64::from(hi - lo) + 1;
+                Some(step.map_or(len, |step| len.min(u64::from(step))))
+            }
+        }
+    }
+
     /// The values `hash` picks from this term.
     fn values(&self, hash: u64) -> BTreeSet<u8> {
         match self {
@@ -253,6 +272,21 @@ impl ParsedField {
         self.terms.iter().any(|term| matches!(term, Term::Hashed { .. }))
     }
 
+    /// The least common multiple of the `H` terms' moduli: every term's pick depends only on the
+    /// hash modulo it, so on the hash modulo this. `None` when there is no `H` term, or when it
+    /// does not fit `u64`, in which case no reduction applies.
+    fn hash_modulus(&self) -> Option<u64> {
+        let mut lcm: u128 = 1;
+        for modulus in self.terms.iter().filter_map(Term::modulus) {
+            let modulus = u128::from(modulus);
+            lcm = lcm / gcd(lcm, modulus) * modulus;
+            if lcm > u128::from(u64::MAX) {
+                return None;
+            }
+        }
+        (lcm > 1 || self.has_hash()).then(|| u64::try_from(lcm).expect("checked against u64::MAX"))
+    }
+
     /// The field `hash` resolves this one to.
     fn resolve(&self, hash: u64) -> CronField {
         CronField {
@@ -260,6 +294,10 @@ impl ParsedField {
             restricted: self.restricted,
         }
     }
+}
+
+fn gcd(a: u128, b: u128) -> u128 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// Splits `text` into its five fields and reads each field's terms. Messages name the field.
@@ -391,6 +429,11 @@ fn check(parsed: &ParsedField, field: &CronField, hash: Option<u64>) -> Result<(
         (true, None) => return Err("has an `H` term but no hash".to_owned()),
         (false, Some(_)) => return Err("has a hash but no `H` term".to_owned()),
         _ => {}
+    }
+    if let (Some(hash), Some(modulus)) = (hash, parsed.hash_modulus())
+        && hash >= modulus
+    {
+        return Err(format!("has hash {hash}, which is not reduced below {modulus}"));
     }
     let expected = parsed.resolve(hash.unwrap_or(0));
     if *field != expected {

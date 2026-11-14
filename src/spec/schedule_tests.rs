@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::{CronField, DayRule, HashSeed, Schedule};
+use super::{CronField, DayRule, HashSeed, Schedule, field_hash};
 use crate::error::Error;
 use crate::spec::Id;
 
@@ -375,7 +375,6 @@ fn schedules_with_the_same_picks_are_equal_whatever_the_hash() {
         parse_for("nightly", "host0", "H(0-1) * * * *").unwrap(),
         parse_for("nightly", "host1", "H(0-1) * * * *").unwrap(),
     );
-    assert_ne!(a.hashes(), b.hashes());
     assert_eq!(a.fields(), b.fields());
     assert_eq!(a, b);
 
@@ -435,6 +434,9 @@ fn from_parts_refuses_what_parse_cannot_give() {
         ("H,H * * * *", 0, vec![3, 40], true, hash),
         ("5,H(10-20) * * * *", 0, vec![12], true, hash),
         ("5,H(10-20) * * * *", 0, vec![5], true, hash),
+        // a hash its field's moduli would reduce: one blob, one encoding
+        ("H * * * *", 0, vec![13], true, hash.map(|h| h + 60)),
+        ("H(0-1) * * * *", 0, vec![0], true, Some(2)),
         // a hash that picks otherwise
         ("H * * * *", 0, vec![13], true, Some(1)),
         // an H field needs its hash, an H-free one has none
@@ -462,6 +464,49 @@ fn from_parts_refuses_what_parse_cannot_give() {
             "{case} must name its field: {message}"
         );
     }
+}
+
+#[skuld::test]
+fn a_stored_hash_is_reduced_by_its_fields_moduli() {
+    let seed_id = id("nightly");
+    let seed = HashSeed {
+        hostname: HOST,
+        id: &seed_id,
+    };
+    let hashes = |text: &str| *parse(text).hashes();
+    // Bare `H`: minute 60, hour 24; `H(0-1)`: 2; the least common multiple of 2 and 3 for a list.
+    assert_eq!(
+        hashes("H H * * *"),
+        [
+            Some(field_hash(&seed, 0) % 60),
+            Some(field_hash(&seed, 1) % 24),
+            None,
+            None,
+            None
+        ]
+    );
+    assert_eq!(hashes("H(0-1) * * * *")[0], Some(field_hash(&seed, 0) % 2));
+    assert_eq!(hashes("H(0-1),H(0-2) * * * *")[0], Some(field_hash(&seed, 0) % 6));
+    assert_eq!(hashes("H(0-3)/2,H(0-5)/4 * * * *")[0], Some(field_hash(&seed, 0) % 4));
+}
+
+#[skuld::test]
+fn a_hash_is_stored_whole_when_its_moduli_overflow_u64() {
+    // 59, 58, ... 23: their least common multiple is above `u64::MAX`.
+    let terms: Vec<String> = [59, 58, 57, 55, 53, 49, 47, 43, 41, 37, 31, 23]
+        .iter()
+        .map(|m| format!("H(0-{})", m - 1))
+        .collect();
+    let text = format!("{} * * * *", terms.join(","));
+    let seed_id = id("nightly");
+    let seed = HashSeed {
+        hostname: HOST,
+        id: &seed_id,
+    };
+    let parsed = parse(&text);
+    assert_eq!(parsed.hashes()[0], Some(field_hash(&seed, 0)));
+    let rebuilt = Schedule::from_parts(&seed_id, text, parts(&parsed)).unwrap();
+    assert_eq!(rebuilt, parsed);
 }
 
 #[skuld::test]

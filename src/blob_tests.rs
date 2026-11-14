@@ -128,17 +128,13 @@ fn encode_decode_round_trips() {
 const GOLDEN_HOST: &str = "build-host";
 
 fn task_with(schedule: Option<&str>) -> DaemonSpec {
+    task_on(GOLDEN_HOST, schedule)
+}
+
+/// A task whose `H` resolves for `hostname`.
+fn task_on(hostname: &str, schedule: Option<&str>) -> DaemonSpec {
     let id = Id::try_from("nightly").unwrap();
-    let schedule = schedule.map(|text| {
-        Schedule::parse(
-            text,
-            &HashSeed {
-                hostname: GOLDEN_HOST,
-                id: &id,
-            },
-        )
-        .unwrap()
-    });
+    let schedule = schedule.map(|text| Schedule::parse(text, &HashSeed { hostname, id: &id }).unwrap());
     TaskSpec::new(TaskFields {
         common: DaemonFields {
             id,
@@ -176,15 +172,27 @@ fn task_blob_golden() {
 
 #[skuld::test]
 fn task_blob_with_h_golden() {
-    // `build-host`, `nightly`: minute hash mod 60 = 13, hour hash mod 24 = 2 (the vectors in the spec).
+    // `build-host`, `nightly`: minute hash mod 60 = 13, hour hash mod 24 = 2 (the vectors in the spec); the
+    // blob stores each hash reduced by its field's moduli, here 60 and 24.
     let program = serde_json::to_string(&program("backup")).unwrap();
     let expected = format!(
-        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"hash":7538705722102554794,"restricted":true,"values":[2]}},"minute":{{"hash":12459716714857138573,"restricted":true,"values":[13]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"H H * * *"}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
+        r#"{{"schema":1,"spec":{{"command":[{program}],"cwd":null,"env":{{}},"id":"nightly","logs":null,"name":"Nightly","schedule":{{"day_of_month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]}},"day_of_week":{{"restricted":false,"values":[0,1,2,3,4,5,6]}},"hour":{{"hash":2,"restricted":true,"values":[2]}},"minute":{{"hash":13,"restricted":true,"values":[13]}},"month":{{"restricted":false,"values":[1,2,3,4,5,6,7,8,9,10,11,12]}},"text":"H H * * *"}},"type":"task","user":{{"kind":"root"}}}},"version":"0.1.0"}}"#
     );
     let spec = task_with(Some("H H * * *"));
 
     assert_eq!(encode_with_version(&spec, "0.1.0"), BASE64.encode(expected));
     assert_eq!(decode(&encode(&spec)).unwrap().spec, spec);
+}
+
+#[skuld::test]
+fn equal_picks_encode_to_equal_bytes() {
+    // `host0` and `host1` hash differently and both pick 0 of `H(0-1)`.
+    let (a, b) = (
+        task_on("host0", Some("H(0-1) * * * *")),
+        task_on("host1", Some("H(0-1) * * * *")),
+    );
+    assert_eq!(a, b);
+    assert_eq!(encode(&a), encode(&b));
 }
 
 #[skuld::test]
