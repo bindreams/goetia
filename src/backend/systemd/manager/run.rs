@@ -26,7 +26,9 @@
 //!   and one more read of the unit's lines, the run shows a note, and its exit is still the run's.
 //! - A task with a `logs` file writes the marker there too, as the first line of each run. The file
 //!   is shown from the length it had before the request, from our marker to the next run's
-//!   ([`OutputSource::LogFile`]'s `marker`), so a run a timer starts right after ours is not shown.
+//!   ([`OutputSource::LogFile`]'s `marker`), so a run a timer starts right after ours is not shown. A
+//!   request that joined a run begun before that length was measured has its marker earlier: once the
+//!   run has ended the file is searched again from byte 0 for it.
 
 use std::cell::Cell;
 use std::io::Write;

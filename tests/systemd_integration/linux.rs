@@ -192,7 +192,7 @@ fn find_ours(installed: Vec<Installed>, id: &str) -> Option<DaemonSpec> {
     })
 }
 
-fn mkfifo(path: &Path) {
+pub(crate) fn mkfifo(path: &Path) {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a unit path with no NUL");
     // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
     let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
@@ -227,7 +227,7 @@ fn uid_of(account: &str) -> u32 {
 /// directory (`/etc/systemd`, `/run/systemd`), shared by every test that runs concurrently, so no
 /// test creates it or removes it. `create_dir` answers `AlreadyExists` for
 /// a root that was there first, so ownership is not a check followed by a create.
-fn create_root(root: &Path) -> CreatedRoot {
+pub(crate) fn create_root(root: &Path) -> CreatedRoot {
     support::require_system_dir(root.parent().expect("a search root has a parent"));
     match fs::create_dir(root) {
         Ok(()) => CreatedRoot(Some(root.to_path_buf())),
@@ -240,7 +240,7 @@ fn create_root(root: &Path) -> CreatedRoot {
 /// expected, not a failure: a directory systemd itself populated for some other unit is left as it
 /// was found.
 #[derive(Default)]
-struct CreatedRoot(Option<PathBuf>);
+pub(crate) struct CreatedRoot(Option<PathBuf>);
 
 impl Drop for CreatedRoot {
     fn drop(&mut self) {
@@ -317,6 +317,15 @@ fn systemd_passes_conformance(#[fixture(systemd_group)] _group: &Group) {
     let _undetermined_seed = seed_unreadable_dropin_enotdir(conformance::UNDETERMINED_ID);
 
     conformance::run(&mgr, &mk);
+}
+
+/// `UNIT_DIR_EXCLUSIVE`: like [`systemd_passes_conformance`], it installs units in the shared
+/// `/etc/systemd/system` for its whole length. Every id it uses is fresh and removed by `run_tasks`.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn systemd_passes_task_conformance(#[fixture(systemd_group)] _group: &Group) {
+    conformance::run_tasks(&Systemd::new(), &|id, schedule| {
+        goetia::testing::task(id, vec!["/bin/true".to_string()], schedule)
+    });
 }
 
 // Step 2: scenarios for each correctness property =====================================================================
@@ -2445,18 +2454,18 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
 
 // Tasks ===============================================================================================================
 
-fn timer_path(id: &str) -> PathBuf {
+pub(crate) fn timer_path(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.timer"))
 }
 
-fn timer_wants_symlink(id: &str) -> PathBuf {
+pub(crate) fn timer_wants_symlink(id: &str) -> PathBuf {
     PathBuf::from(support::SYSTEMD_UNIT_DIR)
         .join("timers.target.wants")
         .join(format!("{id}.timer"))
 }
 
 /// A task that exits with `code` the moment it starts, and runs daily at 03:30.
-fn exiting(id: &str, code: i32) -> DaemonSpec {
+pub(crate) fn exiting(id: &str, code: i32) -> DaemonSpec {
     goetia::testing::task(
         id,
         vec!["/bin/sh".to_string(), "-c".to_string(), format!("exit {code}")],
@@ -2464,7 +2473,7 @@ fn exiting(id: &str, code: i32) -> DaemonSpec {
     )
 }
 
-fn task_status(mgr: &Systemd, id: &Id) -> TaskStatus {
+pub(crate) fn task_status(mgr: &Systemd, id: &Id) -> TaskStatus {
     match mgr.status(id).expect("status") {
         Status::Task(status) => status,
         other => panic!("a task's status is a task's: {other:?}"),

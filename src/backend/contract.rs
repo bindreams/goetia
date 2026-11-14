@@ -199,6 +199,9 @@ pub(crate) enum OutputSource {
     ///
     /// `marker` is `Some` for a backend whose every run writes a [`Marker`] line first (so that runs
     /// that share the file are told apart); `None` for one that does not, whose file is shown as it is.
+    /// A run whose marker is not after `offset` (the request joined a run a timer began before the
+    /// length was measured) is looked for once more from byte 0 when it has ended, so `offset` does not
+    /// hide its output.
     LogFile {
         path: PathBuf,
         offset: u64,

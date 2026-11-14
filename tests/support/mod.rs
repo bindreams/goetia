@@ -9,6 +9,8 @@
 
 pub mod cmd;
 pub mod connect_back;
+#[cfg(unix)]
+pub mod cron_oracle;
 pub mod kill;
 pub mod list_json;
 #[cfg(windows)]
