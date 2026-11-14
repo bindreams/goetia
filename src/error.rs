@@ -772,14 +772,7 @@ impl Error {
         }
     }
 
-    /// The first OS error code found in this error, depth first: an `io::Error`'s own code, then
-    /// for a [`Both`](Error::Both) its first half and then its second, for a [`Kept`](Error::Kept)
-    /// the error it holds, and otherwise the [`source`](std::error::Error::source) chain and then
-    /// the error the message embeds when that error is the cause.
-    ///
-    /// Not found: an embedded error that is not the cause; anything `source()` does not return (a
-    /// `cosca` list's later members, a `MembersLeft`'s `others`, a `MayHaveStarted`'s `cleanup`,
-    /// and the error inside an `io::Error` made with `io::Error::other` or `io::Error::new`).
+    /// The first OS error code this error carries; the search order is `report::os_error_in`'s.
     pub fn raw_os_error(&self) -> Option<i32> {
         report::os_error_in(self)
     }
