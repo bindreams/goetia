@@ -1277,8 +1277,10 @@ fn a_failing_stream_still_waits_for_the_run() {
     );
 }
 
+/// Both failed: the exit could not be established and the output could not be shown. Neither hides the
+/// other.
 #[skuld::test]
-fn the_waits_error_wins_over_the_streams() {
+fn a_wait_error_and_a_stream_error_are_both_returned() {
     let fake = Fake::new();
     fake.install(&a_task("nightly"), false).unwrap();
     fake.seed_run_wait_fails("nightly", || Error::RunUnrecorded {
@@ -1288,11 +1290,12 @@ fn the_waits_error_wins_over_the_streams() {
 
     let result = fake.run(&Id::try_from("nightly").unwrap(), &mut Refuses);
 
-    let e = result.expect_err("the exit status is the more basic fact");
-    assert_eq!(
-        e.to_string(),
-        "the run of `nightly` ended without recording its exit status: no record (seeded)"
-    );
+    let e = result.expect_err("neither the exit nor the output");
+    let Error::Both { first, then } = &e else {
+        panic!("{e:?}")
+    };
+    assert!(matches!(**first, Error::RunUnrecorded { .. }), "{first:?}");
+    assert!(then.report().to_string().contains("sink refused"), "{}", then.report());
 }
 
 #[skuld::test]
