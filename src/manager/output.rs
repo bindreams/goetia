@@ -118,14 +118,17 @@ fn read_new(path: &Path, mut position: u64, mut marked: Option<&mut Marked>, out
 /// line and before the next marker line of any run. A line is judged whole, so one written in pieces
 /// waits for its end.
 ///
-/// A line the program itself prints that starts as a marker does (`<prefix> `) ends the run's output
-/// there: that is the program's own action, and is not guarded.
+/// A line the program itself prints that starts or ends as a marker does ([`Marked::split`]) ends the
+/// run's output there: that is the program's own action, and is not guarded.
 struct Marked {
     marker: Marker,
     phase: Phase,
     /// The start of a line not yet whole.
     pending: Vec<u8>,
 }
+
+/// The digits of an `INVOCATION_ID`: a 128-bit id as 32 lowercase hex digits (`sd_id128_to_string`).
+const INVOCATION_ID_DIGITS: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -157,24 +160,63 @@ impl Marked {
                 return;
             };
             let line: Vec<u8> = self.pending.drain(..=end).collect();
-            self.line(&line[..end], &line, shown);
+            self.line(&line[..end], true, shown);
         }
         self.pending.clear();
     }
 
-    /// One line: `text` without its newline, `whole` with it.
-    fn line(&mut self, text: &[u8], whole: &[u8], shown: &mut Vec<u8>) {
+    /// One line, `text` without its newline; `terminated` is whether it had one.
+    ///
+    /// A run whose last line has no newline leaves the next run's marker at the end of that line, so
+    /// [`Marked::split`] may find one there: what is before it is the earlier run's last line.
+    fn line(&mut self, text: &[u8], terminated: bool, shown: &mut Vec<u8>) {
+        let (before, marker) = self.split(text);
         match self.phase {
-            Phase::Seeking if text == self.marker.line.as_bytes() => self.phase = Phase::Ours,
+            Phase::Seeking if marker == Some(self.marker.line.as_bytes()) => self.phase = Phase::Ours,
             Phase::Seeking | Phase::Over => {}
-            Phase::Ours if self.is_a_marker(text) => self.phase = Phase::Over,
-            Phase::Ours => shown.extend_from_slice(whole),
+            Phase::Ours => match marker {
+                Some(_) => {
+                    // The run's last line, which a newline did not end.
+                    if !before.is_empty() {
+                        shown.extend_from_slice(before);
+                        shown.push(b'\n');
+                    }
+                    self.phase = Phase::Over;
+                }
+                None => {
+                    shown.extend_from_slice(text);
+                    if terminated {
+                        shown.push(b'\n');
+                    }
+                }
+            },
         }
     }
 
-    fn is_a_marker(&self, text: &[u8]) -> bool {
-        text.strip_prefix(self.marker.prefix.as_bytes())
+    /// `text` as what is before a marker, and the marker, when it holds one: a line that starts with
+    /// `<prefix> ` (whatever follows), or a line that ends with the prefix, a space and 32 lowercase
+    /// hex digits, the form of an `INVOCATION_ID` (what is before that is the run before's last line,
+    /// which had no newline). A program that prints such text itself has done it itself: it is not
+    /// guarded.
+    fn split<'a>(&self, text: &'a [u8]) -> (&'a [u8], Option<&'a [u8]>) {
+        let prefix = self.marker.prefix.as_bytes();
+        if text
+            .strip_prefix(prefix)
             .is_some_and(|rest| rest.first() == Some(&b' '))
+        {
+            return (&[], Some(text));
+        }
+        let length = prefix.len() + 1 + INVOCATION_ID_DIGITS;
+        let Some(start) = text.len().checked_sub(length) else {
+            return (text, None);
+        };
+        let (before, tail) = text.split_at(start);
+        let glued = tail.starts_with(prefix)
+            && tail[prefix.len()] == b' '
+            && tail[prefix.len() + 1..]
+                .iter()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if glued { (before, Some(tail)) } else { (text, None) }
     }
 
     /// The file was emptied: what was read of it is gone, and the state stays.
@@ -188,7 +230,7 @@ impl Marked {
         let rest = std::mem::take(&mut self.pending);
         let mut shown = Vec::new();
         if !rest.is_empty() {
-            self.line(&rest, &rest, &mut shown);
+            self.line(&rest, false, &mut shown);
         }
         if !shown.is_empty() {
             show(out, &shown)?;

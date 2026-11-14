@@ -411,6 +411,99 @@ fn a_truncated_marked_file_goes_on_with_the_state_it_was_in() {
     streaming.ends().unwrap();
 }
 
+// Glued markers -------------------------------------------------------------------------------------------------------
+//
+// A run whose last line has no newline leaves the next run's marker on that line: `partialgoetia-run <id>`.
+// A marker that ends a line as `goetia-run ` and 32 lowercase hex digits (an `INVOCATION_ID`) is split off.
+
+const RUN_A: &str = "0123456789abcdef0123456789abcdef";
+const RUN_B: &str = "fedcba9876543210fedcba9876543210";
+
+/// Our run's last line has no newline, and the next run's marker follows it on the same line: our line
+/// is shown, ended with a newline, and the next run's lines are not.
+#[skuld::test]
+fn our_unterminated_last_line_is_shown_when_the_next_marker_is_glued_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(&path, &format!("goetia-run {RUN_A}\n1\nlastgoetia-run {RUN_B}\nb1\nb2"));
+
+    let (result, out) = streamed_after_the_end(marked(path, 0, RUN_A));
+
+    result.unwrap();
+    assert_eq!(out, "1\nlast\n");
+}
+
+/// The run before ours left no newline: our marker is on its last line, and our output starts after it.
+#[skuld::test]
+fn our_marker_glued_to_the_previous_runs_last_line_starts_our_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(
+        &path,
+        &format!("goetia-run {RUN_B}\nb1\nb lastgoetia-run {RUN_A}\n1\n2\n"),
+    );
+
+    let (result, out) = streamed_after_the_end(marked(path, 0, RUN_A));
+
+    result.unwrap();
+    assert_eq!(out, "1\n2\n");
+}
+
+/// While the run lasts the unterminated line waits for its end, and is shown when the next marker
+/// ends it.
+#[skuld::test]
+fn a_glued_marker_ends_the_output_while_the_run_lasts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(&path, "");
+    let mut streaming = Streaming::start(marked(path.clone(), 0, RUN_A));
+
+    append(&path, &format!("goetia-run {RUN_A}\n1\nlast"));
+    streaming.shows("1\n");
+    append(&path, &format!("goetia-run {RUN_B}\nb1\n"));
+    streaming.shows("1\nlast\n");
+    let (result, out) = streaming.ends_with_output();
+
+    result.unwrap();
+    assert_eq!(out, "1\nlast\n");
+}
+
+/// The glued marker is the file's last bytes, with no newline of its own yet.
+#[skuld::test]
+fn a_glued_marker_at_the_end_of_the_file_ends_the_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(&path, &format!("goetia-run {RUN_A}\n1\nlastgoetia-run {RUN_B}"));
+
+    let (result, out) = streamed_after_the_end(marked(path, 0, RUN_A));
+
+    result.unwrap();
+    assert_eq!(out, "1\nlast\n");
+}
+
+/// Only a marker of the form an `INVOCATION_ID` makes is split off a line: the same words with fewer
+/// digits, or with capitals, are the program's output. A program that prints a line that does end so
+/// has done it itself, which is not guarded.
+#[skuld::test]
+fn text_that_only_resembles_a_glued_marker_is_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    let short = &RUN_B[1..];
+    let upper = RUN_B.to_uppercase();
+    append(
+        &path,
+        &format!("goetia-run {RUN_A}\nsee goetia-run {short}\nsee goetia-run {upper}\nsee goetia-run\n"),
+    );
+
+    let (result, out) = streamed_after_the_end(marked(path, 0, RUN_A));
+
+    result.unwrap();
+    assert_eq!(
+        out,
+        format!("see goetia-run {short}\nsee goetia-run {upper}\nsee goetia-run\n")
+    );
+}
+
 // None ================================================================================================================
 
 #[skuld::test]
