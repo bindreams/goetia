@@ -16,7 +16,7 @@ use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
+use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status, TaskStatus, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
 use goetia::testing::service_fields;
 
@@ -43,7 +43,7 @@ pub(crate) fn mk(id: &str) -> DaemonSpec {
     .unwrap()
 }
 
-/// Bytes goetia never writes: `generate::unit` emits UTF-8 ini and nothing else, so a fragment that
+/// Bytes goetia never writes: `generate::units` emits UTF-8 ini and nothing else, so a fragment that
 /// will not decode is positively not goetia's — foreign, and omitted from `list` exactly like an
 /// unmarked one. The systemd twin of `tests/launchd_integration/launchd.rs`'s `NON_UTF8_PLIST`,
 /// and the reason those two backends now answer one question one way.
@@ -192,7 +192,7 @@ fn find_ours(installed: Vec<Installed>, id: &str) -> Option<DaemonSpec> {
     })
 }
 
-fn mkfifo(path: &Path) {
+pub(crate) fn mkfifo(path: &Path) {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a unit path with no NUL");
     // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
     let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
@@ -227,7 +227,7 @@ fn uid_of(account: &str) -> u32 {
 /// directory (`/etc/systemd`, `/run/systemd`), shared by every test that runs concurrently, so no
 /// test creates it or removes it. `create_dir` answers `AlreadyExists` for
 /// a root that was there first, so ownership is not a check followed by a create.
-fn create_root(root: &Path) -> CreatedRoot {
+pub(crate) fn create_root(root: &Path) -> CreatedRoot {
     support::require_system_dir(root.parent().expect("a search root has a parent"));
     match fs::create_dir(root) {
         Ok(()) => CreatedRoot(Some(root.to_path_buf())),
@@ -240,7 +240,7 @@ fn create_root(root: &Path) -> CreatedRoot {
 /// expected, not a failure: a directory systemd itself populated for some other unit is left as it
 /// was found.
 #[derive(Default)]
-struct CreatedRoot(Option<PathBuf>);
+pub(crate) struct CreatedRoot(Option<PathBuf>);
 
 impl Drop for CreatedRoot {
     fn drop(&mut self) {
@@ -317,6 +317,15 @@ fn systemd_passes_conformance(#[fixture(systemd_group)] _group: &Group) {
     let _undetermined_seed = seed_unreadable_dropin_enotdir(conformance::UNDETERMINED_ID);
 
     conformance::run(&mgr, &mk);
+}
+
+/// `UNIT_DIR_EXCLUSIVE`: like [`systemd_passes_conformance`], it installs units in the shared
+/// `/etc/systemd/system` for its whole length. Every id it uses is fresh and removed by `run_tasks`.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn systemd_passes_task_conformance(#[fixture(systemd_group)] _group: &Group) {
+    conformance::run_tasks(&Systemd::new(), &|id, schedule| {
+        goetia::testing::task(id, vec!["/bin/true".to_string()], schedule)
+    });
 }
 
 // Step 2: scenarios for each correctness property =====================================================================
@@ -694,7 +703,9 @@ fn a_start_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _gr
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let result = mgr.start(&spec.common().id, Budget::Bounded(Duration::from_nanos(1)));
+    let result = mgr
+        .start(&spec.common().id, Budget::Bounded(Duration::from_nanos(1)))
+        .map(drop);
 
     assert!(
         matches!(
@@ -1501,7 +1512,9 @@ fn list_reports_a_sid_account_as_ours_unusable(#[fixture(systemd_group)] _group:
     let mut spec = service_fields(mk(guard.id()));
     spec.common.user = User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string()));
     let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
-    let text = generate::unit(&spec, &Identity { user: "0".to_string() }).unwrap();
+    let text = generate::units(&spec, &Identity { user: "0".to_string() })
+        .unwrap()
+        .service;
     fs::write(unit_path(guard.id()), text).expect("seed a unit whose spec names a SID");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
 
@@ -2424,6 +2437,11 @@ fn list_does_not_hang_on_a_fifo_in_the_unit_directory(#[fixture(systemd_group)] 
 /// it has none of `sudo`'s `requiretty`/PAM-session pitfalls when spawned from
 /// a test process with no controlling terminal.
 fn run_unelevated(args: &[&str]) -> std::process::Output {
+    run_as("nobody", args)
+}
+
+/// [`run_unelevated`] as the account `account`.
+pub(crate) fn run_as(account: &str, args: &[&str]) -> std::process::Output {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // Per call, not per process: three tests stage a binary now, and skuld runs them concurrently —
     // two sharing one path would have each `remove_file` the copy the other was still executing.
@@ -2433,10 +2451,151 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
     fs::copy(env!("CARGO_BIN_EXE_goetia"), &staged).expect("stage the binary somewhere traversable");
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
 
-    let mut argv = vec!["-u", "nobody", "--", staged.to_str().expect("utf-8 temp path")];
+    let mut argv = vec!["-u", account, "--", staged.to_str().expect("utf-8 temp path")];
     argv.extend_from_slice(args);
-    Command::new("runuser")
-        .args(&argv)
-        .output()
-        .expect("spawn runuser -u nobody")
+    Command::new("runuser").args(&argv).output().expect("spawn runuser")
+}
+
+// Tasks ===============================================================================================================
+
+pub(crate) fn timer_path(id: &str) -> PathBuf {
+    PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.timer"))
+}
+
+pub(crate) fn timer_wants_symlink(id: &str) -> PathBuf {
+    PathBuf::from(support::SYSTEMD_UNIT_DIR)
+        .join("timers.target.wants")
+        .join(format!("{id}.timer"))
+}
+
+/// A task that exits with `code` the moment it starts, and runs daily at 03:30.
+pub(crate) fn exiting(id: &str, code: i32) -> DaemonSpec {
+    goetia::testing::task(
+        id,
+        vec!["/bin/sh".to_string(), "-c".to_string(), format!("exit {code}")],
+        Some("30 3 * * *"),
+    )
+}
+
+pub(crate) fn task_status(mgr: &Systemd, id: &Id) -> TaskStatus {
+    match mgr.status(id).expect("status") {
+        Status::Task(status) => status,
+        other => panic!("a task's status is a task's: {other:?}"),
+    }
+}
+
+/// The whole life of a task against the real manager: installed idle and unarmed, enabled (its
+/// timer armed, its own unit never enabled), run to its end (read back from the journal), disabled,
+/// and uninstalled with nothing left behind.
+#[skuld::test]
+fn a_task_is_installed_armed_run_reported_and_uninstalled(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = exiting(&id, 3);
+    let task_id = spec.common().id.clone();
+    let mgr = Systemd::new();
+
+    let outcome = mgr.install(&spec, false).expect("install");
+    assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
+    assert!(unit_path(&id).exists() && timer_path(&id).exists());
+    let status = task_status(&mgr, &task_id);
+    assert_eq!(status.common.state, State::Idle, "{status:?}");
+    assert!(!status.common.enabled, "install never enables: {status:?}");
+    assert_eq!(status.next_run, None, "{status:?}");
+    assert_eq!((status.last_run, status.last_result), (None, None), "{status:?}");
+    assert!(
+        matches!(mgr.install(&spec, false), Ok(Outcome::UpToDate)),
+        "a task that was just installed is up to date"
+    );
+
+    mgr.enable(&task_id).expect("enable");
+    let status = task_status(&mgr, &task_id);
+    assert!(status.common.enabled, "{status:?}");
+    assert!(
+        status.next_run.is_some(),
+        "an armed timer has a next elapse: {status:?}"
+    );
+    assert!(
+        timer_wants_symlink(&id).exists(),
+        "the timer is linked into timers.target"
+    );
+    assert!(
+        fs::symlink_metadata(wants_symlink(&id)).is_err(),
+        "the task's own unit is never enabled"
+    );
+
+    // `systemctl start` of a oneshot returns when its program has exited, so this waits on the run.
+    let run = cmd::run("systemctl", &["start", &format!("{id}.service")]);
+    assert!(!run.ok(), "the run exits 3, which fails the start: {run}");
+    cmd::run("journalctl", &["--sync"]).expect_ok();
+    let status = task_status(&mgr, &task_id);
+    assert_eq!(
+        status.common.state,
+        State::Idle,
+        "a failed run is a result, not a state: {status:?}"
+    );
+    assert_eq!(status.last_result, Some(Exit::Code(3)), "{status:?}");
+    assert!(status.last_run.is_some(), "{status:?}");
+    assert!(
+        status.common.enabled && status.next_run.is_some(),
+        "the run left the schedule armed: {status:?}"
+    );
+
+    mgr.disable(&task_id).expect("disable");
+    let status = task_status(&mgr, &task_id);
+    assert!(!status.common.enabled, "{status:?}");
+    assert_eq!(status.next_run, None, "{status:?}");
+    assert!(!timer_wants_symlink(&id).exists());
+
+    mgr.enable(&task_id).expect("enable again");
+    mgr.uninstall(&task_id).expect("uninstall");
+    assert!(!unit_path(&id).exists(), "the job must be gone");
+    assert!(!timer_path(&id).exists(), "the timer must be gone");
+    assert!(
+        fs::symlink_metadata(timer_wants_symlink(&id)).is_err(),
+        "the timer's `.wants` symlink must be gone"
+    );
+}
+
+/// A service that becomes a task must not keep the boot link that would run the task at every boot,
+/// and a task that becomes a service must not keep its timer.
+#[skuld::test]
+fn a_retyped_daemon_keeps_nothing_of_the_old_kind_that_still_acts(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let service = mk(&id);
+    let task = exiting(&id, 0);
+    let daemon_id = service.common().id.clone();
+    let mgr = Systemd::new();
+    mgr.install(&service, false).expect("install the service");
+    mgr.enable(&daemon_id).expect("enable the service");
+    assert!(
+        fs::symlink_metadata(wants_symlink(&id)).is_ok(),
+        "the service is enrolled at boot"
+    );
+
+    let outcome = mgr.install(&task, false).expect("install the task over the service");
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert!(
+        fs::symlink_metadata(wants_symlink(&id)).is_err(),
+        "the old boot link would run the task at every boot"
+    );
+    assert!(timer_path(&id).exists());
+    let status = task_status(&mgr, &daemon_id);
+    assert!(!status.common.enabled, "a retype drops arming: {status:?}");
+
+    mgr.enable(&daemon_id).expect("enable the task");
+    assert!(timer_wants_symlink(&id).exists());
+
+    let outcome = mgr.install(&service, false).expect("install the service over the task");
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert!(!timer_path(&id).exists(), "the timer would start a service's job");
+    assert!(
+        fs::symlink_metadata(timer_wants_symlink(&id)).is_err(),
+        "the timer's link is gone with it"
+    );
+    let active = cmd::run("systemctl", &["is-active", &format!("{id}.timer")]);
+    assert!(!active.ok(), "the timer is not running: {active}");
 }

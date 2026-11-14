@@ -1,18 +1,19 @@
-//! The flows every [`Backend`] shares: `install`, `preview`, `status`, `list` and the ownership
-//! gate, written once over the backend's primitives.
+//! The flows every [`Backend`] shares: `install`, `preview`, `status`, `list`, `run` and the
+//! ownership gate, written once over the backend's primitives.
 //!
 //! [`crate::backend::Backend`]'s blanket [`ServiceManager`](crate::manager::ServiceManager) impl
 //! calls these. [`crate::decide::decide`] is reached only from here, so no backend can restate a
 //! row of the install policy.
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::backend::{Backend, InstalledService, ReadOutcome, ScanEntry, WriteOutcome};
+use crate::backend::{Backend, InstalledService, ReadOutcome, RunHandle, ScanEntry, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
 use crate::error::{Error, Reason, Result};
-use crate::manager::{Budget, Installed, Status, Step};
-use crate::spec::{DaemonSpec, Id};
+use crate::manager::{Budget, Exit, Installed, State, Status, Step, output};
+use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 // Ownership ===========================================================================================================
 
@@ -145,6 +146,25 @@ pub(crate) fn reserved<B: Backend>(b: &B, id: &Id, steps: &[Step], budget: Budge
     })
 }
 
+/// What [`require_armable`] refuses a task with: `install --enable` says the same before it writes.
+pub(crate) const NOTHING_TO_ARM: &str =
+    "`schedule` is missing, so there is nothing to arm: `enable` applies to a task with a schedule";
+
+/// A task's `enable` arms its schedule, so a task with none has nothing to arm. A service, and a blob
+/// that will not decode (the marker alone is proof of ownership, and a verb must still work on it),
+/// pass: the backend decides what it does with them.
+pub(crate) fn require_armable<S: InstalledService>(snapshot: &S) -> Result<()> {
+    match snapshot.blob() {
+        Ok(blob) => match &blob.spec {
+            DaemonSpec::Task(task) if task.schedule.is_none() => {
+                Err(crate::spec::invalid(snapshot.id(), NOTHING_TO_ARM))
+            }
+            _ => Ok(()),
+        },
+        Err(_) => Ok(()),
+    }
+}
+
 // install and preview =================================================================================================
 
 /// `spec` installed, drawing on `reservation`, which the caller made for [`Step::Install`] and which
@@ -183,6 +203,7 @@ pub(crate) fn install<B: Backend>(
                     reservation,
                 )? {
                     WriteOutcome::Done => return Ok(outcome),
+                    WriteOutcome::Refused(refusal) => return Ok(refusal),
                     WriteOutcome::Raced => {}
                 }
             }
@@ -301,6 +322,131 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
     }
     out.extend(scan.reported);
     Ok(out)
+}
+
+// run =================================================================================================================
+
+/// Runs the idle task `id` once and follows the run: its output to `out` until it ends, then how it
+/// ended. See [`ServiceManager::run`](crate::manager::ServiceManager::run).
+///
+/// The state is read once, before the request: a task found running is refused without anything
+/// being reserved or sent. The thread that waits for the run is made before the request too, so a
+/// start that was sent is never left unwatched for want of one.
+pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exit> {
+    let snapshot = owned(b, id)?;
+    if kind_of(&snapshot)? != DaemonKind::Task {
+        return Err(Error::NotATask { id: id.to_string() });
+    }
+    match b.task_state(&snapshot)? {
+        State::Idle => {}
+        State::Running => return Err(Error::AlreadyRunning { id: id.to_string() }),
+        State::Stopped | State::Failed | State::Unknown => return Err(Error::RunStateUnknown { id: id.to_string() }),
+    }
+    let mut reservation = reserved(b, id, &[Step::Start], Budget::Immediate)?;
+    let waiter = Waiter::<B::Run>::spawn(id)?;
+
+    match b.begin_run(snapshot, &mut reservation) {
+        Ok(run) => waiter.follow(run, id, out),
+        Err(e) => {
+            waiter.abandon();
+            Err(e)
+        }
+    }
+}
+
+/// Whether the marked service `snapshot` is a service or a task, from its blob. A blob that will not
+/// decode is its error: the kind is not guessed.
+pub(crate) fn kind_of<S: InstalledService>(snapshot: &S) -> Result<DaemonKind> {
+    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+    Ok(blob.spec.kind())
+}
+
+/// The thread that waits for a run, made before the run is requested.
+struct Waiter<R> {
+    /// How the run reaches the thread once the request has made one.
+    hand_over: crossbeam_channel::Sender<R>,
+    /// Closed by the thread when the wait has finished: the stream's signal that the run ended.
+    ended: crossbeam_channel::Receiver<()>,
+    /// Set by the thread before it closes `ended`: whether the wait found how the run ended.
+    exit_recorded: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<Option<Result<Exit>>>,
+}
+
+impl<R: RunHandle> Waiter<R> {
+    /// Nothing has been sent when this fails, so it fails as any step that could not be made ready.
+    fn spawn(id: &Id) -> Result<Self> {
+        let (hand_over, handed) = crossbeam_channel::bounded::<R>(1);
+        // Nothing is sent on `ended`: closing it is the signal, and it closes on a panic too, so the
+        // stream never outlives a run whose wait is gone.
+        let (end, ended) = crossbeam_channel::bounded::<()>(0);
+        let exit_recorded = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::clone(&exit_recorded);
+        let thread = std::thread::Builder::new()
+            .name(format!("goetia run {id}"))
+            .spawn(move || {
+                // `None`: the request failed, so there was no run.
+                let exit = handed.recv().ok().map(RunHandle::wait);
+                recorded.store(matches!(exit, Some(Ok(_))), Ordering::SeqCst);
+                drop(end);
+                exit
+            })
+            .map_err(|source| Error::Reservation {
+                id: Some(id.to_string()),
+                source,
+            })?;
+        Ok(Self {
+            hand_over,
+            ended,
+            exit_recorded,
+            thread,
+        })
+    }
+
+    /// The request failed: no run is coming, and the thread ends having waited for nothing.
+    fn abandon(self) {
+        drop(self.hand_over);
+        if let Err(panic) = self.thread.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Shows `run`'s output while the thread waits for its end, and returns how it ended.
+    ///
+    /// The run is in flight, so it is waited for whatever happens to the output. If the wait failed
+    /// its error is returned, with the output's failure beside it if that failed too ([`Error::Both`],
+    /// or an [`Error::Step`] around a wait whose outcome is open, so that it stays open). Otherwise a
+    /// failure to show the output is returned, naming the exit.
+    fn follow(self, run: R, id: &Id, out: &mut dyn Write) -> Result<Exit> {
+        let source = run.output();
+        // The thread is alive until it has a run or its sender is dropped: this cannot fail.
+        let handed = self.hand_over.send(run).is_ok();
+        debug_assert!(handed, "the wait thread ended before it was given the run");
+
+        let shown = output::stream(source, id, out, &self.ended, &self.exit_recorded);
+        let waited = match self.thread.join() {
+            Ok(Some(waited)) => waited,
+            Ok(None) => unreachable!("the wait thread was given the run"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        match (waited, shown) {
+            // `Both` is indeterminate only when both halves are: a wait that left the outcome open must
+            // stay open, so the output's failure is said in a wrapper around the wait.
+            (Err(wait), Err(shown)) if wait.is_indeterminate() => Err(Error::Step {
+                what: format!("goetia could not show the output of `{id}` either: {}", shown.report()),
+                source: Box::new(wait),
+            }),
+            (Err(wait), Err(shown)) => Err(Error::Both {
+                first: Box::new(wait),
+                then: Box::new(shown),
+            }),
+            (Err(e), Ok(())) => Err(e),
+            (Ok(exit), Ok(())) => Ok(exit),
+            (Ok(exit), Err(shown)) => Err(Error::Step {
+                what: format!("`{id}` ended with {exit}, but goetia stopped showing its output"),
+                source: Box::new(shown),
+            }),
+        }
+    }
 }
 
 // scan ================================================================================================================

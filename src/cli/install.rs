@@ -12,10 +12,11 @@ use clap::Args as ClapArgs;
 use super::ExitCode;
 use super::refusal::{Lines, Mood, NotRefused};
 use super::support::{load_and_warn, print_error, print_line, require_elevation};
-use super::wait::WaitArgs;
+use super::wait::{NOT_FOR_A_TASK, WaitArgs};
 use crate::backend::Identity;
 use crate::decide::Outcome;
 use crate::error::Result;
+use crate::manager::flow::NOTHING_TO_ARM;
 use crate::manager::{Budget, ServiceManager, Step};
 use crate::shim::HostCommand;
 use crate::spec::{AccountId, DaemonSpec, Id, User};
@@ -79,6 +80,12 @@ pub fn run(
     if let Err(code) = require_elevation("daemon install", is_elevated, err) {
         return code;
     }
+    // Refused before anything is sent: what a task's `start` and `enable` cannot do is known from the
+    // spec alone.
+    if let Err(e) = refuse_for_a_task(&spec, args) {
+        print_error(err, Some(spec.common().id.as_str()), "", &e);
+        return ExitCode::Error;
+    }
     let mgr = match get_manager() {
         Ok(mgr) => mgr,
         Err(e) => {
@@ -132,6 +139,22 @@ pub fn run(
         }
     }
     codes.into_iter().max().unwrap_or(ExitCode::Success)
+}
+
+/// What `--start` and `--enable` cannot do for the task `spec` is, so the install is not begun: its
+/// start takes no wait flag, and with no schedule it has nothing to arm. A service is never refused.
+fn refuse_for_a_task(spec: &DaemonSpec, args: &Args) -> Result<()> {
+    let DaemonSpec::Task(task) = spec else {
+        return Ok(());
+    };
+    let id = &spec.common().id;
+    if args.start && args.wait.was_given() {
+        return Err(crate::spec::invalid(id, NOT_FOR_A_TASK));
+    }
+    if args.enable && task.schedule.is_none() {
+        return Err(crate::spec::invalid(id, NOTHING_TO_ARM));
+    }
+    Ok(())
 }
 
 /// Print one outcome and classify it for the exit code. The full text
@@ -207,7 +230,7 @@ fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>) -
     #[cfg(target_os = "linux")]
     {
         let _ = host;
-        crate::backend::systemd::generate::unit(spec, &identity)
+        crate::backend::systemd::generate::units(spec, &identity).map(|units| units.to_string())
     }
     #[cfg(target_os = "macos")]
     {

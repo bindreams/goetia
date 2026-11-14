@@ -56,6 +56,9 @@ impl WaitArgs {
     }
 }
 
+/// Why a wait flag is refused for a task's `start`: the request is all it does.
+pub(crate) const NOT_FOR_A_TASK: &str = "`--timeout` and `--no-timeout` do not apply to a task: `start` returns as soon as the manager has accepted the run";
+
 /// The word a verb reports after succeeding under `budget`: `confirmed` when
 /// the budget waited, `requested` when it did not: "started" after
 /// `--timeout 0` would claim a confirmation the flag declined to obtain.

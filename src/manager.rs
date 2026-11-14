@@ -14,8 +14,12 @@ pub mod budget;
 pub mod conformance;
 pub mod fake;
 pub(crate) mod flow;
+pub(crate) mod output;
 
 pub use budget::Budget;
+
+use std::io::Write;
+use std::time::SystemTime;
 
 use crate::error::{Error, Reason, Result};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
@@ -63,7 +67,8 @@ pub trait ServiceManager {
     fn uninstall(&self, id: &Id) -> Result<()>;
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if
-    /// `id` is not managed by Goetia.
+    /// `id` is not managed by Goetia. A task's `enable` arms its schedule; a task with no schedule
+    /// has nothing to arm, and its `enable` is [`Error::Invalid`] before the manager is asked.
     fn enable(&self, id: &Id) -> Result<()>;
 
     /// Disable the service at boot. Does not stop it if running.
@@ -116,9 +121,33 @@ pub trait ServiceManager {
     /// Idempotent under every budget: starting an already-running service is
     /// `Ok(())`, not an error.
     ///
+    /// **A task's start requests a run and returns once the manager has accepted it:** `budget` is
+    /// not read, and `Ok` says nothing of the run.
+    ///
+    /// The answer is the kind of what was started, read from the definition the ownership gate
+    /// passed: `None` where it will not decode, which does not stop a start.
+    ///
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     /// [`Error::Undetermined`]: crate::Error::Undetermined
-    fn start(&self, id: &Id, budget: Budget) -> Result<()>;
+    fn start(&self, id: &Id, budget: Budget) -> Result<Option<DaemonKind>>;
+
+    /// Run the task `id` once, now, and follow that run: request a start, copy what the run writes to
+    /// `out` as it is written, and return how the run ended once it has.
+    ///
+    /// Only an idle task is run, so that `run` never joins or restarts a run someone else began:
+    /// [`Error::NotATask`] for a service, [`Error::AlreadyRunning`] for a task in flight and
+    /// [`Error::RunStateUnknown`] where the manager does not say. The state is read once, before the
+    /// request: a run begun between that read and the request is one the request may join, which the
+    /// manager decides. No request is sent after a refusal.
+    ///
+    /// Everything the run wrote before it ended has been written to `out` when `run` returns. A task
+    /// with no `logs` file has no output to show: one note says so, and `run` waits for the run to end.
+    /// [`Error::RunNotStarted`] means the manager ended the start before a run began (no Starting entry);
+    /// [`Error::RunUnrecorded`] that the run's exit could not be established; a wait that lost track of
+    /// the run is [`Error::RequestInDoubt`], which does not say it ended. If showing the
+    /// output fails the run is still waited for: the wait's error is returned if it failed, else a
+    /// [`Error::Step`] that names the exit and holds the failure.
+    fn run(&self, id: &Id, out: &mut dyn Write) -> Result<Exit>;
 
     /// Make ready, before the first of `steps` sends anything, whatever they could need under
     /// `budget` that might run out between two of them. A failure here means nothing was sent;
@@ -171,6 +200,9 @@ pub trait ServiceManager {
     /// `start` waits for a job still going away before it loads it. See the
     /// README's "Waiting for a start or stop".
     ///
+    /// **A task's stop ends the run in flight and leaves its schedule armed;** the task is then
+    /// [`State::Idle`].
+    ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never
     /// started, and `launchctl bootout` and `ControlService(STOP)` on an
@@ -217,6 +249,15 @@ pub trait ServiceManager {
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     /// [`Error::NoManager`]: crate::Error::NoManager
     fn status(&self, id: &Id) -> Result<Status>;
+
+    /// Whether `id` is a service or a task, read from the definition goetia installed it with, and
+    /// nothing else of its status. The ownership gate applies as for any verb ([`Error::NotInstalled`],
+    /// [`Error::Undetermined`]); a definition that will not decode is its error ([`Error::Kept`]).
+    ///
+    /// [`Error::NotInstalled`]: crate::Error::NotInstalled
+    /// [`Error::Undetermined`]: crate::Error::Undetermined
+    /// [`Error::Kept`]: crate::Error::Kept
+    fn kind(&self, id: &Id) -> Result<DaemonKind>;
 
     /// Every id this backend could account for. A foreign (unmarked)
     /// service at some id is never included; see [`Installed`] for what
@@ -275,7 +316,7 @@ pub trait Sequence {
     /// See [`ServiceManager::install`].
     fn install(&mut self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
-    /// See [`ServiceManager::enable`].
+    /// See [`ServiceManager::enable`], including the refusal of a task with no schedule.
     fn enable(&mut self, id: &Id) -> Result<()>;
 
     /// See [`ServiceManager::stop`].
@@ -376,6 +417,7 @@ impl Installed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Service(DaemonStatus),
+    Task(TaskStatus),
 }
 
 impl Status {
@@ -383,6 +425,7 @@ impl Status {
     pub fn common(&self) -> &DaemonStatus {
         match self {
             Status::Service(status) => status,
+            Status::Task(status) => &status.common,
         }
     }
 
@@ -390,8 +433,39 @@ impl Status {
     pub fn kind(&self) -> DaemonKind {
         match self {
             Status::Service(_) => DaemonKind::Service,
+            Status::Task(_) => DaemonKind::Task,
         }
     }
+}
+
+/// How a task's run ended: the code the program exited with, or the signal that killed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Code(i32),
+    Signal(i32),
+}
+
+impl std::fmt::Display for Exit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Exit::Code(code) => write!(f, "exit code {code}"),
+            Exit::Signal(signal) => write!(f, "signal {signal}"),
+        }
+    }
+}
+
+/// A task's status: the common fields, and what the manager knows of its runs. A field the
+/// manager cannot say is `None`: no run yet, a run still in flight, or a manager that does not keep
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskStatus {
+    pub common: DaemonStatus,
+    /// How the most recent finished run ended.
+    pub last_result: Option<Exit>,
+    /// When the most recent run started.
+    pub last_run: Option<SystemTime>,
+    /// When the manager will start the task next; `None` for a task with no schedule armed.
+    pub next_run: Option<SystemTime>,
 }
 
 /// The status fields every kind of daemon reports.
@@ -412,10 +486,12 @@ pub struct DaemonStatus {
     pub enabled: bool,
 }
 
-/// A service's run state, as the platform's manager reports it.
+/// A daemon's run state, as the platform's manager reports it. A service is never `Idle` and a
+/// task is never `Stopped`: a task between runs is `Idle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Running,
+    Idle,
     Stopped,
     Failed,
     Unknown,

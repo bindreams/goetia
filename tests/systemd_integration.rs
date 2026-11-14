@@ -21,6 +21,10 @@ mod no_manager;
 #[path = "systemd_integration/not_loaded.rs"]
 mod not_loaded;
 
+#[cfg(target_os = "linux")]
+#[path = "systemd_integration/tasks.rs"]
+mod tasks;
+
 fn main() {
     // Dispatched before the harness starts; see `support::sentinel`. This binary is itself the
     // daemon the `kill` tests install and start.

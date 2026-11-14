@@ -23,8 +23,8 @@ pub(crate) mod test_allowance;
 mod unreaped;
 
 pub(crate) use contract::{
-    Backend, Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed,
-    WriteOutcome,
+    Backend, Decoded, InstalledDefinition, InstalledService, Marker, NativeRestart, OutputSource, ReadOutcome,
+    RunHandle, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
 
 /// A platform account, already resolved from [`crate::spec::User`] by the
