@@ -987,6 +987,10 @@ fn service_units_are_unchanged() {
     }
 }
 
+/// What a task's `ExecStart=` begins with: `sh` prints the run's marker and execs the command, whose
+/// words follow. Spelled out, not built from the generator's constant, so the bytes are pinned.
+const WRAPPER: &str = r#"/bin/sh -c 'printf "%%s\n" "goetia-run $$INVOCATION_ID"; exec "$$0" "$$@"'"#;
+
 #[skuld::test]
 fn task_unit_is_oneshot_with_no_start_limit_restart_or_install() {
     let spec = full_task(Some("30 3 * * *"));
@@ -998,7 +1002,7 @@ fn task_unit_is_oneshot_with_no_start_limit_restart_or_install() {
          \n\
          [Service]\n\
          Type=oneshot\n\
-         ExecStart={exec} -c frpc.toml\n\
+         ExecStart={WRAPPER} {exec} -c frpc.toml\n\
          WorkingDirectory={cwd}\n\
          Environment=RUST_LOG=info\n\
          Environment=URL=http://x/a%%20b\n\
@@ -1014,6 +1018,99 @@ fn task_unit_is_oneshot_with_no_start_limit_restart_or_install() {
     );
 
     assert_eq!(unit(&spec, &full_identity()).unwrap(), expected);
+}
+
+/// Each odd word is written as the KB note "ExecStart arguments reach the program unchanged through
+/// an sh exec wrapper when written with systemd's escapes" measured it: `$` and `%` doubled, a word
+/// that needs it double-quoted with `\\`, `\"`, `\n`, `\t` and `\xNN`, and a bare `;` quoted.
+///
+/// A control character is refused before the generator (`TaskSpec::new`), so the words are rendered
+/// directly.
+#[skuld::test]
+fn a_tasks_command_words_are_written_with_systemds_escapes_after_the_wrapper() {
+    for (word, written) in [
+        ("plain", "plain"),
+        ("a b", r#""a b""#),
+        (" lead and trail ", r#"" lead and trail ""#),
+        (r#"say "hi""#, r#""say \"hi\"""#),
+        ("it's", r#""it's""#),
+        ("$HOME", "$$HOME"),
+        ("${HOME}", "$${HOME}"),
+        ("$", "$$"),
+        ("100%", "100%%"),
+        ("%h", "%%h"),
+        (r"back\slash", r#""back\\slash""#),
+        (r"ends\", r#""ends\\""#),
+        (r"a\nb", r#""a\\nb""#),
+        ("", r#""""#),
+        (";", r#"";""#),
+        ("a;b", "a;b"),
+        ("a\nb", r#""a\nb""#),
+        ("a\tb", r#""a\tb""#),
+        ("a\u{1}b", r#""a\x01b""#),
+        ("a\u{7f}b", r#""a\x7fb""#),
+        ("é中😀", "é中😀"),
+        ("-n", "-n"),
+        ("@x", "@x"),
+        ("*", "*"),
+    ] {
+        assert_eq!(
+            render_task_exec_start(&words(&[PROGRAM, word])),
+            format!("{WRAPPER} {PROGRAM} {written}"),
+            "{word:?}"
+        );
+    }
+}
+
+/// Through the wrapper the program's path is an ordinary word: a `$` in it is doubled, with no
+/// `@path argv0` form, and the characters that begin a command prefix mean nothing there.
+#[skuld::test]
+fn a_tasks_executable_path_is_an_ordinary_word_after_the_wrapper() {
+    for (suffix, written) in [("a$b", "{p}a$$b"), ("a%b", "{p}a%%b"), (" b", "\"{p} b\"")] {
+        let spec = task_with(|c| c.command = vec![format!("{PROGRAM}{suffix}"), "$X".to_string()]);
+        let text = unit(&spec, &minimal_identity()).unwrap();
+        assert_eq!(
+            line_of(&text, "ExecStart="),
+            format!("ExecStart={WRAPPER} {} $$X", written.replace("{p}", PROGRAM)),
+            "{suffix:?}"
+        );
+        assert_eq!(extract(&text).unwrap().unwrap().spec, spec, "{suffix:?}");
+    }
+}
+
+/// `sh` resets these on its way to the program, so the program would not see what `env` set.
+#[skuld::test]
+fn a_task_that_sets_a_variable_sh_resets_is_refused() {
+    for key in ["IFS", "PWD", "SHLVL", "PS4", "_", "OLDPWD"] {
+        let spec = task_with(|c| c.env = BTreeMap::from([(key.to_string(), "x".to_string())]));
+
+        let err = units(&spec, &minimal_identity()).unwrap_err();
+
+        let Error::Invalid { daemon, message, .. } = &err else {
+            panic!("{key}: expected Error::Invalid, got {err:?}");
+        };
+        assert_eq!(daemon, "frpc");
+        assert!(message.contains(&format!("`{key}`")), "{key}: {message}");
+        assert!(message.contains("/bin/sh"), "{key}: {message}");
+        assert!(message.contains("resets"), "{key}: {message}");
+    }
+
+    // Only a task starts through `sh`; a service, and every other variable, is as before.
+    let service = with_fields(|f| f.common.env = BTreeMap::from([("PWD".to_string(), "/x".to_string())]));
+    assert!(units(&service, &minimal_identity()).is_ok());
+    let other = task_with(|c| c.env = BTreeMap::from([("PATH_X".to_string(), "x".to_string())]));
+    assert!(units(&other, &minimal_identity()).is_ok());
+}
+
+/// systemd's per-unit `LogRateLimit*` does nothing (measured), so no unit carries one.
+#[skuld::test]
+fn no_unit_has_a_log_rate_limit_line() {
+    for spec in [full_task(Some("30 3 * * *")), full_spec(), minimal_spec()] {
+        let units = units(&spec, &full_identity()).unwrap();
+        for text in [Some(units.service), units.timer].into_iter().flatten() {
+            assert!(!text.contains("LogRateLimit"), "{text}");
+        }
+    }
 }
 
 #[skuld::test]

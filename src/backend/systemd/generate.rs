@@ -11,7 +11,9 @@
 //! further doubles `$` in its arguments (systemd performs `$FOO`/`${FOO}` environment
 //! substitution there, but not in the executable path; it does in `argv[0]`, so a path holding `$`
 //! is written `@<path> <argv[0]>`), and quotes a bare `;` argument (systemd's
-//! command-line separator).
+//! command-line separator). A task's `ExecStart=` runs its command through `sh` instead, so its path
+//! is one more argument ([`render_task_exec_start`]); a control character in a word is written as an
+//! escape.
 //!
 //! Backslashes are never refused: a quoted word doubles each, and a raw value ending in an odd
 //! run of them gets a trailing space (see `raw_value`). The values no encoding can carry are
@@ -124,7 +126,11 @@ fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
 
     out.push_str("[Service]\n");
     out.push_str("Type=exec\n");
-    out.push_str(&exec_lines(&service.common, id));
+    out.push_str(&exec_lines(
+        &service.common,
+        id,
+        &render_exec_start(&service.common.command),
+    ));
     out.push_str(&format!("Restart={}\n", render_restart(service.restart)));
     if let Some(delay) = service.restart_delay {
         out.push_str(&format!("RestartSec={}\n", delay.as_secs_f64()));
@@ -141,8 +147,13 @@ fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
 /// A task's oneshot unit, up to the `[X-Goetia]` section. A failed run ends and waits for the next
 /// one: no `Restart=`. No `RemainAfterExit=`, so a finished run is `inactive`. No `[Install]`: the
 /// timer, not boot, starts it.
+///
+/// Its command runs through `sh`, which prints the run's marker first ([`render_task_exec_start`]).
+/// No `LogRateLimit*` line: a per-unit limit does not lift journald's (measured), so it would only
+/// look like a guarantee.
 fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
     refuse_unrepresentable(&task.common, id)?;
+    refuse_env_sh_resets(&task.common)?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
@@ -154,7 +165,11 @@ fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
 
     out.push_str("[Service]\n");
     out.push_str("Type=oneshot\n");
-    out.push_str(&exec_lines(&task.common, id));
+    out.push_str(&exec_lines(
+        &task.common,
+        id,
+        &render_task_exec_start(&task.common.command),
+    ));
     out.push_str(&log_lines(&task.common));
 
     Ok(out)
@@ -187,9 +202,9 @@ fn timer_unit(task: &TaskSpec, schedule: &Schedule) -> String {
 }
 
 /// `[Service]`'s lines from `ExecStart=` through `User=`, which a service and a task share.
-fn exec_lines(common: &DaemonFields, id: &Identity) -> String {
+fn exec_lines(common: &DaemonFields, id: &Identity, exec_start: &str) -> String {
     let mut out = String::new();
-    out.push_str(&format!("ExecStart={}\n", render_exec_start(&common.command)));
+    out.push_str(&format!("ExecStart={exec_start}\n"));
     if let Some(cwd) = &common.cwd {
         out.push_str(&format!("WorkingDirectory={}\n", raw_value(&cwd.display().to_string())));
     }
@@ -278,6 +293,46 @@ fn refuse_unrepresentable(common: &DaemonFields, id: &Identity) -> Result<(), Er
         }),
         None => Ok(()),
     }
+}
+
+/// What a task's run prints first, followed by the run's invocation id: `run` finds its run's
+/// stream in the journal by the line `<RUN_MARKER> <INVOCATION_ID>`.
+pub(crate) const RUN_MARKER: &str = "goetia-run";
+
+/// The variables `/bin/sh` resets or removes on its way to the program (measured on dash and bash
+/// 5.2: the KB note "A sh exec wrapper adds PWD, and under bash SHLVL=0, to the program's environment
+/// and resets IFS"), so a task cannot pass them.
+const RESET_BY_SH: [&str; 6] = ["IFS", "PWD", "SHLVL", "PS4", "_", "OLDPWD"];
+
+/// Refuse an `env` of a task that sets a variable `sh` resets: the program would not see the value.
+fn refuse_env_sh_resets(common: &DaemonFields) -> Result<(), Error> {
+    match RESET_BY_SH.iter().find(|name| common.env.contains_key(**name)) {
+        Some(name) => Err(Error::Invalid {
+            daemon: common.id.to_string(),
+            message: format!(
+                "`env` sets `{name}`, but a task starts through /bin/sh, which resets it, so the program \
+                 would not see the value"
+            ),
+            source: None,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// A task's `ExecStart=` value: `/bin/sh` prints [`RUN_MARKER`] and the run's `INVOCATION_ID`, then
+/// execs the command. `command` follows as the script's `$0` (the program, so its `argv[0]` is the
+/// path) and `$@`, each word written as an `ExecStart=` argument: through `sh` the path is an
+/// ordinary word, so it gets none of the `@path argv0` form a direct `ExecStart=` needs. The script
+/// itself is single-quoted, with `%` and `$` doubled for systemd. Measured in the KB note "ExecStart
+/// arguments reach the program unchanged through an sh exec wrapper when written with systemd's
+/// escapes".
+fn render_task_exec_start(command: &[String]) -> String {
+    let mut out = format!(r#"/bin/sh -c 'printf "%%s\n" "{RUN_MARKER} $$INVOCATION_ID"; exec "$$0" "$$@"'"#);
+    for word in command {
+        out.push(' ');
+        out.push_str(&render_exec_arg(word));
+    }
+    out
 }
 
 /// The characters systemd reads as a prefix of `ExecStart=`'s first word, after unquoting, and
@@ -376,14 +431,18 @@ fn trailing_backslash_run(s: &str) -> usize {
 }
 
 /// Whether `s` needs systemd command-line quoting: it is empty, or
-/// contains whitespace or a character that quoting itself is relevant to
-/// (`"`, `'`, `\`).
+/// contains whitespace, an ASCII control character (only a quoted word can
+/// carry it, as an escape) or a character that quoting itself is relevant
+/// to (`"`, `'`, `\`).
 fn needs_quoting(s: &str) -> bool {
-    s.is_empty() || s.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'))
+    s.is_empty()
+        || s.chars()
+            .any(|c| c.is_whitespace() || c.is_ascii_control() || matches!(c, '"' | '\'' | '\\'))
 }
 
 /// Wrap `s` in double quotes per systemd's command-line syntax, escaping
-/// embedded `"` and `\`.
+/// embedded `"` and `\`, and an ASCII control character as `\n`, `\t` or
+/// `\xNN` (a raw newline would end the unit's line).
 fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -391,6 +450,9 @@ fn quote(s: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii_control() => out.push_str(&format!("\\x{:02x}", c as u8)),
             _ => out.push(c),
         }
     }
