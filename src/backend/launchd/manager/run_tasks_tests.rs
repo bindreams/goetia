@@ -42,6 +42,11 @@ fn in_flight(pid: u32) -> String {
     format!("\tstate = running\n\tpid = {pid}\n\tstarted suspended = 0\n")
 }
 
+/// A `print` of the job's process `pid` that does not say how it was launched.
+fn without_hold_line(pid: u32) -> String {
+    format!("\tstate = running\n\tpid = {pid}\n")
+}
+
 fn print(body: &str) -> Entry {
     reply(&["print", &target()], exited(0, body, ""))
 }
@@ -691,22 +696,11 @@ fn a_print_that_cannot_say_which_launch_it_shows_is_an_error_not_another_attempt
 /// resumed, and the launch may sit stopped, so this is the stranded hold, not a run that ended.
 #[skuld::test]
 fn a_confirming_print_that_shows_the_pid_without_the_hold_line_is_the_stranded_hold() {
-    let cases: [(&str, fn(u32) -> String); 2] = [
-        ("no `started suspended` line", |pid| {
-            format!("\tstate = running\n\tpid = {pid}\n")
-        }),
-        ("shown as unheld", in_flight),
-    ];
-    for (what, shown) in cases {
+    for (what, unheld) in [("no `started suspended` line", false), ("shown as unheld", true)] {
         let child = Held::new(0);
         let pid = child.pid();
-        let fake = Fake::new([
-            print(IDLE),
-            debug(),
-            kickstart(pid),
-            print(&held(pid)),
-            print(&shown(pid)),
-        ]);
+        let shown = if unheld { in_flight(pid) } else { without_hold_line(pid) };
+        let fake = Fake::new([print(IDLE), debug(), kickstart(pid), print(&held(pid)), print(&shown)]);
         let tree = Tree::new();
 
         let e = failed(&fake, snapshot(&tree, None));
@@ -722,21 +716,11 @@ fn a_confirming_print_that_shows_the_pid_without_the_hold_line_is_the_stranded_h
 /// hold, and one that shows it gone is the next attempt.
 #[skuld::test]
 fn a_slipped_in_run_whose_confirming_print_is_not_what_it_was_is_an_error() {
-    for (what, shown) in [
-        ("shown as held", held as fn(u32) -> String),
-        ("shown with no hold line", |pid| {
-            format!("\tstate = running\n\tpid = {pid}\n")
-        }),
-    ] {
+    for (what, as_held) in [("shown as held", true), ("shown with no hold line", false)] {
         let scheduled = Held::new(0);
         let a = scheduled.pid();
-        let fake = Fake::new([
-            print(IDLE),
-            debug(),
-            kickstart(a),
-            print(&in_flight(a)),
-            print(&shown(a)),
-        ]);
+        let shown = if as_held { held(a) } else { without_hold_line(a) };
+        let fake = Fake::new([print(IDLE), debug(), kickstart(a), print(&in_flight(a)), print(&shown)]);
         let tree = Tree::new();
 
         let (result, notes) = begin(&fake, snapshot(&tree, None));
