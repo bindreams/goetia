@@ -203,3 +203,16 @@ fn the_restore_notice_names_the_call_and_the_error() {
     assert!(notice.contains("SetThreadToken"), "{notice}");
     assert!(notice.contains("the token handle is invalid"), "{notice}");
 }
+
+/// A token opened without `TOKEN_ADJUST_PRIVILEGES` refuses the adjustment: the error names that call
+/// and keeps the OS's code.
+#[skuld::test]
+fn a_token_that_cannot_be_adjusted_is_an_error_naming_the_call() {
+    let query_only = test_support::open_process_token(TOKEN_QUERY).unwrap();
+
+    let e = enable_in(query_only.as_raw_handle()).unwrap_err();
+
+    assert!(e.to_string().contains("AdjustTokenPrivileges"), "{e}");
+    let code = std::error::Error::source(e.get_ref().unwrap()).and_then(|s| s.downcast_ref::<io::Error>());
+    assert_eq!(code.and_then(io::Error::raw_os_error), Some(ERROR_ACCESS_DENIED as i32));
+}

@@ -15,19 +15,14 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::backend::scm::shim::acl::Descriptor;
 use crate::backend::scm::sid::Sid;
-
-/// The last OS error, naming the call that set it.
-fn failed(call: &str) -> io::Error {
-    let e = io::Error::last_os_error();
-    io::Error::new(e.kind(), format!("{call}: {e}"))
-}
+use crate::error::within;
 
 /// This process's token, opened with `access`; `Err` names the call.
 pub(crate) fn open_process_token(access: u32) -> io::Result<OwnedHandle> {
     let mut process = std::ptr::null_mut();
     // SAFETY: a pointer to a local; a returned token is owned below.
     if unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut process) } == 0 {
-        return Err(failed("OpenProcessToken"));
+        return Err(within("OpenProcessToken", io::Error::last_os_error()));
     }
     // SAFETY: a valid handle `OpenProcessToken` just returned and nothing else owns.
     Ok(unsafe { OwnedHandle::from_raw_handle(process) })
@@ -49,7 +44,7 @@ const TOKEN_COPY: &str = "D:(A;;GA;;;WD)";
 /// An impersonation copy of `source`, opened with `access`, that the thread impersonating it can open
 /// on any host (see [`TOKEN_COPY`]); `Err` names the call.
 pub(crate) fn impersonation_copy(source: &OwnedHandle, access: u32) -> io::Result<OwnedHandle> {
-    let permissions = Descriptor::from_sddl(TOKEN_COPY).expect("the permissions of a token copy");
+    let permissions = Descriptor::from_sddl(TOKEN_COPY).map_err(io::Error::other)?;
     let attributes = permissions.attributes();
     let mut copy = std::ptr::null_mut();
     // SAFETY: `source` is a live token handle with `TOKEN_DUPLICATE`; `attributes` points at
@@ -65,7 +60,7 @@ pub(crate) fn impersonation_copy(source: &OwnedHandle, access: u32) -> io::Resul
         )
     };
     if ok == 0 {
-        return Err(failed("DuplicateTokenEx"));
+        return Err(within("DuplicateTokenEx", io::Error::last_os_error()));
     }
     // SAFETY: a valid handle `DuplicateTokenEx` just returned and nothing else owns.
     Ok(unsafe { OwnedHandle::from_raw_handle(copy) })

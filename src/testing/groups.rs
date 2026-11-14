@@ -120,7 +120,7 @@ pub(crate) fn enter(
     match check_group(group_var, var) {
         // skuld runs the body of a test whose `requires` failed when ignored tests are included
         // (`--run-ignored only`), so a group that is off refuses here as well.
-        Ok(false) => Err(format!("{group_var}=0")),
+        Ok(false) => Err(switched_off(group_var)),
         Ok(true) if elevated() => Ok(Group(())),
         Ok(true) => Err(format!(
             "the group {group_var} needs an elevated token (root, or an Administrator shell), which this \
