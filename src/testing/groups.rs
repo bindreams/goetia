@@ -150,8 +150,7 @@ pub(crate) fn need(
         Ok(true) => Ok(()),
         Ok(false) => Err(format!("{missing}; or set {switch_var}=0 to opt out")),
         Err(probe) => Err(format!(
-            "{probe}; the check failed, so this does not show the dependency is missing; set {switch_var}=0 to \
-             ignore these tests"
+            "{probe} (the dependency may be present); or set {switch_var}=0 to opt out"
         )),
     }
 }

@@ -27,7 +27,7 @@ fn debug_privilege() -> Result<(), String> {
     need(
         DEBUG_PRIVILEGE,
         process_var,
-        "this token does not hold SeDebugPrivilege; run elevated (an elevated Administrator's token does)",
+        "this token does not hold SeDebugPrivilege; run with a token that does (an elevated one usually does)",
         holds_debug_privilege,
     )
 }

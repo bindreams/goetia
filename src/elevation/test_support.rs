@@ -43,8 +43,9 @@ const TOKEN_COPY: &str = "D:(A;;GA;;;WD)";
 
 /// An impersonation copy of `source`, opened with `access`, that the thread impersonating it can open
 /// on any host (see [`TOKEN_COPY`]); `Err` names the call.
-pub(crate) fn impersonation_copy(source: &OwnedHandle, access: u32) -> io::Result<OwnedHandle> {
-    let permissions = Descriptor::from_sddl(TOKEN_COPY).map_err(io::Error::other)?;
+fn impersonation_copy(source: &OwnedHandle, access: u32) -> io::Result<OwnedHandle> {
+    let permissions = Descriptor::from_sddl(TOKEN_COPY)
+        .map_err(|e| within("the permissions of a token copy", io::Error::other(e)))?;
     let attributes = permissions.attributes();
     let mut copy = std::ptr::null_mut();
     // SAFETY: `source` is a live token handle with `TOKEN_DUPLICATE`; `attributes` points at
