@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
-use super::{Cursor, Entries, Entry, Follower, Journal, Match, Stop};
+use super::{Cursor, Entries, Entry, Follower, Journal, Match, Scope, Stop};
 use crate::backend::bounded::Reservation;
 use crate::error::{Error, Result};
 
@@ -21,6 +21,8 @@ struct State {
     after: VecDeque<Vec<Entry>>,
     followed: Vec<(Vec<String>, Option<String>)>,
     read_after: Vec<(Vec<String>, String)>,
+    /// The scope of every `follow` and `read_after`, in the order they were asked.
+    scopes: Vec<(&'static str, Scope)>,
     syncs: usize,
     stops: usize,
 }
@@ -125,6 +127,11 @@ impl Fake {
         self.state.lock().unwrap().read_after.clone()
     }
 
+    /// The scope of every `follow` and `read_after` so far, in order, each with its name.
+    pub(in crate::backend::systemd::manager) fn scopes(&self) -> Vec<(&'static str, Scope)> {
+        self.state.lock().unwrap().scopes.clone()
+    }
+
     pub(in crate::backend::systemd::manager) fn syncs(&self) -> usize {
         self.state.lock().unwrap().syncs
     }
@@ -169,8 +176,15 @@ impl Journal for Fake {
         }))
     }
 
-    fn follow(&self, matches: &[Match], after: Option<&Cursor>, draws: &mut Reservation) -> Result<Box<dyn Follower>> {
+    fn follow(
+        &self,
+        scope: Scope,
+        matches: &[Match],
+        after: Option<&Cursor>,
+        draws: &mut Reservation,
+    ) -> Result<Box<dyn Follower>> {
         Fake::draw(draws)?;
+        self.state.lock().unwrap().scopes.push(("follow", scope));
         self.record(format!("follow {}", Fake::arguments(matches).join(" ")));
         let script = {
             let mut state = self.state.lock().unwrap();
@@ -194,8 +208,15 @@ impl Journal for Fake {
         }))
     }
 
-    fn read_after(&self, matches: &[Match], cursor: &Cursor, draws: &mut Reservation) -> Result<Vec<Entry>> {
+    fn read_after(
+        &self,
+        scope: Scope,
+        matches: &[Match],
+        cursor: &Cursor,
+        draws: &mut Reservation,
+    ) -> Result<Vec<Entry>> {
         Fake::draw(draws)?;
+        self.state.lock().unwrap().scopes.push(("read_after", scope));
         self.record("read_after".to_string());
         self.state
             .lock()

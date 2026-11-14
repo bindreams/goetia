@@ -494,6 +494,37 @@ fn shown_after_an_end(journal: &JournalFake, exit_recorded: bool) -> (Result<()>
 
 /// The run's output is the lines of the marker's stream, the marker not among them, and another
 /// stream's lines are never shown, whether they come first or between the run's own.
+/// The manager's entries (a run's Starting entry, its exit) are read from the system journal alone.
+#[skuld::test]
+fn the_starting_entry_and_the_exit_are_read_in_the_manager_scope() {
+    let journal = running(vec![deactivated("inv")]);
+
+    begun(&journal).wait().expect("the exit");
+
+    assert_eq!(
+        journal.scopes(),
+        [("follow", Scope::Manager), ("follow", Scope::Manager)],
+        "the Starting entry, then the exit"
+    );
+}
+
+/// A run's output (the follow for the marker, the final read after the end) is read from every journal
+/// the reader may open, since a unit that runs as a regular uid writes it to a user journal.
+#[skuld::test]
+fn the_output_is_read_in_the_output_scope() {
+    let journal = JournalFake::new(Vec::new())
+        .follows(vec![marker("c2", "s1", "inv")])
+        .then_reads(vec![line("c3", "s1", "last")]);
+
+    let (result, _) = shown_after_the_end(&journal);
+
+    result.expect("the stream");
+    assert_eq!(
+        journal.scopes(),
+        [("follow", Scope::Output), ("read_after", Scope::Output)]
+    );
+}
+
 #[skuld::test]
 fn output_is_the_lines_of_the_markers_stream_minus_the_marker() {
     let journal = JournalFake::new(Vec::new())

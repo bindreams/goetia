@@ -6,15 +6,14 @@ use std::io::{BufRead as _, BufReader, Read as _, Seek as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{Cursor, Entries, Entry, Follower, Journal, Match, Stop};
+use super::{Cursor, Entries, Entry, Follower, Journal, Match, Scope, Stop};
 use crate::backend::bounded::{self, Finished, Reservation};
 use crate::backend::client::{Client as _, ClientError, Real, Wait};
 use crate::backend::systemd::manager::systemctl::environment;
 use crate::error::{Error, Result};
 
-/// What every query passes: all of every field (`-a`), as JSON, with no pager, from the system
-/// journal only (`--system`: see [`Journal`]).
-const COMMON: [&str; 5] = ["-a", "-o", "json", "--no-pager", "--system"];
+/// What every query passes: all of every field (`-a`), as JSON, with no pager.
+const COMMON: [&str; 4] = ["-a", "-o", "json", "--no-pager"];
 
 pub(in crate::backend::systemd::manager) struct Journalctl {
     program: Vec<String>,
@@ -78,11 +77,13 @@ fn drawn(draws: &mut Reservation) -> Result<File> {
         .map_err(|e| Error::os("make a file for `journalctl`'s diagnostics", e))
 }
 
-/// `COMMON`, then `options`, then `matches`.
-fn arguments(options: &[String], matches: &[Match]) -> Vec<String> {
+/// `COMMON`, then `--system` for the [`Scope::Manager`] (the one place the scope is spelled), then
+/// `options`, then `matches`.
+fn arguments(scope: Scope, options: &[String], matches: &[Match]) -> Vec<String> {
     COMMON
         .iter()
         .map(|argument| argument.to_string())
+        .chain((scope == Scope::Manager).then(|| "--system".to_string()))
         .chain(options.iter().cloned())
         .chain(matches.iter().map(Match::argument))
         .collect()
@@ -96,13 +97,19 @@ impl Journal for Journalctl {
     fn newest_first(&self, matches: &[Match]) -> Result<Box<dyn Entries>> {
         // The newest-first read is `status`'s, which draws on no reservation.
         Ok(Box::new(self.query(
-            arguments(&options(&["-r"]), matches),
+            arguments(Scope::Manager, &options(&["-r"]), matches),
             false,
             diagnostics()?,
         )?))
     }
 
-    fn follow(&self, matches: &[Match], after: Option<&Cursor>, draws: &mut Reservation) -> Result<Box<dyn Follower>> {
+    fn follow(
+        &self,
+        scope: Scope,
+        matches: &[Match],
+        after: Option<&Cursor>,
+        draws: &mut Reservation,
+    ) -> Result<Box<dyn Follower>> {
         let mut chosen = options(&["-f", "-n", "all"]);
         // Job numbers restart with each boot.
         if matches.iter().any(|m| m.is("JOB_ID")) {
@@ -112,15 +119,21 @@ impl Journal for Journalctl {
             chosen.push(format!("--after-cursor={}", cursor.as_str()));
         }
         Ok(Box::new(self.query(
-            arguments(&chosen, matches),
+            arguments(scope, &chosen, matches),
             true,
             drawn(draws)?,
         )?))
     }
 
-    fn read_after(&self, matches: &[Match], cursor: &Cursor, draws: &mut Reservation) -> Result<Vec<Entry>> {
+    fn read_after(
+        &self,
+        scope: Scope,
+        matches: &[Match],
+        cursor: &Cursor,
+        draws: &mut Reservation,
+    ) -> Result<Vec<Entry>> {
         let chosen = vec![format!("--after-cursor={}", cursor.as_str())];
-        let mut lines = self.query(arguments(&chosen, matches), false, drawn(draws)?)?;
+        let mut lines = self.query(arguments(scope, &chosen, matches), false, drawn(draws)?)?;
         let mut all = Vec::new();
         while let Some(entry) = lines.next()? {
             all.push(entry);

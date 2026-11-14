@@ -351,17 +351,25 @@ fn every_query_passes_dash_a() {
         ("newest first", args_of(entries_of(&journal).expect("entries"))),
         (
             "follow a job",
-            args_of(first_of(journal.follow(&job, None, &mut one()).expect("follow"))),
+            args_of(first_of(
+                journal.follow(Scope::Manager, &job, None, &mut one()).expect("follow"),
+            )),
         ),
         (
             "follow after a cursor",
             args_of(first_of(
-                journal.follow(&unit, Some(&cursor), &mut one()).expect("follow"),
+                journal
+                    .follow(Scope::Manager, &unit, Some(&cursor), &mut one())
+                    .expect("follow"),
             )),
         ),
         (
             "read after a cursor",
-            args_of(journal.read_after(&unit, &cursor, &mut one()).expect("read_after")),
+            args_of(
+                journal
+                    .read_after(Scope::Manager, &unit, &cursor, &mut one())
+                    .expect("read_after"),
+            ),
         ),
     ] {
         assert!(args.starts_with("-a -o json --no-pager --system "), "{what}: {args}");
@@ -374,13 +382,22 @@ fn a_follow_starts_from_the_beginning_or_after_its_cursor_and_job_numbers_are_bo
     let cursor = Cursor::of("s=1;i=2");
     let unit = [Match::new("UNIT", "x.service")];
 
-    let from_the_start = args_of(first_of(journal.follow(&unit, None, &mut one()).expect("follow")));
+    let from_the_start = args_of(first_of(
+        journal.follow(Scope::Manager, &unit, None, &mut one()).expect("follow"),
+    ));
     let after = args_of(first_of(
-        journal.follow(&unit, Some(&cursor), &mut one()).expect("follow"),
+        journal
+            .follow(Scope::Manager, &unit, Some(&cursor), &mut one())
+            .expect("follow"),
     ));
     let job = args_of(first_of(
         journal
-            .follow(&[unit[0].clone(), Match::new("JOB_ID", "7")], None, &mut one())
+            .follow(
+                Scope::Manager,
+                &[unit[0].clone(), Match::new("JOB_ID", "7")],
+                None,
+                &mut one(),
+            )
             .expect("follow"),
     ));
 
@@ -398,6 +415,34 @@ fn a_follow_starts_from_the_beginning_or_after_its_cursor_and_job_numbers_are_bo
     );
 }
 
+/// Which queries carry `--system`: the manager's (newest first, and the follows that find a run's
+/// Starting and exit entries) do; a unit's own output (a follow and a read after a cursor of the
+/// `Output` scope) does not, since a unit that runs as a regular uid writes it to a user journal.
+#[skuld::test]
+fn only_the_managers_queries_read_the_system_journal_alone() {
+    let journal = sh(ECHO);
+    let unit = [Match::new("UNIT", "x.service")];
+    let cursor = Cursor::of("c");
+    let has_system = |args: String| args.split(' ').any(|argument| argument == "--system");
+
+    assert!(
+        has_system(args_of(entries_of(&journal).expect("entries"))),
+        "newest first"
+    );
+    for (scope, system) in [(Scope::Manager, true), (Scope::Output, false)] {
+        let follow = args_of(first_of(
+            journal.follow(scope, &unit, Some(&cursor), &mut one()).expect("follow"),
+        ));
+        assert_eq!(has_system(follow.clone()), system, "follow {scope:?}: {follow}");
+        let read = args_of(
+            journal
+                .read_after(scope, &unit, &cursor, &mut one())
+                .expect("read_after"),
+        );
+        assert_eq!(has_system(read.clone()), system, "read_after {scope:?}: {read}");
+    }
+}
+
 #[skuld::test]
 fn a_read_after_a_cursor_asks_for_every_match() {
     let journal = sh(ECHO);
@@ -408,13 +453,13 @@ fn a_read_after_a_cursor_asks_for_every_match() {
 
     let args = args_of(
         journal
-            .read_after(&matches, &Cursor::of("c"), &mut one())
+            .read_after(Scope::Output, &matches, &Cursor::of("c"), &mut one())
             .expect("read_after"),
     );
 
     assert_eq!(
         args,
-        "-a -o json --no-pager --system --after-cursor=c _SYSTEMD_UNIT=x.service _TRANSPORT=stdout"
+        "-a -o json --no-pager --after-cursor=c _SYSTEMD_UNIT=x.service _TRANSPORT=stdout"
     );
 }
 
@@ -422,13 +467,13 @@ fn a_read_after_a_cursor_asks_for_every_match() {
 fn a_read_after_discards_a_partial_trailing_line_and_fails_with_journalctls_words() {
     let journal = sh(r##"printf '{"N":"1"}\n{"N":'"##);
     let all = journal
-        .read_after(&[], &Cursor::of("c"), &mut one())
+        .read_after(Scope::Manager, &[], &Cursor::of("c"), &mut one())
         .expect("read_after");
     assert_eq!(all.len(), 1);
 
     let journal = sh(r#"echo "Failed to seek" >&2; exit 1"#);
     let e = journal
-        .read_after(&[], &Cursor::of("c"), &mut one())
+        .read_after(Scope::Manager, &[], &Cursor::of("c"), &mut one())
         .expect_err("it failed");
     assert!(e.report().to_string().contains("Failed to seek"), "{e}");
 }
@@ -447,7 +492,7 @@ fn a_message_of_4088_bytes_arrives_whole() {
     let journal = sh(r#"printf '{"MESSAGE":"'; head -c 4088 /dev/zero | tr '\0' x; printf '"}\n'"#);
 
     let all = journal
-        .read_after(&[], &Cursor::of("c"), &mut one())
+        .read_after(Scope::Manager, &[], &Cursor::of("c"), &mut one())
         .expect("read_after");
 
     assert_eq!(all[0].bytes("MESSAGE").map(<[u8]>::len), Some(4088));
@@ -489,7 +534,7 @@ fn journalctl_runs_with_the_environment_of_every_systemctl() {
 fn a_stopped_follower_ends_with_no_error_and_leaves_no_child() {
     let journal = sh(r#"printf '{"PID":"%s"}\n' "$$"; exec sleep 100000"#);
     let mut follower = journal
-        .follow(&[Match::new("UNIT", "x.service")], None, &mut one())
+        .follow(Scope::Manager, &[Match::new("UNIT", "x.service")], None, &mut one())
         .expect("spawn");
     let pid = follower
         .next()
@@ -516,7 +561,7 @@ fn a_stopped_follower_ends_with_no_error_and_leaves_no_child() {
 fn a_follower_that_ends_on_its_own_is_the_error() {
     let journal = sh(r#"printf '{"N":"1"}\n'"#);
     let mut follower = journal
-        .follow(&[Match::new("UNIT", "x.service")], None, &mut one())
+        .follow(Scope::Manager, &[Match::new("UNIT", "x.service")], None, &mut one())
         .expect("spawn");
 
     assert!(follower.next().expect("the entry").is_some());

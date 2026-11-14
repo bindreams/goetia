@@ -168,14 +168,26 @@ pub(super) fn lacks(what: &str) -> Error {
 
 // Journal =============================================================================================================
 
-/// The system journal, as the systemd backend reads it.
-///
-/// Queries read the system journal only (`journalctl --system`). Without it an account outside
-/// `systemd-journal` that has a user journal of its own opens that file and gets exit 0 and no entry:
-/// an empty answer that cannot be told from a unit that never ran. With it such an account opens no
-/// file, and `journalctl` fails ("No journal files were opened due to insufficient permissions"),
-/// which is the error a journal that cannot be read must be. A host whose journal holds no files
-/// still answers with nothing (exit 0).
+/// Which of the journal's files a query reads. The one place the choice is made is `Journalctl`'s
+/// argument list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Scope {
+    /// The manager's own entries about a unit, which are in the system journal: `journalctl --system`.
+    /// An account outside `systemd-journal` that has a user journal of its own would otherwise open
+    /// that file alone and get exit 0 and no entry, an empty answer that cannot be told from a unit
+    /// that never ran. With the flag such an account opens no file, and `journalctl` fails ("No
+    /// journal files were opened due to insufficient permissions"), which is the error a journal that
+    /// cannot be read must be. A host whose journal holds no files still answers with nothing (exit 0).
+    Manager,
+    /// A unit's own output, which journald splits by uid (`SplitMode=uid`): a unit that runs as a
+    /// regular uid writes to that uid's user journal, which `--system` would hide. Every file the
+    /// reader may open, which for root is all of them. `run` needs a reader of the system journal
+    /// anyway (`sync` is refused to an account that is not one).
+    Output,
+}
+
+/// The system journal, as the systemd backend reads it. `newest_first` is the manager's entries
+/// ([`Scope::Manager`]); `follow` and `read_after` take the [`Scope`] of what they read.
 pub(super) trait Journal: Send + Sync {
     /// The entries holding every one of `matches`, newest first. `Err` where the journal cannot be
     /// read at all, which is never an empty answer: a host with no journal files answers with none.
@@ -186,12 +198,24 @@ pub(super) trait Journal: Send + Sync {
     /// arrives. It ends only when stopped ([`Follower::stop`]) or dropped; a query on `JOB_ID` is
     /// bound to the current boot, since job numbers restart with it. The `journalctl` writes its
     /// diagnostics to a temp file drawn from `draws`, which the caller made before it sent anything.
-    fn follow(&self, matches: &[Match], after: Option<&Cursor>, draws: &mut Reservation) -> Result<Box<dyn Follower>>;
+    fn follow(
+        &self,
+        scope: Scope,
+        matches: &[Match],
+        after: Option<&Cursor>,
+        draws: &mut Reservation,
+    ) -> Result<Box<dyn Follower>>;
 
     /// Every entry holding `matches` after `cursor`, once the journal holds everything written
     /// before the call ([`Journal::sync`] is the caller's to have made). Draws a temp file as
     /// [`Journal::follow`] does.
-    fn read_after(&self, matches: &[Match], cursor: &Cursor, draws: &mut Reservation) -> Result<Vec<Entry>>;
+    fn read_after(
+        &self,
+        scope: Scope,
+        matches: &[Match],
+        cursor: &Cursor,
+        draws: &mut Reservation,
+    ) -> Result<Vec<Entry>>;
 
     /// Waits until journald has stored everything sent to it before the call (`journalctl --sync`).
     fn sync(&self) -> Result<()>;

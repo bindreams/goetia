@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
 
-use super::journal::{Cursor, Entry, Follower, Journal, Match, STARTING, Stop, exit_of, lacks};
+use super::journal::{Cursor, Entry, Follower, Journal, Match, STARTING, Scope, Stop, exit_of, lacks};
 use super::systemctl::Held;
 use super::task::Fragment;
 use super::{Systemd, UnitKind, unit_name};
@@ -193,6 +193,7 @@ fn find_start(
     draws: &mut Reservation,
 ) -> Result<(String, Cursor)> {
     let mut follower = journal.follow(
+        Scope::Manager,
         &[Match::new("UNIT", unit), Match::new("JOB_ID", job.to_string())],
         None,
         draws,
@@ -301,6 +302,7 @@ impl RunHandle for Run {
 impl Run {
     fn exit(&mut self) -> Result<Exit> {
         let mut follower = self.journal.follow(
+            Scope::Manager,
             &[Match::new("UNIT", self.unit.as_str())],
             Some(&self.start),
             &mut self.draws,
@@ -358,7 +360,7 @@ impl JournalOutput {
             watcher,
         } = self;
         let query = stdout_query(&unit);
-        let mut follower = journal.follow(&query, Some(&cursor), &mut draws)?;
+        let mut follower = journal.follow(Scope::Output, &query, Some(&cursor), &mut draws)?;
         // Closed when the live read is over, which releases the thread that waits for the run's end.
         let (finished, watching) = crossbeam_channel::bounded::<()>(0);
         let (done, watcher_done) = crossbeam_channel::bounded::<()>(0);
@@ -464,8 +466,10 @@ fn rest(
 ) -> Result<()> {
     journal.sync()?;
     let entries = match &selection.found {
-        Some((stream, last)) => journal.read_after(&[Match::new("_STREAM_ID", stream.as_str())], last, draws)?,
-        None => journal.read_after(query, from, draws)?,
+        Some((stream, last)) => {
+            journal.read_after(Scope::Output, &[Match::new("_STREAM_ID", stream.as_str())], last, draws)?
+        }
+        None => journal.read_after(Scope::Output, query, from, draws)?,
     };
     let mut text = Vec::new();
     for entry in &entries {

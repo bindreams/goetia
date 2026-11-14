@@ -18,7 +18,7 @@ use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
 use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status, TaskStatus};
-use goetia::spec::{DaemonSpec, HashSeed, Id, Schedule, TaskSpec};
+use goetia::spec::{DaemonSpec, HashSeed, Id, Schedule, TaskSpec, User};
 use serde_json::Value;
 
 use crate::linux::{
@@ -893,6 +893,69 @@ fn back_to_back_runs_show_only_their_own_lines_in_the_logs_file(#[fixture(system
         assert_eq!(exit, Exit::Code(0));
         assert_same_text(n, &out, format!("run {n}\n").as_bytes());
     }
+}
+
+/// A task that runs as an account of a regular uid (>= 1000) shows its output on a host that keeps a
+/// journal and splits it by uid, through `goetia daemon run`: journald stores such a unit's lines in the
+/// account's user journal, which a read of the system journal alone would not find. The test checks
+/// that the lines are where it says, so that it exercises the split. The storage setting is the
+/// fixture's and goes back with the drop-in.
+#[skuld::test(labels = [JOURNALD_CONFIG], serial = JOURNALD_CONFIG)]
+fn run_of_a_task_as_a_regular_uid_shows_its_output_on_persistent_storage(#[fixture(systemd_group)] _group: &Group) {
+    let _journald = JournaldConf::set("Storage=persistent\n");
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let account = support::random_test_id();
+    let _account = AccountGuard(account.clone());
+    cmd::run(
+        "useradd",
+        &[
+            "--no-create-home",
+            "--no-user-group",
+            "--shell",
+            "/usr/sbin/nologin",
+            &account,
+        ],
+    )
+    .expect_ok();
+    let uid: u32 = cmd::run("id", &["-u", &account])
+        .expect_ok()
+        .stdout
+        .trim()
+        .parse()
+        .expect("a uid");
+    assert!(uid >= 1000, "{account} has uid {uid}, which is a system uid");
+    let DaemonSpec::Task(spec) = task(&id, sh("echo one; echo two >&2; exit 2"), None) else {
+        unreachable!("`task` builds a task");
+    };
+    let mut fields = spec.into_fields();
+    fields.common.user = User::Name(account);
+    let mgr = Systemd::new();
+    mgr.install(&TaskSpec::new(fields).expect("a task as an account").into(), false)
+        .expect("install");
+
+    let args = goetia::cli::run::Args { id: id.clone() };
+    let get_manager = || -> goetia::Result<Box<dyn ServiceManager>> { Ok(Box::new(Systemd::new())) };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    // Truthful, not a stub: the group's elevation check is this test's own precondition.
+    let code = goetia::cli::run::run(&args, &get_manager, &|| true, &mut out, &mut err);
+
+    assert_eq!(code, ExitCode::Run(2), "stderr:\n{}", String::from_utf8_lossy(&err));
+    assert_eq!(String::from_utf8_lossy(&out), "one\ntwo\n");
+    let unit = format!("_SYSTEMD_UNIT={}", unit_of(&id));
+    let lines = |system: bool| {
+        let mut args = vec!["-a", "-o", "json", "--no-pager", unit.as_str(), "_TRANSPORT=stdout"];
+        if system {
+            args.push("--system");
+        }
+        cmd::run("journalctl", &args).expect_ok().stdout.lines().count()
+    };
+    assert_eq!(lines(true), 0, "the account's lines are not in the system journal");
+    assert_eq!(
+        lines(false),
+        3,
+        "the marker and the two lines are in the account's own journal"
+    );
 }
 
 /// A run whose marker journald dropped shows the note and still returns the run's exit. Journald
