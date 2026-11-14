@@ -365,14 +365,16 @@ impl std::fmt::Display for Plists {
 
 /// The label of a task's timer. `@` is outside an id's characters, so no id is a timer's label, and
 /// a plist stem that ends in `@timer` with an id before it is a timer's.
-#[allow(dead_code)] // Used by the two-plist snapshot, which removes this allow.
+// Only the macOS manager reads it; other hosts compile it for its tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn timer_label(id: &str) -> String {
     format!("{id}{TIMER_SUFFIX}")
 }
 
 /// The id of the task whose timer's plist stem (the file name without `.plist`) is `stem`: `Some`
 /// when `stem` is a valid id followed by `@timer`.
-#[allow(dead_code)] // Used by the two-plist snapshot, which removes this allow.
+// Only the macOS manager reads it; other hosts compile it for its tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn id_of_timer_stem(stem: &str) -> Option<&str> {
     let id = stem.strip_suffix(TIMER_SUFFIX)?;
     Id::try_from(id).ok().map(|_| id)

@@ -35,6 +35,8 @@
 //!   [`ServiceManager::disable`](crate::manager::ServiceManager::disable) promises not to stop a
 //!   running one, and launchd holds a bootstrapped job by label, whichever directory its plist is
 //!   in, so moving the file leaves it running.
+//! - A task is two plists, the job `<id>.plist` and its timer `<id>@timer.plist`; reading and
+//!   `status` treat them as one id (see `task`).
 //! - Reading (`list`, and every verb's ownership check) scans both directories, never `launchctl
 //!   print`, whose format Apple does not guarantee. `status`'s live run state is the one exception,
 //!   since no file says whether a job is running. It reads `launchctl print` leniently: a shape it
@@ -68,25 +70,23 @@ use std::{fs, io};
 
 use crate::backend::bounded::{self, Finished, Kept, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
+use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::state::Evidence;
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
-    self, Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    self, Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, WriteOutcome,
 };
 use crate::blob::Blob;
 use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Occupant, PutBackFound, Reason, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step, flow};
-use crate::spec::{AccountId, DaemonSpec, Id, Restart, User};
+use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, Restart, User};
 
-/// Where `install` writes a plist that is not enabled at boot. launchd never scans this directory,
-/// so a job here is inert until `start` bootstraps it or `enable` moves it into [`ENABLED_DIR`].
-pub const STAGING_DIR: &str = "/Library/Application Support/Goetia/daemons";
+pub use super::{ENABLED_DIR, STAGING_DIR};
+use task::{Artifact, Assembled, Body};
 
-/// The system LaunchDaemons directory. A plist here is loaded at boot: being here is the
-/// enrollment bit.
-pub const ENABLED_DIR: &str = "/Library/LaunchDaemons";
+mod task;
 
 pub struct Launchd {
     launchctl: Launchctl,
@@ -126,6 +126,12 @@ struct Location {
     enabled: bool,
 }
 
+/// The two directories a plist can be in, each with whether it is the enabled one: staging first.
+type Dirs<'a> = [(&'a str, bool); 2];
+
+/// The directories goetia's plists are in.
+const DIRS: Dirs<'static> = [(STAGING_DIR, false), (ENABLED_DIR, true)];
+
 /// What a stat established about a path: absence, presence, or neither.
 ///
 /// [`Presence::Undetermined`] carries the [`io::Error`] itself, not a rendered reason, because
@@ -153,15 +159,16 @@ fn occupied(path: &Path) -> Presence {
     }
 }
 
-/// Where `id`'s plist lives, and whether that is the enabled directory. `Ok(None)` if it lives in
-/// neither.
+/// Where the plist `<stem>.plist` of `id` lives in `dirs`, and whether that is the enabled directory.
+/// `Ok(None)` if it lives in neither. `stem` is `id` for the job and [`generate::timer_label`] of it
+/// for a task's timer: one mechanism for both slots.
 ///
 /// `Err` if a plist exists at both paths. No operation of this backend leaves that (`enable` and
 /// `disable` move, never copy), but a hand-edit or a crash mid-move could; preferring one would
 /// make the other's content vanish from every command, so both paths are named instead.
-fn locate(id: &str) -> Result<Option<Location>> {
-    let staging = staging_path(id);
-    let enabled = enabled_path(id);
+fn locate(dirs: Dirs, id: &str, stem: &str) -> Result<Option<Location>> {
+    let path = |(dir, _): (&str, bool)| Path::new(dir).join(format!("{stem}.plist"));
+    let (staging, enabled) = (path(dirs[0]), path(dirs[1]));
     match (occupied(&staging), occupied(&enabled)) {
         // One unresolved probe leaves the pair unresolved: each remaining answer claims something
         // about the directory that was never read.
@@ -320,7 +327,7 @@ fn classify(bytes: Vec<u8>) -> ClassifyOutcome {
 }
 
 /// Read the artifact `locate` found for `id`, for the callers that look for a marker in it
-/// ([`read_at`]).
+/// ([`task::read_at`]).
 ///
 /// An absent path is [`Error::NotInstalled`]: the plist was there when `locate` stat'd it, so an
 /// uninstall completed in between, and absence is the truth. Every read that did not complete is
@@ -342,22 +349,33 @@ fn read_artifact(path: &Path, id: &str) -> Result<String> {
     }
 }
 
-/// A marked plist, as `read` saw it: where it is, and its text.
+/// A marked id, as `read` saw it: the job's plist and, for a task, its timer's, each with where it is
+/// and its text. `blob` is the job's metadata, or why there is none: it will not decode, or the job is
+/// missing (a timer alone at the id, which is goetia's and unusable). So a snapshot whose blob decoded
+/// has a job.
 pub(crate) struct Plist {
     id: Id,
     blob: Decoded,
-    location: Location,
-    text: String,
+    job: Option<Artifact>,
+    timer: Option<Artifact>,
 }
 
 impl Plist {
-    fn new(id: Id, blob: Decoded, (location, text): (Location, String)) -> Self {
-        Self {
-            id,
-            blob,
-            location,
-            text,
-        }
+    fn new(id: Id, blob: Decoded, Body { job, timer }: Body) -> Self {
+        Self { id, blob, job, timer }
+    }
+
+    /// The job's plist. For an id whose job is missing, the error that says so, which the verbs that
+    /// act on a job's file return: its blob is that error.
+    fn job(&self) -> Result<&Artifact> {
+        self.job.as_ref().ok_or_else(|| match &self.blob {
+            Err(e) => Error::Kept(Arc::clone(e)),
+            Ok(_) => Error::blob("the job's plist is missing"),
+        })
+    }
+
+    fn is_task(&self) -> bool {
+        matches!(&self.blob, Ok(blob) if blob.spec.kind() == DaemonKind::Task)
     }
 }
 
@@ -369,21 +387,6 @@ impl InstalledService for Plist {
     fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
         self.blob.as_ref()
     }
-}
-
-/// What is at `location`: no marker is `Foreign`, a marker is `Marked` whether or not its blob
-/// decodes, since the marker alone is proof of ownership. Whether the spec can still be rendered
-/// here is `flow`'s question, answered with `render`.
-fn read_at(id: &str, location: Location) -> Result<ReadOutcome<Unnamed<(Location, String)>>> {
-    let text = read_artifact(&location.path, id)?;
-    let Some(blob) = generate::extract(&text).transpose() else {
-        return Ok(ReadOutcome::Foreign { recovery: None });
-    };
-    let blob = blob.map_err(Arc::new);
-    Ok(ReadOutcome::Marked(Unnamed {
-        blob,
-        body: (location, text),
-    }))
 }
 
 // Account resolution ==================================================================================================
@@ -1033,11 +1036,24 @@ impl Launchctl {
     ) -> Result<(State, Option<u32>)> {
         // An expiry degrades to `Unknown`, as a capture that is not whole does. The budgeted verbs
         // check the deadline wherever an `Unknown` would otherwise become a wrong error.
-        let Finished::Exited { status, capture } = self.run(&["print", &target(id)], deadline, role, reservation)?
-        else {
+        let Some((status, capture)) = self.read_print(id, deadline, role, reservation)? else {
             return Ok((State::Unknown, None));
         };
-        Ok(classified(status, &capture))
+        Ok(classified(status, &capture, DaemonKind::Service))
+    }
+
+    /// One `print` of `id` as `role`, whatever it answered. `Ok(None)` iff `deadline` expired.
+    fn read_print(
+        &self,
+        id: &str,
+        deadline: Deadline,
+        role: Role,
+        reservation: &mut Reservation,
+    ) -> Result<Option<(std::process::ExitStatus, bounded::Capture)>> {
+        Ok(match self.run(&["print", &target(id)], deadline, role, reservation)? {
+            Finished::Exited { status, capture } => Some((status, capture)),
+            Finished::Left(_) | Finished::Expired => None,
+        })
     }
 }
 
@@ -1092,8 +1108,9 @@ fn counted(steps: &[Step]) -> (usize, usize) {
     (requests, calls * Role::COUNTED_FILES)
 }
 
-/// What a `launchctl print` that ran says about the job's live state.
-fn classified(status: std::process::ExitStatus, capture: &bounded::Capture) -> (State, Option<u32>) {
+/// What a `launchctl print` that ran says about the live state of the job of a daemon of `kind`: a
+/// task's job is read by [`state::classify_task`], and one launchd does not hold is `Idle`.
+fn classified(status: std::process::ExitStatus, capture: &bounded::Capture, kind: DaemonKind) -> (State, Option<u32>) {
     if !capture.complete {
         return (State::Unknown, None);
     }
@@ -1103,13 +1120,22 @@ fn classified(status: std::process::ExitStatus, capture: &bounded::Capture) -> (
         // the system domain, must not read as "stopped": `list`/`status` work unelevated, and a
         // running daemon reported `Stopped` because the caller could not ask is a wrong answer.
         return if is_not_found(status.code()) {
-            (State::Stopped, None)
+            (
+                match kind {
+                    DaemonKind::Service => State::Stopped,
+                    DaemonKind::Task => State::Idle,
+                },
+                None,
+            )
         } else {
             (State::Unknown, None)
         };
     }
     let text = String::from_utf8_lossy(&capture.stdout);
-    state::classify(&text)
+    match kind {
+        DaemonKind::Service => state::classify(&text),
+        DaemonKind::Task => state::classify_task(&text),
+    }
 }
 
 // Backend =============================================================================================================
@@ -1143,13 +1169,13 @@ impl Launchd {
 }
 
 impl backend::Backend for Launchd {
-    type Definition = String;
+    type Definition = Plists;
     type Snapshot = Plist;
     type InstallScope = ();
     type Reservation = Reservation;
     type Run = std::convert::Infallible;
 
-    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String, _reservation: &mut Reservation) -> Result<()> {
+    fn begin_install(&self, _spec: &DaemonSpec, _desired: &Plists, _reservation: &mut Reservation) -> Result<()> {
         Ok(())
     }
 
@@ -1161,22 +1187,38 @@ impl backend::Backend for Launchd {
         Reservation::make(reapers, files).map_err(|source| Error::Reservation { id: None, source })
     }
 
-    /// Interim: a task's definition is its job's plist alone, until the two-plist install lands.
-    fn render(&self, spec: &DaemonSpec) -> Result<String> {
+    fn render(&self, spec: &DaemonSpec) -> Result<Plists> {
         let account = resolve_account(&spec.common().user)?;
-        generate::plists(spec, &account.identity()).map(|plists| plists.job)
+        generate::plists(spec, &account.identity())
+    }
+
+    /// `spec` as `render` would write it: the job from `spec`, and the timer from its own metadata
+    /// where that decodes (else from `spec`), so that a job and a timer left by two different installs
+    /// are each unmodified. A job beside no timer regenerates without one, so a missing timer is not
+    /// drift. Each spec goes through `render`, which refuses what cannot be written, so a timer is
+    /// never generated for a spec its job could not be.
+    fn regenerate(&self, spec: &DaemonSpec, snapshot: &Plist) -> Result<Plists> {
+        let mut plists = self.render(spec)?;
+        plists.timer = match &snapshot.timer {
+            None => None,
+            Some(timer) => match timer.blob() {
+                Ok(blob) => self.render(&blob.spec)?.timer,
+                Err(_) => plists.timer,
+            },
+        };
+        Ok(plists)
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Plist>> {
-        match locate(id.as_str())? {
-            None => Ok(ReadOutcome::Absent),
-            Some(location) => read_at(id.as_str(), location).map(|found| found.named(id, Plist::new)),
-        }
+        task::read_in(DIRS, id)
     }
 
-    fn installed(&self, snapshot: &Plist) -> Result<InstalledDefinition<String>> {
+    fn installed(&self, snapshot: &Plist) -> Result<InstalledDefinition<Plists>> {
         Ok(InstalledDefinition {
-            definition: snapshot.text.clone(),
+            definition: Plists {
+                job: snapshot.job()?.text.clone(),
+                timer: snapshot.timer.as_ref().map(|timer| timer.text.clone()),
+            },
             // launchd has no drop-in or override that alters a job without touching its plist.
             // Enablement lives in the plist's directory, outside the compared surface.
             external: ExternalConfig::Absent,
@@ -1188,10 +1230,12 @@ impl backend::Backend for Launchd {
     ///
     /// `Raced` only where no `launchctl` call has been made yet: another pass could then make more
     /// calls than the verb reserved ([`INSTALL_CALLS`]), so a race after one is an error instead.
+    ///
+    /// Interim: writes the job's plist alone, for a task too, until the two-plist install lands.
     fn write(
         &self,
         spec: &DaemonSpec,
-        desired: &String,
+        desired: &Plists,
         outcome: &Outcome,
         snapshot: Option<&Plist>,
         _scope: &mut (),
@@ -1200,6 +1244,7 @@ impl backend::Backend for Launchd {
         // Resolved again: `render` kept only the plist, which names the account, and launchd
         // resolves that name at launch too.
         let account = resolve_account(&spec.common().user)?;
+        let desired = desired.job.as_str();
         let deadline = Budget::Unbounded.start();
 
         match outcome {
@@ -1241,7 +1286,8 @@ impl backend::Backend for Launchd {
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {
                 let snapshot = snapshot.expect("an id `decide` chose to update was read as marked");
-                let previous = snapshot.text.as_str();
+                let job = snapshot.job()?;
+                let previous = job.text.as_str();
                 // `Stale` is checked too: a release can change what the generator renders.
                 let changes_job = refuse::changes_loaded_job(previous, desired);
                 if changes_job
@@ -1253,7 +1299,7 @@ impl backend::Backend for Launchd {
                     return Err(refuse::loaded_refusal(&spec.common().id));
                 }
                 prepare_parent_dirs(spec, &account)?;
-                let target = snapshot.location.path.as_path();
+                let target = job.location.path.as_path();
                 // `target` was captured by `read`, before `decide` ran. A concurrent `enable` or
                 // `disable` may have moved it since, and writing here would put a plist in both
                 // directories, which `locate` errors on; a concurrent `uninstall` would report
@@ -1286,6 +1332,9 @@ impl backend::Backend for Launchd {
     }
 
     fn live_status(&self, snapshot: &Plist) -> Result<Status> {
+        if snapshot.is_task() {
+            return self.task_status(snapshot);
+        }
         // `status` and `list` have no budget of their own: unbounded.
         // Read as `UncountedQuery`: neither verb counted this read, so it draws on no reservation
         // and is handed an empty one.
@@ -1298,47 +1347,55 @@ impl backend::Backend for Launchd {
         Ok(Status::Service(DaemonStatus {
             state,
             pid,
-            enabled: snapshot.location.enabled,
+            enabled: snapshot.job()?.location.enabled,
         }))
     }
 
-    fn scan(&self) -> Scan<Plist> {
-        scan_in([(STAGING_DIR, false), (ENABLED_DIR, true)])
+    fn task_state(&self, snapshot: &Plist) -> Result<State> {
+        self.task_run_state(snapshot)
     }
 
+    fn scan(&self) -> Scan<Plist> {
+        scan_in(DIRS)
+    }
+
+    /// Interim: a task's job alone, until the two-plist uninstall lands.
     fn uninstall(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
-        let Plist { id, location, .. } = snapshot;
+        let location = &snapshot.job()?.location;
 
         // Unbounded, like `install`'s: `uninstall` has no `--timeout`, and bounding this would turn a
         // slow-stopping job into a failed uninstall.
         never_expires(
             self.launchctl
-                .bootout(id.as_str(), Budget::Unbounded.start(), reservation)?,
+                .bootout(snapshot.id.as_str(), Budget::Unbounded.start(), reservation)?,
         );
         fs::remove_file(&location.path).map_err(|e| Error::os_at("remove", &location.path, e))
     }
 
+    /// Interim: a task's job alone, until the two-plist `enable` lands.
     fn enable(&self, snapshot: Plist, _reservation: &mut Reservation) -> Result<()> {
-        let Plist { id, location, .. } = snapshot;
+        let location = &snapshot.job()?.location;
 
         if location.enabled {
             return Ok(());
         }
-        let dest = enabled_path(id.as_str());
+        let dest = enabled_path(snapshot.id.as_str());
         move_no_clobber(&location.path, &dest)
     }
 
     /// Does not stop the job if it is loaded, as [`ServiceManager::disable`] requires: launchd
     /// holds a bootstrapped job by label, whichever directory its plist is in.
     ///
+    /// Interim: a task's job alone, until the two-plist `disable` lands.
+    ///
     /// [`ServiceManager::disable`]: crate::manager::ServiceManager::disable
     fn disable(&self, snapshot: Plist) -> Result<()> {
-        let Plist { id, location, .. } = snapshot;
+        let location = &snapshot.job()?.location;
 
         if !location.enabled {
             return Ok(());
         }
-        let dest = staging_path(id.as_str());
+        let dest = staging_path(snapshot.id.as_str());
         ensure_dir(Path::new(STAGING_DIR))?;
         move_no_clobber(&location.path, &dest)
     }
@@ -1346,9 +1403,11 @@ impl backend::Backend for Launchd {
     fn start(&self, snapshot: Plist, budget: Budget, reservation: &mut Reservation) -> Result<()> {
         // First, so the wait is counted from the verb's entry (see `verb_deadline`).
         let deadline = verb_deadline(budget);
-        let Plist { id, blob, location, .. } = snapshot;
+        let Plist { id, blob, job, .. } = snapshot;
         let id = &id;
         let blob = blob.map_err(Error::Kept)?;
+        // A snapshot whose metadata decoded has a job (see `Plist`).
+        let Artifact { location, .. } = job.expect("a snapshot whose metadata decoded has a job");
         let DaemonSpec::Service(service) = &blob.spec else {
             return Err(backend::cannot_run_tasks("launchd", id));
         };
@@ -1524,70 +1583,70 @@ impl backend::Backend for Launchd {
 /// A pass that stopped in one directory does not stop the other: scanning on only adds ids goetia
 /// has established, and the aggregate in `reported` forbids concluding absence for anything either
 /// pass missed. Both stopping gives two aggregates.
-fn scan_in(dirs: [(&str, bool); 2]) -> Scan<Plist> {
-    let mut by_id: BTreeMap<String, Vec<Location>> = BTreeMap::new();
+fn scan_in(dirs: Dirs) -> Scan<Plist> {
+    let mut by_stem: BTreeMap<String, Vec<Location>> = BTreeMap::new();
     let mut incomplete = Vec::new();
     for (dir, enabled) in dirs {
         let pass = scan_plists(dir);
-        for (id, path) in pass.plists {
-            by_id.entry(id).or_default().push(Location { path, enabled });
+        for (stem, path) in pass.plists {
+            by_stem.entry(stem).or_default().push(Location { path, enabled });
         }
         incomplete.extend(pass.incomplete);
+    }
+
+    // A stem `id_of_timer_stem` answers for is that id's timer, which no listing names as an id of
+    // its own; any other stem is a job.
+    let mut by_id: BTreeMap<String, Names> = BTreeMap::new();
+    for (stem, locations) in by_stem {
+        match generate::id_of_timer_stem(&stem) {
+            Some(id) => by_id.entry(id.to_string()).or_default().timer = locations,
+            None => by_id.entry(stem).or_default().job = locations,
+        }
     }
 
     let mut entries = Vec::new();
     let mut reported = Vec::new();
     // A partial scan can narrow a positive claim but never supports absence: `reported` forbids
     // that. Untested: needs a mid-`readdir` fault on macOS.
-    for (id, locations) in by_id {
+    for (id, names) in by_id {
         // Each location is read, because `/Library/LaunchDaemons` holds every vendor's daemons: a
-        // stem found in both is goetia's only if one of the two carries the marker.
-        let mut found = Vec::new();
-        let mut unestablished = Vec::new();
-        for location in locations {
-            match read_at(&id, location) {
-                Ok(found_here) => found.push(found_here),
-                // Gone since the scan: an uninstall completed. Absence is established, so skip;
-                // reporting it would let a benign concurrent uninstall raise `list`'s exit code.
-                Err(e) if matches!(e.cause(), Error::NotInstalled { .. }) => {}
-                // Undetermined, not absence or ownership: the failed read established neither. The
-                // read is its reason; the `status` recovery is left out.
-                Err(e) => {
-                    let failed = match e.into_undetermined() {
-                        Ok((read, _recovery)) => *read,
-                        Err(e) => e,
-                    };
-                    unestablished.push(failed);
-                }
+        // name found in both directories is goetia's only if one of the two carries the marker.
+        match task::assemble(&id, names.job, || Ok(names.timer)) {
+            // Undetermined, not absence or ownership: the failed read established neither. The
+            // read is its reason; the `status` recovery is left out.
+            Err(failures) => {
+                let failures = failures.into_iter().map(|e| match e.into_undetermined() {
+                    Ok((read, _recovery)) => *read,
+                    Err(e) => e,
+                });
+                reported.push(Installed::Undetermined {
+                    name: Some(id),
+                    reason: Reason::failed(Error::both_all(failures).expect("a failed read has a failure")),
+                });
             }
-        }
-        if let Some(failed) = Error::both_all(unestablished) {
-            reported.push(Installed::Undetermined {
-                name: Some(id),
-                reason: Reason::failed(failed),
-            });
-            continue;
-        }
-        match <[_; 1]>::try_from(found) {
-            Ok([only]) => {
-                let entry = ScanEntry::of(&id, only, Plist::new);
+            // Gone since the scan: an uninstall completed. Absence is established, so nothing.
+            Ok(Assembled::Read(ReadOutcome::Absent)) => {}
+            Ok(Assembled::Read(found)) => {
+                let entry = ScanEntry::of(&id, found, Plist::new);
                 entries.push((id, entry));
             }
-            // Two plists, or none left: only a marker among them makes the id goetia's.
-            Err(found) => {
-                if found.iter().any(|f| matches!(f, ReadOutcome::Marked(_))) {
-                    reported.push(Installed::OursUnusable {
-                        name: id,
-                        reason: Reason::said(format!("present in both {STAGING_DIR} and {ENABLED_DIR}")),
-                    });
-                }
-            }
+            Ok(Assembled::Unusable { reason, .. }) => reported.push(Installed::OursUnusable {
+                name: id,
+                reason: Reason::said(reason),
+            }),
         }
     }
     // Last, so a pass that got some way in still reports what it named before what it could
     // not — the order `cli::support::partition_installed` imposes on the rendered output too.
     reported.extend(incomplete);
     Scan { entries, reported }
+}
+
+/// Where an id's two file names were found: its job's and its timer's.
+#[derive(Default)]
+struct Names {
+    job: Vec<Location>,
+    timer: Vec<Location>,
 }
 
 /// What one pass over one of `list`'s two directories found: the `<id>.plist` files it reached,

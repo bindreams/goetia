@@ -3,7 +3,7 @@
 //! unlike `manager`.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use crate::manager::State;
+use crate::manager::{Exit, State};
 
 /// Classifies one `launchctl print` body into the `(State, pid)` pair `status`/`list` report.
 ///
@@ -12,7 +12,7 @@ use crate::manager::State;
 /// running, so with a pid it is `Running`: launchd's side of the start is done, and the exec that
 /// follows is the user process's.
 pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
-    let pid = find_field(print_body, "pid").and_then(|s| s.trim().parse().ok());
+    let pid = has_process(print_body);
     let state = match find_field(print_body, "state").map(str::trim) {
         Some("running") => State::Running,
         Some("xpcproxy") | Some("trampoline") if pid.is_some() => State::Running,
@@ -27,6 +27,53 @@ pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
         _ => State::Unknown,
     };
     (state, pid)
+}
+
+/// [`classify`] for a task's job, which a run starts and ends rather than keeps running: `exited` and
+/// `not running` are [`State::Idle`], and `spawn scheduled` is [`State::Running`] with no pid, a start
+/// launchd has accepted and not yet forked (`kickstart` returns before the fork), so a `run` straight
+/// after a `start` is refused as running and a `stop` does not take it for an idle task.
+pub(crate) fn classify_task(print_body: &str) -> (State, Option<u32>) {
+    match classify(print_body) {
+        (State::Stopped, pid) => (State::Idle, pid),
+        (State::Unknown, pid) if find_field(print_body, "state").map(str::trim) == Some("spawn scheduled") => {
+            (State::Running, pid)
+        }
+        other => other,
+    }
+}
+
+/// The job's pid in one `launchctl print` body, if it holds a process: from `xpcproxy` or
+/// `trampoline` on, whatever the `state`. `None` for a job with no `pid` line, `spawn scheduled`
+/// included.
+pub(crate) fn has_process(print_body: &str) -> Option<u32> {
+    find_field(print_body, "pid").and_then(|s| s.trim().parse().ok())
+}
+
+/// How the job's last run ended, from one `launchctl print` body: `last exit code = N` is
+/// [`Exit::Code`], and `last terminating signal = Terminated: 15` (the signal's name, a colon, its
+/// number) is [`Exit::Signal`]. `None` before the first exit (`last exit code = (never exited)`), and
+/// for a body with neither line. `print` has one of the two lines at a time, and while a run is in
+/// flight (a `pid` line) it holds the run before's.
+pub(crate) fn last_result(print_body: &str) -> Option<Exit> {
+    if let Some(code) = find_field(print_body, "last exit code") {
+        return code.trim().parse().ok().map(Exit::Code);
+    }
+    let signal = find_field(print_body, "last terminating signal")?;
+    signal.rsplit(':').next()?.trim().parse().ok().map(Exit::Signal)
+}
+
+/// `started suspended = 1` or `0`: whether the launch `print` shows was held by `launchctl debug
+/// --start-suspended`. It stays `1` for the life of a held launch after it is resumed, so it says how
+/// the launch began, not whether it is stopped now.
+// Nothing on macOS calls it until `begin_run` does, which removes this `allow`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn started_suspended(print_body: &str) -> Option<bool> {
+    match find_field(print_body, "started suspended").map(str::trim) {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
 }
 
 /// Whether one `launchctl print` body shows a job whose `bootout` has returned and whose process has

@@ -406,9 +406,7 @@ fn check(parsed: &ParsedField, field: &CronField) -> Result<(), String> {
 // `not(doc)`: `rustdoc-tests.sh` documents the library with `--cfg test` but without dev-dependencies, and
 // `jiff` is one of them off macOS.
 #[cfg(any(all(test, not(doc)), target_os = "macos"))]
-// Nothing on macOS calls it until the launchd `live_status` does (Task 6), which removes this `allow`.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-mod next;
+pub(super) mod next;
 
 #[cfg(test)]
 #[path = "schedule_tests.rs"]

@@ -3,7 +3,7 @@
 //! tests run on every host this crate builds on, not only macOS.
 
 use super::*;
-use crate::manager::State;
+use crate::manager::{Exit, State};
 
 /// A `launchctl print` body shaped like the real thing: tab-indented
 /// `key = value` lines, with header fields (`active count`, `path`, `type`)
@@ -193,4 +193,136 @@ fn any_other_state_is_not_a_job_being_torn_down() {
         assert!(!tearing_down(&print_body(state, Some(4242))), "{state}");
     }
     assert!(!tearing_down("no state line at all\n"));
+}
+
+// A task's `print` =====================================================================================================
+
+/// A `print` body of a task's job: the header, the `state` and, where the job holds a process, its
+/// `pid`, then `runs`, the result line (`result` is the whole line without its tab and newline) and
+/// `started suspended`. The result line and the pid sit well apart, as in the real output.
+fn task_print(state: &str, pid: Option<u32>, result: &str, suspended: Option<bool>) -> String {
+    let pid_line = pid.map(|pid| format!("\tpid = {pid}\n")).unwrap_or_default();
+    let suspended_line = suspended
+        .map(|held| format!("\tstarted suspended = {}\n", u8::from(held)))
+        .unwrap_or_default();
+    format!(
+        "system/com.example.task = {{\n\
+         \tactive count = 1\n\
+         \tpath = /Library/LaunchDaemons/com.example.task.plist\n\
+         \ttype = LaunchDaemon\n\
+         \tstate = {state}\n\
+         \n\
+         \tprogram = /usr/local/bin/example-task\n\
+         \truns = 3\n\
+         {pid_line}\
+         \t{result}\n\
+         {suspended_line}\
+         }}\n"
+    )
+}
+
+// classify_task -------------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn classify_task_reads_spawn_scheduled_as_running_and_exited_as_stopped() {
+    let queued = task_print("spawn scheduled", None, "last exit code = 0", None);
+    // A start launchd has accepted and not yet forked: no pid, and a task is `Running` for it.
+    assert_eq!(classify_task(&queued), (State::Running, None));
+    // A service reads the same body as `Unknown`; it is the task's reading that differs.
+    assert_eq!(classify(&queued), (State::Unknown, None));
+
+    for state in ["exited", "not running"] {
+        let body = task_print(state, None, "last exit code = 0", None);
+        assert_eq!(classify_task(&body), (State::Idle, None), "{state}");
+        assert_eq!(classify(&body), (State::Stopped, None), "{state}");
+    }
+}
+
+#[skuld::test]
+fn classify_task_keeps_every_other_reading_of_classify() {
+    let running = task_print("running", Some(4242), "last exit code = 0", None);
+    assert_eq!(classify_task(&running), (State::Running, Some(4242)));
+    let starting = task_print("xpcproxy", Some(39459), "last exit code = 0", None);
+    assert_eq!(classify_task(&starting), (State::Running, Some(39459)));
+    for body in [
+        task_print("xpcproxy", None, "last exit code = 0", None),
+        task_print("someday-new-apple-state", None, "last exit code = 0", None),
+        "system/com.example.task = {\n\tactive count = 1\n}\n".to_string(),
+    ] {
+        assert_eq!(classify_task(&body), classify(&body), "{body}");
+        assert_eq!(classify_task(&body).0, State::Unknown, "{body}");
+    }
+}
+
+// last_result ---------------------------------------------------------------------------------------------------------
+
+/// The result line in each form P4 measured, read from a body as `print` gives it.
+#[skuld::test]
+fn last_result_reads_each_form_from_a_real_print() {
+    let cases = [
+        ("last exit code = 0", Some(Exit::Code(0))),
+        ("last exit code = 3", Some(Exit::Code(3))),
+        ("last terminating signal = Terminated: 15", Some(Exit::Signal(15))),
+        ("last terminating signal = Killed: 9", Some(Exit::Signal(9))),
+        ("last exit code = (never exited)", None),
+    ];
+    for (line, expected) in cases {
+        let body = task_print("not running", None, line, None);
+        assert_eq!(last_result(&body), expected, "{line}");
+    }
+}
+
+/// While a run is in flight (a `pid` line) the result line is the run before's, and that is what is read.
+#[skuld::test]
+fn last_result_of_a_running_job_is_the_previous_runs() {
+    let body = task_print("running", Some(4242), "last terminating signal = Killed: 9", None);
+    assert_eq!(last_result(&body), Some(Exit::Signal(9)));
+    let first = task_print("running", Some(4242), "last exit code = (never exited)", None);
+    assert_eq!(last_result(&first), None);
+}
+
+#[skuld::test]
+fn a_body_with_no_result_line_has_no_result() {
+    assert_eq!(last_result("system/com.example.task = {\n\tstate = running\n}\n"), None);
+    assert_eq!(last_result(""), None);
+}
+
+// has_process ---------------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn has_process_reads_the_pid_for_every_state() {
+    for state in [
+        "running",
+        "xpcproxy",
+        "trampoline",
+        "SIGTERMed",
+        "someday-new-apple-state",
+    ] {
+        let body = task_print(state, Some(4242), "last exit code = 0", None);
+        assert_eq!(has_process(&body), Some(4242), "{state}");
+    }
+    for state in ["spawn scheduled", "not running", "exited"] {
+        let body = task_print(state, None, "last exit code = 0", None);
+        assert_eq!(has_process(&body), None, "{state}");
+    }
+    assert_eq!(has_process(""), None);
+}
+
+// started_suspended ---------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn started_suspended_reads_both_values() {
+    let held = task_print("running", Some(4242), "last exit code = 0", Some(true));
+    let unheld = task_print("running", Some(4242), "last exit code = 0", Some(false));
+    assert_eq!(started_suspended(&held), Some(true));
+    assert_eq!(started_suspended(&unheld), Some(false));
+}
+
+#[skuld::test]
+fn started_suspended_is_none_where_print_does_not_say() {
+    assert_eq!(
+        started_suspended(&task_print("running", Some(4242), "last exit code = 0", None)),
+        None
+    );
+    assert_eq!(started_suspended("\tstarted suspended = maybe\n"), None);
 }

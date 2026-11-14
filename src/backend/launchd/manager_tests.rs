@@ -428,7 +428,7 @@ fn locate_reports_absent_for_an_unknown_id() {
     // needs no elevation, since a random id that has never been installed
     // is absent from both regardless of who owns those directories.
     let id = format!("goetia-manager-unit-test-absent-{}", std::process::id());
-    let location = locate(&id).expect("locate should not error for an absent id");
+    let location = locate(DIRS, &id, &id).expect("locate should not error for an absent id");
     assert!(location.is_none());
 }
 
@@ -795,9 +795,11 @@ fn a_marked_plist_is_scanned_as_marked_in_the_directory_it_was_found_in() {
             assert_eq!(name, "ours");
             assert_eq!(snapshot.id().as_str(), "ours");
             assert!(snapshot.blob().is_ok(), "the marker decodes");
-            assert!(snapshot.location.enabled);
-            assert_eq!(snapshot.location.path, path);
-            assert_eq!(snapshot.text, sample_plist("ours"));
+            let job = snapshot.job.as_ref().expect("a marked job is the snapshot's job");
+            assert!(job.location.enabled);
+            assert_eq!(job.location.path, path);
+            assert_eq!(job.text, sample_plist("ours"));
+            assert!(snapshot.timer.is_none());
         }
         _ => panic!("one marked entry expected, got {} entries", scan.entries.len()),
     }
@@ -901,8 +903,7 @@ fn a_marked_plist_beside_an_unmarked_one_of_the_same_stem_is_reported() {
     assert_reported_in_both(&scan.reported);
 }
 
-/// Nothing at the stem is goetia's, and `list` omits foreign entries, so neither an entry nor a
-/// report is made.
+/// Nothing at the stem is goetia's, and `list` omits foreign entries, so nothing is reported.
 #[skuld::test]
 fn an_unmarked_plist_in_both_directories_is_not_reported() {
     let (staging, enabled) = (
@@ -915,7 +916,15 @@ fn an_unmarked_plist_in_both_directories_is_not_reported() {
 
     let scan = scanned(staging.path(), enabled.path());
 
-    assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+    // `list` omits a foreign entry, so what is observable is that nothing is reported and nothing
+    // is an entry `list` would show.
+    assert!(
+        scan.entries
+            .iter()
+            .all(|(_, entry)| matches!(entry, ScanEntry::Read(ReadOutcome::Foreign { .. }))),
+        "{} entries",
+        scan.entries.len()
+    );
     assert!(scan.reported.is_empty(), "{:?}", scan.reported);
 }
 
@@ -933,7 +942,7 @@ fn render_of_a_task_no_longer_refuses() {
         Some("30 3 * * *"),
     );
 
-    let text = mgr.render(&spec).expect("a task renders");
+    let text = mgr.render(&spec).expect("a task renders").job;
 
     assert_eq!(generate::extract(&text).unwrap().expect("marked").spec, spec);
     assert!(
@@ -956,15 +965,13 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
     let (mgr, script) = scripted(&[]);
     let spec = spec_named("goetia-raced-before-any-call");
     let desired = mgr.render(&spec).expect("render");
-    let on_disk = desired.replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
-    assert_ne!(on_disk, desired);
+    let on_disk = desired
+        .job
+        .replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
+    assert_ne!(on_disk, desired.job);
     let tmp = tempfile::tempdir().expect("tempdir");
     let snapshot = Plist {
-        location: Location {
-            path: tmp.path().join("gone.plist"),
-            enabled: false,
-        },
-        text: on_disk,
+        job: job_at(tmp.path().join("gone.plist"), on_disk),
         ..marked_plist(&spec.common().id)
     };
     let stale = Outcome::Stale {
@@ -1004,12 +1011,17 @@ fn marked_plist_restarting(id: &Id, restart: Restart) -> Plist {
     Plist {
         id: id.clone(),
         blob: blob.map_err(Arc::new),
-        location: Location {
-            path: PathBuf::from("/nonexistent/goetia-marked.plist"),
-            enabled: false,
-        },
-        text,
+        job: job_at(PathBuf::from("/nonexistent/goetia-marked.plist"), text),
+        timer: None,
     }
+}
+
+/// The job artifact of a plist at `path`, in the staging directory's terms (not enabled).
+fn job_at(path: PathBuf, text: String) -> Option<Artifact> {
+    Some(Artifact {
+        location: Location { path, enabled: false },
+        text,
+    })
 }
 
 /// A reservation of the stated size: `requests` reapers and the files of `calls` calls.
@@ -1325,11 +1337,7 @@ fn a_live_status_whose_launchctl_cannot_be_run_is_an_error() {
     let unrunnable = ClientError::NotRun(io::Error::from_raw_os_error(libc::EAGAIN).into());
     let mgr = launchd_over(Fake::new([fail(&["print"], unrunnable)]));
     let snapshot = Plist {
-        location: Location {
-            path: PathBuf::from("/nonexistent/goetia-live-status.plist"),
-            enabled: false,
-        },
-        text: String::new(),
+        job: job_at(PathBuf::from("/nonexistent/goetia-live-status.plist"), String::new()),
         ..marked_plist(&never_installed())
     };
 
@@ -1418,7 +1426,7 @@ fn table(calls: &[(&str, Answer)]) -> Fake {
 }
 
 /// A launchd whose `launchctl` is `client`.
-fn launchd_over(client: impl Client + 'static) -> Launchd {
+pub(super) fn launchd_over(client: impl Client + 'static) -> Launchd {
     Launchd {
         launchctl: Launchctl::new(Box::new(client)),
     }
@@ -1801,10 +1809,7 @@ fn an_uninstall_removes_the_plist_only_after_the_old_instance_is_gone() {
     ]);
     let mgr = launchd_over(fake.clone());
     let plist = Plist {
-        location: Location {
-            path: path.clone(),
-            enabled: false,
-        },
+        job: job_at(path.clone(), sample_plist(never_installed().as_str())),
         ..marked_plist(&never_installed())
     };
 
