@@ -251,6 +251,48 @@ fn a_handler_that_finishes_after_the_window_closed_re_raises_its_own_signal() {
     );
 }
 
+/// `begin` opens the window before it installs anything, so a signal that a handler records while it
+/// installs is held, and a `begin` whose install fails closes the window as the last drop does: the
+/// handlers it changed are back, and what was recorded meanwhile is re-raised to them once. Here the
+/// install is refused for the second signal, and a bit a handler recorded is there when it fails.
+#[skuld::test]
+fn a_begin_whose_install_fails_part_way_closes_the_window_and_re_raises_what_was_recorded() {
+    let before = StandIn::install();
+    let term = SIGNALS
+        .iter()
+        .position(|&s| s == libc::SIGTERM)
+        .expect("SIGTERM is deferred");
+    RECORDED.store(1 << term, Ordering::SeqCst);
+    let after_one = test_hook::installs(1);
+
+    let refused = Deferred::begin().err().expect("the second install is refused");
+
+    drop(after_one);
+    assert!(refused.to_string().contains("interrupts"), "{refused}");
+    assert!(!OPEN.load(Ordering::SeqCst), "the window is closed");
+    assert_eq!(RECORDED.load(Ordering::SeqCst), 0, "what was recorded was claimed");
+    assert_eq!(before.seen(), 1, "and re-raised once");
+    assert!(before.saw(libc::SIGTERM));
+    before.assert_back();
+    assert_eq!(SHARED.lock().unwrap_or_else(PoisonError::into_inner).holders, 0);
+}
+
+/// The window is open once `begin` has installed a handler, so a signal that arrives with only some of
+/// them installed is recorded, never raised into our own handler.
+#[skuld::test]
+fn the_window_is_open_while_the_handlers_are_installed() {
+    let before = StandIn::install();
+    let deferred = Deferred::begin().expect("begin");
+
+    assert!(OPEN.load(Ordering::SeqCst));
+    raise(libc::SIGHUP);
+    assert_eq!(before.seen(), 0);
+
+    drop(deferred);
+    assert_eq!(before.seen(), 1);
+    assert!(!OPEN.load(Ordering::SeqCst));
+}
+
 /// Windows that follow one another each save and restore: nothing a first one recorded is re-raised by
 /// the second.
 #[skuld::test]

@@ -10,10 +10,11 @@
 //! A registration is a value, [`Registered`]: waiting consumes it, and dropping it, on whatever path
 //! leaves the pass that made it, deletes the registration and drains the queue. So no exit event
 //! outlives its pass, and a later registration of a reused pid number can never be handed the earlier
-//! process's. One [`Watch`] serves every pid of one verb in turn, one registration at a time.
+//! process's. One [`Watch`] serves every pid of one verb, and a registration reads only its own pid's
+//! events: an event it reads for another registration's pid is kept for that one, never dropped.
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use nix::errno::Errno;
@@ -24,7 +25,21 @@ use crate::manager::budget::Deadline;
 
 /// One kqueue fd.
 pub(crate) struct Watch {
-    queue: Arc<Kqueue>,
+    shared: Arc<Shared>,
+}
+
+/// The queue, and the exits read from it for a registration other than the one that read them.
+struct Shared {
+    queue: Kqueue,
+    /// Taken out of the queue by one registration's `wait` or drop and not its own, so kept here for the
+    /// registration whose pid it is. `status` is `None` for an exit the kernel reported without a status.
+    kept: Mutex<Vec<Exited>>,
+}
+
+/// One pid's exit, read from the queue.
+struct Exited {
+    pid: u32,
+    status: Option<i32>,
 }
 
 /// What [`Watch::add`] found.
@@ -38,7 +53,7 @@ pub(crate) enum Added {
 
 /// A pid registered for its exit. It shares the queue, so it outlives the [`Watch`] that made it.
 pub(crate) struct Registered {
-    queue: Arc<Kqueue>,
+    shared: Arc<Shared>,
     pid: u32,
 }
 
@@ -51,12 +66,17 @@ impl Watch {
     /// descriptors) strands nothing.
     pub(crate) fn new() -> Result<Watch> {
         make_queue()
-            .map(|queue| Watch { queue: Arc::new(queue) })
+            .map(|queue| Watch {
+                shared: Arc::new(Shared {
+                    queue,
+                    kept: Mutex::new(Vec::new()),
+                }),
+            })
             .map_err(|source| Error::os("make a kqueue to watch processes exit with", source))
     }
 
     /// Registers `pid` for its exit and the status it exits with. [`Added::Gone`] where there is no such
-    /// process. One registration at a time: the previous one is waited on or dropped first.
+    /// process. Registrations are waited on one at a time, by one thread.
     pub(crate) fn add(&self, pid: u32) -> Result<Added> {
         let change = KEvent::new(
             pid as usize,
@@ -71,7 +91,7 @@ impl Watch {
         let mut receipt = [blank()];
         let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let answered = loop {
-            match self.queue.kevent(&[change], &mut receipt, Some(now)) {
+            match self.shared.queue.kevent(&[change], &mut receipt, Some(now)) {
                 Err(Errno::EINTR) => {}
                 Err(Errno::ESRCH) => return Ok(Added::Gone),
                 other => break other,
@@ -87,7 +107,7 @@ impl Watch {
         );
         match receipt.data() {
             0 => Ok(Added::Watching(Registered {
-                queue: Arc::clone(&self.queue),
+                shared: Arc::clone(&self.shared),
                 pid,
             })),
             code => match Errno::from_raw(code as i32) {
@@ -106,25 +126,26 @@ impl Registered {
         let pid = self.pid;
         let mut events = [blank(); 8];
         loop {
+            if let Some(exited) = self.take_kept() {
+                return exited.status.map(Some).ok_or_else(|| {
+                    Error::os(
+                        format!("wait for process {pid} to exit"),
+                        io::Error::other("the kernel reported its exit without its status"),
+                    )
+                });
+            }
             // Asked again with what is left each time: the kernel's clock is not the deadline's, and
             // a call that returns early finds the deadline not yet spent.
             let remaining = deadline.and_then(|deadline| deadline.remaining());
             let timeout = remaining.map(timespec);
-            match self.queue.kevent(&[], &mut events, timeout) {
+            match self.shared.queue.kevent(&[], &mut events, timeout) {
                 Ok(0) => {
                     if deadline.is_some_and(|deadline| deadline.expired()) {
                         return Ok(None);
                     }
                 }
-                Ok(n) => {
-                    debug_assert!(
-                        events[..n].iter().all(|event| event.ident() == pid as usize),
-                        "the queue holds only the one registration's events"
-                    );
-                    if let Some(status) = events[..n].iter().find_map(|event| exit_status(event, pid)) {
-                        return status.map(Some);
-                    }
-                }
+                // Every exit read is kept, this pid's included: the next turn takes it.
+                Ok(n) => self.shared.keep(&events[..n], None),
                 Err(Errno::EINTR) => {}
                 Err(errno) => {
                     return Err(Error::os(
@@ -151,7 +172,7 @@ impl Registered {
         let mut receipt = [blank()];
         let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         loop {
-            match self.queue.kevent(&[change], &mut receipt, Some(now)) {
+            match self.shared.queue.kevent(&[change], &mut receipt, Some(now)) {
                 Err(Errno::EINTR) => {}
                 Err(errno) => return Err(errno),
                 Ok(0) => return Ok(()),
@@ -165,19 +186,51 @@ impl Registered {
         }
     }
 
-    /// Reads every event the queue holds, discarding them. Whatever `delete` did or did not remove, no
-    /// event of this registration is left.
+    /// Takes this pid's exit out of what other reads kept, if one did.
+    fn take_kept(&self) -> Option<Exited> {
+        let mut kept = self.shared.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let at = kept.iter().position(|exited| exited.pid == self.pid)?;
+        Some(kept.swap_remove(at))
+    }
+
+    /// Removes every event of this pid from the queue and from what was kept, and leaves any other pid's
+    /// kept for its registration. Whatever `delete` did or did not remove, no event of this pid is left.
+    ///
+    /// It reads the queue with a zero timeout until a read finds it empty. Each read takes its events out
+    /// of the queue and this adds none back (what it keeps for others goes to `kept`), and after `delete`
+    /// the knote is gone, so this pid adds no more: the queue only shrinks, and the loop ends when it is
+    /// empty, not after a count or a time.
     fn drain(&self) {
         let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let mut events = [blank(); 8];
         loop {
-            match self.queue.kevent(&[], &mut events, Some(now)) {
-                Ok(0) => return,
-                Ok(_) | Err(Errno::EINTR) => {}
+            match self.shared.queue.kevent(&[], &mut events, Some(now)) {
+                Ok(0) => break,
+                Ok(n) => self.shared.keep(&events[..n], Some(self.pid)),
+                Err(Errno::EINTR) => {}
                 // A queue that cannot be read holds nothing a later wait could be handed.
-                Err(_) => return,
+                Err(_) => break,
             }
         }
+        self.shared
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|exited| exited.pid != self.pid);
+    }
+}
+
+impl Shared {
+    /// Keeps the exits among `events`, except `pid`'s where it is given: those are the registration's own
+    /// and are being discarded.
+    fn keep(&self, events: &[KEvent], pid: Option<u32>) {
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        kept.extend(
+            events
+                .iter()
+                .filter_map(exited)
+                .filter(|exited| Some(exited.pid) != pid),
+        );
     }
 }
 
@@ -190,20 +243,15 @@ impl Drop for Registered {
     }
 }
 
-/// `event`'s status if it is `pid`'s exit: `None` for any other event.
-fn exit_status(event: &KEvent, pid: u32) -> Option<Result<i32>> {
-    let is_exit = event.ident() == pid as usize
-        && event.filter() == Ok(EventFilter::EVFILT_PROC)
-        && event.fflags().contains(FilterFlag::NOTE_EXIT);
-    is_exit.then(|| {
-        if event.fflags().contains(FilterFlag::NOTE_EXITSTATUS) {
-            Ok(event.data() as i32)
-        } else {
-            Err(Error::os(
-                format!("wait for process {pid} to exit"),
-                io::Error::other("the kernel reported its exit without its status"),
-            ))
-        }
+/// The exit `event` reports: `None` for any other event.
+fn exited(event: &KEvent) -> Option<Exited> {
+    let is_exit = event.filter() == Ok(EventFilter::EVFILT_PROC) && event.fflags().contains(FilterFlag::NOTE_EXIT);
+    is_exit.then(|| Exited {
+        pid: event.ident() as u32,
+        status: event
+            .fflags()
+            .contains(FilterFlag::NOTE_EXITSTATUS)
+            .then(|| event.data() as i32),
     })
 }
 

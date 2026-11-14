@@ -73,12 +73,41 @@ pub(crate) struct Deferred(());
 impl Deferred {
     /// Joins the window, opening it (saving the previous dispositions and installing the recording
     /// handler) if it is the first. An `Err` leaves every disposition as it was.
+    ///
+    /// # Exactly once, in this order
+    ///
+    /// Opening: `OPEN` is set **before** the first handler is installed, so that a handler that runs while
+    /// the others are still being installed finds the window open and only records. (Set after, such a
+    /// handler would find it closed, claim its own bit and `raise` into itself, and on this thread the
+    /// redelivery would come before the store ever ran: a livelock.) Nothing of ours runs before the first
+    /// install, so a signal before it goes to the previous handler as it always did.
+    ///
+    /// Closing, by the last drop or by an install that failed: the previous handlers are put back first,
+    /// then `OPEN` is cleared, then every bit is claimed and re-raised. A handler `H` does `fetch_or`
+    /// (A), reads `OPEN` (B), and if it is clear claims its bit (C) and raises it. All of these are
+    /// `SeqCst`, so there is one order, and `claim` is a `fetch_and`, so a set bit is taken by exactly one
+    /// of the claimers.
+    ///
+    /// - B reads set: B precedes the clear, so A precedes the closer's claim, which takes the bit.
+    /// - B reads clear: the handlers are back already, so `H` (or the closer, if its claim came first)
+    ///   raises the bit once, to the previous handler, never into ours.
+    /// - A signal that arrives while the install is part way (some handlers ours, some previous) is
+    ///   recorded if it is one of ours and goes to the previous handler if not; a failed install puts
+    ///   back the ones it changed before it closes.
     pub(crate) fn begin() -> Result<Deferred> {
         let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
         if shared.holders == 0 {
-            let previous = install().map_err(|source| Error::os("hold back interrupts while a run is held", source))?;
-            shared.previous = Some(previous);
             OPEN.store(true, Ordering::SeqCst);
+            match install() {
+                Ok(previous) => shared.previous = Some(previous),
+                Err(source) => {
+                    // `install` put back what it changed. Not under the lock: the handler reached may be
+                    // anything.
+                    drop(shared);
+                    reraise(close());
+                    return Err(Error::os("hold back interrupts while a run is held", source));
+                }
+            }
         }
         shared.holders += 1;
         Ok(Deferred(()))
@@ -96,17 +125,28 @@ impl Drop for Deferred {
             if let Some(previous) = shared.previous.take() {
                 restore(&previous);
             }
-            // After the previous handlers are back: a handler that finds the window closed raises to them.
-            OPEN.store(false, Ordering::SeqCst);
-            claim(ALL)
+            close()
         };
         // Not under the lock: the handler it reaches may be anything.
-        for (bit, &signal) in SIGNALS.iter().enumerate() {
-            if recorded & (1 << bit) != 0 {
-                // SAFETY: `raise` takes a valid signal number.
-                let raised = unsafe { libc::raise(signal) };
-                debug_assert_eq!(raised, 0, "raise({signal}) failed");
-            }
+        reraise(recorded);
+    }
+}
+
+/// Closes the window, after the previous handlers are back: `OPEN` is cleared, so that a handler that finds
+/// it clear raises to them, and every recorded bit is claimed. The bits it answers are the caller's to
+/// [`reraise`].
+fn close() -> u32 {
+    OPEN.store(false, Ordering::SeqCst);
+    claim(ALL)
+}
+
+/// Raises each signal whose bit is in `recorded`.
+fn reraise(recorded: u32) {
+    for (bit, &signal) in SIGNALS.iter().enumerate() {
+        if recorded & (1 << bit) != 0 {
+            // SAFETY: `raise` takes a valid signal number.
+            let raised = unsafe { libc::raise(signal) };
+            debug_assert_eq!(raised, 0, "raise({signal}) failed");
         }
     }
 }
@@ -124,6 +164,11 @@ fn install() -> io::Result<[libc::sigaction; 3]> {
     // SAFETY: as above.
     let mut previous: [libc::sigaction; 3] = unsafe { std::mem::zeroed() };
     for (i, &signal) in SIGNALS.iter().enumerate() {
+        #[cfg(test)]
+        if let Err(refused) = test_hook::install() {
+            restore(&previous[..i]);
+            return Err(refused);
+        }
         // SAFETY: `ours` is a valid `sigaction`, and `previous[i]` a valid place for the old one.
         if unsafe { libc::sigaction(signal, &ours, &mut previous[i]) } != 0 {
             let failed = io::Error::last_os_error();
@@ -140,6 +185,26 @@ fn restore(previous: &[libc::sigaction]) {
         // SAFETY: `old` is a `sigaction` this process read from the kernel.
         let put_back = unsafe { libc::sigaction(signal, old, std::ptr::null_mut()) };
         debug_assert_eq!(put_back, 0, "restoring the handler of signal {signal} failed");
+    }
+}
+
+#[cfg(test)]
+mod test_hook {
+    use std::cell::Cell;
+
+    use crate::backend::test_allowance::{Allowance, spend};
+
+    thread_local! {
+        static INSTALLS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Let this thread install only `n` more handlers, until the returned guard drops.
+    pub(super) fn installs(n: usize) -> Allowance {
+        Allowance::set(&INSTALLS, n)
+    }
+
+    pub(super) fn install() -> std::io::Result<()> {
+        spend(&INSTALLS, "no handler may be installed (test hook)")
     }
 }
 

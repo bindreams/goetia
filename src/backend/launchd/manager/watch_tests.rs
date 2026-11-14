@@ -81,7 +81,7 @@ fn poll(queue: &Kqueue) -> usize {
 
 /// [`poll`] of the queue `registered` is on.
 pub(in crate::backend::launchd::manager) fn pending(registered: &Registered) -> usize {
-    poll(&registered.queue)
+    poll(&registered.shared.queue)
 }
 
 /// A child that exits while nobody is waiting still has its status reported: the event is held by the
@@ -179,7 +179,11 @@ fn a_registration_dropped_after_its_pid_exited_leaves_nothing_queued() {
 
     drop(registration);
 
-    assert_eq!(poll(&watch.queue), 0, "the dropped registration took its event with it");
+    assert_eq!(
+        poll(&watch.shared.queue),
+        0,
+        "the dropped registration took its event with it"
+    );
 }
 
 /// A registration dropped while its pid is alive is deleted: the exit that follows is no event.
@@ -192,7 +196,38 @@ fn a_registration_dropped_before_its_pid_exits_queues_nothing_when_it_does() {
 
     child.finish();
 
-    assert_eq!(poll(&watch.queue), 0);
+    assert_eq!(poll(&watch.shared.queue), 0);
+}
+
+/// A registration's drop removes only its own pid's events: another registration's exit, read while
+/// draining, is kept for it, and its wait still reports that exit.
+#[skuld::test]
+fn dropping_a_registration_keeps_a_siblings_exit_for_it() {
+    let watch = watch();
+    let (mut first, mut second) = (Held::new(3), Held::new(5));
+    let dropped = registered(&watch, first.pid());
+    let sibling = registered(&watch, second.pid());
+    first.finish();
+    second.finish();
+
+    drop(dropped);
+
+    assert_eq!(poll(&watch.shared.queue), 0, "the drain read everything the queue held");
+    assert_eq!(sibling.wait(failure_bound()).expect("wait"), Some(5 << 8));
+}
+
+/// A wait for one pid takes that pid's exit and keeps another's, which was read first, for its own wait.
+#[skuld::test]
+fn a_wait_keeps_the_exits_it_reads_for_other_pids() {
+    let watch = watch();
+    let (mut first, mut second) = (Held::new(3), Held::new(5));
+    let one = registered(&watch, first.pid());
+    let other = registered(&watch, second.pid());
+    first.finish();
+    second.finish();
+
+    assert_eq!(other.wait(failure_bound()).expect("wait"), Some(5 << 8));
+    assert_eq!(one.wait(failure_bound()).expect("wait"), Some(3 << 8));
 }
 
 /// What deleting a registration answers, measured: where its event fired and was not read, it is still
