@@ -2,7 +2,7 @@
 // CLI dispatch below is dead code in that build.
 #![cfg_attr(test, allow(dead_code))]
 
-/// The stock shim goetia.exe installs `type: simple` services under: the one embedded in this
+/// The stock shim goetia.exe installs `protocol: plain` services under: the one embedded in this
 /// binary (a release build, `goetia-shim` feature)...
 #[cfg(all(windows, feature = "goetia-shim"))]
 fn stock_shim() -> impl goetia::shim::ShimProvider {
@@ -29,7 +29,7 @@ fn main() {
     // All three lazy: `dispatch` only builds a manager, checks elevation or asks for the host
     // command when the dispatched subcommand actually needs it — see `goetia::cli`'s module doc
     // comment for why (`install --dry-run` and `show`/`diff -f` need no manager and no elevation,
-    // and only a Windows `install --dry-run` of a `type: simple` daemon needs the host command).
+    // and only a Windows `install --dry-run` of a `protocol: plain` daemon needs the host command).
     #[cfg(windows)]
     let get_manager = || goetia::cli::manager(stock_shim());
     #[cfg(not(windows))]

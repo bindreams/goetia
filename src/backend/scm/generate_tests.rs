@@ -1026,7 +1026,7 @@ fn simple_refuses_a_shim_path_the_writer_would_mangle() {
     install_registration(&simple_spec(), &identity(), &|| Ok(host())).unwrap();
 }
 
-/// Rendering a `type: simple` daemon never fails for the shim path, whatever it is.
+/// Rendering a `protocol: plain` daemon never fails for the shim path, whatever it is.
 #[skuld::test]
 fn rendering_a_simple_daemon_does_not_judge_the_shim_path() {
     for shim in [r"C:\Program Files\Goetia\", r#"C:\a"b\x"#] {
@@ -1043,7 +1043,7 @@ fn an_accepted_shim_path_gives_the_registration_itself() {
     assert_eq!(installed.to_string(), rendered.to_string());
 }
 
-/// A `type: managed` daemon has no shim: its own `command[0]` is what is judged, at rendering.
+/// A `protocol: native` daemon has no shim: its own `command[0]` is what is judged, at rendering.
 #[skuld::test]
 fn a_managed_daemon_is_not_held_to_the_shim_path() {
     install_registration(&managed_spec(), &identity(), &|| {

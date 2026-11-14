@@ -1,8 +1,8 @@
-//! The Windows service host `type: simple` daemons run under (`goetia-shim`).
+//! The Windows service host `protocol: plain` daemons run under (`goetia-shim`).
 //!
 //! SCM has no working-directory, environment, or stdout-capture field of its
 //! own (`backend::scm::generate`'s mapping table calls these cells "shim
-//! spawns child"/"shim sets it"/"shim writes"), so for `type: simple`
+//! spawns child"/"shim sets it"/"shim writes"), so for `protocol: plain`
 //! `ScmRegistration::executable` always names the shim binary — never the
 //! daemon's own command. [`run`] takes the service name SCM hands `ServiceMain`,
 //! reads that daemon's real `DaemonSpec` back out of the same

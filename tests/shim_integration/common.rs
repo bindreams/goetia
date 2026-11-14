@@ -1,4 +1,4 @@
-//! Shared helpers for the `type: simple` integration tests.
+//! Shared helpers for the `protocol: plain` integration tests.
 
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
@@ -19,13 +19,13 @@ use windows_sys::Win32::System::Threading::{
 use crate::fixture;
 use crate::support;
 
-/// Every test that installs or uninstalls a `type: simple` service carries it, which takes the
+/// Every test that installs or uninstalls a `protocol: plain` service carries it, which takes the
 /// machine-wide install lock; those that change what the lock or the services look like to the rest
 /// are also `serial = UNIT_DIR_EXCLUSIVE`, and so wait for the labelled tests, and they for it.
 #[skuld::label]
 pub const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
-/// A manager whose `type: simple` services run the shim this crate builds: see
+/// A manager whose `protocol: plain` services run the shim this crate builds: see
 /// [`support::stock_shim_manager`].
 pub fn manager() -> Scm {
     support::stock_shim_manager()
@@ -60,7 +60,7 @@ pub fn embedded_shim(dir: Option<PathBuf>) -> EmbeddedStockShim {
     EmbeddedStockShim::new(Some(shim_bytes()), dir)
 }
 
-/// A manager whose `type: simple` services run the stock shim [`embedded_shim`] places, with the
+/// A manager whose `protocol: plain` services run the stock shim [`embedded_shim`] places, with the
 /// folder check as `check` says.
 pub fn embedded_manager(dir: Option<PathBuf>, check: CheckPermissions) -> Scm {
     Scm::with_shim(embedded_shim(dir), check)
@@ -211,7 +211,7 @@ impl LogDir {
     }
 }
 
-/// [`support::base_fields`] with `type: simple`, logging to a path in `logs` (a dir the test owns) rather
+/// [`support::base_fields`] with `protocol: plain`, logging to a path in `logs` (a dir the test owns) rather
 /// than the `%ProgramData%` default.
 pub fn simple_spec(id: &str, command: Vec<String>, logs: &LogDir) -> DaemonSpec {
     ServiceSpec::new({
@@ -229,7 +229,7 @@ pub fn simple_spec(id: &str, command: Vec<String>, logs: &LogDir) -> DaemonSpec 
     .unwrap()
 }
 
-/// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid `type: simple` spec for any
+/// The `mk` [`goetia::manager::conformance::run`] needs: a fresh, valid `protocol: plain` spec for any
 /// `id`, logging to `logs.path_for(id)`. The port is dummy — the fixture reports in on a best-effort
 /// basis regardless of whether anything listens, and no conformance scenario reads the report.
 pub fn conformance_mk(logs: &LogDir, id: &str) -> DaemonSpec {

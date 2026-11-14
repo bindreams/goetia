@@ -1,6 +1,6 @@
-//! The `type: simple` conformance suite and round-trip tests, kept here
+//! The `protocol: plain` conformance suite and round-trip tests, kept here
 //! because they need a built shim. See `tests/scm_integration/managed.rs`
-//! for the `type: managed` analogues these mirror.
+//! for the `protocol: native` analogues these mirror.
 
 use std::collections::BTreeMap;
 
@@ -131,7 +131,7 @@ fn start_stop_status_reflect_reality(#[fixture(scm_group)] _group: &Group) {
     started.accept("the fixture (spawned by the shim) to report running");
     let status = mgr.status(&spec.common().id).expect("status while running");
     assert_eq!(status.common().state, State::Running);
-    let pid = status.common().pid.expect("type: simple reports the shim's own pid");
+    let pid = status.common().pid.expect("protocol: plain reports the shim's own pid");
 
     // `DaemonStatus.pid`'s own doc comment promises this is
     // `goetia-shim.exe`'s pid, not the daemon's — SCM knows no
@@ -188,7 +188,7 @@ fn list_ignores_foreign_services(#[fixture(scm_group)] _group: &Group) {
 
 /// A host of another version is refused before anything is registered: the copy of the shim has
 /// every occurrence of this crate's version in it replaced by a different one of the same length.
-// Labelled but not serial: it takes the install lock, as every `type: simple` install does.
+// Labelled but not serial: it takes the install lock, as every `protocol: plain` install does.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE])]
 fn install_refuses_host_of_another_version(#[fixture(scm_group)] _group: &Group) {
     let id = support::random_test_id();

@@ -685,7 +685,7 @@ fn a_running_entry_is_left_alone_by_a_stop_under_a_budget_that_does_not_wait() {
 // request_start_after_stop ============================================================================================
 
 /// The Fake's request-only `stop` settles nothing, so an entry that was running still is when
-/// `restart --timeout 0`'s start arrives — the shape a Windows `type: simple` service presents, and
+/// `restart --timeout 0`'s start arrives — the shape a Windows `protocol: plain` service presents, and
 /// the one answer that start must refuse.
 #[skuld::test]
 fn a_start_request_after_an_unconfirmed_stop_is_refused_while_still_running() {

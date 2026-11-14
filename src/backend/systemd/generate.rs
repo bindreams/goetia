@@ -17,7 +17,7 @@
 //! run of them gets a trailing space (see `raw_value`). The values no encoding can carry are
 //! refused by [`unit()`]: see `refuse_unrepresentable`.
 
-use crate::backend::Identity;
+use crate::backend::{Identity, cannot_run_tasks};
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
 use crate::spec::{DaemonFields, DaemonSpec, Restart, systemd_defect, systemd_raw_value_defect};
@@ -51,7 +51,9 @@ use crate::spec::{DaemonFields, DaemonSpec, Restart, systemd_defect, systemd_raw
 /// silently" from "conflict, demand `--force`" apart, and it runs before either `desired` or
 /// `regenerated` is even compared.
 pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
-    let DaemonSpec::Service(s) = spec;
+    let DaemonSpec::Service(s) = spec else {
+        return Err(cannot_run_tasks("systemd", &spec.common().id));
+    };
     refuse_unrepresentable(&s.common, id)?;
     let mut out = String::new();
 

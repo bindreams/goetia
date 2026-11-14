@@ -115,8 +115,8 @@ struct SpecStop {
     reported: Reported,
 }
 
-/// The shim refuses ([`Reported::Refused`]) only when the service is gone, has no goetia marker or
-/// has an undecodable spec; every other error is a restartable failure carrying the OS error the
+/// The shim refuses ([`Reported::Refused`]) only when the service is gone, has no goetia marker, has an
+/// undecodable spec or holds a task; every other error is a restartable failure carrying the OS error the
 /// read met, or `ERROR_INVALID_DATA`.
 fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob, SpecStop> {
     let refused = |message: String| SpecStop {
@@ -124,6 +124,11 @@ fn spec_read(id: &str, read: crate::error::Result<Option<Blob>>) -> Result<Blob,
         reported: Reported::Refused,
     };
     let e = match read {
+        Ok(Some(blob)) if matches!(blob.spec, DaemonSpec::Task(_)) => {
+            return Err(refused(
+                "this is a task's blob; the service host runs only services".to_string(),
+            ));
+        }
         Ok(Some(blob)) => return Ok(blob),
         Ok(None) => {
             return Err(refused(format!(
@@ -419,7 +424,7 @@ fn may_still_run(e: &cosca::error::Error) -> bool {
         .is_some_and(|fate| !matches!(fate, ChildFate::Reaped | ChildFate::Killed | ChildFate::Gone))
 }
 
-/// The daemon, if a Job Object contains it. `type: simple` is stopped, and restarted after a
+/// The daemon, if a Job Object contains it. `protocol: plain` is stopped, and restarted after a
 /// failure, only by terminating its whole tree, which `cosca` can guarantee only with a job: when
 /// assigning the job fails it falls back to a process-tree walk that cannot say whether a
 /// descendant was killed. Any other containment is a start failure: the daemon is killed, but
@@ -455,7 +460,7 @@ fn thread_refused(command: &[String], e: &std::io::Error) -> String {
 
 fn not_job_contained(command: &[String], containment: Containment) -> String {
     format!(
-        "the daemon {command:?} was contained by {containment}, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"
+        "the daemon {command:?} was contained by {containment}, not a job object: `protocol: plain` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"
     )
 }
 
@@ -483,7 +488,11 @@ fn log_version_skew(log: &Log, id: &str, spec: &DaemonSpec, registered_by: &str,
 /// they existed (or by a version that set different ones) keeps running under this shim without
 /// restarts until `goetia daemon install` is run again.
 fn version_skew_notice(id: &str, spec: &DaemonSpec, registered_by: &str, running: &str) -> Option<String> {
-    let DaemonSpec::Service(s) = spec;
+    let DaemonSpec::Service(s) = spec else {
+        // `spec_read` refuses a task's blob before this runs.
+        debug_assert!(false, "a task reached the service host's version-skew notice");
+        return None;
+    };
     if registered_by == running || s.restart == Restart::Never {
         return None;
     }

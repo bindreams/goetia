@@ -152,7 +152,7 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///   gone.
 /// - [`registry_undetermined`] for every other failure, among them a key that vanishes or is marked
 ///   deleted under a service that still stands, and a service key that is a registry link to a
-///   missing key. Never Foreign: this key holds the only proof of ownership a `type: managed`
+///   missing key. Never Foreign: this key holds the only proof of ownership a `protocol: native`
 ///   service has.
 ///
 /// goetia's own writes remove `Parameters` only when it is a registry link (see
