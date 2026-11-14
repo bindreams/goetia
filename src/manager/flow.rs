@@ -414,7 +414,8 @@ impl<R: RunHandle> Waiter<R> {
     ///
     /// The run is in flight, so it is waited for whatever happens to the output. If the wait failed
     /// its error is returned, with the output's failure beside it if that failed too ([`Error::Both`],
-    /// or an [`Error::Step`] around a wait whose outcome is open, so that it stays open). Otherwise a failure to show the output is returned, naming the exit.
+    /// or an [`Error::Step`] around a wait whose outcome is open, so that it stays open). Otherwise a
+    /// failure to show the output is returned, naming the exit.
     fn follow(self, run: R, id: &Id, out: &mut dyn Write) -> Result<Exit> {
         let source = run.output();
         // The thread is alive until it has a run or its sender is dropped: this cannot fail.
