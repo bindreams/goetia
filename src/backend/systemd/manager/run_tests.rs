@@ -14,7 +14,7 @@ use super::super::task::task_tests::{enqueued, fragment, manager, task_spec};
 use super::*;
 use crate::backend::Backend;
 use crate::backend::client::fake::{Entry as Reply, Fake, exited, reply};
-use crate::manager::output_tests::Streaming;
+use crate::manager::output::output_tests::Streaming;
 use crate::manager::{Budget, Exit, Step};
 use crate::spec::{DaemonFields, DaemonSpec, TaskFields, TaskSpec};
 use crate::testing::base_fields;
