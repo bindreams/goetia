@@ -387,7 +387,8 @@ impl Systemd {
     /// cannot be read is the error, never a task that has not run. That includes an account that may
     /// not read the system journal (not root and not in `systemd-journal`): the task's whole status
     /// read is the error then, its state and next run lost with its last run. A service's status needs
-    /// no journal.
+    /// no journal. A run the manager failed before its process was spawned has a start and no result
+    /// (`last_run` set, `last_result` `None`).
     pub(super) fn status_of(&self, snapshot: &Fragment) -> Result<Status> {
         let id = snapshot.id.as_str();
         let job = unit_name(id, UnitKind::Service);

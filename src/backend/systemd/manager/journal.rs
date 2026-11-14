@@ -36,6 +36,11 @@ pub(super) const STARTING: &str = "7d4958e842da4a758f6c1cdc7b36dcc5";
 /// `dumped`) and `EXIT_STATUS` (the exit status, or the signal's number).
 pub(super) const MAIN_PROCESS_EXITED: &str = "98e322203f7a4ed290d09fe03c09fe15";
 
+/// "Failed with result": the unit failed, with `UNIT_RESULT` (`exit-code`, `signal`, `resources` and
+/// so on). Written after a main process's "Main process exited", so it ends a run on its own only
+/// when no process exited: the run never ran.
+pub(super) const FAILED_WITH_RESULT: &str = "d9b373ed55a64feb8242e02dbe79a49c";
+
 /// "Deactivated successfully": a run ended with exit status 0, which has no "Main process exited"
 /// entry of its own.
 pub(super) const DEACTIVATED: &str = "7ad2d189f7e94e70a38c781354912448";
@@ -240,17 +245,38 @@ pub(super) type Stop = Arc<dyn Fn() + Send + Sync>;
 
 // Terminal entries ====================================================================================================
 
+/// How a run ended, as its terminal entry says.
+#[derive(Debug)]
+pub(super) enum Ending {
+    /// The run's process exited: how, or the failure to read how.
+    Exit(Result<Exit>),
+    /// The unit failed (`UNIT_RESULT`) with no exit entry of a process before it: the process was never
+    /// spawned.
+    NeverRan { result: String },
+}
+
 /// How the run an entry belongs to ended, when `entry` is the entry that says so: `None` for any
-/// other entry. `Some(Err)` is an entry that says a run ended and not how, since a status that is
-/// not a number, or an `EXIT_CODE` that is none of `exited`, `killed` and `dumped`, is not read as a
-/// code or a signal.
+/// other entry. A run's terminal entry is the first of these for its invocation: "Main process
+/// exited" and "Deactivated successfully" come before "Failed with result" for a run that had a
+/// process (knowledge base: "A oneshot whose process fails in its child still logs Main process
+/// exited"), so a "Failed with result" first is a run that had none ([`Ending::NeverRan`]).
+/// `Exit(Err)` is an entry that says a run ended and not how, since a status that is not a number, or
+/// an `EXIT_CODE` that is none of `exited`, `killed` and `dumped`, is not read as a code or a signal.
 ///
 /// "Main process exited" carries the exit status (`exited`) or the signal (`killed`, and `dumped` for
-/// one that dumped a core); "Deactivated successfully" is exit status 0, which has no entry of its own.
-pub(super) fn exit_of(entry: &Entry) -> Option<Result<Exit>> {
+/// one that dumped a core); "Deactivated successfully" is exit status 0, which has no entry of its
+/// own. "Control process exited" (`ExecStartPre=` and the others) has the same `MESSAGE_ID` and
+/// fields, and is told apart by `COMMAND`, which is `ExecStart` for the main process; a manager that
+/// does not write it is read as before. goetia's units have no control process.
+pub(super) fn ending_of(entry: &Entry) -> Option<Ending> {
     match entry.get("MESSAGE_ID")? {
-        DEACTIVATED => Some(Ok(Exit::Code(0))),
-        MAIN_PROCESS_EXITED => Some(main_process_exit(entry)),
+        DEACTIVATED => Some(Ending::Exit(Ok(Exit::Code(0)))),
+        MAIN_PROCESS_EXITED if matches!(entry.get("COMMAND"), None | Some("ExecStart")) => {
+            Some(Ending::Exit(main_process_exit(entry)))
+        }
+        FAILED_WITH_RESULT => Some(Ending::NeverRan {
+            result: entry.get("UNIT_RESULT").unwrap_or("unknown").to_string(),
+        }),
         _ => None,
     }
 }
@@ -274,35 +300,41 @@ fn main_process_exit(entry: &Entry) -> Result<Exit> {
 pub(super) struct LastRun {
     /// When it started: `None` when the journal holds no run.
     pub started: Option<SystemTime>,
-    /// How it ended: `None` while it runs, and when it ended with no entry to say so.
+    /// How it ended: `None` while it runs, when it ended with no entry to say so, and when it never
+    /// ran (its first terminal entry is "Failed with result", with no process exit before it): it has
+    /// a start and no result.
     pub exit: Option<Exit>,
 }
 
 /// The most recent run of `unit`, from one walk newest first over every entry the manager wrote about
 /// it, across the unit's whole life in the journal.
 ///
-/// The newest "Starting" entry is the newest run; its terminal entry is the one of its own
-/// `INVOCATION_ID`, which the walk met on the way, so an older run's terminal entry is never taken
-/// for it. The walk stops at that entry: the entries it left are never read, and dropping them ends
+/// The newest "Starting" entry is the newest run; its terminal entry is the earliest of its own
+/// `INVOCATION_ID` that the walk met on the way (the walk is newest first, so the last it met), so an
+/// older run's terminal entry is never taken for it, nor a "Failed with result" for the exit before it. The walk stops at that entry: the entries it left are never read, and dropping them ends
 /// the `journalctl`.
 pub(super) fn last_run(journal: &dyn Journal, unit: &str) -> Result<LastRun> {
     let mut entries = journal.newest_first(&[Match::new("UNIT", unit)])?;
-    let mut ended: Vec<(Option<String>, Result<Exit>)> = Vec::new();
+    let mut ended: Vec<(Option<String>, Ending)> = Vec::new();
     while let Some(entry) = entries.next()? {
         if entry.get("MESSAGE_ID") == Some(STARTING) {
             let invocation = entry.get("INVOCATION_ID");
-            let exit = ended
+            let ending = ended
                 .into_iter()
+                .rev()
                 .find(|(of, _)| invocation.is_some() && of.as_deref() == invocation)
-                .map(|(_, exit)| exit)
-                .transpose()?;
+                .map(|(_, ending)| ending);
+            let exit = match ending {
+                Some(Ending::Exit(exit)) => Some(exit?),
+                Some(Ending::NeverRan { .. }) | None => None,
+            };
             return Ok(LastRun {
                 started: Some(entry.realtime()?),
                 exit,
             });
         }
-        if let Some(exit) = exit_of(&entry) {
-            ended.push((entry.get("INVOCATION_ID").map(str::to_string), exit));
+        if let Some(ending) = ending_of(&entry) {
+            ended.push((entry.get("INVOCATION_ID").map(str::to_string), ending));
         }
     }
     Ok(LastRun {

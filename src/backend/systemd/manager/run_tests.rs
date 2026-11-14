@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use super::super::journal::fake::{Fake as JournalFake, Log};
 use super::super::journal::{Cursor, Journalctl};
-use super::super::journal::{DEACTIVATED, Entry, Journal, MAIN_PROCESS_EXITED, STARTING};
+use super::super::journal::{DEACTIVATED, Entry, FAILED_WITH_RESULT, Journal, MAIN_PROCESS_EXITED, STARTING};
 use super::super::systemctl::systemctl_tests::gate_then;
 use super::super::task::task_tests::{enqueued, fragment, manager, task_spec};
 use super::*;
@@ -430,6 +430,66 @@ fn wait_decodes_each_exit() {
         match (exit, expected) {
             (Ok(exit), Ok(expected)) => assert_eq!(exit, expected, "{what}"),
             (Err(Error::RunUnrecorded { id, .. }), Err(())) => assert_eq!(id, "x", "{what}"),
+            (other, expected) => panic!("{what}: {other:?}, expected {expected:?}"),
+        }
+    }
+}
+
+/// "Failed with result": the unit failed.
+fn failed_with(invocation: &str, result: &str) -> Entry {
+    Entry::of(&[
+        ("MESSAGE_ID", FAILED_WITH_RESULT),
+        ("INVOCATION_ID", invocation),
+        ("UNIT_RESULT", result),
+    ])
+}
+
+/// A run whose process never exited ends with "Failed with result" and no exit entry: it never ran,
+/// and the manager's reason is the unit's result. A control process's exit entry (an `ExecStartPre=`)
+/// is not an exit: the "Failed with result" after it is the first end. An exit entry before it, which
+/// is what every run that has a process has, is the run's.
+#[skuld::test]
+fn the_first_terminal_entry_ends_the_wait_and_a_failure_before_any_exit_is_a_run_that_never_ran() {
+    let control = Entry::of(&[
+        ("MESSAGE_ID", MAIN_PROCESS_EXITED),
+        ("INVOCATION_ID", "inv"),
+        ("EXIT_CODE", "exited"),
+        ("EXIT_STATUS", "1"),
+        ("COMMAND", "ExecStartPre"),
+    ]);
+    for (what, entries, expected) in [
+        (
+            "Failed with result first",
+            vec![failed_with("inv", "resources")],
+            Err("resources"),
+        ),
+        (
+            "a control process's exit, then Failed with result",
+            vec![control, failed_with("inv", "exit-code")],
+            Err("exit-code"),
+        ),
+        (
+            "an exit entry, then Failed with result",
+            vec![main_exited("inv", "exited", "217"), failed_with("inv", "exit-code")],
+            Ok(Exit::Code(217)),
+        ),
+        (
+            "another invocation's Failed with result is ignored",
+            vec![failed_with("another", "resources"), deactivated("inv")],
+            Ok(Exit::Code(0)),
+        ),
+    ] {
+        let journal = running(entries);
+
+        let exit = begun(&journal).wait();
+
+        match (exit, expected) {
+            (Ok(exit), Ok(expected)) => assert_eq!(exit, expected, "{what}"),
+            (Err(e @ Error::RunNotStarted { .. }), Err(result)) => {
+                assert!(!e.is_indeterminate(), "{what}");
+                assert!(e.to_string().contains(result), "{what}: {e}");
+                assert!(e.to_string().starts_with("`x` did not run"), "{what}: {e}");
+            }
             (other, expected) => panic!("{what}: {other:?}, expected {expected:?}"),
         }
     }

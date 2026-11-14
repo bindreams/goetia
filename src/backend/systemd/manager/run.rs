@@ -12,7 +12,9 @@
 //! - The start request's job number finds the run: the "Starting" entry with that `JOB_ID` has its
 //!   `INVOCATION_ID` and cursor. A job that ends with no Starting entry never began a run, and its
 //!   entries carry the *previous* run's invocation, which is never used.
-//! - The exit is the first terminal entry ([`exit_of`]) of that invocation after the cursor.
+//! - The exit is the first terminal entry ([`ending_of`]) of that invocation after the cursor. One that
+//!   is "Failed with result" with no exit before it is a run whose process was never spawned
+//!   ([`Error::RunNotStarted`]).
 //! - Output is the run's stream. A task's `sh` wrapper prints `goetia-run <INVOCATION_ID>` first
 //!   (`RUN_MARKER`), and that line and every line of the program share one `_STREAM_ID`, which no
 //!   other run's lines carry, and which every stdout line has (`_SYSTEMD_INVOCATION_ID` is missing
@@ -38,7 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
 
-use super::journal::{Cursor, Entry, Follower, Journal, Match, STARTING, Scope, Stop, exit_of, lacks};
+use super::journal::{Cursor, Ending, Entry, Follower, Journal, Match, STARTING, Scope, Stop, ending_of, lacks};
 use super::systemctl::Held;
 use super::task::Fragment;
 use super::{Systemd, UnitKind, unit_name};
@@ -319,11 +321,20 @@ impl Run {
             if entry.get("INVOCATION_ID") != Some(self.invocation.as_str()) {
                 continue;
             }
-            if let Some(exit) = exit_of(&entry) {
-                return exit.map_err(|e| Error::RunUnrecorded {
-                    id: self.id.to_string(),
-                    reason: e.report().to_string(),
-                });
+            match ending_of(&entry) {
+                None => {}
+                Some(Ending::Exit(exit)) => {
+                    return exit.map_err(|e| Error::RunUnrecorded {
+                        id: self.id.to_string(),
+                        reason: e.report().to_string(),
+                    });
+                }
+                Some(Ending::NeverRan { result }) => {
+                    return Err(Error::RunNotStarted {
+                        id: self.id.to_string(),
+                        reason: format!("systemd failed the unit as `{result}` before its process exited"),
+                    });
+                }
             }
         }
     }

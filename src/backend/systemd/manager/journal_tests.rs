@@ -33,11 +33,32 @@ fn deactivated(invocation: &str) -> Entry {
     Entry::of(&[("MESSAGE_ID", DEACTIVATED), ("INVOCATION_ID", invocation)])
 }
 
-/// An entry that is about the unit and says nothing of a run's start or end ("Failed with result").
+/// An entry that is about the unit and says nothing of a run's start or end ("Failed to start").
 fn other(invocation: &str) -> Entry {
     Entry::of(&[
-        ("MESSAGE_ID", "d9b373ed55a64feb8242e02dbe79a49c"),
+        ("MESSAGE_ID", "be02cf6855d2428ba40df7e9d022f03d"),
         ("INVOCATION_ID", invocation),
+    ])
+}
+
+/// "Failed with result `result`": the unit failed, which a run whose process never exited ends with.
+fn failed_with(invocation: &str, result: &str) -> Entry {
+    Entry::of(&[
+        ("MESSAGE_ID", FAILED_WITH_RESULT),
+        ("INVOCATION_ID", invocation),
+        ("UNIT_RESULT", result),
+    ])
+}
+
+/// "Control process exited" (an `ExecStartPre=` and the like): the same `MESSAGE_ID` and fields as a
+/// main process's, told apart by `COMMAND`.
+fn control_exited(invocation: &str, status: &str) -> Entry {
+    Entry::of(&[
+        ("MESSAGE_ID", MAIN_PROCESS_EXITED),
+        ("INVOCATION_ID", invocation),
+        ("EXIT_CODE", "exited"),
+        ("EXIT_STATUS", status),
+        ("COMMAND", "ExecStartPre"),
     ])
 }
 
@@ -178,11 +199,79 @@ fn a_terminal_entry_that_does_not_say_how_the_run_ended_is_the_error() {
 }
 
 #[skuld::test]
-fn only_the_two_terminal_entries_end_a_run() {
-    assert!(exit_of(&starting("a", 1)).is_none());
-    assert!(exit_of(&other("a")).is_none());
-    assert!(exit_of(&Entry::of(&[("MESSAGE", "no id")])).is_none());
-    assert_eq!(exit_of(&deactivated("a")).expect("terminal").unwrap(), Exit::Code(0));
+fn only_the_terminal_entries_end_a_run() {
+    assert!(ending_of(&starting("a", 1)).is_none());
+    assert!(ending_of(&other("a")).is_none());
+    assert!(ending_of(&Entry::of(&[("MESSAGE", "no id")])).is_none());
+    assert!(matches!(
+        ending_of(&deactivated("a")),
+        Some(Ending::Exit(Ok(Exit::Code(0))))
+    ));
+    assert!(matches!(
+        ending_of(&failed_with("a", "resources")),
+        Some(Ending::NeverRan { result }) if result == "resources"
+    ));
+}
+
+/// A "Control process exited" entry (`ExecStartPre=` and the others) is not the run's exit; the main
+/// process's, with `COMMAND=ExecStart` or none (a manager that does not write it), is.
+#[skuld::test]
+fn a_control_processs_exit_is_not_the_runs_exit() {
+    assert!(ending_of(&control_exited("a", "1")).is_none());
+    let main = Entry::of(&[
+        ("MESSAGE_ID", MAIN_PROCESS_EXITED),
+        ("INVOCATION_ID", "a"),
+        ("EXIT_CODE", "exited"),
+        ("EXIT_STATUS", "3"),
+        ("COMMAND", "ExecStart"),
+    ]);
+    assert!(matches!(ending_of(&main), Some(Ending::Exit(Ok(Exit::Code(3))))));
+    assert!(matches!(
+        ending_of(&main_exited("a", "exited", "3")),
+        Some(Ending::Exit(Ok(Exit::Code(3))))
+    ));
+}
+
+/// A run whose process never exited ends with "Failed with result" and no exit entry: it has a start
+/// and no result. Where an exit entry exists it is the older of the two, and the run's.
+#[skuld::test]
+fn a_run_that_failed_with_no_exit_has_a_start_and_no_result() {
+    let never = LastRun {
+        started: Some(at(1_000)),
+        exit: None,
+    };
+    for (what, entries, expected) in [
+        (
+            "no exit entry",
+            vec![other("a"), failed_with("a", "resources"), starting("a", 1_000)],
+            never,
+        ),
+        (
+            "a control process's exit does not count",
+            vec![
+                other("a"),
+                failed_with("a", "exit-code"),
+                control_exited("a", "1"),
+                starting("a", 1_000),
+            ],
+            never,
+        ),
+        (
+            "the exit entry is older than Failed with result, and wins",
+            vec![
+                other("a"),
+                failed_with("a", "exit-code"),
+                main_exited("a", "exited", "217"),
+                starting("a", 1_000),
+            ],
+            LastRun {
+                started: Some(at(1_000)),
+                exit: Some(Exit::Code(217)),
+            },
+        ),
+    ] {
+        assert_eq!(run(entries).expect(what), expected, "{what}");
+    }
 }
 
 // Entry ===============================================================================================================
