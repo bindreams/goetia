@@ -45,7 +45,7 @@ pub fn run(
             get_manager,
             is_elevated,
             verb: &|mgr, id| restart(mgr, id, budget),
-            verb_past_tense: &|| wait::reported(budget, "restarted", "restart requested"),
+            verb_past_tense: wait::reported(budget, "restarted", "restart requested"),
             absent_is_success: false,
         },
         out,

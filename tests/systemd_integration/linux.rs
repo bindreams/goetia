@@ -703,7 +703,9 @@ fn a_start_on_a_spent_budget_still_reaches_systemd(#[fixture(systemd_group)] _gr
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let result = mgr.start(&spec.common().id, Budget::Bounded(Duration::from_nanos(1)));
+    let result = mgr
+        .start(&spec.common().id, Budget::Bounded(Duration::from_nanos(1)))
+        .map(drop);
 
     assert!(
         matches!(

@@ -444,12 +444,13 @@ fn failed_with(invocation: &str, result: &str) -> Entry {
     ])
 }
 
-/// A run whose process never exited ends with "Failed with result" and no exit entry: it never ran,
-/// and the manager's reason is the unit's result. A control process's exit entry (an `ExecStartPre=`)
-/// is not an exit: the "Failed with result" after it is the first end. An exit entry before it, which
-/// is what every run that has a process has, is the run's.
+/// A "Failed with result" with no exit entry before it does not say the run never ran (a process that
+/// outlives SIGKILL, or an exit entry journald dropped, ends the same way): the exit is not established,
+/// `RunUnrecorded` naming the unit's result. A control process's exit entry (an `ExecStartPre=`) is not
+/// an exit: the "Failed with result" after it is the first end. An exit entry before it, which is what
+/// every run that has a process has, is the run's.
 #[skuld::test]
-fn the_first_terminal_entry_ends_the_wait_and_a_failure_before_any_exit_is_a_run_that_never_ran() {
+fn the_first_terminal_entry_ends_the_wait_and_a_failure_before_any_exit_is_an_unrecorded_exit() {
     let control = Entry::of(&[
         ("MESSAGE_ID", MAIN_PROCESS_EXITED),
         ("INVOCATION_ID", "inv"),
@@ -485,10 +486,14 @@ fn the_first_terminal_entry_ends_the_wait_and_a_failure_before_any_exit_is_a_run
 
         match (exit, expected) {
             (Ok(exit), Ok(expected)) => assert_eq!(exit, expected, "{what}"),
-            (Err(e @ Error::RunNotStarted { .. }), Err(result)) => {
-                assert!(!e.is_indeterminate(), "{what}");
-                assert!(e.to_string().contains(result), "{what}: {e}");
-                assert!(e.to_string().starts_with("`x` did not run"), "{what}: {e}");
+            (Err(e @ Error::RunUnrecorded { .. }), Err(result)) => {
+                assert!(e.is_indeterminate(), "{what}");
+                let message = e.to_string();
+                assert!(
+                    message.contains(&format!("failed the unit as `{result}`")),
+                    "{what}: {message}"
+                );
+                assert!(message.contains("recorded no exit"), "{what}: {message}");
             }
             (other, expected) => panic!("{what}: {other:?}, expected {expected:?}"),
         }

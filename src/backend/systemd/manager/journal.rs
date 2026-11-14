@@ -37,8 +37,8 @@ pub(super) const STARTING: &str = "7d4958e842da4a758f6c1cdc7b36dcc5";
 pub(super) const MAIN_PROCESS_EXITED: &str = "98e322203f7a4ed290d09fe03c09fe15";
 
 /// "Failed with result": the unit failed, with `UNIT_RESULT` (`exit-code`, `signal`, `resources` and
-/// so on). Written after a main process's "Main process exited", so it ends a run on its own only
-/// when no process exited: the run never ran.
+/// so on). Written after a main process's "Main process exited", so it comes first only
+/// when no exit was recorded.
 pub(super) const FAILED_WITH_RESULT: &str = "d9b373ed55a64feb8242e02dbe79a49c";
 
 /// "Deactivated successfully": a run ended with exit status 0, which has no "Main process exited"
@@ -250,16 +250,17 @@ pub(super) type Stop = Arc<dyn Fn() + Send + Sync>;
 pub(super) enum Ending {
     /// The run's process exited: how, or the failure to read how.
     Exit(Result<Exit>),
-    /// The unit failed (`UNIT_RESULT`) with no exit entry of a process before it: the process was never
-    /// spawned.
-    NeverRan { result: String },
+    /// The unit failed (`UNIT_RESULT`) and no exit entry of a process came before it. That is not
+    /// proof that no process ran (one that outlives SIGKILL, or an exit entry journald dropped, ends
+    /// the same way): the run's exit is not established.
+    NoExit { result: String },
 }
 
 /// How the run an entry belongs to ended, when `entry` is the entry that says so: `None` for any
 /// other entry. A run's terminal entry is the first of these for its invocation: "Main process
 /// exited" and "Deactivated successfully" come before "Failed with result" for a run that had a
 /// process (knowledge base: "A oneshot whose process fails in its child still logs Main process
-/// exited"), so a "Failed with result" first is a run that had none ([`Ending::NeverRan`]).
+/// exited"), so a "Failed with result" first is a run with no recorded exit ([`Ending::NoExit`]).
 /// `Exit(Err)` is an entry that says a run ended and not how, since a status that is not a number, or
 /// an `EXIT_CODE` that is none of `exited`, `killed` and `dumped`, is not read as a code or a signal.
 ///
@@ -274,7 +275,7 @@ pub(super) fn ending_of(entry: &Entry) -> Option<Ending> {
         MAIN_PROCESS_EXITED if matches!(entry.get("COMMAND"), None | Some("ExecStart")) => {
             Some(Ending::Exit(main_process_exit(entry)))
         }
-        FAILED_WITH_RESULT => Some(Ending::NeverRan {
+        FAILED_WITH_RESULT => Some(Ending::NoExit {
             result: entry.get("UNIT_RESULT").unwrap_or("unknown").to_string(),
         }),
         _ => None,
@@ -300,9 +301,9 @@ fn main_process_exit(entry: &Entry) -> Result<Exit> {
 pub(super) struct LastRun {
     /// When it started: `None` when the journal holds no run.
     pub started: Option<SystemTime>,
-    /// How it ended: `None` while it runs, when it ended with no entry to say so, and when it never
-    /// ran (its first terminal entry is "Failed with result", with no process exit before it): it has
-    /// a start and no result.
+    /// How it ended: `None` while it runs, when it ended with no entry to say so, and when its first
+    /// terminal entry is "Failed with result" with no process exit before it: it has a start and no
+    /// result.
     pub exit: Option<Exit>,
 }
 
@@ -311,8 +312,9 @@ pub(super) struct LastRun {
 ///
 /// The newest "Starting" entry is the newest run; its terminal entry is the earliest of its own
 /// `INVOCATION_ID` that the walk met on the way (the walk is newest first, so the last it met), so an
-/// older run's terminal entry is never taken for it, nor a "Failed with result" for the exit before it. The walk stops at that entry: the entries it left are never read, and dropping them ends
-/// the `journalctl`.
+/// older run's terminal entry is never taken for it, nor a "Failed with result" for the exit before
+/// it. The walk stops at that run's Starting entry: the older entries it left are never read, and
+/// dropping them ends the `journalctl`.
 pub(super) fn last_run(journal: &dyn Journal, unit: &str) -> Result<LastRun> {
     let mut entries = journal.newest_first(&[Match::new("UNIT", unit)])?;
     let mut ended: Vec<(Option<String>, Ending)> = Vec::new();
@@ -326,7 +328,7 @@ pub(super) fn last_run(journal: &dyn Journal, unit: &str) -> Result<LastRun> {
                 .map(|(_, ending)| ending);
             let exit = match ending {
                 Some(Ending::Exit(exit)) => Some(exit?),
-                Some(Ending::NeverRan { .. }) | None => None,
+                Some(Ending::NoExit { .. }) | None => None,
             };
             return Ok(LastRun {
                 started: Some(entry.realtime()?),

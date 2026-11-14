@@ -209,7 +209,7 @@ fn only_the_terminal_entries_end_a_run() {
     ));
     assert!(matches!(
         ending_of(&failed_with("a", "resources")),
-        Some(Ending::NeverRan { result }) if result == "resources"
+        Some(Ending::NoExit { result }) if result == "resources"
     ));
 }
 
@@ -232,7 +232,7 @@ fn a_control_processs_exit_is_not_the_runs_exit() {
     ));
 }
 
-/// A run whose process never exited ends with "Failed with result" and no exit entry: it has a start
+/// A run whose first terminal entry is "Failed with result", with no exit entry before it, has a start
 /// and no result. Where an exit entry exists it is the older of the two, and the run's.
 #[skuld::test]
 fn a_run_that_failed_with_no_exit_has_a_start_and_no_result() {

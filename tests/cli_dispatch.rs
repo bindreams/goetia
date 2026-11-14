@@ -357,7 +357,7 @@ impl Sequence for Direct<'_> {
         self.0.stop(id, budget)
     }
     fn start(&mut self, id: &Id, budget: Budget) -> goetia::Result<()> {
-        self.0.start(id, budget)
+        self.0.start(id, budget).map(drop)
     }
     fn request_start_after_stop(&mut self, id: &Id) -> goetia::Result<()> {
         self.0.request_start_after_stop(id)
@@ -418,7 +418,7 @@ impl ServiceManager for FlakyManager {
     fn disable(&self, id: &Id) -> goetia::Result<()> {
         self.inner.disable(id)
     }
-    fn start(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> goetia::Result<Option<goetia::spec::DaemonKind>> {
         self.injected_start(id)?;
         self.inner.start(id, budget)
     }
@@ -1208,7 +1208,7 @@ impl ServiceManager for PanicsOnStart {
     fn disable(&self, id: &Id) -> goetia::Result<()> {
         self.0.disable(id)
     }
-    fn start(&self, _id: &Id, _budget: Budget) -> goetia::Result<()> {
+    fn start(&self, _id: &Id, _budget: Budget) -> goetia::Result<Option<goetia::spec::DaemonKind>> {
         panic!("restart on an absent id must never reach start")
     }
     fn request_start_after_stop(&self, _id: &Id) -> goetia::Result<()> {
@@ -3461,7 +3461,7 @@ impl ServiceManager for PanicsOnStatus {
     fn disable(&self, id: &Id) -> goetia::Result<()> {
         self.0.disable(id)
     }
-    fn start(&self, id: &Id, budget: Budget) -> goetia::Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> goetia::Result<Option<goetia::spec::DaemonKind>> {
         self.0.start(id, budget)
     }
     fn request_start_after_stop(&self, id: &Id) -> goetia::Result<()> {
@@ -4867,13 +4867,7 @@ fn start_refuses_a_flag_on_a_task_whose_status_cannot_be_read() {
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "nightly", "--timeout", "5s"], &fake);
 
-    assert_eq!(
-        code, 1,
-        "stdout:
-{out}
-stderr:
-{err}"
-    );
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
     assert!(
         err.contains(TIMEOUT_ON_A_TASK),
         "the kind is the blob's, not the status's: {err}"
@@ -4888,13 +4882,7 @@ fn start_with_a_flag_on_an_unusable_blob_is_the_blobs_error() {
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc", "--timeout", "5s"], &fake);
 
-    assert_ne!(
-        code, 0,
-        "stdout:
-{out}
-stderr:
-{err}"
-    );
+    assert_ne!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert!(!err.contains(TIMEOUT_ON_A_TASK), "{err}");
     assert!(
         !fake.calls().contains(&("start", "frpc".to_string())),
@@ -4902,25 +4890,16 @@ stderr:
     );
 }
 
+/// A start that could not read the kind claims no more than that it asked.
 #[skuld::test]
-fn start_without_a_flag_still_starts_an_unusable_blob() {
+fn start_without_a_flag_still_starts_an_unusable_blob_and_claims_only_the_request() {
     let fake = Fake::new();
     fake.seed_unusable("frpc");
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc"], &fake);
 
-    assert_eq!(
-        code, 0,
-        "stdout:
-{out}
-stderr:
-{err}"
-    );
-    assert_eq!(
-        out,
-        "frpc: started
-"
-    );
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "frpc: start requested\n");
 }
 
 #[skuld::test]
@@ -4931,19 +4910,8 @@ fn start_of_a_task_says_the_run_was_requested() {
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "nightly", "frpc"], &fake);
 
-    assert_eq!(
-        code, 0,
-        "stdout:
-{out}
-stderr:
-{err}"
-    );
-    assert_eq!(
-        out,
-        "nightly: start requested
-frpc: started
-"
-    );
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "nightly: start requested\nfrpc: started\n");
 }
 
 #[skuld::test]

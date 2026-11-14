@@ -633,7 +633,7 @@ fn every_verb_on_an_id_that_is_not_ours_reports_why_and_performs_nothing() {
         ("uninstall", &|id| mgr.uninstall(id)),
         ("enable", &|id| mgr.enable(id)),
         ("disable", &|id| mgr.disable(id)),
-        ("start", &|id| mgr.start(id, budget)),
+        ("start", &|id| mgr.start(id, budget).map(drop)),
         ("stop", &|id| mgr.stop(id, budget)),
         ("kill", &|id| mgr.kill(id)),
         ("request_restart", &|id| {
@@ -807,7 +807,12 @@ fn single_verbs<'a>(
             Budget::Unbounded,
             Box::new(|| mgr.install(spec, true).map(drop)),
         ),
-        ("start", Step::Start, budget, Box::new(move || mgr.start(id, budget))),
+        (
+            "start",
+            Step::Start,
+            budget,
+            Box::new(move || mgr.start(id, budget).map(drop)),
+        ),
         ("stop", Step::Stop, budget, Box::new(move || mgr.stop(id, budget))),
         ("kill", Step::Kill, Budget::Unbounded, Box::new(|| mgr.kill(id))),
         (
@@ -1135,6 +1140,22 @@ fn kind_is_the_installed_blobs_and_reads_no_status() {
     assert_eq!(kind("nightly").unwrap(), DaemonKind::Task);
     assert!(matches!(kind("broken"), Err(Error::Kept(_))));
     assert!(matches!(kind("ghost"), Err(Error::NotInstalled { .. })));
+}
+
+/// A start answers the kind it started, read from the same ownership read, or `None` where the
+/// definition does not decode (which does not stop it).
+#[skuld::test]
+fn start_answers_the_kind_it_started() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_unusable("broken");
+
+    let start = |id: &str| ServiceManager::start(&fake, &Id::try_from(id).unwrap(), Budget::DEFAULT);
+
+    assert_eq!(start("frpc").unwrap(), Some(DaemonKind::Service));
+    assert_eq!(start("nightly").unwrap(), Some(DaemonKind::Task));
+    assert_eq!(start("broken").unwrap(), None);
 }
 
 /// `run` needs the task's state and nothing else `status` reads: a read that fails for another part of

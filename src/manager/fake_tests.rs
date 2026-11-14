@@ -251,7 +251,7 @@ fn absence_over_a_residual_artifact_is_not_not_installed() {
         ("uninstall", fake.uninstall(&id)),
         ("enable", fake.enable(&id)),
         ("disable", fake.disable(&id)),
-        ("start", fake.start(&id, Budget::DEFAULT)),
+        ("start", fake.start(&id, Budget::DEFAULT).map(drop)),
         ("stop", fake.stop(&id, Budget::DEFAULT)),
         ("status", fake.status(&id).map(drop)),
     ] {
@@ -308,7 +308,7 @@ fn every_verb(fake: &Fake, spec: &DaemonSpec) -> Vec<(&'static str, Result<()>)>
         ("uninstall", fake.uninstall(&spec.common().id)),
         ("enable", fake.enable(&spec.common().id)),
         ("disable", fake.disable(&spec.common().id)),
-        ("start", fake.start(&spec.common().id, Budget::DEFAULT)),
+        ("start", fake.start(&spec.common().id, Budget::DEFAULT).map(drop)),
         ("stop", fake.stop(&spec.common().id, Budget::DEFAULT)),
         ("install", fake.install(spec, false).map(drop)),
         ("preview_install", fake.preview_install(spec).map(drop)),

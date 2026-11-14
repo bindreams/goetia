@@ -192,10 +192,10 @@ pub(crate) trait RunHandle: Send + 'static {
     /// Where the run's output is. Read once, before [`Self::wait`].
     fn output(&self) -> OutputSource;
 
-    /// Blocks until the run has ended, and says how. [`Error::RunUnrecorded`] where it ended and the
-    /// exit could not be found; [`Error::RunNotStarted`] where the manager failed it before its process
-    /// was spawned; an error that does not say the run ended (it may still be going) where
-    /// the wait lost track of it.
+    /// Blocks until the run has ended, and says how. [`Error::RunUnrecorded`] where the run's exit could
+    /// not be established (an entry that does not say it, or a failure with no exit recorded before
+    /// it); an error that does not say the run ended (it may still be going), such as
+    /// [`Error::RequestInDoubt`], where the wait lost track of it.
     fn wait(self) -> Result<Exit>
     where
         Self: Sized;
@@ -381,10 +381,12 @@ impl<B: Backend> ServiceManager for B {
         Backend::disable(self, flow::owned(self, id)?)
     }
 
-    fn start(&self, id: &Id, budget: Budget) -> Result<()> {
+    fn start(&self, id: &Id, budget: Budget) -> Result<Option<DaemonKind>> {
         let snapshot = flow::owned(self, id)?;
+        let kind = flow::kind_of(&snapshot).ok();
         let mut reservation = flow::reserved(self, id, &[Step::Start], budget)?;
-        Backend::start(self, snapshot, budget, &mut reservation)
+        Backend::start(self, snapshot, budget, &mut reservation)?;
+        Ok(kind)
     }
 
     fn prepare(&self, steps: &[Step], budget: Budget) -> Result<Box<dyn Sequence + '_>> {

@@ -13,8 +13,8 @@
 //!   `INVOCATION_ID` and cursor. A job that ends with no Starting entry never began a run, and its
 //!   entries carry the *previous* run's invocation, which is never used.
 //! - The exit is the first terminal entry ([`ending_of`]) of that invocation after the cursor. One that
-//!   is "Failed with result" with no exit before it is a run whose process was never spawned
-//!   ([`Error::RunNotStarted`]).
+//!   is "Failed with result" with no exit before it is a run whose exit is not established
+//!   ([`Error::RunUnrecorded`]).
 //! - Output is the run's stream. A task's `sh` wrapper prints `goetia-run <INVOCATION_ID>` first
 //!   (`RUN_MARKER`), and that line and every line of the program share one `_STREAM_ID`, which no
 //!   other run's lines carry, and which every stdout line has (`_SYSTEMD_INVOCATION_ID` is missing
@@ -294,7 +294,8 @@ impl RunHandle for Run {
     /// Follows the manager's entries about the unit after the run's start to the run's terminal entry,
     /// and decodes the exit from it. The follower is dropped when it returns.
     ///
-    /// [`Error::RunUnrecorded`] only for a terminal entry that does not say how the run ended. Any
+    /// [`Error::RunUnrecorded`] for a terminal entry that does not say how the run ended, and for a
+    /// "Failed with result" with no exit before it. Any
     /// other failure (the follower could not be made, failed or ended) loses track of the run, which
     /// may still be going: it is [`Error::RequestInDoubt`], as every failure to follow a run is.
     fn wait(mut self) -> Result<Exit> {
@@ -329,10 +330,10 @@ impl Run {
                         reason: e.report().to_string(),
                     });
                 }
-                Some(Ending::NeverRan { result }) => {
-                    return Err(Error::RunNotStarted {
+                Some(Ending::NoExit { result }) => {
+                    return Err(Error::RunUnrecorded {
                         id: self.id.to_string(),
-                        reason: format!("systemd failed the unit as `{result}` before its process exited"),
+                        reason: format!("systemd failed the unit as `{result}` and recorded no exit for the run"),
                     });
                 }
             }

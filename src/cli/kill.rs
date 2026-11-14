@@ -33,7 +33,7 @@ pub fn run(
             get_manager,
             is_elevated,
             verb: &|mgr, id| mgr.kill(id),
-            verb_past_tense: &|| "kill delivered",
+            verb_past_tense: "kill delivered",
             absent_is_success: false,
         },
         out,

@@ -122,11 +122,14 @@ pub trait ServiceManager {
     /// `Ok(())`, not an error.
     ///
     /// **A task's start requests a run and returns once the manager has accepted it:** `budget` is
-    /// not read, and `Ok(())` says nothing of the run.
+    /// not read, and `Ok` says nothing of the run.
+    ///
+    /// The answer is the kind of what was started, read from the definition the ownership gate
+    /// passed: `None` where it will not decode, which does not stop a start.
     ///
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     /// [`Error::Undetermined`]: crate::Error::Undetermined
-    fn start(&self, id: &Id, budget: Budget) -> Result<()>;
+    fn start(&self, id: &Id, budget: Budget) -> Result<Option<DaemonKind>>;
 
     /// Run the task `id` once, now, and follow that run: request a start, copy what the run writes to
     /// `out` as it is written, and return how the run ended once it has.
@@ -139,8 +142,9 @@ pub trait ServiceManager {
     ///
     /// Everything the run wrote before it ended has been written to `out` when `run` returns. A task
     /// with no `logs` file has no output to show: one note says so, and `run` waits for the run to end.
-    /// [`Error::RunNotStarted`] means the manager ended the start before a run began;
-    /// [`Error::RunUnrecorded`] that a run ended and its exit status could not be found. If showing the
+    /// [`Error::RunNotStarted`] means the manager ended the start before a run began (no Starting entry);
+    /// [`Error::RunUnrecorded`] that the run's exit could not be established; a wait that lost track of
+    /// the run is [`Error::RequestInDoubt`], which does not say it ended. If showing the
     /// output fails the run is still waited for: the wait's error is returned if it failed, else a
     /// [`Error::Step`] that names the exit and holds the failure.
     fn run(&self, id: &Id, out: &mut dyn Write) -> Result<Exit>;

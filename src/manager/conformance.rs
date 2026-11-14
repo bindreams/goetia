@@ -726,7 +726,7 @@ pub fn an_unclassifiable_id_is_never_silently_absent(mgr: &dyn ServiceManager, m
         ("uninstall", mgr.uninstall(id)),
         ("enable", mgr.enable(id)),
         ("disable", mgr.disable(id)),
-        ("start", mgr.start(id, Budget::DEFAULT)),
+        ("start", mgr.start(id, Budget::DEFAULT).map(drop)),
         ("stop", mgr.stop(id, Budget::DEFAULT)),
         ("kill", mgr.kill(id)),
     ]

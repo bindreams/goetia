@@ -496,13 +496,14 @@ pub enum Error {
     #[error("the manager does not say whether `{id}` is running, so `run` did not start it")]
     RunStateUnknown { id: String },
 
-    /// The manager ended the start before any run began (or failed the run before its process was
-    /// spawned), so the task did not run. `reason` is the manager's. Not indeterminate: goetia established that nothing ran.
+    /// The manager ended the start before any run began (no Starting entry), so the task did not run.
+    /// `reason` is the manager's. Not indeterminate: goetia established that nothing ran.
     #[error("`{id}` did not run: {reason}")]
     RunNotStarted { id: String, reason: String },
 
-    /// A run began and ended, and its exit status was not recorded where goetia reads it. Exit `4`
-    /// (indeterminate): the run happened, so repeating `run` repeats it.
+    /// A run began, and its exit status was not established: it ended with none recorded where goetia
+    /// reads it, or the manager failed it with no exit recorded. Exit `4` (indeterminate): the run
+    /// happened, so repeating `run` repeats it.
     #[error("the run of `{id}` ended without recording its exit status: {reason}")]
     RunUnrecorded { id: String, reason: String },
 

@@ -1,12 +1,11 @@
 //! `goetia daemon start <ID...>`
 
-use std::cell::Cell;
 use std::io::Write;
 
 use clap::Args as ClapArgs;
 
 use super::ExitCode;
-use super::support::{IdVerbCall, run_id_verb};
+use super::support::{WordedVerbCall, run_worded_verb};
 use super::wait::{self, WaitArgs};
 use crate::error::Result;
 use crate::manager::ServiceManager;
@@ -30,35 +29,24 @@ pub fn run(
     err: &mut dyn Write,
 ) -> ExitCode {
     let budget = args.wait.budget();
-    // Whether the id `verb` last started is a task, which only requests a run.
-    let task = Cell::new(false);
-    run_id_verb(
-        IdVerbCall {
+    run_worded_verb(
+        WordedVerbCall {
             subcommand: "daemon start",
             ids: &args.ids,
             get_manager,
             is_elevated,
             verb: &|mgr, id| {
-                task.set(false);
-                // The kind is the installed blob's. A start without a flag has nothing to refuse, so
-                // it only takes the word for its report from it: a blob that will not decode is
-                // `start`'s to report, as it was before the kind was asked.
-                match mgr.kind(id) {
-                    Ok(kind) => task.set(kind == DaemonKind::Task),
-                    Err(e) if args.wait.was_given() => return Err(e),
-                    Err(_) => {}
-                }
-                if task.get() && args.wait.was_given() {
+                // A flag is read against the installed blob's kind before anything is sent. A
+                // start without one reads no more than it did: it learns the kind from the start.
+                if args.wait.was_given() && mgr.kind(id)? == DaemonKind::Task {
                     return Err(crate::spec::invalid(id, wait::NOT_FOR_A_TASK));
                 }
-                mgr.start(id, budget)
-            },
-            verb_past_tense: &|| {
-                if task.get() {
-                    "start requested"
-                } else {
-                    wait::reported(budget, "started", "start requested")
-                }
+                // The word follows what was started: a service reports the budget's, a task only
+                // requested its run, and a start that could not read the kind claims no more.
+                Ok(match mgr.start(id, budget)? {
+                    Some(DaemonKind::Service) => wait::reported(budget, "started", "start requested"),
+                    Some(DaemonKind::Task) | None => "start requested",
+                })
             },
             absent_is_success: false,
         },
