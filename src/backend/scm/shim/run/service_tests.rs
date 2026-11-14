@@ -24,8 +24,8 @@ use windows_sys::Win32::System::Services::{
 
 use super::*;
 use crate::backend::scm::shim::run::os::fake::{
-    FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd, kill_refused, wait_failed,
-    wait_failed_with_code,
+    FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd, tree_kill_refused,
+    wait_failed, wait_failed_with_code,
 };
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
@@ -94,7 +94,7 @@ const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPower
 fn exited_tree_unkilled() -> String {
     format!(
         "terminating the process tree after the daemon ended failed: {}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
-        Report::new(&kill_refused())
+        Report::new(&tree_kill_refused())
     )
 }
 

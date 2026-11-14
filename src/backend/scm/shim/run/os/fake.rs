@@ -33,8 +33,17 @@ const WAIT_FAILED: &str = "the wait failed (fake)";
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
 /// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
+/// A refused [`Spawned::kill`], as `TerminateProcess` refuses: the OS error itself.
 pub(crate) fn kill_refused() -> cosca::error::Error {
     cosca::error::Error::Io(io::Error::other(KILL_REFUSED))
+}
+
+/// A refused [`Spawned::send_kill_tree`], as a `Job` refuses: a `Containment` over the OS error.
+pub(crate) fn tree_kill_refused() -> cosca::error::Error {
+    cosca::error::Error::Containment {
+        detail: "TerminateJobObject could not terminate the job".to_owned(),
+        source: Some(Arc::new(kill_refused())),
+    }
 }
 
 pub(crate) fn wait_failed() -> cosca::error::Error {
@@ -80,7 +89,8 @@ pub(crate) enum WaitReply {
 pub(crate) enum KillReply {
     /// Succeed. The process is ended.
     Ends,
-    /// Fail with [`kill_refused`]. The process is not ended.
+    /// Fail with [`kill_refused`] for a kill, [`tree_kill_refused`] for a tree kill. The process is
+    /// not ended.
     Refuses,
     Panics,
 }
@@ -230,7 +240,12 @@ impl Instance {
         panic!("unstated call: {what} on a process");
     }
 
-    fn kill_with(&self, what: &str, reply: Option<KillReply>) -> Result<(), cosca::error::Error> {
+    fn kill_with(
+        &self,
+        what: &str,
+        refused: fn() -> cosca::error::Error,
+        reply: Option<KillReply>,
+    ) -> Result<(), cosca::error::Error> {
         match reply {
             None => self.unstated(what),
             Some(KillReply::Ends) => {
@@ -238,7 +253,7 @@ impl Instance {
                 self.proc.end(status(1));
                 Ok(())
             }
-            Some(KillReply::Refuses) => Err(kill_refused()),
+            Some(KillReply::Refuses) => Err(refused()),
             Some(KillReply::Panics) => panic!("the {what} panicked (fake)"),
         }
     }
@@ -263,13 +278,13 @@ impl Spawned for Instance {
 
     fn kill(&self) -> Result<(), cosca::error::Error> {
         let reply = lock(&self.proc.state).kills.pop_front();
-        self.kill_with("kill", reply)
+        self.kill_with("kill", kill_refused, reply)
     }
 
     fn send_kill_tree(&self) -> Result<(), cosca::error::Error> {
         self.fake.count(Op::SendKillTree);
         let reply = lock(&self.proc.state).send_kill_tree_replies.pop_front();
-        self.kill_with("send_kill_tree", reply)
+        self.kill_with("send_kill_tree", tree_kill_refused, reply)
     }
 }
 

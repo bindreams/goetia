@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::os::fake::{Fake, kill_refused};
+use super::os::fake::{Fake, kill_refused, tree_kill_refused};
 use super::stop_bus::Supervisor;
 
 /// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
@@ -39,7 +39,7 @@ pub(crate) fn assert_failures(lines: &[String], id: &str, expected: &[String]) {
 pub(crate) fn tree_refused_failure() -> String {
     format!(
         "terminating the daemon's process tree failed: {}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)",
-        cosca::error::Report::new(&kill_refused())
+        cosca::error::Report::new(&tree_kill_refused())
     )
 }
 
