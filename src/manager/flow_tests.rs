@@ -3,7 +3,7 @@ use crate::decide::{self, ExternalConfig, Outcome};
 use crate::error::Error;
 use crate::manager::fake::fake_tests::mk;
 use crate::manager::fake::{Fake, generate};
-use crate::manager::{Budget, Installed, ServiceManager, Step};
+use crate::manager::{Budget, Exit, Installed, ServiceManager, State, Step};
 use crate::spec::{DaemonFields, DaemonSpec, Id, ServiceFields, ServiceSpec, User};
 use crate::testing::service_fields;
 
@@ -1013,4 +1013,262 @@ fn an_enable_in_a_sequence_spends_no_step() {
 
     let mut none = fake.prepare(&[], Budget::DEFAULT).unwrap();
     none.enable(&id).unwrap();
+}
+
+// run =================================================================================================================
+
+fn a_task(id: &str) -> DaemonSpec {
+    crate::testing::task(id, vec![crate::spec::test_support::program("job")], Some("0 3 * * *"))
+}
+
+fn an_unscheduled_task(id: &str) -> DaemonSpec {
+    crate::testing::task(id, vec![crate::spec::test_support::program("job")], None)
+}
+
+fn run_of(fake: &Fake, id: &str) -> (Result<crate::manager::Exit>, String) {
+    let mut out = Vec::new();
+    let result = fake.run(&Id::try_from(id).unwrap(), &mut out);
+    (result, String::from_utf8(out).unwrap())
+}
+
+/// An `out` that refuses every write.
+struct Refuses;
+
+impl std::io::Write for Refuses {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("sink refused"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn began_a_run(fake: &Fake) -> bool {
+    fake.calls().iter().any(|(call, _)| *call == "begin_run")
+}
+
+#[skuld::test]
+fn run_of_a_service_is_not_a_task() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (result, out) = run_of(&fake, "frpc");
+
+    let e = result.expect_err("a service has no runs");
+    assert_eq!(
+        e.to_string(),
+        "`frpc` is a service, not a task: `run` applies only to a task"
+    );
+    assert!(!began_a_run(&fake));
+    assert_eq!(out, "");
+}
+
+#[skuld::test]
+fn run_of_an_id_that_is_not_installed_is_not_installed() {
+    let (result, _) = run_of(&Fake::new(), "ghost");
+
+    assert!(matches!(result, Err(Error::NotInstalled { .. })), "{result:?}");
+}
+
+#[skuld::test]
+fn run_of_an_unusable_blob_is_its_error() {
+    let fake = Fake::new();
+    fake.seed_unusable("frpc");
+
+    let (result, _) = run_of(&fake, "frpc");
+
+    assert!(matches!(result, Err(Error::Kept(_))), "{result:?}");
+    assert!(!began_a_run(&fake));
+}
+
+#[skuld::test]
+fn run_of_a_running_task_is_already_running_and_sends_nothing() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_state("nightly", State::Running);
+    let reservations = fake.prepared().len();
+
+    let (result, out) = run_of(&fake, "nightly");
+
+    let e = result.expect_err("a run in flight is not joined");
+    assert_eq!(
+        e.to_string(),
+        "`nightly` is already running: `run` needs an idle task (`goetia daemon stop nightly` ends the run in flight)"
+    );
+    assert!(!e.is_indeterminate());
+    assert!(!began_a_run(&fake), "nothing was requested");
+    assert_eq!(fake.prepared().len(), reservations, "nothing was reserved either");
+    assert_eq!(out, "");
+}
+
+#[skuld::test]
+fn run_of_an_unknown_state_is_refused() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_state("nightly", State::Unknown);
+
+    let (result, _) = run_of(&fake, "nightly");
+
+    let e = result.expect_err("the state is not established");
+    assert_eq!(
+        e.to_string(),
+        "the manager does not say whether `nightly` is running, so `run` did not start it"
+    );
+    assert!(e.is_indeterminate());
+    assert!(!began_a_run(&fake));
+}
+
+#[skuld::test]
+fn run_of_an_idle_task_follows_the_run_it_began() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_exit("nightly", Exit::Signal(15));
+
+    let (result, _) = run_of(&fake, "nightly");
+
+    assert_eq!(result.unwrap(), Exit::Signal(15));
+    assert!(began_a_run(&fake));
+    assert_eq!(
+        fake.prepared().last(),
+        Some(&(vec![Step::Start], Budget::Immediate)),
+        "the run reserves as a start that does not wait"
+    );
+}
+
+#[skuld::test]
+fn run_streams_what_the_run_wrote_after_the_start_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("job.log");
+    std::fs::write(&log, "an earlier run\n").unwrap();
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_writes("nightly", &log, "this run\n");
+
+    let (result, out) = run_of(&fake, "nightly");
+
+    assert_eq!(result.unwrap(), Exit::Code(0));
+    assert_eq!(out, "this run\n");
+}
+
+#[skuld::test]
+fn a_failed_begin_run_is_the_error() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_begin_run_fails("nightly", || Error::RunNotStarted {
+        id: "nightly".to_string(),
+        reason: "the manager refused (seeded)".to_string(),
+    });
+
+    let (result, _) = run_of(&fake, "nightly");
+
+    let e = result.expect_err("no run began");
+    assert_eq!(e.to_string(), "`nightly` did not run: the manager refused (seeded)");
+}
+
+#[skuld::test]
+fn a_failing_stream_still_waits_for_the_run() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_exit("nightly", Exit::Code(3));
+
+    let result = fake.run(&Id::try_from("nightly").unwrap(), &mut Refuses);
+
+    assert!(result.is_err());
+    assert!(
+        fake.calls().iter().any(|(call, _)| *call == "wait_run"),
+        "the run was waited for although showing its output failed: {:?}",
+        fake.calls()
+    );
+}
+
+#[skuld::test]
+fn the_waits_error_wins_over_the_streams() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_wait_fails("nightly", || Error::RunUnrecorded {
+        id: "nightly".to_string(),
+        reason: "no record (seeded)".to_string(),
+    });
+
+    let result = fake.run(&Id::try_from("nightly").unwrap(), &mut Refuses);
+
+    let e = result.expect_err("the exit status is the more basic fact");
+    assert_eq!(
+        e.to_string(),
+        "the run of `nightly` ended without recording its exit status: no record (seeded)"
+    );
+}
+
+#[skuld::test]
+fn a_stream_error_after_a_good_wait_names_the_exit() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_exit("nightly", Exit::Code(3));
+
+    let e = fake
+        .run(&Id::try_from("nightly").unwrap(), &mut Refuses)
+        .expect_err("the output could not be shown");
+
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert!(e.to_string().contains("`nightly`"), "{e}");
+    assert!(e.to_string().contains("exit code 3"), "{e}");
+    assert!(
+        e.report().to_string().contains("sink refused"),
+        "the cause is kept: {}",
+        e.report()
+    );
+}
+
+// enable ==============================================================================================================
+
+const NOTHING_TO_ARM: &str =
+    "daemon `nightly`: `schedule` is missing, so there is nothing to arm: `enable` applies to a task with a schedule";
+
+fn enabled(fake: &Fake, id: &str) -> bool {
+    fake.status(&Id::try_from(id).unwrap()).unwrap().common().enabled
+}
+
+#[skuld::test]
+fn enable_of_a_task_without_schedule_is_refused_before_any_backend_call() {
+    let fake = Fake::new();
+    fake.install(&an_unscheduled_task("nightly"), false).unwrap();
+    let id = Id::try_from("nightly").unwrap();
+    let reservations = fake.prepared().len();
+
+    let e = ServiceManager::enable(&fake, &id).expect_err("nothing to arm");
+
+    assert_eq!(e.to_string(), NOTHING_TO_ARM);
+    assert!(!enabled(&fake, "nightly"), "the backend was never asked");
+    assert_eq!(fake.prepared().len(), reservations);
+
+    let mut sequence = fake.prepare(&[], Budget::DEFAULT).unwrap();
+    let e = sequence.enable(&id).expect_err("nothing to arm");
+    assert_eq!(e.to_string(), NOTHING_TO_ARM);
+    assert!(!enabled(&fake, "nightly"), "nor from a sequence");
+}
+
+#[skuld::test]
+fn enable_of_a_scheduled_task_reaches_the_backend() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    let id = Id::try_from("nightly").unwrap();
+
+    ServiceManager::enable(&fake, &id).unwrap();
+    assert!(enabled(&fake, "nightly"));
+
+    ServiceManager::disable(&fake, &id).unwrap();
+    let mut sequence = fake.prepare(&[], Budget::DEFAULT).unwrap();
+    sequence.enable(&id).unwrap();
+    assert!(enabled(&fake, "nightly"));
+}
+
+#[skuld::test]
+fn enable_of_a_service_and_of_an_unusable_blob_is_not_judged_by_a_schedule() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.seed_unusable("odd");
+
+    ServiceManager::enable(&fake, &Id::try_from("frpc").unwrap()).unwrap();
+    ServiceManager::enable(&fake, &Id::try_from("odd").unwrap()).unwrap();
 }

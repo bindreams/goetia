@@ -11,12 +11,15 @@
 //! marker, so a backend cannot act on a service goetia did not create. The blanket impl is the one
 //! place that turns an id into a snapshot.
 
+use std::convert::Infallible;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
-use crate::manager::{Budget, Installed, Sequence, ServiceManager, Status, Step, flow};
+use crate::manager::{Budget, Exit, Installed, Sequence, ServiceManager, Status, Step, flow};
 use crate::spec::{DaemonSpec, Id};
 
 /// A marked artifact's metadata as `read` decoded it, or the failure kept in its place. Shared, so
@@ -49,6 +52,8 @@ pub(crate) trait Backend {
     /// What the verbs that send requests draw on, made by [`Self::reserve`] before anything is
     /// sent: see `bounded::Reservation`.
     type Reservation: 'static;
+    /// A run [`Self::begin_run`] began: what a `run` follows to its end.
+    type Run: RunHandle;
 
     // Primitives ------------------------------------------------------------------------------------------------------
 
@@ -164,6 +169,47 @@ pub(crate) trait Backend {
 
     /// See [`ServiceManager::kill`].
     fn kill(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<()>;
+
+    /// Requests a run of the task `snapshot` is (which [`flow::run`] has found idle), and returns the
+    /// run it began: [`RunHandle::output`] names where its output goes and [`RunHandle::wait`] how it
+    /// ended. Draws on a reservation made for [`Step::Start`]. Anything that must be read about the
+    /// output's position (the size of a log file) is read before the request is sent.
+    ///
+    /// [`Error::RunNotStarted`] where the manager ended the start before a run began. A failure after
+    /// the request was sent is never that: the run may have happened.
+    fn begin_run(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<Self::Run>;
+}
+
+/// A run of a task that [`Backend::begin_run`] began.
+pub(crate) trait RunHandle: Send + 'static {
+    /// Where the run's output is. Read once, before [`Self::wait`].
+    fn output(&self) -> OutputSource;
+
+    /// Blocks until the run has ended, and says how. [`Error::RunUnrecorded`] where it ended and the
+    /// exit could not be found.
+    fn wait(self) -> Result<Exit>
+    where
+        Self: Sized;
+}
+
+/// Where a run's output can be read from.
+pub(crate) enum OutputSource {
+    /// A file the run appends to, from byte `offset`: its length as it was before the run was
+    /// requested, so an earlier run's output is not shown. A file that is not there is empty.
+    LogFile { path: PathBuf, offset: u64 },
+    /// The task has no `logs` file, and the manager keeps no output of it that goetia reads.
+    None,
+}
+
+/// What a backend whose tasks are not built yet answers [`Backend::begin_run`] with.
+impl RunHandle for Infallible {
+    fn output(&self) -> OutputSource {
+        match *self {}
+    }
+
+    fn wait(self) -> Result<Exit> {
+        match self {}
+    }
 }
 
 /// One [`Backend`]'s native restart of a service the gate passed.
@@ -285,6 +331,7 @@ impl<B: Backend> ServiceManager for B {
 
     fn enable(&self, id: &Id) -> Result<()> {
         let snapshot = flow::owned(self, id)?;
+        flow::require_armable(&snapshot)?;
         let mut reservation = flow::reserved(self, id, &[], Budget::Unbounded)?;
         Backend::enable(self, snapshot, &mut reservation)
     }
@@ -328,6 +375,10 @@ impl<B: Backend> ServiceManager for B {
         let snapshot = flow::owned(self, id)?;
         let mut reservation = flow::reserved(self, id, &[Step::Kill], Budget::Unbounded)?;
         Backend::kill(self, snapshot, &mut reservation)
+    }
+
+    fn run(&self, id: &Id, out: &mut dyn Write) -> Result<Exit> {
+        flow::run(self, id, out)
     }
 
     fn status(&self, id: &Id) -> Result<Status> {
@@ -374,6 +425,7 @@ impl<B: Backend> Sequence for Reserved<'_, B> {
 
     fn enable(&mut self, id: &Id) -> Result<()> {
         let snapshot = flow::owned(self.backend, id)?;
+        flow::require_armable(&snapshot)?;
         Backend::enable(self.backend, snapshot, &mut self.reservation)
     }
 

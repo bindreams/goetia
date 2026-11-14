@@ -16,7 +16,7 @@ use clap::Parser as _;
 use clap::error::ErrorKind;
 use goetia::cli::{self, Cli, Command, DaemonCommand};
 use goetia::manager::fake::Fake;
-use goetia::manager::{Budget, Installed, Sequence, ServiceManager, State, Status, Step};
+use goetia::manager::{Budget, Exit, Installed, Sequence, ServiceManager, State, Status, Step};
 use goetia::shim::HostCommand;
 use goetia::spec::{DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
 use goetia::testing::service_fields;
@@ -431,6 +431,9 @@ impl ServiceManager for FlakyManager {
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
         self.inner.kill(id)
+    }
+    fn run(&self, id: &Id, out: &mut dyn std::io::Write) -> goetia::Result<Exit> {
+        self.inner.run(id, out)
     }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         if self.unqueryable.as_deref() == Some(id.as_str()) {
@@ -1213,6 +1216,9 @@ impl ServiceManager for PanicsOnStart {
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
         self.0.kill(id)
+    }
+    fn run(&self, id: &Id, out: &mut dyn std::io::Write) -> goetia::Result<Exit> {
+        self.0.run(id, out)
     }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         self.0.status(id)
@@ -3461,6 +3467,9 @@ impl ServiceManager for PanicsOnStatus {
     fn kill(&self, id: &Id) -> goetia::Result<()> {
         self.0.kill(id)
     }
+    fn run(&self, id: &Id, out: &mut dyn std::io::Write) -> goetia::Result<Exit> {
+        self.0.run(id, out)
+    }
     fn status(&self, id: &Id) -> goetia::Result<Status> {
         panic!("`restart` with no budget must not read state: status({id})")
     }
@@ -4670,4 +4679,307 @@ fn a_conflict_with_a_hostile_artifact_diff_is_escaped_on_stdout_with_its_lines()
     assert!(!out.contains(['\u{1b}', '\u{202e}', '\u{2028}']), "{out:?}");
     assert!(out.contains("\\u{1b}[31m\\u{202e}\\u{2028}x\n"), "{out:?}");
     assert!(out.contains("# second line\n"), "{out:?}");
+}
+
+// Tasks ===============================================================================================================
+
+fn a_task(id: &str) -> DaemonSpec {
+    goetia::testing::task(
+        id,
+        vec![std::env::temp_dir().join("job").to_string_lossy().into_owned()],
+        Some("0 3 * * *"),
+    )
+}
+
+fn began_a_run(fake: &Fake) -> bool {
+    fake.calls().iter().any(|(call, _)| *call == "begin_run")
+}
+
+const TIMEOUT_ON_A_TASK: &str = "`--timeout` and `--no-timeout` do not apply to a task: `start` returns as soon as the manager has accepted the run";
+
+const NOTHING_TO_ARM: &str =
+    "`schedule` is missing, so there is nothing to arm: `enable` applies to a task with a schedule";
+
+#[skuld::test]
+fn run_streams_the_log_and_exits_with_the_runs_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("job.log");
+    std::fs::write(&log, "an earlier run\n").unwrap();
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_writes("nightly", &log, "backed up 3 files\n");
+    fake.seed_run_exit("nightly", Exit::Code(7));
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "run", "nightly"], &fake);
+
+    assert_eq!(code, 7, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out, "backed up 3 files\n");
+    assert_eq!(err, "");
+}
+
+#[skuld::test]
+fn run_of_a_signalled_task_exits_128_plus_n() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_exit("nightly", Exit::Signal(15));
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "run", "nightly"], &fake);
+
+    assert_eq!(code, 143, "{err}");
+}
+
+#[skuld::test]
+fn run_of_a_clean_task_exits_zero() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "run", "nightly"], &fake);
+
+    assert_eq!(code, 0, "{err}");
+}
+
+#[skuld::test]
+fn run_needs_elevation() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    let (code, out, err) = dispatch_with(&["goetia", "daemon", "run", "nightly"], &fake, &|| false);
+
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(err.contains("daemon run"), "{err}");
+    assert!(!began_a_run(&fake));
+}
+
+#[skuld::test]
+fn run_with_json_is_refused() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    let (code, _out, _err) = dispatch_elevated(&["goetia", "--json", "daemon", "run", "nightly"], &fake);
+
+    assert_eq!(code, 2);
+    assert!(!began_a_run(&fake));
+}
+
+#[skuld::test]
+fn run_of_a_service_says_not_a_task_exit_1() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "run", "frpc"], &fake);
+
+    assert_eq!(code, 1, "{out}{err}");
+    assert_eq!(
+        err,
+        "error: frpc: `frpc` is a service, not a task: `run` applies only to a task\n"
+    );
+}
+
+#[skuld::test]
+fn run_of_a_running_task_exits_1_and_names_stop() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_state("nightly", State::Running);
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "run", "nightly"], &fake);
+
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("goetia daemon stop nightly"), "{err}");
+}
+
+#[skuld::test]
+fn run_of_an_unknown_state_exits_4() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_state("nightly", State::Unknown);
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "run", "nightly"], &fake);
+
+    assert_eq!(code, 4, "{err}");
+}
+
+#[skuld::test]
+fn start_refuses_timeout_on_a_task_per_id() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(
+        &["goetia", "daemon", "start", "nightly", "frpc", "--timeout", "5s"],
+        &fake,
+    );
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains(TIMEOUT_ON_A_TASK), "{err}");
+    assert!(
+        !fake.calls().contains(&("start", "nightly".to_string())),
+        "the task was not started"
+    );
+    assert_eq!(out, "frpc: started\n", "the service beside it still starts");
+    assert_eq!(
+        fake.status(&Id::try_from("frpc").unwrap()).unwrap().common().state,
+        State::Running
+    );
+}
+
+#[skuld::test]
+fn start_refuses_no_timeout_on_a_task() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "start", "nightly", "--no-timeout"], &fake);
+
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains(TIMEOUT_ON_A_TASK), "{err}");
+}
+
+#[skuld::test]
+fn start_without_a_flag_on_a_task_does_not_read_status() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    let (code, out, err) = dispatch_with(
+        &["goetia", "daemon", "start", "nightly"],
+        &PanicsOnStatus(fake.clone()),
+        &|| true,
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(fake.calls().contains(&("start", "nightly".to_string())));
+}
+
+#[skuld::test]
+fn start_with_a_flag_falls_through_to_start_when_status_fails() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_live_status_fails("nightly", || goetia::Error::NotRunning {
+        id: "nightly".to_string(),
+    });
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "nightly", "--timeout", "5s"], &fake);
+
+    assert!(
+        !err.contains(TIMEOUT_ON_A_TASK),
+        "a status that failed refuses nothing: {err}"
+    );
+    assert!(
+        fake.calls().contains(&("start", "nightly".to_string())),
+        "stdout:
+{out}
+stderr:
+{err} (exit {code})"
+    );
+}
+
+#[skuld::test]
+fn install_start_timeout_on_a_task_is_refused_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "id: nightly
+command: [backup]
+type: task
+schedule: 0 3 * * *
+",
+    );
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "-f",
+            manifest.to_str().unwrap(),
+            "--start",
+            "--timeout",
+            "5s",
+        ],
+        &fake,
+    );
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains(TIMEOUT_ON_A_TASK), "{err}");
+    assert_eq!(fake.writes(), 0, "nothing was installed");
+    assert!(fake.prepared().is_empty(), "nothing was reserved");
+}
+
+#[skuld::test]
+fn install_start_of_a_task_without_a_flag_installs_and_requests_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "id: nightly
+command: [backup]
+type: task
+schedule: 0 3 * * *
+",
+    );
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "-f",
+            manifest.to_str().unwrap(),
+            "--start",
+        ],
+        &fake,
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(fake.calls().contains(&("start", "nightly".to_string())));
+}
+
+#[skuld::test]
+fn install_enable_on_a_scheduleless_task_is_refused_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "id: nightly
+command: [backup]
+type: task
+",
+    );
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_elevated(
+        &[
+            "goetia",
+            "daemon",
+            "install",
+            "-f",
+            manifest.to_str().unwrap(),
+            "--enable",
+        ],
+        &fake,
+    );
+
+    assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains(NOTHING_TO_ARM), "{err}");
+    assert_eq!(fake.writes(), 0, "nothing was installed");
+    assert!(fake.prepared().is_empty(), "nothing was reserved");
+}
+
+#[skuld::test]
+fn install_of_a_scheduleless_task_without_enable_is_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(
+        dir.path(),
+        "id: nightly
+command: [backup]
+type: task
+",
+    );
+    let fake = Fake::new();
+
+    let (code, out, err) = dispatch_elevated(
+        &["goetia", "daemon", "install", "-f", manifest.to_str().unwrap()],
+        &fake,
+    );
+
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(fake.writes(), 1);
 }

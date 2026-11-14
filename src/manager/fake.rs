@@ -7,11 +7,13 @@
 //! compare.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::backend::{
-    Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
+    Decoded, InstalledDefinition, InstalledService, NativeRestart, OutputSource, ReadOutcome, RunHandle, Scan,
+    ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::{self, Blob};
 use crate::decide::{ExternalConfig, Outcome};
@@ -103,12 +105,24 @@ struct Runs {
 }
 
 /// A seeded failure: made afresh at each use, since an [`Error`] cannot be cloned.
+#[derive(Clone)]
 struct Failure(Arc<dyn Fn() -> Error + Send + Sync>);
 
 impl std::fmt::Debug for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Failure")
     }
+}
+
+/// What [`Fake`]'s run of a task does: see [`Fake::seed_run_exit`] and the seeds beside it.
+#[derive(Debug, Clone, Default)]
+struct RunScript {
+    /// How the run ends; `Code(0)` if unseeded.
+    exit: Option<Exit>,
+    /// The log the run appends `text` to, from the length it had before the request.
+    writes: Option<(PathBuf, String)>,
+    begin_fails: Option<Failure>,
+    wait_fails: Option<Failure>,
 }
 
 /// An in-memory [`ServiceManager`]. See the module doc comment.
@@ -167,6 +181,8 @@ struct Store {
     writes: usize,
     calls: Vec<(&'static str, String)>,
     prepared: Vec<(Vec<Step>, Budget)>,
+    /// What a run of each task does, by id; absent means a clean exit and no output.
+    run_scripts: BTreeMap<String, RunScript>,
 }
 
 impl Store {
@@ -556,8 +572,37 @@ impl Fake {
         state.prepare_fails = Some(step);
     }
 
+    /// Test-only seeding: the next runs of the task `id` end with `exit`. Unseeded, a run ends with
+    /// `Exit::Code(0)`.
+    pub fn seed_run_exit(&self, id: &str, exit: Exit) {
+        self.script_run(id, |script| script.exit = Some(exit));
+    }
+
+    /// Test-only seeding: a run of the task `id` appends `text` to the log at `log`, as the program
+    /// does after the start request, and names the log's length from before it as where the run's
+    /// output begins. Unseeded, a run has no output.
+    pub fn seed_run_writes(&self, id: &str, log: &Path, text: &str) {
+        self.script_run(id, |script| script.writes = Some((log.to_path_buf(), text.to_string())));
+    }
+
+    /// Test-only seeding: the request to run the task `id` fails with what `error` makes.
+    pub fn seed_begin_run_fails(&self, id: &str, error: impl Fn() -> Error + Send + Sync + 'static) {
+        self.script_run(id, |script| script.begin_fails = Some(Failure(Arc::new(error))));
+    }
+
+    /// Test-only seeding: waiting for the end of a run of the task `id` fails with what `error` makes.
+    pub fn seed_run_wait_fails(&self, id: &str, error: impl Fn() -> Error + Send + Sync + 'static) {
+        self.script_run(id, |script| script.wait_fails = Some(Failure(Arc::new(error))));
+    }
+
+    fn script_run(&self, id: &str, edit: impl FnOnce(&mut RunScript)) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        edit(state.run_scripts.entry(id.to_string()).or_default());
+    }
+
     /// Every `start`/`stop`/`restart`/`kill` this Fake was asked to perform, in order, recorded
-    /// once the ownership gate passed rather than when it succeeded.
+    /// once the ownership gate passed rather than when it succeeded. A run of a task is recorded as
+    /// `begin_run`, and as `wait_run` once it is waited for.
     ///
     /// For assertions about the **absence** of a call, which no state read can
     /// express: `start` on an already-`Running` entry leaves the state
@@ -724,6 +769,7 @@ impl crate::backend::Backend for Fake {
     type Snapshot = Artifact;
     type InstallScope = ();
     type Reservation = ();
+    type Run = FakeRun;
 
     /// Records the steps asked for, and fails if they include the step [`Fake::seed_prepare_fails`]
     /// named. Makes nothing ready: the fake draws nothing.
@@ -1053,6 +1099,67 @@ impl crate::backend::Backend for Fake {
             entry.state = State::Failed;
         }
         Ok(())
+    }
+
+    /// Recorded as `begin_run`, once the gate has passed. Leaves the task's state alone: a run of the
+    /// Fake is its script ([`Fake::seed_run_exit`]), not a process.
+    fn begin_run(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<FakeRun> {
+        let id = snapshot.id();
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("begin_run", id.as_str().to_string()));
+        state.confirm(&snapshot)?;
+        let script = state.run_scripts.get(id.as_str()).cloned().unwrap_or_default();
+        if let Some(failure) = &script.begin_fails {
+            return Err(failure.0());
+        }
+        let log = script.writes.map(|(path, text)| {
+            // What the run appends is after the length measured here, which is before it was requested.
+            let offset = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|e| panic!("Fake: cannot open the seeded log {}: {e}", path.display()));
+            std::io::Write::write_all(&mut file, text.as_bytes()).expect("Fake: cannot write the seeded log");
+            (path, offset)
+        });
+        Ok(FakeRun {
+            id: id.clone(),
+            state: Arc::clone(&self.state),
+            log,
+            exit: script.exit.unwrap_or(Exit::Code(0)),
+            wait_fails: script.wait_fails,
+        })
+    }
+}
+
+/// A run of [`Fake`]: its script, answered when waited for.
+pub(crate) struct FakeRun {
+    id: Id,
+    state: Arc<Mutex<Store>>,
+    log: Option<(PathBuf, u64)>,
+    exit: Exit,
+    wait_fails: Option<Failure>,
+}
+
+impl RunHandle for FakeRun {
+    fn output(&self) -> OutputSource {
+        match &self.log {
+            Some((path, offset)) => OutputSource::LogFile {
+                path: path.clone(),
+                offset: *offset,
+            },
+            None => OutputSource::None,
+        }
+    }
+
+    fn wait(self) -> Result<Exit> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.calls.push(("wait_run", self.id.as_str().to_string()));
+        match self.wait_fails {
+            Some(failure) => Err(failure.0()),
+            None => Ok(self.exit),
+        }
     }
 }
 

@@ -8,11 +8,12 @@ use super::ExitCode;
 use super::support::{IdVerbCall, run_id_verb};
 use super::wait::{self, WaitArgs};
 use crate::error::Result;
-use crate::manager::ServiceManager;
+use crate::manager::{ServiceManager, Status};
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
-    /// Daemon ids to start. Does not change boot-enablement.
+    /// Daemon ids to start. Does not change boot-enablement. A task's start returns as soon as the
+    /// manager has accepted the run, so `--timeout` and `--no-timeout` do not apply to one.
     #[arg(required = true)]
     pub ids: Vec<String>,
     #[command(flatten)]
@@ -33,7 +34,14 @@ pub fn run(
             ids: &args.ids,
             get_manager,
             is_elevated,
-            verb: &|mgr, id| mgr.start(id, budget),
+            verb: &|mgr, id| {
+                // Read only when a flag was given, so a start without one reads nothing more than before.
+                // A status that fails falls through: `start` reports what is wrong with the id.
+                if args.wait.was_given() && matches!(mgr.status(id), Ok(Status::Task(_))) {
+                    return Err(crate::spec::invalid(id, wait::NOT_FOR_A_TASK));
+                }
+                mgr.start(id, budget)
+            },
             verb_past_tense: wait::reported(budget, "started", "start requested"),
             absent_is_success: false,
         },

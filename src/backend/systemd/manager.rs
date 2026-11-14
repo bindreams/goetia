@@ -127,6 +127,7 @@ impl Backend for Systemd {
     type Snapshot = Fragment;
     type InstallScope = ();
     type Reservation = Held;
+    type Run = std::convert::Infallible;
 
     /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
     /// answer holds for the `daemon-reload` after the write, which draws on the same reservation.
@@ -331,6 +332,11 @@ impl Backend for Systemd {
 
     fn kill(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
         self.systemctl.kill_impl(snapshot.id().as_str(), reservation)
+    }
+
+    /// Interim: replaced when the run is built on the journal.
+    fn begin_run(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<std::convert::Infallible> {
+        Err(cannot_run_tasks("systemd", snapshot.id()))
     }
 }
 

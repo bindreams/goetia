@@ -52,9 +52,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Budget, Installed, ServiceManager, State};
+use super::{Budget, Installed, ServiceManager, State, Status, TaskStatus};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Id, ServiceSpec};
+use crate::spec::{DaemonKind, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
 
 /// See the module doc comment. Reserved: no other scenario uses this id.
 pub const FOREIGN_ID: &str = "goetia-conformance-foreign";
@@ -114,6 +114,174 @@ pub fn run(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -> DaemonSpec) {
     an_unclassifiable_id_is_never_silently_absent(mgr, mk);
 
     // `cleanup` drops here, and on unwinding from a failed assertion.
+}
+
+/// The scenarios about tasks, for a backend that installs them. `mk_task(id, schedule)` builds a
+/// valid, installable task named `id` that starts on `schedule` (a five-field cron expression) or, with
+/// `None`, on nothing. Cleans up what it installs, as [`run`] does.
+///
+/// `run` of a task is tested per backend: what it shows and returns is the backend's to prove.
+pub fn run_tasks(mgr: &dyn ServiceManager, mk_task: &dyn Fn(&str, Option<&str>) -> DaemonSpec) {
+    const SCHEDULE: &str = "0 3 * * *";
+    let mut cleanup = Cleanup { mgr, ids: Vec::new() };
+
+    a_task_installs_disarmed_and_idle(mgr, mk_task, SCHEDULE, &mut cleanup.ids);
+    enable_arms_and_disable_disarms(mgr, mk_task, SCHEDULE, &mut cleanup.ids);
+    enable_of_a_task_without_a_schedule_is_refused(mgr, mk_task, &mut cleanup.ids);
+    run_of_a_service_is_not_a_task(mgr, mk_task, &mut cleanup.ids);
+    a_task_start_returns_and_stop_leaves_it_idle(mgr, mk_task, SCHEDULE, &mut cleanup.ids);
+}
+
+/// A task named by a fresh id, registered in `cleanup` before it is returned.
+fn fresh_task(
+    mk_task: &dyn Fn(&str, Option<&str>) -> DaemonSpec,
+    label: &str,
+    schedule: Option<&str>,
+    cleanup: &mut Vec<Id>,
+) -> DaemonSpec {
+    let spec = mk_task(&fresh_id(label), schedule);
+    assert_eq!(spec.kind(), DaemonKind::Task, "`mk_task` builds tasks");
+    cleanup.push(spec.common().id.clone());
+    spec
+}
+
+fn task_status(mgr: &dyn ServiceManager, id: &Id, when: &str) -> TaskStatus {
+    match mgr.status(id).unwrap_or_else(|e| panic!("status {when}: {e}")) {
+        Status::Task(status) => status,
+        other => panic!("a task reports a task status {when}, got {other:?} (id {id})"),
+    }
+}
+
+/// An install neither arms nor runs a task: it is idle, with nothing scheduled.
+fn a_task_installs_disarmed_and_idle(
+    mgr: &dyn ServiceManager,
+    mk_task: &dyn Fn(&str, Option<&str>) -> DaemonSpec,
+    schedule: &str,
+    cleanup: &mut Vec<Id>,
+) {
+    let spec = fresh_task(mk_task, "task-installs", Some(schedule), cleanup);
+    mgr.install(&spec, false).expect("install");
+
+    let status = task_status(mgr, &spec.common().id, "after install");
+    assert_eq!(
+        status.common.state,
+        State::Idle,
+        "an installed task is idle (id {})",
+        spec.common().id
+    );
+    assert!(
+        !status.common.enabled,
+        "install must not arm a task (id {})",
+        spec.common().id
+    );
+    assert_eq!(
+        status.next_run,
+        None,
+        "a task that is not armed has no next run (id {})",
+        spec.common().id
+    );
+}
+
+/// `enable` arms a task's schedule and `disable` disarms it, as they do a service's boot-enablement.
+fn enable_arms_and_disable_disarms(
+    mgr: &dyn ServiceManager,
+    mk_task: &dyn Fn(&str, Option<&str>) -> DaemonSpec,
+    schedule: &str,
+    cleanup: &mut Vec<Id>,
+) {
+    let spec = fresh_task(mk_task, "task-arms", Some(schedule), cleanup);
+    let id = &spec.common().id;
+    mgr.install(&spec, false).expect("install");
+
+    mgr.enable(id).expect("enable a task with a schedule");
+    assert!(
+        task_status(mgr, id, "after enable").common.enabled,
+        "enable must arm the schedule (id {id})"
+    );
+
+    mgr.disable(id).expect("disable");
+    let status = task_status(mgr, id, "after disable");
+    assert!(!status.common.enabled, "disable must disarm the schedule (id {id})");
+    assert_eq!(status.next_run, None, "a disarmed task has no next run (id {id})");
+}
+
+/// A task nothing starts has nothing to arm, and `enable` says so on every backend.
+fn enable_of_a_task_without_a_schedule_is_refused(
+    mgr: &dyn ServiceManager,
+    mk_task: &dyn Fn(&str, Option<&str>) -> DaemonSpec,
+    cleanup: &mut Vec<Id>,
+) {
+    let spec = fresh_task(mk_task, "task-no-schedule", None, cleanup);
+    let id = &spec.common().id;
+    mgr.install(&spec, false).expect("install a task with no schedule");
+
+    let e = mgr.enable(id).expect_err("there is nothing to arm");
+
+    assert!(matches!(e, Error::Invalid { .. }), "{e:?}");
+    assert!(e.to_string().contains("`schedule` is missing"), "{e}");
+    assert!(
+        !task_status(mgr, id, "after the refused enable").common.enabled,
+        "a refused enable arms nothing (id {id})"
+    );
+}
+
+/// `run` applies only to a task, and a service is refused before anything is requested or shown.
+fn run_of_a_service_is_not_a_task(
+    mgr: &dyn ServiceManager,
+    mk_task: &dyn Fn(&str, Option<&str>) -> DaemonSpec,
+    cleanup: &mut Vec<Id>,
+) {
+    // A service made of the task's own fields, which are valid for the backend under test.
+    let task = fresh_task(mk_task, "run-service", None, &mut Vec::new());
+    let service = ServiceSpec::new(ServiceFields {
+        common: task.common().clone(),
+        restart: Restart::Never,
+        restart_delay: None,
+        protocol: Protocol::Native,
+    })
+    .map(DaemonSpec::from)
+    .expect("a task's fields make a valid service");
+    cleanup.push(service.common().id.clone());
+    mgr.install(&service, false).expect("install a service");
+    let mut out = Vec::new();
+
+    let e = mgr
+        .run(&service.common().id, &mut out)
+        .expect_err("a service has no runs");
+
+    assert!(matches!(e, Error::NotATask { .. }), "{e:?}");
+    assert!(out.is_empty(), "nothing is shown of a run that did not begin");
+    assert_ne!(
+        mgr.status(&service.common().id).expect("status").common().state,
+        State::Running,
+        "nothing was started (id {})",
+        service.common().id
+    );
+}
+
+/// A task's `start` returns once the manager accepted the run, under any budget, and its `stop` ends
+/// a run in flight and leaves it idle. Nothing is asserted between the two: a short task may have
+/// finished already.
+fn a_task_start_returns_and_stop_leaves_it_idle(
+    mgr: &dyn ServiceManager,
+    mk_task: &dyn Fn(&str, Option<&str>) -> DaemonSpec,
+    schedule: &str,
+    cleanup: &mut Vec<Id>,
+) {
+    let spec = fresh_task(mk_task, "task-start-stop", Some(schedule), cleanup);
+    let id = &spec.common().id;
+    mgr.install(&spec, false).expect("install");
+
+    mgr.start(id, Budget::DEFAULT).expect("a task's start is a request");
+    mgr.stop(id, Budget::DEFAULT).expect("stop");
+
+    assert_eq!(
+        task_status(mgr, id, "after stop").common.state,
+        State::Idle,
+        "a stopped task is idle, never stopped (id {id})"
+    );
+    mgr.stop(id, Budget::DEFAULT)
+        .expect("stop of an idle task must be Ok, not an error");
 }
 
 /// This module is compiled into the library (not `#[cfg(test)]`-gated) so that

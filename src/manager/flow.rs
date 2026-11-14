@@ -1,18 +1,18 @@
-//! The flows every [`Backend`] shares: `install`, `preview`, `status`, `list` and the ownership
-//! gate, written once over the backend's primitives.
+//! The flows every [`Backend`] shares: `install`, `preview`, `status`, `list`, `run` and the
+//! ownership gate, written once over the backend's primitives.
 //!
 //! [`crate::backend::Backend`]'s blanket [`ServiceManager`](crate::manager::ServiceManager) impl
 //! calls these. [`crate::decide::decide`] is reached only from here, so no backend can restate a
 //! row of the install policy.
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 
-use crate::backend::{Backend, InstalledService, ReadOutcome, ScanEntry, WriteOutcome};
+use crate::backend::{Backend, InstalledService, ReadOutcome, RunHandle, ScanEntry, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
 use crate::error::{Error, Reason, Result};
-use crate::manager::{Budget, Installed, Status, Step};
-use crate::spec::{DaemonSpec, Id};
+use crate::manager::{Budget, Exit, Installed, State, Status, Step, output};
+use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 // Ownership ===========================================================================================================
 
@@ -143,6 +143,25 @@ pub(crate) fn reserved<B: Backend>(b: &B, id: &Id, steps: &[Step], budget: Budge
         },
         other => other,
     })
+}
+
+/// What [`require_armable`] refuses a task with: `install --enable` says the same before it writes.
+pub(crate) const NOTHING_TO_ARM: &str =
+    "`schedule` is missing, so there is nothing to arm: `enable` applies to a task with a schedule";
+
+/// A task's `enable` arms its schedule, so a task with none has nothing to arm. A service, and a blob
+/// that will not decode (the marker alone is proof of ownership, and a verb must still work on it),
+/// pass: the backend decides what it does with them.
+pub(crate) fn require_armable<S: InstalledService>(snapshot: &S) -> Result<()> {
+    match snapshot.blob() {
+        Ok(blob) => match &blob.spec {
+            DaemonSpec::Task(task) if task.schedule.is_none() => {
+                Err(crate::spec::invalid(snapshot.id(), NOTHING_TO_ARM))
+            }
+            _ => Ok(()),
+        },
+        Err(_) => Ok(()),
+    }
 }
 
 // install and preview =================================================================================================
@@ -301,6 +320,67 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
     }
     out.extend(scan.reported);
     Ok(out)
+}
+
+// run =================================================================================================================
+
+/// Runs the idle task `id` once and follows the run: its output to `out` until it ends, then how it
+/// ended. See [`ServiceManager::run`](crate::manager::ServiceManager::run).
+///
+/// The state is read once, before the request: a task found running is refused without anything
+/// being reserved or sent.
+pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exit> {
+    let snapshot = owned(b, id)?;
+    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+    if blob.spec.kind() != DaemonKind::Task {
+        return Err(Error::NotATask { id: id.to_string() });
+    }
+    match b.live_status(&snapshot)?.common().state {
+        State::Idle => {}
+        State::Running => return Err(Error::AlreadyRunning { id: id.to_string() }),
+        State::Stopped | State::Failed | State::Unknown => return Err(Error::RunStateUnknown { id: id.to_string() }),
+    }
+    let mut reservation = reserved(b, id, &[Step::Start], Budget::Immediate)?;
+    follow(b.begin_run(snapshot, &mut reservation)?, id, out)
+}
+
+/// Shows `run`'s output while another thread waits for its end, and returns how it ended.
+///
+/// The run is in flight, so it is waited for whatever happens to the output. If the wait failed its
+/// error is returned: the exit is the more basic fact. Otherwise a failure to show the output is
+/// returned, naming the exit.
+fn follow<R: RunHandle>(run: R, id: &Id, out: &mut dyn Write) -> Result<Exit> {
+    let source = run.output();
+    // Nothing is sent: closing `end` is how the wait thread tells the stream the run has ended, and
+    // it closes it on a panic too, so the stream never outlives a run whose wait is gone.
+    let (end, ended) = crossbeam_channel::bounded::<()>(0);
+    let waiter = std::thread::Builder::new()
+        .name(format!("goetia run {id}"))
+        .spawn(move || {
+            let exit = run.wait();
+            drop(end);
+            exit
+        })
+        .map_err(|source| Error::RequestInDoubt {
+            request: format!("goetia daemon run {id}"),
+            reached: true,
+            note: Some("goetia could not start a thread to wait for the run".to_string()),
+            source: source.into(),
+        })?;
+
+    let shown = output::stream(source, id, out, &ended);
+    let waited = match waiter.join() {
+        Ok(waited) => waited,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    match (waited, shown) {
+        (Err(e), _) => Err(e),
+        (Ok(exit), Ok(())) => Ok(exit),
+        (Ok(exit), Err(shown)) => Err(Error::Step {
+            what: format!("`{id}` ended with {exit}, but goetia stopped showing its output"),
+            source: Box::new(shown),
+        }),
+    }
 }
 
 // scan ================================================================================================================

@@ -35,6 +35,15 @@ fn fake_passes_conformance() {
     conformance::run(&fake, &mk);
 }
 
+#[skuld::test]
+fn fake_passes_task_conformance() {
+    let fake = Fake::new();
+
+    conformance::run_tasks(&fake, &|id, schedule| {
+        task(id, vec![crate::spec::test_support::program("job")], schedule)
+    });
+}
+
 // Behavior the conformance scenarios do not exercise ==================================================================
 
 #[skuld::test]

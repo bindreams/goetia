@@ -14,9 +14,11 @@ pub mod budget;
 pub mod conformance;
 pub mod fake;
 pub(crate) mod flow;
+pub(crate) mod output;
 
 pub use budget::Budget;
 
+use std::io::Write;
 use std::time::SystemTime;
 
 use crate::error::{Error, Reason, Result};
@@ -65,7 +67,8 @@ pub trait ServiceManager {
     fn uninstall(&self, id: &Id) -> Result<()>;
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if
-    /// `id` is not managed by Goetia. A task's `enable` arms its schedule.
+    /// `id` is not managed by Goetia. A task's `enable` arms its schedule; a task with no schedule
+    /// has nothing to arm, and its `enable` is [`Error::Invalid`] before the manager is asked.
     fn enable(&self, id: &Id) -> Result<()>;
 
     /// Disable the service at boot. Does not stop it if running.
@@ -124,6 +127,23 @@ pub trait ServiceManager {
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     /// [`Error::Undetermined`]: crate::Error::Undetermined
     fn start(&self, id: &Id, budget: Budget) -> Result<()>;
+
+    /// Run the task `id` once, now, and follow that run: request a start, copy what the run writes to
+    /// `out` as it is written, and return how the run ended once it has.
+    ///
+    /// Only an idle task is run, so that `run` never joins or restarts a run someone else began:
+    /// [`Error::NotATask`] for a service, [`Error::AlreadyRunning`] for a task in flight and
+    /// [`Error::RunStateUnknown`] where the manager does not say. The state is read once, before the
+    /// request: a run begun between that read and the request is one the request may join, which the
+    /// manager decides. No request is sent after a refusal.
+    ///
+    /// Everything the run wrote before it ended has been written to `out` when `run` returns. A task
+    /// with no `logs` file has no output to show: one note says so, and `run` waits for the run to end.
+    /// [`Error::RunNotStarted`] means the manager ended the start before a run began;
+    /// [`Error::RunUnrecorded`] that a run ended and its exit status could not be found. If showing the
+    /// output fails the run is still waited for: the wait's error is returned if it failed, else a
+    /// [`Error::Step`] that names the exit and holds the failure.
+    fn run(&self, id: &Id, out: &mut dyn Write) -> Result<Exit>;
 
     /// Make ready, before the first of `steps` sends anything, whatever they could need under
     /// `budget` that might run out between two of them. A failure here means nothing was sent;
@@ -283,7 +303,7 @@ pub trait Sequence {
     /// See [`ServiceManager::install`].
     fn install(&mut self, spec: &DaemonSpec, force: bool) -> Result<crate::decide::Outcome>;
 
-    /// See [`ServiceManager::enable`].
+    /// See [`ServiceManager::enable`], including the refusal of a task with no schedule.
     fn enable(&mut self, id: &Id) -> Result<()>;
 
     /// See [`ServiceManager::stop`].
@@ -410,6 +430,15 @@ impl Status {
 pub enum Exit {
     Code(i32),
     Signal(i32),
+}
+
+impl std::fmt::Display for Exit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Exit::Code(code) => write!(f, "exit code {code}"),
+            Exit::Signal(signal) => write!(f, "signal {signal}"),
+        }
+    }
 }
 
 /// A task's status: the common fields, and what the manager knows of its runs. A field the

@@ -1147,6 +1147,7 @@ impl backend::Backend for Launchd {
     type Snapshot = Plist;
     type InstallScope = ();
     type Reservation = Reservation;
+    type Run = std::convert::Infallible;
 
     fn begin_install(&self, _spec: &DaemonSpec, _desired: &String, _reservation: &mut Reservation) -> Result<()> {
         Ok(())
@@ -1502,6 +1503,11 @@ impl backend::Backend for Launchd {
                 .kill_job(id.as_str(), Budget::Unbounded.start(), reservation)?,
         );
         Ok(())
+    }
+
+    /// Interim: launchd installs no task yet, so no id reaches here as one.
+    fn begin_run(&self, snapshot: Plist, _reservation: &mut Reservation) -> Result<std::convert::Infallible> {
+        Err(backend::cannot_run_tasks("launchd", snapshot.id()))
     }
 }
 
