@@ -1,5 +1,8 @@
-//! The effectful half of the systemd backend: writes `/etc/systemd/system/<id>.service` and talks
-//! to `systemctl`.
+//! The effectful half of the systemd backend: writes `/etc/systemd/system/<id>.service` (and, for a
+//! task with a schedule, `<id>.timer`) and talks to `systemctl`, `busctl` and `journalctl`.
+//!
+//! A service is one artifact. A task is two, kept as one by [`task`]; the obligations below are
+//! stated for the service, and hold for each of a task's two files.
 //!
 //! Seven correctness obligations a systemd unit-file backend must uphold, each with its own test (see
 //! `tests/systemd_integration/linux.rs` and this module's own `manager_tests.rs`):
@@ -62,9 +65,12 @@
 //!    fragment. A listing that asked less would leave out an id `status` answers
 //!    `Error::Undetermined` for, and leaving an id out is how a listing says nothing is there.
 
+mod busctl;
 mod dirs;
 mod discover;
+mod journal;
 mod systemctl;
+mod task;
 mod write;
 
 use std::collections::BTreeSet;
@@ -72,11 +78,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use discover::{DROPIN_SEARCH_DIRS, Fragment};
+use busctl::Busctl;
+use discover::DROPIN_SEARCH_DIRS;
+use journal::{Journal, Journalctl};
 use systemctl::{Held, Systemctl};
-use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
+pub(crate) use task::Fragment;
 
-use crate::backend::systemd::generate;
+use crate::backend::systemd::generate::{self, Units};
 use crate::backend::{
     Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry,
     WriteOutcome, cannot_run_tasks,
@@ -84,7 +92,7 @@ use crate::backend::{
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
 use crate::manager::{Budget, Installed, Status, Step, flow};
-use crate::spec::{AccountId, DaemonSpec, Id, User};
+use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, User};
 
 /// Where systemd looks for system unit files. Never overridden — the integration tests run for real
 /// against this exact path, elevated.
@@ -93,10 +101,14 @@ const UNIT_DIR: &str = "/etc/systemd/system";
 // Systemd =============================================================================================================
 
 /// The Linux [`ServiceManager`](crate::manager::ServiceManager). Holds no state of its own beyond
-/// how it reaches `systemctl`: every operation re-derives what it needs from the filesystem and
-/// `systemctl`, so nothing here can go stale between calls.
+/// how it reaches `systemctl`, `busctl` and the journal: every operation re-derives what it needs from
+/// the filesystem and the manager, so nothing here can go stale between calls.
 pub struct Systemd {
     systemctl: Systemctl,
+    /// For when a task's timer elapses next, which `systemctl show` cannot say to the microsecond.
+    busctl: Busctl,
+    /// For a task's last run and its result.
+    journal: Box<dyn Journal>,
 }
 
 impl Systemd {
@@ -104,9 +116,24 @@ impl Systemd {
         Self::with(Systemctl::native())
     }
 
-    /// A manager reaching `systemd` through `systemctl`, which tests build over a stated client.
+    /// A manager reaching `systemd` through `systemctl`, which tests build over a stated client, and
+    /// the real `busctl` and journal.
     pub(crate) fn with(systemctl: Systemctl) -> Self {
-        Self { systemctl }
+        Self {
+            systemctl,
+            busctl: Busctl::native(),
+            journal: Box::new(Journalctl::native()),
+        }
+    }
+
+    /// A manager over stated `systemctl`, `busctl` and journal.
+    #[cfg(test)]
+    pub(crate) fn with_seams(systemctl: Systemctl, busctl: Busctl, journal: Box<dyn Journal>) -> Self {
+        Self {
+            systemctl,
+            busctl,
+            journal,
+        }
     }
 }
 
@@ -123,7 +150,7 @@ impl std::fmt::Debug for Systemd {
 }
 
 impl Backend for Systemd {
-    type Definition = String;
+    type Definition = Units;
     type Snapshot = Fragment;
     type InstallScope = ();
     type Reservation = Held;
@@ -131,7 +158,7 @@ impl Backend for Systemd {
 
     /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
     /// answer holds for the `daemon-reload` after the write, which draws on the same reservation.
-    fn begin_install(&self, _spec: &DaemonSpec, _desired: &String, reservation: &mut Held) -> Result<()> {
+    fn begin_install(&self, _spec: &DaemonSpec, _desired: &Units, reservation: &mut Held) -> Result<()> {
         self.systemctl.require_supported(reservation)
     }
 
@@ -141,56 +168,38 @@ impl Backend for Systemd {
         Held::of(steps, budget).map_err(|source| Error::Reservation { id: None, source })
     }
 
-    fn render(&self, spec: &DaemonSpec) -> Result<String> {
-        // Interim: the manager keeps one artifact until it keeps the timer too.
-        if matches!(spec, DaemonSpec::Task(_)) {
-            return Err(cannot_run_tasks("systemd", &spec.common().id));
-        }
-        Ok(generate::units(spec, &identity_for(&spec.common().user)?)?.service)
+    fn render(&self, spec: &DaemonSpec) -> Result<Units> {
+        Ok(generate::units(spec, &identity_for(&spec.common().user)?)?)
+    }
+
+    /// The units as `snapshot` holds them, unmodified: see [`task::regenerate`].
+    fn regenerate(&self, spec: &DaemonSpec, snapshot: &Fragment) -> Result<Units> {
+        task::regenerate(spec, snapshot)
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Fragment>> {
         discover::read(id)
     }
 
-    fn installed(&self, snapshot: &Fragment) -> Result<InstalledDefinition<String>> {
-        discover::installed(snapshot.id().as_str(), snapshot.text())
+    fn installed(&self, snapshot: &Fragment) -> Result<InstalledDefinition<Units>> {
+        discover::installed(snapshot)
     }
 
     fn write(
         &self,
         spec: &DaemonSpec,
-        definition: &String,
+        definition: &Units,
         outcome: &Outcome,
         snapshot: Option<&Fragment>,
         _scope: &mut (),
         reservation: &mut Held,
     ) -> Result<WriteOutcome> {
-        let id = spec.common().id.as_str();
         dirs::ensure_parent_dirs(spec)?;
         match outcome {
-            Outcome::Create => match create_unit(id, definition)? {
-                CreateOutcome::Created => {
-                    self.systemctl.daemon_reload_or_report(id, reservation)?;
-                    Ok(WriteOutcome::Done)
-                }
-                CreateOutcome::Raced => Ok(WriteOutcome::Raced),
-            },
+            Outcome::Create => self.create_units(spec.common().id.as_str(), definition, reservation),
             Outcome::Update { .. } | Outcome::Stale { .. } => {
-                let expected = snapshot.expect("an id `decide` chose to update was read as marked");
-                match replace_unit_verified(id, definition, expected.text())? {
-                    ReplaceOutcome::Replaced => {
-                        // Only after the write has actually committed: clearing the drop-in
-                        // first (before the write) would delete an admin's overrides even on a
-                        // path that turns out `Raced` and never writes anything, or errors out
-                        // partway through — `uninstall` clears its own fragment before its
-                        // drop-in for the identical reason.
-                        remove_dir_if_present(&dropin_dir(id))?;
-                        self.systemctl.daemon_reload_or_report(id, reservation)?;
-                        Ok(WriteOutcome::Done)
-                    }
-                    ReplaceOutcome::Raced => Ok(WriteOutcome::Raced),
-                }
+                let old = snapshot.expect("an id `decide` chose to update was read as marked");
+                self.update_units(spec, definition, old, reservation)
             }
             other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
         }
@@ -198,9 +207,7 @@ impl Backend for Systemd {
 
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
         // A read: it draws nothing and asks no gate.
-        self.systemctl
-            .status_from_unit(&unit_name(snapshot.id().as_str()))
-            .map(Status::Service)
+        self.status_of(snapshot)
     }
 
     /// Each id the unit directories name, read as `read` would. An id whose read did not complete
@@ -211,17 +218,17 @@ impl Backend for Systemd {
         let reads = host
             .units
             .into_iter()
+            // Absence is about the id, not the fragment file: an id with no job (a timer alone, or a
+            // *drop-in* that could not be read) is exactly as unclassified as one whose job could not
+            // be — and `status` says so for both.
+            .chain(host.unjobbed.into_iter().map(|id| {
+                let path = unit_path(&id, UnitKind::Service);
+                (id, path)
+            }))
             .map(|(id, path)| {
                 let read = discover::read_at(&id, &path).map(|found| ScanEntry::of(&id, found, Fragment::new));
                 (id, read)
-            })
-            // Absence is about the id, not the fragment file: an id whose
-            // *drop-in* could not be read is exactly as unclassified as one whose fragment could not
-            // be — and `status` says so for both.
-            .chain(host.dropin_only.into_iter().map(|id| {
-                let read = discover::fragmentless(&id).map(ScanEntry::Read);
-                (id, read)
-            }));
+            });
 
         let mut entries = Vec::new();
         let mut reported = Vec::new();
@@ -240,75 +247,37 @@ impl Backend for Systemd {
         Scan { entries, reported }
     }
 
+    /// A task, or a service with a timer of goetia's: the timer disarmed, the job stopped, the timer
+    /// then the job removed. A plain service: stop, disable, remove, reload. See [`task`].
     fn uninstall(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
-        let id = snapshot.id().as_str();
-        // One version gate for the stop, the `disable` and the `daemon-reload`: the stop's, kept in
-        // the reservation they share.
-
-        // Order matters: stop, then disable (needs the fragment's `[Install]` section to know which
-        // symlinks to remove), then remove the fragment and any drop-in, then reload.
-        // Deliberately `Budget::Unbounded`: `uninstall` has no `--timeout` of its own, this stop
-        // is a means rather than an end, and bounding it would turn a slow-stopping service into a
-        // failed uninstall where today it succeeds.
-        self.systemctl
-            .stop_impl(id, Budget::Unbounded, Budget::Unbounded.start(), reservation)?;
-
-        self.systemctl.disable_impl(id, reservation)?;
-
-        // Verified removal, mirroring `replace_unit_verified`: the gap since `read` saw the
-        // fragment spans two full `systemctl` round-trips, wide enough for something else to have
-        // replaced the fragment in the meantime (the same TOCTOU as `create_unit`'s).
-        match quarantine_if_still_ours(id, snapshot.text())? {
-            Some(backup_path) => remove_file_if_present(&backup_path)?,
-            None => {
-                return Err(Error::ConcurrentChange {
-                    id: id.to_string(),
-                    path: Some(unit_path(id)),
-                });
-            }
-        }
-
-        // Both attempted regardless of whether the first failed, and both failures reported
-        // together: a partial failure here must not leave systemd's loaded view silently stale, the
-        // same reasoning `daemon_reload_or_report` documents on the `install` side.
-        let dropin_result = remove_dir_if_present(&dropin_dir(id));
-        let reload_result = self.systemctl.daemon_reload(reservation);
-        match (dropin_result, reload_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(e), Ok(())) => Err(e),
-            (Ok(()), Err(e)) => Err(e),
-            (Err(first), Err(then)) => Err(Error::Step {
-                what: format!("uninstall for `{id}` partially failed, and the unit fragment is already gone"),
-                source: Box::new(Error::Both {
-                    first: Box::new(first),
-                    then: Box::new(then),
-                }),
-            }),
-        }
+        self.uninstall_units(snapshot, reservation)
     }
 
     // `disable` is handed none and asks the gate for itself.
     fn enable(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
-        self.systemctl.enable_impl(snapshot.id().as_str(), reservation)
+        self.enable_units(&snapshot, reservation)
     }
 
     fn disable(&self, snapshot: Fragment) -> Result<()> {
-        self.systemctl
-            .disable_impl(snapshot.id().as_str(), &mut Held::default())
+        self.disable_units(&snapshot)
     }
 
     fn start(&self, snapshot: Fragment, budget: Budget, reservation: &mut Held) -> Result<()> {
+        let id = snapshot.id().as_str();
+        // A task's start requests a run and returns: the run's end is not what a start waits for.
+        if snapshot.kind() == Some(DaemonKind::Task) {
+            return self.systemctl.start_job(id, reservation).map(drop);
+        }
         // Derived at verb entry. It bounds only the wait for the job, never whether the job is
         // enqueued — see `run_verb`.
         let deadline = budget.start();
-        self.systemctl
-            .start_impl(snapshot.id().as_str(), budget, deadline, reservation)
+        self.systemctl.start_impl(id, budget, deadline, reservation)
     }
 
     /// One `systemctl restart --no-block`: one job, so no start can overtake
     /// the stop. systemd stops the unit and starts it again, or, while it is
     /// still activating, folds the restart into the start already running —
-    /// see `request_restart_impl`.
+    /// see `request_restart_impl`. A task's is the same request, of its job.
     fn request_restart(&self) -> Option<NativeRestart<Self>> {
         Some(|mgr, snapshot| {
             mgr.systemctl
@@ -323,6 +292,7 @@ impl Backend for Systemd {
         Backend::start(self, snapshot, Budget::Immediate, reservation)
     }
 
+    /// A task's job is its service unit, so its stop and kill are a service's.
     fn stop(&self, snapshot: Fragment, budget: Budget, reservation: &mut Held) -> Result<()> {
         // Derived at verb entry, as for `start`.
         let deadline = budget.start();
@@ -348,9 +318,9 @@ impl Backend for Systemd {
 /// # Which ids those are
 ///
 /// The names `discover::read` and `discover::residue` treat as this id's artifact, in the same
-/// directories they read: `<id>.service` in [`UNIT_DIR`] alone, the only fragment path this backend
-/// ever reads or writes, and `<id>.service.d` under every root of [`DROPIN_SEARCH_DIRS`], since
-/// `discover::residue` counts one there as much as one in `/etc`.
+/// directories they read: `<id>.service` and `<id>.timer` in [`UNIT_DIR`] alone, the only fragment
+/// paths this backend ever reads or writes, and `<id>.service.d` and `<id>.timer.d` under every root
+/// of [`DROPIN_SEARCH_DIRS`], since `discover::residue` counts one there as much as one in `/etc`.
 ///
 /// Reaching exactly as far as `residue` is the point. An id whose drop-in could not be read is
 /// `Error::Undetermined` to `status`; a listing that never enumerated it says, by leaving it out,
@@ -360,11 +330,13 @@ impl Backend for Systemd {
 ///
 /// A fragment under a root other than `UNIT_DIR` deliberately names no id here. `raw_state` looks
 /// for `<id>.service` in `UNIT_DIR` and nowhere else, so a unit shipped in `/usr/lib` is already
-/// `NotInstalled` to every verb goetia has.
+/// `NotInstalled` to every verb goetia has. A timer alone at an id (a task whose job is gone) names
+/// it, and `read` classifies it: ours and unusable if it is goetia's, foreign if it is not.
 ///
 /// # The half of `residue` this does not name: enablement links
 ///
-/// `residue` also stats `multi-user.target.wants/<id>.service` under four roots, and an id whose
+/// `residue` also stats `multi-user.target.wants/<id>.service` and `timers.target.wants/<id>.timer`
+/// under four roots each, and an id whose
 /// *only* trace is such a link is not named here. A stated limitation: an unsearchable wants
 /// directory makes `status` answer `Error::Undetermined` for every fragmentless id, this scan has
 /// no name for one whose sole trace was a link there, and `show` would call that id absent.
@@ -380,10 +352,11 @@ impl Backend for Systemd {
 struct HostScan {
     /// Ids with a fragment in [`UNIT_DIR`], with its path.
     units: Vec<(String, PathBuf)>,
-    /// Ids named only by a `<id>.service.d` directory. Disjoint from `units` by construction: an id
-    /// with a fragment is classified through that, and one entry per id is what
+    /// Ids with no job in [`UNIT_DIR`] that a `<id>.timer` there, or a `<id>.service.d` or
+    /// `<id>.timer.d` directory anywhere, names. Disjoint from `units` by construction: an id with a
+    /// job is classified through that, and one entry per id is what
     /// `cli::support::partition_installed` asserts.
-    dropin_only: Vec<String>,
+    unjobbed: Vec<String>,
     /// One per pass that started and did not finish — a root each, since a root that could not be
     /// enumerated says nothing about the next one.
     incomplete: Vec<Installed>,
@@ -393,33 +366,34 @@ struct HostScan {
 fn scan_host() -> HostScan {
     let unit_dir = scan_unit_dir(Path::new(UNIT_DIR));
     let mut incomplete: Vec<Installed> = unit_dir.incomplete.into_iter().collect();
-    let mut dropin_ids: BTreeSet<String> = unit_dir.dropins.into_iter().collect();
+    let mut named: BTreeSet<String> = unit_dir.dropins.into_iter().chain(unit_dir.timers).collect();
     for root in DROPIN_SEARCH_DIRS.iter().filter(|root| **root != UNIT_DIR) {
         let scan = scan_unit_dir(Path::new(root));
         // Fragments outside `UNIT_DIR` are not this backend's — see [`HostScan`].
-        dropin_ids.extend(scan.dropins);
+        named.extend(scan.dropins);
         incomplete.extend(scan.incomplete);
     }
-    let dropin_only = {
+    let unjobbed = {
         let with_fragment: BTreeSet<&str> = unit_dir.units.iter().map(|(id, _)| id.as_str()).collect();
-        dropin_ids
+        named
             .into_iter()
             .filter(|id| !with_fragment.contains(id.as_str()))
             .collect()
     };
     HostScan {
         units: unit_dir.units,
-        dropin_only,
+        unjobbed,
         incomplete,
     }
 }
 
-/// What one pass over one directory found: the `<id>.service` fragments and `<id>.service.d`
-/// drop-in directories it reached, and — when the pass stopped early — the entry standing for
-/// whatever it never did.
+/// What one pass over one directory found: the `<id>.service` fragments, the ids of the `<id>.timer`
+/// fragments, and the ids of the `<id>.service.d` and `<id>.timer.d` drop-in directories it reached,
+/// and — when the pass stopped early — the entry standing for whatever it never did.
 #[derive(Debug)]
 struct UnitScan {
     units: Vec<(String, PathBuf)>,
+    timers: Vec<String>,
     dropins: Vec<String>,
     incomplete: Option<Installed>,
 }
@@ -431,6 +405,7 @@ struct UnitScan {
 /// absence is *established* there. See [`flow::scan`].
 fn scan_unit_dir(dir: &Path) -> UnitScan {
     let mut units = Vec::new();
+    let mut timers = Vec::new();
     let mut dropins = Vec::new();
     let incomplete = flow::scan(
         &dir.display().to_string(),
@@ -446,15 +421,21 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
             // The name alone, with nothing stat'd: a drop-in directory that is not one — the regular
             // file `install_refuses_an_unreadable_dropin_over_our_own_fragment` seeds, whose
             // `read_dir` answers `ENOTDIR` for every uid — is exactly an id this pass must not drop.
-            if let Some(id) = file_name.strip_suffix(".service.d") {
+            if let Some(id) = UnitKind::ALL
+                .into_iter()
+                .find_map(|kind| file_name.strip_suffix(&format!("{}.d", kind.suffix())))
+            {
                 dropins.push(id.to_string());
-            } else if let Some(id) = file_name.strip_suffix(".service") {
+            } else if let Some(id) = file_name.strip_suffix(UnitKind::Service.suffix()) {
                 units.push((id.to_string(), path));
+            } else if let Some(id) = file_name.strip_suffix(UnitKind::Timer.suffix()) {
+                timers.push(id.to_string());
             }
         },
     );
     UnitScan {
         units,
+        timers,
         dropins,
         incomplete,
     }
@@ -487,16 +468,51 @@ fn identity_for(user: &User) -> Result<Identity> {
 
 // Paths ===============================================================================================================
 
-fn unit_name(id: &str) -> String {
-    format!("{id}.service")
+/// Which of a daemon's unit files: a service is its job alone, and a task is its job
+/// (`<id>.service`) and, with a schedule, its timer (`<id>.timer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitKind {
+    Service,
+    Timer,
 }
 
-fn unit_path(id: &str) -> PathBuf {
-    Path::new(UNIT_DIR).join(unit_name(id))
+impl UnitKind {
+    const ALL: [UnitKind; 2] = [UnitKind::Service, UnitKind::Timer];
+
+    fn suffix(self) -> &'static str {
+        match self {
+            UnitKind::Service => ".service",
+            UnitKind::Timer => ".timer",
+        }
+    }
+
+    /// The one `*.target.wants` directory `systemctl enable` links a unit of this kind into:
+    /// `generate::units`'s `[Install]` sections are exactly `WantedBy=multi-user.target` for a service
+    /// and `WantedBy=timers.target` for a timer, and goetia emits no `RequiredBy=`, so there is no
+    /// `.requires` counterpart.
+    fn wants_dir(self) -> &'static str {
+        match self {
+            UnitKind::Service => "multi-user.target.wants",
+            UnitKind::Timer => "timers.target.wants",
+        }
+    }
 }
 
-fn dropin_dir(id: &str) -> PathBuf {
-    Path::new(UNIT_DIR).join(format!("{id}.service.d"))
+fn unit_name(id: &str, kind: UnitKind) -> String {
+    format!("{id}{}", kind.suffix())
+}
+
+fn unit_path(id: &str, kind: UnitKind) -> PathBuf {
+    Path::new(UNIT_DIR).join(unit_name(id, kind))
+}
+
+/// The name of `kind`'s drop-in directory for `id`, under any root of [`DROPIN_SEARCH_DIRS`].
+fn dropin_name(id: &str, kind: UnitKind) -> String {
+    format!("{}.d", unit_name(id, kind))
+}
+
+fn dropin_dir(id: &str, kind: UnitKind) -> PathBuf {
+    Path::new(UNIT_DIR).join(dropin_name(id, kind))
 }
 
 // Shared removal helpers ==============================================================================================

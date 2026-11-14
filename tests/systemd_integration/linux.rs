@@ -16,7 +16,7 @@ use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Installed, ServiceManager, State, conformance};
+use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status, TaskStatus, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
 use goetia::testing::service_fields;
 
@@ -2441,4 +2441,148 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
         .args(&argv)
         .output()
         .expect("spawn runuser -u nobody")
+}
+
+// Tasks ===============================================================================================================
+
+fn timer_path(id: &str) -> PathBuf {
+    PathBuf::from(support::SYSTEMD_UNIT_DIR).join(format!("{id}.timer"))
+}
+
+fn timer_wants_symlink(id: &str) -> PathBuf {
+    PathBuf::from(support::SYSTEMD_UNIT_DIR)
+        .join("timers.target.wants")
+        .join(format!("{id}.timer"))
+}
+
+/// A task that exits with `code` the moment it starts, and runs daily at 03:30.
+fn exiting(id: &str, code: i32) -> DaemonSpec {
+    goetia::testing::task(
+        id,
+        vec!["/bin/sh".to_string(), "-c".to_string(), format!("exit {code}")],
+        Some("30 3 * * *"),
+    )
+}
+
+fn task_status(mgr: &Systemd, id: &Id) -> TaskStatus {
+    match mgr.status(id).expect("status") {
+        Status::Task(status) => status,
+        other => panic!("a task's status is a task's: {other:?}"),
+    }
+}
+
+/// The whole life of a task against the real manager: installed idle and unarmed, enabled (its
+/// timer armed, its own unit never enabled), run to its end (read back from the journal), disabled,
+/// and uninstalled with nothing left behind.
+#[skuld::test]
+fn a_task_is_installed_armed_run_reported_and_uninstalled(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let spec = exiting(&id, 3);
+    let task_id = spec.common().id.clone();
+    let mgr = Systemd::new();
+
+    let outcome = mgr.install(&spec, false).expect("install");
+    assert!(matches!(outcome, Outcome::Create), "{outcome:?}");
+    assert!(unit_path(&id).exists() && timer_path(&id).exists());
+    let status = task_status(&mgr, &task_id);
+    assert_eq!(status.common.state, State::Idle, "{status:?}");
+    assert!(!status.common.enabled, "install never enables: {status:?}");
+    assert_eq!(status.next_run, None, "{status:?}");
+    assert_eq!((status.last_run, status.last_result), (None, None), "{status:?}");
+    assert!(
+        matches!(mgr.install(&spec, false), Ok(Outcome::UpToDate)),
+        "a task that was just installed is up to date"
+    );
+
+    mgr.enable(&task_id).expect("enable");
+    let status = task_status(&mgr, &task_id);
+    assert!(status.common.enabled, "{status:?}");
+    assert!(
+        status.next_run.is_some(),
+        "an armed timer has a next elapse: {status:?}"
+    );
+    assert!(
+        timer_wants_symlink(&id).exists(),
+        "the timer is linked into timers.target"
+    );
+    assert!(
+        fs::symlink_metadata(wants_symlink(&id)).is_err(),
+        "the task's own unit is never enabled"
+    );
+
+    // `systemctl start` of a oneshot returns when its program has exited, so this waits on the run.
+    let run = cmd::run("systemctl", &["start", &format!("{id}.service")]);
+    assert!(!run.ok(), "the run exits 3, which fails the start: {run}");
+    cmd::run("journalctl", &["--sync"]).expect_ok();
+    let status = task_status(&mgr, &task_id);
+    assert_eq!(
+        status.common.state,
+        State::Idle,
+        "a failed run is a result, not a state: {status:?}"
+    );
+    assert_eq!(status.last_result, Some(Exit::Code(3)), "{status:?}");
+    assert!(status.last_run.is_some(), "{status:?}");
+    assert!(
+        status.common.enabled && status.next_run.is_some(),
+        "the run left the schedule armed: {status:?}"
+    );
+
+    mgr.disable(&task_id).expect("disable");
+    let status = task_status(&mgr, &task_id);
+    assert!(!status.common.enabled, "{status:?}");
+    assert_eq!(status.next_run, None, "{status:?}");
+    assert!(!timer_wants_symlink(&id).exists());
+
+    mgr.enable(&task_id).expect("enable again");
+    mgr.uninstall(&task_id).expect("uninstall");
+    assert!(!unit_path(&id).exists(), "the job must be gone");
+    assert!(!timer_path(&id).exists(), "the timer must be gone");
+    assert!(
+        fs::symlink_metadata(timer_wants_symlink(&id)).is_err(),
+        "the timer's `.wants` symlink must be gone"
+    );
+}
+
+/// A service that becomes a task must not keep the boot link that would run the task at every boot,
+/// and a task that becomes a service must not keep its timer.
+#[skuld::test]
+fn a_retyped_daemon_keeps_nothing_of_the_old_kind_that_still_acts(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let service = mk(&id);
+    let task = exiting(&id, 0);
+    let daemon_id = service.common().id.clone();
+    let mgr = Systemd::new();
+    mgr.install(&service, false).expect("install the service");
+    mgr.enable(&daemon_id).expect("enable the service");
+    assert!(
+        fs::symlink_metadata(wants_symlink(&id)).is_ok(),
+        "the service is enrolled at boot"
+    );
+
+    let outcome = mgr.install(&task, false).expect("install the task over the service");
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert!(
+        fs::symlink_metadata(wants_symlink(&id)).is_err(),
+        "the old boot link would run the task at every boot"
+    );
+    assert!(timer_path(&id).exists());
+    let status = task_status(&mgr, &daemon_id);
+    assert!(!status.common.enabled, "a retype drops arming: {status:?}");
+
+    mgr.enable(&daemon_id).expect("enable the task");
+    assert!(timer_wants_symlink(&id).exists());
+
+    let outcome = mgr.install(&service, false).expect("install the service over the task");
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert!(!timer_path(&id).exists(), "the timer would start a service's job");
+    assert!(
+        fs::symlink_metadata(timer_wants_symlink(&id)).is_err(),
+        "the timer's link is gone with it"
+    );
+    let active = cmd::run("systemctl", &["is-active", &format!("{id}.timer")]);
+    assert!(!active.ok(), "the timer is not running: {active}");
 }

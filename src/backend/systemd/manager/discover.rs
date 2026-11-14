@@ -4,7 +4,8 @@
 //!
 //! # What counts as this id's artifact
 //!
-//! `<id>.service` and `<id>.service.d`, and nothing else. The drop-in directory counts under *every*
+//! `<id>.service` and `<id>.service.d`, and for a task `<id>.timer` and `<id>.timer.d`: nothing
+//! else. A drop-in directory counts under *every*
 //! root of systemd's system unit search path ([`DROPIN_SEARCH_DIRS`]) — one under
 //! `/etc/systemd/system.control`, where `systemctl set-property` writes, is as much this id's as one
 //! under `/etc/systemd/system`.
@@ -36,14 +37,14 @@ use nix::errno::Errno;
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
 
-use crate::backend::systemd::generate;
+use crate::backend::systemd::generate::{self, Units};
 use crate::backend::{Decoded, InstalledDefinition, InstalledService, ReadOutcome, Unnamed};
-use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
-use crate::spec::Id;
+use crate::spec::{DaemonKind, Id};
 
-use super::{UNIT_DIR, unit_path};
+use super::task::{Body, Fragment, Timer};
+use super::{UNIT_DIR, UnitKind, dropin_name, unit_name, unit_path};
 
 // ReadFailure =========================================================================================================
 
@@ -300,54 +301,95 @@ fn errno_io(errno: Errno) -> io::Error {
 }
 
 pub(super) fn raw_state(id: &str) -> Result<RawState> {
-    classify_and_read(&unit_path(id)).map_err(|failure| failure.undetermined(id))
+    classify_and_read(&unit_path(id, UnitKind::Service)).map_err(|failure| failure.undetermined(id))
 }
 
 // read / installed ====================================================================================================
 
-/// A marked unit fragment, as `read` saw it. Its text is the identity a later write or removal
-/// verifies the fragment against (see `super::write::replace_unit_verified` and
-/// `super::write::quarantine_if_still_ours`): content, not inode, since the kernel can reuse an
-/// inode number moments after its file is unlinked.
-pub(crate) struct Fragment {
-    id: Id,
-    blob: Decoded,
-    text: String,
+/// What a unit file at `<id>.service` or `<id>.timer` is, as far as the marker says.
+enum Artifact {
+    Absent,
+    /// Not goetia's: no marker, not a regular file, or not UTF-8 (see [`RawState::NotOurs`]).
+    Foreign,
+    /// Marked: `Ok(Some)` or `Err` of [`generate::extract`], with the file's text.
+    Marked {
+        text: String,
+        blob: Decoded,
+    },
 }
 
-impl Fragment {
-    pub(super) fn new(id: Id, blob: Decoded, text: String) -> Self {
-        Self { id, blob, text }
-    }
-
-    pub(super) fn text(&self) -> &str {
-        &self.text
-    }
-}
-
-impl InstalledService for Fragment {
-    fn id(&self) -> &Id {
-        &self.id
-    }
-
-    fn blob(&self) -> std::result::Result<&Blob, &Arc<Error>> {
-        self.blob.as_ref()
+fn artifact(raw: RawState) -> Artifact {
+    match raw {
+        RawState::Absent => Artifact::Absent,
+        RawState::NotOurs => Artifact::Foreign,
+        RawState::Regular(text) => match generate::extract(&text) {
+            Ok(None) => Artifact::Foreign,
+            Ok(Some(blob)) => Artifact::Marked { text, blob: Ok(blob) },
+            Err(e) => Artifact::Marked {
+                text,
+                blob: Err(Arc::new(e)),
+            },
+        },
     }
 }
 
-/// What `raw` says about `id`: a marked fragment is [`ReadOutcome::Marked`] with its text, and a
-/// missing one is asked what else occupies the id ([`fragmentless`]).
-fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<Unnamed<String>>> {
-    Ok(match raw {
-        RawState::Absent => return fragmentless(id),
-        RawState::NotOurs => ReadOutcome::Foreign { recovery: None },
-        RawState::Regular(text) => {
-            let blob = match generate::extract(&text) {
-                Ok(None) => return Ok(ReadOutcome::Foreign { recovery: None }),
-                Ok(Some(blob)) => Ok(blob),
-                Err(e) => Err(Arc::new(e)),
+/// What `raw`, the job's file, and the timer at `id` say about `id`. The job decides first, and the
+/// timer is read only where it can change the answer:
+///
+/// | job | timer | result |
+/// |---|---|---|
+/// | absent | absent | [`fragmentless`] |
+/// | marked | absent | marked, no timer |
+/// | marked | marked | marked, with both |
+/// | a task | not goetia's | foreign, recovery names the timer |
+/// | a service, or a blob that will not decode | not goetia's | marked, the timer ignored and never touched |
+/// | absent | marked | marked, no job: ours and unusable |
+/// | absent | not goetia's | foreign |
+/// | not goetia's | any | foreign |
+///
+/// A timer that cannot be read counts as not goetia's where the job is a service or will not decode,
+/// so such a unit reads as it did before it had a timer to ask about.
+fn classified(id: &str, raw: RawState, timer_path: &Path) -> ReadResult<ReadOutcome<Unnamed<Body>>> {
+    let timer = || classify_and_read(timer_path).map(artifact);
+    let foreign_timer = || ReadOutcome::Foreign {
+        recovery: Some(foreign_timer_recovery(id)),
+    };
+    Ok(match artifact(raw) {
+        Artifact::Foreign => ReadOutcome::Foreign { recovery: None },
+        Artifact::Absent => match timer()? {
+            Artifact::Absent => return fragmentless(id),
+            Artifact::Foreign => foreign_timer(),
+            Artifact::Marked { text, blob } => ReadOutcome::Marked(Unnamed {
+                blob: Err(Arc::new(Error::blob(format!(
+                    "the timer's job is missing: `{}` is not there",
+                    unit_path(id, UnitKind::Service).display()
+                )))),
+                body: Body {
+                    service: None,
+                    timer: Some(Timer { text, blob }),
+                },
+            }),
+        },
+        Artifact::Marked { text, blob } => {
+            let task = matches!(&blob, Ok(blob) if blob.spec.kind() == DaemonKind::Task);
+            let timer = if task {
+                timer()?
+            } else {
+                timer().unwrap_or(Artifact::Foreign)
             };
-            ReadOutcome::Marked(Unnamed { blob, body: text })
+            let timer = match timer {
+                Artifact::Absent => None,
+                Artifact::Foreign if task => return Ok(foreign_timer()),
+                Artifact::Foreign => None,
+                Artifact::Marked { text, blob } => Some(Timer { text, blob }),
+            };
+            ReadOutcome::Marked(Unnamed {
+                blob,
+                body: Body {
+                    service: Some(text),
+                    timer,
+                },
+            })
         }
     })
 }
@@ -355,15 +397,16 @@ fn classified(id: &str, raw: RawState) -> ReadResult<ReadOutcome<Unnamed<String>
 /// What `Backend::read` answers for `id`.
 pub(super) fn read(id: &Id) -> Result<ReadOutcome<Fragment>> {
     let id_str = id.as_str();
-    classified(id_str, raw_state(id_str)?)
+    classified(id_str, raw_state(id_str)?, &unit_path(id_str, UnitKind::Timer))
         .map(|found| found.named(id, Fragment::new))
         .map_err(|failure| failure.undetermined(id_str))
 }
 
-/// [`read`] for a fragment `Systemd::scan` found at `path`. The failure stays a [`ReadFailure`]: the
-/// scan reports it by name, where `read` makes it an [`Error::Undetermined`].
-pub(super) fn read_at(id: &str, path: &Path) -> ReadResult<ReadOutcome<Unnamed<String>>> {
-    classify_and_read(path).and_then(|raw| classified(id, raw))
+/// [`read`] for a job `Systemd::scan` found at `path`, or for an id it found no job for (`path` is
+/// then where the job would be). The failure stays a [`ReadFailure`]: the scan reports it by name,
+/// where `read` makes it an [`Error::Undetermined`].
+pub(super) fn read_at(id: &str, path: &Path) -> ReadResult<ReadOutcome<Unnamed<Body>>> {
+    classify_and_read(path).and_then(|raw| classified(id, raw, &unit_path(id, UnitKind::Timer)))
 }
 
 /// `id` read with no fragment of its own: absent when nothing occupies it, foreign when a drop-in or
@@ -378,22 +421,64 @@ pub(super) fn fragmentless<S>(id: &str) -> ReadResult<ReadOutcome<S>> {
     })
 }
 
-/// The fragment `text` of a marked `id` with the drop-in content folded in, and what systemd's
-/// drop-in directories hold for it. Drop-in content is folded into the compared text, so any drop-in
+/// How to free an id whose `<id>.timer` is not goetia's, which a task of that id needs for its
+/// schedule.
+fn foreign_timer_recovery(id: &str) -> String {
+    format!(
+        "`{}` is not goetia's, and a task needs that name for its schedule: remove or rename it \
+         (`systemctl disable --now {id}.timer` first, if it is enabled), run `systemctl daemon-reload`, \
+         and re-run",
+        unit_path(id, UnitKind::Timer).display()
+    )
+}
+
+/// The text of a marked `id` with the drop-in content folded in, and what systemd's drop-in
+/// directories hold for it: the job's text with `<id>.service.d`'s, and the timer's with
+/// `<id>.timer.d`'s. Drop-in content is folded into the compared text, so any drop-in
 /// reads as `Conflict`; the stale-version branch (no text comparison) uses `external` instead.
+///
+/// `<id>.timer.d` is read only where the timer's slot is this id's ([`Fragment::owns_timer_slot`]):
+/// a service beside no timer of goetia's is not asked about it. A task with drop-ins and no timer has
+/// them as a timer text of their own, which differs from the nothing it regenerates, so it is drift.
 ///
 /// A drop-in that could not be read is an [`Error::Step`] over an [`Error::Os`], never [`Error::Undetermined`]: the fragment
 /// is open and its marker decoded, so installation and ownership are both established.
-pub(super) fn installed(id: &str, text: &str) -> Result<InstalledDefinition<String>> {
-    let dirs = dropin_dirs(id).map_err(|failure| Error::Step {
+pub(super) fn installed(snapshot: &Fragment) -> Result<InstalledDefinition<Units>> {
+    let id = snapshot.id().as_str();
+    let Some(service) = snapshot.service_text() else {
+        return Err(Error::blob(
+            "the job is missing, so there is no installed definition to compare",
+        ));
+    };
+    let unreadable = |failure: ReadFailure| Error::Step {
         what: "a drop-in directory could not be read, so what systemd applies to it cannot be compared".to_string(),
         source: Box::new(failure.into_os_error()),
-    })?;
-    let marker: String = dirs.iter().map(|(_, text)| text.as_str()).collect();
+    };
+    let service_dirs = dropin_dirs(id, UnitKind::Service).map_err(unreadable)?;
+    let timer_dirs = if snapshot.owns_timer_slot() {
+        dropin_dirs(id, UnitKind::Timer).map_err(unreadable)?
+    } else {
+        Vec::new()
+    };
+    let timer = match (snapshot.timer(), timer_dirs.is_empty()) {
+        (Some(timer), _) => Some(format!("{}{}", timer.text, marker(&timer_dirs))),
+        (None, false) => Some(marker(&timer_dirs)),
+        (None, true) => None,
+    };
+    let units = Units {
+        service: format!("{service}{}", marker(&service_dirs)),
+        timer,
+    };
+    let dirs: Vec<(PathBuf, String)> = service_dirs.into_iter().chain(timer_dirs).collect();
     Ok(InstalledDefinition {
-        definition: format!("{text}{marker}"),
+        definition: units,
         external: dropin_external_config(id, &dirs),
     })
+}
+
+/// The drop-in text a set of drop-in directories adds to a unit's.
+fn marker(dirs: &[(PathBuf, String)]) -> String {
+    dirs.iter().map(|(_, text)| text.as_str()).collect()
 }
 
 // undetermined ========================================================================================================
@@ -468,17 +553,17 @@ pub(super) const DROPIN_SEARCH_DIRS: [&str; 12] = [
 
 /// What a set of drop-in directories amounts to for [`crate::decide::decide`].
 ///
-/// Goetia writes exactly one of them — `UNIT_DIR/<id>.service.d`, which every successful
-/// `Update`/`Stale` write clears (see `Systemd::install`) — so a drop-in under any other search root
-/// survives a `--force` overwrite untouched, and the run after it reports the identical conflict.
+/// Goetia writes exactly two of them — `UNIT_DIR/<id>.service.d` and `UNIT_DIR/<id>.timer.d`, which every
+/// successful `Update`/`Stale` write clears (see `Systemd::update_units`) — so a drop-in under any other
+/// search root survives a `--force` overwrite untouched, and the run after it reports the identical conflict.
 /// Naming those directories here, where the scan already has them, is what keeps the CLI from
 /// re-reading the filesystem to find out whether its own published remedy applies.
 fn dropin_external_config(id: &str, dirs: &[(PathBuf, String)]) -> ExternalConfig {
-    let ours = Path::new(UNIT_DIR).join(format!("{id}.service.d"));
+    let ours = UnitKind::ALL.map(|kind| Path::new(UNIT_DIR).join(dropin_name(id, kind)));
     let unclearable: Vec<&Path> = dirs
         .iter()
         .map(|(dir, _)| dir.as_path())
-        .filter(|dir| *dir != ours)
+        .filter(|dir| !ours.iter().any(|ours| ours == dir))
         .collect();
     if dirs.is_empty() {
         ExternalConfig::Absent
@@ -497,23 +582,23 @@ fn dropin_recovery(unclearable: &[&Path]) -> String {
     let paths = list(unclearable);
     format!(
         "systemd applies configuration goetia did not write, from outside `{UNIT_DIR}`: {paths}. \
-         `--force` rewrites `{UNIT_DIR}/<id>.service` and clears only `{UNIT_DIR}`'s own drop-in, so \
-         it cannot resolve this — remove those directories by hand, run `systemctl \
+         `--force` rewrites `{UNIT_DIR}/<id>.service` (and `<id>.timer`) and clears only `{UNIT_DIR}`'s \
+         own drop-ins, so it cannot resolve this — remove those directories by hand, run `systemctl \
          daemon-reload`, and re-run."
     )
 }
 
-/// `<id>.service.d`'s `*.conf` files under every root in [`DROPIN_SEARCH_DIRS`], per directory so a
+/// `kind`'s drop-in directory of `id` (`<id>.service.d`, `<id>.timer.d`): its `*.conf` files under every root in [`DROPIN_SEARCH_DIRS`], per directory so a
 /// caller that has to *name* them for a human ([`residue`], [`dropin_recovery`]) and one that has to
 /// *compare their content* ([`installed`]) cannot drift on which files count as drop-ins. One scan
 /// for all of them: what is this id's artifact and what occupies this id are the same set of
 /// directories, which is what keeps `install` and `uninstall` from describing one filesystem state
 /// differently. Only that directory name: see the module doc comment for the family-wide ones
 /// systemd also reads and this deliberately does not.
-fn dropin_dirs(id: &str) -> ReadResult<Vec<(PathBuf, String)>> {
+fn dropin_dirs(id: &str, kind: UnitKind) -> ReadResult<Vec<(PathBuf, String)>> {
     let mut found = Vec::new();
     for search_dir in DROPIN_SEARCH_DIRS {
-        let dir = Path::new(search_dir).join(format!("{id}.service.d"));
+        let dir = Path::new(search_dir).join(dropin_name(id, kind));
         let text = dropin_marker_in(&dir)?;
         if !text.is_empty() {
             found.push((dir, text));
@@ -565,17 +650,12 @@ fn dropin_marker_in(dir: &Path) -> ReadResult<String> {
 
 // Residue =============================================================================================================
 
-/// The one `*.target.wants` directory `systemctl enable` can link this id into: `generate::units`'s
-/// `[Install]` section is always exactly `WantedBy=multi-user.target`, and goetia emits no
-/// `RequiredBy=`, so there is no `.requires` counterpart.
-const WANTS_DIR: &str = "multi-user.target.wants";
-
 /// Where an enablement link for this id can be: the unit directories proper, and not the rest of
 /// [`DROPIN_SEARCH_DIRS`]. `systemctl enable` writes into `/etc/systemd/system` (persistent) or
 /// `/run/systemd/system` (`--runtime`), and a distribution package can ship a preset-enabled unit's
 /// link under `/usr/lib` or `/usr/local/lib`; the `.control`, `transient`, `.attached` and
 /// `generator` roots hold dbus-created, transient or generated configuration, where a stat for
-/// `multi-user.target.wants/<id>.service` is a syscall that can find nothing to act on.
+/// a stat for a unit's `*.target.wants` link is a syscall that can find nothing to act on.
 const WANTS_SEARCH_DIRS: [&str; 4] = [
     UNIT_DIR,
     "/run/systemd/system",
@@ -584,12 +664,16 @@ const WANTS_SEARCH_DIRS: [&str; 4] = [
 ];
 
 /// Everything goetia-attributable that systemd keeps applying at `id` after the fragment itself is
-/// gone: a `<id>.service.d/*.conf` drop-in, and a `multi-user.target.wants/<id>.service` link that
-/// still enrolls the id at boot. Consulted only where [`raw_state`] found no fragment.
+/// gone: a `<id>.service.d/*.conf` or `<id>.timer.d/*.conf` drop-in, and the link that still enrolls
+/// the id at boot or arms its schedule (`multi-user.target.wants/<id>.service`,
+/// `timers.target.wants/<id>.timer`: [`UnitKind::wants_dir`] says which `*.target.wants` directory
+/// `generate::units`'s `[Install]` section links a kind into). Consulted only where `read` found no
+/// fragment of either kind.
 struct Residue {
     /// Each drop-in directory holding at least one `*.conf`, with that directory's marker text.
     dropin: Vec<(PathBuf, String)>,
-    links: Vec<PathBuf>,
+    /// Each enablement link, and the kind of unit it is for.
+    links: Vec<(UnitKind, PathBuf)>,
 }
 
 impl Residue {
@@ -598,7 +682,7 @@ impl Residue {
         self.dropin
             .iter()
             .map(|(dir, _)| dir.as_path())
-            .chain(self.links.iter().map(PathBuf::as_path))
+            .chain(self.links.iter().map(|(_, link)| link.as_path()))
             .collect()
     }
 }
@@ -615,16 +699,19 @@ impl Residue {
 /// `uninstall x && echo "confirmed gone"` came to print for a unit still loaded, still running and
 /// still `.wants`-linked.
 fn residue(id: &str) -> ReadResult<Option<Residue>> {
-    let dropin = dropin_dirs(id)?;
+    let mut dropin = Vec::new();
     let mut links = Vec::new();
-    for search_dir in WANTS_SEARCH_DIRS {
-        let link = Path::new(search_dir).join(WANTS_DIR).join(format!("{id}.service"));
-        // `symlink_metadata`, never `metadata`: the leftover this exists to catch is precisely a
-        // symlink whose target — the fragment — is already gone, which `metadata` reports as absent.
-        match fs::symlink_metadata(&link) {
-            Ok(_) => links.push(link),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(ReadFailure::new("stat", &link, e)),
+    for kind in UnitKind::ALL {
+        dropin.extend(dropin_dirs(id, kind)?);
+        for search_dir in WANTS_SEARCH_DIRS {
+            let link = Path::new(search_dir).join(kind.wants_dir()).join(unit_name(id, kind));
+            // `symlink_metadata`, never `metadata`: the leftover this exists to catch is precisely a
+            // symlink whose target — the fragment — is already gone, which `metadata` reports as absent.
+            match fs::symlink_metadata(&link) {
+                Ok(_) => links.push((kind, link)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ReadFailure::new("stat", &link, e)),
+            }
         }
     }
     if dropin.is_empty() && links.is_empty() {
@@ -647,12 +734,24 @@ fn list(paths: &[&Path]) -> String {
 /// it itself: `<id>.service.d` in `/run` or `/usr/lib` — and, for that matter, in `/etc` — is just
 /// as plausibly an administrator's override of a unit *shipped elsewhere* as it is goetia's own
 /// leftover, and there is nothing on disk that distinguishes the two.
+///
+/// `systemctl disable` is told the unit each link is for, by its own name (`{id}.timer` for a
+/// timer's), and the service where there is no link.
 fn residue_recovery(id: &str, residue: &Residue) -> String {
     let paths = list(&residue.paths());
+    let mut units: Vec<String> = UnitKind::ALL
+        .into_iter()
+        .filter(|kind| residue.links.iter().any(|(of, _)| of == kind))
+        .map(|kind| unit_name(id, kind))
+        .collect();
+    if units.is_empty() {
+        units.push(unit_name(id, UnitKind::Service));
+    }
+    let units = units.join(" ");
     format!(
         "no `{UNIT_DIR}/{id}.service`, but systemd still applies configuration attached to `{id}`: \
          {paths}. goetia cannot tell its own leftovers from an administrator's overrides of a unit \
-         shipped elsewhere, so it removes neither — `systemctl disable {id}.service` drops the \
+         shipped elsewhere, so it removes neither — `systemctl disable {units}` drops the \
          enablement link and a drop-in directory has to go by hand. Then run `systemctl \
          daemon-reload` and re-run."
     )

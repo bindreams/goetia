@@ -1188,19 +1188,3 @@ fn a_value_no_encoding_carries_is_refused_for_a_task_too() {
     assert_eq!(daemon, "frpc");
     assert!(message.contains("`command[0]`"), "{message}");
 }
-
-/// Interim: a Linux install of a task stays refused until the manager keeps both artifacts.
-#[cfg(target_os = "linux")]
-#[skuld::test]
-fn render_refuses_a_task_until_task_5() {
-    use crate::backend::Backend as _;
-    use crate::backend::systemd::manager::Systemd;
-
-    let spec = task_with(|_| {});
-    let err = Systemd::new().render(&spec).unwrap_err();
-
-    assert_eq!(
-        err.to_string(),
-        crate::backend::cannot_run_tasks("systemd", &spec.common().id).to_string()
-    );
-}
