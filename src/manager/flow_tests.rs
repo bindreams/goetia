@@ -1213,27 +1213,13 @@ fn run_hands_out_to_begin_run_as_its_notes_writer() {
     let log = dir.path().join("job.log");
     let fake = Fake::new();
     fake.install(&a_task("nightly"), false).unwrap();
-    fake.seed_run_note(
-        "nightly",
-        "note: from begin_run
-",
-    );
-    fake.seed_run_writes(
-        "nightly",
-        &log,
-        "this run
-",
-    );
+    fake.seed_run_note("nightly", "note: from begin_run\n");
+    fake.seed_run_writes("nightly", &log, "this run\n");
 
     let (result, out) = run_of(&fake, "nightly");
 
     assert_eq!(result.unwrap(), Exit::Code(0));
-    assert_eq!(
-        out,
-        "note: from begin_run
-this run
-"
-    );
+    assert_eq!(out, "note: from begin_run\nthis run\n");
 }
 
 /// A run whose marker the log never held shows the note, and its exit is the run's, untouched.

@@ -57,7 +57,8 @@ pub(crate) fn refuse_env_sh_resets(
         Some(name) => Err(crate::error::Error::Invalid {
             daemon: common.id.to_string(),
             message: format!(
-                "`env` sets `{name}`, but {task} starts through /bin/sh, which resets it, so the program                  would not see the value"
+                "`env` sets `{name}`, but {task} starts through /bin/sh, which resets it, so the program \
+                 would not see the value"
             ),
             source: None,
         }),

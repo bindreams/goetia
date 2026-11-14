@@ -545,19 +545,9 @@ fn a_run_joined_in_flight_shows_from_its_marker_before_the_offset() {
 fn finish_rereads_from_the_start_only_where_an_earlier_start_is_possible() {
     let dir = tempfile::tempdir().unwrap();
     let path = log_in(dir.path());
-    append(
-        &path,
-        &format!(
-            "goetia-run {RUN_A}
-1
-"
-        ),
-    );
+    append(&path, &format!("goetia-run {RUN_A}\n1\n"));
     let offset = std::fs::metadata(&path).unwrap().len();
-    append(
-        &path, "2
-",
-    );
+    append(&path, "2\n");
     let source = |earlier_start_possible| OutputSource::LogFile {
         path: path.clone(),
         offset,
@@ -569,12 +559,7 @@ fn finish_rereads_from_the_start_only_where_an_earlier_start_is_possible() {
 
     let (result, out) = streamed_after_the_end(source(true));
     result.unwrap();
-    assert_eq!(
-        out,
-        "1
-2
-"
-    );
+    assert_eq!(out, "1\n2\n");
 
     let (result, out) = streamed_after_the_end(source(false));
     result.unwrap();
@@ -587,10 +572,7 @@ fn length_of_a_file_that_is_not_there_is_zero() {
     let dir = tempfile::tempdir().unwrap();
     let path = log_in(dir.path());
     assert_eq!(length_of(&path).unwrap(), 0);
-    append(
-        &path, "abc
-",
-    );
+    append(&path, "abc\n");
     assert_eq!(length_of(&path).unwrap(), 4);
 }
 
