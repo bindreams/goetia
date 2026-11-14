@@ -16,6 +16,8 @@ pub use reason::Reason;
 pub(crate) use report::Chain;
 #[cfg(feature = "cli")]
 pub(crate) use report::Sink;
+#[cfg(windows)]
+pub(crate) use report::os_error_in;
 pub(crate) use within::within;
 
 use report::Report;
@@ -770,8 +772,7 @@ impl Error {
         }
     }
 
-    /// The first OS error code this error carries, anywhere in it; the search order is
-    /// `report::os_error_in`'s.
+    /// The first OS error code this error carries; the search order is `report::os_error_in`'s.
     pub fn raw_os_error(&self) -> Option<i32> {
         report::os_error_in(self)
     }

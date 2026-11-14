@@ -257,7 +257,7 @@ fn a_contained_childs_descendant_dies_with_it() {
     // NOTE_EXIT on macOS), with no timeout to choose: it returns when the
     // descendant dies, and hangs if the descendant is not in the child's
     // contained tree (e.g. `command()` without `.contain()`) — then neither
-    // `kill_tree` nor `Drop` can reach it.
+    // `send_kill_tree` nor `Drop` can reach it.
     descendant.wait().unwrap();
 }
 
@@ -334,7 +334,12 @@ fn a_lost_wait_says_whether_the_request_was_announced() {
         test_hook::wait_fails(|| io::Error::other("the wait failed").into());
         let lost = wait_bounded(child, Budget::Unbounded.start()).expect_err(script);
         assert_eq!(lost.announced, expected, "{script}");
-        assert!(lost.error.to_string().contains("the wait failed"), "{script}: {lost:?}");
+        assert!(
+            cosca::error::Report::new(&lost.error)
+                .to_string()
+                .contains("the wait failed"),
+            "{script}: {lost:?}"
+        );
     }
 }
 
@@ -592,6 +597,7 @@ fn a_failed_spawn_is_not_run_unless_cosca_says_it_may_have_started() {
             "before the spawn: containment",
             || cosca::error::Error::Containment {
                 detail: "forced".into(),
+                source: None,
             },
             false,
         ),
@@ -613,6 +619,7 @@ fn a_failed_spawn_is_not_run_unless_cosca_says_it_may_have_started() {
             || {
                 test_hook::may_have_started(cosca::error::Error::Containment {
                     detail: "forced".into(),
+                    source: None,
                 })
             },
             true,
@@ -877,11 +884,11 @@ fn an_announced_request_short_of_a_listener_thread_is_not_spawned() {
     );
 
     match refused {
-        Err(SpawnError::NotRun(e)) => assert!(
-            e.to_string().contains("no thread to read its output could be made"),
-            "{e}"
-        ),
-        Err(SpawnError::MayHaveRun(e)) => panic!("a spawn that never happened may have run: {e}"),
+        Err(e @ SpawnError::NotRun(_)) => {
+            let e = e.to_string();
+            assert!(e.contains("no thread to read its output could be made"), "{e}");
+        }
+        Err(e @ SpawnError::MayHaveRun(_)) => panic!("a spawn that never happened may have run: {e}"),
         Ok(_) => panic!("spawned with no thread to read its output"),
     }
     assert_eq!(test_hook::spawns(), spawned_before, "the child was spawned");
