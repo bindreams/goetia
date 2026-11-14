@@ -171,6 +171,21 @@ fn enable_in(token: RawHandle) -> io::Result<bool> {
     Ok(unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED)
 }
 
+/// Whether the process token holds `SeDebugPrivilege`, enabled or not; `Err` if the probe fails.
+#[cfg(test)]
+pub(crate) fn holds_debug_privilege() -> Result<bool, String> {
+    let probe = || {
+        let copy = crate::elevation::test_support::process_token_copy(TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY)?;
+        enable_in(copy.as_raw_handle())
+    };
+    probe().map_err(|e| {
+        format!(
+            "could not probe the token for SeDebugPrivilege: {}",
+            crate::error::Chain(&e)
+        )
+    })
+}
+
 #[cfg(test)]
 #[path = "privilege_tests.rs"]
 mod privilege_tests;

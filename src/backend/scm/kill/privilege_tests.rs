@@ -1,6 +1,7 @@
 //! A token that does not hold `SeDebugPrivilege` must come out as "not enabled", never as an error,
 //! so the open that follows speaks for itself. The tests that need a token holding the privilege
-//! (an elevated administrator's) are skipped without one; the elevated `kill` tests in
+//! (an elevated administrator's, usually) fail without one, naming it;
+//! `GOETIA_TEST_DEBUG_PRIVILEGE=0` opts them out. The elevated `kill` tests in
 //! `tests/scm_integration` pin the whole path.
 
 use std::io;
@@ -9,21 +10,12 @@ use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, LUID};
 use windows_sys::Win32::Security::{
     GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PRIVILEGE_SET, PrivilegeCheck, SE_DEBUG_NAME,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
+    TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
 };
 
 use super::{DebugPrivilege, enable_in, restore_notice};
 use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
-
-/// Skuld precondition: the process token holds `SeDebugPrivilege`, enabled or not.
-fn holds_debug_privilege() -> Result<(), String> {
-    let copy = process_token_copy(TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY);
-    match enable_in(copy.as_raw_handle()) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err("this token does not hold SeDebugPrivilege (an elevated administrator's does)".to_string()),
-        Err(e) => Err(format!("could not probe the token for SeDebugPrivilege: {e}")),
-    }
-}
+use crate::testing::groups::debug_privilege;
 
 /// The calling thread's own token, if it has one, opened to be queried.
 fn open_thread_token() -> Option<OwnedHandle> {
@@ -105,8 +97,8 @@ fn enabling_and_letting_go_leaves_the_thread_as_it_was() {
     assert!(!thread_has_token());
 }
 
-#[skuld::test(requires = [holds_debug_privilege])]
-fn the_thread_has_the_privilege_enabled_exactly_while_the_guard_lives() {
+#[skuld::test]
+fn the_thread_has_the_privilege_enabled_exactly_while_the_guard_lives(#[fixture(debug_privilege)] _held: &()) {
     let guard = DebugPrivilege::enable();
 
     assert!(guard.failure.is_none(), "{:?}", guard.failure);
@@ -120,9 +112,10 @@ fn the_thread_has_the_privilege_enabled_exactly_while_the_guard_lives() {
 
 /// The thread already impersonates: the guard replaces that token for the open, and puts the same
 /// token back, not the process's and not none.
-#[skuld::test(requires = [holds_debug_privilege])]
-fn dropping_puts_back_the_thread_token_that_was_there() {
-    let prior = process_token_copy(TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE);
+#[skuld::test]
+fn dropping_puts_back_the_thread_token_that_was_there(#[fixture(debug_privilege)] _held: &()) {
+    let prior =
+        process_token_copy(TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE).expect("a copy of the process token");
     let _reset = ThreadTokenReset::impersonate(&prior);
     let prior_id = token_id(prior.as_raw_handle());
     assert_eq!(thread_token_id(), Some(prior_id));
