@@ -1164,6 +1164,8 @@ fn a_failed_begin_run_is_the_error() {
 
     let e = result.expect_err("no run began");
     assert_eq!(e.to_string(), "`nightly` did not run: the manager refused (seeded)");
+    // `run` returned, so the thread made for the wait was joined; it had no run to wait for.
+    assert!(!fake.calls().iter().any(|(call, _)| *call == "wait_run"));
 }
 
 #[skuld::test]

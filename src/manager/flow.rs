@@ -328,7 +328,8 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
 /// ended. See [`ServiceManager::run`](crate::manager::ServiceManager::run).
 ///
 /// The state is read once, before the request: a task found running is refused without anything
-/// being reserved or sent.
+/// being reserved or sent. The thread that waits for the run is made before the request too, so a
+/// start that was sent is never left unwatched for want of one.
 pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exit> {
     let snapshot = owned(b, id)?;
     let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
@@ -341,45 +342,85 @@ pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exi
         State::Stopped | State::Failed | State::Unknown => return Err(Error::RunStateUnknown { id: id.to_string() }),
     }
     let mut reservation = reserved(b, id, &[Step::Start], Budget::Immediate)?;
-    follow(b.begin_run(snapshot, &mut reservation)?, id, out)
+    let waiter = Waiter::<B::Run>::spawn(id)?;
+
+    match b.begin_run(snapshot, &mut reservation) {
+        Ok(run) => waiter.follow(run, id, out),
+        Err(e) => {
+            waiter.abandon();
+            Err(e)
+        }
+    }
 }
 
-/// Shows `run`'s output while another thread waits for its end, and returns how it ended.
-///
-/// The run is in flight, so it is waited for whatever happens to the output. If the wait failed its
-/// error is returned: the exit is the more basic fact. Otherwise a failure to show the output is
-/// returned, naming the exit.
-fn follow<R: RunHandle>(run: R, id: &Id, out: &mut dyn Write) -> Result<Exit> {
-    let source = run.output();
-    // Nothing is sent: closing `end` is how the wait thread tells the stream the run has ended, and
-    // it closes it on a panic too, so the stream never outlives a run whose wait is gone.
-    let (end, ended) = crossbeam_channel::bounded::<()>(0);
-    let waiter = std::thread::Builder::new()
-        .name(format!("goetia run {id}"))
-        .spawn(move || {
-            let exit = run.wait();
-            drop(end);
-            exit
-        })
-        .map_err(|source| Error::RequestInDoubt {
-            request: format!("goetia daemon run {id}"),
-            reached: true,
-            note: Some("goetia could not start a thread to wait for the run".to_string()),
-            source: source.into(),
-        })?;
+/// The thread that waits for a run, made before the run is requested.
+struct Waiter<R> {
+    /// How the run reaches the thread once the request has made one.
+    hand_over: crossbeam_channel::Sender<R>,
+    /// Closed by the thread when the wait has finished: the stream's signal that the run ended.
+    ended: crossbeam_channel::Receiver<()>,
+    thread: std::thread::JoinHandle<Option<Result<Exit>>>,
+}
 
-    let shown = output::stream(source, id, out, &ended);
-    let waited = match waiter.join() {
-        Ok(waited) => waited,
-        Err(panic) => std::panic::resume_unwind(panic),
-    };
-    match (waited, shown) {
-        (Err(e), _) => Err(e),
-        (Ok(exit), Ok(())) => Ok(exit),
-        (Ok(exit), Err(shown)) => Err(Error::Step {
-            what: format!("`{id}` ended with {exit}, but goetia stopped showing its output"),
-            source: Box::new(shown),
-        }),
+impl<R: RunHandle> Waiter<R> {
+    /// Nothing has been sent when this fails, so it fails as any step that could not be made ready.
+    fn spawn(id: &Id) -> Result<Self> {
+        let (hand_over, handed) = crossbeam_channel::bounded::<R>(1);
+        // Nothing is sent on `ended`: closing it is the signal, and it closes on a panic too, so the
+        // stream never outlives a run whose wait is gone.
+        let (end, ended) = crossbeam_channel::bounded::<()>(0);
+        let thread = std::thread::Builder::new()
+            .name(format!("goetia run {id}"))
+            .spawn(move || {
+                // `None`: the request failed, so there was no run.
+                let exit = handed.recv().ok().map(RunHandle::wait);
+                drop(end);
+                exit
+            })
+            .map_err(|source| Error::Reservation {
+                id: Some(id.to_string()),
+                source,
+            })?;
+        Ok(Self {
+            hand_over,
+            ended,
+            thread,
+        })
+    }
+
+    /// The request failed: no run is coming, and the thread ends having waited for nothing.
+    fn abandon(self) {
+        drop(self.hand_over);
+        if let Err(panic) = self.thread.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Shows `run`'s output while the thread waits for its end, and returns how it ended.
+    ///
+    /// The run is in flight, so it is waited for whatever happens to the output. If the wait failed
+    /// its error is returned: the exit is the more basic fact. Otherwise a failure to show the output
+    /// is returned, naming the exit.
+    fn follow(self, run: R, id: &Id, out: &mut dyn Write) -> Result<Exit> {
+        let source = run.output();
+        // The thread is alive until it has a run or its sender is dropped: this cannot fail.
+        let handed = self.hand_over.send(run).is_ok();
+        debug_assert!(handed, "the wait thread ended before it was given the run");
+
+        let shown = output::stream(source, id, out, &self.ended);
+        let waited = match self.thread.join() {
+            Ok(Some(waited)) => waited,
+            Ok(None) => unreachable!("the wait thread was given the run"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        match (waited, shown) {
+            (Err(e), _) => Err(e),
+            (Ok(exit), Ok(())) => Ok(exit),
+            (Ok(exit), Err(shown)) => Err(Error::Step {
+                what: format!("`{id}` ended with {exit}, but goetia stopped showing its output"),
+                source: Box::new(shown),
+            }),
+        }
     }
 }
 

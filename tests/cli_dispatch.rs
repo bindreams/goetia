@@ -4864,10 +4864,7 @@ fn start_with_a_flag_falls_through_to_start_when_status_fails() {
     );
     assert!(
         fake.calls().contains(&("start", "nightly".to_string())),
-        "stdout:
-{out}
-stderr:
-{err} (exit {code})"
+        "stdout:\n{out}\nstderr:\n{err} (exit {code})"
     );
 }
 
@@ -4876,11 +4873,7 @@ fn install_start_timeout_on_a_task_is_refused_before_writing() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(
         dir.path(),
-        "id: nightly
-command: [backup]
-type: task
-schedule: 0 3 * * *
-",
+        "id: nightly\ncommand: [backup]\ntype: task\nschedule: 0 3 * * *\n",
     );
     let fake = Fake::new();
 
@@ -4909,11 +4902,7 @@ fn install_start_of_a_task_without_a_flag_installs_and_requests_the_run() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(
         dir.path(),
-        "id: nightly
-command: [backup]
-type: task
-schedule: 0 3 * * *
-",
+        "id: nightly\ncommand: [backup]\ntype: task\nschedule: 0 3 * * *\n",
     );
     let fake = Fake::new();
 
@@ -4936,13 +4925,7 @@ schedule: 0 3 * * *
 #[skuld::test]
 fn install_enable_on_a_scheduleless_task_is_refused_before_writing() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "id: nightly
-command: [backup]
-type: task
-",
-    );
+    let manifest = write_manifest(dir.path(), "id: nightly\ncommand: [backup]\ntype: task\n");
     let fake = Fake::new();
 
     let (code, out, err) = dispatch_elevated(
@@ -4966,13 +4949,7 @@ type: task
 #[skuld::test]
 fn install_of_a_scheduleless_task_without_enable_is_installed() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(
-        dir.path(),
-        "id: nightly
-command: [backup]
-type: task
-",
-    );
+    let manifest = write_manifest(dir.path(), "id: nightly\ncommand: [backup]\ntype: task\n");
     let fake = Fake::new();
 
     let (code, out, err) = dispatch_elevated(
