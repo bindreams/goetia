@@ -761,9 +761,9 @@ fn run_shows_the_programs_own_line_ends(#[fixture(systemd_group)] _group: &Group
 
 /// A start job queued behind another unit's and canceled before it runs (a `stop` racing the request)
 /// writes no journal entry, so `run` learns of its end from the manager no longer holding it, and says
-/// the task did not run.
+/// the outcome is unknown: a canceled job and a journal that keeps no manager messages look the same.
 #[skuld::test]
-fn run_of_a_start_job_canceled_before_it_ran_is_a_run_that_did_not_start(#[fixture(systemd_group)] _group: &Group) {
+fn run_of_a_start_job_canceled_before_it_ran_ends_with_an_unknown_outcome(#[fixture(systemd_group)] _group: &Group) {
     let blocker_id = support::random_test_id();
     let _blocker_guard = ServiceGuard::new(&blocker_id);
     let id = support::random_test_id();
@@ -804,8 +804,17 @@ fn run_of_a_start_job_canceled_before_it_ran_is_a_run_that_did_not_start(#[fixtu
     });
 
     let e = result.expect_err("the job was canceled");
-    assert!(matches!(e, Error::RunNotStarted { .. }), "{}", e.report());
-    assert!(e.report().to_string().contains("canceled"), "{}", e.report());
+    assert!(
+        matches!(e, Error::RequestInDoubt { reached: true, .. }),
+        "{}",
+        e.report()
+    );
+    assert!(e.is_indeterminate());
+    assert!(
+        e.report().to_string().contains("canceled before it ran"),
+        "{}",
+        e.report()
+    );
     held.release();
 }
 

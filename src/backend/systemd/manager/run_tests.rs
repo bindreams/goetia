@@ -586,21 +586,24 @@ fn the_job() -> Vec<String> {
 
 /// A start job canceled before it ran (a `stop` racing the request) writes no Starting entry and no
 /// result: its end is that the manager no longer holds it. The follower is ended, the journal synced
-/// and read once more, and a job with nothing in it was canceled.
+/// and read once more, and a job with nothing in it is indeterminate: a canceled job and a journal
+/// that keeps no manager messages look the same.
 #[skuld::test]
-fn a_start_job_canceled_before_it_ran_is_a_run_that_did_not_start() {
+fn a_start_job_that_ended_with_nothing_in_the_journal_is_indeterminate() {
     let journal = JournalFake::new(Vec::new()).follows(Vec::new()).then_reads(Vec::new());
 
     let e = begin(&journal, &gate_then([start(), no_jobs()]))
         .err()
-        .expect("no run began");
+        .expect("no run was found");
 
-    let Error::RunNotStarted { id, reason } = &e else {
-        panic!("{e:?}")
-    };
-    assert_eq!(id, "x");
-    assert!(reason.contains("canceled"), "{reason}");
-    assert!(!e.is_indeterminate());
+    assert!(matches!(e, Error::RequestInDoubt { reached: true, .. }), "{e:?}");
+    assert!(e.is_indeterminate());
+    assert_eq!(
+        e.to_string(),
+        "`systemctl start x.service` reached the service manager, but goetia lost track of it before its \
+         outcome was confirmed: the start request's job ended with no record of a run in the journal: it was \
+         canceled before it ran, or this journal keeps no service-manager messages"
+    );
     assert_eq!(journal.stops(), 1, "the follower was ended");
     assert_eq!(journal.syncs(), 1, "what was written before the job ended is stored");
     assert_eq!(
@@ -624,7 +627,8 @@ fn a_starting_entry_that_was_not_stored_yet_when_the_job_ended_is_found_after_th
     assert_eq!(run.start, Cursor::of("c1"));
 }
 
-/// The same for the end of a job that never began a run, whose entry was not stored yet.
+/// The same for the end of a job that never began a run, whose entry was not stored yet: the journal
+/// records the failure, so the run is known not to have happened.
 #[skuld::test]
 fn a_job_result_that_was_not_stored_yet_when_the_job_ended_is_the_reason() {
     let journal = JournalFake::new(Vec::new())
@@ -647,9 +651,9 @@ fn a_job_that_is_still_queued_is_looked_for_again() {
     let journal = JournalFake::new(Vec::new()).follows(Vec::new()).then_reads(Vec::new());
     let client = gate_then([start(), job_7_waits(), job_7_waits(), no_jobs()]);
 
-    let e = begin(&journal, &client).err().expect("no run began");
+    let e = begin(&journal, &client).err().expect("no run was found");
 
-    assert!(matches!(e, Error::RunNotStarted { .. }), "{e:?}");
+    assert!(matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
     assert_eq!(
         client.calls().len(),
         2 + 1 + 3,

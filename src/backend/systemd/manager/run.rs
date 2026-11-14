@@ -4,11 +4,13 @@
 //! The facts it rests on were measured (see the knowledge base). In short:
 //!
 //! - The start request's job number finds the run: the "Starting" entry with that `JOB_ID` has its
-//!   `INVOCATION_ID` and cursor. A job that ends with no Starting entry never began a run, and its
-//!   entries carry the *previous* run's invocation, which is never used. A job canceled before it ran
-//!   writes no entry at all: its end is that the manager no longer holds it (`systemctl list-jobs`),
-//!   looked for while the entries are followed; `busctl` cannot hear the manager's `JobRemoved`, which
-//!   is sent only to a client that subscribed.
+//!   `INVOCATION_ID` and cursor. A job that ends with a result and no Starting entry never began a
+//!   run, and its entries carry the *previous* run's invocation, which is never used
+//!   ([`Error::RunNotStarted`]). A job canceled before it ran writes no entry at all: its end is that
+//!   the manager no longer holds it (`systemctl list-jobs`), looked for while the entries are
+//!   followed; `busctl` cannot hear the manager's `JobRemoved`, which is sent only to a client that
+//!   subscribed. A job that ends with nothing in the journal is indeterminate, since a canceled job
+//!   and a journal that keeps no manager messages look the same ([`Error::RequestInDoubt`]).
 //! - The exit is the first terminal entry ([`ending_of`]) of that invocation after the cursor. One that
 //!   is "Failed with result" with no exit before it is a run whose exit is not established
 //!   ([`Error::RunUnrecorded`]).
@@ -59,15 +61,16 @@ impl Systemd {
     /// length of the task's `logs` file is measured, if it has one, and the cursor where the journal
     /// ends; the request is sent; and the run is found by the job number the request announced. A
     /// failure before the request is sent is its own error and sends nothing. After it, every failure
-    /// is [`Error::RequestInDoubt`] with `reached`, except the determinate [`Error::RunNotStarted`] of
-    /// a job that ended before any run began, whether its end is in the journal or is that the
-    /// manager no longer holds it.
+    /// is [`Error::RequestInDoubt`] with `reached`, except the determinate [`Error::RunNotStarted`]
+    /// where the journal records the start job failing before a run began. A start job that ends with
+    /// no entry at all (canceled before it ran, or a journal that keeps no manager messages) is
+    /// indeterminate.
     ///
-    /// On systemd, `goetia daemon run` finds its run, the
-    /// run's output and its exit in the system journal. On a host whose journal does not keep the
-    /// service manager's messages (`Storage=none`, or `MaxLevelStore=` below `info`), it waits until
-    /// interrupted; the run itself still happens. There, `status` shows state and next run but not
-    /// the last run or its result; use `start`.
+    /// On systemd, `goetia daemon run` finds its run, the run's output and its exit in the system
+    /// journal. On a host whose journal does not keep the service manager's messages (journald off,
+    /// `Storage=none`, or `MaxLevelStore=` below `info`), `goetia daemon run` cannot follow the run: it
+    /// ends with an error saying the outcome is unknown; the run itself may still happen. There,
+    /// `status` shows state and next run but not the last run or its result; use `start`.
     pub(super) fn begin_run(&self, snapshot: Fragment, reservation: &mut Held) -> Result<Run> {
         let id = snapshot.id().clone();
         let unit = unit_name(id.as_str(), UnitKind::Service);
@@ -250,6 +253,10 @@ struct JobEnding<'a> {
     systemctl: Arc<Systemctl>,
 }
 
+/// Why a start job that ended with nothing in the journal is no run that did not happen.
+const NO_RECORD: &str = "the start request's job ended with no record of a run in the journal: it was canceled \
+     before it ran, or this journal keeps no service-manager messages";
+
 /// What an entry of the start job says: the invocation and cursor of the run it began (its Starting
 /// entry), or [`Error::RunNotStarted`] for the end of a job that never began one; `None` for any
 /// other.
@@ -325,12 +332,13 @@ fn find_start(journal: &dyn Journal, id: &Id, unit: &str, job: u64, ending: JobE
                     return Ok(started);
                 }
             }
-            Err(Error::RunNotStarted {
-                id: id.to_string(),
-                reason:
-                    "systemd's start job ended and the journal has no entry of a run: it was canceled before it ran \
-                         (or the journal does not keep the manager's messages)"
-                        .to_string(),
+            // Not `RunNotStarted`: a job canceled before it ran and a journal that keeps no manager
+            // messages look the same, and only the first is a run that did not happen.
+            Err(Error::RequestInDoubt {
+                request: format!("systemctl start {unit}"),
+                reached: true,
+                note: Some(NO_RECORD.to_string()),
+                source: Box::new(lacks("an entry of the run: the start job ended with none")),
             })
         }
         Ok(Err(e)) => Err(e),
@@ -352,7 +360,7 @@ fn first_of_the_job(follower: &mut dyn Follower, id: &Id) -> Result<Option<(Stri
 /// the run may have happened.
 fn after_the_request(unit: &str, e: Error) -> Error {
     match e {
-        e @ Error::RunNotStarted { .. } => e,
+        e @ (Error::RunNotStarted { .. } | Error::RequestInDoubt { .. }) => e,
         e => Error::RequestInDoubt {
             request: format!("systemctl start {unit}"),
             reached: true,
