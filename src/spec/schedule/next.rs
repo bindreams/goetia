@@ -22,31 +22,47 @@ const GREGORIAN_CYCLE_DAYS: u32 = 146_097;
 /// schedule names.
 ///
 /// `None` when no day of the Gregorian cycle names it (`0 0 30 2 *`), or when `after` or the answer
-/// lies outside the years jiff represents (to 9999).
+/// lies outside the years jiff represents (to 9999). A caller treats `None` as "no next run known",
+/// not as "never".
 pub(crate) fn next_fire(schedule: &Schedule, after: SystemTime, zone: &TimeZone) -> Option<SystemTime> {
     let after = Timestamp::try_from(after).ok()?;
-    let [minutes, hours, days, months, weekdays] = schedule.fields();
-    let mut date = after.to_zoned(zone.clone()).date();
-    // The cycle's worth of days after `after`'s own, which a fire earlier that day may not satisfy.
-    for _ in 0..=GREGORIAN_CYCLE_DAYS {
-        if names_date(schedule, date, [days, months, weekdays]) {
-            let fire = minutes
-                .values
-                .iter()
-                .flat_map(|&minute| hours.values.iter().map(move |&hour| (hour, minute)))
-                .flat_map(|(hour, minute)| instants(zone, date, hour, minute))
-                .filter(|&instant| instant > after)
-                .min();
-            if let Some(fire) = fire {
-                return Some(fire.into());
-            }
+    // From the day before `after`'s own date: a fall-back across midnight reads that date again.
+    let mut date = after.to_zoned(zone.clone()).date().yesterday().ok()?;
+    // Then `after`'s own date and a cycle's worth after it, whose first date a fire earlier that day
+    // may not satisfy.
+    for _ in 0..=GREGORIAN_CYCLE_DAYS + 1 {
+        if let Some(fire) = fire_on(schedule, zone, date, after) {
+            // The next date can read an earlier instant than this one (a fall-back across midnight),
+            // and no date after it can.
+            let tomorrow = date
+                .tomorrow()
+                .ok()
+                .and_then(|date| fire_on(schedule, zone, date, after));
+            return Some(tomorrow.map_or(fire, |tomorrow| fire.min(tomorrow)).into());
         }
         date = date.tomorrow().ok()?;
     }
     None
 }
 
-/// Whether the schedule's day-of-month, month and day-of-week fields name `date`.
+/// The first instant after `after` at which `zone` reads a minute the schedule names on `date`.
+fn fire_on(schedule: &Schedule, zone: &TimeZone, date: Date, after: Timestamp) -> Option<Timestamp> {
+    let [minutes, hours, days, months, weekdays] = schedule.fields();
+    if !names_date(schedule, date, [days, months, weekdays]) {
+        return None;
+    }
+    minutes
+        .values
+        .iter()
+        .flat_map(|&minute| hours.values.iter().map(move |&hour| (hour, minute)))
+        .flat_map(|(hour, minute)| instants(zone, date, hour, minute))
+        .filter(|&instant| instant > after)
+        .min()
+}
+
+/// Whether the schedule's day-of-month, month and day-of-week fields name `date`. Not shared with
+/// `testing::cron_matches`: that is the oracle the tests check this walk against, and it must stay
+/// independent of the code it checks.
 fn names_date(schedule: &Schedule, date: Date, [days, months, weekdays]: [&CronField; 3]) -> bool {
     let has = |field: &CronField, value: i8| u8::try_from(value).is_ok_and(|value| field.values.contains(&value));
     let day = has(days, date.day());

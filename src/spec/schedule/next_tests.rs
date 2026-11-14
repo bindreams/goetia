@@ -226,18 +226,57 @@ fn strictly_after() {
     }
 }
 
-/// A TZif (version 1) file of one zone, UTC+05:00 all year.
-fn plus_five() -> Vec<u8> {
+/// A TZif (version 1) file whose zone has the offsets `offsets` (seconds east of UTC, none in DST), the
+/// first holding until the first of `transitions` (Unix second, index into `offsets`).
+fn tzif(offsets: &[i32], transitions: &[(i32, u8)]) -> Vec<u8> {
+    let abbreviations: Vec<u8> = offsets.iter().flat_map(|_| *b"X ").collect();
     let mut bytes = b"TZif".to_vec();
     bytes.extend([0; 16]); // the version, and the reserved bytes
     // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
-    for count in [0u32, 0, 0, 0, 1, 4] {
-        bytes.extend(count.to_be_bytes());
+    for count in [0, 0, 0, transitions.len(), offsets.len(), abbreviations.len()] {
+        bytes.extend(u32::try_from(count).unwrap().to_be_bytes());
     }
-    bytes.extend(18_000i32.to_be_bytes()); // utoff
-    bytes.extend([0, 0]); // not DST, abbreviation at 0
-    bytes.extend(b"XYZ\0");
+    bytes.extend(transitions.iter().flat_map(|(second, _)| second.to_be_bytes()));
+    bytes.extend(transitions.iter().map(|&(_, index)| index));
+    for (index, offset) in offsets.iter().enumerate() {
+        bytes.extend(offset.to_be_bytes());
+        bytes.extend([0, u8::try_from(index * 2).unwrap()]); // not DST, the abbreviation
+    }
+    bytes.extend(abbreviations);
     bytes
+}
+
+/// UTC+05:00 all year.
+fn plus_five() -> Vec<u8> {
+    tzif(&[18_000], &[])
+}
+
+/// A zone at UTC+01:00 until 2026-06-01T23:30:00Z, then at UTC: the clocks go from 00:30 back to 23:30 of
+/// the day before, so the minutes of 23:30 to 24:00 on 2026-06-01 are read twice.
+fn back_across_midnight() -> TimeZone {
+    let at = i32::try_from(timestamp(instant("2026-06-01T23:30:00Z")).as_second()).unwrap();
+    TimeZone::tzif("synthetic", &tzif(&[3_600, 0], &[(at, 1)])).unwrap()
+}
+
+/// The date a repeated minute reads is not always `after`'s own, and a later date is not always a later
+/// instant: the walk looks at the day before `after`'s date, and past the first date that has a fire.
+#[skuld::test]
+fn a_fold_across_midnight_fires_on_the_date_it_reads_again() {
+    let zone = back_across_midnight();
+    // 2026-06-02T00:10 in the first pass. The clocks then go back to 2026-06-01T23:30.
+    let after = instant("2026-06-01T23:10:00Z");
+    assert_eq!(local(&zone, after), "2026-06-02T00:10");
+    for (text, expected) in [
+        // 23:40 on 2026-06-01 is yet to come, in the second pass.
+        ("40 23 * * *", "2026-06-01T23:40:00Z"),
+        // 00:20 on 2026-06-02 comes first, in the first pass, before 23:40 on the date before it.
+        ("20,40 0,23 * * *", "2026-06-01T23:20:00Z"),
+    ] {
+        let schedule = schedule(text);
+        let fire = next_fire(&schedule, after, &zone).unwrap();
+        assert_is_next(&schedule, &zone, after, fire);
+        assert_eq!(timestamp(fire), expected.parse::<Timestamp>().unwrap(), "{text}");
+    }
 }
 
 #[skuld::test]
