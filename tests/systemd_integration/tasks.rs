@@ -736,6 +736,26 @@ fn run_streams_journal_output_and_returns_the_exit_code(#[fixture(systemd_group)
     assert_eq!(String::from_utf8_lossy(&out), "out-line\nerr-line\n");
 }
 
+/// What a run shows is what the program wrote: a last line with no newline has none, and a line longer
+/// than journald's `LineMax` (which it stores in pieces) is one line again.
+#[skuld::test]
+fn run_shows_the_programs_own_line_ends(#[fixture(systemd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let task_id = id_of(&id);
+    let mgr = Systemd::new();
+    // One process writes it all (a second writer would end an unterminated line at its pid change): 60000
+    // bytes, past the default LineMax of 48K (49152), then a line with no newline at its end.
+    let script = r#"awk 'BEGIN { s = "x"; while (length(s) < 60000) s = s s; print substr(s, 1, 60000); printf "a\nlast" }'"#;
+    mgr.install(&task(&id, sh(script), None), false).expect("install");
+
+    let (exit, out) = run_task(&mgr, &task_id);
+
+    assert_eq!(exit, Exit::Code(0));
+    let expected = format!("{}\na\nlast", "x".repeat(60000));
+    assert_eq!(String::from_utf8_lossy(&out), expected);
+}
+
 /// Every line of a run that prints a great deal arrives, in order, run after run: the terminal entry
 /// comes before most of such a run's output, and the rest is read after it.
 #[skuld::test(labels = [JOURNALD_CONFIG], serial = JOURNALD_CONFIG)]

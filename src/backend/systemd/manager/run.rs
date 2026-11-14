@@ -503,12 +503,21 @@ fn rest(
     output::show(out, &text)
 }
 
-/// `entry`'s line, as the bytes the journal holds, if it has one: an entry with no `MESSAGE` adds
-/// nothing.
+/// `entry`'s line, as the bytes the journal holds, if it has one, ended as the program ended it: an
+/// entry has no newline of its own, and journald says in `_LINE_BREAK` where a line ended otherwise
+/// (knowledge base: "journald marks a stdout entry that did not end at a newline"). A last line with
+/// no newline (`eof`), a piece of a line cut at `LineMax` (`line-max`) and a line left unterminated
+/// when another process wrote next (`pid-change`) end with no byte; a line ended by a NUL byte
+/// (`nul`) ends with it; any other entry, with no field or one not known, ends with a newline. An
+/// entry with no `MESSAGE` adds nothing.
 fn push_line(into: &mut Vec<u8>, entry: &Entry) {
     if let Some(message) = entry.bytes("MESSAGE") {
         into.extend_from_slice(message);
-        into.push(b'\n');
+        match entry.get("_LINE_BREAK") {
+            Some("eof" | "line-max" | "pid-change") => {}
+            Some("nul") => into.push(0),
+            _ => into.push(b'\n'),
+        }
     }
 }
 

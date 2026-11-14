@@ -70,6 +70,17 @@ fn line(cursor: &str, stream: &str, text: &str) -> Entry {
     ])
 }
 
+/// A line of stream `stream` that did not end at a newline: journald's `_LINE_BREAK` says how it ended.
+fn broken(cursor: &str, stream: &str, text: &str, how: &str) -> Entry {
+    Entry::of(&[
+        ("MESSAGE", text),
+        ("__CURSOR", cursor),
+        ("_TRANSPORT", "stdout"),
+        ("_STREAM_ID", stream),
+        ("_LINE_BREAK", how),
+    ])
+}
+
 /// The first line of the run of invocation `inv`, which its `sh` wrapper prints: the first of its stream.
 fn marker(cursor: &str, stream: &str, inv: &str) -> Entry {
     line(cursor, stream, &format!("goetia-run {inv}"))
@@ -565,6 +576,61 @@ fn the_output_is_read_in_the_output_scope() {
         journal.scopes(),
         [("follow", Scope::Output), ("read_after", Scope::Output)]
     );
+}
+
+/// A line is written with the newline the program wrote and no other: a last line with none (`eof`),
+/// the pieces of a line cut at `LineMax` (`line-max`) and a line left unterminated when another
+/// process wrote next (`pid-change`) end where the program's text did, and a line ended by a NUL
+/// byte (`nul`) ends with it. No `_LINE_BREAK` is a newline, and so is one this does not know.
+#[skuld::test]
+fn output_ends_each_line_as_the_program_ended_it() {
+    for (what, breaks, expected) in [
+        ("none", vec![None, None], "one
+two
+"),
+        ("a last line with no newline", vec![None, Some("eof")], "one
+two"),
+        ("the pieces of a long line", vec![Some("line-max"), None], "onetwo
+"),
+        ("a line another process cut", vec![Some("pid-change"), None], "onetwo
+"),
+        ("a NUL", vec![Some("nul"), None], "one two
+"),
+        ("a break not known", vec![Some("future"), None], "one
+two
+"),
+    ] {
+        let at = |text, cursor, how: Option<&str>| match how {
+            Some(how) => broken(cursor, "s1", text, how),
+            None => line(cursor, "s1", text),
+        };
+        let journal = JournalFake::new(Vec::new())
+            .follows(vec![
+                marker("c2", "s1", "inv"),
+                at("one", "c3", breaks[0]),
+                at("two", "c4", breaks[1]),
+            ])
+            .then_reads(Vec::new());
+
+        let (result, out) = shown_after_the_end(&journal);
+
+        result.expect("the stream");
+        assert_eq!(String::from_utf8(out).unwrap(), expected, "{what}");
+    }
+}
+
+/// The lines read after the follower is stopped end as the live ones do.
+#[skuld::test]
+fn the_lines_read_after_the_end_keep_their_line_breaks() {
+    let journal = JournalFake::new(Vec::new())
+        .follows(vec![marker("c2", "s1", "inv")])
+        .then_reads(vec![line("c3", "s1", "head"), broken("c4", "s1", "tail", "eof")]);
+
+    let (result, out) = shown_after_the_end(&journal);
+
+    result.expect("the stream");
+    assert_eq!(String::from_utf8(out).unwrap(), "head
+tail");
 }
 
 #[skuld::test]
