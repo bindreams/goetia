@@ -1161,3 +1161,37 @@ fn enable_and_disable_finish_after_a_crash_on_a_real_launchd(#[fixture(launchd_g
     let status = task_status(&mgr, &task_id);
     assert!(status.common.enabled, "{status:?}");
 }
+
+// PROBE (temporary): what `launchctl kickstart` answers over a job with a process, and over an idle one.
+#[skuld::test]
+fn probe_kickstart_reply(#[fixture(launchd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let task_id = id_of(&id);
+    let mut held = Held::ignoring_sigterm();
+    let mgr = Launchd::new();
+    let _guard = Guard::install(&mgr, &task(&id, held.command.clone(), None));
+    mgr.start(&task_id, Budget::DEFAULT).expect("start");
+    held.wait_started();
+    let target = format!("system/{id}");
+    let mut report = String::new();
+    let mut note = |what: &str, run: cmd::Run| report.push_str(&format!("### {what}\n{run}\n"));
+    note(
+        "plain over a running job",
+        cmd::run("launchctl", &["kickstart", &target]),
+    );
+    note(
+        "-p over a running job",
+        cmd::run("launchctl", &["kickstart", "-p", &target]),
+    );
+    note("kill SIGTERM", cmd::run("launchctl", &["kill", "SIGTERM", &target]));
+    note("print after SIGTERM", cmd::run("launchctl", &["print", &target]));
+    note(
+        "plain over a SIGTERMed job",
+        cmd::run("launchctl", &["kickstart", &target]),
+    );
+    note("print after that", cmd::run("launchctl", &["print", &target]));
+    note("kill SIGKILL", cmd::run("launchctl", &["kill", "SIGKILL", &target]));
+    kill::until(|| task_status(&mgr, &task_id).common.state == State::Idle);
+    note("plain over an idle job", cmd::run("launchctl", &["kickstart", &target]));
+    panic!("PROBE RESULT\n{report}");
+}
