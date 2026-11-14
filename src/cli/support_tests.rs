@@ -1,7 +1,9 @@
 use super::{
     UndeterminedEntry, print_undetermined_warnings, print_unusable_warnings, print_warnings, require_elevation,
+    state_str,
 };
 use crate::error::Reason;
+use crate::manager::State;
 use crate::spec::{Id, Warning};
 
 fn rendered(id: Option<Id>) -> String {
@@ -136,4 +138,9 @@ fn a_reason_wrapping_a_command_error_keeps_the_stderr_layout_of_the_report() {
             "warning: x: installed but unusable: {report}\nwarning: y: installation state could not be determined: {report}\nwarning: {report}\n"
         )
     );
+}
+
+#[skuld::test]
+fn state_str_idle_is_idle() {
+    assert_eq!(state_str(State::Idle), "idle");
 }

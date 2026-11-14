@@ -599,7 +599,7 @@ fn still_present(target: &Path) -> Result<bool> {
 fn not_started(id: &Id, state: State, keep_alive: bool) -> Error {
     match state {
         State::Unknown => Error::StartUnconfirmed { id: id.to_string() },
-        State::Stopped | State::Failed | State::Running => Error::NotStarted {
+        State::Stopped | State::Failed | State::Running | State::Idle => Error::NotStarted {
             id: id.to_string(),
             keep_alive,
         },

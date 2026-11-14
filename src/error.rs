@@ -482,6 +482,30 @@ pub enum Error {
     #[error("daemon `{id}` is not running: there is no process to kill")]
     NotRunning { id: String },
 
+    /// `run` was given a service: only a task has runs.
+    #[error("`{id}` is a service, not a task: `run` applies only to a task")]
+    NotATask { id: String },
+
+    /// `run` found the task running: it starts only an idle one, so as not to join or restart a run
+    /// someone else began.
+    #[error("`{id}` is already running: `run` needs an idle task (`goetia daemon stop {id}` ends the run in flight)")]
+    AlreadyRunning { id: String },
+
+    /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
+    /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
+    #[error("the manager does not say whether `{id}` is running, so `run` did not start it")]
+    RunStateUnknown { id: String },
+
+    /// The manager ended the start before any run began, so the task did not run. `reason` is the
+    /// manager's. Not indeterminate: goetia established that nothing ran.
+    #[error("`{id}` did not run: {reason}")]
+    RunNotStarted { id: String, reason: String },
+
+    /// A run began and ended, and its exit status was not recorded where goetia reads it. Exit `4`
+    /// (indeterminate): the run happened, so repeating `run` repeats it.
+    #[error("the run of `{id}` ended without recording its exit status: {reason}")]
+    RunUnrecorded { id: String, reason: String },
+
     /// Steps goetia issued whose outcome nobody established. Produced only
     /// by `cli::restart` under a budget that does not wait, on a manager with
     /// no request-only restart (launchd, SCM), where the stop was issued
@@ -670,7 +694,9 @@ impl Error {
             | Error::LoadedJobInDoubt { .. }
             | Error::LoadedStateInDoubt { .. }
             | Error::StaleJobBootedOut { .. }
-            | Error::StartUnconfirmed { .. } => true,
+            | Error::StartUnconfirmed { .. }
+            | Error::RunStateUnknown { .. }
+            | Error::RunUnrecorded { .. } => true,
             wrapper!(source) | Error::ServiceImageUnreadable { source, .. } => source.is_indeterminate(),
             Error::Kept(kept) => kept.is_indeterminate(),
             Error::Both { first, then } => first.is_indeterminate() && then.is_indeterminate(),
@@ -709,6 +735,9 @@ impl Error {
             | Error::NotInstalled { .. }
             | Error::Foreign { .. }
             | Error::NotRunning { .. }
+            | Error::NotATask { .. }
+            | Error::AlreadyRunning { .. }
+            | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
             | Error::UnsupportedPlatform { .. }
@@ -893,6 +922,11 @@ impl Error {
             | Error::Undetermined { .. }
             | Error::WaitTimeout { .. }
             | Error::NotRunning { .. }
+            | Error::NotATask { .. }
+            | Error::AlreadyRunning { .. }
+            | Error::RunStateUnknown { .. }
+            | Error::RunNotStarted { .. }
+            | Error::RunUnrecorded { .. }
             | Error::Unestablished { .. }
             | Error::RequestInDoubt { .. }
             | Error::LoadedJobInDoubt { .. }

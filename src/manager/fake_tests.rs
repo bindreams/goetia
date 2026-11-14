@@ -1,11 +1,12 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use super::*;
 use crate::manager::Budget;
 use crate::manager::conformance;
+use crate::manager::{Exit, TaskStatus};
 use crate::spec::test_support::program;
 use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
-use crate::testing::{base_fields, service_fields};
+use crate::testing::{base_fields, service_fields, task};
 
 // Fixtures ============================================================================================================
 
@@ -883,4 +884,89 @@ fn a_verb_on_a_snapshot_that_went_stale_refuses_and_performs_nothing() {
             }
         }
     }
+}
+
+// Tasks ===============================================================================================================
+
+fn a_task(id: &str) -> DaemonSpec {
+    task(id, vec![crate::spec::test_support::program("job")], Some("0 3 * * *"))
+}
+
+fn task_status(fake: &Fake, id: &str) -> TaskStatus {
+    match fake.status(&Id::try_from(id).unwrap()).unwrap() {
+        Status::Task(status) => status,
+        other => panic!("a task reports a task status, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+fn a_task_installs_idle_and_reports_a_task_status() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    let status = task_status(&fake, "nightly");
+    assert_eq!(
+        status.common.state,
+        State::Idle,
+        "an installed task is idle, not stopped"
+    );
+    assert_eq!(status.common.pid, None);
+    assert!(!status.common.enabled);
+    assert_eq!(
+        (status.last_result, status.last_run, status.next_run),
+        (None, None, None)
+    );
+
+    fake.enable(&Id::try_from("nightly").unwrap()).unwrap();
+    assert!(task_status(&fake, "nightly").common.enabled);
+}
+
+#[skuld::test]
+fn a_task_start_then_stop_goes_running_then_idle() {
+    let fake = Fake::new();
+    let id = Id::try_from("nightly").unwrap();
+    fake.install(&a_task("nightly"), false).unwrap();
+
+    fake.start(&id, Budget::DEFAULT).unwrap();
+    let running = task_status(&fake, "nightly");
+    assert_eq!(running.common.state, State::Running);
+    assert!(running.common.pid.is_some(), "a running task has a pid");
+
+    fake.stop(&id, Budget::DEFAULT).unwrap();
+    let idle = task_status(&fake, "nightly");
+    assert_eq!(
+        idle.common.state,
+        State::Idle,
+        "stopping a task ends its run and leaves it idle"
+    );
+    assert_eq!(idle.common.pid, None);
+}
+
+#[skuld::test]
+fn seeded_task_fields_are_reported() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let next = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+    fake.seed_task_status("nightly", Some(Exit::Signal(15)), Some(last), Some(next));
+
+    let status = task_status(&fake, "nightly");
+    assert_eq!(status.last_result, Some(Exit::Signal(15)));
+    assert_eq!(status.last_run, Some(last));
+    assert_eq!(status.next_run, Some(next));
+}
+
+#[skuld::test]
+fn list_reports_a_task_with_a_task_status() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_task_status("nightly", Some(Exit::Code(0)), None, None);
+
+    let listed = fake.list().unwrap();
+    let [Installed::Ours { spec, status }] = listed.as_slice() else {
+        panic!("one installed task is listed as ours: {listed:?}");
+    };
+    assert_eq!(spec.kind(), crate::spec::DaemonKind::Task);
+    assert_eq!(status, &Status::Task(task_status(&fake, "nightly")));
+    assert_eq!(task_status(&fake, "nightly").last_result, Some(Exit::Code(0)));
 }

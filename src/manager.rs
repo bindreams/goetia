@@ -17,6 +17,8 @@ pub(crate) mod flow;
 
 pub use budget::Budget;
 
+use std::time::SystemTime;
+
 use crate::error::{Error, Reason, Result};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
@@ -63,7 +65,7 @@ pub trait ServiceManager {
     fn uninstall(&self, id: &Id) -> Result<()>;
 
     /// Enable the service at boot. Does not start it. `Err(NotInstalled)` if
-    /// `id` is not managed by Goetia.
+    /// `id` is not managed by Goetia. A task's `enable` arms its schedule.
     fn enable(&self, id: &Id) -> Result<()>;
 
     /// Disable the service at boot. Does not stop it if running.
@@ -115,6 +117,9 @@ pub trait ServiceManager {
     ///
     /// Idempotent under every budget: starting an already-running service is
     /// `Ok(())`, not an error.
+    ///
+    /// **A task's start requests a run and returns once the manager has accepted it:** `budget` is
+    /// not read, and `Ok(())` says nothing of the run.
     ///
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     /// [`Error::Undetermined`]: crate::Error::Undetermined
@@ -170,6 +175,9 @@ pub trait ServiceManager {
     /// does not wait (`Immediate`, a zero bound) does not bound that wait; a
     /// `start` waits for a job still going away before it loads it. See the
     /// README's "Waiting for a start or stop".
+    ///
+    /// **A task's stop ends the run in flight and leaves its schedule armed;** the task is then
+    /// [`State::Idle`].
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never
@@ -376,6 +384,7 @@ impl Installed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Service(DaemonStatus),
+    Task(TaskStatus),
 }
 
 impl Status {
@@ -383,6 +392,7 @@ impl Status {
     pub fn common(&self) -> &DaemonStatus {
         match self {
             Status::Service(status) => status,
+            Status::Task(status) => &status.common,
         }
     }
 
@@ -390,8 +400,30 @@ impl Status {
     pub fn kind(&self) -> DaemonKind {
         match self {
             Status::Service(_) => DaemonKind::Service,
+            Status::Task(_) => DaemonKind::Task,
         }
     }
+}
+
+/// How a task's run ended: the code the program exited with, or the signal that killed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Code(i32),
+    Signal(i32),
+}
+
+/// A task's status: the common fields, and what the manager knows of its runs. A field the
+/// manager cannot say is `None`: no run yet, a run still in flight, or a manager that does not keep
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskStatus {
+    pub common: DaemonStatus,
+    /// How the most recent finished run ended.
+    pub last_result: Option<Exit>,
+    /// When the most recent run started.
+    pub last_run: Option<SystemTime>,
+    /// When the manager will start the task next; `None` for a task with no schedule armed.
+    pub next_run: Option<SystemTime>,
 }
 
 /// The status fields every kind of daemon reports.
@@ -412,10 +444,12 @@ pub struct DaemonStatus {
     pub enabled: bool,
 }
 
-/// A service's run state, as the platform's manager reports it.
+/// A daemon's run state, as the platform's manager reports it. A service is never `Idle` and a
+/// task is never `Stopped`: a task between runs is `Idle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Running,
+    Idle,
     Stopped,
     Failed,
     Unknown,

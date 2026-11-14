@@ -170,6 +170,7 @@ pub(crate) fn print_undetermined_warnings(undetermined: &[UndeterminedEntry], er
 pub(crate) fn state_str(state: State) -> &'static str {
     match state {
         State::Running => "running",
+        State::Idle => "idle",
         State::Stopped => "stopped",
         State::Failed => "failed",
         State::Unknown => "unknown",

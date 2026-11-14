@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::backend::{
     Decoded, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
@@ -18,8 +18,8 @@ use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Reason, Result};
 use crate::manager::budget;
 use crate::manager::flow;
-use crate::manager::{Budget, DaemonStatus, Installed, ServiceManager, State, Status, Step};
-use crate::spec::{DaemonFields, DaemonSpec, Id, ServiceFields, ServiceSpec, User};
+use crate::manager::{Budget, DaemonStatus, Exit, Installed, ServiceManager, State, Status, Step, TaskStatus};
+use crate::spec::{DaemonFields, DaemonKind, DaemonSpec, Id, ServiceFields, ServiceSpec, User};
 
 /// The fake's own artifact marker, deliberately not any real backend's
 /// `Marker`/`Schema`/`Version`/`Spec` field names: no real manager reads it.
@@ -56,6 +56,19 @@ impl Artifact {
     fn new(id: Id, blob: Decoded, entry: Entry) -> Self {
         Self { id, blob, entry }
     }
+
+    /// The kind of the artifact's spec. An undecodable blob is read as a service.
+    fn kind(&self) -> DaemonKind {
+        self.blob.as_ref().map_or(DaemonKind::Service, |blob| blob.spec.kind())
+    }
+}
+
+/// The state of an entry that is not running: a task is idle between runs, a service stopped.
+fn at_rest(kind: DaemonKind) -> State {
+    match kind {
+        DaemonKind::Task => State::Idle,
+        DaemonKind::Service => State::Stopped,
+    }
 }
 
 impl InstalledService for Artifact {
@@ -77,6 +90,16 @@ pub(crate) struct Entry {
     /// Not just running/stopped: [`Fake::seed_state`] forces `Failed` and
     /// `Unknown`, which no install/start/stop sequence produces.
     state: State,
+    /// What a task reports of its runs — see [`Fake::seed_task_status`].
+    runs: Runs,
+}
+
+/// What the manager knows of a task's runs, as [`TaskStatus`] carries it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Runs {
+    last_result: Option<Exit>,
+    last_run: Option<SystemTime>,
+    next_run: Option<SystemTime>,
 }
 
 /// A seeded failure: made afresh at each use, since an [`Error`] cannot be cloned.
@@ -230,6 +253,7 @@ impl Fake {
                 text: text.into(),
                 enabled: false,
                 state: State::Stopped,
+                runs: Runs::default(),
             },
         );
     }
@@ -569,6 +593,28 @@ impl Fake {
             .unwrap_or_else(|| panic!("seed_state({id}, ..): not installed"));
         entry.state = new_state;
     }
+
+    /// Test-only: force the run history `status` and `list` report for the installed task `id`:
+    /// how its last run ended, when that run started, and when the schedule next fires. A task
+    /// installs with none of them (`None`). `id` must already be installed.
+    pub fn seed_task_status(
+        &self,
+        id: &str,
+        last_result: Option<Exit>,
+        last_run: Option<SystemTime>,
+        next_run: Option<SystemTime>,
+    ) {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        let entry = state
+            .entries
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("seed_task_status({id}, ..): not installed"));
+        entry.runs = Runs {
+            last_result,
+            last_run,
+            next_run,
+        };
+    }
 }
 
 // generate/extract ====================================================================================================
@@ -791,6 +837,7 @@ impl crate::backend::Backend for Fake {
                     text,
                     enabled: false,
                     state: State::Stopped,
+                    runs: Runs::default(),
                 },
             );
         }
@@ -805,13 +852,23 @@ impl crate::backend::Backend for Fake {
         if current.map(|e| &e.text) != snapshot.map(|s| &s.entry.text) {
             return Ok(WriteOutcome::Raced);
         }
-        let (enabled, run_state) = current.map(|e| (e.enabled, e.state)).unwrap_or((false, State::Stopped));
+        let (enabled, run_state, runs) =
+            current
+                .map(|e| (e.enabled, e.state, e.runs))
+                .unwrap_or((false, State::Stopped, Runs::default()));
+        // A run in flight survives an update; a daemon at rest rests as its new kind does.
+        let run_state = if matches!(run_state, State::Idle | State::Stopped) {
+            at_rest(spec.kind())
+        } else {
+            run_state
+        };
         state.entries.insert(
             spec.common().id.as_str().to_string(),
             Entry {
                 text: definition.clone(),
                 enabled,
                 state: run_state,
+                runs,
             },
         );
         Ok(WriteOutcome::Done)
@@ -829,11 +886,22 @@ impl crate::backend::Backend for Fake {
                 id: id.as_str().to_string(),
             });
         }
-        Ok(Status::Service(DaemonStatus {
+        let common = DaemonStatus {
             state: snapshot.entry.state,
             pid: pid_for(snapshot.entry.state),
             enabled: snapshot.entry.enabled,
-        }))
+        };
+        Ok(if snapshot.kind() == DaemonKind::Task {
+            let runs = snapshot.entry.runs;
+            Status::Task(TaskStatus {
+                common,
+                last_result: runs.last_result,
+                last_run: runs.last_run,
+                next_run: runs.next_run,
+            })
+        } else {
+            Status::Service(common)
+        })
     }
 
     /// Aggregates first, then the opaque ids last-to-first: `ServiceManager::list` promises no
@@ -952,13 +1020,15 @@ impl crate::backend::Backend for Fake {
         // Request-only settles nothing, as for `start`: the Fake models the
         // contract's minimum, not launchd's blocking `bootout`.
         if budget.waits() {
-            entry.state = State::Stopped;
+            entry.state = at_rest(snapshot.kind());
         }
         Ok(())
     }
 
-    /// A running entry becomes [`State::Failed`], with no pid: the Fake models the kill and nothing
-    /// of the restart policy that follows it. Any other state has no process to end.
+    /// A running service becomes [`State::Failed`], with no pid: the Fake models the kill and
+    /// nothing of the restart policy that follows it. A running task goes back to [`State::Idle`]
+    /// with `last_result` `Signal(9)`, as a killed run is a result, not a state. Any other state has
+    /// no process to end.
     fn kill(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
@@ -969,7 +1039,12 @@ impl crate::backend::Backend for Fake {
                 id: id.as_str().to_string(),
             });
         }
-        entry.state = State::Failed;
+        if snapshot.kind() == DaemonKind::Task {
+            entry.state = State::Idle;
+            entry.runs.last_result = Some(Exit::Signal(9));
+        } else {
+            entry.state = State::Failed;
+        }
         Ok(())
     }
 }
