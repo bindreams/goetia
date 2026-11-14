@@ -13,7 +13,7 @@ use super::super::{
 use super::*;
 use crate::backend::bounded;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
-use crate::backend::{Backend as _, InstalledService as _};
+use crate::backend::InstalledService as _;
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::manager::Step;
 use crate::spec::{TaskSpec, User};
