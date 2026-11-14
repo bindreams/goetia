@@ -34,6 +34,15 @@ fn a_name_made_from_text_has_no_terminator() {
     assert_eq!(usize::from(counted(&name).Length), "Sub".len() * 2);
 }
 
+/// A name read back from a key keeps every unit, a NUL or a lone surrogate included: the stray
+/// sweep deletes what it enumerated by this name.
+#[skuld::test]
+fn a_name_made_from_units_keeps_every_unit() {
+    let units = vec![0x61, 0, 0xD800];
+
+    assert_eq!(Name::from_units(&units[..]).units(), units);
+}
+
 #[skuld::test]
 fn a_status_reads_as_the_os_error_it_maps_to() {
     assert_eq!(os_error(STATUS_OBJECT_NAME_NOT_FOUND).kind(), ErrorKind::NotFound);
