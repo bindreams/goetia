@@ -961,6 +961,15 @@ impl crate::backend::Backend for Fake {
         })
     }
 
+    /// Recorded as `task_state`. The state alone, as the systemd backend reads it: a seeded failure
+    /// of the whole `live_status` is not this read's.
+    fn task_state(&self, snapshot: &Artifact) -> Result<State> {
+        let mut state = self.state.lock().expect("Fake mutex poisoned");
+        state.manager()?;
+        state.calls.push(("task_state", snapshot.id().as_str().to_string()));
+        Ok(snapshot.entry.state)
+    }
+
     /// Aggregates first, then the opaque ids last-to-first: `ServiceManager::list` promises no
     /// ordering at all, so a caller that renders this order instead of imposing its own must fail
     /// a test rather than pass by luck. An opaque id is never classified from the entry its failed

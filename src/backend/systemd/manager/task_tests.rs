@@ -1532,6 +1532,23 @@ fn a_task_status_with_an_unreadable_journal_is_the_error() {
     );
 }
 
+/// The state `run` checks before it requests a run is the job's alone: an unreadable journal, which
+/// refuses a task's whole status, does not refuse a run.
+#[skuld::test]
+fn a_tasks_state_is_read_from_the_job_alone() {
+    let spec = task_spec("x", "/bin/a", Some("30 3 * * *"));
+    let systemctl = Fake::new([show("inactive", 0)]);
+    let mgr = manager(&systemctl, Fake::new([]), JournalFake::unreadable());
+
+    let state = Backend::task_state(&mgr, &fragment(&spec)).expect("the job's state");
+
+    assert_eq!(state, State::Idle);
+    assert_eq!(
+        systemctl.calls(),
+        [call(&["show", "--property", "ActiveState,MainPID,LoadState", "--", "x.service"])]
+    );
+}
+
 /// A service's status is the one it always had.
 #[skuld::test]
 fn a_service_status_is_read_from_its_unit_alone() {

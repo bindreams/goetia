@@ -338,7 +338,7 @@ pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exi
     if blob.spec.kind() != DaemonKind::Task {
         return Err(Error::NotATask { id: id.to_string() });
     }
-    match b.live_status(&snapshot)?.common().state {
+    match b.task_state(&snapshot)? {
         State::Idle => {}
         State::Running => return Err(Error::AlreadyRunning { id: id.to_string() }),
         State::Stopped | State::Failed | State::Unknown => return Err(Error::RunStateUnknown { id: id.to_string() }),

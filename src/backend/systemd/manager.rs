@@ -95,7 +95,7 @@ use crate::backend::{
 };
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
-use crate::manager::{Budget, Installed, Status, Step, flow};
+use crate::manager::{Budget, Installed, State, Status, Step, flow};
 use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, User};
 
 /// Where systemd looks for system unit files. Never overridden — the integration tests run for real
@@ -212,6 +212,12 @@ impl Backend for Systemd {
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
         // A read: it draws nothing and asks no gate.
         self.status_of(snapshot)
+    }
+
+    /// The job's `ActiveState` alone: no journal walk, timer or bus read.
+    fn task_state(&self, snapshot: &Fragment) -> Result<State> {
+        let unit = unit_name(snapshot.id().as_str(), UnitKind::Service);
+        Ok(self.systemctl.task_state(&unit)?.0)
     }
 
     /// Each id the unit directories name, read as `read` would. An id whose read did not complete

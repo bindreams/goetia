@@ -1119,6 +1119,22 @@ fn run_of_an_unknown_state_is_refused() {
     assert!(!began_a_run(&fake));
 }
 
+/// `run` needs the task's state and nothing else `status` reads: a read that fails for another part of
+/// the status (its last run, its timer) must not refuse a run.
+#[skuld::test]
+fn run_reads_the_tasks_state_and_not_its_whole_status() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_live_status_fails("nightly", || Error::NotRunning {
+        id: "nightly".to_string(),
+    });
+
+    let (result, _) = run_of(&fake, "nightly");
+
+    assert_eq!(result.expect("the task is idle"), crate::manager::Exit::Code(0));
+    assert!(fake.calls().contains(&("task_state", "nightly".to_string())));
+}
+
 #[skuld::test]
 fn run_of_an_idle_task_follows_the_run_it_began() {
     let fake = Fake::new();

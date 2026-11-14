@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::blob::Blob;
 use crate::decide::ExternalConfig;
 use crate::error::{Error, Result};
-use crate::manager::{Budget, Exit, Installed, Sequence, ServiceManager, Status, Step, flow};
+use crate::manager::{Budget, Exit, Installed, Sequence, ServiceManager, State, Status, Step, flow};
 use crate::spec::{DaemonSpec, Id};
 
 /// A marked artifact's metadata as `read` decoded it, or the failure kept in its place. Shared, so
@@ -122,6 +122,13 @@ pub(crate) trait Backend {
     /// The live state of a service `read` found marked. `Error::NotInstalled` where the query
     /// completed and found the service gone, which `list` omits; never for one that is present.
     fn live_status(&self, snapshot: &Self::Snapshot) -> Result<Status>;
+
+    /// The run state of the task `snapshot` is: all [`flow::run`] reads before it requests a run, so
+    /// that a part of the status that is unreadable (a task's last run, its timer) cannot refuse a
+    /// run. The default is the state `live_status` reads, for a backend whose status is no more.
+    fn task_state(&self, snapshot: &Self::Snapshot) -> Result<State> {
+        Ok(self.live_status(snapshot)?.common().state)
+    }
 
     /// Every id this backend can enumerate, as `read` would classify it, and what the enumeration
     /// itself reports (ids it could not read, a scan that stopped early).
