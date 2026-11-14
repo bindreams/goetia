@@ -14,7 +14,6 @@ use windows_sys::Win32::Security::{
 
 use super::{DebugPrivilege, enable_in, restore_notice};
 use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
-use crate::testing::elevation::ELEVATED;
 use crate::testing::groups::{DEBUG_PRIVILEGE, need, process_var, require_enabled};
 
 fn debug_privilege_tests_on() -> Result<(), String> {
@@ -22,9 +21,8 @@ fn debug_privilege_tests_on() -> Result<(), String> {
 }
 
 /// Fixture of the tests that need a token holding `SeDebugPrivilege` (an elevated administrator's):
-/// they fail without one, and `GOETIA_TEST_DEBUG_PRIVILEGE=0` ignores them. They carry the
-/// [`ELEVATED`] label.
-#[skuld::fixture(requires = [debug_privilege_tests_on], labels = [ELEVATED])]
+/// they fail without one, and `GOETIA_TEST_DEBUG_PRIVILEGE=0` ignores them.
+#[skuld::fixture(requires = [debug_privilege_tests_on])]
 fn debug_privilege() -> Result<(), String> {
     need(
         DEBUG_PRIVILEGE,
@@ -36,8 +34,11 @@ fn debug_privilege() -> Result<(), String> {
 
 /// Whether the process token holds `SeDebugPrivilege`, enabled or not; `Err` if the probe fails.
 fn holds_debug_privilege() -> Result<bool, String> {
-    let copy = process_token_copy(TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY);
-    enable_in(copy.as_raw_handle()).map_err(|e| format!("could not probe the token for SeDebugPrivilege: {e}"))
+    let probe = || {
+        let copy = process_token_copy(TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY)?;
+        enable_in(copy.as_raw_handle())
+    };
+    probe().map_err(|e| format!("could not probe the token for SeDebugPrivilege: {e}"))
 }
 
 /// The calling thread's own token, if it has one, opened to be queried.
@@ -137,7 +138,8 @@ fn the_thread_has_the_privilege_enabled_exactly_while_the_guard_lives(#[fixture(
 /// token back, not the process's and not none.
 #[skuld::test]
 fn dropping_puts_back_the_thread_token_that_was_there(#[fixture(debug_privilege)] _held: &()) {
-    let prior = process_token_copy(TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE);
+    let prior =
+        process_token_copy(TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE).expect("a copy of the process token");
     let _reset = ThreadTokenReset::impersonate(&prior);
     let prior_id = token_id(prior.as_raw_handle());
     assert_eq!(thread_token_id(), Some(prior_id));

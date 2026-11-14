@@ -45,7 +45,8 @@ const LAUNCHD: Spec = Spec {
     what: "write plists under /Library/LaunchDaemons and bootstrap, kickstart and boot out real launchd jobs as root",
 };
 
-/// Reads a test variable (a group's, its consent's, or a [`need`] switch): `Ok(None)` if unset, `Ok(Some(flag))` for `1`/`0`, `Err` naming the variable and value otherwise.
+/// Reads a test variable (a group's, its consent's, or a [`need`] switch): `Ok(None)` if unset,
+/// `Ok(Some(flag))` for `1`/`0`, `Err` naming the variable and value otherwise.
 fn switch(name: &str, var: &impl Fn(&str) -> Option<String>) -> Result<Option<bool>, String> {
     match var(name).as_deref() {
         None => Ok(None),
@@ -94,11 +95,16 @@ pub(crate) fn check_group(group_var: &str, var: impl Fn(&str) -> Option<String>)
     ))
 }
 
-/// A group's `requires`: `Err` only when `group_var` is `0`. An invalid value is left to fail the
-/// test at setup, not skip it.
-pub(crate) fn require_enabled(group_var: &str, var: impl Fn(&str) -> Option<String>) -> Result<(), String> {
-    match switch(group_var, &var) {
-        Ok(Some(false)) => Err(format!("{group_var}=0")),
+/// What a test behind the switch `var` fails or refuses with when `var` is `0`.
+fn switched_off(var: &str) -> String {
+    format!("{var}=0")
+}
+
+/// The `requires` of a test behind a switch variable (a group's, or [`DEBUG_PRIVILEGE`]): `Err` only
+/// when `switch_var` is `0`. An invalid value is left to fail the test at setup, not skip it.
+pub(crate) fn require_enabled(switch_var: &str, var: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    match switch(switch_var, &var) {
+        Ok(Some(false)) => Err(switched_off(switch_var)),
         _ => Ok(()),
     }
 }
@@ -129,17 +135,17 @@ pub(crate) fn enter(
 /// failed. The test runs unless the switch is `0`, and fails where the host lacks the dependency
 /// (`missing` says what is missing and how to provide it) or the probe fails, naming the switch in
 /// both: it never skips on a missing dependency. No consent: such a test changes no system state.
-// Only unit tests call it: the Windows privilege tests and its own.
-#[cfg_attr(not(test), allow(dead_code, reason = "only unit tests call it"))]
+#[cfg(test)]
 pub(crate) fn need(
     switch_var: &str,
     var: impl Fn(&str) -> Option<String>,
     missing: &str,
     holds: impl FnOnce() -> Result<bool, String>,
 ) -> Result<(), String> {
-    switch(switch_var, &var)?;
     // As in `enter`: skuld runs the body of an ignored test under `--run-ignored only`.
-    require_enabled(switch_var, &var)?;
+    if switch(switch_var, &var)? == Some(false) {
+        return Err(switched_off(switch_var));
+    }
     match holds() {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!("{missing}; or set {switch_var}=0 to opt out")),
