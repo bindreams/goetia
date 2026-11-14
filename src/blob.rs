@@ -45,9 +45,9 @@ use crate::spec::{
 
 /// The envelope shape `encode`/`decode` agree on. Bumped only when the
 /// JSON structure itself changes for blobs already written, never for a
-/// change in generator output — that is what `version` is for. An additive
-/// variant that leaves existing blobs' structure unchanged (the task
-/// variant) does not bump it, so installed blobs stay readable.
+/// change in generator output — that is what `version` is for. Adding a
+/// member to an existing variant bumps it; adding a variant that leaves
+/// existing blobs unchanged does not, so installed blobs stay readable.
 pub const SCHEMA: u32 = 1;
 
 /// The literal value every generated artifact's marker carries, byte-exact
@@ -88,7 +88,8 @@ pub fn decode(encoded: &str) -> Result<Blob, Error> {
     let bytes = BASE64
         .decode(encoded)
         .map_err(|source| Error::blob_from("invalid base64", source))?;
-    let envelope: WireEnvelope =
+    // The schema is read before the spec: a later schema may carry members this build refuses.
+    let envelope: RawEnvelope =
         serde_json::from_slice(&bytes).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
 
     if envelope.schema != SCHEMA {
@@ -99,7 +100,9 @@ pub fn decode(encoded: &str) -> Result<Blob, Error> {
         )));
     }
 
-    let spec = daemon_spec_from_wire(envelope.spec)?;
+    let wire: WireDaemon =
+        serde_json::from_value(envelope.spec).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
+    let spec = daemon_spec_from_wire(wire)?;
 
     Ok(Blob {
         schema: envelope.schema,
@@ -147,12 +150,23 @@ fn canonicalize(value: Value) -> Value {
 // future rename of a `DaemonSpec` Rust field cannot silently change every
 // already-written artifact's bytes.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 struct WireEnvelope {
     #[serde(rename = "schema")]
     schema: u32,
     #[serde(rename = "spec")]
     spec: WireDaemon,
+    #[serde(rename = "version")]
+    version: String,
+}
+
+/// `WireEnvelope` as `decode` first reads it, the spec not yet interpreted.
+#[derive(Deserialize)]
+struct RawEnvelope {
+    #[serde(rename = "schema")]
+    schema: u32,
+    #[serde(rename = "spec")]
+    spec: Value,
     #[serde(rename = "version")]
     version: String,
 }
@@ -205,7 +219,8 @@ struct WireTask {
     #[serde(rename = "type")]
     kind: WireTaskType,
     #[serde(rename = "schedule")]
-    schedule: Option<WireSchedule>,
+    // Boxed: keeps `WireDaemon`'s variants close in size.
+    schedule: Option<Box<WireSchedule>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -241,6 +256,9 @@ struct WireCronField {
     values: Vec<u8>,
     #[serde(rename = "restricted")]
     restricted: bool,
+    /// What `H` resolved this field by; absent for a field with no `H` term.
+    #[serde(rename = "hash", default, skip_serializing_if = "Option::is_none")]
+    hash: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,14 +359,19 @@ impl From<&TaskSpec> for WireTask {
             user: WireUser::from(&t.common.user),
             logs: t.common.logs.as_ref().map(|p| p.to_string_lossy().into_owned()),
             kind: WireTaskType::Task,
-            schedule: t.schedule.as_ref().map(WireSchedule::from),
+            schedule: t
+                .schedule
+                .as_ref()
+                .map(|schedule| Box::new(WireSchedule::from(schedule))),
         }
     }
 }
 
 impl From<&Schedule> for WireSchedule {
     fn from(schedule: &Schedule) -> Self {
-        let [minute, hour, day_of_month, month, day_of_week] = schedule.fields().each_ref().map(WireCronField::from);
+        let hashes = schedule.hashes();
+        let [minute, hour, day_of_month, month, day_of_week] =
+            std::array::from_fn(|i| WireCronField::new(&schedule.fields()[i], hashes[i]));
         WireSchedule {
             text: schedule.text().to_owned(),
             minute,
@@ -360,21 +383,21 @@ impl From<&Schedule> for WireSchedule {
     }
 }
 
-impl From<&CronField> for WireCronField {
-    fn from(field: &CronField) -> Self {
+impl WireCronField {
+    fn new(field: &CronField, hash: Option<u64>) -> Self {
         WireCronField {
             values: field.values.iter().copied().collect(),
             restricted: field.restricted,
+            hash,
         }
     }
-}
 
-impl From<WireCronField> for CronField {
-    fn from(field: WireCronField) -> Self {
-        CronField {
-            values: field.values.into_iter().collect(),
-            restricted: field.restricted,
-        }
+    fn into_stored(self) -> (CronField, Option<u64>) {
+        let field = CronField {
+            values: self.values.into_iter().collect(),
+            restricted: self.restricted,
+        };
+        (field, self.hash)
     }
 }
 
@@ -486,8 +509,8 @@ fn task_from_wire(wire: WireTask) -> Result<TaskSpec, Error> {
                 day_of_month,
                 month,
                 day_of_week,
-            } = schedule;
-            let fields = [minute, hour, day_of_month, month, day_of_week].map(CronField::from);
+            } = *schedule;
+            let fields = [minute, hour, day_of_month, month, day_of_week].map(WireCronField::into_stored);
             Schedule::from_parts(&id, text, fields)
         })
         .transpose()?;

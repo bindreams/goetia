@@ -130,7 +130,6 @@ fn refuses_each_unsupported_form_naming_its_field() {
         (0, "H/0"),
         (0, "H(1-5)/0"),
         // empty list terms
-        (0, ""),
         (0, "1,,2"),
         (0, "1,"),
         (0, ",1"),
@@ -351,17 +350,29 @@ const ROUND_TRIP_LINES: &[&str] = &[
     "H(10-12)/20 * * * *",
 ];
 
+/// The stored form of `schedule`: each field with its hash.
+fn parts(schedule: &Schedule) -> [(CronField, Option<u64>); 5] {
+    std::array::from_fn(|i| (schedule.fields()[i].clone(), schedule.hashes()[i]))
+}
+
 #[skuld::test]
 fn from_parts_round_trips_parse() {
     for host in [HOST, "other"] {
         for daemon in ["nightly", "backup", "a", "x.y_z-1"] {
             for text in ROUND_TRIP_LINES {
                 let parsed = parse_for(daemon, host, text).unwrap();
-                let rebuilt = Schedule::from_parts(&id(daemon), parsed.text().to_owned(), parsed.fields().clone());
+                let rebuilt = Schedule::from_parts(&id(daemon), parsed.text().to_owned(), parts(&parsed));
                 assert_eq!(rebuilt.unwrap_or_else(|e| panic!("{text:?}: {e}")), parsed);
             }
         }
     }
+}
+
+#[skuld::test]
+fn only_h_fields_carry_a_hash() {
+    let parsed = parse("H 3 H(1-5),7 * 1");
+    let hashed: Vec<bool> = parsed.hashes().iter().map(Option::is_some).collect();
+    assert_eq!(hashed, [true, false, true, false, false]);
 }
 
 fn field(values: &[u8], restricted: bool) -> CronField {
@@ -371,134 +382,123 @@ fn field(values: &[u8], restricted: bool) -> CronField {
     }
 }
 
-/// `text` as parsed for `nightly` on `build-host`, with field `index` swapped for `replacement`,
-/// then handed to `from_parts`.
-fn rebuild(text: &str, index: usize, replacement: CronField) -> Result<Schedule, Error> {
-    let mut fields = parse(text).fields().clone();
-    fields[index] = replacement;
-    Schedule::from_parts(&id("nightly"), text.to_owned(), fields)
+/// `text` as parsed for `nightly` on `build-host`, with field `index` swapped for `replacement`
+/// and `hash`, then handed to `from_parts`.
+fn rebuild(text: &str, index: usize, replacement: CronField, hash: Option<u64>) -> Result<Schedule, Error> {
+    let mut stored = parts(&parse(text));
+    stored[index] = (replacement, hash);
+    Schedule::from_parts(&id("nightly"), text.to_owned(), stored)
+}
+
+/// The hash `parse` stored for field `index` of `text`.
+fn stored_hash(text: &str, index: usize) -> Option<u64> {
+    parse(text).hashes()[index]
 }
 
 #[skuld::test]
-fn from_parts_refuses_a_set_the_text_cannot_give() {
-    // (text, field index, replacement)
-    let table: Vec<(&str, usize, CronField)> = vec![
+fn from_parts_refuses_what_parse_cannot_give() {
+    // The `H` pick of `H * * * *` is minute 13, with its hash.
+    let hash = stored_hash("H * * * *", 0);
+    // (text, field index, replacement values, restricted, hash)
+    type Row = (&'static str, usize, Vec<u8>, bool, Option<u64>);
+    let table: Vec<Row> = vec![
         // an H-free field is exactly what the text gives
-        ("5 * * * *", 0, field(&[6], true)),
-        ("5 * * * *", 0, field(&[5, 6], true)),
-        ("5 * * * *", 0, field(&[], true)),
-        ("*/15 * * * *", 0, field(&[0, 15, 30], true)),
-        ("* * * * *", 1, field(&[0, 1], false)),
-        // an H field is non-empty
-        ("H * * * *", 0, field(&[], true)),
-        // within its term's range
-        ("H(10-20) * * * *", 0, field(&[21], true)),
-        ("H(10-20) * * * *", 0, field(&[9], true)),
-        ("H * * * *", 0, field(&[60], true)),
-        // more values than the `H` terms can give at once
-        (
-            "H * * * *",
-            0,
-            CronField {
-                values: range(0, 59),
-                restricted: true,
-            },
-        ),
-        ("H,H * * * *", 0, field(&[1, 2, 3], true)),
-        ("5,H * * * *", 0, field(&[5, 1, 2], true)),
-        ("* * H * *", 2, field(&[29], true)),
-        ("* * H * *", 2, field(&[0], true)),
-        ("* * * * H", 4, field(&[7], true)),
-        // spaced by n
-        ("H/15 * * * *", 0, field(&[13, 29], true)),
-        ("H/15 * * * *", 0, field(&[13, 28, 43], true)),
-        ("H/15 * * * *", 0, field(&[13, 28, 43, 58, 59], true)),
-        ("H(10-12)/2 * * * *", 0, field(&[10, 11], true)),
-        // the fixed terms of a list stay
-        ("5,H(10-20) * * * *", 0, field(&[12], true)),
-        ("5,H(10-20) * * * *", 0, field(&[5], true)),
-        ("5,H(10-20) * * * *", 0, field(&[5, 12, 40], true)),
-        // a value outside every field's range
-        ("* * * * *", 4, field(&[0, 1, 2, 3, 4, 5, 6, 7], false)),
-        ("* * * * *", 0, field(&[60], false)),
-        ("* * * * *", 3, field(&[0], false)),
+        ("5 * * * *", 0, vec![6], true, None),
+        ("5 * * * *", 0, vec![5, 6], true, None),
+        ("5 * * * *", 0, vec![], true, None),
+        ("*/15 * * * *", 0, vec![0, 15, 30], true, None),
+        ("* * * * *", 1, vec![0, 1], false, None),
+        // an H field is exactly the pick of its hash
+        ("H * * * *", 0, vec![], true, hash),
+        ("H * * * *", 0, vec![14], true, hash),
+        ("H * * * *", 0, vec![13, 14], true, hash),
+        ("H * * * *", 0, (0..=59).collect(), true, hash),
+        ("H(10-20) * * * *", 0, vec![21], true, hash),
+        ("H/15 * * * *", 0, vec![13, 28, 43], true, hash),
+        ("H/15 * * * *", 0, vec![13, 28, 43, 58, 59], true, hash),
+        ("H(10-12)/2 * * * *", 0, vec![10, 11], true, hash),
+        ("H,H * * * *", 0, vec![3, 40], true, hash),
+        ("5,H(10-20) * * * *", 0, vec![12], true, hash),
+        ("5,H(10-20) * * * *", 0, vec![5], true, hash),
+        // a hash that picks otherwise
+        ("H * * * *", 0, vec![13], true, Some(1)),
+        // an H field needs its hash, an H-free one has none
+        ("H * * * *", 0, vec![13], true, None),
+        ("5 * * * *", 0, vec![5], true, Some(1)),
+        ("* * * * *", 0, (0..=59).collect(), false, Some(1)),
+        // a value outside the field's range
+        ("* * * * *", 4, (0..=7).collect(), false, None),
+        ("* * * * *", 0, vec![60], false, None),
+        ("* * * * *", 3, vec![0], false, None),
         // the restricted flag is the text's
-        ("5 * * * *", 0, field(&[5], false)),
-        (
-            "* * * * *",
-            0,
-            CronField {
-                values: range(0, 59),
-                restricted: true,
-            },
-        ),
+        ("5 * * * *", 0, vec![5], false, None),
+        ("* * * * *", 0, (0..=59).collect(), true, None),
     ];
-    for (text, index, replacement) in table {
-        let error = rebuild(text, index, replacement.clone()).expect_err(&format!("{text:?} {index} {replacement:?}"));
-        let (daemon, message) = refusal(error);
+    for (text, index, values, restricted, hash) in table {
+        let replacement = CronField {
+            values: values.iter().copied().collect(),
+            restricted,
+        };
+        let case = format!("{text:?} {index} {replacement:?} {hash:?}");
+        let (daemon, message) = refusal(rebuild(text, index, replacement, hash).expect_err(&case));
         assert_eq!(daemon, "nightly");
         assert!(
             message.contains(FIELD_NAMES[index]),
-            "{text:?} {replacement:?} must name its field: {message}"
+            "{case} must name its field: {message}"
         );
     }
 }
 
 #[skuld::test]
-fn from_parts_accepts_any_set_an_h_term_can_give() {
-    // (text, field index, values): another host or id hashes elsewhere
-    let table: Vec<(&str, usize, Vec<u8>)> = vec![
-        ("H * * * *", 0, vec![0]),
-        ("H,H * * * *", 0, vec![3, 40]),
-        ("H(10-20) * * * *", 0, vec![15]),
-        ("H(10-20) * * * *", 0, vec![10]),
-        ("H(10-20) * * * *", 0, vec![20]),
-        ("H/15 * * * *", 0, vec![2, 17, 32, 47]),
-        ("H/15 * * * *", 0, vec![14, 29, 44, 59]),
-        ("5,H(10-20) * * * *", 0, vec![5, 12]),
-        ("5,H(5-5) * * * *", 0, vec![5]),
-        ("* * H * *", 2, vec![28]),
-        ("* * * * H", 4, vec![6]),
-        ("* * * * H(0-6)", 4, vec![0]),
-    ];
-    for (text, index, values) in table {
-        rebuild(text, index, field(&values, true)).unwrap_or_else(|e| panic!("{text:?} {values:?}: {e}"));
+fn from_parts_decodes_a_foreign_hosts_picks_by_their_hash() {
+    // Another host or id hashed elsewhere; the stored hash is all decode needs.
+    for (text, index) in [
+        ("H * * * *", 0),
+        ("H(10-20) * * * *", 0),
+        ("H/15 * * * *", 0),
+        ("5,H(10-20) * * * *", 0),
+        ("* * H * *", 2),
+        ("* * * * H", 4),
+    ] {
+        for host in ["other", "a-third-host"] {
+            let foreign = parse_for("nightly", host, text).unwrap();
+            let (field, hash) = parts(&foreign)[index].clone();
+            let rebuilt = rebuild(text, index, field, hash).unwrap_or_else(|e| panic!("{text:?} {host}: {e}"));
+            assert_eq!(rebuilt.fields()[index], foreign.fields()[index]);
+        }
     }
 }
 
 #[skuld::test]
-fn from_parts_with_many_h_terms_is_linear() {
-    // Decoding a field must not enumerate combinations of picks; this has to complete.
+fn from_parts_with_many_h_terms_is_exact() {
     let text = format!("{} * * * *", ["H"; 60].join(","));
-    let full = field(&(0..=59).collect::<Vec<u8>>(), true);
-    rebuild(&text, 0, full).unwrap();
-    let missing = field(&(0..=58).collect::<Vec<u8>>(), true);
-    // Coverage, not exact derivation: every H term still has a pick inside this set.
-    rebuild(&text, 0, missing).unwrap();
-    let empty = field(&[], true);
-    rebuild(&text, 0, empty).unwrap_err();
-
-    // Twenty terms give at most twenty values.
-    let text = format!("{} * * * *", ["H"; 20].join(","));
-    rebuild(&text, 0, field(&(0..20).collect::<Vec<u8>>(), true)).unwrap();
-    rebuild(&text, 0, field(&(0..21).collect::<Vec<u8>>(), true)).unwrap_err();
+    let schedule = parse(&text);
+    let (right, hash) = parts(&schedule)[0].clone();
+    assert_eq!(right.values.len(), 1);
+    rebuild(&text, 0, right, hash).unwrap();
+    for values in [vec![], (0..=58).collect(), (0..=59).collect()] {
+        rebuild(&text, 0, field(&values, true), hash).unwrap_err();
+    }
 }
 
 #[skuld::test]
 fn an_empty_term_is_worded_without_blank_quotes() {
-    let (_, message) = refusal(parse_for("nightly", HOST, "1,,2 * * * *").unwrap_err());
-    assert!(
-        message.contains("an empty term") && !message.contains("``"),
-        "{message}"
-    );
+    // A blank field is no word at all, so a lone empty term cannot be written; `,` is the least.
+    for line in ["1,,2 * * * *", ", * * * *", "* 1, * * *"] {
+        let (_, message) = refusal(parse_for("nightly", HOST, line).unwrap_err());
+        assert!(
+            message.contains("an empty term") && !message.contains("``"),
+            "{line:?}: {message}"
+        );
+    }
 }
 
 #[skuld::test]
 fn from_parts_refuses_text_that_does_not_parse() {
-    let fields = parse("* * * * *").fields().clone();
+    let stored = parts(&parse("* * * * *"));
     for text in ["", "foo * * * *", "* * * * * *", "60 * * * *", "H(10-5) * * * *"] {
         let (daemon, _) =
-            refusal(Schedule::from_parts(&id("nightly"), text.to_owned(), fields.clone()).expect_err(text));
+            refusal(Schedule::from_parts(&id("nightly"), text.to_owned(), stored.clone()).expect_err(text));
         assert_eq!(daemon, "nightly");
     }
 }

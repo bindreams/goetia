@@ -13,7 +13,8 @@
 //!
 //! `H` picks one value per daemon so that tasks spread out instead of all firing at minute 0. The
 //! pick is a pure function of the host name, the daemon id and the field's position, so it is the
-//! same on every run and differs across hosts and daemons.
+//! same while the host name stays the same and differs across hosts and daemons. A renamed host
+//! resolves `H` anew, which `diff` shows (the `# resolves to:` comment) and `install` applies.
 //!
 //! - Bare `H` ranges over minute 0-59, hour 0-23, day-of-month 1-28, month 1-12, day-of-week 0-6.
 //! - `H(a-b)` is `a + hash mod (b-a+1)`; `a` and `b` lie within the field's full range
@@ -73,8 +74,15 @@ pub enum DayRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
     text: String,
-    // Boxed so a `DaemonSpec`, which embeds one, stays no larger than its variants need.
-    fields: Box<[CronField; FIELD_COUNT]>,
+    // Boxed: keeps `DaemonSpec`'s variants close in size.
+    resolved: Box<Resolved>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Resolved {
+    fields: [CronField; FIELD_COUNT],
+    /// The hash each field with an `H` term was resolved by; none for an `H`-free field.
+    hashes: [Option<u64>; FIELD_COUNT],
 }
 
 impl Schedule {
@@ -82,17 +90,11 @@ impl Schedule {
     /// `seed.id`, naming the field.
     pub fn parse(text: &str, seed: &HashSeed) -> Result<Schedule, Error> {
         let structure = structure(text).map_err(|message| invalid(seed.id, &message))?;
-        let fields = std::array::from_fn(|position| {
-            let parsed = &structure[position];
-            let hash = field_hash(seed, position);
-            CronField {
-                values: parsed.terms.iter().flat_map(|term| term.values(hash)).collect(),
-                restricted: parsed.restricted,
-            }
-        });
+        let hashes = std::array::from_fn(|position| structure[position].has_hash().then(|| field_hash(seed, position)));
+        let fields = std::array::from_fn(|position| structure[position].resolve(hashes[position].unwrap_or(0)));
         Ok(Schedule {
             text: text.to_owned(),
-            fields: Box::new(fields),
+            resolved: Box::new(Resolved { fields, hashes }),
         })
     }
 
@@ -103,35 +105,43 @@ impl Schedule {
 
     /// Minute, hour, day-of-month, month, day-of-week.
     pub fn fields(&self) -> &[CronField; FIELD_COUNT] {
-        &self.fields
+        &self.resolved.fields
+    }
+
+    /// The hash behind each field, in the order of [`Schedule::fields`]; none for an `H`-free field.
+    pub(crate) fn hashes(&self) -> &[Option<u64>; FIELD_COUNT] {
+        &self.resolved.hashes
     }
 
     pub fn day_rule(&self) -> DayRule {
-        if self.fields[DAY_OF_MONTH].restricted && self.fields[DAY_OF_WEEK].restricted {
+        let fields = self.fields();
+        if fields[DAY_OF_MONTH].restricted && fields[DAY_OF_WEEK].restricted {
             DayRule::Or
         } else {
             DayRule::And
         }
     }
 
-    /// Rebuilds a schedule from `text` and the fields stored with it, needing no host name.
+    /// Rebuilds a schedule from `text` and each field with its stored hash, needing no host name.
     ///
-    /// Checks each field against the text's terms. An `H`-free field equals the text's values.
-    /// The seed is not known, so an `H` field is checked for coverage and not re-derived: it
-    /// holds every fixed term's values, each `H` term has at least one pick (one value, or
-    /// values spaced by its step) wholly inside it, and every value belongs to some such pick or
-    /// fixed term. A field may therefore hold more than one pick of one `H` term. Every value
-    /// lies in the field's range and `restricted` is the text's. Anything else is
-    /// [`Error::Invalid`] for `id`, naming the field.
-    pub(crate) fn from_parts(id: &Id, text: String, fields: [CronField; FIELD_COUNT]) -> Result<Schedule, Error> {
+    /// Each field is recomputed from the text's terms and its hash (none for an `H`-free field)
+    /// and must equal the stored one exactly. A field with `H` and no hash, or a hash on an
+    /// `H`-free field, is refused. Every refusal is [`Error::Invalid`] for `id`, naming the field.
+    pub(crate) fn from_parts(
+        id: &Id,
+        text: String,
+        stored: [(CronField, Option<u64>); FIELD_COUNT],
+    ) -> Result<Schedule, Error> {
         let structure = structure(&text).map_err(|message| invalid(id, &message))?;
-        for ((kind, parsed), field) in KINDS.iter().zip(&structure).zip(&fields) {
-            check(kind, parsed, field)
+        for ((kind, parsed), (field, hash)) in KINDS.iter().zip(&structure).zip(&stored) {
+            check(parsed, field, *hash)
                 .map_err(|reason| invalid(id, &format!("schedule {} field: {reason}", kind.name)))?;
         }
+        let fields = stored.each_ref().map(|(field, _)| field.clone());
+        let hashes = stored.map(|(_, hash)| hash);
         Ok(Schedule {
             text,
-            fields: Box::new(fields),
+            resolved: Box::new(Resolved { fields, hashes }),
         })
     }
 }
@@ -201,17 +211,6 @@ enum Term {
 }
 
 impl Term {
-    /// The number of different picks: `hash` matters only modulo this.
-    fn modulus(&self) -> u64 {
-        match self {
-            Term::Fixed(_) => 1,
-            Term::Hashed { lo, hi, step } => {
-                let len = u64::from(hi - lo) + 1;
-                step.map_or(len, |step| len.min(u64::from(step)))
-            }
-        }
-    }
-
     /// The values `hash` picks from this term.
     fn values(&self, hash: u64) -> BTreeSet<u8> {
         match self {
@@ -237,6 +236,20 @@ impl Term {
 struct ParsedField {
     terms: Vec<Term>,
     restricted: bool,
+}
+
+impl ParsedField {
+    fn has_hash(&self) -> bool {
+        self.terms.iter().any(|term| matches!(term, Term::Hashed { .. }))
+    }
+
+    /// The field `hash` resolves this one to.
+    fn resolve(&self, hash: u64) -> CronField {
+        CronField {
+            values: self.terms.iter().flat_map(|term| term.values(hash)).collect(),
+            restricted: self.restricted,
+        }
+    }
 }
 
 /// Splits `text` into its five fields and reads each field's terms. Messages name the field.
@@ -361,71 +374,19 @@ fn field_hash(seed: &HashSeed, position: usize) -> u64 {
 
 // Decoding ------------------------------------------------------------------------------------------------------------
 
-/// Whether `field` is a set `parsed`'s terms can give. The reason does not name the field.
-///
-/// The seed is not known here, so this checks coverage, in time linear in the number of terms:
-/// every value is one some term can give, every fixed term's values are present, every `H`
-/// term has a pick (one value, or values spaced by its step) wholly inside the field, and the
-/// values beyond the fixed terms' number at most the `H` terms' largest picks together. An
-/// `H`-free field is therefore exactly the text's values.
-fn check(kind: &FieldKind, parsed: &ParsedField, field: &CronField) -> Result<(), String> {
-    if field.restricted != parsed.restricted {
+/// Whether `field` is exactly what `parsed`'s terms give for `hash`. The reason does not name the
+/// field.
+fn check(parsed: &ParsedField, field: &CronField, hash: Option<u64>) -> Result<(), String> {
+    match (parsed.has_hash(), hash) {
+        (true, None) => return Err("has an `H` term but no hash".to_owned()),
+        (false, Some(_)) => return Err("has a hash but no `H` term".to_owned()),
+        _ => {}
+    }
+    let expected = parsed.resolve(hash.unwrap_or(0));
+    if *field != expected {
         return Err(format!(
-            "`restricted` is {}, which the text contradicts",
-            field.restricted
-        ));
-    }
-    if let Some(value) = field.values.iter().find(|v| !(kind.min..=kind.max).contains(v)) {
-        return Err(format!("{value} is out of range {}-{}", kind.min, kind.max));
-    }
-    // The values of every pick that fits inside `field.values`.
-    let mut given = BTreeSet::new();
-    for term in &parsed.terms {
-        let mut fits = false;
-        for pick in (0..term.modulus())
-            .map(|seed| term.values(seed))
-            .filter(|pick| pick.is_subset(&field.values))
-        {
-            fits = true;
-            given.extend(pick);
-        }
-        if !fits {
-            return Err(match term {
-                Term::Fixed(values) => format!("lacks {values:?}, which the text names"),
-                Term::Hashed { lo, hi, .. } => format!("holds nothing `H` could pick over {lo}-{hi}"),
-            });
-        }
-    }
-    if let Some(value) = field.values.difference(&given).next() {
-        return Err(format!("holds {value}, which no term in the text can give"));
-    }
-    // Each value could be some term's pick, yet together they must fit what the terms give at
-    // once: the fixed values, plus at most one pick per `H` term.
-    let fixed: BTreeSet<u8> = parsed
-        .terms
-        .iter()
-        .filter_map(|term| match term {
-            Term::Fixed(values) => Some(values),
-            Term::Hashed { .. } => None,
-        })
-        .flatten()
-        .copied()
-        .collect();
-    let allowed: usize = parsed
-        .terms
-        .iter()
-        .filter(|term| matches!(term, Term::Hashed { .. }))
-        .map(|term| {
-            (0..term.modulus())
-                .map(|seed| term.values(seed).len())
-                .max()
-                .unwrap_or(0)
-        })
-        .sum();
-    let extra = field.values.difference(&fixed).count();
-    if extra > allowed {
-        return Err(format!(
-            "holds {extra} values beyond the text's fixed ones; its `H` terms give at most {allowed}"
+            "holds {:?} (restricted: {}), but its text and hash give {:?} (restricted: {})",
+            field.values, field.restricted, expected.values, expected.restricted
         ));
     }
     Ok(())
