@@ -6,7 +6,7 @@
 //! crate root) so this binary still links and reports zero tests on
 //! non-macOS CI cells, rather than failing to find `main` at all — the same
 //! shape `tests/marker_inertness.rs` already uses. Every actual test lives
-//! in `launchd`, which is the part gated to macOS.
+//! in `launchd` and `tasks`, which are the parts gated to macOS.
 
 #[path = "support/mod.rs"]
 mod support;
@@ -14,6 +14,10 @@ mod support;
 #[cfg(target_os = "macos")]
 #[path = "launchd_integration/launchd.rs"]
 mod launchd;
+
+#[cfg(target_os = "macos")]
+#[path = "launchd_integration/tasks.rs"]
+mod tasks;
 
 fn main() {
     // Dispatched before the harness starts; see `support::sentinel`. This

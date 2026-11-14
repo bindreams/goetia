@@ -5,9 +5,44 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use goetia::spec::Schedule;
+use goetia::manager::TaskStatus;
+use goetia::spec::{HashSeed, Id, Schedule};
 
 const MINUTE: u64 = 60;
+
+/// What a schedule's `next_run` may read for a timer armed anywhere in `[before, after]`: the next
+/// minute after `before`, the next after `after` (`after` is taken once `next_run` has been read, so a
+/// read that comes after the timer fired is still inside the window), and the latest minute at or
+/// before `before`.
+///
+/// The last is for a lane whose wall clock steps back: systemd computes `NextElapseUSecRealtime` from
+/// its own clock read, which may lie before `before` by less than one cron period (the one assumption:
+/// a step is minutes, not days). If the step crosses a fire time P, systemd correctly reports P, which
+/// is not after `before`. Accepting it loses nothing here. goetia reads the property and does not
+/// compute it. A timer that never fired reads none or the epoch for a wrong property, and a
+/// rendering bug yields a future time from another calendar; both are still caught. (launchd's
+/// `next_run` is computed by goetia from the clock it reads, so the first is never needed there.)
+pub fn expected_next_runs(text: &str, id: &Id, before: SystemTime, after: SystemTime) -> [SystemTime; 3] {
+    let seed = HashSeed {
+        hostname: "testing",
+        id,
+    };
+    let schedule = Schedule::parse(text, &seed).expect("a schedule");
+    [
+        latest_minute_at_or_before(&schedule, before),
+        next_minute_after(&schedule, before),
+        next_minute_after(&schedule, after),
+    ]
+}
+
+pub fn assert_next_run(status: &TaskStatus, text: &str, id: &Id, before: SystemTime, after: SystemTime) {
+    let expected = expected_next_runs(text, id, before, after);
+    assert!(
+        status.next_run.is_some_and(|next| expected.contains(&next)),
+        "`{text}`: next_run {:?}, the cron says {expected:?}",
+        status.next_run
+    );
+}
 
 /// The first whole minute (local time, as the manager reads `OnCalendar`) strictly after `after`
 /// that `schedule` names. Every schedule a caller gives has one: the search ends there.
