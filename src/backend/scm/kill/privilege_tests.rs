@@ -38,7 +38,12 @@ fn holds_debug_privilege() -> Result<bool, String> {
         let copy = process_token_copy(TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY)?;
         enable_in(copy.as_raw_handle())
     };
-    probe().map_err(|e| format!("could not probe the token for SeDebugPrivilege: {e}"))
+    probe().map_err(|e| {
+        format!(
+            "could not probe the token for SeDebugPrivilege: {}",
+            crate::error::Chain(&e)
+        )
+    })
 }
 
 /// The calling thread's own token, if it has one, opened to be queried.
@@ -160,7 +165,10 @@ fn dropping_puts_back_the_thread_token_that_was_there(#[fixture(debug_privilege)
 fn failed_to_enable() -> DebugPrivilege {
     DebugPrivilege {
         restore: None,
-        failure: Some(io::Error::other("DuplicateTokenEx failed")),
+        failure: Some(crate::error::within(
+            "DuplicateTokenEx",
+            io::Error::from_raw_os_error(8),
+        )),
     }
 }
 
@@ -170,7 +178,8 @@ fn a_denied_open_names_the_privilege_step_that_failed() {
 
     let msg = e.to_string();
     assert!(msg.contains("SeDebugPrivilege"), "{msg}");
-    assert!(msg.contains("DuplicateTokenEx failed"), "{msg}");
+    assert!(msg.contains("DuplicateTokenEx: "), "the step names its call: {msg}");
+    assert!(msg.contains("(os error 8)"), "the step keeps its OS reason: {msg}");
     assert!(msg.contains("Access is denied"), "the open's own error is kept: {msg}");
     assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
 }
@@ -213,6 +222,6 @@ fn a_token_that_cannot_be_adjusted_is_an_error_naming_the_call() {
     let e = enable_in(query_only.as_raw_handle()).unwrap_err();
 
     assert!(e.to_string().contains("AdjustTokenPrivileges"), "{e}");
-    let code = std::error::Error::source(e.get_ref().unwrap()).and_then(|s| s.downcast_ref::<io::Error>());
+    let code = std::error::Error::source(&e).and_then(|s| s.downcast_ref::<io::Error>());
     assert_eq!(code.and_then(io::Error::raw_os_error), Some(ERROR_ACCESS_DENIED as i32));
 }

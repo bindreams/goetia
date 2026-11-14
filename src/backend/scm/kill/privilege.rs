@@ -49,7 +49,10 @@ impl DebugPrivilege {
         match &self.failure {
             Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => io::Error::new(
                 open.kind(),
-                format!("{open} (enabling SeDebugPrivilege for the open also failed: {step})"),
+                format!(
+                    "{open} (enabling SeDebugPrivilege for the open also failed: {})",
+                    crate::error::Chain(step)
+                ),
             ),
             _ => open,
         }
