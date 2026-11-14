@@ -390,13 +390,11 @@ fn a_follow_starts_from_the_beginning_or_after_its_cursor_and_job_numbers_are_bo
 }
 
 #[skuld::test]
-fn a_read_after_a_cursor_asks_for_every_set_of_matches() {
+fn a_read_after_a_cursor_asks_for_every_match() {
     let journal = sh(ECHO);
     let matches = [
         Match::new("_SYSTEMD_UNIT", "x.service"),
         Match::new("_TRANSPORT", "stdout"),
-        Match::Or,
-        Match::new("UNIT", "x.service"),
     ];
 
     let args = args_of(
@@ -407,7 +405,7 @@ fn a_read_after_a_cursor_asks_for_every_set_of_matches() {
 
     assert_eq!(
         args,
-        "-a -o json --no-pager --after-cursor=c _SYSTEMD_UNIT=x.service _TRANSPORT=stdout + UNIT=x.service"
+        "-a -o json --no-pager --after-cursor=c _SYSTEMD_UNIT=x.service _TRANSPORT=stdout"
     );
 }
 

@@ -1,5 +1,5 @@
 //! A task's run through the journal: `begin_run` finding the run its start produced, `wait` finding
-//! its exit, and `JournalOutput::stream` following its output. Driven through a fake `systemctl` and a
+//! its exit, and `JournalOutput::stream` following its output by the stream of the run's marker. Driven through a fake `systemctl` and a
 //! scripted journal; none of it needs systemd.
 
 use std::io::Write as _;
@@ -58,9 +58,20 @@ fn deactivated(invocation: &str) -> Entry {
     Entry::of(&[("MESSAGE_ID", DEACTIVATED), ("INVOCATION_ID", invocation)])
 }
 
-/// One line the run wrote on stdout. It has no `_SYSTEMD_INVOCATION_ID`: a fast run's lines can lack it.
-fn line(cursor: &str, text: &str) -> Entry {
-    Entry::of(&[("MESSAGE", text), ("__CURSOR", cursor), ("_TRANSPORT", "stdout")])
+/// One line a run wrote on stdout, as part of stream `stream`. It has no `_SYSTEMD_INVOCATION_ID`: a
+/// fast run's lines can lack it.
+fn line(cursor: &str, stream: &str, text: &str) -> Entry {
+    Entry::of(&[
+        ("MESSAGE", text),
+        ("__CURSOR", cursor),
+        ("_TRANSPORT", "stdout"),
+        ("_STREAM_ID", stream),
+    ])
+}
+
+/// The first line of the run of invocation `inv`, which its `sh` wrapper prints: the first of its stream.
+fn marker(cursor: &str, stream: &str, inv: &str) -> Entry {
+    line(cursor, stream, &format!("goetia-run {inv}"))
 }
 
 // Begin ===============================================================================================================
@@ -92,23 +103,19 @@ fn begun(journal: &JournalFake) -> Run {
     begin(journal, &gate_then([start()])).expect("begin_run")
 }
 
-fn query(unit: &str) -> Vec<String> {
-    [
-        format!("_SYSTEMD_UNIT={unit}"),
-        "_TRANSPORT=stdout".to_string(),
-        "+".to_string(),
-        format!("UNIT={unit}"),
-        format!("MESSAGE_ID={STARTING}"),
-    ]
-    .to_vec()
+/// What the output follows: the unit's own lines.
+fn stdout_query(unit: &str) -> Vec<String> {
+    [format!("_SYSTEMD_UNIT={unit}"), "_TRANSPORT=stdout".to_string()].to_vec()
 }
 
 fn call(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| arg.to_string()).collect()
 }
 
+/// A sync before the request has no reason left: the run's lines are found by its marker's stream,
+/// wherever they land.
 #[skuld::test]
-fn begin_run_syncs_the_journal_before_it_sends_the_start() {
+fn begin_run_sends_the_start_and_then_follows_its_job_with_no_sync() {
     let log = Log::default();
     let journal = JournalFake::new(Vec::new())
         .logging(&log)
@@ -120,25 +127,10 @@ fn begin_run_syncs_the_journal_before_it_sends_the_start() {
 
     assert_eq!(
         *log.lock().unwrap(),
-        ["sync", "start", "follow UNIT=x.service JOB_ID=7"],
-        "the sync, then the request, then the first follow"
+        ["start", "follow UNIT=x.service JOB_ID=7"],
+        "the request, then the first follow"
     );
-}
-
-#[skuld::test]
-fn a_failing_sync_is_its_own_error_and_sends_nothing() {
-    let journal = JournalFake::new(Vec::new()).sync_fails();
-    let client = gate_then([]);
-
-    let e = begin(&journal, &client).err().expect("the sync failed");
-
-    assert!(e.report().to_string().contains("it failed"), "{e}");
-    assert!(
-        !matches!(e, Error::RequestInDoubt { .. } | Error::RunNotStarted { .. }),
-        "nothing was sent, so nothing is in doubt: {e:?}"
-    );
-    assert!(client.calls().is_empty(), "{:?}", client.calls());
-    assert!(journal.followed().is_empty());
+    assert_eq!(journal.syncs(), 0);
 }
 
 #[skuld::test]
@@ -158,6 +150,7 @@ fn begin_run_parses_the_job_and_follows_its_starting_entry() {
         panic!("a task with no `logs` shows its output from the journal");
     };
     assert_eq!(output.unit, "x.service");
+    assert_eq!(output.invocation, "inv-1");
     assert_eq!(output.cursor, Cursor::of("c1"));
 }
 
@@ -212,7 +205,6 @@ fn a_start_refused_by_systemctl_is_its_error() {
     let e = begin(&journal, &client).err().expect("systemctl refused");
 
     assert!(matches!(e, Error::Command { .. }), "{e:?}");
-    assert_eq!(journal.syncs(), 1, "the journal was synced before the request");
     assert!(
         journal.followed().is_empty(),
         "no start was sent, so there is no run to follow"
@@ -466,10 +458,11 @@ fn a_wait_whose_journal_cannot_be_followed_is_run_unrecorded() {
 
 // stream ==============================================================================================================
 
-/// The output of the run that began at cursor `c1`, over `journal`.
+/// The output of the run of invocation `inv` that began at cursor `c1`, over `journal`.
 fn output_over(journal: Arc<dyn Journal>) -> JournalOutput {
     JournalOutput {
         unit: "x.service".to_string(),
+        invocation: "inv".to_string(),
         cursor: Cursor::of("c1"),
         journal,
         // What `begin_run` made: a file for the follower and one for the read after it.
@@ -486,12 +479,19 @@ fn shown_after_the_end(journal: &JournalFake) -> (Result<()>, Vec<u8>) {
     (result, out)
 }
 
+/// The run's output is the lines of the marker's stream, the marker not among them, and another
+/// stream's lines are never shown, whether they come first or between the run's own.
 #[skuld::test]
-fn output_is_selected_by_unit_and_transport_after_the_starting_cursor() {
-    // None of the lines has a `_SYSTEMD_INVOCATION_ID`, and all are shown.
+fn output_is_the_lines_of_the_markers_stream_minus_the_marker() {
     let journal = JournalFake::new(Vec::new())
-        .follows(vec![line("c2", "first"), line("c3", "second")])
-        .then_reads(vec![line("c4", "third")]);
+        .follows(vec![
+            line("c2", "s9", "a run that came first"),
+            marker("c3", "s1", "inv"),
+            line("c4", "s9", "a run in between"),
+            line("c5", "s1", "first"),
+            line("c6", "s1", "second"),
+        ])
+        .then_reads(vec![line("c7", "s1", "third")]);
 
     let (result, out) = shown_after_the_end(&journal);
 
@@ -499,54 +499,154 @@ fn output_is_selected_by_unit_and_transport_after_the_starting_cursor() {
     assert_eq!(String::from_utf8(out).unwrap(), "first\nsecond\nthird\n");
     assert_eq!(
         journal.followed(),
-        [(query("x.service"), Some("c1".to_string()))],
-        "the unit's own lines, and its Starting entries to end the read at the next run"
+        [(stdout_query("x.service"), Some("c1".to_string()))],
+        "the unit's own lines after the run's Starting entry"
     );
     assert_eq!(
         journal.read_after_calls(),
-        [(query("x.service"), "c3".to_string())],
-        "the rest is read after the last line shown"
+        [(call(&["_STREAM_ID=s1"]), "c6".to_string())],
+        "what is left is read from the stream, after the stream's last line shown"
     );
 }
 
-/// The next run's Starting entry ends the read: nothing after it is this run's.
+/// After the run's end the rest is read by the stream, so an entry of another stream is not shown.
 #[skuld::test]
-fn a_later_runs_starting_entry_ends_the_read() {
+fn the_rest_of_the_stream_shows_only_the_stream() {
+    let journal = JournalFake::new(Vec::new())
+        .follows(vec![marker("c2", "s1", "inv")])
+        .then_reads(vec![
+            line("c3", "s1", "mine"),
+            line("c4", "s2", "the next run's"),
+            line("c5", "s1", "also mine"),
+        ]);
+
+    let (result, out) = shown_after_the_end(&journal);
+
+    result.expect("the stream");
+    assert_eq!(String::from_utf8(out).unwrap(), "mine\nalso mine\n");
+}
+
+/// The marker is the first line of its stream only: the same text again is the program's.
+#[skuld::test]
+fn only_the_first_line_with_the_markers_text_is_the_marker() {
     let journal = JournalFake::new(Vec::new()).follows(vec![
-        line("c2", "this run"),
-        starting(8, "next", "c3"),
-        line("c4", "the next run's line"),
+        marker("c2", "s1", "inv"),
+        marker("c3", "s1", "inv"),
+        line("c4", "s9", "goetia-run inv"),
     ]);
 
     let (result, out) = shown_after_the_end(&journal);
 
     result.expect("the stream");
-    assert_eq!(String::from_utf8(out).unwrap(), "this run\n");
-    assert_eq!(journal.syncs(), 0, "a run that is over has nothing left to wait for");
-    assert!(journal.read_after_calls().is_empty());
+    assert_eq!(String::from_utf8(out).unwrap(), "goetia-run inv\n");
 }
 
+/// A run that printed nothing has its stream all the same: the marker alone, and no note.
 #[skuld::test]
-fn the_remainder_ends_at_the_next_runs_starting_entry_too() {
-    let journal = JournalFake::new(Vec::new()).follows(vec![]).then_reads(vec![
-        line("c2", "last"),
-        starting(8, "next", "c3"),
-        line("c4", "not ours"),
-    ]);
+fn a_run_that_printed_nothing_shows_nothing_and_no_note() {
+    let journal = JournalFake::new(Vec::new()).follows(vec![marker("c2", "s1", "inv")]);
 
     let (result, out) = shown_after_the_end(&journal);
 
     result.expect("the stream");
-    assert_eq!(String::from_utf8(out).unwrap(), "last\n");
+    assert_eq!(out, b"");
 }
 
+/// A marker the follower had not delivered when the run ended is found by the final read of the
+/// unit's lines after the run's Starting entry, and the run's lines are the stream's from there.
 #[skuld::test]
-fn the_remainder_is_read_after_sync_and_written_once() {
+fn a_marker_the_follower_did_not_deliver_is_found_by_the_final_read() {
     let log = Log::default();
     let journal = JournalFake::new(Vec::new())
         .logging(&log)
-        .follows(vec![line("c2", "live")])
-        .then_reads(vec![line("c3", "late one"), line("c4", "late two")]);
+        .follows(vec![line("c2", "s9", "another run's")])
+        .then_reads(vec![
+            line("c2", "s9", "another run's"),
+            marker("c3", "s1", "inv"),
+            line("c4", "s1", "a"),
+            line("c5", "s9", "another run's, between"),
+            line("c6", "s1", "b"),
+        ]);
+
+    let (result, out) = shown_after_the_end(&journal);
+
+    result.expect("the stream");
+    assert_eq!(String::from_utf8(out).unwrap(), "a\nb\n");
+    assert_eq!(
+        journal.read_after_calls(),
+        [(stdout_query("x.service"), "c1".to_string())],
+        "with no marker found, the unit's lines after the Starting entry"
+    );
+    assert_eq!(
+        log.lock().unwrap().iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            format!("follow {}", stdout_query("x.service").join(" ")).as_str(),
+            "sync",
+            "read_after"
+        ],
+        "the follower, then the sync, then the read"
+    );
+}
+
+/// No marker after the terminal entry, the sync and a final read: the run's lines cannot be told from
+/// another's, so none is shown, and the note says what to do about the limit that dropped it.
+#[skuld::test]
+fn no_marker_after_the_end_is_a_note_and_nothing_else() {
+    let journal = JournalFake::new(Vec::new())
+        .follows(vec![
+            line("c2", "s9", "a line of another run"),
+            marker("c3", "s8", "an-earlier-invocation"),
+        ])
+        .then_reads(vec![line("c4", "s9", "and another")]);
+
+    let (result, out) = shown_after_the_end(&journal);
+
+    result.expect("a missing marker is a note, not a failure");
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.starts_with("note: "), "{out}");
+    assert!(out.ends_with('\n') && out.lines().count() == 1, "{out:?}");
+    for named in [
+        "rate limit",
+        "RateLimitBurst=0",
+        "[Journal]",
+        "journald.conf.d",
+        "systemd-journald",
+    ] {
+        assert!(out.contains(named), "the note names `{named}`: {out}");
+    }
+    assert!(!out.contains("another"), "no line of another stream is shown: {out}");
+    assert_eq!(
+        journal.syncs(),
+        1,
+        "the sync came first, so the marker was not merely late"
+    );
+    assert_eq!(journal.read_after_calls().len(), 1);
+}
+
+/// A marker the journal stores without its stream cannot say which lines are the run's.
+#[skuld::test]
+fn a_marker_with_no_stream_is_an_incomplete_answer() {
+    let bare = Entry::of(&[
+        ("MESSAGE", "goetia-run inv"),
+        ("__CURSOR", "c2"),
+        ("_TRANSPORT", "stdout"),
+    ]);
+    let journal = JournalFake::new(Vec::new()).follows(vec![bare]);
+
+    let (result, out) = shown_after_the_end(&journal);
+
+    let e = result.expect_err("no stream id");
+    assert!(matches!(e, Error::IncompleteAnswer { .. }), "{e:?}");
+    assert!(out.is_empty());
+}
+
+#[skuld::test]
+fn the_rest_is_read_after_sync_and_written_once() {
+    let log = Log::default();
+    let journal = JournalFake::new(Vec::new())
+        .logging(&log)
+        .follows(vec![marker("c2", "s1", "inv"), line("c3", "s1", "live")])
+        .then_reads(vec![line("c4", "s1", "late one"), line("c5", "s1", "late two")]);
 
     let (result, out) = shown_after_the_end(&journal);
 
@@ -555,7 +655,7 @@ fn the_remainder_is_read_after_sync_and_written_once() {
     assert_eq!(
         log.lock().unwrap().iter().map(String::as_str).collect::<Vec<_>>(),
         [
-            format!("follow {}", query("x.service").join(" ")).as_str(),
+            format!("follow {}", stdout_query("x.service").join(" ")).as_str(),
             "sync",
             "read_after"
         ],
@@ -568,11 +668,17 @@ fn the_remainder_is_read_after_sync_and_written_once() {
 /// UTF-8 included, and an entry with no `MESSAGE` writes nothing.
 #[skuld::test]
 fn a_line_is_written_as_the_bytes_the_journal_holds() {
-    let bytes = Entry::parse(br#"{"MESSAGE":[27,91,49,109,255],"__CURSOR":"c2"}"#).expect("an entry");
-    let none = Entry::of(&[("__CURSOR", "c3")]);
-    let long =
-        Entry::parse(format!(r#"{{"MESSAGE":"{}","__CURSOR":"c4"}}"#, "x".repeat(4088)).as_bytes()).expect("an entry");
-    let journal = JournalFake::new(Vec::new()).follows(vec![bytes, none, long]);
+    let bytes = Entry::parse(br#"{"MESSAGE":[27,91,49,109,255],"__CURSOR":"c3","_STREAM_ID":"s1"}"#).expect("an entry");
+    let none = Entry::of(&[("__CURSOR", "c4"), ("_STREAM_ID", "s1")]);
+    let long = Entry::parse(
+        format!(
+            r#"{{"MESSAGE":"{}","__CURSOR":"c5","_STREAM_ID":"s1"}}"#,
+            "x".repeat(4088)
+        )
+        .as_bytes(),
+    )
+    .expect("an entry");
+    let journal = JournalFake::new(Vec::new()).follows(vec![marker("c2", "s1", "inv"), bytes, none, long]);
 
     let (result, out) = shown_after_the_end(&journal);
 
@@ -596,7 +702,7 @@ fn a_follower_that_cannot_start_is_the_streams_error() {
 fn a_sync_or_a_read_that_fails_ends_the_stream_with_its_error_after_what_was_shown() {
     let journal = JournalFake::new(Vec::new())
         .sync_fails()
-        .follows(vec![line("c2", "live")]);
+        .follows(vec![marker("c2", "s1", "inv"), line("c3", "s1", "live")]);
 
     let (result, out) = shown_after_the_end(&journal);
 
@@ -610,8 +716,12 @@ fn a_sync_or_a_read_that_fails_ends_the_stream_with_its_error_after_what_was_sho
 #[skuld::test]
 fn the_follower_is_stopped_when_the_run_ends() {
     let journal = JournalFake::new(Vec::new())
-        .follows(vec![line("c2", "a"), line("c3", "b")])
-        .then_reads(vec![line("c4", "c")]);
+        .follows(vec![
+            marker("c2", "s1", "inv"),
+            line("c3", "s1", "a"),
+            line("c4", "s1", "b"),
+        ])
+        .then_reads(vec![line("c5", "s1", "c")]);
     let mut streaming = Streaming::start(OutputSource::Journal(output_over(Arc::new(journal.clone()))));
 
     streaming.shows("a\nb\n");
@@ -624,17 +734,18 @@ fn the_follower_is_stopped_when_the_run_ends() {
 
 // The real journalctl =================================================================================================
 
-/// A `journalctl` as a shell script: the follow writes one whole line and half of another and then
-/// waits, `--sync` succeeds, and the read after `c2` answers the line the follow did not finish. The
-/// script's pid is written to `pid`.
+/// A `journalctl` as a shell script: the follow writes the run's marker, one whole line and half of
+/// another and then waits, `--sync` succeeds, and the read of the stream after `c3` answers the line
+/// the follow did not finish. The script's pid is written to `pid`.
 fn follower_script(pid: &Path) -> String {
     format!(
         r#"case " $* " in
   *" --sync "*) exit 0;;
   *" -f "*) echo $$ > '{}'
-     printf '{{"MESSAGE":"a","__CURSOR":"c2"}}\n{{"MESSAGE":"b","__CU'
+     printf '{{"MESSAGE":"goetia-run inv","_STREAM_ID":"s1","__CURSOR":"c2"}}\n'
+     printf '{{"MESSAGE":"a","_STREAM_ID":"s1","__CURSOR":"c3"}}\n{{"MESSAGE":"b","_STR'
      exec sleep 100000;;
-  *) printf '{{"MESSAGE":"b","__CURSOR":"c3"}}\n';;
+  *) printf '{{"MESSAGE":"b","_STREAM_ID":"s1","__CURSOR":"c4"}}\n';;
 esac"#,
         pid.display()
     )

@@ -42,17 +42,17 @@ pub(super) const DEACTIVATED: &str = "7ad2d189f7e94e70a38c781354912448";
 
 // Match / Entry =======================================================================================================
 
-/// What `journalctl` is asked to read: one `FIELD=value` match (only entries holding it are read), or
-/// the `+` between two sets of them (an entry is read if it holds every match of either set).
+/// What `journalctl` is asked to read: one `FIELD=value` match. Only entries holding every match of
+/// a query are read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Match {
-    Field { name: &'static str, value: String },
-    Or,
+pub(super) struct Match {
+    name: &'static str,
+    value: String,
 }
 
 impl Match {
     pub(super) fn new(name: &'static str, value: impl Into<String>) -> Match {
-        Match::Field {
+        Match {
             name,
             value: value.into(),
         }
@@ -60,15 +60,12 @@ impl Match {
 
     /// The argument `journalctl` takes it as.
     pub(super) fn argument(&self) -> String {
-        match self {
-            Match::Field { name, value } => format!("{name}={value}"),
-            Match::Or => "+".to_string(),
-        }
+        format!("{}={}", self.name, self.value)
     }
 
     /// Whether this is a match on the field `field`.
     fn is(&self, field: &str) -> bool {
-        matches!(self, Match::Field { name, .. } if *name == field)
+        self.name == field
     }
 }
 
