@@ -9,9 +9,8 @@
 //!
 //! A test joins a group by taking its fixture: `#[fixture(scm_group)] _group: &Group`.
 //!
-//! A test that changes no system state but needs something a host may lack (a privilege) has a
-//! switch and no consent: `GOETIA_TEST_DEBUG_PRIVILEGE` unset or `1` runs it, and it fails where the
-//! host lacks the dependency; `0` ignores it. See `need`.
+//! A test that needs something a host may lack, and changes no system state, has a switch and no
+//! consent: see `need`.
 
 use super::elevation::ELEVATED;
 
@@ -95,7 +94,6 @@ pub(crate) fn check_group(group_var: &str, var: impl Fn(&str) -> Option<String>)
     ))
 }
 
-/// What a test behind the switch `var` fails or refuses with when `var` is `0`.
 fn switched_off(var: &str) -> String {
     format!("{var}=0")
 }
@@ -130,19 +128,15 @@ pub(crate) fn enter(
     }
 }
 
-/// The setup of a test that needs something the host may lack, where `switch_var` is its switch and
-/// `holds` probes the host: `Ok(true)` has the dependency, `Ok(false)` lacks it, `Err` is a probe that
-/// failed. The test runs unless the switch is `0`, and fails where the host lacks the dependency
-/// (`missing` says what is missing and how to provide it) or the probe fails, naming the switch in
-/// both: it never skips on a missing dependency. No consent: such a test changes no system state.
-#[cfg(test)]
+/// Setup of a test that needs something the host may lack. Runs unless `switch_var` is `0`; fails
+/// (naming the switch) when `holds` is `Ok(false)` (`missing` says what and how to provide it) or
+/// `Err` (a failed probe, which does not prove the dependency absent). Never skips.
 pub(crate) fn need(
     switch_var: &str,
     var: impl Fn(&str) -> Option<String>,
     missing: &str,
     holds: impl FnOnce() -> Result<bool, String>,
 ) -> Result<(), String> {
-    // As in `enter`: skuld runs the body of an ignored test under `--run-ignored only`.
     if switch(switch_var, &var)? == Some(false) {
         return Err(switched_off(switch_var));
     }
@@ -161,24 +155,54 @@ pub(crate) fn process_var(name: &str) -> Option<String> {
     std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
 }
 
-/// Declares the fixture `$fixture` of the group `$spec`, ignored by `$enabled` when the group is `0`.
-/// Every group needs an elevated token, so its tests carry the [`ELEVATED`] label.
-macro_rules! group {
-    ($fixture:ident, $enabled:ident, $spec:expr) => {
+/// Declares the fixture `$fixture` behind the switch `$switch`: `$enabled` ignores its tests when the
+/// switch is `0`, and `$setup` is the fixture's body. `labels` are the labels of the tests that take it.
+macro_rules! switched {
+    ($(#[$meta:meta])* $fixture:ident, $enabled:ident, $switch:expr $(, labels = [$($label:ident),+])?; $output:ty = $setup:expr) => {
         fn $enabled() -> Result<(), String> {
-            require_enabled($spec.env, process_var)
+            require_enabled($switch, process_var)
         }
 
-        #[skuld::fixture(requires = [$enabled], labels = [ELEVATED])]
-        pub fn $fixture() -> Result<Group, String> {
-            enter($spec.env, $spec.what, process_var, cosca::elevation::is_elevated)
+        $(#[$meta])*
+        #[skuld::fixture(requires = [$enabled] $(, labels = [$($label),+])?)]
+        pub fn $fixture() -> Result<$output, String> {
+            $setup
         }
+    };
+}
+
+/// Declares the fixture `$fixture` of the group `$spec`. Every group needs an elevated token, so its
+/// tests carry the [`ELEVATED`] label.
+macro_rules! group {
+    ($fixture:ident, $enabled:ident, $spec:expr) => {
+        switched!(
+            $fixture,
+            $enabled,
+            $spec.env,
+            labels = [ELEVATED];
+            Group = enter($spec.env, $spec.what, process_var, cosca::elevation::is_elevated)
+        );
     };
 }
 
 group!(scm_group, scm_enabled, SCM);
 group!(systemd_group, systemd_enabled, SYSTEMD);
 group!(launchd_group, launchd_enabled, LAUNCHD);
+
+#[cfg(windows)]
+switched!(
+    /// Fixture of the tests that need `SeDebugPrivilege`; see the module doc of
+    /// `backend::scm::kill::privilege_tests`.
+    debug_privilege,
+    debug_privilege_enabled,
+    DEBUG_PRIVILEGE;
+    () = need(
+        DEBUG_PRIVILEGE,
+        process_var,
+        "this token does not hold SeDebugPrivilege; run with a token that does (an elevated one usually does)",
+        crate::backend::scm::kill::holds_debug_privilege,
+    )
+);
 
 #[cfg(test)]
 #[path = "groups_tests.rs"]

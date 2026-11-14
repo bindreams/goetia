@@ -9,42 +9,12 @@ use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, LUID};
 use windows_sys::Win32::Security::{
     GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PRIVILEGE_SET, PrivilegeCheck, SE_DEBUG_NAME,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
+    TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
 };
 
 use super::{DebugPrivilege, enable_in, restore_notice};
 use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
-use crate::testing::groups::{DEBUG_PRIVILEGE, need, process_var, require_enabled};
-
-fn debug_privilege_tests_on() -> Result<(), String> {
-    require_enabled(DEBUG_PRIVILEGE, process_var)
-}
-
-/// Fixture of the tests that need a token holding `SeDebugPrivilege` (an elevated administrator's):
-/// they fail without one, and `GOETIA_TEST_DEBUG_PRIVILEGE=0` ignores them.
-#[skuld::fixture(requires = [debug_privilege_tests_on])]
-fn debug_privilege() -> Result<(), String> {
-    need(
-        DEBUG_PRIVILEGE,
-        process_var,
-        "this token does not hold SeDebugPrivilege; run with a token that does (an elevated one usually does)",
-        holds_debug_privilege,
-    )
-}
-
-/// Whether the process token holds `SeDebugPrivilege`, enabled or not; `Err` if the probe fails.
-fn holds_debug_privilege() -> Result<bool, String> {
-    let probe = || {
-        let copy = process_token_copy(TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY)?;
-        enable_in(copy.as_raw_handle())
-    };
-    probe().map_err(|e| {
-        format!(
-            "could not probe the token for SeDebugPrivilege: {}",
-            crate::error::Chain(&e)
-        )
-    })
-}
+use crate::testing::groups::debug_privilege;
 
 /// The calling thread's own token, if it has one, opened to be queried.
 fn open_thread_token() -> Option<OwnedHandle> {

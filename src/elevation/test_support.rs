@@ -1,5 +1,8 @@
 //! Tokens for tests that act as an unelevated user, and a guard that ends the impersonation. Used by
 //! this module's tests and by `backend::scm::kill::privilege`'s.
+//!
+//! Under the `testing` feature alone only the `SeDebugPrivilege` probe uses it.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -17,7 +20,7 @@ use crate::backend::scm::shim::acl::Descriptor;
 use crate::backend::scm::sid::Sid;
 use crate::error::within;
 
-/// This process's token, opened with `access`; `Err` names the call.
+/// This process's token, opened with `access`.
 pub(crate) fn open_process_token(access: u32) -> io::Result<OwnedHandle> {
     let mut process = std::ptr::null_mut();
     // SAFETY: a pointer to a local; a returned token is owned below.
@@ -42,7 +45,7 @@ fn process_token() -> io::Result<OwnedHandle> {
 const TOKEN_COPY: &str = "D:(A;;GA;;;WD)";
 
 /// An impersonation copy of `source`, opened with `access`, that the thread impersonating it can open
-/// on any host (see [`TOKEN_COPY`]); `Err` names the call.
+/// on any host (see [`TOKEN_COPY`]).
 fn impersonation_copy(source: &OwnedHandle, access: u32) -> io::Result<OwnedHandle> {
     let permissions = Descriptor::from_sddl(TOKEN_COPY)
         .map_err(|e| within("the permissions of a token copy", io::Error::other(e)))?;
@@ -67,8 +70,7 @@ fn impersonation_copy(source: &OwnedHandle, access: u32) -> io::Result<OwnedHand
     Ok(unsafe { OwnedHandle::from_raw_handle(copy) })
 }
 
-/// An impersonation copy of this process's token, which holds whatever privileges the process does;
-/// `Err` names the call.
+/// An impersonation copy of this process's token, which holds whatever privileges the process does.
 pub(crate) fn process_token_copy(access: u32) -> io::Result<OwnedHandle> {
     impersonation_copy(&process_token()?, access)
 }

@@ -314,6 +314,9 @@ fn waiting_notice(id: &str, pid: u32, terminate_failed: Option<&io::Error>) -> S
 #[cfg(windows)]
 mod privilege;
 
+#[cfg(all(windows, any(test, feature = "testing")))]
+pub(crate) use privilege::holds_debug_privilege;
+
 #[cfg(windows)]
 pub use system::SystemKillTarget;
 

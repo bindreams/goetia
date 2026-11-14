@@ -24,7 +24,7 @@ pub(crate) fn token_has_administrators() -> io::Result<bool> {
     Ok(member != 0)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub(crate) mod test_support;
 
 #[cfg(test)]

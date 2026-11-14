@@ -120,9 +120,6 @@ fn a_group_that_is_off_refuses_its_setup() {
 
 const MISSING: &str = "this token does not hold SeDebugPrivilege; run elevated";
 
-/// A test that needs something the host may lack, and changes no system state, has a switch and no
-/// consent: it runs by default and fails, naming the missing thing and the switch, where the host
-/// lacks it.
 #[skuld::test]
 fn a_test_that_needs_a_dependency_fails_where_the_host_lacks_it() {
     for vars in [env(&[]), env(&[(GROUP, "1")])] {
@@ -132,8 +129,6 @@ fn a_test_that_needs_a_dependency_fails_where_the_host_lacks_it() {
     }
 }
 
-/// A probe that fails says nothing about the dependency: the failure is reported as the probe's, with
-/// the switch, and does not claim the dependency is missing.
 #[skuld::test]
 fn a_failed_probe_is_reported_as_a_failed_probe_not_a_missing_dependency() {
     let why = need(GROUP, env(&[]), MISSING, || {
