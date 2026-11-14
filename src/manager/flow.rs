@@ -413,8 +413,8 @@ impl<R: RunHandle> Waiter<R> {
     /// Shows `run`'s output while the thread waits for its end, and returns how it ended.
     ///
     /// The run is in flight, so it is waited for whatever happens to the output. If the wait failed
-    /// its error is returned, with the output's failure beside it if that failed too ([`Error::Both`]).
-    /// Otherwise a failure to show the output is returned, naming the exit.
+    /// its error is returned, with the output's failure beside it if that failed too ([`Error::Both`],
+    /// or an [`Error::Step`] around a wait whose outcome is open, so that it stays open). Otherwise a failure to show the output is returned, naming the exit.
     fn follow(self, run: R, id: &Id, out: &mut dyn Write) -> Result<Exit> {
         let source = run.output();
         // The thread is alive until it has a run or its sender is dropped: this cannot fail.
@@ -428,6 +428,12 @@ impl<R: RunHandle> Waiter<R> {
             Err(panic) => std::panic::resume_unwind(panic),
         };
         match (waited, shown) {
+            // `Both` is indeterminate only when both halves are: a wait that left the outcome open must
+            // stay open, so the output's failure is said in a wrapper around the wait.
+            (Err(wait), Err(shown)) if wait.is_indeterminate() => Err(Error::Step {
+                what: format!("goetia could not show the output of `{id}` either: {}", shown.report()),
+                source: Box::new(wait),
+            }),
             (Err(wait), Err(shown)) => Err(Error::Both {
                 first: Box::new(wait),
                 then: Box::new(shown),

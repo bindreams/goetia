@@ -1278,24 +1278,54 @@ fn a_failing_stream_still_waits_for_the_run() {
 }
 
 /// Both failed: the exit could not be established and the output could not be shown. Neither hides the
-/// other.
+/// other, and the exit class is the wait's when it left the outcome open (`4`): `Both` alone is
+/// indeterminate only when both halves are.
 #[skuld::test]
-fn a_wait_error_and_a_stream_error_are_both_returned() {
-    let fake = Fake::new();
-    fake.install(&a_task("nightly"), false).unwrap();
-    fake.seed_run_wait_fails("nightly", || Error::RunUnrecorded {
-        id: "nightly".to_string(),
-        reason: "no record (seeded)".to_string(),
-    });
+fn a_wait_error_and_a_stream_error_are_both_reported_and_an_open_outcome_stays_open() {
+    fn unrecorded() -> Error {
+        Error::RunUnrecorded {
+            id: "nightly".to_string(),
+            reason: "no record (seeded)".to_string(),
+        }
+    }
+    fn in_doubt() -> Error {
+        Error::RequestInDoubt {
+            request: "systemctl start nightly.service".to_string(),
+            reached: true,
+            note: None,
+            source: Box::new(std::io::Error::other("no journal (seeded)")),
+        }
+    }
+    fn not_started() -> Error {
+        Error::RunNotStarted {
+            id: "nightly".to_string(),
+            reason: "the manager refused (seeded)".to_string(),
+        }
+    }
+    for (what, wait, code) in [
+        ("an unrecorded exit", unrecorded as fn() -> Error, 4),
+        ("a lost journal", in_doubt, 4),
+        ("a run that did not start", not_started, 1),
+    ] {
+        let fake = Fake::new();
+        fake.install(&a_task("nightly"), false).unwrap();
+        fake.seed_run_wait_fails("nightly", wait);
 
-    let result = fake.run(&Id::try_from("nightly").unwrap(), &mut Refuses);
+        let e = fake
+            .run(&Id::try_from("nightly").unwrap(), &mut Refuses)
+            .expect_err("neither the exit nor the output");
 
-    let e = result.expect_err("neither the exit nor the output");
-    let Error::Both { first, then } = &e else {
-        panic!("{e:?}")
-    };
-    assert!(matches!(**first, Error::RunUnrecorded { .. }), "{first:?}");
-    assert!(then.report().to_string().contains("sink refused"), "{}", then.report());
+        let report = e.report().to_string();
+        assert!(
+            report.contains("sink refused"),
+            "{what}: the output's failure is said: {report}"
+        );
+        assert!(
+            report.contains(&wait().report().to_string()),
+            "{what}: the wait's failure is said: {report}"
+        );
+        assert_eq!(crate::cli::ExitCode::of(&e).code(), code, "{what}: {report}");
+    }
 }
 
 #[skuld::test]
