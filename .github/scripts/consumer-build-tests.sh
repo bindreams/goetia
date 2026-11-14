@@ -9,7 +9,7 @@
 #      its `install` reports "built without a stock shim"; one that never declared the feature
 #      type-checks with `unexpected_cfgs` denied;
 #   2. the same consumer built in two stages (shim first, then the program with the feature and
-#      `GOETIA_SHIM_EXE`) installs, runs and uninstalls a `type: simple` service, leaving no shim;
+#      `GOETIA_SHIM_EXE`) installs, runs and uninstalls a `protocol: plain` service, leaving no shim;
 #   3. goetia's own two-stage build does the same;
 #   4. `cargo install` goetia previews the shim installed beside it (the sibling route);
 #   5. the consumer's bins pass `libsearch_guard::verify` after the README's `build.rs`.
@@ -63,7 +63,6 @@ write_manifest() {
     cat > "$dir/goetia.yaml" <<EOF
 id: $id
 command: ['C:/Windows/System32/ping.exe', '-t', '127.0.0.1']
-type: simple
 EOF
 }
 
@@ -85,7 +84,7 @@ assert_previews_shim() {
     fi
 }
 
-# Install, run, uninstall a `type: simple` service, and expect nothing of the shim to remain.
+# Install, run, uninstall a `protocol: plain` service, and expect nothing of the shim to remain.
 round_trip() {
     local exe="$1" id="$2" dir="$3" status
     write_manifest "$dir" "$id"

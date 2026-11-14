@@ -13,15 +13,34 @@ const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
 
 #[skuld::test]
 fn a_counted_name_keeps_every_unit_including_a_nul_and_what_follows_it() {
-    let name: Vec<u16> = "Marker\0x".encode_utf16().collect();
+    let name = Name::new("Marker\0x");
+    let units: Vec<u16> = "Marker\0x".encode_utf16().collect();
 
     let counted = counted(&name);
 
-    assert_eq!(usize::from(counted.Length), name.len() * 2);
+    assert_eq!(usize::from(counted.Length), units.len() * 2);
     assert!(usize::from(counted.MaximumLength) >= usize::from(counted.Length));
     // SAFETY: `counted` points at `name`, which is alive, for `Length` bytes.
-    let seen = unsafe { std::slice::from_raw_parts(counted.Buffer, name.len()) };
-    assert_eq!(seen, name);
+    let seen = unsafe { std::slice::from_raw_parts(counted.Buffer, units.len()) };
+    assert_eq!(seen, units);
+}
+
+/// A terminator would be a unit of the name, and open the wrong key.
+#[skuld::test]
+fn a_name_made_from_text_has_no_terminator() {
+    let name = Name::new("Sub");
+
+    assert_eq!(name.units(), "Sub".encode_utf16().collect::<Vec<u16>>());
+    assert_eq!(usize::from(counted(&name).Length), "Sub".len() * 2);
+}
+
+/// A name read back from a key keeps every unit, a NUL or a lone surrogate included: the stray
+/// sweep deletes what it enumerated by this name.
+#[skuld::test]
+fn a_name_made_from_units_keeps_every_unit() {
+    let units = vec![0x61, 0, 0xD800];
+
+    assert_eq!(Name::from_units(&units[..]).units(), units);
 }
 
 #[skuld::test]
@@ -32,7 +51,7 @@ fn a_status_reads_as_the_os_error_it_maps_to() {
 
 #[skuld::test]
 fn a_child_is_opened_as_the_key_it_is_even_when_it_is_a_link() {
-    let name = counted(&"Sub".encode_utf16().collect::<Vec<u16>>());
+    let name = counted(&Name::new("Sub"));
     let parent = 0x1234 as HANDLE;
 
     let attributes = child_attributes(parent, &name, LinkHandling::Itself);
@@ -50,7 +69,7 @@ fn a_child_is_opened_as_the_key_it_is_even_when_it_is_a_link() {
 /// `Followed` enters a link.
 #[skuld::test]
 fn a_child_is_opened_through_a_link_when_asked_to_follow_it() {
-    let name = counted(&"Sub".encode_utf16().collect::<Vec<u16>>());
+    let name = counted(&Name::new("Sub"));
 
     let attributes = child_attributes(0x1234 as HANDLE, &name, LinkHandling::Followed);
 
@@ -108,10 +127,6 @@ fn a_reply_too_short_for_the_key_flags_is_an_error_not_a_key_that_is_no_link() {
 
 // Against the real registry ===========================================================================================
 
-fn units(text: &str) -> Vec<u16> {
-    text.encode_utf16().collect()
-}
-
 /// Writes keys under `HKLM\SOFTWARE`. KEY_DELETED at the open of `name` itself says that the held
 /// parent was marked deleted, which loses the delete's target: an error. A child that is not found
 /// is done.
@@ -120,13 +135,13 @@ fn a_child_of_a_parent_marked_deleted_is_an_error_and_a_child_not_found_is_done(
     let scratch = ScratchKey::new(&format!("counted-{}-parent", std::process::id()));
     let parent = scratch.create();
 
-    delete_subkey(&parent, &units("Missing")).expect("a child that is not there is done");
+    delete_subkey(&parent, &Name::new("Missing")).expect("a child that is not there is done");
 
     // Another handle deletes the parent; this one holds it open, so it is marked deleted.
     RegKey::predef(HKEY_LOCAL_MACHINE)
         .delete_subkey(scratch.path())
         .expect("delete the parent through another handle");
-    let e = delete_subkey(&parent, &units("Child")).expect_err("the parent is marked deleted");
+    let e = delete_subkey(&parent, &Name::new("Child")).expect_err("the parent is marked deleted");
 
     assert_eq!(e.raw_os_error(), Some(ERROR_KEY_DELETED as i32), "{e}");
 }
@@ -143,7 +158,13 @@ fn a_key_marked_deleted_while_the_walk_holds_it_is_done_at_its_listing(#[fixture
     let (top, _) = parent.create_subkey("Top").expect("create Top");
     top.create_subkey("Leaf").expect("create Leaf");
     drop(top);
-    let held = open_raw(parent.raw_handle(), &units("Top"), CHILD_ACCESS, LinkHandling::Itself).expect("open Top");
+    let held = open_raw(
+        parent.raw_handle(),
+        &Name::new("Top"),
+        CHILD_ACCESS,
+        LinkHandling::Itself,
+    )
+    .expect("open Top");
 
     // Another handle deletes the tree under the walk's open handle: `Top` is marked deleted.
     parent

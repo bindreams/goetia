@@ -40,3 +40,8 @@ pub struct Identity {
     /// systemd, `"root"` on launchd, an account name on SCM.
     pub user: String,
 }
+
+/// What a generator answers for a task until its backend's task support lands.
+pub(crate) fn cannot_run_tasks(backend: &str, id: &crate::spec::Id) -> crate::error::Error {
+    crate::spec::invalid(id, &format!("{backend} cannot run tasks yet"))
+}

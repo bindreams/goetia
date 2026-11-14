@@ -411,7 +411,7 @@ fn older_version_is_stale_not_conflict() {
     );
 }
 
-/// A rendering that differs from the desired one only in its recovery actions, as a `type: simple`
+/// A rendering that differs from the desired one only in its recovery actions, as a `protocol: plain`
 /// service registered by 0.1.0 does, is a `Stale` refresh and never a `Conflict`, because the
 /// version is compared before the content. Pins that ordering only; that re-installing such a
 /// service really writes the actions is `reinstalling_an_earlier_version_simple_service_applies_the_recovery_actions`.

@@ -1,5 +1,5 @@
-//! The fixture process a `type: managed` daemon under test actually is:
-//! this test binary, re-invoked as a real SCM service. `type: managed`
+//! The fixture process a `protocol: native` daemon under test actually is:
+//! this test binary, re-invoked as a real SCM service. `protocol: native`
 //! means SCM launches the daemon's own command directly (no shim), so
 //! `goetia.yaml`'s `command` for these tests names this binary itself —
 //! mirroring `tests/support/sentinel.rs`'s `SERVICE_HOST` mode, which

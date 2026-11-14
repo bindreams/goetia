@@ -12,8 +12,8 @@
 //!
 //! [`spec_diff`] instead compares two resolved specs, rendered through
 //! [`render_yaml`] as canonical key-sorted YAML using the same key names
-//! `goetia.yaml` uses — `restart-delay`, not `restart_delay`; `type`, not
-//! `kind` — because it also backs `goetia daemon show`, and someone who
+//! `goetia.yaml` uses — `restart-delay`, not `restart_delay`; `type` and
+//! `protocol`, not `kind` — because it also backs `goetia daemon show`, and someone who
 //! wrote YAML should be shown YAML they recognize.
 //!
 //! `DaemonSpec` deliberately does not derive `Serialize` — the metadata
@@ -49,30 +49,41 @@ pub fn spec_diff(was: &DaemonSpec, now: &DaemonSpec) -> String {
 /// names. Backs `goetia daemon show` and the `before`/`after` sides of
 /// [`spec_diff`].
 pub fn render_yaml(spec: &DaemonSpec) -> String {
-    let DaemonSpec::Service(s) = spec;
+    let common = spec.common();
     let mut fields: Vec<(&'static str, Value)> = vec![
         (
             "command",
-            Value::Sequence(s.common.command.iter().cloned().map(Value::from).collect()),
+            Value::Sequence(common.command.iter().cloned().map(Value::from).collect()),
         ),
-        ("env", Value::Mapping(env_value(&s.common.env))),
-        ("id", Value::from(s.common.id.as_str().to_owned())),
-        ("name", Value::from(s.common.name.clone())),
-        ("restart", Value::from(restart_key(s.restart))),
-        ("type", Value::from(kind_key(s.protocol))),
-        ("user", user_value(&s.common.user)),
+        ("env", Value::Mapping(env_value(&common.env))),
+        ("id", Value::from(common.id.as_str().to_owned())),
+        ("name", Value::from(common.name.clone())),
+        ("user", user_value(&common.user)),
     ];
-    if let Some(cwd) = &s.common.cwd {
+    if let Some(cwd) = &common.cwd {
         fields.push(("cwd", Value::from(cwd.display().to_string())));
     }
-    if let Some(logs) = &s.common.logs {
+    if let Some(logs) = &common.logs {
         fields.push(("logs", Value::from(logs.display().to_string())));
     }
-    if let Some(delay) = s.restart_delay {
-        fields.push((
-            "restart-delay",
-            Value::from(humantime::format_duration(delay).to_string()),
-        ));
+    match spec {
+        DaemonSpec::Service(s) => {
+            fields.push(("type", Value::from("service")));
+            fields.push(("protocol", Value::from(kind_key(s.protocol))));
+            fields.push(("restart", Value::from(restart_key(s.restart))));
+            if let Some(delay) = s.restart_delay {
+                fields.push((
+                    "restart-delay",
+                    Value::from(humantime::format_duration(delay).to_string()),
+                ));
+            }
+        }
+        DaemonSpec::Task(t) => {
+            fields.push(("type", Value::from("task")));
+            if let Some(schedule) = &t.schedule {
+                fields.push(("schedule", Value::from(schedule.text().to_owned())));
+            }
+        }
     }
 
     // Sorted explicitly rather than relying on incidental container
@@ -85,10 +96,59 @@ pub fn render_yaml(spec: &DaemonSpec) -> String {
         .map(|(key, value)| (Value::from(key), value))
         .collect();
 
-    yaml_serde::to_string(&Value::Mapping(mapping)).expect("a resolved DaemonSpec always renders to valid YAML")
+    let rendered =
+        yaml_serde::to_string(&Value::Mapping(mapping)).expect("a resolved DaemonSpec always renders to valid YAML");
+    match resolution_comment(spec) {
+        Some(comment) => annotate_schedule(&rendered, &comment),
+        None => rendered,
+    }
 }
 
 // rendering helpers ===================================================================================================
+
+/// What an `H` in a task's schedule resolved to: each field that has an `H` as its sorted comma
+/// list, the others as written. Specs compare by the resolved values, so the text alone would
+/// render two different specs alike.
+fn resolution_comment(spec: &DaemonSpec) -> Option<String> {
+    let DaemonSpec::Task(task) = spec else {
+        return None;
+    };
+    let schedule = task.schedule.as_ref().filter(|s| s.text().contains('H'))?;
+    let fields: Vec<String> = schedule
+        .text()
+        .split_whitespace()
+        .zip(schedule.fields())
+        .map(|(word, field)| {
+            if word.contains('H') {
+                field.values.iter().map(u8::to_string).collect::<Vec<_>>().join(",")
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect();
+    Some(format!("resolves to: {}", fields.join(" ")))
+}
+
+/// Appends `# comment` to the first line of the `schedule:` entry, where a YAML comment is valid
+/// after a plain, quoted or block scalar's header alike.
+fn annotate_schedule(rendered: &str, comment: &str) -> String {
+    let mut out = String::with_capacity(rendered.len() + comment.len() + 4);
+    let mut annotated = false;
+    for line in rendered.split_inclusive('\n') {
+        if !annotated && line.starts_with("schedule:") {
+            annotated = true;
+            let (body, ending) = line.strip_suffix('\n').map_or((line, ""), |body| (body, "\n"));
+            out.push_str(&format!("{body}  # {comment}{ending}"));
+        } else {
+            out.push_str(line);
+        }
+    }
+    debug_assert!(
+        annotated,
+        "a schedule's comment is due but no `schedule:` line was rendered"
+    );
+    out
+}
 
 /// `env`'s keys are already sorted (`DaemonSpec::env` is a `BTreeMap`), so
 /// this preserves that order rather than re-deriving it.
@@ -108,8 +168,8 @@ fn restart_key(restart: Restart) -> &'static str {
 
 fn kind_key(protocol: Protocol) -> &'static str {
     match protocol {
-        Protocol::Plain => "simple",
-        Protocol::Native => "managed",
+        Protocol::Plain => "plain",
+        Protocol::Native => "native",
     }
 }
 

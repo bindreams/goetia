@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
 };
-use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
+use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec, TaskFields, TaskSpec};
 use crate::testing::{base_fields, service_fields};
 use cosca::Containment;
 use cosca::error::{ChildFate, Report};
@@ -45,7 +45,7 @@ const DAEMON_LOG: &str = r"C:\goetia-shim-test\daemon.log";
 /// `Debug` text of the command that the expected messages below spell out has no escapes.
 const POWERSHELL: &str = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
 
-/// A `type: simple` daemon. Nothing runs it: the `Fake` states what happens to it, and opens its
+/// A `protocol: plain` daemon. Nothing runs it: the `Fake` states what happens to it, and opens its
 /// log, and takes the shim's failure lines, without touching the file system.
 fn spec() -> DaemonSpec {
     let command = [
@@ -88,7 +88,7 @@ fn spawn_failure() -> String {
 }
 
 /// The line logged when the daemon is not job-contained, whatever the kill then does.
-const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
+const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `protocol: plain` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
 
 /// The line logged when the daemon's tree cannot be terminated after the daemon ended.
 fn exited_tree_unkilled() -> String {
@@ -738,7 +738,7 @@ fn no_stopping_report_over_an_uncontained_daemon() {
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
-/// `type: simple` needs a Job Object to terminate the daemon's whole tree. A daemon contained any
+/// `protocol: plain` needs a Job Object to terminate the daemon's whole tree. A daemon contained any
 /// other way is killed and the start fails with nothing reported RUNNING. No kill proves a
 /// non-job tree gone, so the record is the incomplete stop (never restartable), whatever the kill
 /// returned.
@@ -1081,6 +1081,30 @@ fn a_spec_that_was_read_is_the_one_to_run() {
     let read = spec_read(ID, Ok(Some(blob))).expect("a read spec is run");
 
     assert_eq!(read.spec, spec());
+}
+
+/// A task's blob is refused before any daemon runs, so SCM does not restart it.
+#[skuld::test]
+fn service_mode_refuses_a_task_blob() {
+    let task = TaskSpec::new(TaskFields {
+        common: base_fields(ID, vec![POWERSHELL.to_string()]).common,
+        schedule: None,
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    let blob = crate::blob::Blob {
+        schema: crate::blob::SCHEMA,
+        version: crate::version().to_string(),
+        spec: task,
+    };
+
+    let stop = spec_read(ID, Ok(Some(blob))).expect_err("a task's blob is not run");
+
+    assert_eq!(stop.reported, Reported::Refused);
+    assert_eq!(
+        stop.message,
+        "this is a task's blob; the service host runs only services"
+    );
 }
 
 /// A read that did not complete says nothing about the record, so the shim fails restartably (SCM

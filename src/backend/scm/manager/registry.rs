@@ -28,7 +28,7 @@ use crate::manager::{Installed, flow};
 
 mod counted;
 mod settle;
-use counted::LinkHandling;
+use counted::{LinkHandling, Name};
 use settle::{Failure, Settled, Stop, settle, stands, tolerate_not_found};
 
 const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
@@ -52,14 +52,14 @@ fn parameters_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}\{PARAMETERS_KEY}")
 }
 
-fn parameters_key_name() -> Vec<u16> {
-    PARAMETERS_KEY.encode_utf16().collect()
+fn parameters_key_name() -> Name {
+    Name::new(PARAMETERS_KEY)
 }
 
 /// What a read asks `Services` for: `Parameters` of `name` as a path below it, for one open that
 /// passes the service key without opening it, and the access to open it with, which is a read's.
-fn parameters_read_request(name: &str) -> (Vec<u16>, u32) {
-    (format!(r"{name}\{PARAMETERS_KEY}").encode_utf16().collect(), KEY_READ)
+fn parameters_read_request(name: &str) -> (Name, u32) {
+    (Name::new(&format!(r"{name}\{PARAMETERS_KEY}")), KEY_READ)
 }
 
 /// An open `Services` key, which a read opens one service's `Parameters` below. It borrows the key
@@ -119,8 +119,8 @@ fn read_settled<T>(
 ///
 /// The key is opened as SCM reads it, through a registry link (see [`stands`]).
 fn service_stands_in(services: &ServicesRoot<'_>, name: &str) -> std::result::Result<bool, Failure> {
-    let wide: Vec<u16> = name.encode_utf16().collect();
-    let open = |links| counted::open_child(services.0, &wide, KEY_READ, links).map(drop);
+    let key = Name::new(name);
+    let open = |links| counted::open_child(services.0, &key, KEY_READ, links).map(drop);
     stands(open(LinkHandling::Followed), || open(LinkHandling::Itself))
         .map_err(|source| failure("open", &service_key_path(name), source))
 }
@@ -152,7 +152,7 @@ fn failure(op: &str, path: &str, source: std::io::Error) -> Failure {
 ///   gone.
 /// - [`registry_undetermined`] for every other failure, among them a key that vanishes or is marked
 ///   deleted under a service that still stands, and a service key that is a registry link to a
-///   missing key. Never Foreign: this key holds the only proof of ownership a `type: managed`
+///   missing key. Never Foreign: this key holds the only proof of ownership a `protocol: native`
 ///   service has.
 ///
 /// goetia's own writes remove `Parameters` only when it is a registry link (see
@@ -328,18 +328,18 @@ pub fn write_parameters(name: &str, params: &BTreeMap<String, String>) -> Result
 
     let present = enum_values(&key).map_err(|e| registry_error("enumerate", &path, e))?;
     for stray in strays(&present, params) {
-        tolerate_not_found(counted::delete_value(&key, &stray.name))
+        tolerate_not_found(counted::delete_value(&key, &Name::from_units(&stray.name[..])))
             .map_err(|e| registry_error(&format!("delete value {} under", shown_name(&stray.name)), &path, e))?;
     }
 
-    let subkeys: Vec<Vec<u16>> = key
+    let subkeys: Vec<Name> = key
         .enum_keys_os_string()
-        .map(|subkey| subkey.map(|name| name.encode_wide().collect()))
+        .map(|subkey| subkey.map(|name| Name::from_units(name.encode_wide().collect::<Vec<u16>>())))
         .collect::<std::io::Result<_>>()
         .map_err(|e| registry_error("enumerate subkeys of", &path, e))?;
     for subkey in &subkeys {
         counted::delete_subkey(&key, subkey)
-            .map_err(|e| registry_error(&format!("delete subkey {} under", shown_name(subkey)), &path, e))?;
+            .map_err(|e| registry_error(&format!("delete subkey {} under", shown_name(subkey.units())), &path, e))?;
     }
     Ok(())
 }
@@ -384,12 +384,12 @@ pub fn read_environment(name: &str) -> Result<RegistryReadOutcome<Vec<String>>> 
 /// [`read_environment`] below a `Services` key that is already open.
 fn read_environment_in(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Vec<String>>> {
     let path = service_key_path(name);
-    let wide: Vec<u16> = name.encode_utf16().collect();
+    let service = Name::new(name);
     read_settled(
         || service_stands_in(services, name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
-            let key = counted::open_child(services.0, &wide, KEY_READ, LinkHandling::Followed)
+            let key = counted::open_child(services.0, &service, KEY_READ, LinkHandling::Followed)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
             let mut bytes = Vec::new();
             match query_raw_value(&key, ENVIRONMENT_VALUE, &mut bytes) {
@@ -544,12 +544,12 @@ fn scan_names_under(path: &str, mut keep: impl FnMut(String, &ServicesRoot<'_>))
 /// registry link is read through it, as SCM reads it.
 pub fn read_registered_image(services: &ServicesRoot<'_>, name: &str) -> Result<RegistryReadOutcome<Option<String>>> {
     let path = service_key_path(name);
-    let wide: Vec<u16> = name.encode_utf16().collect();
+    let service = Name::new(name);
     read_settled(
         || service_stands_in(services, name),
         |f| registry_error(&f.op, &f.path, f.source),
         || {
-            let key = counted::open_child(services.0, &wide, KEY_READ, LinkHandling::Followed)
+            let key = counted::open_child(services.0, &service, KEY_READ, LinkHandling::Followed)
                 .map_err(|e| Stop::at_open(failure("open", &path, e), None))?;
             match key.get_value::<u32, _>(DELETE_FLAG_VALUE) {
                 Ok(0) => {}

@@ -45,7 +45,7 @@ use super::interpolate::Substitution;
 use super::overrides::Supplied;
 use super::resolve::{FieldValues, Refused, dir_join, directory_is_to_blame, invalid};
 use super::vars::is_valid_name;
-use super::{AccountId, DaemonFields, Id, Protocol, Restart, User, Warning};
+use super::{AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, Schedule, User, Warning};
 use crate::error::Error;
 
 /// One of the three service-manager backends a `backend-specific:` entry
@@ -153,7 +153,9 @@ pub(crate) struct ShapedSpec {
     pub(crate) restart: Shaped<Restart>,
     pub(crate) restart_delay: Shaped<Duration>,
     pub(crate) logs: Option<PathBuf>,
-    pub(crate) kind: Shaped<Protocol>,
+    pub(crate) daemon_type: Shaped<DaemonKind>,
+    pub(crate) protocol: Shaped<Protocol>,
+    pub(crate) schedule: Shaped<Schedule>,
 }
 
 // Advisories and rejections ===========================================================================================
@@ -427,22 +429,22 @@ pub(crate) fn systemd_raw_value_defect(directive: &str, value: &str) -> Option<S
     has_edge_whitespace(value).then(|| raw_value_message(directive, value))
 }
 
-/// `type: managed` on Windows has no working-directory or stdout-capture
+/// `protocol: native` on Windows has no working-directory or stdout-capture
 /// field, so `cwd`/`logs` are accepted, not rejected, but silently
 /// unavailable there.
 ///
-/// Reads `kind` through [`Shaped::parsed`], whose `None` covers both an
+/// Reads `protocol` through [`Shaped::parsed`], whose `None` covers both an
 /// absent value and a `Deferred` one: silence on an unavailable value is
-/// the contract. An absent `type` defaults to `Simple`, which warns about
+/// the contract. An absent `protocol` defaults to plain, which warns about
 /// nothing.
 fn warn_on_windows_divergences(spec: &ShapedSpec, out: &mut Vec<Warning>) {
-    if spec.kind.parsed() != Some(Protocol::Native) {
+    if spec.protocol.parsed() != Some(Protocol::Native) {
         return;
     }
     if spec.cwd.is_some() || spec.logs.is_some() {
         out.push(Warning {
             id: Some(spec.id.clone()),
-            message: "type: managed has no working-directory or stdout-capture field on Windows SCM; \
+            message: "protocol: native has no working-directory or stdout-capture field on Windows SCM; \
                       `cwd`/`logs` are silently unavailable there, and with no working directory, \
                       every relative path in an argument resolves against System32"
                 .to_string(),
