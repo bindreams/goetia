@@ -31,7 +31,7 @@ fn parameters_key_path_is_the_service_key_plus_parameters() {
 fn parameters_are_opened_in_one_step_below_services_for_reading_only() {
     let (name, access) = parameters_read_request("goetia-test");
 
-    assert_eq!(name, utf16(r"goetia-test\Parameters"));
+    assert_eq!(name, Name::new(r"goetia-test\Parameters"));
     assert_eq!(access, KEY_READ);
 }
 
