@@ -58,9 +58,9 @@ pub const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
 pub const LAUNCHD_DAEMON_DIR: &str = "/Library/LaunchDaemons";
 pub const SCM_SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 
-/// A manager whose `type: simple` services run the stock shim this package builds, wherever cargo put
+/// A manager whose `protocol: plain` services run the stock shim this package builds, wherever cargo put
 /// it, through a `StandaloneShim`. The folder check is off: the build directory is the user's, not a
-/// protected one. `Scm::new()` has no provider, so a test that installs a `type: simple` service
+/// protected one. `Scm::new()` has no provider, so a test that installs a `protocol: plain` service
 /// without caring where its host comes from uses this.
 #[cfg(windows)]
 pub fn stock_shim_manager() -> goetia::backend::scm::manager::Scm {

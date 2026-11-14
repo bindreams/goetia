@@ -57,7 +57,10 @@ use super::overrides::Supplied;
 use super::raw::RawSpec;
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
-use super::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, Warning};
+use super::{
+    DaemonFields, DaemonKind, DaemonSpec, HashSeed, Id, Protocol, Restart, Schedule, ServiceFields, ServiceSpec,
+    TaskFields, TaskSpec, Warning, schedule,
+};
 use crate::error::Error;
 
 const MANIFEST_FILE_NAME: &str = "goetia.yaml";
@@ -107,6 +110,10 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     interpolate::reject_interpolated_id(&raw.id)?;
     let id = Id::try_from(raw.id.clone())?;
 
+    // `type` is the daemon's own, never a backend's: refused by name before any merge, and ahead
+    // of "base errors win" (step 3), so an error the override itself causes cannot hide the refusal.
+    refuse_type_overrides(&id, &raw)?;
+
     // Step 2: the `.env` gate, computed from the merged native spec of step 5, the one
     // substitution runs on. Anything else either misses a `${VAR}` written only in the native
     // override, or lets an unrelated or unreadable `.env` break a host whose native backend has
@@ -121,11 +128,14 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
         Vars::empty()
     };
 
+    // Read once, for every pass: the `H` of a `schedule` is a function of the host.
+    let hostname = schedule::this_hostname();
+
     // Step 3: the base pass. Reported verbatim with no backend attribution, so base errors win
     // on precedence. No `BackendKind` verdict: the base spec is nobody's override.
     let base = raw.without_overrides();
     interpolate::check_spec_grammar(&base)?;
-    resolve_shape(&id, base, base_dir, Substitution::Pending, None)?;
+    resolve_shape(&id, base, base_dir, Substitution::Pending, None, &hostname)?;
 
     // Step 4: the all-backends sweep, errors only: every backend's merged spec is checked as
     // authored, and `BackendKind::error` judges the fields its override supplied. A non-native
@@ -138,7 +148,8 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
         let has_entry = raw.backend_specific.contains_key(&backend);
         let sweep: Result<(), Error> = (|| {
             interpolate::check_spec_grammar(&merged)?;
-            let (shaped, _dropped_warnings) = resolve_shape(&id, merged, base_dir, Substitution::Pending, None)?;
+            let (shaped, _dropped_warnings) =
+                resolve_shape(&id, merged, base_dir, Substitution::Pending, None, &hostname)?;
             if Some(backend) == native {
                 return Ok(());
             }
@@ -166,7 +177,7 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
         }
     };
     let (shaped, mut daemon_warnings) =
-        resolve_shape(&id, native_merged, base_dir, Substitution::Done, native).map_err(blame)?;
+        resolve_shape(&id, native_merged, base_dir, Substitution::Done, native, &hostname).map_err(blame)?;
     // `error` reads only `native_supplied` fields, and only `user`: it is the backend's verdict on
     // what the override wrote, so it names the backend too, ahead of the `.env` attribution.
     if let Some(b) = native {
@@ -309,14 +320,21 @@ impl From<Refused> for Error {
 ///
 /// `substitution` says whether the values may still hold references, which decides what is judged
 /// now. `native` is the backend whose rules refuse a path as it is joined
-/// ([`BackendKind::refuse_path`]): only the pass whose result is kept names one. An error says which
-/// field it is about ([`Refused`]); attributing it is the caller's.
+/// ([`BackendKind::refuse_path`]): only the pass whose result is kept names one. `hostname` seeds the
+/// `H` of a `schedule`. An error says which field it is about ([`Refused`]); attributing it is the
+/// caller's.
+///
+/// Once `type` is known (absent is a service), the other type's fields are refused by name, on every
+/// pass and so for every backend's override: a task has no `restart`, `restart-delay` or `protocol`,
+/// and a service has no `schedule`. While `type` is still [`Shaped::Deferred`] the refusal waits for
+/// the pass that parses it.
 fn resolve_shape(
     id: &Id,
     raw: RawSpec,
     base_dir: &Path,
     substitution: Substitution,
     native: Option<BackendKind>,
+    hostname: &str,
 ) -> Result<(ShapedSpec, Vec<Warning>), Refused> {
     debug_assert!(
         raw.backend_specific.is_empty(),
@@ -365,6 +383,18 @@ fn resolve_shape(
     let logs = logs.map(PathBuf::from);
     let env = raw.env;
 
+    let daemon_type = shape(id, Field::Type, raw.daemon_type, substitution, parse_type)?;
+    refuse_fields_of_the_other_type(
+        id,
+        &daemon_type,
+        &[
+            (Field::Restart, raw.restart.is_some()),
+            (Field::RestartDelay, raw.restart_delay.is_some()),
+            (Field::Protocol, raw.protocol.is_some()),
+            (Field::Schedule, raw.schedule.is_some()),
+        ],
+    )?;
+
     let restart = shape(id, Field::Restart, raw.restart, substitution, parse_restart)?;
     let restart_delay = shape(
         id,
@@ -373,7 +403,10 @@ fn resolve_shape(
         substitution,
         parse_restart_delay,
     )?;
-    let kind = shape(id, Field::Kind, raw.kind, substitution, parse_protocol)?;
+    let protocol = shape(id, Field::Protocol, raw.protocol, substitution, parse_protocol)?;
+    let schedule = shape(id, Field::Schedule, raw.schedule, substitution, |id, text| {
+        Schedule::parse(text, &HashSeed { hostname, id })
+    })?;
 
     Ok((
         ShapedSpec {
@@ -386,7 +419,9 @@ fn resolve_shape(
             restart,
             restart_delay,
             logs,
-            kind,
+            daemon_type,
+            protocol,
+            schedule,
         },
         warnings,
     ))
@@ -400,7 +435,7 @@ fn shape<T>(
     field: Field,
     raw: Option<String>,
     substitution: Substitution,
-    parse: fn(&Id, &str) -> Result<T, Error>,
+    parse: impl Fn(&Id, &str) -> Result<T, Error>,
 ) -> Result<Shaped<T>, Refused> {
     match raw {
         None => Ok(Shaped::Absent),
@@ -411,8 +446,43 @@ fn shape<T>(
     }
 }
 
+/// The fields of the other type of daemon, refused by name once `type` is known: a task's `restart`,
+/// `restart-delay` and `protocol`, a service's `schedule`. `fields` says which of the four the
+/// manifest wrote. A `type` that is still [`Shaped::Deferred`] refuses nothing: a later pass knows it.
+fn refuse_fields_of_the_other_type(
+    id: &Id,
+    daemon_type: &Shaped<DaemonKind>,
+    fields: &[(Field, bool)],
+) -> Result<(), Refused> {
+    let kind = match daemon_type {
+        Shaped::Parsed(kind) => *kind,
+        Shaped::Absent => DaemonKind::Service,
+        Shaped::Deferred => return Ok(()),
+    };
+    // `schedule` is the one field of a task; the other three are a service's.
+    let (applies_only_to, this_daemon, of_the_other_type): (&str, &str, fn(&Field) -> bool) = match kind {
+        DaemonKind::Service => ("a task", "service", |field| *field == Field::Schedule),
+        DaemonKind::Task => ("a service", "task", |field| *field != Field::Schedule),
+    };
+    if let Some((field, _)) = fields
+        .iter()
+        .find(|(field, written)| *written && of_the_other_type(field))
+    {
+        let path = field.path();
+        // Blamed on `type`: its text, which `.env` may have supplied, is what makes the field foreign.
+        return Err(Refused::at(
+            Field::Type,
+            invalid(
+                id,
+                &format!("`{path}` applies only to {applies_only_to}; this daemon is `type: {this_daemon}`"),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Completeness: every field the installed spec must actually have, plus the defaults. Errors
-/// name `backend`.
+/// name `backend`. A `service` makes a [`ServiceSpec`] and a `task` a [`TaskSpec`].
 fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<DaemonSpec, Error> {
     let ShapedSpec {
         id,
@@ -424,37 +494,58 @@ fn require_complete(shaped: ShapedSpec, backend: Option<BackendKind>) -> Result<
         restart,
         restart_delay,
         logs,
-        kind,
+        daemon_type,
+        protocol,
+        schedule,
     } = shaped;
 
     // Absent and empty share one check, so they cannot diverge in message.
     let command = command.unwrap_or_default();
     reject_empty_command(&id, &command).map_err(|_| missing_command_error(&id, backend))?;
 
-    let restart = settled(&id, "restart", restart)?.unwrap_or(Restart::Never);
-    let restart_delay = settled(&id, "restart-delay", restart_delay)?;
-    let protocol = settled(&id, "type", kind)?.unwrap_or(Protocol::Plain);
+    let daemon_type = settled(&id, "type", daemon_type)?.unwrap_or(DaemonKind::Service);
+    let daemon = id.clone();
+    let common = DaemonFields {
+        id,
+        name,
+        command,
+        cwd,
+        env,
+        user,
+        logs,
+    };
 
     // The rules already ran on these values and on every path resolved (`command[0]` included, by
     // `resolve_shape`), so `new` is what makes the result a `DaemonSpec`, not a check: it cannot
     // refuse a manifest.
-    let daemon = id.clone();
-    ServiceSpec::new(ServiceFields {
-        common: DaemonFields {
-            id,
-            name,
-            command,
-            cwd,
-            env,
-            user,
-            logs,
-        },
-        restart,
-        restart_delay,
-        protocol,
-    })
-    .map(DaemonSpec::from)
-    .map_err(|err| contract_violation_from(&daemon, "the resolved daemon failed its own field rules", err))
+    let refused = |err| contract_violation_from(&daemon, "the resolved daemon failed its own field rules", err);
+    match daemon_type {
+        DaemonKind::Service => {
+            // `resolve_shape` refuses a `schedule` on a service.
+            unset(&daemon, "schedule", &schedule)?;
+            let restart = settled(&daemon, "restart", restart)?.unwrap_or(Restart::Never);
+            let restart_delay = settled(&daemon, "restart-delay", restart_delay)?;
+            let protocol = settled(&daemon, "protocol", protocol)?.unwrap_or(Protocol::Plain);
+            ServiceSpec::new(ServiceFields {
+                common,
+                restart,
+                restart_delay,
+                protocol,
+            })
+            .map(DaemonSpec::from)
+            .map_err(refused)
+        }
+        DaemonKind::Task => {
+            // `resolve_shape` refuses these on a task.
+            unset(&daemon, "restart", &restart)?;
+            unset(&daemon, "restart-delay", &restart_delay)?;
+            unset(&daemon, "protocol", &protocol)?;
+            let schedule = settled(&daemon, "schedule", schedule)?;
+            TaskSpec::new(TaskFields { common, schedule })
+                .map(DaemonSpec::from)
+                .map_err(refused)
+        }
+    }
 }
 
 /// A defect of this crate, not of any manifest: something an earlier step ruled out happened. An
@@ -495,6 +586,17 @@ fn settled<T>(id: &Id, field: &str, shaped: Shaped<T>) -> Result<Option<T>, Erro
         Shaped::Deferred => Err(contract_violation(
             id,
             &format!("field `{field}` was left to a substitution that has already run"),
+        )),
+    }
+}
+
+/// The contract of a field `resolve_shape` refuses for this type of daemon: it is absent here.
+fn unset<T>(id: &Id, field: &str, shaped: &Shaped<T>) -> Result<(), Error> {
+    match shaped {
+        Shaped::Absent => Ok(()),
+        Shaped::Parsed(_) | Shaped::Deferred => Err(contract_violation(
+            id,
+            &format!("field `{field}` was set on a daemon that its type refuses it on"),
         )),
     }
 }
@@ -541,17 +643,55 @@ pub(crate) fn parse_restart(id: &Id, raw: &str) -> Result<Restart, Error> {
     }
 }
 
-/// Parse an authored `type:` string into a [`Protocol`]. `pub(crate)`: see
-/// [`parse_restart`].
+/// Parse an authored `protocol:` string into a [`Protocol`]. `pub(crate)`: see [`parse_restart`].
 pub(crate) fn parse_protocol(id: &Id, raw: &str) -> Result<Protocol, Error> {
     match raw {
-        "simple" => Ok(Protocol::Plain),
-        "managed" => Ok(Protocol::Native),
+        "plain" => Ok(Protocol::Plain),
+        "native" => Ok(Protocol::Native),
         other => Err(invalid(
             id,
-            &format!("field `type` is `{other}`; expected one of `simple`, `managed`"),
+            &format!("`protocol` must be `plain` or `native`, not `{other}`"),
         )),
     }
+}
+
+/// Parse an authored `type:` string into a [`DaemonKind`]. `pub(crate)`: see [`parse_restart`]. The
+/// values `simple` and `managed` the key had before it named the kind of daemon are refused with
+/// the `protocol` that replaces each.
+pub(crate) fn parse_type(id: &Id, raw: &str) -> Result<DaemonKind, Error> {
+    match raw {
+        "service" => Ok(DaemonKind::Service),
+        "task" => Ok(DaemonKind::Task),
+        other => Err(renamed_type(id, other)
+            .unwrap_or_else(|| invalid(id, &format!("`type` must be `service` or `task`, not `{other}`")))),
+    }
+}
+
+/// The refusal of `type: simple` and `type: managed`, which became `protocol: plain` and `protocol: native`.
+fn renamed_type(id: &Id, raw: &str) -> Option<Error> {
+    let protocol = match raw {
+        "simple" => "plain",
+        "managed" => "native",
+        _ => return None,
+    };
+    Some(invalid(
+        id,
+        &format!("`type: {raw}` is now `protocol: {protocol}`; `type` is `service` or `task`"),
+    ))
+}
+
+/// Refuse every `type` written under a `backend-specific` key, each attributed to its backend. The
+/// two values the key used to take get their `protocol` message; any other, `${...}` included, is
+/// refused as a `type` no backend may set.
+fn refuse_type_overrides(id: &Id, raw: &RawSpec) -> Result<(), Error> {
+    for (&backend, ovr) in &raw.backend_specific {
+        let Some(text) = &ovr.daemon_type else {
+            continue;
+        };
+        let err = renamed_type(id, text).unwrap_or_else(|| invalid(id, "`type` cannot be set per backend"));
+        return Err(attribute_to(err, backend));
+    }
+    Ok(())
 }
 
 /// Parse an authored `restart-delay:` string into a [`Duration`] with `humantime`.
@@ -1227,8 +1367,8 @@ fn reject_relative_path(id: &Id, field: &str, path: &Path) -> Result<(), Error> 
     Ok(())
 }
 
-/// `pub(super)`: `spec::backend` builds the same `Error::Invalid` for `BackendKind::error`.
-pub(super) fn invalid(id: &Id, message: &str) -> Error {
+/// `pub(crate)`: `spec::backend` and `crate::backend` build the same `Error::Invalid`.
+pub(crate) fn invalid(id: &Id, message: &str) -> Error {
     Error::Invalid {
         daemon: id.as_str().to_string(),
         message: message.to_string(),

@@ -279,7 +279,7 @@ impl Supervisor {
     /// caller after it returns.** The [`Waiter`]'s thread performs the real,
     /// blocking `child.wait()`, and this call joins it before returning, so
     /// that wait must itself return before this function can. For a daemon
-    /// that does not exit on its own — the ordinary `type: simple` case —
+    /// that does not exit on its own — the ordinary `protocol: plain` case —
     /// nothing makes `child.wait()` return except killing the child. If the
     /// kill happened only after this call returned, the join would block
     /// forever waiting for a worker that is parked on a process nothing has

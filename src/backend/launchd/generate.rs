@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::backend::Identity;
+use crate::backend::{Identity, cannot_run_tasks};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::spec::{DaemonSpec, Restart};
@@ -304,8 +304,10 @@ fn round_up_seconds(d: Duration) -> u64 {
 /// (if `cwd`), `EnvironmentVariables` (if `env` is non-empty), `UserName`, `KeepAlive`/`RunAtLoad`
 /// (per `restart`), `ThrottleInterval` (if `restart != never` and `restart_delay` is set), and
 /// `StandardOutPath`/`StandardErrorPath` (if `logs`; both name the one log file).
-pub fn plist(spec: &DaemonSpec, id: &Identity) -> String {
-    let DaemonSpec::Service(s) = spec;
+pub fn plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
+    let DaemonSpec::Service(s) = spec else {
+        return Err(cannot_run_tasks("launchd", &spec.common().id));
+    };
     const INDENT: &str = "\t";
     let mut dict = String::new();
 
@@ -336,7 +338,7 @@ pub fn plist(spec: &DaemonSpec, id: &Identity) -> String {
         push_key_string(&mut dict, INDENT, "StandardErrorPath", path);
     }
 
-    format!(
+    Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          {comment}\
@@ -346,7 +348,7 @@ pub fn plist(spec: &DaemonSpec, id: &Identity) -> String {
          </dict>\n\
          </plist>\n",
         comment = metadata_comment(spec),
-    )
+    ))
 }
 
 #[cfg(test)]

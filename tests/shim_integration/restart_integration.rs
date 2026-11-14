@@ -1,4 +1,4 @@
-//! Restarts of `type: simple` daemons. The shim spawns the daemon once and reports its exit; SCM's
+//! Restarts of `protocol: plain` daemons. The shim spawns the daemon once and reports its exit; SCM's
 //! recovery actions (`restart-delay` is the action delay) start a new shim, which reads the
 //! installed spec afresh. Every wait here is for a positive event: the daemon connecting back, or a
 //! process exiting. Nothing proves that something did not happen by letting time pass.

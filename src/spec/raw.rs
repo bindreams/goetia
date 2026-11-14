@@ -46,7 +46,10 @@ pub(super) struct RawSpec {
     pub restart: Option<String>,
     pub restart_delay: Option<String>,
     pub logs: Option<String>,
-    pub kind: Option<String>,
+    /// `type:`.
+    pub daemon_type: Option<String>,
+    pub protocol: Option<String>,
+    pub schedule: Option<String>,
     pub backend_specific: BackendOverrides,
 }
 
@@ -80,7 +83,11 @@ struct Wire {
     #[serde(default)]
     logs: Option<String>,
     #[serde(rename = "type", default)]
-    kind: Option<String>,
+    daemon_type: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+    #[serde(default)]
+    schedule: Option<String>,
     #[serde(
         rename = "backend-specific",
         default,

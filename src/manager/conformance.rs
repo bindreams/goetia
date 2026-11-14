@@ -195,7 +195,9 @@ fn reinstall_preserves_enablement(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) ->
     );
 
     // A routine config update must not undo a deliberate enable (or disable).
-    let DaemonSpec::Service(service) = mk(spec.common().id.as_str());
+    let DaemonSpec::Service(service) = mk(spec.common().id.as_str()) else {
+        panic!("the conformance specs are services: `mk` builds services");
+    };
     let mut fields = service.into_fields();
     fields
         .common

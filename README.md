@@ -148,6 +148,30 @@ backend-specific:
   scm: { restart: on-failure }
 ```
 
+### `type`, `protocol` and `schedule`
+
+`type` is `service` (the default) or `task`. A service has `restart`,
+`restart-delay` and `protocol`; a task has `schedule`. A field of the other
+type is refused, naming the field. `type` cannot be set under
+`backend-specific:`.
+
+`protocol` is `plain` (the default) or `native`. A `plain` service is a command
+goetia runs; on Windows it runs under goetia's shim. A `native` service is a
+program that speaks to the service manager itself. Earlier releases wrote
+these as `type`'s `simple` and `managed`; both are now refused, with a message
+naming the `protocol` that replaces each.
+
+`schedule` is five-field cron, `minute hour day-of-month month day-of-week`,
+with Jenkins's `H`. Each field is a comma list of terms: `*`, `n`, `a-b`,
+`*/n`, `a-b/n`, `H`, `H(a-b)`, `H/n` or `H(a-b)/n`. Names (`mon`), `@` macros,
+`L`, `W`, `#` and `?` are refused. `H` picks one value per daemon and host, from
+a hash of the host name, the id and the field's position, so that tasks do not
+all fire at minute 0. As in Vixie cron, when day-of-month or day-of-week
+starts with `*` both must match; otherwise either may, and a field starting
+with `H` counts as restricted. A schedule that starts with `*` must be quoted in
+YAML: `schedule: "*/15 * * * *"`. A task without a `schedule` is started only by
+hand. No backend installs a task yet: each refuses one.
+
 `-f` takes a manifest file, or a directory holding `goetia.yaml`. Several
 daemons are several manifests, each installed with its own
 `goetia daemon install -f <file>`; manifests in one directory share its
@@ -429,8 +453,9 @@ backend-specific:
       RUST_LOG: debug
 ```
 
-Every field but the daemon's id is overridable: `name`, `command`, `cwd`,
-`env`, `user`, `restart`, `restart-delay`, `logs`, `type`. A scalar or list
+Every field but the daemon's id and `type` is overridable: `name`, `command`,
+`cwd`, `env`, `user`, `restart`, `restart-delay`, `logs`, `protocol`,
+`schedule`. A scalar or list
 field replaces the base value outright; `env` merges key by key, the
 override winning where both set the same key. An unknown backend key is an
 error naming it, as is a repeated one.
@@ -460,8 +485,9 @@ env:
   RUST_LOG: info
 id: frpc
 name: frpc
+protocol: plain
 restart: on-failure
-type: simple
+type: service
 user: frpc
 ```
 
@@ -478,8 +504,8 @@ error: daemon `frpc`: backend-specific.scm: `1000` is a numeric uid, which is ne
 **`restart: always` is valid in the base spec, and refused when installing on
 Windows.** SCM recovery actions fire only on a failure, never after a clean
 exit, so a Windows service cannot be made to restart "always". Every host
-resolves the manifest, so `show` works anywhere, for both `type: simple` and
-`type: managed`; the `scm` backend refuses it when it generates the service,
+resolves the manifest, so `show` works anywhere, for both `protocol: plain` and
+`protocol: native`; the `scm` backend refuses it when it generates the service,
 in `install` and `install --dry-run`:
 
 ```console
@@ -501,11 +527,11 @@ is refused by `install` and `diff` as an unusable artifact, until you run
 fails for it and `list` reports it as `unusable`, because both render the
 embedded copy of the spec and SCM now refuses it. `start`, `stop`, `restart`
 and `uninstall` do not render it and keep working. What changes while it runs
-depends on its `type`. A `type: simple` service is no longer restarted when
+depends on its `protocol`. A `protocol: plain` service is no longer restarted when
 the command exits, because the new `goetia-shim` leaves every restart to SCM
-and the service has no recovery actions. A `type: managed` service is unchanged:
+and the service has no recovery actions. A `protocol: native` service is unchanged:
 it already had on-failure recovery actions, keeps them, and was never restarted
-after a clean exit. To give a `type: simple` service recovery actions, add the
+after a clean exit. To give a `protocol: plain` service recovery actions, add the
 override above to the manifest, run `goetia daemon uninstall <id>`, then
 `goetia daemon install`.
 
@@ -517,11 +543,11 @@ unchecked, while `systemd: {user: "${ACCT}"}` is substituted and checked
 like any other native value.
 
 A host warns only about its native backend, and reads the warning from the
-substituted native spec, base fields included. Moving `type`, `restart` or
+substituted native spec, base fields included. Moving `protocol`, `restart` or
 `restart-delay` into `.env` does not silence a warning or an error the
 literal would have produced. systemd has no warnings. launchd warns about a
 `restart-delay` that is not a whole number of seconds. scm warns about
-`type: managed` with `cwd` or `logs`, and about a `restart-delay` it must
+`protocol: native` with `cwd` or `logs`, and about a `restart-delay` it must
 clamp or round. A value written under a backend's own block is still
 checked, and refused, from any host.
 
@@ -711,9 +737,9 @@ nothing was sent, and a rerun starts afresh.
 
 ## The service host on Windows
 
-On Windows a `type: simple` daemon runs under a service host, goetia's shim
+On Windows a `protocol: plain` daemon runs under a service host, goetia's shim
 (`goetia-shim`), which hands itself to SCM and runs your command. A
-`type: managed` daemon speaks to SCM itself and never touches the shim.
+`protocol: native` daemon speaks to SCM itself and never touches the shim.
 
 `install` places the shim at `%ProgramFiles%\Goetia\goetia-shim-<sha256>.exe`,
 named by the SHA-256 of its contents, and registers that path. The file is
@@ -721,7 +747,7 @@ created with a protected DACL: SYSTEM and Administrators have full control,
 Everyone read and execute. `install` refuses, before writing anything, if
 an account other than SYSTEM, Administrators or TrustedInstaller owns the folder
 or any ancestor, or can change its permissions or owner, rename it, or delete
-files in it. Every `type: simple` install verifies the file against its
+files in it. Every `protocol: plain` install verifies the file against its
 name and repairs it, also when the service is already up to date. Goetia
 versions on one machine each register their own file, and none deletes a file
 another service still uses.
@@ -729,7 +755,7 @@ another service still uses.
 Where the bytes come from depends on the build:
 
 - The `goetia.exe` of a release embeds the shim, and the archive ships
-  `goetia.exe` alone: a lone copy installs `type: simple` daemons.
+  `goetia.exe` alone: a lone copy installs `protocol: plain` daemons.
 - `cargo install goetia` (an MSVC toolchain; other Windows targets fail to link)
   installs `goetia.exe` and `goetia-shim.exe`, and
   `goetia.exe` reads the one beside it. If that file is missing, `install` and
@@ -743,7 +769,7 @@ service before the stop request is sent, the request reaches the new process,
 which goetia does not hold, so `stop` can return while it is still exiting, and
 an `uninstall` right after may leave the shim file for the next sweep.
 
-`uninstall` of a `type: simple` daemon ends the shim process once the service
+`uninstall` of a `protocol: plain` daemon ends the shim process once the service
 is stopped, waits, with no time limit, for it to exit, deletes the service, and deletes every `goetia-shim-*.exe`
 that no remaining service references, and the default folder when it is then
 empty. If a file cannot be deleted, `uninstall` exits non-zero naming each file that
@@ -757,11 +783,11 @@ a program's installer may place a file with a shim's name in its own folder.
 
 ### Shipping the shim from a library
 
-A program that links goetia and installs `type: simple` daemons through
+A program that links goetia and installs `protocol: plain` daemons through
 `goetia::backend::scm::manager::Scm` supplies the host itself, through a
 provider given to `Scm::with_shim`. `Scm::new()` has none: installing a
-`type: simple` daemon through it fails with "no shim provider configured",
-while `status`, `list`, `type: managed` installs and `uninstall` work.
+`protocol: plain` daemon through it fails with "no shim provider configured",
+while `status`, `list`, `protocol: native` installs and `uninstall` work.
 `CheckPermissions::Disable` turns off only the permission check, of the host's
 folder and of the host file; the marker check, which requires the file to
 contain goetia's host code of the same version as the library, and the file
@@ -839,7 +865,7 @@ Scm::with_shim(
 
 Expand `embed_shim!()` in the binary crate, never in a library the shim binary
 links. Without the feature the program still builds and type-checks with no
-variable set, and installing a `type: simple` daemon fails with "built without
+variable set, and installing a `protocol: plain` daemon fails with "built without
 a stock shim". With the feature on and the variable unset, the build fails.
 
 **The program is the service.** The program's own `main` hands over to the shim
@@ -908,7 +934,7 @@ installed, which is a confusing answer to a typo the shell made.
 ### Restarts on Windows
 
 Windows restarts a daemon through the service manager's recovery actions, for
-`type: simple` and `type: managed` alike. `goetia-shim` runs your command once,
+`protocol: plain` and `protocol: native` alike. `goetia-shim` runs your command once,
 reports how it ended as the service's exit, and exits. With `restart: on-failure`
 SCM then starts a new shim after `restart-delay` (1s by default), and that shim
 reads the spec as installed, so a daemon restarted after `goetia daemon install`
@@ -956,13 +982,13 @@ service because it is marked for deletion. A service deleted while a `stop` or
 `uninstall` waits counts as stopped.
 
 After upgrading goetia, run `goetia daemon install` again for every daemon
-installed by an older version. `type: simple` services registered before this
+installed by an older version. `protocol: plain` services registered before this
 shim existed have no recovery actions until then, so the new shim runs them but
 SCM does not restart them. On every start, the shim logs one warning when it
 starts under a service that a different goetia version registered and
 `restart` is not `never`.
 
-A `type: simple` daemon installed by goetia 0.2.x runs the `goetia-shim.exe`
+A `protocol: plain` daemon installed by goetia 0.2.x runs the `goetia-shim.exe`
 that sat beside `goetia.exe`, not the shim under `%ProgramFiles%\Goetia`
 ([above](#the-service-host-on-windows)). Run `goetia daemon uninstall <id>` and
 then `goetia daemon install` for each.
@@ -993,12 +1019,12 @@ restart policy.
 
 Under `on-failure` both failures are restarted, so a spec the shim cannot read
 or a command that is missing retries at `restart-delay` indefinitely, as it
-does for `type: managed`. If the shim cannot terminate the command's job on
+does for `protocol: native`. If the shim cannot terminate the command's job on
 `stop`, it logs why and reports the stop with Win32 code `0`, because a
 non-zero Win32 code would make SCM start a second copy; the service-specific
 code `1003` is the record that the command may still be running.
 
-The shim runs a `type: simple` command inside a Windows Job Object and requires
+The shim runs a `protocol: plain` command inside a Windows Job Object and requires
 one. The command is created suspended and assigned to the job before it runs;
 if the assignment fails, it is resumed anyway and runs outside any job until the
 shim notices and kills it, and anything it started in that time sits outside any
@@ -1068,7 +1094,7 @@ confirms differs:
   `stop` of a unit systemd cannot load and that is not running: systemd
   answers it "not loaded" with no job, since there is nothing to stop, and
   that stop succeeds.
-- **SCM**, for a `type: simple` daemon, confirms that `goetia-shim` started
+- **SCM**, for a `protocol: plain` daemon, confirms that `goetia-shim` started
   your command: the shim reports running after the spawn, so a command that
   cannot start is a failed start under every `restart:` policy. A command that
   starts and then exits at once is a successful start, whatever its exit code,
@@ -1082,7 +1108,7 @@ confirms differs:
   record before it sees it running. A command no Job Object contains is always
   seen that way, as the shim never reports running for it; for a command that
   did run, the shim reports running first, so `start` succeeds if it sees that.
-  For a `type: managed` daemon, which speaks to SCM itself, a
+  For a `protocol: native` daemon, which speaks to SCM itself, a
   service that stops before it reports running is a failed start.
 - **launchd** sits between the two: the pid `launchctl kickstart -p` reports
   is launchd's own fork, taken before the user process reaches its `exec`.
@@ -1126,7 +1152,7 @@ going down, or may never have moved.
 
 **On Windows, `restart --timeout 0` will usually stop the daemon and not
 restart it.** The start arrives while the service is still coming down and is
-refused — for a `type: simple` daemon almost always, since its service reads
+refused — for a `protocol: plain` daemon almost always, since its service reads
 `RUNNING` until the shim has taken the stop, then `STOP_PENDING` until its
 child is gone — which leaves the daemon stopped, at exit `4`. To restart a
 daemon on Windows, let `restart` wait for the stop: leave `--timeout` at its
@@ -1150,7 +1176,7 @@ It addresses the service, never a bare pid:
 | launchd  | `launchctl kill SIGKILL system/<id>`.                                                                                                                                                                                                   |
 | Windows  | SCM has no kill-by-service call, so goetia terminates the service's process (exit code `1`), after confirming through SCM that it is still the service's. SCM sees an unexpected exit and applies the recovery actions, as for a crash. |
 
-On Windows with `type: simple` the service's process is `goetia-shim`; its Job
+On Windows with `protocol: plain` the service's process is `goetia-shim`; its Job
 Object ends the daemon and its descendants with it. Windows does not report when
 that termination has finished, so the daemon's processes can briefly outlive the
 return of `kill`, and a restart by SCM can overlap them.

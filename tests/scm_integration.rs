@@ -1,6 +1,6 @@
 //! Integration tests for the effectful SCM backend
-//! (`goetia::backend::scm::manager`), `type: managed` — see that
-//! module's own doc comment for the traps this covers. Running a `type: simple`
+//! (`goetia::backend::scm::manager`), `protocol: native` — see that
+//! module's own doc comment for the traps this covers. Running a `protocol: plain`
 //! service needs `goetia-shim`, so those tests live there; here one is only
 //! registered and compared, never started.
 //!

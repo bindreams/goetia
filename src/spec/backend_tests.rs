@@ -79,7 +79,9 @@ fn shaped_spec() -> ShapedSpec {
         restart: Shaped::Absent,
         restart_delay: Shaped::Absent,
         logs: None,
-        kind: Shaped::Absent,
+        daemon_type: Shaped::Absent,
+        protocol: Shaped::Absent,
+        schedule: Shaped::Absent,
     }
 }
 
@@ -88,7 +90,7 @@ fn shaped_spec() -> ShapedSpec {
 #[skuld::test]
 fn each_backend_emits_only_its_own_warnings() {
     let mut spec = shaped_spec();
-    spec.kind = Shaped::Parsed(Protocol::Native);
+    spec.protocol = Shaped::Parsed(Protocol::Native);
     spec.cwd = Some(abs("data"));
     spec.restart_delay = Shaped::Parsed(Duration::from_millis(500));
 
@@ -110,7 +112,7 @@ fn each_backend_emits_only_its_own_warnings() {
 #[skuld::test]
 fn an_over_long_delay_warns_from_the_scm_arm() {
     let mut spec = shaped_spec();
-    spec.kind = Shaped::Parsed(Protocol::Native);
+    spec.protocol = Shaped::Parsed(Protocol::Native);
     spec.restart = Shaped::Parsed(Restart::OnFailure);
     spec.restart_delay = Shaped::Parsed(MAX_SC_ACTION_DELAY + Duration::from_millis(1));
 
@@ -132,7 +134,7 @@ fn the_scm_delay_advisory_is_gated_on_restart_alone() {
     let over_long = MAX_SC_ACTION_DELAY + Duration::from_millis(1);
 
     let mut simple = shaped_spec();
-    simple.kind = Shaped::Parsed(Protocol::Plain);
+    simple.protocol = Shaped::Parsed(Protocol::Plain);
     simple.restart = Shaped::Parsed(Restart::OnFailure);
     simple.restart_delay = Shaped::Parsed(over_long);
     let mut warnings = Vec::new();
@@ -144,7 +146,7 @@ fn the_scm_delay_advisory_is_gated_on_restart_alone() {
     );
 
     let mut never_restarts = shaped_spec();
-    never_restarts.kind = Shaped::Parsed(Protocol::Native);
+    never_restarts.protocol = Shaped::Parsed(Protocol::Native);
     never_restarts.restart = Shaped::Parsed(Restart::Never);
     never_restarts.restart_delay = Shaped::Parsed(over_long);
     let mut warnings = Vec::new();
@@ -155,7 +157,7 @@ fn the_scm_delay_advisory_is_gated_on_restart_alone() {
 #[skuld::test]
 fn a_sub_millisecond_delay_warns_from_the_scm_arm_with_the_rounded_value() {
     let mut spec = shaped_spec();
-    spec.kind = Shaped::Parsed(Protocol::Native);
+    spec.protocol = Shaped::Parsed(Protocol::Native);
     spec.restart = Shaped::Parsed(Restart::OnFailure);
     spec.restart_delay = Shaped::Parsed(Duration::from_micros(1500));
 

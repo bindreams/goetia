@@ -54,7 +54,7 @@ pub mod raw_registry;
 #[cfg(windows)]
 pub mod scratch;
 
-/// A root, `restart: never` `Protocol::Native` (`type: managed`) daemon named `id`. Panics on an
+/// A root, `restart: never` `Protocol::Native` (`protocol: native`) daemon named `id`. Panics on an
 /// invalid `Id`.
 /// Vary fields with struct-update syntax, then `ServiceSpec::new`.
 pub fn base_fields(id: &str, command: Vec<String>) -> ServiceFields {
@@ -77,7 +77,9 @@ pub fn base_fields(id: &str, command: Vec<String>) -> ServiceFields {
 /// The fields of the service `spec`, to vary with struct-update syntax and check again with
 /// `ServiceSpec::new`.
 pub fn service_fields(spec: DaemonSpec) -> ServiceFields {
-    let DaemonSpec::Service(service) = spec;
+    let DaemonSpec::Service(service) = spec else {
+        panic!("`service_fields` is given a service: the test helpers build services");
+    };
     service.into_fields()
 }
 

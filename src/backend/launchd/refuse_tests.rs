@@ -27,7 +27,7 @@ fn identity(user: &str) -> Identity {
 
 /// The plist `install` would write for `spec` as `user`.
 fn rendered(spec: &DaemonSpec, user: &str) -> String {
-    generate::plist(spec, &identity(user))
+    generate::plist(spec, &identity(user)).unwrap()
 }
 
 fn changed(spec: &DaemonSpec) -> DaemonSpec {

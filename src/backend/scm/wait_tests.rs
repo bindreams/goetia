@@ -3421,7 +3421,7 @@ fn an_incomplete_stop_with_no_process_held_is_returned_as_it_is() {
 // start's vocabulary, through what `runs_a_shim` answers --------------------------------------------------------------
 
 /// A service whose blob will not decode is a shim's only when its image says so: a start over an image
-/// of the user's own, or one that could not be read, is judged as strictly as a `type: managed`
+/// of the user's own, or one that could not be read, is judged as strictly as a `protocol: native`
 /// service's, and its failure says that the blob could not be read. Driven through `start`'s own wait
 /// over the scripted SCM, from the answer of the predicate `start` and `stop` share.
 /// The service ends right after it was started, which only the shim's vocabulary calls a start.
@@ -3461,7 +3461,7 @@ fn a_start_over_an_unreadable_blob_is_strict_unless_the_image_is_a_shim() {
 }
 
 /// A start that fails over an unreadable blob names the blob whichever vocabulary the image gave it:
-/// a shim's, which is not a `type: managed` service's, says so.
+/// a shim's, which is not a `protocol: native` service's, says so.
 #[cfg(windows)]
 #[skuld::test]
 fn a_failed_start_of_a_shim_known_by_its_image_names_the_unreadable_blob() {
@@ -3487,7 +3487,7 @@ fn a_failed_start_of_a_shim_known_by_its_image_names_the_unreadable_blob() {
     assert!(said.contains("could not be read") && said.contains("corrupt"), "{said}");
     assert!(said.contains("may still be running"), "{said}");
     assert!(
-        !said.contains("type: managed"),
+        !said.contains("protocol: native"),
         "the start was judged as a shim's: {said}"
     );
 }
@@ -3529,8 +3529,8 @@ fn a_timed_out_start_over_an_unreadable_blob_names_the_blob() {
     }
 }
 
-/// A blob that decodes decides the vocabulary of `start`: `type: simple` is the shim's, so a service
-/// that ends right after it was started is started, and `type: managed` is strict and fails, with no
+/// A blob that decodes decides the vocabulary of `start`: `protocol: plain` is the shim's, so a service
+/// that ends right after it was started is started, and `protocol: native` is strict and fails, with no
 /// blob error to name since the blob was read.
 #[cfg(windows)]
 #[skuld::test]

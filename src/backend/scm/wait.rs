@@ -1003,11 +1003,11 @@ const STOPPING: &str = "the service is stopping (STOP_PENDING), so it cannot be 
 /// alone, as the first arm may queue a delivery of the state at registration, which the service can have
 /// left; the status read decides, and a state that is pending keeps the wait going.
 ///
-/// A terminal `Stopped` before `Running` is read by `kind`. For `type: simple` it is a start when
+/// A terminal `Stopped` before `Running` is read by `kind`. For `protocol: plain` it is a start when
 /// the shim launched the daemon and the daemon then ended (the recorded exit is the shim's own
 /// vocabulary, see [`RecordedExit::daemon_ran`]), except the incomplete-stop record: the daemon may
 /// still be running, so that is a failed start; a shim failure or refusal is a failed start returning
-/// `Err`. A `type: managed` service speaks SCM itself, and stopping with a service-specific code
+/// `Err`. A `protocol: native` service speaks SCM itself, and stopping with a service-specific code
 /// before `Running` is how it reports a failed start, so for it any `Stopped` before `Running` is a
 /// failed start. Neither blocks forever.
 ///
@@ -1054,7 +1054,7 @@ pub(crate) fn start_via_notify<A: ScmActor>(a: &mut A, deadline: Deadline, kind:
 /// those of the notification, or of the status read after a re-arm. See [`start_via_notify`] for
 /// the reading of each record.
 ///
-/// A terminal `Stopped` is not an expiry. For `type: simple` it is a start when the shim launched the
+/// A terminal `Stopped` is not an expiry. For `protocol: plain` it is a start when the shim launched the
 /// daemon and the daemon then ended before the wait saw Running, as `systemctl start` confirms the
 /// exec. That holds for the daemon's own exit. A shim failure after the launch (a failed wait, an
 /// unreadable exit status) is recorded as a shim failure, so the answer still depends on which the

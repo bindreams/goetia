@@ -103,6 +103,8 @@ fn explicit_null_is_rejected_for_every_base_field() {
         "restart-delay",
         "logs",
         "type",
+        "protocol",
+        "schedule",
     ];
     for field in fields {
         // `command` is `Option` here — a missing one is a backend's problem,
@@ -145,7 +147,7 @@ restart: null
 
 #[skuld::test]
 fn an_explicit_null_type_is_rejected() {
-    // See `an_explicit_null_restart_is_rejected`: `type` is the `Protocol` half.
+    // See `an_explicit_null_restart_is_rejected`.
     let yaml = "
 id: frpc
 command: [bin/frpc]
@@ -426,7 +428,7 @@ command: [bin/frpc]
 cwd: /tmp
 logs: /tmp/l.log
 name: hello
-type: simple
+protocol: plain
 restart-delay: 5s
 restart: null
 ",

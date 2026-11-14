@@ -13,7 +13,7 @@
 //!
 //! Compiled into both `tests/scm_integration.rs` and `tests/shim_integration.rs`
 //! (by `#[path]`, as `support/mod.rs` already is), which is why the
-//! `dead_code` allow below is needed: `type: simple`'s suite denies only a
+//! `dead_code` allow below is needed: `protocol: plain`'s suite denies only a
 //! `Parameters` read, so [`Denied::service_query`] and the DACL string it
 //! builds are unreferenced in that binary.
 
@@ -169,7 +169,7 @@ pub struct Denied {
 
 impl Denied {
     /// Deny `KEY_READ` on `Services\<id>\Parameters` — the key carrying the
-    /// metadata blob, and the only proof of ownership a `type: managed`
+    /// metadata blob, and the only proof of ownership a `protocol: native`
     /// service has.
     pub fn parameters(id: &str) -> Self {
         let object = format!(r"MACHINE\{}", support::registry::parameters_path(id));

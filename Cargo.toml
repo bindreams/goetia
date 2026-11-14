@@ -32,7 +32,7 @@ path = "src/main.rs"
 harness = false
 required-features = ["cli"]
 
-# The stock shim: the Windows service host `type: simple` daemons run under.
+# The stock shim: the Windows service host `protocol: plain` daemons run under.
 # `goetia::stock_shim!()` expands to its `fn main`, so this target is one line
 # and builds on every target (the library's `shim::main` reduces to an
 # "only on Windows" exit elsewhere), so `CARGO_BIN_EXE_goetia-shim` resolves
@@ -81,12 +81,16 @@ cosca = "0.8"
 # keeps producing (`std::sync::mpsc` has no equivalent — `recv_timeout(ZERO)`
 # still returns a queued item rather than timing out).
 crossbeam-channel = "0.5.17"
+# The host name that seeds `H` in a task's `schedule` (`spec::schedule`).
+gethostname = "1.1.0"
 humantime = "2"
 # The marker scan (`backend::scm::shim::marker`): a SIMD substring search, so a multi-gigabyte host
 # costs one fast pass.
 memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `EmbeddedStockShim` (SHA-256 of the stock shim's bytes) and `spec::schedule` (`H`).
+sha2 = "0.11.1"
 similar = "3"
 # `skuld` is for the `ELEVATED` label and `testing::run_all`.
 skuld = { version = "0.6", optional = true }
@@ -121,9 +125,6 @@ nix = { version = "0.31", features = ["user", "fs"] }
 # `manager::native()` needs it on every Windows build regardless of the `cli`
 # feature, since it is part of the core library, not CLI-only output formatting.
 windows-service = "0.8"
-# `EmbeddedStockShim` names the stock shim by the SHA-256 of its bytes and verifies a file
-# of that name against it.
-sha2 = "0.11.1"
 # `Services\<name>\Parameters` (the metadata blob) and `Services\<name>\Environment`
 # (see `manager::registry`) are read and written directly through the
 # registry: `windows-service`'s `ServiceConfig` exposes neither.
