@@ -384,7 +384,10 @@ impl Systemd {
 impl Systemd {
     /// A service's status from its unit; a task's from three places: the state of its job, whether the
     /// timer is enabled and when it elapses next, and its last run from the journal. A journal that
-    /// cannot be read is the error, never a task that has not run.
+    /// cannot be read is the error, never a task that has not run. That includes an account that may
+    /// not read the system journal (not root and not in `systemd-journal`): the task's whole status
+    /// read is the error then, its state and next run lost with its last run. A service's status needs
+    /// no journal.
     pub(super) fn status_of(&self, snapshot: &Fragment) -> Result<Status> {
         let id = snapshot.id.as_str();
         let job = unit_name(id, UnitKind::Service);
@@ -399,7 +402,12 @@ impl Systemd {
                 self.busctl.next_elapse(&unit_name(id, UnitKind::Timer))?,
             ),
         };
-        let last = journal::last_run(self.journal.as_ref(), &job)?;
+        let last = journal::last_run(self.journal.as_ref(), &job).map_err(|e| Error::Step {
+            what: format!(
+                "read `{id}`'s last run from the system journal (run as root or a member of `systemd-journal`)"
+            ),
+            source: Box::new(e),
+        })?;
         Ok(Status::Task(TaskStatus {
             common: DaemonStatus { state, pid, enabled },
             last_result: last.exit,

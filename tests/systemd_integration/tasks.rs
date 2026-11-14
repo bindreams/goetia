@@ -991,12 +991,14 @@ impl Drop for AccountGuard {
     }
 }
 
-/// `journalctl` for an account outside the `systemd-journal` group. With no journal of its own
-/// (`nobody` never logs) it fails: exit 1, "No journal files were opened due to insufficient
-/// permissions". With one (a process of the account has logged) it opens that one and exits 0 with no
-/// entry of the system's, and says nothing: an empty answer and an unreadable journal look the same.
+/// An account that may not read the system journal gets an error for a task's status, not a status
+/// that says the task never ran: even with a user journal of its own, which `journalctl` without
+/// `--system` would open and answer from with nothing. (The raw `journalctl` facts are in the
+/// knowledge base.) A service's status needs no journal.
 #[skuld::test]
-fn journalctl_for_an_account_outside_the_journal_group_answers_with_nothing(#[fixture(systemd_group)] _group: &Group) {
+fn status_of_a_task_for_an_account_that_cannot_read_the_system_journal_is_the_error(
+    #[fixture(systemd_group)] _group: &Group,
+) {
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let task_id = id_of(&id);
@@ -1004,27 +1006,10 @@ fn journalctl_for_an_account_outside_the_journal_group_answers_with_nothing(#[fi
     mgr.install(&exiting(&id, 0), false).expect("install");
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
     status_with_result(&mgr, &task_id);
-    cmd::run("journalctl", &["--sync"]).expect_ok();
-    let unit = format!("UNIT={}", unit_of(&id));
-    let query = ["journalctl", "-a", "-o", "json", "-r", unit.as_str()];
-    assert!(
-        !cmd::run(query[0], &query[1..]).stdout.is_empty(),
-        "root reads the run's entries"
-    );
-    let as_user = |name: &str, args: &[&str]| {
-        let mut argv = vec!["-u", name, "--"];
-        argv.extend_from_slice(args);
-        cmd::run("runuser", &argv)
-    };
-
-    let none = as_user("nobody", &query);
-    assert_eq!(none.code, Some(1), "{none}");
-    assert!(none.stdout.is_empty(), "{none}");
-    assert!(
-        none.stderr
-            .contains("No journal files were opened due to insufficient permissions"),
-        "{none}"
-    );
+    let service = support::random_test_id();
+    let _service_guard = ServiceGuard::new(&service);
+    mgr.install(&crate::linux::mk(&service), false)
+        .expect("install a service");
 
     let name = support::random_test_id();
     let _account = AccountGuard(name.clone());
@@ -1039,20 +1024,49 @@ fn journalctl_for_an_account_outside_the_journal_group_answers_with_nothing(#[fi
         ],
     )
     .expect_ok();
-    as_user(
-        &name,
+    cmd::run(
+        "runuser",
         &[
+            "-u",
+            &name,
+            "--",
             "systemd-cat",
             "-t",
             "goetia-test",
             "echo",
-            "a line of the account's own",
+            "its own line",
         ],
     )
     .expect_ok();
     cmd::run("journalctl", &["--sync"]).expect_ok();
-    let own = as_user(&name, &query);
-    assert_eq!(own.code, Some(0), "{own}");
-    assert!(own.stdout.is_empty(), "{own}");
-    assert!(own.stderr.is_empty(), "{own}");
+
+    let output = crate::linux::run_as(&name, &["daemon", "status", &id]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let context = format!(
+        "stdout:
+{stdout}
+stderr:
+{stderr}"
+    );
+    assert_ne!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stderr.contains("No journal files were opened due to insufficient permissions"),
+        "{context}"
+    );
+    assert!(
+        stderr.contains("run as root or a member of `systemd-journal`"),
+        "{context}"
+    );
+    assert!(!stdout.contains("idle"), "a status was printed: {context}");
+
+    let output = crate::linux::run_as(&name, &["daemon", "status", &service]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

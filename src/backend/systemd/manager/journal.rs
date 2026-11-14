@@ -169,6 +169,13 @@ pub(super) fn lacks(what: &str) -> Error {
 // Journal =============================================================================================================
 
 /// The system journal, as the systemd backend reads it.
+///
+/// Queries read the system journal only (`journalctl --system`). Without it an account outside
+/// `systemd-journal` that has a user journal of its own opens that file and gets exit 0 and no entry:
+/// an empty answer that cannot be told from a unit that never ran. With it such an account opens no
+/// file, and `journalctl` fails ("No journal files were opened due to insufficient permissions"),
+/// which is the error a journal that cannot be read must be. A host whose journal holds no files
+/// still answers with nothing (exit 0).
 pub(super) trait Journal: Send + Sync {
     /// The entries holding every one of `matches`, newest first. `Err` where the journal cannot be
     /// read at all, which is never an empty answer: a host with no journal files answers with none.

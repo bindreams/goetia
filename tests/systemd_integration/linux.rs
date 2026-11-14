@@ -2435,6 +2435,11 @@ fn list_does_not_hang_on_a_fifo_in_the_unit_directory(#[fixture(systemd_group)] 
 /// it has none of `sudo`'s `requiretty`/PAM-session pitfalls when spawned from
 /// a test process with no controlling terminal.
 fn run_unelevated(args: &[&str]) -> std::process::Output {
+    run_as("nobody", args)
+}
+
+/// [`run_unelevated`] as the account `account`.
+pub(crate) fn run_as(account: &str, args: &[&str]) -> std::process::Output {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // Per call, not per process: three tests stage a binary now, and skuld runs them concurrently —
     // two sharing one path would have each `remove_file` the copy the other was still executing.
@@ -2444,12 +2449,9 @@ fn run_unelevated(args: &[&str]) -> std::process::Output {
     fs::copy(env!("CARGO_BIN_EXE_goetia"), &staged).expect("stage the binary somewhere traversable");
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
 
-    let mut argv = vec!["-u", "nobody", "--", staged.to_str().expect("utf-8 temp path")];
+    let mut argv = vec!["-u", account, "--", staged.to_str().expect("utf-8 temp path")];
     argv.extend_from_slice(args);
-    Command::new("runuser")
-        .args(&argv)
-        .output()
-        .expect("spawn runuser -u nobody")
+    Command::new("runuser").args(&argv).output().expect("spawn runuser")
 }
 
 // Tasks ===============================================================================================================

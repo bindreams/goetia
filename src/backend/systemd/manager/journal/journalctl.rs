@@ -12,8 +12,9 @@ use crate::backend::client::{Client as _, ClientError, Real, Wait};
 use crate::backend::systemd::manager::systemctl::environment;
 use crate::error::{Error, Result};
 
-/// What every query passes: all of every field (`-a`), as JSON, with no pager.
-const COMMON: [&str; 4] = ["-a", "-o", "json", "--no-pager"];
+/// What every query passes: all of every field (`-a`), as JSON, with no pager, from the system
+/// journal only (`--system`: see [`Journal`]).
+const COMMON: [&str; 5] = ["-a", "-o", "json", "--no-pager", "--system"];
 
 pub(in crate::backend::systemd::manager) struct Journalctl {
     program: Vec<String>,

@@ -241,7 +241,10 @@ fn a_query_asks_for_all_of_every_field_as_json_newest_first() {
     let all = entries_of(&journal).expect("entries");
 
     assert_eq!(all.len(), 1);
-    assert_eq!(all[0].get("ARGS"), Some("-a -o json --no-pager -r UNIT=x.service"));
+    assert_eq!(
+        all[0].get("ARGS"),
+        Some("-a -o json --no-pager --system -r UNIT=x.service")
+    );
 }
 
 #[skuld::test]
@@ -272,7 +275,7 @@ fn a_journalctl_that_fails_is_the_error_with_its_words() {
     let msg = e.report().to_string();
     assert!(msg.contains("Failed to open journal"), "{msg}");
     assert!(
-        msg.contains("journalctl -a -o json --no-pager -r UNIT=x.service"),
+        msg.contains("journalctl -a -o json --no-pager --system -r UNIT=x.service"),
         "{msg}"
     );
 }
@@ -361,7 +364,7 @@ fn every_query_passes_dash_a() {
             args_of(journal.read_after(&unit, &cursor, &mut one()).expect("read_after")),
         ),
     ] {
-        assert!(args.starts_with("-a -o json --no-pager "), "{what}: {args}");
+        assert!(args.starts_with("-a -o json --no-pager --system "), "{what}: {args}");
     }
 }
 
@@ -381,12 +384,18 @@ fn a_follow_starts_from_the_beginning_or_after_its_cursor_and_job_numbers_are_bo
             .expect("follow"),
     ));
 
-    assert_eq!(from_the_start, "-a -o json --no-pager -f -n all UNIT=x.service");
+    assert_eq!(
+        from_the_start,
+        "-a -o json --no-pager --system -f -n all UNIT=x.service"
+    );
     assert_eq!(
         after,
-        "-a -o json --no-pager -f -n all --after-cursor=s=1;i=2 UNIT=x.service"
+        "-a -o json --no-pager --system -f -n all --after-cursor=s=1;i=2 UNIT=x.service"
     );
-    assert_eq!(job, "-a -o json --no-pager -f -n all -b UNIT=x.service JOB_ID=7");
+    assert_eq!(
+        job,
+        "-a -o json --no-pager --system -f -n all -b UNIT=x.service JOB_ID=7"
+    );
 }
 
 #[skuld::test]
@@ -405,7 +414,7 @@ fn a_read_after_a_cursor_asks_for_every_match() {
 
     assert_eq!(
         args,
-        "-a -o json --no-pager --after-cursor=c _SYSTEMD_UNIT=x.service _TRANSPORT=stdout"
+        "-a -o json --no-pager --system --after-cursor=c _SYSTEMD_UNIT=x.service _TRANSPORT=stdout"
     );
 }
 
