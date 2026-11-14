@@ -1,9 +1,14 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
+
+use skuld::temp_dir;
 
 use super::*;
 use crate::spec::test_support::{abs, program};
-use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
+use crate::spec::{
+    DaemonFields, DaemonSpec, HashSeed, Protocol, Restart, Schedule, ServiceFields, ServiceSpec, TaskFields, TaskSpec,
+};
 use crate::testing::{base_fields, service_fields};
 
 // The paths are absolute because `ServiceSpec::new` requires it; no assertion reads them, so their
@@ -116,6 +121,10 @@ fn render_yaml_uses_source_key_names() {
     );
     assert!(rendered.contains("type:"), "expected source key `type`: {rendered}");
     assert!(
+        rendered.contains("protocol:"),
+        "expected source key `protocol`: {rendered}"
+    );
+    assert!(
         !rendered.contains("restart_delay"),
         "should not leak the Rust field name `restart_delay`: {rendered}"
     );
@@ -123,6 +132,132 @@ fn render_yaml_uses_source_key_names() {
         !rendered.contains("kind:"),
         "should not leak the Rust field name `kind`: {rendered}"
     );
+}
+
+fn task_fixture(schedule: Option<&str>) -> DaemonSpec {
+    task_fixture_on("build-host", schedule)
+}
+
+/// A task whose `H` resolves for `hostname`.
+fn task_fixture_on(hostname: &str, schedule: Option<&str>) -> DaemonSpec {
+    let base = base_fields("nightly", vec![program("backup")]);
+    let schedule = schedule.map(|text| {
+        let seed = HashSeed {
+            hostname,
+            id: &base.common.id,
+        };
+        Schedule::parse(text, &seed).unwrap()
+    });
+    TaskSpec::new(TaskFields {
+        common: base.common,
+        schedule,
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+fn rendered_keys(spec: &DaemonSpec) -> yaml_serde::Mapping {
+    yaml_serde::from_str(&render_yaml(spec)).expect("render_yaml output should parse as YAML")
+}
+
+#[skuld::test]
+fn a_service_renders_its_type_and_protocol() {
+    for (protocol, key) in [(Protocol::Plain, "plain"), (Protocol::Native, "native")] {
+        let mut fields = service_fields(spec_fixture());
+        fields.protocol = protocol;
+        let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
+
+        let keys = rendered_keys(&spec);
+
+        assert_eq!(keys["type"].as_str(), Some("service"));
+        assert_eq!(keys["protocol"].as_str(), Some(key));
+        assert!(!keys.contains_key("schedule"));
+    }
+}
+
+#[skuld::test]
+fn a_task_renders_its_type_and_schedule_and_no_service_keys() {
+    let keys = rendered_keys(&task_fixture(Some("30 3 * * *")));
+
+    assert_eq!(keys["type"].as_str(), Some("task"));
+    assert_eq!(keys["schedule"].as_str(), Some("30 3 * * *"));
+    for service_key in ["protocol", "restart", "restart-delay"] {
+        assert!(!keys.contains_key(service_key), "{service_key}");
+    }
+}
+
+#[skuld::test]
+fn a_task_without_a_schedule_renders_none() {
+    let keys = rendered_keys(&task_fixture(None));
+
+    assert_eq!(keys["type"].as_str(), Some("task"));
+    assert!(!keys.contains_key("schedule"));
+}
+
+#[skuld::test]
+fn spec_diff_shows_a_changed_schedule() {
+    let diff = spec_diff(&task_fixture(Some("30 3 * * *")), &task_fixture(Some("0 4 * * *")));
+
+    assert!(diff.contains("-schedule: 30 3 * * *"), "{diff}");
+    assert!(diff.contains("+schedule: 0 4 * * *"), "{diff}");
+}
+
+#[skuld::test]
+fn render_yaml_shows_what_h_resolved_to() {
+    let (a, b) = (
+        task_fixture_on("build-host", Some("H 3 * * *")),
+        task_fixture_on("other-host", Some("H 3 * * *")),
+    );
+    assert_ne!(a, b, "the host names must resolve `H` differently");
+    let (was, now) = (render_yaml(&a), render_yaml(&b));
+    assert!(was.contains("schedule: H 3 * * *  # resolves to: 13 3 * * *"), "{was}");
+    assert_ne!(was, now);
+    assert_ne!(spec_diff(&a, &b), "");
+}
+
+/// (schedule text, its `schedule:` line for `nightly` on `build-host`)
+const H_SCHEDULES: &[(&str, &str)] = &[
+    // yaml quotes a text that starts with `*`
+    ("*/5 H * * *", "schedule: '*/5 H * * *'  # resolves to: */5 2 * * *"),
+    ("H H H H H", "schedule: H H H H H  # resolves to: 13 2 28 2 0"),
+    (
+        "H(0-29)/10 * * * *",
+        "schedule: H(0-29)/10 * * * *  # resolves to: 3,13,23 * * * *",
+    ),
+    (
+        "H,5 H(0-11) * * H(1-5)",
+        "schedule: H,5 H(0-11) * * H(1-5)  # resolves to: 5,13 2 * * 4",
+    ),
+];
+
+#[skuld::test]
+fn the_h_resolution_is_the_comment_of_the_schedule_line() {
+    for (text, line) in H_SCHEDULES {
+        let rendered = render_yaml(&task_fixture(Some(text)));
+        assert!(rendered.lines().any(|l| l == *line), "{text:?}: {rendered}");
+    }
+}
+
+#[skuld::test]
+fn an_annotated_schedule_resolves_back_to_the_task(#[fixture(temp_dir)] dir: &Path) {
+    // `load` seeds `H` from this host's name.
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    for (text, _) in H_SCHEDULES {
+        let spec = task_fixture_on(&host, Some(text));
+
+        assert_eq!(resolved_from_rendering(&spec, dir), spec, "{text:?}");
+    }
+}
+
+#[skuld::test]
+fn specs_that_resolve_alike_diff_empty_whatever_the_host() {
+    // `host0` and `host1` hash differently and both pick 0 of `H(0-1)`.
+    let (a, b) = (
+        task_fixture_on("host0", Some("H(0-1) * * * *")),
+        task_fixture_on("host1", Some("H(0-1) * * * *")),
+    );
+    assert_eq!(a, b);
+    assert_eq!(spec_diff(&a, &b), "");
 }
 
 #[skuld::test]
@@ -136,4 +271,32 @@ fn identical_inputs_produce_empty_diff() {
         "",
         "identical artifact text should produce no diff"
     );
+}
+
+/// `spec` rendered by [`render_yaml`] and read back as a manifest in `dir`.
+fn resolved_from_rendering(spec: &DaemonSpec, dir: &Path) -> DaemonSpec {
+    std::fs::write(dir.join("goetia.yaml"), render_yaml(spec)).expect("the manifest is writable");
+    crate::spec::load(dir).expect("a rendered spec is a manifest").0
+}
+
+#[skuld::test]
+fn render_yaml_resolves_back_to_the_service(#[fixture(temp_dir)] dir: &Path) {
+    for protocol in [Protocol::Plain, Protocol::Native] {
+        let mut fields = service_fields(spec_fixture());
+        fields.protocol = protocol;
+        fields.restart_delay = Some(Duration::from_secs(2));
+        let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
+
+        assert_eq!(resolved_from_rendering(&spec, dir), spec, "{protocol:?}");
+    }
+}
+
+#[skuld::test]
+fn render_yaml_resolves_back_to_the_task(#[fixture(temp_dir)] dir: &Path) {
+    // A schedule without `H`: its values do not depend on the host, which `load` reads.
+    for schedule in [Some("30 3 * * 1-5"), Some("*/15 0,12 1 * *"), None] {
+        let spec = task_fixture(schedule);
+
+        assert_eq!(resolved_from_rendering(&spec, dir), spec, "{schedule:?}");
+    }
 }

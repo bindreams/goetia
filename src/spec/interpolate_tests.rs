@@ -289,6 +289,8 @@ user: ${USER_NAME}
 restart: ${RESTART}
 restart-delay: ${DELAY}
 type: ${TYPE}
+protocol: ${PROTOCOL}
+schedule: ${WHEN}
 "#;
     let spec = interpolate_yaml(
         yaml,
@@ -302,7 +304,9 @@ type: ${TYPE}
             ("USER_NAME", "svc-frpc"),
             ("RESTART", "always"),
             ("DELAY", "2s"),
-            ("TYPE", "managed"),
+            ("TYPE", "task"),
+            ("PROTOCOL", "native"),
+            ("WHEN", "30 3 * * *"),
         ],
     )
     .unwrap();
@@ -318,7 +322,9 @@ type: ${TYPE}
     assert_eq!(spec.user, Some(RawUser::Scalar("svc-frpc".to_string())));
     assert_eq!(spec.restart.as_deref(), Some("always"));
     assert_eq!(spec.restart_delay.as_deref(), Some("2s"));
-    assert_eq!(spec.kind.as_deref(), Some("managed"));
+    assert_eq!(spec.daemon_type.as_deref(), Some("task"));
+    assert_eq!(spec.protocol.as_deref(), Some("native"));
+    assert_eq!(spec.schedule.as_deref(), Some("30 3 * * *"));
 }
 
 #[skuld::test]

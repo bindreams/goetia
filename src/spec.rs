@@ -17,6 +17,7 @@ mod no_null;
 mod overrides;
 mod raw;
 mod resolve;
+mod schedule;
 mod user;
 mod vars;
 
@@ -24,7 +25,9 @@ mod vars;
 pub(crate) mod test_support;
 
 pub use backend::BackendKind;
+pub(crate) use resolve::invalid;
 pub use resolve::load;
+pub use schedule::{CronField, DayRule, HashSeed, Schedule};
 pub use user::{AccountId, User};
 
 // Read by `crate::backend::scm::generate` and `crate::backend::systemd::generate`, which cannot see through the
@@ -169,11 +172,49 @@ impl std::ops::Deref for ServiceSpec {
     }
 }
 
+/// What a task is, before goetia checks it: plain data a consumer fills in and passes to
+/// [`TaskSpec::new`]. It has no methods, so `Deref` from a [`TaskSpec`] exposes only fields.
+///
+/// `schedule` is `None` for a task nothing starts on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskFields {
+    pub common: DaemonFields,
+    pub schedule: Option<Schedule>,
+}
+
+/// A task goetia has checked: it passed every field rule. Only [`TaskSpec::new`] makes one; fields
+/// read through `Deref`, there is no `DerefMut`. [`ServiceSpec`]'s guarantees about `common` hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSpec(TaskFields);
+
+impl TaskSpec {
+    /// Check `fields` against the field rules and wrap them. Fails with [`Error::Invalid`] naming
+    /// the field.
+    pub fn new(fields: TaskFields) -> Result<TaskSpec, Error> {
+        resolve::check_fields(&fields.common)?;
+        Ok(TaskSpec(fields))
+    }
+
+    /// Give the fields back, to build a variant and check it with [`TaskSpec::new`].
+    pub fn into_fields(self) -> TaskFields {
+        self.0
+    }
+}
+
+impl std::ops::Deref for TaskSpec {
+    type Target = TaskFields;
+
+    fn deref(&self) -> &TaskFields {
+        &self.0
+    }
+}
+
 /// A daemon goetia has checked, of one of the kinds goetia installs. No `Deref`: read the fields
 /// every kind has with [`DaemonSpec::common`], and match the variant for the rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonSpec {
     Service(ServiceSpec),
+    Task(TaskSpec),
 }
 
 impl DaemonSpec {
@@ -181,6 +222,7 @@ impl DaemonSpec {
     pub fn common(&self) -> &DaemonFields {
         match self {
             DaemonSpec::Service(service) => &service.common,
+            DaemonSpec::Task(task) => &task.common,
         }
     }
 
@@ -188,6 +230,7 @@ impl DaemonSpec {
     pub fn kind(&self) -> DaemonKind {
         match self {
             DaemonSpec::Service(_) => DaemonKind::Service,
+            DaemonSpec::Task(_) => DaemonKind::Task,
         }
     }
 }
@@ -198,10 +241,17 @@ impl From<ServiceSpec> for DaemonSpec {
     }
 }
 
+impl From<TaskSpec> for DaemonSpec {
+    fn from(task: TaskSpec) -> Self {
+        DaemonSpec::Task(task)
+    }
+}
+
 /// The kinds of daemon goetia installs, as [`DaemonSpec::kind`] reports them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonKind {
     Service,
+    Task,
 }
 
 /// Restart policy. Corresponds to systemd's `Restart=`, launchd's
@@ -224,8 +274,8 @@ pub enum Restart {
 /// Whether Goetia runs the command directly (via `goetia-shim` on Windows)
 /// or the command is itself expected to behave as a native service.
 ///
-/// Parsed from its authored kebab-case string (`simple`, `managed`) by `resolve::parse_protocol`.
-/// Not a derived `Deserialize`: its raw field (`RawSpec::kind`, authored as `type:`) is an
+/// Parsed from its authored kebab-case string (`plain`, `native`) by `resolve::parse_protocol`.
+/// Not a derived `Deserialize`: its raw field (`RawSpec::protocol`, authored as `protocol:`) is an
 /// `Option<String>`, and a value holding `$` is left unparsed at resolve time while substitution is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {

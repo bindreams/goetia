@@ -75,7 +75,7 @@ fn spec_with_restart(restart: Restart) -> DaemonSpec {
 #[skuld::test]
 fn plist_snapshot_minimal() {
     let spec = minimal_spec();
-    let text = plist(&spec, &minimal_identity());
+    let text = plist(&spec, &minimal_identity()).unwrap();
 
     let expected = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -109,7 +109,7 @@ fn plist_snapshot_minimal() {
 #[skuld::test]
 fn plist_snapshot_full() {
     let spec = full_spec();
-    let text = plist(&spec, &full_identity());
+    let text = plist(&spec, &full_identity()).unwrap();
 
     let expected = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -168,7 +168,7 @@ fn plist_snapshot_full() {
 #[skuld::test]
 fn plist_round_trips_through_extract() {
     let spec = full_spec();
-    let text = plist(&spec, &full_identity());
+    let text = plist(&spec, &full_identity()).unwrap();
 
     let decoded = extract(&text)
         .expect("extract should succeed on our own output")
@@ -183,10 +183,10 @@ fn plist_round_trips_through_extract() {
 fn plist_is_the_generation_invariant() {
     let spec = full_spec();
     let id = full_identity();
-    let text = plist(&spec, &id);
+    let text = plist(&spec, &id).unwrap();
 
     let decoded = extract(&text).unwrap().unwrap();
-    let regenerated = plist(&decoded.spec, &id);
+    let regenerated = plist(&decoded.spec, &id).unwrap();
 
     assert_eq!(
         regenerated, text,
@@ -229,7 +229,7 @@ fn extract_returns_none_when_no_metadata_comment_matches_our_marker() {
 #[skuld::test]
 fn extract_errors_on_corrupt_blob_in_plist() {
     let spec = full_spec();
-    let text = plist(&spec, &full_identity());
+    let text = plist(&spec, &full_identity()).unwrap();
 
     // Corrupt the base64 payload embedded in the comment, without disturbing
     // the surrounding sentinel structure. The comment is still recognizably
@@ -243,7 +243,7 @@ fn extract_errors_on_corrupt_blob_in_plist() {
 #[skuld::test]
 fn extract_errors_on_duplicate_metadata_comment() {
     let spec = full_spec();
-    let text = plist(&spec, &full_identity());
+    let text = plist(&spec, &full_identity()).unwrap();
 
     // Two well-formed metadata comments in one document.
     let comment_end = text.find("-->").expect("fixture must contain a comment") + "-->".len();
@@ -306,7 +306,7 @@ fn extract_errors_on_metadata_comment_missing_a_field() {
 #[skuld::test]
 fn extract_errors_on_marker_mismatch() {
     let spec = full_spec();
-    let text = plist(&spec, &full_identity());
+    let text = plist(&spec, &full_identity()).unwrap();
     let tampered = text.replacen("Marker: goetia", "Marker: not-goetia", 1);
 
     let err = extract(&tampered).expect_err("a metadata comment naming the wrong marker must error");
@@ -336,7 +336,7 @@ fn extract_tolerates_crlf_line_endings_in_the_metadata_comment() {
     // editor) still carries a fully intact metadata comment — the sentinel
     // match must not be tied to the exact `\n` byte.
     let spec = full_spec();
-    let text = plist(&spec, &full_identity());
+    let text = plist(&spec, &full_identity()).unwrap();
     let crlf = text.replace('\n', "\r\n");
 
     let decoded = extract(&crlf)
@@ -362,7 +362,8 @@ fn xml_special_characters_are_escaped() {
         &Identity {
             user: "svc&name<x>y".to_string(),
         },
-    );
+    )
+    .unwrap();
 
     assert!(
         text.contains("<string>a&amp;b&lt;c&gt;d</string>"),
@@ -412,7 +413,7 @@ fn xml_special_characters_are_escaped() {
 
 #[skuld::test]
 fn restart_variants_map_to_keepalive() {
-    let never = plist(&spec_with_restart(Restart::Never), &minimal_identity());
+    let never = plist(&spec_with_restart(Restart::Never), &minimal_identity()).unwrap();
     assert!(
         !never.contains("<key>KeepAlive</key>"),
         "never must omit KeepAlive:\n{never}"
@@ -422,14 +423,14 @@ fn restart_variants_map_to_keepalive() {
         "never must omit RunAtLoad:\n{never}"
     );
 
-    let on_failure = plist(&spec_with_restart(Restart::OnFailure), &minimal_identity());
+    let on_failure = plist(&spec_with_restart(Restart::OnFailure), &minimal_identity()).unwrap();
     assert!(
         on_failure.contains("<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>\n"),
         "on-failure must emit a KeepAlive dict with SuccessfulExit: false:\n{on_failure}"
     );
     assert!(on_failure.contains("<key>RunAtLoad</key>\n\t<true/>\n"));
 
-    let always = plist(&spec_with_restart(Restart::Always), &minimal_identity());
+    let always = plist(&spec_with_restart(Restart::Always), &minimal_identity()).unwrap();
     assert!(
         always.contains("<key>KeepAlive</key>\n\t<true/>\n"),
         "always must emit KeepAlive: true:\n{always}"
@@ -456,7 +457,7 @@ fn throttle_interval_rounds_up() {
         })
         .map(DaemonSpec::from)
         .unwrap();
-        let text = plist(&spec, &minimal_identity());
+        let text = plist(&spec, &minimal_identity()).unwrap();
         let needle = format!("<key>ThrottleInterval</key>\n\t<integer>{expected}</integer>\n");
         assert!(
             text.contains(&needle),
@@ -478,7 +479,7 @@ fn throttle_interval_rounding_does_not_overflow_at_the_duration_boundary() {
     })
     .map(DaemonSpec::from)
     .unwrap();
-    let text = plist(&spec, &minimal_identity());
+    let text = plist(&spec, &minimal_identity()).unwrap();
     let needle = format!("<key>ThrottleInterval</key>\n\t<integer>{}</integer>\n", u64::MAX);
     assert!(
         text.contains(&needle),
@@ -495,7 +496,7 @@ fn throttle_interval_omitted_without_restart_delay() {
     })
     .map(DaemonSpec::from)
     .unwrap();
-    let text = plist(&spec, &minimal_identity());
+    let text = plist(&spec, &minimal_identity()).unwrap();
     assert!(
         !text.contains("ThrottleInterval"),
         "no restart_delay means no ThrottleInterval:\n{text}"
@@ -514,7 +515,7 @@ fn throttle_interval_omitted_when_restart_is_never() {
     })
     .map(DaemonSpec::from)
     .unwrap();
-    let text = plist(&spec, &minimal_identity());
+    let text = plist(&spec, &minimal_identity()).unwrap();
     assert!(
         !text.contains("ThrottleInterval"),
         "restart: never must omit ThrottleInterval:\n{text}"
@@ -526,7 +527,7 @@ fn throttle_interval_omitted_when_restart_is_never() {
 #[skuld::test]
 fn disabled_key_is_never_emitted() {
     for restart in [Restart::Never, Restart::OnFailure, Restart::Always] {
-        let text = plist(&spec_with_restart(restart), &minimal_identity());
+        let text = plist(&spec_with_restart(restart), &minimal_identity()).unwrap();
         assert!(
             !text.contains("Disabled"),
             "the generated plist must never mention Disabled ({restart:?}):\n{text}"
@@ -536,8 +537,8 @@ fn disabled_key_is_never_emitted() {
     // And explicitly: the text must be byte-identical regardless of any
     // notion of "enabled" — which does not exist as spec data at all, so
     // this is really just restating that `plist` takes no such parameter.
-    let a = plist(&full_spec(), &full_identity());
-    let b = plist(&full_spec(), &full_identity());
+    let a = plist(&full_spec(), &full_identity()).unwrap();
+    let b = plist(&full_spec(), &full_identity()).unwrap();
     assert_eq!(a, b);
 }
 
@@ -563,7 +564,7 @@ fn base64_alphabet_cannot_produce_a_comment_terminator() {
 
 #[skuld::test]
 fn without_metadata_drops_the_whole_comment_and_keeps_the_rest() {
-    let text = plist(&minimal_spec(), &minimal_identity());
+    let text = plist(&minimal_spec(), &minimal_identity()).unwrap();
     let stripped = without_metadata(&text);
 
     assert!(!stripped.contains("goetia"), "{stripped}");
@@ -588,8 +589,8 @@ fn without_metadata_makes_a_spec_change_the_plist_does_not_render_vanish() {
     })
     .map(DaemonSpec::from)
     .unwrap();
-    let before = plist(&minimal_spec(), &minimal_identity());
-    let after = plist(&renamed, &minimal_identity());
+    let before = plist(&minimal_spec(), &minimal_identity()).unwrap();
+    let after = plist(&renamed, &minimal_identity()).unwrap();
 
     assert_ne!(before, after);
     assert_eq!(without_metadata(&before), without_metadata(&after));
@@ -597,7 +598,7 @@ fn without_metadata_makes_a_spec_change_the_plist_does_not_render_vanish() {
 
 #[skuld::test]
 fn without_metadata_makes_a_version_bump_vanish() {
-    let text = plist(&minimal_spec(), &minimal_identity());
+    let text = plist(&minimal_spec(), &minimal_identity()).unwrap();
     let bumped = text.replace(&format!("Version: {}", crate::version()), "Version: 999.0.0");
 
     assert_ne!(text, bumped);
@@ -606,13 +607,14 @@ fn without_metadata_makes_a_version_bump_vanish() {
 
 #[skuld::test]
 fn without_metadata_keeps_what_launchd_reads() {
-    let before = plist(&minimal_spec(), &minimal_identity());
+    let before = plist(&minimal_spec(), &minimal_identity()).unwrap();
     let other_user = plist(
         &minimal_spec(),
         &Identity {
             user: "svc".to_string(),
         },
-    );
+    )
+    .unwrap();
     let other_command = plist(
         &ServiceSpec::new(ServiceFields {
             common: DaemonFields {
@@ -624,7 +626,8 @@ fn without_metadata_keeps_what_launchd_reads() {
         .map(DaemonSpec::from)
         .unwrap(),
         &minimal_identity(),
-    );
+    )
+    .unwrap();
 
     assert_ne!(without_metadata(&before), without_metadata(&other_user));
     assert_ne!(without_metadata(&before), without_metadata(&other_command));
@@ -632,7 +635,7 @@ fn without_metadata_keeps_what_launchd_reads() {
 
 #[skuld::test]
 fn without_metadata_handles_crlf() {
-    let text = plist(&minimal_spec(), &minimal_identity());
+    let text = plist(&minimal_spec(), &minimal_identity()).unwrap();
     let crlf = text.replace('\n', "\r\n");
 
     assert_eq!(without_metadata(&crlf), without_metadata(&text).replace('\n', "\r\n"));

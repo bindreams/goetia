@@ -292,7 +292,7 @@ jobs:
           }
 
       # The staged goetia.exe alone must install, run and uninstall a
-      # `type: simple` service: it carries the stock shim. The runner is
+      # `protocol: plain` service: it carries the stock shim. The runner is
       # elevated; goetia puts the shim under Program Files and sweeps it on
       # uninstall.
       - name: Smoke test the staged goetia.exe (Windows)
@@ -309,7 +309,6 @@ jobs:
           cat > "$dir/goetia.yaml" <<EOF
           id: $id
           command: ['C:/Windows/System32/ping.exe', '-t', '127.0.0.1']
-          type: simple
           EOF
           trap '"$exe" daemon uninstall "$id" || true' EXIT
           "$exe" daemon install -f "$dir" --start

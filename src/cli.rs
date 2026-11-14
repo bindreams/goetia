@@ -12,7 +12,7 @@
 //!
 //! `get_manager`, `is_elevated` and `host` are lazily-invoked closures so that a
 //! subcommand that needs none of them never calls it; tests hand in a closure that
-//! panics if called. `host` names the command a Windows `type: simple` service is
+//! panics if called. `host` names the command a Windows `protocol: plain` service is
 //! registered to run: it is called only by `install --dry-run` of such a daemon,
 //! which has no manager to ask. Linux and macOS never call it.
 
@@ -51,7 +51,7 @@ use crate::shim::{CheckPermissions, ShimProvider};
 
 // Windows providers ===================================================================================================
 
-/// The Windows manager whose `type: simple` services run the host `provider` supplies, with the
+/// The Windows manager whose `protocol: plain` services run the host `provider` supplies, with the
 /// folder permission check on.
 #[cfg(windows)]
 pub fn manager(provider: impl ShimProvider + 'static) -> Result<Box<dyn ServiceManager>> {

@@ -223,7 +223,7 @@ fn an_embedded_errors_stderr_keeps_its_layout() {
     let text = e.report().to_string();
     assert!(
         text.contains(&format!(
-            "judged as a `type: managed` service's (`systemctl start x` failed ({status}): a\nerror: forged): "
+            "judged as a `protocol: native` service's (`systemctl start x` failed ({status}): a\nerror: forged): "
         )),
         "{text:?}"
     );

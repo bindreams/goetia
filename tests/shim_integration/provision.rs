@@ -576,7 +576,7 @@ fn disable_skips_the_folder_check(#[fixture(scm_group)] _group: &Group) {
 
 // The accounts ========================================================================================================
 
-/// Installs a `type: simple` service with `install`, which is given its id, the daemon's
+/// Installs a `protocol: plain` service with `install`, which is given its id, the daemon's
 /// executable, and the port the daemon reports in on; starts it, waits for the daemon's report,
 /// and stops it. `label` names the account in a failure.
 fn runs_as(label: &str, mgr: &Scm, install: impl FnOnce(&str, &str, u16)) {
@@ -779,7 +779,7 @@ fn open_lock() -> OwnedHandle {
     unsafe { OwnedHandle::from_raw_handle(raw) }
 }
 
-/// Runs an install of a `type: simple` service on its own thread, which stops inside the
+/// Runs an install of a `protocol: plain` service on its own thread, which stops inside the
 /// provider's `provide`, where the lock is held, and calls `probe` with the lock opened then. The
 /// install is then let go and must succeed. Returns the lock, opened. A probe that panics lets the
 /// install go too (the closure owns `release`, which is dropped as it unwinds, before the scope
