@@ -1147,7 +1147,14 @@ fn a_service_retyped_to_a_task_beside_a_foreign_timer_is_refused_with_nothing_ch
 
     let outcome = install(&over(&fake), &task, false);
 
-    assert!(matches!(outcome, Outcome::RefuseForeign { .. }), "{outcome:?}");
+    let Outcome::RefuseForeign { recovery } = &outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(
+        recovery.contains(&unit_path(&id, UnitKind::Timer).display().to_string())
+            && recovery.contains(&format!("systemctl disable --now {id}.timer")),
+        "the recovery must name the timer, which is what is in the way: {recovery}"
+    );
     assert_eq!(text_of(&id, UnitKind::Service), Some(job), "the job is unchanged");
     assert_eq!(
         text_of(&id, UnitKind::Timer).as_deref(),

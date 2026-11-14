@@ -433,7 +433,7 @@ pub(super) fn fragmentless<S>(id: &str) -> ReadResult<ReadOutcome<S>> {
 
 /// How to free an id whose `<id>.timer` is not goetia's, which a task of that id needs for its
 /// schedule.
-fn foreign_timer_recovery(id: &str) -> String {
+pub(super) fn foreign_timer_recovery(id: &str) -> String {
     format!(
         "`{}` is not goetia's, and a task needs that name for its schedule: remove or rename it \
          (`systemctl disable --now {id}.timer` first, if it is enabled), run `systemctl daemon-reload`, \

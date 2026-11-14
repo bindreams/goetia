@@ -34,13 +34,13 @@ use std::sync::Arc;
 use crate::backend::systemd::generate::{self, Units};
 use crate::backend::{Decoded, InstalledService, WriteOutcome};
 use crate::blob::Blob;
-use crate::decide::{Outcome, foreign_recovery};
+use crate::decide::Outcome;
 use crate::error::{Error, Result};
 use crate::manager::flow::NOTHING_TO_ARM;
 use crate::manager::{Budget, DaemonStatus, Status, TaskStatus};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
-use super::discover::timer_is_foreign;
+use super::discover::{foreign_timer_recovery, timer_is_foreign};
 use super::systemctl::Held;
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::{
@@ -195,7 +195,7 @@ impl Systemd {
         {
             return Ok(if timer_is_foreign(id)? {
                 WriteOutcome::Refused(Outcome::RefuseForeign {
-                    recovery: foreign_recovery(id),
+                    recovery: foreign_timer_recovery(id),
                 })
             } else {
                 WriteOutcome::Raced
