@@ -111,6 +111,7 @@ fn real_tells_a_spawn_that_failed_before_exec_from_one_that_may_have_run() {
             "before the spawn: containment",
             || cosca::error::Error::Containment {
                 detail: "forced".into(),
+                source: None,
             },
             false,
         ),
@@ -119,6 +120,7 @@ fn real_tells_a_spawn_that_failed_before_exec_from_one_that_may_have_run() {
             || {
                 bounded::test_hook::may_have_started(cosca::error::Error::Containment {
                     detail: "forced".into(),
+                    source: None,
                 })
             },
             true,
@@ -156,7 +158,12 @@ fn real_loses_a_child_and_says_whether_it_announced() {
         match sh(script).run(&[], wait, &mut reservation) {
             Err(ClientError::Lost { error, announced }) => {
                 assert_eq!(announced, expected, "{script}");
-                assert!(error.to_string().contains("the wait failed"), "{script}: {error:?}");
+                assert!(
+                    cosca::error::Report::new(&error)
+                        .to_string()
+                        .contains("the wait failed"),
+                    "{script}: {error:?}"
+                );
             }
             other => panic!("{script}: expected the child to be lost: {other:?}"),
         }
@@ -290,6 +297,7 @@ fn real_to_completion_tells_a_failure_after_the_spawn_from_one_before_it() {
         cosca::error::Error::from(std::io::Error::from_raw_os_error(libc::EAGAIN)),
         cosca::error::Error::Containment {
             detail: "forced".into(),
+            source: None,
         },
     ] {
         let described = format!("{before:?}");

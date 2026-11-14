@@ -508,6 +508,7 @@ fn a_watched_request_that_may_have_run_is_in_doubt() {
     may_or_may_not(
         &start(ClientError::MayHaveRun(cosca::error::Error::Containment {
             detail: "forced".into(),
+            source: None,
         }))
         .expect_err("injected"),
     );
