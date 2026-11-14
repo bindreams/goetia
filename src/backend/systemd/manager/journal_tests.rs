@@ -428,7 +428,10 @@ fn only_the_managers_queries_read_the_system_journal_alone_and_from_pid_1() {
     let has = |args: &str, wanted: &str| args.split(' ').any(|argument| argument == wanted);
 
     let newest = args_of(entries_of(&journal).expect("entries"));
-    assert!(has(&newest, "--system") && has(&newest, "_PID=1"), "newest first: {newest}");
+    assert!(
+        has(&newest, "--system") && has(&newest, "_PID=1"),
+        "newest first: {newest}"
+    );
     for (scope, manager) in [(Scope::Manager, true), (Scope::Output, false)] {
         let follow = args_of(first_of(
             journal.follow(scope, &unit, Some(&cursor), &mut one()).expect("follow"),

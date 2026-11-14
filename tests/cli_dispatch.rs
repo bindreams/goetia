@@ -4867,11 +4867,17 @@ fn start_refuses_a_flag_on_a_task_whose_status_cannot_be_read() {
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "nightly", "--timeout", "5s"], &fake);
 
-    assert_eq!(code, 1, "stdout:
+    assert_eq!(
+        code, 1,
+        "stdout:
 {out}
 stderr:
-{err}");
-    assert!(err.contains(TIMEOUT_ON_A_TASK), "the kind is the blob's, not the status's: {err}");
+{err}"
+    );
+    assert!(
+        err.contains(TIMEOUT_ON_A_TASK),
+        "the kind is the blob's, not the status's: {err}"
+    );
     assert!(!fake.calls().contains(&("start", "nightly".to_string())));
 }
 
@@ -4882,10 +4888,13 @@ fn start_with_a_flag_on_an_unusable_blob_is_the_blobs_error() {
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc", "--timeout", "5s"], &fake);
 
-    assert_ne!(code, 0, "stdout:
+    assert_ne!(
+        code, 0,
+        "stdout:
 {out}
 stderr:
-{err}");
+{err}"
+    );
     assert!(!err.contains(TIMEOUT_ON_A_TASK), "{err}");
     assert!(
         !fake.calls().contains(&("start", "frpc".to_string())),
@@ -4900,12 +4909,18 @@ fn start_without_a_flag_still_starts_an_unusable_blob() {
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc"], &fake);
 
-    assert_eq!(code, 0, "stdout:
+    assert_eq!(
+        code, 0,
+        "stdout:
 {out}
 stderr:
-{err}");
-    assert_eq!(out, "frpc: started
-");
+{err}"
+    );
+    assert_eq!(
+        out,
+        "frpc: started
+"
+    );
 }
 
 #[skuld::test]
@@ -4916,13 +4931,19 @@ fn start_of_a_task_says_the_run_was_requested() {
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "nightly", "frpc"], &fake);
 
-    assert_eq!(code, 0, "stdout:
+    assert_eq!(
+        code, 0,
+        "stdout:
 {out}
 stderr:
-{err}");
-    assert_eq!(out, "nightly: start requested
+{err}"
+    );
+    assert_eq!(
+        out,
+        "nightly: start requested
 frpc: started
-");
+"
+    );
 }
 
 #[skuld::test]

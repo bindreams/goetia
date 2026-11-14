@@ -1545,7 +1545,13 @@ fn a_tasks_state_is_read_from_the_job_alone() {
     assert_eq!(state, State::Idle);
     assert_eq!(
         systemctl.calls(),
-        [call(&["show", "--property", "ActiveState,MainPID,LoadState", "--", "x.service"])]
+        [call(&[
+            "show",
+            "--property",
+            "ActiveState,MainPID,LoadState",
+            "--",
+            "x.service"
+        ])]
     );
 }
 

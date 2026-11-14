@@ -746,7 +746,8 @@ fn run_shows_the_programs_own_line_ends(#[fixture(systemd_group)] _group: &Group
     let mgr = Systemd::new();
     // One process writes it all (a second writer would end an unterminated line at its pid change): 60000
     // bytes, past the default LineMax of 48K (49152), then a line with no newline at its end.
-    let script = r#"awk 'BEGIN { s = "x"; while (length(s) < 60000) s = s s; print substr(s, 1, 60000); printf "a\nlast" }'"#;
+    let script =
+        r#"awk 'BEGIN { s = "x"; while (length(s) < 60000) s = s s; print substr(s, 1, 60000); printf "a\nlast" }'"#;
     mgr.install(&task(&id, sh(script), None), false).expect("install");
 
     let (exit, out) = run_task(&mgr, &task_id);

@@ -452,10 +452,7 @@ fn wait_follows_the_unit_after_the_starting_entry() {
 /// A wait that lost the run (the follower ended, could not be made, failed) does not know the run
 /// ended, so it says it lost track of it: indeterminate, and never "ended without recording".
 fn assert_lost_track(e: &Error) {
-    assert!(
-        matches!(e, Error::RequestInDoubt { reached: true, .. }),
-        "{e:?}"
-    );
+    assert!(matches!(e, Error::RequestInDoubt { reached: true, .. }), "{e:?}");
     assert!(e.is_indeterminate(), "{e:?}");
     let message = e.to_string();
     assert!(message.contains("lost track"), "{message}");
@@ -585,20 +582,12 @@ fn the_output_is_read_in_the_output_scope() {
 #[skuld::test]
 fn output_ends_each_line_as_the_program_ended_it() {
     for (what, breaks, expected) in [
-        ("none", vec![None, None], "one
-two
-"),
-        ("a last line with no newline", vec![None, Some("eof")], "one
-two"),
-        ("the pieces of a long line", vec![Some("line-max"), None], "onetwo
-"),
-        ("a line another process cut", vec![Some("pid-change"), None], "onetwo
-"),
-        ("a NUL", vec![Some("nul"), None], "one two
-"),
-        ("a break not known", vec![Some("future"), None], "one
-two
-"),
+        ("none", vec![None, None], "one\ntwo\n"),
+        ("a last line with no newline", vec![None, Some("eof")], "one\ntwo"),
+        ("the pieces of a long line", vec![Some("line-max"), None], "onetwo\n"),
+        ("a line another process cut", vec![Some("pid-change"), None], "onetwo\n"),
+        ("a NUL", vec![Some("nul"), None], "one\0two\n"),
+        ("a break not known", vec![Some("future"), None], "one\ntwo\n"),
     ] {
         let at = |text, cursor, how: Option<&str>| match how {
             Some(how) => broken(cursor, "s1", text, how),
@@ -629,8 +618,7 @@ fn the_lines_read_after_the_end_keep_their_line_breaks() {
     let (result, out) = shown_after_the_end(&journal);
 
     result.expect("the stream");
-    assert_eq!(String::from_utf8(out).unwrap(), "head
-tail");
+    assert_eq!(String::from_utf8(out).unwrap(), "head\ntail");
 }
 
 #[skuld::test]
