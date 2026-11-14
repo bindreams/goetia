@@ -314,3 +314,122 @@ fn display_of_a_sentence_variant_and_its_report_agree_on_the_words() {
     let (display, report) = (loaded.to_string(), loaded.report().to_string());
     assert_eq!(report.replacen(": diagnostic", "", 1), display);
 }
+
+/// A goetia error holding a `cosca` error prints it as `cosca::error::Report` does.
+#[skuld::test]
+fn a_cosca_error_below_a_goetia_error_is_written_as_cosca_reports_it() {
+    let cosca_error = || cosca::error::Error::MayHaveStarted {
+        fate: cosca::error::ChildFate::Unknown,
+        wrapper_elevated: false,
+        detail: Some("the pipe broke".to_string()),
+        source: Arc::new(cosca::error::Error::Io(std::io::Error::other("no pipe"))),
+        unreaped: None,
+        cleanup: None,
+    };
+    let expected = cosca::error::Report::new(&cosca_error()).to_string();
+    let text = Error::spawn("tool", cosca_error()).report().to_string();
+
+    assert_eq!(text, format!("failed to run `tool`: {expected}"));
+}
+
+// os_error_in ---------------------------------------------------------------------------------------------------------
+
+/// `ERROR_ACCESS_DENIED` and `ERROR_PATH_NOT_FOUND`.
+const DENIED: i32 = 5;
+const PATH_NOT_FOUND: i32 = 3;
+
+fn io_with_code(code: i32) -> cosca::error::Error {
+    cosca::error::Error::Io(std::io::Error::from_raw_os_error(code))
+}
+
+fn code_less() -> cosca::error::Error {
+    cosca::error::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+}
+
+#[skuld::test]
+fn the_os_error_of_an_io_failure_is_kept_and_other_failures_have_none() {
+    assert_eq!(os_error_in(&io_with_code(DENIED)), Some(DENIED));
+    // A failure without a code has none, whatever its kind.
+    assert_eq!(os_error_in(&code_less()), None);
+    assert_eq!(
+        os_error_in(&cosca::error::Error::Unassessable {
+            detail: "query".to_string(),
+            source: Some(Arc::new(code_less())),
+        }),
+        None
+    );
+    assert_eq!(
+        os_error_in(&cosca::error::Error::Io(std::io::Error::other("no os code"))),
+        None
+    );
+    assert_eq!(
+        os_error_in(&cosca::error::Error::Containment {
+            detail: "attach".to_string(),
+            source: None,
+        }),
+        None
+    );
+}
+
+/// `cosca` wraps every failure after `CreateProcess` in `MayHaveStarted`; the code is the wrapped
+/// failure's.
+#[skuld::test]
+fn the_os_error_of_a_failure_after_the_spawn_is_the_one_of_its_source() {
+    let after_spawn = |source: cosca::error::Error| cosca::error::Error::MayHaveStarted {
+        fate: cosca::error::ChildFate::Unknown,
+        wrapper_elevated: false,
+        detail: None,
+        source: Arc::new(source),
+        unreaped: None,
+        cleanup: None,
+    };
+
+    assert_eq!(os_error_in(&after_spawn(io_with_code(DENIED))), Some(DENIED));
+    assert_eq!(
+        os_error_in(&after_spawn(cosca::error::Error::Containment {
+            detail: "attach".to_string(),
+            source: None,
+        })),
+        None
+    );
+}
+
+/// `cosca` keeps the OS error at the bottom of the `source()` chain, below however many layers a call
+/// added; the code is that error's, whichever layers lie above it.
+#[skuld::test]
+fn the_os_error_of_a_failure_is_found_at_any_depth_of_its_causes() {
+    let containment = |source| cosca::error::Error::Containment {
+        detail: "kill".to_string(),
+        source: Some(Arc::new(source)),
+    };
+    let unassessable = |source| cosca::error::Error::Unassessable {
+        detail: "kill".to_string(),
+        source: Some(Arc::new(source)),
+    };
+    let not_killed = |source| cosca::error::Error::MemberNotKilled {
+        pid: 1,
+        source: Arc::new(source),
+    };
+
+    assert_eq!(os_error_in(&containment(io_with_code(DENIED))), Some(DENIED));
+    assert_eq!(
+        os_error_in(&unassessable(not_killed(containment(io_with_code(DENIED))))),
+        Some(DENIED)
+    );
+    let after_spawn = cosca::error::Error::MayHaveStarted {
+        fate: cosca::error::ChildFate::Unknown,
+        wrapper_elevated: false,
+        detail: None,
+        source: Arc::new(unassessable(io_with_code(DENIED))),
+        unreaped: None,
+        cleanup: None,
+    };
+    assert_eq!(os_error_in(&after_spawn), Some(DENIED));
+    // A code-less layer above the code does not hide it.
+    assert_eq!(
+        os_error_in(&containment(io_with_code(PATH_NOT_FOUND))),
+        Some(PATH_NOT_FOUND)
+    );
+    // A chain with no code anywhere has none.
+    assert_eq!(os_error_in(&unassessable(containment(code_less()))), None);
+}

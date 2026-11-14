@@ -6,6 +6,7 @@
 //! is told.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::backend::scm::exit_status::{
     ERROR_CAN_NOT_COMPLETE, ERROR_GEN_FAILURE, ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, Reported, SHIM_REFUSED,
@@ -13,7 +14,7 @@ use crate::backend::scm::exit_status::{
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec};
 use crate::testing::{base_fields, service_fields};
 use cosca::Containment;
-use cosca::error::ChildFate;
+use cosca::error::{ChildFate, Report};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
 };
@@ -23,7 +24,8 @@ use windows_sys::Win32::System::Services::{
 
 use super::*;
 use crate::backend::scm::shim::run::os::fake::{
-    FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WAIT_FAILED, WaitReply, WaiterEnd,
+    FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd, tree_kill_refused,
+    wait_failed, wait_failed_with_code,
 };
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
@@ -81,7 +83,7 @@ fn no_thread_failure() -> String {
 fn spawn_failure() -> String {
     format!(
         r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}"#,
-        not_found()
+        cosca::error::Report::new(&not_found())
     )
 }
 
@@ -89,7 +91,12 @@ fn spawn_failure() -> String {
 const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"] was contained by process-tree walk, not a job object: `type: simple` needs a job object to terminate its whole tree. The daemon ran from its launch, and no kill of it shows that its descendants are gone, so it is reported as possibly still running"#;
 
 /// The line logged when the daemon's tree cannot be terminated after the daemon ended.
-const EXITED_TREE_UNKILLED: &str = "kill_tree after the daemon ended: the kill was refused (fake); its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure";
+fn exited_tree_unkilled() -> String {
+    format!(
+        "terminating the process tree after the daemon ended failed: {}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
+        Report::new(&tree_kill_refused())
+    )
+}
 
 #[skuld::test]
 fn no_daemon_is_spawned_when_no_thread_can_be_made_to_wait_on_it() {
@@ -207,10 +214,12 @@ fn may_have_started(fate: ChildFate) -> cosca::error::Error {
     cosca::error::Error::MayHaveStarted {
         fate,
         wrapper_elevated: false,
-        source: Box::new(cosca::error::Error::Io(std::io::Error::from_raw_os_error(
+        detail: None,
+        source: Arc::new(cosca::error::Error::Io(std::io::Error::from_raw_os_error(
             ERROR_ACCESS_DENIED as i32,
         ))),
         unreaped: None,
+        cleanup: None,
     }
 }
 
@@ -228,7 +237,7 @@ fn a_spawn_error_that_may_have_left_the_daemon_running_is_the_incomplete_stop_re
         assert_eq!(launched.as_ref().err(), Some(&Reported::incomplete_stop()), "{fate:?}");
         let expected = format!(
             r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}; the daemon may still be running{NOT_RESTARTED}"#,
-            may_have_started(fate)
+            cosca::error::Report::new(&may_have_started(fate))
         );
         assert_one_failure(&fake.take_failures(), ID, &expected);
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
@@ -368,7 +377,7 @@ fn running_is_reported_once_and_after_the_spawn() {
 fn a_daemon_that_exits_nonzero_is_one_pass() {
     let fake = FakeGuard::new();
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Ends));
+    fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Ends));
     // The shim ignores the restart policy: no respawn.
     let daemon = ServiceSpec::new(ServiceFields {
         restart: Restart::OnFailure,
@@ -389,7 +398,7 @@ fn a_daemon_that_exits_nonzero_is_one_pass() {
 fn a_daemon_that_exits_zero_is_clean() {
     let fake = FakeGuard::new();
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().exited(0).kill_tree(KillReply::Ends));
+    fake.will_spawn(FakeProcess::new().exited(0).send_kill_tree(KillReply::Ends));
 
     let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
@@ -405,7 +414,7 @@ fn an_unkillable_daemon_reports_the_incomplete_stop_failure() {
     // lets the detached waiter thread be consumed.
     let daemon = FakeProcess::new()
         .wait(WaitReply::Blocks)
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Refuses);
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
@@ -435,7 +444,7 @@ fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(Some(5)))
-        .kill_tree(KillReply::Ends);
+        .send_kill_tree(KillReply::Ends);
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
 
@@ -449,7 +458,7 @@ fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", std::io::Error::from_raw_os_error(5)),
+        &format!("background wait on child: {}", Report::new(&wait_failed_with_code(5))),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -461,7 +470,7 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
     fake.will_spawn(
         FakeProcess::new()
             .wait(WaitReply::Fails(None))
-            .kill_tree(KillReply::Ends),
+            .send_kill_tree(KillReply::Ends),
     );
 
     let reported = run_daemon(&spec(), &supervisor(&fake), || {});
@@ -470,7 +479,7 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {WAIT_FAILED}"),
+        &format!("background wait on child: {}", Report::new(&wait_failed())),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -485,7 +494,7 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
     let supervisor = supervisor(&fake);
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Refuses);
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
@@ -504,7 +513,7 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
         &fake.take_failures(),
         ID,
         &[
-            format!("background wait on child: {WAIT_FAILED}"),
+            format!("background wait on child: {}", Report::new(&wait_failed())),
             tree_refused_failure(),
             fallback_refused_failure(),
         ],
@@ -519,7 +528,7 @@ fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_recor
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Refuses));
+    fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Refuses));
 
     let reported = run_daemon(&spec(), &supervisor, || {});
 
@@ -528,7 +537,7 @@ fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_recor
         !supervisor.bus.request_stop(),
         "the bus accepted a stop over a daemon whose tree may still be running"
     );
-    assert_one_failure(&fake.take_failures(), ID, EXITED_TREE_UNKILLED);
+    assert_one_failure(&fake.take_failures(), ID, &exited_tree_unkilled());
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
@@ -539,12 +548,12 @@ fn a_failing_daemon_whose_tree_cannot_be_terminated_is_the_incomplete_stop_recor
 fn a_clean_exit_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() {
     let fake = FakeGuard::new();
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().exited(0).kill_tree(KillReply::Refuses));
+    fake.will_spawn(FakeProcess::new().exited(0).send_kill_tree(KillReply::Refuses));
 
     let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
     assert_eq!(reported, Reported::incomplete_stop());
-    assert_one_failure(&fake.take_failures(), ID, EXITED_TREE_UNKILLED);
+    assert_one_failure(&fake.take_failures(), ID, &exited_tree_unkilled());
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
@@ -553,7 +562,7 @@ fn a_clean_exit_whose_tree_cannot_be_terminated_is_the_incomplete_stop_record() 
 fn a_clean_exit_whose_tree_is_terminated_is_clean() {
     let fake = FakeGuard::new();
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().exited(0).kill_tree(KillReply::Ends));
+    fake.will_spawn(FakeProcess::new().exited(0).send_kill_tree(KillReply::Ends));
 
     let reported = run_daemon(&spec(), &supervisor(&fake), || {});
 
@@ -574,7 +583,7 @@ fn run_recording_stopping(
 ) -> (Reported, Vec<usize>) {
     let mut stopping = Vec::new();
     let reported = super::run_daemon(daemon, supervisor, ID, on_running, || {
-        stopping.push(fake.calls(Op::KillTree));
+        stopping.push(fake.calls(Op::SendKillTree));
     });
     (reported, stopping)
 }
@@ -608,7 +617,7 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
             supervisor.bus.request_stop();
         },
         || {
-            alive_when_stopping.push((fake.calls(Op::KillTree), !daemon.ended()));
+            alive_when_stopping.push((fake.calls(Op::SendKillTree), !daemon.ended()));
         },
     );
 
@@ -618,7 +627,7 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
         [(0, true)],
         "STOP_PENDING must be reported once, before the teardown begins"
     );
-    assert_eq!(fake.calls(Op::KillTree), 1);
+    assert_eq!(fake.calls(Op::SendKillTree), 1);
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
@@ -626,7 +635,7 @@ fn a_commanded_stop_reports_stopping_once_while_the_daemon_is_still_alive() {
 fn a_daemon_that_exits_reports_stopping_before_its_tree_is_terminated() {
     let fake = FakeGuard::new();
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Ends));
+    fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Ends));
 
     let (reported, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
 
@@ -636,7 +645,7 @@ fn a_daemon_that_exits_reports_stopping_before_its_tree_is_terminated() {
         [0],
         "STOP_PENDING must be reported once, before any tree kill"
     );
-    assert_eq!(fake.calls(Op::KillTree), 1);
+    assert_eq!(fake.calls(Op::SendKillTree), 1);
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
@@ -644,7 +653,7 @@ fn a_daemon_that_exits_reports_stopping_before_its_tree_is_terminated() {
 fn a_daemon_that_exits_cleanly_reports_stopping_before_its_tree_is_terminated() {
     let fake = FakeGuard::new();
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().exited(0).kill_tree(KillReply::Ends));
+    fake.will_spawn(FakeProcess::new().exited(0).send_kill_tree(KillReply::Ends));
 
     let (reported, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
 
@@ -660,7 +669,7 @@ fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
     fake.will_spawn(
         FakeProcess::new()
             .wait(WaitReply::Fails(Some(5)))
-            .kill_tree(KillReply::Ends),
+            .send_kill_tree(KillReply::Ends),
     );
 
     let (reported, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
@@ -670,7 +679,7 @@ fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", std::io::Error::from_raw_os_error(5)),
+        &format!("background wait on child: {}", Report::new(&wait_failed_with_code(5))),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -681,7 +690,7 @@ fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
 fn a_teardown_that_fails_still_reports_stopping_first() {
     let fake = FakeGuard::new();
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Refuses));
+    fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Refuses));
 
     let (reported, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
 
@@ -715,7 +724,7 @@ fn no_stopping_report_over_an_uncontained_daemon() {
     fake.will_spawn(
         FakeProcess::new()
             .containment(Containment::TreeWalk)
-            .kill_tree(KillReply::Ends),
+            .send_kill_tree(KillReply::Ends),
     );
 
     let (_, stopping) = run_recording_stopping(&fake, &spec(), &supervisor(&fake), || {});
@@ -738,7 +747,7 @@ fn a_daemon_without_job_object_containment_is_killed_and_reported_possibly_runni
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .containment(Containment::TreeWalk)
-        .kill_tree(KillReply::Ends);
+        .send_kill_tree(KillReply::Ends);
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
     let mut running_reports = 0;
@@ -752,14 +761,14 @@ fn a_daemon_without_job_object_containment_is_killed_and_reported_possibly_runni
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
-/// The same when `kill_tree` fails and only the direct child is killed: the descendants were never
+/// The same when `send_kill_tree` fails and only the direct child is killed: the descendants were never
 /// reached, so this is no more restartable than a kill that reports success.
 #[skuld::test]
 fn an_uncontained_daemon_whose_tree_kill_failed_is_reported_possibly_running() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .containment(Containment::TreeWalk)
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Ends);
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
@@ -782,7 +791,7 @@ fn an_uncontained_daemon_that_cannot_be_killed_is_the_incomplete_stop_record() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .containment(Containment::TreeWalk)
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Refuses);
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
@@ -813,7 +822,7 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
         FakeProcess::new()
             .wait(WaitReply::Exits(7))
             .wait(WaitReply::Fails(None))
-            .kill_tree(KillReply::Ends),
+            .send_kill_tree(KillReply::Ends),
     );
 
     let reported = run_daemon(&spec(), &supervisor(&fake), || {});
@@ -822,7 +831,7 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("query child exit status: {WAIT_FAILED}"),
+        &format!("query child exit status: {}", Report::new(&wait_failed())),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -835,7 +844,7 @@ fn a_stop_after_a_daemon_failure_was_decided_leaves_the_failure() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().exited(7).kill_tree(KillReply::Ends));
+    fake.will_spawn(FakeProcess::new().exited(7).send_kill_tree(KillReply::Ends));
 
     let reported = run_daemon(&spec(), &supervisor, || {});
 
@@ -883,7 +892,11 @@ fn a_stop_accepted_before_a_daemon_failure_was_decided_is_clean() {
     let supervisor = supervisor(&fake);
     // The accepted stop is what the pass acts on, so the exit status is never read: one wait.
     fake.will_make_thread();
-    fake.will_spawn(FakeProcess::new().wait(WaitReply::Exits(7)).kill_tree(KillReply::Ends));
+    fake.will_spawn(
+        FakeProcess::new()
+            .wait(WaitReply::Exits(7))
+            .send_kill_tree(KillReply::Ends),
+    );
 
     let reported = run_daemon(&spec(), &supervisor, || {
         assert_eq!(handle_control(&supervisor.bus, SERVICE_CONTROL_STOP), NO_ERROR)
@@ -1267,7 +1280,7 @@ fn a_waiter_that_is_not_handed_the_daemon_has_ended_when_launch_returns() {
     uncontained.will_spawn(
         FakeProcess::new()
             .containment(Containment::TreeWalk)
-            .kill_tree(KillReply::Ends),
+            .send_kill_tree(KillReply::Ends),
     );
 
     for fake in [&refused_spawn, &uncontained] {
@@ -1290,7 +1303,7 @@ fn a_daemon_whose_root_was_killed_is_dropped() {
     let fake = FakeGuard::new();
     let daemon = FakeProcess::new()
         .wait(WaitReply::Fails(None))
-        .kill_tree(KillReply::Refuses)
+        .send_kill_tree(KillReply::Refuses)
         .kill(KillReply::Ends);
     fake.will_make_thread();
     fake.will_spawn(daemon.clone());
