@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
@@ -20,13 +21,23 @@ pub(crate) const TAIL_INTERVAL: Duration = Duration::from_millis(100);
 /// is ever sent on it). Returns only after everything the run wrote before it ended has been
 /// written.
 ///
+/// `exit_recorded` is stored by the wait before it closes `ended`: whether it found how the run
+/// ended. A run whose marker is missing shows a note about it only where it did, since a wait that
+/// failed is reported as that error.
+///
 /// A failure to read the output or to write it ends the stream and is returned; the caller still
 /// has the run to wait for.
-pub(crate) fn stream(source: OutputSource, id: &Id, out: &mut dyn Write, ended: &Receiver<()>) -> Result<()> {
+pub(crate) fn stream(
+    source: OutputSource,
+    id: &Id,
+    out: &mut dyn Write,
+    ended: &Receiver<()>,
+    exit_recorded: &AtomicBool,
+) -> Result<()> {
     match source {
-        OutputSource::LogFile { path, offset, marker } => tail(path, offset, marker, out, ended),
+        OutputSource::LogFile { path, offset, marker } => tail(path, offset, marker, out, ended, exit_recorded),
         #[cfg(target_os = "linux")]
-        OutputSource::Journal(journal) => journal.stream(out, ended),
+        OutputSource::Journal(journal) => journal.stream(out, ended, exit_recorded),
         OutputSource::None => {
             note(
                 out,
@@ -44,9 +55,17 @@ pub(crate) fn stream(source: OutputSource, id: &Id, out: &mut dyn Write, ended: 
 /// Shows `path` from `offset` as it grows. The run's end is looked for first and the file read after
 /// it, so a line written before the end is shown whatever `TAIL_INTERVAL` is.
 ///
-/// With a `marker`, only the run's own lines are shown ([`Marked`]), and a run whose marker the file
-/// never held gets a note once it has ended and the file is read to its end.
-fn tail(path: PathBuf, offset: u64, marker: Option<Marker>, out: &mut dyn Write, ended: &Receiver<()>) -> Result<()> {
+/// With a `marker`, only the run's own lines are shown ([`Marked`]). A run whose marker the file
+/// never held gets a note once it has ended and the file is read to its end, unless `exit_recorded`
+/// says the wait found no exit: that failure is the run's error to report.
+fn tail(
+    path: PathBuf,
+    offset: u64,
+    marker: Option<Marker>,
+    out: &mut dyn Write,
+    ended: &Receiver<()>,
+    exit_recorded: &AtomicBool,
+) -> Result<()> {
     let mut position = offset;
     let mut marked = marker.map(Marked::new);
     loop {
@@ -58,7 +77,9 @@ fn tail(path: PathBuf, offset: u64, marker: Option<Marker>, out: &mut dyn Write,
         position = read_new(&path, position, marked.as_mut(), out)?;
         if finished {
             if let Some(marked) = marked {
-                marked.end(&path, out)?;
+                // Read after the channel closed, which the wait does after it stores whether it found
+                // the exit.
+                marked.finish(&path, exit_recorded.load(Ordering::SeqCst), out)?;
             }
             return Ok(());
         }
@@ -115,20 +136,27 @@ fn read_new(path: &Path, mut position: u64, mut marked: Option<&mut Marked>, out
 }
 
 /// Which of the lines of a file that several runs append to are one run's: those after its marker
-/// line and before the next marker line of any run. A line is judged whole, so one written in pieces
-/// waits for its end.
+/// line and before the next marker line of any run.
 ///
-/// A line the program itself prints that starts or ends as a marker does ([`Marked::split`]) ends the
-/// run's output there: that is the program's own action, and is not guarded.
+/// The run's own part is shown as it arrives, partial lines included (a prompt, a `\r` progress
+/// line). Only what could still become a marker waits: a line's first characters while they are a
+/// prefix of `<prefix> `, and a trailing part that could begin a marker glued to the end of a line.
+/// Before the run's marker, only whole lines are judged.
+///
+/// A run whose last line has no newline leaves the next run's marker at the end of that line:
+/// `partial<prefix> <id>`, with `id_len` hex digits. It is split off ([`Marked::split`]), and the line
+/// that was left is the earlier run's last.
+///
+/// A line the program itself prints that starts or ends as a marker does ends the run's output there:
+/// that is the program's own action, and is not guarded.
 struct Marked {
     marker: Marker,
     phase: Phase,
-    /// The start of a line not yet whole.
+    /// What was read of the current line and is not shown or judged yet.
     pending: Vec<u8>,
+    /// Whether nothing of the current line has been shown, so `pending` begins it.
+    line_start: bool,
 }
-
-/// The digits of an `INVOCATION_ID`: a 128-bit id as 32 lowercase hex digits (`sd_id128_to_string`).
-const INVOCATION_ID_DIGITS: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -146,39 +174,44 @@ impl Marked {
             marker,
             phase: Phase::Seeking,
             pending: Vec::new(),
+            line_start: true,
         }
     }
 
-    /// Takes `bytes` of the file in order; adds the run's lines among them to `shown`.
+    /// Takes `bytes` of the file in order; adds the run's output among them to `shown`.
     fn feed(&mut self, bytes: &[u8], shown: &mut Vec<u8>) {
-        if self.phase == Phase::Over {
-            return;
-        }
         self.pending.extend_from_slice(bytes);
-        while self.phase != Phase::Over {
+        loop {
+            if self.phase == Phase::Over {
+                self.pending.clear();
+                return;
+            }
             let Some(end) = self.pending.iter().position(|&b| b == b'\n') else {
+                if self.phase == Phase::Ours {
+                    self.release(shown);
+                }
                 return;
             };
             let line: Vec<u8> = self.pending.drain(..=end).collect();
             self.line(&line[..end], true, shown);
+            self.line_start = true;
         }
-        self.pending.clear();
     }
 
-    /// One line, `text` without its newline; `terminated` is whether it had one.
-    ///
-    /// A run whose last line has no newline leaves the next run's marker at the end of that line, so
-    /// [`Marked::split`] may find one there: what is before it is the earlier run's last line.
+    /// The run's own line (or what is left of one), `text` without its newline; `terminated` is whether
+    /// it had one.
     fn line(&mut self, text: &[u8], terminated: bool, shown: &mut Vec<u8>) {
-        let (before, marker) = self.split(text);
+        let line_start = self.line_start;
+        let (before, marker) = self.split(text, line_start);
         match self.phase {
             Phase::Seeking if marker == Some(self.marker.line.as_bytes()) => self.phase = Phase::Ours,
             Phase::Seeking | Phase::Over => {}
             Phase::Ours => match marker {
                 Some(_) => {
-                    // The run's last line, which a newline did not end.
-                    if !before.is_empty() {
-                        shown.extend_from_slice(before);
+                    // What is before it is the run's last line, which no newline ended; a part of the
+                    // line that was shown already is ended too.
+                    shown.extend_from_slice(before);
+                    if !before.is_empty() || !line_start {
                         shown.push(b'\n');
                     }
                     self.phase = Phase::Over;
@@ -193,49 +226,114 @@ impl Marked {
         }
     }
 
-    /// `text` as what is before a marker, and the marker, when it holds one: a line that starts with
-    /// `<prefix> ` (whatever follows), or a line that ends with the prefix, a space and 32 lowercase
-    /// hex digits, the form of an `INVOCATION_ID` (what is before that is the run before's last line,
-    /// which had no newline). A program that prints such text itself has done it itself: it is not
-    /// guarded.
-    fn split<'a>(&self, text: &'a [u8]) -> (&'a [u8], Option<&'a [u8]>) {
-        let prefix = self.marker.prefix.as_bytes();
-        if text
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.first() == Some(&b' '))
-        {
+    /// `text` as what is before a marker, and the marker, when it holds one: at the start of a line,
+    /// a line that starts with `<prefix> ` (whatever follows); at the end of a line, the prefix, a
+    /// space and `id_len` lowercase hex digits (what is before that is the run before's last line).
+    fn split<'a>(&self, text: &'a [u8], line_start: bool) -> (&'a [u8], Option<&'a [u8]>) {
+        let start = self.start_of_marker();
+        if line_start && text.starts_with(&start) {
             return (&[], Some(text));
         }
-        let length = prefix.len() + 1 + INVOCATION_ID_DIGITS;
-        let Some(start) = text.len().checked_sub(length) else {
+        let Some(from) = text.len().checked_sub(start.len() + self.marker.id_len) else {
             return (text, None);
         };
-        let (before, tail) = text.split_at(start);
-        let glued = tail.starts_with(prefix)
-            && tail[prefix.len()] == b' '
-            && tail[prefix.len() + 1..]
-                .iter()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        if glued { (before, Some(tail)) } else { (text, None) }
+        let (before, tail) = text.split_at(from);
+        if tail.starts_with(&start) && tail[start.len()..].iter().all(is_hex) {
+            (before, Some(tail))
+        } else {
+            (text, None)
+        }
+    }
+
+    /// What every marker line starts with: the prefix and a space.
+    fn start_of_marker(&self) -> Vec<u8> {
+        let mut start = self.marker.prefix.as_bytes().to_vec();
+        start.push(b' ');
+        start
+    }
+
+    /// The run's part has no newline yet in `pending`: shows what cannot still become a marker.
+    fn release(&mut self, shown: &mut Vec<u8>) {
+        let start = self.start_of_marker();
+        if self.line_start {
+            if self.pending.starts_with(&start) {
+                // A marker line begun: it is a marker before its newline comes.
+                self.phase = Phase::Over;
+                self.pending.clear();
+                return;
+            }
+            if start.starts_with(&self.pending) {
+                return;
+            }
+        }
+        let pending = std::mem::take(&mut self.pending);
+        if let (before, Some(_)) = self.split(&pending, false) {
+            shown.extend_from_slice(before);
+            if !before.is_empty() || !self.line_start {
+                shown.push(b'\n');
+            }
+            self.phase = Phase::Over;
+            return;
+        }
+        let keep = pending.len() - self.held(&pending, &start);
+        shown.extend_from_slice(&pending[..keep]);
+        self.line_start = self.line_start && keep == 0;
+        self.pending = pending[keep..].to_vec();
+    }
+
+    /// How much of the end of `pending` could be the start of a marker that is not all there yet.
+    fn held(&self, pending: &[u8], start: &[u8]) -> usize {
+        let longest = start.len() + self.marker.id_len;
+        let from = pending.len().saturating_sub(longest - 1);
+        (from..pending.len())
+            .map(|i| &pending[i..])
+            .find(|tail| {
+                if tail.len() <= start.len() {
+                    start.starts_with(tail)
+                } else {
+                    tail.starts_with(start) && tail[start.len()..].iter().all(is_hex)
+                }
+            })
+            .map_or(0, <[u8]>::len)
     }
 
     /// The file was emptied: what was read of it is gone, and the state stays.
     fn truncated(&mut self) {
         self.pending.clear();
+        self.line_start = true;
     }
 
-    /// The run has ended and the file is read to its end: the last line, if it has no newline, is the
-    /// run's own; a run whose marker was never read gets a note.
-    fn end(mut self, path: &Path, out: &mut dyn Write) -> Result<()> {
+    /// The last line, if it has no newline, is judged and shown.
+    fn flush(&mut self, out: &mut dyn Write) -> Result<()> {
         let rest = std::mem::take(&mut self.pending);
         let mut shown = Vec::new();
         if !rest.is_empty() {
             self.line(&rest, false, &mut shown);
         }
-        if !shown.is_empty() {
-            show(out, &shown)?;
+        if shown.is_empty() {
+            return Ok(());
         }
-        if self.phase == Phase::Seeking {
+        show(out, &shown)
+    }
+
+    /// The run has ended and the file is read to its end.
+    ///
+    /// A run whose marker was not found after the offset may have begun before the offset was
+    /// measured: a timer started it between the state read and the request, and the request joined it.
+    /// Its marker is then earlier in the file, so the file is read again from its start for it. The
+    /// line is exact: it holds the run's own `INVOCATION_ID`, which no other run writes, so the first
+    /// match is the only one. A run still without one gets a note, unless `exit_recorded` is false.
+    fn finish(mut self, path: &Path, exit_recorded: bool, out: &mut dyn Write) -> Result<()> {
+        self.flush(out)?;
+        let marked = if self.phase == Phase::Seeking {
+            let mut again = Marked::new(self.marker);
+            read_new(path, 0, Some(&mut again), out)?;
+            again.flush(out)?;
+            again
+        } else {
+            self
+        };
+        if marked.phase == Phase::Seeking && exit_recorded {
             note(
                 out,
                 &format!(
@@ -247,6 +345,10 @@ impl Marked {
         }
         Ok(())
     }
+}
+
+fn is_hex(digit: &u8) -> bool {
+    matches!(digit, b'0'..=b'9' | b'a'..=b'f')
 }
 
 // Writing =============================================================================================================

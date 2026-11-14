@@ -5,6 +5,7 @@
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use super::super::journal::fake::{Fake as JournalFake, Log};
 use super::super::journal::{Cursor, Journalctl};
@@ -302,7 +303,10 @@ fn log_source(run: &Run) -> (std::path::PathBuf, u64) {
     match run.output() {
         OutputSource::LogFile { path, offset, marker } => {
             let marker = marker.expect("a systemd task's runs write a marker to the file too");
-            assert_eq!((marker.prefix, marker.line.as_str()), ("goetia-run", "goetia-run inv"));
+            assert_eq!(
+                (marker.prefix, marker.line.as_str(), marker.id_len),
+                ("goetia-run", "goetia-run inv", 32)
+            );
             (path, offset)
         }
         _ => panic!("a task with `logs` shows its log file"),
@@ -476,10 +480,15 @@ fn output_over(journal: Arc<dyn Journal>) -> JournalOutput {
 }
 
 fn shown_after_the_end(journal: &JournalFake) -> (Result<()>, Vec<u8>) {
+    shown_after_an_end(journal, true)
+}
+
+/// What the stream shows once the run has ended, and whether the wait recorded its exit.
+fn shown_after_an_end(journal: &JournalFake, exit_recorded: bool) -> (Result<()>, Vec<u8>) {
     let (end, ended) = crossbeam_channel::bounded::<()>(0);
     drop(end);
     let mut out = Vec::new();
-    let result = output_over(Arc::new(journal.clone())).stream(&mut out, &ended);
+    let result = output_over(Arc::new(journal.clone())).stream(&mut out, &ended, &AtomicBool::new(exit_recorded));
     (result, out)
 }
 
@@ -625,6 +634,19 @@ fn no_marker_after_the_end_is_a_note_and_nothing_else() {
         "the sync came first, so the marker was not merely late"
     );
     assert_eq!(journal.read_after_calls().len(), 1);
+}
+
+/// The wait found no exit: the run's own error says what is wrong, and no note about a missing marker
+/// is written beside it.
+#[skuld::test]
+fn no_marker_is_no_note_when_the_waits_exit_is_not_recorded() {
+    let journal = JournalFake::new(Vec::new()).follows(vec![line("c2", "s9", "a line of another run")]);
+
+    let (result, out) = shown_after_an_end(&journal, false);
+
+    result.expect("the stream");
+    assert_eq!(out, b"");
+    assert_eq!(journal.syncs(), 1, "what was there is still read");
 }
 
 /// A marker the journal stores without its stream cannot say which lines are the run's.

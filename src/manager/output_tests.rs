@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -45,7 +46,7 @@ impl Streaming {
     pub(crate) fn start(source: OutputSource) -> Self {
         let (end, ended) = run_end();
         let (tx, shown) = crossbeam_channel::unbounded();
-        let thread = std::thread::spawn(move || stream(source, &id(), &mut Shown(tx), &ended));
+        let thread = std::thread::spawn(move || stream(source, &id(), &mut Shown(tx), &ended, &AtomicBool::new(true)));
         Self {
             end,
             shown,
@@ -98,7 +99,16 @@ fn streamed_after_the_end(source: OutputSource) -> (Result<()>, String) {
     let (end, ended) = run_end();
     drop(end);
     let mut out = Vec::new();
-    let result = stream(source, &id(), &mut out, &ended);
+    let result = stream(source, &id(), &mut out, &ended, &AtomicBool::new(true));
+    (result, String::from_utf8(out).unwrap())
+}
+
+/// [`streamed_after_the_end`] for a run whose wait did not find its exit.
+fn streamed_after_an_unrecorded_end(source: OutputSource) -> (Result<()>, String) {
+    let (end, ended) = run_end();
+    drop(end);
+    let mut out = Vec::new();
+    let result = stream(source, &id(), &mut out, &ended, &AtomicBool::new(false));
     (result, String::from_utf8(out).unwrap())
 }
 
@@ -252,6 +262,7 @@ fn a_failed_write_ends_the_stream_with_its_error() {
         &id(),
         &mut Refuses,
         &ended,
+        &AtomicBool::new(true),
     )
     .expect_err("the sink refuses");
 
@@ -270,6 +281,7 @@ fn marker(inv: &str) -> Marker {
     Marker {
         prefix: "goetia-run",
         line: format!("goetia-run {inv}"),
+        id_len: 32,
     }
 }
 
@@ -449,8 +461,8 @@ fn our_marker_glued_to_the_previous_runs_last_line_starts_our_output() {
     assert_eq!(out, "1\n2\n");
 }
 
-/// While the run lasts the unterminated line waits for its end, and is shown when the next marker
-/// ends it.
+/// While the run lasts the unterminated line is shown as it arrives, and the next marker, glued to
+/// it, ends it.
 #[skuld::test]
 fn a_glued_marker_ends_the_output_while_the_run_lasts() {
     let dir = tempfile::tempdir().unwrap();
@@ -459,7 +471,7 @@ fn a_glued_marker_ends_the_output_while_the_run_lasts() {
     let mut streaming = Streaming::start(marked(path.clone(), 0, RUN_A));
 
     append(&path, &format!("goetia-run {RUN_A}\n1\nlast"));
-    streaming.shows("1\n");
+    streaming.shows("1\nlast");
     append(&path, &format!("goetia-run {RUN_B}\nb1\n"));
     streaming.shows("1\nlast\n");
     let (result, out) = streaming.ends_with_output();
@@ -502,6 +514,117 @@ fn text_that_only_resembles_a_glued_marker_is_output() {
         out,
         format!("see goetia-run {short}\nsee goetia-run {upper}\nsee goetia-run\n")
     );
+}
+
+// Runs that began before the offset -----------------------------------------------------------------------------------
+
+/// A timer started the run between the state read and the request, so the request joined it: its
+/// marker (and its first lines) are before the offset, which was measured before the request. Our
+/// marker is found by a read from the file's start, and our output is shown from it.
+#[skuld::test]
+fn a_run_joined_in_flight_shows_from_its_marker_before_the_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(
+        &path,
+        &format!("an earlier run\ngoetia-run {RUN_B}\nb1\ngoetia-run {RUN_A}\n1\n"),
+    );
+    let offset = std::fs::metadata(&path).unwrap().len();
+    append(&path, &format!("2\ngoetia-run {RUN_B}\nb2\n"));
+
+    let (result, out) = streamed_after_the_end(marked(path, offset, RUN_A));
+
+    result.unwrap();
+    assert_eq!(out, "1\n2\n");
+}
+
+/// A joined run that is found from the start is exact, and a file that does not hold our marker even
+/// there is still the note.
+#[skuld::test]
+fn a_marker_in_neither_part_of_the_file_is_the_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(&path, &format!("goetia-run {RUN_B}\nb1\n"));
+    let offset = std::fs::metadata(&path).unwrap().len();
+    append(&path, "b2\n");
+
+    let (result, out) = streamed_after_the_end(marked(path.clone(), offset, RUN_A));
+
+    result.unwrap();
+    assert_eq!(out, no_marker_note(&path));
+}
+
+/// The wait found no exit, so the stream shows no note about a marker beside that failure: the run's
+/// error says what is wrong.
+#[skuld::test]
+fn no_marker_is_no_note_when_the_waits_exit_is_not_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(&path, &format!("goetia-run {RUN_B}\nb1\n"));
+
+    let (result, out) = streamed_after_an_unrecorded_end(marked(path, 0, RUN_A));
+
+    result.unwrap();
+    assert_eq!(out, "");
+}
+
+// Partial lines -------------------------------------------------------------------------------------------------------
+
+/// A prompt or a `\r` progress line has no newline: it is shown as it arrives, and the line is ended
+/// when the next marker follows it.
+#[skuld::test]
+fn a_partial_line_is_shown_as_it_arrives() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(&path, "");
+    let mut streaming = Streaming::start(marked(path.clone(), 0, RUN_A));
+
+    append(&path, &format!("goetia-run {RUN_A}\n"));
+    append(&path, "Password: ");
+    streaming.shows("Password: ");
+    append(&path, "10%\r20%\r");
+    streaming.shows("Password: 10%\r20%\r");
+    append(&path, &format!("goetia-run {RUN_B}\nb1\n"));
+    streaming.shows("Password: 10%\r20%\r\n");
+    let (result, out) = streaming.ends_with_output();
+
+    result.unwrap();
+    assert_eq!(out, "Password: 10%\r20%\r\n");
+}
+
+/// Only what could still be the start of a marker waits: a line's first characters while they are a
+/// prefix of `goetia-run `, and a trailing part that is a prefix of a marker glued to the line.
+#[skuld::test]
+fn only_what_could_become_a_marker_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(&path, "");
+    let mut streaming = Streaming::start(marked(path.clone(), 0, RUN_A));
+
+    append(&path, &format!("goetia-run {RUN_A}\n"));
+    append(&path, "goe");
+    append(&path, "tia is a word\n");
+    streaming.shows("goetia is a word\n");
+    append(&path, "abc goetia-run 0123");
+    streaming.shows("goetia is a word\nabc ");
+    append(&path, "456789abcdef0123456789abcde\nnot a marker\n");
+    // The glued text was not a marker (31 digits, then a newline), so it is shown with the line.
+    streaming.shows("goetia is a word\nabc goetia-run 0123456789abcdef0123456789abcde\nnot a marker\n");
+
+    streaming.ends().unwrap();
+}
+
+/// A line that begins as a marker is a marker before its newline arrives: nothing of it is shown.
+#[skuld::test]
+fn a_marker_line_begun_but_not_ended_ends_the_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(&path, &format!("goetia-run {RUN_A}\n1\ngoetia-run fe"));
+
+    let (result, out) = streamed_after_the_end(marked(path, 0, RUN_A));
+
+    result.unwrap();
+    assert_eq!(out, "1\n");
 }
 
 // None ================================================================================================================

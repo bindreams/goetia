@@ -1151,6 +1151,44 @@ fn run_streams_what_the_run_wrote_after_the_start_request() {
     assert_eq!(out, "this run\n");
 }
 
+/// A run whose marker the log never held shows the note, and its exit is the run's, untouched.
+#[skuld::test]
+fn a_run_whose_marker_is_missing_is_a_note_and_its_real_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("job.log");
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_writes("nightly", &log, "a line that is nobody's run\n");
+    fake.seed_run_marker("nightly", "goetia-run", "goetia-run 0123456789abcdef0123456789abcdef");
+    fake.seed_run_exit("nightly", Exit::Code(3));
+
+    let (result, out) = run_of(&fake, "nightly");
+
+    assert_eq!(result.unwrap(), Exit::Code(3));
+    assert!(out.starts_with("note: the marker line of this run is not in "), "{out}");
+    assert!(!out.contains("nobody's"), "{out}");
+}
+
+/// The wait found no exit: its error is the result, and no note about a marker comes beside it.
+#[skuld::test]
+fn a_run_whose_exit_is_not_recorded_shows_no_marker_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("job.log");
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_writes("nightly", &log, "a line that is nobody's run\n");
+    fake.seed_run_marker("nightly", "goetia-run", "goetia-run 0123456789abcdef0123456789abcdef");
+    fake.seed_run_wait_fails("nightly", || Error::RunUnrecorded {
+        id: "nightly".to_string(),
+        reason: "no record (seeded)".to_string(),
+    });
+
+    let (result, out) = run_of(&fake, "nightly");
+
+    assert!(matches!(result, Err(Error::RunUnrecorded { .. })), "{result:?}");
+    assert_eq!(out, "");
+}
+
 #[skuld::test]
 fn a_failed_begin_run_is_the_error() {
     let fake = Fake::new();

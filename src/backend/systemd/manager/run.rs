@@ -32,6 +32,7 @@ use std::cell::Cell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -248,11 +249,15 @@ pub(crate) struct Run {
     journal: Arc<dyn Journal>,
 }
 
+/// The digits of an `INVOCATION_ID`: a 128-bit id as 32 lowercase hex digits (`sd_id128_to_string`).
+const INVOCATION_ID_DIGITS: usize = 32;
+
 /// The marker line the run of `invocation` writes first, which its `sh` wrapper prints.
 fn run_marker(invocation: &str) -> Marker {
     Marker {
         prefix: RUN_MARKER,
         line: format!("{RUN_MARKER} {invocation}"),
+        id_len: INVOCATION_ID_DIGITS,
     }
 }
 
@@ -341,7 +346,7 @@ impl JournalOutput {
     /// A run whose marker is not in the journal after all that (journald's rate limit dropped it)
     /// shows a note instead of lines ([`NO_MARKER`]); that is no failure. Any other failure ends the
     /// stream and is returned.
-    pub(crate) fn stream(self, out: &mut dyn Write, ended: &Receiver<()>) -> Result<()> {
+    pub(crate) fn stream(self, out: &mut dyn Write, ended: &Receiver<()>, exit_recorded: &AtomicBool) -> Result<()> {
         let JournalOutput {
             unit,
             invocation,
@@ -374,7 +379,15 @@ impl JournalOutput {
         while watcher_done.recv().is_ok() {}
         drop(follower);
         live?;
-        rest(journal.as_ref(), &query, &cursor, selection, &mut draws, out)
+        rest(
+            journal.as_ref(),
+            &query,
+            &cursor,
+            selection,
+            &mut draws,
+            out,
+            exit_recorded.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -445,6 +458,7 @@ fn rest(
     mut selection: Selection,
     draws: &mut Reservation,
     out: &mut dyn Write,
+    exit_recorded: bool,
 ) -> Result<()> {
     journal.sync()?;
     let entries = match &selection.found {
@@ -456,7 +470,12 @@ fn rest(
         selection.take(entry, &mut text)?;
     }
     if selection.found.is_none() {
-        return output::show(out, NO_MARKER.as_bytes());
+        // A wait that found no exit is reported as its own error, not with a note beside it.
+        return if exit_recorded {
+            output::show(out, NO_MARKER.as_bytes())
+        } else {
+            Ok(())
+        };
     }
     if text.is_empty() {
         return Ok(());

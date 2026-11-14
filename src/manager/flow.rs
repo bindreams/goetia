@@ -7,6 +7,7 @@
 
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::backend::{Backend, InstalledService, ReadOutcome, RunHandle, ScanEntry, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
@@ -360,6 +361,8 @@ struct Waiter<R> {
     hand_over: crossbeam_channel::Sender<R>,
     /// Closed by the thread when the wait has finished: the stream's signal that the run ended.
     ended: crossbeam_channel::Receiver<()>,
+    /// Set by the thread before it closes `ended`: whether the wait found how the run ended.
+    exit_recorded: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<Option<Result<Exit>>>,
 }
 
@@ -370,11 +373,14 @@ impl<R: RunHandle> Waiter<R> {
         // Nothing is sent on `ended`: closing it is the signal, and it closes on a panic too, so the
         // stream never outlives a run whose wait is gone.
         let (end, ended) = crossbeam_channel::bounded::<()>(0);
+        let exit_recorded = Arc::new(AtomicBool::new(false));
+        let recorded = Arc::clone(&exit_recorded);
         let thread = std::thread::Builder::new()
             .name(format!("goetia run {id}"))
             .spawn(move || {
                 // `None`: the request failed, so there was no run.
                 let exit = handed.recv().ok().map(RunHandle::wait);
+                recorded.store(matches!(exit, Some(Ok(_))), Ordering::SeqCst);
                 drop(end);
                 exit
             })
@@ -385,6 +391,7 @@ impl<R: RunHandle> Waiter<R> {
         Ok(Self {
             hand_over,
             ended,
+            exit_recorded,
             thread,
         })
     }
@@ -408,7 +415,7 @@ impl<R: RunHandle> Waiter<R> {
         let handed = self.hand_over.send(run).is_ok();
         debug_assert!(handed, "the wait thread ended before it was given the run");
 
-        let shown = output::stream(source, id, out, &self.ended);
+        let shown = output::stream(source, id, out, &self.ended, &self.exit_recorded);
         let waited = match self.thread.join() {
             Ok(Some(waited)) => waited,
             Ok(None) => unreachable!("the wait thread was given the run"),

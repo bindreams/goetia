@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::backend::{
-    Decoded, InstalledDefinition, InstalledService, NativeRestart, OutputSource, ReadOutcome, RunHandle, Scan,
+    Decoded, InstalledDefinition, InstalledService, Marker, NativeRestart, OutputSource, ReadOutcome, RunHandle, Scan,
     ScanEntry, Unnamed, WriteOutcome,
 };
 use crate::blob::{self, Blob};
@@ -121,6 +121,8 @@ struct RunScript {
     exit: Option<Exit>,
     /// The log the run appends `text` to, from the length it had before the request.
     writes: Option<(PathBuf, String)>,
+    /// The marker prefix and line the run's log carries, as a systemd task's does.
+    marker: Option<(&'static str, String)>,
     begin_fails: Option<Failure>,
     wait_fails: Option<Failure>,
 }
@@ -583,6 +585,13 @@ impl Fake {
     /// output begins. Unseeded, a run has no output.
     pub fn seed_run_writes(&self, id: &str, log: &Path, text: &str) {
         self.script_run(id, |script| script.writes = Some((log.to_path_buf(), text.to_string())));
+    }
+
+    /// Test-only seeding: the runs of the task `id` write a marker to their log, so their output is
+    /// shown from the line `line`, as a systemd task's is: every marker line starts with `prefix` and a
+    /// space, and a marker glued to a line ends with 32 hex digits.
+    pub fn seed_run_marker(&self, id: &str, prefix: &'static str, line: &str) {
+        self.script_run(id, |script| script.marker = Some((prefix, line.to_string())));
     }
 
     /// Test-only seeding: the request to run the task `id` fails with what `error` makes.
@@ -1127,6 +1136,7 @@ impl crate::backend::Backend for Fake {
             id: id.clone(),
             state: Arc::clone(&self.state),
             log,
+            marker: script.marker,
             exit: script.exit.unwrap_or(Exit::Code(0)),
             wait_fails: script.wait_fails,
         })
@@ -1138,6 +1148,7 @@ pub(crate) struct FakeRun {
     id: Id,
     state: Arc<Mutex<Store>>,
     log: Option<(PathBuf, u64)>,
+    marker: Option<(&'static str, String)>,
     exit: Exit,
     wait_fails: Option<Failure>,
 }
@@ -1148,7 +1159,11 @@ impl RunHandle for FakeRun {
             Some((path, offset)) => OutputSource::LogFile {
                 path: path.clone(),
                 offset: *offset,
-                marker: None,
+                marker: self.marker.as_ref().map(|(prefix, line)| Marker {
+                    prefix,
+                    line: line.clone(),
+                    id_len: 32,
+                }),
             },
             None => OutputSource::None,
         }

@@ -219,6 +219,10 @@ pub(crate) struct Marker {
     pub(crate) prefix: &'static str,
     /// This run's marker line, without its newline.
     pub(crate) line: String,
+    /// How many lowercase hex digits a marker line ends with after the prefix and a space. A run whose
+    /// last line has no newline leaves the next run's marker at the end of that line, and it is told
+    /// from the program's own text by this form.
+    pub(crate) id_len: usize,
 }
 
 /// What a backend whose tasks are not built yet answers [`Backend::begin_run`] with.
