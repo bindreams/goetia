@@ -45,7 +45,7 @@ const LAUNCHD: Spec = Spec {
     what: "write plists under /Library/LaunchDaemons and bootstrap, kickstart and boot out real launchd jobs as root",
 };
 
-/// Reads a test variable (a group's, its consent's, or a [`need`] switch): `Ok(None)` if unset,
+/// Reads a test variable (a group's, its consent's, or a `need` switch): `Ok(None)` if unset,
 /// `Ok(Some(flag))` for `1`/`0`, `Err` naming the variable and value otherwise.
 fn switch(name: &str, var: &impl Fn(&str) -> Option<String>) -> Result<Option<bool>, String> {
     match var(name).as_deref() {
