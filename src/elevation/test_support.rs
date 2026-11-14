@@ -1,8 +1,5 @@
 //! Tokens for tests that act as an unelevated user, and a guard that ends the impersonation. Used by
 //! this module's tests and by `backend::scm::kill::privilege`'s.
-//!
-//! Under the `testing` feature alone only the `SeDebugPrivilege` probe uses it.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};

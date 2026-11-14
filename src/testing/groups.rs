@@ -131,14 +131,15 @@ pub(crate) fn enter(
 /// Setup of a test that needs something the host may lack. Runs unless `switch_var` is `0`; fails
 /// (naming the switch) when `holds` is `Ok(false)` (`missing` says what and how to provide it) or
 /// `Err` (a failed probe, which does not prove the dependency absent). Never skips.
-// Only the Windows fixture and the tests use it.
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn need(
     switch_var: &str,
     var: impl Fn(&str) -> Option<String>,
     missing: &str,
     holds: impl FnOnce() -> Result<bool, String>,
 ) -> Result<(), String> {
+    // Not redundant with the fixture's `requires`: skuld runs an ignored test's body under
+    // `--run-ignored only`, as in `enter`.
     if switch(switch_var, &var)? == Some(false) {
         return Err(switched_off(switch_var));
     }
@@ -191,7 +192,7 @@ group!(scm_group, scm_enabled, SCM);
 group!(systemd_group, systemd_enabled, SYSTEMD);
 group!(launchd_group, launchd_enabled, LAUNCHD);
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 switched!(
     /// Fixture of the tests that need `SeDebugPrivilege`; see the module doc of
     /// `backend::scm::kill::privilege_tests`.
