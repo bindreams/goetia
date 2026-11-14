@@ -43,7 +43,7 @@ pub(crate) fn mk(id: &str) -> DaemonSpec {
     .unwrap()
 }
 
-/// Bytes goetia never writes: `generate::unit` emits UTF-8 ini and nothing else, so a fragment that
+/// Bytes goetia never writes: `generate::units` emits UTF-8 ini and nothing else, so a fragment that
 /// will not decode is positively not goetia's — foreign, and omitted from `list` exactly like an
 /// unmarked one. The systemd twin of `tests/launchd_integration/launchd.rs`'s `NON_UTF8_PLIST`,
 /// and the reason those two backends now answer one question one way.
@@ -1501,7 +1501,9 @@ fn list_reports_a_sid_account_as_ours_unusable(#[fixture(systemd_group)] _group:
     let mut spec = service_fields(mk(guard.id()));
     spec.common.user = User::Id(AccountId::Sid("S-1-5-21-1-2-3-1001".to_string()));
     let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
-    let text = generate::unit(&spec, &Identity { user: "0".to_string() }).unwrap();
+    let text = generate::units(&spec, &Identity { user: "0".to_string() })
+        .unwrap()
+        .service;
     fs::write(unit_path(guard.id()), text).expect("seed a unit whose spec names a SID");
     cmd::run("systemctl", &["daemon-reload"]).expect_ok();
 

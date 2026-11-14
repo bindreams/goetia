@@ -202,7 +202,7 @@ fn a_fifo_is_not_ours_without_blocking() {
     );
 }
 
-/// The bytes were obtained and will not decode. `generate::unit` emits UTF-8 ini and nothing else,
+/// The bytes were obtained and will not decode. `generate::units` emits UTF-8 ini and nothing else,
 /// so that is a positive identification of a file goetia did not write — the same answer step 1
 /// gives a symlink, and the same one launchd gives a plist that is not UTF-8. Calling it a read
 /// that did not complete would hand every host carrying one foreign `Description=Café` in Latin-1 a
@@ -461,7 +461,9 @@ fn unit_text() -> String {
     })
     .map(crate::spec::DaemonSpec::from)
     .unwrap();
-    generate::unit(&spec, &crate::backend::Identity { user: "0".to_string() }).unwrap()
+    generate::units(&spec, &crate::backend::Identity { user: "0".to_string() })
+        .unwrap()
+        .service
 }
 
 /// What `classified` makes of a fragment that was read, by what the marker says: no marker is a

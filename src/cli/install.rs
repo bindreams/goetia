@@ -207,7 +207,7 @@ fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>) -
     #[cfg(target_os = "linux")]
     {
         let _ = host;
-        crate::backend::systemd::generate::unit(spec, &identity)
+        crate::backend::systemd::generate::units(spec, &identity).map(|units| units.to_string())
     }
     #[cfg(target_os = "macos")]
     {

@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use super::*;
 use crate::decide::{ExternalConfig, Outcome, Ownership, decide};
-use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
+use crate::spec::{
+    DaemonFields, DaemonSpec, HashSeed, Id, Protocol, Schedule, ServiceFields, ServiceSpec, TaskFields, TaskSpec, User,
+};
 
 // Fixtures ============================================================================================================
 //
@@ -66,6 +68,11 @@ fn minimal_spec() -> DaemonSpec {
 
 fn minimal_identity() -> Identity {
     Identity { user: "0".to_string() }
+}
+
+/// A service's unit text: what `unit` was before a task had a second artifact.
+fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
+    units(spec, id).map(|units| units.service)
 }
 
 // Snapshots ===========================================================================================================
@@ -919,5 +926,281 @@ fn manifest_dollar_escape_survives_into_exec_start() {
     assert!(
         exec_start.ends_with(" $$ARGS"),
         "ExecStart should re-double the escaped dollar: {exec_start}"
+    );
+}
+
+// Tasks ===============================================================================================================
+
+fn schedule(text: &str) -> Schedule {
+    let id = Id::try_from("frpc").unwrap();
+    Schedule::parse(
+        text,
+        &HashSeed {
+            hostname: "testing",
+            id: &id,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{text:?}: {e}"))
+}
+
+/// A task with `full_spec`'s env, cwd, user and logs, on `schedule_text` (`None`: no schedule).
+fn full_task(schedule_text: Option<&str>) -> DaemonSpec {
+    TaskSpec::new(TaskFields {
+        common: service_fields(full_spec()).common,
+        schedule: schedule_text.map(schedule),
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+fn task_with(change: impl FnOnce(&mut DaemonFields)) -> DaemonSpec {
+    let mut fields = TaskFields {
+        common: service_fields(minimal_spec()).common,
+        schedule: Some(schedule("30 3 * * *")),
+    };
+    change(&mut fields.common);
+    TaskSpec::new(fields).map(DaemonSpec::from).unwrap()
+}
+
+/// The `[X-Goetia]` section both units end with.
+fn goetia_text(spec: &DaemonSpec) -> String {
+    format!(
+        "[X-Goetia]\n\
+         Marker=goetia\n\
+         Schema=1\n\
+         Version={version}\n\
+         Spec={spec_b64}\n",
+        version = crate::version(),
+        spec_b64 = blob::encode(spec),
+    )
+}
+
+#[skuld::test]
+fn service_units_are_unchanged() {
+    // The snapshots above are the golden bytes; this pins that a service has no timer and that
+    // `units` and `unit` agree.
+    for (spec, id) in [(full_spec(), full_identity()), (minimal_spec(), minimal_identity())] {
+        let units = units(&spec, &id).unwrap();
+        assert_eq!(units.timer, None);
+        assert_eq!(units.to_string(), units.service);
+        assert_eq!(unit(&spec, &id).unwrap(), units.service);
+    }
+}
+
+#[skuld::test]
+fn task_unit_is_oneshot_with_no_start_limit_restart_or_install() {
+    let spec = full_task(Some("30 3 * * *"));
+
+    let expected = format!(
+        "[Unit]\n\
+         Description=Frpc Tunnel\n\
+         StartLimitIntervalSec=0\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={exec} -c frpc.toml\n\
+         WorkingDirectory={cwd}\n\
+         Environment=RUST_LOG=info\n\
+         Environment=URL=http://x/a%%20b\n\
+         User=svc-frpc\n\
+         StandardOutput=append:{logs}\n\
+         StandardError=append:{logs}\n\
+         \n\
+         {goetia}",
+        exec = PROGRAM,
+        cwd = abs("opt/frpc").display(),
+        logs = abs("var/log/frpc.log").display(),
+        goetia = goetia_text(&spec),
+    );
+
+    assert_eq!(unit(&spec, &full_identity()).unwrap(), expected);
+}
+
+#[skuld::test]
+fn a_task_without_a_schedule_has_no_timer() {
+    let spec = full_task(None);
+    let units = units(&spec, &full_identity()).unwrap();
+
+    assert_eq!(units.timer, None);
+    assert_eq!(units.to_string(), units.service);
+    assert!(units.service.contains("Type=oneshot\n"));
+}
+
+#[skuld::test]
+fn timer_for_a_service_is_none() {
+    assert_eq!(timer_for(&full_spec()), None);
+    assert_eq!(timer_for(&minimal_spec()), None);
+}
+
+#[skuld::test]
+fn timer_unit_text_is_exact() {
+    let spec = full_task(Some("30 3 * * *"));
+
+    let expected = format!(
+        "[Unit]\n\
+         Description=Frpc Tunnel\n\
+         \n\
+         [Timer]\n\
+         OnCalendar=*-*-* 03:30:00\n\
+         AccuracySec=1s\n\
+         Persistent=yes\n\
+         \n\
+         [Install]\n\
+         WantedBy=timers.target\n\
+         \n\
+         {goetia}",
+        goetia = goetia_text(&spec),
+    );
+
+    assert_eq!(
+        units(&spec, &full_identity()).unwrap().timer.as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[skuld::test]
+fn the_display_of_units_is_the_service_then_the_timer_under_a_marker_line() {
+    let units = units(&full_task(Some("30 3 * * *")), &full_identity()).unwrap();
+    let timer = units.timer.as_deref().unwrap();
+
+    assert_eq!(
+        units.to_string(),
+        format!("{}\n# ---- timer unit ----\n{timer}", units.service)
+    );
+}
+
+#[skuld::test]
+fn on_calendar_table() {
+    let rows: [(&str, &[&str]); 7] = [
+        ("30 3 * * *", &["*-*-* 03:30:00"]),
+        ("* * * * *", &["*-*-* *:*:00"]),
+        (
+            "0,30 9-17 * * 1-5",
+            &["Mon,Tue,Wed,Thu,Fri *-*-* 09,10,11,12,13,14,15,16,17:00,30:00"],
+        ),
+        ("15 4 1 6 *", &["*-06-01 04:15:00"]),
+        ("0 0 * * 7", &["Sun *-*-* 00:00:00"]),
+        (
+            "0 0 */2 * 1",
+            &["Mon *-*-01,03,05,07,09,11,13,15,17,19,21,23,25,27,29,31 00:00:00"],
+        ),
+        ("0 0 1,15 * 1", &["*-*-01,15 00:00:00", "Mon *-*-* 00:00:00"]),
+    ];
+    for (cron, expected) in rows {
+        assert_eq!(on_calendar_lines(&schedule(cron)), expected, "{cron}");
+    }
+}
+
+#[skuld::test]
+fn an_or_schedule_writes_one_on_calendar_per_line_in_the_timer() {
+    let spec = full_task(Some("0 0 1,15 * 1"));
+    let timer = units(&spec, &full_identity()).unwrap().timer.unwrap();
+
+    assert!(
+        timer.contains("[Timer]\nOnCalendar=*-*-01,15 00:00:00\nOnCalendar=Mon *-*-* 00:00:00\nAccuracySec=1s\n"),
+        "{timer}"
+    );
+}
+
+#[skuld::test]
+fn an_h_schedule_renders_its_resolved_values() {
+    let id = Id::try_from("frpc").unwrap();
+    for hostname in ["testing", "another-host", "a-third-host"] {
+        let resolved = Schedule::parse("H H * * *", &HashSeed { hostname, id: &id }).unwrap();
+        let [minute, hour, ..] = resolved.fields();
+        let (minute, hour) = (*minute.values.first().unwrap(), *hour.values.first().unwrap());
+
+        assert_eq!(
+            on_calendar_lines(&resolved),
+            [format!("*-*-* {hour:02}:{minute:02}:00")],
+            "{hostname}"
+        );
+    }
+}
+
+#[skuld::test]
+fn service_and_timer_carry_the_same_blob() {
+    let spec = full_task(Some("0,30 9-17 * * 1-5"));
+    let units = units(&spec, &full_identity()).unwrap();
+
+    let from_service = extract(&units.service).unwrap().unwrap();
+    let from_timer = extract(units.timer.as_deref().unwrap()).unwrap().unwrap();
+
+    assert_eq!(from_service.spec, spec);
+    assert_eq!(from_timer.spec, spec);
+    assert_eq!(from_service.version, from_timer.version);
+    assert_eq!(from_service.schema, from_timer.schema);
+}
+
+#[skuld::test]
+fn extract_reads_both_units() {
+    let spec = full_task(Some("30 3 * * *"));
+    let units = units(&spec, &full_identity()).unwrap();
+
+    for text in [Some(units.service.as_str()), units.timer.as_deref()] {
+        assert_eq!(extract(text.unwrap()).unwrap().unwrap().spec, spec);
+    }
+}
+
+#[skuld::test]
+fn generate_of_extract_is_the_identity_for_a_task() {
+    for spec in [full_task(Some("0 0 1,15 * 1")), full_task(None), task_with(|_| {})] {
+        let id = full_identity();
+        let first = units(&spec, &id).unwrap();
+        let recovered = extract(&first.service).unwrap().unwrap().spec;
+        let second = units(&recovered, &id).unwrap();
+
+        assert_eq!(first, second);
+        if let Some(timer) = &first.timer {
+            let from_timer = extract(timer).unwrap().unwrap().spec;
+            assert_eq!(timer_for(&from_timer).as_deref(), Some(timer.as_str()));
+        }
+    }
+}
+
+#[skuld::test]
+fn timer_for_matches_units_timer() {
+    for spec in [
+        full_task(Some("30 3 * * *")),
+        full_task(None),
+        full_spec(),
+        minimal_spec(),
+    ] {
+        assert_eq!(timer_for(&spec), units(&spec, &full_identity()).unwrap().timer);
+    }
+}
+
+#[skuld::test]
+fn a_value_no_encoding_carries_is_refused_for_a_task_too() {
+    let name = task_with(|c| c.name = " padded".to_string());
+    assert_refused_as_stripped(unit(&name, &minimal_identity()), "Description=", " padded");
+
+    let account = Identity {
+        user: "svc ".to_string(),
+    };
+    assert_refused_as_stripped(unit(&task_with(|_| {}), &account), "User=", "svc ");
+
+    let spec = task_with(|c| c.command = vec![format!(r"{PROGRAM}\y")]);
+    let err = units(&spec, &minimal_identity()).unwrap_err();
+    let Error::Invalid { daemon, message, .. } = &err else {
+        panic!("expected Error::Invalid, got {err:?}");
+    };
+    assert_eq!(daemon, "frpc");
+    assert!(message.contains("`command[0]`"), "{message}");
+}
+
+/// Interim: a Linux install of a task stays refused until the manager keeps both artifacts.
+#[cfg(target_os = "linux")]
+#[skuld::test]
+fn render_refuses_a_task_until_task_5() {
+    use crate::backend::Backend as _;
+    use crate::backend::systemd::manager::Systemd;
+
+    let spec = task_with(|_| {});
+    let err = Systemd::new().render(&spec).unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        crate::backend::cannot_run_tasks("systemd", &spec.common().id).to_string()
     );
 }

@@ -718,7 +718,7 @@ impl Systemctl {
     /// too: systemd answers the start with a job, not a state, so a budget shorter than that no-op job's
     /// round trip expires where launchd and SCM report started (see `ServiceManager::start`).
     ///
-    /// Every generated unit carries `Type=exec` (see `generate::unit`'s doc comment for why), so a
+    /// Every generated service carries `Type=exec` (see `generate::units`'s doc comment for why), so a
     /// bounded `systemctl start` confirms the `exec` itself succeeded — not merely that systemd forked
     /// the process. A missing executable or missing user comes back as a failed start.
     pub(super) fn start_impl(&self, id: &str, budget: Budget, deadline: Deadline, held: &mut Held) -> Result<()> {

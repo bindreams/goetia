@@ -112,7 +112,7 @@ pub(super) enum RawState {
     /// - Not a regular file: a symlink (`systemctl mask` points the fragment at `/dev/null`), a
     ///   FIFO, a device node, a directory. Contents are never read; reading through
     ///   a masked unit's target would look identical to "nothing here".
-    /// - A regular file whose bytes are not UTF-8. `generate::unit` writes UTF-8 ini and nothing
+    /// - A regular file whose bytes are not UTF-8. `generate::units` writes UTF-8 ini and nothing
     ///   else, so bytes that will not decode are a positive identification of a format goetia never
     ///   emits — the same claim launchd's `ClassifyOutcome::NotOurs` makes about a plist, and it gets the
     ///   same answer.
@@ -565,7 +565,7 @@ fn dropin_marker_in(dir: &Path) -> ReadResult<String> {
 
 // Residue =============================================================================================================
 
-/// The one `*.target.wants` directory `systemctl enable` can link this id into: `generate::unit`'s
+/// The one `*.target.wants` directory `systemctl enable` can link this id into: `generate::units`'s
 /// `[Install]` section is always exactly `WantedBy=multi-user.target`, and goetia emits no
 /// `RequiredBy=`, so there is no `.requires` counterpart.
 const WANTS_DIR: &str = "multi-user.target.wants";

@@ -78,7 +78,8 @@ use write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours
 
 use crate::backend::systemd::generate;
 use crate::backend::{
-    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, WriteOutcome,
+    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry,
+    WriteOutcome, cannot_run_tasks,
 };
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
@@ -140,7 +141,11 @@ impl Backend for Systemd {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
-        generate::unit(spec, &identity_for(&spec.common().user)?)
+        // Interim: the manager keeps one artifact until it keeps the timer too.
+        if matches!(spec, DaemonSpec::Task(_)) {
+            return Err(cannot_run_tasks("systemd", &spec.common().id));
+        }
+        Ok(generate::units(spec, &identity_for(&spec.common().user)?)?.service)
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Fragment>> {
@@ -457,7 +462,7 @@ fn scan_unit_dir(dir: &Path) -> UnitScan {
 /// start time — so this is otherwise a pure formatting step. The one case rejected outright is a
 /// Windows account SID: `spec::resolve` only checks it for unemittable characters, never for
 /// platform applicability, so a manifest naming `user: {id: "S-1-5-..."}` would otherwise reach
-/// `generate::unit` and be written verbatim into `User=`, failing the unit at start with an opaque
+/// `generate::units` and be written verbatim into `User=`, failing the unit at start with an opaque
 /// status — exactly what `ensure_parent_dirs` goes out of its way to avoid for directory permissions.
 fn identity_for(user: &User) -> Result<Identity> {
     let name = match user {

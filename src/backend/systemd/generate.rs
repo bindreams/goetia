@@ -15,29 +15,54 @@
 //!
 //! Backslashes are never refused: a quoted word doubles each, and a raw value ending in an odd
 //! run of them gets a trailing space (see `raw_value`). The values no encoding can carry are
-//! refused by [`unit()`]: see `refuse_unrepresentable`.
+//! refused by [`units()`]: see `refuse_unrepresentable`.
 
-use crate::backend::{Identity, cannot_run_tasks};
+use std::collections::BTreeSet;
+
+use crate::backend::Identity;
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
-use crate::spec::{DaemonFields, DaemonSpec, Restart, systemd_defect, systemd_raw_value_defect};
+use crate::spec::{
+    DaemonFields, DaemonSpec, DayRule, Restart, Schedule, ServiceSpec, TaskSpec, systemd_defect,
+    systemd_raw_value_defect,
+};
 
 // Generation ==========================================================================================================
 
-/// Render `spec` as a systemd unit file for the already-resolved account
-/// `id`.
+/// What goetia writes for one daemon: the job's unit, and for a task with a `schedule` the timer
+/// unit that starts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Units {
+    /// `<id>.service`.
+    pub service: String,
+    /// `<id>.timer`: `None` for a service, and for a task with no `schedule`.
+    pub timer: Option<String>,
+}
+
+impl std::fmt::Display for Units {
+    /// The service text, then the timer text under a `# ---- timer unit ----` line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.service)?;
+        if let Some(timer) = &self.timer {
+            write!(f, "\n# ---- timer unit ----\n{timer}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Render `spec` as systemd unit files for the already-resolved account `id`: a service gives its
+/// `.service`; a task gives its oneshot `.service` and, when it has a schedule, its `.timer`.
 ///
-/// The `[Install]` section is emitted so `systemctl enable` is possible
-/// later, but generation never consults enablement state — see the
-/// crate-level design notes on why boot-enablement is excluded from every
-/// drift comparison.
+/// A service's `[Install]` section is emitted so `systemctl enable` is possible later, but
+/// generation never consults enablement state: see the crate-level design notes on why
+/// boot-enablement is excluded from every drift comparison.
 ///
-/// `unit(&extract(&unit(spec, id)).unwrap().unwrap().spec, id)` must be
-/// byte-identical to `unit(spec, id)`.
+/// `units(&extract(&units(spec, id).service).unwrap().unwrap().spec, id)` must be byte-identical to
+/// `units(spec, id)`, and so for the timer.
 ///
 /// Fails with [`Error::Invalid`] for the values `refuse_unrepresentable` lists.
 ///
-/// Emits `Type=exec` (requires systemd 240+, 2018): `systemd.service(5)` recommends it for
+/// A service emits `Type=exec` (requires systemd 240+, 2018): `systemd.service(5)` recommends it for
 /// long-running services "as it ensures that process setup errors (e.g. errors such as a missing
 /// service executable, or missing user) are properly tracked", which `Type=simple` does not —
 /// `systemctl start` there can report success for a unit that immediately goes `failed`. The
@@ -46,20 +71,48 @@ use crate::spec::{DaemonFields, DaemonSpec, Restart, systemd_defect, systemd_raw
 /// `--timeout` bounds and reports it.
 ///
 /// Changing what this function emits after a release ships requires bumping `version` in the same
-/// commit (see `blob::encode`), or every already-installed service using the old bytes reports as
+/// commit (see `blob::encode`), or every already-installed daemon using the old bytes reports as
 /// hand-edited: `decide`'s version-mismatch check (`src/decide.rs`) is what tells "stale, regenerate
 /// silently" from "conflict, demand `--force`" apart, and it runs before either `desired` or
 /// `regenerated` is even compared.
-pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
-    let DaemonSpec::Service(s) = spec else {
-        return Err(cannot_run_tasks("systemd", &spec.common().id));
+pub fn units(spec: &DaemonSpec, id: &Identity) -> Result<Units, Error> {
+    match spec {
+        DaemonSpec::Service(service) => Ok(Units {
+            service: with_goetia_section(service_unit(service, id)?, spec),
+            timer: None,
+        }),
+        DaemonSpec::Task(task) => Ok(Units {
+            service: with_goetia_section(task_unit(task, id)?, spec),
+            timer: timer_for(spec),
+        }),
+    }
+}
+
+/// The timer unit `spec` has: `None` for a service and for a task with no schedule. It needs no
+/// identity, so a timer is regenerated from a spec alone.
+pub fn timer_for(spec: &DaemonSpec) -> Option<String> {
+    let DaemonSpec::Task(task) = spec else {
+        return None;
     };
-    refuse_unrepresentable(&s.common, id)?;
+    let schedule = task.schedule.as_ref()?;
+    Some(with_goetia_section(timer_unit(task, schedule), spec))
+}
+
+/// `body`, a blank line, and the `[X-Goetia]` section of `spec`.
+fn with_goetia_section(mut body: String, spec: &DaemonSpec) -> String {
+    body.push('\n');
+    body.push_str(&goetia_section(spec));
+    body
+}
+
+/// A service's unit, up to the `[X-Goetia]` section.
+fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
+    refuse_unrepresentable(&service.common, id)?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
-    out.push_str(&format!("Description={}\n", raw_value(&s.common.name)));
-    if s.restart != Restart::Never {
+    out.push_str(&format!("Description={}\n", raw_value(&service.common.name)));
+    if service.restart != Restart::Never {
         // systemd's defaults (`DefaultStartLimitIntervalSec=10s`,
         // `StartLimitBurst=5`) put a unit permanently into `failed` after
         // five restarts in ten seconds: `restart: always` would mean
@@ -71,36 +124,144 @@ pub fn unit(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
 
     out.push_str("[Service]\n");
     out.push_str("Type=exec\n");
-    out.push_str(&format!("ExecStart={}\n", render_exec_start(&s.common.command)));
-    if let Some(cwd) = &s.common.cwd {
-        out.push_str(&format!("WorkingDirectory={}\n", raw_value(&cwd.display().to_string())));
-    }
-    for (key, value) in &s.common.env {
-        out.push_str(&format!("Environment={}\n", render_environment(key, value)));
-    }
-    out.push_str(&format!("User={}\n", raw_value(&id.user)));
-    out.push_str(&format!("Restart={}\n", render_restart(s.restart)));
-    if let Some(delay) = s.restart_delay {
+    out.push_str(&exec_lines(&service.common, id));
+    out.push_str(&format!("Restart={}\n", render_restart(service.restart)));
+    if let Some(delay) = service.restart_delay {
         out.push_str(&format!("RestartSec={}\n", delay.as_secs_f64()));
     }
-    if let Some(logs) = &s.common.logs {
-        let target = format!("append:{}", raw_value(&logs.display().to_string()));
-        out.push_str(&format!("StandardOutput={target}\n"));
-        out.push_str(&format!("StandardError={target}\n"));
-    }
+    out.push_str(&log_lines(&service.common));
     out.push('\n');
 
     out.push_str("[Install]\n");
     out.push_str("WantedBy=multi-user.target\n");
+
+    Ok(out)
+}
+
+/// A task's oneshot unit, up to the `[X-Goetia]` section. A failed run ends and waits for the next
+/// one: no `Restart=`. No `RemainAfterExit=`, so a finished run is `inactive`. No `[Install]`: the
+/// timer, not boot, starts it.
+fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
+    refuse_unrepresentable(&task.common, id)?;
+    let mut out = String::new();
+
+    out.push_str("[Unit]\n");
+    out.push_str(&format!("Description={}\n", raw_value(&task.common.name)));
+    // A burst of starts (`goetia daemon run` in a loop, a timer catching up after downtime) must
+    // not make systemd refuse the next one: the default allows five in ten seconds.
+    out.push_str("StartLimitIntervalSec=0\n");
     out.push('\n');
 
+    out.push_str("[Service]\n");
+    out.push_str("Type=oneshot\n");
+    out.push_str(&exec_lines(&task.common, id));
+    out.push_str(&log_lines(&task.common));
+
+    Ok(out)
+}
+
+/// A task's timer unit, up to the `[X-Goetia]` section. It names no `Unit=`: the default is the
+/// service of the same name.
+///
+/// `AccuracySec=1s` makes the run start within the cron second; the default of one minute fired
+/// 11 to 25 s late when measured. `Persistent=yes` runs a start the machine missed once it is up.
+fn timer_unit(task: &TaskSpec, schedule: &Schedule) -> String {
+    let mut out = String::new();
+
+    out.push_str("[Unit]\n");
+    out.push_str(&format!("Description={}\n", raw_value(&task.common.name)));
+    out.push('\n');
+
+    out.push_str("[Timer]\n");
+    for line in on_calendar_lines(schedule) {
+        out.push_str(&format!("OnCalendar={line}\n"));
+    }
+    out.push_str("AccuracySec=1s\n");
+    out.push_str("Persistent=yes\n");
+    out.push('\n');
+
+    out.push_str("[Install]\n");
+    out.push_str("WantedBy=timers.target\n");
+
+    out
+}
+
+/// `[Service]`'s lines from `ExecStart=` through `User=`, which a service and a task share.
+fn exec_lines(common: &DaemonFields, id: &Identity) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("ExecStart={}\n", render_exec_start(&common.command)));
+    if let Some(cwd) = &common.cwd {
+        out.push_str(&format!("WorkingDirectory={}\n", raw_value(&cwd.display().to_string())));
+    }
+    for (key, value) in &common.env {
+        out.push_str(&format!("Environment={}\n", render_environment(key, value)));
+    }
+    out.push_str(&format!("User={}\n", raw_value(&id.user)));
+    out
+}
+
+/// `[Service]`'s log lines, which a service and a task share. A service puts `Restart=` between
+/// [`exec_lines`] and these, so its bytes stay as they were.
+fn log_lines(common: &DaemonFields) -> String {
+    let mut out = String::new();
+    if let Some(logs) = &common.logs {
+        let target = format!("append:{}", raw_value(&logs.display().to_string()));
+        out.push_str(&format!("StandardOutput={target}\n"));
+        out.push_str(&format!("StandardError={target}\n"));
+    }
+    out
+}
+
+/// The `[X-Goetia]` section both units carry: the marker and the spec's blob.
+fn goetia_section(spec: &DaemonSpec) -> String {
+    let mut out = String::new();
     out.push_str("[X-Goetia]\n");
     out.push_str(&format!("Marker={MARKER}\n"));
     out.push_str(&format!("Schema={}\n", blob::SCHEMA));
     out.push_str(&format!("Version={}\n", crate::version()));
     out.push_str(&format!("Spec={}\n", blob::encode(spec)));
+    out
+}
 
-    Ok(out)
+// OnCalendar ==========================================================================================================
+
+/// systemd spells day-of-week 0 to 6 `Sun` to `Sat`.
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// The `OnCalendar=` values (each without the key) that fire when `schedule` does.
+///
+/// Every value of every field is listed, two digits each, and a field that holds its whole range is
+/// `*`. Cron's two day fields are one line when both must match (systemd's own rule for a weekday
+/// and a day: AND), and two when either may (`DayRule::Or`): the days of the month on one, the
+/// weekdays on the other, the time and month on both.
+fn on_calendar_lines(schedule: &Schedule) -> Vec<String> {
+    let [minute, hour, day, month, weekday] = schedule.fields();
+    let time = format!("{}:{}:00", numbers(&hour.values, 24), numbers(&minute.values, 60));
+    let month = numbers(&month.values, 12);
+    let weekdays = if weekday.values.len() == WEEKDAYS.len() {
+        String::new()
+    } else {
+        let names: Vec<&str> = weekday.values.iter().map(|&v| WEEKDAYS[usize::from(v)]).collect();
+        format!("{} ", names.join(","))
+    };
+    let days = numbers(&day.values, 31);
+    match schedule.day_rule() {
+        DayRule::And => vec![format!("{weekdays}*-{month}-{days} {time}")],
+        DayRule::Or => vec![
+            format!("*-{month}-{days} {time}"),
+            format!("{weekdays}*-{month}-* {time}"),
+        ],
+    }
+}
+
+/// `values` as systemd reads a calendar component: `*` when it holds all `range_len` values of its
+/// field, else each in two digits, comma separated.
+fn numbers(values: &BTreeSet<u8>, range_len: usize) -> String {
+    if values.len() == range_len {
+        return "*".to_string();
+    }
+    let digits: Vec<String> = values.iter().map(|v| format!("{v:02}")).collect();
+    digits.join(",")
 }
 
 /// Refuse what no encoding can carry: the manifest's values ([`systemd_defect`], which lists each rule
