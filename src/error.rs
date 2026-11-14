@@ -139,13 +139,11 @@ pub enum Error {
     #[error("`{id}` may not have started: the manager accepted the start, but its state is not established")]
     StartUnconfirmed { id: String },
 
-    /// launchd cannot update a loaded job, so the changed definition was not installed.
-    #[error(
-        "`{id}` is loaded in launchd, which cannot update a loaded job, so the changed plist was not installed and \
-         the installed plist is untouched: run `goetia daemon stop {id}` (a job that has exited is still loaded), \
-         re-run install, then start it"
-    )]
-    LoadedJob { id: String },
+    /// launchd cannot update a loaded job, so the changed definition was not installed. `kind` is the
+    /// kind of the loaded job: a service is refused while it is loaded at all, a task only while it
+    /// has a run in flight.
+    #[error("{}", loaded_job(id, *kind))]
+    LoadedJob { id: String, kind: crate::spec::DaemonKind },
 
     /// `install`'s put-back of a plist found `found` at `path` instead of the plist `install` wrote,
     /// so it left the path alone. launchd only; it is the `restore_failed` of the in-doubt variants.
@@ -1291,6 +1289,22 @@ fn process_wait_timeout_message<'a>(
         terminate_failed,
         format!(". {recovery}"),
     )
+}
+
+/// The message of [`Error::LoadedJob`].
+fn loaded_job(id: &str, kind: crate::spec::DaemonKind) -> String {
+    match kind {
+        crate::spec::DaemonKind::Service => format!(
+            "`{id}` is loaded in launchd, which cannot update a loaded job, so the changed plist was not installed \
+             and the installed plist is untouched: run `goetia daemon stop {id}` (a job that has exited is still \
+             loaded), re-run install, then start it"
+        ),
+        crate::spec::DaemonKind::Task => format!(
+            "`{id}` has a run in flight, and launchd cannot replace a task's plist under one, so the changed plists \
+             were not installed and the installed ones are untouched: run `goetia daemon stop {id}` (a task that \
+             has stopped is idle), then re-run install"
+        ),
+    }
 }
 
 /// The message of [`Error::LoadedJobInDoubt`].

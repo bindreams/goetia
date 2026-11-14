@@ -19,24 +19,25 @@ use crate::testing::{base_fields, task};
 
 // Fixtures ============================================================================================================
 
-const ID: &str = "goetia-task-unit";
+// `write_tests` builds its trees and specs from these.
+pub(in crate::backend::launchd::manager) const ID: &str = "goetia-task-unit";
 
-fn id() -> Id {
+pub(in crate::backend::launchd::manager) fn id() -> Id {
     Id::try_from(ID).unwrap()
 }
 
-fn task_spec(schedule: Option<&str>) -> DaemonSpec {
+pub(in crate::backend::launchd::manager) fn task_spec(schedule: Option<&str>) -> DaemonSpec {
     task(ID, vec!["/bin/true".to_string()], schedule)
 }
 
-fn service_spec() -> DaemonSpec {
+pub(in crate::backend::launchd::manager) fn service_spec() -> DaemonSpec {
     ServiceSpec::new(base_fields(ID, vec!["/bin/true".to_string()]))
         .map(DaemonSpec::from)
         .unwrap()
 }
 
 /// What goetia writes for `spec`, run as root.
-fn plists_of(spec: &DaemonSpec) -> Plists {
+pub(in crate::backend::launchd::manager) fn plists_of(spec: &DaemonSpec) -> Plists {
     generate::plists(
         spec,
         &Identity {
@@ -54,27 +55,27 @@ fn damaged(text: &str) -> String {
 }
 
 /// The two directories a plist can be in.
-struct Tree {
+pub(in crate::backend::launchd::manager) struct Tree {
     staging: tempfile::TempDir,
     enabled: tempfile::TempDir,
 }
 
 impl Tree {
-    fn new() -> Self {
+    pub(in crate::backend::launchd::manager) fn new() -> Self {
         Self {
             staging: tempfile::tempdir().expect("tempdir"),
             enabled: tempfile::tempdir().expect("tempdir"),
         }
     }
 
-    fn dirs(&self) -> Dirs<'_> {
+    pub(in crate::backend::launchd::manager) fn dirs(&self) -> Dirs<'_> {
         [
             (self.staging.path().to_str().expect("a UTF-8 path"), false),
             (self.enabled.path().to_str().expect("a UTF-8 path"), true),
         ]
     }
 
-    fn dir(&self, enabled: bool) -> &Path {
+    pub(in crate::backend::launchd::manager) fn dir(&self, enabled: bool) -> &Path {
         if enabled {
             self.enabled.path()
         } else {
@@ -83,11 +84,11 @@ impl Tree {
     }
 
     /// Writes `<stem>.plist` in the enabled or the staging directory.
-    fn put(&self, enabled: bool, stem: &str, content: impl AsRef<[u8]>) {
+    pub(in crate::backend::launchd::manager) fn put(&self, enabled: bool, stem: &str, content: impl AsRef<[u8]>) {
         std::fs::write(self.dir(enabled).join(format!("{stem}.plist")), content).expect("write the plist");
     }
 
-    fn read(&self) -> Result<ReadOutcome<Plist>> {
+    pub(in crate::backend::launchd::manager) fn read(&self) -> Result<ReadOutcome<Plist>> {
         read_in(self.dirs(), &id())
     }
 
@@ -146,7 +147,7 @@ const NOT_LOADED: (i32, &str) = (113, "");
 
 // read ================================================================================================================
 
-fn marked(outcome: Result<ReadOutcome<Plist>>) -> Plist {
+pub(in crate::backend::launchd::manager) fn marked(outcome: Result<ReadOutcome<Plist>>) -> Plist {
     match outcome {
         Ok(ReadOutcome::Marked(plist)) => plist,
         Ok(ReadOutcome::Absent) => panic!("absent, not marked"),

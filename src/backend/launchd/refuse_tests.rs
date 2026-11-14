@@ -106,7 +106,7 @@ fn a_spec_change_the_rendering_does_not_show_does_not() {
 
 #[skuld::test]
 fn the_refusal_names_the_daemon_and_the_remedy() {
-    let message = loaded_refusal(&Id::try_from("frpc").unwrap()).to_string();
+    let message = loaded_refusal(&Id::try_from("frpc").unwrap(), DaemonKind::Service).to_string();
     assert!(message.contains("`frpc`"), "{message}");
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
     assert!(message.contains("not installed"), "{message}");
@@ -114,6 +114,13 @@ fn the_refusal_names_the_daemon_and_the_remedy() {
         message.contains("plist"),
         "it speaks of the plist, not only the spec: {message}"
     );
+}
+
+#[skuld::test]
+fn the_refusal_of_a_task_names_its_run_in_flight() {
+    let message = loaded_refusal(&Id::try_from("frpc").unwrap(), DaemonKind::Task).to_string();
+    assert!(message.contains("`frpc` has a run in flight"), "{message}");
+    assert!(message.contains("goetia daemon stop frpc"), "{message}");
 }
 
 // loaded_after_write ==================================================================================================

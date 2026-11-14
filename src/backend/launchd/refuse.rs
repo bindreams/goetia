@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::backend::launchd::generate;
 use crate::error::{Error, Occupant, Result};
-use crate::spec::Id;
+use crate::spec::{DaemonKind, Id};
 
 /// Whether writing `desired` over `on_disk` would give the plist other content, which is what a
 /// loaded job was bootstrapped from. `install` asks it of an `Update` or `Stale` write; `--force`
@@ -22,10 +22,14 @@ pub(crate) fn changes_loaded_job(on_disk: &str, desired: &str) -> bool {
     generate::without_metadata(on_disk) != generate::without_metadata(desired)
 }
 
-/// The error for a changed plist over a loaded job. Says "loaded", not "running": a job that has
-/// exited is still loaded until it is booted out.
-pub(crate) fn loaded_refusal(id: &Id) -> Error {
-    Error::LoadedJob { id: id.to_string() }
+/// The error for a changed plist over a loaded job of `kind`. A service's says "loaded", not
+/// "running": a job that has exited is still loaded until it is booted out. A task's names its run
+/// in flight, the only thing that makes a task's plist unreplaceable.
+pub(crate) fn loaded_refusal(id: &Id, kind: DaemonKind) -> Error {
+    Error::LoadedJob {
+        id: id.to_string(),
+        kind,
+    }
 }
 
 /// The error for a job that is loaded after `install` wrote its plist, though it was not before.

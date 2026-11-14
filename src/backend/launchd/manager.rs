@@ -36,7 +36,8 @@
 //!   running one, and launchd holds a bootstrapped job by label, whichever directory its plist is
 //!   in, so moving the file leaves it running.
 //! - A task is two plists, the job `<id>.plist` and its timer `<id>@timer.plist`; reading and
-//!   `status` treat them as one id (see `task`).
+//!   `status` treat them as one id (see `task`), and `install` and `uninstall` change both, in the
+//!   order the plans of `launchd::task` give (see `write`).
 //! - Reading (`list`, and every verb's ownership check) scans both directories, never `launchctl
 //!   print`, whose format Apple does not guarantee. `status`'s live run state is the one exception,
 //!   since no file says whether a job is running. It reads `launchctl print` leniently: a shape it
@@ -87,6 +88,7 @@ pub use super::{ENABLED_DIR, STAGING_DIR};
 use task::{Artifact, Assembled, Body};
 
 mod task;
+mod write;
 
 pub struct Launchd {
     launchctl: Launchctl,
@@ -377,6 +379,13 @@ impl Plist {
     fn is_task(&self) -> bool {
         matches!(&self.blob, Ok(blob) if blob.spec.kind() == DaemonKind::Task)
     }
+
+    /// Whether `install` and `uninstall` act on a job and a timer: a task, and any id with a timer of
+    /// goetia's beside it, which one of them would otherwise leave behind. Where it is false the id is
+    /// a service, and its verbs are the service's.
+    fn has_two_plists(&self) -> bool {
+        self.is_task() || self.timer.is_some()
+    }
 }
 
 impl InstalledService for Plist {
@@ -579,8 +588,17 @@ fn persist_new(staged: tempfile::NamedTempFile, target: &Path) -> Result<Persist
 /// Overwrite the plist already at `target`, for `Update`/`Stale` only: `read` has established the
 /// id is marked.
 fn write_existing(target: &Path, content: &str) -> Result<()> {
-    let tmp = staged_tempfile(target.parent().expect("plist path always has a parent"), content)?;
-    tmp.persist(target)
+    persist_over(
+        staged_tempfile(target.parent().expect("plist path always has a parent"), content)?,
+        target,
+    )
+}
+
+/// Replace the plist at `target` with `staged`, which is already linted: a task stages both its plists
+/// before its first `launchctl` request, so a malformed one stops the install before anything changed.
+fn persist_over(staged: tempfile::NamedTempFile, target: &Path) -> Result<()> {
+    staged
+        .persist(target)
         .map(drop)
         .map_err(|e| Error::os_at("replace", target, e.error))
 }
@@ -1069,24 +1087,48 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 
 /// Most requests each verb sends; each draws a reaper from the verb's [`Reservation`].
 /// `start`: bootstrap+kickstart, then the corrective cycle's bootout+bootstrap+kickstart.
-const INSTALL_REQUESTS: usize = 1;
+///
+/// `install` and `uninstall` have a service's count and a task's (see `write`); [`needs`] takes the
+/// larger, since a reservation is made before the kind is known.
+const SERVICE_INSTALL_REQUESTS: usize = 1;
+/// A task's longest `install`, an update of an armed task whose job changes: the timer's `bootout`,
+/// the job's, and both `bootstrap`s.
+const TASK_INSTALL_REQUESTS: usize = 4;
+const INSTALL_REQUESTS: usize = max(SERVICE_INSTALL_REQUESTS, TASK_INSTALL_REQUESTS);
 const START_REQUESTS: usize = 5;
 const STOP_REQUESTS: usize = 1;
+/// A task's `uninstall`: the timer's `bootout` and the job's.
+const TASK_UNINSTALL_REQUESTS: usize = 2;
+const UNINSTALL_REQUESTS: usize = max(STOP_REQUESTS, TASK_UNINSTALL_REQUESTS);
 const KILL_REQUESTS: usize = 1;
 
 /// Most `launchctl` calls per verb, reads included: each draws its role's temp files from the same
-/// reservation. `install` adds two `is_loaded`s; `start` one `is_loaded` and five `live_state`s. The
-/// `print` after an expired `kickstart` is not counted: the verb ends there, in place of its last read.
-/// A wait ([`Launchctl::wait_unloaded`]) is one call however many reads it makes: one after each
-/// `bootout`. `start` has one more: its first read of the label and the wait that may follow it share
-/// one set of files.
-const INSTALL_CALLS: usize = INSTALL_REQUESTS + 2 + 1;
+/// reservation. A service's `install` adds two `is_loaded`s; `start` one `is_loaded` and five
+/// `live_state`s. The `print` after an expired `kickstart` is not counted: the verb ends there, in
+/// place of its last read. A wait ([`Launchctl::wait_unloaded`]) is one call however many reads it
+/// makes: one after each `bootout`. `start` has one more: its first read of the label and the wait
+/// that may follow it share one set of files.
+const SERVICE_INSTALL_CALLS: usize = SERVICE_INSTALL_REQUESTS + 2 + 1;
+/// A task's longest `install`: the two reads of which labels launchd holds, the timer's `bootout` and
+/// its wait, the read that checks the job is idle, the job's `bootout` and its wait, and both
+/// `bootstrap`s. A `Create` is shorter: the same two reads, and the two `bootout`s with their waits.
+const TASK_INSTALL_CALLS: usize = 2 + (1 + 1) + 1 + (1 + 1) + 2;
+const INSTALL_CALLS: usize = max(SERVICE_INSTALL_CALLS, TASK_INSTALL_CALLS);
 const START_CALLS: usize = START_REQUESTS + 6 + 2;
 const STOP_CALLS: usize = STOP_REQUESTS + 1;
+/// A task's `uninstall`: the two reads of which labels launchd holds, then both `bootout`s and their
+/// waits.
+const TASK_UNINSTALL_CALLS: usize = 2 + (1 + 1) + (1 + 1);
+const UNINSTALL_CALLS: usize = max(STOP_CALLS, TASK_UNINSTALL_CALLS);
 const KILL_CALLS: usize = KILL_REQUESTS;
 
-/// The most `step` draws, as `(requests, calls)`. A draw past it is a miscount, caught by the
-/// assertion in [`Reservation`] in every test that runs the verb.
+const fn max(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// The most `step` draws, as `(requests, calls)`: for `install` and `uninstall`, the larger of a
+/// service's and a task's. A draw past it is a miscount, caught by the assertion in [`Reservation`] in
+/// every test that runs the verb.
 ///
 /// `request_start_after_stop` is `start` under a budget that does not wait: it draws no more than
 /// `start` does, and so is counted as it is.
@@ -1094,7 +1136,8 @@ fn needs(step: Step) -> (usize, usize) {
     match step {
         Step::Install => (INSTALL_REQUESTS, INSTALL_CALLS),
         Step::Start | Step::RequestStartAfterStop => (START_REQUESTS, START_CALLS),
-        Step::Stop | Step::Uninstall => (STOP_REQUESTS, STOP_CALLS),
+        Step::Stop => (STOP_REQUESTS, STOP_CALLS),
+        Step::Uninstall => (UNINSTALL_REQUESTS, UNINSTALL_CALLS),
         Step::Kill => (KILL_REQUESTS, KILL_CALLS),
     }
 }
@@ -1231,7 +1274,8 @@ impl backend::Backend for Launchd {
     /// `Raced` only where no `launchctl` call has been made yet: another pass could then make more
     /// calls than the verb reserved ([`INSTALL_CALLS`]), so a race after one is an error instead.
     ///
-    /// Interim: writes the job's plist alone, for a task too, until the two-plist install lands.
+    /// A task, and a daemon that becomes or stops being one, is written as two plists (see `write`);
+    /// what follows is a service's.
     fn write(
         &self,
         spec: &DaemonSpec,
@@ -1241,6 +1285,9 @@ impl backend::Backend for Launchd {
         _scope: &mut (),
         reservation: &mut Reservation,
     ) -> Result<WriteOutcome> {
+        if spec.kind() == DaemonKind::Task || snapshot.is_some_and(Plist::has_two_plists) {
+            return self.write_task(DIRS, spec, desired, outcome, snapshot, reservation);
+        }
         // Resolved again: `render` kept only the plist, which names the account, and launchd
         // resolves that name at launch too.
         let account = resolve_account(&spec.common().user)?;
@@ -1296,7 +1343,7 @@ impl backend::Backend for Launchd {
                             .is_loaded(spec.common().id.as_str(), deadline, reservation)?,
                     )
                 {
-                    return Err(refuse::loaded_refusal(&spec.common().id));
+                    return Err(refuse::loaded_refusal(&spec.common().id, DaemonKind::Service));
                 }
                 prepare_parent_dirs(spec, &account)?;
                 let target = job.location.path.as_path();
@@ -1359,8 +1406,11 @@ impl backend::Backend for Launchd {
         scan_in(DIRS)
     }
 
-    /// Interim: a task's job alone, until the two-plist uninstall lands.
+    /// A task is uninstalled as two plists (see `write`); a service as one.
     fn uninstall(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
+        if snapshot.has_two_plists() {
+            return self.uninstall_task(snapshot, reservation);
+        }
         let location = &snapshot.job()?.location;
 
         // Unbounded, like `install`'s: `uninstall` has no `--timeout`, and bounding this would turn a

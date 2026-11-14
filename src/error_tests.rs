@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use super::{BoxError, Error, Occupant, PutBackFound, VersionReading};
 use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, OWN};
+use crate::spec::DaemonKind;
 
 #[skuld::test]
 fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
@@ -135,7 +136,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             keep_alive: false,
         },
-        Error::LoadedJob { id: id() },
+        Error::LoadedJob {
+            id: id(),
+            kind: DaemonKind::Service,
+        },
         Error::PasswordRequired { account: id() },
         Error::UnsupportedManager {
             client: VersionReading::Major(241),
@@ -648,12 +652,32 @@ fn report_of_a_start_whose_state_is_not_established() {
 }
 
 #[skuld::test]
-fn report_of_a_loaded_job() {
+fn loaded_job_of_a_service_is_unchanged() {
     assert_eq!(
-        Error::LoadedJob { id: id() }.report().to_string(),
+        Error::LoadedJob {
+            id: id(),
+            kind: DaemonKind::Service
+        }
+        .report()
+        .to_string(),
         "`x` is loaded in launchd, which cannot update a loaded job, so the changed plist was not installed and the \
          installed plist is untouched: run `goetia daemon stop x` (a job that has exited is still loaded), re-run \
          install, then start it"
+    );
+}
+
+#[skuld::test]
+fn loaded_job_words_the_task_case() {
+    assert_eq!(
+        Error::LoadedJob {
+            id: id(),
+            kind: DaemonKind::Task
+        }
+        .report()
+        .to_string(),
+        "`x` has a run in flight, and launchd cannot replace a task's plist under one, so the changed plists were not \
+         installed and the installed ones are untouched: run `goetia daemon stop x` (a task that has stopped is \
+         idle), then re-run install"
     );
 }
 

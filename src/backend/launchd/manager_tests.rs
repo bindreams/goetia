@@ -948,6 +948,28 @@ fn render_of_a_task_no_longer_refuses() {
     );
 }
 
+/// What a task renders is both its plists, and each regenerates from its own metadata to the same pair:
+/// a freshly installed task does not read as drifted.
+#[skuld::test]
+fn a_scheduled_task_renders_both_plists_and_each_regenerates_from_its_own_metadata() {
+    use crate::backend::Backend as _;
+
+    let (mgr, _) = scripted(&[]);
+    let spec = crate::testing::task(
+        "goetia-rendered-pair",
+        vec!["/bin/true".to_string()],
+        Some("30 3 * * *"),
+    );
+
+    let rendered = mgr.render(&spec).expect("a task renders");
+
+    let timer = rendered.timer.as_deref().expect("a scheduled task has a timer");
+    for text in [rendered.job.as_str(), timer] {
+        let embedded = generate::extract(text).unwrap().expect("marked").spec;
+        assert_eq!(mgr.render(&embedded).unwrap(), rendered);
+    }
+}
+
 // Writing: a race that has cost no call ===============================================================================
 
 /// A plist that vanished between `read` and `write` — a concurrent `uninstall` — before `install`
@@ -1033,14 +1055,15 @@ fn reserved(steps: &[Step]) -> Reservation {
 
 /// `reserve` makes what the steps count, and nothing else: the reapers and files of their longest
 /// paths, summed over a sequence. The numbers are written out so that changing a count is deliberate.
+/// `install` and `uninstall` hold a task's counts, the larger (see `needs`).
 #[skuld::test]
 fn a_reservation_holds_what_its_steps_count() {
     let cases: [(&[Step], (usize, usize)); 7] = [
-        (&[Step::Install], (1, 8)),
+        (&[Step::Install], (4, 18)),
         (&[Step::Start], (5, 26)),
         (&[Step::Stop], (1, 4)),
         (&[Step::Kill], (1, 2)),
-        (&[Step::Uninstall], (1, 4)),
+        (&[Step::Uninstall], (2, 12)),
         (&[Step::RequestStartAfterStop], (5, 26)),
         (&[Step::Stop, Step::Start], (6, 30)),
     ];
@@ -1399,10 +1422,10 @@ const START_NOT_WAITING: [(&str, Answer); 5] = [
     ("kickstart", DONE),
 ];
 
-/// `install`'s longest path, [`INSTALL_CALLS`] calls: a `Create`'s read, the `bootout` of the stale
-/// job it finds loaded and the wait for it to be gone, and the read after the write. An `Update` makes
-/// two reads, before the write and after it.
-const INSTALL_LONGEST: [(&str, Answer); INSTALL_CALLS] =
+/// A service's `install`'s longest path, [`SERVICE_INSTALL_CALLS`] calls: a `Create`'s read, the
+/// `bootout` of the stale job it finds loaded and the wait for it to be gone, and the read after the
+/// write. An `Update` makes two reads, before the write and after it.
+const INSTALL_LONGEST: [(&str, Answer); SERVICE_INSTALL_CALLS] =
     [("print", DONE), ("bootout", DONE), GONE, ("print", NOT_LOADED)];
 
 /// A `Create` over no loaded job: the read before the write and the read after it.

@@ -5,6 +5,9 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use crate::backend::Decoded;
+use crate::backend::launchd::generate::Plists;
+use crate::backend::launchd::refuse::changes_loaded_job;
+use crate::spec::{DaemonKind, DaemonSpec};
 
 /// What one file name (`<id>.plist` or `<id>@timer.plist`) holds in the two directories a plist can
 /// be in.
@@ -79,6 +82,140 @@ pub(crate) fn classify(job: &Slot, timer: &Slot, job_is_task: Option<bool>) -> C
         (Slot::Marked(_), Slot::Both) if task => Classified::Unusable(IN_BOTH),
         (Slot::Marked(_), Slot::NotOurs | Slot::Both) => Classified::Marked,
     }
+}
+
+// Updating and uninstalling ===========================================================================================
+
+/// One step of changing the files and jobs of an installed task, in the order a plan gives them.
+///
+/// `Action`, not `Step`: [`crate::manager::Step`] (`Install`, `Start`, `Stop`, ...) already names the
+/// verbs a reservation counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Create the timer's plist where the job's is (staging, once the job is moved there), refusing to
+    /// replace what is at that name.
+    CreateTimerFirst,
+    BootoutTimer,
+    /// Read the job again, now that no timer can start it: a service that is loaded, or a task with a
+    /// run in flight, is refused with [`crate::error::Error::LoadedJob`], the timer re-armed first.
+    CheckJobIdle,
+    BootoutJob,
+    /// Move the job's plist from the enabled directory to staging, so that a retyped daemon does not
+    /// start at boot as the other kind.
+    MoveJobToStaging,
+    ReplaceJob,
+    ReplaceTimer,
+    RemoveTimer,
+    RemoveJob,
+    BootstrapJob,
+    BootstrapTimer,
+}
+
+/// A plist as installed: its text, and whether it is in the enabled directory.
+#[derive(Debug, Clone)]
+pub(crate) struct OnDisk {
+    pub(crate) enabled: bool,
+    pub(crate) text: String,
+}
+
+/// An installed task, or a daemon about to become one, as pure facts: what is on disk and what launchd
+/// holds. What `update_plan` and `uninstall_plan` read.
+#[derive(Debug, Clone)]
+pub(crate) struct Old {
+    /// The kind the installed job's metadata names.
+    pub(crate) kind: DaemonKind,
+    /// `None` for a timer alone at the id.
+    pub(crate) job: Option<OnDisk>,
+    pub(crate) timer: Option<OnDisk>,
+    /// Whether launchd has the job's label, and the timer's. A run in flight is not a fact here:
+    /// whether the job has one is read by [`Action::CheckJobIdle`], after the timer is out, since a
+    /// fire between this read and the bootout could start one.
+    pub(crate) job_loaded: bool,
+    pub(crate) timer_loaded: bool,
+}
+
+impl Old {
+    /// Where a task is enabled: its timer's directory, and the job's for a task with no timer.
+    pub(crate) fn enabled(&self) -> bool {
+        self.timer
+            .as_ref()
+            .or(self.job.as_ref())
+            .is_some_and(|plist| plist.enabled)
+    }
+}
+
+/// What `install` does to an installed daemon's plists and jobs to make them `new` (rendered from
+/// `spec`), where either the old or the new is a task. launchd keeps the definition a job was loaded
+/// with and has no way to update it, so a plist launchd holds is booted out, replaced and loaded again.
+///
+/// - The timer goes out first, if it is loaded and anything it or the job holds changes: no fire can
+///   start a run meanwhile.
+/// - A job whose rendering changes and that is loaded is checked (see [`Action::CheckJobIdle`]) before
+///   anything is written, so a refusal leaves the installed files untouched; an idle one is booted out.
+///   A change that touches only the timer leaves the job alone, so a run in flight never blocks a
+///   schedule edit.
+/// - A timer that is new is created before the job's files change, no-clobber, so a stranger's file at
+///   its name refuses with nothing changed; one that is dropped is removed before the job is replaced.
+/// - A retype moves an enabled job to staging first: it drops arming and boot enrolment.
+/// - A task that is enabled ends with its job and its timer loaded, the job first: what went out is
+///   loaded again, a new timer is armed, and a plist launchd did not hold (an install that failed
+///   after booting it out) is loaded now.
+///
+/// A file is replaced when its text differs at all, metadata included.
+pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Action> {
+    let job = old.job.as_ref().expect("an update acts on an id that has a job");
+    let retype = spec.kind() != old.kind;
+    let job_renders_differently = changes_loaded_job(&job.text, &new.job);
+    let added = old.timer.is_none() && new.timer.is_some();
+    let dropped = old.timer.is_some() && new.timer.is_none();
+    let (timer_differs, timer_renders_differently) = match (&old.timer, &new.timer) {
+        (Some(old), Some(new)) => (old.text != *new, changes_loaded_job(&old.text, new)),
+        _ => (false, false),
+    };
+    let job_out = old.job_loaded && job_renders_differently;
+    let timer_out = old.timer_loaded && (dropped || timer_renders_differently || job_out);
+    // A retype leaves nothing enabled.
+    let armed = !retype && old.enabled();
+
+    let mut plan = Vec::new();
+    let mut push = |condition: bool, action: Action| {
+        if condition {
+            plan.push(action);
+        }
+    };
+    push(timer_out, Action::BootoutTimer);
+    push(job_out, Action::CheckJobIdle);
+    push(added, Action::CreateTimerFirst);
+    push(job_out, Action::BootoutJob);
+    push(dropped, Action::RemoveTimer);
+    push(retype && job.enabled, Action::MoveJobToStaging);
+    push(job.text != new.job, Action::ReplaceJob);
+    push(timer_differs, Action::ReplaceTimer);
+    // An enabled task is loaded (`enable` loads it), so whatever launchd does not hold afterwards is
+    // loaded, whether this plan booted it out or an earlier install that failed did.
+    push(armed && !(old.job_loaded && !job_out), Action::BootstrapJob);
+    push(
+        armed && new.timer.is_some() && !(old.timer_loaded && !timer_out),
+        Action::BootstrapTimer,
+    );
+    plan
+}
+
+/// What `uninstall` does: boot out the timer, then the job (each only if launchd holds it, and the
+/// job's boot-out ends a run in flight), then remove the timer's file, then the job's. A crash
+/// anywhere leaves a state the read table names, and running the verb again finishes it.
+pub(crate) fn uninstall_plan(old: &Old) -> Vec<Action> {
+    let mut plan = Vec::new();
+    let mut push = |condition: bool, action: Action| {
+        if condition {
+            plan.push(action);
+        }
+    };
+    push(old.timer_loaded, Action::BootoutTimer);
+    push(old.job_loaded, Action::BootoutJob);
+    push(old.timer.is_some(), Action::RemoveTimer);
+    push(old.job.is_some(), Action::RemoveJob);
+    plan
 }
 
 #[cfg(test)]

@@ -200,7 +200,7 @@ pub(super) fn assemble(
 }
 
 /// How to free the timer's name, which a task needs for its schedule.
-fn foreign_timer_recovery(paths: &[PathBuf]) -> String {
+pub(super) fn foreign_timer_recovery(paths: &[PathBuf]) -> String {
     let paths: Vec<String> = paths.iter().map(|path| format!("`{}`", path.display())).collect();
     format!(
         "{} is not goetia's, and a task needs that name for its schedule: remove or rename it, and re-run",
@@ -340,4 +340,4 @@ pub(super) fn next_run(
 
 #[cfg(test)]
 #[path = "task_tests.rs"]
-mod task_tests;
+pub(super) mod task_tests;
