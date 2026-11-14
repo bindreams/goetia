@@ -911,8 +911,8 @@ fn a_service_is_disabled_before_its_job_is_replaced(#[fixture(systemd_group)] _g
     );
     assert_eq!(
         text_of(&id, UnitKind::Timer),
-        None,
-        "no timer was written after the race"
+        units_of(&new).timer,
+        "the timer was created first, unarmed: nothing reloaded or enabled it"
     );
 }
 
@@ -1068,6 +1068,158 @@ fn a_timer_changed_since_it_was_read_is_a_race(#[fixture(systemd_group)] _group:
         Some(units_of(&new).service),
         "the job, written first, stays: the next read finds job B beside a timer, which is not ours"
     );
+}
+
+// A timer the id has none of =========================================================================================
+
+/// A drop-in of the timer's own, at the id of a task that has no timer.
+fn seed_timer_dropin(id: &str) -> PathBuf {
+    let dropin = dropin_dir(id, UnitKind::Timer);
+    std::fs::create_dir(&dropin).expect("create the drop-in directory");
+    std::fs::write(dropin.join("override.conf"), "[Timer]\nAccuracySec=5min\n").expect("write the drop-in");
+    dropin
+}
+
+/// A task with no schedule reads its timer's drop-ins as drift, so a forced write must clear them
+/// or the next install reports the same conflict: after it the task is up to date.
+#[skuld::test]
+fn a_scheduleless_task_s_timer_drop_in_is_cleared_by_a_forced_install(#[fixture(systemd_group)] _group: &Group) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    let spec = task_spec(&id, "/bin/a", None);
+    seed(&id, UnitKind::Service, &units_of(&spec).service);
+    let dropin = seed_timer_dropin(&id);
+    let fake = gate_then([reload()]);
+    let mgr = over(&fake);
+
+    let preview = flow::preview(&mgr, &spec);
+    assert!(
+        matches!(
+            &preview,
+            Ok(Outcome::Conflict {
+                unclearable_recovery: None,
+                ..
+            })
+        ),
+        "{:?}",
+        preview.map(|_| ())
+    );
+    let outcome = install(&mgr, &spec, true);
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert!(!dropin.exists(), "the forced write clears it");
+    let again = flow::preview(&mgr, &spec);
+    assert!(matches!(again, Ok(Outcome::UpToDate)), "{:?}", again.map(|_| ()));
+}
+
+/// The same for a task with no timer that becomes a service.
+#[skuld::test]
+fn a_scheduleless_task_made_a_service_clears_its_timer_drop_in(#[fixture(systemd_group)] _group: &Group) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    let old = task_spec(&id, "/bin/a", None);
+    let service = service_spec(&id);
+    seed(&id, UnitKind::Service, &units_of(&old).service);
+    let dropin = seed_timer_dropin(&id);
+    let fake = gate_then([reload()]);
+
+    let outcome = install(&over(&fake), &service, true);
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert!(!dropin.exists());
+}
+
+/// A service retyped to a task beside a timer that is not goetia's is refused with nothing changed:
+/// no request reached the manager (so the service is still enabled), and neither file was touched.
+#[skuld::test]
+fn a_service_retyped_to_a_task_beside_a_foreign_timer_is_refused_with_nothing_changed(
+    #[fixture(systemd_group)] _group: &Group,
+) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    let service = service_spec(&id);
+    let task = task_spec(&id, "/bin/a", Some("30 3 * * *"));
+    let job = units_of(&service).service;
+    let foreign = "[Timer]\nOnCalendar=daily\n";
+    seed(&id, UnitKind::Service, &job);
+    seed(&id, UnitKind::Timer, foreign);
+    let fake = gate_then([]);
+
+    let outcome = install(&over(&fake), &task, false);
+
+    assert!(matches!(outcome, Outcome::RefuseForeign { .. }), "{outcome:?}");
+    assert_eq!(text_of(&id, UnitKind::Service), Some(job), "the job is unchanged");
+    assert_eq!(
+        text_of(&id, UnitKind::Timer).as_deref(),
+        Some(foreign),
+        "the stranger's timer is untouched"
+    );
+    assert!(
+        without_gate(&fake).is_empty(),
+        "nothing was disabled or reloaded: {:?}",
+        fake.calls()
+    );
+}
+
+/// A timer that appeared since `read` and is another install's, not a stranger's, is a race: the
+/// re-read finds it, and nothing has been changed.
+#[skuld::test]
+fn a_goetia_timer_that_appeared_since_the_read_is_a_race(#[fixture(systemd_group)] _group: &Group) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    let service = service_spec(&id);
+    let task = task_spec(&id, "/bin/a", Some("30 3 * * *"));
+    let job = units_of(&service).service;
+    seed(&id, UnitKind::Service, &job);
+    let fake = Fake::new([]);
+    let mgr = over(&fake);
+    let snapshot = marked(&mgr, &id);
+    seed(&id, UnitKind::Timer, units_of(&task).timer.as_deref().expect("a timer"));
+
+    let wrote = mgr
+        .update_units(&task, &units_of(&task), &snapshot, &mut held(&mgr))
+        .expect("update_units");
+
+    assert!(matches!(wrote, WriteOutcome::Raced));
+    assert_eq!(text_of(&id, UnitKind::Service), Some(job));
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+/// The state a crash leaves after the timer was created and before the service was disabled: a timer of
+/// goetia's (a task's blob) beside the old service. `read` reads it as ours with both texts, nothing
+/// of it is drift, and the install that follows is an `Update` that finishes the retype.
+#[skuld::test]
+fn a_task_timer_beside_the_old_service_is_ours_and_a_rerun_finishes_the_retype(
+    #[fixture(systemd_group)] _group: &Group,
+) {
+    let id = fresh_id("systemd");
+    let _left = Leftovers::new(&id);
+    let service = service_spec(&id);
+    let task = task_spec(&id, "/bin/a", Some("30 3 * * *"));
+    seed(&id, UnitKind::Service, &units_of(&service).service);
+    seed(&id, UnitKind::Timer, units_of(&task).timer.as_deref().expect("a timer"));
+    let fake = gate_then([reply(&["disable"], exited(0, "", "")), reload()]);
+    let mgr = over(&fake);
+
+    let snapshot = marked(&mgr, &id);
+    assert_eq!(snapshot.kind(), Some(DaemonKind::Service));
+    assert!(snapshot.timer().is_some(), "both artifacts are read as ours");
+    assert!(matches!(flow::preview(&mgr, &task), Ok(Outcome::Update { .. })));
+
+    let outcome = install(&mgr, &task, false);
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert_eq!(
+        without_gate(&fake),
+        [
+            call(&["disable", "--", &format!("{id}.service")]),
+            call(&["daemon-reload"])
+        ]
+    );
+    assert_eq!(text_of(&id, UnitKind::Service), Some(units_of(&task).service));
+    assert_eq!(text_of(&id, UnitKind::Timer), units_of(&task).timer);
+    let again = flow::preview(&mgr, &task);
+    assert!(matches!(again, Ok(Outcome::UpToDate)), "{:?}", again.map(|_| ()));
 }
 
 // uninstall ===========================================================================================================

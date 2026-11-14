@@ -294,6 +294,9 @@ pub(crate) enum WriteOutcome {
     Done,
     /// Something changed at the id between `read` and the write, which therefore wrote nothing.
     Raced,
+    /// The write found, before changing anything, that something at the id is not the daemon's to
+    /// replace, which `read` could not see: `install` ends with this refusal, and re-reads nothing.
+    Refused(crate::decide::Outcome),
 }
 
 /// What [`Backend::scan`] enumerated.

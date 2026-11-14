@@ -202,6 +202,7 @@ pub(crate) fn install<B: Backend>(
                     reservation,
                 )? {
                     WriteOutcome::Done => return Ok(outcome),
+                    WriteOutcome::Refused(refusal) => return Ok(refusal),
                     WriteOutcome::Raced => {}
                 }
             }

@@ -12,6 +12,12 @@
 //! - An update replaces the job and then the timer. A crash between them leaves job B beside timer A,
 //!   which regenerates from each artifact's own blob, so it is two unmodified artifacts, an `Update`
 //!   and not a `Conflict`.
+//! - An update to a definition with a timer, over an id that has none, creates the timer *first*: it
+//!   is neither reloaded nor enabled, so it starts nothing, and a name something else holds is
+//!   refused before the old job is disabled or replaced. A crash after it leaves a timer of goetia's
+//!   (a task's blob) beside the old job (a service's, or a task's that had no schedule): both marked,
+//!   so `read` reads the id as ours, regenerates each from its own blob, and the re-run is an `Update`
+//!   that finishes the retype.
 //! - A timer that is to go (a retype to a service, a schedule dropped) is disarmed and removed
 //!   *before* the job is replaced: the other order leaves a timer starting a job that is no longer a
 //!   task. A crash between them leaves a job and no timer, as above.
@@ -28,11 +34,13 @@ use std::sync::Arc;
 use crate::backend::systemd::generate::{self, Units};
 use crate::backend::{Decoded, InstalledService, WriteOutcome};
 use crate::blob::Blob;
+use crate::decide::{Outcome, foreign_recovery};
 use crate::error::{Error, Result};
 use crate::manager::flow::NOTHING_TO_ARM;
 use crate::manager::{Budget, DaemonStatus, Status, TaskStatus};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
+use super::discover::timer_is_foreign;
 use super::systemctl::Held;
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
 use super::{
@@ -177,6 +185,23 @@ impl Systemd {
             .expect("an id `decide` chose to update has a job: one without is unusable");
         let before = before_replacing(old, units, spec);
 
+        // A timer the id has none of yet is created first, with nothing else changed: it is not
+        // reloaded or enabled, so it cannot start the old job, and a name something else holds stops
+        // the update before the old job is disabled or replaced. A crash after it leaves a timer of
+        // goetia's beside the old job, which `read` reads as ours and a re-run finishes.
+        if let Some(timer) = &units.timer
+            && old.timer().is_none()
+            && let CreateOutcome::Raced = create_unit(id, UnitKind::Timer, timer)?
+        {
+            return Ok(if timer_is_foreign(id)? {
+                WriteOutcome::Refused(Outcome::RefuseForeign {
+                    recovery: foreign_recovery(id),
+                })
+            } else {
+                WriteOutcome::Raced
+            });
+        }
+
         if before.drop_timer {
             let old_timer = old.timer().expect("a timer to drop is installed");
             self.systemctl.disable_timer(id, held)?;
@@ -192,23 +217,17 @@ impl Systemd {
         if let ReplaceOutcome::Raced = replace_unit_verified(id, UnitKind::Service, &units.service, old_job)? {
             return Ok(WriteOutcome::Raced);
         }
-        if let Some(timer) = &units.timer {
-            let raced = match old.timer() {
-                Some(old_timer) => matches!(
-                    replace_unit_verified(id, UnitKind::Timer, timer, &old_timer.text)?,
-                    ReplaceOutcome::Raced
-                ),
-                None => matches!(create_unit(id, UnitKind::Timer, timer)?, CreateOutcome::Raced),
-            };
-            if raced {
-                return Ok(WriteOutcome::Raced);
-            }
+        if let Some(timer) = &units.timer
+            && let Some(old_timer) = old.timer()
+            && let ReplaceOutcome::Raced = replace_unit_verified(id, UnitKind::Timer, timer, &old_timer.text)?
+        {
+            return Ok(WriteOutcome::Raced);
         }
 
         // Only after the last write has committed: clearing a drop-in first would delete an admin's
         // overrides even on a path that turns out `Raced` and never writes anything.
         remove_dir_if_present(&dropin_dir(id, UnitKind::Service))?;
-        if units.timer.is_some() || old.timer().is_some() {
+        if units.timer.is_some() || old.owns_timer_slot() {
             remove_dir_if_present(&dropin_dir(id, UnitKind::Timer))?;
         }
         self.systemctl.daemon_reload_or_report(id, held)?;

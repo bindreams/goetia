@@ -396,6 +396,14 @@ fn classified(id: &str, raw: RawState, timer_path: &Path) -> ReadResult<ReadOutc
     })
 }
 
+/// Whether what is at `id`'s timer now is not goetia's: an answer for a write that found its create
+/// refused by something there, which is another install's timer or a stranger's.
+pub(super) fn timer_is_foreign(id: &str) -> Result<bool> {
+    classify_and_read(&unit_path(id, UnitKind::Timer))
+        .map(|raw| matches!(artifact(raw), Artifact::Foreign))
+        .map_err(|failure| failure.undetermined(id))
+}
+
 /// What `Backend::read` answers for `id`.
 pub(super) fn read(id: &Id) -> Result<ReadOutcome<Fragment>> {
     let id_str = id.as_str();
