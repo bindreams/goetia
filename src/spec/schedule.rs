@@ -403,7 +403,9 @@ fn check(parsed: &ParsedField, field: &CronField) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(test, target_os = "macos"))]
+// `not(doc)`: `rustdoc-tests.sh` documents the library with `--cfg test` but without dev-dependencies, and
+// `jiff` is one of them off macOS.
+#[cfg(any(all(test, not(doc)), target_os = "macos"))]
 mod next;
 
 #[cfg(test)]
