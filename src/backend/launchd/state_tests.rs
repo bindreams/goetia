@@ -195,7 +195,7 @@ fn any_other_state_is_not_a_job_being_torn_down() {
     assert!(!tearing_down("no state line at all\n"));
 }
 
-// A task's `print` =====================================================================================================
+// A task's `print` ====================================================================================================
 
 /// A `print` body of a task's job: the header, the `state` and, where the job holds a process, its
 /// `pid`, then `runs`, the result line (`result` is the whole line without its tab and newline) and
