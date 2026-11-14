@@ -139,15 +139,17 @@ fn begin_run_sends_the_start_and_then_follows_its_job_with_no_sync() {
 
     assert_eq!(
         *log.lock().unwrap(),
-        ["start", "follow UNIT=x.service JOB_ID=7"],
-        "the request, then the first follow"
+        ["tail", "start", "follow UNIT=x.service JOB_ID=7"],
+        "where the journal ends, the request, then the first follow"
     );
     assert_eq!(journal.syncs(), 0);
 }
 
 #[skuld::test]
 fn begin_run_parses_the_job_and_follows_its_starting_entry() {
-    let journal = JournalFake::new(Vec::new()).follows(vec![starting(7, "inv-1", "c1")]);
+    let journal = JournalFake::new(Vec::new())
+        .ends_at("c0")
+        .follows(vec![starting(7, "inv-1", "c1")]);
 
     let run = begin(&journal, &gate_then([start()])).expect("begin_run");
 
@@ -163,7 +165,12 @@ fn begin_run_parses_the_job_and_follows_its_starting_entry() {
     };
     assert_eq!(output.unit, "x.service");
     assert_eq!(output.invocation, "inv-1");
-    assert_eq!(output.cursor, Cursor::of("c1"));
+    assert_eq!(
+        output.cursor,
+        Some(Cursor::of("c0")),
+        "the output is read from where the journal ended before the request, not from the Starting entry"
+    );
+    assert_eq!(journal.tails(), 1);
 }
 
 /// A start that joined a run in flight finds that run's Starting entry, which was written before
@@ -263,14 +270,17 @@ fn a_journal_failure_after_the_request_is_in_doubt_and_reached() {
 fn a_reservation_that_cannot_be_made_sends_nothing() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let log = dir.path().join("job.log");
-    // A run with its output in the journal needs a file each for the follower that finds its start, the
-    // one that waits for its exit and the output's two, and the output's thread. One with a `logs` file
-    // needs the first two.
+    // A run with its output in the journal needs two files for the follower that finds its start and
+    // the read after it, one for the one that waits for its exit, the output's two, and a thread each
+    // for the start job and the output. One with a `logs` file needs the first three files and the
+    // start job's thread.
     for (what, spec, files_allowed, threads_allowed) in [
         ("no file", task_spec("x", "/bin/a", None), 0, 9),
-        ("three of four files", task_spec("x", "/bin/a", None), 3, 9),
+        ("four of five files", task_spec("x", "/bin/a", None), 4, 9),
         ("no thread", task_spec("x", "/bin/a", None), 9, 0),
-        ("one of two files, with logs", logged_task(&log), 1, 9),
+        ("one of two threads", task_spec("x", "/bin/a", None), 9, 1),
+        ("two of three files, with logs", logged_task(&log), 2, 9),
+        ("no thread, with logs", logged_task(&log), 9, 0),
     ] {
         let _files = files::temp_files(files_allowed);
         let _threads = threads::threads(threads_allowed);
@@ -287,8 +297,8 @@ fn a_reservation_that_cannot_be_made_sends_nothing() {
     }
 
     for (what, spec, files_allowed, threads_allowed) in [
-        ("journal output", task_spec("x", "/bin/a", None), 4, 1),
-        ("logs", logged_task(&log), 2, 0),
+        ("journal output", task_spec("x", "/bin/a", None), 5, 2),
+        ("logs", logged_task(&log), 3, 1),
     ] {
         let _files = files::temp_files(files_allowed);
         let _threads = threads::threads(threads_allowed);
@@ -345,6 +355,11 @@ fn the_log_offset_is_measured_before_the_request() {
 
     assert_eq!(log_source(&run), (path.clone(), earlier));
     assert!(std::fs::metadata(&path).unwrap().len() > earlier, "the request wrote");
+    assert_eq!(
+        journal.tails(),
+        0,
+        "a run whose output is a file needs no tail of the journal"
+    );
 }
 
 #[skuld::test]
@@ -550,6 +565,196 @@ fn a_wait_whose_journal_cannot_be_followed_lost_track_of_the_run() {
     assert!(e.report().to_string().contains("no journal"), "{e}");
 }
 
+// The start job's end -------------------------------------------------------------------------------------------------
+
+/// The reply of `systemctl list-jobs --no-legend` when the manager holds no job.
+fn no_jobs() -> Reply {
+    reply(&["list-jobs"], exited(0, "", ""))
+}
+
+/// The reply when the manager still holds job 7, queued behind another.
+fn job_7_waits() -> Reply {
+    reply(
+        &["list-jobs"],
+        exited(0, "7 x.service start waiting\n3 y.service start running\n", ""),
+    )
+}
+
+fn the_job() -> Vec<String> {
+    call(&["UNIT=x.service", "JOB_ID=7"])
+}
+
+/// A start job canceled before it ran (a `stop` racing the request) writes no Starting entry and no
+/// result: its end is that the manager no longer holds it. The follower is ended, the journal synced
+/// and read once more, and a job with nothing in it was canceled.
+#[skuld::test]
+fn a_start_job_canceled_before_it_ran_is_a_run_that_did_not_start() {
+    let journal = JournalFake::new(Vec::new()).follows(Vec::new()).then_reads(Vec::new());
+
+    let e = begin(&journal, &gate_then([start(), no_jobs()]))
+        .err()
+        .expect("no run began");
+
+    let Error::RunNotStarted { id, reason } = &e else {
+        panic!("{e:?}")
+    };
+    assert_eq!(id, "x");
+    assert!(reason.contains("canceled"), "{reason}");
+    assert!(!e.is_indeterminate());
+    assert_eq!(journal.stops(), 1, "the follower was ended");
+    assert_eq!(journal.syncs(), 1, "what was written before the job ended is stored");
+    assert_eq!(
+        journal.read_after_calls(),
+        [(the_job(), None)],
+        "the job's entries, once more"
+    );
+}
+
+/// The manager's job is gone before journald has stored the Starting entry: the read after the sync
+/// finds it, and the run is followed.
+#[skuld::test]
+fn a_starting_entry_that_was_not_stored_yet_when_the_job_ended_is_found_after_the_sync() {
+    let journal = JournalFake::new(Vec::new())
+        .follows(Vec::new())
+        .then_reads(vec![starting(7, "inv", "c1")]);
+
+    let run = begin(&journal, &gate_then([start(), no_jobs()])).expect("the run began");
+
+    assert_eq!(run.invocation, "inv");
+    assert_eq!(run.start, Cursor::of("c1"));
+}
+
+/// The same for the end of a job that never began a run, whose entry was not stored yet.
+#[skuld::test]
+fn a_job_result_that_was_not_stored_yet_when_the_job_ended_is_the_reason() {
+    let journal = JournalFake::new(Vec::new())
+        .follows(Vec::new())
+        .then_reads(vec![job_ended(7, "prev", "dependency")]);
+
+    let e = begin(&journal, &gate_then([start(), no_jobs()]))
+        .err()
+        .expect("no run began");
+
+    assert!(
+        matches!(&e, Error::RunNotStarted { reason, .. } if reason.contains("dependency")),
+        "{e:?}"
+    );
+}
+
+/// A job the manager still holds is looked for again, until it is gone.
+#[skuld::test]
+fn a_job_that_is_still_queued_is_looked_for_again() {
+    let journal = JournalFake::new(Vec::new()).follows(Vec::new()).then_reads(Vec::new());
+    let client = gate_then([start(), job_7_waits(), job_7_waits(), no_jobs()]);
+
+    let e = begin(&journal, &client).err().expect("no run began");
+
+    assert!(matches!(e, Error::RunNotStarted { .. }), "{e:?}");
+    assert_eq!(
+        client.calls().len(),
+        2 + 1 + 3,
+        "the gate's two probes, the start, three looks: {:?}",
+        client.calls()
+    );
+}
+
+/// A look at the jobs that fails does not say the job ended or did not: the run may have happened.
+#[skuld::test]
+fn a_look_at_the_jobs_that_fails_is_in_doubt() {
+    let journal = JournalFake::new(Vec::new()).follows(Vec::new());
+    let failing = reply(&["list-jobs"], exited(1, "", "Failed to list jobs: boom\n"));
+
+    let e = begin(&journal, &gate_then([start(), failing]))
+        .err()
+        .expect("the job is not known to have ended");
+
+    assert!(matches!(e, Error::RequestInDoubt { reached: true, .. }), "{e:?}");
+    assert_eq!(journal.syncs(), 0);
+}
+
+/// Entries of the job that arrive first end the search: the watcher is never asked, and has let go of the
+/// follower when `begin_run` returns.
+#[skuld::test]
+fn a_starting_entry_that_comes_first_asks_nothing_of_the_manager() {
+    let journal = JournalFake::new(Vec::new()).follows(vec![starting(7, "inv", "c1")]);
+    let client = gate_then([start()]);
+
+    begin(&journal, &client).expect("begin_run");
+
+    assert_eq!(journal.stops(), 0);
+    assert_eq!(
+        client.calls().len(),
+        2 + 1,
+        "the gate's two probes and the start: {:?}",
+        client.calls()
+    );
+}
+
+// Output before the Starting entry ------------------------------------------------------------------------------------
+
+/// PID 1 spawns the process before it logs Starting, so the marker can be journalled first. The output
+/// is read from where the journal ended before the request, and a marker before the Starting entry is
+/// found.
+#[skuld::test]
+fn a_marker_journalled_before_the_starting_entry_is_found() {
+    let journal = JournalFake::new(Vec::new())
+        .ends_at("c0")
+        .follows(vec![starting(7, "inv", "c5")])
+        .follows(vec![marker("c3", "s1", "inv"), line("c4", "s1", "out")])
+        .then_reads(Vec::new());
+    let run = begun(&journal);
+    let OutputSource::Journal(output) = run.output() else {
+        panic!("the output is in the journal")
+    };
+    let (end, ended) = crossbeam_channel::bounded::<()>(0);
+    drop(end);
+    let mut out = Vec::new();
+
+    output
+        .stream(&mut out, &ended, &AtomicBool::new(true))
+        .expect("the stream");
+
+    assert_eq!(String::from_utf8(out).unwrap(), "out\n");
+    assert_eq!(
+        journal.followed()[1],
+        (stdout_query("x.service"), Some("c0".to_string())),
+        "the unit's lines after where the journal ended before the request"
+    );
+}
+
+/// A journal with no entry yet is followed from its start.
+#[skuld::test]
+fn an_empty_journal_is_followed_for_the_output_from_its_start() {
+    let journal = JournalFake::new(Vec::new())
+        .follows(vec![starting(7, "inv", "c5")])
+        .follows(vec![marker("c3", "s1", "inv")])
+        .then_reads(Vec::new());
+    let run = begun(&journal);
+    let OutputSource::Journal(output) = run.output() else {
+        panic!("the output is in the journal")
+    };
+    let (end, ended) = crossbeam_channel::bounded::<()>(0);
+    drop(end);
+
+    output
+        .stream(&mut Vec::new(), &ended, &AtomicBool::new(true))
+        .expect("the stream");
+
+    assert_eq!(journal.followed()[1], (stdout_query("x.service"), None));
+}
+
+/// Where the journal ends is read before the request, so a journal that cannot be asked sends nothing.
+#[skuld::test]
+fn a_journal_that_cannot_say_where_it_ends_sends_nothing() {
+    let journal = JournalFake::new(Vec::new()).tail_fails();
+    let client = gate_then([]);
+
+    let e = begin(&journal, &client).err().expect("nothing was sent");
+
+    assert!(!matches!(e, Error::RequestInDoubt { .. }), "{e:?}");
+    assert!(client.calls().is_empty(), "{:?}", client.calls());
+}
+
 // stream ==============================================================================================================
 
 /// The output of the run of invocation `inv` that began at cursor `c1`, over `journal`.
@@ -557,7 +762,7 @@ fn output_over(journal: Arc<dyn Journal>) -> JournalOutput {
     JournalOutput {
         unit: "x.service".to_string(),
         invocation: "inv".to_string(),
-        cursor: Cursor::of("c1"),
+        cursor: Some(Cursor::of("c1")),
         journal,
         // What `begin_run` made: a file for the follower and one for the read after it.
         draws: Reservation::make(0, 2).expect("temp files"),
@@ -607,8 +812,6 @@ fn a_watcher_that_cannot_be_handed_its_share_is_an_error_and_the_read_does_not_b
     assert_eq!(out, b"");
 }
 
-/// The run's output is the lines of the marker's stream, the marker not among them, and another
-/// stream's lines are never shown, whether they come first or between the run's own.
 /// The manager's entries (a run's Starting entry, its exit) are read from the system journal alone.
 #[skuld::test]
 fn the_starting_entry_and_the_exit_are_read_in_the_manager_scope() {
@@ -686,6 +889,8 @@ fn the_lines_read_after_the_end_keep_their_line_breaks() {
     assert_eq!(String::from_utf8(out).unwrap(), "head\ntail");
 }
 
+/// The run's output is the lines of the marker's stream, the marker not among them, and another
+/// stream's lines are never shown, whether they come first or between the run's own.
 #[skuld::test]
 fn output_is_the_lines_of_the_markers_stream_minus_the_marker() {
     let journal = JournalFake::new(Vec::new())
@@ -709,7 +914,7 @@ fn output_is_the_lines_of_the_markers_stream_minus_the_marker() {
     );
     assert_eq!(
         journal.read_after_calls(),
-        [(call(&["_STREAM_ID=s1"]), "c6".to_string())],
+        [(call(&["_STREAM_ID=s1"]), Some("c6".to_string()))],
         "what is left is read from the stream, after the stream's last line shown"
     );
 }
@@ -779,8 +984,8 @@ fn a_marker_the_follower_did_not_deliver_is_found_by_the_final_read() {
     assert_eq!(String::from_utf8(out).unwrap(), "a\nb\n");
     assert_eq!(
         journal.read_after_calls(),
-        [(stdout_query("x.service"), "c1".to_string())],
-        "with no marker found, the unit's lines after the Starting entry"
+        [(stdout_query("x.service"), Some("c1".to_string()))],
+        "with no marker found, the unit's lines after where the output began"
     );
     assert_eq!(
         log.lock().unwrap().iter().map(String::as_str).collect::<Vec<_>>(),

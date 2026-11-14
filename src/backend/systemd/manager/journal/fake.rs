@@ -20,11 +20,14 @@ struct State {
     /// One per `read_after`, consumed in order.
     after: VecDeque<Vec<Entry>>,
     followed: Vec<(Vec<String>, Option<String>)>,
-    read_after: Vec<(Vec<String>, String)>,
+    read_after: Vec<(Vec<String>, Option<String>)>,
     /// The scope of every `follow` and `read_after`, in the order they were asked.
     scopes: Vec<(&'static str, Scope)>,
     syncs: usize,
     stops: usize,
+    /// The cursor `tail` answers, and how many times it was asked.
+    tail: Option<String>,
+    tails: usize,
 }
 
 /// What one follower delivers.
@@ -38,8 +41,10 @@ struct Script {
 #[derive(Clone)]
 pub(in crate::backend::systemd::manager) struct Fake {
     entries: Vec<Entry>,
-    /// Every query fails, before any entry.
+    /// Every follow and read fails, before any entry; `tail` still answers.
     unreadable: bool,
+    /// `tail` fails.
+    tail_fails: bool,
     /// The read fails after the entries.
     then_fails: bool,
     sync_fails: bool,
@@ -52,6 +57,7 @@ impl Fake {
         Fake {
             entries,
             unreadable: false,
+            tail_fails: false,
             then_fails: false,
             sync_fails: false,
             state: Arc::default(),
@@ -65,6 +71,12 @@ impl Fake {
             unreadable: true,
             ..Fake::new(Vec::new())
         }
+    }
+
+    /// A journal whose `tail` fails.
+    pub(in crate::backend::systemd::manager) fn tail_fails(mut self) -> Fake {
+        self.tail_fails = true;
+        self
     }
 
     /// A journal whose read fails once it has given every entry.
@@ -123,7 +135,7 @@ impl Fake {
     }
 
     /// The matches and the cursor of every `read_after` so far.
-    pub(in crate::backend::systemd::manager) fn read_after_calls(&self) -> Vec<(Vec<String>, String)> {
+    pub(in crate::backend::systemd::manager) fn read_after_calls(&self) -> Vec<(Vec<String>, Option<String>)> {
         self.state.lock().unwrap().read_after.clone()
     }
 
@@ -134,6 +146,17 @@ impl Fake {
 
     pub(in crate::backend::systemd::manager) fn syncs(&self) -> usize {
         self.state.lock().unwrap().syncs
+    }
+
+    /// The cursor `tail` answers (the journal has none before this).
+    pub(in crate::backend::systemd::manager) fn ends_at(self, cursor: &str) -> Fake {
+        self.state.lock().unwrap().tail = Some(cursor.to_string());
+        self
+    }
+
+    /// How many times `tail` was asked.
+    pub(in crate::backend::systemd::manager) fn tails(&self) -> usize {
+        self.state.lock().unwrap().tails
     }
 
     /// How many followers have been stopped.
@@ -212,21 +235,30 @@ impl Journal for Fake {
         &self,
         scope: Scope,
         matches: &[Match],
-        cursor: &Cursor,
+        cursor: Option<&Cursor>,
         draws: &mut Reservation,
     ) -> Result<Vec<Entry>> {
         Fake::draw(draws)?;
         self.state.lock().unwrap().scopes.push(("read_after", scope));
         self.record("read_after".to_string());
-        self.state
-            .lock()
-            .unwrap()
-            .read_after
-            .push((Fake::arguments(matches), cursor.as_str().to_string()));
+        self.state.lock().unwrap().read_after.push((
+            Fake::arguments(matches),
+            cursor.map(|cursor| cursor.as_str().to_string()),
+        ));
         if self.unreadable {
             return Err(Fake::unread());
         }
         Ok(self.state.lock().unwrap().after.pop_front().unwrap_or_default())
+    }
+
+    fn tail(&self) -> Result<Option<Cursor>> {
+        self.record("tail".to_string());
+        let mut state = self.state.lock().unwrap();
+        state.tails += 1;
+        if self.tail_fails {
+            return Err(Fake::unread());
+        }
+        Ok(state.tail.as_deref().map(Cursor::of))
     }
 
     fn sync(&self) -> Result<()> {

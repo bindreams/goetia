@@ -456,7 +456,7 @@ fn every_query_passes_dash_a() {
             "read after a cursor",
             args_of(
                 journal
-                    .read_after(Scope::Manager, &unit, &cursor, &mut one())
+                    .read_after(Scope::Manager, &unit, Some(&cursor), &mut one())
                     .expect("read_after"),
             ),
         ),
@@ -529,12 +529,52 @@ fn only_the_managers_queries_read_the_system_journal_alone_and_from_pid_1() {
         assert_eq!(has(&follow, "_PID=1"), manager, "follow {scope:?}: {follow}");
         let read = args_of(
             journal
-                .read_after(scope, &unit, &cursor, &mut one())
+                .read_after(scope, &unit, Some(&cursor), &mut one())
                 .expect("read_after"),
         );
         assert_eq!(has(&read, "--system"), manager, "read_after {scope:?}: {read}");
         assert_eq!(has(&read, "_PID=1"), manager, "read_after {scope:?}: {read}");
     }
+}
+
+/// With no cursor a read starts at the start of the journal, and of the boot for a query on a job
+/// number, which restarts with each boot.
+#[skuld::test]
+fn a_read_after_no_cursor_starts_at_the_start_and_binds_a_job_to_the_boot() {
+    let journal = sh(ECHO);
+    let job = [Match::new("UNIT", "x.service"), Match::new("JOB_ID", "7")];
+
+    let of_a_job = args_of(
+        journal
+            .read_after(Scope::Manager, &job, None, &mut one())
+            .expect("read_after"),
+    );
+    let of_a_unit = args_of(
+        journal
+            .read_after(Scope::Output, &job[..1], None, &mut one())
+            .expect("read_after"),
+    );
+
+    assert_eq!(
+        of_a_job,
+        "-a -o json --no-pager --system -b UNIT=x.service JOB_ID=7 _PID=1"
+    );
+    assert_eq!(of_a_unit, "-a -o json --no-pager UNIT=x.service");
+}
+
+/// Where the journal ends is the cursor of its newest entry, in every journal the reader may open; a
+/// journal with no entry has none.
+#[skuld::test]
+fn the_tail_is_the_newest_entrys_cursor_and_an_empty_journal_has_none() {
+    let asked = sh(r#"printf '{"__CURSOR":"%s"}\n' "$*""#).tail().expect("tail");
+    assert_eq!(
+        asked.as_ref().map(Cursor::as_str),
+        Some("-a -o json --no-pager -n 1"),
+        "the newest entry, with nothing that limits it to the system journal"
+    );
+
+    assert_eq!(sh("exit 0").tail().expect("tail"), None);
+    assert!(sh("echo unreadable >&2; exit 1").tail().is_err());
 }
 
 #[skuld::test]
@@ -547,7 +587,7 @@ fn a_read_after_a_cursor_asks_for_every_match() {
 
     let args = args_of(
         journal
-            .read_after(Scope::Output, &matches, &Cursor::of("c"), &mut one())
+            .read_after(Scope::Output, &matches, Some(&Cursor::of("c")), &mut one())
             .expect("read_after"),
     );
 
@@ -561,13 +601,13 @@ fn a_read_after_a_cursor_asks_for_every_match() {
 fn a_read_after_discards_a_partial_trailing_line_and_fails_with_journalctls_words() {
     let journal = sh(r##"printf '{"N":"1"}\n{"N":'"##);
     let all = journal
-        .read_after(Scope::Manager, &[], &Cursor::of("c"), &mut one())
+        .read_after(Scope::Manager, &[], Some(&Cursor::of("c")), &mut one())
         .expect("read_after");
     assert_eq!(all.len(), 1);
 
     let journal = sh(r#"echo "Failed to seek" >&2; exit 1"#);
     let e = journal
-        .read_after(Scope::Manager, &[], &Cursor::of("c"), &mut one())
+        .read_after(Scope::Manager, &[], Some(&Cursor::of("c")), &mut one())
         .expect_err("it failed");
     assert!(e.report().to_string().contains("Failed to seek"), "{e}");
 }
@@ -586,7 +626,7 @@ fn a_message_of_4088_bytes_arrives_whole() {
     let journal = sh(r#"printf '{"MESSAGE":"'; head -c 4088 /dev/zero | tr '\0' x; printf '"}\n'"#);
 
     let all = journal
-        .read_after(Scope::Manager, &[], &Cursor::of("c"), &mut one())
+        .read_after(Scope::Manager, &[], Some(&Cursor::of("c")), &mut one())
         .expect("read_after");
 
     assert_eq!(all[0].bytes("MESSAGE").map(<[u8]>::len), Some(4088));

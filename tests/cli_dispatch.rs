@@ -4782,6 +4782,7 @@ fn run_of_a_service_says_not_a_task_exit_1() {
         err,
         "error: frpc: `frpc` is a service, not a task: `run` applies only to a task\n"
     );
+    assert!(!began_a_run(&fake));
 }
 
 #[skuld::test]
@@ -4794,6 +4795,7 @@ fn run_of_a_running_task_exits_1_and_names_stop() {
 
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("goetia daemon stop nightly"), "{err}");
+    assert!(!began_a_run(&fake));
 }
 
 #[skuld::test]
@@ -4805,6 +4807,7 @@ fn run_of_an_unknown_state_exits_4() {
     let (code, _out, err) = dispatch_elevated(&["goetia", "daemon", "run", "nightly"], &fake);
 
     assert_eq!(code, 4, "{err}");
+    assert!(!began_a_run(&fake));
 }
 
 #[skuld::test]

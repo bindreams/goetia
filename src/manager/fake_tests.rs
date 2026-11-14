@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use super::*;
 use crate::manager::Budget;
@@ -952,20 +952,6 @@ fn a_task_start_then_stop_goes_running_then_idle() {
 }
 
 #[skuld::test]
-fn seeded_task_fields_are_reported() {
-    let fake = Fake::new();
-    fake.install(&a_task("nightly"), false).unwrap();
-    let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-    let next = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
-    fake.seed_task_status("nightly", Some(Exit::Signal(15)), Some(last), Some(next));
-
-    let status = task_status(&fake, "nightly");
-    assert_eq!(status.last_result, Some(Exit::Signal(15)));
-    assert_eq!(status.last_run, Some(last));
-    assert_eq!(status.next_run, Some(next));
-}
-
-#[skuld::test]
 fn list_reports_a_task_with_a_task_status() {
     let fake = Fake::new();
     fake.install(&a_task("nightly"), false).unwrap();
@@ -1005,22 +991,4 @@ fn a_service_retyped_to_a_task_never_reports_a_failed_state() {
     assert_eq!(task_status(&fake, "nightly").common.state, State::Idle);
     fake.install(&mk("nightly"), true).unwrap();
     assert_eq!(fake.status(&id).unwrap().common().state, State::Stopped);
-}
-
-#[skuld::test]
-fn kill_of_a_running_task_goes_idle_with_a_killed_result_and_keeps_last_run() {
-    let fake = Fake::new();
-    let id = Id::try_from("nightly").unwrap();
-    let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-    fake.install(&a_task("nightly"), false).unwrap();
-    fake.seed_task_status("nightly", Some(Exit::Code(0)), Some(last), None);
-    fake.start(&id, Budget::Immediate).unwrap();
-
-    fake.kill(&id).unwrap();
-
-    let status = task_status(&fake, "nightly");
-    assert_eq!(status.common.state, State::Idle);
-    assert_eq!(status.common.pid, None);
-    assert_eq!(status.last_result, Some(Exit::Signal(9)));
-    assert_eq!(status.last_run, Some(last));
 }

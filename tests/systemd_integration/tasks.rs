@@ -339,10 +339,12 @@ fn a_listed_task_reports_a_task_status(#[fixture(systemd_group)] _group: &Group)
     assert_eq!(status.common.state, State::Idle);
 }
 
-/// `next_run` is the cron's own next minute, whatever the schedule's shape: both day fields set (OR),
-/// steps, Sunday as 0 and as 7, lists.
+/// The `OnCalendar` goetia renders fires at the fields the schedule resolves to: `next_run` is the
+/// oracle's next minute for each shape (both day fields set (OR), steps, Sunday as 0 and as 7, lists).
+/// The oracle shares goetia's parser, so this checks the rendering and systemd's reading of it, not the
+/// parsing.
 #[skuld::test]
-fn next_run_agrees_with_the_cron(#[fixture(systemd_group)] _group: &Group) {
+fn the_rendered_on_calendar_fires_at_the_resolved_fields(#[fixture(systemd_group)] _group: &Group) {
     let mgr = Systemd::new();
     for text in [
         "*/7 * * * *",
@@ -755,6 +757,56 @@ fn run_shows_the_programs_own_line_ends(#[fixture(systemd_group)] _group: &Group
     assert_eq!(exit, Exit::Code(0));
     let expected = format!("{}\na\nlast", "x".repeat(60000));
     assert_eq!(String::from_utf8_lossy(&out), expected);
+}
+
+/// A start job queued behind another unit's and canceled before it runs (a `stop` racing the request)
+/// writes no journal entry, so `run` learns of its end from the manager no longer holding it, and says
+/// the task did not run.
+#[skuld::test]
+fn run_of_a_start_job_canceled_before_it_ran_is_a_run_that_did_not_start(#[fixture(systemd_group)] _group: &Group) {
+    let blocker_id = support::random_test_id();
+    let _blocker_guard = ServiceGuard::new(&blocker_id);
+    let id = support::random_test_id();
+    let _guard = ServiceGuard::new(&id);
+    let task_id = id_of(&id);
+    let mut held = Held::new();
+    let mgr = Systemd::new();
+    mgr.install(&task(&blocker_id, held.command.clone(), None), false)
+        .expect("install the blocker");
+    mgr.install(&task(&id, vec!["/bin/true".to_string()], None), false)
+        .expect("install");
+    // The task's job is ordered after the blocker's, so its start job waits while the blocker runs.
+    // The guard removes the `.d` directory with the unit.
+    let dropin = Path::new(support::SYSTEMD_UNIT_DIR).join(format!("{}.d", unit_of(&id)));
+    fs::create_dir(&dropin).expect("the drop-in directory");
+    fs::write(
+        dropin.join("after.conf"),
+        format!("[Unit]\nAfter={}\n", unit_of(&blocker_id)),
+    )
+    .expect("the drop-in");
+    cmd::run("systemctl", &["daemon-reload"]).expect_ok();
+    mgr.start(&id_of(&blocker_id), Budget::DEFAULT)
+        .expect("start the blocker");
+    held.wait_started();
+    let _release = StopOnDrop(unit_of(&blocker_id));
+
+    let result = std::thread::scope(|scope| {
+        let running = scope.spawn(|| mgr.run(&task_id, &mut Vec::new()));
+        // The job is queued once the manager lists it; then it is canceled.
+        kill::until(|| {
+            cmd::run("systemctl", &["list-jobs", "--no-legend"])
+                .stdout
+                .lines()
+                .any(|job| job.contains(&unit_of(&id)))
+        });
+        cmd::run("systemctl", &["stop", &unit_of(&id)]).expect_ok();
+        running.join().expect("the run did not panic")
+    });
+
+    let e = result.expect_err("the job was canceled");
+    assert!(matches!(e, Error::RunNotStarted { .. }), "{}", e.report());
+    assert!(e.report().to_string().contains("canceled"), "{}", e.report());
+    held.release();
 }
 
 /// Every line of a run that prints a great deal arrives, in order, run after run: the terminal entry

@@ -108,7 +108,8 @@ const UNIT_DIR: &str = "/etc/systemd/system";
 /// how it reaches `systemctl`, `busctl` and the journal: every operation re-derives what it needs from
 /// the filesystem and the manager, so nothing here can go stale between calls.
 pub struct Systemd {
-    systemctl: Systemctl,
+    /// Shared with the thread that watches a run's start job.
+    systemctl: Arc<Systemctl>,
     /// For when a task's timer elapses next, which `systemctl show` cannot say to the microsecond.
     busctl: Busctl,
     /// For a task's last run and its result.
@@ -124,7 +125,7 @@ impl Systemd {
     /// the real `busctl` and journal.
     pub(crate) fn with(systemctl: Systemctl) -> Self {
         Self {
-            systemctl,
+            systemctl: Arc::new(systemctl),
             busctl: Busctl::native(),
             journal: Arc::new(Journalctl::native()),
         }
@@ -134,7 +135,7 @@ impl Systemd {
     #[cfg(test)]
     fn with_seams(systemctl: Systemctl, busctl: Busctl, journal: Arc<dyn Journal>) -> Self {
         Self {
-            systemctl,
+            systemctl: Arc::new(systemctl),
             busctl,
             journal,
         }

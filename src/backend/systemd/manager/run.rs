@@ -1,27 +1,24 @@
 //! A task's run, followed through the system journal: the run its start request produced, what it
 //! wrote and how it ended.
 //!
-//! The measured facts it rests on are in the knowledge base ("A start request's job number leads to
-//! its run's invocation, output and exit in the journal", "A run's terminal journal entry precedes
-//! most of its output when it prints a lot", "Output of a fast-exiting run can lack
-//! _SYSTEMD_INVOCATION_ID", "A start refused by the start limit has no Starting entry", "A marker
-//! line printed by sh before exec shares one _STREAM_ID with the exec'd program's stdout lines", "The
-//! INVOCATION_ID that sh prints in a marker line equals the INVOCATION_ID of the run's Starting
-//! entry"). In short:
+//! The facts it rests on were measured (see the knowledge base). In short:
 //!
 //! - The start request's job number finds the run: the "Starting" entry with that `JOB_ID` has its
 //!   `INVOCATION_ID` and cursor. A job that ends with no Starting entry never began a run, and its
-//!   entries carry the *previous* run's invocation, which is never used.
+//!   entries carry the *previous* run's invocation, which is never used. A job canceled before it ran
+//!   writes no entry at all: its end is that the manager no longer holds it (`systemctl list-jobs`),
+//!   looked for while the entries are followed; `busctl` cannot hear the manager's `JobRemoved`, which
+//!   is sent only to a client that subscribed.
 //! - The exit is the first terminal entry ([`ending_of`]) of that invocation after the cursor. One that
 //!   is "Failed with result" with no exit before it is a run whose exit is not established
 //!   ([`Error::RunUnrecorded`]).
 //! - Output is the run's stream. A task's `sh` wrapper prints `goetia-run <INVOCATION_ID>` first
 //!   (`RUN_MARKER`), and that line and every line of the program share one `_STREAM_ID`, which no
 //!   other run's lines carry, and which every stdout line has (`_SYSTEMD_INVOCATION_ID` is missing
-//!   from a fast run's lines, so it selects nothing). The unit's stdout lines after the Starting
-//!   entry are followed for the marker, and the lines of its stream are the output; the marker is
-//!   not shown. Nothing bounds the read at the next run's Starting entry: a run's lines can land
-//!   after it.
+//!   from a fast run's lines, so it selects nothing). The unit's stdout lines after where the journal
+//!   ended before the request are followed for the marker (PID 1 can journal it before the Starting
+//!   entry), and the lines of its stream are the output; the marker is not shown. Nothing bounds the
+//!   read at the next run's Starting entry: a run's lines can land after it.
 //! - The terminal entry can precede most of a chatty run's output, so once the run has ended the
 //!   output's follower is stopped, the journal is synced, and the rest of the stream is read.
 //! - journald's rate limit can drop the marker. Then, and only after the terminal entry, the sync
@@ -37,11 +34,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use super::journal::{Cursor, Ending, Entry, Follower, Journal, Match, STARTING, Scope, Stop, ending_of, lacks};
-use super::systemctl::Held;
+use super::systemctl::{Held, Systemctl};
 use super::task::Fragment;
 use super::{Systemd, UnitKind, unit_name};
 use crate::backend::bounded::Reservation;
@@ -58,13 +56,14 @@ impl Systemd {
     /// Requests a run of the task `snapshot` is and finds it in the journal.
     ///
     /// In this order: what the run will need once the request is sent is made ([`Spares`]); the
-    /// length of the task's `logs` file is measured, if it has one; the request is sent; and the run
-    /// is found by the job number the request announced. A failure before the request is
-    /// sent is its own error and sends nothing. After it, every failure is [`Error::RequestInDoubt`]
-    /// with `reached`, except the determinate [`Error::RunNotStarted`] of a job that ended before any
-    /// run began.
+    /// length of the task's `logs` file is measured, if it has one, and the cursor where the journal
+    /// ends; the request is sent; and the run is found by the job number the request announced. A
+    /// failure before the request is sent is its own error and sends nothing. After it, every failure
+    /// is [`Error::RequestInDoubt`] with `reached`, except the determinate [`Error::RunNotStarted`] of
+    /// a job that ended before any run began, whether its end is in the journal or is that the
+    /// manager no longer holds it.
     ///
-    /// This is the stated contract (not guarded): On systemd, `goetia daemon run` finds its run, the
+    /// On systemd, `goetia daemon run` finds its run, the
     /// run's output and its exit in the system journal. On a host whose journal does not keep the
     /// service manager's messages (`Storage=none`, or `MaxLevelStore=` below `info`), it waits until
     /// interrupted; the run itself still happens. There, `status` shows state and next run but not
@@ -82,15 +81,28 @@ impl Systemd {
             }
             None => None,
         };
+        // Where the journal ends before the request: what the run writes is after it. Its marker is
+        // too, though PID 1 can journal it before the Starting entry. A run whose output is in a file
+        // has no use for it.
+        let output_from = match logs {
+            Some(_) => None,
+            None => self.journal.tail()?,
+        };
         let job = self.systemctl.start_job(id.as_str(), reservation)?;
 
-        let (invocation, start) = find_start(self.journal.as_ref(), &id, &unit, job, &mut spares.start)
-            .map_err(|e| after_the_request(&unit, e))?;
+        let ending = JobEnding {
+            draws: &mut spares.start,
+            watcher: spares.job,
+            systemctl: Arc::clone(&self.systemctl),
+        };
+        let (invocation, start) =
+            find_start(self.journal.as_ref(), &id, &unit, job, ending).map_err(|e| after_the_request(&unit, e))?;
         Ok(Run {
             id,
             unit,
             invocation,
             start,
+            output_from,
             logs,
             draws: spares.exit,
             output: Cell::new(spares.output),
@@ -101,17 +113,16 @@ impl Systemd {
 
 // Spares ==============================================================================================================
 
-/// What a run needs once its request is sent, made before it is: a request whose follow-up could not
-/// be made must not be sent. A `journalctl` child cannot be made ahead and is spawned afterwards (its
-/// failure is [`Error::RequestInDoubt`]); the temp file each one writes its diagnostics to, and the
-/// thread that ends the output's follower, can be.
-///
-/// `Held` is not where they come from: `flow::run` reserves for [`Step::Start`](crate::manager::Step),
-/// which draws nothing for a journal to follow, so `begin_run` makes these itself with the facilities
-/// `Held` is made of: [`Reservation::make`] for the temp files and [`Standby`] for the thread.
+/// Made by `begin_run` itself, not drawn from `Held`: `Step::Start` reserves nothing for a journal.
+/// What a run needs once its request is sent is made before it, since a request whose follow-up could
+/// not be made must not be sent: the temp files each `journalctl` writes its diagnostics to, and the
+/// threads that end a follower. A `journalctl` child cannot be made ahead and is spawned afterwards
+/// (its failure is [`Error::RequestInDoubt`]).
 struct Spares {
-    /// For the follower that finds the run's Starting entry.
+    /// For the follower that finds the run's Starting entry and the read after it.
     start: Reservation,
+    /// The thread that ends that follower when the start job is gone.
+    job: Standby<JobWatch>,
     /// For the follower that waits for the run's terminal entry.
     exit: Reservation,
     /// For a run whose output is in the journal, which is one with no `logs` file.
@@ -133,7 +144,8 @@ impl Spares {
             source,
         };
         Ok(Spares {
-            start: Reservation::make(0, 1).map_err(failed)?,
+            start: Reservation::make(0, 2).map_err(failed)?,
+            job: Standby::new("goetia run start job", watch_job).map_err(failed)?,
             exit: Reservation::make(0, 1).map_err(failed)?,
             output: if journal_output {
                 Some(OutputSpares {
@@ -145,6 +157,51 @@ impl Spares {
             },
         })
     }
+}
+
+/// How often the start job is looked for while the Starting entry has not come. Only the pace of a
+/// re-check of the real condition (whether the manager still holds the job): nothing is concluded
+/// from a period elapsing.
+const JOB_RECHECK: Duration = Duration::from_millis(100);
+
+/// What the thread that watches the start job is handed.
+struct JobWatch {
+    job: u64,
+    systemctl: Arc<Systemctl>,
+    /// Closed when the Starting entry or the end of the job has been found.
+    found: Receiver<()>,
+    stop: Stop,
+    /// Sent once, before `stop` is called: the job is gone (`Ok`), or it could not be looked for.
+    ended: Sender<Result<()>>,
+    /// Closed when the thread holds no more of the follower.
+    done: Sender<()>,
+}
+
+/// Ends the follower of the job's entries when the manager no longer holds the job, which a job
+/// canceled before it ran leaves no journal entry to say, or does nothing when the entries come first.
+fn watch_job(share: JobWatch) {
+    let JobWatch {
+        job,
+        systemctl,
+        found,
+        stop,
+        ended,
+        done,
+    } = share;
+    // Only a timeout is a turn to look: anything else is the caller having found what it wanted.
+    while let Err(RecvTimeoutError::Timeout) = found.recv_timeout(JOB_RECHECK) {
+        match systemctl.job_exists(job) {
+            Ok(true) => {}
+            gone_or_failed => {
+                // A buffered send of the answer, before the follower is told to end.
+                _ = ended.send(gone_or_failed.map(drop));
+                stop();
+                break;
+            }
+        }
+    }
+    drop(stop);
+    drop(done);
 }
 
 /// What the output's watcher thread is handed.
@@ -185,40 +242,110 @@ fn length(path: &Path) -> Result<u64> {
     }
 }
 
+/// What [`find_start`] needs to learn that the job ended with no entry of its own.
+struct JobEnding<'a> {
+    /// For the follower of the job's entries and the read after it.
+    draws: &'a mut Reservation,
+    watcher: Standby<JobWatch>,
+    systemctl: Arc<Systemctl>,
+}
+
+/// What an entry of the start job says: the invocation and cursor of the run it began (its Starting
+/// entry), or [`Error::RunNotStarted`] for the end of a job that never began one; `None` for any
+/// other.
+fn started_by(entry: &Entry, id: &Id) -> Result<Option<(String, Cursor)>> {
+    if entry.get("MESSAGE_ID") == Some(STARTING) {
+        let invocation = entry.get("INVOCATION_ID").ok_or_else(|| lacks("an invocation id"))?;
+        return Ok(Some((invocation.to_string(), entry.cursor()?)));
+    }
+    if let Some(result) = entry.get("JOB_RESULT") {
+        let message = entry
+            .bytes("MESSAGE")
+            .map(|message| format!(": {}", String::from_utf8_lossy(message)))
+            .unwrap_or_default();
+        return Err(Error::RunNotStarted {
+            id: id.to_string(),
+            reason: format!("systemd ended the start job as `{result}`{message}"),
+        });
+    }
+    Ok(None)
+}
+
 /// The invocation and cursor of the run job `job` of `unit` began, from the first entry of the job
 /// that says anything about it: its Starting entry, or the end of a job that never began a run.
-fn find_start(
-    journal: &dyn Journal,
-    id: &Id,
-    unit: &str,
-    job: u64,
-    draws: &mut Reservation,
-) -> Result<(String, Cursor)> {
-    let mut follower = journal.follow(
-        Scope::Manager,
-        &[Match::new("UNIT", unit), Match::new("JOB_ID", job.to_string())],
-        None,
+///
+/// A job canceled before it ran (by a `stop`, say) writes neither: its end is that the manager no
+/// longer holds it. The watcher thread looks for that while the entries are followed, and ends the
+/// follower when it is gone; the journal is then synced and read once more, since entries written
+/// before the job ended may not be stored yet, and a job with none after that was canceled.
+fn find_start(journal: &dyn Journal, id: &Id, unit: &str, job: u64, ending: JobEnding<'_>) -> Result<(String, Cursor)> {
+    let JobEnding {
         draws,
-    )?;
-    loop {
-        let Some(entry) = follower.next()? else {
-            return Err(lacks("the Starting entry of the run: the journal ended"));
-        };
-        if entry.get("MESSAGE_ID") == Some(STARTING) {
-            let invocation = entry.get("INVOCATION_ID").ok_or_else(|| lacks("an invocation id"))?;
-            return Ok((invocation.to_string(), entry.cursor()?));
-        }
-        if let Some(result) = entry.get("JOB_RESULT") {
-            let message = entry
-                .bytes("MESSAGE")
-                .map(|message| format!(": {}", String::from_utf8_lossy(message)))
-                .unwrap_or_default();
-            return Err(Error::RunNotStarted {
+        watcher,
+        systemctl,
+    } = ending;
+    let query = [Match::new("UNIT", unit), Match::new("JOB_ID", job.to_string())];
+    let mut follower = journal.follow(Scope::Manager, &query, None, draws)?;
+    let (found, searching) = crossbeam_channel::bounded::<()>(0);
+    let (ended, job_ended) = crossbeam_channel::bounded::<Result<()>>(1);
+    let (done, watcher_done) = crossbeam_channel::bounded::<()>(0);
+    // Nothing but the watcher can end the follower of a job that wrote nothing, so with no watcher
+    // there is no read.
+    if watcher
+        .hand(JobWatch {
+            job,
+            systemctl,
+            found: searching,
+            stop: follower.stop(),
+            ended,
+            done,
+        })
+        .is_err()
+    {
+        return Err(Error::os(
+            "follow the start job",
+            std::io::Error::other("the thread that looks for the job's end is gone"),
+        ));
+    }
+
+    let first = first_of_the_job(follower.as_mut(), id);
+    drop(found);
+    // Nothing is sent: the watcher closes this when it holds no more of the follower, so that the
+    // child is gone when the follower is dropped.
+    while watcher_done.recv().is_ok() {}
+    drop(follower);
+    if let Some(started) = first? {
+        return Ok(started);
+    }
+    match job_ended.try_recv() {
+        Ok(Ok(())) => {
+            journal.sync()?;
+            for entry in journal.read_after(Scope::Manager, &query, None, draws)? {
+                if let Some(started) = started_by(&entry, id)? {
+                    return Ok(started);
+                }
+            }
+            Err(Error::RunNotStarted {
                 id: id.to_string(),
-                reason: format!("systemd ended the start job as `{result}`{message}"),
-            });
+                reason:
+                    "systemd's start job ended and the journal has no entry of a run: it was canceled before it ran \
+                         (or the journal does not keep the manager's messages)"
+                        .to_string(),
+            })
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(lacks("the Starting entry of the run: the journal ended")),
+    }
+}
+
+/// The first entry of `follower` that [`started_by`] reads, or `None` when the follower ends first.
+fn first_of_the_job(follower: &mut dyn Follower, id: &Id) -> Result<Option<(String, Cursor)>> {
+    while let Some(entry) = follower.next()? {
+        if let Some(started) = started_by(&entry, id)? {
+            return Ok(Some(started));
         }
     }
+    Ok(None)
 }
 
 /// `e`, a failure to follow the run after the request was sent: the request reached the manager, and
@@ -243,8 +370,11 @@ pub(crate) struct Run {
     unit: String,
     /// The run's `INVOCATION_ID`, from its Starting entry.
     invocation: String,
-    /// The cursor of that entry: everything of the run is after it.
+    /// The cursor of that entry: the run's exit is after it.
     start: Cursor,
+    /// Where the journal ended before the request: the run's output is after it. `None` for a journal
+    /// that had no entry.
+    output_from: Option<Cursor>,
     /// The task's `logs` file and its length before the request, where it has one.
     logs: Option<(PathBuf, u64)>,
     /// What the wait draws.
@@ -282,7 +412,7 @@ impl RunHandle for Run {
                 OutputSource::Journal(JournalOutput {
                     unit: self.unit.clone(),
                     invocation: self.invocation.clone(),
-                    cursor: self.start.clone(),
+                    cursor: self.output_from.clone(),
                     journal: Arc::clone(&self.journal),
                     draws,
                     watcher,
@@ -297,7 +427,7 @@ impl RunHandle for Run {
     /// [`Error::RunUnrecorded`] for a terminal entry that does not say how the run ended, and for a
     /// "Failed with result" with no exit before it. Any
     /// other failure (the follower could not be made, failed or ended) loses track of the run, which
-    /// may still be going: it is [`Error::RequestInDoubt`], as every failure to follow a run is.
+    /// may still be going: it is [`Error::RequestInDoubt`].
     fn wait(mut self) -> Result<Exit> {
         self.exit()
     }
@@ -356,7 +486,8 @@ pub(crate) struct JournalOutput {
     unit: String,
     /// The run's `INVOCATION_ID`, which its marker line names.
     invocation: String,
-    cursor: Cursor,
+    /// Where the journal ended before the run was requested: [`Run::output_from`].
+    cursor: Option<Cursor>,
     journal: Arc<dyn Journal>,
     draws: Reservation,
     watcher: Standby<Watch>,
@@ -380,7 +511,7 @@ impl JournalOutput {
             watcher,
         } = self;
         let query = stdout_query(&unit);
-        let mut follower = journal.follow(Scope::Output, &query, Some(&cursor), &mut draws)?;
+        let mut follower = journal.follow(Scope::Output, &query, cursor.as_ref(), &mut draws)?;
         // Closed when the live read is over, which releases the thread that waits for the run's end.
         let (finished, watching) = crossbeam_channel::bounded::<()>(0);
         let (done, watcher_done) = crossbeam_channel::bounded::<()>(0);
@@ -412,7 +543,7 @@ impl JournalOutput {
         rest(
             journal.as_ref(),
             &query,
-            &cursor,
+            cursor.as_ref(),
             selection,
             &mut draws,
             out,
@@ -484,7 +615,7 @@ fn live(selection: &mut Selection, follower: &mut dyn Follower, out: &mut dyn Wr
 fn rest(
     journal: &dyn Journal,
     query: &[Match],
-    from: &Cursor,
+    from: Option<&Cursor>,
     mut selection: Selection,
     draws: &mut Reservation,
     out: &mut dyn Write,
@@ -492,9 +623,12 @@ fn rest(
 ) -> Result<()> {
     journal.sync()?;
     let entries = match &selection.found {
-        Some((stream, last)) => {
-            journal.read_after(Scope::Output, &[Match::new("_STREAM_ID", stream.as_str())], last, draws)?
-        }
+        Some((stream, last)) => journal.read_after(
+            Scope::Output,
+            &[Match::new("_STREAM_ID", stream.as_str())],
+            Some(last),
+            draws,
+        )?,
         None => journal.read_after(Scope::Output, query, from, draws)?,
     };
     let mut text = Vec::new();

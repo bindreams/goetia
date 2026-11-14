@@ -136,16 +136,33 @@ impl Journal for Journalctl {
         &self,
         scope: Scope,
         matches: &[Match],
-        cursor: &Cursor,
+        cursor: Option<&Cursor>,
         draws: &mut Reservation,
     ) -> Result<Vec<Entry>> {
-        let chosen = vec![format!("--after-cursor={}", cursor.as_str())];
+        let mut chosen = Vec::new();
+        // Job numbers restart with each boot.
+        if matches.iter().any(|m| m.is("JOB_ID")) {
+            chosen.push("-b".to_string());
+        }
+        if let Some(cursor) = cursor {
+            chosen.push(format!("--after-cursor={}", cursor.as_str()));
+        }
         let mut lines = self.query(arguments(scope, &chosen, matches), false, drawn(draws)?)?;
         let mut all = Vec::new();
         while let Some(entry) = lines.next()? {
             all.push(entry);
         }
         Ok(all)
+    }
+
+    fn tail(&self) -> Result<Option<Cursor>> {
+        // Before any request: a failure here sends nothing, so it draws on no reservation.
+        let mut lines = self.query(
+            arguments(Scope::Output, &options(&["-n", "1"]), &[]),
+            false,
+            diagnostics()?,
+        )?;
+        lines.next()?.map(|entry| entry.cursor()).transpose()
     }
 
     fn sync(&self) -> Result<()> {

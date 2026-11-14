@@ -946,6 +946,22 @@ impl Systemctl {
         Ok((state, main_pid(&props)))
     }
 
+    /// Whether the manager still holds the job `job`, queued or running: `systemctl list-jobs` lists
+    /// every one. A job that was canceled leaves no journal entry, so this is where its end shows.
+    pub(super) fn job_exists(&self, job: u64) -> Result<bool> {
+        let (status, capture) = self.completed(Purpose::Read, &["list-jobs", "--no-legend"], &mut Held::default())?;
+        if !status.success() {
+            return Err(Error::command(
+                "systemctl list-jobs".to_string(),
+                status,
+                &capture.stderr,
+            ));
+        }
+        Ok(String::from_utf8_lossy(&capture.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) == Some(job)))
+    }
+
     /// Whether `id`'s timer is enabled: its `UnitFileState` is `enabled`.
     pub(super) fn timer_enabled(&self, id: &str) -> Result<bool> {
         let props = self.show_installed(&unit_name(id, UnitKind::Timer), &["UnitFileState"])?;

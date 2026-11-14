@@ -1,6 +1,5 @@
-//! A task is two artifacts, `<id>.service` (its job) and `<id>.timer` (its schedule), and this
-//! module is what keeps them as one: the snapshot of both, the rule that regenerates them, and every
-//! step of a write, `uninstall`, `enable`, `disable` and `status` that touches the timer.
+//! A task is two artifacts, `<id>.service` (its job) and `<id>.timer` (its schedule); this module
+//! keeps them as one.
 //!
 //! # The two artifacts and a crash between them
 //!
@@ -187,8 +186,7 @@ impl Systemd {
 
         // A timer the id has none of yet is created first, with nothing else changed: it is not
         // reloaded or enabled, so it cannot start the old job, and a name something else holds stops
-        // the update before the old job is disabled or replaced. A crash after it leaves a timer of
-        // goetia's beside the old job, which `read` reads as ours and a re-run finishes.
+        // the update before the old job is disabled or replaced.
         if let Some(timer) = &units.timer
             && old.timer().is_none()
             && let CreateOutcome::Raced = create_unit(id, UnitKind::Timer, timer)?

@@ -211,16 +211,22 @@ pub(super) trait Journal: Send + Sync {
         draws: &mut Reservation,
     ) -> Result<Box<dyn Follower>>;
 
-    /// Every entry holding `matches` after `cursor`, once the journal holds everything written
+    /// Every entry holding `matches` after `cursor` (from the start of the boot for a query on
+    /// `JOB_ID`, and of the journal otherwise, with none), once the journal holds everything written
     /// before the call ([`Journal::sync`] is the caller's to have made). Draws a temp file as
     /// [`Journal::follow`] does.
     fn read_after(
         &self,
         scope: Scope,
         matches: &[Match],
-        cursor: &Cursor,
+        cursor: Option<&Cursor>,
         draws: &mut Reservation,
     ) -> Result<Vec<Entry>>;
+
+    /// Where the journal ends now: the cursor of its newest entry, in every journal the reader may
+    /// open ([`Scope::Output`]); `None` for a journal with no entry. What is written after the call is
+    /// after the cursor.
+    fn tail(&self) -> Result<Option<Cursor>>;
 
     /// Waits until journald has stored everything sent to it before the call (`journalctl --sync`).
     fn sync(&self) -> Result<()>;
