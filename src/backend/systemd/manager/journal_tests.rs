@@ -325,6 +325,11 @@ fn args_of(entries: Vec<Entry>) -> String {
     entries[0].get("ARGS").expect("the echoed arguments").to_string()
 }
 
+/// The reservation of the one temp file a followed query draws.
+fn one() -> Reservation {
+    Reservation::make(0, 1).expect("a temp file")
+}
+
 const ECHO: &str = r#"printf '{"ARGS":"%s"}\n' "$*""#;
 
 /// The first entry of `follower`, which ends it.
@@ -343,15 +348,17 @@ fn every_query_passes_dash_a() {
         ("newest first", args_of(entries_of(&journal).expect("entries"))),
         (
             "follow a job",
-            args_of(first_of(journal.follow(&job, None).expect("follow"))),
+            args_of(first_of(journal.follow(&job, None, &mut one()).expect("follow"))),
         ),
         (
             "follow after a cursor",
-            args_of(first_of(journal.follow(&unit, Some(&cursor)).expect("follow"))),
+            args_of(first_of(
+                journal.follow(&unit, Some(&cursor), &mut one()).expect("follow"),
+            )),
         ),
         (
             "read after a cursor",
-            args_of(journal.read_after(&unit, &cursor).expect("read_after")),
+            args_of(journal.read_after(&unit, &cursor, &mut one()).expect("read_after")),
         ),
     ] {
         assert!(args.starts_with("-a -o json --no-pager "), "{what}: {args}");
@@ -364,11 +371,13 @@ fn a_follow_starts_from_the_beginning_or_after_its_cursor_and_job_numbers_are_bo
     let cursor = Cursor::of("s=1;i=2");
     let unit = [Match::new("UNIT", "x.service")];
 
-    let from_the_start = args_of(first_of(journal.follow(&unit, None).expect("follow")));
-    let after = args_of(first_of(journal.follow(&unit, Some(&cursor)).expect("follow")));
+    let from_the_start = args_of(first_of(journal.follow(&unit, None, &mut one()).expect("follow")));
+    let after = args_of(first_of(
+        journal.follow(&unit, Some(&cursor), &mut one()).expect("follow"),
+    ));
     let job = args_of(first_of(
         journal
-            .follow(&[unit[0].clone(), Match::new("JOB_ID", "7")], None)
+            .follow(&[unit[0].clone(), Match::new("JOB_ID", "7")], None, &mut one())
             .expect("follow"),
     ));
 
@@ -390,7 +399,11 @@ fn a_read_after_a_cursor_asks_for_every_set_of_matches() {
         Match::new("UNIT", "x.service"),
     ];
 
-    let args = args_of(journal.read_after(&matches, &Cursor::of("c")).expect("read_after"));
+    let args = args_of(
+        journal
+            .read_after(&matches, &Cursor::of("c"), &mut one())
+            .expect("read_after"),
+    );
 
     assert_eq!(
         args,
@@ -401,11 +414,15 @@ fn a_read_after_a_cursor_asks_for_every_set_of_matches() {
 #[skuld::test]
 fn a_read_after_discards_a_partial_trailing_line_and_fails_with_journalctls_words() {
     let journal = sh(r##"printf '{"N":"1"}\n{"N":'"##);
-    let all = journal.read_after(&[], &Cursor::of("c")).expect("read_after");
+    let all = journal
+        .read_after(&[], &Cursor::of("c"), &mut one())
+        .expect("read_after");
     assert_eq!(all.len(), 1);
 
     let journal = sh(r#"echo "Failed to seek" >&2; exit 1"#);
-    let e = journal.read_after(&[], &Cursor::of("c")).expect_err("it failed");
+    let e = journal
+        .read_after(&[], &Cursor::of("c"), &mut one())
+        .expect_err("it failed");
     assert!(e.report().to_string().contains("Failed to seek"), "{e}");
 }
 
@@ -422,7 +439,9 @@ fn entries_decode_a_message_given_as_a_byte_array() {
 fn a_message_of_4088_bytes_arrives_whole() {
     let journal = sh(r#"printf '{"MESSAGE":"'; head -c 4088 /dev/zero | tr '\0' x; printf '"}\n'"#);
 
-    let all = journal.read_after(&[], &Cursor::of("c")).expect("read_after");
+    let all = journal
+        .read_after(&[], &Cursor::of("c"), &mut one())
+        .expect("read_after");
 
     assert_eq!(all[0].bytes("MESSAGE").map(<[u8]>::len), Some(4088));
 }
@@ -462,7 +481,9 @@ fn journalctl_runs_with_the_environment_of_every_systemctl() {
 #[skuld::test]
 fn a_stopped_follower_ends_with_no_error_and_leaves_no_child() {
     let journal = sh(r#"printf '{"PID":"%s"}\n' "$$"; exec sleep 100000"#);
-    let mut follower = journal.follow(&[Match::new("UNIT", "x.service")], None).expect("spawn");
+    let mut follower = journal
+        .follow(&[Match::new("UNIT", "x.service")], None, &mut one())
+        .expect("spawn");
     let pid = follower
         .next()
         .expect("an entry")
@@ -487,7 +508,9 @@ fn a_stopped_follower_ends_with_no_error_and_leaves_no_child() {
 #[skuld::test]
 fn a_follower_that_ends_on_its_own_is_the_error() {
     let journal = sh(r#"printf '{"N":"1"}\n'"#);
-    let mut follower = journal.follow(&[Match::new("UNIT", "x.service")], None).expect("spawn");
+    let mut follower = journal
+        .follow(&[Match::new("UNIT", "x.service")], None, &mut one())
+        .expect("spawn");
 
     assert!(follower.next().expect("the entry").is_some());
     let e = follower.next().expect_err("it ended");

@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::backend::bounded::Reservation;
 use crate::error::{Error, Result};
 use crate::manager::Exit;
 
@@ -179,12 +180,14 @@ pub(super) trait Journal: Send + Sync {
     /// The entries holding `matches`, oldest first, as they are written: every one there is from the
     /// start of the boot (or, with `after`, from the entry after it), then each new one as it
     /// arrives. It ends only when stopped ([`Follower::stop`]) or dropped; a query on `JOB_ID` is
-    /// bound to the current boot, since job numbers restart with it.
-    fn follow(&self, matches: &[Match], after: Option<&Cursor>) -> Result<Box<dyn Follower>>;
+    /// bound to the current boot, since job numbers restart with it. The `journalctl` writes its
+    /// diagnostics to a temp file drawn from `draws`, which the caller made before it sent anything.
+    fn follow(&self, matches: &[Match], after: Option<&Cursor>, draws: &mut Reservation) -> Result<Box<dyn Follower>>;
 
     /// Every entry holding `matches` after `cursor`, once the journal holds everything written
-    /// before the call ([`Journal::sync`] is the caller's to have made).
-    fn read_after(&self, matches: &[Match], cursor: &Cursor) -> Result<Vec<Entry>>;
+    /// before the call ([`Journal::sync`] is the caller's to have made). Draws a temp file as
+    /// [`Journal::follow`] does.
+    fn read_after(&self, matches: &[Match], cursor: &Cursor, draws: &mut Reservation) -> Result<Vec<Entry>>;
 
     /// Waits until journald has stored everything sent to it before the call (`journalctl --sync`).
     fn sync(&self) -> Result<()>;

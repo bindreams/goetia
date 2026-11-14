@@ -33,12 +33,11 @@ impl Journalctl {
         Journalctl { program, client }
     }
 
-    /// `journalctl` with `arguments`, its output piped and read by the caller. `follows`: the query
-    /// does not end on its own.
-    fn query(&self, arguments: Vec<String>, follows: bool) -> Result<Lines> {
+    /// `journalctl` with `arguments`, its output piped and read by the caller and its diagnostics
+    /// written to `stderr`. `follows`: the query does not end on its own.
+    fn query(&self, arguments: Vec<String>, follows: bool, stderr: File) -> Result<Lines> {
         let argv: Vec<&str> = self.program.iter().chain(&arguments).map(String::as_str).collect();
         let command = argv.join(" ");
-        let stderr = tempfile::tempfile().map_err(|e| Error::os("make a file for `journalctl`'s diagnostics", e))?;
         let spawn_failed = |e: cosca::error::Error| Error::spawn(command.clone(), e);
         let diagnostics = stderr
             .try_clone()
@@ -66,6 +65,18 @@ impl Journalctl {
     }
 }
 
+/// A temp file for a `journalctl`'s diagnostics, made by the caller.
+fn diagnostics() -> Result<File> {
+    tempfile::tempfile().map_err(|e| Error::os("make a file for `journalctl`'s diagnostics", e))
+}
+
+/// The file a followed query's diagnostics go to, drawn from `draws`.
+fn drawn(draws: &mut Reservation) -> Result<File> {
+    draws
+        .file()
+        .map_err(|e| Error::os("make a file for `journalctl`'s diagnostics", e))
+}
+
 /// `COMMON`, then `options`, then `matches`.
 fn arguments(options: &[String], matches: &[Match]) -> Vec<String> {
     COMMON
@@ -82,10 +93,15 @@ fn options(of: &[&str]) -> Vec<String> {
 
 impl Journal for Journalctl {
     fn newest_first(&self, matches: &[Match]) -> Result<Box<dyn Entries>> {
-        Ok(Box::new(self.query(arguments(&options(&["-r"]), matches), false)?))
+        // The newest-first read is `status`'s, which draws on no reservation.
+        Ok(Box::new(self.query(
+            arguments(&options(&["-r"]), matches),
+            false,
+            diagnostics()?,
+        )?))
     }
 
-    fn follow(&self, matches: &[Match], after: Option<&Cursor>) -> Result<Box<dyn Follower>> {
+    fn follow(&self, matches: &[Match], after: Option<&Cursor>, draws: &mut Reservation) -> Result<Box<dyn Follower>> {
         let mut chosen = options(&["-f", "-n", "all"]);
         // Job numbers restart with each boot.
         if matches.iter().any(|m| m.is("JOB_ID")) {
@@ -94,12 +110,16 @@ impl Journal for Journalctl {
         if let Some(cursor) = after {
             chosen.push(format!("--after-cursor={}", cursor.as_str()));
         }
-        Ok(Box::new(self.query(arguments(&chosen, matches), true)?))
+        Ok(Box::new(self.query(
+            arguments(&chosen, matches),
+            true,
+            drawn(draws)?,
+        )?))
     }
 
-    fn read_after(&self, matches: &[Match], cursor: &Cursor) -> Result<Vec<Entry>> {
+    fn read_after(&self, matches: &[Match], cursor: &Cursor, draws: &mut Reservation) -> Result<Vec<Entry>> {
         let chosen = vec![format!("--after-cursor={}", cursor.as_str())];
-        let mut lines = self.query(arguments(&chosen, matches), false)?;
+        let mut lines = self.query(arguments(&chosen, matches), false, drawn(draws)?)?;
         let mut all = Vec::new();
         while let Some(entry) = lines.next()? {
             all.push(entry);

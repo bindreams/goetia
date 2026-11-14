@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::{Cursor, Entries, Entry, Follower, Journal, Match, Stop};
+use crate::backend::bounded::Reservation;
 use crate::error::{Error, Result};
 
 /// The calls of a journal and of whatever else a test records into it, in the order they happened.
@@ -141,6 +142,15 @@ impl Fake {
         Error::os("read the journal", std::io::Error::other("no journal"))
     }
 
+    /// What the real journal draws for each follower and read: a temp file, so that a caller that
+    /// counted too few trips the reservation's assertion in every test that drives it.
+    fn draw(draws: &mut Reservation) -> Result<()> {
+        draws
+            .file()
+            .map(drop)
+            .map_err(|e| Error::os("make a file for `journalctl`'s diagnostics", e))
+    }
+
     fn record(&self, what: String) {
         self.log.lock().unwrap().push(what);
     }
@@ -159,7 +169,8 @@ impl Journal for Fake {
         }))
     }
 
-    fn follow(&self, matches: &[Match], after: Option<&Cursor>) -> Result<Box<dyn Follower>> {
+    fn follow(&self, matches: &[Match], after: Option<&Cursor>, draws: &mut Reservation) -> Result<Box<dyn Follower>> {
+        Fake::draw(draws)?;
         self.record(format!("follow {}", Fake::arguments(matches).join(" ")));
         let script = {
             let mut state = self.state.lock().unwrap();
@@ -183,7 +194,8 @@ impl Journal for Fake {
         }))
     }
 
-    fn read_after(&self, matches: &[Match], cursor: &Cursor) -> Result<Vec<Entry>> {
+    fn read_after(&self, matches: &[Match], cursor: &Cursor, draws: &mut Reservation) -> Result<Vec<Entry>> {
+        Fake::draw(draws)?;
         self.record("read_after".to_string());
         self.state
             .lock()

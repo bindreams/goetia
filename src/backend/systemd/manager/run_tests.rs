@@ -13,7 +13,9 @@ use super::super::systemctl::systemctl_tests::gate_then;
 use super::super::task::task_tests::{enqueued, fragment, manager, task_spec};
 use super::*;
 use crate::backend::Backend;
+use crate::backend::bounded::test_hook as files;
 use crate::backend::client::fake::{Entry as Reply, Fake, exited, reply};
+use crate::backend::standby::test_hook as threads;
 use crate::manager::output::output_tests::Streaming;
 use crate::manager::{Budget, Exit, Step};
 use crate::spec::{DaemonFields, DaemonSpec, TaskFields, TaskSpec};
@@ -251,6 +253,49 @@ fn a_journal_failure_after_the_request_is_in_doubt_and_reached() {
     }
 }
 
+/// Everything the run needs once the request is sent is made before it, so a thread or a file that
+/// cannot be made sends nothing, and exactly what a run counts for is enough.
+#[skuld::test]
+fn a_reservation_that_cannot_be_made_sends_nothing() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let log = dir.path().join("job.log");
+    // A run with its output in the journal needs a file each for the follower that finds its start, the
+    // one that waits for its exit and the output's two, and the output's thread. One with a `logs` file
+    // needs the first two.
+    for (what, spec, files_allowed, threads_allowed) in [
+        ("no file", task_spec("x", "/bin/a", None), 0, 9),
+        ("three of four files", task_spec("x", "/bin/a", None), 3, 9),
+        ("no thread", task_spec("x", "/bin/a", None), 9, 0),
+        ("one of two files, with logs", logged_task(&log), 1, 9),
+    ] {
+        let _files = files::temp_files(files_allowed);
+        let _threads = threads::threads(threads_allowed);
+        let journal = JournalFake::new(Vec::new());
+        let client = gate_then([]);
+        let mgr = manager(&client, Fake::new([]), journal.clone());
+        let mut held = held(&mgr);
+
+        let e = Backend::begin_run(&mgr, fragment(&spec), &mut held).err().expect(what);
+
+        assert!(matches!(e, Error::Reservation { id: Some(_), .. }), "{what}: {e:?}");
+        assert!(client.calls().is_empty(), "{what}: {:?}", client.calls());
+        assert_eq!(journal.syncs(), 0, "{what}: nothing was run");
+    }
+
+    for (what, spec, files_allowed, threads_allowed) in [
+        ("journal output", task_spec("x", "/bin/a", None), 4, 1),
+        ("logs", logged_task(&log), 2, 0),
+    ] {
+        let _files = files::temp_files(files_allowed);
+        let _threads = threads::threads(threads_allowed);
+        let journal = JournalFake::new(Vec::new()).follows(vec![starting(7, "inv", "c1")]);
+        let mgr = manager(&gate_then([start()]), Fake::new([]), journal);
+        let mut held = held(&mgr);
+
+        Backend::begin_run(&mgr, fragment(&spec), &mut held).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+    }
+}
+
 fn logged_task(path: &Path) -> DaemonSpec {
     let common = DaemonFields {
         logs: Some(path.to_path_buf()),
@@ -427,6 +472,9 @@ fn output_over(journal: Arc<dyn Journal>) -> JournalOutput {
         unit: "x.service".to_string(),
         cursor: Cursor::of("c1"),
         journal,
+        // What `begin_run` made: a file for the follower and one for the read after it.
+        draws: Reservation::make(0, 2).expect("temp files"),
+        watcher: Standby::new("goetia run output", watch).expect("a thread"),
     }
 }
 
