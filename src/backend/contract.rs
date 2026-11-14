@@ -186,7 +186,8 @@ pub(crate) trait RunHandle: Send + 'static {
     fn output(&self) -> OutputSource;
 
     /// Blocks until the run has ended, and says how. [`Error::RunUnrecorded`] where it ended and the
-    /// exit could not be found.
+    /// exit could not be found; an error that does not say the run ended (it may still be going) where
+    /// the wait lost track of it.
     fn wait(self) -> Result<Exit>
     where
         Self: Sized;

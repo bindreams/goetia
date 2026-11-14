@@ -438,19 +438,32 @@ fn wait_follows_the_unit_after_the_starting_entry() {
     );
 }
 
+/// A wait that lost the run (the follower ended, could not be made, failed) does not know the run
+/// ended, so it says it lost track of it: indeterminate, and never "ended without recording".
+fn assert_lost_track(e: &Error) {
+    assert!(
+        matches!(e, Error::RequestInDoubt { reached: true, .. }),
+        "{e:?}"
+    );
+    assert!(e.is_indeterminate(), "{e:?}");
+    let message = e.to_string();
+    assert!(message.contains("lost track"), "{message}");
+    assert!(!message.contains("ended"), "{message}");
+}
+
 #[skuld::test]
-fn a_wait_whose_journal_ends_first_is_run_unrecorded() {
+fn a_wait_whose_journal_ends_first_lost_track_of_the_run() {
     let journal = JournalFake::new(Vec::new())
         .follows(vec![starting(7, "inv", "c1")])
         .follows_then_ends(vec![main_exited("another", "exited", "1")]);
 
     let e = begun(&journal).wait().expect_err("no exit was found");
 
-    assert!(matches!(e, Error::RunUnrecorded { .. }), "{e:?}");
+    assert_lost_track(&e);
 }
 
 #[skuld::test]
-fn a_wait_whose_journal_cannot_be_followed_is_run_unrecorded() {
+fn a_wait_whose_journal_cannot_be_followed_lost_track_of_the_run() {
     let run = begun(&running(Vec::new()));
     // The journal is gone by the time the wait asks.
     let run = Run {
@@ -460,7 +473,7 @@ fn a_wait_whose_journal_cannot_be_followed_is_run_unrecorded() {
 
     let e = run.wait().expect_err("the journal cannot be followed");
 
-    assert!(matches!(e, Error::RunUnrecorded { .. }), "{e:?}");
+    assert_lost_track(&e);
     assert!(e.report().to_string().contains("no journal"), "{e}");
 }
 

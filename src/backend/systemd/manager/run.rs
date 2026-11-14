@@ -291,31 +291,39 @@ impl RunHandle for Run {
 
     /// Follows the manager's entries about the unit after the run's start to the run's terminal entry,
     /// and decodes the exit from it. The follower is dropped when it returns.
+    ///
+    /// [`Error::RunUnrecorded`] only for a terminal entry that does not say how the run ended. Any
+    /// other failure (the follower could not be made, failed or ended) loses track of the run, which
+    /// may still be going: it is [`Error::RequestInDoubt`], as every failure to follow a run is.
     fn wait(mut self) -> Result<Exit> {
-        self.exit().map_err(|e| Error::RunUnrecorded {
-            id: self.id.to_string(),
-            reason: e.report().to_string(),
-        })
+        self.exit()
     }
 }
 
 impl Run {
     fn exit(&mut self) -> Result<Exit> {
-        let mut follower = self.journal.follow(
-            Scope::Manager,
-            &[Match::new("UNIT", self.unit.as_str())],
-            Some(&self.start),
-            &mut self.draws,
-        )?;
+        let lost = |e| after_the_request(&self.unit, e);
+        let mut follower = self
+            .journal
+            .follow(
+                Scope::Manager,
+                &[Match::new("UNIT", self.unit.as_str())],
+                Some(&self.start),
+                &mut self.draws,
+            )
+            .map_err(lost)?;
         loop {
-            let Some(entry) = follower.next()? else {
-                return Err(lacks("the run's terminal entry: the journal ended"));
+            let Some(entry) = follower.next().map_err(lost)? else {
+                return Err(lost(lacks("the run's terminal entry: the journal ended")));
             };
             if entry.get("INVOCATION_ID") != Some(self.invocation.as_str()) {
                 continue;
             }
             if let Some(exit) = exit_of(&entry) {
-                return exit;
+                return exit.map_err(|e| Error::RunUnrecorded {
+                    id: self.id.to_string(),
+                    reason: e.report().to_string(),
+                });
             }
         }
     }
