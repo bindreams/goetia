@@ -33,13 +33,13 @@ const WAIT_FAILED: &str = "the wait failed (fake)";
 pub(crate) const APPEND_FAILED: &str = "the append failed (fake)";
 /// The error a failing [`Os::open_log`] fails with.
 pub(crate) const OPEN_LOG_FAILED: &str = "the log could not be opened (fake)";
-/// A refused [`Spawned::kill`]: one layer.
+/// A refused [`Spawned::kill`].
 pub(crate) fn kill_refused() -> cosca::error::Error {
     cosca::error::Error::Io(io::Error::other(KILL_REFUSED))
 }
 
-/// A refused [`Spawned::send_kill_tree`]: a cause below a wrapper, so a report that prints only
-/// the top layer fails the tests. Not a copy of any one real refusal's shape.
+/// A refused [`Spawned::send_kill_tree`]: a `Containment` over [`kill_refused`], so a report that
+/// prints only the top layer fails the tests.
 pub(crate) fn tree_kill_refused() -> cosca::error::Error {
     cosca::error::Error::Containment {
         detail: "TerminateJobObject could not terminate the job".to_owned(),

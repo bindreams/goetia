@@ -772,8 +772,7 @@ impl Error {
         }
     }
 
-    /// The first OS error code this error carries: down its causes, through both halves of a
-    /// [`Both`](Error::Both) and into a kept or embedded error. A code on a later member of a
+    /// The OS error code `report::os_error_in` finds in this error. A code on a later member of a
     /// `cosca` error's list, in a `MembersLeft`'s `others`, or in a `MayHaveStarted`'s `cleanup` is
     /// not found.
     pub fn raw_os_error(&self) -> Option<i32> {
