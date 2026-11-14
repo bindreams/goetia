@@ -1,5 +1,6 @@
 //! Tokens for tests that act as an unelevated user, and a guard that ends the impersonation. Used by
-//! this module's tests and by `backend::scm::kill::privilege`'s.
+//! this module's tests, `backend::scm::kill::privilege` (its tests and the `SeDebugPrivilege` probe)
+//! and `backend::scm::manager::identity_tests`.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
