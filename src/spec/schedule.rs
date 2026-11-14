@@ -112,8 +112,9 @@ impl Schedule {
     /// Rebuilds a schedule from `text` and its stored `fields`, needing no host name.
     ///
     /// A blob's values are what goetia resolved at install; decode does not re-derive them from
-    /// the text. It checks that the text parses, that each field's `restricted` is the text's, and
-    /// that each field's values are non-empty and inside the field's range. Every refusal is
+    /// the text. A field without an `H` term is fully the text's, so it must equal what the text
+    /// gives. A field with an `H` term takes its values from the blob: they must be non-empty and
+    /// inside the field's range, and its `restricted` must be the text's. Every refusal is
     /// [`Error::Invalid`] for `id`, naming the field.
     pub(crate) fn from_parts(id: &Id, text: String, fields: [CronField; FIELD_COUNT]) -> Result<Schedule, Error> {
         let structure = structure(&text).map_err(|message| invalid(id, &message))?;
@@ -221,6 +222,10 @@ struct ParsedField {
 }
 
 impl ParsedField {
+    fn has_hash(&self) -> bool {
+        self.terms.iter().any(|term| matches!(term, Term::Hashed { .. }))
+    }
+
     /// The field `hash` resolves this one to.
     fn resolve(&self, hash: u64) -> CronField {
         CronField {
@@ -352,9 +357,21 @@ fn field_hash(seed: &HashSeed, position: usize) -> u64 {
 
 // Decoding ------------------------------------------------------------------------------------------------------------
 
-/// Whether `field` is one `parse` could have given for `parsed`'s text: the text's `restricted`, and
-/// values that are non-empty and in the field's range. The reason does not name the field.
+/// Whether `field` is one `parse` could have given for `parsed`'s text. A field without an `H`
+/// term must equal the text's terms exactly. A field with one needs the text's `restricted` and
+/// values that are non-empty and in the field's range; its values are not re-derived. The reason
+/// does not name the field.
 fn check(kind: &FieldKind, parsed: &ParsedField, field: &CronField) -> Result<(), String> {
+    if !parsed.has_hash() {
+        let expected = parsed.resolve(0);
+        if *field != expected {
+            return Err(format!(
+                "holds {:?} (restricted: {}), but its text gives {:?} (restricted: {})",
+                field.values, field.restricted, expected.values, expected.restricted
+            ));
+        }
+        return Ok(());
+    }
     if field.restricted != parsed.restricted {
         return Err(format!(
             "is restricted: {}, but its text gives {}",

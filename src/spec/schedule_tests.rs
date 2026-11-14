@@ -402,16 +402,23 @@ fn from_parts_refuses_what_parse_cannot_give() {
     // (text, field index, replacement values, restricted)
     type Row = (&'static str, usize, Vec<u8>, bool);
     let table: Vec<Row> = vec![
-        // a field matches something
+        // an H-free field is exactly what the text gives
+        ("5 * * * *", 0, vec![6], true),
+        ("5 * * * *", 0, vec![5, 6], true),
         ("5 * * * *", 0, vec![], true),
-        ("H * * * *", 0, vec![], true),
-        ("* * * * *", 1, vec![], false),
-        // a value outside the field's range
+        ("*/15 * * * *", 0, vec![0, 15, 30], true),
+        ("* * * * *", 1, vec![0, 1], false),
+        ("5 H * * *", 0, vec![6], true),
         ("* * * * *", 4, (0..=7).collect(), false),
         ("* * * * *", 0, vec![60], false),
         ("* * * * *", 3, vec![0], false),
-        ("* * * * *", 2, vec![0], false),
+        // an H field matches something, within the field's range
+        ("H * * * *", 0, vec![], true),
         ("H * * * *", 0, vec![13, 60], true),
+        ("H * * * *", 0, vec![60], true),
+        ("* * H * *", 2, vec![0], true),
+        ("* * * H *", 3, vec![13], true),
+        ("* * * * H", 4, vec![7], true),
         // the restricted flag is the text's
         ("5 * * * *", 0, vec![5], false),
         ("H * * * *", 0, vec![13], false),
@@ -433,17 +440,16 @@ fn from_parts_refuses_what_parse_cannot_give() {
 }
 
 #[skuld::test]
-fn from_parts_keeps_the_values_it_is_given() {
-    // A decode does not re-derive values from the text: another host or id resolved these.
+fn from_parts_keeps_the_values_an_h_field_is_given() {
+    // A decode does not re-derive `H`: another host or id resolved these.
     for (text, index, values) in [
         ("H * * * *", 0, vec![14]),
         ("H(10-20) * * * *", 0, vec![21]),
         ("H/15 * * * *", 0, vec![13, 28, 43, 58]),
-        ("5 * * * *", 0, vec![6]),
+        ("5,H(10-20) * * * *", 0, vec![6, 21]),
         ("* * H * *", 2, vec![9]),
     ] {
-        let restricted = !text.split(' ').nth(index).unwrap().starts_with('*');
-        let rebuilt = rebuild(text, index, field(&values, restricted)).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+        let rebuilt = rebuild(text, index, field(&values, true)).unwrap_or_else(|e| panic!("{text:?}: {e}"));
         assert_eq!(rebuilt.fields()[index].values, set(&values), "{text:?}");
     }
 }

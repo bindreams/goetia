@@ -88,21 +88,20 @@ pub fn decode(encoded: &str) -> Result<Blob, Error> {
     let bytes = BASE64
         .decode(encoded)
         .map_err(|source| Error::blob_from("invalid base64", source))?;
-    // The schema is read before the spec: a later schema may carry members this build refuses.
-    let envelope: RawEnvelope =
+    // The schema is read alone first: a later schema may reshape any other member.
+    let found: SchemaOnly =
         serde_json::from_slice(&bytes).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
-
-    if envelope.schema != SCHEMA {
+    if found.schema != SCHEMA {
         return Err(Error::blob(format!(
             "unsupported blob schema {found} (this build of goetia understands schema {supported})",
-            found = envelope.schema,
+            found = found.schema,
             supported = SCHEMA,
         )));
     }
 
-    let wire: WireDaemon =
-        serde_json::from_value(envelope.spec).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
-    let spec = daemon_spec_from_wire(wire)?;
+    let envelope: WireEnvelope =
+        serde_json::from_slice(&bytes).map_err(|source| Error::blob_from("invalid blob JSON", source))?;
+    let spec = daemon_spec_from_wire(envelope.spec)?;
 
     Ok(Blob {
         schema: envelope.schema,
@@ -150,7 +149,7 @@ fn canonicalize(value: Value) -> Value {
 // future rename of a `DaemonSpec` Rust field cannot silently change every
 // already-written artifact's bytes.
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WireEnvelope {
     #[serde(rename = "schema")]
     schema: u32,
@@ -160,15 +159,11 @@ struct WireEnvelope {
     version: String,
 }
 
-/// `WireEnvelope` as `decode` first reads it, the spec not yet interpreted.
+/// The envelope's `schema` member alone; every other member is ignored.
 #[derive(Deserialize)]
-struct RawEnvelope {
+struct SchemaOnly {
     #[serde(rename = "schema")]
     schema: u32,
-    #[serde(rename = "spec")]
-    spec: Value,
-    #[serde(rename = "version")]
-    version: String,
 }
 
 /// The spec object of either kind. A task's carries a `type` member and a service's never does (a
@@ -366,8 +361,7 @@ impl From<&TaskSpec> for WireTask {
 
 impl From<&Schedule> for WireSchedule {
     fn from(schedule: &Schedule) -> Self {
-        let [minute, hour, day_of_month, month, day_of_week] =
-            std::array::from_fn(|i| WireCronField::from(&schedule.fields()[i]));
+        let [minute, hour, day_of_month, month, day_of_week] = schedule.fields().each_ref().map(WireCronField::from);
         WireSchedule {
             text: schedule.text().to_owned(),
             minute,

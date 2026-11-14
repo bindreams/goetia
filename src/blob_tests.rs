@@ -367,6 +367,26 @@ fn an_unknown_schema_is_refused_before_its_spec_is_read() {
 }
 
 #[skuld::test]
+fn an_unknown_schema_is_refused_whatever_else_the_envelope_holds() {
+    // A later schema may reshape any member: the schema alone decides.
+    for edit in [
+        (|value: &mut Value| value["version"] = Value::from(serde_json::Map::new())) as fn(&mut Value),
+        |value| {
+            let spec = value.as_object_mut().unwrap().remove("spec").unwrap();
+            value["payload"] = spec;
+        },
+    ] {
+        let mut value: Value = serde_json::from_slice(&BASE64.decode(encode(&minimal_spec())).unwrap()).unwrap();
+        value["schema"] = Value::from(SCHEMA + 1);
+        edit(&mut value);
+
+        let err = decode(&BASE64.encode(serde_json::to_vec(&value).unwrap())).unwrap_err();
+
+        assert!(err.to_string().contains("unsupported blob schema"), "{err}");
+    }
+}
+
+#[skuld::test]
 #[allow(clippy::type_complexity)]
 fn decode_rejects_invariant_violations() {
     let cases: Vec<(&str, Box<dyn Fn(&mut WireService)>, &str)> = vec![
