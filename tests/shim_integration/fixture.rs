@@ -1,7 +1,7 @@
-//! The daemon `type: simple` specs under test actually run: this test
+//! The daemon `protocol: plain` specs under test actually run: this test
 //! binary itself, re-invoked in one of a few modes. Unlike
 //! `tests/scm_integration/fixture.rs`, this is never dispatched to SCM —
-//! for `type: simple`, SCM only ever launches the service host (the shim, `goetia-shim.exe`);
+//! for `protocol: plain`, SCM only ever launches the service host (the shim, `goetia-shim.exe`);
 //! this process is the shim's own *child*, a perfectly ordinary
 //! process from SCM's point of view.
 //!

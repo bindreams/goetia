@@ -5,13 +5,15 @@
 //!
 //! - Keyed by `systemd`, `launchd`, or `scm`. An unknown key is an error
 //!   naming it; a repeated key is too.
-//! - Every field but the daemon's id is overridable: `name`, `command`,
-//!   `cwd`, `env`, `user`, `restart`, `restart-delay`, `logs`, `type`.
+//! - Every field but the daemon's id and `type` is overridable: `name`, `command`,
+//!   `cwd`, `env`, `user`, `restart`, `restart-delay`, `logs`, `protocol`, `schedule`. `type` is
+//!   parsed only to be refused by name ("cannot be set per backend"), so that it is not an
+//!   unknown field.
 //! - A scalar or list field replaces the base value outright; `env` merges
 //!   key by key instead, the override winning where both set the same key.
 //!   A key repeated *within* one `env` map, or colliding with another by
 //!   case alone, is an error naming it — `raw.rs`'s check, reused here.
-//! - An explicit YAML `null` is an error for all nine fields and for every
+//! - An explicit YAML `null` is an error for all eleven fields and for every
 //!   leaf under them. That is `no_null`'s scan, not this module: the scan
 //!   is schema-blind, so it walks an override like any other subtree, and
 //!   `Slot` routes one exactly like the document it overrides.
@@ -21,7 +23,7 @@
 //!   but only the native one is completed and installed.
 //!
 //! Fields mirror `RawSpec` (`raw.rs`), not `DaemonSpec`: `user`, `restart`,
-//! `restart-delay` and `type` stay authored text so `${VAR}` can be
+//! `restart-delay`, `protocol` and `schedule` stay authored text so `${VAR}` can be
 //! interpolated before `resolve` parses them.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,7 +52,10 @@ pub(super) struct RawOverride {
     pub restart: Option<String>,
     pub restart_delay: Option<String>,
     pub logs: Option<String>,
-    pub kind: Option<String>,
+    /// `type:`, which no override may set.
+    pub daemon_type: Option<String>,
+    pub protocol: Option<String>,
+    pub schedule: Option<String>,
 }
 
 /// `RawOverride`'s serde shape; read only under `RawSpec::parse` (see `Wire`).
@@ -78,7 +83,11 @@ struct OverrideWire {
     #[serde(default)]
     logs: Option<String>,
     #[serde(rename = "type", default)]
-    kind: Option<String>,
+    daemon_type: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+    #[serde(default)]
+    schedule: Option<String>,
 }
 
 struct OverrideEntry(RawOverride);
@@ -130,7 +139,7 @@ impl Supplied {
             Field::Logs => self.logs,
             Field::EnvKey(key) => self.env.contains(&**key),
             Field::EnvValue(key) => self.env.contains(key),
-            Field::Restart | Field::RestartDelay | Field::Kind => false,
+            Field::Restart | Field::RestartDelay | Field::Type | Field::Protocol | Field::Schedule => false,
         }
     }
 }
@@ -168,6 +177,8 @@ impl RawSpec {
             env.extend(ovr_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
 
+        // `type` is the daemon's own: `resolve` refuses an override's before any merge.
+        debug_assert!(ovr.daemon_type.is_none(), "a `type` override reached the merge");
         let merged = RawSpec {
             id: self.id.clone(),
             name: ovr.name.clone().or_else(|| self.name.clone()),
@@ -178,7 +189,9 @@ impl RawSpec {
             restart: ovr.restart.clone().or_else(|| self.restart.clone()),
             restart_delay: ovr.restart_delay.clone().or_else(|| self.restart_delay.clone()),
             logs: ovr.logs.clone().or_else(|| self.logs.clone()),
-            kind: ovr.kind.clone().or_else(|| self.kind.clone()),
+            daemon_type: self.daemon_type.clone(),
+            protocol: ovr.protocol.clone().or_else(|| self.protocol.clone()),
+            schedule: ovr.schedule.clone().or_else(|| self.schedule.clone()),
             backend_specific: BackendOverrides::new(),
         };
 
@@ -197,7 +210,9 @@ impl RawSpec {
             restart: self.restart.clone(),
             restart_delay: self.restart_delay.clone(),
             logs: self.logs.clone(),
-            kind: self.kind.clone(),
+            daemon_type: self.daemon_type.clone(),
+            protocol: self.protocol.clone(),
+            schedule: self.schedule.clone(),
             backend_specific: BackendOverrides::new(),
         }
     }

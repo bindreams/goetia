@@ -1,8 +1,8 @@
-//! A one-shot child process that installs one `type: simple` service for a real local account and
+//! A one-shot child process that installs one `protocol: plain` service for a real local account and
 //! exits: `GOETIA_SERVICE_PASSWORD` is read from the environment of the process that installs, and
 //! `set_var` in the test binary would race every test running beside it. Spawning this with
 //! `Command::env` scopes the variable to a process nobody else shares (see
-//! `tests/scm_integration/install_helper.rs`, which does the same for `type: managed`).
+//! `tests/scm_integration/install_helper.rs`, which does the same for `protocol: native`).
 //!
 //! `<exe> --goetia-shim-install-as <id> <account> <daemon-exe> <log-path> <port>`
 //!

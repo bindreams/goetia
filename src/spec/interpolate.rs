@@ -328,7 +328,9 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
         restart,
         restart_delay,
         logs,
-        kind,
+        daemon_type,
+        protocol,
+        schedule,
         backend_specific,
     } = raw;
     debug_assert!(backend_specific.is_empty(), "interpolation runs on merged specs only");
@@ -354,7 +356,9 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
 
     substitute_option(restart, Field::Restart, vars, &mut from_env)?;
     substitute_option(restart_delay, Field::RestartDelay, vars, &mut from_env)?;
-    substitute_option(kind, Field::Kind, vars, &mut from_env)?;
+    substitute_option(daemon_type, Field::Type, vars, &mut from_env)?;
+    substitute_option(protocol, Field::Protocol, vars, &mut from_env)?;
+    substitute_option(schedule, Field::Schedule, vars, &mut from_env)?;
 
     Ok(from_env)
 }
@@ -374,7 +378,9 @@ pub(super) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
         restart,
         restart_delay,
         logs,
-        kind,
+        daemon_type,
+        protocol,
+        schedule,
         backend_specific,
     } = raw;
     debug_assert!(
@@ -404,8 +410,14 @@ pub(super) fn check_spec_grammar(raw: &RawSpec) -> Result<()> {
     if let Some(restart_delay) = restart_delay {
         check_grammar(restart_delay, "restart-delay")?;
     }
-    if let Some(kind) = kind {
-        check_grammar(kind, "type")?;
+    if let Some(daemon_type) = daemon_type {
+        check_grammar(daemon_type, "type")?;
+    }
+    if let Some(protocol) = protocol {
+        check_grammar(protocol, "protocol")?;
+    }
+    if let Some(schedule) = schedule {
+        check_grammar(schedule, "schedule")?;
     }
     Ok(())
 }
@@ -438,11 +450,13 @@ pub(super) fn spec_would_change(raw: &RawSpec) -> bool {
         restart,
         restart_delay,
         logs,
-        kind,
+        daemon_type,
+        protocol,
+        schedule,
         backend_specific: _,
     } = raw;
 
-    [name, cwd, logs, restart, restart_delay, kind]
+    [name, cwd, logs, restart, restart_delay, daemon_type, protocol, schedule]
         .iter()
         .any(|field| field.as_deref().is_some_and(would_substitution_change))
         || command.iter().flatten().any(|arg| would_substitution_change(arg))

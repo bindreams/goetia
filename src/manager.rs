@@ -54,7 +54,7 @@ pub trait ServiceManager {
     /// Stop the service if running, remove the artifact, and reload the
     /// manager. Operates by id alone, so it works without the original manifest.
     ///
-    /// On Windows a `type: simple` service leaves shim files behind (see
+    /// On Windows a `protocol: plain` service leaves shim files behind (see
     /// `EmbeddedStockShim`), and this removes the ones no other
     /// service or process uses once its own host has exited. If that cleanup fails the service is
     /// still deleted and the error says so: re-run `uninstall` to retry it. `uninstall` of an id that
@@ -148,7 +148,7 @@ pub trait ServiceManager {
     /// **Unlike [`Self::start`], not idempotent over a service that is still
     /// up.** A manager answering "already running" here has refused the
     /// start: the instance it sees may be the one the stop is still taking
-    /// down (a Windows `type: simple` service reads `RUNNING` until its shim
+    /// down (a Windows `protocol: plain` service reads `RUNNING` until its shim
     /// has taken the stop), and reading that answer as a start would report a
     /// restart that leaves the daemon down. `Ok(())` means the manager
     /// accepted a start request and nothing more. Takes no budget: it never
@@ -398,7 +398,7 @@ impl Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonStatus {
     pub state: State,
-    /// For `type: simple` on Windows this is `goetia-shim.exe`'s pid, not the
+    /// For `protocol: plain` on Windows this is `goetia-shim.exe`'s pid, not the
     /// daemon's: SCM knows no other process for that service.
     pub pid: Option<u32>,
     /// Whether the service is enabled at boot: systemd's `.wants` symlink,

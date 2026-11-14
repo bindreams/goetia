@@ -1162,7 +1162,7 @@ impl backend::Backend for Launchd {
 
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
         let account = resolve_account(&spec.common().user)?;
-        Ok(generate::plist(spec, &account.identity()))
+        generate::plist(spec, &account.identity())
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Plist>> {
@@ -1347,7 +1347,9 @@ impl backend::Backend for Launchd {
         let Plist { id, blob, location, .. } = snapshot;
         let id = &id;
         let blob = blob.map_err(Error::Kept)?;
-        let DaemonSpec::Service(service) = &blob.spec;
+        let DaemonSpec::Service(service) = &blob.spec else {
+            return Err(backend::cannot_run_tasks("launchd", id));
+        };
         let timed_out = || budget::timed_out(id.as_str(), "running", budget);
         // Issuing the request is unbounded: the budget bounds waiting for launchd's answer, never
         // whether the request is sent, so a spent budget still reaches launchd.

@@ -428,7 +428,7 @@ fn map_cause_replaces_the_cause_and_keeps_every_wrapper() {
     assert!(matches!(mapped.cause(), Error::NotInstalled { .. }), "{mapped:?}");
     assert_eq!(
         mapped.report().to_string(),
-        "start: its spec blob could not be read, so the start was judged as a `type: managed` service's (blob: \
+        "start: its spec blob could not be read, so the start was judged as a `protocol: native` service's (blob: \
          corrupt): wait: daemon `x` is not installed"
     );
 }
@@ -1039,7 +1039,7 @@ fn report_of_a_start_judged_as_managed_names_the_unreadable_blob_and_then_the_fa
     };
     assert_eq!(
         e.report().to_string(),
-        "its spec blob could not be read, so the start was judged as a `type: managed` service's (blob: invalid blob \
+        "its spec blob could not be read, so the start was judged as a `protocol: native` service's (blob: invalid blob \
          JSON: EOF): failed to start /p: stopped"
     );
     assert!(!e.is_indeterminate());

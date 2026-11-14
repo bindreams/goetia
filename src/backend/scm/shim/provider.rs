@@ -12,7 +12,7 @@ use super::sweep::SweepFailure;
 #[cfg(windows)]
 use crate::error::{Error, Result};
 
-/// The command SCM launches for a `type: simple` service: a host built from `goetia::shim::main()`
+/// The command SCM launches for a `protocol: plain` service: a host built from `goetia::shim::main()`
 /// and the arguments it is started with. The arguments are `String`s because the registry read
 /// back is lossy, so an `OsString` would promise what it cannot keep.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub(crate) fn require_absolute(path: &Path) -> Result<()> {
     }
 }
 
-/// Where the service host of a `type: simple` service comes from. `Scm` consults one for such a
+/// Where the service host of a `protocol: plain` service comes from. `Scm` consults one for such a
 /// service and for no other; the checks on what it returns (the folder check, the marker, the
 /// match with `preview`) are `Scm`'s, so an implementation cannot skip them.
 #[cfg(windows)]

@@ -556,7 +556,7 @@ fn daemon_spec(restart: crate::spec::Restart) -> DaemonSpec {
 // start's vocabulary --------------------------------------------------------------------------------------------------
 
 /// A start judged strictly because the blob could not be read says why, so the user is not told a
-/// `type: simple` daemon failed to start in a way that only a managed service's start can.
+/// `protocol: plain` daemon failed to start in a way that only a managed service's start can.
 #[skuld::test]
 fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     let id = Id::try_from("frpc").unwrap();
@@ -583,7 +583,7 @@ fn a_failed_start_names_the_blob_read_error_that_made_it_strict() {
     assert!(strict.contains("invalid blob JSON: EOF"), "{strict}");
 }
 
-/// A blob that says `restart: always` decodes, and a `type: simple` one starts by the shim's vocabulary like
+/// A blob that says `restart: always` decodes, and a `protocol: plain` one starts by the shim's vocabulary like
 /// any other.
 #[skuld::test]
 fn a_blob_that_says_always_decodes_and_starts_as_its_kind() {
@@ -752,7 +752,7 @@ fn no_image() -> Option<String> {
 }
 
 /// A decodable blob decides whether a service runs a shim, whatever its image is called: a
-/// `StandaloneShim` host is not named `goetia-shim-<hex>.exe`, and a `type: managed` service may be
+/// `StandaloneShim` host is not named `goetia-shim-<hex>.exe`, and a `protocol: native` service may be
 /// registered over one. It has no decode error to carry.
 #[skuld::test]
 fn a_decodable_blob_decides_whether_a_service_runs_a_shim() {
@@ -1357,8 +1357,8 @@ fn shim_image() -> Result<String> {
 }
 
 /// The install lock comes before the first read of the service's image, so that no read is one an
-/// install in progress is about to change: for a blob that may run a shim (`type: simple`, or one that
-/// would not decode), and a `type: managed` service takes neither.
+/// install in progress is about to change: for a blob that may run a shim (`protocol: plain`, or one that
+/// would not decode), and a `protocol: native` service takes neither.
 #[skuld::test]
 fn an_uninstall_takes_the_install_lock_before_it_reads_the_image() {
     let corrupt = Arc::new(Error::blob("corrupt"));

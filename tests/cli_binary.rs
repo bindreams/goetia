@@ -120,14 +120,14 @@ fn dry_run_needs_no_elevation() {
 }
 
 /// A `cargo build`/`cargo install` goetia.exe has no stock shim embedded, so its preview of a
-/// `type: simple` daemon names the copy of the `goetia-shim.exe` beside it, under its hash.
+/// `protocol: plain` daemon names the copy of the `goetia-shim.exe` beside it, under its hash.
 #[cfg(all(windows, not(feature = "goetia-shim")))]
 #[skuld::test]
 fn dry_run_names_the_hashed_sibling_shim() {
     use sha2::{Digest as _, Sha256};
 
     let dir = tempfile::tempdir().unwrap();
-    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\ntype: simple\n");
+    write_manifest(dir.path(), "id: frpc\ncommand: [frpc]\n");
     let sibling = Path::new(goetia_bin()).with_file_name("goetia-shim.exe");
     let bytes = std::fs::read(&sibling).unwrap_or_else(|e| panic!("read {}: {e}", sibling.display()));
     let hex: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();

@@ -35,7 +35,7 @@
 //! `windows_style_split_matches_real_command_line_to_argv_w` (which pins the
 //! `argv[0]` rule against the real Win32 API) and
 //! `executable_trailing_backslash_does_not_round_trip_through_argv0` (which
-//! documents the writer's behaviour). `executable` is a `HostCommand`'s `exe` or, for a `type: managed`
+//! documents the writer's behaviour). `executable` is a `HostCommand`'s `exe` or, for a `protocol: native`
 //! daemon, `command[0]`; one the writer would rewrite is refused, see `refuse_unwritable_executable`:
 //! a `command[0]` by [`registration`], and a host's path by [`install_registration`], which `install` and
 //! `diff` call.
@@ -45,12 +45,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::backend::Identity;
 use crate::backend::scm::parameters::{Stray, field_named_utf16, is_string_type, type_name};
+use crate::backend::{Identity, cannot_run_tasks};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::shim::HostCommand;
-use crate::spec::{DaemonSpec, Id, Protocol, Restart, User, scm_restart_delay, windows_builtin};
+use crate::spec::{DaemonSpec, Id, Protocol, Restart, ServiceSpec, User, scm_restart_delay, windows_builtin};
 
 // Metadata field names ================================================================================================
 
@@ -147,7 +147,7 @@ pub struct FailureActions {
 ///
 /// Refuses, with [`Error::Invalid`]:
 ///
-/// - a `type: managed` `command[0]` the registration writer would rewrite;
+/// - a `protocol: native` `command[0]` the registration writer would rewrite;
 /// - `restart: always`: SCM recovery actions never fire after a clean exit, so the registration
 ///   could only run on-failure semantics.
 pub fn registration(
@@ -155,17 +155,29 @@ pub fn registration(
     id: &Identity,
     host: &dyn Fn() -> Result<HostCommand, Error>,
 ) -> Result<ScmRegistration, Error> {
+    refuse_task(spec)?;
     let host = resolve_host(spec, host)?;
     build(spec, id, host.as_ref())
 }
 
-/// Whether `spec` runs under the shim host: a `Protocol::Plain` service, whose command is not what SCM
-/// launches. A `Protocol::Native` service is its own executable, with no host.
+/// The service in `spec`; a task is refused until the Windows service manager runs tasks. Asked
+/// before the host is, so a task never reaches the host's own failures.
+fn refuse_task(spec: &DaemonSpec) -> Result<&ServiceSpec, Error> {
+    match spec {
+        DaemonSpec::Service(service) => Ok(service),
+        DaemonSpec::Task(_) => Err(cannot_run_tasks("the Windows service manager", &spec.common().id)),
+    }
+}
+
+/// Whether `spec` runs under the shim host: a `Protocol::Plain` service or a task, whose command is not
+/// what SCM launches. A `Protocol::Native` service is its own executable, with no host.
 pub(crate) fn hosted(spec: &DaemonSpec) -> bool {
-    let DaemonSpec::Service(s) = spec;
-    match s.protocol {
-        Protocol::Plain => true,
-        Protocol::Native => false,
+    match spec {
+        DaemonSpec::Service(s) => match s.protocol {
+            Protocol::Plain => true,
+            Protocol::Native => false,
+        },
+        DaemonSpec::Task(_) => true,
     }
 }
 
@@ -184,7 +196,7 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
         hosted(spec),
         "a hosted spec's host is resolved before it is built, and only a hosted spec's"
     );
-    let DaemonSpec::Service(s) = spec;
+    let s = refuse_task(spec)?;
     // SCM applies `Environment` to the process it launches: the daemon for a native service, the shim
     // for a hosted one.
     let (executable, arguments, environment) = match host {
@@ -268,17 +280,17 @@ fn build(spec: &DaemonSpec, id: &Identity, host: Option<&HostCommand>) -> Result
     })
 }
 
-/// [`registration`], for an install or its preview: also refuses a `type: simple` daemon when the
+/// [`registration`], for an install or its preview: also refuses a `protocol: plain` daemon when the
 /// host's path would be written as another path. The path is the host's, not the daemon's, so this is
 /// the install's refusal and not the rendering's: `list` and `status` render every daemon, and must
 /// not report one as having an unusable embedded spec because of where goetia itself is installed.
-/// A `type: managed` daemon never runs the host, so its path is not judged.
+/// A `protocol: native` daemon never runs the host, so its path is not judged.
 pub fn install_registration(
     spec: &DaemonSpec,
     id: &Identity,
     host: &dyn Fn() -> Result<HostCommand, Error>,
 ) -> Result<ScmRegistration, Error> {
-    let DaemonSpec::Service(s) = spec;
+    let s = refuse_task(spec)?;
     let host = resolve_host(spec, host)?;
     if let Some(host) = &host {
         refuse_unwritable_executable(&s.common.id, ExecutablePath::ServiceHost, &host.exe)?;
@@ -299,9 +311,9 @@ const WRITER_QUOTE_TRIGGERS: [(char, &str); 5] = [
 /// Which path [`refuse_unwritable_executable`] judges, as its message names it.
 #[derive(Clone, Copy)]
 enum ExecutablePath {
-    /// `command[0]` of a `type: managed` daemon.
+    /// `command[0]` of a `protocol: native` daemon.
     Command0,
-    /// The service host's path for a `type: simple` daemon, which no manifest sets.
+    /// The service host's path for a `protocol: plain` daemon, which no manifest sets.
     ServiceHost,
 }
 

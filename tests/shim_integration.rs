@@ -1,7 +1,7 @@
-//! Integration tests for `goetia-shim` and the `type: simple` SCM path — see
+//! Integration tests for `goetia-shim` and the `protocol: plain` SCM path — see
 //! `goetia::backend::scm::manager`'s own module doc comment for the five
-//! traps `tests/scm_integration.rs` covers for `type: managed`;
-//! this file is the `type: simple` analogue, plus the shim's own failure
+//! traps `tests/scm_integration.rs` covers for `protocol: native`;
+//! this file is the `protocol: plain` analogue, plus the shim's own failure
 //! paths (a commanded stop must not be restarted, a logged-not-crashed spawn
 //! failure, and the version-skew fallback log) and the SCM recovery actions
 //! that do every restart (`restart_integration`).
