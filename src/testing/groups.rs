@@ -131,6 +131,8 @@ pub(crate) fn enter(
 /// Setup of a test that needs something the host may lack. Runs unless `switch_var` is `0`; fails
 /// (naming the switch) when `holds` is `Ok(false)` (`missing` says what and how to provide it) or
 /// `Err` (a failed probe, which does not prove the dependency absent). Never skips.
+// Only the Windows fixture and the tests use it.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) fn need(
     switch_var: &str,
     var: impl Fn(&str) -> Option<String>,
