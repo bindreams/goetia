@@ -36,7 +36,7 @@ use crate::blob::Blob;
 use crate::decide::Outcome;
 use crate::error::{Error, Result};
 use crate::manager::flow::NOTHING_TO_ARM;
-use crate::manager::{Budget, DaemonStatus, Status, TaskStatus};
+use crate::manager::{Budget, DaemonStatus, State, Status, TaskStatus};
 use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 use super::discover::{foreign_timer_recovery, timer_is_foreign};
@@ -386,14 +386,15 @@ impl Systemd {
     /// not read the system journal (not root and not in `systemd-journal`): the task's whole status
     /// read is the error then, its state and next run lost with its last run. A service's status needs
     /// no journal. A run the manager failed with no exit recorded has a start and no result
-    /// (`last_run` set, `last_result` `None`).
+    /// (`last_run` set, `last_result` `None`). A unit still `Running` whose own invocation is the
+    /// newest run in the journal, with its terminal entry already there, has ended: it is `Idle`.
     pub(super) fn status_of(&self, snapshot: &Fragment) -> Result<Status> {
         let id = snapshot.id.as_str();
         let job = unit_name(id, UnitKind::Service);
         if !snapshot.is_task() {
             return self.systemctl.status_from_unit(&job).map(Status::Service);
         }
-        let (state, pid) = self.systemctl.task_state(&job)?;
+        let job_state = self.systemctl.task_state(&job)?;
         let (enabled, next_run) = match snapshot.timer() {
             None => (false, None),
             Some(_) => (
@@ -407,6 +408,19 @@ impl Systemd {
             ),
             source: Box::new(e),
         })?;
+        // PID 1 journals a run's terminal entry before the unit leaves `activating` or `deactivating`,
+        // so a state read before the journal can pair a run still in flight with that run's result. The
+        // run the journal's newest entry belongs to is the unit's own, and it has ended: the state is
+        // the one the unit is about to have.
+        let ended = job_state.state == State::Running
+            && last.ended
+            && last.invocation.is_some()
+            && last.invocation == job_state.invocation;
+        let (state, pid) = if ended {
+            (State::Idle, None)
+        } else {
+            (job_state.state, job_state.pid)
+        };
         Ok(Status::Task(TaskStatus {
             common: DaemonStatus { state, pid, enabled },
             last_result: last.exit,

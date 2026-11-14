@@ -218,7 +218,7 @@ impl Backend for Systemd {
     /// The job's `ActiveState` alone: no journal walk, timer or bus read.
     fn task_state(&self, snapshot: &Fragment) -> Result<State> {
         let unit = unit_name(snapshot.id().as_str(), UnitKind::Service);
-        Ok(self.systemctl.task_state(&unit)?.0)
+        Ok(self.systemctl.task_state(&unit)?.state)
     }
 
     /// Each id the unit directories name, read as `read` would. An id whose read did not complete

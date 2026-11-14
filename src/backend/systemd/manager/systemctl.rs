@@ -932,18 +932,23 @@ impl Systemctl {
         })
     }
 
-    /// A task's state and pid, from its job `unit`. The run in flight is `Running` whichever of
-    /// `activating`, `active` and `deactivating` it is in; between runs the job is `inactive`, or
-    /// `failed` after a run that failed, which is a result and not a state. Whether the task is
-    /// enabled is the timer's to say: see [`Systemctl::timer_enabled`].
-    pub(super) fn task_state(&self, unit: &str) -> Result<(State, Option<u32>)> {
-        let props = self.show_installed(unit, &["ActiveState", "MainPID"])?;
+    /// A task's state, pid and invocation, from its job `unit`, in one `systemctl show`. The run in
+    /// flight is `Running` whichever of `activating`, `active` and `deactivating` it is in; between runs
+    /// the job is `inactive`, or `failed` after a run that failed, which is a result and not a state.
+    /// The invocation is the run's, which the manager clears once the unit has gone inactive. Whether
+    /// the task is enabled is the timer's to say: see [`Systemctl::timer_enabled`].
+    pub(super) fn task_state(&self, unit: &str) -> Result<TaskJob> {
+        let props = self.show_installed(unit, &["ActiveState", "MainPID", "InvocationID"])?;
         let state = match props.get("ActiveState").map(String::as_str) {
             Some("active" | "activating" | "deactivating") => State::Running,
             Some("inactive" | "failed") => State::Idle,
             _ => State::Unknown,
         };
-        Ok((state, main_pid(&props)))
+        Ok(TaskJob {
+            state,
+            pid: main_pid(&props),
+            invocation: props.get("InvocationID").filter(|id| !id.is_empty()).cloned(),
+        })
     }
 
     /// Whether the manager still holds the job `job`, queued or running: `systemctl list-jobs` lists
@@ -967,6 +972,15 @@ impl Systemctl {
         let props = self.show_installed(&unit_name(id, UnitKind::Timer), &["UnitFileState"])?;
         Ok(props.get("UnitFileState").is_some_and(|s| s == "enabled"))
     }
+}
+
+/// What `systemctl show` says of a task's job: see [`Systemctl::task_state`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct TaskJob {
+    pub state: State,
+    pub pid: Option<u32>,
+    /// The `InvocationID` of the run the unit is in, if it has one.
+    pub invocation: Option<String>,
 }
 
 /// `MainPID`, when it names a process.

@@ -1171,23 +1171,31 @@ fn task_state_table() {
         ("maintenance", State::Unknown),
         ("", State::Unknown),
     ] {
-        let answer = format!("ActiveState={active}\nMainPID=0\nLoadState=loaded\n");
+        let answer = format!("ActiveState={active}\nMainPID=0\nInvocationID=\nLoadState=loaded\n");
         assert_eq!(
             showing(&answer).task_state("x.service").expect(active),
-            (state, None),
+            TaskJob {
+                state,
+                pid: None,
+                invocation: None
+            },
             "{active:?}"
         );
     }
-    let answer = "ActiveState=active\nMainPID=42\nLoadState=loaded\n";
+    let answer = "ActiveState=active\nMainPID=42\nInvocationID=0123abcd\nLoadState=loaded\n";
     assert_eq!(
         showing(answer).task_state("x.service").expect("a pid"),
-        (State::Running, Some(42))
+        TaskJob {
+            state: State::Running,
+            pid: Some(42),
+            invocation: Some("0123abcd".to_string())
+        }
     );
 }
 
 #[skuld::test]
 fn a_task_job_systemd_has_not_loaded_is_not_a_state() {
-    let answer = "ActiveState=inactive\nMainPID=0\nLoadState=not-found\n";
+    let answer = "ActiveState=inactive\nMainPID=0\nInvocationID=\nLoadState=not-found\n";
     let e = showing(answer).task_state("x.service").expect_err(answer);
     assert!(matches!(e, Error::UnitNotLoaded { .. }), "{e:?}");
 }

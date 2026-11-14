@@ -70,6 +70,8 @@ fn run(entries: Vec<Entry>) -> Result<LastRun> {
 fn last_result_reads_the_newest_run() {
     let ended = |exit| LastRun {
         started: Some(at(1_000)),
+        invocation: Some("a".to_string()),
+        ended: true,
         exit: Some(exit),
     };
     // Each walk is newest first: the run's terminal entry, then its Starting entry.
@@ -124,6 +126,8 @@ fn an_older_runs_terminal_entry_is_not_taken_for_the_newest_runs() {
         last,
         LastRun {
             started: Some(at(2_000)),
+            invocation: Some("b".to_string()),
+            ended: false,
             exit: None
         }
     );
@@ -137,6 +141,8 @@ fn a_newest_run_with_no_terminal_entry_has_started_and_no_result() {
         last,
         LastRun {
             started: Some(at(1_000)),
+            invocation: Some("a".to_string()),
+            ended: false,
             exit: None
         }
     );
@@ -146,6 +152,8 @@ fn a_newest_run_with_no_terminal_entry_has_started_and_no_result() {
 fn no_entries_is_no_run() {
     let none = LastRun {
         started: None,
+        invocation: None,
+        ended: false,
         exit: None,
     };
     assert_eq!(run(Vec::new()).expect("run"), none);
@@ -238,13 +246,15 @@ fn a_control_processs_exit_is_not_the_runs_exit() {
 fn a_run_that_failed_with_no_exit_has_a_start_and_no_result() {
     let never = LastRun {
         started: Some(at(1_000)),
+        invocation: Some("a".to_string()),
+        ended: true,
         exit: None,
     };
     for (what, entries, expected) in [
         (
             "no exit entry",
             vec![other("a"), failed_with("a", "resources"), starting("a", 1_000)],
-            never,
+            never.clone(),
         ),
         (
             "a control process's exit does not count",
@@ -266,6 +276,8 @@ fn a_run_that_failed_with_no_exit_has_a_start_and_no_result() {
             ],
             LastRun {
                 started: Some(at(1_000)),
+                invocation: Some("a".to_string()),
+                ended: true,
                 exit: Some(Exit::Code(217)),
             },
         ),

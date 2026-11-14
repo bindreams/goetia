@@ -9,7 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use super::super::UNIT_DIR;
 use super::super::busctl::Busctl;
 use super::super::journal::fake::Fake as JournalFake;
-use super::super::journal::{Entry as JournalEntry, MAIN_PROCESS_EXITED, STARTING};
+use super::super::journal::{DEACTIVATED, Entry as JournalEntry, MAIN_PROCESS_EXITED, STARTING};
 use super::super::manager_tests::QuarantineSweep;
 use super::super::systemctl::Systemctl;
 use super::super::systemctl::systemctl_tests::{booted, gate_then};
@@ -1406,11 +1406,16 @@ fn scan_lists_a_task_once_and_a_timer_only_id_as_unusable(#[fixture(systemd_grou
 // status ==============================================================================================================
 
 fn show(active: &str, pid: u32) -> Entry {
+    show_in(active, pid, "")
+}
+
+/// The job's `show` with the `InvocationID` of the run it is in.
+fn show_in(active: &str, pid: u32, invocation: &str) -> Entry {
     reply(
         &["show"],
         exited(
             0,
-            &format!("ActiveState={active}\nMainPID={pid}\nLoadState=loaded\n"),
+            &format!("ActiveState={active}\nMainPID={pid}\nInvocationID={invocation}\nLoadState=loaded\n"),
             "",
         ),
     )
@@ -1480,10 +1485,66 @@ fn a_task_status_is_read_from_the_job_the_timer_and_the_journal() {
     assert_eq!(
         systemctl.calls(),
         [
-            call(&["show", "--property", "ActiveState,MainPID,LoadState", "--", "x.service"]),
+            call(&[
+                "show",
+                "--property",
+                "ActiveState,MainPID,InvocationID,LoadState",
+                "--",
+                "x.service"
+            ]),
             call(&["show", "--property", "UnitFileState,LoadState", "--", "x.timer"]),
         ]
     );
+}
+
+/// PID 1 journals a run's terminal entry before the unit leaves `activating` or `deactivating`, so a
+/// state read ahead of the journal can pair a run in flight with its own result. The unit's `InvocationID`
+/// being the newest run in the journal, with its terminal entry there, says the run has ended: `Idle`,
+/// and the result is that run's. Any other pairing is left as read.
+#[skuld::test]
+fn a_running_unit_whose_own_run_has_a_terminal_entry_is_idle() {
+    let status_of = |state: Entry, journal: Vec<JournalEntry>| {
+        let spec = task_spec("x", "/bin/a", None);
+        let mgr = manager(&Fake::new([state]), Fake::new([]), JournalFake::new(journal));
+        match mgr.status_of(&job_alone(&spec)).expect("status") {
+            Status::Task(status) => status,
+            other => panic!("a task's status is a task's: {other:?}"),
+        }
+    };
+    let deactivated =
+        |invocation: &str| JournalEntry::of(&[("MESSAGE_ID", DEACTIVATED), ("INVOCATION_ID", invocation)]);
+
+    // The journal is newest first: the terminal entry, then the Starting entry.
+    let ended = status_of(
+        show_in("deactivating", 42, "x1"),
+        vec![deactivated("x1"), starting("x1", 1_000)],
+    );
+    assert_eq!((ended.common.state, ended.common.pid), (State::Idle, None), "{ended:?}");
+    assert_eq!(ended.last_result, Some(Exit::Code(0)));
+
+    let in_flight = status_of(show_in("active", 42, "x1"), vec![starting("x1", 1_000)]);
+    assert_eq!(
+        (in_flight.common.state, in_flight.common.pid),
+        (State::Running, Some(42)),
+        "{in_flight:?}"
+    );
+    assert_eq!(in_flight.last_result, None);
+
+    // The unit is in a newer run than the journal's newest has recorded: that run's result is the last.
+    let older = status_of(
+        show_in("activating", 42, "x2"),
+        vec![exited_with("w", "3"), starting("w", 1_000)],
+    );
+    assert_eq!(
+        (older.common.state, older.common.pid),
+        (State::Running, Some(42)),
+        "{older:?}"
+    );
+    assert_eq!(older.last_result, Some(Exit::Code(3)));
+
+    // A unit with no invocation of its own is not matched with a run.
+    let none = status_of(show("active", 42), vec![deactivated("x1"), starting("x1", 1_000)]);
+    assert_eq!(none.common.state, State::Running, "{none:?}");
 }
 
 /// A task with no timer installed is not enabled and has no next run, and asks neither the manager
@@ -1548,7 +1609,7 @@ fn a_tasks_state_is_read_from_the_job_alone() {
         [call(&[
             "show",
             "--property",
-            "ActiveState,MainPID,LoadState",
+            "ActiveState,MainPID,InvocationID,LoadState",
             "--",
             "x.service"
         ])]

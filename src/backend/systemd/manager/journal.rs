@@ -303,10 +303,14 @@ fn main_process_exit(entry: &Entry) -> Result<Exit> {
 // last_run ============================================================================================================
 
 /// What the journal says of a task's most recent run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LastRun {
     /// When it started: `None` when the journal holds no run.
     pub started: Option<SystemTime>,
+    /// Its `INVOCATION_ID`, which the unit's own `InvocationID` is while the run is the unit's current one.
+    pub invocation: Option<String>,
+    /// Whether a terminal entry of it is in the journal, whatever it says: the run has ended.
+    pub ended: bool,
     /// How it ended: `None` while it runs, when it ended with no entry to say so, and when its first
     /// terminal entry is "Failed with result" with no process exit before it: it has a start and no
     /// result.
@@ -332,12 +336,15 @@ pub(super) fn last_run(journal: &dyn Journal, unit: &str) -> Result<LastRun> {
                 .rev()
                 .find(|(of, _)| invocation.is_some() && of.as_deref() == invocation)
                 .map(|(_, ending)| ending);
+            let ended = ending.is_some();
             let exit = match ending {
                 Some(Ending::Exit(exit)) => Some(exit?),
                 Some(Ending::NoExit { .. }) | None => None,
             };
             return Ok(LastRun {
                 started: Some(entry.realtime()?),
+                invocation: invocation.map(str::to_string),
+                ended,
                 exit,
             });
         }
@@ -347,6 +354,8 @@ pub(super) fn last_run(journal: &dyn Journal, unit: &str) -> Result<LastRun> {
     }
     Ok(LastRun {
         started: None,
+        invocation: None,
+        ended: false,
         exit: None,
     })
 }
