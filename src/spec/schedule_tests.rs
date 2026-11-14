@@ -369,6 +369,21 @@ fn from_parts_round_trips_parse() {
 }
 
 #[skuld::test]
+fn schedules_with_the_same_picks_are_equal_whatever_the_hash() {
+    // `host0` and `host1` hash differently and both pick 0 of `H(0-1)`.
+    let (a, b) = (
+        parse_for("nightly", "host0", "H(0-1) * * * *").unwrap(),
+        parse_for("nightly", "host1", "H(0-1) * * * *").unwrap(),
+    );
+    assert_ne!(a.hashes(), b.hashes());
+    assert_eq!(a.fields(), b.fields());
+    assert_eq!(a, b);
+
+    let other_pick = parse_for("nightly", "host5", "H(0-1) * * * *").unwrap();
+    assert_ne!(a, other_pick);
+}
+
+#[skuld::test]
 fn only_h_fields_carry_a_hash() {
     let parsed = parse("H 3 H(1-5),7 * 1");
     let hashed: Vec<bool> = parsed.hashes().iter().map(Option::is_some).collect();

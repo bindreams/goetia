@@ -71,14 +71,24 @@ pub enum DayRule {
 }
 
 /// A parsed schedule: its text and the five resolved fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Schedule {
     text: String,
     // Boxed: keeps `DaemonSpec`'s variants close in size.
     resolved: Box<Resolved>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Compares the text and the resolved fields, never the hashes: they only let a decode verify the
+/// stored values, and two hashes that pick alike are the same schedule.
+impl PartialEq for Schedule {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.resolved.fields == other.resolved.fields
+    }
+}
+
+impl Eq for Schedule {}
+
+#[derive(Debug, Clone)]
 struct Resolved {
     fields: [CronField; FIELD_COUNT],
     /// The hash each field with an `H` term was resolved by; none for an `H`-free field.

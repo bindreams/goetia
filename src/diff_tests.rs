@@ -250,6 +250,17 @@ fn an_annotated_schedule_resolves_back_to_the_task(#[fixture(temp_dir)] dir: &Pa
 }
 
 #[skuld::test]
+fn specs_that_resolve_alike_diff_empty_whatever_the_host() {
+    // `host0` and `host1` hash differently and both pick 0 of `H(0-1)`.
+    let (a, b) = (
+        task_fixture_on("host0", Some("H(0-1) * * * *")),
+        task_fixture_on("host1", Some("H(0-1) * * * *")),
+    );
+    assert_eq!(a, b);
+    assert_eq!(spec_diff(&a, &b), "");
+}
+
+#[skuld::test]
 fn identical_inputs_produce_empty_diff() {
     let spec = spec_fixture();
     let same = spec_fixture();
