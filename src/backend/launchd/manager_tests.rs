@@ -32,13 +32,14 @@ fn sample_plist_restarting(id: &str, restart: Restart) -> String {
     })
     .map(DaemonSpec::from)
     .unwrap();
-    generate::plist(
+    generate::plists(
         &spec,
         &Identity {
             user: "root".to_string(),
         },
     )
     .unwrap()
+    .job
 }
 
 // persist_new / write_existing ========================================================================================
@@ -632,7 +633,7 @@ fn read_artifact_maps_an_unreadable_plist_to_undetermined() {
 /// encoding below is one a vendor legitimately ships there: `plutil -convert binary1` and `defaults
 /// write` produce a binary plist by default, UTF-16 is a legal property-list encoding whose `FF FE`
 /// BOM is not UTF-8, and a Latin-1 byte in a description is an ordinary accident. None of them is
-/// UTF-8 XML, which is the only thing `generate::plist` writes, so each is a positive
+/// UTF-8 XML, which is the only thing `generate::plists` writes, so each is a positive
 /// identification of a file goetia did not write — foreign, exactly like an unmarked XML plist.
 ///
 /// Answering any of them `undetermined` would give a macOS host a permanent, unclearable
@@ -916,6 +917,29 @@ fn an_unmarked_plist_in_both_directories_is_not_reported() {
 
     assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
     assert!(scan.reported.is_empty(), "{:?}", scan.reported);
+}
+
+// Rendering ===========================================================================================================
+
+/// A task is rendered: its job's plist, with the metadata comment, is what `render` answers.
+#[skuld::test]
+fn render_of_a_task_no_longer_refuses() {
+    use crate::backend::Backend as _;
+
+    let (mgr, _) = scripted(&[]);
+    let spec = crate::testing::task(
+        "goetia-rendered-task",
+        vec!["/bin/true".to_string()],
+        Some("30 3 * * *"),
+    );
+
+    let text = mgr.render(&spec).expect("a task renders");
+
+    assert_eq!(generate::extract(&text).unwrap().expect("marked").spec, spec);
+    assert!(
+        text.contains("<key>ThrottleInterval</key>\n\t<integer>1</integer>"),
+        "{text}"
+    );
 }
 
 // Writing: a race that has cost no call ===============================================================================
@@ -2672,13 +2696,14 @@ fn install_loaded_after_write(name: &str, during: impl FnOnce() + Send + 'static
     let mut fields = service_fields(spec);
     fields.common.command.push("updated".to_string());
     let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
-    let changed = generate::plist(
+    let changed = generate::plists(
         &spec,
         &Identity {
             user: "root".to_string(),
         },
     )
-    .unwrap();
+    .unwrap()
+    .job;
     let script = Fake::new([answer("print", NOT_LOADED), answer("print", RUNNING).then(during)]);
     let mgr = launchd_over(script.clone());
     let e = mgr.install(&spec, false).expect_err("loaded after the write");

@@ -262,8 +262,9 @@ fn the_largest_schedule_entries_can_produce_is_produced_whole() {
 
 #[skuld::test]
 fn entry_order_and_key_order_are_fixed() {
-    // Ascending by month, then the day axis (days, then weekdays), then hour, then minute.
-    let key = |e: &Entry| (e.month, e.day, e.weekday, e.hour, e.minute);
+    // All day entries (no month first, then by month), then all weekday entries; within each, by hour,
+    // then minute.
+    let key = |e: &Entry| (e.weekday.is_some(), e.month, e.day, e.weekday, e.hour, e.minute);
     let compiled = compile("0,30 9,10 1,15 4,5 *");
     let keys: Vec<_> = compiled.iter().map(key).collect();
     let mut sorted = keys.clone();
@@ -277,6 +278,28 @@ fn entry_order_and_key_order_are_fixed() {
         or.iter().map(|e| (e.day, e.weekday)).collect::<Vec<_>>(),
         [(Some(1), None), (Some(15), None), (None, Some(1))]
     );
+
+    // A day some months lack is written with a month, after the days that need none, and the
+    // weekday entries still come last.
+    let mixed = compile("0 0 1,31 * 1");
+    assert_eq!(
+        mixed.iter().map(|e| (e.month, e.day, e.weekday)).collect::<Vec<_>>(),
+        [
+            (None, Some(1), None),
+            (Some(1), Some(31), None),
+            (Some(3), Some(31), None),
+            (Some(5), Some(31), None),
+            (Some(7), Some(31), None),
+            (Some(8), Some(31), None),
+            (Some(10), Some(31), None),
+            (Some(12), Some(31), None),
+            (None, None, Some(1)),
+        ]
+    );
+    let keys: Vec<_> = mixed.iter().map(key).collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted);
 
     // The renderer writes the keys in the order the fields are declared: Minute, Hour, Day, Weekday, Month.
     assert_eq!(

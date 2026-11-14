@@ -235,7 +235,7 @@ fn preview_artifact(spec: &DaemonSpec, host: &dyn Fn() -> Result<HostCommand>) -
     #[cfg(target_os = "macos")]
     {
         let _ = host;
-        crate::backend::launchd::generate::plist(spec, &identity)
+        crate::backend::launchd::generate::plists(spec, &identity).map(|plists| plists.to_string())
     }
     #[cfg(windows)]
     {

@@ -11,9 +11,6 @@
 //! some months lack is therefore written with a month that has it, a weekday under a restricted
 //! month is refused, and so is a schedule that has to name 29 February.
 
-// Nothing calls it until the generator does (Task 5), which removes this `allow`.
-#![allow(dead_code)]
-
 use crate::error::Error;
 use crate::spec::{CronField, DayRule, Id, Schedule, invalid};
 
@@ -37,9 +34,9 @@ const MONTH_DAYS: [u8; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 const FEBRUARY: u8 = 2;
 
-/// The entries that fire exactly when `schedule` does, ordered by month, then the day axis (days,
-/// then weekdays), then hour, then minute. An empty `Vec` is a schedule with no date (`0 0 30 2 *`):
-/// its timer has no `StartCalendarInterval`, which is not an empty dict.
+/// The entries that fire exactly when `schedule` does: all day entries (no month first, then by
+/// month), then all weekday entries; within each, by hour, then minute. An empty `Vec` is a schedule
+/// with no date (`0 0 30 2 *`): its timer has no `StartCalendarInterval`, which is not an empty dict.
 ///
 /// Refused with [`Error::Invalid`] for `id`: a day of the month and a day of the week that must both
 /// match, with neither full (launchd only ORs them); a weekday under a restricted month; and a

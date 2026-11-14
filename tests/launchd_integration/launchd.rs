@@ -129,7 +129,7 @@ fn binary_plist(label: &str) -> Vec<u8> {
 }
 
 /// Bytes that are not UTF-8 and do not begin `bplist00`: still not the UTF-8 XML
-/// `generate::plist` writes, so still a positive identification of a plist
+/// `generate::plists` writes, so still a positive identification of a plist
 /// goetia did not write. `FF FE` is also a UTF-16LE BOM, which is what a legal
 /// UTF-16 property list starts with — the exact file that used to hand a macOS
 /// host a permanent exit `4` for a vendor's service.
@@ -753,7 +753,9 @@ fn list_reports_a_deleted_user_as_ours_unusable(#[fixture(launchd_group)] _group
     ensure_staging_dir();
     write_plist(
         &path,
-        &generate::plist(&spec, &Identity { user: user.to_string() }).unwrap(),
+        &generate::plists(&spec, &Identity { user: user.to_string() })
+            .unwrap()
+            .job,
     );
     let cannot_render = mgr
         .preview_install(&spec)

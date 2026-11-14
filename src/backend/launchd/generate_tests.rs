@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use super::*;
 use crate::spec::test_support::program;
-use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
+use crate::spec::{
+    DaemonFields, DaemonSpec, HashSeed, Id, Protocol, Schedule, ServiceFields, ServiceSpec, TaskFields, TaskSpec, User,
+};
 use crate::testing::{base_fields, service_fields};
 
 // Fixtures ============================================================================================================
@@ -62,6 +64,11 @@ fn spec_with_restart(restart: Restart) -> DaemonSpec {
     })
     .map(DaemonSpec::from)
     .unwrap()
+}
+
+/// The job plist `spec` renders to: the golden tests below read the one text a service has.
+fn plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
+    plists(spec, id).map(|plists| plists.job)
 }
 
 // Snapshots ===========================================================================================================
@@ -660,4 +667,515 @@ fn without_metadata_drops_every_terminated_comment() {
 fn without_metadata_drops_a_terminated_comment_and_keeps_an_unterminated_one_after_it() {
     let text = "<a/>\n<!-- goetia:begin\nx\ngoetia:end -->\n<b/>\n<!-- goetia:begin\ny\n<c/>\n";
     assert_eq!(without_metadata(text), "<a/>\n<b/>\n<!-- goetia:begin\ny\n<c/>\n");
+}
+
+// Tasks ===============================================================================================================
+
+fn schedule(text: &str) -> Schedule {
+    let id = Id::try_from("frpc").unwrap();
+    Schedule::parse(
+        text,
+        &HashSeed {
+            hostname: "testing",
+            id: &id,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{text:?}: {e}"))
+}
+
+/// A task with `full_spec`'s env, cwd, user and logs, on `schedule_text` (`None`: no schedule).
+fn full_task(schedule_text: Option<&str>) -> DaemonSpec {
+    TaskSpec::new(TaskFields {
+        common: service_fields(full_spec()).common,
+        schedule: schedule_text.map(schedule),
+    })
+    .map(DaemonSpec::from)
+    .unwrap()
+}
+
+/// A root task with no `cwd`, `env` or `logs`, on `30 3 * * *`, that `change` then varies.
+fn task_with(change: impl FnOnce(&mut TaskFields)) -> DaemonSpec {
+    let mut fields = TaskFields {
+        common: service_fields(minimal_spec()).common,
+        schedule: Some(schedule("30 3 * * *")),
+    };
+    change(&mut fields);
+    TaskSpec::new(fields).map(DaemonSpec::from).unwrap()
+}
+
+/// A plist as the generator lays it out, around `body`: the dict's keys, one per line, tab-indented.
+fn document(spec: &DaemonSpec, body: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <!-- goetia:begin\n\
+         Marker: goetia\n\
+         Schema: 1\n\
+         Version: {version}\n\
+         Spec: {blob}\n\
+         goetia:end -->\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         {body}\
+         </dict>\n\
+         </plist>\n",
+        version = crate::version(),
+        blob = blob::encode(spec),
+    )
+}
+
+/// What a task with `logs` runs through: `sh` prints the run's marker and the pid, as 8 lowercase hex
+/// digits, then execs the command. Spelled out, not built from the generator's constant, so the bytes
+/// are pinned.
+const SCRIPT: &str = r#"printf '%s %08x\n' goetia-run $$; exec "$0" "$@""#;
+
+fn job_of(spec: &DaemonSpec) -> String {
+    plists(spec, &full_identity()).unwrap().job
+}
+
+fn timer_of(spec: &DaemonSpec) -> Option<String> {
+    plists(spec, &full_identity()).unwrap().timer
+}
+
+#[skuld::test]
+fn service_plist_is_unchanged() {
+    // The snapshots above are the golden bytes; this pins that a service has no timer and that
+    // `Display` is its plist alone.
+    for (spec, id) in [(full_spec(), full_identity()), (minimal_spec(), minimal_identity())] {
+        let plists = plists(&spec, &id).unwrap();
+        assert_eq!(plists.timer, None);
+        assert_eq!(plists.to_string(), plists.job);
+        assert_eq!(plist(&spec, &id).unwrap(), plists.job);
+    }
+}
+
+#[skuld::test]
+fn task_job_text_is_exact() {
+    let spec = full_task(Some("30 3 * * *"));
+    let expected = document(
+        &spec,
+        &format!(
+            "\t<key>Label</key>\n\
+             \t<string>frpc</string>\n\
+             \t<key>ProgramArguments</key>\n\
+             \t<array>\n\
+             \t\t<string>/bin/sh</string>\n\
+             \t\t<string>-c</string>\n\
+             \t\t<string>{SCRIPT}</string>\n\
+             \t\t<string>{program}</string>\n\
+             \t\t<string>-c</string>\n\
+             \t\t<string>frpc.toml</string>\n\
+             \t</array>\n\
+             \t<key>WorkingDirectory</key>\n\
+             \t<string>{cwd}</string>\n\
+             \t<key>EnvironmentVariables</key>\n\
+             \t<dict>\n\
+             \t\t<key>RUST_LOG</key>\n\
+             \t\t<string>info</string>\n\
+             \t\t<key>URL</key>\n\
+             \t\t<string>http://x/a%20b</string>\n\
+             \t</dict>\n\
+             \t<key>UserName</key>\n\
+             \t<string>svc-frpc</string>\n\
+             \t<key>ThrottleInterval</key>\n\
+             \t<integer>1</integer>\n\
+             \t<key>StandardOutPath</key>\n\
+             \t<string>{logs}</string>\n\
+             \t<key>StandardErrorPath</key>\n\
+             \t<string>{logs}</string>\n",
+            program = program("frpc"),
+            cwd = abs("opt/frpc").display(),
+            logs = abs("var/log/frpc.log").display(),
+        ),
+    );
+    assert_eq!(job_of(&spec), expected);
+
+    // No `logs`: the command is `ProgramArguments`, with no `sh` and no log keys.
+    let spec = task_with(|_| {});
+    let expected = document(
+        &spec,
+        &format!(
+            "\t<key>Label</key>\n\
+             \t<string>frpc</string>\n\
+             \t<key>ProgramArguments</key>\n\
+             \t<array>\n\
+             \t\t<string>{program}</string>\n\
+             \t</array>\n\
+             \t<key>UserName</key>\n\
+             \t<string>svc-frpc</string>\n\
+             \t<key>ThrottleInterval</key>\n\
+             \t<integer>1</integer>\n",
+            program = program("frpc"),
+        ),
+    );
+    assert_eq!(job_of(&spec), expected);
+}
+
+/// With no `KeepAlive` the default throttle would hold a `kickstart` for 10 s after the last start; a
+/// task never restarts, so the interval guards nothing.
+#[skuld::test]
+fn a_task_job_always_carries_throttle_interval_1() {
+    for logs in [true, false] {
+        for scheduled in [true, false] {
+            let spec = task_with(|f| {
+                f.common.logs = logs.then(|| abs("var/log/frpc.log"));
+                f.schedule = f.schedule.take().filter(|_| scheduled);
+            });
+            let text = job_of(&spec);
+            assert!(
+                text.contains("\t<key>ThrottleInterval</key>\n\t<integer>1</integer>\n"),
+                "logs {logs}, scheduled {scheduled}:\n{text}"
+            );
+            assert_eq!(text.matches("ThrottleInterval").count(), 1, "{text}");
+        }
+    }
+}
+
+#[skuld::test]
+fn a_task_without_logs_has_no_wrapper() {
+    // Its output goes nowhere launchd keeps, so there is nothing for a marker to attribute.
+    let text = job_of(&task_with(|_| {}));
+    for absent in [
+        "/bin/sh",
+        "printf",
+        "goetia-run",
+        "StandardOutPath",
+        "StandardErrorPath",
+    ] {
+        assert!(!text.contains(absent), "{absent}:\n{text}");
+    }
+
+    let text = job_of(&task_with(|f| f.common.logs = Some(abs("var/log/frpc.log"))));
+    assert!(
+        text.contains(&format!(
+            "\t\t<string>/bin/sh</string>\n\t\t<string>-c</string>\n\t\t<string>{SCRIPT}</string>\n\t\t<string>{}</string>\n",
+            program("frpc")
+        )),
+        "{text}"
+    );
+}
+
+#[skuld::test]
+fn the_wrapper_prints_the_shared_run_marker() {
+    assert!(SCRIPT.contains(crate::backend::RUN_MARKER), "{SCRIPT}");
+}
+
+#[skuld::test]
+fn timer_text_is_exact() {
+    let kickstart = "\t<key>Label</key>\n\
+                     \t<string>frpc@timer</string>\n\
+                     \t<key>ProgramArguments</key>\n\
+                     \t<array>\n\
+                     \t\t<string>/bin/launchctl</string>\n\
+                     \t\t<string>kickstart</string>\n\
+                     \t\t<string>system/frpc</string>\n\
+                     \t</array>\n";
+
+    let spec = full_task(Some("30 3 * * *"));
+    let expected = document(
+        &spec,
+        &format!(
+            "{kickstart}\
+             \t<key>StartCalendarInterval</key>\n\
+             \t<array>\n\
+             \t\t<dict>\n\
+             \t\t\t<key>Minute</key>\n\
+             \t\t\t<integer>30</integer>\n\
+             \t\t\t<key>Hour</key>\n\
+             \t\t\t<integer>3</integer>\n\
+             \t\t</dict>\n\
+             \t</array>\n"
+        ),
+    );
+    assert_eq!(timer_of(&spec), Some(expected));
+
+    // An `Or` schedule: the days, then the weekday.
+    let spec = full_task(Some("0 0 1,15 * 1"));
+    let expected = document(
+        &spec,
+        &format!(
+            "{kickstart}\
+             \t<key>StartCalendarInterval</key>\n\
+             \t<array>\n\
+             \t\t<dict>\n\
+             \t\t\t<key>Minute</key>\n\
+             \t\t\t<integer>0</integer>\n\
+             \t\t\t<key>Hour</key>\n\
+             \t\t\t<integer>0</integer>\n\
+             \t\t\t<key>Day</key>\n\
+             \t\t\t<integer>1</integer>\n\
+             \t\t</dict>\n\
+             \t\t<dict>\n\
+             \t\t\t<key>Minute</key>\n\
+             \t\t\t<integer>0</integer>\n\
+             \t\t\t<key>Hour</key>\n\
+             \t\t\t<integer>0</integer>\n\
+             \t\t\t<key>Day</key>\n\
+             \t\t\t<integer>15</integer>\n\
+             \t\t</dict>\n\
+             \t\t<dict>\n\
+             \t\t\t<key>Minute</key>\n\
+             \t\t\t<integer>0</integer>\n\
+             \t\t\t<key>Hour</key>\n\
+             \t\t\t<integer>0</integer>\n\
+             \t\t\t<key>Weekday</key>\n\
+             \t\t\t<integer>1</integer>\n\
+             \t\t</dict>\n\
+             \t</array>\n"
+        ),
+    );
+    assert_eq!(timer_of(&spec), Some(expected));
+}
+
+#[skuld::test]
+fn a_month_is_the_last_key_of_a_dict() {
+    let text = timer_of(&full_task(Some("15 4 1 6 *"))).unwrap();
+    assert!(
+        text.contains(
+            "\t\t\t<key>Minute</key>\n\t\t\t<integer>15</integer>\n\t\t\t<key>Hour</key>\n\t\t\t<integer>4</integer>\n\
+             \t\t\t<key>Day</key>\n\t\t\t<integer>1</integer>\n\t\t\t<key>Month</key>\n\t\t\t<integer>6</integer>\n"
+        ),
+        "{text}"
+    );
+}
+
+#[skuld::test]
+fn task_without_schedule_has_no_timer() {
+    let spec = task_with(|f| f.schedule = None);
+    let plists = plists(&spec, &full_identity()).unwrap();
+    assert_eq!(plists.timer, None);
+    assert_eq!(plists.to_string(), plists.job);
+}
+
+/// `0 0 30 2 *` names no date that exists: the timer is armed with nothing to fire on, and has no
+/// `StartCalendarInterval`, which an empty array or dict would not be.
+#[skuld::test]
+fn a_schedule_with_no_date_has_a_timer_without_the_calendar_key() {
+    let spec = full_task(Some("0 0 30 2 *"));
+    let expected = document(
+        &spec,
+        "\t<key>Label</key>\n\
+         \t<string>frpc@timer</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>/bin/launchctl</string>\n\
+         \t\t<string>kickstart</string>\n\
+         \t\t<string>system/frpc</string>\n\
+         \t</array>\n",
+    );
+    let timer = timer_of(&spec).expect("the task has a schedule, so a timer");
+    assert_eq!(timer, expected);
+    assert!(!timer.contains("StartCalendarInterval"), "{timer}");
+    assert_eq!(extract(&timer).unwrap().unwrap().spec, spec);
+}
+
+#[skuld::test]
+fn a_schedule_that_runs_every_minute_has_one_empty_dict() {
+    let timer = timer_of(&full_task(Some("* * * * *"))).unwrap();
+    assert!(
+        timer.contains("\t<key>StartCalendarInterval</key>\n\t<array>\n\t\t<dict>\n\t\t</dict>\n\t</array>\n"),
+        "{timer}"
+    );
+}
+
+#[skuld::test]
+fn timer_for_a_service_is_none() {
+    for spec in [full_spec(), minimal_spec(), task_with(|f| f.schedule = None)] {
+        assert_eq!(timer_for(&spec).unwrap(), None);
+    }
+}
+
+#[skuld::test]
+fn timer_for_matches_plists_timer() {
+    for spec in [
+        full_task(Some("30 3 * * *")),
+        full_task(Some("0 0 1,15 * 1")),
+        full_task(Some("0 0 30 2 *")),
+        full_task(Some("* * * * *")),
+        full_task(None),
+        full_spec(),
+    ] {
+        assert_eq!(timer_for(&spec).unwrap(), timer_of(&spec));
+    }
+}
+
+#[skuld::test]
+fn both_plists_carry_the_same_blob() {
+    let spec = full_task(Some("30 3 * * *"));
+    let plists = plists(&spec, &full_identity()).unwrap();
+    let timer = plists.timer.as_deref().unwrap();
+
+    let comment = metadata_comment(&spec);
+    assert!(plists.job.contains(&comment), "{}", plists.job);
+    assert!(timer.contains(&comment), "{timer}");
+    assert_eq!(plists.job.matches("Spec: ").count(), 1);
+    assert_eq!(timer.matches("Spec: ").count(), 1);
+    for text in [&plists.job, timer] {
+        assert!(!text.contains("Disabled"), "{text}");
+    }
+}
+
+#[skuld::test]
+fn extract_reads_both() {
+    let spec = full_task(Some("30 3 * * *"));
+    let plists = plists(&spec, &full_identity()).unwrap();
+
+    for text in [&plists.job, plists.timer.as_ref().unwrap()] {
+        let blob = extract(text).unwrap().expect("a marker");
+        assert_eq!(blob.spec, spec);
+        assert_eq!(blob.schema, blob::SCHEMA);
+        assert_eq!(blob.version, crate::version());
+    }
+}
+
+#[skuld::test]
+fn generate_of_extract_is_the_identity_for_a_task() {
+    for spec in [
+        full_task(Some("30 3 * * *")),
+        full_task(Some("0 0 1,15 * 1")),
+        full_task(Some("0 0 30 2 *")),
+        full_task(None),
+    ] {
+        let id = full_identity();
+        let first = plists(&spec, &id).unwrap();
+
+        let from_job = extract(&first.job).unwrap().unwrap().spec;
+        assert_eq!(plists(&from_job, &id).unwrap(), first);
+        if let Some(timer) = &first.timer {
+            let from_timer = extract(timer).unwrap().unwrap().spec;
+            assert_eq!(plists(&from_timer, &id).unwrap(), first);
+            assert_eq!(timer_for(&from_timer).unwrap().as_ref(), Some(timer));
+        }
+    }
+}
+
+#[skuld::test]
+fn plists_display_puts_the_timer_under_a_comment_line() {
+    let spec = full_task(Some("30 3 * * *"));
+    let plists = plists(&spec, &full_identity()).unwrap();
+    assert_eq!(
+        plists.to_string(),
+        format!(
+            "{}\n<!-- ---- timer plist ---- -->\n{}",
+            plists.job,
+            plists.timer.unwrap()
+        )
+    );
+}
+
+/// `0 0 29 2 *` is a schedule launchd cannot hold: the refusal is the calendar's, whichever entry
+/// point meets it, and names the same daemon and field.
+#[skuld::test]
+fn a_refused_calendar_fails_plists_and_timer_for_alike() {
+    let spec = full_task(Some("0 0 29 2 *"));
+
+    let from_plists = plists(&spec, &full_identity()).unwrap_err();
+    let from_timer_for = timer_for(&spec).unwrap_err();
+
+    assert!(matches!(from_plists, Error::Invalid { .. }), "{from_plists:?}");
+    assert!(matches!(from_timer_for, Error::Invalid { .. }), "{from_timer_for:?}");
+    assert_eq!(from_plists.to_string(), from_timer_for.to_string());
+    assert!(from_plists.to_string().contains("29 February"), "{from_plists}");
+}
+
+/// Only a task with `logs` starts through `sh`, which resets these on its way to the program (measured
+/// on macOS); `SHLVL` and `PS4` pass.
+#[skuld::test]
+fn an_env_a_wrapper_resets_is_refused_only_with_logs() {
+    let logs = || Some(abs("var/log/frpc.log"));
+    for key in ["PWD", "IFS", "OLDPWD", "_"] {
+        let env = || BTreeMap::from([(key.to_string(), "x".to_string())]);
+
+        let with_logs = task_with(|f| {
+            f.common.env = env();
+            f.common.logs = logs();
+        });
+        let err = plists(&with_logs, &full_identity()).unwrap_err();
+        let Error::Invalid { daemon, message, .. } = &err else {
+            panic!("{key}: expected Error::Invalid, got {err:?}");
+        };
+        assert_eq!(daemon, "frpc");
+        assert_eq!(
+            message,
+            &format!(
+                "`env` sets `{key}`, but a task with `logs` starts through /bin/sh, which resets it, so the program \
+                 would not see the value"
+            ),
+        );
+        assert!(timer_for(&with_logs).is_ok(), "{key}: the timer has no env");
+
+        let without_logs = task_with(|f| f.common.env = env());
+        assert!(plists(&without_logs, &full_identity()).is_ok(), "{key}");
+    }
+
+    for key in ["SHLVL", "PS4"] {
+        let spec = task_with(|f| {
+            f.common.env = BTreeMap::from([(key.to_string(), "x".to_string())]);
+            f.common.logs = logs();
+        });
+        assert!(plists(&spec, &full_identity()).is_ok(), "{key}");
+    }
+
+    // A service starts without `sh`, whatever its env and logs.
+    let service = ServiceSpec::new(ServiceFields {
+        common: DaemonFields {
+            env: BTreeMap::from([("PWD".to_string(), "/x".to_string())]),
+            logs: logs(),
+            ..service_fields(minimal_spec()).common
+        },
+        ..service_fields(minimal_spec())
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
+    assert!(plists(&service, &full_identity()).is_ok());
+}
+
+#[skuld::test]
+fn timer_label_is_never_an_id() {
+    for id in ["frpc", "a", "a.b-c_d", "A9", &"x".repeat(80)] {
+        let label = timer_label(id);
+        assert_eq!(label, format!("{id}@timer"));
+        assert!(Id::try_from(label.as_str()).is_err(), "{label}");
+        assert_eq!(id_of_timer_stem(&label), Some(id), "{label}");
+    }
+    for stem in [
+        "frpc",
+        "",
+        "@timer",
+        "a@timer@timer",
+        "a b@timer",
+        "a@time",
+        "a@timers",
+        "a@Timer",
+    ] {
+        assert_eq!(id_of_timer_stem(stem), None, "{stem:?}");
+    }
+}
+
+/// The wrapper's words and the command's are escaped as every other value; the script has no `&`, `<`
+/// or `>`, so it reads back as written.
+#[skuld::test]
+fn the_marker_command_words_survive_xml_escaping() {
+    let spec = task_with(|f| {
+        f.common.command = vec![
+            program("frpc"),
+            "a&b".to_string(),
+            "<c>".to_string(),
+            "say \"hi\"".to_string(),
+        ];
+        f.common.logs = Some(abs("var/log/frpc.log"));
+    });
+    let text = job_of(&spec);
+
+    for escaped in [
+        "<string>a&amp;b</string>",
+        "<string>&lt;c&gt;</string>",
+        "<string>say \"hi\"</string>",
+        &format!("<string>{SCRIPT}</string>"),
+    ] {
+        assert!(text.contains(escaped), "{escaped}:\n{text}");
+    }
+    for raw in ["a&b", "<c>"] {
+        assert!(!text.contains(raw), "{raw}:\n{text}");
+    }
 }

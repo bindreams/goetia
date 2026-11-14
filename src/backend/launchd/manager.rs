@@ -215,7 +215,7 @@ const BINARY_PLIST_MAGIC: &[u8] = b"bplist00";
 /// `fstat`'d as regular and read to the end, so presence is established whichever variant comes out
 /// (unlike [`Error::Undetermined`]).
 enum ClassifyOutcome {
-    /// Valid UTF-8: the only form `generate::plist` writes, and the only one in which
+    /// Valid UTF-8: the only form `generate::plists` writes, and the only one in which
     /// `generate::extract` can look for the `goetia:begin` comment.
     Text(String),
     /// Bytes goetia did not write, identified positively (a binary or UTF-16 plist is as surely not
@@ -1161,9 +1161,10 @@ impl backend::Backend for Launchd {
         Reservation::make(reapers, files).map_err(|source| Error::Reservation { id: None, source })
     }
 
+    /// Interim: a task's definition is its job's plist alone, until the two-plist install lands.
     fn render(&self, spec: &DaemonSpec) -> Result<String> {
         let account = resolve_account(&spec.common().user)?;
-        generate::plist(spec, &account.identity())
+        generate::plists(spec, &account.identity()).map(|plists| plists.job)
     }
 
     fn read(&self, id: &Id) -> Result<ReadOutcome<Plist>> {

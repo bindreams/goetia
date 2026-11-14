@@ -1,5 +1,6 @@
-//! Pure generation of the plist from a resolved spec, and extraction of the embedded metadata blob
-//! back out of one. Not `#[cfg]`-gated: it compiles and its tests run everywhere.
+//! Pure generation of the plists from a resolved spec (a service's one; a task's job and its timer),
+//! and extraction of the embedded metadata blob back out of one. Not `#[cfg]`-gated: it compiles and
+//! its tests run everywhere.
 //!
 //! **Enablement is not a plist key.** `KeepAlive` implies `RunAtLoad`, so a job with a restart
 //! policy runs the instant it is loaded, and `launchctl bootstrap` refuses a `Disabled: true`
@@ -16,10 +17,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::backend::{Identity, cannot_run_tasks};
+use super::calendar::{self, Entry};
+use crate::backend::{Identity, RUN_MARKER, refuse_env_sh_resets};
 use crate::blob::{self, Blob};
 use crate::error::Error;
-use crate::spec::{DaemonSpec, Restart};
+use crate::spec::{DaemonFields, DaemonSpec, Id, Restart, Schedule, TaskSpec};
 
 // Metadata comment ====================================================================================================
 
@@ -296,49 +298,131 @@ fn round_up_seconds(d: Duration) -> u64 {
     }
 }
 
+/// A `StartCalendarInterval` dict's keys, in the order its entry declares them. A key an entry omits
+/// is not written.
+fn calendar_keys(entry: &Entry) -> [(&'static str, Option<u8>); 5] {
+    [
+        ("Minute", entry.minute),
+        ("Hour", entry.hour),
+        ("Day", entry.day),
+        ("Weekday", entry.weekday),
+        ("Month", entry.month),
+    ]
+}
+
+/// `StartCalendarInterval` as an array of dicts, one key per line. No entries writes nothing: a
+/// schedule with no date has no key, which an empty array or dict would not mean. An entry with no
+/// key is the empty dict, which fires every minute.
+fn push_calendar(out: &mut String, indent: &str, entries: &[Entry]) {
+    if entries.is_empty() {
+        return;
+    }
+    out.push_str(indent);
+    out.push_str("<key>StartCalendarInterval</key>\n");
+    out.push_str(indent);
+    out.push_str("<array>\n");
+    let dict = format!("{indent}\t");
+    let keys = format!("{dict}\t");
+    for entry in entries {
+        out.push_str(&dict);
+        out.push_str("<dict>\n");
+        for (key, value) in calendar_keys(entry) {
+            if let Some(value) = value {
+                push_key_integer(out, &keys, key, u64::from(value));
+            }
+        }
+        out.push_str(&dict);
+        out.push_str("</dict>\n");
+    }
+    out.push_str(indent);
+    out.push_str("</array>\n");
+}
+
 // Generation ==========================================================================================================
 
-/// Render `spec` as a launchd plist for the already-resolved account `id`.
+const INDENT: &str = "\t";
+
+/// What goetia writes for one daemon: the job's plist, and for a task with a `schedule` the timer
+/// plist that starts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plists {
+    /// `<id>.plist`.
+    pub job: String,
+    /// `<id>@timer.plist`: `None` for a service, and for a task with no `schedule`.
+    pub timer: Option<String>,
+}
+
+impl std::fmt::Display for Plists {
+    /// The job text, then the timer text under a `<!-- ---- timer plist ---- -->` line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.job)?;
+        if let Some(timer) = &self.timer {
+            write!(f, "\n<!-- ---- timer plist ---- -->\n{timer}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The label of a task's timer. `@` is outside an id's characters, so no id is a timer's label, and
+/// a plist stem that ends in `@timer` with an id before it is a timer's.
+#[allow(dead_code)] // Used by the two-plist snapshot, which removes this allow.
+pub(crate) fn timer_label(id: &str) -> String {
+    format!("{id}{TIMER_SUFFIX}")
+}
+
+/// The id of the task whose timer's plist stem (the file name without `.plist`) is `stem`: `Some`
+/// when `stem` is a valid id followed by `@timer`.
+#[allow(dead_code)] // Used by the two-plist snapshot, which removes this allow.
+pub(crate) fn id_of_timer_stem(stem: &str) -> Option<&str> {
+    let id = stem.strip_suffix(TIMER_SUFFIX)?;
+    Id::try_from(id).ok().map(|_| id)
+}
+
+const TIMER_SUFFIX: &str = "@timer";
+
+/// Render `spec` as launchd plists for the already-resolved account `id`: a service gives its plist;
+/// a task gives its job and, when it has a schedule, the timer that kickstarts it.
 ///
-/// Never emits `Disabled`; see the module doc. Emits `Label`, `ProgramArguments`, `WorkingDirectory`
-/// (if `cwd`), `EnvironmentVariables` (if `env` is non-empty), `UserName`, `KeepAlive`/`RunAtLoad`
-/// (per `restart`), `ThrottleInterval` (if `restart != never` and `restart_delay` is set), and
-/// `StandardOutPath`/`StandardErrorPath` (if `logs`; both name the one log file).
-pub fn plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
-    let DaemonSpec::Service(s) = spec else {
-        return Err(cannot_run_tasks("launchd", &spec.common().id));
+/// Never emits `Disabled`; see the module doc. A service's plist has `Label`, `ProgramArguments`,
+/// `WorkingDirectory` (if `cwd`), `EnvironmentVariables` (if `env` is non-empty), `UserName`,
+/// `KeepAlive`/`RunAtLoad` (per `restart`), `ThrottleInterval` (if `restart != never` and
+/// `restart_delay` is set), and `StandardOutPath`/`StandardErrorPath` (if `logs`; both name the one
+/// log file). A task's job has the same keys but no restart policy and a `ThrottleInterval` of 1; its
+/// timer is described at [`timer_for`].
+///
+/// `plists(&extract(&plists(spec, id).job).spec, id)` is `plists(spec, id)`.
+///
+/// Fails with [`Error::Invalid`] for a schedule launchd cannot hold (see `calendar::entries`), and for
+/// a task with `logs` whose `env` sets a variable `/bin/sh` resets.
+pub fn plists(spec: &DaemonSpec, id: &Identity) -> Result<Plists, Error> {
+    Ok(Plists {
+        job: job_plist(spec, id)?,
+        timer: timer_for(spec)?,
+    })
+}
+
+/// The timer plist `spec` has: `None` for a service and for a task with no schedule. It needs no
+/// identity, so a timer is regenerated from a spec alone.
+///
+/// The timer is a second job, run as root, that runs `launchctl kickstart system/<id>` at the
+/// schedule's `StartCalendarInterval` entries and has no `RunAtLoad`. A schedule with no date has a
+/// timer with no `StartCalendarInterval`, which never fires.
+///
+/// Fails with [`Error::Invalid`] for a schedule launchd cannot hold.
+pub fn timer_for(spec: &DaemonSpec) -> Result<Option<String>, Error> {
+    let DaemonSpec::Task(task) = spec else {
+        return Ok(None);
     };
-    const INDENT: &str = "\t";
-    let mut dict = String::new();
+    let Some(schedule) = &task.schedule else {
+        return Ok(None);
+    };
+    timer_plist(spec, task, schedule).map(Some)
+}
 
-    push_key_string(&mut dict, INDENT, "Label", s.common.id.as_str());
-    push_key_string_array(&mut dict, INDENT, "ProgramArguments", &s.common.command);
-
-    if let Some(cwd) = &s.common.cwd {
-        push_key_string(&mut dict, INDENT, "WorkingDirectory", path_str(cwd));
-    }
-
-    if !s.common.env.is_empty() {
-        push_key_string_dict(&mut dict, INDENT, "EnvironmentVariables", &s.common.env);
-    }
-
-    push_key_string(&mut dict, INDENT, "UserName", &id.user);
-
-    push_keep_alive(&mut dict, INDENT, s.restart);
-
-    if s.restart != Restart::Never
-        && let Some(delay) = s.restart_delay
-    {
-        push_key_integer(&mut dict, INDENT, "ThrottleInterval", round_up_seconds(delay));
-    }
-
-    if let Some(logs) = &s.common.logs {
-        let path = path_str(logs);
-        push_key_string(&mut dict, INDENT, "StandardOutPath", path);
-        push_key_string(&mut dict, INDENT, "StandardErrorPath", path);
-    }
-
-    Ok(format!(
+/// `dict`, the keys of a plist's top-level dict, in a plist document carrying the metadata comment of
+/// `spec`.
+fn document(spec: &DaemonSpec, dict: &str) -> String {
+    format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          {comment}\
@@ -348,7 +432,109 @@ pub fn plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
          </dict>\n\
          </plist>\n",
         comment = metadata_comment(spec),
-    ))
+    )
+}
+
+/// The keys a job starts with, service or task: `Label`, `argv` as `ProgramArguments`,
+/// `WorkingDirectory`, `EnvironmentVariables` and `UserName`.
+fn push_job_head(dict: &mut String, common: &DaemonFields, id: &Identity, argv: &[String]) {
+    push_key_string(dict, INDENT, "Label", common.id.as_str());
+    push_key_string_array(dict, INDENT, "ProgramArguments", argv);
+
+    if let Some(cwd) = &common.cwd {
+        push_key_string(dict, INDENT, "WorkingDirectory", path_str(cwd));
+    }
+
+    if !common.env.is_empty() {
+        push_key_string_dict(dict, INDENT, "EnvironmentVariables", &common.env);
+    }
+
+    push_key_string(dict, INDENT, "UserName", &id.user);
+}
+
+/// `StandardOutPath` and `StandardErrorPath`, both the one log file, if `logs`.
+fn push_logs(dict: &mut String, common: &DaemonFields) {
+    if let Some(logs) = &common.logs {
+        let path = path_str(logs);
+        push_key_string(dict, INDENT, "StandardOutPath", path);
+        push_key_string(dict, INDENT, "StandardErrorPath", path);
+    }
+}
+
+/// The job's plist: a service's, or a task's.
+fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
+    let mut dict = String::new();
+    match spec {
+        DaemonSpec::Service(s) => {
+            push_job_head(&mut dict, &s.common, id, &s.common.command);
+
+            push_keep_alive(&mut dict, INDENT, s.restart);
+
+            if s.restart != Restart::Never
+                && let Some(delay) = s.restart_delay
+            {
+                push_key_integer(&mut dict, INDENT, "ThrottleInterval", round_up_seconds(delay));
+            }
+
+            push_logs(&mut dict, &s.common);
+        }
+        DaemonSpec::Task(task) => {
+            let argv = task_argv(task)?;
+            push_job_head(&mut dict, &task.common, id, &argv);
+
+            // A task never restarts, and with no `KeepAlive` the default throttle would hold a start
+            // for 10 s after the last one. launchd treats 0 as 1 (measured), so 1 says what happens.
+            push_key_integer(&mut dict, INDENT, "ThrottleInterval", 1);
+
+            push_logs(&mut dict, &task.common);
+        }
+    }
+    Ok(document(spec, &dict))
+}
+
+/// The variables `/bin/sh` resets or removes on its way to the program (measured on macOS), so a task
+/// that starts through it cannot pass them.
+const RESET_BY_SH: [&str; 4] = ["PWD", "IFS", "OLDPWD", "_"];
+
+/// What a task with `logs` runs through `/bin/sh`: it prints [`RUN_MARKER`] and the pid as 8
+/// lowercase hex digits, then execs the command. `$$` is the pid `launchctl kickstart -p` prints and
+/// `exec` keeps it; `$0` is the program, so its `argv[0]` is the path as written.
+fn wrapper_script() -> String {
+    format!(r#"printf '%s %08x\n' {RUN_MARKER} $$; exec "$0" "$@""#)
+}
+
+/// A task's `ProgramArguments`. Only a task with `logs` has output launchd keeps, so only it gets the
+/// wrapper that marks each run's start in the log: `/bin/sh -c <script> <command...>`.
+fn task_argv(task: &TaskSpec) -> Result<Vec<String>, Error> {
+    if task.common.logs.is_none() {
+        return Ok(task.common.command.clone());
+    }
+    refuse_env_sh_resets(&task.common, &RESET_BY_SH, "a task with `logs`")?;
+    let mut argv = vec!["/bin/sh".to_string(), "-c".to_string(), wrapper_script()];
+    argv.extend(task.common.command.iter().cloned());
+    Ok(argv)
+}
+
+/// A task's timer plist.
+fn timer_plist(spec: &DaemonSpec, task: &TaskSpec, schedule: &Schedule) -> Result<String, Error> {
+    let entries = calendar::entries(schedule, &task.common.id)?;
+    let id = task.common.id.as_str();
+    let mut dict = String::new();
+
+    push_key_string(&mut dict, INDENT, "Label", &timer_label(id));
+    push_key_string_array(
+        &mut dict,
+        INDENT,
+        "ProgramArguments",
+        &[
+            "/bin/launchctl".to_string(),
+            "kickstart".to_string(),
+            format!("system/{id}"),
+        ],
+    );
+    push_calendar(&mut dict, INDENT, &entries);
+
+    Ok(document(spec, &dict))
 }
 
 #[cfg(test)]
