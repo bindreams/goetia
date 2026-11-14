@@ -259,20 +259,22 @@ fn counted(count: u32) -> Vec<u8> {
 /// The stdout lines of `id`'s newest run, as the journal stores them: the entries of the stream the
 /// unit's newest stdout entry is in (a run has one `_STREAM_ID`, and a run is over when `run` has
 /// returned). `run` shows the journal as stored, which journald can store with a line twice across
-/// a file rotation (systemd/systemd#29016), so this, and not `seq`'s text, is what `run` is compared with.
+/// a file rotation (systemd/systemd#29016), so this, and not `seq`'s text, is what `run` is compared
+/// with. Without the stream's first line, the `goetia-run` marker the unit's wrapper prints, which
+/// `run` does not show.
 fn newest_stream_text(id: &str) -> Vec<u8> {
     let unit = format!("_SYSTEMD_UNIT={}", unit_of(id));
     let newest = journal(&[&unit, "_TRANSPORT=stdout", "-r", "-n", "1"]);
     let stream = field(newest.first().expect("a run wrote a stdout line"), "_STREAM_ID")
         .expect("a stdout entry has a stream")
         .to_string();
-    journal(&[&format!("_STREAM_ID={stream}")])
+    let lines: Vec<String> = journal(&[&format!("_STREAM_ID={stream}")])
         .iter()
-        .flat_map(|entry| {
-            let message = field(entry, "MESSAGE").expect("a line of the run is text");
-            format!("{message}\n").into_bytes()
-        })
-        .collect()
+        .map(|entry| field(entry, "MESSAGE").expect("a line of the run is text").to_string())
+        .collect();
+    let (marker, output) = lines.split_first().expect("a stream has its marker");
+    assert!(marker.starts_with("goetia-run "), "the stream starts with the marker: {marker}");
+    output.iter().flat_map(|line| format!("{line}\n").into_bytes()).collect()
 }
 
 /// Panics unless `got` holds every line of `want`, in order. Lines of its own besides are fine: the
@@ -512,7 +514,9 @@ fn disable_leaves_a_run_in_flight_running(#[fixture(systemd_group)] _group: &Gro
     assert_eq!(status_with_result(&mgr, &task_id).last_result, Some(Exit::Code(0)));
 }
 
-/// An exit 0 unloads the unit, and the journal still says how the run went and when.
+/// An exit 0 unloads the unit, and the journal still says how the run went and when: `last_run` is
+/// the time of the unit's one "Starting" entry. (Not compared with a `SystemTime::now()` taken
+/// before the start: the wall clock of a VM can step back between two reads.)
 #[skuld::test]
 fn status_after_a_successful_run_reads_exit_0_from_the_journal(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -521,13 +525,24 @@ fn status_after_a_successful_run_reads_exit_0_from_the_journal(#[fixture(systemd
     let mgr = Systemd::new();
     mgr.install(&task(&id, vec!["/bin/true".to_string()], None), false)
         .expect("install");
-    let before = SystemTime::now();
 
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
 
     let status = status_with_result(&mgr, &task_id);
     assert_eq!(status.last_result, Some(Exit::Code(0)), "{status:?}");
-    assert!(status.last_run.is_some_and(|at| at >= before), "{status:?}");
+    let unit = format!("UNIT={}", unit_of(&id));
+    let starting = journal(&[&unit, &format!("MESSAGE_ID={STARTING}")]);
+    let [entry] = starting.as_slice() else {
+        panic!("a task run once has one Starting entry: {starting:?}");
+    };
+    let micros: u64 = field(entry, "__REALTIME_TIMESTAMP")
+        .and_then(|micros| micros.parse().ok())
+        .expect("an entry has a time");
+    assert_eq!(
+        status.last_run,
+        Some(SystemTime::UNIX_EPOCH + Duration::from_micros(micros)),
+        "{status:?}"
+    );
     assert_eq!(status.common.state, State::Idle, "{status:?}");
 }
 
