@@ -26,6 +26,7 @@ pub mod list;
 mod refusal;
 mod report;
 pub mod restart;
+pub mod run;
 pub mod show;
 pub mod start;
 pub mod status;
@@ -142,6 +143,8 @@ pub enum DaemonCommand {
     Kill(kill::Args),
     /// Stop then start a daemon. Does not change its boot-enablement.
     Restart(restart::Args),
+    /// Run an idle task once, now: show its output as it is written and exit with the run's own code.
+    Run(run::Args),
     /// Enable a daemon at boot. Does not start it.
     Enable(enable::Args),
     /// Disable a daemon at boot. Does not stop it if running.
@@ -200,6 +203,11 @@ pub enum DaemonCommand {
 ///   `--force` was not given. Returned by `cli::install::run` and by
 ///   `cli::diff::run` for the identical `Outcome::Conflict` — the two places
 ///   this code is returned. App-specific and anchored to nothing, unlike `2`.
+///
+/// `run` is the exception to all of the above once a run has ended: it exits with the program's own
+/// code, or `128` plus the signal that ended it ([`ExitCode::Run`]). A program's `1` or `4` and
+/// goetia's own are indistinguishable. When goetia could not run the task, or could not tell how the
+/// run ended, it exits `1` or `4` as above.
 ///
 /// When more than one outcome applies at once (several ids, or the steps of
 /// one `install`), the verb returns the greatest [`ExitCode`], which is
@@ -279,6 +287,7 @@ fn run(
         DaemonCommand::Stop(args) => stop::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Kill(args) => kill::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Restart(args) => restart::run(args, get_manager, is_elevated, out, err),
+        DaemonCommand::Run(args) => run::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Enable(args) => enable::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Disable(args) => disable::run(args, get_manager, is_elevated, out, err),
         DaemonCommand::Status(args) => status::run(args, cli.json, get_manager, out, err),
@@ -299,6 +308,7 @@ fn subcommand_name(cmd: &DaemonCommand) -> &'static str {
         DaemonCommand::Stop(_) => "stop",
         DaemonCommand::Kill(_) => "kill",
         DaemonCommand::Restart(_) => "restart",
+        DaemonCommand::Run(_) => "run",
         DaemonCommand::Enable(_) => "enable",
         DaemonCommand::Disable(_) => "disable",
         DaemonCommand::Status(_) => "status",

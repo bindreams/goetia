@@ -202,7 +202,7 @@ fn a_fifo_is_not_ours_without_blocking() {
     );
 }
 
-/// The bytes were obtained and will not decode. `generate::unit` emits UTF-8 ini and nothing else,
+/// The bytes were obtained and will not decode. `generate::units` emits UTF-8 ini and nothing else,
 /// so that is a positive identification of a file goetia did not write — the same answer step 1
 /// gives a symlink, and the same one launchd gives a plist that is not UTF-8. Calling it a read
 /// that did not complete would hand every host carrying one foreign `Description=Café` in Latin-1 a
@@ -461,7 +461,9 @@ fn unit_text() -> String {
     })
     .map(crate::spec::DaemonSpec::from)
     .unwrap();
-    generate::unit(&spec, &crate::backend::Identity { user: "0".to_string() }).unwrap()
+    generate::units(&spec, &crate::backend::Identity { user: "0".to_string() })
+        .unwrap()
+        .service
 }
 
 /// What `classified` makes of a fragment that was read, by what the marker says: no marker is a
@@ -473,20 +475,32 @@ fn a_read_fragment_is_foreign_unless_it_carries_the_marker() {
     let corrupt =
         "[Unit]\nDescription=x\n\n[X-Goetia]\nMarker=goetia\nSchema=1\nVersion=0.1.0\nSpec=not-valid-base64!!!\n";
 
-    let foreign = classified("x", RawState::Regular("[Unit]\nDescription=not ours\n".to_string())).expect("classify");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let no_timer = tmp.path().join("x.timer");
+    let foreign = classified(
+        "x",
+        RawState::Regular("[Unit]\nDescription=not ours\n".to_string()),
+        &no_timer,
+    )
+    .expect("classify");
     assert!(matches!(foreign, ReadOutcome::Foreign { recovery: None }));
 
-    let not_ours = classified("x", RawState::NotOurs).expect("classify");
+    let not_ours = classified("x", RawState::NotOurs, &no_timer).expect("classify");
     assert!(matches!(not_ours, ReadOutcome::Foreign { recovery: None }));
 
     let id = Id::try_from("x").unwrap();
-    let named = |raw| classified("x", raw).expect("classify").named(&id, Fragment::new);
+    let named = |raw| {
+        classified("x", raw, &no_timer)
+            .expect("classify")
+            .named(&id, Fragment::new)
+    };
 
     match named(RawState::Regular(text.clone())) {
         ReadOutcome::Marked(fragment) => {
             assert!(fragment.blob().is_ok());
             assert_eq!(fragment.id().as_str(), "x");
-            assert_eq!(fragment.text(), text);
+            assert_eq!(fragment.service_text(), Some(text.as_str()));
+            assert!(fragment.timer().is_none());
         }
         _ => panic!("a fragment goetia wrote is marked, with its own text as the snapshot"),
     }
@@ -494,7 +508,7 @@ fn a_read_fragment_is_foreign_unless_it_carries_the_marker() {
     match named(RawState::Regular(corrupt.to_string())) {
         ReadOutcome::Marked(fragment) => {
             assert!(fragment.blob().is_err());
-            assert_eq!(fragment.text(), corrupt);
+            assert_eq!(fragment.service_text(), Some(corrupt));
         }
         _ => panic!("a marker that will not decode is still goetia's"),
     }
@@ -507,9 +521,24 @@ fn an_id_with_no_dropin_installs_as_its_fragment_alone() {
     let id = crate::manager::conformance::fresh_id("systemd");
     let text = unit_text();
 
-    let read = installed(&id, &text).expect("no drop-in directory to read");
+    let snapshot = Fragment::new(
+        Id::try_from(id.as_str()).expect("an id"),
+        Ok(generate::extract(&text).expect("extracts").expect("marked")),
+        Body {
+            service: Some(text.clone()),
+            timer: None,
+        },
+    );
 
-    assert_eq!(read.definition, text);
+    let read = installed(&snapshot).expect("no drop-in directory to read");
+
+    assert_eq!(
+        read.definition,
+        Units {
+            service: text,
+            timer: None
+        }
+    );
     assert!(matches!(read.external, ExternalConfig::Absent));
 }
 
@@ -526,7 +555,7 @@ fn a_recovery_names_its_paths_on_one_line() {
         "x",
         &Residue {
             dropin: vec![(paths[0].to_path_buf(), String::new())],
-            links: vec![paths[1].to_path_buf()],
+            links: vec![(UnitKind::Service, paths[1].to_path_buf())],
         },
     );
     for recovery in [dropin, residue] {
@@ -536,4 +565,267 @@ fn a_recovery_names_its_paths_on_one_line() {
             "{recovery}"
         );
     }
+}
+
+// A task's timer ------------------------------------------------------------------------------------------------------
+
+fn task_units(id: &str) -> Units {
+    let spec = crate::testing::task(id, vec!["/bin/true".to_string()], Some("30 3 * * *"));
+    generate::units(&spec, &crate::backend::Identity { user: "0".to_string() }).expect("a task that renders")
+}
+
+/// `classified` for the id `x`, whose job reads as `job` and whose timer file is `timer` (absent when
+/// `None`): what `read` makes of the two, by the table in `classified`'s doc comment.
+fn classify(job: RawState, timer: Option<&str>) -> ReadResult<ReadOutcome<Unnamed<Body>>> {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("x.timer");
+    if let Some(timer) = timer {
+        fs::write(&path, timer).expect("write the timer");
+    }
+    classified("x", job, &path)
+}
+
+const FOREIGN: &str = "[Timer]\nOnCalendar=daily\n";
+
+const CORRUPT_MARKER: &str =
+    "[Unit]\nDescription=x\n\n[X-Goetia]\nMarker=goetia\nSchema=1\nVersion=0.1.0\nSpec=not-valid-base64!!!\n";
+
+#[skuld::test]
+fn a_job_with_its_timer_is_read_with_both_texts() {
+    let units = task_units("x");
+    let timer = units.timer.clone().expect("a timer");
+
+    match classify(RawState::Regular(units.service.clone()), Some(&timer)).expect("classify") {
+        ReadOutcome::Marked(Unnamed { blob, body }) => {
+            assert!(blob.is_ok());
+            assert_eq!(body.service.as_deref(), Some(units.service.as_str()));
+            let slot = body.timer.expect("the timer is read");
+            assert_eq!(slot.text, timer);
+            assert!(slot.blob.is_ok());
+        }
+        _ => panic!("a job and a timer of goetia's are marked"),
+    }
+}
+
+#[skuld::test]
+fn a_job_without_a_timer_is_marked_with_no_timer() {
+    let units = task_units("x");
+
+    match classify(RawState::Regular(units.service), None).expect("classify") {
+        ReadOutcome::Marked(Unnamed { body, .. }) => assert!(body.timer.is_none()),
+        _ => panic!("a job of goetia's is marked"),
+    }
+}
+
+/// A timer whose marker will not decode is still goetia's, as a job's is.
+#[skuld::test]
+fn a_marked_timer_that_will_not_decode_is_still_goetias() {
+    let units = task_units("x");
+
+    match classify(RawState::Regular(units.service), Some(CORRUPT_MARKER)).expect("classify") {
+        ReadOutcome::Marked(Unnamed { body, .. }) => {
+            let slot = body.timer.expect("a marker is proof of ownership");
+            assert!(slot.blob.is_err());
+            assert_eq!(slot.text, CORRUPT_MARKER);
+        }
+        _ => panic!("a job of goetia's is marked"),
+    }
+}
+
+/// A timer with no job is ours and unusable, whose blob says why.
+#[skuld::test]
+fn a_timer_without_its_job_is_marked_and_unusable() {
+    let timer = task_units("x").timer.expect("a timer");
+
+    match classify(RawState::Absent, Some(&timer)).expect("classify") {
+        ReadOutcome::Marked(Unnamed { blob, body }) => {
+            assert!(body.service.is_none());
+            assert_eq!(body.timer.expect("the timer").text, timer);
+            let why = blob.expect_err("no job, so no blob").to_string();
+            assert!(why.contains("the timer's job is missing"), "{why}");
+        }
+        _ => panic!("a timer of goetia's is ours, even with no job"),
+    }
+}
+
+/// A task's timer that is not goetia's is a stranger at a name the task needs; with no job at all it
+/// is a stranger at the id's own name.
+#[skuld::test]
+fn a_foreign_timer_makes_a_task_or_absent_id_foreign() {
+    let service = task_units("x").service;
+    for (what, job) in [
+        ("a task beside a foreign timer", RawState::Regular(service)),
+        ("no job beside a foreign timer", RawState::Absent),
+    ] {
+        match classify(job, Some(FOREIGN)).expect("classify") {
+            ReadOutcome::Foreign { recovery: Some(_) } => {}
+            _ => panic!("{what}"),
+        }
+    }
+}
+
+/// `systemctl mask` points the timer at `/dev/null`: not goetia's, and never read through.
+#[skuld::test]
+fn a_masked_timer_is_foreign() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("x.timer");
+    std::os::unix::fs::symlink("/dev/null", &path).expect("mask the timer");
+    let service = task_units("x").service;
+
+    match classified("x", RawState::Regular(service), &path).expect("classify") {
+        ReadOutcome::Foreign { recovery: Some(_) } => {}
+        _ => panic!("a masked timer is a stranger's"),
+    }
+}
+
+/// A job that is not goetia's decides alone: the timer is not even read.
+#[skuld::test]
+fn a_foreign_job_is_foreign_whatever_its_timer_is() {
+    let timer = task_units("x").timer.expect("a timer");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let blocking = tmp.path().join("not-a-directory");
+    fs::write(&blocking, "").expect("write the blocking file");
+    for timer_path in [tmp.path().join("x.timer"), blocking.join("x.timer")] {
+        let found = classified("x", RawState::NotOurs, &timer_path).expect("the timer is never read");
+        assert!(matches!(found, ReadOutcome::Foreign { recovery: None }));
+    }
+    let found = classify(RawState::NotOurs, Some(&timer)).expect("classify");
+    assert!(matches!(found, ReadOutcome::Foreign { recovery: None }));
+}
+
+/// A service beside a timer that is not goetia's reads as it did before it had a timer to ask about:
+/// marked, the timer ignored. So does one whose blob will not decode.
+#[skuld::test]
+fn a_service_beside_a_foreign_timer_is_unchanged() {
+    for job in [unit_text(), CORRUPT_MARKER.to_string()] {
+        match classify(RawState::Regular(job.clone()), Some(FOREIGN)).expect("classify") {
+            ReadOutcome::Marked(Unnamed { body, .. }) => {
+                assert_eq!(body.service, Some(job));
+                assert!(body.timer.is_none(), "the timer is ignored, and never touched");
+            }
+            _ => panic!("a job of goetia's is marked whatever stands beside it"),
+        }
+    }
+}
+
+/// A timer that cannot be read is no change to a service, whose answer never depended on it; to a
+/// task it is a read that did not complete, and says so rather than guess.
+#[skuld::test]
+fn an_unreadable_timer_beside_a_service_is_ignored_and_beside_a_task_is_a_failed_read() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let blocking = tmp.path().join("not-a-directory");
+    fs::write(&blocking, "").expect("write the blocking file");
+    let path = blocking.join("x.timer");
+
+    match classified("x", RawState::Regular(unit_text()), &path).expect("a service ignores it") {
+        ReadOutcome::Marked(Unnamed { body, .. }) => assert!(body.timer.is_none()),
+        _ => panic!("a service is marked"),
+    }
+    let failure = classified("x", RawState::Regular(task_units("x").service), &path)
+        .err()
+        .expect("a task needs to know whose its timer is");
+    assert!(failure.detail().contains("x.timer"), "{}", failure.detail());
+    let failure = classified("x", RawState::Absent, &path)
+        .err()
+        .expect("an id with no job needs to know too");
+    assert!(failure.detail().contains("x.timer"), "{}", failure.detail());
+}
+
+#[skuld::test]
+fn the_foreign_timer_recovery_names_the_timer_unit() {
+    let recovery = foreign_timer_recovery("x");
+
+    assert!(recovery.contains("/etc/systemd/system/x.timer"), "{recovery}");
+    assert!(recovery.contains("systemctl disable --now x.timer"), "{recovery}");
+    assert!(!recovery.contains('\n'), "{recovery}");
+}
+
+/// A link is named by the unit it is for: a timer's is `<id>.timer`, which `systemctl disable
+/// <id>.service` would never remove.
+#[skuld::test]
+fn the_residue_recovery_names_the_unit_of_each_link() {
+    let link = |kind: UnitKind| {
+        (
+            kind,
+            Path::new("/etc/systemd/system")
+                .join(kind.wants_dir())
+                .join(unit_name("x", kind)),
+        )
+    };
+    let recovery = |links| {
+        residue_recovery(
+            "x",
+            &Residue {
+                dropin: Vec::new(),
+                links,
+            },
+        )
+    };
+
+    assert!(recovery(vec![link(UnitKind::Timer)]).contains("`systemctl disable x.timer`"));
+    assert!(recovery(vec![link(UnitKind::Service)]).contains("`systemctl disable x.service`"));
+    assert!(
+        recovery(vec![link(UnitKind::Timer), link(UnitKind::Service)])
+            .contains("`systemctl disable x.service x.timer`")
+    );
+    assert!(
+        recovery(Vec::new()).contains("`systemctl disable x.service`"),
+        "a drop-in alone: the wording a service always had"
+    );
+    assert!(recovery(vec![link(UnitKind::Timer)]).contains("timers.target.wants/x.timer"));
+}
+
+#[skuld::test]
+fn each_kind_is_linked_into_its_own_target() {
+    assert_eq!(UnitKind::Service.wants_dir(), "multi-user.target.wants");
+    assert_eq!(UnitKind::Timer.wants_dir(), "timers.target.wants");
+}
+
+/// Goetia clears the drop-in directories of both units in `/etc/systemd/system`; one under another
+/// root is out of its reach.
+#[skuld::test]
+fn both_own_drop_in_directories_are_clearable() {
+    let ours = |kind| (Path::new(UNIT_DIR).join(dropin_name("x", kind)), "[Unit]\n".to_string());
+    let theirs = (
+        Path::new("/usr/lib/systemd/system").join(dropin_name("x", UnitKind::Timer)),
+        String::new(),
+    );
+
+    assert!(matches!(
+        dropin_external_config("x", &[ours(UnitKind::Service), ours(UnitKind::Timer)]),
+        ExternalConfig::Clearable
+    ));
+    assert!(matches!(
+        dropin_external_config("x", &[ours(UnitKind::Timer), theirs]),
+        ExternalConfig::Unclearable { .. }
+    ));
+    assert!(matches!(dropin_external_config("x", &[]), ExternalConfig::Absent));
+}
+
+/// With no drop-in anywhere, the units are as written: a task's with its timer, a job without one
+/// with none, and a service with none.
+#[skuld::test]
+fn installed_units_with_no_drop_in_are_the_units_as_written() {
+    let id = crate::manager::conformance::fresh_id("systemd");
+    let units = task_units(&id);
+    let snapshot = |service: &str, timer: Option<&str>| {
+        Fragment::new(
+            Id::try_from(id.as_str()).expect("an id"),
+            Ok(generate::extract(service).expect("extracts").expect("marked")),
+            Body {
+                service: Some(service.to_string()),
+                timer: timer.map(|text| Timer {
+                    text: text.to_string(),
+                    blob: Ok(generate::extract(text).expect("extracts").expect("marked")),
+                }),
+            },
+        )
+    };
+
+    let task = installed(&snapshot(&units.service, units.timer.as_deref())).expect("installed");
+    assert_eq!(task.definition, units);
+    let job_alone = installed(&snapshot(&units.service, None)).expect("installed");
+    assert_eq!(job_alone.definition.timer, None, "a job without a timer has none");
+    let service = installed(&snapshot(&unit_text(), None)).expect("installed");
+    assert_eq!(service.definition.timer, None);
 }

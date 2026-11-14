@@ -25,14 +25,14 @@ use crate::testing::base_fields;
 use crate::testing::cleanup::{DirGuard, FileGuard, remove_or_warn};
 use crate::testing::groups::{Group, systemd_group};
 
-/// On drop, removes every `unique_quarantine_path(id)` file the test's scenario left behind.
+/// On drop, removes every quarantine file of either unit of `id` the test's scenario left behind.
 /// Production deliberately leaves one on an unrecoverable double-race so a human can find it, and a
 /// failed assertion can strand the backup of a test that restores it. Register it before the call
 /// that can create one.
-struct QuarantineSweep(String);
+pub(super) struct QuarantineSweep(String);
 
 impl QuarantineSweep {
-    fn new(id: &str) -> Self {
+    pub(super) fn new(id: &str) -> Self {
         Self(id.to_string())
     }
 }
@@ -49,10 +49,14 @@ impl Drop for QuarantineSweep {
                 return;
             }
         };
-        let prefix = format!(".{}.service.goetia-quarantine", self.0);
+        let prefixes = UnitKind::ALL.map(|kind| format!(".{}.goetia-quarantine", unit_name(&self.0, kind)));
         for entry in entries {
             match entry {
-                Ok(entry) if entry.file_name().to_string_lossy().starts_with(&prefix) => {
+                Ok(entry)
+                    if prefixes
+                        .iter()
+                        .any(|prefix| entry.file_name().to_string_lossy().starts_with(prefix)) =>
+                {
                     remove_or_warn(&entry.path(), false);
                 }
                 Ok(_) => {}
@@ -94,7 +98,7 @@ fn mk(id: &str) -> DaemonSpec {
 #[skuld::test]
 fn create_does_not_clobber_a_unit_that_appears_after_classification(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
-    let path = unit_path(&id);
+    let path = unit_path(&id, UnitKind::Service);
     let _cleanup = FileGuard::new(path.clone());
 
     // "Classification" (what `install`'s `read` does) sees nothing here yet.
@@ -108,7 +112,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification(#[fixture(sy
     // `create_unit` must detect this rather than clobber it: a plain `rename(2)` would
     // unconditionally replace whatever is now at `path`, destroying a file the classification step
     // never saw.
-    let outcome = create_unit(&id, "[Unit]\nDescription=goetia\n").expect("create_unit");
+    let outcome = create_unit(&id, UnitKind::Service, "[Unit]\nDescription=goetia\n").expect("create_unit");
     assert!(
         matches!(outcome, CreateOutcome::Raced),
         "create_unit must report the race, not clobber it"
@@ -126,7 +130,7 @@ fn create_does_not_clobber_a_unit_that_appears_after_classification(#[fixture(sy
 #[skuld::test]
 fn quarantine_detects_a_swap_that_happened_after_classification(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
-    let path = unit_path(&id);
+    let path = unit_path(&id, UnitKind::Service);
     let _cleanup = FileGuard::new(path.clone());
     let _sweep = QuarantineSweep::new(&id);
 
@@ -139,7 +143,7 @@ fn quarantine_detects_a_swap_that_happened_after_classification(#[fixture(system
     let swapped_text = "[Unit]\nDescription=swapped in after classification\n";
     std::fs::write(&path, swapped_text).expect("write swapped-in file");
 
-    let result = quarantine_if_still_ours(&id, original_text).expect("quarantine_if_still_ours");
+    let result = quarantine_if_still_ours(&id, UnitKind::Service, original_text).expect("quarantine_if_still_ours");
     assert!(
         result.is_none(),
         "a swapped-in file must be reported as a race, not quarantined"
@@ -152,14 +156,14 @@ fn quarantine_detects_a_swap_that_happened_after_classification(#[fixture(system
 #[skuld::test]
 fn quarantine_succeeds_when_nothing_raced(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
-    let path = unit_path(&id);
+    let path = unit_path(&id, UnitKind::Service);
     let _cleanup = FileGuard::new(path.clone());
     let _sweep = QuarantineSweep::new(&id);
 
     let text = "[Unit]\nDescription=goetia unraced\n";
     std::fs::write(&path, text).expect("write");
 
-    let backup = quarantine_if_still_ours(&id, text)
+    let backup = quarantine_if_still_ours(&id, UnitKind::Service, text)
         .expect("quarantine_if_still_ours")
         .expect("nothing raced, so the file must be quarantined");
     assert!(!path.exists(), "the original name must be free while quarantined");
@@ -190,7 +194,7 @@ fn quarantine_succeeds_when_nothing_raced(#[fixture(systemd_group)] _group: &Gro
 #[skuld::test]
 fn install_never_corrupts_state_when_something_races_the_first_create(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
-    let path = unit_path(&id);
+    let path = unit_path(&id, UnitKind::Service);
     let _cleanup = FileGuard::new(path.clone());
 
     let done = AtomicBool::new(false);
@@ -291,7 +295,7 @@ fn ensure_dir_refuses_a_preexisting_file(#[fixture(systemd_group)] _group: &Grou
 #[skuld::test]
 fn replace_reports_raced_twice_rather_than_guessing_which_file_wins(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
-    let path = unit_path(&id);
+    let path = unit_path(&id, UnitKind::Service);
     let _cleanup = FileGuard::new(path.clone());
     let _sweep = QuarantineSweep::new(&id);
 
@@ -311,7 +315,12 @@ fn replace_reports_raced_twice_rather_than_guessing_which_file_wins(#[fixture(sy
             }
         });
 
-        let result = replace_unit_verified(&id, "[Unit]\nDescription=goetia replacement\n", original_text);
+        let result = replace_unit_verified(
+            &id,
+            UnitKind::Service,
+            "[Unit]\nDescription=goetia replacement\n",
+            original_text,
+        );
         done.store(true, Ordering::Release);
         racer.join().expect("racer thread panicked");
 
@@ -347,7 +356,7 @@ fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_fil
     #[fixture(systemd_group)] _group: &Group,
 ) {
     let id = fresh_id("systemd");
-    let path = unit_path(&id);
+    let path = unit_path(&id, UnitKind::Service);
     let _cleanup = FileGuard::new(path.clone());
     let _sweep = QuarantineSweep::new(&id);
 
@@ -359,7 +368,7 @@ fn quarantine_used_by_uninstall_reports_a_race_instead_of_removing_the_wrong_fil
     let changed_text = "[Unit]\nDescription=changed after classification\n";
     std::fs::write(&path, changed_text).expect("overwrite");
 
-    let result = quarantine_if_still_ours(&id, classified_text).expect("quarantine_if_still_ours");
+    let result = quarantine_if_still_ours(&id, UnitKind::Service, classified_text).expect("quarantine_if_still_ours");
     assert!(
         result.is_none(),
         "uninstall's removal must not proceed against a fragment that changed after classification"
@@ -416,6 +425,8 @@ fn a_pass_that_finishes_names_every_fragment_and_drop_in_and_nothing_else() {
     std::fs::write(tmp.path().join("kept.service"), "").expect("write the fragment");
     std::fs::write(tmp.path().join("ignored.conf"), "").expect("write the non-fragment");
     std::fs::create_dir(tmp.path().join("kept.service.d")).expect("create the drop-in directory");
+    std::fs::write(tmp.path().join("kept.timer"), "").expect("write the timer");
+    std::fs::create_dir(tmp.path().join("kept.timer.d")).expect("create the timer's drop-in directory");
 
     let scan = scan_unit_dir(tmp.path());
 
@@ -424,7 +435,14 @@ fn a_pass_that_finishes_names_every_fragment_and_drop_in_and_nothing_else() {
         ["kept"],
         "{scan:?}"
     );
-    assert_eq!(scan.dropins, ["kept"], "{scan:?}");
+    assert_eq!(scan.timers, ["kept"], "{scan:?}");
+    let mut dropins = scan.dropins.clone();
+    dropins.sort();
+    assert_eq!(
+        dropins,
+        ["kept", "kept"],
+        "both kinds of drop-in directory name the id: {scan:?}"
+    );
     assert!(
         scan.incomplete.is_none(),
         "a pass that finished has nothing to report: {scan:?}"
@@ -494,7 +512,7 @@ fn a_reserved_sequence_needs_nothing_made_later() {
 #[skuld::test]
 fn install_enable_and_start_in_one_sequence_probe_the_gate_once(#[fixture(systemd_group)] _group: &Group) {
     let id = fresh_id("systemd");
-    let _cleanup = FileGuard::new(unit_path(&id));
+    let _cleanup = FileGuard::new(unit_path(&id, UnitKind::Service));
     let spec = mk(&id);
     let fake = gate_then([
         reply(&["daemon-reload"], exited(0, "", "")),

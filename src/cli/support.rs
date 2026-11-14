@@ -170,6 +170,7 @@ pub(crate) fn print_undetermined_warnings(undetermined: &[UndeterminedEntry], er
 pub(crate) fn state_str(state: State) -> &'static str {
     match state {
         State::Running => "running",
+        State::Idle => "idle",
         State::Stopped => "stopped",
         State::Failed => "failed",
         State::Unknown => "unknown",
@@ -237,6 +238,35 @@ pub(crate) struct IdVerbCall<'a> {
     pub absent_is_success: bool,
 }
 
+/// [`run_worded_verb`]'s parameters: [`IdVerbCall`] for a verb that says its own past-tense word per
+/// id, from what the call to the manager learned of it.
+pub(crate) struct WordedVerbCall<'a> {
+    pub subcommand: &'a str,
+    pub ids: &'a [String],
+    pub get_manager: &'a dyn Fn() -> Result<Box<dyn ServiceManager>>,
+    pub is_elevated: &'a dyn Fn() -> bool,
+    /// Acts on one id and returns the word printed after it, which is the verb's past tense.
+    pub verb: &'a dyn Fn(&dyn ServiceManager, &Id) -> Result<&'a str>,
+    /// See [`IdVerbCall::absent_is_success`].
+    pub absent_is_success: bool,
+}
+
+/// [`run_worded_verb`] for a verb whose word is the same for every id.
+pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    run_worded_verb(
+        WordedVerbCall {
+            subcommand: call.subcommand,
+            ids: call.ids,
+            get_manager: call.get_manager,
+            is_elevated: call.is_elevated,
+            verb: &|mgr, id| (call.verb)(mgr, id).map(|()| call.verb_past_tense),
+            absent_is_success: call.absent_is_success,
+        },
+        out,
+        err,
+    )
+}
+
 /// Shared shape for the id-list mutating verbs (`uninstall`, `start`,
 /// `stop`, `kill`, `enable`, `disable`, `restart`): check elevation once, obtain
 /// the manager once, then call `verb` per id, printing one result line per
@@ -246,7 +276,7 @@ pub(crate) struct IdVerbCall<'a> {
 ///
 /// Every id is parsed *before* `verb` is called for any of them, so a bad id
 /// at position N cannot surface after ids `1..N-1` were already mutated.
-pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+pub(crate) fn run_worded_verb(call: WordedVerbCall<'_>, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let ids: std::result::Result<Vec<Id>, Error> = call.ids.iter().map(|s| parse_id(s)).collect();
     let ids = match ids {
         Ok(ids) => ids,
@@ -270,8 +300,8 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
     let mut codes: Vec<ExitCode> = Vec::new();
     for id in &ids {
         match (call.verb)(mgr.as_ref(), id) {
-            Ok(()) => {
-                let _ = writeln!(out, "{id}: {}", call.verb_past_tense);
+            Ok(word) => {
+                let _ = writeln!(out, "{id}: {word}");
                 codes.push(ExitCode::Success);
             }
             // Absence already satisfies this verb's goal (see

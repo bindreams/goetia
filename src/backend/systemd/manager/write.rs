@@ -1,4 +1,4 @@
-//! Writing the fragment itself, with the non-clobbering guarantees it needs: a brand-new
+//! Writing the unit files themselves (`<id>.service` and `<id>.timer`, as `UnitKind` says), with the non-clobbering guarantees it needs: a brand-new
 //! unit must never replace something it never classified, and an update/regenerate must never replace
 //! a fragment that changed underneath it since classification.
 
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{Error, Result};
 
 use super::discover::{RawState, ReadFailure, classify_and_read};
-use super::{UNIT_DIR, remove_file_if_present, unit_path};
+use super::{UNIT_DIR, UnitKind, remove_file_if_present, unit_name, unit_path};
 
 // CreateOutcome / create_unit =========================================================================================
 
@@ -22,12 +22,12 @@ pub(super) enum CreateOutcome {
     Raced,
 }
 
-/// Write `text` as a brand-new unit at `id`, never replacing an existing file.
+/// Write `text` as a brand-new `kind` unit at `id`, never replacing an existing file.
 /// [`tempfile::NamedTempFile::persist_noclobber`] is `linkat(2)` without
-/// replace semantics, so this fails rather than clobbers if anything now occupies `unit_path(id)`.
-pub(super) fn create_unit(id: &str, text: &str) -> Result<CreateOutcome> {
-    let final_path = unit_path(id);
-    let tmp = write_temp_unit(id, text)?;
+/// replace semantics, so this fails rather than clobbers if anything now occupies `unit_path(id, kind)`.
+pub(super) fn create_unit(id: &str, kind: UnitKind, text: &str) -> Result<CreateOutcome> {
+    let final_path = unit_path(id, kind);
+    let tmp = write_temp_unit(id, kind, text)?;
     match tmp.persist_noclobber(&final_path) {
         Ok(_file) => {
             fsync_unit_dir()?;
@@ -47,7 +47,7 @@ pub(super) enum ReplaceOutcome {
     Raced,
 }
 
-/// Overwrite `id`'s unit with `text`, but only if the fragment currently at `unit_path(id)` still has
+/// Overwrite `id`'s `kind` unit with `text`, but only if the fragment currently at `unit_path(id, kind)` still has
 /// exactly the content `expected_text` names — closing the same TOCTOU `create_unit` closes, reached
 /// here from the `Update`/`Stale` arm instead: the gap between classification and this write spans
 /// `decide`, `ensure_parent_dirs` (which can spawn a `chown` subprocess), and building the
@@ -58,17 +58,22 @@ pub(super) enum ReplaceOutcome {
 /// `rename`s: quarantine the current occupant under a private name and verify its content
 /// (`quarantine_if_still_ours`), then place the new content and either discard the quarantined file
 /// (verified match) or put it back (mismatch, reported as a race to retry).
-pub(super) fn replace_unit_verified(id: &str, text: &str, expected_text: &str) -> Result<ReplaceOutcome> {
-    let Some(backup_path) = quarantine_if_still_ours(id, expected_text)? else {
+pub(super) fn replace_unit_verified(
+    id: &str,
+    kind: UnitKind,
+    text: &str,
+    expected_text: &str,
+) -> Result<ReplaceOutcome> {
+    let Some(backup_path) = quarantine_if_still_ours(id, kind, expected_text)? else {
         return Ok(ReplaceOutcome::Raced);
     };
-    let final_path = unit_path(id);
+    let final_path = unit_path(id, kind);
 
     // Every failure from here on restores the quarantined original before reporting, except the one
     // case where doing so would itself clobber a third file — see that arm's own comment. A transient
     // write failure (ENOSPC, EIO, a permission error) must never turn a routine `install` over an
     // already-installed service into a silent uninstall.
-    let tmp = match write_temp_unit(id, text) {
+    let tmp = match write_temp_unit(id, kind, text) {
         Ok(tmp) => tmp,
         Err(e) => return Err(restore_or_chain(id, &backup_path, &final_path, e)),
     };
@@ -118,7 +123,7 @@ fn restore_or_chain(id: &str, backup_path: &Path, final_path: &Path, primary: Er
 
 // quarantine_if_still_ours / restore_quarantine =======================================================================
 
-/// Rename `unit_path(id)` to a private, per-attempt-unique backup name, then confirm the moved file's
+/// Rename `unit_path(id, kind)` to a private, per-attempt-unique backup name, then confirm the moved file's
 /// content is still exactly `expected_text` — the same content `discover::read`
 /// found marked. If it is not (or the path no longer exists at all), the backup is restored to
 /// where it came from and this returns `Ok(None)`: something changed after classification, which the
@@ -143,9 +148,9 @@ fn restore_or_chain(id: &str, backup_path: &Path, final_path: &Path, primary: Er
 /// proof of a race — treated exactly like a content mismatch. Bytes that will not decode arrive in
 /// the same arm and get the same answer: `expected_text` is UTF-8 by construction, so they cannot be
 /// the file this was asked to verify.
-pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<Option<PathBuf>> {
-    let final_path = unit_path(id);
-    let backup_path = unique_quarantine_path(id);
+pub(super) fn quarantine_if_still_ours(id: &str, kind: UnitKind, expected_text: &str) -> Result<Option<PathBuf>> {
+    let final_path = unit_path(id, kind);
+    let backup_path = unique_quarantine_path(id, kind);
 
     match fs::rename(&final_path, &backup_path) {
         Ok(()) => {}
@@ -175,11 +180,12 @@ pub(super) fn quarantine_if_still_ours(id: &str, expected_text: &str) -> Result<
 /// left one behind, or a genuinely concurrent one — never collide. A monotonic per-process counter
 /// combined with the PID is unique across both this process's own repeated attempts and any other
 /// process running concurrently.
-fn unique_quarantine_path(id: &str) -> PathBuf {
+fn unique_quarantine_path(id: &str, kind: UnitKind) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     Path::new(UNIT_DIR).join(format!(
-        ".{id}.service.goetia-quarantine.{pid:x}-{n:x}",
+        ".{unit}.goetia-quarantine.{pid:x}-{n:x}",
+        unit = unit_name(id, kind),
         pid = std::process::id()
     ))
 }
@@ -215,11 +221,11 @@ pub(super) fn restore_quarantine(id: &str, backup_path: &Path, final_path: &Path
 /// so without a real `sync_all()` here a crash between this write and the later rename can leave the
 /// fragment on disk fully or partially zero-filled: no `[X-Goetia]` marker, `extract` returns
 /// `Ok(None)`, and every verb then refuses an id goetia itself created.
-pub(super) fn write_temp_unit(id: &str, text: &str) -> Result<tempfile::NamedTempFile> {
+pub(super) fn write_temp_unit(id: &str, kind: UnitKind, text: &str) -> Result<tempfile::NamedTempFile> {
     let dir = Path::new(UNIT_DIR);
     let mut tmp = tempfile::Builder::new()
         .prefix(&format!(".goetia-{id}-"))
-        .suffix(".service.tmp")
+        .suffix(&format!("{}.tmp", kind.suffix()))
         .tempfile_in(dir)
         .map_err(|e| Error::os_at("create a temp file in", dir, e))?;
     tmp.write_all(text.as_bytes())

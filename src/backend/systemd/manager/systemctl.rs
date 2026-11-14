@@ -12,6 +12,8 @@ use crate::error::{Error, Result, VersionReading};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, State, Step};
 
+use super::{UnitKind, unit_name};
+
 // Held ================================================================================================================
 
 /// What one verb of systemd, or a sequence of them, draws on, made by [`Held::of`] before anything is
@@ -106,9 +108,7 @@ impl Systemctl {
     /// anything acts, a chroot goetia could not see for itself: `enable` and `disable` act on unit
     /// files offline and say nothing about it. [`answered`] is the other half.
     fn door(&self, purpose: Purpose, held: &mut Held) -> Result<()> {
-        if let Some(evidence) = (self.host)().evidence() {
-            return Err(no_manager(evidence));
-        }
+        refuse_unreachable(self.host)?;
         if purpose == Purpose::Request {
             self.require_supported(held)?;
         }
@@ -135,6 +135,15 @@ impl Systemctl {
             Finished::Exited { status, capture } => Ok((status, capture)),
             Finished::Expired | Finished::Left(_) => unreachable!("a run to completion does not expire"),
         }
+    }
+}
+
+/// The refusal where `host` shows, without asking, that no manager can be asked: the first half of
+/// [`Systemctl::door`], and the whole of `busctl`'s.
+pub(super) fn refuse_unreachable(host: fn() -> Host) -> Result<()> {
+    match host().evidence() {
+        Some(evidence) => Err(no_manager(evidence)),
+        None => Ok(()),
     }
 }
 
@@ -230,7 +239,7 @@ fn removals(inherited: impl Iterator<Item = String>) -> Vec<String> {
 /// [removed](removals), and [`ENVIRONMENT`] set. The names are those this process would pass a
 /// child of its own; one that is not UTF-8 is skipped, because `getenv` finds a switch by its exact
 /// ASCII name, so a name that does not decode is not one of them.
-fn environment(cmd: &mut cosca::Command) {
+pub(super) fn environment(cmd: &mut cosca::Command) {
     for key in removals(std::env::vars_os().filter_map(|(key, _)| key.into_string().ok())) {
         cmd.env_remove(key);
     }
@@ -320,7 +329,7 @@ pub(crate) struct Host {
 }
 
 impl Host {
-    fn this() -> Host {
+    pub(super) fn this() -> Host {
         Host {
             offline: std::env::var("SYSTEMD_OFFLINE").ok(),
             unbooted: established_absent(std::path::Path::new(SD_BOOTED)),
@@ -600,6 +609,14 @@ fn enqueued(stderr: &[u8]) -> bool {
     stderr.windows(LINE.len()).any(|w| w == LINE)
 }
 
+/// The number of the job `stderr` announces: `Enqueued anchor job <N> <unit>/<verb>.`.
+fn job_number(stderr: &[u8]) -> Option<u64> {
+    const LINE: &[u8] = b"Enqueued anchor job ";
+    let at = stderr.windows(LINE.len()).position(|w| w == LINE)? + LINE.len();
+    let digits: Vec<u8> = stderr[at..].iter().copied().take_while(u8::is_ascii_digit).collect();
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
 /// Whether [`Systemctl::run_verb`] takes its bounded path under `budget` — the one whose `systemctl`
 /// goetia watches, and which draws two listener threads from its [`Held`], one per stream
 /// ([`Role::AnnouncedRequest`]).
@@ -718,11 +735,11 @@ impl Systemctl {
     /// too: systemd answers the start with a job, not a state, so a budget shorter than that no-op job's
     /// round trip expires where launchd and SCM report started (see `ServiceManager::start`).
     ///
-    /// Every generated unit carries `Type=exec` (see `generate::unit`'s doc comment for why), so a
+    /// Every generated service carries `Type=exec` (see `generate::units`'s doc comment for why), so a
     /// bounded `systemctl start` confirms the `exec` itself succeeded — not merely that systemd forked
     /// the process. A missing executable or missing user comes back as a failed start.
     pub(super) fn start_impl(&self, id: &str, budget: Budget, deadline: Deadline, held: &mut Held) -> Result<()> {
-        let unit = super::unit_name(id);
+        let unit = unit_name(id, UnitKind::Service);
         match self.run_verb("start", &unit, budget, deadline, held)? {
             Finished::Exited { status, capture } if status.success() => took("start", &unit, &capture),
             Finished::Exited { status, capture } => Err(failed("start", &unit, status, &capture)),
@@ -730,10 +747,30 @@ impl Systemctl {
         }
     }
 
+    /// A task's start: `systemctl start --no-block`, which returns once the manager has enqueued the
+    /// job, and the number of that job. It never waits for the run, under any budget: the run is over
+    /// when its program is, which is not when a start returns.
+    pub(super) fn start_job(&self, id: &str, held: &mut Held) -> Result<u64> {
+        let unit = unit_name(id, UnitKind::Service);
+        match self.run_verb("start", &unit, Budget::Immediate, Budget::Immediate.start(), held)? {
+            Finished::Exited { status, capture } if status.success() => {
+                took("start", &unit, &capture)?;
+                job_number(&capture.stderr).ok_or_else(|| Error::NotEnqueued {
+                    request: format!("systemctl start {unit}"),
+                    diagnostic: Some("it announced a job with no number".to_string()),
+                })
+            }
+            Finished::Exited { status, capture } => Err(failed("start", &unit, status, &capture)),
+            Finished::Expired | Finished::Left(_) => {
+                unreachable!("a budget that does not wait never takes the bounded path")
+            }
+        }
+    }
+
     /// Idempotent per `ServiceManager::stop`'s doc comment. Exit code 5 ("unit not loaded") means there
     /// was nothing to stop, which is success here, not a failure to stop something that was never running.
     pub(super) fn stop_impl(&self, id: &str, budget: Budget, deadline: Deadline, held: &mut Held) -> Result<()> {
-        let unit = super::unit_name(id);
+        let unit = unit_name(id, UnitKind::Service);
         match self.run_verb("stop", &unit, budget, deadline, held)? {
             Finished::Exited { status, capture } if status.success() => took("stop", &unit, &capture),
             Finished::Exited { status, .. } if status.code() == Some(5) => Ok(()),
@@ -762,7 +799,7 @@ impl Systemctl {
     /// `Ok` means the signal was delivered: systemd sends it before it answers, and goetia does not wait
     /// for the process to be gone.
     pub(super) fn kill_impl(&self, id: &str, held: &mut Held) -> Result<()> {
-        let unit = super::unit_name(id);
+        let unit = unit_name(id, UnitKind::Service);
         let (status, capture) = self.completed(Purpose::Request, &unit_args(&KILL_ARGS, &unit), held)?;
         if status.success() {
             return Ok(());
@@ -775,22 +812,34 @@ impl Systemctl {
 
     /// `systemctl enable` for `id`'s unit; a failure carries systemd's words.
     pub(super) fn enable_impl(&self, id: &str, held: &mut Held) -> Result<()> {
-        self.unit_file_verb("enable", id, held)
+        self.unit_file_verb(&["enable"], id, UnitKind::Service, held)
     }
 
     /// `systemctl disable` for `id`'s unit, as [`Systemctl::enable_impl`]: `Systemd::disable` and `uninstall` both.
     pub(super) fn disable_impl(&self, id: &str, held: &mut Held) -> Result<()> {
-        self.unit_file_verb("disable", id, held)
+        self.unit_file_verb(&["disable"], id, UnitKind::Service, held)
     }
 
-    fn unit_file_verb(&self, verb: &str, id: &str, held: &mut Held) -> Result<()> {
-        let unit = super::unit_name(id);
-        let (status, capture) = self.completed(Purpose::Request, &unit_args(&[verb], &unit), held)?;
+    /// `systemctl enable --now` for `id`'s timer: the schedule is armed at boot and now. The task's
+    /// own unit is never enabled: it has no `[Install]`, and boot does not start it.
+    pub(super) fn enable_timer(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.unit_file_verb(&["enable", "--now"], id, UnitKind::Timer, held)
+    }
+
+    /// `systemctl disable --now` for `id`'s timer: the schedule is disarmed at boot and now. A run in
+    /// flight is the task's unit's, not the timer's, and goes on.
+    pub(super) fn disable_timer(&self, id: &str, held: &mut Held) -> Result<()> {
+        self.unit_file_verb(&["disable", "--now"], id, UnitKind::Timer, held)
+    }
+
+    fn unit_file_verb(&self, head: &[&str], id: &str, kind: UnitKind, held: &mut Held) -> Result<()> {
+        let unit = unit_name(id, kind);
+        let (status, capture) = self.completed(Purpose::Request, &unit_args(head, &unit), held)?;
         if status.success() {
             return Ok(());
         }
         Err(Error::command(
-            format!("systemctl {verb} {unit}"),
+            format!("systemctl {} {unit}", head.join(" ")),
             status,
             &capture.stderr,
         ))
@@ -802,7 +851,7 @@ impl Systemctl {
     /// stopped, and the daemon comes up fresh from that start. [`took`] as for `start`: an exit of `0`
     /// with no job is a restart nobody made.
     pub(super) fn request_restart_impl(&self, id: &str, held: &mut Held) -> Result<()> {
-        let unit = super::unit_name(id);
+        let unit = unit_name(id, UnitKind::Service);
         match self.run_verb("restart", &unit, Budget::Immediate, Budget::Immediate.start(), held)? {
             Finished::Exited { status, capture } if status.success() => took("restart", &unit, &capture),
             Finished::Exited { status, capture } => Err(failed("restart", &unit, status, &capture)),
@@ -848,18 +897,26 @@ impl Systemctl {
         Ok(map)
     }
 
-    /// `UnitFileState` is the same install-state systemd derives for `systemctl is-enabled` — one query
-    /// covers state, pid, and boot-enablement together.
+    /// `props` of `unit`, which goetia finds installed, and `LoadState` with them.
     ///
     /// Asked only about a unit goetia finds installed, so `LoadState=not-found` — systemd has no unit
     /// file for the name — is a unit file systemd cannot see, one goetia's own mount namespace holds,
     /// say. Not one merely written and not yet reloaded: the manager picks a unit file up on demand.
     /// What systemd reports for such a name is not that unit's state, and never read as one.
-    pub(super) fn status_from_unit(&self, unit: &str) -> Result<DaemonStatus> {
-        let props = self.show_properties(unit, &["ActiveState", "MainPID", "UnitFileState", "LoadState"])?;
-        if props.get("LoadState").map(String::as_str) == Some("not-found") {
+    fn show_installed(&self, unit: &str, props: &[&str]) -> Result<BTreeMap<String, String>> {
+        let mut asked = props.to_vec();
+        asked.push("LoadState");
+        let shown = self.show_properties(unit, &asked)?;
+        if shown.get("LoadState").map(String::as_str) == Some("not-found") {
             return Err(Error::UnitNotLoaded { unit: unit.to_string() });
         }
+        Ok(shown)
+    }
+
+    /// `UnitFileState` is the same install-state systemd derives for `systemctl is-enabled` — one query
+    /// covers state, pid, and boot-enablement together.
+    pub(super) fn status_from_unit(&self, unit: &str) -> Result<DaemonStatus> {
+        let props = self.show_installed(unit, &["ActiveState", "MainPID", "UnitFileState"])?;
         let state = match props.get("ActiveState").map(String::as_str) {
             Some("active") => State::Running,
             Some("inactive") => State::Stopped,
@@ -867,13 +924,71 @@ impl Systemctl {
             // `activating`/`deactivating` land here, along with anything else systemd reports.
             _ => State::Unknown,
         };
-        let pid = props
-            .get("MainPID")
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|&p| p != 0);
         let enabled = props.get("UnitFileState").is_some_and(|s| s == "enabled");
-        Ok(DaemonStatus { state, pid, enabled })
+        Ok(DaemonStatus {
+            state,
+            pid: main_pid(&props),
+            enabled,
+        })
     }
+
+    /// A task's state, pid and invocation, from its job `unit`, in one `systemctl show`. The run in
+    /// flight is `Running` whichever of `activating`, `active` and `deactivating` it is in; between runs
+    /// the job is `inactive`, or `failed` after a run that failed, which is a result and not a state.
+    /// The invocation is the run's, which the manager clears once the unit has gone inactive. Whether
+    /// the task is enabled is the timer's to say: see [`Systemctl::timer_enabled`].
+    pub(super) fn task_state(&self, unit: &str) -> Result<TaskJob> {
+        let props = self.show_installed(unit, &["ActiveState", "MainPID", "InvocationID"])?;
+        let state = match props.get("ActiveState").map(String::as_str) {
+            Some("active" | "activating" | "deactivating") => State::Running,
+            Some("inactive" | "failed") => State::Idle,
+            _ => State::Unknown,
+        };
+        Ok(TaskJob {
+            state,
+            pid: main_pid(&props),
+            invocation: props.get("InvocationID").filter(|id| !id.is_empty()).cloned(),
+        })
+    }
+
+    /// Whether the manager still holds the job `job`, queued or running: `systemctl list-jobs` lists
+    /// every one. A job that was canceled leaves no journal entry, so this is where its end shows.
+    pub(super) fn job_exists(&self, job: u64) -> Result<bool> {
+        let (status, capture) = self.completed(Purpose::Read, &["list-jobs", "--no-legend"], &mut Held::default())?;
+        if !status.success() {
+            return Err(Error::command(
+                "systemctl list-jobs".to_string(),
+                status,
+                &capture.stderr,
+            ));
+        }
+        Ok(String::from_utf8_lossy(&capture.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) == Some(job)))
+    }
+
+    /// Whether `id`'s timer is enabled: its `UnitFileState` is `enabled`.
+    pub(super) fn timer_enabled(&self, id: &str) -> Result<bool> {
+        let props = self.show_installed(&unit_name(id, UnitKind::Timer), &["UnitFileState"])?;
+        Ok(props.get("UnitFileState").is_some_and(|s| s == "enabled"))
+    }
+}
+
+/// What `systemctl show` says of a task's job: see [`Systemctl::task_state`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct TaskJob {
+    pub state: State,
+    pub pid: Option<u32>,
+    /// The `InvocationID` of the run the unit is in, if it has one.
+    pub invocation: Option<String>,
+}
+
+/// `MainPID`, when it names a process.
+fn main_pid(props: &BTreeMap<String, String>) -> Option<u32> {
+    props
+        .get("MainPID")
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&p| p != 0)
 }
 
 #[cfg(test)]

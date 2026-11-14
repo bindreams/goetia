@@ -38,3 +38,14 @@ fn of_maps_an_error_by_whether_it_left_the_outcome_open() {
     assert_eq!(ExitCode::of(&in_doubt), ExitCode::Indeterminate);
     assert_eq!(ExitCode::of(&failed), ExitCode::Error);
 }
+
+#[skuld::test]
+fn run_exit_code_is_the_programs() {
+    use crate::manager::Exit;
+
+    assert_eq!(ExitCode::Run(7).code(), 7);
+    assert_eq!(ExitCode::Run(0).code(), 0);
+    assert_eq!(ExitCode::of_run(Exit::Code(4)), ExitCode::Run(4));
+    assert_eq!(ExitCode::of_run(Exit::Signal(9)), ExitCode::Run(137));
+    assert!(ExitCode::Usage < ExitCode::Run(0), "declared last, and never combined");
+}
