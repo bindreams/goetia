@@ -82,6 +82,11 @@ impl Deferred {
     /// redelivery would come before the store ever ran: a livelock.) Nothing of ours runs before the first
     /// install, so a signal before it goes to the previous handler as it always did.
     ///
+    /// Both transitions, opening and closing, happen under the `SHARED` lock; so do the installs and
+    /// restores of the handlers. The only code that touches `OPEN` or `RECORDED` outside it is the handler
+    /// (`record`) and the re-raise after a close, which acts on bits the close claimed. So two windows
+    /// never overlap in time, and a close cannot clear the `OPEN` of a window another `begin` opened.
+    ///
     /// Closing, by the last drop or by an install that failed: the previous handlers are put back first,
     /// then `OPEN` is cleared, then every bit is claimed and re-raised. A handler `H` does `fetch_or`
     /// (A), reads `OPEN` (B), and if it is clear claims its bit (C) and raises it. All of these are
@@ -101,10 +106,12 @@ impl Deferred {
             match install() {
                 Ok(previous) => shared.previous = Some(previous),
                 Err(source) => {
-                    // `install` put back what it changed. Not under the lock: the handler reached may be
-                    // anything.
+                    // `install` put back what it changed. Closed under the lock, as `Drop` does, so a
+                    // concurrent `begin` cannot open a window that this close then shuts; re-raised after
+                    // it, since the handler reached may be anything.
+                    let recorded = close();
                     drop(shared);
-                    reraise(close());
+                    reraise(recorded);
                     return Err(Error::os("hold back interrupts while a run is held", source));
                 }
             }
