@@ -116,9 +116,11 @@ impl Launchd {
                 }),
             };
         };
-        if watch.add(pid)? == Added::Gone {
+        // Dropped on any way out of this pass, which deletes the registration and drains the queue: a
+        // pid that is reused later cannot be handed this process's exit.
+        let Added::Watching(registered) = watch.add(pid)? else {
             return Ok(Pass::Behind);
-        }
+        };
         // The pid was read before it was watched, and a pid can be reused: only a job that `print`
         // still shows with this pid is the one the watch holds.
         let still = self
@@ -133,7 +135,7 @@ impl Launchd {
         if budget == Budget::Immediate {
             return Ok(Pass::Done);
         }
-        match watch.wait(pid, Some(deadline))? {
+        match registered.wait(Some(deadline))? {
             Some(_) => Ok(Pass::Again),
             None => Err(budget::timed_out(name, "stopped", budget)),
         }

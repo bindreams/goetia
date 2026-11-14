@@ -18,12 +18,12 @@
 //! while it waits for a slipped-in run. A failure in that window carries [`stranded_hold`]: the hold, or
 //! the launch it holds, stays until a `stop`, a boot-out or a later `run` ends it.
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use super::interrupts::Deferred;
 use super::task::{Shown, TaskPrint};
-use super::watch::{Added, Watch};
+use super::watch::{Added, Registered, Watch};
 use super::{Kickstarted, Launchd, Plist, SignalOutcome, never_expires};
 use crate::backend::bounded::{Reservation, Role};
 use crate::backend::launchd::generate::run_marker;
@@ -38,8 +38,8 @@ use crate::spec::Id;
 pub(crate) struct Run {
     id: Id,
     pid: u32,
-    /// The kqueue the pid was registered on before it was resumed.
-    watch: Watch,
+    /// The pid, registered for its exit before it was resumed.
+    registered: Registered,
     /// The task's `logs` file and its length while the launch was held, where it has one.
     logs: Option<(PathBuf, u64)>,
 }
@@ -59,7 +59,7 @@ impl RunHandle for Run {
     /// Blocks on the watch, under no bound: the run lasts as long as it lasts. A wait that failed has lost
     /// the run, which may still be going ([`run_lost`]).
     fn wait(self) -> Result<Exit> {
-        let status = self.watch.wait(self.pid, None).map_err(|e| run_lost(&self.id, e))?;
+        let status = self.registered.wait(None).map_err(|e| run_lost(&self.id, e))?;
         Ok(exit_of(never_expires(status)))
     }
 }
@@ -108,7 +108,7 @@ impl Launchd {
                 Some(flow::reserved(self, &id, &[Step::Start], Budget::Immediate).map_err(|e| stranded_hold(&id, e))?);
         };
         let draws = later.as_mut().unwrap_or(reservation);
-        self.resume(id, pid, watch, logs, draws)
+        self.resume(id, pid, &watch, logs, draws)
     }
 
     /// One attempt: arms `debug`, starts the launch and reads what `print` shows of it. `armed` is
@@ -149,14 +149,14 @@ impl Launchd {
             )
         else {
             return Err(unestablished(
-                "read the pid `launchctl kickstart -p` printed",
-                "no whole pid",
+                id,
+                "launchctl kickstart -p printed no whole pid".to_string(),
             ));
         };
         let print = self
             .launchctl
             .read_task_print(name, issuing, Role::Query, reservation)?;
-        match launch_shown(&print, pid)? {
+        match launch_shown(&print, id, pid)? {
             Launch::Held => Ok(Attempt::Held(pid)),
             Launch::Ended => Ok(Attempt::Again),
             Launch::InFlight => {
@@ -168,57 +168,66 @@ impl Launchd {
                     output::show(notes, note.as_bytes())?;
                     *noted = true;
                 }
-                if watch.add(pid)? == Added::Gone {
+                let Added::Watching(registered) = watch.add(pid)? else {
                     return Ok(Attempt::Again);
-                }
-                // A pid can be reused: wait only for the job's process that `print` still shows.
+                };
+                // A pid can be reused: wait only for the job's process that `print` still shows. A
+                // registration left by any other way out of here is deleted as it is dropped.
                 let still = self
                     .launchctl
                     .read_task_print(name, issuing, Role::Query, reservation)?;
-                match launch_shown(&still, pid)? {
+                match launch_shown(&still, id, pid)? {
                     Launch::InFlight => {
-                        never_expires(watch.wait(pid, None)?);
+                        never_expires(registered.wait(None)?);
                         Ok(Attempt::Again)
                     }
                     Launch::Ended => Ok(Attempt::Again),
                     Launch::Held | Launch::Unreadable => Err(unestablished(
-                        "tell what launch the pid is",
-                        "launchctl print no longer shows how it was launched",
+                        id,
+                        format!("launchctl print no longer shows how the launch of process {pid} began"),
                     )),
                 }
             }
             Launch::Unreadable => Err(unestablished(
-                "tell whether launchd held the launch of the run",
-                &format!("launchctl print shows process {pid} and no `started suspended` line"),
+                id,
+                format!("launchctl print shows process {pid} and no `started suspended` line"),
             )),
         }
     }
 
     /// Watches the held launch `pid`, confirms `print` still shows it held, reads the log's length, and
     /// resumes it by label. A launch that is gone before it can be watched or resumed is
-    /// [`Error::RunUnrecorded`]: it was ended, and nothing is stranded. Any other failure is the
-    /// stranded hold.
+    /// [`Error::RunUnrecorded`]: it was ended, and nothing is stranded. Any other failure, and a launch
+    /// `print` shows alive without saying it is held, is the stranded hold.
     fn resume(
         &self,
         id: Id,
         pid: u32,
-        watch: Watch,
+        watch: &Watch,
         logs: Option<PathBuf>,
         reservation: &mut Reservation,
     ) -> Result<Run> {
         let strand = |e: Error| stranded_hold(&id, e);
         let name = id.as_str();
-        if watch.add(pid).map_err(strand)? == Added::Gone {
+        let Added::Watching(registered) = watch.add(pid).map_err(strand)? else {
             return Err(run_unwatched(&id));
-        }
+        };
         // Registered, but only a pid `print` shows as the job's held launch is the one to resume: the
         // one that was read may have ended, and its pid been reused, before it was watched.
         let print = self
             .launchctl
             .read_task_print(name, Budget::Unbounded.start(), Role::Query, reservation)
             .map_err(strand)?;
-        if launch_shown(&print, pid).map_err(strand)? != Launch::Held {
-            return Err(run_unwatched(&id));
+        match launch_shown(&print, &id, pid).map_err(strand)? {
+            Launch::Held => {}
+            Launch::Ended => return Err(run_unwatched(&id)),
+            // Alive, and nothing was resumed: the launch may sit stopped.
+            Launch::InFlight | Launch::Unreadable => {
+                return Err(strand(unestablished(
+                    &id,
+                    format!("launchctl print no longer shows the launch of process {pid} as held"),
+                )));
+            }
         }
         // While the launch is held, launchd has opened the log and the program has written nothing.
         let logs = logs
@@ -226,7 +235,12 @@ impl Launchd {
             .transpose()
             .map_err(strand)?;
         match self.launchctl.signal(name, "SIGCONT", reservation).map_err(strand)? {
-            SignalOutcome::Sent => Ok(Run { id, pid, watch, logs }),
+            SignalOutcome::Sent => Ok(Run {
+                id,
+                pid,
+                registered,
+                logs,
+            }),
             SignalOutcome::NoProcess => Err(run_unresumed(&id)),
         }
     }
@@ -235,19 +249,20 @@ impl Launchd {
 /// What `print` shows of the launch `pid`, which `kickstart -p` named. A read that failed or was not
 /// whole shows nothing, and is not mistaken for a launch that ended: another attempt would start another
 /// run.
-fn launch_shown(print: &TaskPrint, pid: u32) -> Result<Launch> {
+fn launch_shown(print: &TaskPrint, id: &Id, pid: u32) -> Result<Launch> {
     if matches!(print.shown, Shown::Failed) {
-        return Err(unestablished(
-            "read launchd's view of the launch of the run",
-            "launchctl print failed or was not whole",
-        ));
+        return Err(unestablished(id, "launchctl print failed or was not whole".to_string()));
     }
     Ok(launch_of(print.pid, print.started_suspended, pid))
 }
 
-/// `what` could not be established, for `why`.
-fn unestablished(what: &str, why: &str) -> Error {
-    Error::os(what, io::Error::other(why.to_string()))
+/// What `run` could not establish of the launch it started, `why`: the start was accepted and its state is
+/// not known, which is not a failure of the operating system.
+fn unestablished(id: &Id, why: String) -> Error {
+    Error::Step {
+        what: why,
+        source: Box::new(Error::StartUnconfirmed { id: id.to_string() }),
+    }
 }
 
 #[cfg(test)]

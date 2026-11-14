@@ -81,6 +81,13 @@ fn a_stranded_hold_names_the_hold_and_the_ways_out_and_keeps_the_cause() {
         },
     );
     assert!(doubtful.is_indeterminate());
+    assert_eq!(
+        doubtful.to_string(),
+        "`launchctl debug` held the next launch of `frpc` and the run may have started: that launch, a \
+         scheduled run or the next `run`, may wait stopped until `goetia daemon stop frpc` or `goetia daemon \
+         run frpc` ends it",
+        "a request lost in doubt may have started the run"
+    );
 }
 
 #[skuld::test]

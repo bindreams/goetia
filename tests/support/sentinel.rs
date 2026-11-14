@@ -33,7 +33,7 @@ pub const RUN_UNTIL_KILLED: &str = "--goetia-run-until-killed";
 pub const REPORT_UID: &str = "--goetia-report-uid";
 
 /// `<exe> --goetia-contained-child`: spawn `/bin/sleep 300` as goetia spawns `launchctl`
-/// (`backend::bounded::command`: stdin from `/dev/null`, the process tree contained), print its pid and a
+/// (`goetia::testing::spawn_contained`, which is `backend::bounded::command`), print its pid and a
 /// newline on stdout, and block forever. A test that signals this process's group sees whether the child
 /// is in it.
 #[cfg(unix)]
@@ -111,10 +111,7 @@ fn contained_child() -> ! {
     // it to this process and means it to end the process.
     // SAFETY: restoring a signal's default disposition touches no memory.
     unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
-    let mut command = cosca::run(["/bin/sleep", "300"]);
-    command.stdin(cosca::Stdio::null()).expect("stdin from /dev/null");
-    command.contain();
-    let child = command.spawn().expect("spawn the contained child");
+    let child = goetia::testing::spawn_contained("/bin/sleep", &["300"]);
     println!("{}", child.pid());
     std::io::stdout().flush().expect("flush stdout");
     loop {

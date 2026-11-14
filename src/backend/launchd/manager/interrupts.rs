@@ -11,7 +11,7 @@
 //! process (library use) share the one set, and neither saves the other's as the previous.
 
 use std::io;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use crate::error::{Error, Result};
@@ -31,13 +31,38 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     previous: None,
 });
 
-/// Bit `i` is set once `SIGNALS[i]` has arrived since the first holder.
+/// Bit `i` is set once `SIGNALS[i]` has arrived and nobody has claimed it yet.
 static RECORDED: AtomicU32 = AtomicU32::new(0);
 
-/// The handler: records the signal and nothing else, which is all a handler may safely do.
+/// Every bit of [`RECORDED`].
+const ALL: u32 = (1 << SIGNALS.len()) - 1;
+
+/// Whether a window is open: set once its handlers are installed, cleared by the drop of the last holder
+/// after the previous ones are back.
+static OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Takes the bits of `mask` out of [`RECORDED`], and answers those that were set: the caller that took a
+/// bit is the one to re-raise it, so each recorded signal is re-raised exactly once.
+fn claim(mask: u32) -> u32 {
+    RECORDED.fetch_and(!mask, Ordering::SeqCst) & mask
+}
+
+/// The handler: records the signal, and where the window has closed already, claims it back and raises
+/// it. A signal can be delivered on any thread, so a handler may still be running while the last holder is
+/// dropped: its bit then lands after the drop has claimed what it saw. Both orders are covered: the drop
+/// clears [`OPEN`] only after the previous handlers are back, so a handler that finds it clear raises to
+/// them, and one that finds it set has recorded before the drop's claim, which then takes the bit.
+///
+/// Only async-signal-safe calls: atomics, `raise`.
 extern "C" fn record(signal: libc::c_int) {
-    if let Some(bit) = SIGNALS.iter().position(|&s| s == signal) {
-        RECORDED.fetch_or(1 << bit, Ordering::SeqCst);
+    let Some(bit) = SIGNALS.iter().position(|&s| s == signal) else {
+        return;
+    };
+    let mask = 1 << bit;
+    RECORDED.fetch_or(mask, Ordering::SeqCst);
+    if !OPEN.load(Ordering::SeqCst) && claim(mask) != 0 {
+        // SAFETY: `raise` takes a valid signal number.
+        unsafe { libc::raise(signal) };
     }
 }
 
@@ -51,9 +76,9 @@ impl Deferred {
     pub(crate) fn begin() -> Result<Deferred> {
         let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
         if shared.holders == 0 {
-            RECORDED.store(0, Ordering::SeqCst);
             let previous = install().map_err(|source| Error::os("hold back interrupts while a run is held", source))?;
             shared.previous = Some(previous);
+            OPEN.store(true, Ordering::SeqCst);
         }
         shared.holders += 1;
         Ok(Deferred(()))
@@ -71,7 +96,9 @@ impl Drop for Deferred {
             if let Some(previous) = shared.previous.take() {
                 restore(&previous);
             }
-            RECORDED.swap(0, Ordering::SeqCst)
+            // After the previous handlers are back: a handler that finds the window closed raises to them.
+            OPEN.store(false, Ordering::SeqCst);
+            claim(ALL)
         };
         // Not under the lock: the handler it reaches may be anything.
         for (bit, &signal) in SIGNALS.iter().enumerate() {

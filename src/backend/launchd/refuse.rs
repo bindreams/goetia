@@ -77,11 +77,17 @@ pub(crate) fn changed_during_install(id: &Id, path: &Path) -> Error {
 
 /// `source`, a failure after `launchctl debug` held the next launch of `id`: the run was not started, and
 /// the hold stays until a launch consumes it. A launch held and not resumed waits stopped, so the error
-/// says what ends it. The cause stays under it, so a request left in doubt is still indeterminate.
+/// says what ends it. The cause stays under it, so a request left in doubt is still indeterminate, and
+/// then the run may have started: only a failure that left nothing in doubt says it did not.
 pub(crate) fn stranded_hold(id: &Id, source: Error) -> Error {
+    let run = if source.is_indeterminate() {
+        "the run may have started"
+    } else {
+        "the run was not started"
+    };
     Error::Step {
         what: format!(
-            "`launchctl debug` held the next launch of `{id}` and the run was not started: that launch, a \
+            "`launchctl debug` held the next launch of `{id}` and {run}: that launch, a \
              scheduled run or the next `run`, may wait stopped until `goetia daemon stop {id}` or `goetia \
              daemon run {id}` ends it"
         ),

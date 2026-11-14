@@ -312,6 +312,18 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// The sentinel, a process group leader: its whole group is killed and the sentinel reaped when this
+/// drops, so a test that fails leaves nothing behind. Cleanup never panics.
+struct SentinelGroup(std::process::Child);
+
+impl Drop for SentinelGroup {
+    fn drop(&mut self) {
+        // SAFETY: `killpg` takes a process group id and a signal number; a group that is gone answers `ESRCH`.
+        unsafe { libc::killpg(self.0.id() as libc::pid_t, libc::SIGKILL) };
+        drop(self.0.wait());
+    }
+}
+
 /// Ctrl-C is a SIGINT to the terminal's foreground process group, which goetia is in. `run` defers
 /// SIGINT only while a launch is held, so the `launchctl` calls it spawns (contained, as
 /// `backend::bounded::command` spawns them) must not be in that group: an interrupt that ended one
@@ -319,19 +331,21 @@ impl Drop for KillOnDrop {
 /// the test signals the sentinel's process group, which the sentinel is the leader of, and the child is
 /// not in it and lives on.
 #[skuld::test]
-fn a_launchctl_child_survives_a_sigint_to_goetias_process_group(#[fixture(launchd_group)] _group: &Group) {
+fn a_launchctl_child_survives_a_sigint_to_goetias_process_group() {
     use std::io::BufRead as _;
     use std::os::unix::process::ExitStatusExt as _;
 
-    let mut goetia = Command::new(std::env::current_exe().expect("the test binary's path"))
-        .arg(support::sentinel::CONTAINED_CHILD)
-        .stdout(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .expect("spawn the sentinel");
-    let goetia_group = goetia.id() as libc::pid_t;
+    let mut goetia = SentinelGroup(
+        Command::new(std::env::current_exe().expect("the test binary's path"))
+            .arg(support::sentinel::CONTAINED_CHILD)
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn the sentinel"),
+    );
+    let goetia_group = goetia.0.id() as libc::pid_t;
     let mut line = String::new();
-    std::io::BufReader::new(goetia.stdout.take().expect("the sentinel's stdout"))
+    std::io::BufReader::new(goetia.0.stdout.take().expect("the sentinel's stdout"))
         .read_line(&mut line)
         .expect("the child's pid");
     let child: libc::pid_t = line.trim().parse().expect("a pid");
@@ -350,7 +364,7 @@ fn a_launchctl_child_survives_a_sigint_to_goetias_process_group(#[fixture(launch
         0,
         "signal goetia's group"
     );
-    let status = goetia.wait().expect("wait for the sentinel");
+    let status = goetia.0.wait().expect("wait for the sentinel");
     assert_eq!(
         status.signal(),
         Some(libc::SIGINT),

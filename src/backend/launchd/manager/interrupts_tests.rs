@@ -1,13 +1,42 @@
 //! The deferral over real signals raised at this process. Each test puts a stand-in handler where the
 //! process's own would be, so a re-raised signal lands there and never ends the test.
 
-use std::sync::Mutex;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use super::*;
 
-/// Dispositions belong to the process, so the tests that change them take turns, whatever runs them.
+/// Dispositions belong to the process, so every test that changes them, `begin_run`'s included, takes
+/// turns, whatever runs them.
 static SERIAL: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// Whether this thread holds [`SERIAL`] already, so that a test that holds it through a [`StandIn`]
+    /// can call what takes it too.
+    static HOLDS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The turn a test takes before it changes the process's signal dispositions.
+pub(in crate::backend::launchd::manager) struct Serial(Option<MutexGuard<'static, ()>>);
+
+/// Waits for the turn, unless this thread has it.
+pub(in crate::backend::launchd::manager) fn serial() -> Serial {
+    if HOLDS.get() {
+        return Serial(None);
+    }
+    let guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    HOLDS.set(true);
+    Serial(Some(guard))
+}
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            HOLDS.set(false);
+        }
+    }
+}
 
 /// How many signals the stand-in handler has seen, and which (bit `n` for signal `n`).
 static SEEN: AtomicUsize = AtomicUsize::new(0);
@@ -38,13 +67,13 @@ pub(in crate::backend::launchd::manager) fn seen() -> usize {
 
 /// The stand-in installed for the three signals, and what they had before it, put back when it drops.
 pub(in crate::backend::launchd::manager) struct StandIn {
-    _serial: std::sync::MutexGuard<'static, ()>,
+    _serial: Serial,
     before: [libc::sigaction; 3],
 }
 
 impl StandIn {
     pub(in crate::backend::launchd::manager) fn install() -> StandIn {
-        let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let serial = serial();
         SEEN.store(0, Ordering::SeqCst);
         SEEN_BITS.store(0, Ordering::SeqCst);
         // SAFETY: an all-zero `sigaction` is valid; the mask is emptied before use.
@@ -187,6 +216,39 @@ fn two_overlapping_begin_runs_restore_the_signal_handlers() {
     assert_eq!(before.seen(), 1);
     assert!(before.saw(libc::SIGTERM));
     before.assert_back();
+}
+
+/// Each recorded bit is claimed once: whoever takes it re-raises it, so a signal is never lost between the
+/// handler and the drop, and never raised twice.
+#[skuld::test]
+fn a_recorded_signal_is_claimed_once() {
+    let _before = StandIn::install();
+    RECORDED.store(0b101, Ordering::SeqCst);
+
+    assert_eq!(claim(0b001), 0b001);
+    assert_eq!(claim(0b001), 0, "taken already");
+    assert_eq!(claim(ALL), 0b100, "what is left");
+    assert_eq!(RECORDED.load(Ordering::SeqCst), 0);
+}
+
+/// A handler that was running while the last window was dropped records its signal after the drop has
+/// claimed what it saw. It finds the window closed, claims its own bit, and raises it to the handler that
+/// is back in place: the signal is delivered once, not swallowed.
+#[skuld::test]
+fn a_handler_that_finishes_after_the_window_closed_re_raises_its_own_signal() {
+    let before = StandIn::install();
+    // What `Drop` leaves: the previous handlers back (here the stand-in), the window closed, nothing recorded.
+    OPEN.store(false, Ordering::SeqCst);
+
+    record(libc::SIGTERM);
+
+    assert_eq!(before.seen(), 1);
+    assert!(before.saw(libc::SIGTERM));
+    assert_eq!(
+        RECORDED.load(Ordering::SeqCst),
+        0,
+        "claimed, so not left for a drop that is over"
+    );
 }
 
 /// Windows that follow one another each save and restore: nothing a first one recorded is re-raised by

@@ -7,9 +7,13 @@
 //! kqueue's reach, and its pid may be reused, so [`Watch::add`] says [`Added::Gone`] for it and the
 //! caller reads launchd again.
 //!
-//! One [`Watch`] serves every pid of one verb in turn.
+//! A registration is a value, [`Registered`]: waiting consumes it, and dropping it, on whatever path
+//! leaves the pass that made it, deletes the registration and drains the queue. So no exit event
+//! outlives its pass, and a later registration of a reused pid number can never be handed the earlier
+//! process's. One [`Watch`] serves every pid of one verb in turn, one registration at a time.
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nix::errno::Errno;
@@ -20,17 +24,22 @@ use crate::manager::budget::Deadline;
 
 /// One kqueue fd.
 pub(crate) struct Watch {
-    queue: Kqueue,
+    queue: Arc<Kqueue>,
 }
 
 /// What [`Watch::add`] found.
-#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Added {
-    /// The pid is registered: its exit will be reported by [`Watch::wait`], even one that happens
+    /// The pid is registered: its exit will be reported by [`Registered::wait`], even one that happens
     /// before the wait starts.
-    Watching,
+    Watching(Registered),
     /// No such process: it has exited, or never was.
     Gone,
+}
+
+/// A pid registered for its exit. It shares the queue, so it outlives the [`Watch`] that made it.
+pub(crate) struct Registered {
+    queue: Arc<Kqueue>,
+    pid: u32,
 }
 
 /// The longest a single `kevent` call is asked to block, in seconds. A `wait` under a longer deadline
@@ -42,12 +51,12 @@ impl Watch {
     /// descriptors) strands nothing.
     pub(crate) fn new() -> Result<Watch> {
         make_queue()
-            .map(|queue| Watch { queue })
+            .map(|queue| Watch { queue: Arc::new(queue) })
             .map_err(|source| Error::os("make a kqueue to watch processes exit with", source))
     }
 
     /// Registers `pid` for its exit and the status it exits with. [`Added::Gone`] where there is no such
-    /// process. Registering a pid again leaves it registered once.
+    /// process. One registration at a time: the previous one is waited on or dropped first.
     pub(crate) fn add(&self, pid: u32) -> Result<Added> {
         let change = KEvent::new(
             pid as usize,
@@ -77,19 +86,24 @@ impl Watch {
             "a receipt is an EV_ERROR event"
         );
         match receipt.data() {
-            0 => Ok(Added::Watching),
+            0 => Ok(Added::Watching(Registered {
+                queue: Arc::clone(&self.queue),
+                pid,
+            })),
             code => match Errno::from_raw(code as i32) {
                 Errno::ESRCH => Ok(Added::Gone),
                 errno => Err(watching(errno.into())),
             },
         }
     }
+}
 
-    /// Blocks until `pid`, which [`Self::add`] registered, has exited, and answers its raw `wait(2)`
-    /// status. `None` iff `deadline` expired first, and none expires without one. The exits of other
-    /// pids registered on this watch are passed over: each verb waits for the pid it signalled, in turn.
-    /// An exit that happened before the wait began is reported at once.
-    pub(crate) fn wait(&self, pid: u32, deadline: Option<Deadline>) -> Result<Option<i32>> {
+impl Registered {
+    /// Blocks until the pid has exited, and answers its raw `wait(2)` status. `None` iff `deadline`
+    /// expired first, and none expires without one. An exit that happened before the wait began is
+    /// reported at once.
+    pub(crate) fn wait(self, deadline: Option<Deadline>) -> Result<Option<i32>> {
+        let pid = self.pid;
         let mut events = [blank(); 8];
         loop {
             // Asked again with what is left each time: the kernel's clock is not the deadline's, and
@@ -103,6 +117,10 @@ impl Watch {
                     }
                 }
                 Ok(n) => {
+                    debug_assert!(
+                        events[..n].iter().all(|event| event.ident() == pid as usize),
+                        "the queue holds only the one registration's events"
+                    );
                     if let Some(status) = events[..n].iter().find_map(|event| exit_status(event, pid)) {
                         return status.map(Some);
                     }
@@ -116,6 +134,59 @@ impl Watch {
                 }
             }
         }
+    }
+
+    /// Deletes the registration, and answers what the kernel said of it: `Ok` where it was still there
+    /// (its event, if it had fired and was not read, goes with it), `ENOENT` where there was none to
+    /// delete. [`Drop`] does not depend on the answer.
+    fn delete(&self) -> std::result::Result<(), Errno> {
+        let change = KEvent::new(
+            self.pid as usize,
+            EventFilter::EVFILT_PROC,
+            EvFlags::EV_DELETE | EvFlags::EV_RECEIPT,
+            FilterFlag::empty(),
+            0,
+            0,
+        );
+        let mut receipt = [blank()];
+        let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        loop {
+            match self.queue.kevent(&[change], &mut receipt, Some(now)) {
+                Err(Errno::EINTR) => {}
+                Err(errno) => return Err(errno),
+                Ok(0) => return Ok(()),
+                Ok(_) => {
+                    return match receipt[0].data() {
+                        0 => Ok(()),
+                        code => Err(Errno::from_raw(code as i32)),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Reads every event the queue holds, discarding them. Whatever `delete` did or did not remove, no
+    /// event of this registration is left.
+    fn drain(&self) {
+        let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut events = [blank(); 8];
+        loop {
+            match self.queue.kevent(&[], &mut events, Some(now)) {
+                Ok(0) => return,
+                Ok(_) | Err(Errno::EINTR) => {}
+                // A queue that cannot be read holds nothing a later wait could be handed.
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+impl Drop for Registered {
+    /// Deletes the registration and drains the queue, answering to nobody: the exit may have been waited
+    /// on already (`delete` finds nothing), or fired unread (its event goes with the knote, or is drained).
+    fn drop(&mut self) {
+        _ = self.delete();
+        self.drain();
     }
 }
 

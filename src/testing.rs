@@ -31,6 +31,18 @@ pub fn run_all() -> ! {
     runner.run()
 }
 
+/// Spawns `program` with `args` as the unix backends spawn `launchctl` and `systemctl`
+/// (`backend::bounded::command`: stdin from `/dev/null`, the process tree contained), and gives back the
+/// running child. A test of what that spawn does to the child (which process group it leaves it in) calls
+/// this, so that it follows the real spawn. Fails the calling test if the child cannot be spawned.
+#[cfg(unix)]
+pub fn spawn_contained(program: &str, args: &[&str]) -> cosca::Child {
+    crate::backend::bounded::command(program, args)
+        .unwrap_or_else(|e| panic!("cannot make the command `{program}`: {e}"))
+        .spawn()
+        .unwrap_or_else(|e| panic!("cannot spawn `{program}`: {e}"))
+}
+
 /// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
 /// a test never takes a placeholder for a SID.
 #[cfg(windows)]
