@@ -343,7 +343,7 @@ pub(crate) enum WriteOutcome {
     Raced,
     /// The write found, before changing anything, that something at the id is not the daemon's to
     /// replace, which `read` could not see: `install` ends with this refusal, and re-reads nothing.
-    // systemd's, and launchd's for a timer's name that a stranger holds.
+    /// systemd's, and launchd's for a task's timer name that a stranger holds.
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Refused(crate::decide::Outcome),
 }

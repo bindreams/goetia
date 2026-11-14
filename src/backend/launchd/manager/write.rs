@@ -2,9 +2,10 @@
 //!
 //! What to do is decided purely, in [`crate::backend::launchd::task`] (`update_plan`,
 //! `uninstall_plan`), from what is on disk and what launchd holds; [`Executor`] performs the plan's
-//! actions in order. Both plists are staged and linted before the first `launchctl` request, so a
-//! malformed one stops the install before anything changed. A crash anywhere leaves a state of the read
-//! table, and running the verb again finishes it.
+//! actions in order. An update first reads which labels launchd holds (two `print`s, which decide what
+//! to stage); then both plists are staged and linted before the first request that changes anything,
+//! so a malformed one stops the install before anything changed. A crash anywhere leaves a state of
+//! the read table, and running the verb again finishes it.
 //!
 //! A task's directories are an argument (`Dirs`), as `read` and `scan` take theirs.
 
@@ -14,9 +15,9 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use super::{
-    Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, describe_at, ensure_dir, move_no_clobber,
-    never_expires, persist_new, persist_over, prepare_parent_dirs, read_artifact, resolve_account, staged_tempfile,
-    still_present,
+    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, ensure_dir, move_no_clobber, never_expires,
+    persist_new, persist_new_unraced, persist_over, prepare_parent_dirs, read_artifact, resolve_account,
+    staged_tempfile, still_present,
 };
 use crate::backend::WriteOutcome;
 use crate::backend::bounded::Reservation;
@@ -61,10 +62,10 @@ impl Launchd {
         let account = resolve_account(&spec.common().user)?;
         let id = &spec.common().id;
         let staging = Path::new(dirs[0].0);
-        prepare_parent_dirs(spec, &account)?;
 
         match outcome {
             Outcome::Create => {
+                prepare_parent_dirs(spec, &account)?;
                 let (job_target, timer_target) = (
                     plist_in(staging, id.as_str()),
                     plist_in(staging, &timer_label(id.as_str())),
@@ -87,16 +88,7 @@ impl Launchd {
                         booted_out = true;
                     }
                 }
-                match persist_new(staged_job, &job_target)? {
-                    PersistOutcome::Written => {}
-                    PersistOutcome::Raced => {
-                        return Err(if booted_out {
-                            refuse::slot_taken_after_bootout(id, &job_target, describe_at(&job_target))
-                        } else {
-                            refuse::changed_during_install(id, &job_target)
-                        });
-                    }
-                }
+                persist_new_unraced(staged_job, &job_target, id, booted_out)?;
                 if let Some(staged) = staged_timer {
                     match persist_new(staged, &timer_target)? {
                         PersistOutcome::Written => {}
@@ -173,6 +165,8 @@ impl Launchd {
                     staged_job,
                     staged_timer,
                     timer_out: false,
+                    // After a refusal, as the service path has it: a refused update creates nothing.
+                    prepare: Some((spec, &account)),
                 }
                 .run(&plan, reservation)
             }
@@ -195,6 +189,7 @@ impl Launchd {
             staged_job: None,
             staged_timer: None,
             timer_out: false,
+            prepare: None,
         }
         .run(&uninstall_plan(&old), reservation)?;
         debug_assert!(matches!(executed, WriteOutcome::Done), "an uninstall refuses nothing");
@@ -257,15 +252,22 @@ struct Executor<'a> {
     /// The linted files a `Replace` or a `Create` puts in place, staged before the first request.
     staged_job: Option<NamedTempFile>,
     staged_timer: Option<NamedTempFile>,
-    /// Whether this plan booted the timer out, which a refusal then loads again.
+    /// Whether this plan booted the timer out and has not loaded it again or removed it: an error
+    /// then says the timer is not loaded, and a refusal loads it again first.
     timer_out: bool,
+    /// The directories the spec names (`cwd`, the parent of `logs`), made before the first action that
+    /// changes anything a refusal could leave untouched.
+    prepare: Option<(&'a DaemonSpec, &'a Account)>,
 }
 
 impl Executor<'_> {
     fn run(&mut self, plan: &[Action], reservation: &mut Reservation) -> Result<WriteOutcome> {
         for &action in plan {
-            if let Some(refusal) = self.perform(action, reservation)? {
-                return Ok(refusal);
+            match self.perform(action, reservation) {
+                Ok(Some(refusal)) => return Ok(refusal),
+                Ok(None) => {}
+                Err(e) if self.timer_out => return Err(self.timer_stranded(e)),
+                Err(e) => return Err(e),
             }
         }
         Ok(WriteOutcome::Done)
@@ -273,6 +275,11 @@ impl Executor<'_> {
 
     /// `Some` where the install ends with a refusal that is not an error.
     fn perform(&mut self, action: Action, reservation: &mut Reservation) -> Result<Option<WriteOutcome>> {
+        if !matches!(action, Action::BootoutTimer | Action::CheckJobIdle)
+            && let Some((spec, account)) = self.prepare.take()
+        {
+            prepare_parent_dirs(spec, account)?;
+        }
         let (launchctl, id) = (&self.launchd.launchctl, self.id.as_str());
         let deadline = Budget::Unbounded.start();
         let timer_label = timer_label(id);
@@ -283,16 +290,43 @@ impl Executor<'_> {
             }
             Action::CheckJobIdle => {
                 // A service is refused while launchd has it at all (one that has exited is still
-                // loaded); a task only while it has a run in flight, which `Idle` rules out. Anything
-                // this cannot establish as idle, a state it does not recognise included, is refused.
-                let busy = match self.old.kind {
-                    DaemonKind::Service => never_expires(launchctl.is_loaded(id, deadline, reservation)?),
+                // loaded); a task while it has a process or a start launchd has accepted. A state this
+                // cannot read as idle or as a run is refused too, and said not to be known.
+                let verdict = match self.old.kind {
+                    DaemonKind::Service if never_expires(launchctl.is_loaded(id, deadline, reservation)?) => {
+                        Verdict::InFlight
+                    }
+                    DaemonKind::Service => Verdict::Idle,
                     DaemonKind::Task => {
-                        launchctl.read_task_print(id, deadline, Role::Query, reservation)?.state != State::Idle
+                        let print = launchctl.read_task_print(id, deadline, Role::Query, reservation)?;
+                        if print.pid.is_some() || print.state == State::Running {
+                            Verdict::InFlight
+                        } else if print.state == State::Idle {
+                            Verdict::Idle
+                        } else {
+                            Verdict::Unknown
+                        }
                     }
                 };
-                if busy {
-                    return Err(self.refusal(reservation));
+                match verdict {
+                    Verdict::Idle => {}
+                    Verdict::InFlight => {
+                        let refusal = refuse::loaded_refusal(self.id, self.old.kind);
+                        return Err(self.refuse(refusal, reservation));
+                    }
+                    Verdict::Unknown => {
+                        let refusal = Error::Step {
+                            what: format!(
+                                "the changed plists of `{id}` were not installed and the installed ones are \
+                                 untouched: re-run install"
+                            ),
+                            source: Box::new(Error::os(
+                                format!("read whether the job of `{id}` is idle"),
+                                std::io::Error::other("launchctl print shows a state goetia does not recognise"),
+                            )),
+                        };
+                        return Err(self.refuse(refusal, reservation));
+                    }
                 }
             }
             Action::CreateTimerFirst => {
@@ -339,6 +373,8 @@ impl Executor<'_> {
             Action::RemoveTimer => {
                 let path = self.timer.take().expect("a removed timer is where it was read");
                 fs::remove_file(&path).map_err(|e| Error::os_at("remove", &path, e))?;
+                // Gone for good, as the new spec has no schedule: there is nothing to load again.
+                self.timer_out = false;
             }
             Action::RemoveJob => {
                 let path = self.job.take().expect("a removed job is where it was read");
@@ -346,6 +382,8 @@ impl Executor<'_> {
             }
             Action::BootstrapJob => self.load(&self.job.clone().expect("a loaded job has a file"), id, reservation)?,
             Action::BootstrapTimer => {
+                // A failure to load says what is left to do, which covers the timer.
+                self.timer_out = false;
                 self.load(
                     &self.timer.clone().expect("a loaded timer has a file"),
                     &timer_label,
@@ -372,14 +410,26 @@ impl Executor<'_> {
             })
     }
 
-    /// The refusal of a job that is not idle, the timer loaded again first if this plan booted it out. A
-    /// timer that cannot be loaded again is told beside the refusal: the task is not armed.
-    fn refusal(&self, reservation: &mut Reservation) -> Error {
-        let refusal = refuse::loaded_refusal(self.id, self.old.kind);
-        if !self.timer_out {
+    /// `refusal`, the job not being idle, with the timer loaded again first if this plan booted it out.
+    /// A timer that cannot be loaded again is told beside the refusal: the task is not armed. A timer
+    /// label launchd held with no plist of ours (a stranger's, or a file removed by hand) has nothing to
+    /// load it from, and the refusal says so.
+    fn refuse(&mut self, refusal: Error, reservation: &mut Reservation) -> Error {
+        if !std::mem::take(&mut self.timer_out) {
             return refusal;
         }
-        let timer = self.timer.as_deref().expect("a timer booted out has a file");
+        let id = self.id;
+        let label = timer_label(id.as_str());
+        // Before any file changes, the timer's path is where it was read, if it was read.
+        let Some(timer) = self.timer.as_deref().filter(|_| self.old.timer.is_some()) else {
+            return Error::Step {
+                what: format!(
+                    "launchd held `{label}`, which has no plist of goetia's to load it from, so it was booted \
+                     out for this install and is not loaded again"
+                ),
+                source: Box::new(refusal),
+            };
+        };
         match self
             .launchd
             .launchctl
@@ -395,6 +445,28 @@ impl Executor<'_> {
             },
         }
     }
+
+    /// `error`, which ended the install after the timer was booted out and before it was loaded again
+    /// or removed: the timer is not loaded, and a re-run of install loads it.
+    fn timer_stranded(&self, error: Error) -> Error {
+        let (id, label) = (self.id, timer_label(self.id.as_str()));
+        Error::Step {
+            what: format!(
+                "`{id}`'s timer (`{label}`) was booted out and this install failed before loading it again, so it \
+                 is not loaded: re-run install"
+            ),
+            source: Box::new(error),
+        }
+    }
+}
+
+/// What `CheckJobIdle` read of the job.
+enum Verdict {
+    Idle,
+    /// A service that is loaded, or a task with a process or an accepted start.
+    InFlight,
+    /// A task whose `print` shows a state that is neither.
+    Unknown,
 }
 
 #[cfg(test)]

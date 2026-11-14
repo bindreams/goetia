@@ -585,6 +585,17 @@ fn persist_new(staged: tempfile::NamedTempFile, target: &Path) -> Result<Persist
     }
 }
 
+/// [`persist_new`] for a `Create`, where a `Raced` is an error: something now exists where `read` saw
+/// nothing, and a `launchctl` call has been made since, so another pass would draw more than the verb
+/// reserved. `booted_out` is whether a loaded job was booted out first, which the error then says.
+fn persist_new_unraced(staged: tempfile::NamedTempFile, target: &Path, id: &Id, booted_out: bool) -> Result<()> {
+    match persist_new(staged, target)? {
+        PersistOutcome::Written => Ok(()),
+        PersistOutcome::Raced if booted_out => Err(refuse::slot_taken_after_bootout(id, target, describe_at(target))),
+        PersistOutcome::Raced => Err(refuse::changed_during_install(id, target)),
+    }
+}
+
 /// Overwrite the plist already at `target`, for `Update`/`Stale` only: `read` has established the
 /// id is marked.
 fn write_existing(target: &Path, content: &str) -> Result<()> {
@@ -1318,17 +1329,7 @@ impl backend::Backend for Launchd {
                             .bootout(spec.common().id.as_str(), deadline, reservation)?,
                     );
                 }
-                match persist_new(staged, &target)? {
-                    PersistOutcome::Written => {}
-                    // Something now exists where `read` saw nothing, and `is_loaded` has been called.
-                    PersistOutcome::Raced => {
-                        return Err(if loaded {
-                            refuse::slot_taken_after_bootout(&spec.common().id, &target, describe_at(&target))
-                        } else {
-                            refuse::changed_during_install(&spec.common().id, &target)
-                        });
-                    }
-                }
+                persist_new_unraced(staged, &target, &spec.common().id, loaded)?;
                 self.recheck_after_write(&spec.common().id, deadline, &target, desired, None, reservation)?;
             }
             Outcome::Update { .. } | Outcome::Stale { .. } => {

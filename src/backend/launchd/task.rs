@@ -97,7 +97,8 @@ pub(crate) enum Action {
     CreateTimerFirst,
     BootoutTimer,
     /// Read the job again, now that no timer can start it: a service that is loaded, or a task with a
-    /// run in flight, is refused with [`crate::error::Error::LoadedJob`], the timer re-armed first.
+    /// run in flight, is refused with [`crate::error::Error::LoadedJob`], the timer re-armed first. A
+    /// state that is neither idle nor a run is refused too, with an error that says it is not known.
     CheckJobIdle,
     BootoutJob,
     /// Move the job's plist from the enabled directory to staging, so that a retyped daemon does not

@@ -335,6 +335,12 @@ fn update_plan_table() {
             vec![CheckJobIdle, BootoutJob, ReplaceJob, BootstrapJob],
         ),
         (
+            "a timer label launchd holds with no timer file: it goes out with the job, and nothing is loaded for it",
+            installed(&unscheduled("a"), true, BOTH),
+            unscheduled("b"),
+            vec![BootoutTimer, CheckJobIdle, BootoutJob, ReplaceJob, BootstrapJob],
+        ),
+        (
             "a task with no schedule, no change but the metadata",
             installed(&unscheduled("a"), false, NOTHING),
             rename(unscheduled("a"), "another name"),

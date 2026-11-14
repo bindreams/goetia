@@ -14,6 +14,7 @@ use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::{Backend as _, InstalledService as _};
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::manager::Step;
+use crate::spec::TaskSpec;
 use crate::testing::task;
 
 // Fixtures ============================================================================================================
@@ -358,6 +359,137 @@ fn a_command_edit_over_a_running_task_is_loaded_job_of_kind_task_and_rearms_the_
     fake.assert_spent("the timer is armed again after the refusal");
     assert_eq!(text_at(&tree, true, ID), old.job);
     assert_eq!(text_at(&tree, true, &timer_name()), old.timer.unwrap());
+}
+
+/// A failure after the timer went out, other than the refusal, says the timer is not loaded and that
+/// re-running install loads it.
+#[skuld::test]
+fn a_failure_after_the_timer_went_out_names_the_timer_and_says_to_rerun() {
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, IDLE),
+        reply(&["bootout", &job_label()], exited(5, "", "boom")),
+    ]);
+
+    let e = rewrite(&tree, &fake, &command("/bin/false")).expect_err("the job's bootout failed");
+
+    let text = e.to_string();
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert!(text.contains(&timer_name()) && text.contains("not loaded"), "{text}");
+    assert!(text.contains("re-run install"), "{text}");
+    assert!(matches!(e.cause(), Error::Command { .. }), "{e:?}");
+    fake.assert_spent("the install stopped at the failed bootout");
+    assert_eq!(text_at(&tree, true, ID), old.job);
+}
+
+/// A timer label launchd holds with no plist of ours (removed by hand, or a stranger's) is booted out
+/// with the job; a refusal then has nothing to load it from, and says so instead of loading a path that
+/// is not there.
+#[skuld::test]
+fn a_busy_job_beside_a_timer_label_with_no_timer_file_is_refused_without_a_panic() {
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(None), true);
+    let fake = Fake::new([
+        print(job_label(), LOADED, BUSY),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, BUSY),
+    ]);
+
+    let e = rewrite(&tree, &fake, &task(ID, vec!["/bin/false".into()], None)).expect_err("a run is in flight");
+
+    let text = e.to_string();
+    assert!(text.contains(&timer_name()) && text.contains("no plist"), "{text}");
+    assert!(
+        matches!(
+            e.cause(),
+            Error::LoadedJob {
+                kind: DaemonKind::Task,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    fake.assert_spent("nothing is loaded again: there is no file to load");
+    assert_eq!(text_at(&tree, true, ID), old.job);
+}
+
+/// A `print` state goetia does not recognise is refused, and not called a run in flight.
+#[skuld::test]
+fn a_state_launchd_does_not_show_is_not_reported_as_a_run_in_flight() {
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(Some(SCHEDULE)), false);
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, "\tstate = someday-new-apple-state\n"),
+    ]);
+
+    let e = rewrite(&tree, &fake, &command("/bin/false")).expect_err("a state that is not known");
+
+    let report = e.report().to_string();
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert!(!report.contains("run in flight"), "{report}");
+    assert!(report.contains("does not recognise"), "{report}");
+    assert!(report.contains("untouched"), "{report}");
+    fake.assert_spent("nothing is booted out");
+    assert_eq!(text_at(&tree, false, ID), old.job);
+}
+
+/// A refused update has created none of the new spec's directories.
+#[skuld::test]
+fn a_refused_update_creates_none_of_the_specs_directories() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), false);
+    let cwd = tree.dir(false).join("new-cwd");
+    let DaemonSpec::Task(task) = command("/bin/false") else {
+        unreachable!("`command` builds a task");
+    };
+    let mut fields = task.into_fields();
+    fields.common.cwd = Some(cwd.clone());
+    let spec = DaemonSpec::from(TaskSpec::new(fields).unwrap());
+    let fake = Fake::new([
+        print(job_label(), LOADED, BUSY),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, BUSY),
+    ]);
+
+    rewrite(&tree, &fake, &spec).expect_err("a run is in flight");
+
+    assert!(!cwd.exists(), "the refusal came first");
+}
+
+/// A stranger's file at the timer's name is a refusal whatever it is: a binary plist, bytes that are not
+/// UTF-8, or not a file at all, as the read table has it.
+#[skuld::test]
+fn a_strangers_file_of_any_shape_at_the_timer_path_is_refused_as_foreign() {
+    type Put = fn(&Tree);
+    let shapes: [(&str, Put); 3] = [
+        ("a binary plist", |tree| {
+            tree.put(false, &timer_name(), b"bplist00\0\0\0")
+        }),
+        ("bytes that are not UTF-8", |tree| {
+            tree.put(false, &timer_name(), [0xffu8, 0xfe, 0x00, 0xc3])
+        }),
+        ("a directory", |tree| {
+            std::fs::create_dir(at(tree, false, &timer_name())).unwrap()
+        }),
+    ];
+    for (what, put) in shapes {
+        let tree = Tree::new();
+        put(&tree);
+        let fake = Fake::new([print(timer_target(), UNLOADED, ""), print(job_label(), UNLOADED, "")]);
+
+        let recovery = refused_as_foreign(create(&tree, &fake, &task_spec(Some(SCHEDULE))));
+
+        assert!(recovery.contains(&timer_name()), "{what}: {recovery}");
+    }
 }
 
 /// An idle job that launchd holds is booted out (and waited for) before it is replaced; a task that is
