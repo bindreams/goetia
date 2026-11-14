@@ -52,7 +52,6 @@ fn parameters_key_path(name: &str) -> String {
     format!(r"{SERVICES_KEY}\{name}\{PARAMETERS_KEY}")
 }
 
-/// The name of the `Parameters` key below a service key.
 fn parameters_key_name() -> Name {
     Name::new(PARAMETERS_KEY)
 }
