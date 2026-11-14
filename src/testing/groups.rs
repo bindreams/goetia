@@ -11,7 +11,7 @@
 //!
 //! A test that changes no system state but needs something a host may lack (a privilege) has a
 //! switch and no consent: `GOETIA_TEST_DEBUG_PRIVILEGE` unset or `1` runs it, and it fails where the
-//! host lacks the dependency; `0` ignores it. See [`need`].
+//! host lacks the dependency; `0` ignores it. See `need`.
 
 use super::elevation::ELEVATED;
 
