@@ -50,8 +50,6 @@ pub(crate) fn spawn_scheduled(print_body: &str) -> bool {
 /// How a process ended, from the `wait(2)` status a kqueue `NOTE_EXITSTATUS` event carries: the exit
 /// code (its second byte) for a process that exited, else the signal (its low seven bits; bit 7 says a
 /// core was dumped) that killed it.
-// Nothing on macOS calls it until `begin_run`'s `Run::wait` does, which removes this `allow`.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn exit_of(raw_status: i32) -> Exit {
     match raw_status & 0x7f {
         0 => Exit::Code((raw_status >> 8) & 0xff),
@@ -82,13 +80,36 @@ pub(crate) fn last_result(print_body: &str) -> Option<Exit> {
 /// `started suspended = 1` or `0`: whether the launch `print` shows was held by `launchctl debug
 /// --start-suspended`. It stays `1` for the life of a held launch after it is resumed, so it says how
 /// the launch began, not whether it is stopped now.
-// Nothing on macOS calls it until `begin_run` does, which removes this `allow`.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn started_suspended(print_body: &str) -> Option<bool> {
     match find_field(print_body, "started suspended").map(str::trim) {
         Some("1") => Some(true),
         Some("0") => Some(false),
         _ => None,
+    }
+}
+
+/// What one `launchctl print` shows of the launch `kickstart -p` named `followed`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Launch {
+    /// The job's process is `followed` and it was launched held: the launch `run` armed `debug` for.
+    Held,
+    /// The job's process is `followed` and it was not held: a run that was already in flight, which
+    /// `kickstart -p` named instead of starting one (a scheduled run that slipped in).
+    InFlight,
+    /// The job shows another process, or none: `followed` has ended.
+    Ended,
+    /// The job's process is `followed` and `print` does not say how it was launched, so it cannot be
+    /// told from either of the above.
+    Unreadable,
+}
+
+/// [`Launch`] from the `pid` and [`started_suspended`] of one `print`.
+pub(crate) fn launch_of(pid: Option<u32>, suspended: Option<bool>, followed: u32) -> Launch {
+    match (pid == Some(followed), suspended) {
+        (false, _) => Launch::Ended,
+        (true, Some(true)) => Launch::Held,
+        (true, Some(false)) => Launch::InFlight,
+        (true, None) => Launch::Unreadable,
     }
 }
 

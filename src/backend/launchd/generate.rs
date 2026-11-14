@@ -18,7 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::calendar::{self, Entry};
-use crate::backend::{Identity, RUN_MARKER, refuse_env_sh_resets};
+use crate::backend::{Identity, Marker, RUN_MARKER, refuse_env_sh_resets};
 use crate::blob::{self, Blob};
 use crate::error::Error;
 use crate::spec::{DaemonFields, DaemonSpec, Id, Restart, Schedule, TaskSpec};
@@ -503,6 +503,19 @@ const RESET_BY_SH: [&str; 4] = ["PWD", "IFS", "OLDPWD", "_"];
 /// `exec` keeps it; `$0` is the program, so its `argv[0]` is the path as written.
 fn wrapper_script() -> String {
     format!(r#"printf '%s %08x\n' {RUN_MARKER} $$; exec "$0" "$@""#)
+}
+
+/// The line [`wrapper_script`] writes first to the log for the run whose process is `pid`, which is
+/// what `run` follows. A run goetia held starts after the offset it measured, so no earlier start
+/// can have put its marker before it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn run_marker(pid: u32) -> Marker {
+    Marker {
+        prefix: RUN_MARKER,
+        line: format!("{RUN_MARKER} {pid:08x}"),
+        id_len: 8,
+        earlier_start_possible: false,
+    }
 }
 
 /// A task's `ProgramArguments`. Only a task with `logs` has output launchd keeps, so only it gets the

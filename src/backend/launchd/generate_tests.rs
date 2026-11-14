@@ -1152,6 +1152,22 @@ fn timer_label_is_never_an_id() {
     }
 }
 
+/// The marker a run follows is the line the wrapper's `printf` writes for that pid: the prefix, a space and
+/// the pid as 8 lowercase hex digits.
+#[skuld::test]
+fn the_run_marker_is_the_line_the_wrapper_prints_for_the_pid() {
+    let marker = run_marker(0x1a2b);
+
+    assert_eq!(marker.line, "goetia-run 00001a2b");
+    assert_eq!(marker.prefix, "goetia-run");
+    assert_eq!(marker.id_len, 8);
+    assert!(
+        !marker.earlier_start_possible,
+        "`run` follows only a run it held, so its marker is after the offset"
+    );
+    assert_eq!(run_marker(99_999).line, "goetia-run 0001869f");
+}
+
 /// The wrapper's words and the command's are escaped as every other value; the script has no `&`, `<`
 /// or `>`, so it reads back as written.
 #[skuld::test]

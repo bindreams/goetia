@@ -252,6 +252,11 @@ fn stop_with_no_process_and_a_state_that_is_not_idle_is_unconfirmed() {
             "launchd shows its job in state `xpcproxy` with no process, a state goetia does not know",
         ),
         (
+            "a state goetia knows, with no pid line",
+            print("\tstate = running\n"),
+            "launchd shows its job in state `running` with no process",
+        ),
+        (
             "no state line",
             print("system/x = {\n\tactive count = 1\n}\n"),
             "launchd shows its job with no process and no state",

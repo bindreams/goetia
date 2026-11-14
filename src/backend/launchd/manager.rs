@@ -39,7 +39,8 @@
 //!   `status` treat them as one id (see `task`), and `install`, `uninstall`, `enable` and `disable`
 //!   change both, in the order the plans of `launchd::task` give (see `write`). A task's `start` loads
 //!   its job and kicks it, and its `stop` sends SIGTERM to the run in flight and never boots the job
-//!   out (see `verbs`).
+//!   out (see `verbs`). Its `run` holds the job's next launch with `launchctl debug --start-suspended`
+//!   until goetia is watching the process it names, then resumes it (see `run`).
 //! - Reading (`list`, and every verb's ownership check) scans both directories, never `launchctl
 //!   print`, whose format Apple does not guarantee. `status`'s live run state is the one exception,
 //!   since no file says whether a job is running. It reads `launchctl print` leniently: a shape it
@@ -89,6 +90,8 @@ use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, Restart, User};
 pub use super::{ENABLED_DIR, STAGING_DIR};
 use task::{Artifact, Assembled, Body};
 
+mod interrupts;
+mod run;
 mod task;
 mod verbs;
 mod watch;
@@ -730,7 +733,7 @@ fn run(command: &str, args: &[&str]) -> Result<std::process::Output> {
         .map_err(|e| Error::spawn(format!("{command} {}", args.join(" ")), e))
 }
 
-/// [`run`] for a caller that only needs success: a spawn failure is an [`Error::Spawn`], a non-zero
+/// [`run()`] for a caller that only needs success: a spawn failure is an [`Error::Spawn`], a non-zero
 /// exit an [`Error::Command`].
 fn require_success(command: &str, args: &[&str]) -> Result<()> {
     let out = run(command, args)?;
@@ -797,9 +800,9 @@ fn never_expires<T>(step: Option<T>) -> T {
 
 /// What a `kickstart` established about the job.
 enum Kickstarted {
-    /// launchd forked the job and named a pid on a whole capture. That a pid parsed is the
-    /// confirmation, so the number is not carried.
-    Confirmed,
+    /// launchd forked the job and named this pid on a whole capture. That a pid parsed is the
+    /// confirmation.
+    Confirmed(u32),
     /// `kickstart` succeeded but named no pid this code will trust: the plain form, which never
     /// prints one, or a `-p` whose stdout is not the whole `<digits>\n` line.
     NoPid,
@@ -862,6 +865,20 @@ enum SignalOutcome {
     /// The job has no process to signal: it is not loaded (113), or loaded with none (3).
     NoProcess,
 }
+
+/// What `launchctl debug --start-suspended` answered.
+#[derive(Debug, PartialEq, Eq)]
+enum DebugOutcome {
+    /// The next launch of the job is now held.
+    Held,
+    /// A hold was already pending: another `run`'s, a stranded one, or one an earlier attempt of this
+    /// `run` armed. The next launch is held all the same.
+    AlreadyHeld,
+}
+
+/// What `launchctl debug` exits with for a hold that is already pending: 37, "Operation already in
+/// progress" (measured on macOS CI).
+const DEBUG_IN_PROGRESS: i32 = 37;
 
 /// The files of one more read over `kept`, for a read repeated as often as it takes. A failure is a
 /// read that could not be made, never a job that is gone.
@@ -994,7 +1011,7 @@ impl Launchctl {
             .then(|| state::kickstart_pid(&String::from_utf8_lossy(&capture.stdout)))
             .flatten();
         Ok(Some(match pid {
-            Some(_) => Kickstarted::Confirmed,
+            Some(pid) => Kickstarted::Confirmed(pid),
             None => Kickstarted::NoPid,
         }))
     }
@@ -1089,17 +1106,44 @@ impl Launchctl {
     fn signal(&self, id: &str, signal: &str, reservation: &mut Reservation) -> Result<SignalOutcome> {
         let target = target(id);
         let args = ["kill", signal, target.as_str()];
-        let role = request(reservation)?;
-        let Finished::Exited { status, capture } = self.run(&args, Budget::Unbounded.start(), role, reservation)?
-        else {
-            unreachable!("a call under an unbounded deadline never expires");
-        };
+        let (status, capture) = self.request_to_end(&args, reservation)?;
         if status.success() {
             Ok(SignalOutcome::Sent)
         } else if is_not_found(status.code()) {
             Ok(SignalOutcome::NoProcess)
         } else {
             Err(command_failed(&args, status, &capture.stderr))
+        }
+    }
+
+    /// `launchctl debug <id> --start-suspended`: the next launch of the job starts stopped, whoever starts
+    /// it, and stays so until it is sent SIGCONT. One launch only, and a hold already pending is not
+    /// replaced ([`DebugOutcome::AlreadyHeld`]), so what holds the next launch is one hold either way.
+    /// Unbounded, as [`Self::signal`] is.
+    fn debug_start_suspended(&self, id: &str, reservation: &mut Reservation) -> Result<DebugOutcome> {
+        let target = target(id);
+        let args = ["debug", target.as_str(), "--start-suspended"];
+        let (status, capture) = self.request_to_end(&args, reservation)?;
+        if status.success() {
+            Ok(DebugOutcome::Held)
+        } else if status.code() == Some(DEBUG_IN_PROGRESS) {
+            Ok(DebugOutcome::AlreadyHeld)
+        } else {
+            Err(command_failed(&args, status, &capture.stderr))
+        }
+    }
+
+    /// `args` as a request that runs to its end: the deadline is unbounded, so it never expires and what
+    /// it answered is whole.
+    fn request_to_end(
+        &self,
+        args: &[&str],
+        reservation: &mut Reservation,
+    ) -> Result<(std::process::ExitStatus, bounded::Capture)> {
+        let role = request(reservation)?;
+        match self.run(args, Budget::Unbounded.start(), role, reservation)? {
+            Finished::Exited { status, capture } => Ok((status, capture)),
+            Finished::Left(_) | Finished::Expired => unreachable!("a call under an unbounded deadline never expires"),
         }
     }
 
@@ -1195,7 +1239,10 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 /// `start`: bootstrap+kickstart, then the corrective cycle's bootout+bootstrap+kickstart.
 ///
 /// `install` and `uninstall` have a service's count and a task's (see `write`); [`needs`] takes the
-/// larger, since a reservation is made before the kind is known.
+/// larger, since a reservation is made before the kind is known. A task's `run` draws within `start`'s
+/// count: its first attempt is the load (a kept read and wait, the `bootstrap`, one more read), the
+/// `debug`, the `kickstart -p`, the `print`, the confirming `print` and the `SIGCONT`, 8 calls and 4
+/// reapers; each later attempt makes its own reservation and draws at most the last five of these.
 const SERVICE_INSTALL_REQUESTS: usize = 1;
 /// A task's longest `install`, an update of an armed task whose job changes: the timer's `bootout`,
 /// the job's, and both `bootstrap`s.
@@ -1347,7 +1394,7 @@ impl backend::Backend for Launchd {
     type Snapshot = Plist;
     type InstallScope = ();
     type Reservation = Reservation;
-    type Run = std::convert::Infallible;
+    type Run = run::Run;
 
     fn begin_install(&self, _spec: &DaemonSpec, _desired: &Plists, _reservation: &mut Reservation) -> Result<()> {
         Ok(())
@@ -1623,7 +1670,7 @@ impl backend::Backend for Launchd {
                 .ok_or_else(timed_out)?
             {
                 // launchd forked the job and named the pid: the confirmation.
-                Kickstarted::Confirmed => {}
+                Kickstarted::Confirmed(_) => {}
                 // `-p` returned no pid this code trusts. Not expected from launchd, and not
                 // guessed at: one bounded read decides it.
                 Kickstarted::NoPid if budget.waits() => {
@@ -1721,14 +1768,14 @@ impl backend::Backend for Launchd {
         }
     }
 
-    /// Interim: launchd installs no task yet, so no id reaches here as one.
+    /// Holds the job's next launch, starts it, and follows the process it names (see `run`).
     fn begin_run(
         &self,
         snapshot: Plist,
-        _reservation: &mut Reservation,
-        _notes: &mut dyn std::io::Write,
-    ) -> Result<std::convert::Infallible> {
-        Err(backend::cannot_run_tasks("launchd", snapshot.id()))
+        reservation: &mut Reservation,
+        notes: &mut dyn std::io::Write,
+    ) -> Result<run::Run> {
+        self.begin_task_run(snapshot, reservation, notes)
     }
 }
 

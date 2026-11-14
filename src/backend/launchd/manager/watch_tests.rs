@@ -16,8 +16,17 @@ pub(in crate::backend::launchd::manager) struct Held {
 
 impl Held {
     pub(in crate::backend::launchd::manager) fn new(code: i32) -> Held {
+        Held::running(&format!("read _; exit {code}"))
+    }
+
+    /// A child that ends itself with `signal` once its stdin closes.
+    pub(in crate::backend::launchd::manager) fn signalled(signal: i32) -> Held {
+        Held::running(&format!("read _; kill -{signal} $$"))
+    }
+
+    fn running(script: &str) -> Held {
         let mut child = Command::new("/bin/sh")
-            .args(["-c", &format!("read _; exit {code}")])
+            .args(["-c", script])
             .stdin(Stdio::piped())
             .spawn()
             .expect("spawn /bin/sh");

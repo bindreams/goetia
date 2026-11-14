@@ -1,5 +1,5 @@
-//! When `install` must not write over a plist launchd has loaded. Pure, so it compiles and its tests
-//! run on every platform, unlike `manager`.
+//! When `install` must not write over a plist launchd has loaded, and the errors of a `run` that could not
+//! be carried through. Pure, so it compiles and its tests run on every platform, unlike `manager`.
 //!
 //! launchd keeps the definition a job was bootstrapped with and has no way to update it. A plist
 //! rewritten under a loaded job would leave `start` kickstarting the old definition and reporting
@@ -70,6 +70,49 @@ pub(crate) fn changed_during_install(id: &Id, path: &Path) -> Error {
     Error::ConcurrentChange {
         id: id.to_string(),
         path: Some(path.to_path_buf()),
+    }
+}
+
+// A run `begin_run` could not carry through ===========================================================================
+
+/// `source`, a failure after `launchctl debug` held the next launch of `id`: the run was not started, and
+/// the hold stays until a launch consumes it. A launch held and not resumed waits stopped, so the error
+/// says what ends it. The cause stays under it, so a request left in doubt is still indeterminate.
+pub(crate) fn stranded_hold(id: &Id, source: Error) -> Error {
+    Error::Step {
+        what: format!(
+            "`launchctl debug` held the next launch of `{id}` and the run was not started: that launch, a \
+             scheduled run or the next `run`, may wait stopped until `goetia daemon stop {id}` or `goetia \
+             daemon run {id}` ends it"
+        ),
+        source: Box::new(source),
+    }
+}
+
+/// The held launch of `id` was gone, or not the job's any more, by the time goetia could watch it.
+pub(crate) fn run_unwatched(id: &Id) -> Error {
+    Error::RunUnrecorded {
+        id: id.to_string(),
+        reason: "it was ended before goetia could watch it (a `stop`, a `kill`, or the system)".to_string(),
+    }
+}
+
+/// The held launch of `id` was gone by the time goetia could resume it.
+pub(crate) fn run_unresumed(id: &Id) -> Error {
+    Error::RunUnrecorded {
+        id: id.to_string(),
+        reason: "it was ended before goetia could resume it".to_string(),
+    }
+}
+
+/// A wait for the run of `id` that failed: the run may still be going, so this is in doubt, as a request
+/// goetia lost track of is.
+pub(crate) fn run_lost(id: &Id, source: Error) -> Error {
+    Error::RequestInDoubt {
+        request: format!("launchctl kickstart -p system/{id}"),
+        reached: true,
+        note: Some("its run could not be waited for".to_string()),
+        source: Box::new(source),
     }
 }
 

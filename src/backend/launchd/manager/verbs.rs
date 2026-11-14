@@ -61,10 +61,10 @@ impl Launchd {
     ///   run and is ended too, so the loop ends only when no process is left.
     ///
     /// A pid that exited before it was watched, or is not the job's any more, is the next pass, paced
-    /// by [`UNLOAD_POLL`] while launchd's view catches up. The
-    /// first pass draws on `reservation`, and each later one on one of its own: an uncapped loop would
-    /// draw what was never reserved. A pass that cannot reserve returns that error, the SIGTERM
-    /// standing. The one [`Watch`] is made first, so that failing to make it sends nothing.
+    /// by [`UNLOAD_POLL`] while launchd's view catches up. The first pass draws on `reservation`, and each
+    /// later one on one of its own: an uncapped loop would draw what was never reserved. A pass that
+    /// cannot reserve returns that error, the SIGTERM standing. The one [`Watch`] is made first, so that
+    /// failing to make it sends nothing.
     pub(super) fn stop_task(&self, id: &Id, budget: Budget, reservation: &mut Reservation) -> Result<()> {
         let watch = Watch::new()?;
         // From the verb's entry. Unused under `Immediate`, which waits for no exit.
@@ -112,7 +112,7 @@ impl Launchd {
                 State::Idle => Ok(Pass::Done),
                 _ => Err(Error::StopUnconfirmed {
                     id: id.to_string(),
-                    shown: print.shown.describe(),
+                    shown: print.shown.describe(print.state),
                 }),
             };
         };

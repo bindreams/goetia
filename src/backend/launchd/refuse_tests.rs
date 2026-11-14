@@ -52,6 +52,66 @@ fn renamed(spec: &DaemonSpec) -> DaemonSpec {
     .unwrap()
 }
 
+// A run that `begin_run` could not carry through ======================================================================
+
+fn frpc() -> Id {
+    Id::try_from("frpc").unwrap()
+}
+
+/// A failure after `debug` held the next launch says so, and what to do: the cause stays under it, so a
+/// request left in doubt stays indeterminate and a plain failure stays one.
+#[skuld::test]
+fn a_stranded_hold_names_the_hold_and_the_ways_out_and_keeps_the_cause() {
+    let determinate = stranded_hold(&frpc(), Error::blob("a plain failure"));
+    assert_eq!(
+        determinate.to_string(),
+        "`launchctl debug` held the next launch of `frpc` and the run was not started: that launch, a \
+         scheduled run or the next `run`, may wait stopped until `goetia daemon stop frpc` or `goetia daemon \
+         run frpc` ends it"
+    );
+    assert!(!determinate.is_indeterminate());
+
+    let doubtful = stranded_hold(
+        &frpc(),
+        Error::RequestInDoubt {
+            request: "launchctl kickstart -p system/frpc".to_string(),
+            reached: false,
+            note: None,
+            source: std::io::Error::other("lost").into(),
+        },
+    );
+    assert!(doubtful.is_indeterminate());
+}
+
+#[skuld::test]
+fn a_run_that_ended_before_it_could_be_watched_or_resumed_says_which() {
+    let watched = run_unwatched(&frpc());
+    let resumed = run_unresumed(&frpc());
+
+    assert!(
+        matches!(&watched, Error::RunUnrecorded { id, reason }
+            if id == "frpc" && reason == "it was ended before goetia could watch it (a `stop`, a `kill`, or the system)"),
+        "{watched:?}"
+    );
+    assert!(
+        matches!(&resumed, Error::RunUnrecorded { id, reason }
+            if id == "frpc" && reason == "it was ended before goetia could resume it"),
+        "{resumed:?}"
+    );
+}
+
+/// A wait that lost the run leaves it possibly going: indeterminate, never a plain failure.
+#[skuld::test]
+fn a_run_goetia_lost_track_of_is_in_doubt() {
+    let lost = run_lost(
+        &frpc(),
+        Error::os("wait for process 7 to exit", std::io::Error::other("x")),
+    );
+
+    assert!(lost.is_indeterminate());
+    assert!(lost.to_string().contains("frpc"), "{lost}");
+}
+
 // changes_loaded_job ==================================================================================================
 
 /// An `Update` (also what `--force` turns a `Conflict` into) or a `Stale` artifact, which `decide`

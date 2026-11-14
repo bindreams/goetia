@@ -368,3 +368,18 @@ fn exit_of_decodes_exited_and_signalled() {
         "a core dump is the signal that caused it"
     );
 }
+
+// launch_of -----------------------------------------------------------------------------------------------------------
+
+/// The pid `kickstart -p` printed is a held launch where `print` shows it with `started suspended = 1`,
+/// a run already in flight where it shows `0`, and ended where `print` shows another pid or none. A pid
+/// with no `started suspended` line is neither: the launch cannot be told.
+#[skuld::test]
+fn launch_of_tells_a_held_launch_from_a_run_in_flight_and_one_that_ended() {
+    assert_eq!(launch_of(Some(7), Some(true), 7), Launch::Held);
+    assert_eq!(launch_of(Some(7), Some(false), 7), Launch::InFlight);
+    assert_eq!(launch_of(Some(8), Some(true), 7), Launch::Ended);
+    assert_eq!(launch_of(Some(8), Some(false), 7), Launch::Ended);
+    assert_eq!(launch_of(None, None, 7), Launch::Ended);
+    assert_eq!(launch_of(Some(7), None, 7), Launch::Unreadable);
+}

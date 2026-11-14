@@ -300,6 +300,67 @@ fn launchd_passes_conformance(#[fixture(launchd_group)] _group: &Group) {
     manager::conformance::run(&mgr, &sleepy);
 }
 
+// A run's children and Ctrl-C =========================================================================================
+
+/// Kills a process by pid when dropped, so a test that fails leaves nothing behind. Cleanup never panics.
+struct KillOnDrop(libc::pid_t);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: `kill` takes a pid and a signal number; a pid that is gone answers `ESRCH`.
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+}
+
+/// Ctrl-C is a SIGINT to the terminal's foreground process group, which goetia is in. `run` defers
+/// SIGINT only while a launch is held, so the `launchctl` calls it spawns (contained, as
+/// `backend::bounded::command` spawns them) must not be in that group: an interrupt that ended one
+/// mid-request would lose what goetia sent. The sentinel spawns a child as goetia spawns `launchctl`;
+/// the test signals the sentinel's process group, which the sentinel is the leader of, and the child is
+/// not in it and lives on.
+#[skuld::test]
+fn a_launchctl_child_survives_a_sigint_to_goetias_process_group(#[fixture(launchd_group)] _group: &Group) {
+    use std::io::BufRead as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut goetia = Command::new(std::env::current_exe().expect("the test binary's path"))
+        .arg(support::sentinel::CONTAINED_CHILD)
+        .stdout(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn the sentinel");
+    let goetia_group = goetia.id() as libc::pid_t;
+    let mut line = String::new();
+    std::io::BufReader::new(goetia.stdout.take().expect("the sentinel's stdout"))
+        .read_line(&mut line)
+        .expect("the child's pid");
+    let child: libc::pid_t = line.trim().parse().expect("a pid");
+    let _cleanup = KillOnDrop(child);
+
+    // SAFETY: `getpgid` takes a pid, and every pid here is a process this test spawned.
+    let child_group = unsafe { libc::getpgid(child) };
+    assert_ne!(
+        child_group, goetia_group,
+        "the contained child is in goetia's process group"
+    );
+
+    // SAFETY: `killpg` takes a process group id and a signal number.
+    assert_eq!(
+        unsafe { libc::killpg(goetia_group, libc::SIGINT) },
+        0,
+        "signal goetia's group"
+    );
+    let status = goetia.wait().expect("wait for the sentinel");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "the interrupt reached goetia: {status:?}"
+    );
+
+    // SAFETY: signal 0 only checks that the process exists.
+    assert_eq!(unsafe { libc::kill(child, 0) }, 0, "the child outlived the interrupt");
+}
+
 // Round trips and drift ===============================================================================================
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]

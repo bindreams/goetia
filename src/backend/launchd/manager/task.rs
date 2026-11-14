@@ -240,6 +240,9 @@ pub(super) struct TaskPrint {
     /// What the read showed of the `state`, as launchd said it: what a verb that cannot conclude from
     /// `state` (an `Unknown`) names.
     pub(super) shown: Shown,
+    /// Whether the launch `print` shows was held by `launchctl debug --start-suspended`, where the read
+    /// was whole and said.
+    pub(super) started_suspended: Option<bool>,
     pub(super) last_result: Option<Exit>,
 }
 
@@ -253,15 +256,17 @@ pub(super) enum Shown {
 }
 
 impl Shown {
-    /// What launchd showed, as the end of a sentence about a job with no process.
-    pub(super) fn describe(&self) -> String {
+    /// What launchd showed, as the end of a sentence about a job with no process. `state` is how goetia
+    /// classified the read: only [`State::Unknown`] is a name goetia does not know.
+    pub(super) fn describe(&self, state: State) -> String {
         match self {
             Shown::Failed => {
                 "reading its job from launchd failed, so whether a process remains is not established".to_string()
             }
-            Shown::State(Some(state)) => {
-                format!("launchd shows its job in state `{state}` with no process, a state goetia does not know")
+            Shown::State(Some(name)) if state == State::Unknown => {
+                format!("launchd shows its job in state `{name}` with no process, a state goetia does not know")
             }
+            Shown::State(Some(name)) => format!("launchd shows its job in state `{name}` with no process"),
             Shown::State(None) => "launchd shows its job with no process and no state".to_string(),
         }
     }
@@ -284,6 +289,7 @@ impl Launchctl {
                 pid: None,
                 queued: false,
                 shown: Shown::Failed,
+                started_suspended: None,
                 last_result: None,
             });
         };
@@ -302,6 +308,7 @@ impl Launchctl {
             pid,
             queued: whole && state::spawn_scheduled(&body),
             shown,
+            started_suspended: whole.then(|| state::started_suspended(&body)).flatten(),
             last_result,
         })
     }
