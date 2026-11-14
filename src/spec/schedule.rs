@@ -403,6 +403,9 @@ fn check(parsed: &ParsedField, field: &CronField) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
+mod next;
+
 #[cfg(test)]
 #[path = "schedule_tests.rs"]
 mod schedule_tests;
