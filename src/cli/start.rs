@@ -1,5 +1,6 @@
 //! `goetia daemon start <ID...>`
 
+use std::cell::Cell;
 use std::io::Write;
 
 use clap::Args as ClapArgs;
@@ -8,7 +9,8 @@ use super::ExitCode;
 use super::support::{IdVerbCall, run_id_verb};
 use super::wait::{self, WaitArgs};
 use crate::error::Result;
-use crate::manager::{ServiceManager, Status};
+use crate::manager::ServiceManager;
+use crate::spec::DaemonKind;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -28,6 +30,8 @@ pub fn run(
     err: &mut dyn Write,
 ) -> ExitCode {
     let budget = args.wait.budget();
+    // Whether the id `verb` last started is a task, which only requests a run.
+    let task = Cell::new(false);
     run_id_verb(
         IdVerbCall {
             subcommand: "daemon start",
@@ -35,14 +39,27 @@ pub fn run(
             get_manager,
             is_elevated,
             verb: &|mgr, id| {
-                // Read only when a flag was given, so a start without one reads nothing more than before.
-                // A status that fails falls through: `start` reports what is wrong with the id.
-                if args.wait.was_given() && matches!(mgr.status(id), Ok(Status::Task(_))) {
+                task.set(false);
+                // The kind is the installed blob's. A start without a flag has nothing to refuse, so
+                // it only takes the word for its report from it: a blob that will not decode is
+                // `start`'s to report, as it was before the kind was asked.
+                match mgr.kind(id) {
+                    Ok(kind) => task.set(kind == DaemonKind::Task),
+                    Err(e) if args.wait.was_given() => return Err(e),
+                    Err(_) => {}
+                }
+                if task.get() && args.wait.was_given() {
                     return Err(crate::spec::invalid(id, wait::NOT_FOR_A_TASK));
                 }
                 mgr.start(id, budget)
             },
-            verb_past_tense: wait::reported(budget, "started", "start requested"),
+            verb_past_tense: &|| {
+                if task.get() {
+                    "start requested"
+                } else {
+                    wait::reported(budget, "started", "start requested")
+                }
+            },
             absent_is_success: false,
         },
         out,

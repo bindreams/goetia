@@ -334,8 +334,7 @@ pub(crate) fn list<B: Backend>(b: &B) -> Result<Vec<Installed>> {
 /// start that was sent is never left unwatched for want of one.
 pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exit> {
     let snapshot = owned(b, id)?;
-    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
-    if blob.spec.kind() != DaemonKind::Task {
+    if kind_of(&snapshot)? != DaemonKind::Task {
         return Err(Error::NotATask { id: id.to_string() });
     }
     match b.task_state(&snapshot)? {
@@ -353,6 +352,13 @@ pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exi
             Err(e)
         }
     }
+}
+
+/// Whether the marked service `snapshot` is a service or a task, from its blob. A blob that will not
+/// decode is its error: the kind is not guessed.
+pub(crate) fn kind_of<S: InstalledService>(snapshot: &S) -> Result<DaemonKind> {
+    let blob = snapshot.blob().map_err(|e| Error::Kept(Arc::clone(e)))?;
+    Ok(blob.spec.kind())
 }
 
 /// The thread that waits for a run, made before the run is requested.

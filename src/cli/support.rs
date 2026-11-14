@@ -207,10 +207,10 @@ pub(crate) struct IdVerbCall<'a> {
     pub get_manager: &'a dyn Fn() -> Result<Box<dyn ServiceManager>>,
     pub is_elevated: &'a dyn Fn() -> bool,
     pub verb: &'a dyn Fn(&dyn ServiceManager, &Id) -> Result<()>,
-    /// The word printed after an id that succeeded. It follows the budget: a
-    /// verb that waited reports `started`, one that did not `start requested`
-    /// (see [`super::wait::reported`]).
-    pub verb_past_tense: &'a str,
+    /// The word printed after an id that succeeded, asked after `verb` has returned for it. It
+    /// follows the budget: a verb that waited reports `started`, one that did not `start requested`
+    /// (see [`super::wait::reported`]); it may follow what `verb` learned of the id.
+    pub verb_past_tense: &'a dyn Fn() -> &'static str,
     /// Whether an absent *artifact* already satisfies this verb's goal.
     /// True for `uninstall` alone; every other id-verb keeps `Error::
     /// NotInstalled` as a plain failure:
@@ -272,7 +272,7 @@ pub(crate) fn run_id_verb(call: IdVerbCall<'_>, out: &mut dyn Write, err: &mut d
     for id in &ids {
         match (call.verb)(mgr.as_ref(), id) {
             Ok(()) => {
-                let _ = writeln!(out, "{id}: {}", call.verb_past_tense);
+                let _ = writeln!(out, "{id}: {}", (call.verb_past_tense)());
                 codes.push(ExitCode::Success);
             }
             // Absence already satisfies this verb's goal (see

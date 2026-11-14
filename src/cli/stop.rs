@@ -34,7 +34,7 @@ pub fn run(
             get_manager,
             is_elevated,
             verb: &|mgr, id| mgr.stop(id, budget),
-            verb_past_tense: wait::reported(budget, "stopped", "stop requested"),
+            verb_past_tense: &|| wait::reported(budget, "stopped", "stop requested"),
             absent_is_success: false,
         },
         out,

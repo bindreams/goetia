@@ -31,7 +31,7 @@ pub fn run(
             get_manager,
             is_elevated,
             verb: &|mgr, id| mgr.uninstall(id),
-            verb_past_tense: "uninstalled",
+            verb_past_tense: &|| "uninstalled",
             absent_is_success: true,
         },
         out,

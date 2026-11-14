@@ -246,6 +246,15 @@ pub trait ServiceManager {
     /// [`Error::NoManager`]: crate::Error::NoManager
     fn status(&self, id: &Id) -> Result<Status>;
 
+    /// Whether `id` is a service or a task, read from the definition goetia installed it with, and
+    /// nothing else of its status. The ownership gate applies as for any verb ([`Error::NotInstalled`],
+    /// [`Error::Undetermined`]); a definition that will not decode is its error ([`Error::Kept`]).
+    ///
+    /// [`Error::NotInstalled`]: crate::Error::NotInstalled
+    /// [`Error::Undetermined`]: crate::Error::Undetermined
+    /// [`Error::Kept`]: crate::Error::Kept
+    fn kind(&self, id: &Id) -> Result<DaemonKind>;
+
     /// Every id this backend could account for. A foreign (unmarked)
     /// service at some id is never included; see [`Installed`] for what
     /// happens when a marked one exists but its blob will not decode, and

@@ -1119,6 +1119,24 @@ fn run_of_an_unknown_state_is_refused() {
     assert!(!began_a_run(&fake));
 }
 
+#[skuld::test]
+fn kind_is_the_installed_blobs_and_reads_no_status() {
+    let fake = Fake::new();
+    fake.install(&mk("frpc"), false).unwrap();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_live_status_fails("nightly", || Error::NotRunning {
+        id: "nightly".to_string(),
+    });
+    fake.seed_unusable("broken");
+
+    let kind = |id: &str| fake.kind(&Id::try_from(id).unwrap());
+
+    assert_eq!(kind("frpc").unwrap(), DaemonKind::Service);
+    assert_eq!(kind("nightly").unwrap(), DaemonKind::Task);
+    assert!(matches!(kind("broken"), Err(Error::Kept(_))));
+    assert!(matches!(kind("ghost"), Err(Error::NotInstalled { .. })));
+}
+
 /// `run` needs the task's state and nothing else `status` reads: a read that fails for another part of
 /// the status (its last run, its timer) must not refuse a run.
 #[skuld::test]

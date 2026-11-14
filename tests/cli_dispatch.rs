@@ -432,6 +432,9 @@ impl ServiceManager for FlakyManager {
     fn kill(&self, id: &Id) -> goetia::Result<()> {
         self.inner.kill(id)
     }
+    fn kind(&self, id: &Id) -> goetia::Result<goetia::spec::DaemonKind> {
+        self.inner.kind(id)
+    }
     fn run(&self, id: &Id, out: &mut dyn std::io::Write) -> goetia::Result<Exit> {
         self.inner.run(id, out)
     }
@@ -1216,6 +1219,9 @@ impl ServiceManager for PanicsOnStart {
     }
     fn kill(&self, id: &Id) -> goetia::Result<()> {
         self.0.kill(id)
+    }
+    fn kind(&self, id: &Id) -> goetia::Result<goetia::spec::DaemonKind> {
+        self.0.kind(id)
     }
     fn run(&self, id: &Id, out: &mut dyn std::io::Write) -> goetia::Result<Exit> {
         self.0.run(id, out)
@@ -3467,6 +3473,9 @@ impl ServiceManager for PanicsOnStatus {
     fn kill(&self, id: &Id) -> goetia::Result<()> {
         self.0.kill(id)
     }
+    fn kind(&self, id: &Id) -> goetia::Result<goetia::spec::DaemonKind> {
+        self.0.kind(id)
+    }
     fn run(&self, id: &Id, out: &mut dyn std::io::Write) -> goetia::Result<Exit> {
         self.0.run(id, out)
     }
@@ -4849,7 +4858,7 @@ fn start_without_a_flag_on_a_task_does_not_read_status() {
 }
 
 #[skuld::test]
-fn start_with_a_flag_falls_through_to_start_when_status_fails() {
+fn start_refuses_a_flag_on_a_task_whose_status_cannot_be_read() {
     let fake = Fake::new();
     fake.install(&a_task("nightly"), false).unwrap();
     fake.seed_live_status_fails("nightly", || goetia::Error::NotRunning {
@@ -4858,14 +4867,62 @@ fn start_with_a_flag_falls_through_to_start_when_status_fails() {
 
     let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "nightly", "--timeout", "5s"], &fake);
 
+    assert_eq!(code, 1, "stdout:
+{out}
+stderr:
+{err}");
+    assert!(err.contains(TIMEOUT_ON_A_TASK), "the kind is the blob's, not the status's: {err}");
+    assert!(!fake.calls().contains(&("start", "nightly".to_string())));
+}
+
+#[skuld::test]
+fn start_with_a_flag_on_an_unusable_blob_is_the_blobs_error() {
+    let fake = Fake::new();
+    fake.seed_unusable("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc", "--timeout", "5s"], &fake);
+
+    assert_ne!(code, 0, "stdout:
+{out}
+stderr:
+{err}");
+    assert!(!err.contains(TIMEOUT_ON_A_TASK), "{err}");
     assert!(
-        !err.contains(TIMEOUT_ON_A_TASK),
-        "a status that failed refuses nothing: {err}"
+        !fake.calls().contains(&("start", "frpc".to_string())),
+        "a kind that cannot be read is not guessed: {err}"
     );
-    assert!(
-        fake.calls().contains(&("start", "nightly".to_string())),
-        "stdout:\n{out}\nstderr:\n{err} (exit {code})"
-    );
+}
+
+#[skuld::test]
+fn start_without_a_flag_still_starts_an_unusable_blob() {
+    let fake = Fake::new();
+    fake.seed_unusable("frpc");
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "frpc"], &fake);
+
+    assert_eq!(code, 0, "stdout:
+{out}
+stderr:
+{err}");
+    assert_eq!(out, "frpc: started
+");
+}
+
+#[skuld::test]
+fn start_of_a_task_says_the_run_was_requested() {
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.install(&mk("frpc"), false).unwrap();
+
+    let (code, out, err) = dispatch_elevated(&["goetia", "daemon", "start", "nightly", "frpc"], &fake);
+
+    assert_eq!(code, 0, "stdout:
+{out}
+stderr:
+{err}");
+    assert_eq!(out, "nightly: start requested
+frpc: started
+");
 }
 
 #[skuld::test]
