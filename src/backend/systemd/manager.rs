@@ -2,7 +2,8 @@
 //! task with a schedule, `<id>.timer`) and talks to `systemctl`, `busctl` and `journalctl`.
 //!
 //! A service is one artifact. A task is two, kept as one by the `task` module; the obligations below are
-//! stated for the service, and hold for each of a task's two files.
+//! stated for the service, and hold for each of a task's two files (`write::create_unit` and the other
+//! write helpers take the kind of unit, and `discover` reads both kinds' drop-ins and links).
 //!
 //! Seven correctness obligations a systemd unit-file backend must uphold, each with its own test (see
 //! `tests/systemd_integration/linux.rs` and this module's own `manager_tests.rs`):
@@ -53,7 +54,8 @@
 //!    traverse fails at start.
 //! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
 //!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
-//!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for.
+//!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for. A task's order puts
+//!    its timer first, so that nothing starts the job again: see the `task` module.
 //! 7. **Absence is about the id, not about the fragment file.** `cli::uninstall` maps
 //!    [`Error::NotInstalled`] — and only that variant — to exit `0` and "nothing to do", so a
 //!    backend reporting it off `<id>.service`'s absence alone would certify "confirmed gone" for an

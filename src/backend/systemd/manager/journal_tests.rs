@@ -153,10 +153,10 @@ fn the_walk_stops_at_the_starting_entry() {
 #[skuld::test]
 fn a_journal_that_cannot_be_read_is_the_error_and_never_no_run() {
     let e = last_run(&Fake::unreadable(), "x.service").expect_err("unreadable");
-    assert!(e.to_string().contains("no journal"), "{e}");
+    assert!(e.report().to_string().contains("no journal"), "{e}");
 
     let e = last_run(&Fake::new(vec![other("a")]).then_fails(), "x.service").expect_err("fails before the answer");
-    assert!(e.to_string().contains("it failed"), "{e}");
+    assert!(e.report().to_string().contains("it failed"), "{e}");
 
     let found = last_run(&Fake::new(vec![starting("a", 1_000)]).then_fails(), "x.service");
     assert!(found.is_ok(), "the walk ended before the failure: {found:?}");
@@ -279,7 +279,7 @@ fn a_journalctl_that_fails_is_the_error_with_its_words() {
 /// A line the child did not finish is no entry: the killed `journalctl` of a follow, a pipe cut short.
 #[skuld::test]
 fn a_partial_trailing_line_is_discarded() {
-    let journal = sh(r#"printf '{"N":"1"}\n{"N":"#);
+    let journal = sh(r##"printf '{"N":"1"}\n{"N":'"##);
 
     let all = entries_of(&journal).expect("entries");
 

@@ -1365,7 +1365,7 @@ fn a_task_status_with_an_unreadable_journal_is_the_error() {
         .status_of(&job_alone(&spec))
         .expect_err("the journal cannot be read");
 
-    assert!(e.to_string().contains("no journal"), "{e}");
+    assert!(e.report().to_string().contains("no journal"), "{e}");
 }
 
 /// A service's status is the one it always had.

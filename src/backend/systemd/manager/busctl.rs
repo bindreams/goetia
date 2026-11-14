@@ -16,6 +16,11 @@ use super::systemctl::{Host, environment, refuse_unreachable};
 
 const SYSTEMD1: &str = "org.freedesktop.systemd1";
 
+/// What the manager answers for a timer that has no next elapse: `USEC_INFINITY`, which a timer that
+/// was never armed reads as (measured on systemd 255). `0` is the other reading of "none", and means
+/// the same.
+const NEVER: u64 = u64::MAX;
+
 /// `busctl`, reached through a [`Client`], on the system `host` reads: the same door and the same
 /// environment as [`Systemctl`](super::systemctl::Systemctl).
 pub(super) struct Busctl {
@@ -34,7 +39,7 @@ impl Busctl {
     }
 
     /// When `timer_unit` elapses next on the realtime clock, as the manager has it now: `None` for a
-    /// timer that is not armed, which the manager answers `0`.
+    /// timer that is not armed, which the manager answers `0` or [`NEVER`].
     pub(super) fn next_elapse(&self, timer_unit: &str) -> Result<Option<SystemTime>> {
         let path = self.unit_path(timer_unit)?;
         let property = self.run(&[
@@ -47,7 +52,7 @@ impl Busctl {
         ])?;
         let micros =
             parse_micros(&property).ok_or_else(|| answer_lacks("get-property NextElapseUSecRealtime", "a time"))?;
-        Ok((micros != 0).then(|| UNIX_EPOCH + Duration::from_micros(micros)))
+        Ok((micros != 0 && micros != NEVER).then(|| UNIX_EPOCH + Duration::from_micros(micros)))
     }
 
     /// The object path the manager keeps `unit` at, which it loads for the answer.

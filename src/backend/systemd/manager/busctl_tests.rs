@@ -32,12 +32,15 @@ fn next_run_parses_the_bus_reply() {
     fake.assert_spent("both calls");
 }
 
-/// What the manager answers for a timer that is not armed.
+/// What the manager answers for a timer that is not armed: `USEC_INFINITY` for one never armed
+/// (measured on 255), and `0`.
 #[skuld::test]
 fn a_timer_that_is_not_armed_has_no_next_run() {
-    let at = over(bus(&path_reply(), "t 0\n")).next_elapse("x-y.timer");
+    for answer in ["t 0\n", "t 18446744073709551615\n"] {
+        let at = over(bus(&path_reply(), answer)).next_elapse("x-y.timer");
 
-    assert_eq!(at.expect("next_elapse"), None);
+        assert_eq!(at.expect("next_elapse"), None, "{answer:?}");
+    }
 }
 
 /// The property is read at the path the manager answered, however that path is escaped: goetia
