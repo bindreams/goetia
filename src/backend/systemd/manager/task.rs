@@ -411,4 +411,4 @@ impl Systemd {
 
 #[cfg(test)]
 #[path = "task_tests.rs"]
-mod task_tests;
+pub(super) mod task_tests;

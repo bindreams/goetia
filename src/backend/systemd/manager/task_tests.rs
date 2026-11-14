@@ -31,7 +31,7 @@ fn units_of(spec: &DaemonSpec) -> Units {
 }
 
 /// A task named `id` that runs `command` on `schedule`, if it has one.
-fn task_spec(id: &str, command: &str, schedule: Option<&str>) -> DaemonSpec {
+pub(in crate::backend::systemd::manager) fn task_spec(id: &str, command: &str, schedule: Option<&str>) -> DaemonSpec {
     task(id, vec![command.to_string()], schedule)
 }
 
@@ -55,7 +55,7 @@ fn timer_of(text: &str) -> Timer {
 }
 
 /// What `read` makes of `spec`'s units as `units` writes them: the job, and the timer if it has one.
-fn fragment(spec: &DaemonSpec) -> Fragment {
+pub(in crate::backend::systemd::manager) fn fragment(spec: &DaemonSpec) -> Fragment {
     let units = units_of(spec);
     Fragment::new(
         spec.common().id.clone(),
@@ -278,7 +278,7 @@ fn reload() -> Entry {
 }
 
 /// `systemctl --no-block`'s announcement of job `n` for `verb`.
-fn enqueued(verb: &str, n: u32) -> Entry {
+pub(in crate::backend::systemd::manager) fn enqueued(verb: &str, n: u32) -> Entry {
     reply(
         &[verb],
         exited(0, "", &format!("Enqueued anchor job {n} x.service/{verb}.\n")),
@@ -286,11 +286,11 @@ fn enqueued(verb: &str, n: u32) -> Entry {
 }
 
 /// A manager over stated `systemctl`, `busctl` and journal.
-fn manager(systemctl: &Fake, busctl: Fake, journal: JournalFake) -> Systemd {
+pub(in crate::backend::systemd::manager) fn manager(systemctl: &Fake, busctl: Fake, journal: JournalFake) -> Systemd {
     Systemd::with_seams(
         Systemctl::new(Box::new(systemctl.clone()), booted),
         Busctl::new(Box::new(busctl), booted),
-        Box::new(journal),
+        Arc::new(journal),
     )
 }
 

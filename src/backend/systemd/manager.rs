@@ -71,6 +71,7 @@ mod busctl;
 mod dirs;
 mod discover;
 mod journal;
+mod run;
 mod systemctl;
 mod task;
 mod write;
@@ -79,17 +80,18 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use busctl::Busctl;
 use discover::DROPIN_SEARCH_DIRS;
 use journal::{Journal, Journalctl};
+pub(crate) use run::{JournalOutput, Run};
 use systemctl::{Held, Systemctl};
 pub(crate) use task::Fragment;
 
 use crate::backend::systemd::generate::{self, Units};
 use crate::backend::{
-    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry,
-    WriteOutcome, cannot_run_tasks,
+    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, WriteOutcome,
 };
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
@@ -110,7 +112,7 @@ pub struct Systemd {
     /// For when a task's timer elapses next, which `systemctl show` cannot say to the microsecond.
     busctl: Busctl,
     /// For a task's last run and its result.
-    journal: Box<dyn Journal>,
+    journal: Arc<dyn Journal>,
 }
 
 impl Systemd {
@@ -124,13 +126,13 @@ impl Systemd {
         Self {
             systemctl,
             busctl: Busctl::native(),
-            journal: Box::new(Journalctl::native()),
+            journal: Arc::new(Journalctl::native()),
         }
     }
 
     /// A manager over stated `systemctl`, `busctl` and journal.
     #[cfg(test)]
-    fn with_seams(systemctl: Systemctl, busctl: Busctl, journal: Box<dyn Journal>) -> Self {
+    fn with_seams(systemctl: Systemctl, busctl: Busctl, journal: Arc<dyn Journal>) -> Self {
         Self {
             systemctl,
             busctl,
@@ -156,7 +158,7 @@ impl Backend for Systemd {
     type Snapshot = Fragment;
     type InstallScope = ();
     type Reservation = Held;
-    type Run = std::convert::Infallible;
+    type Run = Run;
 
     /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
     /// answer holds for the `daemon-reload` after the write, which draws on the same reservation.
@@ -306,9 +308,9 @@ impl Backend for Systemd {
         self.systemctl.kill_impl(snapshot.id().as_str(), reservation)
     }
 
-    /// Interim: replaced when the run is built on the journal.
-    fn begin_run(&self, snapshot: Fragment, _reservation: &mut Held) -> Result<std::convert::Infallible> {
-        Err(cannot_run_tasks("systemd", snapshot.id()))
+    /// See [`Systemd::begin_run`], which is the journal-less host's stated contract too.
+    fn begin_run(&self, snapshot: Fragment, reservation: &mut Held) -> Result<Run> {
+        Systemd::begin_run(self, snapshot, reservation)
     }
 }
 

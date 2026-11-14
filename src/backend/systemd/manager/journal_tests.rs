@@ -196,10 +196,11 @@ fn an_entry_is_read_from_a_line_of_json() {
 
     assert_eq!(entry.get("MESSAGE_ID"), Some("7d49"));
     assert_eq!(
-        entry.get("MESSAGE"),
-        Some("Hi\u{fffd}"),
-        "bytes decode, a byte that is not UTF-8 lossily"
+        entry.bytes("MESSAGE"),
+        Some(&[72, 105, 255][..]),
+        "bytes decode to the bytes"
     );
+    assert_eq!(entry.get("MESSAGE"), None, "and are no text where they are not UTF-8");
     assert_eq!(entry.get("EMPTY"), None);
     assert_eq!(entry.get("TWICE"), Some("first"));
     assert_eq!(entry.realtime().expect("a time"), at(1_794_626_807_000_123));
@@ -314,4 +315,182 @@ fn dropping_the_entries_ends_the_journalctl() {
         !std::path::Path::new(&format!("/proc/{pid}")).exists(),
         "the journalctl outlived its entries"
     );
+}
+
+// follow, read_after, sync ============================================================================================
+
+/// The one entry a script that echoes its arguments writes.
+fn args_of(entries: Vec<Entry>) -> String {
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    entries[0].get("ARGS").expect("the echoed arguments").to_string()
+}
+
+const ECHO: &str = r#"printf '{"ARGS":"%s"}\n' "$*""#;
+
+/// The first entry of `follower`, which ends it.
+fn first_of(mut follower: Box<dyn Follower>) -> Vec<Entry> {
+    vec![follower.next().expect("an entry").expect("the first line")]
+}
+
+#[skuld::test]
+fn every_query_passes_dash_a() {
+    let journal = sh(ECHO);
+    let job = [Match::new("UNIT", "x.service"), Match::new("JOB_ID", "7")];
+    let unit = [Match::new("UNIT", "x.service")];
+    let cursor = Cursor::of("s=1;i=2");
+
+    for (what, args) in [
+        ("newest first", args_of(entries_of(&journal).expect("entries"))),
+        (
+            "follow a job",
+            args_of(first_of(journal.follow(&job, None).expect("follow"))),
+        ),
+        (
+            "follow after a cursor",
+            args_of(first_of(journal.follow(&unit, Some(&cursor)).expect("follow"))),
+        ),
+        (
+            "read after a cursor",
+            args_of(journal.read_after(&unit, &cursor).expect("read_after")),
+        ),
+    ] {
+        assert!(args.starts_with("-a -o json --no-pager "), "{what}: {args}");
+    }
+}
+
+#[skuld::test]
+fn a_follow_starts_from_the_beginning_or_after_its_cursor_and_job_numbers_are_bound_to_the_boot() {
+    let journal = sh(ECHO);
+    let cursor = Cursor::of("s=1;i=2");
+    let unit = [Match::new("UNIT", "x.service")];
+
+    let from_the_start = args_of(first_of(journal.follow(&unit, None).expect("follow")));
+    let after = args_of(first_of(journal.follow(&unit, Some(&cursor)).expect("follow")));
+    let job = args_of(first_of(
+        journal
+            .follow(&[unit[0].clone(), Match::new("JOB_ID", "7")], None)
+            .expect("follow"),
+    ));
+
+    assert_eq!(from_the_start, "-a -o json --no-pager -f -n all UNIT=x.service");
+    assert_eq!(
+        after,
+        "-a -o json --no-pager -f -n all --after-cursor=s=1;i=2 UNIT=x.service"
+    );
+    assert_eq!(job, "-a -o json --no-pager -f -n all -b UNIT=x.service JOB_ID=7");
+}
+
+#[skuld::test]
+fn a_read_after_a_cursor_asks_for_every_set_of_matches() {
+    let journal = sh(ECHO);
+    let matches = [
+        Match::new("_SYSTEMD_UNIT", "x.service"),
+        Match::new("_TRANSPORT", "stdout"),
+        Match::Or,
+        Match::new("UNIT", "x.service"),
+    ];
+
+    let args = args_of(journal.read_after(&matches, &Cursor::of("c")).expect("read_after"));
+
+    assert_eq!(
+        args,
+        "-a -o json --no-pager --after-cursor=c _SYSTEMD_UNIT=x.service _TRANSPORT=stdout + UNIT=x.service"
+    );
+}
+
+#[skuld::test]
+fn a_read_after_discards_a_partial_trailing_line_and_fails_with_journalctls_words() {
+    let journal = sh(r##"printf '{"N":"1"}\n{"N":'"##);
+    let all = journal.read_after(&[], &Cursor::of("c")).expect("read_after");
+    assert_eq!(all.len(), 1);
+
+    let journal = sh(r#"echo "Failed to seek" >&2; exit 1"#);
+    let e = journal.read_after(&[], &Cursor::of("c")).expect_err("it failed");
+    assert!(e.report().to_string().contains("Failed to seek"), "{e}");
+}
+
+#[skuld::test]
+fn entries_decode_a_message_given_as_a_byte_array() {
+    let entry = Entry::parse(br#"{"MESSAGE":[104,105,7,27,255],"__CURSOR":"c"}"#).expect("an entry");
+
+    assert_eq!(entry.bytes("MESSAGE"), Some(&[104, 105, 7, 27, 255][..]));
+    assert_eq!(entry.cursor().expect("a cursor"), Cursor::of("c"));
+}
+
+/// 4088 bytes is where `journalctl -o json` without `-a` gives `null`.
+#[skuld::test]
+fn a_message_of_4088_bytes_arrives_whole() {
+    let journal = sh(r#"printf '{"MESSAGE":"'; head -c 4088 /dev/zero | tr '\0' x; printf '"}\n'"#);
+
+    let all = journal.read_after(&[], &Cursor::of("c")).expect("read_after");
+
+    assert_eq!(all[0].bytes("MESSAGE").map(<[u8]>::len), Some(4088));
+}
+
+#[skuld::test]
+fn sync_runs_journalctl_dash_dash_sync() {
+    // The script's own words say what it was asked.
+    let e = sh(r#"echo "asked: $*" >&2; exit 3"#).sync().expect_err("it failed");
+    let said = e.report().to_string();
+    assert!(said.contains("asked: --sync"), "{said}");
+
+    sh("exit 0").sync().expect("a sync that succeeded");
+}
+
+#[skuld::test]
+fn a_journalctl_that_cannot_be_spawned_cannot_sync() {
+    let journal = Journalctl::of(vec!["/nonexistent/goetia-journalctl".to_string()]);
+
+    assert!(matches!(
+        journal.sync().expect_err("no such program"),
+        Error::Spawn { .. }
+    ));
+}
+
+/// The environment every `systemctl` of goetia's gets: `SYSTEMD_COLORS=0` is one of its settings.
+#[skuld::test]
+fn journalctl_runs_with_the_environment_of_every_systemctl() {
+    let journal = sh(r#"printf '{"COLORS":"%s"}\n' "$SYSTEMD_COLORS""#);
+
+    let all = entries_of(&journal).expect("entries");
+
+    assert_eq!(all[0].get("COLORS"), Some("0"));
+}
+
+/// A stopped follower gives what it had read and then ends without an error, though its child was
+/// killed; the child is gone when the follower is dropped.
+#[skuld::test]
+fn a_stopped_follower_ends_with_no_error_and_leaves_no_child() {
+    let journal = sh(r#"printf '{"PID":"%s"}\n' "$$"; exec sleep 100000"#);
+    let mut follower = journal.follow(&[Match::new("UNIT", "x.service")], None).expect("spawn");
+    let pid = follower
+        .next()
+        .expect("an entry")
+        .expect("the first line")
+        .get("PID")
+        .expect("the child's pid")
+        .to_string();
+    let stop = follower.stop();
+
+    stop();
+
+    assert!(follower.next().expect("the end is no error").is_none());
+    drop(follower);
+    drop(stop);
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the journalctl outlived its follower"
+    );
+}
+
+/// A follow does not end: a `journalctl` that exited by itself has lost the journal.
+#[skuld::test]
+fn a_follower_that_ends_on_its_own_is_the_error() {
+    let journal = sh(r#"printf '{"N":"1"}\n'"#);
+    let mut follower = journal.follow(&[Match::new("UNIT", "x.service")], None).expect("spawn");
+
+    assert!(follower.next().expect("the entry").is_some());
+    let e = follower.next().expect_err("it ended");
+
+    assert!(e.report().to_string().contains("ended on its own"), "{e}");
 }

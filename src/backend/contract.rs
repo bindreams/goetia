@@ -197,6 +197,9 @@ pub(crate) enum OutputSource {
     /// A file the run appends to, from byte `offset`: its length as it was before the run was
     /// requested, so an earlier run's output is not shown. A file that is not there is empty.
     LogFile { path: PathBuf, offset: u64 },
+    /// The lines the task's unit wrote to the system journal.
+    #[cfg(target_os = "linux")]
+    Journal(crate::backend::systemd::manager::JournalOutput),
     /// The task has no `logs` file, and the manager keeps no output of it that goetia reads.
     None,
 }

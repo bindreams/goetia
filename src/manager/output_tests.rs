@@ -34,7 +34,7 @@ impl Write for Shown {
 }
 
 /// A stream running on its own thread, as `flow::run`'s caller runs it, over a log.
-struct Streaming {
+pub(crate) struct Streaming {
     end: Sender<()>,
     shown: Receiver<Vec<u8>>,
     thread: std::thread::JoinHandle<Result<()>>,
@@ -42,7 +42,7 @@ struct Streaming {
 }
 
 impl Streaming {
-    fn start(source: OutputSource) -> Self {
+    pub(crate) fn start(source: OutputSource) -> Self {
         let (end, ended) = run_end();
         let (tx, shown) = crossbeam_channel::unbounded();
         let thread = std::thread::spawn(move || stream(source, &id(), &mut Shown(tx), &ended));
@@ -55,7 +55,7 @@ impl Streaming {
     }
 
     /// Blocks until the stream has shown everything of `expected` and no more.
-    fn shows(&mut self, expected: &str) {
+    pub(crate) fn shows(&mut self, expected: &str) {
         while self.seen.len() < expected.len() {
             let chunk = self.shown.recv().expect("the stream ended before showing it all");
             self.seen.push_str(std::str::from_utf8(&chunk).unwrap());
@@ -64,9 +64,19 @@ impl Streaming {
     }
 
     /// The run ends; the stream's result.
-    fn ends(self) -> Result<()> {
+    pub(crate) fn ends(self) -> Result<()> {
+        self.ends_with_output().0
+    }
+
+    /// The run ends; the stream's result, and everything it has shown in all.
+    pub(crate) fn ends_with_output(mut self) -> (Result<()>, String) {
         drop(self.end);
-        self.thread.join().expect("the stream does not panic")
+        let result = self.thread.join().expect("the stream does not panic");
+        // The stream has returned: everything it showed is in the channel.
+        for chunk in self.shown.try_iter() {
+            self.seen.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        (result, self.seen)
     }
 }
 

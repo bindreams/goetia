@@ -25,6 +25,8 @@ pub(crate) const TAIL_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) fn stream(source: OutputSource, id: &Id, out: &mut dyn Write, ended: &Receiver<()>) -> Result<()> {
     match source {
         OutputSource::LogFile { path, offset } => tail(path, offset, out, ended),
+        #[cfg(target_os = "linux")]
+        OutputSource::Journal(journal) => journal.stream(out, ended),
         OutputSource::None => {
             note(
                 out,
@@ -100,7 +102,7 @@ fn note(out: &mut dyn Write, line: &str) -> Result<()> {
 }
 
 /// `bytes` to `out`, flushed: the output is read as it is written.
-fn show(out: &mut dyn Write, bytes: &[u8]) -> Result<()> {
+pub(crate) fn show(out: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     out.write_all(bytes)
         .and_then(|()| out.flush())
         .map_err(|source| Error::os("write the output of the run", source))
@@ -108,4 +110,4 @@ fn show(out: &mut dyn Write, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 #[path = "output_tests.rs"]
-mod output_tests;
+pub(crate) mod output_tests;
