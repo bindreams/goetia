@@ -1565,8 +1565,9 @@ Windows, `SYSTEMD` on Linux, `LAUNCHD` on macOS):
   Unset is `0`. Any other value fails it too.
 
 A consented group also needs elevation (root, or an Administrator shell) and fails without it. On a
-machine you care about, in any shell, keep the group switches at `0` and run everything else; an
-elevated shell, which usually holds `SeDebugPrivilege` (policy can withdraw it), may leave out only `GOETIA_TEST_DEBUG_PRIVILEGE=0`:
+machine you care about, in any shell, keep the group switches at `0` and run everything else. A
+shell whose token holds `SeDebugPrivilege` (an elevated one usually does) may leave out
+`GOETIA_TEST_DEBUG_PRIVILEGE=0`:
 
 ```sh
 GOETIA_TEST_SCM=0 GOETIA_TEST_SYSTEMD=0 GOETIA_TEST_LAUNCHD=0 GOETIA_TEST_DEBUG_PRIVILEGE=0 cargo nextest run

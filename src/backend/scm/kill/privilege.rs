@@ -19,8 +19,6 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
 
-use crate::error::within;
-
 /// While alive, the calling thread runs with the caller's `SeDebugPrivilege` enabled, if the caller
 /// holds it. Dropping restores the thread's earlier token.
 pub(super) struct DebugPrivilege {
@@ -49,10 +47,7 @@ impl DebugPrivilege {
         match &self.failure {
             Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => io::Error::new(
                 open.kind(),
-                format!(
-                    "{open} (enabling SeDebugPrivilege for the open also failed: {})",
-                    crate::error::Chain(step)
-                ),
+                format!("{open} (enabling SeDebugPrivilege for the open also failed: {step})"),
             ),
             _ => open,
         }
@@ -157,7 +152,7 @@ fn enable_in(token: RawHandle) -> io::Result<bool> {
     };
     // SAFETY: a pointer to a local, and the constant name of a privilege.
     if unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_DEBUG_NAME, &mut luid) } == 0 {
-        return Err(within("LookupPrivilegeValueW", io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     let privileges = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
@@ -169,7 +164,7 @@ fn enable_in(token: RawHandle) -> io::Result<bool> {
     // SAFETY: `token` is live; `privileges` outlives the call and the optional outputs are null.
     let ok = unsafe { AdjustTokenPrivileges(token, 0, &privileges, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
     if ok == 0 {
-        return Err(within("AdjustTokenPrivileges", io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     // The call succeeds for a token that lacks the privilege and says so only here.
     // SAFETY: no arguments.
