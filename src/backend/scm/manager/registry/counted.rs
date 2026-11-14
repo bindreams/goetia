@@ -29,14 +29,39 @@ use super::settle::{gone_is_done, tolerate_not_found};
 /// The access right to delete a key (`winnt.h`).
 const DELETE: u32 = 0x0001_0000;
 
-/// `name` as the counted string `ntdll` takes: its length is stated, and no unit ends it.
-fn counted(name: &[u16]) -> UNICODE_STRING {
+/// A key or value name, or a path of key names, as UTF-16 with no terminator.
+///
+/// Every function here takes its names as a `Name`, and `ntdll` reads them as counted strings: the
+/// length is stated, so a NUL in a name is part of it, not its end. Neither constructor checks or
+/// adds a unit, so a NUL in `text`, or a terminated buffer (`wide_null`) passed as units, names a
+/// different key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Name(Vec<u16>);
+
+impl Name {
+    /// The name `text` spells.
+    pub(super) fn new(text: &str) -> Self {
+        Self(text.encode_utf16().collect())
+    }
+
+    /// A name as the registry returned it.
+    pub(super) fn from_units(units: impl Into<Vec<u16>>) -> Self {
+        Self(units.into())
+    }
+
+    pub(super) fn units(&self) -> &[u16] {
+        &self.0
+    }
+}
+
+/// `name` as the counted string `ntdll` takes.
+fn counted(name: &Name) -> UNICODE_STRING {
     // A value name has at most 16 383 units, so its length in bytes fits.
-    let bytes = u16::try_from(name.len() * 2).expect("a registry name is at most 16 383 units");
+    let bytes = u16::try_from(name.0.len() * 2).expect("a registry name is at most 16 383 units");
     UNICODE_STRING {
         Length: bytes,
         MaximumLength: bytes,
-        Buffer: name.as_ptr().cast_mut(),
+        Buffer: name.0.as_ptr().cast_mut(),
     }
 }
 
@@ -50,7 +75,7 @@ fn checked(status: NTSTATUS) -> io::Result<()> {
 }
 
 /// Deletes the value of `key` named `name`, compared case-insensitively.
-pub(super) fn delete_value(key: &RegKey, name: &[u16]) -> io::Result<()> {
+pub(super) fn delete_value(key: &RegKey, name: &Name) -> io::Result<()> {
     let name = counted(name);
     // SAFETY: `key` holds an open handle with `KEY_SET_VALUE`; `name` outlives the call.
     checked(unsafe { NtDeleteValueKey(key.raw_handle(), &name) })
@@ -64,7 +89,7 @@ pub(super) fn delete_value(key: &RegKey, name: &[u16]) -> io::Result<()> {
 /// at its open below `name`, is gone already, which is what this wants: not an error. At the open
 /// of `name` itself only NotFound is: KEY_DELETED there says that `key`, the held parent, was
 /// marked deleted, not that the child is gone.
-pub(super) fn delete_subkey(key: &RegKey, name: &[u16]) -> io::Result<()> {
+pub(super) fn delete_subkey(key: &RegKey, name: &Name) -> io::Result<()> {
     match open_raw(key.raw_handle(), name, CHILD_ACCESS, LinkHandling::Itself) {
         Ok(child) => delete_tree(child),
         Err(e) => tolerate_not_found(Err(e)),
@@ -82,7 +107,7 @@ pub(super) enum LinkHandling {
 
 /// Opens the subkey of the key `parent` named `name`, which may be a path of names, with `access`.
 /// `parent` is an open key, whose own access is not asked.
-pub(super) fn open_child(parent: HANDLE, name: &[u16], access: u32, links: LinkHandling) -> io::Result<RegKey> {
+pub(super) fn open_child(parent: HANDLE, name: &Name, access: u32, links: LinkHandling) -> io::Result<RegKey> {
     Ok(open_raw(parent, name, access, links)?.into_key())
 }
 
@@ -124,7 +149,7 @@ fn link_flag(flags: [u32; 3], written: u32) -> io::Result<bool> {
 
 /// Creates the subkey of `key` named `name`, or opens it if it exists, as the key it is: an
 /// existing link is returned as the link, not its target.
-pub(super) fn create_child(key: &RegKey, name: &[u16], access: u32) -> io::Result<RegKey> {
+pub(super) fn create_child(key: &RegKey, name: &Name, access: u32) -> io::Result<RegKey> {
     let name = counted(name);
     let attributes = child_attributes(key.raw_handle(), &name, LinkHandling::Itself);
     let mut handle: HANDLE = null_mut();
@@ -183,7 +208,7 @@ fn basic_name(buffer: &[u8]) -> Vec<u16> {
 }
 
 /// Opens the child `name` of `parent` with `access`, a link as `links` says.
-fn open_raw(parent: HANDLE, name: &[u16], access: u32, links: LinkHandling) -> io::Result<Opened> {
+fn open_raw(parent: HANDLE, name: &Name, access: u32, links: LinkHandling) -> io::Result<Opened> {
     let name = counted(name);
     let attributes = child_attributes(parent, &name, links);
     let mut handle: HANDLE = null_mut();
@@ -211,7 +236,7 @@ fn delete_tree(child: Opened) -> io::Result<()> {
 }
 
 /// The name of every subkey of the open `key`, by counted name.
-fn child_names(key: HANDLE) -> io::Result<Vec<Vec<u16>>> {
+fn child_names(key: HANDLE) -> io::Result<Vec<Name>> {
     // `u64`s, so that the buffer is aligned for the header's 8-byte time.
     let mut buffer = [0u64; BASIC_INFORMATION_BYTES / 8];
     let mut names = Vec::new();
@@ -235,7 +260,7 @@ fn child_names(key: HANDLE) -> io::Result<Vec<Vec<u16>>> {
         checked(status)?;
         // SAFETY: the buffer is initialized, and `buffer.len() * 8` bytes long.
         let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), BASIC_INFORMATION_BYTES) };
-        names.push(basic_name(&bytes[..written as usize]));
+        names.push(Name::from_units(basic_name(&bytes[..written as usize])));
     }
     Ok(names)
 }
