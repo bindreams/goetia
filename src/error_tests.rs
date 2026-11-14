@@ -53,6 +53,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             found: Occupant::File,
         },
         Error::StartUnconfirmed { id: id() },
+        Error::StopUnconfirmed {
+            id: id(),
+            shown: String::new(),
+        },
         Error::RunStateUnknown { id: id() },
         Error::RunUnrecorded {
             id: id(),
@@ -648,6 +652,19 @@ fn report_of_a_start_whose_state_is_not_established() {
     assert_eq!(
         Error::StartUnconfirmed { id: id() }.report().to_string(),
         "`x` may not have started: the manager accepted the start, but its state is not established"
+    );
+}
+
+#[skuld::test]
+fn report_of_a_stop_that_cannot_tell_no_process_is_left() {
+    assert_eq!(
+        Error::StopUnconfirmed {
+            id: id(),
+            shown: "launchd shows its job with no process and no state".to_string(),
+        }
+        .report()
+        .to_string(),
+        "`x` may not have stopped: launchd shows its job with no process and no state"
     );
 }
 

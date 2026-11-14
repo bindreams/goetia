@@ -203,8 +203,11 @@ pub trait ServiceManager {
     /// **A task's stop ends the run in flight and leaves its schedule armed;** the task is then
     /// [`State::Idle`]. On macOS, a task's `stop` sends SIGTERM only and waits until the run ends
     /// (bounded by `budget`); a task that ignores SIGTERM keeps running, and `kill` ends it. `stop` also
-    /// ends a run that begins while it is stopping. On macOS, a task's `stop` with no budget also waits for
-    /// a start launchd has accepted to begin, so it can end it.
+    /// ends a run that begins while it is stopping. On macOS, a task's `stop` under every budget (`Immediate`
+    /// and a zero bound included) also waits for a start launchd has accepted to begin, so it can end it;
+    /// then it signals, and returns `Ok` under `Immediate` and [`Error::WaitTimeout`] under a zero
+    /// `Bounded` bound, the signal standing. If launchd shows the job with no process in a state that does
+    /// not say it is idle, or the read fails, the result is [`Error::StopUnconfirmed`].
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never
@@ -214,6 +217,7 @@ pub trait ServiceManager {
     ///
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     /// [`Error::ProcessWaitTimeout`]: crate::Error::ProcessWaitTimeout
+    /// [`Error::StopUnconfirmed`]: crate::Error::StopUnconfirmed
     fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
 
     /// End the service's running process as a failure, and return once that is delivered. Does not

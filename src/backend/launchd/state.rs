@@ -18,8 +18,8 @@ pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
         Some("xpcproxy") | Some("trampoline") if pid.is_some() => State::Running,
         Some("not running") | Some("exited") => State::Stopped,
         // Everything else is `Unknown` rather than a guess: `spawn scheduled` (decided to start,
-        // not yet forked, no pid), `xpcproxy`/`trampoline` without a pid, any `state` a future
-        // macOS introduces, and no `state` line at all.
+        // not yet forked, no pid), `xpcproxy`/`trampoline` without a pid (never observed, so not
+        // taken for a start), any `state` a future macOS introduces, and no `state` line at all.
         //
         // One of three places a `State::Starting` would be produced if goetia grows one (routed
         // post-0.1.0): also `map_state` in `src/backend/scm/manager.rs` and `status_from_unit` in

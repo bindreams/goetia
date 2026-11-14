@@ -139,6 +139,14 @@ pub enum Error {
     #[error("`{id}` may not have started: the manager accepted the start, but its state is not established")]
     StartUnconfirmed { id: String },
 
+    /// A launchd task's `stop` read its job with no process, and in a state that does not say it is idle
+    /// (a state goetia does not know, no `state` line), or could not read it whole: that no process
+    /// remains is not established, so the stop is not reported as done. A SIGTERM an earlier pass sent
+    /// stands. Indeterminate, like [`StartUnconfirmed`](Error::StartUnconfirmed). `shown` is what launchd
+    /// showed, as the rest of the sentence.
+    #[error("`{id}` may not have stopped: {shown}")]
+    StopUnconfirmed { id: String, shown: String },
+
     /// launchd cannot update a loaded job, so the changed definition was not installed. `kind` is the
     /// kind of the loaded job: a service is refused while it is loaded at all, a task only while it
     /// has a run in flight.
@@ -695,6 +703,7 @@ impl Error {
             | Error::LoadedStateInDoubt { .. }
             | Error::StaleJobBootedOut { .. }
             | Error::StartUnconfirmed { .. }
+            | Error::StopUnconfirmed { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunUnrecorded { .. } => true,
             wrapper!(source) | Error::ServiceImageUnreadable { source, .. } => source.is_indeterminate(),
@@ -892,6 +901,7 @@ impl Error {
             | Error::AmbiguousInstall { .. }
             | Error::NotStarted { .. }
             | Error::StartUnconfirmed { .. }
+            | Error::StopUnconfirmed { .. }
             | Error::LoadedJob { .. }
             | Error::PutBackBlocked { .. }
             | Error::InvalidPassword { .. }

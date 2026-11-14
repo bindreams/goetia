@@ -7,7 +7,7 @@
 //! launchd shows no process.
 
 use super::watch::{Added, Watch};
-use super::{Launchd, Plist, SignalOutcome, Until, never_expires};
+use super::{Launchd, Plist, SignalOutcome, UNLOAD_POLL, Until, never_expires};
 use crate::backend::bounded::{Reservation, Role};
 use crate::backend::launchd::state::Evidence;
 use crate::error::{Error, Result};
@@ -22,6 +22,10 @@ enum Pass {
     Done,
     /// Read again: a run ended, or may have begun.
     Again,
+    /// Read again, paced: launchd still shows what has ended (a pid that exited, a process a signal
+    /// found none for) or a job other than the one watched, and its view has to catch up. The pause is
+    /// [`UNLOAD_POLL`], as for a wait on `print`: it spaces the reads and decides nothing.
+    Behind,
 }
 
 impl Launchd {
@@ -44,7 +48,10 @@ impl Launchd {
 
     /// Ends the run in flight, and returns once launchd shows no process. Each pass reads `print`:
     ///
-    /// - No process and no start launchd has accepted: done.
+    /// - No process and an idle job (`not running`, `exited`, or a label launchd does not hold): done.
+    ///   No process and any other state, or a `print` that failed or was not whole, is
+    ///   [`Error::StopUnconfirmed`]: a stop that cannot tell that no process is left does not report that
+    ///   it stopped, and a SIGTERM an earlier pass sent stands.
     /// - A start accepted and not yet forked (`spawn scheduled`, no pid): waits for the pid, which a
     ///   signal cannot reach before (`launchctl kill` of that state answers "No process to signal"
     ///   and does not cancel the start). That wait is on `print`, and under no budget, whatever it is:
@@ -53,7 +60,8 @@ impl Launchd {
     ///   for the exit under `budget` (`Immediate` does not wait). A run that began meanwhile is a real
     ///   run and is ended too, so the loop ends only when no process is left.
     ///
-    /// A pid that exited before it was watched, or is not the job's any more, is the next pass. The
+    /// A pid that exited before it was watched, or is not the job's any more, is the next pass, paced
+    /// by [`UNLOAD_POLL`] while launchd's view catches up. The
     /// first pass draws on `reservation`, and each later one on one of its own: an uncapped loop would
     /// draw what was never reserved. A pass that cannot reserve returns that error, the SIGTERM
     /// standing. The one [`Watch`] is made first, so that failing to make it sends nothing.
@@ -66,8 +74,10 @@ impl Launchd {
             let pass = own.as_mut().unwrap_or(&mut *reservation);
             match self.stop_pass(id, budget, deadline, &watch, pass)? {
                 Pass::Done => return Ok(()),
-                Pass::Again => own = Some(flow::reserved(self, id, &[Step::Stop], budget)?),
+                Pass::Again => {}
+                Pass::Behind => std::thread::sleep(UNLOAD_POLL),
             }
+            own = Some(flow::reserved(self, id, &[Step::Stop], budget)?);
         }
     }
 
@@ -96,18 +106,18 @@ impl Launchd {
                 );
                 return Ok(Pass::Again);
             }
-            // Idle: no process, and launchd holds no start. Anything else with no pid is a state that
-            // does not say so, which is not an idle job.
+            // Idle: no process, and launchd holds no start. Anything else with no pid, or a read that
+            // was not whole, does not establish that none is left, so the stop is not reported done.
             return match print.state {
                 State::Idle => Ok(Pass::Done),
-                _ => Err(Error::os(
-                    format!("read whether the job of `{id}` has a process"),
-                    std::io::Error::other("launchctl print shows a state goetia does not recognise"),
-                )),
+                _ => Err(Error::StopUnconfirmed {
+                    id: id.to_string(),
+                    shown: print.shown.describe(),
+                }),
             };
         };
         if watch.add(pid)? == Added::Gone {
-            return Ok(Pass::Again);
+            return Ok(Pass::Behind);
         }
         // The pid was read before it was watched, and a pid can be reused: only a job that `print`
         // still shows with this pid is the one the watch holds.
@@ -115,10 +125,10 @@ impl Launchd {
             .launchctl
             .read_task_print(name, issuing, Role::Query, reservation)?;
         if still.pid != Some(pid) {
-            return Ok(Pass::Again);
+            return Ok(Pass::Behind);
         }
         if self.launchctl.signal(name, "SIGTERM", reservation)? == SignalOutcome::NoProcess {
-            return Ok(Pass::Again);
+            return Ok(Pass::Behind);
         }
         if budget == Budget::Immediate {
             return Ok(Pass::Done);

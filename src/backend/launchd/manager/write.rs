@@ -3,10 +3,10 @@
 //!
 //! What to do is decided purely, in [`crate::backend::launchd::task`] (`update_plan`,
 //! `uninstall_plan`, `enable_plan`, `disable_plan`), from what is on disk and what launchd holds;
-//! [`Executor`] performs the plan's actions in order. An update first reads which labels launchd holds (two `print`s, which decide what
-//! to stage); then both plists are staged and linted before the first request that changes anything,
-//! so a malformed one stops the install before anything changed. A crash anywhere leaves a state of
-//! the read table, and running the verb again finishes it.
+//! [`Executor`] performs the plan's actions in order. An update first reads which labels launchd holds
+//! (two `print`s, which decide what to stage); then both plists are staged and linted before the first
+//! request that changes anything, so a malformed one stops the install before anything changed. A crash
+//! anywhere leaves a state of the read table, and running the verb again finishes it.
 //!
 //! A task's directories are an argument (`Dirs`), as `read` and `scan` take theirs.
 
@@ -624,4 +624,4 @@ enum Verdict {
 
 #[cfg(test)]
 #[path = "write_tests.rs"]
-mod write_tests;
+pub(super) mod write_tests;

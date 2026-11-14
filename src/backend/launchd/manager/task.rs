@@ -237,13 +237,40 @@ pub(super) struct TaskPrint {
     pub(super) pid: Option<u32>,
     /// A start launchd has accepted and not yet forked (`spawn scheduled`): `Running`, with no pid.
     pub(super) queued: bool,
+    /// What the read showed of the `state`, as launchd said it: what a verb that cannot conclude from
+    /// `state` (an `Unknown`) names.
+    pub(super) shown: Shown,
     pub(super) last_result: Option<Exit>,
+}
+
+/// What a `print` showed of a job's `state`.
+pub(super) enum Shown {
+    /// The read failed or was not whole: nothing is established, and the job's `state` is not known.
+    Failed,
+    /// A whole read, with the text of its `state` line, if it had one. A label launchd does not hold is a
+    /// whole read with no line.
+    State(Option<String>),
+}
+
+impl Shown {
+    /// What launchd showed, as the end of a sentence about a job with no process.
+    pub(super) fn describe(&self) -> String {
+        match self {
+            Shown::Failed => {
+                "reading its job from launchd failed, so whether a process remains is not established".to_string()
+            }
+            Shown::State(Some(state)) => {
+                format!("launchd shows its job in state `{state}` with no process, a state goetia does not know")
+            }
+            Shown::State(None) => "launchd shows its job with no process and no state".to_string(),
+        }
+    }
 }
 
 impl Launchctl {
     /// One `print` of the task `id`'s job as `role`, read as a task's (see [`state::classify_task`]): a
     /// job launchd does not hold is idle. `Err` iff `launchctl` could not be run at all; anything else
-    /// it answers that is not recognised is `Unknown`, as for a service.
+    /// it answers that is not recognised is `Unknown`, as for a service, and `shown` says what was read.
     pub(super) fn read_task_print(
         &self,
         id: &str,
@@ -256,6 +283,7 @@ impl Launchctl {
                 state: State::Unknown,
                 pid: None,
                 queued: false,
+                shown: Shown::Failed,
                 last_result: None,
             });
         };
@@ -263,10 +291,17 @@ impl Launchctl {
         let whole = status.success() && capture.complete;
         let body = String::from_utf8_lossy(&capture.stdout);
         let last_result = whole.then(|| state::last_result(&body)).flatten();
+        // A label launchd does not hold answers whole, with nothing to show.
+        let shown = if capture.complete && (status.success() || super::is_not_found(status.code())) {
+            Shown::State(state::find_field(&body, "state").map(|state| state.trim().to_string()))
+        } else {
+            Shown::Failed
+        };
         Ok(TaskPrint {
             state,
             pid,
             queued: whole && state::spawn_scheduled(&body),
+            shown,
             last_result,
         })
     }

@@ -2,16 +2,18 @@
 //! stands for a run (the pid `print` shows), and the scripted `kill` ends it, so the watch that `stop`
 //! waits on is a real kqueue's. Nothing here touches the system's own directories or services.
 
-use std::path::Path;
+use std::os::unix::process::ExitStatusExt as _;
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::super::manager_tests::launchd_over;
 use super::super::task::task_tests::{ID, Tree, marked, plists_of, service_spec, task_spec};
 use super::super::watch::{test_hook, watch_tests::Held};
+use super::super::write::write_tests::bootstrap;
 use super::*;
 use crate::backend::Backend as _;
-use crate::backend::bounded;
+use crate::backend::bounded::{self, Capture, Finished};
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::launchd::generate::timer_label;
 use crate::spec::DaemonKind;
@@ -52,13 +54,6 @@ fn sigterm_ending(mut run: Held) -> Entry {
     sigterm().then(move || {
         run.finish();
     })
-}
-
-fn bootstrap(path: &Path) -> Entry {
-    reply(
-        &["bootstrap", "system", path.to_str().expect("a UTF-8 path")],
-        exited(0, "", ""),
-    )
 }
 
 fn kickstart() -> Entry {
@@ -221,7 +216,7 @@ fn stop_signals_sigterm_and_waits_for_the_pid_it_saw() {
 
 #[skuld::test]
 fn stop_of_an_idle_task_is_ok() {
-    for read in [print(IDLE), not_loaded()] {
+    for read in [print(IDLE), print("\tstate = exited\n"), not_loaded()] {
         let fake = Fake::new([read]);
 
         stopping(&fake, Budget::DEFAULT).expect("a stop of an idle task");
@@ -231,15 +226,78 @@ fn stop_of_an_idle_task_is_ok() {
     }
 }
 
-/// A state that is neither idle nor a process is not an idle job: nothing is concluded from it.
+/// No process and a state that is not idle, or a read that is not whole, do not establish that the job
+/// stopped: `StopUnconfirmed`, saying what launchd showed. `xpcproxy` without a pid has never been seen
+/// and is not taken for a start.
 #[skuld::test]
-fn stop_of_a_task_with_a_state_goetia_does_not_recognise_is_an_error() {
-    let fake = Fake::new([print("\tstate = someday-new-apple-state\n")]);
+fn stop_with_no_process_and_a_state_that_is_not_idle_is_unconfirmed() {
+    let cut = Finished::Exited {
+        status: ExitStatus::from_raw(0),
+        capture: Capture {
+            stdout: b"\tstate = not run".to_vec(),
+            stderr: Vec::new(),
+            complete: false,
+        },
+    };
+    let failed = "reading its job from launchd failed, so whether a process remains is not established";
+    let cases = [
+        (
+            "a state goetia does not know",
+            print("\tstate = someday-new-apple-state\n"),
+            "launchd shows its job in state `someday-new-apple-state` with no process, a state goetia does not know",
+        ),
+        (
+            "xpcproxy without a pid",
+            print("\tstate = xpcproxy\n"),
+            "launchd shows its job in state `xpcproxy` with no process, a state goetia does not know",
+        ),
+        (
+            "no state line",
+            print("system/x = {\n\tactive count = 1\n}\n"),
+            "launchd shows its job with no process and no state",
+        ),
+        (
+            "a print that failed",
+            reply(
+                &["print", &target()],
+                exited(5, "", "Could not print: 5: Input/output error\n"),
+            ),
+            failed,
+        ),
+        ("a print that was not whole", reply(&["print", &target()], cut), failed),
+    ];
+    for (what, read, shown) in cases {
+        let fake = Fake::new([read]);
 
-    let e = stopping(&fake, Budget::DEFAULT).expect_err("an unrecognised state");
+        let e = stopping(&fake, Budget::DEFAULT).expect_err(what);
 
-    assert!(e.report().to_string().contains("does not recognise"), "{e:?}");
-    assert!(calls_of(&fake, "kill").is_empty());
+        assert!(
+            matches!(&e, Error::StopUnconfirmed { id, .. } if id == ID),
+            "{what}: {e:?}"
+        );
+        assert_eq!(e.to_string(), format!("`{ID}` may not have stopped: {shown}"), "{what}");
+        assert!(e.is_indeterminate(), "{what}");
+        assert!(calls_of(&fake, "kill").is_empty(), "{what}");
+    }
+}
+
+/// A SIGTERM an earlier pass sent stands when a later pass cannot tell that no process is left.
+#[skuld::test]
+fn stop_unconfirmed_after_a_sigterm_leaves_the_sigterm() {
+    let run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        sigterm_ending(run),
+        print("\tstate = someday-new-apple-state\n"),
+    ]);
+
+    let e = stopping(&fake, Budget::Unbounded).expect_err("the next pass cannot tell");
+
+    assert!(matches!(e, Error::StopUnconfirmed { .. }), "{e:?}");
+    fake.assert_spent("the signal went out, and the next read was not conclusive");
+    assert_eq!(calls_of(&fake, "kill").len(), 1);
 }
 
 /// `kickstart` returns before the fork, so a `stop` straight after a `start` finds a start launchd has

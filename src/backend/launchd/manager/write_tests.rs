@@ -51,7 +51,7 @@ fn bootout(target: String) -> Entry {
     reply(&["bootout", &target], exited(0, "", ""))
 }
 
-fn bootstrap(path: &Path) -> Entry {
+pub(in crate::backend::launchd::manager) fn bootstrap(path: &Path) -> Entry {
     reply(
         &["bootstrap", "system", path.to_str().expect("a UTF-8 path")],
         exited(0, "", ""),

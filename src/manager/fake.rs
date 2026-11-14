@@ -714,6 +714,10 @@ fn extract(text: &str) -> Result<Option<Blob>> {
 /// | `Bounded(d)`, `d > 0` | [`budget::timed_out`] |
 /// | `Unbounded` | **panic** |
 ///
+/// This is the contract the real managers share. A launchd task's `stop` is the one real behaviour that
+/// departs from it (a zero `Bounded` bound ends in a wait timeout there); the fake does not model it, since
+/// systemd and SCM, which back tasks too, keep the contract.
+///
 /// `Unbounded` has to panic. `waits()` is true for it, so "a stalled entry
 /// under a waiting budget times out" would route it into `budget::timed_out`,
 /// whose `debug_assert!` requires a `Bounded` budget, or report an expiry that
