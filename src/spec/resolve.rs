@@ -110,6 +110,12 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     interpolate::reject_interpolated_id(&raw.id)?;
     let id = Id::try_from(raw.id.clone())?;
 
+    // `type` is the daemon's own, never a backend's: refused by name before any merge. This is
+    // the one exception to "base errors win" (step 3): an error the forbidden override itself
+    // causes (a `type: ${T}` that needs an unreadable `.env`, a `type: task` that leaves a service
+    // field on a task) must not hide the refusal of the override.
+    refuse_type_overrides(&id, &raw)?;
+
     // Step 2: the `.env` gate, computed from the merged native spec of step 5, the one
     // substitution runs on. Anything else either misses a `${VAR}` written only in the native
     // override, or lets an unrelated or unreadable `.env` break a host whose native backend has
@@ -132,10 +138,6 @@ fn resolve_as(raw: RawSpec, base_dir: &Path, native: Option<BackendKind>) -> Res
     let base = raw.without_overrides();
     interpolate::check_spec_grammar(&base)?;
     resolve_shape(&id, base, base_dir, Substitution::Pending, None, &hostname)?;
-
-    // `type` is the daemon's own, never a backend's: refused by name after the base pass, whose
-    // errors win, and before the sweep, so that no override is merged with one.
-    refuse_type_overrides(&id, &raw)?;
 
     // Step 4: the all-backends sweep, errors only: every backend's merged spec is checked as
     // authored, and `BackendKind::error` judges the fields its override supplied. A non-native

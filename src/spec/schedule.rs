@@ -273,8 +273,9 @@ fn unsupported() -> String {
     format!("is not supported; {GRAMMAR}")
 }
 
-/// Digits only; a number too large for `u8` saturates to 255, which every value range refuses and which, as a
-/// step, yields the first value only, as in Vixie cron.
+/// Digits only. A number too large for `u8` saturates to 255, which every value range refuses and
+/// which, as a step, gives the first value only. That matches Vixie cron for any step that fits an
+/// int, and is the same answer for a larger one.
 fn digits(text: &str) -> Option<u8> {
     (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())).then(|| text.parse().unwrap_or(u8::MAX))
 }
@@ -363,8 +364,9 @@ fn field_hash(seed: &HashSeed, position: usize) -> u64 {
 /// Whether `field` is a set `parsed`'s terms can give. The reason does not name the field.
 ///
 /// The seed is not known here, so this checks coverage, in time linear in the number of terms:
-/// every value is one some term can give, every fixed term's values are present, and every `H`
-/// term has a pick (one value, or values spaced by its step) wholly inside the field. An
+/// every value is one some term can give, every fixed term's values are present, every `H`
+/// term has a pick (one value, or values spaced by its step) wholly inside the field, and the
+/// values beyond the fixed terms' number at most the `H` terms' largest picks together. An
 /// `H`-free field is therefore exactly the text's values.
 fn check(kind: &FieldKind, parsed: &ParsedField, field: &CronField) -> Result<(), String> {
     if field.restricted != parsed.restricted {
@@ -394,10 +396,39 @@ fn check(kind: &FieldKind, parsed: &ParsedField, field: &CronField) -> Result<()
             });
         }
     }
-    match field.values.difference(&given).next() {
-        None => Ok(()),
-        Some(value) => Err(format!("holds {value}, which no term in the text can give")),
+    if let Some(value) = field.values.difference(&given).next() {
+        return Err(format!("holds {value}, which no term in the text can give"));
     }
+    // Each value could be some term's pick, yet together they must fit what the terms give at
+    // once: the fixed values, plus at most one pick per `H` term.
+    let fixed: BTreeSet<u8> = parsed
+        .terms
+        .iter()
+        .filter_map(|term| match term {
+            Term::Fixed(values) => Some(values),
+            Term::Hashed { .. } => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    let allowed: usize = parsed
+        .terms
+        .iter()
+        .filter(|term| matches!(term, Term::Hashed { .. }))
+        .map(|term| {
+            (0..term.modulus())
+                .map(|seed| term.values(seed).len())
+                .max()
+                .unwrap_or(0)
+        })
+        .sum();
+    let extra = field.values.difference(&fixed).count();
+    if extra > allowed {
+        return Err(format!(
+            "holds {extra} values beyond the text's fixed ones; its `H` terms give at most {allowed}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

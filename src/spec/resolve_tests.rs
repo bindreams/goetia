@@ -1051,17 +1051,23 @@ fn type_in_an_override_is_refused() {
 }
 
 #[skuld::test]
-fn a_base_error_outranks_a_type_in_an_override() {
-    let yaml = "id: frpc
-command: [bin/frpc]
-restart: sometimes
-backend-specific:
-  scm:
-    type: task
-";
+fn a_type_in_an_override_is_refused_before_an_unreadable_env_file(#[fixture(temp_dir)] dir: &Path) {
+    write_fixture(dir, "", None);
+    std::fs::create_dir(dir.join(".env")).expect("fixture directory should be creatable");
+    let native = BackendKind::native().expect("native() is Some on every CI platform");
+    let yaml = format!("id: frpc\ncommand: [/bin/frpc]\nbackend-specific:\n  {native}:\n    type: ${{T}}\n");
+    assert_eq!(
+        resolve(parse_manifest(&yaml), dir).unwrap_err().to_string(),
+        format!("daemon `frpc`: backend-specific.{native}: `type` cannot be set per backend")
+    );
+}
+
+#[skuld::test]
+fn a_type_in_an_override_is_refused_before_the_base_errors_it_causes() {
+    let yaml = "id: frpc\ncommand: [bin/frpc]\nschedule: '0 3 * * *'\nbackend-specific:\n  systemd:\n    type: task\n";
     assert_eq!(
         resolve_yaml(yaml).unwrap_err().to_string(),
-        "daemon `frpc`: field `restart` is `sometimes`; expected one of `never`, `on-failure`, `always`"
+        "daemon `frpc`: backend-specific.systemd: `type` cannot be set per backend"
     );
 }
 

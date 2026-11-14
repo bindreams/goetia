@@ -64,6 +64,8 @@ fn parses_every_vixie_form() {
         (0, "*/100", set(&[0])),
         (0, "*/300", set(&[0])),
         (0, "*/99999999999", set(&[0])),
+        (1, "*/25", set(&[0])),
+        (4, "*/8", set(&[0])),
         (1, "*", range(0, 23)),
         (1, "23", set(&[23])),
         (1, "*/6", set(&[0, 6, 12, 18])),
@@ -393,6 +395,17 @@ fn from_parts_refuses_a_set_the_text_cannot_give() {
         ("H(10-20) * * * *", 0, field(&[21], true)),
         ("H(10-20) * * * *", 0, field(&[9], true)),
         ("H * * * *", 0, field(&[60], true)),
+        // more values than the `H` terms can give at once
+        (
+            "H * * * *",
+            0,
+            CronField {
+                values: range(0, 59),
+                restricted: true,
+            },
+        ),
+        ("H,H * * * *", 0, field(&[1, 2, 3], true)),
+        ("5,H * * * *", 0, field(&[5, 1, 2], true)),
         ("* * H * *", 2, field(&[29], true)),
         ("* * H * *", 2, field(&[0], true)),
         ("* * * * H", 4, field(&[7], true)),
@@ -435,6 +448,8 @@ fn from_parts_refuses_a_set_the_text_cannot_give() {
 fn from_parts_accepts_any_set_an_h_term_can_give() {
     // (text, field index, values): another host or id hashes elsewhere
     let table: Vec<(&str, usize, Vec<u8>)> = vec![
+        ("H * * * *", 0, vec![0]),
+        ("H,H * * * *", 0, vec![3, 40]),
         ("H(10-20) * * * *", 0, vec![15]),
         ("H(10-20) * * * *", 0, vec![10]),
         ("H(10-20) * * * *", 0, vec![20]),
@@ -454,7 +469,7 @@ fn from_parts_accepts_any_set_an_h_term_can_give() {
 #[skuld::test]
 fn from_parts_with_many_h_terms_is_linear() {
     // Decoding a field must not enumerate combinations of picks; this has to complete.
-    let text = format!("{} * * * *", ["H"; 20].join(","));
+    let text = format!("{} * * * *", ["H"; 60].join(","));
     let full = field(&(0..=59).collect::<Vec<u8>>(), true);
     rebuild(&text, 0, full).unwrap();
     let missing = field(&(0..=58).collect::<Vec<u8>>(), true);
@@ -462,6 +477,11 @@ fn from_parts_with_many_h_terms_is_linear() {
     rebuild(&text, 0, missing).unwrap();
     let empty = field(&[], true);
     rebuild(&text, 0, empty).unwrap_err();
+
+    // Twenty terms give at most twenty values.
+    let text = format!("{} * * * *", ["H"; 20].join(","));
+    rebuild(&text, 0, field(&(0..20).collect::<Vec<u8>>(), true)).unwrap();
+    rebuild(&text, 0, field(&(0..21).collect::<Vec<u8>>(), true)).unwrap_err();
 }
 
 #[skuld::test]
