@@ -345,7 +345,7 @@ pub(crate) fn run<B: Backend>(b: &B, id: &Id, out: &mut dyn Write) -> Result<Exi
     let mut reservation = reserved(b, id, &[Step::Start], Budget::Immediate)?;
     let waiter = Waiter::<B::Run>::spawn(id)?;
 
-    match b.begin_run(snapshot, &mut reservation) {
+    match b.begin_run(snapshot, &mut reservation, out) {
         Ok(run) => waiter.follow(run, id, out),
         Err(e) => {
             waiter.abandon();

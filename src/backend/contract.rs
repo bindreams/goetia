@@ -182,9 +182,17 @@ pub(crate) trait Backend {
     /// ended. Draws on a reservation made for [`Step::Start`]. Anything that must be read about the
     /// output's position (the size of a log file) is read before the request is sent.
     ///
+    /// `notes` is where the backend says what it did that the run's output does not: the same writer
+    /// `run`'s output goes to, written before the run's lines.
+    ///
     /// [`Error::RunNotStarted`] where the manager ended the start before a run began. A failure after
     /// the request was sent is never that: the run may have happened.
-    fn begin_run(&self, snapshot: Self::Snapshot, reservation: &mut Self::Reservation) -> Result<Self::Run>;
+    fn begin_run(
+        &self,
+        snapshot: Self::Snapshot,
+        reservation: &mut Self::Reservation,
+        notes: &mut dyn Write,
+    ) -> Result<Self::Run>;
 }
 
 /// A run of a task that [`Backend::begin_run`] began.
@@ -208,9 +216,8 @@ pub(crate) enum OutputSource {
     ///
     /// `marker` is `Some` for a backend whose every run writes a [`Marker`] line first (so that runs
     /// that share the file are told apart); `None` for one that does not, whose file is shown as it is.
-    /// A run whose marker is not after `offset` (the request joined a run a timer began before the
-    /// length was measured) is looked for once more from byte 0 when it has ended, so `offset` does not
-    /// hide its output.
+    /// A run whose marker is not after `offset` is looked for once more from byte 0 when it has ended,
+    /// so `offset` does not hide its output, where [`Marker::earlier_start_possible`].
     LogFile {
         path: PathBuf,
         offset: u64,
@@ -235,6 +242,9 @@ pub(crate) struct Marker {
     /// last line has no newline leaves the next run's marker at the end of that line, and it is told
     /// from the program's own text by this form.
     pub(crate) id_len: usize,
+    /// Whether a run can have begun before `offset` was measured: a timer started it between the state
+    /// read and the request, and the request joined it. Its marker is then before `offset`.
+    pub(crate) earlier_start_possible: bool,
 }
 
 /// What a backend whose tasks are not built yet answers [`Backend::begin_run`] with.

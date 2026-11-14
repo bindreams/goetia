@@ -123,6 +123,8 @@ struct RunScript {
     writes: Option<(PathBuf, String)>,
     /// The marker prefix and line the run's log carries, as a systemd task's does.
     marker: Option<(&'static str, String)>,
+    /// What `begin_run` writes to its notes writer.
+    note: Option<String>,
     begin_fails: Option<Failure>,
     wait_fails: Option<Failure>,
 }
@@ -592,6 +594,11 @@ impl Fake {
     /// space, and a marker glued to a line ends with 32 hex digits.
     pub fn seed_run_marker(&self, id: &str, prefix: &'static str, line: &str) {
         self.script_run(id, |script| script.marker = Some((prefix, line.to_string())));
+    }
+
+    /// Test-only seeding: a request to run the task `id` writes `text` to its notes writer.
+    pub fn seed_run_note(&self, id: &str, text: &str) {
+        self.script_run(id, |script| script.note = Some(text.to_string()));
     }
 
     /// Test-only seeding: the request to run the task `id` fails with what `error` makes.
@@ -1121,7 +1128,7 @@ impl crate::backend::Backend for Fake {
 
     /// Recorded as `begin_run`, once the gate has passed. Leaves the task's state alone: a run of the
     /// Fake is its script ([`Fake::seed_run_exit`]), not a process.
-    fn begin_run(&self, snapshot: Artifact, _reservation: &mut ()) -> Result<FakeRun> {
+    fn begin_run(&self, snapshot: Artifact, _reservation: &mut (), notes: &mut dyn std::io::Write) -> Result<FakeRun> {
         let id = snapshot.id();
         let mut state = self.state.lock().expect("Fake mutex poisoned");
         state.calls.push(("begin_run", id.as_str().to_string()));
@@ -1130,9 +1137,12 @@ impl crate::backend::Backend for Fake {
         if let Some(failure) = &script.begin_fails {
             return Err(failure.0());
         }
+        if let Some(note) = &script.note {
+            crate::manager::output::show(notes, note.as_bytes())?;
+        }
         let log = script.writes.map(|(path, text)| {
             // What the run appends is after the length measured here, which is before it was requested.
-            let offset = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+            let offset = crate::manager::output::length_of(&path).unwrap_or(0);
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -1172,6 +1182,7 @@ impl RunHandle for FakeRun {
                     prefix,
                     line: line.clone(),
                     id_len: 32,
+                    earlier_start_possible: true,
                 }),
             },
             None => OutputSource::None,

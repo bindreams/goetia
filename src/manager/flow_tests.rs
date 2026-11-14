@@ -1206,6 +1206,36 @@ fn run_streams_what_the_run_wrote_after_the_start_request() {
     assert_eq!(out, "this run\n");
 }
 
+/// `begin_run` writes to the same `out` the run's output goes to, before the run's own lines.
+#[skuld::test]
+fn run_hands_out_to_begin_run_as_its_notes_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("job.log");
+    let fake = Fake::new();
+    fake.install(&a_task("nightly"), false).unwrap();
+    fake.seed_run_note(
+        "nightly",
+        "note: from begin_run
+",
+    );
+    fake.seed_run_writes(
+        "nightly",
+        &log,
+        "this run
+",
+    );
+
+    let (result, out) = run_of(&fake, "nightly");
+
+    assert_eq!(result.unwrap(), Exit::Code(0));
+    assert_eq!(
+        out,
+        "note: from begin_run
+this run
+"
+    );
+}
+
 /// A run whose marker the log never held shows the note, and its exit is the run's, untouched.
 #[skuld::test]
 fn a_run_whose_marker_is_missing_is_a_note_and_its_real_exit() {

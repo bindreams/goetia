@@ -1506,7 +1506,12 @@ impl backend::Backend for Launchd {
     }
 
     /// Interim: launchd installs no task yet, so no id reaches here as one.
-    fn begin_run(&self, snapshot: Plist, _reservation: &mut Reservation) -> Result<std::convert::Infallible> {
+    fn begin_run(
+        &self,
+        snapshot: Plist,
+        _reservation: &mut Reservation,
+        _notes: &mut dyn std::io::Write,
+    ) -> Result<std::convert::Infallible> {
         Err(backend::cannot_run_tasks("launchd", snapshot.id()))
     }
 }
