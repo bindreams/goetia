@@ -185,9 +185,8 @@ pub(crate) trait Backend {
     /// `notes` is where the backend says what it did that the run's output does not: the same writer
     /// `run`'s output goes to, written before the run's lines.
     ///
-    /// [`Error::RunNotStarted`] where the manager ended the start before a run began, as the journal
-    /// records, or where the kernel shows that the launch the request made ended before its program
-    /// started. Any other failure after the request was sent is never that: the run may have happened.
+    /// [`Error::RunNotStarted`] where the manager ended the start before a run began. A failure after
+    /// the request was sent is never that: the run may have happened.
     fn begin_run(
         &self,
         snapshot: Self::Snapshot,

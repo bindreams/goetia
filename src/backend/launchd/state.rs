@@ -3,7 +3,10 @@
 //! unlike `manager`.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+use crate::backend::launchd::refuse::{run_ended_unfollowed, run_unfollowed, run_vanished, stranded_hold};
+use crate::error::Error;
 use crate::manager::{Exit, State};
+use crate::spec::Id;
 
 /// Classifies one `launchctl print` body into the `(State, pid)` pair `status`/`list` report.
 ///
@@ -77,34 +80,26 @@ pub(crate) fn last_result(print_body: &str) -> Option<Exit> {
     signal.rsplit(':').next()?.trim().parse().ok().map(Exit::Signal)
 }
 
-/// What the kernel showed of the process `kickstart -p` named, once its start time was read: how it stands
-/// after its exec, or that it did not get there.
+/// What the reads of the process `kickstart -p` named showed once its start time was read: that it is
+/// not the job's launch, that it is gone, or how it stands after its exec.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Then {
-    /// No process at a later read, or one the watch showed had exited after it.
-    Gone,
-    /// The path read `xpcproxy`, and the process exited with no exec: with its `wait(2)` status, where the
-    /// kernel reported one.
-    ExitedBeforeExec(Option<i32>),
+    /// `launchctl procinfo` did not name the pid as the job's launch: it is another process's. Nothing
+    /// else was read of it.
+    Stranger,
+    /// No process at a later read, or one the watch showed had exited after it, or one that exited before
+    /// its first exec: with its `wait(2)` status where the watch kept one.
+    Gone(Option<i32>),
     /// Alive after its exec, `stopped` or not.
     Process { stopped: bool },
 }
 
 /// What `run` makes of the launch `kickstart -p` named.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum Launch {
-    /// No process when it was registered, or at the read of its start time: goetia never saw it, so whose
-    /// launch it was is not known. The run ends in doubt.
-    Lost,
-    /// An older launch that is over: it started at or before our `debug` returned and is gone, or exited
-    /// before its exec. Another pass is made.
+    /// An older launch that is over: it started at or before our `debug` returned and is gone. Another pass
+    /// is made.
     Ended,
-    /// Started after our `debug`, and exited before its exec, with its `wait(2)` status where the kernel
-    /// reported one: our launch, whose program never started. The run ends, not started.
-    NotStarted(Option<i32>),
-    /// Started after our `debug`, and gone at a read after its exec: our launch, which ended before goetia
-    /// could follow it. The run ends, unrecorded.
-    Unrecorded,
     /// Stopped, and started after our `debug`: the launch that `debug` held for this run.
     Held,
     /// Stopped, and started before our `debug` returned: an older launch that took a hold, which is
@@ -113,25 +108,39 @@ pub(crate) enum Launch {
     /// Not stopped, and started before our `debug` returned: a run already in flight (a scheduled one),
     /// which is waited for.
     InFlight,
-    /// Not stopped, and started after our `debug`: our own `kickstart` launched it with no hold, which
-    /// goetia does not follow.
-    Unheld,
+    /// The run ends, with this error. Every end is decided here, with its error, so that nothing else
+    /// makes one.
+    Ends(Error),
 }
 
-/// The [`Launch`] of a process that `started` at the time shown and then stood as `then`, where `ta` is the
-/// time read after the `launchctl debug` process was reaped (both in `mach_absolute_time` units). A start
-/// after `ta` began after `debug`; one at or before it began before `debug` returned. [`Launch::Lost`] is
-/// not decided here: it is a process whose start time was never read.
-pub(crate) fn launch_of(then: Then, started: u64, ta: u64) -> Launch {
+/// The [`Launch`] of the pid `kickstart -p` named for a run of `id`: `started` is its start time with what
+/// the reads showed after it, or `None` where no start time was read (the pid was gone when it was
+/// registered, or at the read). `ta` is the time read after the `launchctl debug` process was reaped (both
+/// in `mach_absolute_time` units): a start after `ta` began after `debug`; one at or before it began
+/// before `debug` returned.
+///
+/// | reads | the launch is | result |
+/// | --- | --- | --- |
+/// | no start time, or [`Then::Stranger`] | not known: this run's, or a scheduled run's | ends: [`run_vanished`], in the stranded hold |
+/// | gone, started after `ta` | ours, which ended before goetia could follow it | ends: [`run_ended_unfollowed`] |
+/// | running, started after `ta` | ours, our `kickstart`'s, with no hold | ends: [`run_unfollowed`] |
+/// | gone, started at or before `ta` | an older one, that is over | [`Launch::Ended`] |
+/// | stopped, started after `ta` | the one `debug` held | [`Launch::Held`] |
+/// | stopped, started at or before `ta` | an older one that took a hold | [`Launch::TookHold`] |
+/// | running, started at or before `ta` | a run in flight | [`Launch::InFlight`] |
+pub(crate) fn launch_of(started: Option<(u64, Then)>, ta: u64, id: &Id, pid: u32) -> Launch {
+    let Some((started, then)) = started else {
+        return Launch::Ends(stranded_hold(id, run_vanished(id, pid)));
+    };
     let ours = started > ta;
     match (then, ours) {
+        (Then::Stranger, _) => Launch::Ends(stranded_hold(id, run_vanished(id, pid))),
         (Then::Process { stopped: true }, true) => Launch::Held,
         (Then::Process { stopped: true }, false) => Launch::TookHold,
         (Then::Process { stopped: false }, false) => Launch::InFlight,
-        (Then::Process { stopped: false }, true) => Launch::Unheld,
-        (Then::Gone | Then::ExitedBeforeExec(_), false) => Launch::Ended,
-        (Then::Gone, true) => Launch::Unrecorded,
-        (Then::ExitedBeforeExec(status), true) => Launch::NotStarted(status),
+        (Then::Process { stopped: false }, true) => Launch::Ends(run_unfollowed(id, pid)),
+        (Then::Gone(_), false) => Launch::Ended,
+        (Then::Gone(status), true) => Launch::Ends(run_ended_unfollowed(id, status)),
     }
 }
 

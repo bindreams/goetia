@@ -2350,6 +2350,83 @@ fn signal_maps_exit_3_and_113_to_no_process_and_0_to_sent() {
     assert!(matches!(&e, Error::Command { .. }), "{e:?}");
 }
 
+/// What `launchctl procinfo <pid>` prints of a launch of `id`: the process, then launchd's block for the job.
+fn procinfo_of_a_launch(id: &Id, pid: u32) -> String {
+    format!(
+        "program path = /usr/libexec/xpcproxy\n\
+         argument vector = {{\n\txpcproxy\n\t{id}\n}}\n\
+         \n\
+         system/{id} = {{\n\
+         \tactive count = 1\n\
+         \tstate = xpcproxy\n\
+         \tpid = {pid}\n\
+         }}\n"
+    )
+}
+
+/// `names_launch` of `pid` over a `procinfo` that exited `code` having written `stdout` and `stderr`, with
+/// the launchctl calls it made.
+fn names_launch_over(code: i32, stdout: &str, stderr: &str, pid: u32) -> (Result<bool>, Fake) {
+    let script = Fake::new([reply(&["procinfo"], exited(code, stdout, stderr))]);
+    let launchctl = Launchctl::new(Box::new(script.clone()));
+    let named = launchctl.names_launch(never_installed().as_str(), pid, &mut reserved(&[Step::Start]));
+    (named, script)
+}
+
+/// `procinfo` names a pid as the job's launch iff its output has the job's block, the line `system/<id> = {`;
+/// the exit code is 0 for a stranger and for a dead pid too, and says nothing. The call is a read by pid,
+/// run to its end.
+#[skuld::test]
+fn names_launch_reads_the_job_block_of_procinfo_and_not_its_exit_code() {
+    let id = never_installed();
+    let block = procinfo_of_a_launch(&id, 7);
+    let stranger = "program path = /bin/sleep\n(pid 7 is not managed by launchd)\n";
+    let gone = "program path = (could not resolve path)\n(pid 7 is not managed by launchd)\n";
+    let other_job = block.replace(id.as_str(), "some-other-job");
+    let inside_a_line = block.replace(&format!("system/{id} = {{"), &format!("a system/{id} = {{"));
+    let cases = [
+        ((0, block.as_str(), ""), true, "a launch"),
+        ((1, block.as_str(), "failed"), true, "the block, whatever the exit code"),
+        ((0, stranger, ""), false, "a process no job owns"),
+        (
+            (0, gone, "Could not get proc info PID 7: 3: No such process\n"),
+            false,
+            "a dead pid",
+        ),
+        ((0, other_job.as_str(), ""), false, "another job's block"),
+        ((0, inside_a_line.as_str(), ""), false, "the text inside another line"),
+    ];
+    for ((code, stdout, stderr), expected, what) in cases {
+        let (named, script) = names_launch_over(code, stdout, stderr, 7);
+
+        assert_eq!(named.expect("an answer"), expected, "{what}");
+        assert_eq!(script.calls(), [["procinfo", "7"]], "{what}");
+        assert_eq!(
+            script.waits(),
+            [Waited {
+                role: RoleKind::Query,
+                bounded: false
+            }],
+            "{what}"
+        );
+    }
+}
+
+/// A `launchctl` that could not be run is an error, never "not named": the caller ends the run as in doubt
+/// on a "no", and a failure to ask is not that.
+#[skuld::test]
+fn names_launch_is_an_error_when_launchctl_cannot_be_run() {
+    let not_run = ClientError::NotRun(std::io::Error::other("no launchctl").into());
+    let script = Fake::new([fail(&["procinfo"], not_run)]);
+    let launchctl = Launchctl::new(Box::new(script));
+
+    let e = launchctl
+        .names_launch(never_installed().as_str(), 7, &mut reserved(&[Step::Start]))
+        .expect_err("no launchctl to run");
+
+    assert!(matches!(&e, Error::Spawn { .. }), "{e:?}");
+}
+
 /// SIGKILL to the job by label, in the system domain; the signal is named so a failure of the job
 /// is what launchd records, whatever `restart` then does.
 #[skuld::test]

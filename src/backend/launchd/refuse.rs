@@ -113,60 +113,53 @@ pub(crate) fn run_unfollowed(id: &Id, pid: u32) -> Error {
     }
 }
 
-/// The launch `kickstart -p` of a `run` of `id` named started after the `run`'s `debug` and ended with its
-/// program unstarted; `status` is the `wait(2)` status the kernel reported for it, if it did. Determinate:
-/// the program did not run.
-pub(crate) fn run_not_started(id: &Id, status: Option<i32>) -> Error {
+/// The launch of a `run` of `id` started after the `run`'s `debug` and ended before goetia could follow it:
+/// gone at a read, or exited before its first exec. `status` is the `wait(2)` status the watch kept for
+/// the process, where it kept one: the process's, which is not necessarily the program's. The run is
+/// unrecorded; it may have happened.
+pub(crate) fn run_ended_unfollowed(id: &Id, status: Option<i32>) -> Error {
     let status = match status {
-        Some(raw) => exit_of(raw).to_string(),
-        None => "no status was reported".to_string(),
+        Some(raw) => format!(" (the process's status: {})", exit_of(raw)),
+        None => String::new(),
     };
-    Error::RunNotStarted {
-        id: id.to_string(),
-        reason: format!(
-            "its launch ended before its program started ({status}): launchd could not start the program, or a \
-             `goetia daemon stop` or `kill` ended it"
-        ),
-    }
-}
-
-/// The launch of a `run` of `id`, `pid`, started after the `run`'s `debug` and was gone at a read after its
-/// program started. It ended before goetia could follow it, so the run is unrecorded.
-pub(crate) fn run_ended_unfollowed(id: &Id, pid: u32) -> Error {
     Error::RunUnrecorded {
         id: id.to_string(),
         reason: format!(
-            "the launch it started, process {pid}, ended before goetia could follow it: a `goetia daemon stop`, \
-             a `kill` or the system ended it"
+            "its launch ended before goetia could follow it{status}: its program may have failed to start or \
+             exited at once, or a `goetia daemon stop` or `kill` ended it"
         ),
     }
 }
 
 /// `pid`, which `kickstart -p` named for a `run` of `id`, was gone before goetia could watch it or read its
-/// start. Whose launch it was is not known: this run's, or a scheduled run's, so this is in doubt, as a
-/// request goetia lost track of is.
+/// start, or `launchctl procinfo` did not name it as the job's launch: it was another process's. Whose
+/// launch it was is not known: this run's, or a scheduled run's, so this is in doubt, as a request goetia
+/// lost track of is.
 pub(crate) fn run_vanished(id: &Id, pid: u32) -> Error {
     Error::RequestInDoubt {
         request: format!("launchctl kickstart -p system/{id}"),
         reached: true,
         note: Some(format!(
-            "the launch it named, process {pid}, ended before goetia could watch it: it was this run's (its \
-             program may have failed to start, or a `stop` or `kill` ended it), or a scheduled run that was in \
-             flight"
+            "the launch it named, process {pid}, was gone, or its pid was another process's, before goetia \
+             could watch it: if it was gone, it was this run's (its program may have failed to start, or a \
+             `stop` or `kill` ended it), or a scheduled run that was in flight"
         )),
-        source: Box::new(io::Error::new(io::ErrorKind::NotFound, format!("no process {pid}"))),
+        source: Box::new(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("process {pid} was not the job's launch"),
+        )),
     }
 }
 
-/// An interrupt (SIGINT, SIGTERM or SIGHUP) ended goetia's wait for `waiting_for` (`a scheduled run`, `the
-/// start`) of `id`. It is the `source` of a [`stranded_hold`]. True of every wait: it says what goetia sent
-/// after the interrupt, not what had begun before it.
-pub(crate) fn run_interrupted(id: &Id, waiting_for: &str) -> Error {
+/// An interrupt (SIGINT, SIGTERM or SIGHUP) ended the run of `id`; `when` says when it arrived (`while the
+/// job was loaded`, `while goetia waited for a scheduled run`). It is the `source` of a [`stranded_hold`].
+/// True wherever it arrived: it says what goetia sent after the interrupt, not what had begun before it.
+pub(crate) fn run_interrupted(id: &Id, when: &str) -> Error {
     Error::os(
-        format!("wait for {waiting_for} of `{id}`"),
+        format!("start the run of `{id}`"),
         io::Error::new(
             io::ErrorKind::Interrupted,
-            "interrupted by SIGINT, SIGTERM or SIGHUP; goetia sent nothing after it",
+            format!("interrupted by SIGINT, SIGTERM or SIGHUP {when}; goetia sent nothing after it"),
         ),
     )
 }

@@ -117,78 +117,67 @@ fn a_launch_goetia_started_unheld_is_unrecorded_and_names_its_pid() {
     assert!(unfollowed.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
 }
 
-/// A launch of ours that exited before its program started is a run that did not happen, whatever the
-/// kernel said it ended with: determinate, and the status named.
+/// Our launch that ended before goetia could follow it, wherever it ended: unrecorded. The status is the
+/// process's, said where the watch kept one.
 #[skuld::test]
-fn a_launch_that_ended_before_its_program_started_is_not_started_with_its_status() {
-    let code = run_not_started(&frpc(), Some(3 << 8));
-    let signal = run_not_started(&frpc(), Some(9));
-    let unknown = run_not_started(&frpc(), None);
-
+fn a_launch_that_ended_before_it_could_be_followed_is_unrecorded_with_the_process_status() {
     let reason = |status: &str| {
         format!(
-            "its launch ended before its program started ({status}): launchd could not start the program, or a \
-             `goetia daemon stop` or `kill` ended it"
+            "its launch ended before goetia could follow it{status}: its program may have failed to start or \
+             exited at once, or a `goetia daemon stop` or `kill` ended it"
         )
     };
-    for (error, status) in [
-        (&code, "exit code 3"),
-        (&signal, "signal 9"),
-        (&unknown, "no status was reported"),
+    for (gone, status) in [
+        (
+            run_ended_unfollowed(&frpc(), Some(3 << 8)),
+            " (the process's status: exit code 3)",
+        ),
+        (
+            run_ended_unfollowed(&frpc(), Some(9)),
+            " (the process's status: signal 9)",
+        ),
+        (run_ended_unfollowed(&frpc(), None), ""),
     ] {
         assert!(
-            matches!(error, Error::RunNotStarted { id, reason: said } if id == "frpc" && *said == reason(status)),
-            "{error:?}"
+            matches!(&gone, Error::RunUnrecorded { id, reason: said } if id == "frpc" && *said == reason(status)),
+            "{gone:?}"
         );
-        assert!(!error.is_indeterminate(), "goetia established that nothing ran");
+        assert!(gone.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
     }
 }
 
-/// Our launch that was gone at a read after its exec ended before goetia could follow it: unrecorded, and
-/// the pid that was started stays named.
+/// A launch that was gone, or whose pid was another process's, before goetia could watch it is in doubt
+/// whose it was: the request is named, as reached, and the launch's end is not guessed.
 #[skuld::test]
-fn a_launch_that_ended_before_it_could_be_followed_is_unrecorded_and_names_its_pid() {
-    let gone = run_ended_unfollowed(&frpc(), 4242);
-
-    assert!(
-        matches!(&gone, Error::RunUnrecorded { id, reason }
-            if id == "frpc"
-                && reason == "the launch it started, process 4242, ended before goetia could follow it: a \
-                              `goetia daemon stop`, a `kill` or the system ended it"),
-        "{gone:?}"
-    );
-    assert!(gone.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
-}
-
-/// A launch that was gone before goetia could watch it is in doubt whose it was: the request is named, as
-/// reached, and the launch's end is not guessed.
-#[skuld::test]
-fn a_launch_that_was_gone_before_it_could_be_watched_is_in_doubt() {
+fn a_launch_that_was_gone_or_another_process_before_it_could_be_watched_is_in_doubt() {
     let vanished = run_vanished(&frpc(), 4242);
 
     assert!(
         matches!(&vanished, Error::RequestInDoubt { request, reached: true, note: Some(note), .. }
             if request == "launchctl kickstart -p system/frpc"
-                && note == "the launch it named, process 4242, ended before goetia could watch it: it was this \
-                            run's (its program may have failed to start, or a `stop` or `kill` ended it), or a \
-                            scheduled run that was in flight"),
+                && note == "the launch it named, process 4242, was gone, or its pid was another process's, \
+                            before goetia could watch it: if it was gone, it was this run's (its program may \
+                            have failed to start, or a `stop` or `kill` ended it), or a scheduled run that was \
+                            in flight"),
         "{vanished:?}"
     );
     assert!(vanished.is_indeterminate());
 }
 
-/// An interrupt that ended a wait is the cause under the stranded hold, and says what was being waited
-/// for. Its text is true of every wait, the start of a launch included: it says what goetia did after the
-/// interrupt, not what had happened before.
+/// An interrupt that ended the run is the cause under the stranded hold, and says when it arrived. Its text
+/// is true wherever that was, the start of a launch included: it says what goetia did after the interrupt,
+/// not what had happened before.
 #[skuld::test]
-fn an_interrupted_wait_says_what_it_waited_for_and_that_nothing_was_sent_after() {
-    let interrupted = run_interrupted(&frpc(), "a scheduled run");
+fn an_interrupt_says_when_it_arrived_and_that_nothing_was_sent_after() {
+    let interrupted = run_interrupted(&frpc(), "while the job was loaded");
 
-    assert_eq!(interrupted.to_string(), "failed to wait for a scheduled run of `frpc`");
+    assert_eq!(interrupted.to_string(), "failed to start the run of `frpc`");
     assert!(!interrupted.is_indeterminate());
     let report = interrupted.report().to_string();
     assert!(
-        report.contains("interrupted by SIGINT, SIGTERM or SIGHUP; goetia sent nothing after it"),
+        report.contains(
+            "interrupted by SIGINT, SIGTERM or SIGHUP while the job was loaded; goetia sent nothing after it"
+        ),
         "{report}"
     );
     assert!(!report.contains("no run was started"), "a launch may exist: {report}");

@@ -12,21 +12,30 @@
 //! launch got there first: a scheduled run can be in flight, or can have taken a pending hold. So a pass
 //! tells what the pid is from the kernel, not from `print`, which lags the launch ([`super::proc`]). The
 //! pid is registered for its exec and exit, and its start time is read at once (it is read of a process
-//! that is still `xpcproxy` too). Where its program is `xpcproxy` its first exec is waited for, and then
-//! its state is read, which is only a fact of the launch after the exec. A read by pid counts only if the
-//! watch shows no exit for the pid after it: otherwise the process is gone at that read. With `ta` the time
-//! read after the `launchctl debug` process was reaped:
+//! that is still `xpcproxy` too). Then its program's path is read, and `launchctl procinfo` is asked
+//! whether the pid is the job's launch: launchd's own pid-to-job lookup names the launch from the
+//! `xpcproxy` stage on, with no lag, and never a descendant of it, a stranger or a dead pid (KB, "macOS -
+//! launchctl procinfo names a launch's job from the xpcproxy stage on, in every call"). That is asked
+//! before any signal, wait or follow, once per pass: a pid is a number, and what it names can have changed
+//! between `kickstart -p` printing it and goetia reading it. Where the program is `xpcproxy` its first exec
+//! is waited for, and then the state is read, which is only a fact of the launch after the exec. A read by
+//! pid counts only if the watch shows no exit for the pid after it: otherwise the process is gone at that
+//! read. The reads and the rule that decides from them are [`launch_of`], with `ta` the time read after the
+//! `launchctl debug` process was reaped:
 //!
 //! | process | started | the launch is | `run` |
 //! | --- | --- | --- | --- |
 //! | gone at the registration, or at the read of its start | | not known: this run's, or a scheduled run's | ends: [`run_vanished`], in doubt |
-//! | exited before its exec | after `ta` | ours, whose program never started | ends: [`run_not_started`] |
-//! | gone at a later read | after `ta` | ours, which ended before goetia could follow it | ends: [`run_ended_unfollowed`] |
+//! | not named by `launchctl procinfo` | | another process's: not known whose launch ended | ends: [`run_vanished`], in doubt |
+//! | gone at the read of its path, exited before its exec, or gone at the read of its state | after `ta` | ours, which ended before goetia could follow it | ends: [`run_ended_unfollowed`] |
 //! | stopped | after `ta` | the one `debug` held | resumes it, and follows it |
 //! | running | after `ta` | our own `kickstart`'s, with no hold | ends: [`run_unfollowed`] |
-//! | exited before its exec, or gone at a later read | at or before `ta` | an older one, that is over | starts another pass |
+//! | gone, as above | at or before `ta` | an older one, that is over | starts another pass |
 //! | stopped | at or before `ta` | an older one that took a hold | resumes it, waits for its exit, starts another pass |
 //! | running | at or before `ta` | a run in flight | waits for its exit, starts another pass |
+//!
+//! A launch of ours of a task without `logs` whose program cannot be started ends here too, as one that
+//! ended before goetia could follow it (a task with `logs` runs `/bin/sh` first, which starts).
 //!
 //! Another pass is a fresh `debug`: a hold the older launch took is gone, and one it did not take is still
 //! pending and the `debug` is refused as pending (exit 37), which is the same hold. No pass count is
@@ -45,6 +54,11 @@
 //! one starts nothing: it is [`stranded_hold`]. A failure in the window carries it too: a launch that took
 //! the hold waits stopped until `goetia daemon stop` ends it, and a hold no launch has taken is consumed
 //! by the next `goetia daemon run`.
+//!
+//! [`launch_of`]: crate::backend::launchd::state::launch_of
+//! [`run_vanished`]: crate::backend::launchd::refuse::run_vanished
+//! [`run_ended_unfollowed`]: crate::backend::launchd::refuse::run_ended_unfollowed
+//! [`run_unfollowed`]: crate::backend::launchd::refuse::run_unfollowed
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
@@ -56,10 +70,7 @@ use super::watch::{Added, Registered, Watch, Woke};
 use super::{Kickstarted, Launchd, Plist, SignalOutcome, never_expires};
 use crate::backend::bounded::Reservation;
 use crate::backend::launchd::generate::run_marker;
-use crate::backend::launchd::refuse::{
-    run_ended_unfollowed, run_interrupted, run_lost, run_not_started, run_unfollowed, run_unresumed, run_vanished,
-    stranded_hold,
-};
+use crate::backend::launchd::refuse::{run_interrupted, run_lost, run_unresumed, stranded_hold};
 use crate::backend::launchd::state::{Evidence, Launch, Then, exit_of, launch_of};
 use crate::backend::{OutputSource, RunHandle};
 use crate::error::{Error, Result};
@@ -99,14 +110,16 @@ impl RunHandle for Run {
 impl Launchd {
     /// Holds the job's next launch, starts it, and follows its pid to the end; see the module doc.
     ///
-    /// In this order: the kqueue is made, so that failing to make it holds nothing; interrupts are
-    /// deferred; the job is loaded; then passes until one follows a launch. A pass is `debug`, `kickstart
-    /// -p`, the registration and the kernel's account of the pid, and then one of: the log's length read
-    /// and `SIGCONT` of the held launch, `SIGCONT` of an older launch that took a hold and a wait for its
-    /// exit, a wait for a run's exit, or the end of the `run`. The first pass draws on `reservation` (made
-    /// for [`Step::Start`], which the longest first pass stays within: the load, `debug`, `kickstart -p`
-    /// and `SIGCONT`), each later one on its own. A failure of the first `debug`, and an interrupt recorded
-    /// before it (while the job loads), are their own errors: no hold exists. Any later failure is
+    /// In this order: interrupts are deferred; the kqueue is made, so that failing to make it holds
+    /// nothing, and after the deferral, so that a signal that came before it, and that the earlier
+    /// disposition handled or ignored, is none of this run's interrupts; the job is loaded; then passes
+    /// until one follows a launch. A pass is `debug`, `kickstart -p`, the registration and the kernel's
+    /// account of the pid, and then one of: the log's length read and `SIGCONT` of the held launch,
+    /// `SIGCONT` of an older launch that took a hold and a wait for its exit, a wait for a run's exit, or
+    /// the end of the `run`. The first pass draws on `reservation` (made for [`Step::Start`], which the
+    /// longest first pass stays within: the load, `debug`, `kickstart -p`, `launchctl procinfo` and
+    /// `SIGCONT`), each later one on its own. A failure of the first `debug`, and an interrupt recorded
+    /// before it (while the job is loaded), are their own errors: no hold exists. Any later failure is
     /// [`stranded_hold`].
     pub(super) fn begin_task_run(
         &self,
@@ -117,8 +130,8 @@ impl Launchd {
         let path = snapshot.job()?.location.path.clone();
         let Plist { id, blob, .. } = snapshot;
         let logs = blob.map_err(Error::Kept)?.spec.common().logs.clone();
-        let watch = Watch::new_interruptible()?;
         let window = Deferred::begin()?;
+        let watch = Watch::new_interruptible()?;
         self.launchctl.load_job(id.as_str(), &path, reservation)?;
 
         let mut attempt = Attempt {
@@ -168,8 +181,12 @@ impl Attempt<'_> {
         // An interrupt recorded while the job loaded, or that arrived while an earlier pass waited and its
         // exit came with it: nothing is started after it.
         if self.watch.interrupted(self.window) {
-            let waited_for = if first { "the load" } else { "a scheduled run" };
-            return Err(before_debug(run_interrupted(id, waited_for)));
+            let when = if first {
+                "while the job was loaded"
+            } else {
+                "while goetia waited for a scheduled run"
+            };
+            return Err(before_debug(run_interrupted(id, when)));
         }
 
         let ta = self
@@ -190,17 +207,17 @@ impl Attempt<'_> {
             )));
         };
 
-        // Registered before anything reads the pid: what happens to it from here on is an event.
-        let Added::Watching(registered) = self.watch.add_launch(pid).map_err(strand)? else {
-            return Err(strand(run_vanished(id, pid)));
+        // Registered before anything reads the pid: what happens to it from here on is an event. A pid that
+        // is gone at the registration is a launch with no start time.
+        let (launch, registered) = match self.watch.add_launch(pid).map_err(strand)? {
+            Added::Gone => (launch_of(None, ta, id, pid), None),
+            Added::Watching(registered) => (self.read_launch(pid, ta, &registered, reservation)?, Some(registered)),
         };
-        match self.read_launch(pid, ta, &registered)? {
-            Launch::Lost => Err(strand(run_vanished(id, pid))),
-            Launch::Ended => Ok(None),
-            Launch::NotStarted(status) => Err(run_not_started(id, status)),
-            Launch::Unrecorded => Err(run_ended_unfollowed(id, pid)),
-            Launch::Held => self.resume(pid, registered, reservation).map(Some),
-            Launch::TookHold => {
+        match (launch, registered) {
+            (Launch::Ends(error), _) => Err(error),
+            (Launch::Ended, _) => Ok(None),
+            (Launch::Held, Some(registered)) => self.resume(pid, registered, reservation).map(Some),
+            (Launch::TookHold, Some(registered)) => {
                 // Whether the launch is still the label's does not matter: it is waited for either way.
                 self.launchd
                     .launchctl
@@ -208,59 +225,73 @@ impl Attempt<'_> {
                     .map_err(strand)?;
                 self.wait_for_exit(registered)
             }
-            Launch::InFlight => self.wait_for_exit(registered),
-            Launch::Unheld => Err(run_unfollowed(id, pid)),
+            (Launch::InFlight, Some(registered)) => self.wait_for_exit(registered),
+            (Launch::Held | Launch::TookHold | Launch::InFlight, None) => {
+                unreachable!("a launch that is followed was registered: with no start time the run ends")
+            }
         }
     }
 
     /// The [`Launch`] `pid` is, from the kernel: its start time is read at once, and [`Self::then_of`] says
-    /// what became of it. [`Launch::Lost`] where there is no process at the start time's read.
-    fn read_launch(&self, pid: u32, ta: u64, registered: &Registered) -> Result<Launch> {
-        let Some(started) = self.seen(pid, registered, proc::started)? else {
-            return Ok(Launch::Lost);
+    /// what became of it. A pid with no process at the start time's read has no start time.
+    fn read_launch(&self, pid: u32, ta: u64, registered: &Registered, reservation: &mut Reservation) -> Result<Launch> {
+        let started = self.seen(registered, || kernel(pid, proc::started))?;
+        let started = match started {
+            Some(started) => Some((started, self.then_of(pid, registered, reservation)?)),
+            None => None,
         };
-        Ok(launch_of(self.then_of(pid, registered)?, started, ta))
+        Ok(launch_of(started, ta, self.id, pid))
     }
 
-    /// What became of `pid` after its start time was read. Where its program is `xpcproxy` its first exec
-    /// is waited for, under no bound: the exec is certain to come (measured), and from it the process is
-    /// stopped if it is held. A launch that exits before it execs is [`Then::ExitedBeforeExec`], with its
-    /// status, which only a path read before the exit counts toward.
-    fn then_of(&self, pid: u32, registered: &Registered) -> Result<Then> {
+    /// What the reads of `pid` show after its start time was read. Its program's path is read together with
+    /// `launchctl procinfo`'s answer to whether it is the job's launch, before anything else: a pid that is
+    /// not is [`Then::Stranger`] and nothing more is read or waited for. Where the program is `xpcproxy`
+    /// its first exec is waited for, under no bound: the exec is certain to come (measured), and from it the
+    /// process is stopped if it is held. A launch that exits before it execs is [`Then::Gone`], with its
+    /// status.
+    fn then_of(&self, pid: u32, registered: &Registered, reservation: &mut Reservation) -> Result<Then> {
         let id = self.id;
         let strand = |e: Error| stranded_hold(id, e);
-        let Some(path) = self.seen(pid, registered, proc::path_of)? else {
-            return Ok(Then::Gone);
+        let Some((path, named)) = self.seen(registered, || {
+            let Some(path) = kernel(pid, proc::path_of)? else {
+                return Ok(None);
+            };
+            let named = self.launchd.launchctl.names_launch(id.as_str(), pid, reservation)?;
+            Ok(Some((path, named)))
+        })?
+        else {
+            return Ok(Then::Gone(None));
         };
+        if !named {
+            return Ok(Then::Stranger);
+        }
         if path.file_name() == Some(OsStr::new("xpcproxy")) {
             match registered.first_exec(self.window).map_err(strand)? {
                 Woke::Exec => {}
-                Woke::Exited(status) => return Ok(Then::ExitedBeforeExec(status)),
-                Woke::Interrupted => return Err(strand(run_interrupted(id, "the start"))),
+                Woke::Exited(status) => return Ok(Then::Gone(status)),
+                Woke::Interrupted => {
+                    return Err(strand(run_interrupted(
+                        id,
+                        "while goetia waited for the launch to exec its program",
+                    )));
+                }
             }
         }
-        Ok(match self.seen(pid, registered, proc::stopped)? {
+        Ok(match self.seen(registered, || kernel(pid, proc::stopped))? {
             Some(stopped) => Then::Process { stopped },
-            None => Then::Gone,
+            None => Then::Gone(None),
         })
     }
 
-    /// What `read` says of `pid`, where it counts: `None` where there is no such process, and where the
-    /// watch shows an exit of `pid` after the read, as the pid may be another process's by then.
-    fn seen<T>(
-        &self,
-        pid: u32,
-        registered: &Registered,
-        read: impl FnOnce(u32) -> io::Result<Option<T>>,
-    ) -> Result<Option<T>> {
+    /// What `reads` say of the pid `registered` watches, where they count: `None` where there is no such
+    /// process, and where the watch shows an exit of the pid after the reads, as the pid may be another
+    /// process's by then. The reads are made together and checked once: an exit is no later than its event,
+    /// and until the pid is reaped it names no other process, so a check that shows none after the last
+    /// read covers every read before it. A read that fails is the stranded hold.
+    fn seen<T>(&self, registered: &Registered, reads: impl FnOnce() -> Result<Option<T>>) -> Result<Option<T>> {
         let id = self.id;
         let strand = |e: Error| stranded_hold(id, e);
-        let value = read(pid).map_err(|source| {
-            strand(Error::os(
-                format!("read what the kernel shows of process {pid}"),
-                source,
-            ))
-        })?;
+        let value = reads().map_err(strand)?;
         if value.is_some() && registered.has_exited().map_err(strand)? {
             return Ok(None);
         }
@@ -273,7 +304,10 @@ impl Attempt<'_> {
         let id = self.id;
         self.note();
         match registered.exit(self.window).map_err(|e| stranded_hold(id, e))? {
-            Woke::Interrupted => Err(stranded_hold(id, run_interrupted(id, "a scheduled run"))),
+            Woke::Interrupted => Err(stranded_hold(
+                id,
+                run_interrupted(id, "while goetia waited for a scheduled run"),
+            )),
             Woke::Exited(_) | Woke::Exec => Ok(None),
         }
     }
@@ -321,6 +355,11 @@ impl Attempt<'_> {
             SignalOutcome::NoProcess => Err(run_unresumed(id)),
         }
     }
+}
+
+/// What the kernel shows of `pid` through `read`, a read of [`proc`]: its failure said as the run's.
+fn kernel<T>(pid: u32, read: impl FnOnce(u32) -> io::Result<Option<T>>) -> Result<Option<T>> {
+    read(pid).map_err(|source| Error::os(format!("read what the kernel shows of process {pid}"), source))
 }
 
 /// What `run` could not establish of the launch it started, `why`: the start was accepted and its state is

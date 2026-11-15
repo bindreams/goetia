@@ -3,7 +3,9 @@
 //! tests run on every host this crate builds on, not only macOS.
 
 use super::*;
+use crate::cli::ExitCode;
 use crate::manager::{Exit, State};
+use crate::spec::Id;
 
 /// A `launchctl print` body shaped like the real thing: tab-indented
 /// `key = value` lines, with header fields (`active count`, `path`, `type`)
@@ -353,6 +355,29 @@ fn exit_of_decodes_exited_and_signalled() {
 // launch_of -----------------------------------------------------------------------------------------------------------
 
 const TA: u64 = 1_000;
+const PID: u32 = 4242;
+
+fn id() -> Id {
+    Id::try_from("frpc").expect("an id")
+}
+
+/// `launch_of` of a process that started at `started` and then stood as `then`.
+fn launch(then: Then, started: u64) -> Launch {
+    launch_of(Some((started, then)), TA, &id(), PID)
+}
+
+/// The error a launch that ends the run carries.
+fn ends(launch: Launch) -> Error {
+    match launch {
+        Launch::Ends(error) => error,
+        other => panic!("the run was to end, got {other:?}"),
+    }
+}
+
+/// Whether `error` is the stranded hold, which says a hold is pending.
+fn is_stranded(error: &Error) -> bool {
+    matches!(error, Error::Step { what, .. } if what.starts_with("`launchctl debug` held the next launch of `frpc`"))
+}
 
 /// A process that is alive after its exec is told by two kernel facts: whether it is stopped, and whether
 /// it started after `ta`, the time read after our `debug` returned. Stopped is a held launch, and one that
@@ -360,48 +385,97 @@ const TA: u64 = 1_000;
 #[skuld::test]
 fn launch_of_tells_our_held_launch_from_an_older_one_taking_a_hold_or_not() {
     let alive = |stopped| Then::Process { stopped };
-    assert_eq!(launch_of(alive(true), TA + 1, TA), Launch::Held);
-    assert_eq!(
-        launch_of(alive(true), TA, TA),
-        Launch::TookHold,
+    assert!(matches!(launch(alive(true), TA + 1), Launch::Held));
+    assert!(
+        matches!(launch(alive(true), TA), Launch::TookHold),
         "a start at ta is not after it"
     );
-    assert_eq!(launch_of(alive(true), TA - 1, TA), Launch::TookHold);
-    assert_eq!(launch_of(alive(false), TA, TA), Launch::InFlight);
-    assert_eq!(launch_of(alive(false), 1, TA), Launch::InFlight);
-    assert_eq!(launch_of(alive(false), TA + 1, TA), Launch::Unheld);
+    assert!(matches!(launch(alive(true), TA - 1), Launch::TookHold));
+    assert!(matches!(launch(alive(false), TA), Launch::InFlight));
+    assert!(matches!(launch(alive(false), 1), Launch::InFlight));
+}
+
+/// Our own launch that is running and not held was started by our `kickstart` with no hold on it: not
+/// followed, and no hold is pending, so nothing is stranded.
+#[skuld::test]
+fn our_launch_that_is_running_is_unfollowed_and_strands_nothing() {
+    let e = ends(launch(Then::Process { stopped: false }, TA + 1));
+
+    assert!(!is_stranded(&e), "{e:?}");
+    assert!(
+        matches!(&e, Error::RunUnrecorded { id, reason }
+            if id == "frpc" && reason.contains(&format!("launched process {PID} with no hold on it"))),
+        "{e:?}"
+    );
+    assert_eq!(ExitCode::of(&e), ExitCode::Indeterminate);
 }
 
 /// A launch that started at or before `ta` is not this run's, so however it ended, `run` makes another
 /// pass: it never ends the run.
 #[skuld::test]
-fn an_older_launch_that_is_gone_or_exits_before_its_exec_starts_another_pass() {
+fn an_older_launch_that_is_gone_starts_another_pass() {
     for started in [1, TA - 1, TA] {
-        assert_eq!(
-            launch_of(Then::Gone, started, TA),
-            Launch::Ended,
-            "gone, started at {started}"
-        );
-        assert_eq!(
-            launch_of(Then::ExitedBeforeExec(Some(3 << 8)), started, TA),
-            Launch::Ended,
-            "exited before its exec, started at {started}"
-        );
+        for status in [None, Some(3 << 8)] {
+            assert!(
+                matches!(launch(Then::Gone(status), started), Launch::Ended),
+                "gone with {status:?}, started at {started}"
+            );
+        }
     }
 }
 
-/// A launch that started after `ta` is `run`'s own: one that exits before its exec did not start its
-/// program, with the status it exited with, and one that is gone at a later read ended before goetia could
-/// follow it. Neither starts another pass.
+/// A launch that started after `ta` is `run`'s own: gone at the path read, exited before its first exec
+/// or gone at the stopped read, it ended before goetia could follow it. It is one error whichever it was,
+/// with the status of the process where the watch kept one, and not the stranded hold: a launch that ends
+/// in `xpcproxy` consumes the hold it took (KB, "macOS - A held launch killed in xpcproxy consumes its hold,
+/// and the next launch is not held").
 #[skuld::test]
-fn our_launch_that_exits_before_its_exec_did_not_start_and_one_that_is_gone_is_unrecorded() {
-    assert_eq!(
-        launch_of(Then::ExitedBeforeExec(Some(3 << 8)), TA + 1, TA),
-        Launch::NotStarted(Some(3 << 8))
+fn our_launch_that_is_gone_ended_before_goetia_could_follow_it() {
+    for (status, said) in [
+        (None, ""),
+        (Some(3 << 8), " (the process's status: exit code 3)"),
+        (Some(9), " (the process's status: signal 9)"),
+    ] {
+        let e = ends(launch(Then::Gone(status), TA + 1));
+
+        assert!(!is_stranded(&e), "{e:?}");
+        let expected = format!("its launch ended before goetia could follow it{said}: ");
+        assert!(
+            matches!(&e, Error::RunUnrecorded { id, reason } if id == "frpc" && reason.starts_with(&expected)),
+            "{e:?}"
+        );
+        assert_eq!(ExitCode::of(&e), ExitCode::Indeterminate);
+    }
+}
+
+/// No start time: the pid was gone when it was registered, or at the read of its start. Whose launch it was
+/// is not known, so the run ends in doubt, in the stranded hold.
+#[skuld::test]
+fn a_launch_with_no_start_time_is_in_doubt_in_the_stranded_hold() {
+    let e = ends(launch_of(None, TA, &id(), PID));
+
+    assert!(is_stranded(&e), "{e:?}");
+    assert!(
+        matches!(&e, Error::Step { source, .. }
+            if matches!(&**source, Error::RequestInDoubt { request, reached: true, .. }
+                if request == "launchctl kickstart -p system/frpc")),
+        "{e:?}"
     );
-    assert_eq!(
-        launch_of(Then::ExitedBeforeExec(None), TA + 1, TA),
-        Launch::NotStarted(None)
-    );
-    assert_eq!(launch_of(Then::Gone, TA + 1, TA), Launch::Unrecorded);
+    assert_eq!(ExitCode::of(&e), ExitCode::Indeterminate);
+}
+
+/// A pid `launchctl procinfo` does not name as the job's launch is another process's: the same end as a
+/// pid that was gone, whenever it started and whether or not it is stopped.
+#[skuld::test]
+fn a_pid_that_is_another_process_is_in_doubt_in_the_stranded_hold() {
+    for started in [1, TA, TA + 1] {
+        let e = ends(launch(Then::Stranger, started));
+
+        assert!(is_stranded(&e), "started at {started}: {e:?}");
+        assert!(
+            matches!(&e, Error::Step { source, .. } if matches!(**source, Error::RequestInDoubt { .. })),
+            "{e:?}"
+        );
+        assert_eq!(ExitCode::of(&e), ExitCode::Indeterminate);
+    }
 }

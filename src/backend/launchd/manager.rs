@@ -1121,6 +1121,27 @@ impl Launchctl {
         }
     }
 
+    /// Whether `launchctl procinfo <pid>` names `pid` as the launch of the job `id`: its output has the
+    /// job's block, the line `system/<id> = {`. launchd's own pid-to-job lookup answers it, from the
+    /// `xpcproxy` stage on and with no lag, for the launch and never for a descendant, a stranger or a
+    /// dead pid (KB, "macOS - launchctl procinfo names a launch's job from the xpcproxy stage on, in every
+    /// call"). Its exit code is 0 for all of those and says nothing, and its stderr is noise: only the
+    /// text is read. A `pid` of a process that is not the launch, or is gone, is `false`; `launchctl`
+    /// that cannot be run is an `Err`. Unbounded, as [`Self::signal`] is; a read, with no reaper.
+    fn names_launch(&self, id: &str, pid: u32, reservation: &mut Reservation) -> Result<bool> {
+        let pid = pid.to_string();
+        let args = ["procinfo", pid.as_str()];
+        let Finished::Exited { capture, .. } = self.run(&args, Budget::Unbounded.start(), Role::Query, reservation)?
+        else {
+            unreachable!("a call under an unbounded deadline never expires")
+        };
+        debug_assert!(capture.complete, "a read under an unbounded deadline is whole");
+        let block = format!("system/{id} = {{");
+        Ok(String::from_utf8_lossy(&capture.stdout)
+            .lines()
+            .any(|line| line == block))
+    }
+
     /// `launchctl debug <id> --start-suspended`: the next launch of the job starts stopped, whoever starts
     /// it, and stays so until it is sent SIGCONT. One launch only, and a hold already pending (exit 37) is
     /// not replaced, so what holds the next launch is one hold either way, and both answer `Ok`. Unbounded,
@@ -1247,10 +1268,11 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 ///
 /// `install`, `uninstall` and `kill` have a service's count and a task's (see `write`); [`needs`] takes the
 /// larger, since a reservation is made before the kind is known. A task's `run` draws within `start`'s
-/// count: a pass is the `debug`, the `kickstart -p` and one `SIGCONT` (the resume, or the release of an
-/// older launch that took a hold), 3 calls and 3 reapers, and the first pass is preceded by the load (a
-/// kept read and wait, the `bootstrap`, one more read), 6 calls and 4 reapers. Each pass after the first
-/// makes its own reservation, of a start's, before its `debug`.
+/// count: a pass is the `debug`, the `kickstart -p`, the `procinfo` that names the launch's pid (a read,
+/// with no reaper) and one `SIGCONT` (the resume, or the release of an older launch that took a hold), 4
+/// calls and 3 reapers, and the first pass is preceded by the load (a kept read and wait, the `bootstrap`,
+/// one more read), 7 calls and 4 reapers. Each pass after the first makes its own reservation, of a
+/// start's, before its `debug`.
 const SERVICE_INSTALL_REQUESTS: usize = 1;
 /// A task's longest `install`, an update of an armed task whose job changes: the timer's `bootout`,
 /// the job's, and both `bootstrap`s. A stray timer label's `bootout` is the timer's: a plan boots out
