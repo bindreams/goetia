@@ -354,6 +354,13 @@ fn launched(watch: &Watch, pid: u32) -> Registered {
     }
 }
 
+/// An interrupt sent to this process, not to this thread: a kqueue has its event for the first only, which
+/// is what a terminal's or a service manager's interrupt is. (`raise` is thread-directed.)
+fn send_interrupt() {
+    // SAFETY: `kill` takes plain integers, and every signal sent here has a handler.
+    assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGINT) }, 0, "send SIGINT");
+}
+
 fn raise_interrupt() {
     // SAFETY: `raise` takes a valid signal number, and the window's handler is in place.
     assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0, "raise SIGINT");
@@ -438,16 +445,25 @@ fn an_interrupt_during_a_wait_wakes_it() {
     sending.join().expect("the sender's thread");
 }
 
+/// Sends an interrupt and waits until the stand-in handler has run for it: the handler that is there when
+/// it is delivered, which is not the window's, so the window records nothing of it.
+fn interrupt_before_a_window(stand_in: &StandIn) {
+    send_interrupt();
+    while stand_in.seen() == 0 {
+        std::thread::yield_now();
+    }
+}
+
 /// A signal whose event a read took out of the queue before the window's handler recorded it is not lost:
 /// the watch has it. The signal arrives before a window is open, so the queue has its event and the record
 /// has nothing; a poll then reads the event.
 #[skuld::test]
 fn a_signal_event_read_by_a_poll_is_still_an_interrupt() {
-    let _stand_in = StandIn::install();
+    let stand_in = StandIn::install();
     let watch = Watch::new_interruptible().expect("a kqueue");
     let child = Held::new(0);
     let registered = launched(&watch, child.pid());
-    raise_interrupt();
+    interrupt_before_a_window(&stand_in);
     let window = Deferred::begin().expect("begin the window");
     assert!(!window.interrupted(), "the handler recorded nothing");
 
@@ -460,12 +476,12 @@ fn a_signal_event_read_by_a_poll_is_still_an_interrupt() {
 /// The same for an event that the drop of another registration drained.
 #[skuld::test]
 fn a_signal_event_drained_by_a_dropped_registration_is_still_an_interrupt() {
-    let _stand_in = StandIn::install();
+    let stand_in = StandIn::install();
     let watch = Watch::new_interruptible().expect("a kqueue");
     let (child, other) = (Held::new(0), Held::new(0));
     let dropped = launched(&watch, other.pid());
     let registered = launched(&watch, child.pid());
-    raise_interrupt();
+    interrupt_before_a_window(&stand_in);
     let window = Deferred::begin().expect("begin the window");
     assert!(!window.interrupted(), "the handler recorded nothing");
 
