@@ -275,14 +275,15 @@ impl<W: Window> Registered<W> {
     /// reported at once.
     pub(crate) fn wait(self, deadline: Option<Deadline>) -> Result<Option<i32>> {
         let pid = self.pid;
-        match self.next(false, None, deadline)? {
-            Some(Woke::Exited(Some(status))) => Ok(Some(status)),
-            Some(Woke::Exited(None)) => Err(Error::os(
+        match self.wait_for_exit(deadline)? {
+            Some(Exited {
+                status: Some(status), ..
+            }) => Ok(Some(status)),
+            Some(Exited { status: None, .. }) => Err(Error::os(
                 format!("wait for process {pid} to exit"),
                 io::Error::other("the kernel reported its exit without its status"),
             )),
             None => Ok(None),
-            Some(Woke::Exec | Woke::Interrupted(_)) => unreachable!("neither was waited for"),
         }
     }
 
@@ -291,10 +292,11 @@ impl<W: Window> Registered<W> {
     /// an exit.
     pub(crate) fn wait_for_exit(self, deadline: Option<Deadline>) -> Result<Option<Exited>> {
         let pid = self.pid;
-        Ok(self.wait(deadline)?.map(|status| Exited {
-            pid,
-            status: Some(status),
-        }))
+        match self.next(false, None, deadline)? {
+            Some(Woke::Exited(status)) => Ok(Some(Exited { pid, status })),
+            None => Ok(None),
+            Some(Woke::Exec | Woke::Interrupted(_)) => unreachable!("neither was waited for"),
+        }
     }
 
     /// Lets go of the registration's hold on the window, which the registration of a launch that has been

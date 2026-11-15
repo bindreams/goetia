@@ -408,7 +408,7 @@ fn waited_out(
             // breaks under its writer.
             return Ok(Finished::Left(Left::new(move |fate| {
                 if fate == Fate::Kill
-                    && let Some(warning) = end_left(&child, EXIT_AFTER_REFUSED_KILL)
+                    && let Some(warning) = end_left(&child, refused_for)
                 {
                     eprintln!("{warning}");
                 }
@@ -506,9 +506,9 @@ fn refused_kill(
 }
 
 /// Whether the child `pid` has exited within `bound`, seen without reaping it: a kqueue watch of its
-/// exit ([`Watch`]). `pid` is goetia's own child and not reaped, so it names no other
-/// process; one the kernel has no process for (`Added::Gone`) has exited. `Err` says what failed,
-/// worded for [`KillRefused`].
+/// exit ([`Watch`]), and a check of the kernel for an exit the watch missed ([`exit_after`]). `pid` is
+/// goetia's own child and not reaped, so it names no other process; one the kernel has no process for
+/// (`Added::Gone`) has exited. `Err` says what failed, worded for [`KillRefused`].
 ///
 /// `bound` is a failure bound on another process's exit, surfaced to a human, not a wait for it to
 /// do something: a child that is exiting is seen at once, and one still there after refusing the
@@ -521,25 +521,53 @@ fn exit_within(pid: u32, bound: Duration) -> Result<bool, String> {
     exit_after(added, bound, || exited_unreaped(pid))
 }
 
+/// [`exit_within`] once the pid is registered. The exit may have fired before the registration, which
+/// may leave the queue no event to report, and the child is goetia's own and not reaped, so `peek`
+/// (whether it has exited, [`exited_unreaped`]) is exact: it is asked once after the registration and
+/// once more when `bound` expires, and what it finds is the exit. The queue is waited on in between. An
+/// exit the kernel reports without its status is an exit.
 #[cfg(target_os = "macos")]
-fn exit_after(
-    added: Added<Unwoken>,
-    bound: Duration,
-    _peek: impl Fn() -> Result<bool, String>,
-) -> Result<bool, String> {
+fn exit_after(added: Added<Unwoken>, bound: Duration, peek: impl Fn() -> Result<bool, String>) -> Result<bool, String> {
     let report = |e: crate::error::Error| format!("watching for its exit failed: {}", e.report());
-    match added {
-        Added::Gone => Ok(true),
-        Added::Watching(registered) => registered
-            .wait_for_exit(Some(Budget::Bounded(bound).start()))
-            .map(|exited| exited.is_some())
-            .map_err(report),
+    let Added::Watching(registered) = added else {
+        return Ok(true);
+    };
+    if peek()? {
+        return Ok(true);
+    }
+    match registered
+        .wait_for_exit(Some(Budget::Bounded(bound).start()))
+        .map_err(report)?
+    {
+        Some(_) => Ok(true),
+        None => peek(),
     }
 }
 
+/// Whether the child `pid` of this process has exited and is not reaped, asked of the kernel without
+/// reaping it (`waitid` with `WNOWAIT`). `Err` for a pid that is not such a child, worded for
+/// [`KillRefused`].
 #[cfg(target_os = "macos")]
-fn exited_unreaped(_pid: u32) -> Result<bool, String> {
-    Ok(false)
+fn exited_unreaped(pid: u32) -> Result<bool, String> {
+    // SAFETY: an all-zero `siginfo_t` is a valid place for `waitid` to fill, and `waitid` reads nothing
+    // else. `WNOHANG` leaves it zeroed for a child that has not exited, and `WNOWAIT` leaves one that
+    // has waitable.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let waited = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        if waited != 0 {
+            return Err(format!(
+                "asking whether it had exited failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(info.si_pid != 0)
+    }
 }
 
 /// Whether `e` is the `EPERM` a child on its way out gives, bare or as cosca wraps it (macOS reads
