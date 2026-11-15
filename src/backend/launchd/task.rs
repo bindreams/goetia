@@ -146,13 +146,19 @@ pub(crate) struct Old {
     pub(crate) scheduled: bool,
 }
 
+/// Where a task is enabled: its timer's directory, and the job's for a task with no timer. Each argument
+/// is whether that plist, where there is one, is in the enabled directory.
+pub(crate) fn enabled_in(timer: Option<bool>, job: Option<bool>) -> bool {
+    timer.or(job).unwrap_or(false)
+}
+
 impl Old {
-    /// Where a task is enabled: its timer's directory, and the job's for a task with no timer.
+    /// Where a task is enabled (see [`enabled_in`]).
     pub(crate) fn enabled(&self) -> bool {
-        self.timer
-            .as_ref()
-            .or(self.job.as_ref())
-            .is_some_and(|plist| plist.enabled)
+        enabled_in(
+            self.timer.as_ref().map(|t| t.enabled),
+            self.job.as_ref().map(|j| j.enabled),
+        )
     }
 }
 

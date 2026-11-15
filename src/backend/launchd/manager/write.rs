@@ -17,7 +17,7 @@ use tempfile::NamedTempFile;
 
 use super::{
     Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, ensure_dir, move_no_clobber, never_expires,
-    persist_new, persist_new_unraced, persist_over, prepare_parent_dirs, read_artifact, resolve_account,
+    persist_new, persist_new_unraced, persist_over, plist_in, prepare_parent_dirs, read_artifact, resolve_account,
     staged_tempfile, still_present,
 };
 use crate::backend::bounded::Reservation;
@@ -29,11 +29,6 @@ use crate::decide::Outcome;
 use crate::error::{Error, Result};
 use crate::manager::Budget;
 use crate::spec::{DaemonKind, DaemonSpec, Id};
-
-/// `<stem>.plist` in `dir`.
-fn plist_in(dir: &Path, stem: &str) -> PathBuf {
-    dir.join(format!("{stem}.plist"))
-}
 
 impl Launchd {
     /// `install` of a task (or of a daemon that becomes or stops being one), over `dirs`.

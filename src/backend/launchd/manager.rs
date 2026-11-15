@@ -76,6 +76,7 @@ use crate::backend::bounded::{self, Finished, Kept, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
 use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::state::Evidence;
+use crate::backend::launchd::task::enabled_in;
 use crate::backend::launchd::{generate, refuse, state};
 use crate::backend::{
     self, Decoded, Identity, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, WriteOutcome,
@@ -117,12 +118,17 @@ impl Default for Launchd {
 
 // Paths and discovery =================================================================================================
 
+/// `<stem>.plist` in `dir`: the one place a plist's file name is built.
+fn plist_in(dir: &Path, stem: &str) -> PathBuf {
+    dir.join(format!("{stem}.plist"))
+}
+
 fn staging_path(id: &str) -> PathBuf {
-    Path::new(STAGING_DIR).join(format!("{id}.plist"))
+    plist_in(Path::new(STAGING_DIR), id)
 }
 
 fn enabled_path(id: &str) -> PathBuf {
-    Path::new(ENABLED_DIR).join(format!("{id}.plist"))
+    plist_in(Path::new(ENABLED_DIR), id)
 }
 
 fn target(id: &str) -> String {
@@ -176,7 +182,7 @@ fn occupied(path: &Path) -> Presence {
 /// `disable` move, never copy), but a hand-edit or a crash mid-move could; preferring one would
 /// make the other's content vanish from every command, so both paths are named instead.
 fn locate(dirs: Dirs, id: &str, stem: &str) -> Result<Option<Location>> {
-    let path = |(dir, _): (&str, bool)| Path::new(dir).join(format!("{stem}.plist"));
+    let path = |(dir, _): (&str, bool)| plist_in(Path::new(dir), stem);
     let (staging, enabled) = (path(dirs[0]), path(dirs[1]));
     match (occupied(&staging), occupied(&enabled)) {
         // One unresolved probe leaves the pair unresolved: each remaining answer claims something
@@ -385,6 +391,14 @@ impl Plist {
 
     fn is_task(&self) -> bool {
         matches!(&self.blob, Ok(blob) if blob.spec.kind() == DaemonKind::Task)
+    }
+
+    /// Where a task is enabled: see [`enabled_in`].
+    fn enabled(&self) -> bool {
+        enabled_in(
+            self.timer.as_ref().map(|artifact| artifact.location.enabled),
+            self.job.as_ref().map(|artifact| artifact.location.enabled),
+        )
     }
 
     /// The kind the verbs that start, stop, kill, enable and disable treat the id as: what the job's

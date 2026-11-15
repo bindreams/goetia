@@ -340,11 +340,7 @@ impl Launchd {
             Role::UncountedQuery,
             &mut Reservation::default(),
         )?;
-        let enabled = snapshot
-            .timer
-            .as_ref()
-            .or(snapshot.job.as_ref())
-            .is_some_and(|artifact| artifact.location.enabled);
+        let enabled = snapshot.enabled();
         // A timer in the enabled directory that launchd does not hold (an `enable` or an install that
         // stopped before loading it) fires nothing, as a systemd timer that is not active has no next
         // elapse.
