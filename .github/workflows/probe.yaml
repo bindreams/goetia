@@ -16,10 +16,8 @@ jobs:
       matrix:
         args:
           - ident held plain late 300 fresh
-          - ident held wrap late 300 fresh
-          - ident unheld plain late 300 fresh
           - ident unheld wrap late 300 fresh
-          - ident held plain late 200
+          - desc 200
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

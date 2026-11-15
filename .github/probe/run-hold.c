@@ -292,7 +292,11 @@ static void write_plist_for(const char *label, const char *path, int wrap, const
         arg_xml(f, "-c");
         arg_xml(f, "printf '%s %08x\\n' goetia-run $$; exec \"$0\" \"$@\"");
     }
-    if (!strcmp(prog, "true")) {
+    if (!strcmp(prog, "fork")) { /* the job's program starts a child and waits: a descendant of the launch */
+        arg_xml(f, "/bin/sh");
+        arg_xml(f, "-c");
+        arg_xml(f, "/bin/sleep 600 & wait");
+    } else if (!strcmp(prog, "true")) {
         arg_xml(f, "/usr/bin/true");
     } else {
         arg_xml(f, "/bin/sleep");
@@ -911,8 +915,9 @@ static void procinfo(const char *what, pid_t pid) {
     int sa = bsd_stat_of(pid, &e);
     path_base(pid, pa, sizeof pa);
     int lab = strstr(c.out, LABEL) || strstr(c.err, LABEL);
-    if (tally("I1 procinfo of %s (path %s -> %s; state %s -> %s): exit %d, label named %s, stdout %s, stderr %s", what, pb, pa, sname(sb), sname(sa), c.code,
-              lab ? "YES" : "no", c.out[0] ? "non-empty" : "empty", c.err[0] ? "non-empty" : "empty"))
+    int blk = strstr(c.out, "system/" LABEL " = {") != NULL;
+    if (tally("I1 procinfo of %s (path %s -> %s; state %s -> %s): exit %d, label %s, job block %s, stdout %s, stderr %s", what, pb, pa, sname(sb), sname(sa),
+              c.code, lab ? "YES" : "no", blk ? "YES" : "no", c.out[0] ? "non-empty" : "empty", c.err[0] ? "non-empty" : "empty"))
         say("----- procinfo output, first of [%s, path %s -> %s, exit %d] -----\n%s----- stderr -----\n%s-----", what, pb, pa, c.code, c.out, c.err);
 }
 
@@ -1131,6 +1136,32 @@ static void run_coal(int passes) {
     uninstall();
 }
 
+/* A descendant of the launch (the job's sh waits on a sleep child): what do procinfo and the coalition say of it? */
+static void desc_pass(int i) {
+    struct cmd c;
+    char seq[160];
+    pid_t pid = launch_to_exec(SYS);
+    if (pid < 0) return;
+    pid_t kids[8];
+    int n;
+    do n = proc_listchildpids(pid, kids, sizeof kids) > 0; /* bytes or a count, by OS version: only "any child" is used */
+    while (!n && kill(pid, 0) == 0);
+    if (n <= 0) {
+        anom("pass %d: launch %d ended before a child showed", i, pid);
+        return;
+    }
+    pid_t kid = kids[0];
+    char kb[32];
+    path_base(kid, kb, sizeof kb);
+    long long cp = coal_of(pid), ck = coal_of(kid);
+    tally("I2 descendant (path %s): coalition == the launch's %s", kb, eq(cp, ck));
+    procinfo("a descendant of the launch (the job's sh waits on it)", kid);
+    procinfo("the launch itself (sh waiting on a child)", pid);
+    lc(&c, "kill", "SIGKILL", SYS, NULL);
+    wait_exit(pid, seq, sizeof seq);
+    kill(kid, SIGKILL);
+}
+
 /* I3: a held launch killed while still xpcproxy: is its hold consumed? */
 static void killed_pass(int i) {
     int variant = i % 2;
@@ -1259,6 +1290,13 @@ int main(int argc, char **argv) {
         if (argc < 6) return 2;
         O_fresh = argc > 6 && !strcmp(argv[6], "fresh");
         run_ident(!strcmp(argv[2], "held"), !strcmp(argv[3], "wrap"), !strcmp(argv[4], "early"), atoi(argv[5]));
+    } else if (!strcmp(sc, "desc")) { /* desc <passes> */
+        anomalies = 0;
+        install(0, "fork", 0);
+        int n = atoi(argv[2]);
+        for (int i = 0; i < n; i++) desc_pass(i);
+        dump("DESC");
+        uninstall();
     } else if (!strcmp(sc, "coal")) { /* coal <passes> */
         run_coal(atoi(argv[2]));
     } else if (!strcmp(sc, "killed")) { /* killed <plain|wrap> <passes> */
