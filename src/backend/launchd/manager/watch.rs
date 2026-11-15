@@ -51,7 +51,7 @@ pub(crate) struct Watch {
 struct Shared {
     queue: Kqueue,
     /// Taken out of the queue by one registration's `wait` or drop and not its own, so kept here for the
-    /// registration whose pid it is. `status` is `None` for an exit the kernel reported without a status.
+    /// registration whose pid it is.
     kept: Mutex<Vec<Exited>>,
     /// The pids whose exec was read the same way, once each: later execs of a pid add nothing.
     execed: Mutex<Vec<u32>>,
@@ -166,6 +166,14 @@ impl Watch {
 
     /// Registers `pid` for its exit and the status it exits with. [`Added::Gone`] where there is no such
     /// process. Registrations are waited on one at a time, by one thread.
+    ///
+    /// A registration that succeeds is a registration whose exit is reported: none missed it in 535,000
+    /// passes (a root prober, a target that is not its child). The kernel refuses (`ESRCH`, [`Added::Gone`])
+    /// from the start of the process's exit, before `NOTE_EXIT` is posted, and refuses a zombie its parent
+    /// has not reaped. Measured on macOS CI (KB cc08f57: "macOS - A successful NOTE_EXIT registration on a
+    /// process that is not the caller's child never misses the exit", "macOS - kqueue refuses a NOTE_EXIT
+    /// registration once a process's exit has begun, before NOTE_EXIT is posted and before the zombie",
+    /// "macOS - kqueue refuses a NOTE_EXIT registration on a zombie its parent has not reaped").
     pub(crate) fn add(&self, pid: u32) -> Result<Added> {
         self.register(
             pid,
@@ -233,17 +241,13 @@ impl Watch {
 }
 
 impl Registered {
-    /// Blocks until the pid has exited, and answers its raw `wait(2)` status. `None` iff `deadline`
-    /// expired first, and none expires without one. An exit that happened before the wait began is
-    /// reported at once.
-    pub(crate) fn wait(self, deadline: Option<Deadline>) -> Result<Option<i32>> {
+    /// Blocks until the pid has exited, and answers the exit, with or without its status. `None` iff
+    /// `deadline` expired first, and none expires without one. An exit that happened before the wait began
+    /// is reported at once.
+    pub(crate) fn wait(self, deadline: Option<Deadline>) -> Result<Option<Exited>> {
         let pid = self.pid;
         match self.next(false, None, deadline)? {
-            Some(Woke::Exited(Some(status))) => Ok(Some(status)),
-            Some(Woke::Exited(None)) => Err(Error::os(
-                format!("wait for process {pid} to exit"),
-                io::Error::other("the kernel reported its exit without its status"),
-            )),
+            Some(Woke::Exited(status)) => Ok(Some(Exited { pid, status })),
             None => Ok(None),
             Some(Woke::Exec | Woke::Interrupted(_)) => unreachable!("neither was waited for"),
         }
@@ -428,8 +432,9 @@ impl Shared {
         kept.extend(
             events
                 .iter()
-                .filter_map(exited)
-                .filter(|exited| Some(exited.pid) != pid),
+                // The discarded pid's events go before `exited`, which spends the test hook's allowance.
+                .filter(|event| event.filter() != Ok(EventFilter::EVFILT_PROC) || Some(event.ident() as u32) != pid)
+                .filter_map(exited),
         );
         drop(kept);
         let mut execed = self.execed.lock().unwrap_or_else(PoisonError::into_inner);
@@ -463,12 +468,14 @@ fn recorded_in(window: Option<&Deferred>) -> Option<Interrupts> {
 /// The exit `event` reports: `None` for any other event.
 fn exited(event: &KEvent) -> Option<Exited> {
     let is_exit = event.filter() == Ok(EventFilter::EVFILT_PROC) && event.fflags().contains(FilterFlag::NOTE_EXIT);
-    is_exit.then(|| Exited {
-        pid: event.ident() as u32,
-        status: event
-            .fflags()
-            .contains(FilterFlag::NOTE_EXITSTATUS)
-            .then(|| event.data() as i32),
+    is_exit.then(|| {
+        let reported = event.fflags().contains(FilterFlag::NOTE_EXITSTATUS);
+        #[cfg(test)]
+        let reported = reported && test_hook::reported();
+        Exited {
+            pid: event.ident() as u32,
+            status: reported.then(|| event.data() as i32),
+        }
     })
 }
 
@@ -503,6 +510,7 @@ pub(crate) mod test_hook {
 
     thread_local! {
         static QUEUES: Cell<Option<usize>> = const { Cell::new(None) };
+        static STATUSES: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
     /// Let this thread make only `n` more kqueues, until the returned guard drops.
@@ -510,8 +518,19 @@ pub(crate) mod test_hook {
         Allowance::set(&QUEUES, n)
     }
 
+    /// Let this thread read only `n` more exits with their status: every later exit it reads is reported
+    /// without one, as the kernel may report it, until the returned guard drops.
+    pub(crate) fn statuses(n: usize) -> Allowance {
+        Allowance::set(&STATUSES, n)
+    }
+
     pub(super) fn make() -> std::io::Result<()> {
         spend(&QUEUES, "no kqueue may be made (test hook)")
+    }
+
+    /// Whether the exit being read keeps its status.
+    pub(super) fn reported() -> bool {
+        spend(&STATUSES, "no status (test hook)").is_ok()
     }
 }
 
