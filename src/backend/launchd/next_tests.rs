@@ -162,6 +162,63 @@ fn a_schedule_with_no_entries_has_no_fire() {
     }
 }
 
+/// An entry that names a date no year has never fires, and the answer is `None`, not a walk to the last year.
+#[skuld::test]
+fn entries_that_name_no_real_date_have_no_fire() {
+    let after = instant("2026-11-14T00:00:00Z");
+    let entry = |month, day| Entry {
+        minute: Some(0),
+        hour: Some(0),
+        day: Some(day),
+        month: Some(month),
+        weekday: None,
+    };
+    for entries in [
+        vec![entry(2, 30)],
+        vec![entry(4, 31), entry(11, 31)],
+        vec![entry(13, 1)],
+        vec![entry(1, 32)],
+    ] {
+        assert_eq!(next_fire(&entries, after, &zone("UTC")), None, "{entries:?}");
+    }
+    // 29 February is a real date, in a leap year: 2028 is the next after 2026.
+    assert_eq!(
+        timestamp(next_fire(&[entry(2, 29)], after, &zone("UTC")).unwrap()),
+        "2028-02-29T00:00:00Z".parse::<Timestamp>().unwrap()
+    );
+}
+
+/// 44,640 entries (every minute of January) are indexed by their date, and the answer is the same as for
+/// the few entries of a schedule that names the minutes of a day.
+#[skuld::test]
+fn a_month_restricted_schedule_with_many_entries_gives_its_next_fire() {
+    let entries = entries("* * * 1 *");
+    assert_eq!(entries.len(), 31 * 24 * 60);
+    let zone = zone("UTC");
+    for (after, expected) in [
+        ("2027-06-10T12:00:00Z", "2028-01-01T00:00:00Z"),
+        ("2027-01-10T05:07:30Z", "2027-01-10T05:08:00Z"),
+        ("2027-01-31T23:59:00Z", "2028-01-01T00:00:00Z"),
+        ("2026-12-31T23:59:59Z", "2027-01-01T00:00:00Z"),
+    ] {
+        let fire = next_fire(&entries, instant(after), &zone).unwrap();
+        assert_eq!(timestamp(fire), expected.parse::<Timestamp>().unwrap(), "after {after}");
+    }
+}
+
+/// The compiler leaves out the keys above the most significant one it gives, and none below it.
+#[cfg(debug_assertions)]
+#[skuld::test]
+#[should_panic(expected = "omits are a prefix")]
+fn an_entry_that_omits_a_key_below_one_it_names_is_refused() {
+    let entry = Entry {
+        minute: None,
+        hour: Some(3),
+        ..Entry::default()
+    };
+    let _ = next_fire(&[entry], instant("2026-11-14T00:00:00Z"), &zone("UTC"));
+}
+
 #[skuld::test]
 fn or_and_and_day_rules() {
     // Both day fields restricted: the 13th or a Friday. 2026-11-06 is a Friday.

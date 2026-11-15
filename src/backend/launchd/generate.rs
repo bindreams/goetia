@@ -30,7 +30,7 @@ const COMMENT_END: &str = "goetia:end -->";
 
 /// Render the metadata comment carrying `Marker`, `Schema`, `Version`, and `Spec`: byte-exact field
 /// names, per the crate's metadata convention (shared with the systemd `[X-Goetia]` section).
-fn metadata_comment(spec: &DaemonSpec) -> String {
+pub(in crate::backend::launchd) fn metadata_comment(spec: &DaemonSpec) -> String {
     format!(
         "{COMMENT_BEGIN}\nMarker: {marker}\nSchema: {schema}\nVersion: {version}\nSpec: {encoded}\n{COMMENT_END}\n",
         marker = blob::MARKER,

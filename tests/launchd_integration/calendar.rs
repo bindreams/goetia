@@ -8,34 +8,20 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::SystemTime;
 
 use goetia::backend::launchd::manager::Launchd;
 use goetia::manager::ServiceManager as _;
-use goetia::testing::task;
+use goetia::testing::{system_zone, task};
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
 
 use crate::launchd::{Guard, print_job};
 use crate::support::cron_oracle::assert_next_run_strict;
 use crate::support::tasks::{id_of, task_status};
 use crate::support::{self, Group, cmd, launchd_group};
 use crate::tasks::ChildGuard;
-
-const MONTHS: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-];
 
 /// The `Registered` lines of UserEventAgent, from a `log stream` that is attached when [`start`] returns.
 ///
@@ -71,31 +57,26 @@ impl Registrations {
         };
 
         // The first line is the stream's own, printed before the stream is subscribed to the log (measured: a
-        // line logged straight after it was lost). So the canary is logged again and again, until one of
-        // them comes back through the stream.
+        // line logged straight after it was lost). So the canary is logged, and the next line the stream
+        // prints is read: if it is not the canary, the stream may not have been attached when it was logged,
+        // and another is logged. A `logger` that fails, or a stream that ends, ends the test.
         registrations.next_line();
         let canary = format!("StartCalendarInterval canary {}", std::process::id());
-        let attached = Arc::new(AtomicBool::new(false));
-        let logging = std::thread::spawn({
-            let (attached, canary) = (Arc::clone(&attached), canary.clone());
-            move || {
-                while !attached.load(Ordering::Acquire) {
-                    cmd::run("logger", &[canary.as_str()]).expect_ok();
-                }
+        loop {
+            cmd::run("logger", &[canary.as_str()]).expect_ok();
+            if registrations.next_line().contains(&canary) {
+                return registrations;
             }
-        });
-        while !registrations.next_line().contains(&canary) {}
-        attached.store(true, Ordering::Release);
-        logging.join().expect("the thread that logs the canary");
-        registrations
+        }
     }
 
     fn next_line(&self) -> String {
         self.lines.recv().expect("`log stream` ended")
     }
 
-    /// The next fire of each of the `count` entries of the job `label`, one per `Registered` line.
-    fn next_fires(&self, label: &str, count: usize) -> Vec<SystemTime> {
+    /// The next fire of each of the `count` entries of the job `label`, one per `Registered` line, read in
+    /// `zone` and not before `after`.
+    fn next_fires(&self, label: &str, count: usize, zone: &TimeZone, after: SystemTime) -> Vec<SystemTime> {
         let prefix = format!("Registered StartCalendarInterval: {label}.");
         let mut fires = BTreeMap::new();
         while fires.len() < count {
@@ -106,51 +87,38 @@ impl Registrations {
             let (entry, date) = rest
                 .split_once(": ")
                 .unwrap_or_else(|| panic!("a `Registered` line with no date: {line}"));
-            fires.insert(entry.to_string(), fire_of(date));
+            fires.insert(entry.to_string(), fire_of(date, zone, after));
         }
         fires.into_values().collect()
     }
 }
 
-/// The instant of a date as UserEventAgent writes it, in the machine's zone:
+/// The instant of a date as UserEventAgent writes it:
 /// `Monday, January 4, 2027 at 9:00:00 AM Greenwich Mean Time`, where a narrow no-break space (U+202F)
-/// stands before `AM` or `PM`. The zone's name is not read: the machine's own rules turn the fields into an
-/// instant.
-fn fire_of(date: &str) -> SystemTime {
+/// stands before `AM` or `PM`. The zone's name is not read: `zone`, the machine's zone as goetia reads it,
+/// turns the fields into an instant.
+///
+/// A time the zone repeats (the clocks go back) is two instants, and the text does not say which. The fire is
+/// the first of them that is after `after`, the clock read before launchd was told to register: launchd
+/// registers the first instant after its own clock.
+fn fire_of(date: &str, zone: &TimeZone, after: SystemTime) -> SystemTime {
     let text = date.replace('\u{202f}', " ");
-    let mut words = text.split_whitespace().skip(1);
-    let (Some(month), Some(day), Some(year), Some("at"), Some(time), Some(half)) = (
-        words.next(),
-        words.next(),
-        words.next(),
-        words.next(),
-        words.next(),
-        words.next(),
-    ) else {
-        panic!("a date this test cannot read: {date:?}");
-    };
-    let number = |text: &str| -> i32 { text.parse().unwrap_or_else(|_| panic!("`{text}` in {date:?}")) };
-    let [hour, minute, second] = {
-        let mut parts = time.split(':').map(number);
-        [(); 3].map(|()| parts.next().unwrap_or_else(|| panic!("a time in {date:?}")))
-    };
-
-    // SAFETY: an all-zero `tm` is a valid value.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    tm.tm_year = number(year) - 1900;
-    tm.tm_mon = MONTHS
+    // The words up to `AM` or `PM`; what follows is the zone's name.
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let end = words
         .iter()
-        .position(|name| *name == month)
-        .and_then(|month| i32::try_from(month).ok())
-        .unwrap_or_else(|| panic!("a month in {date:?}"));
-    tm.tm_mday = number(day.trim_end_matches(','));
-    tm.tm_hour = hour % 12 + if half == "PM" { 12 } else { 0 };
-    tm.tm_min = minute;
-    tm.tm_sec = second;
-    tm.tm_isdst = -1;
-    // SAFETY: the pointer is valid for the call.
-    let seconds = unsafe { libc::mktime(&mut tm) };
-    UNIX_EPOCH + Duration::from_secs(u64::try_from(seconds).unwrap_or_else(|_| panic!("mktime failed for {date:?}")))
+        .position(|word| matches!(*word, "AM" | "PM"))
+        .unwrap_or_else(|| panic!("a date with no AM or PM: {date:?}"));
+    let local = words[..=end].join(" ");
+    let civil = DateTime::strptime("%A, %B %d, %Y at %I:%M:%S %p", &local)
+        .unwrap_or_else(|e| panic!("a date this test cannot read: {date:?}: {e}"));
+
+    let ambiguous = zone.to_ambiguous_timestamp(civil);
+    [ambiguous.earlier(), ambiguous.later()]
+        .into_iter()
+        .map(|instant| SystemTime::from(instant.unwrap_or_else(|e| panic!("{date:?} is not an instant: {e}"))))
+        .find(|&instant| instant > after)
+        .unwrap_or_else(|| panic!("{date:?} is not after the clock read before launchd registered it"))
 }
 
 /// `next_run` of a timer with 180 entries (nine hours, four minutes, five weekdays) is the earliest of the
@@ -168,12 +136,13 @@ fn next_run_is_the_earliest_fire_launchd_registered(#[fixture(launchd_group)] _g
         &task(&id, ["/bin/sleep", "300"].map(String::from).to_vec(), Some(SCHEDULE)),
     );
     let registrations = Registrations::start();
+    let zone = system_zone().expect("the system time zone");
 
     let before = SystemTime::now();
     mgr.enable(&task_id).expect("enable");
     let listed = print_job(&timer).stdout.matches("descriptor = ").count();
     assert_eq!(listed, 180, "`print` lists the entries of `{SCHEDULE}`");
-    let fires = registrations.next_fires(&timer, listed);
+    let fires = registrations.next_fires(&timer, listed, &zone, before);
     let earliest = *fires.iter().min().expect("a fire");
     let status = task_status(&mgr, &task_id);
     let after = SystemTime::now();

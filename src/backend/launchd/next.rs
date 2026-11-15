@@ -16,6 +16,7 @@
 //!
 //! The next fire of a task is the earliest over its entries.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -27,14 +28,37 @@ use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
 use super::calendar::Entry;
 use crate::error::{Error, Result};
 
+/// The days of the Gregorian calendar's cycle: 400 years, 97 of them leap, a whole number of weeks. Dates,
+/// weekdays and leap years all repeat after it, and a zone's rules beyond its listed transitions are yearly
+/// rules over the same calendar. So an entry that has not fired within one cycle of the walk's start never
+/// will.
+const CALENDAR_CYCLE_DAYS: u32 = 146_097;
+
+/// An entry's date keys: month, day of the month, weekday (0 for Sunday), each `None` for a wildcard.
+type DateKey = (Option<u8>, Option<u8>, Option<u8>);
+
 /// The first instant strictly after `after`, on a whole minute, that one of `entries` fires at in `zone`.
 ///
-/// `None` when `entries` is empty, or when `after` or the answer lies outside the years jiff represents
-/// (to 9999). A caller treats `None` as "no next run known", not as "never".
+/// Precondition: the keys an entry omits are a prefix of month, day or weekday, hour, minute, as
+/// [`calendar::entries`] returns them and as launchd reads them (an omitted key above the one it names is a
+/// wildcard; one below it is not), and an entry with a weekday has no month and no day. A `debug_assert!`
+/// checks it. An entry that names a date no year has
+/// (30 February) never fires: it does not make the walk longer than one calendar cycle.
+///
+/// `None` when no entry fires within a calendar cycle (none, or none that names a real date), or when `after`
+/// or the answer lies outside the years jiff represents (to 9999). A caller treats `None` as "no next run
+/// known", not as "never".
+///
+/// [`calendar::entries`]: super::calendar::entries
 pub(crate) fn next_fire(entries: &[Entry], after: SystemTime, zone: &TimeZone) -> Option<SystemTime> {
+    debug_assert!(
+        entries.iter().all(omits_a_prefix),
+        "the keys an entry omits are a prefix of month, day or weekday, hour, minute: {entries:?}"
+    );
     if entries.is_empty() {
         return None;
     }
+    let by_date = index_by_date(entries);
     let after = Timestamp::try_from(after).ok()?;
     // A date's readings lie within an offset's span (`Offset::MAX`, 25:59:59, either way) of its UTC day.
     // The walk starts at the first date that can still read an instant after `after`, and goes on past a
@@ -43,45 +67,77 @@ pub(crate) fn next_fire(entries: &[Entry], after: SystemTime, zone: &TimeZone) -
     let span = SignedDuration::from_secs(i64::from(Offset::MAX.seconds()));
     let mut date = after.checked_sub(span).ok()?.to_zoned(TimeZone::UTC).date();
     let mut best: Option<Timestamp> = None;
+    let mut walked = 0;
     loop {
-        if let Some(best) = best {
+        match best {
             // The earliest instant `date` can be read at is its midnight at the largest offset.
-            if Offset::MAX
-                .to_timestamp(date.at(0, 0, 0, 0))
-                .is_ok_and(|earliest| earliest >= best)
+            Some(best)
+                if Offset::MAX
+                    .to_timestamp(date.at(0, 0, 0, 0))
+                    .is_ok_and(|earliest| earliest >= best) =>
             {
                 break;
             }
+            None if walked == CALENDAR_CYCLE_DAYS => break,
+            _ => {}
         }
-        if let Some(fire) = fire_on(entries, zone, date, after) {
+        if let Some(fire) = fire_on(&by_date, zone, date, after) {
             best = Some(best.map_or(fire, |best| best.min(fire)));
         }
         let Ok(tomorrow) = date.tomorrow() else { break };
         date = tomorrow;
+        walked += 1;
     }
     best.map(Into::into)
 }
 
+/// Whether the entry's omitted keys are a prefix of month, day or weekday, hour, minute, and it does not
+/// name both a day and a weekday, or a weekday and a month.
+fn omits_a_prefix(entry: &Entry) -> bool {
+    let named = [
+        entry.month.is_some(),
+        entry.day.is_some() || entry.weekday.is_some(),
+        entry.hour.is_some(),
+        entry.minute.is_some(),
+    ];
+    named.windows(2).all(|pair| !pair[0] || pair[1])
+        && (entry.weekday.is_none() || (entry.day.is_none() && entry.month.is_none()))
+}
+
+/// The entries, each under the date keys it names. Every date then looks up the few keys that can name it,
+/// not every entry (`* * * 1 *` has 44,640).
+fn index_by_date(entries: &[Entry]) -> HashMap<DateKey, Vec<&Entry>> {
+    let mut by_date: HashMap<DateKey, Vec<&Entry>> = HashMap::new();
+    for entry in entries {
+        // 0 and 7 are both Sunday.
+        by_date
+            .entry((entry.month, entry.day, entry.weekday.map(|weekday| weekday % 7)))
+            .or_default()
+            .push(entry);
+    }
+    by_date
+}
+
 /// The first instant after `after` at which an entry that names `date` fires on it.
-fn fire_on(entries: &[Entry], zone: &TimeZone, date: Date, after: Timestamp) -> Option<Timestamp> {
-    entries
-        .iter()
-        .filter(|entry| names_date(entry, date))
+fn fire_on(
+    by_date: &HashMap<DateKey, Vec<&Entry>>,
+    zone: &TimeZone,
+    date: Date,
+    after: Timestamp,
+) -> Option<Timestamp> {
+    let (month, day) = (date.month().unsigned_abs(), date.day().unsigned_abs());
+    let weekday = date.weekday().to_sunday_zero_offset().unsigned_abs();
+    // Each key an entry can name is either a wildcard or this date's value.
+    let keys = [None, Some(month)].into_iter().flat_map(|month| {
+        [None, Some(day)]
+            .into_iter()
+            .flat_map(move |day| [None, Some(weekday)].map(move |weekday| (month, day, weekday)))
+    });
+    keys.filter_map(|key| by_date.get(&key))
+        .flatten()
         .flat_map(|entry| instants(zone, date, entry))
         .filter(|&instant| instant > after)
         .min()
-}
-
-/// Whether the entry's date keys (the day of the month, the month, the weekday; an omitted key is a
-/// wildcard) name `date`.
-fn names_date(entry: &Entry, date: Date) -> bool {
-    let is = |key: Option<u8>, value: i8| key.is_none_or(|key| i8::try_from(key).is_ok_and(|key| key == value));
-    is(entry.day, date.day())
-        && is(entry.month, date.month())
-        // 0 and 7 are both Sunday.
-        && entry
-            .weekday
-            .is_none_or(|weekday| i8::try_from(weekday % 7).is_ok_and(|weekday| weekday == date.weekday().to_sunday_zero_offset()))
 }
 
 /// The instants at which the entry fires on `date` in `zone`: those of each local time it names, read as the
@@ -116,7 +172,7 @@ fn instants(zone: &TimeZone, date: Date, entry: &Entry) -> impl Iterator<Item = 
 /// launchd schedules by the machine's zone, and a task's next fire must follow it.
 // Only macOS calls it; other hosts compile the module for its tests, which read a zone file of their own.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn system_zone() -> Result<TimeZone> {
+pub fn system_zone() -> Result<TimeZone> {
     zone_from(Path::new("/etc/localtime"))
 }
 

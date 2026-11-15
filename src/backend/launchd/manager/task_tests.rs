@@ -649,19 +649,12 @@ fn next_run_follows_launchd_across_a_dst_gap() {
 fn next_run_is_none_for_a_schedule_launchd_cannot_hold() {
     // Both day fields restricted, and day-of-month starting with `*`: both must match, which launchd cannot.
     let spec = task_spec(Some("0 12 */2 * 5"));
-    let text = format!(
-        "<!-- goetia:begin\nMarker: {}\nSchema: {}\nVersion: {}\nSpec: {}\ngoetia:end -->\n",
-        crate::blob::MARKER,
-        crate::blob::SCHEMA,
-        crate::version(),
-        crate::blob::encode(&spec),
-    );
     let timer = Artifact {
         location: Location {
             path: PathBuf::from("/nonexistent/goetia-task-unit@timer.plist"),
             enabled: true,
         },
-        text,
+        text: generate::metadata_comment(&spec),
     };
     assert!(timer.blob().is_ok(), "the blob decodes");
 
