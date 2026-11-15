@@ -543,47 +543,25 @@ fn a_start_after_a_kill_sees_the_restart_in_the_auto_restart_window(#[fixture(sy
     support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &listener);
 }
 
-/// A unit the policy has stopped restarting because it started too often (systemd's start limit) makes
-/// `start` fail at once and say so, and does not leave it waiting for a process that will not come. The
-/// limit is reached by killing the daemon, which the policy restarts each time, until it gives up.
+/// A unit that was started too often (systemd's start limit, which goetia leaves on for a `restart: never`
+/// unit: five starts in ten seconds) makes `start` fail at once and say so, and does not leave it waiting
+/// for a process that will not come. A `kill` between the starts ends each process, so that the next
+/// start is a fresh one; the limit is reached when a start is refused.
 #[skuld::test]
 fn a_start_of_a_unit_at_its_start_limit_fails_and_says_so(#[fixture(systemd_group)] _group: &Group) {
     let guard = ServiceGuard::new(support::random_test_id());
     let listener = support::ConnectBack::listen();
-    let spec = reporting(guard.id(), Restart::Always, &listener);
+    let spec = reporting(guard.id(), Restart::Never, &listener);
     let id = spec.common().id.clone();
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
-    mgr.start(&id, Budget::DEFAULT).expect("start");
-    let mut pid = mgr
-        .status(&id)
-        .expect("status")
-        .common()
-        .pid
-        .expect("a started daemon has a pid");
 
-    // Each kill is followed by the policy's restart, until it has restarted too often and gives up: the
-    // unit is `failed` and has no process.
-    loop {
-        mgr.kill(&id).expect("kill the running daemon");
-        let settled = loop {
-            let status = mgr.status(&id).expect("status");
-            let common = status.common();
-            if common.state == State::Failed || common.pid.is_some_and(|new| new != pid) {
-                break status;
-            }
-            std::thread::yield_now();
-        };
-        match settled.common().pid {
-            Some(new) if settled.common().state != State::Failed => pid = new,
-            _ => break,
+    let e = loop {
+        match mgr.start(&id, Budget::DEFAULT) {
+            Ok(()) => mgr.kill(&id).expect("kill the running daemon"),
+            Err(e) => break e,
         }
-    }
-    assert_eq!(mgr.status(&id).expect("status").common().state, State::Failed);
-
-    let e = mgr
-        .start(&id, Budget::DEFAULT)
-        .expect_err("a unit at its start limit does not start");
+    };
 
     let report = e.report().to_string();
     assert!(
