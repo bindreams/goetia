@@ -20,21 +20,12 @@ use windows_sys::Win32::System::Services::{
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::RecordedExit;
+use crate::backend::scm::win32::winapi_io;
 
 use super::{
     Armed, Cancelled, Deadline, Observed, QueriedState, QueriedStatus, Registration, SERVICE_ACCEPT_STOP, StartReply,
     WantState,
 };
-
-/// `windows-service`'s `Error` does not implement `Into<io::Error>` for
-/// every variant (it also carries parse errors this module never
-/// produces), so this narrows to the one case that matters here.
-fn to_io_error(e: windows_service::Error) -> io::Error {
-    match e {
-        windows_service::Error::Winapi(e) => e,
-        other => io::Error::other(other),
-    }
-}
 
 /// Receives the callback-reported current state across the `SleepEx`
 /// wait. Heap-pinned (its address is handed to the SCM as `pContext`).
@@ -280,7 +271,7 @@ impl SystemScmActor {
 }
 
 fn open_scm() -> io::Result<WinServiceManager> {
-    WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(to_io_error)
+    WinServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(winapi_io)
 }
 
 fn open_handle(scm: &WinServiceManager, name: &str) -> io::Result<Service> {
@@ -288,7 +279,7 @@ fn open_handle(scm: &WinServiceManager, name: &str) -> io::Result<Service> {
         name,
         ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
     )
-    .map_err(to_io_error)
+    .map_err(winapi_io)
 }
 
 /// The three steps [`super::close_then_drain`] puts in order.
@@ -420,10 +411,10 @@ impl super::ScmActor for SystemScmActor {
             Err(windows_service::Error::Winapi(e))
                 if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING as i32) =>
             {
-                let status = self.service()?.query_status().map_err(to_io_error)?;
+                let status = self.service()?.query_status().map_err(winapi_io)?;
                 Ok(StartReply::AlreadyRunning(queried_state(status.current_state)))
             }
-            Err(e) => Err(to_io_error(e)),
+            Err(e) => Err(winapi_io(e)),
         }
     }
 

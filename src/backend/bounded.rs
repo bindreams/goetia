@@ -27,7 +27,7 @@ pub(crate) use spares::test_hook;
 pub(crate) use spares::{Reaper, Reservation};
 
 use crate::backend::unreaped::release_unreaped;
-use crate::error::within;
+use crate::error::{Chain, within};
 use crate::manager::budget::{Budget, Deadline};
 use cosca::identity::Liveness;
 
@@ -277,7 +277,7 @@ impl SpawnError {
 impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpawnError::NotRun(e) | SpawnError::MayHaveRun(e) => write!(f, "{}", cosca::error::Report::new(e)),
+            SpawnError::NotRun(e) | SpawnError::MayHaveRun(e) => write!(f, "{}", Chain(e)),
         }
     }
 }
@@ -467,12 +467,9 @@ fn end(child: &cosca::Child, bound: Duration) -> Result<KillRootOutcome, cosca::
 /// [`end`] for the child of a [`Left`]: what to say on stderr if it could not be ended. It says what
 /// failed, not what became of the child: the child is released to its reaper either way.
 fn end_left(child: &cosca::Child, bound: Duration) -> Option<String> {
-    end(child, bound).err().map(|e| {
-        format!(
-            "warning: could not kill a request left running: {}",
-            cosca::error::Report::new(&e)
-        )
-    })
+    end(child, bound)
+        .err()
+        .map(|e| format!("warning: could not kill a request left running: {}", Chain(&e)))
 }
 
 /// How [`kill_root`] ended the root.

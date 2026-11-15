@@ -60,7 +60,7 @@ impl Reaper {
 /// on a refusal the child would come back armed, and dropping it would kill the tree.
 fn let_go(child: cosca::Child) {
     if let Err((_armed, e)) = child.detach() {
-        debug_assert!(false, "detach refused off Windows: {}", cosca::error::Report::new(&e));
+        debug_assert!(false, "detach refused off Windows: {}", crate::error::Chain(&e));
     }
 }
 
