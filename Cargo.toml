@@ -118,7 +118,11 @@ nix = { version = "0.31", features = ["fs"] }
 # account and to hand cwd/logs directories to it, regardless of whether the
 # CLI's own optional deps are pulled in.
 libc = "0.2"
-nix = { version = "0.31", features = ["user", "fs"] }
+nix = { version = "0.31", features = ["user", "fs", "event"] }
+# `spec::schedule::next`: the next fire of a task's schedule in the system time zone, which
+# `launchd` (calendar intervals only, no next-fire query) cannot tell. Zones are read from
+# `/etc/localtime`'s bytes.
+jiff = "0.2.43"
 
 [target.'cfg(windows)'.dependencies]
 # The real SCM backend (`src/backend/scm/manager.rs`). Not `optional`/`cli`-gated:
@@ -176,6 +180,9 @@ libsearch-guard = "0.1.1"
 goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.6"
 rand = "0.10"
+# `spec::schedule::next`'s tests, on every host: the default features bundle a zone database where the
+# host has none (Windows).
+jiff = "0.2.43"
 libsearch-guard = "0.1.1"
 
 [target.'cfg(unix)'.dev-dependencies]

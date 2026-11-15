@@ -28,6 +28,9 @@ pub use backend::BackendKind;
 pub(crate) use resolve::invalid;
 pub use resolve::load;
 pub use schedule::{CronField, DayRule, HashSeed, Schedule};
+// Read by `crate::backend::launchd::manager`, which computes a task's next run: launchd reports none.
+#[cfg(target_os = "macos")]
+pub(crate) use schedule::next::{next_fire, system_zone};
 pub use user::{AccountId, User};
 
 // Read by `crate::backend::scm::generate` and `crate::backend::systemd::generate`, which cannot see through the

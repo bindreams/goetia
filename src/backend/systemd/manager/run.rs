@@ -33,7 +33,7 @@
 
 use std::cell::Cell;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -46,8 +46,7 @@ use super::task::Fragment;
 use super::{Systemd, UnitKind, unit_name};
 use crate::backend::bounded::Reservation;
 use crate::backend::standby::Standby;
-use crate::backend::systemd::generate::RUN_MARKER;
-use crate::backend::{InstalledService as _, Marker, OutputSource, RunHandle};
+use crate::backend::{InstalledService as _, Marker, OutputSource, RUN_MARKER, RunHandle};
 use crate::error::{Error, Result};
 use crate::manager::{Exit, output};
 use crate::spec::Id;
@@ -79,7 +78,7 @@ impl Systemd {
         let mut spares = Spares::make(&id, logs.is_none())?;
         let logs = match logs {
             Some(path) => {
-                let offset = length(&path)?;
+                let offset = output::length_of(&path)?;
                 Some((path, offset))
             }
             None => None,
@@ -233,16 +232,6 @@ fn watch(share: Watch) {
     }
     drop(stop);
     drop(done);
-}
-
-/// The length of `path`, which is where a run's output to it begins; a file that is not there is
-/// empty.
-fn length(path: &Path) -> Result<u64> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.len()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(Error::os_at("read the length of", path, e)),
-    }
 }
 
 /// What [`find_start`] needs to learn that the job ended with no entry of its own.
@@ -401,6 +390,7 @@ fn run_marker(invocation: &str) -> Marker {
         prefix: RUN_MARKER,
         line: format!("{RUN_MARKER} {invocation}"),
         id_len: INVOCATION_ID_DIGITS,
+        earlier_start_possible: true,
     }
 }
 

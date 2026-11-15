@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use super::{BoxError, Error, Occupant, PutBackFound, VersionReading};
 use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, OWN};
+use crate::spec::DaemonKind;
 
 #[skuld::test]
 fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
@@ -52,6 +53,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             found: Occupant::File,
         },
         Error::StartUnconfirmed { id: id() },
+        Error::StopUnconfirmed {
+            id: id(),
+            shown: String::new(),
+        },
         Error::RunStateUnknown { id: id() },
         Error::RunUnrecorded {
             id: id(),
@@ -92,6 +97,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::NotRunning { id: id() },
         Error::NotATask { id: id() },
         Error::AlreadyRunning { id: id() },
+        Error::StillRunning { id: id(), pid: 1 },
         Error::RunNotStarted {
             id: id(),
             reason: String::new(),
@@ -135,7 +141,10 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             id: id(),
             keep_alive: false,
         },
-        Error::LoadedJob { id: id() },
+        Error::LoadedJob {
+            id: id(),
+            kind: DaemonKind::Service,
+        },
         Error::PasswordRequired { account: id() },
         Error::UnsupportedManager {
             client: VersionReading::Major(241),
@@ -648,12 +657,45 @@ fn report_of_a_start_whose_state_is_not_established() {
 }
 
 #[skuld::test]
-fn report_of_a_loaded_job() {
+fn report_of_a_stop_that_cannot_tell_no_process_is_left() {
     assert_eq!(
-        Error::LoadedJob { id: id() }.report().to_string(),
+        Error::StopUnconfirmed {
+            id: id(),
+            shown: "launchd shows its job with no process and no state".to_string(),
+        }
+        .report()
+        .to_string(),
+        "`x` may not have stopped: launchd shows its job with no process and no state"
+    );
+}
+
+#[skuld::test]
+fn loaded_job_of_a_service_is_unchanged() {
+    assert_eq!(
+        Error::LoadedJob {
+            id: id(),
+            kind: DaemonKind::Service
+        }
+        .report()
+        .to_string(),
         "`x` is loaded in launchd, which cannot update a loaded job, so the changed plist was not installed and the \
          installed plist is untouched: run `goetia daemon stop x` (a job that has exited is still loaded), re-run \
          install, then start it"
+    );
+}
+
+#[skuld::test]
+fn loaded_job_words_the_task_case() {
+    assert_eq!(
+        Error::LoadedJob {
+            id: id(),
+            kind: DaemonKind::Task
+        }
+        .report()
+        .to_string(),
+        "`x` has a run in flight, and launchd cannot replace a task's plist under one, so the changed plists were not \
+         installed and the installed ones are untouched: run `goetia daemon stop x` (a task that has stopped is \
+         idle), then re-run install"
     );
 }
 
@@ -1175,6 +1217,13 @@ fn error_messages_and_exit_class() {
         (
             Error::AlreadyRunning { id: id() },
             "`nightly` is already running: `run` needs an idle task (`goetia daemon stop nightly` ends the run in flight)",
+            false,
+        ),
+        (
+            Error::StillRunning { id: id(), pid: 4242 },
+            "`nightly` still has the run that was sent SIGTERM (pid 4242), and launchd starts no new run of a task \
+             while one is in flight, so no start was issued; `goetia daemon start nightly` starts one once it has \
+             exited, and `goetia daemon restart nightly` without `--timeout 0` waits for the exit",
             false,
         ),
         (

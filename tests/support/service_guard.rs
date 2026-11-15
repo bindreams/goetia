@@ -4,8 +4,8 @@
 //! removes is created, in creation order: locals drop in reverse, so a thing is removed only
 //! after everything that uses it.
 //!
-//! On macOS it boots the job out and removes only
-//! `/Library/LaunchDaemons/<id>.plist`, not goetia's staging directory. A
+//! On macOS it boots the job and a task's timer (`<id>@timer`) out and removes only
+//! `/Library/LaunchDaemons/<id>.plist` and `<id>@timer.plist`, not goetia's staging directory. A
 //! goetia-installed launchd id is guarded with the launchd suite's `Guard`.
 //!
 //! `Drop` cannot return a `Result`, so every failure other than "not found" is
@@ -63,11 +63,17 @@ fn cleanup(id: &str) -> Vec<String> {
     let mut problems = Vec::new();
 
     // 3 (no such process) and 113 (could not find specified service) both mean
-    // the job was never bootstrapped, which is not a failure to clean up.
-    let target = format!("system/{id}");
-    problems.extend(cmd::run_cleanup("launchctl", &[&["bootout", &target]], &[3, 113]));
-    let path = std::path::PathBuf::from(LAUNCHD_DAEMON_DIR).join(format!("{id}.plist"));
-    problems.extend(remove_path_retrying(&path, false));
+    // the job was never bootstrapped, which is not a failure to clean up. A task's timer (the
+    // `<id>@timer` job) goes first, so that nothing starts the job again.
+    let timer = format!("{id}@timer");
+    for label in [timer.as_str(), id] {
+        let target = format!("system/{label}");
+        problems.extend(cmd::run_cleanup("launchctl", &[&["bootout", &target]], &[3, 113]));
+    }
+    for label in [id, timer.as_str()] {
+        let path = std::path::PathBuf::from(LAUNCHD_DAEMON_DIR).join(format!("{label}.plist"));
+        problems.extend(remove_path_retrying(&path, false));
+    }
 
     // launchd exposes no way to delete an override-database entry, so a label
     // the disabled-key probe called `launchctl enable` on keeps one. It refers

@@ -370,6 +370,39 @@ fn the_fake_draws_an_announced_requests_listeners_from_the_reservation() {
     assert_eq!(bounded::test_hook::listeners_left(&reservation), 1);
 }
 
+/// A reply made at the call is made after the entry's action, so it can name what the action made.
+#[skuld::test]
+fn the_fake_makes_a_reply_at_the_call_after_the_entrys_action() {
+    use fake::{Fake, exited, reply_at};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let made = Arc::new(AtomicU32::new(0));
+    let by_action = Arc::clone(&made);
+    let seen_by_reply = Arc::clone(&made);
+    let table = Fake::new([reply_at(&["kickstart"], move || {
+        exited(0, &format!("{}\n", seen_by_reply.load(Ordering::SeqCst)), "")
+    })
+    .then(move || by_action.store(4242, Ordering::SeqCst))]);
+    let mut reservation = Reservation::make(0, bounded::STREAMS).unwrap();
+
+    let finished = table
+        .run(
+            &["kickstart"],
+            Wait::Bounded {
+                role: Role::Query,
+                deadline: Budget::Unbounded.start(),
+            },
+            &mut reservation,
+        )
+        .expect("a scripted reply");
+
+    assert!(
+        matches!(finished, Finished::Exited { capture, .. } if capture.stdout == b"4242\n"),
+        "the reply was made after the action"
+    );
+}
+
 /// How a call was waited on is recorded, and a run to completion draws no file.
 #[skuld::test]
 fn the_fake_records_a_run_to_completion_and_draws_nothing_for_it() {

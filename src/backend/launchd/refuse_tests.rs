@@ -27,7 +27,7 @@ fn identity(user: &str) -> Identity {
 
 /// The plist `install` would write for `spec` as `user`.
 fn rendered(spec: &DaemonSpec, user: &str) -> String {
-    generate::plist(spec, &identity(user)).unwrap()
+    generate::plists(spec, &identity(user)).unwrap().job
 }
 
 fn changed(spec: &DaemonSpec) -> DaemonSpec {
@@ -50,6 +50,170 @@ fn renamed(spec: &DaemonSpec) -> DaemonSpec {
     })
     .map(DaemonSpec::from)
     .unwrap()
+}
+
+// A run that `begin_run` could not carry through ======================================================================
+
+fn frpc() -> Id {
+    Id::try_from("frpc").unwrap()
+}
+
+/// A failure after `debug` held the next launch says so, and what to do: the cause stays under it, so a
+/// request left in doubt stays indeterminate and a plain failure stays one.
+#[skuld::test]
+fn a_stranded_hold_names_the_hold_and_the_ways_out_and_keeps_the_cause() {
+    let determinate = stranded_hold(&frpc(), Error::blob("a plain failure"));
+    assert_eq!(
+        determinate.to_string(),
+        "`launchctl debug` held the next launch of `frpc` and the run was not started: a launch that took \
+         the hold waits stopped until `goetia daemon stop frpc` ends it, and a hold no launch has taken is \
+         consumed by the next `goetia daemon run frpc`"
+    );
+    assert!(!determinate.is_indeterminate());
+
+    let doubtful = stranded_hold(
+        &frpc(),
+        Error::RequestInDoubt {
+            request: "launchctl kickstart -p system/frpc".to_string(),
+            reached: false,
+            note: None,
+            source: std::io::Error::other("lost").into(),
+        },
+    );
+    assert!(doubtful.is_indeterminate());
+    assert_eq!(
+        doubtful.to_string(),
+        "`launchctl debug` held the next launch of `frpc` and the run may have started: a launch that took \
+         the hold waits stopped until `goetia daemon stop frpc` ends it, and a hold no launch has taken is \
+         consumed by the next `goetia daemon run frpc`",
+        "a request lost in doubt may have started the run"
+    );
+}
+
+#[skuld::test]
+fn a_run_that_ended_before_it_could_be_resumed_says_so() {
+    let resumed = run_unresumed(&frpc());
+
+    assert!(
+        matches!(&resumed, Error::RunUnrecorded { id, reason }
+            if id == "frpc" && reason == "it was ended before goetia could resume it"),
+        "{resumed:?}"
+    );
+}
+
+/// Our own `kickstart` launched a process with no hold on it: the run is unrecorded, and the pid that was
+/// started stays named.
+#[skuld::test]
+fn a_launch_goetia_started_unheld_is_unrecorded_and_names_its_pid() {
+    let unfollowed = run_unfollowed(&frpc(), 4242);
+
+    assert!(
+        matches!(&unfollowed, Error::RunUnrecorded { id, reason }
+            if id == "frpc"
+                && reason == "the `launchctl kickstart` goetia made for it launched process 4242 with no hold \
+                              on it, so goetia does not follow it"),
+        "{unfollowed:?}"
+    );
+    assert!(unfollowed.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
+}
+
+/// Our launch that ended before goetia could follow it, wherever it ended: unrecorded. The status is the
+/// process's, said where the watch kept one.
+#[skuld::test]
+fn a_launch_that_ended_before_it_could_be_followed_is_unrecorded_with_the_process_status() {
+    let reason = |status: &str| {
+        format!(
+            "its launch ended before goetia could follow it{status}: its program may have failed to start or \
+             exited at once, or a `goetia daemon stop` or `kill` ended it"
+        )
+    };
+    for (gone, status) in [
+        (
+            run_ended_unfollowed(&frpc(), Some(3 << 8)),
+            " (the process's status: exit code 3)",
+        ),
+        (
+            run_ended_unfollowed(&frpc(), Some(9)),
+            " (the process's status: signal 9)",
+        ),
+        (run_ended_unfollowed(&frpc(), None), ""),
+    ] {
+        assert!(
+            matches!(&gone, Error::RunUnrecorded { id, reason: said } if id == "frpc" && *said == reason(status)),
+            "{gone:?}"
+        );
+        assert!(gone.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
+    }
+}
+
+/// A launch that was gone, or whose pid was another process's, before goetia could watch it is in doubt
+/// whose it was: the request is named, as reached, and the launch's end is not guessed.
+#[skuld::test]
+fn a_launch_that_was_gone_or_another_process_before_it_could_be_watched_is_in_doubt() {
+    let vanished = run_vanished(&frpc(), 4242);
+
+    assert!(
+        matches!(&vanished, Error::RequestInDoubt { request, reached: true, note: Some(note), .. }
+            if request == "launchctl kickstart -p system/frpc"
+                && note == "the launch it named, process 4242, was gone, or its pid was another process's, \
+                            before goetia could watch it: if it was gone, it was this run's (its program may \
+                            have failed to start, or a `stop` or `kill` ended it), or a scheduled run that was \
+                            in flight"),
+        "{vanished:?}"
+    );
+    assert!(vanished.is_indeterminate());
+}
+
+/// The source says what is true of every way in: the pid was gone at the registration or at the read of its
+/// start, or `launchctl procinfo` did not name it. It does not say whose launch it was.
+#[skuld::test]
+fn the_source_of_a_vanished_launch_does_not_say_whose_it_was() {
+    let vanished = run_vanished(&frpc(), 4242);
+
+    let report = vanished.report().to_string();
+    assert!(
+        report.contains("process 4242 was gone, or was not the job's launch"),
+        "{report}"
+    );
+    assert!(!report.contains("process 4242 was not the job's launch"), "{report}");
+}
+
+/// An interrupt that ended the run is the cause under the stranded hold. It names the signals that were
+/// recorded, says when it was received relative to what goetia was about to do, and what is left; it makes
+/// no claim about when it came.
+#[skuld::test]
+fn an_interrupt_says_what_it_was_received_before_and_what_is_left() {
+    let interrupted = run_interrupted(
+        &frpc(),
+        "SIGINT and SIGTERM",
+        "before goetia armed a hold",
+        "no hold was armed",
+    );
+
+    assert_eq!(interrupted.to_string(), "failed to start the run of `frpc`");
+    assert!(!interrupted.is_indeterminate());
+    let report = interrupted.report().to_string();
+    assert!(
+        report.contains(
+            "interrupted by SIGINT and SIGTERM, received before goetia armed a hold; goetia sent \
+             nothing after acting on it; no hold was armed"
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("while goetia waited"), "{report}");
+    assert!(!report.contains("no run was started"), "a launch may exist: {report}");
+}
+
+/// A wait that lost the run leaves it possibly going: indeterminate, never a plain failure.
+#[skuld::test]
+fn a_run_goetia_lost_track_of_is_in_doubt() {
+    let lost = run_lost(
+        &frpc(),
+        Error::os("wait for process 7 to exit", std::io::Error::other("x")),
+    );
+
+    assert!(lost.is_indeterminate());
+    assert!(lost.to_string().contains("frpc"), "{lost}");
 }
 
 // changes_loaded_job ==================================================================================================
@@ -106,7 +270,7 @@ fn a_spec_change_the_rendering_does_not_show_does_not() {
 
 #[skuld::test]
 fn the_refusal_names_the_daemon_and_the_remedy() {
-    let message = loaded_refusal(&Id::try_from("frpc").unwrap()).to_string();
+    let message = loaded_refusal(&Id::try_from("frpc").unwrap(), DaemonKind::Service).to_string();
     assert!(message.contains("`frpc`"), "{message}");
     assert!(message.contains("goetia daemon stop frpc"), "{message}");
     assert!(message.contains("not installed"), "{message}");
@@ -114,6 +278,13 @@ fn the_refusal_names_the_daemon_and_the_remedy() {
         message.contains("plist"),
         "it speaks of the plist, not only the spec: {message}"
     );
+}
+
+#[skuld::test]
+fn the_refusal_of_a_task_names_its_run_in_flight() {
+    let message = loaded_refusal(&Id::try_from("frpc").unwrap(), DaemonKind::Task).to_string();
+    assert!(message.contains("`frpc` has a run in flight"), "{message}");
+    assert!(message.contains("goetia daemon stop frpc"), "{message}");
 }
 
 // loaded_after_write ==================================================================================================

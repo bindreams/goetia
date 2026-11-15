@@ -16,11 +16,12 @@ use goetia::backend::systemd::generate;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status, TaskStatus, conformance};
+use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, conformance};
 use goetia::spec::{AccountId, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
 use goetia::testing::service_fields;
 
 use crate::support::cleanup::{DirGuard, FileGuard, remove_or_warn, warn_left_behind};
+use crate::support::tasks::{mkfifo, task_status};
 use crate::support::{self, Group, ServiceGuard, cmd, may_account_for, systemd_group};
 
 /// Held by every test that reads or seeds hostile state in the shared `/etc/systemd/system`, and by
@@ -190,13 +191,6 @@ fn find_ours(installed: Vec<Installed>, id: &str) -> Option<DaemonSpec> {
         Installed::Ours { spec, .. } if spec.common().id.as_str() == id => Some(spec),
         _ => None,
     })
-}
-
-pub(crate) fn mkfifo(path: &Path) {
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a unit path with no NUL");
-    // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
-    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
-    assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), std::io::Error::last_os_error());
 }
 
 /// Run `f` on its own thread and report — rather than hang — if it never returns.
@@ -2475,13 +2469,6 @@ pub(crate) fn exiting(id: &str, code: i32) -> DaemonSpec {
         vec!["/bin/sh".to_string(), "-c".to_string(), format!("exit {code}")],
         Some("30 3 * * *"),
     )
-}
-
-pub(crate) fn task_status(mgr: &Systemd, id: &Id) -> TaskStatus {
-    match mgr.status(id).expect("status") {
-        Status::Task(status) => status,
-        other => panic!("a task's status is a task's: {other:?}"),
-    }
 }
 
 /// The whole life of a task against the real manager: installed idle and unarmed, enabled (its

@@ -554,7 +554,12 @@ impl Backend for Scm {
     }
 
     /// Interim: SCM installs no task yet, so no id reaches here as one.
-    fn begin_run(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<std::convert::Infallible> {
+    fn begin_run(
+        &self,
+        snapshot: ScmSnapshot,
+        _reservation: &mut (),
+        _notes: &mut dyn std::io::Write,
+    ) -> Result<std::convert::Infallible> {
         Err(crate::backend::cannot_run_tasks(
             "the Windows service manager",
             &snapshot.into_id(),
