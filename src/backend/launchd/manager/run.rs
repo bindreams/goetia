@@ -15,8 +15,8 @@
 //! that is held. One that ended, or is alive and not held, is [`run_unfollowed`]: after a pending hold the
 //! next launch is held, so a second slipped-in run cannot be what `kickstart -p` names.
 //!
-//! From the `debug` to the `SIGCONT`, SIGINT, SIGTERM and SIGHUP are held back ([`Deferred`]): ending
-//! goetia there would leave a launch held and stopped. So `run` cannot be interrupted by those three while
+//! From before the job is loaded to the `SIGCONT`, SIGINT, SIGTERM and SIGHUP are held back
+//! ([`Deferred`]): ending goetia after the `debug` would leave a launch held and stopped. So `run` cannot be interrupted by those three while
 //! it waits for a slipped-in run. A failure in that window carries [`stranded_hold`]: the hold, or the
 //! launch it holds, stays until a `stop`, a boot-out or a later `run` ends it.
 
