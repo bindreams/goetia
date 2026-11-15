@@ -84,10 +84,11 @@ impl Launchd {
     /// SIGKILL to the run in flight, by label. A start launchd has accepted and not yet forked
     /// (`spawn scheduled`, no pid) is a run, as `status` and `stop` have it, but a signal reaches
     /// nothing before the fork: `launchctl kill` answers "No such process", the start goes on, and the
-    /// run it begins would not be killed. So a signal that finds no process reads `print`, and for a
-    /// start that is queued waits for the pid, under no budget as `stop`'s wait is, then signals again.
-    /// Any other `print` is [`Error::NotRunning`], as the signal's own answer said. Draws a signal, a
-    /// read, a wait and a second signal at most.
+    /// run it begins would not be killed. So a signal that finds no process reads `print`. A start that
+    /// is queued is waited for until it forks, under no budget as `stop`'s wait is; a pid shown is a fork
+    /// that came after the signal. Either way the signal is sent again. Any other `print` is
+    /// [`Error::NotRunning`], as the signal's own answer said. Draws a signal, a read, a wait and a second
+    /// signal at most.
     pub(super) fn kill_task(&self, id: &Id, reservation: &mut Reservation) -> Result<()> {
         let name = id.as_str();
         if self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
@@ -96,8 +97,10 @@ impl Launchd {
         let print = self
             .launchctl
             .read_task_print(name, Budget::Unbounded.start(), Role::Query, reservation)?;
-        if print.queued {
-            self.await_queued_start(name, reservation)?;
+        if print.queued || print.pid.is_some() {
+            if print.queued {
+                self.await_queued_start(name, reservation)?;
+            }
             if self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
                 return Ok(());
             }

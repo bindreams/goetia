@@ -1272,7 +1272,7 @@ const TASK_UNINSTALL_REQUESTS: usize = 2;
 const UNINSTALL_REQUESTS: usize = max(STOP_REQUESTS, TASK_UNINSTALL_REQUESTS);
 const SERVICE_KILL_REQUESTS: usize = 1;
 /// A task's `kill` that finds a start launchd has accepted and not yet forked: the signal that finds no
-/// process, the wait, and the signal after it.
+/// process, and the signal after the wait. The wait draws no reaper.
 const TASK_KILL_REQUESTS: usize = 2;
 const KILL_REQUESTS: usize = max(SERVICE_KILL_REQUESTS, TASK_KILL_REQUESTS);
 /// A task's `enable` makes its own reservation: the `bootstrap` of the job and of the timer.

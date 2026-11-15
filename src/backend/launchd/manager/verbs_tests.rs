@@ -749,6 +749,22 @@ fn kill_of_a_task_whose_start_is_still_queued_waits_for_the_pid_and_kills_it() {
     );
 }
 
+/// A start that forks between the refused signal and the read shows its pid: it is signalled again, with
+/// no wait.
+#[skuld::test]
+fn kill_of_a_start_that_forked_after_the_signal_kills_the_run() {
+    let tree = Tree::new();
+    let fake = Fake::new([sigkill(3), print(&running(4242)), sigkill(0)]);
+    let mgr = launchd_over(fake.clone());
+    let mut held = reserved(&mgr, Step::Kill);
+
+    mgr.kill(task_snapshot(&tree, false), &mut held)
+        .expect("a kill of the run that forked");
+
+    fake.assert_spent("the refused signal, the read that shows the pid, and the signal");
+    assert_never_booted_out(&fake);
+}
+
 /// A start that is accepted and then does not happen leaves `spawn scheduled` with no pid: the wait
 /// ends on the state, and the signal that follows finds no process.
 #[skuld::test]
