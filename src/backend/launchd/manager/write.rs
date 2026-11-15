@@ -22,6 +22,7 @@ use super::{
     staged_tempfile, still_present,
 };
 use crate::backend::bounded::Reservation;
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::launchd::generate::{self, Plists, timer_label};
 use crate::backend::launchd::refuse;
 use crate::backend::launchd::task::{Action, Old, OnDisk, disable_plan, enable_plan, uninstall_plan, update_plan};
@@ -30,6 +31,13 @@ use crate::decide::Outcome;
 use crate::error::{Error, Result};
 use crate::manager::Budget;
 use crate::spec::{DaemonKind, DaemonSpec, Id};
+
+/// What an install of a task draws on and makes: the reservation it sends requests under, and the
+/// directories it creates for the spec.
+pub(super) struct Scope<'a> {
+    pub(super) created: &'a mut CreatedDirs,
+    pub(super) reservation: &'a mut Reservation,
+}
 
 impl Launchd {
     /// `install` of a task (or of a daemon that becomes or stops being one), over `dirs`.
@@ -55,8 +63,9 @@ impl Launchd {
         desired: &Plists,
         outcome: &Outcome,
         snapshot: Option<&Plist>,
-        reservation: &mut Reservation,
+        scope: Scope<'_>,
     ) -> Result<WriteOutcome> {
+        let Scope { created, reservation } = scope;
         // Resolved again: `render` kept only the plists, which name the account, and launchd resolves
         // that name at launch too.
         let account = resolve_account(&spec.common().user)?;
@@ -65,7 +74,7 @@ impl Launchd {
 
         match outcome {
             Outcome::Create => {
-                prepare_parent_dirs(spec, &account)?;
+                prepare_parent_dirs(spec, &account, created)?;
                 let (job_target, timer_target) = (
                     plist_in(staging, id.as_str()),
                     plist_in(staging, &timer_label(id.as_str())),
@@ -168,7 +177,7 @@ impl Launchd {
                     verb: Verb::Install,
                     timer_out: false,
                     // After a refusal, as the service path has it: a refused update creates nothing.
-                    prepare: Some((spec, &account)),
+                    prepare: Some((spec, &account, created)),
                 }
                 .run(&plan, reservation)
             }
@@ -338,7 +347,7 @@ struct Executor<'a> {
     timer_out: bool,
     /// The directories the spec names (`cwd`, the parent of `logs`), made before the first action that
     /// changes anything a refusal could leave untouched.
-    prepare: Option<(&'a DaemonSpec, &'a Account)>,
+    prepare: Option<(&'a DaemonSpec, &'a Account, &'a mut CreatedDirs)>,
 }
 
 /// The verb a plan belongs to.
@@ -355,9 +364,9 @@ impl Executor<'_> {
         // A plan with no action has no refusal to come before: the directories are made, as an
         // install that changes nothing has always made them.
         if plan.is_empty()
-            && let Some((spec, account)) = self.prepare.take()
+            && let Some((spec, account, created)) = self.prepare.take()
         {
-            prepare_parent_dirs(spec, account)?;
+            prepare_parent_dirs(spec, account, created)?;
         }
         for (at, &action) in plan.iter().enumerate() {
             match self.perform(action, reservation) {
@@ -374,9 +383,9 @@ impl Executor<'_> {
     /// `Some` where the install ends with a refusal that is not an error.
     fn perform(&mut self, action: Action, reservation: &mut Reservation) -> Result<Option<WriteOutcome>> {
         if !matches!(action, Action::BootoutTimer | Action::CheckJobIdle)
-            && let Some((spec, account)) = self.prepare.take()
+            && let Some((spec, account, created)) = self.prepare.take()
         {
-            prepare_parent_dirs(spec, account)?;
+            prepare_parent_dirs(spec, account, created)?;
         }
         let (launchctl, id) = (&self.launchd.launchctl, self.id.as_str());
         let deadline = Budget::Unbounded.start();

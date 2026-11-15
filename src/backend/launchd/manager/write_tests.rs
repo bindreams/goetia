@@ -19,6 +19,7 @@ use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::decide::{self, ExternalConfig, Ownership};
 use crate::manager::Step;
 use crate::spec::{TaskSpec, User};
+use crate::testing::elevation::{ELEVATED, require_elevated};
 use crate::testing::task;
 
 // Fixtures ============================================================================================================
@@ -105,7 +106,10 @@ fn create(tree: &Tree, fake: &Fake, spec: &DaemonSpec) -> Result<WriteOutcome> {
         &desired,
         &Outcome::Create,
         None,
-        &mut reserved(&mgr, Step::Install),
+        Scope {
+            created: &mut CreatedDirs::default(),
+            reservation: &mut reserved(&mgr, Step::Install),
+        },
     )
 }
 
@@ -115,6 +119,17 @@ fn rewrite(tree: &Tree, fake: &Fake, spec: &DaemonSpec) -> Result<WriteOutcome> 
 }
 
 fn rewrite_drawing(tree: &Tree, fake: &Fake, spec: &DaemonSpec, reservation: &mut Reservation) -> Result<WriteOutcome> {
+    rewrite_making(tree, fake, spec, reservation, &mut CreatedDirs::default())
+}
+
+/// [`rewrite_drawing`], making the directories the spec names in `created`.
+fn rewrite_making(
+    tree: &Tree,
+    fake: &Fake,
+    spec: &DaemonSpec,
+    reservation: &mut Reservation,
+    created: &mut CreatedDirs,
+) -> Result<WriteOutcome> {
     let mgr = manager(fake);
     let snapshot = marked(tree.read());
     let desired = mgr.render(spec)?;
@@ -126,7 +141,7 @@ fn rewrite_drawing(tree: &Tree, fake: &Fake, spec: &DaemonSpec, reservation: &mu
             spec_diff: String::new(),
         },
         Some(&snapshot),
-        reservation,
+        Scope { created, reservation },
     )
 }
 
@@ -566,10 +581,16 @@ fn a_later_error_after_a_stray_timer_label_went_out_is_bare() {
 }
 
 /// An update that changes nothing still makes the directories the spec names, as it always did.
-#[skuld::test]
+#[skuld::test(labels = [ELEVATED])]
 fn an_update_with_nothing_to_change_still_makes_the_specs_directories() {
+    require_elevated();
     let tree = Tree::new();
-    let cwd = tree.dir(false).join("kept-cwd");
+    // Under `/tmp`, which root owns on every host: directories are made only where root's own are.
+    let root = tempfile::Builder::new()
+        .prefix("goetia-cwd-")
+        .tempdir_in("/tmp")
+        .expect("a directory under /tmp");
+    let cwd = root.path().join("kept-cwd");
     let user = nix::unistd::User::from_uid(nix::unistd::getuid())
         .unwrap()
         .expect("the current user has an account")
@@ -586,7 +607,15 @@ fn an_update_with_nothing_to_change_still_makes_the_specs_directories() {
     tree.put(false, &timer_name(), rendered.timer.as_deref().unwrap());
     let fake = Fake::new([print(job_label(), UNLOADED, ""), print(timer_target(), UNLOADED, "")]);
 
-    rewrite(&tree, &fake, &spec).expect("an update with nothing to change");
+    let mut created = CreatedDirs::under(vec![root.path().to_path_buf()]);
+    rewrite_making(
+        &tree,
+        &fake,
+        &spec,
+        &mut reserved(&manager(&fake), Step::Install),
+        &mut created,
+    )
+    .expect("an update with nothing to change");
 
     fake.assert_spent("only the two reads");
     assert!(cwd.is_dir(), "the directory the spec names was made");
@@ -1469,8 +1498,18 @@ fn the_verbs_draw_no_more_than_they_reserved() {
     let mut held = reserved(&mgr, Step::Install);
     let spec = task_spec(Some(SCHEDULE));
     let desired = mgr.render(&spec).unwrap();
-    mgr.write_task(tree.dirs(), &spec, &desired, &Outcome::Create, None, &mut held)
-        .expect("a create");
+    mgr.write_task(
+        tree.dirs(),
+        &spec,
+        &desired,
+        &Outcome::Create,
+        None,
+        Scope {
+            created: &mut CreatedDirs::default(),
+            reservation: &mut held,
+        },
+    )
+    .expect("a create");
     assert_eq!(
         left(&held),
         (INSTALL_REQUESTS - 2, (INSTALL_CALLS - 6) * files),

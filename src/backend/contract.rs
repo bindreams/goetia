@@ -47,8 +47,11 @@ pub(crate) trait Backend {
     /// What `read` saw at a marked id; only this backend looks inside. Built only by `read` and
     /// `scan`.
     type Snapshot: InstalledService;
-    /// What an install needs before it reads anything that is not a [`Self::Reservation`].
-    type InstallScope;
+    /// What an install needs before it reads anything that is not a [`Self::Reservation`]. It also
+    /// holds what a [`Self::write`] makes besides the definition, which `install` keeps or takes
+    /// back by whether the definition stands ([`Settle`]): the directories a Unix backend creates
+    /// for a spec's `cwd` and `logs`.
+    type InstallScope: Settle;
     /// What the verbs that send requests draw on, made by [`Self::reserve`] before anything is
     /// sent: see `bounded::Reservation`.
     type Reservation: 'static;
@@ -118,6 +121,18 @@ pub(crate) trait Backend {
         scope: &mut Self::InstallScope,
         reservation: &mut Self::Reservation,
     ) -> Result<WriteOutcome>;
+
+    /// Whether the definition a [`Self::write`] of `outcome` was to leave is in place, read the way
+    /// this backend reads one. Asked after every write, failed or not, and only if the write made
+    /// something to keep or take back. Every backend states it: one whose scope makes nothing says
+    /// [`Standing::Yes`].
+    fn standing(
+        &self,
+        spec: &DaemonSpec,
+        definition: &Self::Definition,
+        outcome: &crate::decide::Outcome,
+        snapshot: Option<&Self::Snapshot>,
+    ) -> Standing;
 
     /// The live state of a service `read` found marked. `Error::NotInstalled` where the query
     /// completed and found the service gone, which `list` omits; never for one that is present.
@@ -256,6 +271,32 @@ impl RunHandle for Infallible {
     fn wait(self) -> Result<Exit> {
         match self {}
     }
+}
+
+/// Whether the definition an install wrote is in place.
+#[derive(Debug)]
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "only the Unix backends write anything but the definition")
+)]
+pub(crate) enum Standing {
+    Yes,
+    No,
+    /// The read did not complete: why, naming what was read.
+    Unknown(String),
+}
+
+/// What a [`Backend::write`] made besides the definition, in the [`Backend::InstallScope`]. `()`
+/// for a backend that makes nothing.
+pub(crate) trait Settle {
+    /// Keep what was made, or take it back, by whether the definition stands. `standing` is asked
+    /// only if something was made. What is not kept is taken back when the scope is dropped, so a
+    /// write that lost a race and a later one that failed are both undone.
+    fn settle(&mut self, standing: impl FnOnce() -> Standing);
+}
+
+impl Settle for () {
+    fn settle(&mut self, _standing: impl FnOnce() -> Standing) {}
 }
 
 /// One [`Backend`]'s native restart of a service the gate passed.

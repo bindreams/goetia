@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::backend::{
     Decoded, InstalledDefinition, InstalledService, Marker, NativeRestart, OutputSource, ReadOutcome, RunHandle, Scan,
-    ScanEntry, Unnamed, WriteOutcome,
+    ScanEntry, Standing, Unnamed, WriteOutcome,
 };
 use crate::blob::{self, Blob};
 use crate::decide::{ExternalConfig, Outcome};
@@ -940,6 +940,17 @@ impl crate::backend::Backend for Fake {
             },
         );
         Ok(WriteOutcome::Done)
+    }
+
+    /// The fake's scope makes nothing but the entry.
+    fn standing(
+        &self,
+        _spec: &DaemonSpec,
+        _definition: &String,
+        _outcome: &Outcome,
+        _snapshot: Option<&Artifact>,
+    ) -> Standing {
+        Standing::Yes
     }
 
     fn live_status(&self, snapshot: &Artifact) -> Result<Status> {

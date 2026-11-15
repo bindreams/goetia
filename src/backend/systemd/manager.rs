@@ -44,14 +44,16 @@
 //! 4. **Permissions.** `NamedTempFile` is created mode 0600; after persisting, the unit would be
 //!    root-only, breaking the promise that `list`/`show`/`diff` need no elevation.
 //!    `write::write_temp_unit` `chmod`s 0644 before persisting.
-//! 5. **Parent directories.** `dirs::ensure_parent_dirs` creates and, for a non-root account,
-//!    `chown`s the parents of `logs` and `cwd` while still elevated. A missing log directory fails
-//!    the unit at start (`ENOENT` opening `StandardOutput=append:`), and a missing `cwd` fails it
-//!    with `200/CHDIR`. Only path components this call actually creates are touched; an
-//!    already-existing directory is not checked, because install is not a start. systemd opens the
-//!    log file as root before it drops privileges, so an existing log directory is never a problem
-//!    for the account; it `chdir`s into `cwd` after the switch, so only a `cwd` the account cannot
-//!    traverse fails at start.
+//! 5. **Parent directories.** `dirs::ensure_parent_dirs` makes the parents of `logs` and `cwd`
+//!    where they are missing (only under `/var/log`, `/var/lib` and `/var/cache`; elsewhere it
+//!    refuses), hands `cwd` to a non-root account, and refuses a log whose directory an account
+//!    other than root can write, while still elevated: see [`CreatedDirs`]. A missing log directory
+//!    fails the unit at start (`ENOENT` opening `StandardOutput=append:`), and a missing `cwd` fails
+//!    it with `200/CHDIR`. A path that exists is used as it is, because install is not a start.
+//!    systemd opens the log file as root before it drops privileges, and follows a symlink there: so
+//!    the log directory stays root's, and one the account can write is the way for it to make root
+//!    append to any file. The unit `chdir`s into `cwd` after the switch, so `cwd` is the account's.
+//!    What is made is removed again, deepest first, unless the unit is in place when `write` ends.
 //! 6. **Uninstall order** is stop -> `systemctl disable` -> remove -> `daemon-reload`. Disabling
 //!    after the fragment is gone is impossible (no `[Install]` section left to read), which would
 //!    leave exactly the `.wants` symlink `uninstall_leaves_nothing` checks for. A task's order puts
@@ -89,9 +91,11 @@ pub(crate) use run::{JournalOutput, Run};
 use systemctl::{Held, Systemctl};
 pub(crate) use task::Fragment;
 
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::systemd::generate::{self, Units};
 use crate::backend::{
-    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, WriteOutcome,
+    Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, Standing,
+    WriteOutcome,
 };
 use crate::decide::Outcome;
 use crate::error::{Error, Reason, Result};
@@ -157,14 +161,15 @@ impl std::fmt::Debug for Systemd {
 impl Backend for Systemd {
     type Definition = Units;
     type Snapshot = Fragment;
-    type InstallScope = ();
+    type InstallScope = CreatedDirs;
     type Reservation = Held;
     type Run = Run;
 
     /// Before anything is read or written: the gate is where no manager to ask refuses too. Its
     /// answer holds for the `daemon-reload` after the write, which draws on the same reservation.
-    fn begin_install(&self, _spec: &DaemonSpec, _desired: &Units, reservation: &mut Held) -> Result<()> {
-        self.systemctl.require_supported(reservation)
+    fn begin_install(&self, _spec: &DaemonSpec, _desired: &Units, reservation: &mut Held) -> Result<CreatedDirs> {
+        self.systemctl.require_supported(reservation)?;
+        Ok(CreatedDirs::default())
     }
 
     /// The listener threads each watched start or stop in `steps` reads its streams with, made all
@@ -196,10 +201,10 @@ impl Backend for Systemd {
         definition: &Units,
         outcome: &Outcome,
         snapshot: Option<&Fragment>,
-        _scope: &mut (),
+        scope: &mut CreatedDirs,
         reservation: &mut Held,
     ) -> Result<WriteOutcome> {
-        dirs::ensure_parent_dirs(spec)?;
+        dirs::ensure_parent_dirs(spec, scope)?;
         match outcome {
             Outcome::Create => self.create_units(spec.common().id.as_str(), definition, reservation),
             Outcome::Update { .. } | Outcome::Stale { .. } => {
@@ -208,6 +213,21 @@ impl Backend for Systemd {
             }
             other => unreachable!("`flow::install` writes only `Create`, `Update` and `Stale`, got {other:?}"),
         }
+    }
+
+    /// Whether the job's unit is `definition`'s, as `discover` reads it: the unit is what names the
+    /// directories. A timer names none.
+    fn standing(
+        &self,
+        spec: &DaemonSpec,
+        definition: &Units,
+        _outcome: &Outcome,
+        _snapshot: Option<&Fragment>,
+    ) -> Standing {
+        unit_standing(
+            &unit_path(spec.common().id.as_str(), UnitKind::Service),
+            &definition.service,
+        )
     }
 
     fn live_status(&self, snapshot: &Fragment) -> Result<Status> {
@@ -318,6 +338,15 @@ impl Backend for Systemd {
     /// See [`Systemd::begin_run`], which is the journal-less host's stated contract too.
     fn begin_run(&self, snapshot: Fragment, reservation: &mut Held, _notes: &mut dyn std::io::Write) -> Result<Run> {
         Systemd::begin_run(self, snapshot, reservation)
+    }
+}
+
+/// Whether the unit at `path` is `text`, as `discover` reads one.
+fn unit_standing(path: &Path, text: &str) -> Standing {
+    match discover::classify_and_read(path) {
+        Ok(discover::RawState::Regular(found)) if found == text => Standing::Yes,
+        Ok(_) => Standing::No,
+        Err(failure) => Standing::Unknown(format!("could not read the unit: {}", failure.into_os_error().report())),
     }
 }
 

@@ -406,23 +406,39 @@ was ever the problem. Set `cwd`, or write the argument absolute.
 
 (`cwd` and `logs` are resolved against the manifest's directory too.)
 
-## Directories: `install` prepares, it does not check
+## Directories: `install` makes them under system roots
 
-`install` creates a `cwd` and the parent directory of `logs` if they are
-missing. A directory that already exists is not checked or changed: `install`
-is not a start, and you may still be preparing it. On systemd an existing log
-directory is never a problem for the account, because systemd opens the log
-file as root before dropping privileges; a `cwd` the account cannot traverse
-fails at `start` with `200/CHDIR`. A missing directory fails at `start` too,
-which is why `install` creates it. The backends differ in what they create
-and what they refuse:
+`install` makes a `cwd` and the parent directory of `logs` if they are missing, but only under the places
+the platform keeps a daemon's state and logs (the _roots_): `/var/log`, `/var/lib` and `/var/cache` on
+Linux; `/var/log`, `/Library/Logs` and `/Library/Application Support` on macOS. A missing directory
+anywhere else (`/opt/app/logs`, a home directory, a Homebrew prefix) is an error that names the path and
+the roots: create it first. A directory that already exists is used as it is, wherever it is and whoever
+owns it, since `install` is not a start and you may still be preparing it.
 
-- **systemd** creates every missing component and gives each one it created
-  to a non-root `user`. A path that exists but is not a directory is refused.
-- **launchd** creates every missing component and gives each one it created
-  to a non-root `user`. An existing path of any kind, a dangling symlink
-  included, is accepted, so a file where a directory belongs surfaces at
-  `start`.
+- **What it makes.** Every missing component, owned by root, `0755`. It makes a directory only where every
+  directory and symlink on the way (resolved, so `..` and links count) is root's: a path through a
+  directory an account owns is refused, which includes a directory an earlier install handed to its
+  account (a second daemon's `cwd` below it).
+- **Who gets what.** Only the deepest directory of a path is handed over, and only where the daemon's
+  account has to write it: `cwd` goes to a non-root `user` (and its primary group) on both backends; the
+  log directory goes to it on launchd, which opens the log as that user. On systemd the log directory
+  stays root's: systemd opens `append:` as root before it drops privileges, and a directory an account can
+  write lets it plant a symlink there and make root append to any file. A daemon that writes other files
+  beside its log needs a `cwd` for them.
+- **systemd's log directory.** `install` refuses a `logs` whose directory, or any directory or symlink on
+  the way to it, a user other than root can change (owned by another user, or writable by a group or by
+  everyone without the sticky bit), and names who. This covers a directory that already exists. Debian
+  and Ubuntu ship `/var/log` as `root:syslog 0775`, so `logs: /var/log/app.log` is refused there; use a
+  directory of the daemon's own, `/var/log/<app>/app.log`, which `install` makes root's.
+- **A path that is not a directory** (a file, or a symlink that leads nowhere) is refused by both
+  backends.
+- **A failed install** removes the directories it made, deepest first, by descriptor and only if they are
+  still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
+  (the unit or plist cannot be read back): it then says so, hands over what it would have handed over, and
+  keeps them, since removing them could break a definition that stands.
+- **A limit.** An install killed between making `cwd` and handing it over leaves a root-owned `cwd`. The
+  next install uses it as it is, and the daemon cannot write it: remove the directory and run `install`
+  again.
 - **scm** creates nothing.
 
 ## Per-backend overrides

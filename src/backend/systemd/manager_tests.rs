@@ -7,10 +7,8 @@
 //! Most of these are elevated (they write real files under `/etc/systemd/system`), so they join
 //! the `systemd_group` fixture of `crate::testing::groups`.
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::dirs::ensure_dir;
 use super::discover::{RawState, raw_state};
 use super::systemctl::systemctl_tests::{booted, gate_then};
 use super::write::{CreateOutcome, ReplaceOutcome, create_unit, quarantine_if_still_ours, replace_unit_verified};
@@ -22,7 +20,7 @@ use crate::manager::conformance::fresh_id;
 use crate::spec::{DaemonSpec, Protocol, ServiceFields, ServiceSpec};
 use crate::testing::base_fields;
 
-use crate::testing::cleanup::{DirGuard, FileGuard, remove_or_warn};
+use crate::testing::cleanup::{FileGuard, remove_or_warn};
 use crate::testing::groups::{Group, systemd_group};
 
 /// On drop, removes every quarantine file of either unit of `id` the test's scenario left behind.
@@ -239,51 +237,6 @@ fn install_never_corrupts_state_when_something_races_the_first_create(#[fixture(
             other => panic!("a raced install must Create or RefuseForeign, got {other:?}"),
         }
     });
-}
-
-// ensure_dir: parent directories ======================================================================================
-
-#[skuld::test]
-fn ensure_dir_leaves_a_preexisting_directory_untouched(#[fixture(systemd_group)] _group: &Group) {
-    let dir = std::env::temp_dir().join(format!("{}-preexisting", fresh_id("systemd")));
-    std::fs::create_dir(&dir).expect("create pre-existing dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let _cleanup = DirGuard::new(dir.clone());
-
-    ensure_dir(&dir, &User::Root).expect("ensure_dir on a pre-existing dir");
-
-    let meta = std::fs::metadata(&dir).expect("stat");
-    assert_eq!(
-        meta.permissions().mode() & 0o777,
-        0o700,
-        "a pre-existing directory's mode must not be widened"
-    );
-}
-
-#[skuld::test]
-fn ensure_dir_accepts_a_preexisting_directory_the_account_cannot_write(#[fixture(systemd_group)] _group: &Group) {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let dir = std::env::temp_dir().join(format!("{}-unwritable", fresh_id("systemd")));
-    std::fs::create_dir(&dir).expect("create pre-existing dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let _cleanup = DirGuard::new(dir.clone());
-
-    ensure_dir(&dir, &User::Name("nobody".to_string())).expect("ensure_dir");
-
-    let meta = std::fs::metadata(&dir).expect("stat");
-    assert_eq!(meta.permissions().mode() & 0o777, 0o700, "mode must be untouched");
-    assert_eq!(meta.uid(), 0, "owner must be untouched");
-}
-
-#[skuld::test]
-fn ensure_dir_refuses_a_preexisting_file(#[fixture(systemd_group)] _group: &Group) {
-    let path = std::env::temp_dir().join(format!("{}-a-file", fresh_id("systemd")));
-    std::fs::write(&path, b"").expect("create file");
-    let _cleanup = FileGuard::new(path.clone());
-
-    let err = ensure_dir(&path, &User::Root).expect_err("a file cannot be a directory");
-    assert!(err.to_string().contains("not a directory"), "{err}");
 }
 
 // replace_unit_verified / quarantine_if_still_ours: the remaining race branches =======================================

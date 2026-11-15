@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::backend::{Backend, InstalledService, ReadOutcome, RunHandle, ScanEntry, WriteOutcome};
+use crate::backend::{Backend, InstalledService, ReadOutcome, RunHandle, ScanEntry, Settle as _, WriteOutcome};
 use crate::decide::{self, ExternalConfig, Outcome, Ownership};
 use crate::error::{Error, Reason, Result};
 use crate::manager::{Budget, Exit, Installed, State, Status, Step, output};
@@ -194,14 +194,16 @@ pub(crate) fn install<B: Backend>(
         );
         match outcome {
             Outcome::Create | Outcome::Update { .. } | Outcome::Stale { .. } => {
-                match b.write(
+                let written = b.write(
                     spec,
                     &desired,
                     &outcome,
                     found.snapshot.as_ref(),
                     &mut scope,
                     reservation,
-                )? {
+                );
+                scope.settle(|| b.standing(spec, &desired, &outcome, found.snapshot.as_ref()));
+                match written? {
                     WriteOutcome::Done => return Ok(outcome),
                     WriteOutcome::Refused(refusal) => return Ok(refusal),
                     WriteOutcome::Raced => {}

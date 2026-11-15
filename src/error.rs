@@ -219,6 +219,11 @@ pub enum Error {
     )]
     NotADirectory { path: PathBuf },
 
+    /// A directory that is a daemon's `cwd`, the directory of its log, or one of their ancestors is
+    /// refused: `why` says what is wrong with it and what to do. No OS call failed.
+    #[error("refusing {} for a daemon's cwd or log directory: {why}", path.display())]
+    DirectoryRefused { path: PathBuf, why: String },
+
     /// A folder the shim would be written to, one of its ancestors, or the host file itself can be
     /// modified by an account goetia does not trust, so that account could replace the shim, which
     /// runs as `LocalSystem`. No OS call failed.
@@ -739,6 +744,7 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::DirectoryRefused { .. }
             | Error::ShimFolderUnsafe { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }
@@ -926,6 +932,7 @@ impl Error {
             | Error::UnitNotLoaded { .. }
             | Error::Reservation { .. }
             | Error::NotADirectory { .. }
+            | Error::DirectoryRefused { .. }
             | Error::ShimFolderUnsafe { .. }
             | Error::ShimMarkerMissing { .. }
             | Error::ShimMarkerVersion { .. }

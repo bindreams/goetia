@@ -50,7 +50,7 @@ pub(super) enum ReplaceOutcome {
 /// Overwrite `id`'s `kind` unit with `text`, but only if the fragment currently at `unit_path(id, kind)` still has
 /// exactly the content `expected_text` names — closing the same TOCTOU `create_unit` closes, reached
 /// here from the `Update`/`Stale` arm instead: the gap between classification and this write spans
-/// `decide`, `ensure_parent_dirs` (which can spawn a `chown` subprocess), and building the
+/// `decide`, `ensure_parent_dirs`, and building the
 /// replacement's contents, wide enough for something else to land at this exact path in between
 /// (e.g. a concurrent `systemctl mask` on this same, already-managed id).
 ///

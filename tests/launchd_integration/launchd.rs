@@ -1391,38 +1391,51 @@ fn a_start_with_no_budget_is_ok_for_a_restart_always_job(#[fixture(launchd_group
 
 // Parent directories ==================================================================================================
 
-/// `install` creates a missing `cwd` and parent of `logs`, and hands each
-/// component it created to the daemon's own account — otherwise a non-root daemon whose
-/// `WorkingDirectory` or `StandardOutPath` names a directory only root can
-/// write into fails at launch with an opaque status.
-#[skuld::test]
-fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account(#[fixture(launchd_group)] _group: &Group) {
-    let nobody_uid: u32 = cmd::run("id", &["-u", "nobody"])
-        .stdout
-        .trim()
-        .parse()
-        .expect("nobody's uid");
-    let nobody_gid: u32 = cmd::run("id", &["-g", "nobody"])
-        .stdout
-        .trim()
-        .parse()
-        .expect("nobody's gid");
+/// A directory of one test's own under a root goetia makes directories in: `/Library/Application
+/// Support` for a `cwd`, `/Library/Logs` for a log. Tests of a missing directory cannot use `/tmp`,
+/// where goetia makes none.
+fn under_state(id: &str, what: &str) -> PathBuf {
+    PathBuf::from("/Library/Application Support").join(format!("{id}-{what}"))
+}
 
+fn under_logs(id: &str, what: &str) -> PathBuf {
+    PathBuf::from("/Library/Logs").join(format!("{id}-{what}"))
+}
+
+fn nobody_ids() -> (u32, u32) {
+    let id = |flag: &str| -> u32 {
+        cmd::run("id", &[flag, "nobody"])
+            .stdout
+            .trim()
+            .parse()
+            .expect("nobody's id")
+    };
+    (id("-u"), id("-g"))
+}
+
+/// `install` makes a missing `cwd` and parent of `logs` under the roots, and hands each deepest
+/// directory to the daemon's own account, whose job launchd runs and whose log launchd opens as that
+/// account: otherwise a non-root daemon whose `WorkingDirectory` or `StandardOutPath` names a directory
+/// only root can write into fails at launch with an opaque status. What is above them stays root's.
+#[skuld::test]
+fn install_makes_and_hands_over_cwd_and_logs_parent_for_a_non_root_account(#[fixture(launchd_group)] _group: &Group) {
+    let (nobody_uid, nobody_gid) = nobody_ids();
     let mgr = Launchd::new();
     let id = support::random_test_id();
-    let cwd = Path::new("/tmp").join(format!("{id}-cwd"));
-    let logs = Path::new("/tmp").join(format!("{id}-logs")).join("out.log");
-    let _cleanup_cwd = DirGuard::new(cwd.clone());
-    let _cleanup_logs_parent = DirGuard::new(logs.parent().unwrap().to_path_buf());
+    let state = under_state(&id, "state");
+    let cwd = state.join("work");
+    let logs_parent = under_logs(&id, "logs");
+    let _cleanup_cwd = DirGuard::new(state.clone());
+    let _cleanup_logs_parent = DirGuard::new(logs_parent.clone());
 
     let mut spec = service_fields(base_spec(&id, vec!["/bin/true".to_string()]));
     spec.common.user = User::Name("nobody".to_string());
     spec.common.cwd = Some(cwd.clone());
-    spec.common.logs = Some(logs.clone());
+    spec.common.logs = Some(logs_parent.join("out.log"));
     let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let _guard = Guard::install(&mgr, &spec);
 
-    for (dir, what) in [(cwd.as_path(), "cwd"), (logs.parent().unwrap(), "logs' parent")] {
+    for (dir, what) in [(cwd.as_path(), "cwd"), (logs_parent.as_path(), "logs' parent")] {
         let meta = std::fs::metadata(dir).unwrap_or_else(|e| panic!("{what} ({}) must exist: {e}", dir.display()));
         assert!(meta.is_dir(), "{what} ({}) must be a directory", dir.display());
         assert_eq!(
@@ -1432,18 +1445,132 @@ fn install_creates_and_owns_cwd_and_logs_parent_for_a_non_root_account(#[fixture
             dir.display()
         );
         assert_eq!(
-            meta.uid(),
-            nobody_uid,
-            "{what} ({}) must be owned by nobody",
-            dir.display()
-        );
-        assert_eq!(
-            meta.gid(),
-            nobody_gid,
-            "{what} ({}) must be grouped as nobody",
+            (meta.uid(), meta.gid()),
+            (nobody_uid, nobody_gid),
+            "{what} ({}) must be nobody's",
             dir.display()
         );
     }
+    assert_eq!(
+        std::fs::metadata(&state).expect("stat").uid(),
+        0,
+        "what is above the cwd stays root's"
+    );
+}
+
+/// The daemon runs, with its `cwd` entered and its log opened by launchd as its account.
+#[skuld::test]
+fn a_daemon_runs_in_the_directories_install_made_for_its_account(#[fixture(launchd_group)] _group: &Group) {
+    let (nobody_uid, _) = nobody_ids();
+    let mgr = Launchd::new();
+    let id = support::random_test_id();
+    let state = under_state(&id, "state");
+    let logs_parent = under_logs(&id, "logs");
+    let _cleanup_cwd = DirGuard::new(state.clone());
+    let _cleanup_logs_parent = DirGuard::new(logs_parent.clone());
+    let mut spec = service_fields(sleepy(&id));
+    spec.common.user = User::Name("nobody".to_string());
+    spec.common.cwd = Some(state.join("work"));
+    spec.common.logs = Some(logs_parent.join("out.log"));
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
+    let _guard = Guard::install(&mgr, &spec);
+
+    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+
+    let log = std::fs::metadata(logs_parent.join("out.log")).expect("launchd opened the log");
+    assert_eq!(log.uid(), nobody_uid, "launchd opens the log as the job's account");
+}
+
+#[skuld::test]
+fn install_refuses_a_missing_directory_outside_the_roots_and_makes_nothing(#[fixture(launchd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let base = Path::new("/tmp").join(format!("{id}-outside"));
+    let _cleanup = DirGuard::new(base.clone());
+    let mut spec = service_fields(base_spec(&id, vec!["/bin/true".to_string()]));
+    spec.common.cwd = Some(base.join("work"));
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
+    let _guard = Guard(spec.common().id.clone());
+
+    let err = Launchd::new().install(&spec, false).expect_err("outside every root");
+
+    let goetia::Error::DirectoryRefused { why, .. } = &err else {
+        panic!("expected a refused directory, got {err:?}");
+    };
+    assert!(
+        why.contains("create it first") && why.contains("/Library/Logs"),
+        "{why}"
+    );
+    assert!(!base.exists(), "nothing was made outside the roots");
+    assert!(!staging_path(&id).exists(), "a refused install writes no plist");
+}
+
+/// A spec whose `cwd` is `cwd` and whose `logs` parent lies under a regular file, so the install makes
+/// what is missing of the former and then fails on the latter.
+fn spec_failing_on_logs_after_cwd(id: &str, base: &Path, cwd: &Path) -> DaemonSpec {
+    let file = base.join("file");
+    std::fs::write(&file, b"x").unwrap_or_else(|e| panic!("write {}: {e}", file.display()));
+    let mut spec = service_fields(base_spec(id, vec!["/bin/true".to_string()]));
+    spec.common.cwd = Some(cwd.to_path_buf());
+    spec.common.logs = Some(file.join("sub").join("out.log"));
+    ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
+}
+
+#[skuld::test]
+fn a_failed_install_removes_the_directories_it_made(#[fixture(launchd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let base = under_state(&id, "undo-made");
+    let _cleanup = DirGuard::new(base.clone());
+    std::fs::create_dir(&base).unwrap_or_else(|e| panic!("mkdir {}: {e}", base.display()));
+    let spec = spec_failing_on_logs_after_cwd(&id, &base, &base.join("a").join("b"));
+    let _guard = Guard(spec.common().id.clone());
+
+    let err = Launchd::new()
+        .install(&spec, false)
+        .expect_err("the logs parent is under a file");
+    support::assert_failed_on_a_path_under_a_file(&err);
+
+    assert!(!base.join("a").exists(), "the failed install left its cwd");
+    assert!(base.is_dir(), "a directory that existed before must stay");
+}
+
+#[skuld::test]
+fn a_failed_install_removes_a_new_directory_in_one_that_existed_before(#[fixture(launchd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let base = under_state(&id, "undo-preexisting");
+    let _cleanup = DirGuard::new(base.clone());
+    let existing = base.join("cwd");
+    std::fs::create_dir_all(&existing).unwrap_or_else(|e| panic!("mkdir {}: {e}", existing.display()));
+    let made = existing.join("new");
+    let spec = spec_failing_on_logs_after_cwd(&id, &base, &made);
+    let _guard = Guard(spec.common().id.clone());
+
+    let err = Launchd::new()
+        .install(&spec, false)
+        .expect_err("the logs parent is under a file");
+    support::assert_failed_on_a_path_under_a_file(&err);
+
+    assert!(!made.exists(), "the failed install left {}", made.display());
+    assert!(existing.is_dir(), "a directory that existed before must stay");
+}
+
+/// An update that writes a plist asking for a new `cwd` makes it and keeps it: the directories are kept
+/// because the plist the install wrote stands where `read` found it.
+#[skuld::test]
+fn an_update_keeps_the_cwd_it_made(#[fixture(launchd_group)] _group: &Group) {
+    let mgr = Launchd::new();
+    let id = support::random_test_id();
+    let spec = base_spec(&id, vec!["/bin/true".to_string()]);
+    let _guard = Guard::install(&mgr, &spec);
+    let cwd = under_state(&id, "update-cwd");
+    let _cleanup = DirGuard::new(cwd.clone());
+    let mut fields = service_fields(spec);
+    fields.common.cwd = Some(cwd.clone());
+    let updated = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
+
+    let outcome = mgr.install(&updated, false).expect("update");
+
+    assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
+    assert!(cwd.is_dir(), "the update's cwd must stay");
 }
 
 // Non-regular occupants ===============================================================================================
