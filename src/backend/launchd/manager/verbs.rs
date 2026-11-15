@@ -81,6 +81,45 @@ impl Launchd {
         }
     }
 
+    /// SIGKILL to the run in flight, by label. A start launchd has accepted and not yet forked
+    /// (`spawn scheduled`, no pid) is a run, as `status` and `stop` have it, but a signal reaches
+    /// nothing before the fork: `launchctl kill` answers "No such process", the start goes on, and the
+    /// run it begins would not be killed. So a signal that finds no process reads `print`, and for a
+    /// start that is queued waits for the pid, under no budget as `stop`'s wait is, then signals again.
+    /// Any other `print` is [`Error::NotRunning`], as the signal's own answer said. Draws a signal, a
+    /// read, a wait and a second signal at most.
+    pub(super) fn kill_task(&self, id: &Id, reservation: &mut Reservation) -> Result<()> {
+        let name = id.as_str();
+        if self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
+            return Ok(());
+        }
+        let print = self
+            .launchctl
+            .read_task_print(name, Budget::Unbounded.start(), Role::Query, reservation)?;
+        if print.queued {
+            self.await_queued_start(name, reservation)?;
+            if self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
+                return Ok(());
+            }
+        }
+        Err(Error::NotRunning { id: id.to_string() })
+    }
+
+    /// Waits for the start launchd has accepted for `name` to fork, or to turn out not to happen (see
+    /// [`Until::ProcessOrNotScheduled`]), under no budget. One call, drawing a call's files.
+    fn await_queued_start(&self, name: &str, reservation: &mut Reservation) -> Result<()> {
+        let kept = reservation
+            .keep(Role::COUNTED_FILES)
+            .map_err(|source| Error::Reservation { id: None, source })?;
+        never_expires(self.launchctl.wait_print(
+            name,
+            Budget::Unbounded.start(),
+            &kept,
+            Until::ProcessOrNotScheduled,
+        )?);
+        Ok(())
+    }
+
     fn stop_pass(
         &self,
         id: &Id,
@@ -97,13 +136,7 @@ impl Launchd {
             .read_task_print(name, issuing, Role::Query, reservation)?;
         let Some(pid) = print.pid else {
             if print.queued {
-                let kept = reservation
-                    .keep(Role::COUNTED_FILES)
-                    .map_err(|source| Error::Reservation { id: None, source })?;
-                never_expires(
-                    self.launchctl
-                        .wait_print(name, issuing, &kept, Until::ProcessOrNotScheduled)?,
-                );
+                self.await_queued_start(name, reservation)?;
                 return Ok(Pass::Again);
             }
             // Idle: no process, and launchd holds no start. Anything else with no pid, or a read that

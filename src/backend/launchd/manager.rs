@@ -1238,7 +1238,7 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 /// Most requests each verb sends; each draws a reaper from the verb's [`Reservation`].
 /// `start`: bootstrap+kickstart, then the corrective cycle's bootout+bootstrap+kickstart.
 ///
-/// `install` and `uninstall` have a service's count and a task's (see `write`); [`needs`] takes the
+/// `install`, `uninstall` and `kill` have a service's count and a task's (see `write`); [`needs`] takes the
 /// larger, since a reservation is made before the kind is known. A task's `run` draws within `start`'s
 /// count: its first pass is the load (a kept read and wait, the `bootstrap`, one more read), the
 /// `debug`, the `kickstart -p`, the `print`, the confirming `print` and the `SIGCONT`, 8 calls and 4
@@ -1256,7 +1256,11 @@ const STOP_REQUESTS: usize = 1;
 /// A task's `uninstall`: the timer's `bootout` and the job's.
 const TASK_UNINSTALL_REQUESTS: usize = 2;
 const UNINSTALL_REQUESTS: usize = max(STOP_REQUESTS, TASK_UNINSTALL_REQUESTS);
-const KILL_REQUESTS: usize = 1;
+const SERVICE_KILL_REQUESTS: usize = 1;
+/// A task's `kill` that finds a start launchd has accepted and not yet forked: the signal that finds no
+/// process, the wait, and the signal after it.
+const TASK_KILL_REQUESTS: usize = 2;
+const KILL_REQUESTS: usize = max(SERVICE_KILL_REQUESTS, TASK_KILL_REQUESTS);
 /// A task's `enable` makes its own reservation: the `bootstrap` of the job and of the timer.
 const TASK_ENABLE_REQUESTS: usize = 2;
 /// A task's `disable` makes its own: the timer's `bootout`.
@@ -1285,7 +1289,11 @@ const STOP_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_STOP_CALLS);
 /// waits.
 const TASK_UNINSTALL_CALLS: usize = 2 + (1 + 1) + (1 + 1);
 const UNINSTALL_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_UNINSTALL_CALLS);
-const KILL_CALLS: usize = KILL_REQUESTS;
+const SERVICE_KILL_CALLS: usize = SERVICE_KILL_REQUESTS;
+/// A task's longest `kill`: the signal, the read, the wait for the pid (one call, however many reads it
+/// makes), and the signal.
+const TASK_KILL_CALLS: usize = TASK_KILL_REQUESTS + 1 + 1;
+const KILL_CALLS: usize = max(SERVICE_KILL_CALLS, TASK_KILL_CALLS);
 /// A task's `enable`: the two reads of which labels launchd holds, and both `bootstrap`s.
 const TASK_ENABLE_CALLS: usize = 2 + 2;
 /// A task's `disable`: the same two reads, the timer's `bootout` and its wait.
@@ -1295,7 +1303,7 @@ const fn max(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
 
-/// The most `step` draws, as `(requests, calls)`: for `install`, `uninstall` and `stop`, the larger of a
+/// The most `step` draws, as `(requests, calls)`: for `install`, `uninstall`, `stop` and `kill`, the larger of a
 /// service's and a task's (a task's `stop` is counted per pass: a later pass reserves again). A draw
 /// past it is a miscount, caught by the assertion in [`Reservation`] in every test that runs the verb.
 ///
@@ -1785,8 +1793,13 @@ impl backend::Backend for Launchd {
     }
 
     /// SIGKILL to the job by label, for a service and a task alike: a job with no process is
-    /// [`Error::NotRunning`], classified off the kill's own answer.
+    /// [`Error::NotRunning`], classified off the kill's own answer. A task's `kill` that finds no process
+    /// while launchd has accepted a start and not yet forked it (`spawn scheduled`, which `status` calls
+    /// running) waits for the pid and then signals (see `kill_task`); a service has no such state.
     fn kill(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
+        if snapshot.kind() == DaemonKind::Task {
+            return self.kill_task(snapshot.id(), reservation);
+        }
         let id = snapshot.id();
         match self.launchctl.signal(id.as_str(), "SIGKILL", reservation)? {
             SignalOutcome::Sent => Ok(()),

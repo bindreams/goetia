@@ -236,7 +236,10 @@ pub trait ServiceManager {
     ///
     /// [`Error::NotRunning`] where the service has no process, **classified off the kill request's
     /// own answer** and never off a state read before it, which would race the kill. Not an
-    /// `Ok(())`: nothing was killed.
+    /// `Ok(())`: nothing was killed. The one read after that answer is a launchd task's: `kickstart`
+    /// returns before the fork, and a task whose accepted start has not forked yet (which `status` reports
+    /// as running) has no process to signal, so its `kill` waits, under no budget, for the pid and then
+    /// signals; where the start does not happen, or the job was idle, it is `NotRunning`.
     ///
     /// SCM returns once it has recorded the exit: the service is then stopped, or already restarted
     /// by its restart policy. systemd and launchd return once the signal is sent.

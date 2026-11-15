@@ -640,12 +640,16 @@ fn a_watch_that_cannot_be_made_is_an_error_before_any_request() {
 
 // kill ================================================================================================================
 
-/// SIGKILL by label, for a task as for a service; a job with no process is `NotRunning`.
+fn sigkill(code: i32) -> Entry {
+    reply(&["kill", "SIGKILL", &target()], exited(code, "", ""))
+}
+
+/// SIGKILL by label, for a task as for a service; a job with no process, and no start launchd has
+/// accepted, is `NotRunning`.
 #[skuld::test]
 fn kill_of_a_task_is_the_sigkill_by_label_and_not_running_when_idle() {
     let tree = Tree::new();
-    let sigkill = |code| reply(&["kill", "SIGKILL", &target()], exited(code, "", ""));
-    let fake = Fake::new([sigkill(0), sigkill(3), sigkill(113)]);
+    let fake = Fake::new([sigkill(0), sigkill(3), print(IDLE), sigkill(113), not_loaded()]);
     let mgr = launchd_over(fake.clone());
     let mut held = mgr.reserve(&[Step::Kill; 3], Budget::Unbounded).expect("reserve");
 
@@ -657,7 +661,58 @@ fn kill_of_a_task_is_the_sigkill_by_label_and_not_running_when_idle() {
         assert!(matches!(&e, Error::NotRunning { id } if id == ID), "{e:?}");
     }
 
-    fake.assert_spent("three kills, each by label");
+    fake.assert_spent("three kills, each by label, and a read after each that found no process");
+}
+
+/// `kickstart` returns before the fork, so a `kill` straight after a `start` finds a start launchd has
+/// accepted and no process: `launchctl kill` answers "No such process" and the run goes ahead. `status`
+/// calls that moment `Running`, so the kill waits for the pid, as `stop` does, and then sends the
+/// signal. The longest path draws exactly what a kill reserved.
+#[skuld::test]
+fn kill_of_a_task_whose_start_is_still_queued_waits_for_the_pid_and_kills_it() {
+    let tree = Tree::new();
+    let fake = Fake::new([
+        sigkill(3),
+        print(QUEUED),
+        print(QUEUED),
+        print(&running(4242)),
+        sigkill(0),
+    ]);
+    let mgr = launchd_over(fake.clone());
+    let mut held = reserved(&mgr, Step::Kill);
+
+    mgr.kill(task_snapshot(&tree, false), &mut held)
+        .expect("a kill of a queued start");
+
+    fake.assert_spent("the refused signal, the read, the wait for the pid, and the signal");
+    assert_eq!(
+        calls_of(&fake, "kill").len(),
+        2,
+        "one SIGKILL before the pid, one after"
+    );
+    assert_never_booted_out(&fake);
+    assert_eq!(
+        bounded::test_hook::left(&held),
+        (0, 0),
+        "the longest path spends the kill's reservation exactly"
+    );
+}
+
+/// A start that is accepted and then does not happen leaves `spawn scheduled` with no pid: the wait
+/// ends on the state, and the signal that follows finds no process.
+#[skuld::test]
+fn kill_of_a_queued_start_that_never_forks_is_not_running() {
+    let tree = Tree::new();
+    let fake = Fake::new([sigkill(3), print(QUEUED), print(IDLE), sigkill(3)]);
+    let mgr = launchd_over(fake.clone());
+    let mut held = reserved(&mgr, Step::Kill);
+
+    let e = mgr
+        .kill(task_snapshot(&tree, false), &mut held)
+        .expect_err("there is nothing to kill");
+
+    assert!(matches!(&e, Error::NotRunning { id } if id == ID), "{e:?}");
+    fake.assert_spent("the refused signal, the read, the wait that ended on the state, and the signal");
 }
 
 /// `restart` is a stop and then the plain start: the start that follows a stop is the request alone.

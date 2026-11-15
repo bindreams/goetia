@@ -1055,14 +1055,14 @@ fn reserved(steps: &[Step]) -> Reservation {
 
 /// `reserve` makes what the steps count, and nothing else: the reapers and files of their longest
 /// paths, summed over a sequence. The numbers are written out so that changing a count is deliberate.
-/// `install`, `uninstall` and `stop` hold a task's counts, the larger (see `needs`).
+/// `install`, `uninstall`, `stop` and `kill` hold a task's counts, the larger (see `needs`).
 #[skuld::test]
 fn a_reservation_holds_what_its_steps_count() {
     let cases: [(&[Step], (usize, usize)); 7] = [
         (&[Step::Install], (4, 18)),
         (&[Step::Start], (5, 26)),
         (&[Step::Stop], (1, 6)),
-        (&[Step::Kill], (1, 2)),
+        (&[Step::Kill], (2, 8)),
         (&[Step::Uninstall], (2, 12)),
         (&[Step::RequestStartAfterStop], (5, 26)),
         (&[Step::Stop, Step::Start], (6, 32)),
@@ -1145,7 +1145,7 @@ fn drawings() -> [Drawing; 5] {
             step: Step::Kill,
             restart: Restart::Never,
             calls: &[("kill", DONE)],
-            drew: (KILL_REQUESTS, KILL_CALLS),
+            drew: (SERVICE_KILL_REQUESTS, SERVICE_KILL_CALLS),
             run: |mgr, plist, reservation| Backend::kill(mgr, plist, reservation),
         },
         // The `bootout`, and then the removal of a plist nothing backs, which fails.
