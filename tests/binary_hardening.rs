@@ -2,9 +2,12 @@
 //!
 //! `libsearch_guard::verify` reads the built files. On Windows it checks the effects of `build.rs`'s
 //! `libsearch_guard::bins()` in the PE file (System32-only import loading, no `vcruntime140.dll` import, the
-//! pre-`main` initializer linked). These are the debug-profile bins; `examples/verify.rs` runs the same check on
-//! the release and two-stage executables in CI. On Linux and macOS it checks that the binary carries no RPATH/RUNPATH or
+//! pre-`main` initializer linked). On Linux and macOS it checks that the binary carries no RPATH/RUNPATH or
 //! `@rpath` search relative to itself.
+//!
+//! These are the debug-profile bins. CI runs the same check on the executables that ship, with
+//! `tools/verify-hardening`: in `consumer-build` on Windows (the two-stage and installed builds) and in
+//! `draft-release` on every row (the release build).
 
 fn main() {
     goetia::testing::run_all();

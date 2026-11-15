@@ -9,3 +9,4 @@ probe-results/
 __pycache__/
 CLAUDE.local.md
 .claude/*.local.*
+/tools/verify-hardening/target/
