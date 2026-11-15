@@ -454,13 +454,13 @@ impl Drop for Registered {
     }
 }
 
-/// The exit `event` reports: `None` for any other event.
 /// The interrupts `window` has recorded, as of this one read, and `None` where there are none or no window:
 /// the one read of the record, which a [`Watch`] and a wait share.
 fn recorded_in(window: Option<&Deferred>) -> Option<Interrupts> {
     window.and_then(Deferred::recorded)
 }
 
+/// The exit `event` reports: `None` for any other event.
 fn exited(event: &KEvent) -> Option<Exited> {
     let is_exit = event.filter() == Ok(EventFilter::EVFILT_PROC) && event.fflags().contains(FilterFlag::NOTE_EXIT);
     is_exit.then(|| Exited {

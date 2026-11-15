@@ -484,8 +484,6 @@ fn a_signal_blocked_on_the_opening_thread_but_delivered_to_another_ends_a_wait_a
     let _marked = mark_thread();
     drop(watch);
     drop(window);
-    // XNU posts a signal sent to the process to one thread it picks when it is sent, so no other thread
-    // shares this one's pending signal.
     drop(blocking);
     // Sent to the process, it is delivered to another thread, asynchronously, so it is awaited, under no
     // bound; one held pending here was delivered as the block lifted, and is counted already.

@@ -59,7 +59,10 @@ static MARKED_THREAD: AtomicUsize = AtomicUsize::new(0);
 /// The calling thread, marked until this drops. It is not `Send`: the thread that holds the mark is the one
 /// marked, and it must stay alive, not joined, until the test has looked, so that its `pthread_t` is not
 /// reused by a thread the handler runs on in between.
-pub(in crate::backend::launchd::manager) struct Marked(PhantomData<*const ()>);
+pub(in crate::backend::launchd::manager) struct Marked {
+    id: usize,
+    _unsend: PhantomData<*const ()>,
+}
 
 /// Marks the calling thread: [`StandIn::ran_on_marked`] says whether the stand-in has run on it. One thread
 /// is marked at a time.
@@ -68,12 +71,16 @@ pub(in crate::backend::launchd::manager) fn mark_thread() -> Marked {
     let id = unsafe { libc::pthread_self() };
     let before = MARKED_THREAD.swap(id, Ordering::SeqCst);
     debug_assert_eq!(before, 0, "a thread is marked already");
-    Marked(PhantomData)
+    Marked {
+        id,
+        _unsend: PhantomData,
+    }
 }
 
 impl Drop for Marked {
+    /// Clears only its own mark, so a stale guard cannot clear a later test's.
     fn drop(&mut self) {
-        MARKED_THREAD.store(0, Ordering::SeqCst);
+        _ = MARKED_THREAD.compare_exchange(self.id, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
@@ -511,9 +518,11 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
     let deferred = Deferred::begin().expect("begin");
     raise(libc::SIGINT);
 
+    // Declared before `release`, so that on a failed assertion `release` drops first and the join ends.
+    let mut closing = Joined::default();
     let (closed, has_closed) = channel();
     let (release, released) = channel::<()>();
-    let closing = std::thread::spawn(move || {
+    closing.0 = Some(std::thread::spawn(move || {
         // Dropped last, after the thread is released: a signal the thread held pending is delivered to it as
         // the block lifts, and the handler finds it marked. The thread stays alive until the test has
         // looked, so that its thread id is not reused in between.
@@ -523,8 +532,9 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
             drop(deferred);
         }
         closed.send(()).expect("the test is waiting");
-        released.recv().expect("the test releases the thread");
-    });
+        // Released, or let go by a test that failed: either ends the thread.
+        _ = released.recv();
+    }));
     // The window is closed and the block lifted: a signal the thread held pending has been delivered to it by
     // now. A signal taken by another thread is delivered on that thread, asynchronously, so it is awaited,
     // under no bound; one the closer held is seen already.
@@ -539,7 +549,7 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
         "the signal was held by the thread that closed the window"
     );
     release.send(()).expect("the closing thread is waiting");
-    closing.join().expect("the closing thread");
+    drop(closing);
 }
 
 /// A window whose pipe cannot be made is an `Err` and installs nothing: no handler is ours, nothing is
