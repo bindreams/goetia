@@ -444,16 +444,16 @@ fn a_run_arms_debug_before_kickstart_and_resumes_after_registering_the_watch() {
 /// unrecorded, and the error says it ended, not that it may still be going.
 #[skuld::test]
 fn a_run_whose_exit_came_without_a_status_is_unrecorded() {
+    let _unreported = test_hook::statuses(0);
     let (fake, _launched) = held_at_once(3);
     let tree = Tree::new();
     let run = begun(&fake, snapshot(&tree, None));
-    let _unreported = test_hook::statuses(0);
 
     let e = run.wait().expect_err("an exit with no status");
 
     assert!(
         matches!(&e, Error::RunUnrecorded { id, reason }
-            if id == ID && reason == "it ended, and the kernel reported its exit without a status"),
+            if id == ID && reason == "the kernel reported its exit without one"),
         "{e:?}"
     );
 }

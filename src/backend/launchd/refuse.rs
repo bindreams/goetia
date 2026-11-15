@@ -118,7 +118,7 @@ pub(crate) fn run_unfollowed(id: &Id, pid: u32) -> Error {
 pub(crate) fn run_ended_without_status(id: &Id) -> Error {
     Error::RunUnrecorded {
         id: id.to_string(),
-        reason: "it ended, and the kernel reported its exit without a status".to_string(),
+        reason: "the kernel reported its exit without one".to_string(),
     }
 }
 

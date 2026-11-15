@@ -432,8 +432,9 @@ impl Shared {
         kept.extend(
             events
                 .iter()
-                .filter_map(exited)
-                .filter(|exited| Some(exited.pid) != pid),
+                // The discarded pid's events go before `exited`, which spends the test hook's allowance.
+                .filter(|event| event.filter() != Ok(EventFilter::EVFILT_PROC) || Some(event.ident() as u32) != pid)
+                .filter_map(exited),
         );
         drop(kept);
         let mut execed = self.execed.lock().unwrap_or_else(PoisonError::into_inner);
