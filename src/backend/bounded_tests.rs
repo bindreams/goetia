@@ -448,7 +448,7 @@ fn a_kill_refused_with_eperm_by_a_child_that_stays_is_the_refusal_naming_the_bou
         "{said}"
     );
     assert!(
-        said.ends_with(&eperm().to_string()),
+        said.ends_with(&cosca::error::Report::new(&eperm()).to_string()),
         "the kill's error is the source: {said}"
     );
 }
@@ -484,7 +484,10 @@ fn a_failed_wait_after_a_refused_kill_is_reported_with_the_refusal() {
         "{said}"
     );
     assert!(said.contains("the wait failed"), "{said}");
-    assert!(said.ends_with(&eperm().to_string()), "{said}");
+    assert!(
+        said.ends_with(&cosca::error::Report::new(&eperm()).to_string()),
+        "the kill's error is the source: {said}"
+    );
 }
 
 /// What the child wrote while issuing its request is kept: it is the start of the diagnostic.
