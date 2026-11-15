@@ -399,7 +399,7 @@ fn a_failed_signal_is_an_error_and_waits_for_nothing() {
 fn a_record_the_manager_does_not_make_by_the_deadline_expires_the_hold() {
     let mut target = Scripted::new([Some(100)], [Open::Gone]).expiring_recorded();
 
-    let error = hold_once(&mut target, spent()).err().expect("an expired hold");
+    let error = hold_once(&mut target, spent()).expect_err("an expired hold");
 
     assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "await_recorded 100"]));

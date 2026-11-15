@@ -53,7 +53,7 @@ impl Drop for Sleeper {
     }
 }
 
-// The pid ---------------------------------------------------------------------------------------------------------------
+// The pid -------------------------------------------------------------------------------------------------------------
 
 #[skuld::test]
 fn the_pid_is_the_main_pid_systemd_shows_for_the_unit() {
@@ -95,7 +95,7 @@ fn a_show_that_fails_is_an_error_and_never_no_process() {
     assert!(matches!(e, Error::Command { .. }), "{e:?}");
 }
 
-// The wait for the record -----------------------------------------------------------------------------------------------
+// The wait for the record ---------------------------------------------------------------------------------------------
 
 /// systemd clears `MainPID` when it reaps the process, after the process has exited: a read straight
 /// after the exit can still show the pid.
@@ -154,7 +154,7 @@ fn a_read_that_fails_in_the_wait_is_an_error() {
     assert!(target(&systemctl).await_recorded(100, unbounded()).is_err());
 }
 
-// The kill --------------------------------------------------------------------------------------------------------------
+// The kill ------------------------------------------------------------------------------------------------------------
 
 /// The process is held by pidfd, confirmed by a second read, signalled, waited for, and then the
 /// record is waited for: the whole machine, over a real process.

@@ -213,8 +213,8 @@ pub(in crate::backend::scm) mod system {
         /// The daemon's id: the service's name, and the label of the notice printed when a kill has
         /// to wait.
         id: String,
-        /// Opened by the first [`KillTarget::arm_release`], as a kill that finds SCM already
-        /// released never needs it, and dropped by [`KillTarget::cancel_release`].
+        /// Opened by the first [`ScmRelease::arm_release`], as a kill that finds SCM already
+        /// released never needs it, and dropped by [`ScmRelease::cancel_release`].
         notifier: Option<SystemScmActor>,
     }
 
