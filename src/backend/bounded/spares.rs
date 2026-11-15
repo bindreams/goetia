@@ -260,7 +260,6 @@ pub(crate) mod test_hook {
             const { std::cell::RefCell::new(None) };
         static WAIT_FAILS: std::cell::RefCell<Option<fn() -> cosca::error::Error>> =
             const { std::cell::RefCell::new(None) };
-        static KILLS: Cell<Option<usize>> = const { Cell::new(None) };
         static KILL_REFUSAL: Cell<Option<KillRefusal>> = const { Cell::new(None) };
     }
 
@@ -270,18 +269,13 @@ pub(crate) mod test_hook {
     /// Make this thread's kills of a child refuse with `error(child)`, until the returned guard
     /// drops. The child receives no signal from the kill: `error` may itself act on the child, as
     /// the world does between a kill's refusal and the next look at the child.
-    pub(crate) fn kill_fails(error: KillRefusal) -> Allowance {
-        KILL_REFUSAL.set(Some(error));
-        Allowance::set(&KILLS, 0)
+    pub(crate) fn kill_fails(error: KillRefusal) -> Allowance<KillRefusal> {
+        Allowance::set(&KILL_REFUSAL, error)
     }
 
     /// The refusal [`kill_fails`] set up for this kill of `child`, if any.
     pub(in crate::backend::bounded) fn killing(child: &cosca::Child) -> Option<cosca::error::Error> {
-        spend(&KILLS, "").err()?;
-        let refusal = KILL_REFUSAL
-            .get()
-            .expect("kill_fails sets the refusal with the allowance");
-        Some(refusal(child))
+        KILL_REFUSAL.get().map(|refusal| refusal(child))
     }
 
     /// Make this thread's next wait on a spawned child fail with `error()`, the child already

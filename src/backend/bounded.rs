@@ -109,9 +109,12 @@ impl Left {
         Left(Some(Box::new(settle)))
     }
 
-    /// End the child. One that already exited is not an error, nor is one that refuses the kill by
-    /// exiting ([`kill_root`]); one that cannot be signalled runs on, which is [`Fate::Release`],
-    /// and says so on stderr.
+    /// End the child and its contained tree ([`end`]). One that already exited is not an error, nor
+    /// is one that refuses the kill by exiting; one that cannot be ended runs on, which is
+    /// [`Fate::Release`], and says so on stderr.
+    ///
+    /// Blocks its caller for up to [`EXIT_AFTER_REFUSED_KILL`] when the kill is refused with `EPERM`,
+    /// while the child's exit is awaited.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn kill(mut self) {
         self.settle(Fate::Kill);
@@ -345,8 +348,8 @@ pub(crate) struct Lost {
 /// them all.
 ///
 /// Returns at the deadline, except when the kill an expiry sends is refused with `EPERM`: then the
-/// call waits for the child's exit for up to [`EXIT_AFTER_REFUSED_KILL`] more, and only that failure
-/// path runs past the deadline.
+/// call waits for the child's exit for up to [`EXIT_AFTER_REFUSED_KILL`] more. That is one of two
+/// ways a call runs past its deadline: [`Left::kill`] is the other.
 pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, Lost> {
     let Spawned {
         child,
@@ -370,10 +373,13 @@ pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finis
         }
     }
     let announced = matches!(&role, Role::AnnouncedRequest(issued) if issued(&heard));
-    waited_out(child, role, stdout, stderr, heard, deadline).map_err(|error| Lost { error, announced })
+    waited_out(child, role, stdout, stderr, heard, deadline, EXIT_AFTER_REFUSED_KILL)
+        .map_err(|error| Lost { error, announced })
 }
 
 /// [`wait_bounded`] once the request is out: the wait for its answer, and the output it wrote.
+/// `refused_for` is how long a refused kill waits for the child's exit ([`EXIT_AFTER_REFUSED_KILL`]
+/// in production).
 fn waited_out(
     child: cosca::Child,
     role: Role,
@@ -381,6 +387,7 @@ fn waited_out(
     stderr: Stream,
     heard: Vec<u8>,
     deadline: Deadline,
+    refused_for: Duration,
 ) -> Result<Finished, cosca::error::Error> {
     #[cfg(test)]
     if let Some(e) = test_hook::waiting() {
@@ -397,28 +404,16 @@ fn waited_out(
             // breaks under its writer.
             return Ok(Finished::Left(Left::new(move |fate| {
                 if fate == Fate::Kill
-                    && let Err(e) = kill_root(&child, EXIT_AFTER_REFUSED_KILL)
+                    && let Some(warning) = end_left(&child, EXIT_AFTER_REFUSED_KILL)
                 {
-                    eprintln!(
-                        "warning: could not kill a request left running, which runs on: {}",
-                        cosca::error::Report::new(&e)
-                    );
+                    eprintln!("{warning}");
                 }
                 reaper.reap(child);
             })));
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
-            // The root first, and its `Ok` is what makes the reap below unable to block.
-            kill_root(&child, EXIT_AFTER_REFUSED_KILL)?;
-            // Then the tree, best-effort. This runs BEFORE the reap below, while the killed root is
-            // still a zombie pinning its pid and pgid, so a kill that names the tree by the root's
-            // number cannot hit another process on any platform. `Drop` (at the end of this
-            // function) runs after the reap, where cosca may skip such a kill. An uncontained child
-            // (the descendant test spawns one) reports `Unsupported` here, and a contained tree
-            // whose member refused SIGKILL reports `Containment`; the `Result` is discarded either
-            // way, so nothing surfaces it, and a descendant still holding a pipe is exactly what
-            // `collect` reports as `complete == false`.
-            let _tree_teardown = child.send_kill_tree();
+            // `Ok` is what makes the reap below unable to block.
+            end(&child, refused_for)?;
             let reaped = child.wait()?;
             match expiry_disposition(reaped) {
                 Disposition::WeKilledIt => return Ok(Finished::Expired),
@@ -443,8 +438,34 @@ fn waited_out(
 /// How long a child whose kill was refused with `EPERM` is given to be seen exited. A failure bound
 /// on another process, not a wait for the child to do anything: a child that refused the kill by
 /// exiting is seen at once, and one still there after refusing it for another reason never will be.
-/// Only that failure path can run a bounded call past its deadline, and by no more than this.
+/// Only a refused kill can run a bounded call past its deadline ([`wait_bounded`], [`Left::kill`]),
+/// and by no more than this.
 const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
+
+/// End `child`: its root ([`kill_root`]), then, best-effort, its tree. The one order, for every
+/// caller: the tree is ended BEFORE the root is reaped, while the killed root is still a zombie
+/// pinning its pid and pgid, so a kill that names the tree by the root's number cannot hit another
+/// process on any platform. `Drop` runs after the reap, where cosca may skip such a kill.
+///
+/// An uncontained child (the descendant test spawns one) reports `Unsupported` for the tree, and a
+/// contained tree whose member refused SIGKILL reports `Containment`; the `Result` is discarded
+/// either way, so nothing surfaces it, and a descendant still holding a pipe is exactly what
+/// `collect` reports as `complete == false`.
+fn end(child: &cosca::Child, bound: Duration) -> Result<(), cosca::error::Error> {
+    kill_root(child, bound)?;
+    let _tree_teardown = child.send_kill_tree();
+    Ok(())
+}
+
+/// [`end`] for the child of a [`Left`]: what to say on stderr if it cannot be ended and so runs on.
+fn end_left(child: &cosca::Child, bound: Duration) -> Option<String> {
+    end(child, bound).err().map(|e| {
+        format!(
+            "warning: could not kill a request left running, which runs on: {}",
+            cosca::error::Report::new(&e)
+        )
+    })
+}
 
 /// Kill the root of `child`, the one kill an expiry makes. `Ok` says the root is dead or has exited,
 /// and has not been reaped, so it still pins its pid.
@@ -452,20 +473,30 @@ const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 /// A child that is exiting can refuse the kill (macOS answers `EPERM` to a send by audit token in
 /// that window). Only `EPERM` is waited on, for `bound`: a child that then exits has ended on its
 /// own, as one that exits before the kill is sent, and the wait leaves it unreaped. Every other
-/// error is returned at once. A child still there when the bound ends, or a wait that failed, is
-/// the refusal, with what was seen: see [`KillRefused`].
+/// error is returned at once. A child still there when the bound ends, or one that could not be
+/// watched, is the refusal, with what was seen: see [`KillRefused`].
 fn kill_root(child: &cosca::Child, bound: Duration) -> Result<(), cosca::error::Error> {
     let refused = match send_kill(child) {
         Ok(()) => return Ok(()),
         Err(e) if is_eperm(&e) => e,
         Err(e) => return Err(e),
     };
-    // Through a handle of its own, which sees the exit without reaping the root.
-    let exited = cosca::Process::open_pid(child.pid()).and_then(|process| match process {
-        Some(process) => process.wait_timeout(bound),
-        None => Ok(true), // already reaped elsewhere: `wait` on the child says so
-    });
-    after_refusal(refused, exited, bound)
+    after_refusal(refused, exit_within(child.id(), bound), bound)
+}
+
+/// Whether the process `id` names exits within `bound`, seen without reaping it. Opened by identity,
+/// never by pid: only the child's own `Child` can reap it, so a process no longer having `id` is an
+/// error here, and nothing is signalled by number. `Err` says what failed, worded for [`KillRefused`].
+fn exit_within(id: Option<cosca::identity::ProcessId>, bound: Duration) -> Result<bool, String> {
+    let report = |e: cosca::error::Error| cosca::error::Report::new(&e).to_string();
+    let could_not_open = |why: String| format!("the process could not be opened to watch its exit: {why}");
+    let id = id.ok_or_else(|| could_not_open("the OS did not report its identity at spawn".into()))?;
+    let process = cosca::Process::open(id)
+        .map_err(|e| could_not_open(report(e)))?
+        .ok_or_else(|| could_not_open("no process has its identity".into()))?;
+    process
+        .wait_timeout(bound)
+        .map_err(|e| format!("waiting for it to exit failed: {}", report(e)))
 }
 
 /// [`cosca::Child::kill`], the kill [`kill_root`] sends.
@@ -477,21 +508,31 @@ fn send_kill(child: &cosca::Child) -> Result<(), cosca::error::Error> {
     child.kill()
 }
 
+/// Whether `e` is a refusal for want of permission that a child on its way out gives: `EPERM`, bare
+/// or as cosca wraps it (macOS reads the child's identity before a send, and its refused read is an
+/// `io::Error` of kind `PermissionDenied` with no code of its own, the `EPERM` its source). Another
+/// code of that kind (`EACCES`) is not one, nor is an error that is not `Io`: those do not wait.
 fn is_eperm(e: &cosca::error::Error) -> bool {
-    matches!(e, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM))
+    let cosca::error::Error::Io(e) = e else {
+        return false;
+    };
+    std::iter::successors(Some(e as &(dyn std::error::Error + 'static)), |e| e.source()).any(|e| {
+        e.downcast_ref::<io::Error>()
+            .is_some_and(|e| e.raw_os_error() == Some(libc::EPERM))
+    })
 }
 
 /// What [`kill_root`] makes of a refused kill, given whether the wait for the child's exit (`bound`
-/// long) saw it exit.
+/// long) saw it exit, or what went wrong with watching for it.
 fn after_refusal(
     refused: cosca::error::Error,
-    exited: Result<bool, cosca::error::Error>,
+    exited: Result<bool, String>,
     bound: Duration,
 ) -> Result<(), cosca::error::Error> {
     let seen = match exited {
         Ok(true) => return Ok(()),
         Ok(false) => format!("the process had not exited {bound:?} later"),
-        Err(e) => format!("waiting for it to exit failed: {}", cosca::error::Report::new(&e)),
+        Err(seen) => seen,
     };
     Err(cosca::error::Error::Io(io::Error::new(
         io::ErrorKind::PermissionDenied,
