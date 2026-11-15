@@ -168,6 +168,51 @@ fn set_errno(value: i32) {
     unsafe { *libc::__error() = value };
 }
 
+/// Bits of [`RECORDED`] set by hand, cleared again when this drops, whatever the test left of them.
+struct Planted(u32);
+
+impl Planted {
+    fn bits(mask: u32) -> Planted {
+        RECORDED.fetch_or(mask, Ordering::SeqCst);
+        Planted(mask)
+    }
+}
+
+impl Drop for Planted {
+    fn drop(&mut self) {
+        claim(self.0);
+    }
+}
+
+/// A handler stood in for as running: [`IN_FLIGHT`] counts it until this drops.
+struct Running;
+
+impl Running {
+    fn enter() -> Running {
+        IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Running
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A thread joined when this drops, so that a test that fails does not leave it running into the next. It
+/// is declared before whatever the thread waits for, which then drops first.
+#[derive(Default)]
+struct Joined(Option<JoinHandle<()>>);
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.take() {
+            _ = thread.join();
+        }
+    }
+}
+
 /// A signal that was ignored before the window stays ignored: the window does not take it over, so its
 /// handler never runs, it is no interrupt and wakes nothing, it is not re-raised, and its disposition is
 /// the ignored one throughout and after.
@@ -374,17 +419,78 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
     let wake = deferred.wake();
-    IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    let mut closing = Joined::default();
+    let running = Running::enter();
 
-    let closing = std::thread::spawn(move || drop(deferred));
+    closing.0 = Some(std::thread::spawn(move || drop(deferred)));
     while WAKE.load(Ordering::SeqCst) != -1 {
         std::thread::yield_now();
     }
     assert!(is_open(wake), "a handler is running, so the pipe is still open");
 
-    IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-    closing.join().expect("the drop");
+    drop(running);
+    drop(closing);
     before.assert_back();
+}
+
+/// What [`IN_FLIGHT`] was when the probe ran.
+static COUNTED_BY_PROBE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+extern "C" fn probe(_: libc::c_int) {
+    COUNTED_BY_PROBE.store(IN_FLIGHT.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+/// A handler is counted in only for the load of the pipe and the write, so a close never waits on what a
+/// handler does after: here the previous handler, which the handler raises the signal to once the window is
+/// closed, and which may never return.
+#[skuld::test]
+fn a_handler_is_not_counted_in_when_it_raises_to_the_previous_handler() {
+    let _before = StandIn::install();
+    let probing = action(probe as extern "C" fn(libc::c_int) as libc::sighandler_t);
+    // SAFETY: `probing` is a valid `sigaction`, and a null old action is allowed; the stand-in's drop puts
+    // the earlier handler back.
+    let set = unsafe { libc::sigaction(libc::SIGTERM, &probing, std::ptr::null_mut()) };
+    assert_eq!(set, 0, "install the probe");
+    COUNTED_BY_PROBE.store(usize::MAX, Ordering::SeqCst);
+
+    record(libc::SIGTERM);
+
+    assert_eq!(
+        COUNTED_BY_PROBE.load(Ordering::SeqCst),
+        0,
+        "the probe ran, and nothing was counted in"
+    );
+}
+
+/// The re-raised signal is sent to the process, not to the thread that closes the window: a thread that
+/// blocks it would hold it pending for as long as it blocks, while another thread that does not can take it
+/// at once. The closing thread here blocks the signal until the previous handler has seen it.
+#[skuld::test]
+fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blocks_it() {
+    let before = StandIn::install();
+    let deferred = Deferred::begin().expect("begin");
+    raise(libc::SIGINT);
+    let mut closing = Joined::default();
+    let (closed, wait_for_close) = channel::<()>();
+    let (release, released) = channel::<()>();
+
+    closing.0 = Some(std::thread::spawn(move || {
+        let _blocked = Blocking::signal(libc::SIGINT);
+        drop(deferred);
+        closed.send(()).expect("the test is waiting");
+        // The thread blocks the signal until the test lets go of it.
+        _ = released.recv();
+    }));
+    wait_for_close.recv().expect("the window was closed");
+    // A signal taken by another thread is delivered on that thread, so it is awaited, under no bound: the
+    // thread that blocks it never takes it.
+    while before.seen() == 0 {
+        std::thread::yield_now();
+    }
+
+    assert!(before.saw(libc::SIGINT));
+    drop(release);
+    drop(closing);
 }
 
 /// A window whose pipe cannot be made is an `Err` and installs nothing: no handler is ours, nothing is
@@ -392,7 +498,7 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
 #[skuld::test]
 fn a_begin_that_cannot_make_the_pipe_installs_nothing() {
     let before = StandIn::install();
-    let none = test_hook::installs(0);
+    let none = test_hook::steps(0);
 
     let refused = Deferred::begin().err().expect("no pipe, no window");
 
@@ -525,7 +631,7 @@ fn two_overlapping_begin_runs_restore_the_signal_handlers() {
 #[skuld::test]
 fn a_recorded_signal_is_claimed_once() {
     let _before = StandIn::install();
-    RECORDED.store(0b101, Ordering::SeqCst);
+    let _planted = Planted::bits(0b101);
 
     assert_eq!(claim(0b001), 0b001);
     assert_eq!(claim(0b001), 0, "taken already");
@@ -565,8 +671,8 @@ fn a_begin_whose_install_fails_part_way_closes_the_window_and_re_raises_what_was
         .iter()
         .position(|&(signal, _)| signal == libc::SIGTERM)
         .expect("SIGTERM is deferred");
-    RECORDED.store(1 << term, Ordering::SeqCst);
-    let after_one = test_hook::installs(2);
+    let _planted = Planted::bits(1 << term);
+    let after_one = test_hook::steps(2);
 
     let refused = Deferred::begin().err().expect("the second install is refused");
 

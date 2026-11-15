@@ -31,7 +31,7 @@ use std::time::Duration;
 use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::interrupts::{Deferred, Interrupts};
+use super::interrupts::{Deferred, Interrupts, WindowId};
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
 
@@ -43,9 +43,9 @@ pub(crate) struct Watch {
 /// The queue, and the events read from it for a registration other than the one that read them.
 struct Shared {
     queue: Kqueue,
-    /// The read end of a window's pipe registered on the queue: only a wait given that window can end on an
-    /// interrupt.
-    wake: Option<RawFd>,
+    /// The window whose pipe is registered on the queue: only a wait given that window can end on an
+    /// interrupt. Its identity, not the descriptor's number, which a later window's pipe may reuse.
+    window: Option<WindowId>,
     /// Taken out of the queue by one registration's `wait` or drop and not its own, so kept here for the
     /// registration whose pid it is. `status` is `None` for an exit the kernel reported without a status.
     kept: Mutex<Vec<Exited>>,
@@ -102,22 +102,22 @@ impl Watch {
     /// waits that end on an interrupt. The pipe is closed when the window's last holder is dropped, which
     /// removes the registration with it.
     pub(crate) fn new_interruptible(window: &Deferred) -> Result<Watch> {
-        Watch::make(Some(window.wake()))
+        Watch::make(Some(window))
     }
 
-    fn make(wake: Option<RawFd>) -> Result<Watch> {
+    fn make(window: Option<&Deferred>) -> Result<Watch> {
         let queue = make_queue().map_err(|source| Error::os("make a kqueue to watch processes exit with", source))?;
         let watch = Watch {
             shared: Arc::new(Shared {
                 queue,
-                wake,
+                window: window.map(Deferred::id),
                 kept: Mutex::new(Vec::new()),
                 execed: Mutex::new(Vec::new()),
             }),
         };
-        if let Some(wake) = wake {
+        if let Some(window) = window {
             watch
-                .register_wake(wake)
+                .register_wake(window.wake())
                 .map_err(|source| Error::os("watch for interrupts on the kqueue", source))?;
         }
         Ok(watch)
@@ -287,7 +287,7 @@ impl Registered {
     /// back to the record, which the handler sets before it writes.
     fn next(&self, exec: bool, window: Option<&Deferred>, deadline: Option<Deadline>) -> Result<Option<Woke>> {
         debug_assert!(
-            window.is_none_or(|window| self.shared.wake == Some(window.wake())),
+            window.is_none_or(|window| self.shared.window == Some(window.id())),
             "a window needs its pipe registered on the queue"
         );
         let pid = self.pid;

@@ -535,6 +535,23 @@ fn a_recorded_interrupt_is_an_event_of_every_queue_of_the_window() {
     }
 }
 
+/// A watch is registered for the window it was made with. The next window's pipe may get the descriptor
+/// numbers the first one had, so a wait of the old watch given the new window is refused (as a debug
+/// assertion) even then.
+#[skuld::test]
+#[should_panic(expected = "a window needs its pipe registered on the queue")]
+fn a_watch_of_a_closed_window_is_not_registered_for_the_next_window() {
+    let (_stand_in, first, watch) = interruptible();
+    let mut child = Held::new(0);
+    let registered = launched(&watch, child.pid());
+    drop(first);
+    let second = Deferred::begin().expect("the next window");
+    // Gone already, so that a wait that is not refused ends on its own.
+    child.finish();
+
+    _ = registered.exit(&second);
+}
+
 /// The exit the poll found is reported with its status, without taking it: a wait after it still reports
 /// it, and so does a second poll.
 #[skuld::test]
