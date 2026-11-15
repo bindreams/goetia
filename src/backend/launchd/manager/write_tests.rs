@@ -623,9 +623,10 @@ fn a_busy_job_beside_a_timer_label_with_no_timer_file_is_refused_without_a_panic
     assert_eq!(text_at(&tree, true, ID), old.job);
 }
 
-/// A `print` that shows `state = running` and no pid is a run in flight, as launchd reports it.
+/// A `print` that shows `state = running` and no pid is read as `stop` reads it: not established, so
+/// the refusal does not advise a `stop` that would answer the same.
 #[skuld::test]
-fn a_running_state_with_no_pid_is_a_run_in_flight() {
+fn a_running_state_with_no_pid_is_refused_as_stop_reads_it() {
     let tree = Tree::new();
     let old = installed(&tree, &task_spec(Some(SCHEDULE)), false);
     let fake = Fake::new([
@@ -634,19 +635,12 @@ fn a_running_state_with_no_pid_is_a_run_in_flight() {
         print(job_label(), LOADED, "\tstate = running\n"),
     ]);
 
-    let e = rewrite(&tree, &fake, &command("/bin/false")).expect_err("a run is in flight");
+    let e = rewrite(&tree, &fake, &command("/bin/false")).expect_err("a state stop cannot conclude on");
 
-    assert!(
-        matches!(
-            e,
-            Error::LoadedJob {
-                kind: DaemonKind::Task,
-                ..
-            }
-        ),
-        "{e:?}"
-    );
-    assert!(e.to_string().contains("has a run in flight"), "{e}");
+    let report = e.report().to_string();
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert!(!report.contains("run in flight"), "{report}");
+    assert!(report.contains("untouched"), "{report}");
     fake.assert_spent("nothing is booted out");
     assert_eq!(text_at(&tree, false, ID), old.job);
 }

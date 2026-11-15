@@ -17,7 +17,7 @@ use tempfile::NamedTempFile;
 
 use super::verbs::{self, Quiet};
 use super::{
-    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, ensure_dir, move_no_clobber, never_expires,
+    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, ensure_dir, move_no_clobber, never_expires,
     persist_new, persist_new_unraced, persist_over, plist_in, prepare_parent_dirs, read_artifact, resolve_account,
     staged_tempfile, still_present,
 };
@@ -45,7 +45,8 @@ impl Launchd {
     /// Never `Raced`: the reads of which labels launchd holds have been made by the time a plist is
     /// found changed, and another pass would make more calls than the verb reserved, so a race is
     /// an error instead. A file written at a task's timer name, or a second install of the same id,
-    /// while install runs ends it with a re-run error; the job plist it wrote stays.
+    /// while install runs ends a `Create` with a re-run error, and the job plist it wrote stays; an
+    /// `Update` that finds a stranger's file there refuses it as foreign.
     pub(super) fn write_task(
         &self,
         dirs: Dirs,
@@ -398,9 +399,9 @@ impl Executor<'_> {
                     DaemonKind::Service => Verdict::Idle,
                     DaemonKind::Task => {
                         let print = launchctl.read_task_print(id, deadline, Role::Query, reservation)?;
-                        // A state of `running` is a run, as launchd reports it; any other print with no
-                        // pid is read as `stop` reads it.
-                        if print.pid.is_some() || print.state == State::Running {
+                        // A print with no pid is read as `stop` reads it, so that the refusal's advice
+                        // (`stop`, then re-run) is one `stop` can carry out.
+                        if print.pid.is_some() {
                             Verdict::InFlight
                         } else {
                             match verbs::quiet(self.id, &print) {
@@ -589,7 +590,10 @@ impl Executor<'_> {
                 "`{id}`'s timer (`{label}`) was booted out and this disable failed before the plists were moved to \
                  staging, so the task is disarmed but not fully disabled: re-run disable"
             ),
-            Verb::Enable => unreachable!("an enable boots nothing out"),
+            Verb::Enable => format!(
+                "`{id}`'s timer (`{label}`) was booted out and this enable failed before loading it again, so it \
+                 is not loaded: re-run enable"
+            ),
         };
         Error::Step {
             what,
