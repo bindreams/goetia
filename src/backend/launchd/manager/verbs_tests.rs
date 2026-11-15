@@ -183,6 +183,75 @@ fn start_is_the_same_for_a_staged_and_an_enabled_task() {
     }
 }
 
+/// A start requested right after a stop nobody waited for (`restart --timeout 0`) over a job that still
+/// has the run that was sent SIGTERM: `kickstart` would start nothing and answer success (measured), so
+/// it is refused, naming the pid, and nothing is sent: one read, no `kickstart`, no `bootstrap`.
+#[skuld::test]
+fn a_start_after_an_unwaited_stop_is_refused_while_the_job_still_has_its_run() {
+    let tree = Tree::new();
+    let fake = Fake::new([print(&running(4242))]);
+    let mgr = launchd_over(fake.clone());
+
+    let e = mgr
+        .request_start_after_stop(
+            task_snapshot(&tree, false),
+            &mut reserved(&mgr, Step::RequestStartAfterStop),
+        )
+        .expect_err("a start over a run still in flight is refused");
+
+    assert!(matches!(e, Error::StillRunning { pid: 4242, .. }), "{e:?}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "`{ID}` still has the run that was sent SIGTERM (pid 4242), and launchd starts no new run of a task \
+             while one is in flight, so no start was issued; `goetia daemon start {ID}` starts one once it has \
+             exited, and `goetia daemon restart {ID}` without `--timeout 0` waits for the exit"
+        )
+    );
+    assert!(!e.is_indeterminate(), "nothing was sent");
+    fake.assert_spent("the one read");
+    assert!(calls_of(&fake, "kickstart").is_empty() && calls_of(&fake, "bootstrap").is_empty());
+}
+
+/// Whatever shows a process is the run: a job whose `print` reads `SIGTERMed` with a pid is refused too.
+#[skuld::test]
+fn a_start_after_an_unwaited_stop_is_refused_for_every_state_that_shows_a_pid() {
+    for body in [TEARING_DOWN.to_string(), running(7)] {
+        let tree = Tree::new();
+        let fake = Fake::new([print(&body)]);
+        let mgr = launchd_over(fake.clone());
+
+        let e = mgr
+            .request_start_after_stop(
+                task_snapshot(&tree, true),
+                &mut reserved(&mgr, Step::RequestStartAfterStop),
+            )
+            .expect_err("refused");
+
+        assert!(matches!(e, Error::StillRunning { .. }), "{body}: {e:?}");
+        fake.assert_spent("the one read");
+    }
+}
+
+/// With no process left it is the task's `start` as before, its one read first: the longest path (the
+/// job not loaded: the check, the load's read and `bootstrap`, the plain `kickstart`) stays inside what a
+/// start reserves, which the reservation asserts.
+#[skuld::test]
+fn a_start_after_an_unwaited_stop_over_an_idle_job_is_a_start() {
+    for idle in [IDLE, QUEUED] {
+        let tree = Tree::new();
+        let snapshot = task_snapshot(&tree, false);
+        let job = snapshot.job().unwrap().location.path.clone();
+        let fake = Fake::new([print(idle), not_loaded(), bootstrap(&job), kickstart()]);
+        let mgr = launchd_over(fake.clone());
+
+        mgr.request_start_after_stop(snapshot, &mut reserved(&mgr, Step::RequestStartAfterStop))
+            .expect("a start over a job with no process");
+
+        fake.assert_spent("the read, the load, the plain kickstart");
+    }
+}
+
 // stop ================================================================================================================
 
 /// The pid `print` showed is watched, confirmed, signalled with SIGTERM by label, and waited for: the

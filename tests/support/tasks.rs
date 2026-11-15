@@ -36,13 +36,15 @@ pub fn mkfifo(path: &Path) {
     assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), std::io::Error::last_os_error());
 }
 
-/// A task that is in flight until the test releases it. It prints `ready`, announces itself on a FIFO
-/// and waits for the test to open the other. The announcing FIFO is opened read-write here, so the
-/// task's write never waits for the test to read it: [`Held::wait_started`] reads it when it wants to
-/// know a run has begun, once per run. Released, the run exits 0.
+/// A task that is in flight until the test releases it. It numbers its run (1, 2, ...), prints `ready`,
+/// announces itself and its number on a FIFO and waits for the test to open the other. The announcing
+/// FIFO is opened read-write here, so the task's write never waits for the test to read it:
+/// [`Held::wait_started`] reads it when it wants to know a run has begun, once per run. Released, the run
+/// exits 0.
 pub struct Held {
     started: BufReader<File>,
     hold: PathBuf,
+    count: PathBuf,
     pub command: Vec<String>,
     _dir: tempfile::TempDir,
 }
@@ -68,24 +70,42 @@ impl Held {
             .write(true)
             .open(&started)
             .expect("open the announcing FIFO");
+        // The count is replaced whole (a rename), so a read of it never meets a half-written one.
+        let count = dir.path().join("count");
         let script = format!(
-            "{prelude}echo ready; echo started > \"{}\"; read line < \"{}\"; exit 0",
+            "{prelude}n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > \"{c}.new\"; \
+             mv \"{c}.new\" \"{c}\"; echo ready; echo started $n > \"{}\"; read line < \"{}\"; exit 0",
             started.display(),
-            hold.display()
+            hold.display(),
+            c = count.display()
         );
         Held {
             started: BufReader::new(announce),
             hold,
+            count,
             command: sh(&script),
             _dir: dir,
         }
     }
 
-    /// Blocks until the next run has printed `ready`. A run that never starts hangs the test.
-    pub fn wait_started(&mut self) {
+    /// Blocks until the next run has printed `ready`, and returns its number. A run that never starts
+    /// hangs the test.
+    pub fn wait_started(&mut self) -> u32 {
         let mut line = String::new();
         self.started.read_line(&mut line).expect("read the announcing FIFO");
-        assert_eq!(line, "started\n");
+        line.strip_prefix("started ")
+            .and_then(|n| n.trim_end().parse().ok())
+            .unwrap_or_else(|| panic!("the announcing FIFO held `{line}`"))
+    }
+
+    /// The number of the newest run that has numbered itself: 0 before any. A run that began before the
+    /// call and has not numbered itself yet is not counted.
+    pub fn begun(&self) -> u32 {
+        match std::fs::read_to_string(&self.count) {
+            Ok(text) => text.trim().parse().expect("the count is whole"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => panic!("read the run count: {e}"),
+        }
     }
 
     /// Lets the run in flight end. Blocks until the run is waiting for it, so only call it while one is.

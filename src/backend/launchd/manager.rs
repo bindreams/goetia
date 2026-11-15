@@ -1299,7 +1299,8 @@ const fn max(a: usize, b: usize) -> usize {
 ///
 /// `request_start_after_stop` is `start` under a budget that does not wait: it draws no more than
 /// `start` does, and so is counted as it is. A task's `start` is a `bootstrap` and a `kickstart`, which
-/// the service's longest path covers.
+/// the service's longest path covers; a task's `request_start_after_stop` reads `print` first, which
+/// makes its longest path 5 calls (the read, the load's 3, the `kickstart`) and 2 requests, inside it.
 fn needs(step: Step) -> (usize, usize) {
     match step {
         Step::Install => (INSTALL_REQUESTS, INSTALL_CALLS),
@@ -1735,10 +1736,33 @@ impl backend::Backend for Launchd {
         Ok(())
     }
 
-    /// The plain request-only start. The stop before it waited until launchd no longer had the job
-    /// (see [`Launchctl::bootout`]), even under [`Budget::Immediate`], so the instance it stopped
-    /// cannot be what answers for the label here.
+    /// The plain request-only start.
+    ///
+    /// A service's stop before it waited until launchd no longer had the job (see
+    /// [`Launchctl::bootout`]), even under [`Budget::Immediate`], so the instance it stopped cannot be
+    /// what answers for the label here.
+    ///
+    /// A task's stop before it, under a budget that does not wait, only sent SIGTERM, and `kickstart` of
+    /// a job that still has a process starts nothing and answers as a start does (measured: exit 0,
+    /// nothing written). So one `print` reads whether the run is still there, and if it is, no start is
+    /// issued ([`Error::StillRunning`]). If the run exits after the read the refusal is still true of
+    /// what was read; if a fire starts a run in the gap, a fresh run is up. A read that failed concludes
+    /// nothing, and the start goes ahead as a task's `start` does.
     fn request_start_after_stop(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
+        if snapshot.kind() == DaemonKind::Task {
+            let print = self.launchctl.read_task_print(
+                snapshot.id().as_str(),
+                Budget::Unbounded.start(),
+                Role::Query,
+                reservation,
+            )?;
+            if let Some(pid) = print.pid {
+                return Err(Error::StillRunning {
+                    id: snapshot.id().to_string(),
+                    pid,
+                });
+            }
+        }
         backend::Backend::start(self, snapshot, Budget::Immediate, reservation)
     }
 

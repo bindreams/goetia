@@ -497,6 +497,16 @@ pub enum Error {
     #[error("`{id}` is already running: `run` needs an idle task (`goetia daemon stop {id}` ends the run in flight)")]
     AlreadyRunning { id: String },
 
+    /// A start requested right after a stop nobody waited for (`restart --timeout 0` of a launchd task)
+    /// found the run that was sent SIGTERM still alive, and so issued no start: launchd starts no new
+    /// run of a task while one is in flight. Determinate: nothing was sent.
+    #[error(
+        "`{id}` still has the run that was sent SIGTERM (pid {pid}), and launchd starts no new run of a task \
+         while one is in flight, so no start was issued; `goetia daemon start {id}` starts one once it has \
+         exited, and `goetia daemon restart {id}` without `--timeout 0` waits for the exit"
+    )]
+    StillRunning { id: String, pid: u32 },
+
     /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
     /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
     #[error("the manager does not say whether `{id}` is running, so `run` did not start it")]
@@ -746,6 +756,7 @@ impl Error {
             | Error::NotRunning { .. }
             | Error::NotATask { .. }
             | Error::AlreadyRunning { .. }
+            | Error::StillRunning { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
@@ -934,6 +945,7 @@ impl Error {
             | Error::NotRunning { .. }
             | Error::NotATask { .. }
             | Error::AlreadyRunning { .. }
+            | Error::StillRunning { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
             | Error::RunUnrecorded { .. }

@@ -97,6 +97,7 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
         Error::NotRunning { id: id() },
         Error::NotATask { id: id() },
         Error::AlreadyRunning { id: id() },
+        Error::StillRunning { id: id(), pid: 1 },
         Error::RunNotStarted {
             id: id(),
             reason: String::new(),
@@ -1216,6 +1217,13 @@ fn error_messages_and_exit_class() {
         (
             Error::AlreadyRunning { id: id() },
             "`nightly` is already running: `run` needs an idle task (`goetia daemon stop nightly` ends the run in flight)",
+            false,
+        ),
+        (
+            Error::StillRunning { id: id(), pid: 4242 },
+            "`nightly` still has the run that was sent SIGTERM (pid 4242), and launchd starts no new run of a task \
+             while one is in flight, so no start was issued; `goetia daemon start nightly` starts one once it has \
+             exited, and `goetia daemon restart nightly` without `--timeout 0` waits for the exit",
             false,
         ),
         (

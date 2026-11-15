@@ -407,15 +407,17 @@ fn the_timer_fire_after_a_stop_starts_a_fresh_run(#[fixture(launchd_group)] _gro
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
     held.wait_started();
     mgr.stop(&task_id, Budget::DEFAULT).expect("stop");
+
+    // The stop's outcome is the run's result, not the task's state: a fire may start a run the moment
+    // after `stop` returns. `stop` returned with no run left, so every run numbered up to now is dead
+    // (one that `stop` ended too, because a fire began it meanwhile, has an announcement waiting) and
+    // a run numbered after is a fire's, begun after the stop.
     let stopped = task_status(&mgr, &task_id);
-    assert_eq!(stopped.common.state, State::Idle, "{stopped:?}");
+    assert_eq!(stopped.last_result, Some(Exit::Signal(15)), "{stopped:?}");
     assert!(stopped.common.enabled, "stop leaves the schedule armed: {stopped:?}");
+    let before = held.begun();
+    while held.wait_started() <= before {}
 
-    // A fire's run, announced. (Not read for its state: a fire that came while `stop` was ending the
-    // first run began a run that `stop` ended too, and its announcement is waiting here.)
-    held.wait_started();
-
-    assert!(runs_of(&id) >= 2, "the job was started again after the stop");
     held.release();
 }
 
@@ -498,6 +500,7 @@ fn run_straight_after_start_answers_already_running(#[fixture(launchd_group)] _g
     held.release();
     assert_eq!(status_with_result(&mgr, &task_id).last_result, Some(Exit::Code(0)));
     assert_eq!(runs_of(&id), 1, "the refused run started nothing");
+    assert_no_hold_pending(&id);
 }
 
 /// A `stop` of a task whose start is queued waits for the run to begin and ends it: the run ended by
@@ -790,6 +793,8 @@ fn run_refuses_a_run_in_flight(#[fixture(launchd_group)] _group: &Group) {
     assert_eq!(runs_of(&id), 1, "a second run began");
     assert_eq!(task_status(&mgr, &task_id).common.pid, pid);
     held.release();
+    assert_eq!(status_with_result(&mgr, &task_id).last_result, Some(Exit::Code(0)));
+    assert_no_hold_pending(&id);
 }
 
 /// A run starts right behind another that has just returned and shows none of its lines: run 1 prints
@@ -1160,38 +1165,4 @@ fn enable_and_disable_finish_after_a_crash_on_a_real_launchd(#[fixture(launchd_g
     assert!(enabled_path(&id).is_file() && timer_enabled_path(&id).is_file());
     let status = task_status(&mgr, &task_id);
     assert!(status.common.enabled, "{status:?}");
-}
-
-// PROBE (temporary): what `launchctl kickstart` answers over a job with a process, and over an idle one.
-#[skuld::test]
-fn probe_kickstart_reply(#[fixture(launchd_group)] _group: &Group) {
-    let id = support::random_test_id();
-    let task_id = id_of(&id);
-    let mut held = Held::ignoring_sigterm();
-    let mgr = Launchd::new();
-    let _guard = Guard::install(&mgr, &task(&id, held.command.clone(), None));
-    mgr.start(&task_id, Budget::DEFAULT).expect("start");
-    held.wait_started();
-    let target = format!("system/{id}");
-    let mut report = String::new();
-    let mut note = |what: &str, run: cmd::Run| report.push_str(&format!("### {what}\n{run}\n"));
-    note(
-        "plain over a running job",
-        cmd::run("launchctl", &["kickstart", &target]),
-    );
-    note(
-        "-p over a running job",
-        cmd::run("launchctl", &["kickstart", "-p", &target]),
-    );
-    note("kill SIGTERM", cmd::run("launchctl", &["kill", "SIGTERM", &target]));
-    note("print after SIGTERM", cmd::run("launchctl", &["print", &target]));
-    note(
-        "plain over a SIGTERMed job",
-        cmd::run("launchctl", &["kickstart", &target]),
-    );
-    note("print after that", cmd::run("launchctl", &["print", &target]));
-    note("kill SIGKILL", cmd::run("launchctl", &["kill", "SIGKILL", &target]));
-    kill::until(|| task_status(&mgr, &task_id).common.state == State::Idle);
-    note("plain over an idle job", cmd::run("launchctl", &["kickstart", &target]));
-    panic!("PROBE RESULT\n{report}");
 }

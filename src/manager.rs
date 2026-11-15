@@ -179,7 +179,10 @@ pub trait ServiceManager {
     /// start: the instance it sees may be the one the stop is still taking
     /// down (a Windows `protocol: plain` service reads `RUNNING` until its shim
     /// has taken the stop), and reading that answer as a start would report a
-    /// restart that leaves the daemon down. `Ok(())` means the manager
+    /// restart that leaves the daemon down. launchd answers a `kickstart` of
+    /// a task that still has its run as it answers a start, so there a task's
+    /// start reads the job first and is refused with [`Error::StillRunning`],
+    /// sending nothing. `Ok(())` means the manager
     /// accepted a start request and nothing more. Takes no budget: it never
     /// waits.
     fn request_start_after_stop(&self, id: &Id) -> Result<()>;
