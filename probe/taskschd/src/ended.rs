@@ -234,6 +234,7 @@ pub fn run(a: &[String]) -> i32 {
     let t = task(path).expect("task");
     let mut agg = Agg::default();
     let ch = if churn { Some(start_churn()) } else { None };
+    let mut run_info: Vec<(u32, u64, u64)> = Vec::new(); // action pid, its creation time, the listing's drop
     println!("##### ended label={label} exp={exp} runs={runs} churn={churn} task={path}");
 
     for i in 1..=runs {
@@ -263,6 +264,8 @@ pub fn run(a: &[String]) -> i32 {
             std::thread::spawn(move || spam(p, k, s))
         });
 
+        let mut held: Option<Held> = None;
+        let mut held_signalled: Option<u64> = None;
         let mut obs: Vec<(u32, u64)> = Vec::new();
         let (mut samples, mut alive, mut exited) = (0u64, 0u64, 0u64);
         let (mut pid0_first, mut pid0_last): (Option<u64>, u64) = (None, 0);
@@ -284,6 +287,11 @@ pub fn run(a: &[String]) -> i32 {
         loop {
             let raw = instances_raw(&t);
             let ts = now_ft();
+            if let Some(h) = &held {
+                if held_signalled.is_none() && h.signalled() {
+                    held_signalled = Some(now_ft());
+                }
+            }
             let mut short = String::new();
             let mut detail = String::new();
             let mut ended = false;
@@ -350,6 +358,9 @@ pub fn run(a: &[String]) -> i32 {
                                             None => first_pid = Some(*p),
                                             Some(q) if q != *p => pid_changed = true,
                                             _ => {}
+                                        }
+                                        if spam_kind.is_some() && held.is_none() {
+                                            held = Held::open(*p);
                                         }
                                         match probe_pid(*p) {
                                             Ok(pi) => {
@@ -442,6 +453,41 @@ pub fn run(a: &[String]) -> i32 {
                 }
             }
             let u = bad_first.unwrap_or(drop1);
+            if let Some(h) = &held {
+                let (_ct, ex) = h.times();
+                if ex != 0 {
+                    // Where the real exit of the first process (kernel ExitTime) lies against the calls and the listing.
+                    let succ = calls.iter().rev().find(|c| c.pid != 0);
+                    let last_ign = calls.iter().rev().find(|c| c.pid == 0 && c.err.is_none());
+                    spam_note.push_str(&format!(
+                        "first process's kernel ExitTime: {:+.2} ms from U, {:+.2} ms from E; our handle saw it signalled at {:+.2} ms from ExitTime; \
+                         successful call a/b from ExitTime: {} ; last ignored call a/b from ExitTime: {} ; ",
+                        ms(u, ex),
+                        ms(drop1, ex),
+                        held_signalled.map(|s| ms(ex, s)).unwrap_or(f64::NAN),
+                        succ.map(|c| format!("{:+.2}/{:+.2}", ms(ex, c.a), ms(ex, c.b))).unwrap_or("-".into()),
+                        last_ign.map(|c| format!("{:+.2}/{:+.2}", ms(ex, c.a), ms(ex, c.b))).unwrap_or("-".into()),
+                    ));
+                    if let Some(c) = succ {
+                        agg.t(format!(
+                            "the call that started the new instance was issued {} the first process's kernel ExitTime",
+                            if c.a >= ex { "after" } else { "BEFORE" }
+                        ));
+                        agg.t(format!(
+                            "the call that started the new instance returned {} the first process's kernel ExitTime",
+                            if c.b >= ex { "after" } else { "BEFORE" }
+                        ));
+                    }
+                    if let Some(c) = last_ign {
+                        agg.t(format!(
+                            "the last call that was ignored was issued {} the first process's kernel ExitTime",
+                            if c.a >= ex { "after" } else { "before" }
+                        ));
+                    }
+                } else {
+                    agg.t("the held process had no ExitTime at the end of the run");
+                }
+            }
             let last3: Vec<String> = calls
                 .iter()
                 .rev()
@@ -481,12 +527,10 @@ pub fn run(a: &[String]) -> i32 {
         }
         let mut coll = String::new();
         if let Some(ch) = &ch {
-            // The first churn process created with the action's pid after this run began: how long after the drop?
-            let first = ch.log.lock().unwrap().iter().filter(|(p, _, tc)| *p == rec_pid && *tc >= t_run).map(|(_, _, tc)| *tc).min();
-            if let Some(tc) = first {
-                agg.reuse_ms.push(ms(drop1, tc));
-            }
-            let hit: Vec<_> = ch.log.lock().unwrap().iter().filter(|(p, _, tc)| *p == rec_pid && *tc >= t_run && *tc <= drop1).cloned().collect();
+            // A churn process created with the action's pid after the action itself existed, before the listing dropped.
+            // (Before `rec_ct` the pid was legitimately free: the first Run of a user's task can take seconds.)
+            run_info.push((rec_pid, rec_ct, drop1));
+            let hit: Vec<_> = ch.log.lock().unwrap().iter().filter(|(p, _, tc)| *p == rec_pid && rec_ct != 0 && *tc >= rec_ct && *tc <= drop1).cloned().collect();
             if !hit.is_empty() {
                 agg.t("CHURN: a new process got the action's pid before the listing dropped");
                 coll = format!("churn pid collision before drop: {hit:?}");
@@ -548,8 +592,26 @@ pub fn run(a: &[String]) -> i32 {
         for th in c.th.drain(..) {
             let _ = th.join();
         }
-        let n = c.log.lock().unwrap().len();
-        println!("churn processes created: {n}");
+        let log = c.log.lock().unwrap();
+        let distinct: std::collections::BTreeSet<u32> = log.iter().map(|(p, _, _)| *p).collect();
+        let action_pids: std::collections::BTreeSet<u32> = run_info.iter().map(|(p, _, _)| *p).collect();
+        println!(
+            "churn processes created: {}, with {} distinct pids (the pid allocator reuses pids among them); {} of the {} distinct action pids also came up among the churn processes at some time",
+            log.len(),
+            distinct.len(),
+            action_pids.iter().filter(|p| distinct.contains(p)).count(),
+            action_pids.len()
+        );
+        // For each run: the first churn process created with the action's pid after the action existed, relative to the
+        // listing's drop (negative would be a pid handed out while the instance was still listed).
+        for (pid, ct, drop) in &run_info {
+            if *ct == 0 {
+                continue;
+            }
+            if let Some(tc) = log.iter().filter(|(p, _, tc)| p == pid && *tc >= *ct).map(|(_, _, tc)| *tc).min() {
+                agg.reuse_ms.push(ms(*drop, tc));
+            }
+        }
     }
     println!("===== SUMMARY label={label} exp={exp} runs_ok={} churn={churn}", agg.runs);
     println!("samples of our entry={} alive={} exited={} listed-pid0-samples={}", agg.samples, agg.alive, agg.exited, agg.pid0_samples);

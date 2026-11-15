@@ -128,6 +128,10 @@ foreach ($k in @($cases.Keys)) {
         $wantBytes = [Text.Encoding]::UTF8.GetBytes($want)
         $defBytes = if ($null -ne $viaDef) { [Text.Encoding]::UTF8.GetBytes($viaDef) } else { @() }
         "data[$k]: Definition.Data equals what XML parsing gives: $($viaDef -ceq $want) (len want $($want.Length), got $($viaDef.Length)); Xml has a <Data> element: $($m.Success); its decoded text equals: $($viaXml -ceq $want)"
+        if ($k -ne 'big-64k' -and $m.Success) {
+            $rawb = [Text.Encoding]::UTF8.GetBytes($m.Groups[1].Value)
+            "   the <Data> element's raw text in Xml, bytes: $([BitConverter]::ToString($rawb[0..([math]::Min(70, $rawb.Length - 1))]))"
+        }
         if ($viaDef -cne $want) { "   want bytes: $([BitConverter]::ToString($wantBytes[0..([math]::Min(40, $wantBytes.Length - 1))])) got bytes: $([BitConverter]::ToString($defBytes[0..([math]::Min(40, [math]::Max(0, $defBytes.Length - 1)))]))" }
     } catch { "data[$k]: REFUSED $($_.Exception.Message) [$(HexOf $_.Exception.HResult)]" }
 }

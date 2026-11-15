@@ -131,6 +131,38 @@ pub fn probe_pid(pid: u32) -> std::result::Result<PInfo, u32> {
     }
 }
 
+/// A process handle held across samples (the L2 experiments read the real exit time from it).
+pub struct Held(HANDLE);
+
+impl Held {
+    pub fn open(pid: u32) -> Option<Held> {
+        // SAFETY: the handle is closed in Drop.
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid).ok().map(Held) }
+    }
+    pub fn signalled(&self) -> bool {
+        // SAFETY: plain call on a handle we own.
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
+    /// (creation time, exit time) as FILETIMEs; the exit time is 0 while the process runs.
+    pub fn times(&self) -> (u64, u64) {
+        // SAFETY: the out structs are live.
+        unsafe {
+            let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+            let _ = GetProcessTimes(self.0, &mut c, &mut e, &mut k, &mut u);
+            (ft_u64(c), ft_u64(e))
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // SAFETY: we own the handle.
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 pub fn image_of(pid: u32) -> String {
     // SAFETY: the handle is closed before return; the buffer is live.
     unsafe {
