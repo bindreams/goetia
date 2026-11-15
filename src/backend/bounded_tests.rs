@@ -679,6 +679,39 @@ mod refused_kill {
         descendant.0.wait().unwrap();
     }
 
+    /// A [`Left`] whose kill is refused by a child that stays still hands the child to its reaper,
+    /// which reaps it once it exits. The bound is `waited_out`'s argument, so this test does not wait
+    /// out a real 5 s.
+    #[skuld::test]
+    fn a_left_request_that_cannot_be_ended_is_still_reaped() {
+        let Requested { child, reaped } = requested(released_at_eof("exit 7"));
+        let Spawned {
+            child,
+            role,
+            stdout,
+            stderr,
+        } = child;
+        let _refused = test_hook::kill_fails(|_| eperm());
+        let finished = waited_out(
+            child,
+            role,
+            stdout,
+            stderr,
+            Vec::new(),
+            Budget::Immediate.start(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let Finished::Left(left) = finished else {
+            panic!("expected Left, got {finished:?}");
+        };
+
+        left.kill();
+
+        let status = reaped.recv().unwrap().unwrap();
+        assert_eq!(status.code(), Some(7), "{status:?}");
+    }
+
     /// A [`Left`] whose child stays after refusing the kill says it could not kill it, naming the
     /// refusal and the bound `end_left` was given, so this test does not wait out a real 5 s. That
     /// `waited_out` hands the `Left` its own bound is one captured line, which no test here observes.

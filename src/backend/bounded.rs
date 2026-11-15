@@ -111,14 +111,14 @@ impl Left {
     }
 
     /// End the child and its contained tree ([`end`]). One that already exited is not an error, nor
-    /// is one that refuses the kill by exiting; one that cannot be ended is released to its
-    /// [`Reaper`] ([`Fate::Release`]), and stderr says it could not be killed.
+    /// is one that refuses the kill by exiting. One that cannot be ended is still handed to its
+    /// [`Reaper`], which reaps it once it exits, and stderr says it could not be killed.
     ///
-    /// A kill refused with `EPERM` on macOS blocks its caller for up to [`EXIT_AFTER_REFUSED_KILL`]
-    /// while the child's exit is awaited. Such a kill can happen here and in [`wait_bounded`], when
-    /// a query's or an announced request's deadline expires, so a caller that runs a bounded query
-    /// and then this (launchd's `end_if_held` runs a `print` first) can overrun its deadline by that
-    /// bound twice, once for each refused kill.
+    /// A kill refused with `EPERM` on macOS blocks its caller for up to [`EXIT_AFTER_REFUSED_KILL`] plus
+    /// one re-read while the child's exit is awaited. Such a kill can happen here and in
+    /// [`wait_bounded`], when a query's or an announced request's deadline expires, so a caller that
+    /// runs a bounded query and then this (launchd's `end_if_held` runs a `print` first) can overrun
+    /// its deadline by that twice, once for each refused kill.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn kill(mut self) {
         self.settle(Fate::Kill);
@@ -352,8 +352,11 @@ pub(crate) struct Lost {
 /// them all.
 ///
 /// Returns at the deadline, except when the kill an expiry sends is refused with `EPERM` on macOS:
-/// then the call waits for the child's exit for up to [`EXIT_AFTER_REFUSED_KILL`] more. That is one
-/// of two ways a call runs past its deadline: [`Left::kill`] is the other.
+/// then the call waits for the child's exit for up to [`EXIT_AFTER_REFUSED_KILL`] plus one re-read more.
+/// That is one of two ways a call runs past its deadline: [`Left::kill`] is the other.
+///
+/// The reap that follows a sent or a refused kill is not bounded: it can block while a tracer that
+/// is not goetia holds the child's zombie.
 pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, Lost> {
     let Spawned {
         child,
@@ -416,7 +419,7 @@ fn waited_out(
             })));
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
-            // `Ok` is what makes the reap below unable to block.
+            // `Ok` says the root is dead or has exited, so it is reaped here as after a sent kill.
             end(&child, refused_for)?;
             let reaped = child.wait()?;
             match expiry_disposition(reaped) {
@@ -443,7 +446,7 @@ fn waited_out(
 /// failure bound on another process, not a wait for the child to do anything: a child that refused
 /// the kill by exiting is seen within one re-read, and one still there after refusing it for another
 /// reason never will be. Only a refused kill can run a bounded call past its deadline
-/// ([`wait_bounded`], [`Left::kill`]), and by no more than this for each refused kill.
+/// ([`wait_bounded`], [`Left::kill`]), by this plus one re-read for each refused kill.
 const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 
 /// End `child`: its root ([`kill_root`]), then, best-effort, its tree. The one order, for every
