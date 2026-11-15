@@ -286,6 +286,17 @@ impl<W: Window> Registered<W> {
         }
     }
 
+    /// [`Self::wait`] for a caller that needs only to know that the pid exited: the exit, with the status
+    /// the kernel gave it or none, `None` iff `deadline` expired first. An exit reported without a status is
+    /// an exit.
+    pub(crate) fn wait_for_exit(self, deadline: Option<Deadline>) -> Result<Option<Exited>> {
+        let pid = self.pid;
+        Ok(self.wait(deadline)?.map(|status| Exited {
+            pid,
+            status: Some(status),
+        }))
+    }
+
     /// Lets go of the registration's hold on the window, which the registration of a launch that has been
     /// resumed must not keep: a `Run` lasts as long as the process does, and interrupts
     /// are held back only until the `SIGCONT`.

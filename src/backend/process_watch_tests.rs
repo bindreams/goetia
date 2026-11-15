@@ -171,6 +171,15 @@ pub(crate) fn pending<W: Window>(registered: &Registered<W>) -> usize {
     poll(&registered.shared.queue)
 }
 
+/// The exit of `registered`'s pid as the watch would hold it had the kernel reported it without a status:
+/// the kernel gives none to ask for, so the test keeps it.
+pub(crate) fn keep_exit_without_status<W: Window>(registered: &Registered<W>) {
+    registered.shared.kept.lock().unwrap().push(Exited {
+        pid: registered.pid,
+        status: None,
+    });
+}
+
 /// Whether `queue` has an event for the wake `fd`: a poll that blocks for none, which takes the event.
 pub(crate) fn woken_by(queue: &Kqueue, fd: std::os::fd::RawFd) -> bool {
     let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -251,6 +260,67 @@ fn an_exit_already_queued_is_reported_under_an_expired_deadline() {
     assert_eq!(
         registered.wait(Some(Budget::Immediate.start())).expect("wait"),
         Some(2 << 8)
+    );
+}
+
+/// An exit the kernel reported without its status is an exit to a caller that needs only that: it is
+/// answered, where [`Registered::wait`], which returns the status, calls it an error.
+#[skuld::test]
+fn an_exit_without_a_status_is_an_exit_to_wait_for_exit() {
+    let watch = watch();
+    let child = Held::new(0);
+    let registered = registered(&watch, child.pid());
+    keep_exit_without_status(&registered);
+
+    let exited = registered
+        .wait_for_exit(failure_bound())
+        .expect("wait")
+        .expect("an exit");
+
+    assert_eq!(exited.status, None);
+}
+
+/// [`Registered::wait`] still refuses an exit without a status, which it has none to answer with.
+#[skuld::test]
+fn an_exit_without_a_status_is_an_error_to_wait() {
+    let watch = watch();
+    let child = Held::new(0);
+    let registered = registered(&watch, child.pid());
+    keep_exit_without_status(&registered);
+
+    let error = registered.wait(failure_bound()).expect_err("no status to answer");
+
+    let said = format!("{}", error.report());
+    assert!(said.contains("without its status"), "{said}");
+}
+
+/// A real exit is answered by `wait_for_exit` with the status [`Registered::wait`] gives.
+#[skuld::test]
+fn wait_for_exit_reports_the_status_of_an_exit() {
+    let watch = watch();
+    let mut child = Held::new(4);
+    let registered = registered(&watch, child.pid());
+    child.finish();
+
+    let exited = registered
+        .wait_for_exit(failure_bound())
+        .expect("wait")
+        .expect("an exit");
+
+    assert_eq!(exited.status, Some(4 << 8));
+}
+
+#[skuld::test]
+fn wait_for_exit_under_an_expired_deadline_is_none() {
+    let watch = watch();
+    let child = Held::new(0);
+    let registered = registered(&watch, child.pid());
+
+    assert!(
+        registered
+            .wait_for_exit(Some(Budget::Immediate.start()))
+            .expect("wait")
+            .is_none()
     );
 }
 

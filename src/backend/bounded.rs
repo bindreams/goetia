@@ -517,13 +517,29 @@ fn refused_kill(
 fn exit_within(pid: u32, bound: Duration) -> Result<bool, String> {
     let report = |e: crate::error::Error| format!("watching for its exit failed: {}", e.report());
     let watch = Watch::<Unwoken>::new().map_err(report)?;
-    match watch.add(pid).map_err(report)? {
+    let added = watch.add(pid).map_err(report)?;
+    exit_after(added, bound, || exited_unreaped(pid))
+}
+
+#[cfg(target_os = "macos")]
+fn exit_after(
+    added: Added<Unwoken>,
+    bound: Duration,
+    _peek: impl Fn() -> Result<bool, String>,
+) -> Result<bool, String> {
+    let report = |e: crate::error::Error| format!("watching for its exit failed: {}", e.report());
+    match added {
         Added::Gone => Ok(true),
         Added::Watching(registered) => registered
-            .wait(Some(Budget::Bounded(bound).start()))
-            .map(|status| status.is_some())
+            .wait_for_exit(Some(Budget::Bounded(bound).start()))
+            .map(|exited| exited.is_some())
             .map_err(report),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn exited_unreaped(_pid: u32) -> Result<bool, String> {
+    Ok(false)
 }
 
 /// Whether `e` is the `EPERM` a child on its way out gives, bare or as cosca wraps it (macOS reads
