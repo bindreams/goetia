@@ -1,5 +1,7 @@
-//! A limit on how many of something one thread may make, for the test hooks that refuse the next
-//! thread, temp file or reuse on demand.
+//! A setting one thread holds for the test hooks that refuse on demand: a count of how many of
+//! something it may make ([`spend`]), or a value a hook answers from ([`Allowance`]). A guard
+//! clears its setting when it drops; a hook that answers once takes the value out, so none outlives
+//! its kill, spawn or wait.
 
 use std::cell::Cell;
 use std::io;
