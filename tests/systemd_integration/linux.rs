@@ -556,11 +556,19 @@ fn a_start_of_a_unit_at_its_start_limit_fails_and_says_so(#[fixture(systemd_grou
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let e = loop {
-        match mgr.start(&id, Budget::DEFAULT) {
-            Ok(_) => mgr.stop(&id, Budget::DEFAULT).expect("stop the running daemon"),
-            Err(e) => break e,
+    let mut seen = Vec::new();
+    let e = 'probe: {
+        for _ in 0..12 {
+            match mgr.start(&id, Budget::DEFAULT) {
+                Ok(_) => {
+                    seen.push("start ok".to_string());
+                    mgr.kill(&id).expect("kill the running daemon");
+                    support::kill::until(|| mgr.status(&id).expect("status").common().state == State::Failed);
+                }
+                Err(e) => break 'probe e,
+            }
         }
+        panic!("PROBE never refused: {seen:?}");
     };
 
     let report = e.report().to_string();
