@@ -2492,11 +2492,7 @@ fn procinfo_not_naming(pid: u32) -> Entry {
         &["procinfo", &pid.to_string()],
         exited(
             0,
-            &format!(
-                "program path = /bin/sleep
-(pid {pid} is not managed by launchd)
-"
-            ),
+            &format!("program path = /bin/sleep\n(pid {pid} is not managed by launchd)\n"),
             "",
         ),
     )

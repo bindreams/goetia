@@ -750,15 +750,7 @@ const KILLED: &str = "\tstate = spawn scheduled\n";
 
 /// `launchctl procinfo` naming `pid` as a launch of the job.
 fn procinfo(pid: u32) -> Entry {
-    let block = format!(
-        "program path = /bin/sh
-
-system/{ID} = {{
-	state = running
-	pid = {pid}
-}}
-"
-    );
+    let block = format!("program path = /bin/sh\n\nsystem/{ID} = {{\n\tstate = running\n\tpid = {pid}\n}}\n");
     reply(&["procinfo", &pid.to_string()], exited(0, &block, ""))
 }
 
