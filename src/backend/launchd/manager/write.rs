@@ -381,7 +381,7 @@ struct Executor<'a> {
     /// it: an error then says the timer is not loaded, and a refusal loads it again first.
     timer_out: bool,
     /// Whether this plan booted out a timer label that has no plist of ours (a stranger's, or a file
-    /// removed by hand): a refusal says there is nothing to load it from.
+    /// removed by hand) and has not tried to load a timer since: whatever ends the plan says so.
     stray_out: bool,
     /// The directories the spec names (`cwd`, the parent of `logs`), made before the first action that
     /// changes anything a refusal could leave untouched.
@@ -406,13 +406,15 @@ impl Executor<'_> {
         {
             prepare_parent_dirs(spec, account)?;
         }
+        // Every refusal and error of a plan leaves here, so the note of a timer label booted out and not
+        // loaded again is made in one place.
         for (at, &action) in plan.iter().enumerate() {
             match self.perform(action, reservation) {
-                Ok(Some(refusal)) => return Ok(refusal),
+                Ok(Some(refusal)) => return Ok(self.stray_noted_refusal(refusal)),
                 Ok(None) => {}
                 // `plan[at..]` still holds the action that failed: a write that failed is not done.
                 Err(e) if self.timer_out => return Err(self.timer_stranded(e, files_written(&plan[at..]))),
-                Err(e) => return Err(e),
+                Err(e) => return Err(self.stray_noted(e)),
             }
         }
         Ok(WriteOutcome::Done)
@@ -555,6 +557,7 @@ impl Executor<'_> {
             Action::BootstrapTimer => {
                 // A failure to load says what is left to do, which covers the timer.
                 self.timer_out = false;
+                self.stray_out = false;
                 self.load(
                     &self.timer.clone().expect("a loaded timer has a file"),
                     &timer_label,
@@ -592,20 +595,9 @@ impl Executor<'_> {
 
     /// `refusal`, the job not being idle, with the timer loaded again first if this plan booted it out.
     /// A timer that cannot be loaded again is told beside the refusal: the task is not armed. A timer
-    /// label launchd held with no plist of ours (a stranger's, or a file removed by hand) has nothing to
-    /// load it from, and the refusal says so.
+    /// label with no plist of ours has nothing to load it from: `run` says so (see [`Self::stray_noted`]).
     fn refuse(&mut self, refusal: Error, reservation: &mut Reservation) -> Error {
-        let (ours, stray) = (std::mem::take(&mut self.timer_out), std::mem::take(&mut self.stray_out));
-        let label = timer_label(self.id.as_str());
-        if stray {
-            return Error::Step {
-                what: format!(
-                    "launchd held `{label}`, which has no plist of goetia's to load it from, so it was booted \
-                     out for this install and is not loaded again"
-                ),
-                source: Box::new(refusal),
-            };
-        }
+        let ours = std::mem::take(&mut self.timer_out);
         // Before any file changes, the timer's path is where it was read.
         let Some(timer) = self.timer.as_deref().filter(|_| ours) else {
             return refusal;
@@ -623,6 +615,41 @@ impl Executor<'_> {
                 first: Box::new(refusal),
                 then: Box::new(rearm),
             },
+        }
+    }
+
+    /// What a refusal or an error says once this plan booted out a timer label with no plist of ours
+    /// (a stranger's, or a file removed by hand), if it did: there was nothing to load it from.
+    fn stray_note(&self) -> Option<String> {
+        self.stray_out.then(|| {
+            format!(
+                "launchd held `{}`, which has no plist of goetia's to load it from, so it was booted out \
+                 and is not loaded again",
+                timer_label(self.id.as_str())
+            )
+        })
+    }
+
+    /// `error`, which ended the plan, with [`Self::stray_note`] around it.
+    fn stray_noted(&self, error: Error) -> Error {
+        match self.stray_note() {
+            Some(what) => Error::Step {
+                what,
+                source: Box::new(error),
+            },
+            None => error,
+        }
+    }
+
+    /// `outcome`, which ended the plan without an error, with [`Self::stray_note`] beside the recovery.
+    fn stray_noted_refusal(&self, outcome: WriteOutcome) -> WriteOutcome {
+        match (outcome, self.stray_note()) {
+            (WriteOutcome::Refused(Outcome::RefuseForeign { recovery }), Some(note)) => {
+                WriteOutcome::Refused(Outcome::RefuseForeign {
+                    recovery: format!("{recovery}; also, {note}"),
+                })
+            }
+            (outcome, _) => outcome,
         }
     }
 

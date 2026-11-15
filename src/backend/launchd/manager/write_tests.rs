@@ -407,19 +407,19 @@ fn a_schedule_edit_leaves_a_run_in_flight_alone() {
 }
 
 /// A timer label launchd holds after its file was removed by hand is a definition goetia did not write:
-/// where an install gives the task a schedule it goes out once the new timer's file is created, so that
-/// the new timer is loaded in its place and the stale one stops firing.
+/// where an install gives the task a schedule it goes out before the new timer's file is created, so
+/// that the new timer is loaded in its place and the stale one stops firing.
 #[skuld::test]
 fn an_install_that_adds_a_schedule_replaces_a_timer_label_whose_file_is_gone() {
     let tree = Tree::new();
     installed(&tree, &task_spec(None), true);
     let new = task_spec(Some(SCHEDULE));
     let timer_in = at(&tree, true, &timer_name());
-    let created = timer_in.clone();
+    let absent = timer_in.clone();
     let fake = Fake::new([
         print(job_label(), LOADED, IDLE),
         print(timer_target(), LOADED, ""),
-        bootout(timer_target()).then(move || assert!(created.exists(), "the new timer is there before the stray goes")),
+        bootout(timer_target()).then(move || assert!(!absent.exists(), "the stray goes before the new timer is made")),
         print(timer_target(), UNLOADED, ""),
         bootstrap(&timer_in),
     ]);
@@ -591,7 +591,8 @@ fn a_failed_uninstall_after_the_timer_went_out_says_to_rerun_uninstall() {
 }
 
 /// A timer label with no plist is not a timer of ours that is waiting to be loaded again: a later
-/// failure is told as itself.
+/// failure says the label was booted out and has no plist, not that the timer's install failed before
+/// loading it again.
 #[skuld::test]
 fn a_stray_timer_label_does_not_make_a_later_failure_say_the_timer_is_unloaded() {
     let tree = Tree::new();
@@ -607,7 +608,10 @@ fn a_stray_timer_label_does_not_make_a_later_failure_say_the_timer_is_unloaded()
 
     let e = rewrite(&tree, &fake, &task(ID, vec!["/bin/false".into()], None)).expect_err("the job's bootout failed");
 
-    assert!(matches!(e, Error::Command { .. }), "{e:?}");
+    let text = e.to_string();
+    assert!(text.contains("no plist") && text.contains("not loaded again"), "{text}");
+    assert!(!text.contains("failed before loading it again"), "{text}");
+    assert!(matches!(e.cause(), Error::Command { .. }), "{e:?}");
 }
 
 /// An update that changes nothing still makes the directories the spec names, as it always did.
@@ -668,6 +672,78 @@ fn a_busy_job_beside_a_timer_label_with_no_timer_file_is_refused_without_a_panic
     );
     fake.assert_spent("nothing is loaded again: there is no file to load");
     assert_eq!(text_at(&tree, true, ID), old.job);
+}
+
+/// An install that adds a schedule over a timer label with no file boots the label out before the idle
+/// check, as it would the timer: a refusal for a run in flight says so, and the new timer was not made.
+#[skuld::test]
+fn a_refusal_after_a_stray_timer_label_went_out_names_it() {
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(None), true);
+    let fake = Fake::new([
+        print(job_label(), LOADED, BUSY),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, BUSY),
+    ]);
+
+    let e =
+        rewrite(&tree, &fake, &task(ID, vec!["/bin/false".into()], Some(SCHEDULE))).expect_err("a run is in flight");
+
+    let text = e.to_string();
+    assert!(
+        text.contains(&timer_name()) && text.contains("booted out") && text.contains("not loaded again"),
+        "{text}"
+    );
+    assert!(matches!(e.cause(), Error::LoadedJob { .. }), "{e:?}");
+    fake.assert_spent("nothing is sent after the refusal");
+    assert_eq!(text_at(&tree, true, ID), old.job);
+    assert!(!exists(&tree, true, &timer_name()) && !exists(&tree, false, &timer_name()));
+}
+
+/// The new timer's name taken by someone else after the stray label went out ends the install, and the
+/// result says the label is not loaded again: a stranger's file as a refusal, a timer of goetia's as an
+/// error.
+#[skuld::test]
+fn a_create_that_races_after_a_stray_timer_label_went_out_names_it() {
+    let spec = task_spec(Some(SCHEDULE));
+    // An update that adds a schedule over a stray label, where `taken` is written at the timer's name
+    // once the label is out.
+    let raced = |taken: String| -> Result<WriteOutcome> {
+        let tree = Tree::new();
+        installed(&tree, &task_spec(None), true);
+        let timer_in = at(&tree, true, &timer_name());
+        let fake = Fake::new([
+            print(job_label(), LOADED, IDLE),
+            print(timer_target(), LOADED, ""),
+            bootout(timer_target()).then(move || std::fs::write(timer_in, taken).unwrap()),
+            print(timer_target(), UNLOADED, ""),
+        ]);
+        let outcome = rewrite(&tree, &fake, &spec);
+        fake.assert_spent("nothing is sent after the race");
+        assert_eq!(
+            text_at(&tree, true, ID),
+            plists_of(&task_spec(None)).job,
+            "the job was not replaced"
+        );
+        outcome
+    };
+
+    let recovery = refused_as_foreign(raced("a stranger's file\n".to_string()));
+    assert!(recovery.contains(&timer_name()), "{recovery}");
+    assert!(
+        recovery.contains("booted out") && recovery.contains("not loaded again"),
+        "{recovery}"
+    );
+
+    let e = raced(plists_of(&spec).timer.unwrap()).expect_err("another install's timer is a concurrent change");
+    let text = e.to_string();
+    assert!(
+        text.contains("booted out") && text.contains("not loaded again"),
+        "{text}"
+    );
+    assert!(matches!(e.cause(), Error::ConcurrentChange { .. }), "{e:?}");
 }
 
 /// A `print` state goetia does not recognise is refused, and not called a run in flight.

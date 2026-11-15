@@ -181,9 +181,9 @@ impl Old {
 ///   schedule edit.
 /// - A timer that is new is created before the job's files change, no-clobber, so a stranger's file at
 ///   its name refuses with nothing changed; one that is dropped is removed before the job is replaced.
-/// - A stray timer label ([`Old::timer_stray`]) goes out in every plan: after the new timer is created
-///   where there is one (launchd would otherwise keep the old definition under the new one's name), and
-///   before a timer is loaded.
+/// - A stray timer label ([`Old::timer_stray`]) goes out in every plan, as that same first boot-out: it
+///   would otherwise stand in for the timer the plan creates or loads, and fire between the idle check
+///   and the job's boot-out. A refusal after it says the label is not loaded again.
 /// - A retype, or a dropped schedule, moves an enabled job to staging first: it drops arming and boot
 ///   enrolment, so `enabled` and `enable` agree that a task with no timer has nothing to arm.
 /// - A task that is enabled ends with its job and its timer loaded, the job first: what went out is
@@ -202,12 +202,9 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
         _ => (false, false),
     };
     let job_out = old.job_loaded && job_renders_differently;
-    // A stray timer label (see [`Old::timer_stray`]) goes out whatever the plan changes. Where the plan
-    // creates a timer file it goes out after that, which refuses a stranger's file at the name first.
-    let stray_after_create = old.timer_stray() && added;
-    let timer_out = old.timer_loaded
-        && !stray_after_create
-        && (dropped || timer_renders_differently || job_out || old.timer_stray());
+    // A stray timer label (see [`Old::timer_stray`]) goes out whatever the plan changes, as the timer
+    // does where it is loaded and changes: first, so no fire starts a run before the job's boot-out.
+    let timer_out = old.timer_loaded && (dropped || timer_renders_differently || job_out || old.timer_stray());
     // A retype, or a dropped schedule, leaves nothing enabled: there is nothing to arm.
     let armed = !retype && !dropped && old.enabled();
 
@@ -220,7 +217,6 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
     push(timer_out, Action::BootoutTimer);
     push(job_out, Action::CheckJobIdle);
     push(added, Action::CreateTimerFirst);
-    push(stray_after_create, Action::BootoutTimer);
     push(job_out, Action::BootoutJob);
     push(dropped, Action::RemoveTimer);
     push((retype || dropped) && job.enabled, Action::MoveJobToStaging);
@@ -229,7 +225,7 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
     // An enabled task is loaded (`enable` loads it), so whatever launchd does not hold afterwards is
     // loaded, whether this plan booted it out or an earlier install that failed did.
     let job_held = old.job_loaded && !job_out;
-    let timer_held = old.timer_loaded && !timer_out && !stray_after_create;
+    let timer_held = old.timer_loaded && !timer_out;
     push(armed && !job_held, Action::BootstrapJob);
     push(armed && new.timer.is_some() && !timer_held, Action::BootstrapTimer);
     plan

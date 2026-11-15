@@ -381,28 +381,28 @@ fn update_cases() -> Vec<UpdateCase> {
             vec![CreateTimerFirst, ReplaceJob, BootstrapTimer],
         ),
         (
-            "schedule added where a timer label is loaded with no timer file, enabled: the stray goes out once \
-             the new timer is created, and the new one is loaded",
+            "schedule added where a timer label is loaded with no timer file, enabled: the stray goes out first, \
+             and the new timer is loaded",
             installed(&unscheduled("a"), true, BOTH),
             scheduled("a", "30 3 * * *"),
-            vec![CreateTimerFirst, BootoutTimer, ReplaceJob, BootstrapTimer],
+            vec![BootoutTimer, CreateTimerFirst, ReplaceJob, BootstrapTimer],
         ),
         (
             "schedule added where a timer label is loaded with no timer file, disarmed: the stray goes out and \
              nothing is loaded",
             installed(&unscheduled("a"), false, BOTH),
             scheduled("a", "30 3 * * *"),
-            vec![CreateTimerFirst, BootoutTimer, ReplaceJob],
+            vec![BootoutTimer, CreateTimerFirst, ReplaceJob],
         ),
         (
             "schedule added and command changed, a timer label loaded with no timer file: it goes out once, \
-             after the new timer is created",
+             before the idle check, so no fire can start a run between the check and the job's bootout",
             installed(&unscheduled("a"), true, BOTH),
             scheduled("b", "30 3 * * *"),
             vec![
+                BootoutTimer,
                 CheckJobIdle,
                 CreateTimerFirst,
-                BootoutTimer,
                 BootoutJob,
                 ReplaceJob,
                 BootstrapJob,
@@ -417,7 +417,7 @@ fn update_cases() -> Vec<UpdateCase> {
                 ..installed(&scheduled("a", "30 3 * * *"), true, BOTH)
             },
             scheduled("a", "30 3 * * *"),
-            vec![CreateTimerFirst, BootoutTimer, BootstrapTimer],
+            vec![BootoutTimer, CreateTimerFirst, BootstrapTimer],
         ),
         (
             "schedule dropped, armed: the timer goes before the job is replaced, and the job leaves the enabled \
@@ -664,7 +664,7 @@ fn with_stray_timer(old: &Old) -> Old {
 }
 
 /// Where the actions of `plan` that `of` picks are.
-fn positions(plan: &[Action], of: fn(Action) -> bool) -> Vec<usize> {
+fn positions(plan: &[Action], of: impl Fn(Action) -> bool) -> Vec<usize> {
     plan.iter()
         .enumerate()
         .filter(|&(_, &action)| of(action))
@@ -673,26 +673,27 @@ fn positions(plan: &[Action], of: fn(Action) -> bool) -> Vec<usize> {
 }
 
 /// The rule for a timer label launchd holds with no timer file (`timer_stray`), for every plan: it is
-/// booted out once, after any timer file the plan creates (so a stranger's file at the name refuses
-/// before anything goes out) and before any timer it loads. The shapes are the installed side of every
-/// row of the update and enable tables, set to hold a stray label, crossed with every new spec the update
-/// table names and, for `enable`, a task with and without a schedule.
+/// booted out once, before the idle check and the job's bootout (a fire between them would start a run
+/// that the bootout ends, as for any timer the plan boots out) and before any timer it loads. The shapes
+/// are the installed side of every row of the update and enable tables, set to hold a stray label,
+/// crossed with every new spec the update table names and, for `enable`, a task with and without a
+/// schedule.
 #[skuld::test]
-fn a_stray_timer_label_is_booted_out_once_between_the_create_and_the_load() {
-    let is_create = |action| matches!(action, CreateTimerFirst | CreateTimerEnabled);
+fn a_stray_timer_label_is_booted_out_once_before_the_idle_check_the_job_bootout_and_the_load() {
     let check = |what: &str, plan: &[Action]| {
         let out = positions(plan, |action| action == BootoutTimer);
         assert_eq!(out.len(), 1, "one bootout of the stray: {what}: {plan:?}");
-        let created = positions(plan, is_create);
-        assert!(
-            created.iter().all(|&c| c < out[0]),
-            "the bootout comes after the create: {what}: {plan:?}"
-        );
-        let loaded = positions(plan, |action| action == BootstrapTimer);
-        assert!(
-            loaded.iter().all(|&l| out[0] < l),
-            "the bootout comes before the load: {what}: {plan:?}"
-        );
+        for (name, behind) in [
+            ("the idle check", CheckJobIdle),
+            ("the job's bootout", BootoutJob),
+            ("the load", BootstrapTimer),
+        ] {
+            let at = positions(plan, |action| action == behind);
+            assert!(
+                at.iter().all(|&at| out[0] < at),
+                "the bootout comes before {name}: {what}: {plan:?}"
+            );
+        }
     };
 
     let rows = update_cases();
