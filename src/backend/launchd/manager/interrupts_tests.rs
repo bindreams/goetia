@@ -249,18 +249,31 @@ impl Drop for Running {
 }
 
 /// A thread joined when this drops, so that a test that fails does not leave it running into the next. It
-/// is declared before whatever the thread waits for, which then drops first. A panic of the thread fails
-/// the test with its own message, unless the test is failing already.
+/// is declared before whatever the thread waits for, which then drops first. The drop is cleanup and never
+/// panics; [`Joined::finish`] is where a test fails on the thread's panic.
 #[derive(Default)]
 struct Joined(Option<JoinHandle<()>>);
 
-impl Drop for Joined {
-    fn drop(&mut self) {
+impl Joined {
+    /// Whether the thread has ended, so that a test waiting on what it does can stop waiting when it panics.
+    fn ended(&self) -> bool {
+        self.0.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Joins the thread, failing the test with the thread's own panic, message and all.
+    fn finish(mut self) {
         if let Some(thread) = self.0.take()
             && let Err(payload) = thread.join()
-            && !std::thread::panicking()
         {
             std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+impl Drop for Joined {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.take() {
+            _ = thread.join();
         }
     }
 }
@@ -475,13 +488,18 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     let running = Running::enter();
 
     closing.0 = Some(std::thread::spawn(move || drop(deferred)));
-    while WAKE.load(Ordering::SeqCst) != -1 {
+    // Also ends if the closing thread does, so that its panic fails the test rather than hanging it.
+    while WAKE.load(Ordering::SeqCst) != -1 && !closing.ended() {
         std::thread::yield_now();
+    }
+    if WAKE.load(Ordering::SeqCst) != -1 {
+        closing.finish();
+        panic!("the closing thread ended without un-publishing the pipe");
     }
     assert!(is_open(wake), "a handler is running, so the pipe is still open");
 
     drop(running);
-    drop(closing);
+    closing.finish();
     before.assert_back();
 }
 
@@ -544,7 +562,11 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
     // The window is closed and the block lifted: a signal the thread held pending has been delivered to it by
     // now. A signal taken by another thread is delivered on that thread, asynchronously, so it is awaited,
     // under no bound; one the closer held is seen already.
-    has_closed.recv().expect("the closing thread");
+    if has_closed.recv().is_err() {
+        // It ended without closing: fail with its own panic.
+        closing.finish();
+        panic!("the closing thread ended without closing the window");
+    }
     while before.seen() == 0 {
         std::thread::yield_now();
     }
@@ -555,7 +577,7 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
         "the signal was held by the thread that closed the window"
     );
     release.send(()).expect("the closing thread is waiting");
-    drop(closing);
+    closing.finish();
 }
 
 /// A window whose pipe cannot be made is an `Err` and installs nothing: no handler is ours, nothing is
