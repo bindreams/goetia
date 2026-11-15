@@ -1166,3 +1166,39 @@ fn enable_and_disable_finish_after_a_crash_on_a_real_launchd(#[fixture(launchd_g
     let status = task_status(&mgr, &task_id);
     assert!(status.common.enabled, "{status:?}");
 }
+
+// PROBE (temporary): what `print` shows of `started suspended` right after `debug` and `kickstart -p`.
+#[skuld::test]
+fn probe_print_after_a_held_kickstart(#[fixture(launchd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let task_id = id_of(&id);
+    let mgr = Launchd::new();
+    let _guard = Guard::install(&mgr, &task(&id, sh("exit 0"), None));
+    mgr.start(&task_id, Budget::DEFAULT).expect("start");
+    status_with_result(&mgr, &task_id);
+    let target = format!("system/{id}");
+    let fields = |body: &str| {
+        format!(
+            "state={:?} pid={:?} suspended={:?} runs={:?}",
+            print_field(body, "state = "),
+            print_field(body, "pid = "),
+            print_field(body, "started suspended = "),
+            print_field(body, "runs = ")
+        )
+    };
+    let mut report = String::new();
+    for i in 0..60 {
+        let debug = cmd::run("launchctl", &["debug", &target, "--start-suspended"]);
+        let kick = cmd::run("launchctl", &["kickstart", "-p", &target]).expect_ok();
+        let reads: Vec<String> = (0..3).map(|_| fields(&print_job(&id).stdout)).collect();
+        report.push_str(&format!(
+            "#{i} debug={:?} kickstart={:?}\n  {}\n",
+            debug.code,
+            kick.stdout.trim(),
+            reads.join("\n  ")
+        ));
+        cmd::run("launchctl", &["kill", "SIGCONT", &target]).expect_ok();
+        kill::until(|| pid_of(&id).is_none());
+    }
+    panic!("PROBE RESULT\n{report}");
+}
