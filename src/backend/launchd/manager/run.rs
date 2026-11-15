@@ -219,7 +219,7 @@ impl Attempt<'_> {
             match registered.first_exec(self.window).map_err(strand)? {
                 Woke::Exec => {}
                 Woke::Exited(_) => return Ok(None),
-                Woke::Interrupted => return Err(strand(run_interrupted(id, "a launch to start"))),
+                Woke::Interrupted => return Err(strand(run_interrupted(id, "the start"))),
             }
         }
         let Some(process) = proc::read(pid).map_err(read)? else {
