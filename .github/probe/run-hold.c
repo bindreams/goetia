@@ -905,11 +905,14 @@ static void procinfo(const char *what, pid_t pid) {
     struct cmd c;
     snprintf(s, sizeof s, "%d", pid);
     path_base(pid, pb, sizeof pb);
+    int e = 0;
+    int sb = bsd_stat_of(pid, &e);
     lc(&c, "procinfo", s, NULL);
+    int sa = bsd_stat_of(pid, &e);
     path_base(pid, pa, sizeof pa);
     int lab = strstr(c.out, LABEL) || strstr(c.err, LABEL);
-    if (tally("I1 procinfo of %s (path %s -> %s): exit %d, label named %s, stdout %s, stderr %s", what, pb, pa, c.code, lab ? "YES" : "no",
-              c.out[0] ? "non-empty" : "empty", c.err[0] ? "non-empty" : "empty"))
+    if (tally("I1 procinfo of %s (path %s -> %s; state %s -> %s): exit %d, label named %s, stdout %s, stderr %s", what, pb, pa, sname(sb), sname(sa), c.code,
+              lab ? "YES" : "no", c.out[0] ? "non-empty" : "empty", c.err[0] ? "non-empty" : "empty"))
         say("----- procinfo output, first of [%s, path %s -> %s, exit %d] -----\n%s----- stderr -----\n%s-----", what, pb, pa, c.code, c.out, c.err);
 }
 
@@ -946,6 +949,8 @@ static int wait_exit(pid_t pid, char *seq, size_t cap) {
     }
 }
 
+static int O_fresh; /* ident: bootout and bootstrap before every pass, so each launch is the job's first */
+
 /* I1 and I2: one launch of the job, read from the xpcproxy stage on. */
 static void ident_pass(int i, int held, int early) {
     struct cmd c, pr;
@@ -963,6 +968,7 @@ static void ident_pass(int i, int held, int early) {
     reap(ch);
     procinfo("a pid that no longer exists (our reaped child)", ch);
 
+    if (O_fresh) reset();
     if (held) {
         lc(&c, "debug", SYS, "--start-suspended", NULL);
         if (c.code) tally("debug exit %d", c.code);
@@ -985,6 +991,11 @@ static void ident_pass(int i, int held, int early) {
     path_base(pid, pb, sizeof pb);
     long long c0 = coal_of(pid);
     path_base(pid, pa, sizeof pa);
+    /* print right after the reply: does it name this launch's coalition, and the pid, with no lag? */
+    lc(&pr, "print", SYS, NULL);
+    long long pcx = print_coal(pr.out);
+    tally("I2 print right after kickstart -p (%s launch of the job): coalition named %s; == launch's %s; pid shown %s", O_fresh ? "first" : "later",
+          pcx >= 0 ? "yes" : "no", eq(c0, pcx), field(pr.out, "pid = ") == pid ? "this one" : "not this one");
     procinfo(early ? "the launch, kickstart -p still running" : "the launch right after kickstart -p", pid);
 
     int rr = reg(pid);
@@ -1246,6 +1257,7 @@ int main(int argc, char **argv) {
         uninstall();
     } else if (!strcmp(sc, "ident")) { /* ident <held|unheld> <plain|wrap> <early|late> <passes> */
         if (argc < 6) return 2;
+        O_fresh = argc > 6 && !strcmp(argv[6], "fresh");
         run_ident(!strcmp(argv[2], "held"), !strcmp(argv[3], "wrap"), !strcmp(argv[4], "early"), atoi(argv[5]));
     } else if (!strcmp(sc, "coal")) { /* coal <passes> */
         run_coal(atoi(argv[2]));
