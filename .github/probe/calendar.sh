@@ -50,6 +50,19 @@ set_clock() { # set_clock <mmddHHMMccyy.SS>, UTC
     echo "clock set: $(date -u)"
 }
 
+mode="${2:-gmt}"
+uea=system/com.apple.UserEventAgent-System
+uea_pid() { launchctl print "$uea" | awk '$1 == "pid" {print $3}'; }
+if [[ "$mode" == ny ]]; then
+    # tz.sh: restarting UserEventAgent after the zone change makes it compute in the new zone.
+    systemsetup -settimezone America/New_York
+    old="$(uea_pid)"
+    launchctl kickstart -k "$uea"
+    new="$(uea_pid)"
+    until [[ -n "$new" && "$new" != "$old" ]]; do new="$(uea_pid)"; done
+    echo "UserEventAgent restarted in $(systemsetup -gettimezone)"
+fi
+
 stream="$work/stream.log"
 log stream --level debug --style compact --predicate 'eventMessage CONTAINS "StartCalendarInterval"' > "$stream" 2>&1 &
 stream_pid=$!
@@ -69,6 +82,7 @@ reg_lines() { # reg_lines <label> <count>
     echo "$lines"
 }
 
+if [[ "$mode" == gmt ]]; then
 echo "=== PART A: does print show the registered entries?"
 label=goetia.probe.printarray
 labels+=" $label"
@@ -96,6 +110,7 @@ launchctl print "system/$label" | grep -nE 'Hour|Minute|Weekday|Day|Month|descri
 echo "--- launchctl dumpstate, lines of the job that mention an entry or a time"
 launchctl dumpstate | grep -n "$label"
 launchctl bootout "system/$label"
+fi
 
 echo "=== PART B: goetia's compiler and next-run against launchd's registered next fires"
 idx=0
@@ -124,6 +139,17 @@ compare() { # compare <cron> <clock>...
     done
 }
 
-compare '*/15 9-17 * * 1-5' 010408502027.10 010409072027.20 010817462027.00 010912002027.00 011023592027.30
-compare '0 3 1,15 * *' 011412002027.00 011503052027.00 013123502027.00 021412002027.00 121504002027.00
+if [[ "$mode" == gmt ]]; then
+    compare '*/15 9-17 * * 1-5' 010408502027.10 010409072027.20 010817462027.00 010912002027.00 011023592027.30
+    compare '0 3 1,15 * *' 011412002027.00 011503052027.00 013123502027.00 021412002027.00 121504002027.00
+else
+    # Around the 2027 transitions (spring: 07:00 UTC on 03-14; fall: 06:00 UTC on 11-07), each in clock order.
+    for clock in 031317002027.00 031406302027.00 031407052027.00 110617002027.00 110705002027.00 110706152027.00; do
+        for cron in '30 2 * * *' '30 1 * * *' '30 2 14 3 *' '30 1 7 11 *' '30 2 14 * *' '30 1 7 * *' '30 2 * * 0' '30 1 * * 0' '0 3 * * *' '0 2 * * *' '0 1 * * *'; do
+            compare "$cron" "$clock"
+        done
+        # Back to the real time between clocks: the runner agent does not tolerate a long stay in 2027.
+        restore_clock
+    done
+fi
 date

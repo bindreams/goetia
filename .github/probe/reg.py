@@ -3,9 +3,13 @@ each date, one per line. The zone name must be one this probe understands (GMT).
 
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-ZONES = {"Greenwich Mean Time": timezone.utc}
+ZONES = {
+    "Greenwich Mean Time": timezone.utc,
+    "Eastern Standard Time": timezone(timedelta(hours=-5)),
+    "Eastern Daylight Time": timezone(timedelta(hours=-4)),
+}
 LINE = re.compile(r": \w+, (\w+) (\d+), (\d+) at (\d+):(\d+):(\d+) (AM|PM) (.+)$")
 
 for raw in sys.stdin:

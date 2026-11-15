@@ -171,21 +171,25 @@ unload() {
 # Spring forward: 2027-03-14, 02:00 EST -> 03:00 EDT at 07:00 UTC.
 # Fall back: 2027-11-07, 02:00 EDT -> 01:00 EST at 06:00 UTC; 01:00 to 02:00 local happens twice.
 case "$case_name" in
-spring)
-    step "spring A: the day before (12:00 EST), daily and dated entries" 031317002027.00 \
-        d159:Hour=1,Minute=59 d200:Hour=2,Minute=0 d230:Hour=2,Minute=30 d300:Hour=3,Minute=0 d330:Hour=3,Minute=30 \
-        t230:Month=3,Day=14,Hour=2,Minute=30 t330:Month=3,Day=14,Hour=3,Minute=30
+spring_a)
+    step "spring A: the day before (12:00 EST), daily and dated entries" 031317002027.00         d159:Hour=1,Minute=59 d200:Hour=2,Minute=0 d230:Hour=2,Minute=30 d300:Hour=3,Minute=0 d330:Hour=3,Minute=30         t230:Month=3,Day=14,Hour=2,Minute=30 t330:Month=3,Day=14,Hour=3,Minute=30
     unload
-    step "spring B: 01:57:30 EST, entries around the gap" 031406572027.30 \
-        t159:Month=3,Day=14,Hour=1,Minute=59 t200:Month=3,Day=14,Hour=2,Minute=0 t230:Month=3,Day=14,Hour=2,Minute=30 \
-        t300:Month=3,Day=14,Hour=3,Minute=0 t301:Month=3,Day=14,Hour=3,Minute=1 t302:Month=3,Day=14,Hour=3,Minute=2 \
-        t330:Month=3,Day=14,Hour=3,Minute=30 t332:Month=3,Day=14,Hour=3,Minute=32 \
-        d230:Hour=2,Minute=30
-    wait_fires t302 1 900
+    ;;
+spring_b)
+    step "spring B0: 01:58:30 EST, an entry before the gap" 031406582027.30 t159:Month=3,Day=14,Hour=1,Minute=59
+    wait_fires t159 1 120
     show
+    unload
+    step "spring B2: 01:59:40 EST, entries in and after the gap" 031406592027.40         t200:Month=3,Day=14,Hour=2,Minute=0 t230:Month=3,Day=14,Hour=2,Minute=30         t300:Month=3,Day=14,Hour=3,Minute=0 t301:Month=3,Day=14,Hour=3,Minute=1 d230:Hour=2,Minute=30
+    wait_fires t301 1 150
+    show
+    unload
+    ;;
+spring_c)
+    step "spring C0: 01:59:40 EST, entries registered before the transition" 031406592027.40         t230:Month=3,Day=14,Hour=2,Minute=30 t330:Month=3,Day=14,Hour=3,Minute=30 c331:Month=3,Day=14,Hour=3,Minute=31         d230:Hour=2,Minute=30
     echo "=== STEP spring C: the clock jumps to 03:29:40 EDT (07:29:40 UTC), after the entries were registered"
     set_clock 031407292027.40
-    wait_fires t332 1 400
+    wait_fires c331 1 150
     show
     unload
     ;;
@@ -201,20 +205,32 @@ fall1)
     show
     unload
     ;;
-fall2)
-    step "fall2 A: the day before (13:00 EDT), daily and dated entries" 110617002027.00 \
-        d059:Hour=0,Minute=59 d130:Hour=1,Minute=30 d159:Hour=1,Minute=59 d200:Hour=2,Minute=0 d201:Hour=2,Minute=1 \
-        t130:Month=11,Day=7,Hour=1,Minute=30
-    unload
-    step "fall2 B3: 01:57:30 EDT, entries around the fold" 110705572027.30 \
-        d159:Hour=1,Minute=59 t059:Month=11,Day=7,Hour=0,Minute=59 t130:Month=11,Day=7,Hour=1,Minute=30 \
-        t159:Month=11,Day=7,Hour=1,Minute=59 t200:Month=11,Day=7,Hour=2,Minute=0 t201:Month=11,Day=7,Hour=2,Minute=1
-    wait_fires d159 1 300
+fall3)
+    # The four shapes goetia's compiler emits (no date, Day, Month and Day, Weekday) at 01:30, in the fold. 2027-11-07 is a Sunday.
+    step "fall3 B1: 01:29:40 EDT, first pass of the fold" 110705292027.40 \
+        s0:Hour=1,Minute=30 sd:Day=7,Hour=1,Minute=30 smd:Month=11,Day=7,Hour=1,Minute=30 sw:Weekday=0,Hour=1,Minute=30 \
+        c31:Hour=1,Minute=31
+    wait_fires c31 1 300
+    show
+    echo "=== STEP fall3 C: the clock jumps to 01:29:40 EST (06:29:40 UTC), second pass, after the entries were registered"
+    set_clock 110706292027.40
+    wait_fires c31 2 400
     show
     unload
-    step "fall2 B2: 01:29:40 EST (06:29:40 UTC), registered in the second pass" 110706292027.40 \
-        t130:Month=11,Day=7,Hour=1,Minute=30 t131:Month=11,Day=7,Hour=1,Minute=31
-    wait_fires t131 1 300
+    ;;
+fall2_a)
+    step "fall2 A: the day before (13:00 EDT), daily and dated entries" 110617002027.00         d059:Hour=0,Minute=59 d130:Hour=1,Minute=30 d159:Hour=1,Minute=59 d200:Hour=2,Minute=0 d201:Hour=2,Minute=1         t130:Month=11,Day=7,Hour=1,Minute=30
+    unload
+    ;;
+fall2_b)
+    step "fall2 B3: 01:57:30 EDT, entries around the fold" 110705572027.30         d159:Hour=1,Minute=59 t059:Month=11,Day=7,Hour=0,Minute=59 t130:Month=11,Day=7,Hour=1,Minute=30         t159:Month=11,Day=7,Hour=1,Minute=59 t200:Month=11,Day=7,Hour=2,Minute=0 t201:Month=11,Day=7,Hour=2,Minute=1
+    wait_fires d159 1 150
+    show
+    unload
+    ;;
+fall2_c)
+    step "fall2 B2: 01:29:40 EST (06:29:40 UTC), registered in the second pass" 110706292027.40         t130:Month=11,Day=7,Hour=1,Minute=30 t131:Month=11,Day=7,Hour=1,Minute=31
+    wait_fires t131 1 150
     show
     unload
     ;;

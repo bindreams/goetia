@@ -7,40 +7,28 @@ permissions:
   contents: read
 
 jobs:
-  tz:
-    name: tz ${{ matrix.method }} (macos)
-    runs-on: macos-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        method:
-          - ss-kick
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Probe
-        run: sudo bash .github/probe/tz.sh ${{ matrix.method }}
-
   dst:
     name: dst ${{ matrix.case }} (macos)
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        case: [spring, fall1, fall2]
+        case: [spring_a, spring_b, spring_c, fall2_a, fall2_b, fall2_c, fall3]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # The output goes to a file and is printed once the clock is back: a step that logs while the clock is in 2027 loses its log.
       - name: Probe
-        run: sudo bash .github/probe/dst.sh ${{ matrix.case }}
+        run: |
+          sudo bash .github/probe/dst.sh ${{ matrix.case }} > dst.log 2>&1
+          status=$?
+          cat dst.log
+          exit $status
 
-  calendar:
-    name: calendar (macos)
+  calendar-ny:
+    name: calendar in America/New_York (macos)
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -56,4 +44,8 @@ jobs:
         run: cargo build --locked --example calendar_probe --features testing
 
       - name: Probe
-        run: sudo bash .github/probe/calendar.sh target/debug/examples/calendar_probe
+        run: |
+          sudo bash .github/probe/calendar.sh target/debug/examples/calendar_probe ny > calendar.log 2>&1
+          status=$?
+          cat calendar.log
+          exit $status
