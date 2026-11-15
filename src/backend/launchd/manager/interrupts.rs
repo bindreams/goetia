@@ -4,8 +4,8 @@
 //! interrupt that ended goetia would leave the job's next launch held and stopped. So a [`Deferred`]
 //! makes SIGINT, SIGTERM and SIGHUP be recorded instead, and re-raises each one the window recorded once
 //! the last [`Deferred`] is dropped, to whatever handled it before. A signal that was ignored when the
-//! window opened (`nohup` ignores SIGHUP) is not taken over: it stays ignored, and
-//! [`Deferred::signals`] names the ones that are.
+//! window opened (`nohup` ignores SIGHUP), or that the opening thread blocks, is not taken over: it
+//! stays as it was, and [`Deferred::signals`] names the ones that are taken over.
 //!
 //! It is a process-wide handler, not a mask: `run` has already spawned the thread that waits for the run,
 //! and a signal sent to the process goes to any thread that does not block it, so a mask on the calling
@@ -21,11 +21,15 @@ use crate::error::{Error, Result};
 /// The signals a terminal, a session or a service manager ends a process with.
 pub(super) const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
+/// The names of [`SIGNALS`], in the same order.
+const NAMES: [&str; 3] = ["SIGINT", "SIGTERM", "SIGHUP"];
+
 /// Who holds a [`Deferred`], and what to put back when the last one is dropped.
 struct Shared {
     holders: usize,
     /// The dispositions of [`SIGNALS`] before the first holder, while there is one, and the mask of those
-    /// the window took over (bit `i` for `SIGNALS[i]`): a signal that was ignored is left as it was.
+    /// the window took over (bit `i` for `SIGNALS[i]`): a signal that was ignored or blocked is left as it
+    /// was.
     previous: Option<([libc::sigaction; 3], u32)>,
 }
 
@@ -127,14 +131,38 @@ impl Deferred {
         Ok(Deferred { taken })
     }
 
-    /// The signals of [`SIGNALS`] the window took over: those that were not ignored when it opened. The
-    /// others stay ignored throughout, so nothing may wait for them or count them as an interrupt.
+    /// The signals of [`SIGNALS`] the window took over: those that were neither ignored nor blocked in the
+    /// opening thread's mask when it opened. The others stay as they were, so nothing may wait for them or
+    /// count them as an interrupt.
     pub(crate) fn signals(&self) -> impl Iterator<Item = libc::c_int> + use<> {
         let taken = self.taken;
         SIGNALS
             .into_iter()
             .enumerate()
             .filter_map(move |(bit, signal)| (taken & (1 << bit) != 0).then_some(signal))
+    }
+
+    /// Names what interrupted the run, for its error: the signals recorded, as "SIGINT and SIGTERM", or,
+    /// where none is recorded yet (the watch's event can come before the handler's record), those the
+    /// window took over, as "SIGINT, SIGTERM or SIGHUP". A signal that stays ignored or blocked is in
+    /// neither.
+    pub(crate) fn interrupt_signals(&self) -> String {
+        let recorded = RECORDED.load(Ordering::SeqCst) & self.taken;
+        let (bits, last) = if recorded != 0 {
+            (recorded, "and")
+        } else {
+            (self.taken, "or")
+        };
+        let names: Vec<&str> = NAMES
+            .into_iter()
+            .enumerate()
+            .filter_map(|(bit, name)| (bits & (1 << bit) != 0).then_some(name))
+            .collect();
+        match names.split_last() {
+            None => String::new(),
+            Some((only, [])) => only.to_string(),
+            Some((end, rest)) => format!("{} {last} {end}", rest.join(", ")),
+        }
     }
 
     /// Whether SIGINT, SIGTERM or SIGHUP has arrived since the window opened, as far as the handler has
@@ -183,20 +211,38 @@ fn reraise(recorded: u32) {
     }
 }
 
-/// Installs [`record`] for the signals of [`SIGNALS`] that are not ignored, giving back what each had and
-/// the mask of those it took over. A signal that is ignored (`nohup` ignores SIGHUP) is left alone: the user
-/// set it so, and it stays so. All or none.
-fn install() -> io::Result<([libc::sigaction; 3], u32)> {
+/// A `sigaction` for `handler` with no flags and an empty mask.
+fn action(handler: libc::sighandler_t) -> libc::sigaction {
     // SAFETY: an all-zero `sigaction` is a valid value (no handler, no flags); the mask is then emptied.
-    let mut ours: libc::sigaction = unsafe { std::mem::zeroed() };
-    ours.sa_sigaction = record as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler;
+    // SAFETY: `action.sa_mask` is a valid `sigset_t`.
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    action
+}
+
+/// Whether `signal` is blocked in the calling thread's mask.
+fn blocked(signal: libc::c_int) -> bool {
+    // SAFETY: an all-zero `sigset_t` is a valid place to read the mask into.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `mask` is a valid `sigset_t`; a null new set only reads the current mask into it.
+    let read = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) };
+    debug_assert_eq!(read, 0, "reading the signal mask failed");
+    // SAFETY: `mask` was filled by `pthread_sigmask`, and `signal` is a valid signal number.
+    unsafe { libc::sigismember(&mask, signal) == 1 }
+}
+
+/// Installs [`record`] for the signals of [`SIGNALS`] that are neither ignored nor blocked in the calling
+/// thread's mask, giving back what each had and the mask of those it took over. A signal that is ignored
+/// (`nohup` ignores SIGHUP) is left alone: the user set it so, and it stays so. A signal the thread blocks
+/// is treated the same way: it was kept from this thread on purpose, and goetia does not take it over.
+/// All or none.
+fn install() -> io::Result<([libc::sigaction; 3], u32)> {
+    let mut ours = action(record as extern "C" fn(libc::c_int) as libc::sighandler_t);
     // Calls interrupted by a signal are restarted, so a wait in this window does not see the interrupt.
     ours.sa_flags = libc::SA_RESTART;
-    // SAFETY: `ours.sa_mask` is a valid `sigset_t`.
-    unsafe { libc::sigemptyset(&mut ours.sa_mask) };
 
-    // SAFETY: as above.
-    let mut previous: [libc::sigaction; 3] = unsafe { std::mem::zeroed() };
+    let mut previous = [action(libc::SIG_DFL); 3];
     let mut taken = 0;
     for (i, &signal) in SIGNALS.iter().enumerate() {
         // SAFETY: a null new action only reads, into `previous[i]`, a valid place for the old one.
@@ -205,7 +251,7 @@ fn install() -> io::Result<([libc::sigaction; 3], u32)> {
             restore(&previous[..i], taken);
             return Err(failed);
         }
-        if previous[i].sa_sigaction == libc::SIG_IGN {
+        if previous[i].sa_sigaction == libc::SIG_IGN || blocked(signal) {
             continue;
         }
         #[cfg(test)]

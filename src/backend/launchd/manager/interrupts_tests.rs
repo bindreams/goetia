@@ -53,8 +53,8 @@ fn stand_in_address() -> libc::sighandler_t {
 
 /// The handler a signal has now.
 fn handler_of(signal: libc::c_int) -> libc::sighandler_t {
-    // SAFETY: an all-zero `sigaction` is a valid place to read one into; a null new action only reads.
-    let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut current = action(libc::SIG_DFL);
+    // SAFETY: `current` is a valid place to read one into; a null new action only reads.
     let read = unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) };
     assert_eq!(read, 0, "read the handler of signal {signal}");
     current.sa_sigaction
@@ -76,12 +76,10 @@ impl StandIn {
         let serial = serial();
         SEEN.store(0, Ordering::SeqCst);
         SEEN_BITS.store(0, Ordering::SeqCst);
-        // SAFETY: an all-zero `sigaction` is valid; the mask is emptied before use.
-        let mut ours: libc::sigaction = unsafe { std::mem::zeroed() };
-        ours.sa_sigaction = stand_in_address();
-        unsafe { libc::sigemptyset(&mut ours.sa_mask) };
-        let mut before: [libc::sigaction; 3] = unsafe { std::mem::zeroed() };
+        let ours = action(stand_in_address());
+        let mut before = [action(libc::SIG_DFL); 3];
         for (i, &signal) in SIGNALS.iter().enumerate() {
+            // SAFETY: `ours` is a valid `sigaction`, and `before[i]` a valid place for the old one.
             let set = unsafe { libc::sigaction(signal, &ours, &mut before[i]) };
             assert_eq!(set, 0, "install the stand-in for signal {signal}");
         }
@@ -121,10 +119,7 @@ fn raise(signal: libc::c_int) {
 /// Sets `signal` to be ignored, as `nohup` does SIGHUP. A [`StandIn`] taken before it puts the earlier
 /// disposition back.
 pub(in crate::backend::launchd::manager) fn ignore(signal: libc::c_int) {
-    // SAFETY: an all-zero `sigaction` is valid; the mask is emptied before use.
-    let mut ignoring: libc::sigaction = unsafe { std::mem::zeroed() };
-    ignoring.sa_sigaction = libc::SIG_IGN;
-    unsafe { libc::sigemptyset(&mut ignoring.sa_mask) };
+    let ignoring = action(libc::SIG_IGN);
     // SAFETY: `ignoring` is a valid `sigaction`, and a null old action is allowed.
     let set = unsafe { libc::sigaction(signal, &ignoring, std::ptr::null_mut()) };
     assert_eq!(set, 0, "ignore signal {signal}");
@@ -161,6 +156,97 @@ fn an_ignored_signal_stays_ignored_and_is_not_taken_over() {
     assert_eq!(handler_of(libc::SIGHUP), libc::SIG_IGN, "still ignored after");
     assert_eq!(before.seen(), 1, "only the interrupt that was held is re-raised");
     assert!(before.saw(libc::SIGINT) && !before.saw(libc::SIGHUP));
+}
+
+/// One signal blocked in this thread's mask, put back when it drops.
+pub(in crate::backend::launchd::manager) struct Blocking(libc::sigset_t);
+
+impl Blocking {
+    pub(in crate::backend::launchd::manager) fn signal(signal: libc::c_int) -> Blocking {
+        // SAFETY: an all-zero `sigset_t` is a valid place for one; `sigemptyset` and `sigaddset` fill it
+        // with a valid signal, and `pthread_sigmask` reads it and writes the old mask into `old`.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, signal);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old),
+                0,
+                "block {signal}"
+            );
+            Blocking(old)
+        }
+    }
+}
+
+impl Drop for Blocking {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the mask `pthread_sigmask` gave back. Cleanup never panics.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
+    }
+}
+
+/// A signal the opening thread blocks is treated as an ignored one: the window does not take it over, so
+/// it is no interrupt of the window's and its disposition is the earlier one throughout and after.
+#[skuld::test]
+fn a_blocked_signal_is_not_taken_over() {
+    let before = StandIn::install();
+    let blocking = Blocking::signal(libc::SIGHUP);
+    let deferred = Deferred::begin().expect("begin");
+
+    assert_eq!(handler_of(libc::SIGHUP), stand_in_address(), "left alone");
+    assert_eq!(
+        deferred.signals().collect::<Vec<_>>(),
+        [libc::SIGINT, libc::SIGTERM],
+        "the signals it took over"
+    );
+    raise(libc::SIGINT);
+    assert!(deferred.interrupted(), "the others are still held");
+
+    drop(deferred);
+    drop(blocking);
+
+    assert_eq!(
+        handler_of(libc::SIGHUP),
+        stand_in_address(),
+        "still the earlier one after"
+    );
+    assert_eq!(before.seen(), 1, "only the interrupt that was held is re-raised");
+    assert!(before.saw(libc::SIGINT) && !before.saw(libc::SIGHUP));
+}
+
+/// An interrupt is named by the signal that was recorded, or, while none is recorded, by those the
+/// window took over: a signal that stays ignored is not one it could be.
+#[skuld::test]
+fn the_interrupt_is_named_by_the_signal_recorded_or_else_by_those_taken_over() {
+    let before = StandIn::install();
+    let deferred = Deferred::begin().expect("begin");
+    assert_eq!(deferred.interrupt_signals(), "SIGINT, SIGTERM or SIGHUP");
+    drop(deferred);
+
+    for (signal, name) in [
+        (libc::SIGINT, "SIGINT"),
+        (libc::SIGTERM, "SIGTERM"),
+        (libc::SIGHUP, "SIGHUP"),
+    ] {
+        let deferred = Deferred::begin().expect("begin");
+        raise(signal);
+        assert_eq!(deferred.interrupt_signals(), name);
+        drop(deferred);
+    }
+    assert_eq!(before.seen(), 3);
+
+    ignore(libc::SIGHUP);
+    let deferred = Deferred::begin().expect("begin");
+    assert_eq!(
+        deferred.interrupt_signals(),
+        "SIGINT or SIGTERM",
+        "SIGHUP is not one it took over"
+    );
+    raise(libc::SIGINT);
+    raise(libc::SIGTERM);
+    assert_eq!(deferred.interrupt_signals(), "SIGINT and SIGTERM", "both were recorded");
 }
 
 /// An interrupt that arrives in the window is held until it ends, and then reaches the handler that was

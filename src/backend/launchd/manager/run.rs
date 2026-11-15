@@ -49,16 +49,18 @@
 //! after `ta` is this measured fact and not something launchd promises.
 //!
 //! From before the job is loaded to the `SIGCONT`, SIGINT, SIGTERM and SIGHUP are held back
-//! ([`Deferred`]): ending goetia after the `debug` would leave a launch held and stopped. Nothing is
-//! started after an interrupt: one recorded at any time before the `SIGCONT` that resumes our launch, or
-//! before the `SIGCONT` that releases an older launch which took the hold, ends the `run` as
-//! [`stranded_hold`] and that `SIGCONT` is not sent; the record is read immediately before each. The waits
-//! for another launch's exit and for `xpcproxy`'s exec end on an interrupt too, and a pass that follows
-//! one starts nothing, with the same end. One that comes after the `SIGCONT` of our own launch is held
-//! back until `begin_run` returns. A signal that was ignored when the window opened is none of these: it
-//! stays ignored. A failure in the window carries it too: a launch that took
-//! the hold waits stopped until `goetia daemon stop` ends it, and a hold no launch has taken is consumed
-//! by the next `goetia daemon run`.
+//! ([`Deferred`]): ending goetia after the `debug` would leave a launch held and stopped. The check
+//! immediately before each `SIGCONT` decides, the one that resumes our launch and the one that releases an
+//! older launch which took the hold: an interrupt recorded by then ends the `run` as [`stranded_hold`] and
+//! that `SIGCONT` is not sent. The `SIGCONT` is a `launchctl` subprocess and signals are not blocked around
+//! it, so an interrupt can arrive between the check and its effect: one recorded after the check is held
+//! back until `begin_run` returns, as one after the resume of our own launch is. After the release of an
+//! older launch, the wait for its exit ends on that interrupt. The waits for another launch's exit and for
+//! `xpcproxy`'s exec end on an interrupt too, and a pass that follows one starts nothing, with the same
+//! end. A signal that was ignored when the window opened, or that the opening thread blocks, is none of
+//! these: it stays as it was. A failure in the window carries it too: a launch that took the hold waits
+//! stopped until `goetia daemon stop` ends it, and a hold no launch has taken is consumed by the next
+//! `goetia daemon run`.
 //!
 //! [`launch_of`]: crate::backend::launchd::state::launch_of
 //! [`run_vanished`]: crate::backend::launchd::refuse::run_vanished
@@ -191,7 +193,7 @@ impl Attempt<'_> {
             } else {
                 ("before goetia began another pass", "a hold may be pending")
             };
-            return Err(before_debug(run_interrupted(id, received, left)));
+            return Err(before_debug(self.interrupted(received, left)));
         }
 
         let ta = self
@@ -236,13 +238,21 @@ impl Attempt<'_> {
         }
     }
 
-    /// The end of the `run` if an interrupt has been received, as [`stranded_hold`]: `received` and `left`
-    /// say what it was received before and what is left ([`run_interrupted`]). Asked immediately before each
-    /// `SIGCONT`, so that nothing is started after an interrupt recorded before it. One that comes after
-    /// the `SIGCONT` of our own launch is held back until `begin_run` returns.
+    /// The interrupt that ended the run: `received` and `left` say what it was received before and what is
+    /// left ([`run_interrupted`]), and the window names the signals it can be.
+    fn interrupted(&self, received: &str, left: &str) -> Error {
+        run_interrupted(self.id, &self.window.interrupt_signals(), received, left)
+    }
+
+    /// The end of the `run` as [`stranded_hold`] if an interrupt has been received by now, and no `Err`
+    /// otherwise: `received` and `left` are for [`Self::interrupted`]. This check, made immediately before a
+    /// `SIGCONT`, is what decides: one received by then ends the `run` and no `SIGCONT` is sent. The
+    /// `SIGCONT` is a `launchctl` subprocess, so an interrupt can still arrive between the check and its
+    /// effect; one received after the check is held back until `begin_run` returns, as one after the
+    /// resume of our own launch is.
     fn unless_interrupted(&self, received: &str, left: &str) -> Result<()> {
         if self.watch.interrupted(self.window) {
-            return Err(stranded_hold(self.id, run_interrupted(self.id, received, left)));
+            return Err(stranded_hold(self.id, self.interrupted(received, left)));
         }
         Ok(())
     }
@@ -283,8 +293,7 @@ impl Attempt<'_> {
                 Woke::Exec => {}
                 Woke::Exited(status) => return Ok(Then::Gone(status)),
                 Woke::Interrupted => {
-                    return Err(strand(run_interrupted(
-                        id,
+                    return Err(strand(self.interrupted(
                         "before goetia resumed or released the launch it waited to exec its program",
                         "a launch may be held and stopped, or a hold pending",
                     )));
@@ -299,8 +308,9 @@ impl Attempt<'_> {
 
     /// What `reads` say of the pid `registered` watches: [`Seen::Value`] where they count, and
     /// [`Seen::Gone`] where there is no such process, and where the watch shows an exit of the pid after the
-    /// reads, as the pid may be another process's by then; the exit's status goes with it, whichever read it
-    /// raced. The reads are made together and checked once: an exit is no later than its event, and until the
+    /// reads, as the pid may be another process's by then. The exit's status goes with it only where the watch
+    /// has the exit by the time of the check, whichever read it raced; a pid that no read found, and no exit
+    /// has been seen of yet, is gone with no status. The reads are made together and checked once: an exit is no later than its event, and until the
     /// pid is reaped it names no other process, so a check that shows none after the last read covers every
     /// read before it. A read that fails is the stranded hold.
     fn seen<T>(&self, registered: &Registered, reads: impl FnOnce() -> Result<Option<T>>) -> Result<Seen<T>> {
@@ -324,8 +334,7 @@ impl Attempt<'_> {
         match registered.exit(self.window).map_err(|e| stranded_hold(id, e))? {
             Woke::Interrupted => Err(stranded_hold(
                 id,
-                run_interrupted(
-                    id,
+                self.interrupted(
                     "by the time goetia stopped waiting for a scheduled run",
                     "a hold may be pending",
                 ),
@@ -385,7 +394,7 @@ enum Seen<T> {
     /// The read counts.
     Value(T),
     /// There is no such process, or the watch showed it exit after the read: with the `wait(2)` status the
-    /// watch kept for the exit, where it kept one.
+    /// watch has for the exit by the time of the check, where it has one.
     Gone(Option<i32>),
 }
 

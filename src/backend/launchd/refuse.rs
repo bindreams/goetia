@@ -151,18 +151,19 @@ pub(crate) fn run_vanished(id: &Id, pid: u32) -> Error {
     }
 }
 
-/// An interrupt (SIGINT, SIGTERM or SIGHUP) ended the run of `id`: `received` says what it was received
-/// before (`before goetia armed a hold`), and `left` what is left. It is the `source` of a
-/// [`stranded_hold`]. It says what is known where the interrupt was acted on, never when it came: it was
-/// received by then, and goetia sent nothing after acting on it.
-pub(crate) fn run_interrupted(id: &Id, received: &str, left: &str) -> Error {
+/// An interrupt ended the run of `id`: `signals` names the signals it can be (`SIGINT or SIGTERM`: only
+/// those the run took over), `received` says what it was received before (`before goetia armed a hold`),
+/// and `left` what is left. It is the `source` of a [`stranded_hold`]. It says what is known where the
+/// interrupt was acted on, never when it came: it was received by then, and goetia sent nothing after
+/// acting on it.
+pub(crate) fn run_interrupted(id: &Id, signals: &str, received: &str, left: &str) -> Error {
     Error::os(
         format!("start the run of `{id}`"),
         io::Error::new(
             io::ErrorKind::Interrupted,
             format!(
-                "interrupted by SIGINT, SIGTERM or SIGHUP, received {received}; goetia sent nothing after \
-                 acting on it; {left}"
+                "interrupted by {signals}, received {received}; goetia sent nothing after acting on it; \
+                 {left}"
             ),
         ),
     )

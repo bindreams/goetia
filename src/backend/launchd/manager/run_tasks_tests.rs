@@ -353,9 +353,7 @@ fn assert_interrupted(e: &Error, what: &str) {
         "{what}: {e:?}"
     );
     assert!(
-        e.report()
-            .to_string()
-            .contains("interrupted by SIGINT, SIGTERM or SIGHUP"),
+        e.report().to_string().contains("interrupted by SIGINT, received"),
         "{what}: {}",
         e.report()
     );
@@ -862,6 +860,8 @@ fn a_launch_that_ends_during_the_procinfo_is_gone_at_the_read() {
     assert_ended_unfollowed(&e);
     assert!(
         matches!(&e, Error::RunUnrecorded { reason, .. } if reason.contains("(the process's status: exit code 0)")),
+        // `finish` reaps the child inside the procinfo, so its exit event is queued before the check reads
+        // the watch: the status is certain here, as it is not for an exit that comes after the check.
         "the exit the watch kept is shown, though the read that raced it was discarded: {e:?}"
     );
     fake.assert_spent("nothing was sent after the procinfo");
@@ -1336,7 +1336,7 @@ fn an_interrupt_during_the_load_ends_the_run_before_any_hold() {
     assert!(matches!(&e, Error::Os { .. }), "no hold is stranded: {e:?}");
     assert!(
         e.report().to_string().contains(
-            "interrupted by SIGINT, SIGTERM or SIGHUP, received before goetia armed a hold; goetia sent \
+            "interrupted by SIGINT, received before goetia armed a hold; goetia sent \
                  nothing after acting on it; no hold was armed"
         ),
         "{}",

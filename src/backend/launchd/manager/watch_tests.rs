@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 
-use super::super::interrupts::interrupts_tests::{StandIn, ignore, send_to_process};
+use super::super::interrupts::interrupts_tests::{Blocking, StandIn, ignore, send_to_process};
 use super::*;
 use crate::manager::Budget;
 
@@ -539,6 +539,29 @@ fn an_ignored_signal_is_no_interrupt_to_the_watch() {
     );
     assert!(!watch.interrupted(&window), "an ignored signal is no interrupt");
     assert_eq!(stand_in.seen(), 0);
+}
+
+/// The same for a signal the opening thread blocked: the window did not take it over, so the queue has no
+/// event for it. It is then ignored, so that the one sent to the process is delivered to no handler (the
+/// queue records it all the same), and the window puts back nothing of it.
+#[skuld::test]
+fn a_blocked_signal_is_no_interrupt_to_the_watch() {
+    let _stand_in = StandIn::install();
+    let blocking = Blocking::signal(libc::SIGHUP);
+    let window = Deferred::begin().expect("begin the window");
+    let watch = Watch::new_interruptible(&window).expect("a kqueue");
+    let child = Held::new(0);
+    let registered = launched(&watch, child.pid());
+    ignore(libc::SIGHUP);
+
+    send_to_process(libc::SIGHUP);
+
+    assert!(
+        registered.exit_kept().expect("poll").is_none(),
+        "the poll reads the queue"
+    );
+    assert!(!watch.interrupted(&window), "a blocked signal is no interrupt");
+    drop(blocking);
 }
 
 /// The exit the poll found is reported with its status, without taking it: a wait after it still reports

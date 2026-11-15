@@ -112,8 +112,8 @@ pub(crate) enum Launch {
 
 /// The end of a `run` whose launch has no start time: the pid `kickstart -p` named was gone when it was
 /// registered, or at the read of its start. Whose launch it was is not known, so it is in doubt, in the
-/// stranded hold ([`run_vanished`]). Every end is decided here or in [`launch_of`], so that nothing else
-/// makes one.
+/// stranded hold ([`run_vanished`]). [`launch_of`] ends with it for a pid `launchctl procinfo` does not
+/// name; `run` ends with it for the other two.
 pub(crate) fn launch_unknown(id: &Id, pid: u32) -> Error {
     stranded_hold(id, run_vanished(id, pid))
 }

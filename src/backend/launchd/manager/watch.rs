@@ -16,8 +16,8 @@
 //! `run` watches a launch ([`Watch::add_launch`]): its pid is also registered for `NOTE_EXEC`, and its
 //! waits ([`Registered::first_exec`], [`Registered::exit`]) end when an interrupt does. An
 //! [interruptible](Watch::new_interruptible) watch has the signals of the [`Deferred`] window registered on
-//! its queue (those it took over: a signal that was ignored stays ignored and is none of them), so a signal
-//! that arrives while a wait blocks wakes it. A signal that arrived before the wait
+//! its queue (those it took over: a signal that was ignored or blocked stays as it was and is none of
+//! them), so a signal that arrives while a wait blocks wakes it. A signal that arrived before the wait
 //! has no event for it, so the wait reads the [`Deferred`] window's record after the registration and
 //! before it blocks, and again before each block. A signal's event that any read of the queue takes is
 //! flagged on the queue ([`Watch::interrupted`] reads the flag and the record together), so no interrupt is
@@ -31,7 +31,7 @@ use std::time::Duration;
 use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::interrupts::Deferred;
+use super::interrupts::{Deferred, SIGNALS};
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
 
@@ -101,9 +101,9 @@ impl Watch {
     }
 
     /// A watch whose queue also has the signals `window` took over registered ([`Deferred::signals`]), for
-    /// the waits that end on an interrupt: a signal that was ignored before the window stays ignored, and the
-    /// queue, which records even an ignored signal, has no event for it. Its signals are the process's own,
-    /// so a test that raises one takes the whole process's turn.
+    /// the waits that end on an interrupt: a signal that was ignored or blocked before the window stays as it
+    /// was, and the queue, which records even an ignored signal, has no event for it. Its signals are the
+    /// process's own, so a test that raises one takes the whole process's turn.
     pub(crate) fn new_interruptible(window: &Deferred) -> Result<Watch> {
         Watch::make(Some(window))
     }
@@ -137,23 +137,25 @@ impl Watch {
 
     /// Registers each of the signals `window` took over, answered by its own receipt.
     fn register_signals(&self, window: &Deferred) -> io::Result<()> {
-        let changes: Vec<KEvent> = window
-            .signals()
-            .map(|signal| {
-                KEvent::new(
-                    signal as usize,
-                    EventFilter::EVFILT_SIGNAL,
-                    EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_RECEIPT,
-                    FilterFlag::empty(),
-                    0,
-                    0,
-                )
-            })
-            .collect();
-        let mut receipts = vec![blank(); changes.len()];
+        let mut changes = [blank(); SIGNALS.len()];
+        let mut count = 0;
+        for signal in window.signals() {
+            changes[count] = KEvent::new(
+                signal as usize,
+                EventFilter::EVFILT_SIGNAL,
+                EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_RECEIPT,
+                FilterFlag::empty(),
+                0,
+                0,
+            );
+            count += 1;
+        }
+        let changes = &changes[..count];
+        let mut receipts = [blank(); SIGNALS.len()];
+        let receipts = &mut receipts[..count];
         let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let answered = loop {
-            match self.shared.queue.kevent(&changes, &mut receipts, Some(now)) {
+            match self.shared.queue.kevent(changes, receipts, Some(now)) {
                 Err(Errno::EINTR) => {}
                 other => break other.map_err(io::Error::from)?,
             }
