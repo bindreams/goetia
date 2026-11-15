@@ -48,7 +48,7 @@ pub(in crate::backend::launchd::manager) fn plists_of(spec: &DaemonSpec) -> Plis
 }
 
 /// A job's plist whose marker is there and whose metadata will not decode.
-fn damaged(text: &str) -> String {
+pub(in crate::backend::launchd::manager) fn damaged(text: &str) -> String {
     let damaged = text.replace("Spec: ", "Spec: !!");
     assert_ne!(damaged, text);
     damaged

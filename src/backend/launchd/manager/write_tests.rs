@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use super::super::manager_tests::launchd_over;
 use super::super::task::Shown;
-use super::super::task::task_tests::{ID, Tree, marked, plists_of, service_spec, task_spec};
+use super::super::task::task_tests::{ID, Tree, damaged, marked, plists_of, service_spec, task_spec};
 use super::super::{
     INSTALL_CALLS, INSTALL_REQUESTS, TASK_DISABLE_CALLS, TASK_DISABLE_REQUESTS, TASK_ENABLE_CALLS, TASK_ENABLE_REQUESTS,
 };
@@ -215,27 +215,31 @@ fn stale_labels() -> Vec<Entry> {
     ]
 }
 
-/// The job is written first and the timer after it, so a failure after the job leaves a job without a
-/// timer: ours, and an `Update` that writes the timer, never a `Conflict`.
+/// A stranger's file at the timer's name, found after the job was written, refuses the install as a
+/// stranger's file is refused at `read`: the job this install wrote is removed again, so nothing of it
+/// is left behind and the refusal's "nothing was changed" is true.
 #[skuld::test]
-fn with_a_failure_after_the_job_the_state_is_a_job_without_a_timer() {
+fn a_create_refused_for_a_strangers_timer_removes_the_job_it_wrote() {
     let tree = Tree::new();
-    let spec = task_spec(Some(SCHEDULE));
     tree.put(false, &timer_name(), "a stranger's file\n");
     let fake = Fake::new([print(timer_target(), UNLOADED, ""), print(job_label(), UNLOADED, "")]);
 
-    let recovery = refused_as_foreign(create(&tree, &fake, &spec));
+    let recovery = refused_as_foreign(create(&tree, &fake, &task_spec(Some(SCHEDULE))));
 
     assert!(recovery.contains(&timer_name()), "{recovery}");
-    assert_eq!(
-        text_at(&tree, false, ID),
-        plists_of(&spec).job,
-        "the job was written first"
-    );
+    assert!(!exists(&tree, false, ID), "the job this install wrote is gone");
     assert_eq!(text_at(&tree, false, &timer_name()), "a stranger's file\n");
+    let left: Vec<_> = std::fs::read_dir(tree.dir(false)).unwrap().collect();
+    assert_eq!(left.len(), 1, "only the stranger's file is left: {left:?}");
+}
 
-    // The stranger's file goes; what is left is a job and no timer.
-    std::fs::remove_file(at(&tree, false, &timer_name())).unwrap();
+/// A job whose timer was not written (a failure after the job) is ours, and an `Update` that writes the
+/// timer, never a `Conflict`.
+#[skuld::test]
+fn a_job_without_a_timer_is_an_update_that_writes_the_timer() {
+    let tree = Tree::new();
+    let spec = task_spec(Some(SCHEDULE));
+    tree.put(false, ID, plists_of(&spec).job);
     assert!(
         matches!(decided(&tree, &spec), Outcome::Update { .. }),
         "a job without its timer is an update, not a conflict"
@@ -329,6 +333,30 @@ fn a_schedule_edit_leaves_a_run_in_flight_alone() {
         "the job's metadata names the new schedule"
     );
     assert_eq!(text_at(&tree, true, &timer_name()), plists.timer.unwrap());
+}
+
+/// A timer label launchd holds after its file was removed by hand is a definition goetia did not write:
+/// where an install gives the task a schedule it goes out once the new timer's file is created, so that
+/// the new timer is loaded in its place and the stale one stops firing.
+#[skuld::test]
+fn an_install_that_adds_a_schedule_replaces_a_timer_label_whose_file_is_gone() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(None), true);
+    let new = task_spec(Some(SCHEDULE));
+    let timer_in = at(&tree, true, &timer_name());
+    let created = timer_in.clone();
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()).then(move || assert!(created.exists(), "the new timer is there before the stray goes")),
+        print(timer_target(), UNLOADED, ""),
+        bootstrap(&timer_in),
+    ]);
+
+    rewrite(&tree, &fake, &new).expect("an update");
+
+    fake.assert_spent("the stray timer went out and the new one was loaded; the job was left alone");
+    assert_eq!(text_at(&tree, true, &timer_name()), plists_of(&new).timer.unwrap());
 }
 
 /// A change to the job over a run in flight is refused with the task's wording, the timer armed again
@@ -750,6 +778,29 @@ fn retyping_a_service_to_a_task_leaves_no_boot_enrolment() {
     assert_eq!(text_at(&tree, false, &timer_name()), plists.timer.unwrap());
 }
 
+/// A job whose metadata will not decode, beside a timer of goetia's, is a task as every verb reads it
+/// ([`Plist::kind`]): an update is no retype, so the job stays where it is enabled and both are loaded.
+#[skuld::test]
+fn an_update_over_a_damaged_job_beside_a_timer_is_no_retype() {
+    let tree = Tree::new();
+    let spec = task_spec(Some(SCHEDULE));
+    let plists = plists_of(&spec);
+    tree.put(true, ID, damaged(&plists.job));
+    tree.put(true, &timer_name(), plists.timer.as_ref().unwrap());
+    let fake = Fake::new([
+        print(job_label(), UNLOADED, ""),
+        print(timer_target(), UNLOADED, ""),
+        bootstrap(&at(&tree, true, ID)),
+        bootstrap(&at(&tree, true, &timer_name())),
+    ]);
+
+    rewrite(&tree, &fake, &spec).expect("an update");
+
+    fake.assert_spent("the job was written back and loaded with its timer");
+    assert_eq!(text_at(&tree, true, ID), plists.job);
+    assert!(!exists(&tree, false, ID), "the job was not moved to staging");
+}
+
 /// A loaded service is refused as it always was, before anything is written.
 #[skuld::test]
 fn retyping_a_loaded_service_is_loaded_job_of_kind_service() {
@@ -1099,6 +1150,32 @@ fn enable_creates_a_missing_timer_in_launchdaemons() {
     assert_eq!(left.len(), 2, "no temporary file is left behind: {left:?}");
 }
 
+/// The timer's label launchd holds after its file was removed by hand goes out, once the new timer's file
+/// is created, and the new timer is loaded: `bootstrap` of a held label would load nothing.
+#[skuld::test]
+fn enable_replaces_a_timer_label_whose_file_is_gone() {
+    let tree = Tree::new();
+    let plists = plists_of(&task_spec(Some(SCHEDULE)));
+    tree.put(false, ID, &plists.job);
+    let (job_in, timer_in) = (at(&tree, true, ID), at(&tree, true, &timer_name()));
+    let created = timer_in.clone();
+    let fake =
+        Fake::new(
+            held_reads(false, true).into_iter().chain([
+                bootstrap(&job_in),
+                bootout(timer_target())
+                    .then(move || assert!(created.exists(), "the new timer is there before the stray goes")),
+                print(timer_target(), UNLOADED, ""),
+                bootstrap(&timer_in),
+            ]),
+        );
+
+    enable(&tree, &fake).expect("an enable");
+
+    fake.assert_spent("the job loaded, the stray out and waited for, the new timer loaded");
+    assert_eq!(text_at(&tree, true, &timer_name()), plists.timer.unwrap());
+}
+
 /// A stranger's file that appears at the timer's name after `read` ends the enable as foreign, with the
 /// recovery that names the path, and the timer is not loaded.
 #[skuld::test]
@@ -1339,18 +1416,21 @@ fn the_verbs_draw_no_more_than_they_reserved() {
         "an uninstall's longest path spends its reservation"
     );
 
-    // An enable's longest path: both plists staged and nothing loaded, so both are loaded in turn.
+    // An enable's longest path: a job staged and not loaded, with no timer file and a timer label
+    // launchd holds, so the job is loaded, the timer created, the stray label booted out and waited for,
+    // and the timer loaded.
     let enabling = |tree: &Tree, reservation: &mut Reservation| {
         let (job_in, timer_in) = (at(tree, true, ID), at(tree, true, &timer_name()));
-        let fake = Fake::new(
-            held_reads(false, false)
-                .into_iter()
-                .chain([bootstrap(&job_in), bootstrap(&timer_in)]),
-        );
+        let fake = Fake::new(held_reads(false, true).into_iter().chain([
+            bootstrap(&job_in),
+            bootout(timer_target()),
+            print(timer_target(), UNLOADED, ""),
+            bootstrap(&timer_in),
+        ]));
         manager(&fake).enable_task(tree.dirs(), marked(tree.read()), reservation)
     };
     let tree = Tree::new();
-    installed(&tree, &task_spec(Some(SCHEDULE)), false);
+    tree.put(false, ID, plists_of(&task_spec(Some(SCHEDULE))).job);
     let mut held = enable_reservation();
     enabling(&tree, &mut held).expect("an enable");
     assert_eq!(left(&held), (0, 0), "an enable's longest path spends its reservation");
@@ -1376,7 +1456,7 @@ fn the_verbs_draw_no_more_than_they_reserved() {
         ("temp file", TASK_ENABLE_REQUESTS, TASK_ENABLE_CALLS * files - 1),
     ] {
         let tree = Tree::new();
-        installed(&tree, &task_spec(Some(SCHEDULE)), false);
+        tree.put(false, ID, plists_of(&task_spec(Some(SCHEDULE))).job);
         let mut short = Reservation::make(requests, calls).expect("make a reservation");
         let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(enabling(&tree, &mut short))));
         let payload = drawn.expect_err(&format!("an enable a {what} short went unnoticed"));

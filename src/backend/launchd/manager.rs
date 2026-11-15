@@ -1261,7 +1261,8 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 /// draws at most the last five of these, 2 reapers.
 const SERVICE_INSTALL_REQUESTS: usize = 1;
 /// A task's longest `install`, an update of an armed task whose job changes: the timer's `bootout`,
-/// the job's, and both `bootstrap`s.
+/// the job's, and both `bootstrap`s. An update that boots out a stray timer label is shorter: its job is
+/// not booted out.
 const TASK_INSTALL_REQUESTS: usize = 4;
 const INSTALL_REQUESTS: usize = max(SERVICE_INSTALL_REQUESTS, TASK_INSTALL_REQUESTS);
 const START_REQUESTS: usize = 5;
@@ -1275,8 +1276,9 @@ const SERVICE_KILL_REQUESTS: usize = 1;
 /// process, and the signal after the wait. The wait draws no reaper.
 const TASK_KILL_REQUESTS: usize = 2;
 const KILL_REQUESTS: usize = max(SERVICE_KILL_REQUESTS, TASK_KILL_REQUESTS);
-/// A task's `enable` makes its own reservation: the `bootstrap` of the job and of the timer.
-const TASK_ENABLE_REQUESTS: usize = 2;
+/// A task's `enable` makes its own reservation: the `bootstrap` of the job, the `bootout` of a timer
+/// label launchd holds with no timer file, and the `bootstrap` of the timer.
+const TASK_ENABLE_REQUESTS: usize = 3;
 /// A task's `disable` makes its own: the timer's `bootout`.
 const TASK_DISABLE_REQUESTS: usize = 1;
 
@@ -1308,8 +1310,9 @@ const SERVICE_KILL_CALLS: usize = SERVICE_KILL_REQUESTS;
 /// makes), and the signal.
 const TASK_KILL_CALLS: usize = TASK_KILL_REQUESTS + 1 + 1;
 const KILL_CALLS: usize = max(SERVICE_KILL_CALLS, TASK_KILL_CALLS);
-/// A task's `enable`: the two reads of which labels launchd holds, and both `bootstrap`s.
-const TASK_ENABLE_CALLS: usize = 2 + 2;
+/// A task's longest `enable`: the two reads of which labels launchd holds, both `bootstrap`s, and the
+/// `bootout` of a stray timer label with its wait.
+const TASK_ENABLE_CALLS: usize = 2 + 2 + (1 + 1);
 /// A task's `disable`: the same two reads, the timer's `bootout` and its wait.
 const TASK_DISABLE_CALLS: usize = 2 + (1 + 1);
 

@@ -360,6 +360,44 @@ fn update_plan_table() {
             vec![CreateTimerFirst, ReplaceJob, BootstrapTimer],
         ),
         (
+            "schedule added where a timer label is loaded with no timer file, enabled: the stray goes out once \
+             the new timer is created, and the new one is loaded",
+            installed(&unscheduled("a"), true, BOTH),
+            scheduled("a", "30 3 * * *"),
+            vec![CreateTimerFirst, BootoutTimer, ReplaceJob, BootstrapTimer],
+        ),
+        (
+            "schedule added where a timer label is loaded with no timer file, disarmed: the stray goes out and \
+             nothing is loaded",
+            installed(&unscheduled("a"), false, BOTH),
+            scheduled("a", "30 3 * * *"),
+            vec![CreateTimerFirst, BootoutTimer, ReplaceJob],
+        ),
+        (
+            "schedule added and command changed, a timer label loaded with no timer file: it goes out once, first",
+            installed(&unscheduled("a"), true, BOTH),
+            scheduled("b", "30 3 * * *"),
+            vec![
+                BootoutTimer,
+                CheckJobIdle,
+                CreateTimerFirst,
+                BootoutJob,
+                ReplaceJob,
+                BootstrapJob,
+                BootstrapTimer,
+            ],
+        ),
+        (
+            "a job without its timer (the crash after the job), its timer label loaded: the stray goes out and the \
+             new timer is loaded",
+            Old {
+                timer: None,
+                ..installed(&scheduled("a", "30 3 * * *"), true, BOTH)
+            },
+            scheduled("a", "30 3 * * *"),
+            vec![CreateTimerFirst, BootoutTimer, BootstrapTimer],
+        ),
+        (
             "schedule dropped, armed: the timer goes before the job is replaced, and the job leaves the enabled \
              directory, as there is nothing left to arm",
             installed(&scheduled("a", "30 3 * * *"), true, BOTH),
@@ -560,6 +598,17 @@ fn enable_plan_table() {
             "a job without its timer, in place and loaded: the timer is created and loaded",
             placed(true, None, JOB),
             vec![CreateTimerEnabled, BootstrapTimer],
+        ),
+        (
+            "a job without its timer, its timer label loaded: the stray goes out once the timer is created, and the \
+             new one is loaded",
+            placed(true, None, BOTH),
+            vec![CreateTimerEnabled, BootoutTimer, BootstrapTimer],
+        ),
+        (
+            "a job without its timer, staged, its timer label loaded",
+            placed(false, None, BOTH),
+            vec![MoveJobToEnabled, CreateTimerEnabled, BootoutTimer, BootstrapTimer],
         ),
         (
             "a task with no schedule has no timer to create",

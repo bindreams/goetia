@@ -174,6 +174,8 @@ impl Old {
 ///   schedule edit.
 /// - A timer that is new is created before the job's files change, no-clobber, so a stranger's file at
 ///   its name refuses with nothing changed; one that is dropped is removed before the job is replaced.
+/// - A timer label launchd holds with no timer file of goetia's, where a timer is added, goes out once
+///   the new file is created: launchd would otherwise keep the old definition under the new one's name.
 /// - A retype, or a dropped schedule, moves an enabled job to staging first: it drops arming and boot
 ///   enrolment, so `enabled` and `enable` agree that a task with no timer has nothing to arm.
 /// - A task that is enabled ends with its job and its timer loaded, the job first: what went out is
@@ -193,6 +195,10 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
     };
     let job_out = old.job_loaded && job_renders_differently;
     let timer_out = old.timer_loaded && (dropped || timer_renders_differently || job_out);
+    // A timer label launchd holds with no timer file of goetia's (removed by hand while loaded) would
+    // keep its old definition under the new timer's name, so it goes out once the new file is created,
+    // which refuses a stranger's file at that name first.
+    let stray_out = added && old.timer_loaded && !timer_out;
     // A retype, or a dropped schedule, leaves nothing enabled: there is nothing to arm.
     let armed = !retype && !dropped && old.enabled();
 
@@ -205,6 +211,7 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
     push(timer_out, Action::BootoutTimer);
     push(job_out, Action::CheckJobIdle);
     push(added, Action::CreateTimerFirst);
+    push(stray_out, Action::BootoutTimer);
     push(job_out, Action::BootoutJob);
     push(dropped, Action::RemoveTimer);
     push((retype || dropped) && job.enabled, Action::MoveJobToStaging);
@@ -213,7 +220,7 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
     // An enabled task is loaded (`enable` loads it), so whatever launchd does not hold afterwards is
     // loaded, whether this plan booted it out or an earlier install that failed did.
     let job_held = old.job_loaded && !job_out;
-    let timer_held = old.timer_loaded && !timer_out;
+    let timer_held = old.timer_loaded && !timer_out && !stray_out;
     push(armed && !job_held, Action::BootstrapJob);
     push(armed && new.timer.is_some() && !timer_held, Action::BootstrapTimer);
     plan
@@ -240,7 +247,8 @@ pub(crate) fn uninstall_plan(old: &Old) -> Vec<Action> {
 /// there where a scheduled task has none). Each step is taken only where it is not already done, so
 /// running the verb again finishes what a crash left, whatever `enabled` says: a timer that moved and
 /// was not loaded is loaded, and nothing else is touched. A job launchd holds already (a `start` loaded
-/// it from staging) is not loaded again.
+/// it from staging) is not loaded again. A timer label launchd holds with no timer file, where one is
+/// created, goes out first: it was loaded from a file that is gone, and carries that definition.
 pub(crate) fn enable_plan(old: &Old) -> Vec<Action> {
     let mut plan = Vec::new();
     let mut push = |condition: bool, action: Action| {
@@ -257,9 +265,15 @@ pub(crate) fn enable_plan(old: &Old) -> Vec<Action> {
         old.timer.as_ref().is_some_and(|timer| !timer.enabled),
         Action::MoveTimerToEnabled,
     );
-    push(old.timer.is_none() && old.scheduled, Action::CreateTimerEnabled);
+    let created = old.timer.is_none() && old.scheduled;
+    push(created, Action::CreateTimerEnabled);
+    // A timer label launchd holds with no timer file of goetia's (removed by hand while loaded) has
+    // another definition than the one just created: it goes out once the file is there, which refuses a
+    // stranger's file at that name first.
+    let stray_out = created && old.timer_loaded;
+    push(stray_out, Action::BootoutTimer);
     push(
-        !old.timer_loaded && (old.timer.is_some() || old.scheduled),
+        (!old.timer_loaded || stray_out) && (old.timer.is_some() || old.scheduled),
         Action::BootstrapTimer,
     );
     plan

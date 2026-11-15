@@ -37,7 +37,8 @@ impl Launchd {
     /// either label (a hand-installed predecessor, or one still tearing down, which `start` would
     /// take for ours), then writes the job into staging and the timer after it, each refusing to
     /// replace anything. A write that fails after the job leaves a job without its timer, which is
-    /// ours: the next install is an `Update` that writes the timer.
+    /// ours: the next install is an `Update` that writes the timer. A stranger's file at the timer's
+    /// name, found then, refuses the install, and the job it wrote is removed.
     ///
     /// An `Update` or `Stale` reads which labels launchd holds, then runs `update_plan`.
     ///
@@ -88,7 +89,22 @@ impl Launchd {
                 if let Some(staged) = staged_timer {
                     match persist_new(staged, &timer_target)? {
                         PersistOutcome::Written => {}
-                        PersistOutcome::Raced => return timer_taken(id, &timer_target),
+                        PersistOutcome::Raced => {
+                            let taken = timer_taken(id, &timer_target)?;
+                            // A refusal says nothing was changed, so the job this install wrote goes.
+                            if matches!(taken, WriteOutcome::Refused(_)) {
+                                fs::remove_file(&job_target).map_err(|e| Error::Step {
+                                    what: format!(
+                                        "the install of `{id}` was refused for the file at its timer's name, and \
+                                         the job's plist it wrote could not be removed: remove `{}`, or re-run \
+                                         install once the timer's name is free",
+                                        job_target.display()
+                                    ),
+                                    source: Box::new(Error::os_at("remove", &job_target, e)),
+                                })?;
+                            }
+                            return Ok(taken);
+                        }
                     }
                 }
                 Ok(WriteOutcome::Done)
@@ -286,11 +302,7 @@ impl Launchd {
         let job_loaded = never_expires(self.launchctl.is_loaded(id, deadline, reservation)?);
         let timer_loaded = never_expires(self.launchctl.is_loaded(&timer_label(id), deadline, reservation)?);
         Ok(Old {
-            kind: if snapshot.is_task() {
-                DaemonKind::Task
-            } else {
-                DaemonKind::Service
-            },
+            kind: snapshot.kind(),
             job: snapshot.job.as_ref().map(on_disk),
             timer: snapshot.timer.as_ref().map(on_disk),
             job_loaded,
