@@ -31,10 +31,13 @@ fn sh(script: &str) -> cosca::Command {
 fn a_spawn_error_prints_the_cause_of_the_refusal() {
     let refusal = || cosca::error::Error::Io(within("make the pipe", io::Error::other("the cause")));
 
-    assert_eq!(SpawnError::NotRun(refusal()).to_string(), "make the pipe: the cause");
+    assert_eq!(
+        SpawnError::NotRun(refusal()).to_string(),
+        "an I/O operation failed: make the pipe: the cause"
+    );
     assert_eq!(
         SpawnError::MayHaveRun(refusal()).to_string(),
-        "make the pipe: the cause"
+        "an I/O operation failed: make the pipe: the cause"
     );
 }
 
@@ -541,7 +544,9 @@ fn the_warning_for_a_left_request_that_cannot_be_ended_prints_the_cause() {
     let warning = end_left(&child.child, Duration::from_millis(50)).expect("the child could not be ended");
 
     assert!(
-        warning.ends_with("could not kill a request left running: send the kill: the signal was refused"),
+        warning.ends_with(
+            "could not kill a request left running: an I/O operation failed: send the kill: the signal was refused"
+        ),
         "{warning}"
     );
 }
