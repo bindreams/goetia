@@ -43,7 +43,8 @@ pass_filenames = false
 [[repos.hooks]]
 id = "cargo-clippy"
 name = "cargo clippy"
-entry = "cargo clippy --all-targets --locked -- -D warnings"
+# `--workspace`: also `tools/verify-hardening`. `cargo fmt` already formats every workspace member.
+entry = "cargo clippy --workspace --all-targets --locked -- -D warnings"
 language = "system"
 types = ["rust"]
 pass_filenames = false

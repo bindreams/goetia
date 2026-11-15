@@ -75,7 +75,8 @@ jobs:
         run: uv tool install prek==0.5.9
 
       # Clippy is defined in prek.toml: the default build (with the `testing` feature, which the
-      # self dev-dependency turns on) and the library-only build.
+      # self dev-dependency turns on) of the whole workspace, `tools/verify-hardening` included, and
+      # the library-only build.
       - name: Clippy
         if: matrix.toolchain != 'stable'
         run: prek run --all-files cargo-clippy cargo-clippy-lib-only

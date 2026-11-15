@@ -305,7 +305,7 @@ jobs:
           else
             executables=("goetia-${TARGET}/goetia")
           fi
-          cargo run --release --locked --manifest-path tools/verify-hardening/Cargo.toml -- "${executables[@]}"
+          cargo run -p verify-hardening --locked -- "${executables[@]}"
 
       # The staged goetia.exe alone must install, run and uninstall a
       # `protocol: plain` service: it carries the stock shim. The runner is
