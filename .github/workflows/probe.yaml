@@ -1,0 +1,31 @@
+name: Probe
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tz:
+    name: tz ${{ matrix.method }} (macos)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        method:
+          - ss
+          - ss-kick
+          - ss-kill
+          - ss-bootout
+          - link-kick
+          - ss-setenv-kick
+          - setenv-kick
+          - ss-notify
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Probe
+        run: sudo bash .github/probe/tz.sh ${{ matrix.method }}
