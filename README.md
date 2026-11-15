@@ -442,12 +442,18 @@ owns it, since `install` is not a start and you may still be preparing it.
   beside its log needs a `cwd` for them.
 - **systemd's log directory.** `install` refuses a `logs` whose directory, or any directory or symlink on
   the way to it, a user other than root can change (owned by another user, or writable by a group or by
-  everyone without the sticky bit), and names who. This covers a directory that already exists. Debian
+  everyone), and names who. The sticky bit excuses a writable directory above the log's, which it keeps
+  others from renaming, but not the log's own directory, where it does not keep them from making an
+  entry (a symlink at the log's name). A log in or under the `cwd` that is to be handed to the account is
+  refused before anything is handed over. This covers a directory that already exists. Debian
   and Ubuntu ship `/var/log` as `root:syslog 0775`, and the group can rename what is inside it, so there
   no log under `/var/log` is accepted, however deep; keep it under another root such as `/var/lib`, or in
   a directory only root can change.
 - **A path that is not a directory** (a file, or a symlink that leads nowhere) is refused by both
   backends.
+- **An account with no passwd entry.** On systemd a `user` that is a uid, or a name that is a number, with
+  no passwd entry is used as that number (systemd runs a unit as one): `cwd` is handed to it and its group
+  is left as it is. On launchd it is an error, as it was.
 - **A failed install** removes the directories it made, deepest first, by descriptor and only if they are
   still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
   (the unit or plist cannot be read back): it then says so, hands over what it would have handed over, and

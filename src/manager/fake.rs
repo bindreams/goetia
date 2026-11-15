@@ -943,13 +943,7 @@ impl crate::backend::Backend for Fake {
     }
 
     /// The fake's scope makes nothing but the entry.
-    fn standing(
-        &self,
-        _spec: &DaemonSpec,
-        _definition: &String,
-        _outcome: &Outcome,
-        _snapshot: Option<&Artifact>,
-    ) -> Standing {
+    fn standing(&self, _spec: &DaemonSpec, _definition: &String) -> Standing {
         Standing::Yes
     }
 

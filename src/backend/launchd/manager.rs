@@ -72,9 +72,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, io};
 
+use crate::backend::account::{Account, Unlisted, resolve_account};
 use crate::backend::bounded::{self, Finished, Kept, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
-use crate::backend::created_dirs::{CreatedDirs, Owner};
+use crate::backend::created_dirs::CreatedDirs;
 use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::state::Evidence;
 use crate::backend::launchd::task::enabled_in;
@@ -88,7 +89,7 @@ use crate::decide::{ExternalConfig, Outcome};
 use crate::error::{Error, Occupant, PutBackFound, Reason, Result};
 use crate::manager::budget::{self, Deadline};
 use crate::manager::{Budget, DaemonStatus, Installed, State, Status, Step, flow};
-use crate::spec::{AccountId, DaemonKind, DaemonSpec, Id, Restart, User};
+use crate::spec::{DaemonKind, DaemonSpec, Id, Restart};
 
 pub use super::{ENABLED_DIR, STAGING_DIR};
 use task::{Artifact, Assembled, Body};
@@ -436,68 +437,15 @@ impl InstalledService for Plist {
 
 // Account resolution ==================================================================================================
 
-/// A platform account resolved from [`crate::spec::User`]: the [`Identity`] a generator needs, plus
-/// the uid/gid `install` needs to hand a `cwd`/`logs` directory to its owner.
-#[derive(Debug)]
-struct Account {
-    name: String,
-    uid: nix::unistd::Uid,
-    gid: nix::unistd::Gid,
-}
-
+/// The [`Identity`] a generator needs of an account. Every account here is resolved by name and
+/// `Unlisted::Refuse`: `launchd.plist(5)` does not say whether `UserName` accepts a numeric string,
+/// so a uid goes through a passwd lookup too, and one with no entry is an error.
 impl Account {
     fn identity(&self) -> Identity {
         Identity {
             user: self.name.clone(),
         }
     }
-}
-
-impl From<nix::unistd::User> for Account {
-    fn from(u: nix::unistd::User) -> Self {
-        Account {
-            name: u.name,
-            uid: u.uid,
-            gid: u.gid,
-        }
-    }
-}
-
-/// Resolve a [`User`] to a real macOS account, always by *name*: `launchd.plist(5)` does not say
-/// whether `UserName` accepts a numeric string, so every case, `User::Id(AccountId::Uid(_))`
-/// included, goes through a passwd lookup.
-fn resolve_account(user: &User) -> Result<Account> {
-    match user {
-        User::Root => account_from_uid(0),
-        User::Name(name) => nix::unistd::User::from_name(name)
-            .map_err(|e| Error::AccountLookup {
-                detail: format!("look up user `{name}`"),
-                source: Some(e.into()),
-            })?
-            .map(Account::from)
-            .ok_or_else(|| Error::AccountLookup {
-                detail: format!("no such user `{name}` on this host"),
-                source: None,
-            }),
-        User::Id(AccountId::Uid(uid)) => account_from_uid(*uid),
-        User::Id(AccountId::Sid(sid)) => Err(Error::AccountLookup {
-            detail: format!("user `{{id: {sid}}}` names a Windows SID, which is not meaningful on macOS"),
-            source: None,
-        }),
-    }
-}
-
-fn account_from_uid(uid: u32) -> Result<Account> {
-    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-        .map_err(|e| Error::AccountLookup {
-            detail: format!("look up uid {uid}"),
-            source: Some(e.into()),
-        })?
-        .map(Account::from)
-        .ok_or_else(|| Error::AccountLookup {
-            detail: format!("no such uid {uid} on this host"),
-            source: None,
-        })
 }
 
 // Writing the plist ===================================================================================================
@@ -516,7 +464,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a missing
 /// `WorkingDirectory` refuses the job outright.
 fn prepare_parent_dirs(spec: &DaemonSpec, account: &Account, created: &mut CreatedDirs) -> Result<()> {
-    let owner = Owner::new(account.uid, Some(account.gid))?;
+    let owner = account.owner()?;
     if let Some(cwd) = &spec.common().cwd {
         created.create(cwd, Some(owner))?;
     }
@@ -1410,7 +1358,7 @@ impl backend::Backend for Launchd {
     }
 
     fn render(&self, spec: &DaemonSpec) -> Result<Plists> {
-        let account = resolve_account(&spec.common().user)?;
+        let account = resolve_account(&spec.common().user, Unlisted::Refuse)?;
         generate::plists(spec, &account.identity())
     }
 
@@ -1476,7 +1424,7 @@ impl backend::Backend for Launchd {
         }
         // Resolved again: `render` kept only the plist, which names the account, and launchd
         // resolves that name at launch too.
-        let account = resolve_account(&spec.common().user)?;
+        let account = resolve_account(&spec.common().user, Unlisted::Refuse)?;
         let desired = desired.job.as_str();
         let deadline = Budget::Unbounded.start();
 
@@ -1556,7 +1504,7 @@ impl backend::Backend for Launchd {
 
     /// Whether the job's plist, read as `read` reads it, is `desired`'s: the plist is what names the
     /// directories. A timer's names none.
-    fn standing(&self, spec: &DaemonSpec, desired: &Plists, _outcome: &Outcome, _snapshot: Option<&Plist>) -> Standing {
+    fn standing(&self, spec: &DaemonSpec, desired: &Plists) -> Standing {
         match self.read(&spec.common().id) {
             Ok(ReadOutcome::Marked(plist)) => match &plist.job {
                 Some(job) if job.text == desired.job => Standing::Yes,

@@ -202,7 +202,7 @@ pub(crate) fn install<B: Backend>(
                     &mut scope,
                     reservation,
                 );
-                scope.settle(|| b.standing(spec, &desired, &outcome, found.snapshot.as_ref()));
+                scope.settle(|| b.standing(spec, &desired));
                 match written? {
                     WriteOutcome::Done => return Ok(outcome),
                     WriteOutcome::Refused(refusal) => return Ok(refusal),

@@ -243,9 +243,10 @@ pub(super) fn walk(dir: &Path, roots: &[PathBuf]) -> Result<Walk> {
                 link: true,
             });
         }
-        if queue.is_empty() {
+        // A link as the last component is walked to its target like one in the middle, so that every
+        // directory its target is under reaches the trail.
+        if queue.is_empty() && !matches!(found, Entry::Link(..)) {
             let stat = require_directory(cur.as_fd(), &name, &found, &so_far)?;
-            // The directory the path names, which a link leads to: judged as one entered.
             trail.push(Step { at, stat, link: false });
             chain.push(id_of(&stat));
             let under_root = chain.iter().any(|id| root_ids.contains(id));
@@ -285,11 +286,14 @@ pub(super) fn walk(dir: &Path, roots: &[PathBuf]) -> Result<Walk> {
         }
     }
     let under_root = chain.iter().any(|id| root_ids.contains(id));
-    Ok(Walk {
-        end: End::Missing { holder: cur, missing },
-        trail,
-        under_root,
-    })
+    // Nothing is missing when the path ended in `..`, or in a link to `/`, or is `/`: the directory
+    // the walk is in is the one the path names.
+    let end = if missing.is_empty() {
+        End::Whole(fstat(&cur).map_err(|e| Error::os_at("stat", &shown, e))?)
+    } else {
+        End::Missing { holder: cur, missing }
+    };
+    Ok(Walk { end, trail, under_root })
 }
 
 /// The steps of `path`, as names and `..`, the root and `.` left out.

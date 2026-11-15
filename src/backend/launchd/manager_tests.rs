@@ -14,7 +14,7 @@ use crate::backend::client::{Client, ClientError, Real};
 use crate::backend::standby;
 use crate::backend::test_allowance;
 use crate::manager::ServiceManager;
-use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec, User};
+use crate::spec::{DaemonFields, DaemonSpec, Id, Protocol, Restart, ServiceFields, ServiceSpec};
 use crate::testing::{base_fields, service_fields};
 
 use crate::testing::cleanup::{FileGuard, remove_or_warn};
@@ -265,40 +265,6 @@ fn move_no_clobber_does_not_clobber_existing_content() {
         "the occupant must survive a losing move"
     );
     assert!(src.exists(), "the source must not be consumed by a failed move");
-}
-
-// resolve_account =====================================================================================================
-
-#[skuld::test]
-fn resolve_account_root_is_uid_zero() {
-    let account = resolve_account(&User::Root).expect("root always exists");
-    assert_eq!(account.uid.as_raw(), 0);
-    assert_eq!(account.name, "root");
-}
-
-#[skuld::test]
-fn resolve_account_uid_zero_is_also_root() {
-    // `User::Id(AccountId::Uid(0))` and `User::Root` must resolve to the
-    // same account: both name uid 0, and `install`'s comparison between the
-    // new spec's identity and the embedded spec's identity has to agree on
-    // that regardless of which spelling either one used.
-    let account = resolve_account(&crate::spec::User::Id(crate::spec::AccountId::Uid(0))).unwrap();
-    assert_eq!(account.name, "root");
-}
-
-#[skuld::test]
-fn resolve_account_sid_is_rejected_on_macos() {
-    let err = resolve_account(&crate::spec::User::Id(crate::spec::AccountId::Sid(
-        "S-1-5-21-0".to_string(),
-    )))
-    .expect_err("a Windows SID is meaningless on macOS");
-    assert!(err.to_string().contains("SID"), "{err}");
-}
-
-#[skuld::test]
-fn resolve_account_rejects_a_nonexistent_user() {
-    let err = resolve_account(&User::Name("goetia-no-such-user-xyz".to_string())).expect_err("no such user");
-    assert!(err.to_string().contains("goetia-no-such-user-xyz"), "{err}");
 }
 
 // locate ==============================================================================================================

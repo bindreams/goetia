@@ -76,7 +76,7 @@ fn refusal(err: &Error) -> String {
     }
 }
 
-fn stranger_owner() -> Owner {
+pub(super) fn stranger_owner() -> Owner {
     Owner::new(Uid::from_raw(STRANGER), Some(Gid::from_raw(STRANGER))).unwrap()
 }
 
@@ -333,6 +333,29 @@ fn walking_dotdot_at_the_root_stays_at_the_root() {
     let mut dirs = CreatedDirs::under(vec![PathBuf::from("/")]);
 
     dirs.create(Path::new("/../.."), None).expect("the root is a directory");
+}
+
+/// A path with nothing left to walk is a directory that exists, wherever the roots are: `/` has no
+/// last component, and a path that ends in `..` has none the walk takes.
+#[skuld::test(labels = [ELEVATED])]
+fn create_uses_the_root_directory_whatever_the_roots_are() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+
+    dirs.create(Path::new("/"), None).expect("`/` exists");
+    dirs.create(Path::new("/."), None).expect("`/.` is `/`");
+}
+
+#[skuld::test(labels = [ELEVATED])]
+fn create_uses_a_path_that_ends_in_dotdot_as_the_directory_it_names() {
+    let layout = Layout::new();
+    fs::create_dir(layout.outside().join("deep")).unwrap();
+    let mut dirs = layout.dirs();
+
+    dirs.create(&layout.outside().join("deep/.."), None)
+        .expect("it names the directory above `deep`, which exists");
+
+    assert!(!layout.outside().join("deep/new").exists());
 }
 
 /// A component another install creates after the walk is not ours: it is used as it is, and what is

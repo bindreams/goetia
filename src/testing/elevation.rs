@@ -11,6 +11,7 @@ pub const ELEVATED: skuld::Label;
 pub fn require_elevated() {
     assert!(
         cosca::elevation::is_elevated(),
-        "this test needs an elevated process (root); run the elevated tests as root, or leave them out with          SKULD_LABELS='!elevated'"
+        "this test needs an elevated process (root); run the elevated tests as root, or leave them out with \
+         SKULD_LABELS='!elevated'"
     );
 }

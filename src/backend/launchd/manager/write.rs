@@ -17,9 +17,9 @@ use tempfile::NamedTempFile;
 
 use super::verbs::{self, Quiet};
 use super::{
-    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, ensure_dir, move_no_clobber, never_expires,
-    persist_new, persist_new_unraced, persist_over, plist_in, prepare_parent_dirs, read_artifact, resolve_account,
-    staged_tempfile, still_present,
+    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, Unlisted, ensure_dir, move_no_clobber,
+    never_expires, persist_new, persist_new_unraced, persist_over, plist_in, prepare_parent_dirs, read_artifact,
+    resolve_account, staged_tempfile, still_present,
 };
 use crate::backend::bounded::Reservation;
 use crate::backend::created_dirs::CreatedDirs;
@@ -68,7 +68,7 @@ impl Launchd {
         let Scope { created, reservation } = scope;
         // Resolved again: `render` kept only the plists, which name the account, and launchd resolves
         // that name at launch too.
-        let account = resolve_account(&spec.common().user)?;
+        let account = resolve_account(&spec.common().user, Unlisted::Refuse)?;
         let id = &spec.common().id;
         let staging = Path::new(dirs[0].0);
 

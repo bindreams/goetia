@@ -217,13 +217,7 @@ impl Backend for Systemd {
 
     /// Whether the job's unit is `definition`'s, as `discover` reads it: the unit is what names the
     /// directories. A timer names none.
-    fn standing(
-        &self,
-        spec: &DaemonSpec,
-        definition: &Units,
-        _outcome: &Outcome,
-        _snapshot: Option<&Fragment>,
-    ) -> Standing {
+    fn standing(&self, spec: &DaemonSpec, definition: &Units) -> Standing {
         unit_standing(
             &unit_path(spec.common().id.as_str(), UnitKind::Service),
             &definition.service,

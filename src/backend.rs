@@ -10,6 +10,8 @@
 //! [`DaemonSpec`]: crate::spec::DaemonSpec
 
 #[cfg(unix)]
+pub(crate) mod account;
+#[cfg(unix)]
 pub(crate) mod bounded;
 #[cfg(unix)]
 pub(crate) mod client;

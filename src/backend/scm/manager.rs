@@ -398,13 +398,7 @@ impl Backend for Scm {
     }
 
     /// The install scope makes nothing besides the service, so there is nothing to keep or take back.
-    fn standing(
-        &self,
-        _spec: &DaemonSpec,
-        _definition: &ScmRegistration,
-        _outcome: &Outcome,
-        _snapshot: Option<&ScmSnapshot>,
-    ) -> Standing {
+    fn standing(&self, _spec: &DaemonSpec, _definition: &ScmRegistration) -> Standing {
         Standing::Yes
     }
 

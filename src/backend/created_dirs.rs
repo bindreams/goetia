@@ -94,6 +94,16 @@ impl Owner {
     }
 }
 
+/// A directory made and marked for an owner, not yet handed to it.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct PendingHandOver {
+    pub(crate) dev: libc::dev_t,
+    pub(crate) ino: libc::ino_t,
+    pub(crate) path: PathBuf,
+    pub(crate) owner: Owner,
+}
+
 /// One directory made. It is in the list from its `mkdirat`, before anything is judged of it.
 #[derive(Debug)]
 struct Made {
@@ -293,6 +303,24 @@ impl CreatedDirs {
         fchmod(&held.dir, Mode::from_bits_truncate(0o755)).map_err(|e| Error::os_at("chmod", &made.path, e))?;
         made.ready = true;
         Ok(())
+    }
+
+    /// The directories marked for an owner that [`hand_over`](Self::hand_over) has yet to give it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn to_hand_over(&self) -> Vec<PendingHandOver> {
+        self.made
+            .iter()
+            .filter(|made| !made.handed)
+            .filter_map(|made| {
+                let held = made.held.as_ref()?;
+                Some(PendingHandOver {
+                    dev: held.dev,
+                    ino: held.ino,
+                    path: made.path.clone(),
+                    owner: made.hand?,
+                })
+            })
+            .collect()
     }
 
     /// Give every directory marked for an owner to it. The account can enter what it owns, so this is
