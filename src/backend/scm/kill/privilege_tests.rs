@@ -15,6 +15,7 @@ use windows_sys::Win32::Security::{
 
 use super::{DebugPrivilege, enable_in, restore_notice};
 use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
+use crate::error::Chain;
 use crate::testing::groups::debug_privilege;
 
 /// The calling thread's own token, if it has one, opened to be queried.
@@ -144,10 +145,14 @@ fn failed_to_enable() -> DebugPrivilege {
 fn a_denied_open_names_the_privilege_step_that_failed() {
     let e = failed_to_enable().explain_denial(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
 
-    let msg = e.to_string();
+    let msg = Chain(&e).to_string();
     assert!(msg.contains("SeDebugPrivilege"), "{msg}");
     assert!(msg.contains("DuplicateTokenEx failed"), "{msg}");
-    assert!(msg.contains("Access is denied"), "the open's own error is kept: {msg}");
+    assert_eq!(
+        msg.matches("Access is denied").count(),
+        1,
+        "the open's own error is kept, once: {msg}"
+    );
     assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
 }
 
@@ -173,7 +178,7 @@ fn a_denied_open_names_the_causes_of_the_step_that_failed() {
 
     let e = guard.explain_denial(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
 
-    let msg = e.to_string();
+    let msg = Chain(&e).to_string();
     assert!(msg.contains("the token is not for this user"), "{msg}");
 }
 

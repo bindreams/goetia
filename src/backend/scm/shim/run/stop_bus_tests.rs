@@ -272,14 +272,7 @@ fn a_failed_background_wait_kills_the_daemon_and_is_reported_as_a_wait_failure()
         "a failed wait was not reported as one"
     );
     assert!(daemon.killed(), "the daemon was left running after its failed wait");
-    assert_one_failure(
-        &fake.take_failures(),
-        ID,
-        &format!(
-            "background wait on child: {}",
-            cosca::error::Report::new(&wait_failed())
-        ),
-    );
+    assert_one_failure(&fake.take_failures(), ID, &super::wait_failed(&wait_failed()));
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
@@ -391,10 +384,7 @@ fn a_failed_background_wait_carries_its_os_error() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!(
-            "background wait on child: {}",
-            cosca::error::Report::new(&wait_failed_with_code(5))
-        ),
+        &super::wait_failed(&wait_failed_with_code(5)),
     );
 }
 
@@ -413,14 +403,7 @@ fn a_stop_wins_over_a_failed_background_wait() {
     assert!(matches!(outcome, WaitOutcome::Stopping));
     assert!(daemon.killed());
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
-    assert_one_failure(
-        &fake.take_failures(),
-        ID,
-        &format!(
-            "background wait on child: {}",
-            cosca::error::Report::new(&wait_failed())
-        ),
-    );
+    assert_one_failure(&fake.take_failures(), ID, &super::wait_failed(&wait_failed()));
 }
 
 /// With only the direct child killed, the daemon's descendants were not reached, so the failed wait
@@ -530,10 +513,7 @@ fn a_repeated_stop_is_accepted_again() {
 /// The lines of a failed wait whose `send_kill_tree` was refused and whose direct-child kill worked.
 fn tree_unkilled_failures() -> [String; 3] {
     [
-        format!(
-            "background wait on child: {}",
-            cosca::error::Report::new(&wait_failed())
-        ),
+        super::wait_failed(&wait_failed()),
         tree_refused_failure(),
         TREE_UNKILLED.to_string(),
     ]
@@ -545,10 +525,7 @@ const TREE_UNKILLED: &str = "the daemon's descendants were not killed: only the 
 /// The lines of a failed wait whose `send_kill_tree` and direct-child kill were both refused.
 fn unkillable_failures() -> [String; 3] {
     [
-        format!(
-            "background wait on child: {}",
-            cosca::error::Report::new(&wait_failed())
-        ),
+        super::wait_failed(&wait_failed()),
         tree_refused_failure(),
         fallback_refused_failure(),
     ]

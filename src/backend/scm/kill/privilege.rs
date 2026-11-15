@@ -6,7 +6,6 @@
 //! token for the open alone, so the rest of the process never sees the change. A token that does not
 //! hold the privilege is left as it is: the open then fails or succeeds on its own terms.
 
-use std::fmt;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
@@ -20,7 +19,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
 
-use crate::error::Chain;
+use crate::error::{Chain, within};
 
 /// While alive, the calling thread runs with the caller's `SeDebugPrivilege` enabled, if the caller
 /// holds it. Dropping restores the thread's earlier token.
@@ -49,36 +48,12 @@ impl DebugPrivilege {
     /// before the error is returned. The denial stays the error's `source()`.
     pub(super) fn explain_denial(mut self, open: io::Error) -> io::Error {
         match self.failure.take() {
-            Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
-                io::Error::new(open.kind(), DeniedAfterPrivilegeFailure { open, step })
-            }
+            Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => within(
+                format!("enabling SeDebugPrivilege for the open also failed ({})", Chain(&step)),
+                open,
+            ),
             _ => open,
         }
-    }
-}
-
-/// A denied open, and the privilege step that failed before it: the denial's own error stays the
-/// `source()`, so a search for the OS code of the denial finds it.
-#[derive(Debug)]
-struct DeniedAfterPrivilegeFailure {
-    open: io::Error,
-    step: io::Error,
-}
-
-impl fmt::Display for DeniedAfterPrivilegeFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} (enabling SeDebugPrivilege for the open also failed: {})",
-            Chain(&self.open),
-            Chain(&self.step)
-        )
-    }
-}
-
-impl std::error::Error for DeniedAfterPrivilegeFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.open)
     }
 }
 
