@@ -101,8 +101,7 @@ fn a_task_registers_reads_back_and_deletes(#[fixture(scm_group)] _group: &Group)
     assert_eq!(Com.instances(&path).unwrap(), vec![]);
     // M1: a task that never ran has no last run, and one with no trigger has no next run.
     let info = Com.info(&path).unwrap();
-    assert_eq!(info.last_run, None);
-    assert_eq!(info.next_run, None);
+    assert_eq!((info.last_run, info.next_run), (None, None), "{info:?}");
 
     assert!(Com.delete(&path).unwrap());
     assert!(!Com.delete(&path).unwrap());

@@ -12,10 +12,15 @@ fn apart(a: std::time::SystemTime, b: std::time::SystemTime) -> Duration {
     a.duration_since(b).unwrap_or_else(|e| e.duration())
 }
 
-// M1: the value Task Scheduler gives a date it has none for (a task that never ran; one with no next
-// run) is OLE date zero, 1899-12-30.
+// M1: Task Scheduler gives a date it has none for (a task that never ran) as 1999-11-30 00:00, OLE date
+// 36494; zero is the absence COM itself uses.
 #[skuld::test]
 fn ole_date_maps_the_sentinels_m1_measured_to_none() {
+    assert_eq!(ole_date(36494.0), None);
+    assert!(
+        ole_date(36494.5).is_some(),
+        "only the sentinel's midnight is the sentinel"
+    );
     assert_eq!(ole_date(0.0), None);
     assert_eq!(ole_date(-1.0), None);
     assert_eq!(ole_date(f64::NAN), None);

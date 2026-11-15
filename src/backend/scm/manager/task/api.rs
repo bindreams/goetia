@@ -103,12 +103,16 @@ pub(crate) trait TaskApi: Send + Sync {
     fn stop(&self, path: &TaskPath, instance: &InstanceId) -> Result<()>;
 }
 
+/// 1999-11-30 00:00 as an OLE date.
+const NO_DATE: f64 = 36494.0;
+
 /// The instant of one of Task Scheduler's date properties, a COM `DATE` in local time.
 ///
-/// M1: a task with no last run or no next run reads as OLE date zero (1899-12-30); that, and what is
-/// not a date at all, is `None`.
+/// M1: a task that never ran reads as 1999-11-30 00:00, which Task Scheduler's engine uses for "no
+/// date" (CI's first read of `LastRunTime`); OLE date zero (1899-12-30) is the same absence in
+/// the other places COM uses one. Both, and what is not a date at all, are `None`.
 pub(crate) fn ole_date(date: f64) -> Option<SystemTime> {
-    if !date.is_finite() || date <= 0.0 {
+    if !date.is_finite() || date <= 0.0 || date == NO_DATE {
         return None;
     }
     let mut local = SYSTEMTIME::default();
