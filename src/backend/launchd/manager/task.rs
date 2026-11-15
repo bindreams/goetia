@@ -317,22 +317,30 @@ impl Launchctl {
     /// A read that fails or is not whole says no, as [`Self::read_task_print`] degrades it, so that an
     /// unprivileged `status` still answers. `Err` iff `launchctl` could not be run at all.
     fn holds(&self, label: &str) -> Result<bool> {
-        let (deadline, role, mut reservation) = uncounted();
-        let read = self.read_print(label, deadline, role, &mut reservation)?;
+        let read = self.uncounted(|launchctl, deadline, role, reservation| {
+            launchctl.read_print(label, deadline, role, reservation)
+        })?;
         Ok(matches!(read, Some((status, capture)) if status.success() && capture.complete))
     }
 
-    /// One [`Self::read_task_print`] that no reservation counts (see [`uncounted`]).
+    /// One [`Self::read_task_print`] that no reservation counts (see [`Self::uncounted`]).
     fn uncounted_task_print(&self, id: &str) -> Result<TaskPrint> {
-        let (deadline, role, mut reservation) = uncounted();
-        self.read_task_print(id, deadline, role, &mut reservation)
+        self.uncounted(|launchctl, deadline, role, reservation| {
+            launchctl.read_task_print(id, deadline, role, reservation)
+        })
     }
-}
 
-/// What a `print` that no reservation counts is read with: `status` and `list` have no budget of their
-/// own, and neither counted these reads. No deadline, as `print` answers at once and its body is whole.
-fn uncounted() -> (Deadline, Role, Reservation) {
-    (Budget::Unbounded.start(), Role::UncountedQuery, Reservation::default())
+    /// Runs `read` with what a `print` that no reservation counts is read with: `status` and `list` have no
+    /// budget of their own, and neither counted these reads. No deadline, as `print` answers at once and its
+    /// body is whole.
+    fn uncounted<T>(&self, read: impl FnOnce(&Self, Deadline, Role, &mut Reservation) -> Result<T>) -> Result<T> {
+        read(
+            self,
+            Budget::Unbounded.start(),
+            Role::UncountedQuery,
+            &mut Reservation::default(),
+        )
+    }
 }
 
 impl Launchd {
