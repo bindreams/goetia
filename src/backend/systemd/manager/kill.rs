@@ -10,8 +10,7 @@ use std::time::Duration;
 use cosca::Process;
 
 use super::systemctl::Systemctl;
-use crate::backend::kill::{KillTarget, process};
-use crate::backend::scm::wait::Waited;
+use crate::backend::kill::{KillTarget, Waited, process};
 use crate::manager::budget::Deadline;
 
 /// How long [`UnitKill::await_recorded`] rests between two reads of `MainPID`. Pacing, never proof of
@@ -47,16 +46,22 @@ impl KillTarget for UnitKill<'_> {
         process::terminate(held)
     }
 
+    fn has_exited(&mut self, held: &Process) -> io::Result<bool> {
+        process::has_exited(held)
+    }
+
     fn await_exit(&mut self, held: &Process) -> io::Result<()> {
         process::await_exit(held)
     }
 
     /// The process is a zombie once it has exited, which is not systemd's record of it: `MainPID` is
     /// cleared when systemd reaps it. Every read re-checks that, and [`RECORD_RECHECK`] only paces them.
-    /// A unit systemd no longer has loaded reports no pid, which is the record.
-    fn await_recorded(&mut self, pid: u32, deadline: Deadline) -> io::Result<Waited> {
+    /// A unit systemd no longer has loaded reports no pid, which is the record. So does a `MainPID` that
+    /// is the killed pid's number and no longer the killed process: systemd reaped it and started the
+    /// unit again, and the new process was given the number.
+    fn await_recorded(&mut self, pid: u32, held: Option<&Process>, deadline: Deadline) -> io::Result<Waited> {
         loop {
-            if self.service_pid()? != Some(pid) {
+            if self.service_pid()? != Some(pid) || !process::report_is_stale(held, pid)? {
                 return Ok(Waited::Confirmed);
             }
             if deadline.expired() {

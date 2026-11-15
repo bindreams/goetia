@@ -20,12 +20,25 @@
 
 use std::io;
 
-use crate::backend::scm::wait::Waited;
-use crate::error::{Chain, Error, within};
+use crate::error::{Chain, Error, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
 #[cfg(unix)]
 pub(crate) mod process;
+
+/// Whether a wait reached the state it was waiting for, or ran out of
+/// [`Deadline`] first. An expiry is not an error: the request was issued and
+/// the service may yet arrive, so what to say about it is the caller's.
+///
+/// `#[must_use]` because dropping this reads an expiry as success, and
+/// `Result`'s own `#[must_use]` does not catch it: `?` consumes the
+/// `Result` and leaves a bare `Waited` behind.
+#[must_use = "an expired wait did not confirm the state; decide what to report rather than discarding it"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waited {
+    Confirmed,
+    Expired,
+}
 
 /// How a kill ended, when the manager could be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,36 +80,66 @@ pub trait KillTarget {
     /// has exited or is exiting is success: [`Self::await_exit`] is the wait.
     fn terminate(&mut self, process: &Self::Process) -> io::Result<()>;
 
+    /// Whether `process` has exited: a read of its state, not a wait.
+    fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool>;
+
     /// Block until `process` has exited. Unbounded: the exit is the event.
     fn await_exit(&mut self, process: &Self::Process) -> io::Result<()>;
+
+    /// Say `line` where the person running the verb reads it. The state machine says why an unbounded
+    /// wait blocks; a target that has somewhere else to say it overrides this, and a test that wants to
+    /// see it does too.
+    fn notice(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
 
     /// Block until the manager no longer reports `pid` as the service's process: it reports none, or
     /// another pid, or no longer has the service at all. Ends at `deadline` as [`Waited::Expired`].
     ///
+    /// `held` is the process `pid` was held through, `None` when it was gone before it could be
+    /// opened. A manager that reports `pid` is reporting that same process only while the process is
+    /// still there to be reported: once it has been reaped, a `pid` the manager reports is another
+    /// process that was given the number, and the end of the held one is recorded. A target whose
+    /// held handle keeps the pid from being reused (SCM's) has no such case.
+    ///
     /// The manager learns of an exit after it has happened, so a read straight after the exit can
     /// still show the pid; this is the wait for the manager's own record, which is what a caller who
     /// reads the manager next needs.
-    fn await_recorded(&mut self, pid: u32, deadline: Deadline) -> io::Result<Waited>;
+    fn await_recorded(&mut self, pid: u32, held: Option<&Self::Process>, deadline: Deadline) -> io::Result<Waited>;
+}
+
+/// What an unbounded wait for `id`'s process `pid` says it is blocked on. `terminate_failed` is why
+/// the process is still running when ending it failed.
+pub(crate) fn waiting_notice(id: &str, pid: u32, terminate_failed: Option<&io::Error>) -> String {
+    terminating_failed(format!("{id}: waiting for process {pid} to exit"), terminate_failed, "").to_string()
+}
+
+/// Wait for `process`, held for `id`, to exit, and say why first when it has not: a process in
+/// uninterruptible sleep on a hung device is never signalled, and without the line the verb would look
+/// stuck.
+fn await_exit_saying<T: KillTarget>(target: &mut T, process: &T::Process, id: &str, pid: u32) -> io::Result<()> {
+    if !target.has_exited(process)? {
+        target.notice(&waiting_notice(id, pid, None));
+    }
+    target.await_exit(process)
 }
 
 /// End the service's process, or report that it has none. See the module doc for what it returns on.
+/// `id` is the service's, for the line said before a wait that blocks.
 ///
 /// The signal is sent before any wait, so a caller that dies in the wait still has the process ended.
-pub fn kill_service<T: KillTarget>(target: &mut T) -> io::Result<KillOutcome> {
+pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillOutcome> {
     match hold_once(target, Budget::Unbounded.start()) {
         Err(HoldError::Expired { .. }) => unreachable!("an unbounded deadline never expires"),
         Err(HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
         Ok(Hold::NoProcess) => Ok(KillOutcome::NotRunning),
-        // The hold waited for the manager to let go of a process it could not open.
-        Ok(Hold::Ended { process: None }) => Ok(KillOutcome::Ended),
-        Ok(Hold::Ended { process: Some(process) }) => {
-            target.await_exit(&process)?;
-            Ok(KillOutcome::Ended)
-        }
+        // The manager moved off the pid, or let go of one whose process was gone. A held process was
+        // then gone too, or a stranger that took its pid: neither is waited for.
+        Ok(Hold::Ended) => Ok(KillOutcome::Ended),
         Ok(Hold::Held { pid, process }) => {
             target.terminate(&process)?;
-            target.await_exit(&process).map_err(|e| signalled_but(pid, e))?;
-            match target.await_recorded(pid, Budget::Unbounded.start()) {
+            await_exit_saying(target, &process, id, pid).map_err(|e| signalled_but(pid, e))?;
+            match target.await_recorded(pid, Some(&process), Budget::Unbounded.start()) {
                 Ok(Waited::Confirmed) => Ok(KillOutcome::Ended),
                 Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),
                 Err(e) => Err(signalled_but(pid, e)),
@@ -112,10 +155,11 @@ pub(crate) enum Hold<P> {
     NoProcess,
     /// The service's process, opened, and confirmed by a second read of the manager.
     Held { pid: u32, process: P },
-    /// The pid the manager reported has ended and the manager no longer reports it. `process` is the
-    /// hold, when one was made: the manager moved off the pid between the open and the confirmation,
-    /// and the process may not yet have exited.
-    Ended { process: Option<P> },
+    /// The pid the manager reported is no longer the service's: the process was gone before it could
+    /// be opened, and the manager has recorded that, or the manager moved off the pid between the
+    /// open and the confirmation. A process opened by then is let go, not waited for: it is gone or
+    /// somebody else's.
+    Ended,
 }
 
 /// The service's process and its pid, opened and held, once: what everything that acts on a service's
@@ -136,8 +180,8 @@ pub(crate) fn hold_once<T: KillTarget>(
         Ok(Some(process)) => process,
         // The process is gone and the manager has not yet recorded it.
         Ok(None) => {
-            return match target.await_recorded(pid, deadline).map_err(HoldError::Read)? {
-                Waited::Confirmed => Ok(Hold::Ended { process: None }),
+            return match target.await_recorded(pid, None, deadline).map_err(HoldError::Read)? {
+                Waited::Confirmed => Ok(Hold::Ended),
                 Waited::Expired => Err(HoldError::Expired { pid }),
             };
         }
@@ -147,7 +191,7 @@ pub(crate) fn hold_once<T: KillTarget>(
                 Ok(Some(now)) if now == pid => Err(HoldError::Refused(e)),
                 // The manager has moved on: the pid was a process that exited, or somebody else's,
                 // and `e` is superseded by that.
-                Ok(_) => Ok(Hold::Ended { process: None }),
+                Ok(_) => Ok(Hold::Ended),
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
                 Err(read) => Err(HoldError::Read(io::Error::new(
                     read.kind(),
@@ -159,7 +203,9 @@ pub(crate) fn hold_once<T: KillTarget>(
     if target.service_pid().map_err(HoldError::Read)? == Some(pid) {
         Ok(Hold::Held { pid, process })
     } else {
-        Ok(Hold::Ended { process: Some(process) })
+        // Let go: the manager has moved off it.
+        drop(process);
+        Ok(Hold::Ended)
     }
 }
 

@@ -72,9 +72,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, io};
 
+use cosca::Process;
+
 use crate::backend::bounded::{self, Finished, Kept, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
-use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
+use crate::backend::kill::{KillOutcome, kill_failed, kill_service, process};
 use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::state::Evidence;
 use crate::backend::launchd::task::enabled_in;
@@ -849,22 +851,24 @@ enum Printed {
 
 /// What [`Launchctl::wait_print`] waits for.
 #[derive(Clone, Copy)]
-enum Until {
+enum Until<'a> {
     /// launchd no longer has the label.
     Unloaded,
     /// A task's job has a process, or no longer shows `state = spawn scheduled`: a start launchd has
     /// accepted has forked, or has not happened and will not. `kickstart` returns before the fork, and
     /// `launchctl kill` of a job in that state signals nothing, so a `stop` waits for this first.
     ProcessOrNotScheduled,
-    /// The job's pid is not this one: `print` shows another process, or none (a job launchd holds that
-    /// has exited, or is throttled and `spawn scheduled`), or the label is not held. What the record of
-    /// a killed process is: launchd no longer shows it as the job's.
-    PidNot(u32),
+    /// The end of the process `held` is recorded: `print` shows another pid, or none (a job launchd
+    /// holds that has exited, or is throttled and `spawn scheduled`), or the label is not held, or it
+    /// shows `pid` and what has that number is not the process held (launchd started the job again
+    /// and the number was reused). `held` is `None` for a process that was gone before it could be
+    /// held.
+    Recorded { pid: u32, held: Option<&'a Process> },
 }
 
-impl Until {
-    fn reached(self, printed: &Printed) -> bool {
-        match (self, printed) {
+impl Until<'_> {
+    fn reached(self, printed: &Printed) -> Result<bool> {
+        Ok(match (self, printed) {
             // Not found: not loaded, so no process and no start.
             (_, Printed::Absent) => true,
             (Until::Unloaded, Printed::Present(_)) => false,
@@ -875,10 +879,13 @@ impl Until {
                     state::has_process(&body).is_some() || !state::spawn_scheduled(&body)
                 }
             }
-            (Until::PidNot(pid), Printed::Present(capture)) => {
-                capture.complete && state::has_process(&String::from_utf8_lossy(&capture.stdout)) != Some(pid)
+            (Until::Recorded { pid, held }, Printed::Present(capture)) => {
+                capture.complete
+                    && (state::has_process(&String::from_utf8_lossy(&capture.stdout)) != Some(pid)
+                        || !process::report_is_stale(held, pid)
+                            .map_err(|e| Error::os(format!("read what has process {pid}"), e))?)
             }
-        }
+        })
     }
 }
 
@@ -1094,7 +1101,7 @@ impl Launchctl {
     /// A deadline already spent still gets one last read, under [`HELD_READ_BOUND`] (`print` answers
     /// in milliseconds), so a condition reached in the last interval is reported; no read is made
     /// under a spent deadline, which would be killed at once.
-    fn wait_print(&self, id: &str, deadline: Deadline, kept: &Kept, until: Until) -> Result<Option<()>> {
+    fn wait_print(&self, id: &str, deadline: Deadline, kept: &Kept, until: Until<'_>) -> Result<Option<()>> {
         loop {
             let spent = deadline.expired();
             let read_deadline = if spent {
@@ -1103,7 +1110,7 @@ impl Launchctl {
                 deadline
             };
             match self.print(id, read_deadline, &mut reread(id, kept)?)? {
-                Some(printed) if until.reached(&printed) => return Ok(Some(())),
+                Some(printed) if until.reached(&printed)? => return Ok(Some(())),
                 Some(_) if !spent => {}
                 Some(_) | None => return Ok(None),
             }
@@ -1869,7 +1876,7 @@ impl backend::Backend for Launchd {
         }
         let id = snapshot.id();
         let mut target = kill::JobKill::new(&self.launchctl, id.as_str(), reservation)?;
-        match kill_service(&mut target).map_err(|e| kill_failed(id.as_str(), e))? {
+        match kill_service(&mut target, id.as_str()).map_err(|e| kill_failed(id.as_str(), e))? {
             KillOutcome::Ended => Ok(()),
             KillOutcome::NotRunning => Err(Error::NotRunning { id: id.to_string() }),
         }

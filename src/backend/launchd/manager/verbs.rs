@@ -120,7 +120,7 @@ impl Launchd {
     pub(super) fn kill_task(&self, id: &Id, reservation: &mut Reservation) -> Result<()> {
         let name = id.as_str();
         let mut target = JobKill::new(&self.launchctl, name, reservation)?;
-        if kill_service(&mut target).map_err(|e| kill_failed(name, e))? == KillOutcome::Ended {
+        if kill_service(&mut target, name).map_err(|e| kill_failed(name, e))? == KillOutcome::Ended {
             return Ok(());
         }
         let print = self
@@ -132,7 +132,7 @@ impl Launchd {
                 Quiet::Queued => self.await_queued_start(name, reservation)?,
             }
         }
-        match kill_service(&mut target).map_err(|e| kill_failed(name, e))? {
+        match kill_service(&mut target, name).map_err(|e| kill_failed(name, e))? {
             KillOutcome::Ended => Ok(()),
             KillOutcome::NotRunning => Err(Error::NotRunning { id: id.to_string() }),
         }

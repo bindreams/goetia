@@ -1023,7 +1023,20 @@ fn marked_plist(id: &Id) -> Plist {
 
 /// [`marked_plist`] of a job with `restart`: `Always` is the one `start`'s corrective cycle runs for.
 fn marked_plist_restarting(id: &Id, restart: Restart) -> Plist {
-    let text = sample_plist_restarting(id.as_str(), restart);
+    marked_plist_of(id, sample_plist_restarting(id.as_str(), restart))
+}
+
+/// A marked plist for a task, as [`marked_plist`] is for a service: `kill` and `stop` act on a task's
+/// run by its kind.
+fn marked_task_plist(id: &Id) -> Plist {
+    marked_plist_of(
+        id,
+        super::task::task_tests::plists_of(&super::task::task_tests::task_spec(None)).job,
+    )
+}
+
+/// The plist `text` is the job of, with no file behind it.
+fn marked_plist_of(id: &Id, text: String) -> Plist {
     let blob = generate::extract(&text)
         .transpose()
         .expect("sample_plist carries the marker");
@@ -1107,23 +1120,31 @@ struct Drawing {
     /// The step it is counted under.
     step: Step,
     restart: Restart,
-    /// Its longest path, call for call.
-    calls: &'static [(&'static str, Answer)],
+    /// The job it acts on: a service's, or a task's where the verb's longest path is a task's.
+    plist: fn(&Id, Restart) -> Plist,
+    /// Its longest path, call for call, given the pid of a real child: a path that holds a process
+    /// has `print` show it.
+    calls: fn(u32) -> Vec<Entry>,
     /// The requests and calls that path makes: what `needs` counts when it is `step`'s longest.
     drew: (usize, usize),
     run: fn(&Launchd, Plist, &mut Reservation) -> Result<()>,
 }
 
-/// Every verb that draws, down its longest path. `kill` is not here: its path needs a real process to
-/// hold, and its draws are checked over a real child (`kill_tests`).
-fn drawings() -> [Drawing; 4] {
+/// The calls of a path that shows no process of its own.
+fn fixed(calls: &[(&str, Answer)]) -> Vec<Entry> {
+    calls.iter().map(|&(verb, a)| answer(verb, a)).collect()
+}
+
+/// Every verb that draws, down its longest path. `kill`'s holds a real process, which the test hands it.
+fn drawings() -> [Drawing; 5] {
     use crate::backend::Backend;
 
     [
         Drawing {
             step: Step::Start,
             restart: Restart::Always,
-            calls: &START_LONGEST,
+            plist: marked_plist_restarting,
+            calls: |_| fixed(&START_LONGEST),
             drew: (START_REQUESTS, START_CALLS),
             run: |mgr, plist, reservation| Backend::start(mgr, plist, Budget::DEFAULT, reservation),
         },
@@ -1131,22 +1152,47 @@ fn drawings() -> [Drawing; 4] {
         Drawing {
             step: Step::RequestStartAfterStop,
             restart: Restart::Always,
-            calls: &START_NOT_WAITING,
+            plist: marked_plist_restarting,
+            calls: |_| fixed(&START_NOT_WAITING),
             drew: (2, 5),
             run: |mgr, plist, reservation| Backend::request_start_after_stop(mgr, plist, reservation),
         },
         Drawing {
             step: Step::Stop,
             restart: Restart::Never,
-            calls: &BOOTOUT,
+            plist: marked_plist_restarting,
+            calls: |_| fixed(&BOOTOUT),
             drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| Backend::stop(mgr, plist, Budget::DEFAULT, reservation),
+        },
+        // A task's longest `kill`: the first run finds no process, the read finds a start launchd has accepted
+        // and not yet forked, the wait for the fork ends on the process, and the run that forked is killed: the
+        // read, the confirmation, and the wait for the record, whose first read still shows the pid.
+        Drawing {
+            step: Step::Kill,
+            restart: Restart::Never,
+            plist: |id, _| marked_task_plist(id),
+            calls: |pid| {
+                vec![
+                    answer("print", SPAWN_SCHEDULED),
+                    answer("print", SPAWN_SCHEDULED),
+                    answer("print", SPAWN_SCHEDULED),
+                    printed_running(pid),
+                    printed_running(pid),
+                    printed_running(pid),
+                    printed_running(pid),
+                    answer("print", SPAWN_SCHEDULED),
+                ]
+            },
+            drew: (KILL_REQUESTS, TASK_KILL_CALLS),
+            run: |mgr, plist, reservation| Backend::kill(mgr, plist, reservation),
         },
         // The `bootout`, and then the removal of a plist nothing backs, which fails.
         Drawing {
             step: Step::Uninstall,
             restart: Restart::Never,
-            calls: &BOOTOUT,
+            plist: marked_plist_restarting,
+            calls: |_| fixed(&BOOTOUT),
             drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, reservation) {
                 Err(Error::Os { what, source, .. })
@@ -1169,12 +1215,17 @@ fn drawings() -> [Drawing; 4] {
 /// a real child.
 #[skuld::test]
 fn every_verb_draws_what_its_step_counts() {
+    use super::watch::watch_tests::Held;
+
     let id = never_installed();
     for drawing in drawings() {
-        let (mgr, script) = scripted(drawing.calls);
+        // A verb that holds a process holds this one; one that does not leaves it be.
+        let child = Held::new(0);
+        let script = Fake::new((drawing.calls)(child.pid()));
+        let mgr = launchd_over(script.clone());
         let mut held = reserved(&[drawing.step]);
 
-        let result = (drawing.run)(&mgr, marked_plist_restarting(&id, drawing.restart), &mut held);
+        let result = (drawing.run)(&mgr, (drawing.plist)(&id, drawing.restart), &mut held);
 
         result.unwrap_or_else(|e| panic!("{:?}: {e:?}", drawing.step));
         script.assert_spent(&format!("{:?}'s longest path", drawing.step));
@@ -1195,22 +1246,26 @@ fn every_verb_draws_what_its_step_counts() {
 /// build that has debug assertions: an undercount cannot pass an ordinary test.
 #[skuld::test]
 fn a_verb_handed_one_item_too_few_trips_the_assertion() {
+    use super::watch::watch_tests::Held;
+
     let id = never_installed();
     for drawing in drawings() {
         let (requests, calls) = drawing.drew;
         for (what, (reapers, files)) in [
-            ("reaper", (requests - 1, calls * Role::COUNTED_FILES)),
+            ("reaper", (requests.saturating_sub(1), calls * Role::COUNTED_FILES)),
             ("temp file", (requests, calls * Role::COUNTED_FILES - 1)),
         ] {
-            let (mgr, script) = scripted(drawing.calls);
+            // A verb that draws no reaper cannot be a reaper short.
+            if what == "reaper" && requests == 0 {
+                continue;
+            }
+            let child = Held::new(0);
+            let script = Fake::new((drawing.calls)(child.pid()));
+            let mgr = launchd_over(script.clone());
             let mut short = Reservation::make(reapers, files).expect("make a reservation");
 
             let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                drop((drawing.run)(
-                    &mgr,
-                    marked_plist_restarting(&id, drawing.restart),
-                    &mut short,
-                ));
+                drop((drawing.run)(&mgr, (drawing.plist)(&id, drawing.restart), &mut short));
             }));
 
             let payload = drawn.expect_err(&format!("{:?}: a {what} short went unnoticed", drawing.step));
@@ -2528,8 +2583,17 @@ fn a_failed_read_after_the_signal_says_it_was_delivered() {
 // wait_print ==========================================================================================================
 
 /// A wait for `until` over `calls`, which it makes as one call's files kept once, and the table.
-fn waiting(until: Until, deadline: Deadline, calls: &[(&str, Answer)]) -> (Result<Option<()>>, Fake) {
-    let script = table(calls);
+fn waiting(until: Until<'_>, deadline: Deadline, calls: &[(&str, Answer)]) -> (Result<Option<()>>, Fake) {
+    waiting_over(until, deadline, calls.iter().map(|&(verb, a)| answer(verb, a)))
+}
+
+/// [`waiting`] over `entries`, for a table whose answers name a pid that is only known at run time.
+fn waiting_over(
+    until: Until<'_>,
+    deadline: Deadline,
+    entries: impl IntoIterator<Item = Entry>,
+) -> (Result<Option<()>>, Fake) {
+    let script = Fake::new(entries);
     let launchctl = Launchctl::new(Box::new(script.clone()));
     let kept = reservation(0, 1)
         .keep(Role::COUNTED_FILES)
@@ -2611,10 +2675,16 @@ fn wait_print_until_unloaded_is_the_wait_for_the_label_to_go() {
 }
 
 /// The record of a killed process is that `print` no longer shows it as the job's: it goes on while the
-/// pid is shown, in any state, and ends on another pid, on none, and on a label launchd does not hold.
+/// pid is shown over the process held, in any state, and ends on another pid, on none, and on a label
+/// launchd does not hold.
 #[skuld::test]
 fn wait_print_until_the_pid_is_not_the_killed_one() {
+    use super::watch::watch_tests::Held;
+
     let forever = Budget::Unbounded.start();
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let held = process::open(pid).expect("open the child").expect("it is running");
     let cases: [(&str, Answer); 4] = [
         ("another pid", RUNNING_AGAIN),
         ("no process", SPAWN_SCHEDULED),
@@ -2622,17 +2692,51 @@ fn wait_print_until_the_pid_is_not_the_killed_one() {
         ("a label launchd does not hold", NOT_LOADED),
     ];
     for (what, recorded) in cases {
-        let (result, script) = waiting(
-            Until::PidNot(4242),
+        let (result, script) = waiting_over(
+            Until::Recorded { pid, held: Some(&held) },
             forever,
-            &[("print", RUNNING), ("print", SIGTERMED), ("print", recorded)],
+            [printed_running(pid), printed_running(pid), answer("print", recorded)],
         );
 
         assert!(matches!(result, Ok(Some(()))), "{what}: {result:?}");
         script.assert_spent(&format!("two reads that show the pid, then {what}"));
     }
-    let (still_shown, _) = waiting(Until::PidNot(4242), Budget::Immediate.start(), &[("print", RUNNING)]);
+    let (still_shown, _) = waiting_over(
+        Until::Recorded { pid, held: Some(&held) },
+        Budget::Immediate.start(),
+        [printed_running(pid)],
+    );
     assert!(matches!(still_shown, Ok(None)), "{still_shown:?}");
+    run.finish();
+}
+
+/// launchd started the job again and the new process was given the number of the one killed: `print`
+/// shows the same pid, and the process that has it is not the one held, so the end of the held one is
+/// recorded. A process that was gone before it could be held is the same: nothing held is what has the
+/// number now.
+#[skuld::test]
+fn wait_print_until_the_number_of_the_killed_pid_is_another_process() {
+    use super::watch::watch_tests::Held;
+
+    let mut killed = Held::new(0);
+    let held = process::open(killed.pid())
+        .expect("open the child")
+        .expect("it is running");
+    let mut newcomer = Held::new(0);
+    // `newcomer`'s pid stands in for the number the killed process had.
+    let pid = newcomer.pid();
+    for (what, held) in [("a held process", Some(&held)), ("nothing held", None)] {
+        let (result, script) = waiting_over(
+            Until::Recorded { pid, held },
+            Budget::Unbounded.start(),
+            [printed_running(pid)],
+        );
+
+        assert!(matches!(result, Ok(Some(()))), "{what}: {result:?}");
+        script.assert_spent(&format!("one read: {what}, and another process has the pid"));
+    }
+    killed.finish();
+    newcomer.finish();
 }
 
 // A changed spec over a loaded job ====================================================================================

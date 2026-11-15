@@ -320,7 +320,9 @@ impl Backend for Systemd {
         self.systemctl.require_supported(reservation)?;
         let id = snapshot.id();
         let unit = unit_name(id.as_str(), UnitKind::Service);
-        match kill_service(&mut kill::UnitKill::new(&self.systemctl, unit)).map_err(|e| kill_failed(id.as_str(), e))? {
+        match kill_service(&mut kill::UnitKill::new(&self.systemctl, unit), id.as_str())
+            .map_err(|e| kill_failed(id.as_str(), e))?
+        {
             KillOutcome::Ended => Ok(()),
             KillOutcome::NotRunning => Err(Error::NotRunning { id: id.to_string() }),
         }

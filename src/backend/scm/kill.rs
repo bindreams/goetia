@@ -24,9 +24,7 @@
 
 use std::io;
 
-use crate::backend::kill::{Hold, HoldError, KillTarget, hold_once};
-use crate::backend::scm::wait::Waited;
-use crate::error::terminating_failed;
+use crate::backend::kill::{Hold, HoldError, KillTarget, Waited, hold_once};
 use crate::manager::budget::Deadline;
 
 /// What [`ScmRelease::arm_release`] came to.
@@ -89,7 +87,7 @@ pub(crate) fn hold_service_process<T: KillTarget>(
         match hold_once(target, deadline)? {
             Hold::NoProcess => return Ok(None),
             Hold::Held { pid, process } => return Ok(Some((pid, process))),
-            Hold::Ended { .. } => {}
+            Hold::Ended => {}
         }
     }
 }
@@ -170,11 +168,6 @@ pub(crate) fn hold_if_possible<T: KillTarget>(
     }
 }
 
-/// What an unbounded wait for `id`'s process `pid` says it is blocked on.
-fn waiting_notice(id: &str, pid: u32, terminate_failed: Option<&io::Error>) -> String {
-    terminating_failed(format!("{id}: waiting for process {pid} to exit"), terminate_failed, "").to_string()
-}
-
 #[cfg(windows)]
 mod privilege;
 
@@ -231,10 +224,6 @@ pub(in crate::backend::scm) mod system {
             }
         }
 
-        fn notice(&self, process: &Held) {
-            process.notice(&self.id, None);
-        }
-
         fn notifier(&mut self) -> io::Result<&mut SystemScmActor> {
             match &mut self.notifier {
                 Some(actor) => Ok(actor),
@@ -253,7 +242,10 @@ pub(in crate::backend::scm) mod system {
         /// Says on stderr why nothing returns while `id`'s process runs, and why it is still
         /// running if ending it failed.
         pub(in crate::backend::scm) fn notice(&self, id: &str, terminate_failed: Option<&io::Error>) {
-            eprintln!("{}", super::waiting_notice(id, self.pid, terminate_failed));
+            eprintln!(
+                "{}",
+                crate::backend::kill::waiting_notice(id, self.pid, terminate_failed)
+            );
         }
 
         /// Ends the process through this handle, never by pid, and does not wait for it: a process
@@ -319,11 +311,17 @@ pub(in crate::backend::scm) mod system {
             process.terminate()
         }
 
-        fn await_exit(&mut self, process: &Held) -> io::Result<()> {
-            wait_exit_unbounded(&process.handle, || self.notice(process))
+        fn has_exited(&mut self, process: &Held) -> io::Result<bool> {
+            has_exited(&process.handle)
         }
 
-        fn await_recorded(&mut self, pid: u32, deadline: Deadline) -> io::Result<Waited> {
+        fn await_exit(&mut self, process: &Held) -> io::Result<()> {
+            // The state machine has said why this blocks, if it does.
+            wait_exit_unbounded(&process.handle)
+        }
+
+        /// The held handle keeps the pid from being reused, so a pid SCM reports is the process held.
+        fn await_recorded(&mut self, pid: u32, _held: Option<&Held>, deadline: Deadline) -> io::Result<Waited> {
             await_scm_released(self, pid, deadline)
         }
     }
@@ -443,8 +441,8 @@ pub(in crate::backend::scm) mod system {
     }
 
     /// [`wait_exit`] with no bound, for the callers that terminate the process.
-    fn wait_exit_unbounded(process: &OwnedHandle, on_wait: impl FnOnce()) -> io::Result<()> {
-        match wait_exit(process, Budget::Unbounded.start(), on_wait)? {
+    fn wait_exit_unbounded(process: &OwnedHandle) -> io::Result<()> {
+        match wait_exit(process, Budget::Unbounded.start(), || {})? {
             Waited::Confirmed => Ok(()),
             Waited::Expired => unreachable!("an unbounded deadline never expires"),
         }

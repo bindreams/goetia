@@ -162,12 +162,16 @@ impl KillTarget for Scripted {
         }
     }
 
+    fn has_exited(&mut self, _process: &Held) -> io::Result<bool> {
+        Ok(true)
+    }
+
     fn await_exit(&mut self, process: &Held) -> io::Result<()> {
         self.log.borrow_mut().push(format!("await_exit {}", process.pid));
         Ok(())
     }
 
-    fn await_recorded(&mut self, pid: u32, deadline: Deadline) -> io::Result<Waited> {
+    fn await_recorded(&mut self, pid: u32, _held: Option<&Held>, deadline: Deadline) -> io::Result<Waited> {
         await_scm_released(self, pid, deadline)
     }
 }
@@ -389,7 +393,7 @@ fn a_failed_read_of_scm_is_not_let_go_by_hold_if_possible() {
 fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
     let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone], []);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
         steps([
@@ -410,7 +414,7 @@ fn a_process_gone_before_it_was_opened_waits_for_scm_to_let_go_of_the_pid() {
 fn a_wake_that_shows_scm_let_go_of_the_pid_arms_nothing_again() {
     let mut target = Scripted::new([Some(100), Some(100), None], [Open::Gone], []).unwatchable_from(1);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
         steps([
@@ -430,7 +434,7 @@ fn a_wake_that_shows_scm_let_go_of_the_pid_arms_nothing_again() {
 fn a_service_scm_will_not_watch_and_shows_stopped_is_released() {
     let mut target = Scripted::new([Some(100), None], [Open::Gone], []).unwatchable_from(0);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(target.log(), steps(["service_pid", "open 100", "arm_release"]));
 }
 
@@ -444,7 +448,7 @@ fn a_re_arm_scm_refuses_on_a_stopped_service_is_the_release() {
     )
     .unwatchable_from(1);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
         steps([
@@ -474,7 +478,7 @@ fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
         [Terminate::Done],
     );
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
         steps([
@@ -504,7 +508,7 @@ fn a_kill_waits_while_scm_still_reports_the_killed_pid() {
 fn a_kill_is_done_when_scm_reports_a_new_pid() {
     let mut target = Scripted::new([Some(100), Some(100), Some(200)], [Open::Found], [Terminate::Done]);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, "frpc").unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
         steps([
@@ -542,7 +546,7 @@ fn assert_terminated_but_unconfirmed(e: &io::Error, cause: &str, kind: io::Error
 fn a_failed_read_after_the_termination_says_the_signal_was_delivered() {
     let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_read(3);
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, "frpc").unwrap_err();
 
     assert_terminated_but_unconfirmed(&e, "scm read failed", READ_FAILED_KIND);
     assert_eq!(
@@ -564,7 +568,7 @@ fn a_failed_read_after_the_termination_says_the_signal_was_delivered() {
 fn a_failed_registration_after_the_termination_says_the_signal_was_delivered() {
     let mut target = Scripted::new([Some(100)], [Open::Found], [Terminate::Done]).failing_arm();
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, "frpc").unwrap_err();
 
     assert_terminated_but_unconfirmed(&e, "notifier could not be opened", io::ErrorKind::Other);
 }
@@ -574,31 +578,9 @@ fn a_failed_registration_after_the_termination_says_the_signal_was_delivered() {
 fn a_failed_registration_for_a_process_found_gone_is_not_called_a_termination() {
     let mut target = Scripted::new([Some(100)], [Open::Gone], []).failing_arm();
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, "frpc").unwrap_err();
 
     assert_eq!(e.to_string(), "notifier could not be opened");
-}
-
-// The notice of a wait ------------------------------------------------------------------------------------------------
-
-#[skuld::test]
-fn the_waiting_notice_names_the_process() {
-    assert_eq!(
-        waiting_notice("frpc", 4242, None),
-        "frpc: waiting for process 4242 to exit"
-    );
-}
-
-#[skuld::test]
-fn the_waiting_notice_names_a_failed_terminate() {
-    assert_eq!(
-        waiting_notice(
-            "frpc",
-            4242,
-            Some(&io::Error::other("The handle is invalid. (os error 6)"))
-        ),
-        "frpc: waiting for process 4242 to exit, and terminating it failed: The handle is invalid. (os error 6)"
-    );
 }
 
 // The raw status ------------------------------------------------------------------------------------------------------

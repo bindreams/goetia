@@ -13,8 +13,7 @@ use cosca::Process;
 
 use super::{Launchctl, Until};
 use crate::backend::bounded::{Kept, Reservation, Role};
-use crate::backend::kill::{KillTarget, process};
-use crate::backend::scm::wait::Waited;
+use crate::backend::kill::{KillTarget, Waited, process};
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
 
@@ -52,16 +51,22 @@ impl KillTarget for JobKill<'_> {
         process::terminate(held)
     }
 
+    fn has_exited(&mut self, held: &Process) -> io::Result<bool> {
+        process::has_exited(held)
+    }
+
     fn await_exit(&mut self, held: &Process) -> io::Result<()> {
         process::await_exit(held)
     }
 
-    /// Reads `print` until the job shows another pid, none, or is not held ([`Until::PidNot`]): launchd
-    /// learns of the exit after the process is a zombie, and a throttled restart shows no pid.
-    fn await_recorded(&mut self, pid: u32, deadline: Deadline) -> io::Result<Waited> {
+    /// Reads `print` until the job shows another pid, none, or is not held, or shows the killed pid's
+    /// number on a process that is not the killed one ([`Until::Recorded`]): launchd learns of the exit
+    /// after the process is a zombie, a throttled restart shows no pid, and an unthrottled one can be
+    /// given the number.
+    fn await_recorded(&mut self, pid: u32, held: Option<&Process>, deadline: Deadline) -> io::Result<Waited> {
         match self
             .launchctl
-            .wait_print(self.id, deadline, &self.kept, Until::PidNot(pid))
+            .wait_print(self.id, deadline, &self.kept, Until::Recorded { pid, held })
             .map_err(io::Error::other)?
         {
             Some(()) => Ok(Waited::Confirmed),

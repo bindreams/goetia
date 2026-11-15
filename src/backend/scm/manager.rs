@@ -546,7 +546,7 @@ impl Backend for Scm {
         let id = snapshot.into_id();
         let (_scm, service) = open_existing(&id, "kill", ServiceAccess::QUERY_STATUS)?;
         let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
-        match kill_service(&mut target).map_err(|e| kill_failed(id.as_str(), e))? {
+        match kill_service(&mut target, id.as_str()).map_err(|e| kill_failed(id.as_str(), e))? {
             KillOutcome::Ended => Ok(()),
             KillOutcome::NotRunning => Err(Error::NotRunning {
                 id: id.as_str().to_string(),

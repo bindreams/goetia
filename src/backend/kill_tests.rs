@@ -6,12 +6,14 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use super::*;
-use crate::backend::scm::test_support::{spent, unbounded};
 
 type Log = Rc<RefCell<Vec<String>>>;
 
 /// The kind of a failed `service_pid`: not `Other`, so a test sees whether a kind is kept.
 const READ_FAILED_KIND: io::ErrorKind = io::ErrorKind::TimedOut;
+
+/// The service every test kills.
+const ID: &str = "frpc";
 
 /// What opening a pid finds.
 enum Open {
@@ -31,6 +33,8 @@ struct Scripted {
     failing_terminate: bool,
     failing_exit: bool,
     failing_recorded: bool,
+    /// Whether a held process is still running when asked.
+    running: bool,
     /// Whether `await_recorded` is cut short by its deadline.
     expiring_recorded: bool,
     log: Log,
@@ -46,6 +50,7 @@ impl Scripted {
             failing_terminate: false,
             failing_exit: false,
             failing_recorded: false,
+            running: false,
             expiring_recorded: false,
             log: Log::default(),
         }
@@ -69,6 +74,12 @@ impl Scripted {
 
     fn failing_recorded(mut self) -> Self {
         self.failing_recorded = true;
+        self
+    }
+
+    /// The held process has not exited when the kill looks, so the wait for it blocks.
+    fn running(mut self) -> Self {
+        self.running = true;
         self
     }
 
@@ -131,6 +142,14 @@ impl KillTarget for Scripted {
         Ok(())
     }
 
+    fn has_exited(&mut self, _process: &Held) -> io::Result<bool> {
+        Ok(!self.running)
+    }
+
+    fn notice(&mut self, line: &str) {
+        self.log.borrow_mut().push(format!("notice {line}"));
+    }
+
     fn await_exit(&mut self, process: &Held) -> io::Result<()> {
         self.log.borrow_mut().push(format!("await_exit {}", process.pid));
         if self.failing_exit {
@@ -139,8 +158,11 @@ impl KillTarget for Scripted {
         Ok(())
     }
 
-    fn await_recorded(&mut self, pid: u32, deadline: Deadline) -> io::Result<Waited> {
-        self.log.borrow_mut().push(format!("await_recorded {pid}"));
+    fn await_recorded(&mut self, pid: u32, held: Option<&Held>, deadline: Deadline) -> io::Result<Waited> {
+        self.log.borrow_mut().push(match held {
+            Some(_) => format!("await_recorded {pid}"),
+            None => format!("await_recorded {pid} unheld"),
+        });
         if self.failing_recorded {
             return Err(io::Error::new(READ_FAILED_KIND, "manager read failed"));
         }
@@ -165,7 +187,7 @@ fn steps<const N: usize>(steps: [&str; N]) -> Vec<String> {
 fn a_service_with_no_process_has_nothing_to_kill() {
     let mut target = Scripted::new([None], []);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::NotRunning);
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::NotRunning);
     assert_eq!(
         target.log(),
         steps(["service_pid"]),
@@ -182,7 +204,7 @@ fn a_service_with_no_process_has_nothing_to_kill() {
 fn the_process_is_held_from_the_open_through_the_waits_and_signalled_before_any_wait() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
         steps([
@@ -197,27 +219,86 @@ fn the_process_is_held_from_the_open_through_the_waits_and_signalled_before_any_
     );
 }
 
+/// A process that has not exited when the kill looks is waited for with no bound, and the verb says
+/// why it blocks, once, before the wait: a process that never exits would otherwise look like a hang.
+#[skuld::test]
+fn a_wait_for_a_process_that_has_not_exited_says_why_before_it_blocks() {
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]).running();
+
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
+    assert_eq!(
+        target.log(),
+        steps([
+            "service_pid",
+            "open 100",
+            "service_pid",
+            "terminate 100",
+            "notice frpc: waiting for process 100 to exit",
+            "await_exit 100",
+            "await_recorded 100",
+            "close 100",
+        ])
+    );
+}
+
+/// A process that has already exited is not waited for out loud: the notice is for a wait that blocks.
+#[skuld::test]
+fn a_process_that_has_exited_by_the_time_of_the_wait_is_not_announced() {
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]);
+
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
+    assert!(
+        target.log().iter().all(|call| !call.starts_with("notice")),
+        "{:?}",
+        target.log()
+    );
+}
+
+/// What the notice says: the service, the process, and what it waits for.
+#[skuld::test]
+fn the_waiting_notice_names_the_service_and_the_process() {
+    assert_eq!(
+        waiting_notice("frpc", 4242, None),
+        "frpc: waiting for process 4242 to exit"
+    );
+}
+
+#[skuld::test]
+fn the_waiting_notice_names_a_failed_terminate() {
+    assert_eq!(
+        waiting_notice(
+            "frpc",
+            4242,
+            Some(&io::Error::other("The handle is invalid. (os error 6)"))
+        ),
+        "frpc: waiting for process 4242 to exit, and terminating it failed: The handle is invalid. (os error 6)"
+    );
+}
+
 /// The process was gone when the open came: it has ended, so the kill waits for the manager to stop
 /// reporting it and returns. It does not ask what the service runs now.
 #[skuld::test]
 fn a_process_gone_before_it_was_opened_is_waited_for_in_the_manager_and_not_followed() {
     let mut target = Scripted::new([Some(100), Some(200)], [Open::Gone]);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
-    assert_eq!(target.log(), steps(["service_pid", "open 100", "await_recorded 100"]));
-}
-
-/// The manager reports another process by the confirmation: the one held has ended, and is waited
-/// for through the hold, which is the kill's one process. The new one is not opened, and nothing is
-/// signalled.
-#[skuld::test]
-fn another_pid_at_the_confirmation_ends_the_kill_with_the_held_process_waited_for() {
-    let mut target = Scripted::new([Some(100), Some(200)], [Open::Found]);
-
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
-        steps(["service_pid", "open 100", "service_pid", "await_exit 100", "close 100"])
+        steps(["service_pid", "open 100", "await_recorded 100 unheld"])
+    );
+}
+
+/// The manager reports another process by the confirmation: it has moved off the one held, which is
+/// either gone or a stranger that took its pid, so it is not waited for. The hold is let go, the new
+/// process is not opened and nothing is signalled.
+#[skuld::test]
+fn another_pid_at_the_confirmation_ends_the_kill_and_the_held_process_is_not_waited_for() {
+    let mut target = Scripted::new([Some(100), Some(200)], [Open::Found]);
+
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "service_pid", "close 100"])
     );
 }
 
@@ -227,10 +308,10 @@ fn another_pid_at_the_confirmation_ends_the_kill_with_the_held_process_waited_fo
 fn no_pid_at_the_confirmation_ends_the_kill_and_is_not_a_service_with_no_process() {
     let mut target = Scripted::new([Some(100), None], [Open::Found]);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log(),
-        steps(["service_pid", "open 100", "service_pid", "await_exit 100", "close 100"])
+        steps(["service_pid", "open 100", "service_pid", "close 100"])
     );
 }
 
@@ -240,7 +321,7 @@ fn a_restart_during_the_kill_is_not_followed() {
     // `opens` holds one entry: a second `open` would panic.
     let mut target = Scripted::new([Some(100), Some(100), Some(200), Some(300)], [Open::Found]);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
     assert_eq!(
         target.log().iter().filter(|call| call.starts_with("terminate")).count(),
         1
@@ -253,7 +334,7 @@ fn a_restart_during_the_kill_is_not_followed() {
 fn an_open_that_failed_on_a_pid_the_manager_moved_off_is_an_ended_process() {
     let mut target = Scripted::new([Some(100), Some(200)], [Open::Fails]);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
 }
 
@@ -261,7 +342,7 @@ fn an_open_that_failed_on_a_pid_the_manager_moved_off_is_an_ended_process() {
 fn an_open_that_failed_on_a_service_that_stopped_is_an_ended_process() {
     let mut target = Scripted::new([Some(100), None], [Open::Fails]);
 
-    assert_eq!(kill_service(&mut target).unwrap(), KillOutcome::Ended);
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
 }
 
 /// The manager still vouches for the pid and it cannot be opened: that is a refusal, and it is reported.
@@ -269,7 +350,7 @@ fn an_open_that_failed_on_a_service_that_stopped_is_an_ended_process() {
 fn an_open_that_failed_on_the_services_own_pid_is_an_error() {
     let mut target = Scripted::new([Some(100)], [Open::Fails]);
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, ID).unwrap_err();
 
     assert_eq!(e.to_string(), "access denied");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
@@ -282,7 +363,7 @@ fn an_open_that_failed_on_the_services_own_pid_is_an_error() {
 fn a_failed_first_read_is_an_error_and_touches_nothing() {
     let mut target = Scripted::new([Some(100)], []).failing_read(1);
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, ID).unwrap_err();
 
     assert_eq!(e.to_string(), "manager read failed");
     assert_eq!(target.log(), steps(["service_pid"]));
@@ -293,7 +374,7 @@ fn a_failed_first_read_is_an_error_and_touches_nothing() {
 fn a_failed_read_after_a_refused_open_reports_both_errors() {
     let mut target = Scripted::new([Some(100)], [Open::Fails]).failing_read(2);
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, ID).unwrap_err();
 
     assert_eq!(
         e.to_string(),
@@ -311,7 +392,7 @@ fn a_failed_read_after_a_refused_open_reports_both_errors() {
 fn a_failed_confirming_read_closes_the_process_and_signals_nothing() {
     let mut target = Scripted::new([Some(100)], [Open::Found]).failing_read(2);
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, ID).unwrap_err();
 
     assert_eq!(e.to_string(), "manager read failed");
     assert_eq!(
@@ -339,7 +420,7 @@ fn assert_signalled_but_unconfirmed(e: &io::Error, cause: &str, kind: io::ErrorK
 fn a_failed_record_wait_after_the_signal_says_the_signal_was_delivered() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]).failing_recorded();
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, ID).unwrap_err();
 
     assert_signalled_but_unconfirmed(&e, "manager read failed", READ_FAILED_KIND);
     assert_eq!(
@@ -360,7 +441,7 @@ fn a_failed_record_wait_after_the_signal_says_the_signal_was_delivered() {
 fn a_failed_wait_for_the_exit_says_the_signal_was_delivered_and_waits_for_no_record() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]).failing_exit();
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, ID).unwrap_err();
 
     assert_signalled_but_unconfirmed(&e, "wait on the process failed", io::ErrorKind::Other);
     assert!(!target.log().contains(&"await_recorded 100".to_string()));
@@ -371,7 +452,7 @@ fn a_failed_wait_for_the_exit_says_the_signal_was_delivered_and_waits_for_no_rec
 fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
     let mut target = Scripted::new([Some(100)], [Open::Gone]).failing_recorded();
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, ID).unwrap_err();
 
     assert_eq!(e.to_string(), "manager read failed");
 }
@@ -380,7 +461,7 @@ fn a_failed_record_wait_for_a_process_found_gone_is_not_called_a_signal() {
 fn a_failed_signal_is_an_error_and_waits_for_nothing() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]).failing_terminate();
 
-    let e = kill_service(&mut target).unwrap_err();
+    let e = kill_service(&mut target, ID).unwrap_err();
 
     assert_eq!(e.to_string(), "terminate failed");
     assert_eq!(
@@ -399,17 +480,20 @@ fn a_failed_signal_is_an_error_and_waits_for_nothing() {
 fn a_record_the_manager_does_not_make_by_the_deadline_expires_the_hold() {
     let mut target = Scripted::new([Some(100)], [Open::Gone]).expiring_recorded();
 
-    let error = hold_once(&mut target, spent()).expect_err("an expired hold");
+    let error = hold_once(&mut target, Budget::Immediate.start()).expect_err("an expired hold");
 
     assert!(matches!(error, HoldError::Expired { pid: 100 }), "{error:?}");
-    assert_eq!(target.log(), steps(["service_pid", "open 100", "await_recorded 100"]));
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "await_recorded 100 unheld"])
+    );
 }
 
 #[skuld::test]
 fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]);
 
-    let Ok(Hold::Held { pid, process }) = hold_once(&mut target, unbounded()) else {
+    let Ok(Hold::Held { pid, process }) = hold_once(&mut target, Budget::Unbounded.start()) else {
         panic!("a held process");
     };
 
