@@ -28,7 +28,7 @@ jobs:
           MSG: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
-          sel="$(grep -o 'legs:.*' <<<"$MSG" | head -n1 | sed 's/^legs://' || true)"
+          sel="$(grep -oE 'legs:[ a-z0-9-]*' <<<"$MSG" | head -n1 | sed 's/^legs://' || true)"
           sel="${sel:-all}"
           echo "selection: $sel"
           matrix="$(jq -c --arg sel "$sel" '{include: [.[] | select(($sel | test("(^| )all( |$)")) or ([.name] | inside($sel | split(" "))))]}' probe/taskschd/legs.json)"
