@@ -360,10 +360,11 @@ fn update_plan_table() {
             vec![CreateTimerFirst, ReplaceJob, BootstrapTimer],
         ),
         (
-            "schedule dropped, armed: the timer goes before the job is replaced",
+            "schedule dropped, armed: the timer goes before the job is replaced, and the job leaves the enabled \
+             directory, as there is nothing left to arm",
             installed(&scheduled("a", "30 3 * * *"), true, BOTH),
             unscheduled("a"),
-            vec![BootoutTimer, RemoveTimer, ReplaceJob],
+            vec![BootoutTimer, RemoveTimer, MoveJobToStaging, ReplaceJob],
         ),
         (
             "schedule dropped, disarmed",
@@ -372,7 +373,7 @@ fn update_plan_table() {
             vec![RemoveTimer, ReplaceJob],
         ),
         (
-            "schedule dropped and command changed, armed",
+            "schedule dropped and command changed, armed: the job is staged, so it is not loaded again",
             installed(&scheduled("a", "30 3 * * *"), true, BOTH),
             unscheduled("b"),
             vec![
@@ -380,8 +381,8 @@ fn update_plan_table() {
                 CheckJobIdle,
                 BootoutJob,
                 RemoveTimer,
+                MoveJobToStaging,
                 ReplaceJob,
-                BootstrapJob,
             ],
         ),
         (

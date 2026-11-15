@@ -739,6 +739,28 @@ fn dropping_the_schedule_removes_the_timer_before_the_job() {
     );
 }
 
+/// A task left with no timer has nothing to arm, so its job leaves the enabled directory: `status` then
+/// reports it as not enabled, as systemd does, and `enable` refuses it for the same reason.
+#[skuld::test]
+fn dropping_the_schedule_of_an_enabled_task_leaves_its_job_staged() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let new = task_spec(None);
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+    ]);
+
+    rewrite(&tree, &fake, &new).expect("dropping the schedule");
+
+    fake.assert_spent("the timer goes out, and nothing is loaded again");
+    assert_eq!(text_at(&tree, false, ID), plists_of(&new).job);
+    assert!(!exists(&tree, true, ID), "the job left the enabled directory");
+    assert!(!exists(&tree, true, &timer_name()) && !exists(&tree, false, &timer_name()));
+}
+
 /// A plist removed or moved between the read and the write is a change to re-run over, found before
 /// anything is sent that changes a job.
 #[skuld::test]

@@ -167,7 +167,8 @@ impl Old {
 ///   schedule edit.
 /// - A timer that is new is created before the job's files change, no-clobber, so a stranger's file at
 ///   its name refuses with nothing changed; one that is dropped is removed before the job is replaced.
-/// - A retype moves an enabled job to staging first: it drops arming and boot enrolment.
+/// - A retype, or a dropped schedule, moves an enabled job to staging first: it drops arming and boot
+///   enrolment, so `enabled` and `enable` agree that a task with no timer has nothing to arm.
 /// - A task that is enabled ends with its job and its timer loaded, the job first: what went out is
 ///   loaded again, a new timer is armed, and a plist launchd did not hold (an install that failed
 ///   after booting it out) is loaded now.
@@ -185,8 +186,8 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
     };
     let job_out = old.job_loaded && job_renders_differently;
     let timer_out = old.timer_loaded && (dropped || timer_renders_differently || job_out);
-    // A retype leaves nothing enabled.
-    let armed = !retype && old.enabled();
+    // A retype, or a dropped schedule, leaves nothing enabled: there is nothing to arm.
+    let armed = !retype && !dropped && old.enabled();
 
     let mut plan = Vec::new();
     let mut push = |condition: bool, action: Action| {
@@ -199,7 +200,7 @@ pub(crate) fn update_plan(old: &Old, new: &Plists, spec: &DaemonSpec) -> Vec<Act
     push(added, Action::CreateTimerFirst);
     push(job_out, Action::BootoutJob);
     push(dropped, Action::RemoveTimer);
-    push(retype && job.enabled, Action::MoveJobToStaging);
+    push((retype || dropped) && job.enabled, Action::MoveJobToStaging);
     push(job.text != new.job, Action::ReplaceJob);
     push(timer_differs, Action::ReplaceTimer);
     // An enabled task is loaded (`enable` loads it), so whatever launchd does not hold afterwards is

@@ -234,7 +234,8 @@ fn retyping_a_service_to_a_task_and_back(#[fixture(launchd_group)] _group: &Grou
     assert!(!status.common().enabled, "{status:?}");
 }
 
-/// A task with its schedule dropped has no timer, on disk or in launchd; its job is not touched.
+/// A task with its schedule dropped has no timer, on disk or in launchd; its job is not unloaded, but is
+/// no longer enabled.
 #[skuld::test]
 fn dropping_the_schedule_unloads_and_removes_the_timer(#[fixture(launchd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -251,9 +252,14 @@ fn dropping_the_schedule_unloads_and_removes_the_timer(#[fixture(launchd_group)]
     assert!(matches!(outcome, Outcome::Update { .. }), "{outcome:?}");
     assert!(!timer_enabled_path(&id).exists() && !timer_staging_path(&id).exists());
     assert!(!is_loaded(&timer_of(&id)), "the timer is not loaded");
-    assert!(is_loaded(&id), "the job is untouched");
+    assert!(is_loaded(&id), "the job is not unloaded");
+    assert!(
+        staging_path(&id).is_file() && !enabled_path(&id).exists(),
+        "nothing is left to arm"
+    );
     let status = task_status(&mgr, &task_id);
     assert_eq!(status.next_run, None, "{status:?}");
+    assert!(!status.common.enabled, "{status:?}");
 }
 
 // Arming and the timer ================================================================================================
