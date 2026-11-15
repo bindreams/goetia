@@ -56,6 +56,8 @@ struct tally {
     long passes;
     long token[MAXERR];  /* answers of proc_signal_with_audittoken(.., 0) */
     long killz[MAXERR];  /* answers of kill(pid, 0): errno, 0 on success */
+    long streak_hist[MAXERR]; /* consecutive EPERM answers before something else, by length */
+    long gone_kill[MAXERR];   /* kill(pid,0) at the ESRCH that ended a pass */
     long zombie_token[MAXERR], zombie_kill[MAXERR]; /* the answers once pbi_status read SZOMB */
     long eperm_passes;
     long eperm_status[8];
@@ -96,7 +98,7 @@ static void pass(int mode, struct tally *t) {
     char run[256];
     size_t rl = 0;
     int last = -2;
-    long iters = 0;
+    long iters = 0, streak = 0;
     run[0] = 0;
     for (;;) {
         audit_token_t tok = make_token(p, ver);
@@ -134,6 +136,11 @@ static void pass(int mode, struct tally *t) {
                 printf("  EPERM sample (mode %d): pbi_status=%d answers so far: %s\n", mode, st, run);
             }
         }
+        if (e == EPERM) streak++;
+        else if (streak) {
+            bump(t->streak_hist, (int)streak);
+            streak = 0;
+        }
         if (e == 0) continue;
         if (e == ESRCH || e == EPERM) {
             struct uniqid now;
@@ -144,7 +151,9 @@ static void pass(int mode, struct tally *t) {
                 if (e == ESRCH) { t->esrch_zombie++; break; }
                 continue; /* EPERM: keep asking until it resolves */
             }
+            if (e == EPERM) continue; /* identity unreadable: it is exiting. Keep signalling to the end. */
             t->ended_gone++;
+            bump(t->gone_kill, k);
             break;
         }
         break;
@@ -166,6 +175,12 @@ static void report(int mode, struct tally *t) {
     for (int e = 0; e < MAXERR; e++) {
         if (t->zombie_token[e]) printf("  to a zombie: token-signal answer %3d (%s): %ld\n", e, e ? strerror(e) : "ok", t->zombie_token[e]);
         if (t->zombie_kill[e]) printf("  to a zombie: kill(pid,0) answer  %3d (%s): %ld\n", e, e ? strerror(e) : "ok", t->zombie_kill[e]);
+    }
+    for (int n = 1; n < MAXERR; n++) {
+        if (t->streak_hist[n]) printf("  a run of %d EPERM answers, then another answer: %ld times\n", n, t->streak_hist[n]);
+    }
+    for (int e = 0; e < MAXERR; e++) {
+        if (t->gone_kill[e]) printf("  at the ending ESRCH, kill(pid,0) answered %d: %ld times\n", e, t->gone_kill[e]);
     }
     printf("  passes with a token-signal EPERM: %ld; passes with a kill() EPERM: %ld\n", t->eperm_passes,
            t->kill_eperm_passes);
