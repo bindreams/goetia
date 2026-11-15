@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 
 use crate::backend::scm::exit_status::Reported;
+use crate::error::Chain;
 
 use super::logging::Log;
 use super::service::TABLE_NAME;
@@ -32,7 +33,10 @@ pub(super) fn end_process(code: i32) -> ! {
     // SAFETY: the pseudo handle of the current process is always valid.
     if unsafe { TerminateProcess(GetCurrentProcess(), code as u32) } == 0 {
         let e = std::io::Error::last_os_error();
-        Log::real().failure(TABLE_NAME, &format!("end the shim's process with code {code}: {e}"));
+        Log::real().failure(
+            TABLE_NAME,
+            &format!("end the shim's process with code {code}: {}", Chain(&e)),
+        );
     }
     std::process::exit(code)
 }

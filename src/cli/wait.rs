@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use clap::Args as ClapArgs;
 
+use crate::error::Chain;
 use crate::manager::Budget;
 
 /// The flag pair every waiting verb flattens in.
@@ -74,7 +75,7 @@ pub(crate) fn reported(budget: Budget, confirmed: &'static str, requested: &'sta
 /// rejected for naming no unit.
 pub fn parse_timeout(raw: &str) -> std::result::Result<Duration, String> {
     humantime::parse_duration(raw)
-        .map_err(|source| format!("`{raw}` is not a duration (e.g. `30s`, `2m30s`): {source}"))
+        .map_err(|source| format!("`{raw}` is not a duration (e.g. `30s`, `2m30s`): {}", Chain(&source)))
 }
 
 #[cfg(test)]
