@@ -1,0 +1,11 @@
+# Runs `libsearch_guard::verify` on built executables, for CI to check the binaries it builds outside `cargo test`
+# (release, two-stage, installed). A workspace member, not a goetia target: it links only `libsearch-guard`, so
+# `cargo run -p verify-hardening` does not build goetia, and it is not packaged with goetia.
+[package]
+name = "verify-hardening"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libsearch-guard.workspace = true
