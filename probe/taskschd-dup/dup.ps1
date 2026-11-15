@@ -37,6 +37,9 @@ $allDow = 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'S
 
 $dayText = $d.ToString('yyyy-MM-dd')
 $due = "${dayText}T12:02:00"
+# The trigger's boundary is 90 days before D, as in M2 (whose boundary preceded every listed day): D is not its first day.
+$begun = $d.AddDays(-90).ToString('yyyy-MM-dd') + 'T12:02:00'
+$from = $d.AddDays(-90).ToString('yyyy-MM-dd')
 $marker = "${dayText}T12:06:00"
 $cases = [ordered]@{
     'multi-1to4-last'  = @{ W = $allWeeks; D = @($dow, $other); What = "weeks 1-4 + Last, {$dow, $other}" }
@@ -56,7 +59,7 @@ try {
 
     foreach ($k in $cases.Keys) {
         $log = "$Logs\dup-$k.log"; Remove-Item $log -ErrorAction SilentlyContinue
-        $trig = Cal (ByMonthDow $cases[$k].W $cases[$k].D) $due
+        $trig = Cal (ByMonthDow $cases[$k].W $cases[$k].D) $begun
         $xml = New-TaskXml -P $P -Command $Script:Exe -Arguments "act rec $log 0" -Triggers $trig -Policy 'Parallel'
         $t = Register-ProbeTask $folder $k $xml $P
         "registered $k ($($cases[$k].What)); NextRunTime=$($t.NextRunTime.ToString('o'))"
@@ -71,6 +74,8 @@ try {
     foreach ($k in $cases.Keys) {
         "--- $k"
         & $Script:Exe runtimes "$Script:TaskFolder\$k" $dayText $next 1000 | Where-Object { $_ -match '^(count|first|duplicates|weekdays|times)' }
+        "  over the 90 days before D as well (the listing's duplicates, as in M2):"
+        & $Script:Exe runtimes "$Script:TaskFolder\$k" $from $next 1000 | Where-Object { $_ -match '^(count|last|weekdays)' }
     }
 
     # The marker is due after every case's trigger: its line proves the cases' minute has passed.
