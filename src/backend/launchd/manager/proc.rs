@@ -1,6 +1,6 @@
 //! What the kernel says of the process a launch is, read through `libproc`: where it runs from, whether
 //! it is stopped, and when it started. `run` tells the launch its `debug` held from every other by these
-//! (see [`super::run`]), not by anything `launchctl print` says, which lags the launch.
+//! (see [`mod@super::run`]), not by anything `launchctl print` says, which lags the launch.
 //!
 //! Every read answers `None` for a process that is not there: no such pid, or one that has exited and is
 //! not yet reaped. Any other failure is an error, a refused read included.

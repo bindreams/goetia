@@ -374,6 +374,7 @@ fn the_fake_draws_an_announced_requests_listeners_from_the_reservation() {
 #[skuld::test]
 fn the_fake_makes_a_reply_at_the_call_after_the_entrys_action() {
     use fake::{Fake, exited, reply_at};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     let made = Arc::new(AtomicU32::new(0));
