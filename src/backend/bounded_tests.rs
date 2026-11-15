@@ -385,7 +385,8 @@ fn eperm() -> cosca::error::Error {
     io::Error::from_raw_os_error(libc::EPERM).into()
 }
 
-/// What cosca's `io_context` makes of an error: its text, and the error itself as the source.
+/// Imitates cosca 0.8's wrapping of an `EPERM` (its text, the error itself as the source); the macOS
+/// test with a real refused kill is what checks the real shape.
 #[derive(Debug, thiserror::Error)]
 #[error("pid 1: its identity could not be read; SIGKILL not sent")]
 struct Wrapped(#[source] io::Error);
@@ -412,30 +413,32 @@ fn only_eperm_is_a_refusal_a_child_on_its_way_out_gives() {
     }));
 }
 
-/// What was last read of the child after a refused kill is carried into the error, with the refusal
-/// as its source, and says what was seen, never that the child "runs on": a child still running when
-/// goetia stopped waiting and one whose liveness could not be read are told apart, and one that reads
-/// `Dead` is no error.
+/// A refused kill's error says what was last read of the child, with the refusal as its source. A
+/// child read `Dead` is no error, and is reported as having exited after the refusal.
 #[skuld::test]
 fn what_was_last_read_after_a_refused_kill_is_reported_with_the_refusal() {
     let said = |last| {
         let error = after_refusal(eperm(), last, EXIT_AFTER_REFUSED_KILL).expect_err("the child was not seen to exit");
         cosca::error::Report::new(&error).to_string()
     };
+    let bound = format!("{EXIT_AFTER_REFUSED_KILL:?}");
 
-    assert!(after_refusal(eperm(), Liveness::Dead, EXIT_AFTER_REFUSED_KILL).is_ok());
+    assert!(matches!(
+        after_refusal(eperm(), Liveness::Dead, EXIT_AFTER_REFUSED_KILL),
+        Ok(KillRootOutcome::ExitedAfterRefusal)
+    ));
     assert!(
-        said(Liveness::Alive).contains(
-            "the kill was refused (EPERM) and the process was still running when goetia stopped waiting, 5s later"
-        ),
+        said(Liveness::Alive).contains(&format!(
+            "the kill was refused (EPERM) and the process was still running when goetia stopped waiting, {bound} later"
+        )),
         "{}",
         said(Liveness::Alive)
     );
     assert!(
-        said(Liveness::Unknown).contains(
+        said(Liveness::Unknown).contains(&format!(
             "the kill was refused (EPERM) and whether the process was running could not be read when goetia \
-             stopped waiting, 5s later"
-        ),
+             stopped waiting, {bound} later"
+        )),
         "{}",
         said(Liveness::Unknown)
     );
@@ -529,9 +532,8 @@ mod refused_kill {
 
     /// The child traps SIGTERM and tells the test its descendant's pid only once the trap is set, so
     /// the hook's SIGTERM, standing for the exit that raced the kill, is answered with exit 7 and never
-    /// with the default action. What the trap writes is read back, so the output is read after the
-    /// exit. The descendant outlives the child unless the tree is ended: the test watches it die, and
-    /// kills it however the test ends.
+    /// with the default action. The descendant outlives the child unless the tree is ended: the test
+    /// watches it die, and kills it however the test ends.
     fn trapping(role: Role, trap: &str) -> (Spawned, KillOnDrop) {
         let mut cmd = sh(&format!("trap '{trap}' TERM; sleep 2147483647 & echo $! >&3; wait"));
         cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
@@ -541,31 +543,23 @@ mod refused_kill {
     }
 
     /// The child is exiting when the deadline's kill reaches it: the kill is refused, and the child
-    /// then exits within the bound. That is the child's own exit, as if it had ended before the kill
-    /// was sent, and its contained tree is ended all the same.
+    /// then exits within the bound. The call reports an expiry whatever the child's status, and its
+    /// contained tree is ended all the same.
     #[skuld::test]
-    fn a_kill_refused_at_the_deadline_by_a_child_that_then_exits_is_reported_exited() {
+    fn a_kill_refused_at_the_deadline_by_a_child_that_then_exits_is_reported_expired() {
         let (child, descendant) = trapping(Role::Query, "echo bye; exit 7");
         let _refused = test_hook::kill_fails(term_then_eperm);
 
         let finished = wait_bounded(child, Budget::Immediate.start());
 
-        match finished {
-            Ok(Finished::Exited { status, capture }) => {
-                assert_eq!(status.code(), Some(7));
-                assert_eq!(capture.stdout, b"bye\n");
-            }
-            other => panic!("expected the child's own exit, got {other:?}"),
-        }
+        assert!(matches!(finished, Ok(Finished::Expired)), "{finished:?}");
         // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
         descendant.0.wait().unwrap();
     }
 
-    /// The same refusal of an [`Role::AnnouncedRequest`], whose streams are pipes read as written: the
-    /// child's own exit, its tree ended, and a capture that says what the spent deadline left of it:
-    /// what was heard, not established whole.
+    /// The same refusal of an [`Role::AnnouncedRequest`], whose streams are pipes read as written.
     #[skuld::test]
-    fn a_kill_refused_at_the_deadline_of_an_announced_request_that_then_exits_is_reported_exited() {
+    fn a_kill_refused_at_the_deadline_of_an_announced_request_that_then_exits_is_reported_expired() {
         let mut cmd = sh("trap 'exit 7' TERM; sleep 2147483647 & echo $! >&3; echo 'request issued' >&2; wait");
         cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
         let mut child = spawned(cmd, Role::AnnouncedRequest(announced));
@@ -574,14 +568,7 @@ mod refused_kill {
 
         let finished = wait_bounded(child, Budget::Immediate.start());
 
-        match finished {
-            Ok(Finished::Exited { status, capture }) => {
-                assert_eq!(status.code(), Some(7));
-                assert!(announced(&capture.stderr), "{capture:?}");
-                assert!(!capture.complete, "the spent deadline ended the read: {capture:?}");
-            }
-            other => panic!("expected the child's own exit, got {other:?}"),
-        }
+        assert!(matches!(finished, Ok(Finished::Expired)), "{finished:?}");
         descendant.0.wait().unwrap();
     }
 
@@ -598,13 +585,16 @@ mod refused_kill {
             ))
         });
 
-        kill_root(&child.child, EXIT_AFTER_REFUSED_KILL).expect("the child exited, and its exit is not an error");
+        let ended =
+            kill_root(&child.child, EXIT_AFTER_REFUSED_KILL).expect("the child exited, and its exit is not an error");
+
+        assert!(matches!(ended, KillRootOutcome::ExitedAfterRefusal), "{ended:?}");
     }
 
     /// A child that stays after refusing the kill is a lost wait: the refusal, naming the bound on the
     /// wait for the child's exit, with the kill's own error as its source. The expiry of that wait is
-    /// not read as an exit. The bound is an argument of [`waited_out`] ([`EXIT_AFTER_REFUSED_KILL`] in
-    /// production), so this test does not wait out a real 5 s.
+    /// not read as an exit. The bound is an argument of [`waited_out`], so this test does not wait out
+    /// [`EXIT_AFTER_REFUSED_KILL`].
     #[skuld::test]
     fn a_deadline_kill_refused_by_a_child_that_stays_is_a_lost_wait_naming_the_bound() {
         let Spawned {
@@ -680,8 +670,7 @@ mod refused_kill {
     }
 
     /// A [`Left`] whose kill is refused by a child that stays still hands the child to its reaper,
-    /// which reaps it once it exits. The bound is `waited_out`'s argument, so this test does not wait
-    /// out a real 5 s.
+    /// which reaps it once it exits. The bound is `waited_out`'s argument, as above.
     #[skuld::test]
     fn a_left_request_that_cannot_be_ended_is_still_reaped() {
         let Requested { child, reaped } = requested(released_at_eof("exit 7"));
@@ -713,8 +702,8 @@ mod refused_kill {
     }
 
     /// A [`Left`] whose child stays after refusing the kill says it could not kill it, naming the
-    /// refusal and the bound `end_left` was given, so this test does not wait out a real 5 s. That
-    /// `waited_out` hands the `Left` its own bound is one captured line, which no test here observes.
+    /// refusal and the bound `end_left` was given. That `waited_out` hands the `Left` its own bound is
+    /// one captured line, which no test here observes.
     #[skuld::test]
     fn a_left_request_that_cannot_be_ended_says_so() {
         let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);

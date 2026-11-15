@@ -268,8 +268,7 @@ pub(crate) mod test_hook {
 
     /// Make this thread's next kill of a child refuse with `error(child)`: the setting is gone once
     /// that kill takes it, or when the returned guard drops first. The child receives no signal from
-    /// the kill: `error` may itself act on the child, as the world does between a kill's refusal and
-    /// the next look at the child.
+    /// the kill; `error` may act on the child (e.g. signal it) to stand in for an exit racing the kill.
     pub(crate) fn kill_fails(error: KillRefusal) -> Allowance<KillRefusal> {
         Allowance::set(&KILL_REFUSAL, error)
     }

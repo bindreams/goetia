@@ -1,7 +1,6 @@
 //! A setting one thread holds for the test hooks that refuse on demand: a count of how many of
-//! something it may make ([`spend`]), or a value a hook answers from ([`Allowance`]). A count stays
-//! until its guard drops; a value that a hook takes (the kill's refusal) is gone at its first use, or
-//! when its guard drops first.
+//! something it may make ([`spend`]), or a value a hook answers from ([`Allowance`]). It is cleared
+//! when its guard drops, or earlier if a hook takes it.
 
 use std::cell::Cell;
 use std::io;
