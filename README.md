@@ -15,7 +15,10 @@ may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
 On macOS goetia requires **14.4+**: `kill` holds the daemon's process by its
-identity, which the OS offers from 14.4. On Linux it requires **systemd 242+**
+identity, which the OS offers from 14.4. On Linux it requires **kernel 5.6+**,
+with `pidfd_open` and `openat2` not blocked by a seccomp profile or an LSM: the
+process library goetia runs `systemctl` with, and holds a daemon's process with
+for `kill`, needs both. It also requires **systemd 242+**
 (2019), and refuses to install, uninstall, start, stop, restart, enable or
 disable anything on an older one, before writing or running anything. It checks both the running systemd and the
 `systemctl` client, which is what parses `--show-transaction`. A running
@@ -1198,8 +1201,8 @@ return of `kill`, and a restart by SCM can overlap them.
 time limit: the exit of a process that was sent `SIGKILL` is an event, not a wait
 to bound. A process the kernel cannot end, one in uninterruptible sleep on a hung
 mount or in a stuck driver, keeps it waiting, as it keeps `stop` waiting; Ctrl-C
-ends the wait and the signal stands. On Windows, when the process has not exited
-yet, goetia prints `<id>: waiting for process <pid> to exit` to stderr.
+ends the wait and the signal stands. On every platform, when the process has not
+exited yet, goetia prints `<id>: waiting for process <pid> to exit` to stderr.
 
 A daemon with no process, whether stopped or between runs, is an error: exit
 `1` and "is not running", because nothing was killed. A launchd task whose
