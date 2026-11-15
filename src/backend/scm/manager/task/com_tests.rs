@@ -246,6 +246,23 @@ fn a_task_that_went_since_it_was_counted_is_skipped() {
     assert!(matches!(unless_gone(Ok(7_u32)), Ok(Some(7))));
 }
 
+// `get`'s read of a task it found: a "not found" from it says the task went after the lookup, the
+// lookup's own answer, so it is `None`; any other failure is the read's.
+#[skuld::test]
+fn a_task_that_went_during_get_s_read_is_none_and_any_other_failure_is_not() {
+    let read = Registered {
+        xml: "<Task/>".to_owned(),
+        data: "d".to_owned(),
+    };
+
+    assert_eq!(unless_gone(Ok(read.clone())).unwrap(), Some(read));
+    assert_eq!(
+        unless_gone::<Registered>(Err(error_of(ERROR_FILE_NOT_FOUND))).unwrap(),
+        None
+    );
+    assert!(unless_gone::<Registered>(Err(error_of(ERROR_ACCESS_DENIED))).is_err());
+}
+
 #[skuld::test]
 fn a_task_read_that_fails_for_another_reason_fails() {
     let failed = unless_gone::<u32>(Err(error_of(ERROR_ACCESS_DENIED))).unwrap_err();

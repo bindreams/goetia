@@ -354,18 +354,24 @@ impl Com {
 impl TaskApi for Com {
     fn get(&self, path: &TaskPath) -> Result<Option<Registered>> {
         let session = Session::open()?;
-        session.with_task(path.as_str(), "read the task", |task| {
-            // SAFETY: calls on live interfaces; `Data` fills the BSTR it is given.
-            unsafe {
-                let xml = task.Xml()?.to_string();
-                let mut data = BSTR::new();
-                task.Definition()?.Data(&mut data)?;
-                Ok(Registered {
-                    xml,
-                    data: data.to_string(),
-                })
-            }
-        })
+        // A "not found" from the read of a task the lookup found means it went since: the lookup's own
+        // answer. The operations (`stop`, `run`, instance reads) stay strict in `with_task`.
+        let read = session.with_task(path.as_str(), "read the task", |task| {
+            let read = || {
+                // SAFETY: calls on live interfaces; `Data` fills the BSTR it is given.
+                unsafe {
+                    let xml = task.Xml()?.to_string();
+                    let mut data = BSTR::new();
+                    task.Definition()?.Data(&mut data)?;
+                    Ok(Registered {
+                        xml,
+                        data: data.to_string(),
+                    })
+                }
+            };
+            unless_gone(read())
+        });
+        read.map(Option::flatten)
     }
 
     fn names(&self) -> Result<Vec<String>> {
