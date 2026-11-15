@@ -70,8 +70,9 @@ pub(in crate::backend::launchd::manager) fn mark_thread() -> Marked {
     // SAFETY: `pthread_self` has no preconditions.
     let id = unsafe { libc::pthread_self() };
     // Stores nothing where a mark is held, so a failed call leaves no mark behind.
-    let marked = MARKED_THREAD.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst);
-    assert!(marked.is_ok(), "a thread is marked already");
+    if let Err(held) = MARKED_THREAD.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst) {
+        panic!("thread {held:#x} is marked already");
+    }
     Marked {
         id,
         _unsend: PhantomData,
@@ -248,14 +249,18 @@ impl Drop for Running {
 }
 
 /// A thread joined when this drops, so that a test that fails does not leave it running into the next. It
-/// is declared before whatever the thread waits for, which then drops first.
+/// is declared before whatever the thread waits for, which then drops first. A panic of the thread fails
+/// the test with its own message, unless the test is failing already.
 #[derive(Default)]
 struct Joined(Option<JoinHandle<()>>);
 
 impl Drop for Joined {
     fn drop(&mut self) {
-        if let Some(thread) = self.0.take() {
-            _ = thread.join();
+        if let Some(thread) = self.0.take()
+            && let Err(payload) = thread.join()
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(payload);
         }
     }
 }
@@ -550,8 +555,7 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
         "the signal was held by the thread that closed the window"
     );
     release.send(()).expect("the closing thread is waiting");
-    let thread = closing.0.take().expect("the closing thread was spawned");
-    thread.join().expect("the closing thread");
+    drop(closing);
 }
 
 /// A window whose pipe cannot be made is an `Err` and installs nothing: no handler is ours, nothing is
