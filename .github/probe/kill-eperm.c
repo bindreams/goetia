@@ -56,6 +56,7 @@ struct tally {
     long passes;
     long token[MAXERR];  /* answers of proc_signal_with_audittoken(.., 0) */
     long killz[MAXERR];  /* answers of kill(pid, 0): errno, 0 on success */
+    long zombie_token[MAXERR], zombie_kill[MAXERR]; /* the answers once pbi_status read SZOMB */
     long eperm_passes;
     long eperm_status[8];
     long ended_zombie, ended_gone, never_identified, kill_eperm_passes;
@@ -94,7 +95,7 @@ static void pass(int mode, struct tally *t) {
     char run[256];
     size_t rl = 0;
     int last = -2;
-    long eperm_streak = 0;
+    long eperm_streak = 0, iters = 0;
     run[0] = 0;
     for (;;) {
         audit_token_t tok = make_token(p, ver);
@@ -102,7 +103,17 @@ static void pass(int mode, struct tally *t) {
          * child). Mode 3 sends SIGKILL, the signal cosca sends, after a random delay. */
         int e = proc_signal_with_audittoken(&tok, mode == 3 ? SIGKILL : SIGCONT);
         int k = kill(p, 0) == 0 ? 0 : errno;
+        int st0 = read_status(p); /* read after the answers: the child may have moved on since */
         bump(t->token, e);
+        if (st0 == 5) { /* SZOMB: what do the sends answer a zombie? */
+            bump(t->zombie_token, e);
+            bump(t->zombie_kill, k);
+            t->ended_zombie++;
+            if (e == EPERM) saw_eperm = 1;
+            break;
+        }
+        if (st0 < 0 && e != 0 && e != EPERM && e != ESRCH) break;
+        if (++iters > 5000000) { t->ended_gone += 1000000; break; } /* probe guard */
         bump(t->killz, k);
         if (e != last && rl + 12 < sizeof run) {
             rl += (size_t)snprintf(run + rl, sizeof run - rl, "%d,", e);
@@ -125,7 +136,6 @@ static void pass(int mode, struct tally *t) {
             if (r == 0 && now.p_uniqueid == unique) {
                 if ((uint32_t)now.p_idversion != ver) { ver = (uint32_t)now.p_idversion; continue; }
                 /* same unique id, same version, and the send was refused: ESRCH is a zombie. */
-                if (e == ESRCH) { t->ended_zombie++; break; }
                 if (++eperm_streak > 5000000) { t->ended_gone += 1000000; break; } /* probe guard */
                 continue; /* EPERM: keep asking until it resolves */
             }
@@ -147,6 +157,10 @@ static void report(int mode, struct tally *t) {
     }
     for (int e = 0; e < MAXERR; e++) {
         if (t->killz[e]) printf("  kill(pid,0) answer  %3d (%s): %ld\n", e, e ? strerror(e) : "ok", t->killz[e]);
+    }
+    for (int e = 0; e < MAXERR; e++) {
+        if (t->zombie_token[e]) printf("  to a zombie: token-signal answer %3d (%s): %ld\n", e, e ? strerror(e) : "ok", t->zombie_token[e]);
+        if (t->zombie_kill[e]) printf("  to a zombie: kill(pid,0) answer  %3d (%s): %ld\n", e, e ? strerror(e) : "ok", t->zombie_kill[e]);
     }
     printf("  passes with a token-signal EPERM: %ld; passes with a kill() EPERM: %ld\n", t->eperm_passes,
            t->kill_eperm_passes);
