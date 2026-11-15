@@ -305,6 +305,7 @@ jobs:
           else
             executables=("goetia-${TARGET}/goetia")
           fi
+          # A debug build: the checker needs no optimisation.
           cargo run -p verify-hardening --locked -- "${executables[@]}"
 
       # The staged goetia.exe alone must install, run and uninstall a

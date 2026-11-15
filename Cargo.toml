@@ -13,10 +13,12 @@ keywords = ["daemon", "service", "systemd", "launchd", "windows-service"]
 categories = ["command-line-utilities", "os"]
 exclude = ["/.github", "/.claude", "/.config", "/CLAUDE.md", "/scripts", "/prek.toml", "/.editorconfig", "/.gitattributes", "/.rustfmt.toml"]
 
-# `tools/verify-hardening` shares this lock, target directory and lint gates. It is not packaged (a
+# `tools/verify-hardening` shares this lock, target directory, fmt and clippy. It is not packaged (a
 # directory with its own manifest is left out) and a bare `cargo` command at the root still builds only goetia.
 [workspace]
 members = ["tools/verify-hardening"]
+# Worktrees and scratch crates under `.tmp` are their own roots, not members.
+exclude = [".tmp"]
 
 # One requirement, for the build script, the tests and `tools/verify-hardening`.
 [workspace.dependencies]
