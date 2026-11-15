@@ -52,6 +52,16 @@ pub(crate) fn stream(
 
 // Log file ============================================================================================================
 
+/// The length of `path`, which is where a run's output to it begins; a file that is not there is
+/// empty.
+pub(crate) fn length_of(path: &Path) -> Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(Error::os_at("read the length of", path, e)),
+    }
+}
+
 /// Shows `path` from `offset` as it grows. The run's end is looked for first and the file read after
 /// it, so a line written before the end is shown whatever `TAIL_INTERVAL` is.
 ///
@@ -319,13 +329,14 @@ impl Marked {
     /// The run has ended and the file is read to its end.
     ///
     /// A run whose marker was not found after the offset may have begun before the offset was
-    /// measured: a timer started it between the state read and the request, and the request joined it.
-    /// Its marker is then earlier in the file, so the file is read again from its start for it. The
-    /// line is exact: it holds the run's own `INVOCATION_ID`, which no other run writes, so the first
-    /// match is the only one. A run still without one gets a note, unless `exit_recorded` is false.
+    /// measured, where the marker says it can ([`Marker::earlier_start_possible`]): a timer started it
+    /// between the state read and the request, and the request joined it. Its marker is then earlier in
+    /// the file, so the file is read again from its start for it. The line is exact: it holds the run's
+    /// own id, which no other run writes, so the first match is the only one. A run still without one
+    /// gets a note, unless `exit_recorded` is false.
     fn finish(mut self, path: &Path, exit_recorded: bool, out: &mut dyn Write) -> Result<()> {
         self.flush(out)?;
-        let marked = if self.phase == Phase::Seeking {
+        let marked = if self.phase == Phase::Seeking && self.marker.earlier_start_possible {
             let mut again = Marked::new(self.marker);
             read_new(path, 0, Some(&mut again), out)?;
             again.flush(out)?;
@@ -337,8 +348,8 @@ impl Marked {
             note(
                 out,
                 &format!(
-                    "note: the marker line of this run is not in {}, so its output is not shown: the file was \
-                     emptied or replaced after the run began\n",
+                    "note: the marker line of this run is not in {}, so its output is not shown: the run ended \
+                     before it wrote its marker, or the file was emptied or replaced after the run began\n",
                     path.display()
                 ),
             )?;

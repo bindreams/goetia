@@ -96,7 +96,12 @@ fn held(mgr: &Systemd) -> Held {
 fn begin(journal: &JournalFake, client: &Fake) -> Result<Run> {
     let mgr = manager(client, Fake::new([]), journal.clone());
     let mut held = held(&mgr);
-    Backend::begin_run(&mgr, fragment(&task_spec("x", "/bin/a", None)), &mut held)
+    Backend::begin_run(
+        &mgr,
+        fragment(&task_spec("x", "/bin/a", None)),
+        &mut held,
+        &mut std::io::sink(),
+    )
 }
 
 fn start() -> Reply {
@@ -289,7 +294,9 @@ fn a_reservation_that_cannot_be_made_sends_nothing() {
         let mgr = manager(&client, Fake::new([]), journal.clone());
         let mut held = held(&mgr);
 
-        let e = Backend::begin_run(&mgr, fragment(&spec), &mut held).err().expect(what);
+        let e = Backend::begin_run(&mgr, fragment(&spec), &mut held, &mut std::io::sink())
+            .err()
+            .expect(what);
 
         assert!(matches!(e, Error::Reservation { id: Some(_), .. }), "{what}: {e:?}");
         assert!(client.calls().is_empty(), "{what}: {:?}", client.calls());
@@ -306,7 +313,8 @@ fn a_reservation_that_cannot_be_made_sends_nothing() {
         let mgr = manager(&gate_then([start()]), Fake::new([]), journal);
         let mut held = held(&mgr);
 
-        Backend::begin_run(&mgr, fragment(&spec), &mut held).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+        Backend::begin_run(&mgr, fragment(&spec), &mut held, &mut std::io::sink())
+            .unwrap_or_else(|e| panic!("{what}: {e:?}"));
     }
 }
 
@@ -325,8 +333,13 @@ fn log_source(run: &Run) -> (std::path::PathBuf, u64) {
         OutputSource::LogFile { path, offset, marker } => {
             let marker = marker.expect("a systemd task's runs write a marker to the file too");
             assert_eq!(
-                (marker.prefix, marker.line.as_str(), marker.id_len),
-                ("goetia-run", "goetia-run inv", 32)
+                (
+                    marker.prefix,
+                    marker.line.as_str(),
+                    marker.id_len,
+                    marker.earlier_start_possible
+                ),
+                ("goetia-run", "goetia-run inv", 32, true)
             );
             (path, offset)
         }
@@ -351,7 +364,8 @@ fn the_log_offset_is_measured_before_the_request() {
     let mgr = manager(&client, Fake::new([]), journal.clone());
     let mut held = held(&mgr);
 
-    let run = Backend::begin_run(&mgr, fragment(&logged_task(&path)), &mut held).expect("begin_run");
+    let run =
+        Backend::begin_run(&mgr, fragment(&logged_task(&path)), &mut held, &mut std::io::sink()).expect("begin_run");
 
     assert_eq!(log_source(&run), (path.clone(), earlier));
     assert!(std::fs::metadata(&path).unwrap().len() > earlier, "the request wrote");
@@ -371,7 +385,8 @@ fn a_log_file_that_is_not_there_is_offset_zero() {
     let mgr = manager(&client, Fake::new([]), journal);
     let mut held = held(&mgr);
 
-    let run = Backend::begin_run(&mgr, fragment(&logged_task(&path)), &mut held).expect("begin_run");
+    let run =
+        Backend::begin_run(&mgr, fragment(&logged_task(&path)), &mut held, &mut std::io::sink()).expect("begin_run");
 
     assert_eq!(log_source(&run), (path, 0));
 }
@@ -386,9 +401,14 @@ fn a_log_whose_length_cannot_be_read_fails_before_anything_is_sent() {
     let mgr = manager(&client, Fake::new([]), JournalFake::new(Vec::new()));
     let mut held = held(&mgr);
 
-    let e = Backend::begin_run(&mgr, fragment(&logged_task(&file.join("job.log"))), &mut held)
-        .err()
-        .expect("the length cannot be read");
+    let e = Backend::begin_run(
+        &mgr,
+        fragment(&logged_task(&file.join("job.log"))),
+        &mut held,
+        &mut std::io::sink(),
+    )
+    .err()
+    .expect("the length cannot be read");
 
     assert!(matches!(e, Error::Os { .. }), "{e:?}");
     assert!(client.calls().is_empty(), "{:?}", client.calls());

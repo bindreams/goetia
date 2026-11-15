@@ -21,7 +21,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::backend::Identity;
+use crate::backend::{Identity, RUN_MARKER, refuse_env_sh_resets};
 use crate::blob::{self, Blob, MARKER};
 use crate::error::Error;
 use crate::spec::{
@@ -153,7 +153,7 @@ fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
 /// look like a guarantee.
 fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
     refuse_unrepresentable(&task.common, id)?;
-    refuse_env_sh_resets(&task.common)?;
+    refuse_env_sh_resets(&task.common, &RESET_BY_SH, "a task")?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
@@ -295,29 +295,10 @@ fn refuse_unrepresentable(common: &DaemonFields, id: &Identity) -> Result<(), Er
     }
 }
 
-/// What a task's run prints first, followed by the run's invocation id: `run` finds its run's
-/// stream in the journal by the line `<RUN_MARKER> <INVOCATION_ID>`.
-pub(crate) const RUN_MARKER: &str = "goetia-run";
-
 /// The variables `/bin/sh` resets or removes on its way to the program (measured on dash and bash
 /// 5.2: the KB note "A sh exec wrapper adds PWD, and under bash SHLVL=0, to the program's environment
 /// and resets IFS"), so a task cannot pass them.
 const RESET_BY_SH: [&str; 6] = ["IFS", "PWD", "SHLVL", "PS4", "_", "OLDPWD"];
-
-/// Refuse an `env` of a task that sets a variable `sh` resets: the program would not see the value.
-fn refuse_env_sh_resets(common: &DaemonFields) -> Result<(), Error> {
-    match RESET_BY_SH.iter().find(|name| common.env.contains_key(**name)) {
-        Some(name) => Err(Error::Invalid {
-            daemon: common.id.to_string(),
-            message: format!(
-                "`env` sets `{name}`, but a task starts through /bin/sh, which resets it, so the program \
-                 would not see the value"
-            ),
-            source: None,
-        }),
-        None => Ok(()),
-    }
-}
 
 /// A task's `ExecStart=` value: `/bin/sh` prints [`RUN_MARKER`] and the run's `INVOCATION_ID`, then
 /// execs the command. `command` follows as the script's `$0` (the program, so its `argv[0]` is the

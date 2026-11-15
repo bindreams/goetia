@@ -7,25 +7,25 @@
 //! the tests that change journald's configuration share the `JOURNALD_CONFIG` label, so that no two of
 //! them overlap where tests run in parallel.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead as _, BufReader, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::Error;
 use goetia::backend::systemd::manager::Systemd;
 use goetia::cli::ExitCode;
 use goetia::decide::Outcome;
-use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status, TaskStatus};
-use goetia::spec::{DaemonSpec, HashSeed, Id, Schedule, TaskSpec, User};
+use goetia::manager::{Budget, Exit, Installed, ServiceManager, State, Status};
+use goetia::spec::{DaemonSpec, HashSeed, Schedule, TaskSpec, User};
 use serde_json::Value;
 
-use crate::linux::{
-    CreatedRoot, UNIT_DIR_EXCLUSIVE, create_root, exiting, main_pid, mkfifo, task_status, timer_path,
-    timer_wants_symlink,
-};
+use crate::linux::{CreatedRoot, UNIT_DIR_EXCLUSIVE, create_root, exiting, main_pid, timer_path, timer_wants_symlink};
 use crate::support::cleanup::{remove_or_warn, warn_left_behind};
+use crate::support::cron_oracle::assert_next_run;
+use crate::support::tasks::{
+    Held, Lines, assert_same_text, id_of, run_task, sh, status_with_result, task_status, with_logs,
+};
 use crate::support::{self, Group, ServiceGuard, cmd, cron_oracle, kill, systemd_group};
 
 /// Held by the tests that rewrite journald's configuration (and restart it) while they run.
@@ -37,83 +37,12 @@ const STARTING: &str = "7d4958e842da4a758f6c1cdc7b36dcc5";
 
 // Fixtures ============================================================================================================
 
-fn id_of(id: &str) -> Id {
-    Id::try_from(id).unwrap_or_else(|e| panic!("`{id}` is not an id: {e}"))
-}
-
 fn unit_of(id: &str) -> String {
     format!("{id}.service")
 }
 
-fn sh(script: &str) -> Vec<String> {
-    ["/bin/sh", "-c", script].map(String::from).to_vec()
-}
-
 fn task(id: &str, command: Vec<String>, schedule: Option<&str>) -> DaemonSpec {
     goetia::testing::task(id, command, schedule)
-}
-
-/// `spec` with its output going to `logs`.
-fn with_logs(spec: DaemonSpec, logs: &Path) -> DaemonSpec {
-    let DaemonSpec::Task(task) = spec else {
-        panic!("`with_logs` is given a task");
-    };
-    let mut fields = task.into_fields();
-    fields.common.logs = Some(logs.to_path_buf());
-    TaskSpec::new(fields).expect("a task with logs").into()
-}
-
-/// A task that is in flight until the test releases it. It prints `ready`, announces itself on a FIFO
-/// and waits for the test to open the other. The announcing FIFO is opened read-write here, so the
-/// task's write never waits for the test to read it: [`Held::wait_started`] reads it when it wants to
-/// know a run has begun, once per run. Released, the run exits 0.
-struct Held {
-    started: BufReader<File>,
-    hold: PathBuf,
-    command: Vec<String>,
-    _dir: tempfile::TempDir,
-}
-
-impl Held {
-    fn new() -> Held {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (started, hold) = (dir.path().join("started"), dir.path().join("hold"));
-        mkfifo(&started);
-        mkfifo(&hold);
-        let announce = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&started)
-            .expect("open the announcing FIFO");
-        let script = format!(
-            "echo ready; echo started > \"{}\"; read line < \"{}\"; exit 0",
-            started.display(),
-            hold.display()
-        );
-        Held {
-            started: BufReader::new(announce),
-            hold,
-            command: sh(&script),
-            _dir: dir,
-        }
-    }
-
-    /// Blocks until the next run has printed `ready`. A run that never starts hangs the test.
-    fn wait_started(&mut self) {
-        let mut line = String::new();
-        self.started.read_line(&mut line).expect("read the announcing FIFO");
-        assert_eq!(line, "started\n");
-    }
-
-    /// Lets the run in flight end. Blocks until the run is waiting for it, so only call it while one is.
-    fn release(&self) {
-        drop(
-            OpenOptions::new()
-                .write(true)
-                .open(&self.hold)
-                .expect("open the hold FIFO"),
-        );
-    }
 }
 
 /// Stops `unit` on drop, so a thread waiting for a held run can end when its test panics.
@@ -188,27 +117,6 @@ impl Drop for JournaldConf {
     }
 }
 
-/// What `run` shows, and how it ended.
-fn run_task(mgr: &Systemd, id: &Id) -> (Exit, Vec<u8>) {
-    let mut out = Vec::new();
-    let exit = mgr
-        .run(id, &mut out)
-        .unwrap_or_else(|e| panic!("run {id}: {}", e.report()));
-    (exit, out)
-}
-
-/// The status of `id` once its newest run has a result.
-fn status_with_result(mgr: &Systemd, id: &Id) -> TaskStatus {
-    let mut found = None;
-    kill::until(|| {
-        let status = task_status(mgr, id);
-        let done = status.last_result.is_some();
-        found = Some(status);
-        done
-    });
-    found.expect("a status was read")
-}
-
 /// The entries `journalctl` holds for `matches`, oldest first, as JSON objects.
 fn journal(matches: &[&str]) -> Vec<Value> {
     cmd::run("journalctl", &["--sync"]).expect_ok();
@@ -256,24 +164,48 @@ fn counted(count: u32) -> Vec<u8> {
     (1..=count).flat_map(|n| format!("{n}\n").into_bytes()).collect()
 }
 
-/// A diff small enough to read: the first line where `got` and `want` differ.
-fn assert_same_text(run: usize, got: &[u8], want: &[u8]) {
-    if got == want {
-        return;
-    }
-    let (got, want) = (String::from_utf8_lossy(got), String::from_utf8_lossy(want));
-    let (mut got_lines, mut want_lines) = (got.lines(), want.lines());
-    let mut line = 1;
-    loop {
-        match (got_lines.next(), want_lines.next()) {
-            (a, b) if a == b => line += 1,
-            (a, b) => panic!(
-                "run {run}: the output differs at line {line}: got {a:?}, want {b:?} ({} lines against {})",
-                got.lines().count(),
-                want.lines().count()
-            ),
+/// The stdout lines of `id`'s newest run, as the journal stores them: the entries of the stream the
+/// unit's newest stdout entry is in (a run has one `_STREAM_ID`, and a run is over when `run` has
+/// returned). `run` shows the journal as stored, which journald can store with a line twice across
+/// a file rotation (systemd/systemd#29016), so this, and not `seq`'s text, is what `run` is compared
+/// with. Without the stream's first line, the `goetia-run` marker the unit's wrapper prints, which
+/// `run` does not show.
+fn newest_stream_text(id: &str) -> Vec<u8> {
+    let unit = format!("_SYSTEMD_UNIT={}", unit_of(id));
+    let newest = journal(&[&unit, "_TRANSPORT=stdout", "-r", "-n", "1"]);
+    let stream = field(newest.first().expect("a run wrote a stdout line"), "_STREAM_ID")
+        .expect("a stdout entry has a stream")
+        .to_string();
+    let lines: Vec<String> = journal(&[&format!("_STREAM_ID={stream}")])
+        .iter()
+        .map(|entry| field(entry, "MESSAGE").expect("a line of the run is text").to_string())
+        .collect();
+    let (marker, output) = lines.split_first().expect("a stream has its marker");
+    assert!(
+        marker.starts_with("goetia-run "),
+        "the stream starts with the marker: {marker}"
+    );
+    output
+        .iter()
+        .flat_map(|line| format!("{line}\n").into_bytes())
+        .collect()
+}
+
+/// Panics unless `got` holds every line of `want`, in order. Lines of its own besides are fine: the
+/// journal's duplicates are not `run`'s to remove.
+fn assert_holds_in_order(run: usize, got: &[u8], want: &[u8]) {
+    let mut wanted = want.split_inclusive(|&b| b == b'\n').peekable();
+    for line in got.split_inclusive(|&b| b == b'\n') {
+        if wanted.peek() == Some(&line) {
+            wanted.next();
         }
     }
+    let missing = wanted.next();
+    assert!(
+        missing.is_none(),
+        "run {run}: the journal lacks {:?} (and what follows it)",
+        missing.map(String::from_utf8_lossy)
+    );
 }
 
 /// The pids of this process's children that are `journalctl`, a zombie among them. The test binary is
@@ -293,24 +225,49 @@ fn journalctl_children() -> Vec<u32> {
         .collect()
 }
 
-/// Both ends of a schedule's next minute across a window: a timer armed anywhere in `[before, after]`
-/// reads one of them. `after` is taken once `next_run` has been read, so that a read that comes after
-/// the timer fired (its next run then the occurrence after) is still inside the window.
-fn expected_next_runs(text: &str, id: &Id, before: SystemTime, after: SystemTime) -> [SystemTime; 2] {
-    let seed = HashSeed {
-        hostname: "testing",
-        id,
-    };
-    let schedule = Schedule::parse(text, &seed).expect("a schedule");
-    [before, after].map(|at| cron_oracle::next_minute_after(&schedule, at))
+/// The local-time wall clock `year-month-day hour:minute` as a time, as the oracle reads it.
+fn local_time(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> SystemTime {
+    // SAFETY: an all-zero `tm` is a valid value.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_isdst = -1;
+    // SAFETY: `tm` is valid for the call.
+    let secs = unsafe { libc::mktime(&mut tm) };
+    UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).expect("a time after the epoch"))
 }
 
-fn assert_next_run(status: &TaskStatus, text: &str, id: &Id, before: SystemTime, after: SystemTime) {
-    let expected = expected_next_runs(text, id, before, after);
-    assert!(
-        status.next_run.is_some_and(|next| expected.contains(&next)),
-        "`{text}`: next_run {:?}, the cron says {expected:?}",
-        status.next_run
+fn parse_schedule(text: &str) -> Schedule {
+    let id = id_of("oracle-walk");
+    let seed = HashSeed {
+        hostname: "testing",
+        id: &id,
+    };
+    Schedule::parse(text, &seed).expect("a schedule")
+}
+
+/// A minute that matches at `before` is its own latest match, whether `before` is on it or inside it.
+#[skuld::test]
+fn the_latest_minute_at_or_before_includes_the_minute_of_before() {
+    let schedule = parse_schedule("* * * * *");
+    let minute = local_time(2026, 5, 20, 9, 41);
+
+    for before in [minute, minute + Duration::from_secs(25)] {
+        assert_eq!(cron_oracle::latest_minute_at_or_before(&schedule, before), minute);
+    }
+}
+
+/// The walk back crosses months: the 31st at midnight, looked for from mid-April, is 31 March.
+#[skuld::test]
+fn the_latest_minute_at_or_before_walks_back_across_months() {
+    let schedule = parse_schedule("0 0 31 * *");
+
+    assert_eq!(
+        cron_oracle::latest_minute_at_or_before(&schedule, local_time(2026, 4, 15, 12, 0)),
+        local_time(2026, 3, 31, 0, 0)
     );
 }
 
@@ -476,7 +433,9 @@ fn disable_leaves_a_run_in_flight_running(#[fixture(systemd_group)] _group: &Gro
     assert_eq!(status_with_result(&mgr, &task_id).last_result, Some(Exit::Code(0)));
 }
 
-/// An exit 0 unloads the unit, and the journal still says how the run went and when.
+/// An exit 0 unloads the unit, and the journal still says how the run went and when: `last_run` is
+/// the time of the unit's one "Starting" entry. (Not compared with a `SystemTime::now()` taken
+/// before the start: the wall clock of a VM can step back between two reads.)
 #[skuld::test]
 fn status_after_a_successful_run_reads_exit_0_from_the_journal(#[fixture(systemd_group)] _group: &Group) {
     let id = support::random_test_id();
@@ -485,13 +444,24 @@ fn status_after_a_successful_run_reads_exit_0_from_the_journal(#[fixture(systemd
     let mgr = Systemd::new();
     mgr.install(&task(&id, vec!["/bin/true".to_string()], None), false)
         .expect("install");
-    let before = SystemTime::now();
 
     mgr.start(&task_id, Budget::DEFAULT).expect("start");
 
     let status = status_with_result(&mgr, &task_id);
     assert_eq!(status.last_result, Some(Exit::Code(0)), "{status:?}");
-    assert!(status.last_run.is_some_and(|at| at >= before), "{status:?}");
+    let unit = format!("UNIT={}", unit_of(&id));
+    let starting = journal(&[&unit, &format!("MESSAGE_ID={STARTING}")]);
+    let [entry] = starting.as_slice() else {
+        panic!("a task run once has one Starting entry: {starting:?}");
+    };
+    let micros: u64 = field(entry, "__REALTIME_TIMESTAMP")
+        .and_then(|micros| micros.parse().ok())
+        .expect("an entry has a time");
+    assert_eq!(
+        status.last_run,
+        Some(SystemTime::UNIX_EPOCH + Duration::from_micros(micros)),
+        "{status:?}"
+    );
     assert_eq!(status.common.state, State::Idle, "{status:?}");
 }
 
@@ -540,18 +510,6 @@ fn start_of_a_task_while_it_runs_starts_nothing_new(#[fixture(systemd_group)] _g
 /// returns the signal.
 #[skuld::test]
 fn run_of_a_stopped_run_reports_sigterm(#[fixture(systemd_group)] _group: &Group) {
-    struct Lines(mpsc::Sender<Vec<u8>>);
-    impl Write for Lines {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.send(buf.to_vec()).map_err(std::io::Error::other)?;
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let task_id = id_of(&id);
@@ -842,7 +800,9 @@ fn run_returns_every_line_of_a_chatty_run(#[fixture(systemd_group)] _group: &Gro
         let (exit, out) = run_task(&mgr, &task_id);
 
         assert_eq!(exit, Exit::Code(0));
-        assert_same_text(n, &out, &want);
+        let journaled = newest_stream_text(&id);
+        assert_same_text(n, &out, &journaled);
+        assert_holds_in_order(n, &journaled, &want);
     }
 }
 
@@ -875,7 +835,8 @@ fn a_line_of_5000_bytes_and_a_control_byte_arrive_whole(#[fixture(systemd_group)
 }
 
 /// A run starts right behind a chatty one (the first run's lines can still be on their way to the
-/// journal) and shows none of its lines.
+/// journal) and shows none of its lines: what it shows is its own stream in the journal, which holds
+/// `second-run` and nothing of the first run's.
 #[skuld::test(labels = [JOURNALD_CONFIG], serial = JOURNALD_CONFIG)]
 fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(systemd_group)] _group: &Group) {
     let _journald = JournaldConf::unlimited();
@@ -894,11 +855,21 @@ fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(systemd_group)] _gr
 
     for n in 1..=20 {
         let (_, out) = run_task(&mgr, &task_id);
-        assert_same_text(n, &out, &first);
+        let journaled = newest_stream_text(&id);
+        assert_same_text(n, &out, &journaled);
+        assert_holds_in_order(n, &journaled, &first);
 
         let (exit, out) = run_task(&mgr, &task_id);
         assert_eq!(exit, Exit::Code(0));
-        assert_same_text(n, &out, b"second-run\n");
+        let journaled = newest_stream_text(&id);
+        assert_same_text(n, &out, &journaled);
+        assert_holds_in_order(n, &journaled, b"second-run\n");
+        assert!(
+            journaled
+                .split_inclusive(|&b| b == b'\n')
+                .all(|line| line == b"second-run\n"),
+            "run {n}: the second run's stream holds a line of another run"
+        );
     }
 }
 

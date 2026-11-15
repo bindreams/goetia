@@ -12,7 +12,8 @@ use crate::error::Result;
 #[cfg(windows)]
 use crate::shim::{FolderCheck, HostCommand, ShimProvider, SweepFailure};
 use crate::spec::{
-    DaemonFields, DaemonSpec, HashSeed, Id, Protocol, Restart, Schedule, ServiceFields, TaskFields, TaskSpec, User,
+    CronField, DaemonFields, DaemonSpec, DayRule, HashSeed, Id, Protocol, Restart, Schedule, ServiceFields, TaskFields,
+    TaskSpec, User,
 };
 
 pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
@@ -28,6 +29,18 @@ pub fn run_all() -> ! {
     let mut runner = skuld::TestRunner::new();
     runner.libtest_names();
     runner.run()
+}
+
+/// Spawns `program` with `args` as the unix backends spawn `launchctl` and `systemctl`
+/// (`backend::bounded::command`: stdin from `/dev/null`, the process tree contained), and gives back the
+/// running child. A test of what that spawn does to the child (which process group it leaves it in) calls
+/// this, so that it follows the real spawn. Fails the calling test if the child cannot be spawned.
+#[cfg(unix)]
+pub fn spawn_contained(program: &str, args: &[&str]) -> cosca::Child {
+    crate::backend::bounded::command(program, args)
+        .unwrap_or_else(|e| panic!("cannot make the command `{program}`: {e}"))
+        .spawn()
+        .unwrap_or_else(|e| panic!("cannot spawn `{program}`: {e}"))
 }
 
 /// `sid` as Windows writes it. A SID Windows cannot show fails the calling test, naming its bytes:
@@ -101,6 +114,19 @@ pub fn task(id: &str, command: Vec<String>, schedule: Option<&str>) -> DaemonSpe
     TaskSpec::new(TaskFields { common, schedule })
         .unwrap_or_else(|e| panic!("`{id}` is not a valid task: {e}"))
         .into()
+}
+
+/// Whether `schedule` names the minute whose civil fields are given: `weekday` is 0 to 6, Sunday 0.
+/// The rule itself, a plain reading of the five resolved fields and the day rule, kept apart from
+/// the code that finds a next fire so a test can check one against the other.
+pub fn cron_matches(schedule: &Schedule, minute: u8, hour: u8, day: u8, month: u8, weekday: u8) -> bool {
+    let [minutes, hours, days, months, weekdays] = schedule.fields();
+    let has = |field: &CronField, value: u8| field.values.contains(&value);
+    let day_ok = match schedule.day_rule() {
+        DayRule::And => has(days, day) && has(weekdays, weekday),
+        DayRule::Or => has(days, day) || has(weekdays, weekday),
+    };
+    has(minutes, minute) && has(hours, hour) && has(months, month) && day_ok
 }
 
 /// A [`ShimProvider`] that records the calls it gets (`"preview"`, `"provide"`, `"sweep"`, in

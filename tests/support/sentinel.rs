@@ -32,6 +32,13 @@ pub const RUN_UNTIL_KILLED: &str = "--goetia-run-until-killed";
 #[cfg(unix)]
 pub const REPORT_UID: &str = "--goetia-report-uid";
 
+/// `<exe> --goetia-contained-child`: spawn `/bin/sleep 300` as goetia spawns `launchctl`
+/// (`goetia::testing::spawn_contained`, which is `backend::bounded::command`), print its pid and a
+/// newline on stdout, and block forever. A test that signals this process's group sees whether the child
+/// is in it.
+#[cfg(unix)]
+pub const CONTAINED_CHILD: &str = "--goetia-contained-child";
+
 /// `<exe> --goetia-service-host <service-name> <start-port> <stop-port>`:
 /// a minimal SCM-aware service. Without one, `sc start` would fail with
 /// ERROR_SERVICE_REQUEST_TIMEOUT and the registry probe would be claiming to
@@ -59,6 +66,8 @@ pub fn run_if_requested() -> bool {
             report_uid(args[2].parse().expect("port argument"));
             true
         }
+        #[cfg(unix)]
+        Some(CONTAINED_CHILD) => contained_child(),
         #[cfg(windows)]
         Some(SERVICE_HOST) => {
             windows::run(&args[2]);
@@ -93,6 +102,20 @@ fn report_uid(port: u16) {
         // SAFETY: `getuid` takes no arguments, reads no memory, and cannot fail.
         let uid = unsafe { libc::getuid() };
         log_failure(port, "write", write!(stream, "{uid}"));
+    }
+}
+
+#[cfg(unix)]
+fn contained_child() -> ! {
+    // A job-control shell's background job, or a harness, may have left SIGINT ignored: the test sends
+    // it to this process and means it to end the process.
+    // SAFETY: restoring a signal's default disposition touches no memory.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+    let child = goetia::testing::spawn_contained("/bin/sleep", &["300"]);
+    println!("{}", child.pid());
+    std::io::stdout().flush().expect("flush stdout");
+    loop {
+        std::thread::park();
     }
 }
 

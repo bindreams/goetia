@@ -144,20 +144,29 @@ fn the_recovery_says_the_request_was_not_cancelled_and_names_both_ways_to_wait_l
     assert!(recovery.contains("--no-timeout"), "{recovery}");
 }
 
-/// Only a non-zero `Bounded` budget can expire: `Immediate` and
-/// `Bounded(ZERO)` never waited, and `Unbounded` never ends. A backend that
-/// reaches this constructor with one of those has reported an expiry that
-/// provably cannot have happened.
+/// Only a `Bounded` budget can expire: `Immediate` never waited, and
+/// `Unbounded` never ends. A backend that reaches this constructor with one of
+/// those has reported an expiry that provably cannot have happened.
 #[skuld::test]
-#[should_panic(expected = "only a non-zero Bounded budget can expire")]
+#[should_panic(expected = "only a Bounded budget can expire")]
 fn timed_out_refuses_a_budget_that_cannot_expire() {
     let _ = timed_out("frpc", "running", Budget::Unbounded);
 }
 
 #[skuld::test]
-#[should_panic(expected = "only a non-zero Bounded budget can expire")]
-fn timed_out_refuses_a_zero_length_budget() {
-    let _ = timed_out("frpc", "running", Budget::Bounded(Duration::ZERO));
+#[should_panic(expected = "only a Bounded budget can expire")]
+fn timed_out_refuses_immediate() {
+    let _ = timed_out("frpc", "running", Budget::Immediate);
+}
+
+/// A zero-length bound is a bound that has run out: a launchd task's `stop` under it still waits for a
+/// queued start's pid and sends SIGTERM, and then reports the wait it did not make as an expiry.
+#[skuld::test]
+fn timed_out_accepts_a_zero_length_bound() {
+    match timed_out("frpc", "stopped", Budget::Bounded(Duration::ZERO)) {
+        crate::Error::WaitTimeout { waited, .. } => assert_eq!(waited, Duration::ZERO),
+        other => panic!("expected Error::WaitTimeout, got {other:?}"),
+    }
 }
 
 // process_timed_out ===================================================================================================
