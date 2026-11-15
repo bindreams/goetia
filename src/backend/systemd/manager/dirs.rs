@@ -65,3 +65,7 @@ pub(super) fn owner_of(user: &User) -> Result<Option<Owner>> {
     };
     Owner::new(found.0, found.1).map(Some)
 }
+
+#[cfg(test)]
+#[path = "dirs_tests.rs"]
+mod dirs_tests;

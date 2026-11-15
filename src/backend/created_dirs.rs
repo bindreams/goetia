@@ -7,7 +7,7 @@
 //!   itself makes directories in (`LogsDirectory=` and its kin). Anywhere else it is an error that
 //!   says to create it first: goetia makes nothing in a user's home or a prefix of its own. A path
 //!   that exists whole is used as it is, wherever it is and whoever owns it.
-//! - **Walk.** Where something is missing, [`walk`] resolves the path on descriptors, and every
+//! - **Walk.** Where something is missing, [`walk()`] resolves the path on descriptors, and every
 //!   directory and symlink it passed through must be root's: root does not create inside a directory
 //!   an account can rename, nor follow a link it can retarget.
 //! - **Making.** Each component is made `0700` by `mkdirat` under the descriptor of the one above,
@@ -75,9 +75,9 @@ impl Default for CreatedDirs {
 /// Whom a created directory is handed to.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Owner {
-    uid: Uid,
+    pub(crate) uid: Uid,
     /// `None` leaves the group as the creating process's.
-    gid: Option<Gid>,
+    pub(crate) gid: Option<Gid>,
 }
 
 impl Owner {

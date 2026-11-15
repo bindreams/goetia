@@ -47,7 +47,7 @@
 //! 5. **Parent directories.** `dirs::ensure_parent_dirs` makes the parents of `logs` and `cwd`
 //!    where they are missing (only under `/var/log`, `/var/lib` and `/var/cache`; elsewhere it
 //!    refuses), hands `cwd` to a non-root account, and refuses a log whose directory an account
-//!    other than root can write, while still elevated: see [`CreatedDirs`]. A missing log directory
+//!    other than root can write, while still elevated: see `CreatedDirs`. A missing log directory
 //!    fails the unit at start (`ENOENT` opening `StandardOutput=append:`), and a missing `cwd` fails
 //!    it with `200/CHDIR`. A path that exists is used as it is, because install is not a start.
 //!    systemd opens the log file as root before it drops privileges, and follows a symlink there: so
