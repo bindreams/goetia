@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::backend::launchd::manager::Launchd;
+use goetia::manager::ServiceManager as _;
 use goetia::testing::task;
 
 use crate::launchd::{Guard, print_job};
