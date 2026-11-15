@@ -205,16 +205,21 @@ fall1)
     show
     unload
     ;;
-fall3)
+fall3a)
     # The four shapes goetia's compiler emits (no date, Day, Month and Day, Weekday) at 01:30, in the fold. 2027-11-07 is a Sunday.
-    step "fall3 B1: 01:29:40 EDT, first pass of the fold" 110705292027.40 \
+    # The daily control c31 fires at 01:31 in the first pass; the Rescheduling lines show whether a second pass follows.
+    step "fall3a: 01:29:40 EDT, first pass of the fold" 110705292027.40 \
         s0:Hour=1,Minute=30 sd:Day=7,Hour=1,Minute=30 smd:Month=11,Day=7,Hour=1,Minute=30 sw:Weekday=0,Hour=1,Minute=30 \
         c31:Hour=1,Minute=31
-    wait_fires c31 1 300
+    wait_fires c31 1 150
     show
-    echo "=== STEP fall3 C: the clock jumps to 01:29:40 EST (06:29:40 UTC), second pass, after the entries were registered"
-    set_clock 110706292027.40
-    wait_fires c31 2 400
+    unload
+    ;;
+fall3b)
+    step "fall3b: 01:29:40 EST (06:29:40 UTC), second pass of the fold" 110706292027.40 \
+        s0:Hour=1,Minute=30 sd:Day=7,Hour=1,Minute=30 smd:Month=11,Day=7,Hour=1,Minute=30 sw:Weekday=0,Hour=1,Minute=30 \
+        c31:Hour=1,Minute=31
+    wait_fires c31 1 150
     show
     unload
     ;;
@@ -225,12 +230,6 @@ fall2_a)
 fall2_b)
     step "fall2 B3: 01:57:30 EDT, entries around the fold" 110705572027.30         d159:Hour=1,Minute=59 t059:Month=11,Day=7,Hour=0,Minute=59 t130:Month=11,Day=7,Hour=1,Minute=30         t159:Month=11,Day=7,Hour=1,Minute=59 t200:Month=11,Day=7,Hour=2,Minute=0 t201:Month=11,Day=7,Hour=2,Minute=1
     wait_fires d159 1 150
-    show
-    unload
-    ;;
-fall2_c)
-    step "fall2 B2: 01:29:40 EST (06:29:40 UTC), registered in the second pass" 110706292027.40         t130:Month=11,Day=7,Hour=1,Minute=30 t131:Month=11,Day=7,Hour=1,Minute=31
-    wait_fires t131 1 150
     show
     unload
     ;;
