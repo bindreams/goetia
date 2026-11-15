@@ -572,9 +572,28 @@ fn a_start_of_a_unit_at_its_start_limit_fails_and_says_so(#[fixture(systemd_grou
     };
 
     let report = e.report().to_string();
+    let unit = format!("{id}.service");
+    let shown = cmd::run(
+        "systemctl",
+        &[
+            "show",
+            "--property=ActiveState,SubState,Result,NRestarts,MainPID,ExecMainStatus",
+            "--",
+            &unit,
+        ],
+    );
+    let journal = cmd::run(
+        "journalctl",
+        &["-u", &unit, "--no-pager", "-n", "60", "-o", "short-precise"],
+    );
     assert!(
         report.to_lowercase().contains("start request repeated too quickly"),
-        "the error does not say the start limit was reached: {report}"
+        "PROBE after {} starts: {report}
+{}
+{}",
+        seen.len(),
+        shown.stdout,
+        journal.stdout
     );
 }
 
