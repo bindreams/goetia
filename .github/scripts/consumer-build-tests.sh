@@ -136,7 +136,7 @@ clap = "4"
 $pinned_crate = "=$pinned_version"
 
 # The build dependency is what the README tells a program that ships a stock shim; the dev
-# dependency runs `verify` on the result.
+# dependency runs verify on the result.
 [build-dependencies]
 libsearch-guard = "0.2"
 
