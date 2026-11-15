@@ -20,8 +20,9 @@ use crate::error::Result;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Instance {
     pub id: InstanceId,
-    /// The process of the run, or `None` while the engine has not started it.
-    pub pid: Option<u32>,
+    /// The process of the run. A listed instance always has one: an entry that no longer offers its
+    /// pid has ended and is not listed, and a pid of 0 is a failed read.
+    pub pid: u32,
 }
 
 /// What a registered task says of itself.
@@ -48,6 +49,7 @@ pub(crate) struct TaskInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Started {
     pub id: InstanceId,
+    /// `None` for a `Run` that started nothing: an action that cannot start still returns a GUID.
     pub pid: Option<u32>,
 }
 
@@ -98,13 +100,16 @@ pub(crate) trait TaskApi: Send + Sync {
 
     fn info(&self, path: &TaskPath) -> Result<TaskInfo>;
 
-    /// Starts the task now and returns the run it listed.
+    /// Starts the task now (`Run`) and returns the run it names. Never `RunEx` with
+    /// `TASK_RUN_IGNORE_CONSTRAINTS`: it bypasses `IgnoreNew`, so it would start a second instance
+    /// beside a run that is alive.
     fn run(&self, path: &TaskPath) -> Result<Started>;
 
-    /// Asks Task Scheduler to end the run `instance`. A run it no longer lists is done. A run it lists
-    /// that has already ended makes Task Scheduler's `Stop` fail (`SCHED_E_TASK_NOT_RUNNING`, in every
-    /// measured case): that is returned as the call's own `Error::Os`, with the HRESULT in its source,
-    /// never as `NotInstalled`, for the caller to judge.
+    /// Asks Task Scheduler to end the run `instance`. A run that has ended is not listed, so it is
+    /// found nothing to stop and the call is `Ok`. A run that ends between the listing and the `Stop`
+    /// makes Task Scheduler fail the `Stop` with `SCHED_E_TASK_NOT_RUNNING`: that is returned as the
+    /// call's own `Error::Os`, with the HRESULT in its source, never as `NotInstalled`, and the
+    /// caller maps it (to `Ok`: the run is stopped).
     fn stop(&self, path: &TaskPath, instance: &InstanceId) -> Result<()>;
 }
 

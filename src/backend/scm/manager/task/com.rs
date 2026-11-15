@@ -224,6 +224,27 @@ fn instance_id(guid: &str) -> Result<InstanceId> {
     InstanceId::parse(guid).ok_or_else(|| Error::os("read an instance", format!("`{guid}` is not a GUID")))
 }
 
+/// The instance a listing entry names. L1: a listed instance always had a process, so a pid of 0 is
+/// a failed read, never a run that is alive.
+fn instance_of(guid: &str, pid: u32) -> Result<Instance> {
+    if pid == 0 {
+        return Err(Error::os(
+            "read an instance",
+            format!("the listing gives `{guid}` no process"),
+        ));
+    }
+    Ok(Instance {
+        id: instance_id(guid)?,
+        pid,
+    })
+}
+
+/// The process a `Run` started: `None` for a `Run` that started nothing (an action that cannot start
+/// returns a GUID and no process, M7), read as a pid of 0 or as the instance not running.
+fn started_pid(read: windows::core::Result<u32>) -> windows::core::Result<Option<u32>> {
+    Ok(unless_ended(read)?.filter(|&pid| pid != 0))
+}
+
 // The trait -----------------------------------------------------------------------------------------------------------
 
 impl Com {
@@ -292,8 +313,10 @@ impl Com {
         Ok(existed)
     }
 
-    /// The times `path` is to run between `from` and `to`, Task Scheduler's own answer (`GetRunTimes`).
-    /// Production never asks it; the schedule tests compare it with the cron they translated.
+    /// The times `path` is to run in the window `(from, to]`, Task Scheduler's own answer
+    /// (`GetRunTimes`). Both ends and every time returned are civil times in the machine's zone, as
+    /// every other date of Task Scheduler (M2), converted through the OS's own rules. Production never
+    /// asks it; the schedule tests compare it with the cron they translated.
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn run_times(&self, path: &TaskPath, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
         let range = |time| {
@@ -388,13 +411,7 @@ impl TaskApi for Com {
             .ok_or_else(|| not_installed(path))?;
         found
             .into_iter()
-            // L1: an instance the engine has not started has no process: pid 0.
-            .map(|(_, guid, pid)| {
-                Ok(Instance {
-                    id: instance_id(&guid)?,
-                    pid: (pid != 0).then_some(pid),
-                })
-            })
+            .map(|(_, guid, pid)| instance_of(&guid, pid))
             .collect()
     }
 
@@ -414,6 +431,8 @@ impl TaskApi for Com {
             .ok_or_else(|| not_installed(path))
     }
 
+    /// `Run`, never `RunEx` with `TASK_RUN_IGNORE_CONSTRAINTS`: that flag bypasses `IgnoreNew`, which
+    /// is what keeps a second instance from starting beside a live one.
     fn run(&self, path: &TaskPath) -> Result<Started> {
         let session = Session::open()?;
         let (guid, pid) = session
@@ -421,14 +440,13 @@ impl TaskApi for Com {
                 // SAFETY: calls on live interfaces; no parameters for the action.
                 unsafe {
                     let instance = task.Run(&VARIANT::default())?;
-                    Ok((instance.InstanceGuid()?.to_string(), instance.EnginePID()?))
+                    Ok((instance.InstanceGuid()?.to_string(), started_pid(instance.EnginePID())?))
                 }
             })?
             .ok_or_else(|| not_installed(path))?;
         Ok(Started {
             id: instance_id(&guid)?,
-            // L1: as in `instances`.
-            pid: (pid != 0).then_some(pid),
+            pid,
         })
     }
 

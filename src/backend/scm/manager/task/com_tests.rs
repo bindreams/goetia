@@ -265,6 +265,43 @@ fn an_instance_whose_pid_read_says_it_ended_is_skipped() {
 }
 
 #[skuld::test]
+fn a_listed_instance_is_its_guid_and_its_process() {
+    let found = instance_of("{001AFF10-2030-4050-6070-8090A0B0C0D0}", 4242).unwrap();
+
+    assert_eq!(found.pid, 4242);
+    assert_eq!(found.id.hex(), "001aff102030405060708090a0b0c0d0");
+}
+
+// L1: a listed instance always had a process; a pid of 0 is a read that failed, never a run that is
+// alive.
+#[skuld::test]
+fn a_listed_instance_with_a_pid_of_zero_is_a_failed_read() {
+    let failed = instance_of("{001AFF10-2030-4050-6070-8090A0B0C0D0}", 0);
+
+    assert!(matches!(failed, Err(Error::Os { .. })), "{failed:?}");
+}
+
+#[skuld::test]
+fn a_listed_instance_with_no_guid_is_a_failed_read() {
+    let failed = instance_of("not a guid", 4242);
+
+    assert!(matches!(failed, Err(Error::Os { .. })), "{failed:?}");
+}
+
+// M7: a `Run` that started nothing (an action that cannot start) returns a GUID and no process: a pid of
+// 0, or a read of it that says the instance is not running.
+#[skuld::test]
+fn a_run_that_started_nothing_has_no_pid() {
+    assert_eq!(started_pid(Ok(0)).unwrap(), None);
+    assert_eq!(
+        started_pid(Err(windows::core::Error::from(SCHED_E_TASK_NOT_RUNNING))).unwrap(),
+        None
+    );
+    assert_eq!(started_pid(Ok(4242)).unwrap(), Some(4242));
+    assert!(started_pid(Err(error_of(ERROR_ACCESS_DENIED))).is_err());
+}
+
+#[skuld::test]
 fn an_instance_pid_read_that_fails_for_another_reason_fails() {
     for other in [error_of(ERROR_ACCESS_DENIED), error_of(ERROR_FILE_NOT_FOUND)] {
         let code = other.code();
