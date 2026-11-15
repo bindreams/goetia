@@ -834,6 +834,25 @@ static void lag(int i) {
     tally("after the launch ended, debug exit %d (37 = the hold armed after it is still pending)", c.code);
 }
 
+/* Does a `kickstart -p` over a running held launch lose the fresh hold pending behind it? Alternating passes with and
+ * without it: after the launch ends, `debug` answering 37 means the hold is still pending, 0 that it is gone. */
+static void noop(int i) {
+    int with = i % 2;
+    struct cmd c, x, y;
+    reset();
+    lc(&c, "debug", SYS, "--start-suspended", NULL);
+    lc(&x, "kickstart", "-p", SYS, NULL);
+    pid_t p = (pid_t)atol(x.out);
+    lc(&c, "debug", SYS, "--start-suspended", NULL);
+    int armed = c.code;
+    if (with) lc(&y, "kickstart", "-p", SYS, NULL);
+    lc(&c, "kill", "SIGKILL", SYS, NULL);
+    gone(p);
+    lc(&c, "debug", SYS, "--start-suspended", NULL);
+    tally("%s a no-op kickstart -p: our debug after the older launch took the hold exit %d; after it ended, debug exit %d", with ? "WITH" : "without", armed,
+          c.code);
+}
+
 /* ---- main ---- */
 
 int main(int argc, char **argv) {
@@ -865,6 +884,12 @@ int main(int argc, char **argv) {
         int n = atoi(argv[2]);
         for (int i = 0; i < n; i++) lag(i);
         dump("LAG");
+        uninstall();
+    } else if (!strcmp(sc, "noop")) {
+        install(0, "sleep", 0);
+        int n = atoi(argv[2]);
+        for (int i = 0; i < n; i++) noop(i);
+        dump("NOOP");
         uninstall();
     } else if (!strcmp(sc, "race")) {
         if (argc < 5) return 2;

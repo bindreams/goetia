@@ -15,9 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         args:
-          - held wrap late b2b 150
-          - unheld wrap late b2b 150
-          - lag 600
+          - noop 1000
+          - reply 200
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
