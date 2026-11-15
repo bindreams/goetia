@@ -17,7 +17,7 @@ use std::io::{self, Read, Seek};
 use std::os::unix::process::ExitStatusExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitStatus;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError};
 #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
@@ -66,7 +66,9 @@ pub(crate) struct Capture {
 pub(crate) enum Finished {
     /// The child exited on its own, inside the budget.
     Exited { status: ExitStatus, capture: Capture },
-    /// The deadline expired first. The child was killed and reaped.
+    /// The deadline expired first. The child was killed and reaped. (A child that exits while its
+    /// kill is being refused is not this: it is [`Finished::Exited`], as one that exits before the
+    /// kill is sent.)
     ///
     /// Carries no capture. Whatever the child had written by then is a
     /// prefix no consumer may treat as whole, and the one thing every
@@ -402,17 +404,28 @@ fn waited_out(
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
             // The root first, and its `Ok` is what makes the reap below unable to block.
-            kill_root(&child)?;
-            // Then the tree, best-effort. This runs BEFORE the reap below, while the killed
-            // root is still a zombie pinning its pid and pgid, so a kill that names the tree
-            // by the root's number cannot hit another process on any platform. `Drop` (at the
-            // end of this function) runs after the reap, where cosca may skip such a kill. An
-            // uncontained child (the descendant test spawns one) reports `Unsupported` here, and a
-            // contained tree whose member refused SIGKILL reports `Containment`; the `Result` is
-            // discarded either way, so nothing surfaces it, and a descendant still holding a pipe
-            // is exactly what `collect` reports as `complete == false`.
-            let _tree_teardown = child.send_kill_tree();
-            let reaped = child.wait()?;
+            let reaped = match kill_root(&child) {
+                Ok(()) => {
+                    // Then the tree, best-effort. This runs BEFORE the reap below, while the killed
+                    // root is still a zombie pinning its pid and pgid, so a kill that names the tree
+                    // by the root's number cannot hit another process on any platform. `Drop` (at
+                    // the end of this function) runs after the reap, where cosca may skip such a
+                    // kill. An uncontained child (the descendant test spawns one) reports
+                    // `Unsupported` here, and a contained tree whose member refused SIGKILL reports
+                    // `Containment`; the `Result` is discarded either way, so nothing surfaces it,
+                    // and a descendant still holding a pipe is exactly what `collect` reports as
+                    // `complete == false`.
+                    let _tree_teardown = child.send_kill_tree();
+                    child.wait()?
+                }
+                // A child that is exiting can refuse the kill (macOS answers EPERM to a send by
+                // audit token in that window), and then it has exited: the child's own exit, as
+                // when it ends before the kill is sent. One that does not exit stays refused.
+                Err(refused) => match child.wait_deadline(Instant::now() + EXIT_AFTER_REFUSED_KILL) {
+                    Ok(Some(exited)) => exited,
+                    Ok(None) | Err(_) => return Err(refused),
+                },
+            };
             match expiry_disposition(reaped) {
                 Disposition::WeKilledIt => return Ok(Finished::Expired),
                 Disposition::ItExitedOnItsOwn => reaped,
@@ -432,6 +445,11 @@ fn waited_out(
     };
     Ok(Finished::Exited { status, capture })
 }
+
+/// How long a child whose kill was refused is given to be seen exited. A failure bound on another
+/// process, not a wait for the child to do anything: an exiting child is reaped at once, and one
+/// still there after it refused a kill for another reason never will be.
+const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 
 /// [`cosca::Child::kill`], the one kill an expired query or announced request makes.
 fn kill_root(child: &cosca::Child) -> Result<(), cosca::error::Error> {

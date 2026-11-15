@@ -387,6 +387,22 @@ fn a_kill_refused_at_the_deadline_by_a_child_that_has_exited_is_reported_exited(
     }
 }
 
+/// A refused kill after which the child is still there is the kill's error, not a verdict on the
+/// child: the wait that looks for its exit is bounded ([`EXIT_AFTER_REFUSED_KILL`]), and its expiry
+/// is not read as an exit. The one test here that waits out a real bound.
+#[skuld::test]
+fn a_kill_refused_at_the_deadline_by_a_child_that_stays_is_the_kills_error() {
+    let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+    test_hook::kill_fails(|_| io::Error::from_raw_os_error(libc::EPERM).into());
+
+    let lost = wait_bounded(child, Budget::Immediate.start()).expect_err("the child is still running");
+
+    assert!(
+        matches!(&lost.error, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
+        "{lost:?}"
+    );
+}
+
 /// What the child wrote while issuing its request is kept: it is the start of the diagnostic.
 #[skuld::test]
 fn what_an_announced_request_wrote_before_announcing_is_kept() {
