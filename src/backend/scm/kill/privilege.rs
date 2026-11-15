@@ -48,10 +48,7 @@ impl DebugPrivilege {
     pub(super) fn explain_denial(&self, open: io::Error) -> io::Error {
         match &self.failure {
             Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => within(
-                format!(
-                    "open the process without SeDebugPrivilege, which could not be enabled ({})",
-                    Chain(step)
-                ),
+                format!("without SeDebugPrivilege (enabling it failed: {})", Chain(step)),
                 open,
             ),
             _ => open,

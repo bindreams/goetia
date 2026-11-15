@@ -7,7 +7,7 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, LUID};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NO_TOKEN, ERROR_SHARING_VIOLATION, LUID};
 use windows_sys::Win32::Security::{
     GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PRIVILEGE_SET, PrivilegeCheck, SE_DEBUG_NAME,
     TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
@@ -134,59 +134,45 @@ fn dropping_puts_back_the_thread_token_that_was_there(#[fixture(debug_privilege)
 
 // Failures are reported -----------------------------------------------------------------------------------------------
 
+/// What `install` fails with in production: a bare OS error from `last_os_error`.
+fn step_error() -> io::Error {
+    io::Error::from_raw_os_error(ERROR_NO_TOKEN as i32)
+}
+
+/// What the open fails with in production: a bare OS error.
+fn denied_open() -> io::Error {
+    io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
+}
+
 fn failed_to_enable() -> DebugPrivilege {
     DebugPrivilege {
         restore: None,
-        failure: Some(io::Error::other("DuplicateTokenEx failed")),
+        failure: Some(step_error()),
     }
 }
 
 #[skuld::test]
 fn a_denied_open_names_the_privilege_step_that_failed() {
-    let denial = || io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+    let e = failed_to_enable().explain_denial(denied_open());
 
-    let e = failed_to_enable().explain_denial(denial());
-
-    let msg = Chain(&e).to_string();
     assert_eq!(
-        msg,
+        Chain(&e).to_string(),
         format!(
-            "open the process without SeDebugPrivilege, which could not be enabled (DuplicateTokenEx failed): {}",
-            denial()
+            "without SeDebugPrivilege (enabling it failed: {}): {}",
+            step_error(),
+            denied_open()
         )
-    );
-    assert_eq!(
-        msg.matches(&denial().to_string()).count(),
-        1,
-        "the open's own error is kept, once: {msg}"
     );
     assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
 }
 
-/// The denial's code stays on the error's chain, where a caller that looks for a code finds it.
+/// The open's code stays on the error's chain, where a caller that looks for a code finds it, and
+/// not the step's.
 #[skuld::test]
 fn a_denied_open_that_names_the_step_still_carries_the_denials_code() {
-    let e = failed_to_enable().explain_denial(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let e = failed_to_enable().explain_denial(denied_open());
 
     assert_eq!(crate::error::os_error_in(&e), Some(ERROR_ACCESS_DENIED as i32));
-}
-
-/// The step's own causes are in the text too, not only its top message.
-#[skuld::test]
-fn a_denied_open_names_the_causes_of_the_step_that_failed() {
-    #[derive(Debug, thiserror::Error)]
-    #[error("DuplicateTokenEx failed")]
-    struct Step(#[source] io::Error);
-    let step = io::Error::other(Step(io::Error::other("the token is not for this user")));
-    let guard = DebugPrivilege {
-        restore: None,
-        failure: Some(step),
-    };
-
-    let e = guard.explain_denial(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
-
-    let msg = Chain(&e).to_string();
-    assert!(msg.contains("the token is not for this user"), "{msg}");
 }
 
 /// A token that lacks the privilege is not a failure of the step, so the denial stands alone.

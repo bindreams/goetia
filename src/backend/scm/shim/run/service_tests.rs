@@ -1290,18 +1290,18 @@ fn a_failed_stopped_report_says_scm_is_expected_to_read_a_crash() {
     }
 }
 
-/// `windows_service::Error::Winapi` displays as "IO error in winapi call" and keeps the OS reason as
-/// its source, so the line must print the chain.
+/// `windows_service::Error::Winapi` displays as "IO error in winapi call"; the line carries the
+/// wrapped OS error alone.
 #[skuld::test]
 fn a_failed_dispatcher_connection_names_the_os_reason() {
     let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
 
-    let text = dispatcher_failure(&e);
+    let text = dispatcher_failure(e);
 
     assert_eq!(
         text,
         format!(
-            "connect to the SCM dispatcher: IO error in winapi call: {}",
+            "failed to connect to the SCM dispatcher: {}",
             std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
         )
     );

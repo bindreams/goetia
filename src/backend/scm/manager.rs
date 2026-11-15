@@ -1882,7 +1882,7 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
 /// through `to_error` read that and nothing else, useless for diagnosing an
 /// actual Win32 failure). Unwrap to the inner `io::Error` first, whose
 /// `Display` does carry `FormatMessage`'s real text.
-fn to_error(context: &str, e: windows_service::Error) -> Error {
+pub(crate) fn to_error(context: &str, e: windows_service::Error) -> Error {
     match e {
         windows_service::Error::Winapi(io_err) => Error::os(context, io_err),
         other => Error::os(context, other),
