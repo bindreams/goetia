@@ -76,7 +76,8 @@ static struct {
 } tal[2048];
 static int ntal;
 
-static void tally(const char *fmt, ...) {
+/* Counts one occurrence of the formatted key; returns 1 the first time a key is seen. */
+static int tally(const char *fmt, ...) {
     char k[MAXKEY];
     va_list ap;
     va_start(ap, fmt);
@@ -85,11 +86,12 @@ static void tally(const char *fmt, ...) {
     for (int i = 0; i < ntal; i++)
         if (!strcmp(tal[i].key, k)) {
             tal[i].n++;
-            return;
+            return 0;
         }
-    if (ntal == 2048) return;
+    if (ntal == 2048) return 0;
     strcpy(tal[ntal].key, k);
     tal[ntal++].n = 1;
+    return 1;
 }
 
 static void dump(const char *title) {
@@ -273,8 +275,8 @@ static void arg_xml(FILE *f, const char *s) {
     fputs("</string>", f);
 }
 
-static void write_plist(int wrap, const char *prog, int throttle) {
-    FILE *f = fopen(PLIST, "w");
+static void write_plist_for(const char *label, const char *path, int wrap, const char *prog, int throttle) {
+    FILE *f = fopen(path, "w");
     if (!f) {
         perror("plist");
         exit(2);
@@ -283,7 +285,7 @@ static void write_plist(int wrap, const char *prog, int throttle) {
           "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n",
           f);
     fputs("<key>Label</key>", f);
-    arg_xml(f, LABEL);
+    arg_xml(f, label);
     fputs("\n<key>ProgramArguments</key><array>", f);
     if (wrap) {
         arg_xml(f, "/bin/sh");
@@ -301,14 +303,16 @@ static void write_plist(int wrap, const char *prog, int throttle) {
     if (wrap) fputs("<key>StandardOutPath</key><string>" LOGFILE "</string><key>StandardErrorPath</key><string>" LOGFILE "</string>\n", f);
     fputs("</dict></plist>\n", f);
     fclose(f);
-    chown(PLIST, 0, 0);
-    chmod(PLIST, 0644);
+    chown(path, 0, 0);
+    chmod(path, 0644);
 }
 
-static void bootstrap(void) {
+static void write_plist(int wrap, const char *prog, int throttle) { write_plist_for(LABEL, PLIST, wrap, prog, throttle); }
+
+static void bootstrap_plist(const char *plist) {
     struct cmd c;
     for (long tries = 0;; tries++) {
-        lc(&c, "bootstrap", "system", PLIST, NULL);
+        lc(&c, "bootstrap", "system", plist, NULL);
         if (c.code == 0) {
             if (tries) tally("bootstrap needed %s retries", tries < 10 ? "<10" : ">=10");
             return;
@@ -316,6 +320,8 @@ static void bootstrap(void) {
         if (tries == 0) tally("bootstrap first try exit %d", c.code);
     }
 }
+
+static void bootstrap(void) { bootstrap_plist(PLIST); }
 
 static void install(int wrap, const char *prog, int throttle) {
     struct cmd c;
@@ -853,6 +859,353 @@ static void noop(int i) {
           c.code);
 }
 
+/* ---- identity: can a pid be confirmed as the job's launch? (I1-I4) ---- */
+
+#define LABEL2 "goetia.probe.runident2"
+#define SYS2 "system/" LABEL2
+#define PLIST2 "/Library/LaunchDaemons/" LABEL2 ".plist"
+
+static void path_base(pid_t pid, char *buf, size_t cap) {
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    if (proc_pidpath(pid, path, sizeof path) > 0) {
+        const char *b = strrchr(path, '/');
+        snprintf(buf, cap, "%s", b ? b + 1 : path);
+    } else
+        snprintf(buf, cap, "(none)");
+}
+
+/* The resource coalition id of a pid by proc_pidinfo flavor PROC_PIDCOALITIONINFO (20), or -1. */
+static long long coal_of(pid_t pid) {
+    static const int sizes[] = {40, 16};
+    for (int i = 0; i < 2; i++) {
+        uint64_t b[8] = {0};
+        int n = proc_pidinfo(pid, 20, 0, b, sizes[i]);
+        if (n > 0) {
+            tally("coalition read: struct size %d answered %d bytes", sizes[i], n);
+            return (long long)b[0];
+        }
+    }
+    tally("coalition read failed (errno %d)", errno);
+    return -1;
+}
+
+/* The first number after the first "resource coalition" (else "coalition") in a `launchctl print` output, or -1. */
+static long long print_coal(const char *out) {
+    const char *p = strstr(out, "resource coalition");
+    if (!p) p = strstr(out, "oalition");
+    if (!p) return -1;
+    while (*p && (*p < '0' || *p > '9')) p++;
+    return *p ? strtoll(p, NULL, 10) : -1;
+}
+
+static const char *eq(long long a, long long b) { return (a < 0 || b < 0) ? "n/a" : (a == b ? "YES" : "no"); }
+
+static void procinfo(const char *what, pid_t pid) {
+    char pb[32], pa[32], s[16];
+    struct cmd c;
+    snprintf(s, sizeof s, "%d", pid);
+    path_base(pid, pb, sizeof pb);
+    lc(&c, "procinfo", s, NULL);
+    path_base(pid, pa, sizeof pa);
+    int lab = strstr(c.out, LABEL) || strstr(c.err, LABEL);
+    if (tally("I1 procinfo of %s (path %s -> %s): exit %d, label named %s, stdout %s, stderr %s", what, pb, pa, c.code, lab ? "YES" : "no",
+              c.out[0] ? "non-empty" : "empty", c.err[0] ? "non-empty" : "empty"))
+        say("----- procinfo output, first of [%s, path %s -> %s, exit %d] -----\n%s----- stderr -----\n%s-----", what, pb, pa, c.code, c.out, c.err);
+}
+
+/* 1 = NOTE_EXEC for pid, 2 = its exit came first, 0 = nothing in 5 s (the probe's failure bound). */
+static int wait_exec(pid_t pid) {
+    for (;;) {
+        struct ev f;
+        if (!next_ev(&f, 5000)) return 0;
+        if (f.pid != pid) continue;
+        if (f.fflags & NOTE_EXEC) return 1;
+        if (f.fflags & NOTE_EXIT) return 2;
+    }
+}
+
+/* 1 = NOTE_EXIT for pid seen, 0 = nothing in 5 s. seq gets the events seen and the exit status. */
+static int wait_exit(pid_t pid, char *seq, size_t cap) {
+    seq[0] = 0;
+    for (;;) {
+        struct ev f;
+        char one[48];
+        if (!next_ev(&f, 5000)) {
+            strncat(seq, "(none in 5s)", cap - strlen(seq) - 1);
+            return 0;
+        }
+        if (f.pid != pid) continue;
+        snprintf(one, sizeof one, "%s%s", seq[0] ? "," : "", evname(f.fflags));
+        strncat(seq, one, cap - strlen(seq) - 1);
+        if (f.fflags & NOTE_EXIT) {
+            int st = (int)f.data;
+            snprintf(one, sizeof one, "(%s %d)", WIFEXITED(st) ? "exit" : "signal", WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st));
+            strncat(seq, one, cap - strlen(seq) - 1);
+            return 1;
+        }
+    }
+}
+
+/* I1 and I2: one launch of the job, read from the xpcproxy stage on. */
+static void ident_pass(int i, int held, int early) {
+    struct cmd c, pr;
+    char pb[32], pa[32], pc[32];
+
+    /* A pid no job owns, and one that no longer exists. */
+    pid_t ch = fork();
+    if (ch == 0) {
+        execl("/bin/sleep", "sleep", "30", (char *)NULL);
+        _exit(127);
+    }
+    procinfo("a pid no job owns (our own child)", ch);
+    long long cc = coal_of(ch), own = coal_of(getpid());
+    kill(ch, SIGKILL);
+    reap(ch);
+    procinfo("a pid that no longer exists (our reaped child)", ch);
+
+    if (held) {
+        lc(&c, "debug", SYS, "--start-suspended", NULL);
+        if (c.code) tally("debug exit %d", c.code);
+    }
+    struct kp k;
+    if (kick_spawn(&k, 0)) {
+        anom("pass %d: spawn kickstart failed", i);
+        return;
+    }
+    kick_read_pid(&k);
+    pid_t pid = k.pid;
+    if (pid < 0) {
+        kick_finish(&k, &c);
+        anom("pass %d: no pid", i);
+        return;
+    }
+    if (!early) kick_finish(&k, &c);
+
+    /* The reads the design would make right after the reply. */
+    path_base(pid, pb, sizeof pb);
+    long long c0 = coal_of(pid);
+    path_base(pid, pa, sizeof pa);
+    procinfo(early ? "the launch, kickstart -p still running" : "the launch right after kickstart -p", pid);
+
+    int rr = reg(pid);
+    if (early) kick_finish(&k, &c);
+    if (rr) {
+        tally("register errno %d", rr);
+        anom("pass %d: register pid %d: errno %d", i, pid, rr);
+        return;
+    }
+    path_base(pid, pc, sizeof pc);
+    if (!strcmp(pc, "xpcproxy")) {
+        int ex = wait_exec(pid);
+        tally("path xpcproxy after registering: waited for exec: %s", ex == 1 ? "exec" : (ex == 2 ? "exit first" : "nothing in 5 s"));
+    }
+    procinfo(held ? "the held launch after its exec" : "a running unheld launch after its exec", pid);
+    long long c1 = coal_of(pid);
+    lc(&pr, "print", SYS, NULL);
+    long long pcr = print_coal(pr.out);
+    if (i == 0) say("----- print while the launch runs -----\n%s", pr.out);
+
+    lc(&c, "kill", held ? "SIGCONT" : "SIGKILL", SYS, NULL);
+    char seq[160];
+    if (!wait_exit(pid, seq, sizeof seq)) {
+        anom("pass %d: no exit seen: %s", i, seq);
+        lc(&c, "kill", "SIGKILL", SYS, NULL);
+    }
+    procinfo("the launch just after its exit", pid);
+
+    long long pci = -1;
+    do {
+        lc(&pr, "print", SYS, NULL);
+    } while (field(pr.out, "pid = ") == pid);
+    pci = print_coal(pr.out);
+    if (i == 0) say("----- print, job idle -----\n%s", pr.out);
+    tally("I2 print names a coalition: idle %s, running %s", pci >= 0 ? "yes" : "no", pcr >= 0 ? "yes" : "no");
+    tally("I2 launch coalition at stage %s->%s (before procinfo): read %s; == idle print %s; == running print %s", pb, pa, c0 >= 0 ? "ok" : "FAILED",
+          eq(c0, pci), eq(c0, pcr));
+    tally("I2 launch coalition after exec: read %s; == idle print %s; == running print %s; == the stage read %s", c1 >= 0 ? "ok" : "FAILED", eq(c1, pci),
+          eq(c1, pcr), eq(c1, c0));
+    tally("I2 no-job child coalition: read %s; == idle print %s; == launch's %s; == the probe's own %s", cc >= 0 ? "ok" : "FAILED", eq(cc, pci), eq(cc, c1),
+          eq(cc, own));
+}
+
+static void run_ident(int held, int wrap, int early, int passes) {
+    anomalies = 0;
+    install(wrap, held ? "true" : "sleep", 0);
+    for (int i = 0; i < passes; i++) {
+        ident_pass(i, held, early);
+        if (i % 100 == 99) say("... %d passes", i + 1);
+    }
+    char title[160];
+    snprintf(title, sizeof title, "IDENT %s %s %s passes=%d", held ? "held" : "unheld", wrap ? "wrap(/bin/sh)" : "plain", early ? "early" : "late", passes);
+    dump(title);
+    uninstall();
+}
+
+/* Kickstart `sys`, wait for the program's exec as goetia would, return the pid (or -1). */
+static pid_t launch_to_exec(const char *sys) {
+    struct cmd x;
+    char b[32];
+    lc(&x, "kickstart", "-p", sys, NULL);
+    pid_t p = (pid_t)atol(x.out);
+    if (p <= 0) {
+        tally("kickstart -p %s printed no pid (exit %d)", sys, x.code);
+        return -1;
+    }
+    int rr = reg(p);
+    if (rr) {
+        tally("register errno %d", rr);
+        return -1;
+    }
+    path_base(p, b, sizeof b);
+    if (!strcmp(b, "xpcproxy")) wait_exec(p);
+    return p;
+}
+
+static void stop_launch(const char *sys, pid_t p) {
+    struct cmd c;
+    char seq[160];
+    lc(&c, "kill", "SIGKILL", sys, NULL);
+    wait_exit(p, seq, sizeof seq);
+}
+
+/* I2: the coalition across launches, a bootout and bootstrap, and two jobs. */
+static void run_coal(int passes) {
+    anomalies = 0;
+    struct cmd c, pr;
+    install(0, "sleep", 0);
+    lc(&c, "bootout", SYS2, NULL);
+    write_plist_for(LABEL2, PLIST2, 0, "sleep", 0);
+    bootstrap_plist(PLIST2);
+    long long prev1 = -1, prev2 = -1;
+    int rebooted = 0;
+    long long own = coal_of(getpid());
+    for (int i = 0; i < passes; i++) {
+        lc(&pr, "print", SYS, NULL);
+        long long idle1 = print_coal(pr.out);
+        if (i == 0) say("----- print of job 1, never launched -----\n%s", pr.out);
+        lc(&pr, "print", SYS2, NULL);
+        long long idle2 = print_coal(pr.out);
+        pid_t a = launch_to_exec(SYS);
+        long long ca = a > 0 ? coal_of(a) : -1;
+        lc(&pr, "print", SYS, NULL);
+        long long pa = print_coal(pr.out);
+        if (a > 0) stop_launch(SYS, a);
+        pid_t b = launch_to_exec(SYS2);
+        long long cb = b > 0 ? coal_of(b) : -1;
+        lc(&pr, "print", SYS2, NULL);
+        long long pb = print_coal(pr.out);
+        if (b > 0) stop_launch(SYS2, b);
+        tally("I2 job 1 launch coalition: == its running print %s; == its idle print %s; == the previous pass's launch %s%s", eq(ca, pa), eq(ca, idle1),
+              eq(ca, prev1), rebooted ? " (a bootout+bootstrap between)" : "");
+        tally("I2 job 2 launch coalition: == its running print %s; == its idle print %s; == the previous pass's launch %s", eq(cb, pb), eq(cb, idle2),
+              eq(cb, prev2));
+        tally("I2 two jobs: launch coalitions differ %s; print coalitions differ %s", (ca < 0 || cb < 0) ? "n/a" : (ca != cb ? "YES" : "no"),
+              (pa < 0 || pb < 0) ? "n/a" : (pa != pb ? "YES" : "no"));
+        tally("I2 job 1 launch coalition == the probe's own: %s", eq(ca, own));
+        prev1 = ca;
+        prev2 = cb;
+        rebooted = 0;
+        if (i % 5 == 4) {
+            reset();
+            rebooted = 1;
+            lc(&pr, "print", SYS, NULL);
+            tally("I2 job 1 print coalition after bootout+bootstrap == before: %s", eq(print_coal(pr.out), pa));
+        }
+        if (i % 100 == 99) say("... %d passes", i + 1);
+    }
+    dump("COAL");
+    lc(&c, "kill", "SIGKILL", SYS2, NULL);
+    lc(&c, "bootout", SYS2, NULL);
+    unlink(PLIST2);
+    uninstall();
+}
+
+/* I3: a held launch killed while still xpcproxy: is its hold consumed? */
+static void killed_pass(int i) {
+    int variant = i % 2;
+    struct cmd c, d;
+    struct ev s;
+    char pb[32], pb2[32], seq[160];
+    while (next_ev(&s, 0)) {}
+    reset();
+    lc(&c, "debug", SYS, "--start-suspended", NULL);
+    if (c.code) tally("arming debug exit %d", c.code);
+    struct kp k;
+    if (kick_spawn(&k, 0)) return;
+    kick_read_pid(&k);
+    pid_t pid = k.pid;
+    kick_finish(&k, &c);
+    if (pid < 0) {
+        tally("kickstart -p printed no pid");
+        return;
+    }
+    int rr = reg(pid);
+    path_base(pid, pb, sizeof pb);
+    int kr = kill(pid, SIGKILL), kerrno = kr ? errno : 0;
+    int exited = rr ? 0 : wait_exit(pid, seq, sizeof seq);
+    if (rr) snprintf(seq, sizeof seq, "(not registered)");
+    tally("I3 kill of a launch whose path read %s: register %s, kill errno %d, events %s", pb, rr ? "failed" : "ok", kerrno, seq);
+    (void)exited;
+    if (variant == 0) {
+        lc(&d, "debug", SYS, "--start-suspended", NULL);
+        tally("I3a launch killed at path %s, then debug: exit %d (37 = the hold is still pending)", pb, d.code);
+        return;
+    }
+    /* Without a new debug: does the next launch start held? */
+    pid_t p2 = launch_to_exec(SYS);
+    if (p2 < 0) {
+        tally("I3b launch killed at path %s, next launch: gone before registration (not held)", pb);
+        return;
+    }
+    int e = 0;
+    path_base(p2, pb2, sizeof pb2);
+    tally("I3b launch killed at path %s, next launch, no new debug: reads %s (STOP = the hold was still pending)", pb, sname(bsd_stat_of(p2, &e)));
+    stop_launch(SYS, p2);
+}
+
+/* I4: how fresh pids are handed out. */
+static void run_pids(long n) {
+    int prev = 0, mx = 0, mn = INT32_MAX, first[40], nf = 0, wrapped = 0, after[16], na = 0;
+    long seq1 = 0, small = 0, mid = 0, big = 0, back = 0;
+    int maxproc = 0;
+    size_t ml = sizeof maxproc;
+    if (!sysctlbyname("kern.maxproc", &maxproc, &ml, NULL, 0)) say("kern.maxproc = %d", maxproc);
+    for (long i = 0; i < n; i++) {
+        pid_t p = fork();
+        if (p == 0) _exit(0);
+        if (p < 0) {
+            say("fork failed errno %d after %ld", errno, i);
+            break;
+        }
+        reap(p);
+        if (nf < 40) first[nf++] = p;
+        if (p > mx) mx = p;
+        if (p < mn) mn = p;
+        if (prev) {
+            long d = (long)p - prev;
+            if (d == 1) seq1++;
+            else if (d > 1 && d <= 10) small++;
+            else if (d > 10 && d <= 100) mid++;
+            else if (d > 100) big++;
+            else {
+                back++;
+                if (back <= 5) say("step backward: %d -> %d (fork number %ld)", prev, p, i);
+                wrapped = 1;
+            }
+        }
+        if (wrapped && na < 16) after[na++] = p;
+        prev = p;
+    }
+    say("I4 forks %ld: next pid is previous+1 in %ld, +2..10 in %ld, +11..100 in %ld, more than +100 in %ld, backward steps %ld", n, seq1, small, mid, big, back);
+    say("I4 smallest pid seen %d, largest %d", mn, mx);
+    printf("I4 first 40 pids:");
+    for (int i = 0; i < nf; i++) printf(" %d", first[i]);
+    printf("\nI4 the 16 pids from the first backward step:");
+    for (int i = 0; i < na; i++) printf(" %d", after[i]);
+    printf("\n");
+    fflush(stdout);
+}
+
 /* ---- main ---- */
 
 int main(int argc, char **argv) {
@@ -891,6 +1244,26 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n; i++) noop(i);
         dump("NOOP");
         uninstall();
+    } else if (!strcmp(sc, "ident")) { /* ident <held|unheld> <plain|wrap> <early|late> <passes> */
+        if (argc < 6) return 2;
+        run_ident(!strcmp(argv[2], "held"), !strcmp(argv[3], "wrap"), !strcmp(argv[4], "early"), atoi(argv[5]));
+    } else if (!strcmp(sc, "coal")) { /* coal <passes> */
+        run_coal(atoi(argv[2]));
+    } else if (!strcmp(sc, "killed")) { /* killed <plain|wrap> <passes> */
+        if (argc < 4) return 2;
+        anomalies = 0;
+        install(!strcmp(argv[2], "wrap"), "true", 0);
+        int n = atoi(argv[3]);
+        for (int i = 0; i < n; i++) {
+            killed_pass(i);
+            if (i % 100 == 99) say("... %d passes", i + 1);
+        }
+        char t[64];
+        snprintf(t, sizeof t, "KILLED %s passes=%d", argv[2], n);
+        dump(t);
+        uninstall();
+    } else if (!strcmp(sc, "pids")) { /* pids <forks> */
+        run_pids(atol(argv[2]));
     } else if (!strcmp(sc, "race")) {
         if (argc < 5) return 2;
         install(0, "sleep", 0);

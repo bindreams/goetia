@@ -15,8 +15,15 @@ jobs:
       fail-fast: false
       matrix:
         args:
-          - noop 1000
-          - reply 200
+          - ident held plain late 300
+          - ident held wrap late 300
+          - ident held plain early 200
+          - ident unheld plain late 300
+          - ident unheld wrap late 300
+          - coal 200
+          - killed plain 400
+          - killed wrap 400
+          - pids 300000
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
