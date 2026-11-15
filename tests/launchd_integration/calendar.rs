@@ -8,7 +8,8 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use goetia::backend::launchd::manager::Launchd;
@@ -69,11 +70,23 @@ impl Registrations {
             _stream: ChildGuard(stream),
         };
 
-        // The first line is the stream's own; a line logged after it reaches the stream.
+        // The first line is the stream's own, printed before the stream is subscribed to the log (measured: a
+        // line logged straight after it was lost). So the canary is logged again and again, until one of
+        // them comes back through the stream.
         registrations.next_line();
         let canary = format!("StartCalendarInterval canary {}", std::process::id());
-        cmd::run("logger", &[canary.as_str()]).expect_ok();
+        let attached = Arc::new(AtomicBool::new(false));
+        let logging = std::thread::spawn({
+            let (attached, canary) = (Arc::clone(&attached), canary.clone());
+            move || {
+                while !attached.load(Ordering::Acquire) {
+                    cmd::run("logger", &[canary.as_str()]).expect_ok();
+                }
+            }
+        });
         while !registrations.next_line().contains(&canary) {}
+        attached.store(true, Ordering::Release);
+        logging.join().expect("the thread that logs the canary");
         registrations
     }
 
