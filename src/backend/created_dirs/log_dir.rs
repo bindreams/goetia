@@ -41,7 +41,8 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, handing: &[PendingHandOver]) 
             .find(|pending| !step.link && pending.dev == step.stat.st_dev && pending.ino == step.stat.st_ino);
         let reason = match (handed, writer(step, n == last)) {
             (Some(pending), _) => format!(
-                "{kind} {} will belong to {}, to whom this install hands {} once it has made every directory,                  who could",
+                "{kind} {} will belong to {}, to whom this install hands {} once it has made every directory, \
+                 who could",
                 step.at.display(),
                 account_text(pending.owner.uid.as_raw()),
                 pending.path.display(),

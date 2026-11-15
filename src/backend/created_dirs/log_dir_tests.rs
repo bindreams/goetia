@@ -205,3 +205,18 @@ fn the_refusal_text_has_no_runs_of_spaces() {
 
     assert!(!why.contains("  "), "{why}");
 }
+
+#[skuld::test(labels = [ELEVATED])]
+fn the_hand_over_refusal_text_has_no_runs_of_spaces() {
+    let layout = Layout::new();
+    let cwd = layout.system().join("work");
+    let mut dirs = CreatedDirs::under(vec![layout.system()]);
+    dirs.create(&cwd, Some(stranger_owner())).unwrap();
+
+    let why = match refuse_writable_log_dir(&cwd.join("app.log"), &dirs.to_hand_over()) {
+        Err(Error::DirectoryRefused { why, .. }) => why,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+
+    assert!(!why.contains("  "), "{why}");
+}

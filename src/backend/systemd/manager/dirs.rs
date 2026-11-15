@@ -2,7 +2,7 @@
 //! [`CreatedDirs`] and judged for the one thing systemd does as root with them.
 
 use crate::backend::account::{Unlisted, resolve_account};
-use crate::backend::created_dirs::{CreatedDirs, refuse_writable_log_dir};
+use crate::backend::created_dirs::{CreatedDirs, Owner, refuse_writable_log_dir};
 use crate::error::Result;
 use crate::spec::{DaemonSpec, User};
 
@@ -12,15 +12,12 @@ use crate::spec::{DaemonSpec, User};
 /// make root append to any file. The log directory is therefore never handed over, a log in or under
 /// `cwd` is refused (the check reads `cwd` as the account's, which it is to be), and an existing
 /// directory the account can write is refused too. The check comes before anything is handed over.
-/// Runs while still elevated; the account is resolved first, so an unknown one creates nothing. A uid
-/// with no passwd entry is the number: systemd runs a unit as one, and its `cwd` is handed to it with
-/// the group left as it is.
+/// Runs while still elevated. The account is looked up only when `cwd` is made to be handed to it: an
+/// install that hands nothing over does not need it to exist yet (`sysusers` or a package may make it
+/// later), and an unknown one then fails before `cwd` is made. A uid with no passwd entry is the
+/// number: systemd runs a unit as one, and its `cwd` is handed to it with the group left as it is.
 pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -> Result<()> {
     let common = spec.common();
-    let owner = match &common.user {
-        User::Root => None,
-        user => Some(resolve_account(user, Unlisted::AsNumber)?.owner()?),
-    };
     let logs_parent = common.logs.as_deref().and_then(|logs| logs.parent());
     if let Some(parent) = logs_parent
         && !parent.as_os_str().is_empty()
@@ -28,10 +25,27 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
         created.create(parent, None)?;
     }
     if let Some(cwd) = &common.cwd {
-        created.create(cwd, owner)?;
+        created.create_for(cwd, || owner_of(&common.user))?;
     }
     if let Some(logs) = &common.logs {
         refuse_writable_log_dir(logs, &created.to_hand_over())?;
     }
     created.hand_over()
 }
+
+/// Whom `cwd` is handed to for `user`. Root, by any spelling (uid 0 is root whatever names it), is
+/// handed nothing: the directory is already root's.
+fn owner_of(user: &User) -> Result<Option<Owner>> {
+    if matches!(user, User::Root) {
+        return Ok(None);
+    }
+    let account = resolve_account(user, Unlisted::AsNumber)?;
+    if account.uid.is_root() {
+        return Ok(None);
+    }
+    account.owner().map(Some)
+}
+
+#[cfg(test)]
+#[path = "dirs_tests.rs"]
+mod dirs_tests;

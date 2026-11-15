@@ -171,6 +171,14 @@ impl CreatedDirs {
     /// missing component needs the path to lead through a root and every directory and link on the
     /// way to be root's.
     pub(crate) fn create(&mut self, dir: &Path, hand_to: Option<Owner>) -> Result<()> {
+        self.create_for(dir, || Ok(hand_to))
+    }
+
+    /// [`create`](Self::create) for an owner that is looked up: `owner` runs, once, only when a
+    /// directory is to be handed over, after the path is judged and before anything is made. An
+    /// existing path, or one this guard made and an earlier call marked, needs no owner. `Ok(None)` is
+    /// no hand-over.
+    pub(crate) fn create_for(&mut self, dir: &Path, owner: impl FnOnce() -> Result<Option<Owner>>) -> Result<()> {
         let found = walk(dir, &self.roots)?;
         if matches!(found.end, End::Missing { .. }) {
             if !found.under_root {
@@ -195,7 +203,7 @@ impl CreatedDirs {
                 });
             }
         }
-        self.make(found, hand_to)
+        self.make(found, owner)
     }
 
     fn roots_text(&self) -> String {
@@ -211,7 +219,7 @@ impl CreatedDirs {
 
     /// Make what `found` says is missing under the directory it holds, or, for a path that exists,
     /// mark the directory it names for the hand-over if this guard made it.
-    fn make(&mut self, found: Walk, hand_to: Option<Owner>) -> Result<()> {
+    fn make(&mut self, found: Walk, owner: impl FnOnce() -> Result<Option<Owner>>) -> Result<()> {
         let (holder, missing) = match found.end {
             End::Whole(stat) => {
                 if let Some(made) = self.made.iter_mut().find(|made| {
@@ -220,12 +228,13 @@ impl CreatedDirs {
                         .is_some_and(|held| held.dev == stat.st_dev && held.ino == stat.st_ino)
                 }) && made.hand.is_none()
                 {
-                    made.hand = hand_to;
+                    made.hand = owner()?;
                 }
                 return Ok(());
             }
             End::Missing { holder, missing } => (holder, missing),
         };
+        let hand_to = owner()?;
         let mut parent = Parent::Existing(holder);
         for (n, (path, name)) in missing.iter().enumerate() {
             let last = n + 1 == missing.len();
@@ -448,4 +457,4 @@ fn report(message: std::fmt::Arguments<'_>) {
 
 #[cfg(test)]
 #[path = "created_dirs_tests.rs"]
-mod created_dirs_tests;
+pub(crate) mod created_dirs_tests;

@@ -19,12 +19,12 @@ pub(super) fn as_root() {
 
 /// A directory under `/tmp`, which is root's on every host (a macOS temp directory is the
 /// logged-in user's), holding `system`, the one root of the tests, and `outside`, which is not.
-pub(super) struct Layout {
+pub(crate) struct Layout {
     tmp: tempfile::TempDir,
 }
 
 impl Layout {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         as_root();
         let tmp = tempfile::Builder::new()
             .prefix("goetia-dirs-")
@@ -41,7 +41,7 @@ impl Layout {
         self.tmp.path().canonicalize().unwrap()
     }
 
-    pub(super) fn system(&self) -> PathBuf {
+    pub(crate) fn system(&self) -> PathBuf {
         self.base().join("system")
     }
 
@@ -370,7 +370,7 @@ fn create_uses_a_component_that_appeared_after_the_walk_and_makes_what_is_below_
     fs::set_permissions(&raced, fs::Permissions::from_mode(0o700)).unwrap();
     let mut dirs = layout.dirs();
 
-    dirs.make(found, None).unwrap();
+    dirs.make(found, || Ok(None)).unwrap();
 
     assert_eq!(mode(&raced), 0o700, "the other install's directory is untouched");
     assert_eq!(mode(&leaf), 0o755);
@@ -388,7 +388,7 @@ fn create_refuses_a_component_that_appeared_after_the_walk_for_an_account() {
     give_to_a_stranger(&raced);
     let mut dirs = layout.dirs();
 
-    let err = dirs.make(found, None).expect_err("an account owns it now");
+    let err = dirs.make(found, || Ok(None)).expect_err("an account owns it now");
 
     assert!(refusal(&err).contains(&format!("uid {STRANGER}")));
     assert!(!raced.join("b").exists());
@@ -401,7 +401,7 @@ fn create_does_not_descend_into_a_symlink_planted_after_the_walk() {
     symlink(layout.outside(), layout.system().join("a")).unwrap();
     let mut dirs = layout.dirs();
 
-    dirs.make(found, None).expect_err("a symlink is not a directory");
+    dirs.make(found, || Ok(None)).expect_err("a symlink is not a directory");
 
     assert_eq!(fs::read_dir(layout.outside()).unwrap().count(), 0);
 }
@@ -512,6 +512,34 @@ fn hand_over_gives_the_deepest_directory_to_the_owner_and_no_other() {
     assert_eq!(owner_of(&layout.system().join("a")), (0, owner_of(&layout.system()).1));
     assert_eq!(mode(&layout.system().join("a")), 0o755);
     assert_eq!(mode(&layout.system().join("a/b")), 0o755);
+}
+
+/// The owner is looked up when a directory is to be handed over, and not otherwise: never for a path
+/// that exists whole, once for one made now or made earlier and marked now.
+#[skuld::test(labels = [ELEVATED])]
+fn create_for_asks_for_the_owner_only_when_a_directory_is_handed_over() {
+    let layout = Layout::new();
+    let mut dirs = layout.dirs();
+    let asked = std::cell::Cell::new(0);
+    let owner = || {
+        asked.set(asked.get() + 1);
+        Ok(Some(stranger_owner()))
+    };
+    fs::create_dir(layout.system().join("existing")).unwrap();
+
+    dirs.create_for(&layout.system().join("existing"), owner).unwrap();
+    assert_eq!(asked.get(), 0, "an existing path is handed nothing");
+
+    dirs.create(&layout.system().join("a/b"), None).unwrap();
+    dirs.create_for(&layout.system().join("a"), owner).unwrap();
+    assert_eq!(asked.get(), 1, "a directory made earlier is marked now");
+    dirs.create_for(&layout.system().join("c"), owner).unwrap();
+    assert_eq!(asked.get(), 2);
+    dirs.hand_over().unwrap();
+
+    assert_eq!(owner_of(&layout.system().join("a")).0, STRANGER);
+    assert_eq!(owner_of(&layout.system().join("c")).0, STRANGER);
+    assert_eq!(owner_of(&layout.system().join("existing")).0, 0);
 }
 
 #[skuld::test(labels = [ELEVATED])]

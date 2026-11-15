@@ -453,7 +453,9 @@ owns it, since `install` is not a start and you may still be preparing it.
   backends.
 - **An account with no passwd entry.** On systemd a `user` that is a uid, or a name that is a number, with
   no passwd entry is used as that number (systemd runs a unit as one): `cwd` is handed to it and its group
-  is left as it is. On launchd it is an error, as it was.
+  is left as it is. On launchd it is an error, as it was. On systemd the account is looked up only when
+  `install` makes a `cwd` to hand to it: a `user` that does not exist yet, with no `cwd` or one that exists,
+  installs as it did. uid 0, by any spelling, is root and is handed nothing.
 - **A failed install** removes the directories it made, deepest first, by descriptor and only if they are
   still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
   (the unit or plist cannot be read back): it then says so, hands over what it would have handed over, and
