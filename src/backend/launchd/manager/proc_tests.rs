@@ -1,8 +1,8 @@
 //! What the kernel says of real child processes: nothing here needs root, launchd or a file outside the
 //! process's own temporary directory.
 
-use super::super::watch::watch_tests::Held;
 use super::*;
+use crate::backend::process_watch::process_watch_tests::Held;
 
 /// A live child started at a `mach_absolute_time` between the reads either side of its spawn.
 #[skuld::test]
