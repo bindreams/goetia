@@ -382,6 +382,33 @@ fn eperm() -> cosca::error::Error {
     io::Error::from_raw_os_error(libc::EPERM).into()
 }
 
+/// What cosca's `io_context` makes of an error: its text, and the error itself as the source.
+#[derive(Debug, thiserror::Error)]
+#[error("pid 1: its identity could not be read; SIGKILL not sent")]
+struct Wrapped(#[source] io::Error);
+
+/// A refusal is the `EPERM` of a child on its way out whether it is bare or wrapped as cosca wraps
+/// it (macOS: an `io::Error` of kind `PermissionDenied` with no code, the `EPERM` its source). No other
+/// refusal is: not `EACCES`, bare or wrapped, and not a kind of error that is not `Io`.
+#[skuld::test]
+fn only_eperm_is_a_refusal_a_child_on_its_way_out_gives() {
+    let wrapped = |errno: i32| {
+        cosca::error::Error::Io(io::Error::new(
+            ErrorKind::PermissionDenied,
+            Wrapped(io::Error::from_raw_os_error(errno)),
+        ))
+    };
+    assert!(is_eperm(&eperm()));
+    assert!(is_eperm(&wrapped(libc::EPERM)));
+    assert!(!is_eperm(&io::Error::from_raw_os_error(libc::EACCES).into()));
+    assert!(!is_eperm(&wrapped(libc::EACCES)));
+    assert!(!is_eperm(&io::Error::from(ErrorKind::PermissionDenied).into()));
+    assert!(!is_eperm(&cosca::error::Error::Unassessable {
+        detail: "pid 1 cannot be signalled".into(),
+        source: None,
+    }));
+}
+
 /// [`Left::kill`] ends the tree before the reaper reaps the root, as a query's expiry does: the
 /// reaper detaches the child, which never ends a tree, so a descendant is left running unless the
 /// kill ended it. The test watches the descendant die, and kills it however the test ends.
@@ -573,10 +600,27 @@ mod refused_kill {
         kill_root(&child.child, Duration::from_secs(3600)).expect("the child exited, and its exit is not an error");
     }
 
-    /// What cosca's `io_context` makes of an error: its text, and the error itself as the source.
-    #[derive(Debug, thiserror::Error)]
-    #[error("pid 1: its identity could not be read; SIGKILL not sent")]
-    struct Wrapped(#[source] io::Error);
+    /// What was seen of the child after a refused kill is carried into the error, with the refusal as
+    /// its source.
+    #[skuld::test]
+    fn what_was_seen_after_a_refused_kill_is_reported_with_the_refusal() {
+        let error = after_refusal(
+            eperm(),
+            Err("watching for its exit failed: the watch failed".into()),
+            EXIT_AFTER_REFUSED_KILL,
+        )
+        .expect_err("the child was not seen to exit");
+
+        let said = cosca::error::Report::new(&error).to_string();
+        assert!(
+            said.contains("the kill was refused (EPERM) and watching for its exit failed: the watch failed"),
+            "{said}"
+        );
+        assert!(
+            said.ends_with(&cosca::error::Report::new(&eperm()).to_string()),
+            "the kill's error is the source: {said}"
+        );
+    }
 
     /// A child that stays after refusing the kill is a lost wait: the refusal, naming the bound on the
     /// wait for the child's exit, with the kill's own error as its source. The expiry of that wait is
