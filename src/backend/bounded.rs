@@ -436,10 +436,10 @@ fn waited_out(
 /// How long a child whose kill was refused with `EPERM` is given to be seen exited (macOS). A
 /// failure bound on another process, not a wait for it to do anything. One seen exited is
 /// [`Finished::Expired`], whether it exited in the refusal window or refused the kill for another
-/// reason and then finished: goetia cannot tell them apart. One not seen exited is a lost wait, and
-/// its contained tree is not torn down: for [`wait_bounded`] an error naming the bound, for a
-/// [`Left::kill`] a warning on stderr that it could not be killed, its child handed to its [`Reaper`]
-/// all the same.
+/// reason and then finished: goetia cannot tell them apart. One not seen exited is a lost wait: for
+/// [`wait_bounded`] an error naming the bound, the child dropped (its drop tears the contained tree
+/// down); for a [`Left::kill`] a warning on stderr that it could not be killed, its child handed to
+/// its [`Reaper`] with its tree not torn down.
 ///
 /// What runs a bounded call ([`wait_bounded`], [`Left::kill`]) past its deadline:
 /// - each kill refused with `EPERM` (macOS), by up to this plus one re-read. launchd's `end_if_held`
