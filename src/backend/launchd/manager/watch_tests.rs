@@ -342,7 +342,7 @@ fn deleting_a_registration_whose_exit_fired_answers_as_measured() {
 fn interruptible() -> (StandIn, Deferred, Watch) {
     let stand_in = StandIn::install();
     let window = Deferred::begin().expect("begin the window");
-    let watch = Watch::new_interruptible(&window).expect("a kqueue");
+    let watch = Watch::new_interruptible().expect("a kqueue");
     (stand_in, window, watch)
 }
 
@@ -363,18 +363,15 @@ fn raise_interrupt() {
 /// exit both happened before anything asked.
 #[skuld::test]
 fn a_launch_reports_its_first_exec_and_keeps_its_exit() {
-    let (_stand_in, window, watch) = interruptible();
+    let (_stand_in, _window, watch) = interruptible();
     let mut child = Held::execing(3);
     let registered = launched(&watch, child.pid());
     child.finish();
 
-    assert!(matches!(
-        registered.first_exec(&window).expect("first_exec"),
-        Woke::Exec
-    ));
+    assert!(matches!(registered.first_exec().expect("first_exec"), Woke::Exec));
 
     assert!(
-        matches!(registered.exit(&window).expect("exit"), Woke::Exited(Some(status)) if status == 3 << 8),
+        matches!(registered.exit().expect("exit"), Woke::Exited(Some(status)) if status == 3 << 8),
         "the exit was kept"
     );
 }
@@ -382,14 +379,12 @@ fn a_launch_reports_its_first_exec_and_keeps_its_exit() {
 /// A launch that exits without an exec is reported as its exit.
 #[skuld::test]
 fn a_launch_that_exits_without_an_exec_is_its_exit() {
-    let (_stand_in, window, watch) = interruptible();
+    let (_stand_in, _window, watch) = interruptible();
     let mut child = Held::new(2);
     let registered = launched(&watch, child.pid());
     child.finish();
 
-    assert!(
-        matches!(registered.first_exec(&window).expect("first_exec"), Woke::Exited(Some(status)) if status == 2 << 8)
-    );
+    assert!(matches!(registered.first_exec().expect("first_exec"), Woke::Exited(Some(status)) if status == 2 << 8));
 }
 
 /// A registration made for a launch is still a registration of one pid, deleted on drop: the exec and the
@@ -409,16 +404,16 @@ fn a_launch_registration_dropped_early_queues_nothing() {
 /// returns the pid's state, and the pid is still alive.
 #[skuld::test]
 fn an_interrupt_recorded_before_a_wait_ends_it_before_it_blocks() {
-    let (_stand_in, window, watch) = interruptible();
+    let (_stand_in, _window, watch) = interruptible();
     let child = Held::new(0);
     let registered = launched(&watch, child.pid());
     raise_interrupt();
 
     assert!(matches!(
-        registered.first_exec(&window).expect("first_exec"),
+        registered.first_exec().expect("first_exec"),
         Woke::Interrupted(_)
     ));
-    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted(_)));
+    assert!(matches!(registered.exit().expect("exit"), Woke::Interrupted(_)));
 }
 
 /// An interrupt wins over an exec or an exit that another read kept: a wait that reports the pid's state
@@ -426,7 +421,7 @@ fn an_interrupt_recorded_before_a_wait_ends_it_before_it_blocks() {
 /// the exec and the exit before the interrupt is recorded, so both are waiting when the wait begins.
 #[skuld::test]
 fn an_interrupt_wins_over_an_exec_and_an_exit_that_were_kept() {
-    let (_stand_in, window, watch) = interruptible();
+    let (_stand_in, _window, watch) = interruptible();
     let mut child = Held::execing(3);
     let registered = launched(&watch, child.pid());
     child.finish();
@@ -437,10 +432,10 @@ fn an_interrupt_wins_over_an_exec_and_an_exit_that_were_kept() {
     raise_interrupt();
 
     assert!(matches!(
-        registered.first_exec(&window).expect("first_exec"),
+        registered.first_exec().expect("first_exec"),
         Woke::Interrupted(_)
     ));
-    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted(_)));
+    assert!(matches!(registered.exit().expect("exit"), Woke::Interrupted(_)));
 }
 
 /// An interrupt that arrives while the wait blocks wakes it. A second process sends SIGINT to this one
@@ -448,13 +443,13 @@ fn an_interrupt_wins_over_an_exec_and_an_exit_that_were_kept() {
 /// blocks (recorded) or after (the pipe's wake), the wait ends.
 #[skuld::test]
 fn an_interrupt_during_a_wait_wakes_it() {
-    let (_stand_in, window, watch) = interruptible();
+    let (_stand_in, _window, watch) = interruptible();
     let child = Held::new(0);
     let registered = launched(&watch, child.pid());
     let mut sender = Held::running("read _; kill -INT $PPID");
     let sending = std::thread::spawn(move || sender.finish());
 
-    let woke = registered.exit(&window).expect("exit");
+    let woke = registered.exit().expect("exit");
 
     assert!(matches!(woke, Woke::Interrupted(_)));
     sending.join().expect("the sender's thread");
@@ -470,12 +465,12 @@ fn a_signal_blocked_on_the_opening_thread_but_delivered_to_another_ends_a_wait_a
     let stand_in = StandIn::install();
     let blocking = Blocking::signal(libc::SIGTERM);
     let window = Deferred::begin().expect("begin the window");
-    let watch = Watch::new_interruptible(&window).expect("a kqueue");
+    let watch = Watch::new_interruptible().expect("a kqueue");
     let child = Held::new(0);
     let registered = launched(&watch, child.pid());
 
     receiver.send(libc::SIGTERM);
-    let woke = registered.exit(&window).expect("exit");
+    let woke = registered.exit().expect("exit");
 
     let Woke::Interrupted(interrupts) = woke else {
         panic!("the wait ended by the child's exit, which is alive");
@@ -493,8 +488,8 @@ fn a_signal_blocked_on_the_opening_thread_but_delivered_to_another_ends_a_wait_a
 fn an_ignored_signal_neither_wakes_nor_interrupts_a_wait() {
     let stand_in = StandIn::install();
     ignore(libc::SIGHUP);
-    let window = Deferred::begin().expect("begin the window");
-    let watch = Watch::new_interruptible(&window).expect("a kqueue");
+    let _window = Deferred::begin().expect("begin the window");
+    let watch = Watch::new_interruptible().expect("a kqueue");
     let mut child = Held::new(0);
     let registered = launched(&watch, child.pid());
     let ending = std::thread::spawn(move || {
@@ -502,7 +497,7 @@ fn an_ignored_signal_neither_wakes_nor_interrupts_a_wait() {
         child.finish()
     });
 
-    let woke = registered.exit(&window).expect("exit");
+    let woke = registered.exit().expect("exit");
 
     assert!(matches!(woke, Woke::Exited(Some(0))), "the child's own exit ended it");
     assert_eq!(ending.join().expect("the child's thread"), Some(0));
@@ -524,32 +519,46 @@ fn woken_by(queue: &Kqueue, fd: std::os::fd::RawFd) -> bool {
 #[skuld::test]
 fn a_recorded_interrupt_is_an_event_of_every_queue_of_the_window() {
     let (_stand_in, window, first) = interruptible();
-    let second = Watch::new_interruptible(&window).expect("a second kqueue");
+    let second = Watch::new_interruptible().expect("a second kqueue");
     assert!(!woken_by(&first.shared.queue, window.wake()), "nothing recorded yet");
 
     raise_interrupt();
-    let third = Watch::new_interruptible(&window).expect("a third kqueue");
+    let third = Watch::new_interruptible().expect("a third kqueue");
 
     for (name, watch) in [("first", &first), ("second", &second), ("third", &third)] {
         assert!(woken_by(&watch.shared.queue, window.wake()), "the {name} queue");
     }
 }
 
-/// A watch is registered for the window it was made with. The next window's pipe may get the descriptor
-/// numbers the first one had, so a wait of the old watch given the new window is refused (as a debug
-/// assertion) even then.
+/// A launch's registration that has left the window does not hold it open: with the watch and the window
+/// gone, the signals are the earlier handler's again, though the registration is alive.
 #[skuld::test]
-#[should_panic(expected = "a window needs its pipe registered on the queue")]
-fn a_watch_of_a_closed_window_is_not_registered_for_the_next_window() {
-    let (_stand_in, first, watch) = interruptible();
-    let mut child = Held::new(0);
-    let registered = launched(&watch, child.pid());
-    drop(first);
-    let second = Deferred::begin().expect("the next window");
-    // Gone already, so that a wait that is not refused ends on its own.
-    child.finish();
+fn a_registration_that_left_the_window_does_not_keep_it_open() {
+    let (stand_in, window, watch) = interruptible();
+    let child = Held::new(0);
+    let registered = launched(&watch, child.pid()).leave_window();
 
-    _ = registered.exit(&second);
+    drop(watch);
+    drop(window);
+
+    stand_in.assert_back();
+    drop(registered);
+}
+
+/// A launch's registration holds the window, as its watch does: with the window itself dropped and the watch
+/// alive, an interrupt is still recorded and not delivered to the earlier handler.
+#[skuld::test]
+fn a_launch_registration_holds_the_window_of_its_watch() {
+    let (stand_in, window, watch) = interruptible();
+    let child = Held::new(0);
+    let registered = launched(&watch, child.pid());
+    drop(watch);
+    drop(window);
+
+    raise_interrupt();
+
+    assert_eq!(stand_in.seen(), 0, "held back, not delivered to the earlier handler");
+    assert!(matches!(registered.exit().expect("exit"), Woke::Interrupted(_)));
 }
 
 /// The exit the poll found is reported with its status, without taking it: a wait after it still reports
@@ -572,15 +581,12 @@ fn exit_kept_reports_an_exit_and_its_status_without_taking_it() {
 /// A poll for the exit keeps the exec it reads for the wait for the exec.
 #[skuld::test]
 fn a_poll_keeps_the_exec_for_the_wait_for_it() {
-    let (_stand_in, window, watch) = interruptible();
+    let (_stand_in, _window, watch) = interruptible();
     let mut child = Held::execing(3);
     let registered = launched(&watch, child.pid());
     child.finish();
 
     assert!(registered.exit_kept().expect("poll").is_some());
 
-    assert!(matches!(
-        registered.first_exec(&window).expect("first_exec"),
-        Woke::Exec
-    ));
+    assert!(matches!(registered.first_exec().expect("first_exec"), Woke::Exec));
 }

@@ -49,8 +49,12 @@ impl Drop for Serial {
 /// How many signals the stand-in handler has seen, and which (bit `n` for signal `n`).
 static SEEN: AtomicUsize = AtomicUsize::new(0);
 static SEEN_BITS: AtomicU32 = AtomicU32::new(0);
+/// The thread the stand-in handler ran on last (a `pthread_t`).
+static SEEN_ON: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" fn stand_in(signal: libc::c_int) {
+    // SAFETY: `pthread_self` has no preconditions.
+    SEEN_ON.store(unsafe { libc::pthread_self() }, Ordering::SeqCst);
     SEEN.fetch_add(1, Ordering::SeqCst);
     SEEN_BITS.fetch_or(1 << signal, Ordering::SeqCst);
 }
@@ -103,6 +107,11 @@ impl StandIn {
 
     pub(in crate::backend::launchd::manager) fn saw(&self, signal: libc::c_int) -> bool {
         SEEN_BITS.load(Ordering::SeqCst) & (1 << signal) != 0
+    }
+
+    /// Whether the stand-in last ran on `thread`.
+    fn ran_on(&self, thread: libc::pthread_t) -> bool {
+        SEEN_ON.load(Ordering::SeqCst) == thread
     }
 
     /// Every one of the three signals is the stand-in's again.
@@ -463,34 +472,34 @@ fn a_handler_is_not_counted_in_when_it_raises_to_the_previous_handler() {
 }
 
 /// The re-raised signal is sent to the process, not to the thread that closes the window: a thread that
-/// blocks it would hold it pending for as long as it blocks, while another thread that does not can take it
-/// at once. The closing thread here blocks the signal until the previous handler has seen it.
+/// blocks it would hold it pending for as long as it blocks, and deliver it to itself only once it lets go,
+/// while another thread that does not block it takes it at once. The closing thread lets go of the signal
+/// before the test looks, so that a signal held pending on it would be seen, and be seen on that thread.
 #[skuld::test]
 fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blocks_it() {
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
     raise(libc::SIGINT);
-    let mut closing = Joined::default();
-    let (closed, wait_for_close) = channel::<()>();
-    let (release, released) = channel::<()>();
 
-    closing.0 = Some(std::thread::spawn(move || {
+    let closing = std::thread::spawn(move || {
         let _blocked = Blocking::signal(libc::SIGINT);
         drop(deferred);
-        closed.send(()).expect("the test is waiting");
-        // The thread blocks the signal until the test lets go of it.
-        _ = released.recv();
-    }));
-    wait_for_close.recv().expect("the window was closed");
-    // A signal taken by another thread is delivered on that thread, so it is awaited, under no bound: the
-    // thread that blocks it never takes it.
+        // SAFETY: `pthread_self` has no preconditions.
+        unsafe { libc::pthread_self() }
+    });
+    // The thread is over, its block lifted: a signal it held pending has been delivered to it by now.
+    let closer = closing.join().expect("the closing thread");
+    // A signal taken by another thread is delivered on that thread, asynchronously, so it is awaited, under
+    // no bound; one the closer held is seen already.
     while before.seen() == 0 {
         std::thread::yield_now();
     }
 
     assert!(before.saw(libc::SIGINT));
-    drop(release);
-    drop(closing);
+    assert!(
+        !before.ran_on(closer),
+        "the signal was held by the thread that closed the window"
+    );
 }
 
 /// A window whose pipe cannot be made is an `Err` and installs nothing: no handler is ours, nothing is

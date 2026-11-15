@@ -15,13 +15,16 @@
 //!
 //! `run` watches a launch ([`Watch::add_launch`]): its pid is also registered for `NOTE_EXEC`, and its
 //! waits ([`Registered::first_exec`], [`Registered::exit`]) end when an interrupt does. An
-//! [interruptible](Watch::new_interruptible) watch has the read end of the [`Deferred`] window's pipe
-//! registered on its queue, which its handler writes to after it records a signal. So a wait that blocks
-//! wakes on an interrupt, and a wake means only "read the record again": the wait reads the window's
-//! record before it blocks and after every wake, and the record is the interrupt. The registration is
+//! [interruptible](Watch::new_interruptible) watch holds a [`Deferred`] of its own, which joins the window
+//! the caller has open, and has the read end of that window's pipe registered on its queue; the handler
+//! writes to the pipe after it records a signal. So a wait that blocks wakes on an interrupt, and a wake
+//! means only "read the record again": the wait reads the window's record before it blocks and after every
+//! wake, and the record is the interrupt. Each launch's registration holds one too, so that its waits read
+//! the record of the window their watch's pipe belongs to and no other's; [`Registered::leave_window`] lets
+//! it go, as the [`Run`](super::run::Run) that outlives the window's end must. The registration is
 //! `EV_CLEAR`: an event that a read of the queue takes (a poll for an exit included) is not there again, so
-//! a wait with no window (a [`Run`](super::run::Run)'s, while another holder keeps the pipe open) is not
-//! woken over and over by it, and nothing is lost, as every wait with a window reads the record next.
+//! a wait with no window (a `Run`'s, while another holder keeps the pipe open) is not woken over and over
+//! by it, and nothing is lost, as every wait with a window reads the record next.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -31,21 +34,22 @@ use std::time::Duration;
 use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::interrupts::{Deferred, Interrupts, WindowId};
+use super::interrupts::{Deferred, Interrupts};
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
 
 /// One kqueue fd.
 pub(crate) struct Watch {
     shared: Arc<Shared>,
+    /// The window whose pipe is registered on the queue, held for as long as the watch is: a window that
+    /// closes and a later one that opens cannot take its place, whichever descriptor numbers the pipes get.
+    /// `None` for a watch that cannot be woken by an interrupt.
+    window: Option<Deferred>,
 }
 
 /// The queue, and the events read from it for a registration other than the one that read them.
 struct Shared {
     queue: Kqueue,
-    /// The window whose pipe is registered on the queue: only a wait given that window can end on an
-    /// interrupt. Its identity, not the descriptor's number, which a later window's pipe may reuse.
-    window: Option<WindowId>,
     /// Taken out of the queue by one registration's `wait` or drop and not its own, so kept here for the
     /// registration whose pid it is. `status` is `None` for an exit the kernel reported without a status.
     kept: Mutex<Vec<Exited>>,
@@ -74,6 +78,9 @@ pub(crate) enum Added {
 pub(crate) struct Registered {
     shared: Arc<Shared>,
     pid: u32,
+    /// The watch's window, joined for a launch ([`Watch::add_launch`]) of an interruptible watch: what its
+    /// waits for an exec and an exit read. `None` for any other registration.
+    window: Option<Deferred>,
 }
 
 /// What ended a wait of [`Registered::first_exec`] or [`Registered::exit`].
@@ -98,24 +105,25 @@ impl Watch {
         Watch::make(None)
     }
 
-    /// A watch whose queue also has the read end of `window`'s pipe registered ([`Deferred::wake`]), for the
-    /// waits that end on an interrupt. The pipe is closed when the window's last holder is dropped, which
-    /// removes the registration with it.
-    pub(crate) fn new_interruptible(window: &Deferred) -> Result<Watch> {
-        Watch::make(Some(window))
+    /// A watch that holds the window the caller has open, and whose queue also has the read end of its
+    /// pipe registered ([`Deferred::wake`]), for the waits that end on an interrupt. The caller opens the
+    /// window first, so that the signals are taken over before the queue is made. The pipe is closed when
+    /// the window's last holder is dropped, which removes the registration with it.
+    pub(crate) fn new_interruptible() -> Result<Watch> {
+        Watch::make(Some(Deferred::begin()?))
     }
 
-    fn make(window: Option<&Deferred>) -> Result<Watch> {
+    fn make(window: Option<Deferred>) -> Result<Watch> {
         let queue = make_queue().map_err(|source| Error::os("make a kqueue to watch processes exit with", source))?;
         let watch = Watch {
             shared: Arc::new(Shared {
                 queue,
-                window: window.map(Deferred::id),
                 kept: Mutex::new(Vec::new()),
                 execed: Mutex::new(Vec::new()),
             }),
+            window,
         };
-        if let Some(window) = window {
+        if let Some(window) = &watch.window {
             watch
                 .register_wake(window.wake())
                 .map_err(|source| Error::os("watch for interrupts on the kqueue", source))?;
@@ -156,22 +164,26 @@ impl Watch {
             pid,
             EvFlags::empty(),
             FilterFlag::NOTE_EXIT | FilterFlag::NOTE_EXITSTATUS,
+            None,
         )
     }
 
     /// [`Self::add`] for a launch `run` follows: `pid` is also registered for its exec, which the waits
-    /// that take an interrupt window report. With `EV_CLEAR`, which an exec that repeats needs to be read
+    /// report, and the registration joins the watch's window, if it has one. With `EV_CLEAR`, which an exec that repeats needs to be read
     /// once per time: the flags are the ones measured on macOS CI (KB, "macOS - NOTE_EXEC reaches a
     /// kqueue on a held launch's pid, and the process reads stopped from then until SIGCONT").
     pub(crate) fn add_launch(&self, pid: u32) -> Result<Added> {
+        // The watch holds its window, so this joins that one.
+        let window = self.window.as_ref().map(|_| Deferred::begin()).transpose()?;
         self.register(
             pid,
             EvFlags::EV_CLEAR,
             FilterFlag::NOTE_EXEC | FilterFlag::NOTE_EXIT | FilterFlag::NOTE_EXITSTATUS,
+            window,
         )
     }
 
-    fn register(&self, pid: u32, flags: EvFlags, fflags: FilterFlag) -> Result<Added> {
+    fn register(&self, pid: u32, flags: EvFlags, fflags: FilterFlag, window: Option<Deferred>) -> Result<Added> {
         let change = KEvent::new(
             pid as usize,
             EventFilter::EVFILT_PROC,
@@ -203,6 +215,7 @@ impl Watch {
             0 => Ok(Added::Watching(Registered {
                 shared: Arc::clone(&self.shared),
                 pid,
+                window,
             })),
             code => match Errno::from_raw(code as i32) {
                 Errno::ESRCH => Ok(Added::Gone),
@@ -227,6 +240,14 @@ impl Registered {
             None => Ok(None),
             Some(Woke::Exec | Woke::Interrupted(_)) => unreachable!("neither was waited for"),
         }
+    }
+
+    /// Lets go of the registration's hold on the window, which the registration of a launch that has been
+    /// resumed must not keep: a [`Run`](super::run::Run) lasts as long as the process does, and interrupts
+    /// are held back only until the `SIGCONT`.
+    pub(crate) fn leave_window(mut self) -> Registered {
+        self.window = None;
+        self
     }
 
     /// The exit of the pid, if it has happened: read without blocking and without taking the exit. The queue
@@ -258,22 +279,23 @@ impl Registered {
         }
     }
 
-    /// Blocks until the launch's pid has exec'd for the first time, exited, or `window` has recorded an
+    /// Blocks until the launch's pid has exec'd for the first time, exited, or its window has recorded an
     /// interrupt: [`Woke::Exec`] (also where its exit came with it, which a [`Self::exit`] then reports),
-    /// [`Woke::Exited`] or [`Woke::Interrupted`]. Under no bound. Only for a registration of
-    /// [`Watch::add_launch`] on an [interruptible](Watch::new_interruptible) watch, with its own `window`.
-    pub(crate) fn first_exec(&self, window: &Deferred) -> Result<Woke> {
+    /// [`Woke::Exited`] or [`Woke::Interrupted`]. Under no bound. A registration that has no window
+    /// (anything but [`Watch::add_launch`] on an [interruptible](Watch::new_interruptible) watch, or one
+    /// that has [left](Self::leave_window) it) is never interrupted.
+    pub(crate) fn first_exec(&self) -> Result<Woke> {
         Ok(self
-            .next(true, Some(window), None)?
+            .next(true, self.window.as_ref(), None)?
             .expect("a wait under no deadline never expires"))
     }
 
     /// Blocks until the pid has exited ([`Woke::Exited`], whose status is of no concern to a caller that
-    /// does not read it) or `window` has recorded an interrupt. Under no bound. Only on an
-    /// [interruptible](Watch::new_interruptible) watch, with its own `window`.
-    pub(crate) fn exit(self, window: &Deferred) -> Result<Woke> {
+    /// does not read it) or its window has recorded an interrupt. Under no bound. As for
+    /// [`Self::first_exec`], a registration with no window is never interrupted.
+    pub(crate) fn exit(self) -> Result<Woke> {
         Ok(self
-            .next(false, Some(window), None)?
+            .next(false, self.window.as_ref(), None)?
             .expect("a wait under no deadline never expires"))
     }
 
@@ -286,10 +308,6 @@ impl Registered {
     /// writes the pipe, which the queue has registered already. Any wake, and an `EINTR`, only sends the wait
     /// back to the record, which the handler sets before it writes.
     fn next(&self, exec: bool, window: Option<&Deferred>, deadline: Option<Deadline>) -> Result<Option<Woke>> {
-        debug_assert!(
-            window.is_none_or(|window| self.shared.window == Some(window.id())),
-            "a window needs its pipe registered on the queue"
-        );
         let pid = self.pid;
         let waited_for = if exec { "exec" } else { "exit" };
         let waiting = |errno: Errno| {

@@ -128,6 +128,11 @@ impl Launchd {
     /// `SIGCONT`), each later one on its own. A failure of the first `debug`, and an interrupt recorded
     /// before it (while the job is loaded), are their own errors: no hold exists. Any later failure is
     /// [`stranded_hold`].
+    ///
+    /// The window has three kinds of holder: this function's own, which it reads the record through; the
+    /// watch's; and each launch's registration's. The watch and the registrations read the record of the
+    /// window their kqueue's pipe belongs to. The launch that is resumed lets go of its hold as it becomes the
+    /// [`Run`], so the window ends when this function returns, not when the run does.
     pub(super) fn begin_task_run(
         &self,
         snapshot: Plist,
@@ -138,7 +143,7 @@ impl Launchd {
         let Plist { id, blob, .. } = snapshot;
         let logs = blob.map_err(Error::Kept)?.spec.common().logs.clone();
         let window = Deferred::begin()?;
-        let watch = Watch::new_interruptible(&window)?;
+        let watch = Watch::new_interruptible()?;
         self.launchctl.load_job(id.as_str(), &path, reservation)?;
 
         let mut attempt = Attempt {
@@ -290,7 +295,7 @@ impl Attempt<'_> {
             return Ok(Then::Stranger);
         }
         if path.file_name() == Some(OsStr::new("xpcproxy")) {
-            match registered.first_exec(self.window).map_err(strand)? {
+            match registered.first_exec().map_err(strand)? {
                 Woke::Exec => {}
                 Woke::Exited(status) => return Ok(Then::Gone(status)),
                 Woke::Interrupted(interrupts) => {
@@ -334,7 +339,7 @@ impl Attempt<'_> {
     fn wait_for_exit(&mut self, registered: Registered) -> Result<Option<Run>> {
         let id = self.id;
         self.note();
-        match registered.exit(self.window).map_err(|e| stranded_hold(id, e))? {
+        match registered.exit().map_err(|e| stranded_hold(id, e))? {
             Woke::Interrupted(interrupts) => Err(stranded_hold(
                 id,
                 self.interrupted(
@@ -385,7 +390,8 @@ impl Attempt<'_> {
             SignalOutcome::Sent => Ok(Run {
                 id: id.clone(),
                 pid,
-                registered,
+                // Past the `SIGCONT` interrupts are no longer held back: the run outlives the window.
+                registered: registered.leave_window(),
                 logs,
             }),
             SignalOutcome::NoProcess => Err(run_unresumed(id)),

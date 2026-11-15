@@ -41,7 +41,6 @@ const SIGNALS: [(libc::c_int, &str); 3] = [
 
 /// What an open window holds.
 struct Open {
-    id: WindowId,
     /// The dispositions of [`SIGNALS`] before the first holder.
     previous: [libc::sigaction; 3],
     /// The mask of the signals the window took over (bit `i` for `SIGNALS[i]`): a signal that was ignored
@@ -55,21 +54,9 @@ struct Shared {
     holders: usize,
     /// `Some` while there is a holder.
     open: Option<Open>,
-    /// How many windows have been opened: the last one's [`WindowId`].
-    opened: u64,
 }
 
-static SHARED: Mutex<Shared> = Mutex::new(Shared {
-    holders: 0,
-    open: None,
-    opened: 0,
-});
-
-/// Which window a [`Deferred`] and what it hands out belong to: one per window, never reused in the
-/// process. A descriptor number is not one, as the pipe of a later window may get the number of the pipe of
-/// an earlier one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WindowId(u64);
+static SHARED: Mutex<Shared> = Mutex::new(Shared { holders: 0, open: None });
 
 /// Bit `i` is set once `SIGNALS[i]` has arrived and nobody has claimed it yet.
 static RECORDED: AtomicU32 = AtomicU32::new(0);
@@ -120,7 +107,7 @@ fn claim(mask: u32) -> u32 {
     RECORDED.fetch_and(!mask, Ordering::SeqCst) & mask
 }
 
-/// The handler: records the signal and wakes the waits ([`wake`]), and where the window has closed already,
+/// The handler: records the signal and wakes the waits ([`record_and_write`]), and where the window has closed already,
 /// claims the signal back and raises it. It leaves `errno` as it found it.
 ///
 /// A signal can be delivered on any thread, so a handler may still be running while the last holder is
@@ -136,7 +123,7 @@ extern "C" fn record(signal: libc::c_int) {
     let mask = 1 << bit;
     // SAFETY: `__error` is the calling thread's `errno`, which a handler may read and write.
     let errno = unsafe { *libc::__error() };
-    wake(signal, mask);
+    record_and_write(mask);
     if !OPEN.load(Ordering::SeqCst) && claim(mask) != 0 {
         // SAFETY: `raise` takes a valid signal number.
         unsafe { libc::raise(signal) };
@@ -145,16 +132,16 @@ extern "C" fn record(signal: libc::c_int) {
     unsafe { *libc::__error() = errno };
 }
 
-/// Records `signal` (`mask` is its bit) and writes a byte to the open window's pipe, if one is published.
+/// Records the signal whose bit is `mask` and writes a byte to the open window's pipe, if one is published.
 /// The only part of the handler that [`IN_FLIGHT`] counts: the previous handler it raises to afterwards is
 /// no business of the close.
-fn wake(signal: libc::c_int, mask: u32) {
+fn record_and_write(mask: u32) {
     IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
     // The record before the wake: a wait that the byte wakes finds the record set.
     RECORDED.fetch_or(mask, Ordering::SeqCst);
     let fd = WAKE.load(Ordering::SeqCst);
     if fd >= 0 {
-        let byte = signal as u8;
+        let byte = 1u8;
         // A pipe that is full already holds a byte that nothing has read, so a failed write loses nothing.
         // SAFETY: `fd` is open: the close un-publishes it, then waits for the handlers counted in, this one
         // included, before it closes it. `byte` is one valid byte.
@@ -192,7 +179,6 @@ pub(crate) struct Deferred {
     taken: u32,
     /// The read end of the window's pipe, open for as long as a holder is.
     wake: RawFd,
-    id: WindowId,
 }
 
 impl Deferred {
@@ -240,14 +226,7 @@ impl Deferred {
             OPEN.store(true, Ordering::SeqCst);
             match install() {
                 Ok((previous, taken)) => {
-                    shared.opened += 1;
-                    let id = WindowId(shared.opened);
-                    shared.open = Some(Open {
-                        id,
-                        previous,
-                        taken,
-                        wake,
-                    });
+                    shared.open = Some(Open { previous, taken, wake });
                 }
                 Err(source) => {
                     // `install` put back what it changed. Closed under the lock, as `Drop` does, so a
@@ -265,13 +244,7 @@ impl Deferred {
         Ok(Deferred {
             taken: open.taken,
             wake: open.wake.read.as_raw_fd(),
-            id: open.id,
         })
-    }
-
-    /// Which window this holder is in.
-    pub(crate) fn id(&self) -> WindowId {
-        self.id
     }
 
     /// The read end of the window's pipe: readable once any interrupt is recorded, and for the rest of the
@@ -307,11 +280,11 @@ impl Drop for Deferred {
     }
 }
 
-/// Closes the window, after the previous handlers are back: the pipe's write end is un-published, so that no
-/// handler that starts from now on writes to it, the handlers in their write are waited for, under no
-/// bound (a write to a non-blocking pipe ends on its own), and the pipe is closed. Then `OPEN` is cleared, so that a handler that finds
-/// it clear raises to the previous handlers, and every recorded bit is claimed. The bits it answers are the
-/// caller's to [`reraise`].
+/// Closes the window, after the previous handlers are back: the pipe's write end is un-published, so that
+/// no handler that starts from now on writes to it, the handlers in their write are waited for, under no
+/// bound (a write to a non-blocking pipe ends on its own), and the pipe is closed. Then `OPEN` is cleared,
+/// so that a handler that finds it clear raises to the previous handlers, and every recorded bit is
+/// claimed. The bits it answers are the caller's to [`reraise`].
 fn shut(wake: Wake) -> u32 {
     WAKE.store(-1, Ordering::SeqCst);
     while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
@@ -326,9 +299,11 @@ fn shut(wake: Wake) -> u32 {
 ///
 /// The window took the signal over on every thread that did not block it, so the calling thread may be one
 /// that blocks it: `raise`, which sends to the calling thread only, would leave it pending there for as long
-/// as the block lasts. Such a signal is sent to the process, which gives it to a thread that takes it. One
-/// the calling thread takes is raised on it, so that the previous handler has run when this returns, as a
-/// signal sent to the process need not have (any thread may be the one to take it).
+/// as the block lasts. Such a signal is sent to the process, which gives it to a thread that takes it, so the
+/// previous disposition acts on that thread, after `Drop` returns: a `SIG_DFL` that ends the process ends it
+/// then, and a handler runs then. goetia's own threads block none of these signals. One the calling thread
+/// takes is raised on it, so that the previous handler has run when this returns, as a signal sent to the
+/// process need not have (any thread may be the one to take it).
 fn reraise(recorded: u32) {
     for (bit, &(signal, _)) in SIGNALS.iter().enumerate() {
         if recorded & (1 << bit) != 0 {
