@@ -15,17 +15,45 @@ jobs:
       fail-fast: false
       matrix:
         method:
-          - ss
           - ss-kick
-          - ss-kill
-          - ss-bootout
-          - link-kick
-          - ss-setenv-kick
-          - setenv-kick
-          - ss-notify
+
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Probe
         run: sudo bash .github/probe/tz.sh ${{ matrix.method }}
+
+  dst:
+    name: dst ${{ matrix.case }} (macos)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [spring, fall1, fall2]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Probe
+        run: sudo bash .github/probe/dst.sh ${{ matrix.case }}
+
+  calendar:
+    name: calendar (macos)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - name: Build
+        run: cargo build --locked --example calendar_probe --features testing
+
+      - name: Probe
+        run: sudo bash .github/probe/calendar.sh target/debug/examples/calendar_probe

@@ -50,7 +50,8 @@ PLIST
     done
     echo "CANARY [$what] $(date '+%H:%M:%S %Z'): $line"
     case "$line" in
-    *" 3:00:00 AM "*) echo "VERDICT [$what]: computed in $zone" ;;
+    # The time and "AM" are separated by U+202F, not a space.
+    *"at 3:00:00"*AM*Eastern*) echo "VERDICT [$what]: computed in $zone" ;;
     *) echo "VERDICT [$what]: NOT computed in $zone" ;;
     esac
     launchctl bootout "system/$label"
