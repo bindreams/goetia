@@ -1175,7 +1175,11 @@ fn probe_run_until_it_fails(#[fixture(launchd_group)] _group: &Group) {
     let log = dir.path().join("task.log");
     let bin = tempfile::tempdir().expect("tempdir");
     let mgr = Launchd::new();
-    let _guard = Guard::install(&mgr, &with_logs(task(&id, sh("echo first-run"), None), &log));
+    let _guard = Guard::install(
+        &mgr,
+        &with_logs(task(&id, sh("echo first-run"), Some("* * * * *")), &log),
+    );
+    mgr.enable(&id_of(&id)).expect("enable");
     let calls = bin.path().join("calls");
     let wrapper = bin.path().join("launchctl");
     fs::write(
@@ -1200,7 +1204,7 @@ fn probe_run_until_it_fails(#[fixture(launchd_group)] _group: &Group) {
         std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string())
     );
     let mut report = String::new();
-    for i in 1..=80 {
+    for i in 1..=300 {
         drop(fs::remove_file(&calls));
         let output = Command::new(env!("CARGO_BIN_EXE_goetia"))
             .args(["daemon", "run", id.as_str()])
@@ -1208,7 +1212,7 @@ fn probe_run_until_it_fails(#[fixture(launchd_group)] _group: &Group) {
             .stdin(Stdio::null())
             .output()
             .expect("run goetia");
-        if !output.status.success() || output.stdout != b"first-run\n" {
+        if String::from_utf8_lossy(&output.stderr).contains("may not have started") {
             report = format!(
                 "iteration {i}: exit {:?}\nstdout: {:?}\nstderr: {}\ncalls:\n{}",
                 output.status.code(),
