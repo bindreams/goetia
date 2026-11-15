@@ -292,8 +292,8 @@ jobs:
           }
 
       # `libsearch_guard::verify` on what ships, on every row: the staged executable, and on Windows
-      # also the shim it embeds. `cargo test` only verifies the debug build. The checker is built for
-      # the runner's own host (no `--target`), and reads ELF, Mach-O and PE alike.
+      # also the shim it embeds. `cargo test` only verifies the debug build. The checker is a debug build
+      # for the runner's own host (no `--target`), and reads ELF, Mach-O and PE alike.
       - name: Verify the binaries are hardened
         env:
           TARGET: ${{ matrix.target }}
@@ -305,7 +305,6 @@ jobs:
           else
             executables=("goetia-${TARGET}/goetia")
           fi
-          # A debug build: the checker needs no optimisation.
           cargo run -p verify-hardening --locked -- "${executables[@]}"
 
       # The staged goetia.exe alone must install, run and uninstall a

@@ -17,7 +17,8 @@ exclude = ["/.github", "/.claude", "/.config", "/CLAUDE.md", "/scripts", "/prek.
 # directory with its own manifest is left out) and a bare `cargo` command at the root still builds only goetia.
 [workspace]
 members = ["tools/verify-hardening"]
-# Worktrees and scratch crates under `.tmp` are their own roots, not members.
+# A manifest under `.tmp` without its own `[workspace]` (a scratch crate, a worktree of a branch from before this
+# workspace) would otherwise be taken for a member and fail to build.
 exclude = [".tmp"]
 
 # One requirement, for the build script, the tests and `tools/verify-hardening`.
