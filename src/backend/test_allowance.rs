@@ -30,6 +30,14 @@ impl<T: 'static> Allowance<T> {
         left.set(Some(value));
         Allowance(left)
     }
+
+    /// Whether a hook has taken the value: for a value, not a count, which [`spend`] never takes.
+    pub(crate) fn taken(&self) -> bool {
+        let value = self.0.take();
+        let taken = value.is_none();
+        self.0.set(value);
+        taken
+    }
 }
 
 impl<T: 'static> Drop for Allowance<T> {

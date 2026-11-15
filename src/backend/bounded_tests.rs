@@ -532,11 +532,11 @@ mod refused_kill {
     }
 
     /// The child traps SIGTERM and tells the test its descendant's pid only once the trap is set, so
-    /// the hook's SIGTERM, standing for the exit that raced the kill, is answered with exit 7 and never
-    /// with the default action. The descendant outlives the child unless the tree is ended: the test
+    /// the hook's SIGTERM, standing for the exit that raced the kill, makes it exit and never takes
+    /// the default action. The descendant outlives the child unless the tree is ended: the test
     /// watches it die, and kills it however the test ends.
-    fn trapping(role: Role, trap: &str) -> (Spawned, KillOnDrop) {
-        let mut cmd = sh(&format!("trap '{trap}' TERM; sleep 2147483647 & echo $! >&3; wait"));
+    fn trapping(role: Role) -> (Spawned, KillOnDrop) {
+        let mut cmd = sh("trap exit TERM; sleep 2147483647 & echo $! >&3; wait");
         cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
         let mut child = spawned(cmd, role);
         let descendant = descendant_on_fd3(&mut child.child);
@@ -548,11 +548,12 @@ mod refused_kill {
     /// contained tree is ended all the same.
     #[skuld::test]
     fn a_kill_refused_at_the_deadline_by_a_child_that_then_exits_is_reported_expired() {
-        let (child, descendant) = trapping(Role::Query, "echo bye; exit 7");
-        let _refused = test_hook::kill_fails(term_then_eperm);
+        let (child, descendant) = trapping(Role::Query);
+        let refused = test_hook::kill_fails(term_then_eperm);
 
         let finished = wait_bounded(child, Budget::Immediate.start());
 
+        assert!(refused.taken(), "the kill was never refused");
         assert!(matches!(finished, Ok(Finished::Expired)), "{finished:?}");
         // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
         descendant.0.wait().unwrap();
@@ -561,14 +562,15 @@ mod refused_kill {
     /// The same refusal of an [`Role::AnnouncedRequest`], whose streams are pipes read as written.
     #[skuld::test]
     fn a_kill_refused_at_the_deadline_of_an_announced_request_that_then_exits_is_reported_expired() {
-        let mut cmd = sh("trap 'exit 7' TERM; sleep 2147483647 & echo $! >&3; echo 'request issued' >&2; wait");
+        let mut cmd = sh("trap exit TERM; sleep 2147483647 & echo $! >&3; echo 'request issued' >&2; wait");
         cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
         let mut child = spawned(cmd, Role::AnnouncedRequest(announced));
         let descendant = descendant_on_fd3(&mut child.child);
-        let _refused = test_hook::kill_fails(term_then_eperm);
+        let refused = test_hook::kill_fails(term_then_eperm);
 
         let finished = wait_bounded(child, Budget::Immediate.start());
 
+        assert!(refused.taken(), "the kill was never refused");
         assert!(matches!(finished, Ok(Finished::Expired)), "{finished:?}");
         descendant.0.wait().unwrap();
     }
@@ -577,7 +579,7 @@ mod refused_kill {
     /// `PermissionDenied` with no code, the `EPERM` its source) is the same refusal.
     #[skuld::test]
     fn a_kill_refused_with_a_wrapped_eperm_by_a_child_that_then_exits_is_not_an_error() {
-        let (child, _descendant) = trapping(Role::Query, "exit 7");
+        let (child, _descendant) = trapping(Role::Query);
         let _refused = test_hook::kill_fails(|child| {
             let _ = term_then_eperm(child);
             cosca::error::Error::Io(io::Error::new(
