@@ -4,7 +4,7 @@
 //!
 //! The lines are read from a `log stream` that is attached before the timer is armed. Every wait here is on
 //! the log's own lines, with no cap: the suite's watchdog is its bound. (The canary is logged again while it
-//! has not come back; see [`Registrations::start`].)
+//! has not come back; see `Registrations::start`.)
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader};
