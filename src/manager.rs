@@ -182,7 +182,8 @@ pub trait ServiceManager {
     /// restart that leaves the daemon down. launchd answers a `kickstart` of
     /// a task that still has its run as it answers a start, so there a task's
     /// start reads the job first and is refused with [`Error::StillRunning`],
-    /// sending nothing. `Ok(())` means the manager
+    /// sending nothing, and one whose read fails is [`Error::StopUnconfirmed`], also sending nothing.
+    /// `Ok(())` means the manager
     /// accepted a start request and nothing more. Takes no budget: it never
     /// waits.
     fn request_start_after_stop(&self, id: &Id) -> Result<()>;

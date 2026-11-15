@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::super::manager_tests::launchd_over;
+use super::super::task::Shown;
 use super::super::task::task_tests::{ID, Tree, marked, plists_of, service_spec, task_spec};
 use super::super::watch::{test_hook, watch_tests::Held};
 use super::super::write::write_tests::bootstrap;
@@ -249,6 +250,56 @@ fn a_start_after_an_unwaited_stop_over_an_idle_job_is_a_start() {
             .expect("a start over a job with no process");
 
         fake.assert_spent("the read, the load, the plain kickstart");
+    }
+}
+
+/// A read that failed or was not whole concludes nothing, and a `kickstart` over a run that is still
+/// there starts nothing and answers success (measured): so no start is sent, and the error is `stop`'s
+/// failed-read one, in the words `stop` uses, indeterminate.
+#[skuld::test]
+fn a_start_after_an_unwaited_stop_is_not_sent_when_the_read_failed() {
+    let cut = Finished::Exited {
+        status: ExitStatus::from_raw(0),
+        capture: Capture {
+            stdout: b"\tstate = not run".to_vec(),
+            stderr: Vec::new(),
+            complete: false,
+        },
+    };
+    let failed = reply(
+        &["print", &target()],
+        exited(5, "", "Could not print: 5: Input/output error\n"),
+    );
+    for (what, read) in [
+        ("a print that failed", failed),
+        ("a print that was not whole", reply(&["print"], cut)),
+    ] {
+        let tree = Tree::new();
+        let fake = Fake::new([read]);
+        let mgr = launchd_over(fake.clone());
+
+        let e = mgr
+            .request_start_after_stop(
+                task_snapshot(&tree, false),
+                &mut reserved(&mgr, Step::RequestStartAfterStop),
+            )
+            .expect_err("a start is not sent over a read that failed");
+
+        assert!(matches!(e, Error::StopUnconfirmed { .. }), "{what}: {e:?}");
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "`{ID}` may not have stopped: {}",
+                Shown::Failed.describe(State::Unknown)
+            ),
+            "{what}"
+        );
+        assert!(e.is_indeterminate(), "{what}: the exit code is 4");
+        fake.assert_spent("the one read");
+        assert!(
+            calls_of(&fake, "kickstart").is_empty() && calls_of(&fake, "bootstrap").is_empty(),
+            "{what}: nothing is sent"
+        );
     }
 }
 

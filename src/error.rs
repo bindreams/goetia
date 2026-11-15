@@ -142,8 +142,10 @@ pub enum Error {
     /// A launchd task's `stop` read its job with no process, and in a state that does not say it is idle
     /// (a state goetia does not know, no `state` line), or could not read it whole: that no process
     /// remains is not established, so the stop is not reported as done. A SIGTERM an earlier pass sent
-    /// stands. Indeterminate, like [`StartUnconfirmed`](Error::StartUnconfirmed). `shown` is what launchd
-    /// showed, as the rest of the sentence.
+    /// stands. A task's start requested right after an unwaited stop (`restart --timeout 0`) reads its job
+    /// first, and a read that failed is this too: no start is sent. Indeterminate, like
+    /// [`StartUnconfirmed`](Error::StartUnconfirmed). `shown` is what launchd showed, as the rest of the
+    /// sentence.
     #[error("`{id}` may not have stopped: {shown}")]
     StopUnconfirmed { id: String, shown: String },
 

@@ -1756,8 +1756,9 @@ impl backend::Backend for Launchd {
     /// a job that still has a process starts nothing and answers as a start does (measured: exit 0,
     /// nothing written). So one `print` reads whether the run is still there, and if it is, no start is
     /// issued ([`Error::StillRunning`]). If the run exits after the read the refusal is still true of
-    /// what was read; if a fire starts a run in the gap, a fresh run is up. A read that failed concludes
-    /// nothing, and the start goes ahead as a task's `start` does.
+    /// what was read; if a fire starts a run in the gap, a fresh run is up. A read that failed or was not
+    /// whole concludes nothing, so no start is issued either: the result is [`Error::StopUnconfirmed`],
+    /// as `stop`'s is, and indeterminate.
     fn request_start_after_stop(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
         if snapshot.kind() == DaemonKind::Task {
             let print = self.launchctl.read_task_print(
@@ -1770,6 +1771,12 @@ impl backend::Backend for Launchd {
                 return Err(Error::StillRunning {
                     id: snapshot.id().to_string(),
                     pid,
+                });
+            }
+            if matches!(print.shown, task::Shown::Failed) {
+                return Err(Error::StopUnconfirmed {
+                    id: snapshot.id().to_string(),
+                    shown: print.shown.describe(print.state),
                 });
             }
         }
