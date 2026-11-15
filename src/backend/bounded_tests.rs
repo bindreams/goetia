@@ -385,8 +385,9 @@ fn eperm() -> cosca::error::Error {
     io::Error::from_raw_os_error(libc::EPERM).into()
 }
 
-/// Imitates cosca 0.8's wrapping of an `EPERM` (its text, the error itself as the source); the macOS
-/// test with a real refused kill is what checks the real shape.
+/// Imitates cosca 0.8's wrapping of an `EPERM` (its text, the error itself as the source). That cosca
+/// still wraps it so is an assumption no test here checks against a real refused kill: the refusal is a
+/// rare kernel window that a test cannot open on demand.
 #[derive(Debug, thiserror::Error)]
 #[error("pid 1: its identity could not be read; SIGKILL not sent")]
 struct Wrapped(#[source] io::Error);
