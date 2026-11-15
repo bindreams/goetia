@@ -32,7 +32,7 @@ impl<'a> UnitKill<'a> {
 
 impl Reports for UnitKill<'_> {
     /// `MainPID`: `None` when the unit has no main process, which `systemctl kill` called "No main process
-    /// to kill". A unit systemd has not loaded is [`Error::UnitNotLoaded`], never no process.
+    /// to kill". A unit systemd has not loaded is [`crate::error::Error::UnitNotLoaded`], never no process.
     fn service_pid(&mut self) -> io::Result<Option<u32>> {
         self.systemctl.main_pid_of(&self.unit).map_err(io::Error::other)
     }
