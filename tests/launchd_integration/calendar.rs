@@ -64,18 +64,24 @@ impl Registrations {
         // The first line is the stream's own, printed before the stream is subscribed to the log (measured: a
         // line logged straight after it was lost). The second, a column header, is printed with the first
         // event the stream delivers, and with none to deliver (the canary was lost) it never comes: in the
-        // measured run it came 55 s later, with an unrelated event. So the canary is logged again whenever
-        // `RELOG` passes with no line. That expiry proves nothing about the stream: the wait ends only on the
-        // canary coming back. A `logger` that fails, or a stream that ends, ends the test.
+        // measured run it came 55 s later, with an unrelated event. So the canary is logged again once `RELOG`
+        // has passed since the last one, whether or not other lines arrive meanwhile. That spacing proves
+        // nothing about the stream: the wait ends only on the canary coming back. A `logger` that fails, or a
+        // stream that ends, ends the test.
         registrations.next_line();
         let canary = format!("StartCalendarInterval canary {}", std::process::id());
-        cmd::run("logger", &[canary.as_str()]).expect_ok();
+        let log_canary = || {
+            cmd::run("logger", &[canary.as_str()]).expect_ok();
+            std::time::Instant::now()
+        };
+        let mut logged = log_canary();
         loop {
-            match registrations.lines.recv_timeout(RELOG) {
+            match registrations.lines.recv_timeout(RELOG.saturating_sub(logged.elapsed())) {
                 Ok(line) if line.contains(&canary) => return registrations,
-                Ok(_) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    cmd::run("logger", &[canary.as_str()]).expect_ok();
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if logged.elapsed() >= RELOG {
+                        logged = log_canary();
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => panic!("`log stream` ended"),
             }
