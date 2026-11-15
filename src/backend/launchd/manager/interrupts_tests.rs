@@ -3,7 +3,7 @@
 
 use std::cell::Cell;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -49,12 +49,36 @@ impl Drop for Serial {
 /// How many signals the stand-in handler has seen, and which (bit `n` for signal `n`).
 static SEEN: AtomicUsize = AtomicUsize::new(0);
 static SEEN_BITS: AtomicU32 = AtomicU32::new(0);
-/// The thread the stand-in handler ran on last (a `pthread_t`).
-static SEEN_ON: AtomicUsize = AtomicUsize::new(0);
+/// Whether the stand-in handler has run on a marked thread ([`mark_thread`]).
+static SEEN_ON_MARKED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Whether this thread is marked. Set on the thread itself, so that the handler, which runs on whichever
+    /// thread takes the signal, tells that thread from the others without comparing thread ids, which are
+    /// reused once a thread is joined.
+    static MARKED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The calling thread, marked until this drops.
+pub(in crate::backend::launchd::manager) struct Marked;
+
+/// Marks the calling thread: [`StandIn::ran_on_marked`] says whether the stand-in has run on it.
+pub(in crate::backend::launchd::manager) fn mark_thread() -> Marked {
+    MARKED.set(true);
+    Marked
+}
+
+impl Drop for Marked {
+    fn drop(&mut self) {
+        MARKED.set(false);
+    }
+}
 
 extern "C" fn stand_in(signal: libc::c_int) {
-    // SAFETY: `pthread_self` has no preconditions.
-    SEEN_ON.store(unsafe { libc::pthread_self() }, Ordering::SeqCst);
+    // Before the count, so that a test that waits for the count finds this set.
+    if MARKED.get() {
+        SEEN_ON_MARKED.store(true, Ordering::SeqCst);
+    }
     SEEN.fetch_add(1, Ordering::SeqCst);
     SEEN_BITS.fetch_or(1 << signal, Ordering::SeqCst);
 }
@@ -88,6 +112,7 @@ impl StandIn {
         let serial = serial();
         SEEN.store(0, Ordering::SeqCst);
         SEEN_BITS.store(0, Ordering::SeqCst);
+        SEEN_ON_MARKED.store(false, Ordering::SeqCst);
         let ours = action(stand_in_address());
         let mut before = [action(libc::SIG_DFL); 3];
         for (i, signal) in signals().into_iter().enumerate() {
@@ -109,9 +134,9 @@ impl StandIn {
         SEEN_BITS.load(Ordering::SeqCst) & (1 << signal) != 0
     }
 
-    /// Whether the stand-in last ran on `thread`.
-    fn ran_on(&self, thread: libc::pthread_t) -> bool {
-        SEEN_ON.load(Ordering::SeqCst) == thread
+    /// Whether the stand-in has run on a thread that was marked at the time.
+    pub(in crate::backend::launchd::manager) fn ran_on_marked(&self) -> bool {
+        SEEN_ON_MARKED.load(Ordering::SeqCst)
     }
 
     /// Every one of the three signals is the stand-in's again.
@@ -482,13 +507,14 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
     raise(libc::SIGINT);
 
     let closing = std::thread::spawn(move || {
+        // Dropped last, after the block is lifted: a signal the thread held pending is delivered to it as
+        // the block lifts, and the handler finds it marked.
+        let _marked = mark_thread();
         let _blocked = Blocking::signal(libc::SIGINT);
         drop(deferred);
-        // SAFETY: `pthread_self` has no preconditions.
-        unsafe { libc::pthread_self() }
     });
     // The thread is over, its block lifted: a signal it held pending has been delivered to it by now.
-    let closer = closing.join().expect("the closing thread");
+    closing.join().expect("the closing thread");
     // A signal taken by another thread is delivered on that thread, asynchronously, so it is awaited, under
     // no bound; one the closer held is seen already.
     while before.seen() == 0 {
@@ -497,7 +523,7 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
 
     assert!(before.saw(libc::SIGINT));
     assert!(
-        !before.ran_on(closer),
+        !before.ran_on_marked(),
         "the signal was held by the thread that closed the window"
     );
 }
@@ -629,6 +655,28 @@ fn two_overlapping_begin_runs_restore_the_signal_handlers() {
     assert_eq!(before.seen(), 0, "still held with one window live");
 
     drop(second);
+
+    assert_eq!(before.seen(), 1);
+    assert!(before.saw(libc::SIGTERM));
+    before.assert_back();
+}
+
+/// A holder that joined keeps the window open when the one it joined from is dropped: the signal is still
+/// held back and recorded, and it is re-raised when the joined one is dropped.
+#[skuld::test]
+fn a_joined_holder_keeps_the_window_open_when_the_first_is_dropped() {
+    let before = StandIn::install();
+    let first = Deferred::begin().expect("begin");
+    let joined = first.join();
+    assert_eq!(joined.wake(), first.wake(), "the same window's pipe");
+
+    drop(first);
+    raise(libc::SIGTERM);
+
+    assert_eq!(before.seen(), 0, "still held with one holder live");
+    assert_eq!(joined.recorded().expect("recorded").to_string(), "SIGTERM");
+
+    drop(joined);
 
     assert_eq!(before.seen(), 1);
     assert!(before.saw(libc::SIGTERM));

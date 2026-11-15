@@ -129,10 +129,11 @@ impl Launchd {
     /// before it (while the job is loaded), are their own errors: no hold exists. Any later failure is
     /// [`stranded_hold`].
     ///
-    /// The window has three kinds of holder: this function's own, which it reads the record through; the
-    /// watch's; and each launch's registration's. The watch and the registrations read the record of the
-    /// window their kqueue's pipe belongs to. The launch that is resumed lets go of its hold as it becomes the
-    /// [`Run`], so the window ends when this function returns, not when the run does.
+    /// The window has two kinds of holder: the watch's, which the record is read through, and each launch's
+    /// registration's. Both are of the window their kqueue's pipe belongs to. The launch that is resumed lets
+    /// go of its hold as it becomes the [`Run`], so the window ends when this function returns, not when the
+    /// run does. It is opened here, before the watch, which only joins it: the signals are taken over before
+    /// the queue is made, and the window's pipe is there to register on it.
     pub(super) fn begin_task_run(
         &self,
         snapshot: Plist,
@@ -142,15 +143,13 @@ impl Launchd {
         let path = snapshot.job()?.location.path.clone();
         let Plist { id, blob, .. } = snapshot;
         let logs = blob.map_err(Error::Kept)?.spec.common().logs.clone();
-        let window = Deferred::begin()?;
-        let watch = Watch::new_interruptible()?;
+        let watch = Watch::new_interruptible(&Deferred::begin()?)?;
         self.launchctl.load_job(id.as_str(), &path, reservation)?;
 
         let mut attempt = Attempt {
             launchd: self,
             id: &id,
             watch: &watch,
-            window: &window,
             logs,
             notes,
         };
@@ -175,7 +174,6 @@ struct Attempt<'a> {
     launchd: &'a Launchd,
     id: &'a Id,
     watch: &'a Watch,
-    window: &'a Deferred,
     logs: Option<PathBuf>,
     notes: &'a mut dyn Write,
 }
@@ -192,7 +190,7 @@ impl Attempt<'_> {
         let before_debug = |e: Error| if first { e } else { strand(e) };
         // An interrupt recorded while the job loaded, or that arrived while an earlier pass waited and its
         // exit came with it: nothing is started after it.
-        if let Some(interrupts) = self.window.recorded() {
+        if let Some(interrupts) = self.watch.recorded() {
             let (received, left) = if first {
                 ("before goetia armed a hold", "no hold was armed")
             } else {
@@ -257,7 +255,7 @@ impl Attempt<'_> {
     /// effect; one received after the check is held back until `begin_run` returns, as one after the
     /// resume of our own launch is.
     fn unless_interrupted(&self, received: &str, left: &str) -> Result<()> {
-        match self.window.recorded() {
+        match self.watch.recorded() {
             Some(interrupts) => Err(stranded_hold(self.id, self.interrupted(interrupts, received, left))),
             None => Ok(()),
         }

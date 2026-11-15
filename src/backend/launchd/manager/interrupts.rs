@@ -239,12 +239,13 @@ impl Deferred {
                 }
             }
         }
-        shared.holders += 1;
-        let open = shared.open.as_ref().expect("a window with a holder is open");
-        Ok(Deferred {
-            taken: open.taken,
-            wake: open.wake.read.as_raw_fd(),
-        })
+        Ok(hold(&mut shared))
+    }
+
+    /// Another holder of the window this one is in, which keeps it open until it is dropped too. It opens
+    /// no window and cannot fail: the window is open for as long as `self` is held.
+    pub(crate) fn join(&self) -> Deferred {
+        hold(&mut SHARED.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// The read end of the window's pipe: readable once any interrupt is recorded, and for the rest of the
@@ -260,6 +261,16 @@ impl Deferred {
     pub(crate) fn recorded(&self) -> Option<Interrupts> {
         let bits = RECORDED.load(Ordering::SeqCst) & self.taken;
         (bits != 0).then_some(Interrupts(bits))
+    }
+}
+
+/// Adds a holder to the window, which must be open already.
+fn hold(shared: &mut Shared) -> Deferred {
+    let open = shared.open.as_ref().expect("a window to hold is open");
+    shared.holders += 1;
+    Deferred {
+        taken: open.taken,
+        wake: open.wake.read.as_raw_fd(),
     }
 }
 

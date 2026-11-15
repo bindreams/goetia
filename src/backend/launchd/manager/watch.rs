@@ -15,8 +15,8 @@
 //!
 //! `run` watches a launch ([`Watch::add_launch`]): its pid is also registered for `NOTE_EXEC`, and its
 //! waits ([`Registered::first_exec`], [`Registered::exit`]) end when an interrupt does. An
-//! [interruptible](Watch::new_interruptible) watch holds a [`Deferred`] of its own, which joins the window
-//! the caller has open, and has the read end of that window's pipe registered on its queue; the handler
+//! [interruptible](Watch::new_interruptible) watch joins the window the caller has open, with a
+//! [`Deferred`] of its own, and has the read end of that window's pipe registered on its queue; the handler
 //! writes to the pipe after it records a signal. So a wait that blocks wakes on an interrupt, and a wake
 //! means only "read the record again": the wait reads the window's record before it blocks and after every
 //! wake, and the record is the interrupt. Each launch's registration holds one too, so that its waits read
@@ -105,12 +105,19 @@ impl Watch {
         Watch::make(None)
     }
 
-    /// A watch that holds the window the caller has open, and whose queue also has the read end of its
-    /// pipe registered ([`Deferred::wake`]), for the waits that end on an interrupt. The caller opens the
-    /// window first, so that the signals are taken over before the queue is made. The pipe is closed when
-    /// the window's last holder is dropped, which removes the registration with it.
-    pub(crate) fn new_interruptible() -> Result<Watch> {
-        Watch::make(Some(Deferred::begin()?))
+    /// A watch that joins `window`, and whose queue also has the read end of its pipe registered
+    /// ([`Deferred::wake`]), for the waits that end on an interrupt. The window is the caller's to open,
+    /// before this, so that the signals are taken over before the queue is made, and a watch cannot open
+    /// a window of its own. The pipe is closed when the window's last holder is dropped, which removes the
+    /// registration with it.
+    pub(crate) fn new_interruptible(window: &Deferred) -> Result<Watch> {
+        Watch::make(Some(window.join()))
+    }
+
+    /// The interrupts the watch's window has recorded so far, as of this one read: `None` where there are
+    /// none, and for a watch that is not interruptible.
+    pub(crate) fn recorded(&self) -> Option<Interrupts> {
+        self.window.as_ref().and_then(Deferred::recorded)
     }
 
     fn make(window: Option<Deferred>) -> Result<Watch> {
@@ -169,12 +176,12 @@ impl Watch {
     }
 
     /// [`Self::add`] for a launch `run` follows: `pid` is also registered for its exec, which the waits
-    /// report, and the registration joins the watch's window, if it has one. With `EV_CLEAR`, which an exec that repeats needs to be read
-    /// once per time: the flags are the ones measured on macOS CI (KB, "macOS - NOTE_EXEC reaches a
-    /// kqueue on a held launch's pid, and the process reads stopped from then until SIGCONT").
+    /// report, and the registration joins the watch's window, if it has one. With `EV_CLEAR`, which an
+    /// exec that repeats needs to be read once per time: the flags are the ones measured on macOS CI (KB,
+    /// "macOS - NOTE_EXEC reaches a kqueue on a held launch's pid, and the process reads stopped from then
+    /// until SIGCONT").
     pub(crate) fn add_launch(&self, pid: u32) -> Result<Added> {
-        // The watch holds its window, so this joins that one.
-        let window = self.window.as_ref().map(|_| Deferred::begin()).transpose()?;
+        let window = self.window.as_ref().map(Deferred::join);
         self.register(
             pid,
             EvFlags::EV_CLEAR,
