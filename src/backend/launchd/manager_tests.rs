@@ -2508,8 +2508,8 @@ fn kill_over(entries: impl IntoIterator<Item = Entry>) -> (Result<()>, Fake, (us
 }
 
 /// SIGKILL to the job's process through a hold, and the wait until `print` stops showing its pid: the
-/// read, the confirmation, and the wait's reads. No `launchctl kill` is sent, and the wait is the only
-/// call the reservation counts.
+/// read, the confirmation (with its `procinfo`), and the wait's reads. No `launchctl kill` is sent, and the wait is the
+/// only call the reservation counts.
 #[skuld::test]
 fn kill_ends_the_process_and_waits_until_launchd_stops_showing_it() {
     use super::watch::watch_tests::Held;
@@ -2526,10 +2526,13 @@ fn kill_ends_the_process_and_waits_until_launchd_stops_showing_it() {
     ]);
 
     assert!(matches!(result, Ok(())), "{result:?}");
-    script.assert_spent("the read, the confirmation, and the wait's two reads");
+    script.assert_spent("the read, the confirmation and its lookup, and the wait's two reads");
     assert!(
-        script.calls().iter().all(|call| call[0] == "print"),
-        "{:?}",
+        script
+            .calls()
+            .iter()
+            .all(|call| call[0] == "print" || call[0] == "procinfo"),
+        "no `launchctl kill` is sent: {:?}",
         script.calls()
     );
     assert_eq!(run.finish(), None, "the process was signalled to its end");
