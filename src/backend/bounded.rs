@@ -26,13 +26,13 @@ pub(crate) use spares::Kept;
 pub(crate) use spares::test_hook;
 pub(crate) use spares::{Reaper, Reservation};
 
-#[cfg(target_os = "macos")]
-use crate::backend::process_watch::{Added, Unwoken, Watch};
 use crate::backend::unreaped::release_unreaped;
 use crate::error::within;
 #[cfg(target_os = "macos")]
 use crate::manager::budget::Budget;
 use crate::manager::budget::Deadline;
+#[cfg(target_os = "macos")]
+use cosca::identity::Liveness;
 
 // command =============================================================================================================
 
@@ -441,8 +441,8 @@ fn waited_out(
 
 /// How long a child whose kill was refused with `EPERM` is given to be seen exited (macOS). A
 /// failure bound on another process, not a wait for the child to do anything: a child that refused
-/// the kill by exiting is seen at once, and one still there after refusing it for another reason
-/// never will be. Only a refused kill can run a bounded call past its deadline ([`wait_bounded`],
+/// the kill by exiting is seen within one re-read, and one still there after refusing it for another
+/// reason never will be. Only a refused kill can run a bounded call past its deadline ([`wait_bounded`],
 /// [`Left::kill`]), and by no more than this.
 const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 
@@ -492,7 +492,7 @@ fn refused_kill(
     refused: cosca::error::Error,
     bound: Duration,
 ) -> Result<(), cosca::error::Error> {
-    after_refusal(refused, exit_within(child.pid(), bound), bound)
+    after_refusal(refused, last_read(child, bound), bound)
 }
 
 /// A send that goes through a pidfd does not refuse a child that is exiting: its `EPERM` is real.
@@ -505,68 +505,29 @@ fn refused_kill(
     Err(refused)
 }
 
-/// Whether the child `pid` has exited within `bound`, seen without reaping it: a kqueue watch of its
-/// exit ([`Watch`]), and a check of the kernel for an exit the watch missed ([`exit_after`]). `pid` is
-/// goetia's own child and not reaped, so it names no other process; one the kernel has no process for
-/// (`Added::Gone`) has exited. `Err` says what failed, worded for [`KillRefused`].
+/// How often a refused kill's wait re-reads the child's liveness (macOS). It spaces the reads and
+/// decides nothing.
+#[cfg(target_os = "macos")]
+const REREAD: Duration = Duration::from_millis(20);
+
+/// What `child.is_alive()` reads once it is `Dead`, or once `bound` has passed and it has been read
+/// once more since: `Alive` and `Unknown` both mean "not yet". It polls because cosca has no public
+/// timed wait that does not reap. The reads are of the real condition and the clock only says when to
+/// give up, so the time spent sleeping never decides the outcome.
 ///
-/// `bound` is a failure bound on another process's exit, surfaced to a human, not a wait for it to
-/// do something: a child that is exiting is seen at once, and one still there after refusing the
-/// kill for another reason never will be.
+/// `bound` is a failure bound on another process, surfaced to a human, not a wait for it to do
+/// something: a child that is exiting reads `Dead` within a re-read, and one still there after
+/// refusing the kill for another reason never will.
 #[cfg(target_os = "macos")]
-fn exit_within(pid: u32, bound: Duration) -> Result<bool, String> {
-    let report = |e: crate::error::Error| format!("watching for its exit failed: {}", e.report());
-    let watch = Watch::<Unwoken>::new().map_err(report)?;
-    let added = watch.add(pid).map_err(report)?;
-    exit_after(added, bound, || exited_unreaped(pid))
-}
-
-/// [`exit_within`] once the pid is registered. The exit may have fired before the registration, which
-/// may leave the queue no event to report, and the child is goetia's own and not reaped, so `peek`
-/// (whether it has exited, [`exited_unreaped`]) is exact: it is asked once after the registration and
-/// once more when `bound` expires, and what it finds is the exit. The queue is waited on in between. An
-/// exit the kernel reports without its status is an exit.
-#[cfg(target_os = "macos")]
-fn exit_after(added: Added<Unwoken>, bound: Duration, peek: impl Fn() -> Result<bool, String>) -> Result<bool, String> {
-    let report = |e: crate::error::Error| format!("watching for its exit failed: {}", e.report());
-    let Added::Watching(registered) = added else {
-        return Ok(true);
-    };
-    if peek()? {
-        return Ok(true);
-    }
-    match registered
-        .wait_for_exit(Some(Budget::Bounded(bound).start()))
-        .map_err(report)?
-    {
-        Some(_) => Ok(true),
-        None => peek(),
-    }
-}
-
-/// Whether the child `pid` of this process has exited and is not reaped, asked of the kernel without
-/// reaping it (`waitid` with `WNOWAIT`). `Err` for a pid that is not such a child, worded for
-/// [`KillRefused`].
-#[cfg(target_os = "macos")]
-fn exited_unreaped(pid: u32) -> Result<bool, String> {
-    // SAFETY: an all-zero `siginfo_t` is a valid place for `waitid` to fill, and `waitid` reads nothing
-    // else. `WNOHANG` leaves it zeroed for a child that has not exited, and `WNOWAIT` leaves one that
-    // has waitable.
-    unsafe {
-        let mut info: libc::siginfo_t = std::mem::zeroed();
-        let waited = libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        );
-        if waited != 0 {
-            return Err(format!(
-                "asking whether it had exited failed: {}",
-                io::Error::last_os_error()
-            ));
+fn last_read(child: &cosca::Child, bound: Duration) -> Liveness {
+    let deadline = Budget::Bounded(bound).start();
+    loop {
+        let passed = deadline.expired();
+        let read = child.is_alive();
+        if read == Liveness::Dead || passed {
+            return read;
         }
-        Ok(info.si_pid != 0)
+        std::thread::sleep(REREAD);
     }
 }
 
@@ -584,18 +545,13 @@ fn is_eperm(e: &cosca::error::Error) -> bool {
     })
 }
 
-/// What [`kill_root`] makes of a refused kill, given whether the child exited within `bound`, or what
-/// went wrong with watching for it.
+/// What [`kill_root`] makes of a refused kill, given the last liveness [`last_read`] read.
 #[cfg(target_os = "macos")]
-fn after_refusal(
-    refused: cosca::error::Error,
-    exited: Result<bool, String>,
-    bound: Duration,
-) -> Result<(), cosca::error::Error> {
-    let seen = match exited {
-        Ok(true) => return Ok(()),
-        Ok(false) => format!("the process had not exited {bound:?} later"),
-        Err(seen) => seen,
+fn after_refusal(refused: cosca::error::Error, last: Liveness, bound: Duration) -> Result<(), cosca::error::Error> {
+    let seen = match last {
+        Liveness::Dead => return Ok(()),
+        Liveness::Alive => format!("the process was still running {bound:?} later"),
+        Liveness::Unknown => format!("whether the process was running could not be read {bound:?} later"),
     };
     Err(cosca::error::Error::Io(io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -603,8 +559,8 @@ fn after_refusal(
     )))
 }
 
-/// A kill refused with `EPERM`, and what became of the child after: it was still there when the
-/// bound on its exit ended, or watching for it failed. The refusal is its source.
+/// A kill refused with `EPERM`, and what became of the child after: it was still running when the
+/// bound on its exit ended, or its liveness could not be read. The refusal is its source.
 #[cfg(target_os = "macos")]
 #[derive(Debug, thiserror::Error)]
 #[error("the kill was refused (EPERM) and {seen}")]

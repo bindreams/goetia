@@ -435,8 +435,8 @@ fn a_left_request_the_caller_kills_takes_its_descendant_with_it() {
     descendant.0.wait().unwrap();
 }
 
-/// A refusal other than `EPERM` is returned at once, whatever it is: the bound here is an hour, which
-/// a wait on this child would last.
+/// A refusal other than `EPERM` is returned as it came, whatever it is: a wait on this child would
+/// turn it into the lost wait that `EPERM` gets.
 #[skuld::test]
 fn a_kill_refused_for_another_reason_than_eperm_is_returned_without_waiting() {
     type Refusal = fn(&cosca::Child) -> cosca::error::Error;
@@ -458,21 +458,21 @@ fn a_kill_refused_for_another_reason_than_eperm_is_returned_without_waiting() {
         let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
         let _refused = test_hook::kill_fails(refusal);
 
-        let error = kill_root(&child.child, Duration::from_secs(3600)).expect_err("the kill is refused");
+        let error = kill_root(&child.child, Duration::from_millis(50)).expect_err("the kill is refused");
 
         assert!(is_it(&error), "the refusal is returned as it came: {error:?}");
     }
 }
 
 /// A kill refused with `EPERM` is a real refusal off macOS, where a send goes through a pidfd: it is
-/// returned at once, as it came, whatever the bound.
+/// returned as it came.
 #[cfg(not(target_os = "macos"))]
 #[skuld::test]
 fn a_kill_refused_with_eperm_is_returned_at_once_off_macos() {
     let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
     let _refused = test_hook::kill_fails(|_| eperm());
 
-    let error = kill_root(&child.child, Duration::from_secs(3600)).expect_err("the kill is refused");
+    let error = kill_root(&child.child, Duration::from_millis(50)).expect_err("the kill is refused");
 
     assert!(
         matches!(&error, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
@@ -485,36 +485,15 @@ fn a_kill_refused_with_eperm_is_returned_at_once_off_macos() {
 /// hook.
 #[cfg(target_os = "macos")]
 mod refused_kill {
-    use std::cell::Cell;
     use std::time::Instant;
 
     use super::*;
-    use crate::backend::process_watch::process_watch_tests::{Held, keep_exit_without_status};
 
     /// A refused kill that signals the child with SIGTERM first, as the exit that raced the kill does.
     fn term_then_eperm(child: &cosca::Child) -> cosca::error::Error {
         // SAFETY: `kill` takes a pid and a signal and touches no memory; the child is this call's own.
         assert_eq!(unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGTERM) }, 0);
         eperm()
-    }
-
-    /// [`term_then_eperm`], and the child has exited, and is not reaped, before the refusal: it is
-    /// gone by the time anyone registers for its exit.
-    fn term_then_exited_then_eperm(child: &cosca::Child) -> cosca::error::Error {
-        let refusal = term_then_eperm(child);
-        // SAFETY: an all-zero `siginfo_t` is a valid place for `waitid` to fill, and the pid is this
-        // process's own child. `WNOWAIT` leaves the child waitable.
-        unsafe {
-            let mut info: libc::siginfo_t = std::mem::zeroed();
-            let waited = libc::waitid(
-                libc::P_PID,
-                child.pid() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            );
-            assert_eq!(waited, 0, "wait for the child to exit");
-        }
-        refusal
     }
 
     /// The child traps SIGTERM and tells the test its descendant's pid only once the trap is set, so
@@ -551,22 +530,6 @@ mod refused_kill {
         descendant.0.wait().unwrap();
     }
 
-    /// The child has exited, and is not reaped, before anything registers for its exit: a pid the
-    /// kernel no longer has to watch is an exit all the same.
-    #[skuld::test]
-    fn a_kill_refused_at_the_deadline_by_a_child_already_gone_is_reported_exited() {
-        let (child, descendant) = trapping(Role::Query, "exit 7");
-        let _refused = test_hook::kill_fails(term_then_exited_then_eperm);
-
-        let finished = wait_bounded(child, Budget::Immediate.start());
-
-        match finished {
-            Ok(Finished::Exited { status, .. }) => assert_eq!(status.code(), Some(7)),
-            other => panic!("expected the child's own exit, got {other:?}"),
-        }
-        descendant.0.wait().unwrap();
-    }
-
     /// The same refusal of an [`Role::AnnouncedRequest`], whose streams are pipes read as written: the
     /// child's own exit, its tree ended, and a capture that says what the spent deadline left of it:
     /// what was heard, not established whole.
@@ -591,106 +554,6 @@ mod refused_kill {
         descendant.0.wait().unwrap();
     }
 
-    /// What [`exit_after`] makes of a child that the kernel still lists and has not reported exited,
-    /// whose `peek` answers `peeks` in turn: the child is goetia's own and held alive, so any exit the
-    /// result shows is the peek's. Returns the result and how many times the peek was asked.
-    fn exit_after_peeking(peeks: &[Result<bool, String>]) -> (Result<bool, String>, usize) {
-        let watch = Watch::<Unwoken>::new().unwrap();
-        let child = Held::new(0);
-        let added = watch.add(child.pid()).unwrap();
-        assert!(matches!(added, Added::Watching(_)), "the child is alive");
-        let asked = Cell::new(0);
-        let result = exit_after(added, Duration::from_millis(50), || {
-            let answer = peeks.get(asked.get()).cloned().unwrap_or(Ok(false));
-            asked.set(asked.get() + 1);
-            answer
-        });
-        (result, asked.get())
-    }
-
-    /// The exit may have fired before the registration was made, and then no event comes: the peek
-    /// right after registering finds it, and the wait is not entered.
-    #[skuld::test]
-    fn an_exit_the_peek_finds_after_registering_is_the_exit() {
-        // Answers `true` only the first time: a peek made only at the expiry would not see it.
-        let (result, asked) = exit_after_peeking(&[Ok(true)]);
-
-        assert_eq!(result, Ok(true));
-        assert_eq!(asked, 1);
-    }
-
-    /// The same, found at the expiry: the child exited in the time in between, unseen by the queue.
-    #[skuld::test]
-    fn an_exit_the_peek_finds_at_the_expiry_is_the_exit() {
-        let (result, asked) = exit_after_peeking(&[Ok(false), Ok(true)]);
-
-        assert_eq!(result, Ok(true));
-        assert_eq!(asked, 2);
-    }
-
-    /// A child that is neither seen exiting nor found exited is not one that exited.
-    #[skuld::test]
-    fn a_child_neither_watched_nor_peeked_exited_is_not_exited() {
-        let (result, asked) = exit_after_peeking(&[]);
-
-        assert_eq!(result, Ok(false));
-        assert_eq!(asked, 2);
-    }
-
-    /// A peek that fails says what failed, whichever of the two it is.
-    #[skuld::test]
-    fn a_peek_that_fails_is_reported() {
-        let failed = || Err("the peek failed".to_string());
-
-        assert_eq!(exit_after_peeking(&[failed()]).0, failed());
-        assert_eq!(exit_after_peeking(&[Ok(false), failed()]).0, failed());
-    }
-
-    /// An exit the kernel reports without its status is an exit: the watch's answer is not a refusal.
-    #[skuld::test]
-    fn an_exit_reported_without_a_status_is_an_exit() {
-        let watch = Watch::<Unwoken>::new().unwrap();
-        let child = Held::new(0);
-        let added = watch.add(child.pid()).unwrap();
-        let Added::Watching(registered) = &added else {
-            panic!("the child is alive");
-        };
-        keep_exit_without_status(registered);
-
-        assert_eq!(exit_after(added, Duration::from_secs(3600), || Ok(false)), Ok(true));
-    }
-
-    /// The peek of the kernel: a child that has exited and is not reaped is found exited, and stays
-    /// unreaped; one that is running is not.
-    #[skuld::test]
-    fn the_peek_finds_an_exited_child_without_reaping_it() {
-        let mut running = Held::new(3);
-        assert_eq!(exited_unreaped(running.pid()), Ok(false));
-
-        running.exit_unreaped();
-        assert_eq!(exited_unreaped(running.pid()), Ok(true));
-        assert_eq!(
-            exited_unreaped(running.pid()),
-            Ok(true),
-            "the first peek reaped nothing"
-        );
-
-        assert_eq!(running.finish(), Some(3), "the child was still there to be reaped");
-    }
-
-    /// A pid that is not an unreaped child of this process is an error: the peek is exact for goetia's
-    /// own child, and says so when it is not one.
-    #[skuld::test]
-    fn the_peek_of_a_child_already_reaped_is_an_error() {
-        let mut child = Held::new(0);
-        let pid = child.pid();
-        child.finish();
-
-        let said = exited_unreaped(pid).expect_err("no such child");
-
-        assert!(said.contains("whether it had exited"), "{said}");
-    }
-
     /// A kill refused with `EPERM` that is cosca's wrapped one (an `io::Error` of kind
     /// `PermissionDenied` with no code, the `EPERM` its source) is the same refusal.
     #[skuld::test]
@@ -704,28 +567,36 @@ mod refused_kill {
             ))
         });
 
-        kill_root(&child.child, Duration::from_secs(3600)).expect("the child exited, and its exit is not an error");
+        kill_root(&child.child, EXIT_AFTER_REFUSED_KILL).expect("the child exited, and its exit is not an error");
     }
 
-    /// What was seen of the child after a refused kill is carried into the error, with the refusal as
-    /// its source.
+    /// What was last read of the child after a refused kill is carried into the error, with the
+    /// refusal as its source: a child still running and one whose liveness could not be read are told
+    /// apart, and one that reads `Dead` is no error.
     #[skuld::test]
-    fn what_was_seen_after_a_refused_kill_is_reported_with_the_refusal() {
-        let error = after_refusal(
-            eperm(),
-            Err("watching for its exit failed: the watch failed".into()),
-            EXIT_AFTER_REFUSED_KILL,
-        )
-        .expect_err("the child was not seen to exit");
+    fn what_was_last_read_after_a_refused_kill_is_reported_with_the_refusal() {
+        let said = |last| {
+            let error =
+                after_refusal(eperm(), last, EXIT_AFTER_REFUSED_KILL).expect_err("the child was not seen to exit");
+            cosca::error::Report::new(&error).to_string()
+        };
 
-        let said = cosca::error::Report::new(&error).to_string();
+        assert!(after_refusal(eperm(), Liveness::Dead, EXIT_AFTER_REFUSED_KILL).is_ok());
         assert!(
-            said.contains("the kill was refused (EPERM) and watching for its exit failed: the watch failed"),
-            "{said}"
+            said(Liveness::Alive).contains("the kill was refused (EPERM) and the process was still running 5s later"),
+            "{}",
+            said(Liveness::Alive)
         );
         assert!(
-            said.ends_with(&cosca::error::Report::new(&eperm()).to_string()),
-            "the kill's error is the source: {said}"
+            said(Liveness::Unknown).contains(
+                "the kill was refused (EPERM) and whether the process was running could not be read 5s later"
+            ),
+            "{}",
+            said(Liveness::Unknown)
+        );
+        assert!(
+            said(Liveness::Alive).ends_with(&cosca::error::Report::new(&eperm()).to_string()),
+            "the kill's error is the source"
         );
     }
 
@@ -756,7 +627,7 @@ mod refused_kill {
 
         let said = cosca::error::Report::new(&error).to_string();
         assert!(
-            said.contains("the kill was refused (EPERM) and the process had not exited 50ms later"),
+            said.contains("the kill was refused (EPERM) and the process was still running 50ms later"),
             "{said}"
         );
         assert!(
@@ -772,7 +643,7 @@ mod refused_kill {
         let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
         let _refused = test_hook::kill_fails(term_then_eperm);
 
-        let warning = end_left(&child.child, Duration::from_secs(3600));
+        let warning = end_left(&child.child, EXIT_AFTER_REFUSED_KILL);
 
         assert_eq!(warning, None);
     }
@@ -832,7 +703,7 @@ mod refused_kill {
             "{warning}"
         );
         assert!(
-            warning.contains("the kill was refused (EPERM) and the process had not exited 50ms later"),
+            warning.contains("the kill was refused (EPERM) and the process was still running 50ms later"),
             "{warning}"
         );
         assert!(matches!(child.child.is_alive(), cosca::identity::Liveness::Alive));

@@ -15,8 +15,6 @@ pub(crate) mod bounded;
 pub(crate) mod client;
 mod contract;
 pub mod launchd;
-#[cfg(target_os = "macos")]
-pub(crate) mod process_watch;
 pub mod scm;
 pub(crate) mod standby;
 pub mod systemd;

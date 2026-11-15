@@ -10,14 +10,13 @@ use std::time::Duration;
 use super::super::manager_tests::launchd_over;
 use super::super::task::Shown;
 use super::super::task::task_tests::{ID, Tree, marked, plists_of, service_spec, task_spec};
+use super::super::watch::{test_hook, watch_tests::Held};
 use super::super::write::write_tests::bootstrap;
 use super::*;
 use crate::backend::Backend as _;
 use crate::backend::bounded::{self, Capture, Finished};
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::launchd::generate::timer_label;
-use crate::backend::process_watch::process_watch_tests::Held;
-use crate::backend::process_watch::test_hook;
 use crate::spec::DaemonKind;
 
 // Fixtures ============================================================================================================
