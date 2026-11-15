@@ -235,8 +235,10 @@ fn after_start_failed(id: &Id, budget: Budget, e: Error) -> Error {
         Error::Undetermined { .. } | Error::RequestInDoubt { .. } => e.map_cause(reworded),
         // The stop was issued and not waited for, and the start that followed
         // was refused: determinately (a launchd `bootstrap` that fails
-        // outright) or not (SCM's `ERROR_SERVICE_ALREADY_RUNNING` over a
-        // service still coming down). systemd never gets here: its restart is
+        // outright; a launchd task's start that found the run that was sent
+        // SIGTERM still alive and was not issued) or not (SCM's
+        // `ERROR_SERVICE_ALREADY_RUNNING` over a service still coming down).
+        // systemd never gets here: its restart is
         // one request. Nothing confirmed the stop, so where the daemon ended
         // up is what nobody established.
         _ if !budget.waits() => Error::Unestablished {

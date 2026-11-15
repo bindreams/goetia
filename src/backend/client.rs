@@ -194,23 +194,34 @@ pub(crate) mod fake {
         }
     }
 
-    /// One stated reply: see [`reply`] and [`fail`].
+    /// One stated reply: see [`reply`], [`reply_at`] and [`fail`]. The reply is made at the call, after the
+    /// entry's action: a reply that names what the action made (a pid of a process it spawned) is
+    /// [`reply_at`]'s.
     pub(crate) struct Entry {
         prefix: Vec<String>,
-        reply: Result<Finished, ClientError>,
+        reply: Box<dyn FnOnce() -> Result<Finished, ClientError> + Send>,
         action: Option<Box<dyn FnOnce() + Send>>,
     }
 
     fn entry(prefix: &[&str], reply: Result<Finished, ClientError>) -> Entry {
+        made_at(prefix, move || reply)
+    }
+
+    fn made_at(prefix: &[&str], reply: impl FnOnce() -> Result<Finished, ClientError> + Send + 'static) -> Entry {
         Entry {
             prefix: prefix.iter().map(|arg| arg.to_string()).collect(),
-            reply,
+            reply: Box::new(reply),
             action: None,
         }
     }
 
     pub(crate) fn reply(prefix: &[&str], finished: Finished) -> Entry {
         entry(prefix, Ok(finished))
+    }
+
+    /// [`reply`], with the reply made when the call is, after the entry's [`Entry::then`] action.
+    pub(crate) fn reply_at(prefix: &[&str], finished: impl FnOnce() -> Finished + Send + 'static) -> Entry {
+        made_at(prefix, move || Ok(finished()))
     }
 
     pub(crate) fn fail(prefix: &[&str], error: ClientError) -> Entry {
@@ -317,13 +328,14 @@ pub(crate) mod fake {
             if let Some(action) = entry.action {
                 action();
             }
+            let reply = (entry.reply)();
             // A fake cannot see the deadline, so it holds only this part of the contract: an unbounded wait
             // never expires.
             assert!(
-                waited.bounded || !matches!(entry.reply, Ok(Finished::Expired | Finished::Left(_))),
+                waited.bounded || !matches!(reply, Ok(Finished::Expired | Finished::Left(_))),
                 "Fake: a call waited on without a bound ({waited:?}) never expires, yet {argv:?} is scripted to"
             );
-            entry.reply
+            reply
         }
     }
 }

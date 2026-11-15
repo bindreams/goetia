@@ -1188,7 +1188,10 @@ time limit. When it has not exited yet, goetia prints
 driver request can keep it waiting.
 
 A daemon with no process, whether stopped or between runs, is an error: exit
-`1` and "is not running", because nothing was killed.
+`1` and "is not running", because nothing was killed. A launchd task whose
+start launchd has accepted and not yet forked (`goetia daemon start`, then
+`kill` at once) is running by `status`: its `kill` waits for the process, with
+no time limit, and then ends it.
 
 ## Exit codes
 

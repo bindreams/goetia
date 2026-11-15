@@ -32,13 +32,14 @@ fn sample_plist_restarting(id: &str, restart: Restart) -> String {
     })
     .map(DaemonSpec::from)
     .unwrap();
-    generate::plist(
+    generate::plists(
         &spec,
         &Identity {
             user: "root".to_string(),
         },
     )
     .unwrap()
+    .job
 }
 
 // persist_new / write_existing ========================================================================================
@@ -427,7 +428,7 @@ fn locate_reports_absent_for_an_unknown_id() {
     // needs no elevation, since a random id that has never been installed
     // is absent from both regardless of who owns those directories.
     let id = format!("goetia-manager-unit-test-absent-{}", std::process::id());
-    let location = locate(&id).expect("locate should not error for an absent id");
+    let location = locate(DIRS, &id, &id).expect("locate should not error for an absent id");
     assert!(location.is_none());
 }
 
@@ -632,7 +633,7 @@ fn read_artifact_maps_an_unreadable_plist_to_undetermined() {
 /// encoding below is one a vendor legitimately ships there: `plutil -convert binary1` and `defaults
 /// write` produce a binary plist by default, UTF-16 is a legal property-list encoding whose `FF FE`
 /// BOM is not UTF-8, and a Latin-1 byte in a description is an ordinary accident. None of them is
-/// UTF-8 XML, which is the only thing `generate::plist` writes, so each is a positive
+/// UTF-8 XML, which is the only thing `generate::plists` writes, so each is a positive
 /// identification of a file goetia did not write — foreign, exactly like an unmarked XML plist.
 ///
 /// Answering any of them `undetermined` would give a macOS host a permanent, unclearable
@@ -794,9 +795,11 @@ fn a_marked_plist_is_scanned_as_marked_in_the_directory_it_was_found_in() {
             assert_eq!(name, "ours");
             assert_eq!(snapshot.id().as_str(), "ours");
             assert!(snapshot.blob().is_ok(), "the marker decodes");
-            assert!(snapshot.location.enabled);
-            assert_eq!(snapshot.location.path, path);
-            assert_eq!(snapshot.text, sample_plist("ours"));
+            let job = snapshot.job.as_ref().expect("a marked job is the snapshot's job");
+            assert!(job.location.enabled);
+            assert_eq!(job.location.path, path);
+            assert_eq!(job.text, sample_plist("ours"));
+            assert!(snapshot.timer.is_none());
         }
         _ => panic!("one marked entry expected, got {} entries", scan.entries.len()),
     }
@@ -900,8 +903,7 @@ fn a_marked_plist_beside_an_unmarked_one_of_the_same_stem_is_reported() {
     assert_reported_in_both(&scan.reported);
 }
 
-/// Nothing at the stem is goetia's, and `list` omits foreign entries, so neither an entry nor a
-/// report is made.
+/// Nothing at the stem is goetia's, and `list` omits foreign entries, so nothing is reported.
 #[skuld::test]
 fn an_unmarked_plist_in_both_directories_is_not_reported() {
     let (staging, enabled) = (
@@ -914,8 +916,58 @@ fn an_unmarked_plist_in_both_directories_is_not_reported() {
 
     let scan = scanned(staging.path(), enabled.path());
 
-    assert!(scan.entries.is_empty(), "{} entries", scan.entries.len());
+    // One foreign entry, as for a single foreign plist; `list` omits it.
+    assert!(
+        matches!(scan.entries.as_slice(), [(name, ScanEntry::Read(ReadOutcome::Foreign { .. }))] if name == "theirs"),
+        "{} entries",
+        scan.entries.len()
+    );
     assert!(scan.reported.is_empty(), "{:?}", scan.reported);
+}
+
+// Rendering ===========================================================================================================
+
+/// A task is rendered: its job's plist, with the metadata comment, is what `render` answers.
+#[skuld::test]
+fn render_of_a_task_no_longer_refuses() {
+    use crate::backend::Backend as _;
+
+    let (mgr, _) = scripted(&[]);
+    let spec = crate::testing::task(
+        "goetia-rendered-task",
+        vec!["/bin/true".to_string()],
+        Some("30 3 * * *"),
+    );
+
+    let text = mgr.render(&spec).expect("a task renders").job;
+
+    assert_eq!(generate::extract(&text).unwrap().expect("marked").spec, spec);
+    assert!(
+        text.contains("<key>ThrottleInterval</key>\n\t<integer>1</integer>"),
+        "{text}"
+    );
+}
+
+/// What a task renders is both its plists, and each regenerates from its own metadata to the same pair:
+/// a freshly installed task does not read as drifted.
+#[skuld::test]
+fn a_scheduled_task_renders_both_plists_and_each_regenerates_from_its_own_metadata() {
+    use crate::backend::Backend as _;
+
+    let (mgr, _) = scripted(&[]);
+    let spec = crate::testing::task(
+        "goetia-rendered-pair",
+        vec!["/bin/true".to_string()],
+        Some("30 3 * * *"),
+    );
+
+    let rendered = mgr.render(&spec).expect("a task renders");
+
+    let timer = rendered.timer.as_deref().expect("a scheduled task has a timer");
+    for text in [rendered.job.as_str(), timer] {
+        let embedded = generate::extract(text).unwrap().expect("marked").spec;
+        assert_eq!(mgr.render(&embedded).unwrap(), rendered);
+    }
 }
 
 // Writing: a race that has cost no call ===============================================================================
@@ -932,15 +984,13 @@ fn a_write_over_a_plist_that_vanished_before_any_call_is_raced() {
     let (mgr, script) = scripted(&[]);
     let spec = spec_named("goetia-raced-before-any-call");
     let desired = mgr.render(&spec).expect("render");
-    let on_disk = desired.replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
-    assert_ne!(on_disk, desired);
+    let on_disk = desired
+        .job
+        .replace(&format!("Version: {}", crate::version()), "Version: 0.0.1");
+    assert_ne!(on_disk, desired.job);
     let tmp = tempfile::tempdir().expect("tempdir");
     let snapshot = Plist {
-        location: Location {
-            path: tmp.path().join("gone.plist"),
-            enabled: false,
-        },
-        text: on_disk,
+        job: job_at(tmp.path().join("gone.plist"), on_disk),
         ..marked_plist(&spec.common().id)
     };
     let stale = Outcome::Stale {
@@ -980,12 +1030,17 @@ fn marked_plist_restarting(id: &Id, restart: Restart) -> Plist {
     Plist {
         id: id.clone(),
         blob: blob.map_err(Arc::new),
-        location: Location {
-            path: PathBuf::from("/nonexistent/goetia-marked.plist"),
-            enabled: false,
-        },
-        text,
+        job: job_at(PathBuf::from("/nonexistent/goetia-marked.plist"), text),
+        timer: None,
     }
+}
+
+/// The job artifact of a plist at `path`, in the staging directory's terms (not enabled).
+fn job_at(path: PathBuf, text: String) -> Option<Artifact> {
+    Some(Artifact {
+        location: Location { path, enabled: false },
+        text,
+    })
 }
 
 /// A reservation of the stated size: `requests` reapers and the files of `calls` calls.
@@ -1000,16 +1055,17 @@ fn reserved(steps: &[Step]) -> Reservation {
 
 /// `reserve` makes what the steps count, and nothing else: the reapers and files of their longest
 /// paths, summed over a sequence. The numbers are written out so that changing a count is deliberate.
+/// `install`, `uninstall`, `stop` and `kill` hold a task's counts, the larger (see `needs`).
 #[skuld::test]
 fn a_reservation_holds_what_its_steps_count() {
     let cases: [(&[Step], (usize, usize)); 7] = [
-        (&[Step::Install], (1, 8)),
+        (&[Step::Install], (4, 18)),
         (&[Step::Start], (5, 26)),
-        (&[Step::Stop], (1, 4)),
-        (&[Step::Kill], (1, 2)),
-        (&[Step::Uninstall], (1, 4)),
+        (&[Step::Stop], (1, 6)),
+        (&[Step::Kill], (2, 8)),
+        (&[Step::Uninstall], (2, 12)),
         (&[Step::RequestStartAfterStop], (5, 26)),
-        (&[Step::Stop, Step::Start], (6, 30)),
+        (&[Step::Stop, Step::Start], (6, 32)),
     ];
     for (steps, held) in cases {
         assert_eq!(bounded::test_hook::left(&reserved(steps)), held, "{steps:?}");
@@ -1082,14 +1138,14 @@ fn drawings() -> [Drawing; 5] {
             step: Step::Stop,
             restart: Restart::Never,
             calls: &BOOTOUT,
-            drew: (STOP_REQUESTS, STOP_CALLS),
+            drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| Backend::stop(mgr, plist, Budget::DEFAULT, reservation),
         },
         Drawing {
             step: Step::Kill,
             restart: Restart::Never,
             calls: &[("kill", DONE)],
-            drew: (KILL_REQUESTS, KILL_CALLS),
+            drew: (SERVICE_KILL_REQUESTS, SERVICE_KILL_CALLS),
             run: |mgr, plist, reservation| Backend::kill(mgr, plist, reservation),
         },
         // The `bootout`, and then the removal of a plist nothing backs, which fails.
@@ -1097,7 +1153,7 @@ fn drawings() -> [Drawing; 5] {
             step: Step::Uninstall,
             restart: Restart::Never,
             calls: &BOOTOUT,
-            drew: (STOP_REQUESTS, STOP_CALLS),
+            drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, reservation) {
                 Err(Error::Os { what, source, .. })
                     if what == "remove"
@@ -1301,11 +1357,7 @@ fn a_live_status_whose_launchctl_cannot_be_run_is_an_error() {
     let unrunnable = ClientError::NotRun(io::Error::from_raw_os_error(libc::EAGAIN).into());
     let mgr = launchd_over(Fake::new([fail(&["print"], unrunnable)]));
     let snapshot = Plist {
-        location: Location {
-            path: PathBuf::from("/nonexistent/goetia-live-status.plist"),
-            enabled: false,
-        },
-        text: String::new(),
+        job: job_at(PathBuf::from("/nonexistent/goetia-live-status.plist"), String::new()),
         ..marked_plist(&never_installed())
     };
 
@@ -1370,17 +1422,17 @@ const START_NOT_WAITING: [(&str, Answer); 5] = [
     ("kickstart", DONE),
 ];
 
-/// `install`'s longest path, [`INSTALL_CALLS`] calls: a `Create`'s read, the `bootout` of the stale
-/// job it finds loaded and the wait for it to be gone, and the read after the write. An `Update` makes
-/// two reads, before the write and after it.
-const INSTALL_LONGEST: [(&str, Answer); INSTALL_CALLS] =
+/// A service's `install`'s longest path, [`SERVICE_INSTALL_CALLS`] calls: a `Create`'s read, the
+/// `bootout` of the stale job it finds loaded and the wait for it to be gone, and the read after the
+/// write. An `Update` makes two reads, before the write and after it.
+const INSTALL_LONGEST: [(&str, Answer); SERVICE_INSTALL_CALLS] =
     [("print", DONE), ("bootout", DONE), GONE, ("print", NOT_LOADED)];
 
 /// A `Create` over no loaded job: the read before the write and the read after it.
 const CREATED: [(&str, Answer); 2] = [("print", NOT_LOADED), ("print", NOT_LOADED)];
 
 /// `stop`'s and `uninstall`'s calls: the `bootout` and the wait for the job to be gone.
-const BOOTOUT: [(&str, Answer); STOP_CALLS] = [("bootout", DONE), GONE];
+const BOOTOUT: [(&str, Answer); SERVICE_STOP_CALLS] = [("bootout", DONE), GONE];
 
 /// One scripted call: `verb` answers `answer`.
 fn answer(verb: &str, (code, stdout, stderr): Answer) -> Entry {
@@ -1394,7 +1446,7 @@ fn table(calls: &[(&str, Answer)]) -> Fake {
 }
 
 /// A launchd whose `launchctl` is `client`.
-fn launchd_over(client: impl Client + 'static) -> Launchd {
+pub(super) fn launchd_over(client: impl Client + 'static) -> Launchd {
     Launchd {
         launchctl: Launchctl::new(Box::new(client)),
     }
@@ -1501,10 +1553,12 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     })
     .map(DaemonSpec::from)
     .unwrap();
-    let exhausted = |reservation: &Reservation| {
+    // `spare` is the calls a step counts for the other kind: a task's `stop` pass is longer than a
+    // service's bootout and its wait (see `needs`), and a reservation is made before the kind is known.
+    let exhausted = |reservation: &Reservation, spare: usize| {
         assert_eq!(
             bounded::test_hook::left(reservation),
-            (0, 0),
+            (0, spare * Role::COUNTED_FILES),
             "the sequence reserved more than its steps spent"
         );
     };
@@ -1539,7 +1593,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     backend::Backend::stop(&mgr, flow::owned(&mgr, &id).unwrap(), Budget::DEFAULT, &mut held).expect("restart's stop");
     backend::Backend::start(&mgr, flow::owned(&mgr, &id).unwrap(), Budget::DEFAULT, &mut held)
         .expect("restart's start");
-    exhausted(&held);
+    exhausted(&held, STOP_CALLS - SERVICE_STOP_CALLS);
     script.assert_driven("restart");
 
     // `install --start`: the start's reservation is made first, and the install reserves for itself;
@@ -1551,7 +1605,7 @@ fn every_launchd_verb_path_stays_inside_its_reservation(#[fixture(launchd_group)
     assert!(matches!(mgr.install(&spec, false), Ok(Outcome::Create)));
     backend::Backend::start(&mgr, flow::owned(&mgr, &id).unwrap(), Budget::DEFAULT, &mut held)
         .expect("install --start's start");
-    exhausted(&held);
+    exhausted(&held, 0);
     script.assert_driven("install --start");
 
     // `status` counts nothing and is handed no reservation: it makes its own files, over a real child
@@ -1576,7 +1630,7 @@ fn launchctl_replying(verb: &str, finished: Finished) -> (Launchctl, Fake) {
 
 /// A call that changes the job goes out as a request, and one that only reads goes out as a query:
 /// the role is what decides whether an expiry leaves the child running or kills it. `status` and
-/// `list` read as an uncounted query. (`kill_job`'s role is pinned with its argv, below.)
+/// `list` read as an uncounted query. (`signal`'s role is pinned with its argv, below.)
 #[skuld::test]
 fn launchctl_sends_requests_as_requests_and_reads_as_queries() {
     let id = never_installed();
@@ -1670,8 +1724,6 @@ fn launchctl_calls_that_expire_report_the_expiry() {
     fake.assert_spent("an expired kickstart is followed by one print");
     let booted_out = left("bootout").bootout(id, deadline, &mut held);
     assert!(booted_out.expect("an expiry is not a failure").is_none());
-    let killed = left("kill").kill_job(id, deadline, &mut held);
-    assert!(killed.expect("an expiry is not a failure").is_none());
 
     for role in [Role::Query, Role::UncountedQuery] {
         let live = expired("print").read_live_state(id, deadline, role, &mut held);
@@ -1724,8 +1776,8 @@ fn a_stop_waits_until_the_old_instance_is_gone() {
         script.assert_spent(&format!("{budget:?}: the wait for the old instance"));
         assert_eq!(
             bounded::test_hook::left(&held),
-            (0, 0),
-            "{budget:?}: the wait's three reads are one counted call, its files kept"
+            (0, (STOP_CALLS - SERVICE_STOP_CALLS) * Role::COUNTED_FILES),
+            "{budget:?}: the wait's three reads are one counted call, its files kept; the rest is a task's pass"
         );
     }
 }
@@ -1777,10 +1829,7 @@ fn an_uninstall_removes_the_plist_only_after_the_old_instance_is_gone() {
     ]);
     let mgr = launchd_over(fake.clone());
     let plist = Plist {
-        location: Location {
-            path: path.clone(),
-            enabled: false,
-        },
+        job: job_at(path.clone(), sample_plist(never_installed().as_str())),
         ..marked_plist(&never_installed())
     };
 
@@ -2263,13 +2312,119 @@ fn a_kickstart_that_outlasts_the_budget_is_left_running_when_the_print_fails() {
 
 // kill ================================================================================================================
 
-/// `kill_job` over `id`, with `answer` standing in for what `launchctl kill` says.
-fn kill_answered(answer: Answer) -> (Result<Option<()>>, Fake) {
+/// `kill` of a service over `id`, with `answer` standing in for what `launchctl kill` says: unchanged
+/// by the one `signal` that a task's `stop` and `kill` share.
+fn kill_answered(answer: Answer) -> (Result<()>, Fake) {
     let script = table(&[("kill", answer)]);
-    let launchctl = Launchctl::new(Box::new(script.clone()));
+    let mgr = launchd_over(script.clone());
     let mut held = reserved(&[Step::Kill]);
-    let result = launchctl.kill_job(never_installed().as_str(), Budget::Unbounded.start(), &mut held);
+    let result = backend::Backend::kill(&mgr, marked_plist(&never_installed()), &mut held);
     (result, script)
+}
+
+/// `signal` says what launchctl answered and names no verb's error: exit `0` is sent, and `3` and `113`,
+/// the two ways launchd says the job has no process, are `NoProcess`. The signal is the caller's.
+#[skuld::test]
+fn signal_maps_exit_3_and_113_to_no_process_and_0_to_sent() {
+    let id = never_installed();
+    let cases = [
+        (DONE, SignalOutcome::Sent),
+        ((3, "", ""), SignalOutcome::NoProcess),
+        (NOT_LOADED, SignalOutcome::NoProcess),
+    ];
+    for (answer, expected) in cases {
+        let script = table(&[("kill", answer)]);
+        let launchctl = Launchctl::new(Box::new(script.clone()));
+        let mut held = reserved(&[Step::Kill]);
+
+        let outcome = launchctl.signal(id.as_str(), "SIGTERM", &mut held);
+
+        assert_eq!(outcome.expect("an outcome"), expected, "{answer:?}");
+        assert_eq!(script.calls(), [["kill", "SIGTERM", format!("system/{id}").as_str()]]);
+    }
+    let script = table(&[("kill", (1, "", "Operation not permitted\n"))]);
+    let launchctl = Launchctl::new(Box::new(script));
+    let e = launchctl
+        .signal(id.as_str(), "SIGTERM", &mut reserved(&[Step::Kill]))
+        .expect_err("refused");
+    assert!(matches!(&e, Error::Command { .. }), "{e:?}");
+}
+
+/// What `launchctl procinfo <pid>` prints of a launch of `id`: the process, then launchd's block for the job.
+fn procinfo_of_a_launch(id: &Id, pid: u32) -> String {
+    format!(
+        "program path = /usr/libexec/xpcproxy\n\
+         argument vector = {{\n\txpcproxy\n\t{id}\n}}\n\
+         \n\
+         system/{id} = {{\n\
+         \tactive count = 1\n\
+         \tstate = xpcproxy\n\
+         \tpid = {pid}\n\
+         }}\n"
+    )
+}
+
+/// `names_launch` of `pid` over a `procinfo` that exited `code` having written `stdout` and `stderr`, with
+/// the launchctl calls it made.
+fn names_launch_over(code: i32, stdout: &str, stderr: &str, pid: u32) -> (Result<bool>, Fake) {
+    let script = Fake::new([reply(&["procinfo"], exited(code, stdout, stderr))]);
+    let launchctl = Launchctl::new(Box::new(script.clone()));
+    let named = launchctl.names_launch(never_installed().as_str(), pid, &mut reserved(&[Step::Start]));
+    (named, script)
+}
+
+/// `procinfo` names a pid as the job's launch iff its output has the job's block, the line `system/<id> = {`;
+/// the exit code is 0 for a stranger and for a dead pid too, and says nothing. The call is a read by pid,
+/// run to its end.
+#[skuld::test]
+fn names_launch_reads_the_job_block_of_procinfo_and_not_its_exit_code() {
+    let id = never_installed();
+    let block = procinfo_of_a_launch(&id, 7);
+    let stranger = "program path = /bin/sleep\n(pid 7 is not managed by launchd)\n";
+    let gone = "program path = (could not resolve path)\n(pid 7 is not managed by launchd)\n";
+    let other_job = block.replace(id.as_str(), "some-other-job");
+    let inside_a_line = block.replace(&format!("system/{id} = {{"), &format!("a system/{id} = {{"));
+    let cases = [
+        ((0, block.as_str(), ""), true, "a launch"),
+        ((1, block.as_str(), "failed"), true, "the block, whatever the exit code"),
+        ((0, stranger, ""), false, "a process no job owns"),
+        (
+            (0, gone, "Could not get proc info PID 7: 3: No such process\n"),
+            false,
+            "a dead pid",
+        ),
+        ((0, other_job.as_str(), ""), false, "another job's block"),
+        ((0, inside_a_line.as_str(), ""), false, "the text inside another line"),
+    ];
+    for ((code, stdout, stderr), expected, what) in cases {
+        let (named, script) = names_launch_over(code, stdout, stderr, 7);
+
+        assert_eq!(named.expect("an answer"), expected, "{what}");
+        assert_eq!(script.calls(), [["procinfo", "7"]], "{what}");
+        assert_eq!(
+            script.waits(),
+            [Waited {
+                role: RoleKind::Query,
+                bounded: false
+            }],
+            "{what}"
+        );
+    }
+}
+
+/// A `launchctl` that could not be run is an error, never "not named": the caller ends the run as in doubt
+/// on a "no", and a failure to ask is not that.
+#[skuld::test]
+fn names_launch_is_an_error_when_launchctl_cannot_be_run() {
+    let not_run = ClientError::NotRun(std::io::Error::other("no launchctl").into());
+    let script = Fake::new([fail(&["procinfo"], not_run)]);
+    let launchctl = Launchctl::new(Box::new(script));
+
+    let e = launchctl
+        .names_launch(never_installed().as_str(), 7, &mut reserved(&[Step::Start]))
+        .expect_err("no launchctl to run");
+
+    assert!(matches!(&e, Error::Spawn { .. }), "{e:?}");
 }
 
 /// SIGKILL to the job by label, in the system domain; the signal is named so a failure of the job
@@ -2279,7 +2434,7 @@ fn kill_sends_sigkill_to_the_job_in_the_system_domain() {
     let id = never_installed();
     let (result, script) = kill_answered(DONE);
 
-    assert!(matches!(result, Ok(Some(()))), "{result:?}");
+    assert!(matches!(result, Ok(())), "{result:?}");
     assert_eq!(script.calls(), [["kill", "SIGKILL", format!("system/{id}").as_str()]]);
     assert_eq!(
         script.waits(),
@@ -2318,6 +2473,91 @@ fn kill_refused_for_any_other_reason_is_a_plain_failure() {
         matches!(&e, Error::Command { stderr, .. } if stderr.contains("Operation not permitted")),
         "{e:?}"
     );
+}
+
+// wait_print ==========================================================================================================
+
+/// A wait for `until` over `calls`, which it makes as one call's files kept once, and the table.
+fn waiting(until: Until, deadline: Deadline, calls: &[(&str, Answer)]) -> (Result<Option<()>>, Fake) {
+    let script = table(calls);
+    let launchctl = Launchctl::new(Box::new(script.clone()));
+    let kept = reservation(0, 1)
+        .keep(Role::COUNTED_FILES)
+        .expect("keep a call's files");
+    let result = launchctl.wait_print(never_installed().as_str(), deadline, &kept, until);
+    (result, script)
+}
+
+/// A task's `stop` waits for a start launchd has accepted to fork: a process, or the state leaving
+/// `spawn scheduled`, or a label launchd does not hold, ends the wait, and a start still queued does not.
+#[skuld::test]
+fn wait_print_until_a_process_appears_or_the_state_leaves_spawn_scheduled() {
+    let forever = Budget::Unbounded.start();
+    let cases: [(&str, [(&str, Answer); 3]); 3] = [
+        (
+            "a process",
+            [
+                ("print", SPAWN_SCHEDULED),
+                ("print", SPAWN_SCHEDULED),
+                ("print", RUNNING),
+            ],
+        ),
+        (
+            "a state that is not queued",
+            [
+                ("print", SPAWN_SCHEDULED),
+                ("print", SPAWN_SCHEDULED),
+                ("print", NOT_RUNNING),
+            ],
+        ),
+        (
+            "a label launchd does not hold",
+            [
+                ("print", SPAWN_SCHEDULED),
+                ("print", SPAWN_SCHEDULED),
+                ("print", NOT_LOADED),
+            ],
+        ),
+    ];
+    for (what, calls) in cases {
+        let (result, script) = waiting(Until::ProcessOrNotScheduled, forever, &calls);
+
+        assert!(matches!(result, Ok(Some(()))), "{what}: {result:?}");
+        script.assert_spent(&format!("two reads of a queued start, then {what}"));
+    }
+}
+
+/// A deadline already spent still gets one last read, so a condition reached in the last interval is
+/// reported, and one that is not is an expiry.
+#[skuld::test]
+fn wait_print_reads_once_more_under_a_spent_deadline() {
+    let spent = Budget::Immediate.start();
+
+    let (queued, script) = waiting(Until::ProcessOrNotScheduled, spent, &[("print", SPAWN_SCHEDULED)]);
+    assert!(matches!(queued, Ok(None)), "{queued:?}");
+    script.assert_spent("one read");
+
+    let (forked, script) = waiting(Until::ProcessOrNotScheduled, spent, &[("print", RUNNING)]);
+    assert!(matches!(forked, Ok(Some(()))), "{forked:?}");
+    script.assert_spent("one read");
+}
+
+/// What `bootout` and `start` wait for, as before the wait was general: the label no longer loaded,
+/// whatever its state.
+#[skuld::test]
+fn wait_print_until_unloaded_is_the_wait_for_the_label_to_go() {
+    let forever = Budget::Unbounded.start();
+
+    let (result, script) = waiting(
+        Until::Unloaded,
+        forever,
+        &[("print", RUNNING), ("print", SIGTERMED), ("print", NOT_LOADED)],
+    );
+
+    assert!(matches!(result, Ok(Some(()))), "{result:?}");
+    script.assert_spent("it waited past a process and a job tearing down");
+    let (still_loaded, _) = waiting(Until::Unloaded, Budget::Immediate.start(), &[("print", NOT_RUNNING)]);
+    assert!(matches!(still_loaded, Ok(None)), "{still_loaded:?}");
 }
 
 // A changed spec over a loaded job ====================================================================================
@@ -2672,13 +2912,14 @@ fn install_loaded_after_write(name: &str, during: impl FnOnce() + Send + 'static
     let mut fields = service_fields(spec);
     fields.common.command.push("updated".to_string());
     let spec = ServiceSpec::new(fields).map(DaemonSpec::from).unwrap();
-    let changed = generate::plist(
+    let changed = generate::plists(
         &spec,
         &Identity {
             user: "root".to_string(),
         },
     )
-    .unwrap();
+    .unwrap()
+    .job;
     let script = Fake::new([answer("print", NOT_LOADED), answer("print", RUNNING).then(during)]);
     let mgr = launchd_over(script.clone());
     let e = mgr.install(&spec, false).expect_err("loaded after the write");

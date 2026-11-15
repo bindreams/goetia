@@ -179,7 +179,11 @@ pub trait ServiceManager {
     /// start: the instance it sees may be the one the stop is still taking
     /// down (a Windows `protocol: plain` service reads `RUNNING` until its shim
     /// has taken the stop), and reading that answer as a start would report a
-    /// restart that leaves the daemon down. `Ok(())` means the manager
+    /// restart that leaves the daemon down. launchd answers a `kickstart` of
+    /// a task that still has its run as it answers a start, so there a task's
+    /// start reads the job first and is refused with [`Error::StillRunning`],
+    /// sending nothing, and one whose read fails is [`Error::StopUnconfirmed`], also sending nothing.
+    /// `Ok(())` means the manager
     /// accepted a start request and nothing more. Takes no budget: it never
     /// waits.
     fn request_start_after_stop(&self, id: &Id) -> Result<()>;
@@ -201,7 +205,13 @@ pub trait ServiceManager {
     /// README's "Waiting for a start or stop".
     ///
     /// **A task's stop ends the run in flight and leaves its schedule armed;** the task is then
-    /// [`State::Idle`].
+    /// [`State::Idle`]. On macOS, a task's `stop` sends SIGTERM only and waits until the run ends
+    /// (bounded by `budget`); a task that ignores SIGTERM keeps running, and `kill` ends it. `stop` also
+    /// ends a run that begins while it is stopping. On macOS, a task's `stop` under every budget (`Immediate`
+    /// and a zero bound included) also waits for a start launchd has accepted to begin, so it can end it;
+    /// then it signals, and returns `Ok` under `Immediate` and [`Error::WaitTimeout`] under a zero
+    /// `Bounded` bound, the signal standing. If launchd shows the job with no process in a state that does
+    /// not say it is idle, or the read fails, the result is [`Error::StopUnconfirmed`].
     ///
     /// Idempotent: stopping an already-stopped service is `Ok(())`, not an
     /// error. `daemon restart` depends on this for a daemon that was never
@@ -211,6 +221,7 @@ pub trait ServiceManager {
     ///
     /// [`Error::WaitTimeout`]: crate::Error::WaitTimeout
     /// [`Error::ProcessWaitTimeout`]: crate::Error::ProcessWaitTimeout
+    /// [`Error::StopUnconfirmed`]: crate::Error::StopUnconfirmed
     fn stop(&self, id: &Id, budget: Budget) -> Result<()>;
 
     /// End the service's running process as a failure, and return once that is delivered. Does not
@@ -226,7 +237,10 @@ pub trait ServiceManager {
     ///
     /// [`Error::NotRunning`] where the service has no process, **classified off the kill request's
     /// own answer** and never off a state read before it, which would race the kill. Not an
-    /// `Ok(())`: nothing was killed.
+    /// `Ok(())`: nothing was killed. The one read after that answer is a launchd task's: `kickstart`
+    /// returns before the fork, and a task whose accepted start has not forked yet (which `status` reports
+    /// as running) has no process to signal, so its `kill` waits, under no budget, for the pid and then
+    /// signals; where the start does not happen, or the job was idle, it is `NotRunning`.
     ///
     /// SCM returns once it has recorded the exit: the service is then stopped, or already restarted
     /// by its restart policy. systemd and launchd return once the signal is sent.

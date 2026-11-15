@@ -23,6 +23,8 @@ pub mod sentinel;
 #[cfg(windows)]
 pub mod service_ctrl;
 pub mod service_guard;
+#[cfg(unix)]
+pub mod tasks;
 #[cfg(windows)]
 pub mod world_readable_exe;
 

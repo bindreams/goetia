@@ -139,13 +139,21 @@ pub enum Error {
     #[error("`{id}` may not have started: the manager accepted the start, but its state is not established")]
     StartUnconfirmed { id: String },
 
-    /// launchd cannot update a loaded job, so the changed definition was not installed.
-    #[error(
-        "`{id}` is loaded in launchd, which cannot update a loaded job, so the changed plist was not installed and \
-         the installed plist is untouched: run `goetia daemon stop {id}` (a job that has exited is still loaded), \
-         re-run install, then start it"
-    )]
-    LoadedJob { id: String },
+    /// A launchd task's `stop` read its job with no process, and in a state that does not say it is idle
+    /// (a state goetia does not know, no `state` line), or could not read it whole: that no process
+    /// remains is not established, so the stop is not reported as done. A SIGTERM an earlier pass sent
+    /// stands. A task's start requested right after an unwaited stop (`restart --timeout 0`) reads its job
+    /// first, and a read that failed is this too: no start is sent. Indeterminate, like
+    /// [`StartUnconfirmed`](Error::StartUnconfirmed). `shown` is what launchd showed, as the rest of the
+    /// sentence.
+    #[error("`{id}` may not have stopped: {shown}")]
+    StopUnconfirmed { id: String, shown: String },
+
+    /// launchd cannot update a loaded job, so the changed definition was not installed. `kind` is the
+    /// kind of the loaded job: a service is refused while it is loaded at all, a task only while it
+    /// has a run in flight.
+    #[error("{}", loaded_job(id, *kind))]
+    LoadedJob { id: String, kind: crate::spec::DaemonKind },
 
     /// `install`'s put-back of a plist found `found` at `path` instead of the plist `install` wrote,
     /// so it left the path alone. launchd only; it is the `restore_failed` of the in-doubt variants.
@@ -491,6 +499,16 @@ pub enum Error {
     #[error("`{id}` is already running: `run` needs an idle task (`goetia daemon stop {id}` ends the run in flight)")]
     AlreadyRunning { id: String },
 
+    /// A start requested right after a stop nobody waited for (`restart --timeout 0` of a launchd task)
+    /// found the run that was sent SIGTERM still alive, and so issued no start: launchd starts no new
+    /// run of a task while one is in flight. Determinate: nothing was sent.
+    #[error(
+        "`{id}` still has the run that was sent SIGTERM (pid {pid}), and launchd starts no new run of a task \
+         while one is in flight, so no start was issued; `goetia daemon start {id}` starts one once it has \
+         exited, and `goetia daemon restart {id}` without `--timeout 0` waits for the exit"
+    )]
+    StillRunning { id: String, pid: u32 },
+
     /// `run` could not tell whether the task is running, and so did not start it. Exit `4`
     /// (indeterminate): the run itself was never requested, but the manager's state is unestablished.
     #[error("the manager does not say whether `{id}` is running, so `run` did not start it")]
@@ -502,9 +520,10 @@ pub enum Error {
     #[error("`{id}` did not run: {reason}")]
     RunNotStarted { id: String, reason: String },
 
-    /// A run began, and its exit status was not established: it ended with none recorded where goetia
-    /// reads it, or the manager failed it with no exit recorded. Exit `4` (indeterminate): the run
-    /// happened, so repeating `run` repeats it.
+    /// A run began, or may have, and its exit status was not established: it ended with none recorded
+    /// where goetia reads it, the manager failed it with no exit recorded, or its launch ended before goetia
+    /// could follow it (launchd). Exit `4` (indeterminate): the run may have happened, so repeating `run`
+    /// may repeat it.
     #[error("the run of `{id}` ended without recording its exit status: {reason}")]
     RunUnrecorded { id: String, reason: String },
 
@@ -697,6 +716,7 @@ impl Error {
             | Error::LoadedStateInDoubt { .. }
             | Error::StaleJobBootedOut { .. }
             | Error::StartUnconfirmed { .. }
+            | Error::StopUnconfirmed { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunUnrecorded { .. } => true,
             wrapper!(source) | Error::ServiceImageUnreadable { source, .. } => source.is_indeterminate(),
@@ -739,6 +759,7 @@ impl Error {
             | Error::NotRunning { .. }
             | Error::NotATask { .. }
             | Error::AlreadyRunning { .. }
+            | Error::StillRunning { .. }
             | Error::RunNotStarted { .. }
             | Error::NoManager { .. }
             | Error::ElevationRequired { .. }
@@ -894,6 +915,7 @@ impl Error {
             | Error::AmbiguousInstall { .. }
             | Error::NotStarted { .. }
             | Error::StartUnconfirmed { .. }
+            | Error::StopUnconfirmed { .. }
             | Error::LoadedJob { .. }
             | Error::PutBackBlocked { .. }
             | Error::InvalidPassword { .. }
@@ -926,6 +948,7 @@ impl Error {
             | Error::NotRunning { .. }
             | Error::NotATask { .. }
             | Error::AlreadyRunning { .. }
+            | Error::StillRunning { .. }
             | Error::RunStateUnknown { .. }
             | Error::RunNotStarted { .. }
             | Error::RunUnrecorded { .. }
@@ -1291,6 +1314,22 @@ fn process_wait_timeout_message<'a>(
         terminate_failed,
         format!(". {recovery}"),
     )
+}
+
+/// The message of [`Error::LoadedJob`].
+fn loaded_job(id: &str, kind: crate::spec::DaemonKind) -> String {
+    match kind {
+        crate::spec::DaemonKind::Service => format!(
+            "`{id}` is loaded in launchd, which cannot update a loaded job, so the changed plist was not installed \
+             and the installed plist is untouched: run `goetia daemon stop {id}` (a job that has exited is still \
+             loaded), re-run install, then start it"
+        ),
+        crate::spec::DaemonKind::Task => format!(
+            "`{id}` has a run in flight, and launchd cannot replace a task's plist under one, so the changed plists \
+             were not installed and the installed ones are untouched: run `goetia daemon stop {id}` (a task that \
+             has stopped is idle), then re-run install"
+        ),
+    }
 }
 
 /// The message of [`Error::LoadedJobInDoubt`].

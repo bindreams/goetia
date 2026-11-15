@@ -282,6 +282,7 @@ fn marker(inv: &str) -> Marker {
         prefix: "goetia-run",
         line: format!("goetia-run {inv}"),
         id_len: 32,
+        earlier_start_possible: true,
     }
 }
 
@@ -296,8 +297,8 @@ fn marked(path: PathBuf, offset: u64, inv: &str) -> OutputSource {
 /// The note of a run whose marker is not in its file.
 fn no_marker_note(path: &Path) -> String {
     format!(
-        "note: the marker line of this run is not in {}, so its output is not shown: the file was \
-         emptied or replaced after the run began\n",
+        "note: the marker line of this run is not in {}, so its output is not shown: the run ended before it \
+         wrote its marker, or the file was emptied or replaced after the run began\n",
         path.display()
     )
 }
@@ -536,6 +537,43 @@ fn a_run_joined_in_flight_shows_from_its_marker_before_the_offset() {
 
     result.unwrap();
     assert_eq!(out, "1\n2\n");
+}
+
+/// A backend whose run cannot begin before the offset (its marker is only ever after it) has nothing
+/// to look for in the file's start: the same file that shows the joined run above shows the note.
+#[skuld::test]
+fn finish_rereads_from_the_start_only_where_an_earlier_start_is_possible() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    append(&path, &format!("goetia-run {RUN_A}\n1\n"));
+    let offset = std::fs::metadata(&path).unwrap().len();
+    append(&path, "2\n");
+    let source = |earlier_start_possible| OutputSource::LogFile {
+        path: path.clone(),
+        offset,
+        marker: Some(Marker {
+            earlier_start_possible,
+            ..marker(RUN_A)
+        }),
+    };
+
+    let (result, out) = streamed_after_the_end(source(true));
+    result.unwrap();
+    assert_eq!(out, "1\n2\n");
+
+    let (result, out) = streamed_after_the_end(source(false));
+    result.unwrap();
+    assert_eq!(out, no_marker_note(&path));
+}
+
+/// What a run's output begins after is the file's length, and a file that is not there is empty.
+#[skuld::test]
+fn length_of_a_file_that_is_not_there_is_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = log_in(dir.path());
+    assert_eq!(length_of(&path).unwrap(), 0);
+    append(&path, "abc\n");
+    assert_eq!(length_of(&path).unwrap(), 4);
 }
 
 /// A joined run that is found from the start is exact, and a file that does not hold our marker even

@@ -40,12 +40,12 @@ use crate::support::{self, ConnectBack, Group, cmd, launchd_group, may_account_f
 /// runs a real `daemon list` — on macOS, through this backend — holding that
 /// same name.
 #[skuld::label]
-const UNIT_DIR_EXCLUSIVE: skuld::Label;
+pub(crate) const UNIT_DIR_EXCLUSIVE: skuld::Label;
 
 // Fixtures ============================================================================================================
 
 /// [`support::base_fields`] as a `simple` daemon: every spec this suite installs is one.
-fn base_spec(id: &str, command: Vec<String>) -> DaemonSpec {
+pub(crate) fn base_spec(id: &str, command: Vec<String>) -> DaemonSpec {
     ServiceSpec::new(ServiceFields {
         protocol: Protocol::Plain,
         ..support::base_fields(id, command)
@@ -69,7 +69,7 @@ fn enabled_dir() -> PathBuf {
     PathBuf::from(ENABLED_DIR)
 }
 
-fn staging_path(id: &str) -> PathBuf {
+pub(crate) fn staging_path(id: &str) -> PathBuf {
     staging_dir().join(format!("{id}.plist"))
 }
 
@@ -83,11 +83,11 @@ fn ensure_staging_dir() {
         .unwrap_or_else(|e| panic!("chmod 0755 {}: {e}", dir.display()));
 }
 
-fn enabled_path(id: &str) -> PathBuf {
+pub(crate) fn enabled_path(id: &str) -> PathBuf {
     enabled_dir().join(format!("{id}.plist"))
 }
 
-fn is_loaded(id: &str) -> bool {
+pub(crate) fn is_loaded(id: &str) -> bool {
     cmd::run("launchctl", &["print", &format!("system/{id}")]).ok()
 }
 
@@ -129,7 +129,7 @@ fn binary_plist(label: &str) -> Vec<u8> {
 }
 
 /// Bytes that are not UTF-8 and do not begin `bplist00`: still not the UTF-8 XML
-/// `generate::plist` writes, so still a positive identification of a plist
+/// `generate::plists` writes, so still a positive identification of a plist
 /// goetia did not write. `FF FE` is also a UTF-16LE BOM, which is what a legal
 /// UTF-16 property list starts with — the exact file that used to hand a macOS
 /// host a permanent exit `4` for a vendor's service.
@@ -154,10 +154,14 @@ fn write_bytes(path: &Path, bytes: &[u8]) {
 /// the staging and enabled locations — `uninstall` locates the artifact
 /// wherever it currently lives — so a test that calls `enable` doesn't need
 /// a second guard.
-struct Guard(Id);
+///
+/// After `uninstall`, which refuses what it does not read whole, it boots out the job and a task's
+/// timer (`<id>@timer`) and removes both plists from both directories, so that a test that broke
+/// halfway leaves nothing a later test could meet.
+pub(crate) struct Guard(pub(crate) Id);
 
 impl Guard {
-    fn install(mgr: &Launchd, spec: &DaemonSpec) -> Self {
+    pub(crate) fn install(mgr: &Launchd, spec: &DaemonSpec) -> Self {
         let guard = Self(spec.common().id.clone());
         mgr.install(spec, false).expect("seed install");
         guard
@@ -170,7 +174,23 @@ impl Drop for Guard {
             Ok(()) | Err(goetia::Error::NotInstalled { .. }) => {}
             Err(e) => eprintln!("Guard[{}]: cleanup failed: {e}", self.0),
         }
+        let id = self.0.as_str();
+        // Boots both labels out and removes the pair from `LaunchDaemons`.
+        drop(support::ServiceGuard::new(id));
+        for path in [staging_path(id), timer_staging_path(id)] {
+            support::cleanup::remove_or_warn(&path, false);
+        }
     }
+}
+
+/// Where a task's timer's plist is while it is not armed.
+pub(crate) fn timer_staging_path(id: &str) -> PathBuf {
+    staging_dir().join(format!("{id}@timer.plist"))
+}
+
+/// Where a task's timer's plist is while it is armed.
+pub(crate) fn timer_enabled_path(id: &str) -> PathBuf {
+    enabled_dir().join(format!("{id}@timer.plist"))
 }
 
 /// Kills the `launchctl kickstart -p system/<id>` that a `start` answering `WaitTimeout` leaves
@@ -219,7 +239,7 @@ fn kickstart_is_running(id: &Id) -> bool {
 }
 
 /// The trimmed value on the first `key`-prefixed line of a `launchctl print` body.
-fn print_field<'a>(printed: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn print_field<'a>(printed: &'a str, key: &str) -> Option<&'a str> {
     printed
         .lines()
         .find_map(|line| line.trim_start().strip_prefix(key))
@@ -235,7 +255,7 @@ const PRINT_FAILURE_BOUND: Duration = Duration::from_secs(5);
 /// (no such job, which is final) or once [`PRINT_FAILURE_BOUND`] has passed. A success is
 /// returned whatever it says.
 #[track_caller]
-fn print_job(id: &str) -> cmd::Run {
+pub(crate) fn print_job(id: &str) -> cmd::Run {
     let target = format!("system/{id}");
     let started = std::time::Instant::now();
     loop {
@@ -298,6 +318,90 @@ fn launchd_passes_conformance(#[fixture(launchd_group)] _group: &Group) {
     .expect("plant the self-referential symlink");
 
     manager::conformance::run(&mgr, &sleepy);
+}
+
+/// `UNIT_DIR_EXCLUSIVE`: like [`launchd_passes_conformance`], it installs tasks in the shared plist
+/// directories for its whole length. Every id it uses is fresh and removed by `run_tasks`.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn launchd_passes_task_conformance(#[fixture(launchd_group)] _group: &Group) {
+    manager::conformance::run_tasks(&Launchd::new(), &|id, schedule| {
+        goetia::testing::task(id, vec!["/bin/sleep".to_string(), "300".to_string()], schedule)
+    });
+}
+
+// A run's children and Ctrl-C =========================================================================================
+
+/// Kills a process by pid when dropped, so a test that fails leaves nothing behind. Cleanup never panics.
+struct KillOnDrop(libc::pid_t);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: `kill` takes a pid and a signal number; a pid that is gone answers `ESRCH`.
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+}
+
+/// The sentinel, a process group leader: its whole group is killed and the sentinel reaped when this
+/// drops, so a test that fails leaves nothing behind. Cleanup never panics.
+struct SentinelGroup(std::process::Child);
+
+impl Drop for SentinelGroup {
+    fn drop(&mut self) {
+        // SAFETY: `killpg` takes a process group id and a signal number; a group that is gone answers `ESRCH`.
+        unsafe { libc::killpg(self.0.id() as libc::pid_t, libc::SIGKILL) };
+        drop(self.0.wait());
+    }
+}
+
+/// Ctrl-C is a SIGINT to the terminal's foreground process group, which goetia is in. `run` defers
+/// SIGINT only while a launch is held, so the `launchctl` calls it spawns (contained, as
+/// `backend::bounded::command` spawns them) must not be in that group: an interrupt that ended one
+/// mid-request would lose what goetia sent. The sentinel spawns a child as goetia spawns `launchctl`;
+/// the test signals the sentinel's process group, which the sentinel is the leader of, and the child is
+/// not in it and lives on.
+#[skuld::test]
+fn a_launchctl_child_survives_a_sigint_to_goetias_process_group() {
+    use std::io::BufRead as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let mut goetia = SentinelGroup(
+        Command::new(std::env::current_exe().expect("the test binary's path"))
+            .arg(support::sentinel::CONTAINED_CHILD)
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn the sentinel"),
+    );
+    let goetia_group = goetia.0.id() as libc::pid_t;
+    let mut line = String::new();
+    std::io::BufReader::new(goetia.0.stdout.take().expect("the sentinel's stdout"))
+        .read_line(&mut line)
+        .expect("the child's pid");
+    let child: libc::pid_t = line.trim().parse().expect("a pid");
+    let _cleanup = KillOnDrop(child);
+
+    // SAFETY: `getpgid` takes a pid, and every pid here is a process this test spawned.
+    let child_group = unsafe { libc::getpgid(child) };
+    assert_ne!(
+        child_group, goetia_group,
+        "the contained child is in goetia's process group"
+    );
+
+    // SAFETY: `killpg` takes a process group id and a signal number.
+    assert_eq!(
+        unsafe { libc::killpg(goetia_group, libc::SIGINT) },
+        0,
+        "signal goetia's group"
+    );
+    let status = goetia.0.wait().expect("wait for the sentinel");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "the interrupt reached goetia: {status:?}"
+    );
+
+    // SAFETY: signal 0 only checks that the process exists.
+    assert_eq!(unsafe { libc::kill(child, 0) }, 0, "the child outlived the interrupt");
 }
 
 // Round trips and drift ===============================================================================================
@@ -753,7 +857,9 @@ fn list_reports_a_deleted_user_as_ours_unusable(#[fixture(launchd_group)] _group
     ensure_staging_dir();
     write_plist(
         &path,
-        &generate::plist(&spec, &Identity { user: user.to_string() }).unwrap(),
+        &generate::plists(&spec, &Identity { user: user.to_string() })
+            .unwrap()
+            .job,
     );
     let cannot_render = mgr
         .preview_install(&spec)
@@ -1391,7 +1497,8 @@ fn list_does_not_hang_on_a_fifo_in_the_plist_directory(#[fixture(launchd_group)]
     let id = support::random_test_id();
     let path = enabled_path(&id);
     let _cleanup = FileGuard::new(path.clone());
-    mkfifo(&path);
+    support::require_system_dir(path.parent().unwrap());
+    support::tasks::mkfifo(&path);
 
     let listed = without_blocking("Launchd::list", || Launchd::new().list()).expect("list");
 
@@ -1399,14 +1506,6 @@ fn list_does_not_hang_on_a_fifo_in_the_plist_directory(#[fixture(launchd_group)]
         !may_account_for(&listed, &id),
         "a FIFO is not a plist, and nothing about it was left undetermined: {listed:?}"
     );
-}
-
-fn mkfifo(path: &Path) {
-    support::require_system_dir(path.parent().unwrap());
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a plist path with no NUL");
-    // SAFETY: `c_path` is a NUL-terminated pointer valid for the call.
-    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
-    assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), std::io::Error::last_os_error());
 }
 
 /// Run `f` on its own thread and report — rather than hang — if it never

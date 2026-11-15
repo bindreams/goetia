@@ -316,7 +316,7 @@ impl Backend for Systemd {
     }
 
     /// See [`Systemd::begin_run`], which is the journal-less host's stated contract too.
-    fn begin_run(&self, snapshot: Fragment, reservation: &mut Held) -> Result<Run> {
+    fn begin_run(&self, snapshot: Fragment, reservation: &mut Held, _notes: &mut dyn std::io::Write) -> Result<Run> {
         Systemd::begin_run(self, snapshot, reservation)
     }
 }

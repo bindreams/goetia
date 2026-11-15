@@ -3,7 +3,10 @@
 //! unlike `manager`.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use crate::manager::State;
+use crate::backend::launchd::refuse::{run_ended_unfollowed, run_unfollowed, run_vanished, stranded_hold};
+use crate::error::Error;
+use crate::manager::{Exit, State};
+use crate::spec::Id;
 
 /// Classifies one `launchctl print` body into the `(State, pid)` pair `status`/`list` report.
 ///
@@ -12,14 +15,14 @@ use crate::manager::State;
 /// running, so with a pid it is `Running`: launchd's side of the start is done, and the exec that
 /// follows is the user process's.
 pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
-    let pid = find_field(print_body, "pid").and_then(|s| s.trim().parse().ok());
+    let pid = has_process(print_body);
     let state = match find_field(print_body, "state").map(str::trim) {
         Some("running") => State::Running,
         Some("xpcproxy") | Some("trampoline") if pid.is_some() => State::Running,
         Some("not running") | Some("exited") => State::Stopped,
         // Everything else is `Unknown` rather than a guess: `spawn scheduled` (decided to start,
-        // not yet forked, no pid), `xpcproxy`/`trampoline` without a pid, any `state` a future
-        // macOS introduces, and no `state` line at all.
+        // not yet forked, no pid), `xpcproxy`/`trampoline` without a pid (never observed, so not
+        // taken for a start), any `state` a future macOS introduces, and no `state` line at all.
         //
         // One of three places a `State::Starting` would be produced if goetia grows one (routed
         // post-0.1.0): also `map_state` in `src/backend/scm/manager.rs` and `status_from_unit` in
@@ -27,6 +30,119 @@ pub(crate) fn classify(print_body: &str) -> (State, Option<u32>) {
         _ => State::Unknown,
     };
     (state, pid)
+}
+
+/// [`classify`] for a task's job, which a run starts and ends rather than keeps running: `exited` and
+/// `not running` are [`State::Idle`], and `spawn scheduled` is [`State::Running`] with no pid, a start
+/// launchd has accepted and not yet forked (`kickstart` returns before the fork), so a `run` straight
+/// after a `start` is refused as running and a `stop` does not take it for an idle task.
+pub(crate) fn classify_task(print_body: &str) -> (State, Option<u32>) {
+    match classify(print_body) {
+        (State::Stopped, pid) => (State::Idle, pid),
+        (State::Unknown, pid) if spawn_scheduled(print_body) => (State::Running, pid),
+        other => other,
+    }
+}
+
+/// Whether one `launchctl print` body shows a start launchd has accepted and not yet forked
+/// (`state = spawn scheduled`, no pid).
+pub(crate) fn spawn_scheduled(print_body: &str) -> bool {
+    find_field(print_body, "state").map(str::trim) == Some("spawn scheduled")
+}
+
+/// How a process ended, from the `wait(2)` status a kqueue `NOTE_EXITSTATUS` event carries: the exit
+/// code (its second byte) for a process that exited, else the signal (its low seven bits; bit 7 says a
+/// core was dumped) that killed it.
+pub(crate) fn exit_of(raw_status: i32) -> Exit {
+    match raw_status & 0x7f {
+        0 => Exit::Code((raw_status >> 8) & 0xff),
+        signal => Exit::Signal(signal),
+    }
+}
+
+/// The job's pid in one `launchctl print` body, if it holds a process: from `xpcproxy` or
+/// `trampoline` on, whatever the `state`. `None` for a job with no `pid` line, `spawn scheduled`
+/// included.
+pub(crate) fn has_process(print_body: &str) -> Option<u32> {
+    find_field(print_body, "pid").and_then(|s| s.trim().parse().ok())
+}
+
+/// How the job's last run ended, from one `launchctl print` body: `last exit code = N` is
+/// [`Exit::Code`], and `last terminating signal = Terminated: 15` (the signal's name, a colon, its
+/// number) is [`Exit::Signal`]. `None` before the first exit (`last exit code = (never exited)`), and
+/// for a body with neither line. `print` has one of the two lines at a time, and while a run is in
+/// flight (a `pid` line) it holds the run before's.
+pub(crate) fn last_result(print_body: &str) -> Option<Exit> {
+    if let Some(code) = find_field(print_body, "last exit code") {
+        return code.trim().parse().ok().map(Exit::Code);
+    }
+    let signal = find_field(print_body, "last terminating signal")?;
+    signal.rsplit(':').next()?.trim().parse().ok().map(Exit::Signal)
+}
+
+/// What the reads of the process `kickstart -p` named showed once its start time was read: that it is
+/// not the job's launch, that it is gone, or how it stands after its exec.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Then {
+    /// `launchctl procinfo` did not name the pid as the job's launch: it is another process's. Nothing
+    /// else was read of it.
+    Stranger,
+    /// No process at a later read, or one the watch showed had exited after it, or one that exited before
+    /// its first exec: with its `wait(2)` status where the watch kept one.
+    Gone(Option<i32>),
+    /// Alive after its exec, `stopped` or not.
+    Process { stopped: bool },
+}
+
+/// What `run` makes of the launch `kickstart -p` named.
+#[derive(Debug)]
+pub(crate) enum Launch {
+    /// An older launch that is over: it started at or before our `debug` returned and is gone. Another pass
+    /// is made.
+    Ended,
+    /// Stopped, and started after our `debug`: the launch that `debug` held for this run.
+    Held,
+    /// Stopped, and started before our `debug` returned: an older launch that took a hold, which is
+    /// resumed and waited for.
+    TookHold,
+    /// Not stopped, and started before our `debug` returned: a run already in flight (a scheduled one),
+    /// which is waited for.
+    InFlight,
+}
+
+/// The end of a `run` whose launch has no start time: the pid `kickstart -p` named was gone when it was
+/// registered, or at the read of its start. Whose launch it was is not known, so it is in doubt, in the
+/// stranded hold ([`run_vanished`]). [`launch_of`] ends with it for a pid `launchctl procinfo` does not
+/// name; `run` ends with it for the other two.
+pub(crate) fn launch_unknown(id: &Id, pid: u32) -> Error {
+    stranded_hold(id, run_vanished(id, pid))
+}
+
+/// The [`Launch`] of the pid `kickstart -p` named for a run of `id`, or the end of the run: `started` is its
+/// start time and `then` what the reads showed after it. `ta` is the time read after the `launchctl debug`
+/// process was reaped (both in `mach_absolute_time` units): a start after `ta` began after `debug`; one at
+/// or before it began before `debug` returned.
+///
+/// | reads | the launch is | result |
+/// | --- | --- | --- |
+/// | [`Then::Stranger`] | not known: this run's, or a scheduled run's | ends: [`launch_unknown`] |
+/// | gone, started after `ta` | ours, which ended before goetia could follow it | ends: [`run_ended_unfollowed`] |
+/// | running, started after `ta` | ours, our `kickstart`'s, with no hold | ends: [`run_unfollowed`] |
+/// | gone, started at or before `ta` | an older one, that is over | [`Launch::Ended`] |
+/// | stopped, started after `ta` | the one `debug` held | [`Launch::Held`] |
+/// | stopped, started at or before `ta` | an older one that took a hold | [`Launch::TookHold`] |
+/// | running, started at or before `ta` | a run in flight | [`Launch::InFlight`] |
+pub(crate) fn launch_of(started: u64, then: Then, ta: u64, id: &Id, pid: u32) -> Result<Launch, Error> {
+    let ours = started > ta;
+    match (then, ours) {
+        (Then::Stranger, _) => Err(launch_unknown(id, pid)),
+        (Then::Process { stopped: true }, true) => Ok(Launch::Held),
+        (Then::Process { stopped: true }, false) => Ok(Launch::TookHold),
+        (Then::Process { stopped: false }, false) => Ok(Launch::InFlight),
+        (Then::Process { stopped: false }, true) => Err(run_unfollowed(id, pid)),
+        (Then::Gone(_), false) => Ok(Launch::Ended),
+        (Then::Gone(status), true) => Err(run_ended_unfollowed(id, status)),
+    }
 }
 
 /// Whether one `launchctl print` body shows a job whose `bootout` has returned and whose process has
@@ -55,7 +171,7 @@ impl Evidence {
     /// Whether one `launchctl print` body shows it. Any other reading, an unrecognised or missing
     /// `state` included, is no evidence that launchd has the request.
     pub(crate) fn shown_by(self, print_body: &str) -> bool {
-        let queued = find_field(print_body, "state").map(str::trim) == Some("spawn scheduled");
+        let queued = spawn_scheduled(print_body);
         match self {
             Evidence::Queued => queued,
             Evidence::QueuedOrRunning => queued || classify(print_body).0 == State::Running,

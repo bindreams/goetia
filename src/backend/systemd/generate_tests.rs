@@ -1093,6 +1093,13 @@ fn a_task_that_sets_a_variable_sh_resets_is_refused() {
         assert!(message.contains(&format!("`{key}`")), "{key}: {message}");
         assert!(message.contains("/bin/sh"), "{key}: {message}");
         assert!(message.contains("resets"), "{key}: {message}");
+        assert_eq!(
+            message,
+            &format!(
+                "`env` sets `{key}`, but a task starts through /bin/sh, which resets it, so the program would not \
+                 see the value"
+            ),
+        );
     }
 
     // Only a task starts through `sh`; a service, and every other variable, is as before.
