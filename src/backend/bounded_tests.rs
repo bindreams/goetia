@@ -412,6 +412,62 @@ fn only_eperm_is_a_refusal_a_child_on_its_way_out_gives() {
     }));
 }
 
+/// What was last read of the child after a refused kill is carried into the error, with the refusal
+/// as its source, and says what was seen, never that the child "runs on": a child still running when
+/// goetia stopped waiting and one whose liveness could not be read are told apart, and one that reads
+/// `Dead` is no error, and gives back the refusal.
+#[skuld::test]
+fn what_was_last_read_after_a_refused_kill_is_reported_with_the_refusal() {
+    let said = |last| {
+        let error = after_refusal(eperm(), last, EXIT_AFTER_REFUSED_KILL).expect_err("the child was not seen to exit");
+        cosca::error::Report::new(&error).to_string()
+    };
+
+    assert!(after_refusal(eperm(), Liveness::Dead, EXIT_AFTER_REFUSED_KILL).is_ok());
+    assert!(
+        said(Liveness::Alive).contains(
+            "the kill was refused (EPERM) and the process was still running when goetia stopped waiting, 5s later"
+        ),
+        "{}",
+        said(Liveness::Alive)
+    );
+    assert!(
+        said(Liveness::Unknown).contains(
+            "the kill was refused (EPERM) and whether the process was running could not be read when goetia \
+             stopped waiting, 5s later"
+        ),
+        "{}",
+        said(Liveness::Unknown)
+    );
+    assert!(
+        said(Liveness::Alive).ends_with(&cosca::error::Report::new(&eperm()).to_string()),
+        "the kill's error is the source"
+    );
+}
+
+/// A child read `Dead` after a refused kill is reaped within the bound or the call says it could not
+/// be: cosca reads `Dead` for a zombie only a tracer can reap, which an unbounded reap would wait on
+/// for ever. The exit seen is the status; no exit within the bound is an error naming the bound, with
+/// the refusal as its source.
+#[skuld::test]
+fn a_child_read_dead_after_a_refused_kill_is_reaped_within_the_bound_or_the_call_says_it_was_not() {
+    let status = ExitStatus::from_raw(7 << 8);
+    let reaped = after_reap(eperm(), Some(status), Duration::from_millis(50)).expect("the child was reaped");
+    assert_eq!(reaped.code(), Some(7));
+
+    let error = after_reap(eperm(), None, Duration::from_millis(50)).expect_err("the child was not reaped");
+
+    let said = cosca::error::Report::new(&error).to_string();
+    assert!(
+        said.contains("the kill was refused (EPERM) and the process exited, but could not be reaped within 50ms"),
+        "{said}"
+    );
+    assert!(
+        said.ends_with(&cosca::error::Report::new(&eperm()).to_string()),
+        "the kill's error is the source: {said}"
+    );
+}
+
 /// [`Left::kill`] ends the tree before the reaper reaps the root, as a query's expiry does: the
 /// reaper detaches the child, which never ends a tree, so a descendant is left running unless the
 /// kill ended it. The test watches the descendant die, and kills it however the test ends.
@@ -485,8 +541,6 @@ fn a_kill_refused_with_eperm_is_returned_at_once_off_macos() {
 /// hook.
 #[cfg(target_os = "macos")]
 mod refused_kill {
-    use std::time::Instant;
-
     use super::*;
 
     /// A refused kill that signals the child with SIGTERM first, as the exit that raced the kill does.
@@ -567,37 +621,10 @@ mod refused_kill {
             ))
         });
 
-        kill_root(&child.child, EXIT_AFTER_REFUSED_KILL).expect("the child exited, and its exit is not an error");
-    }
+        let outcome =
+            kill_root(&child.child, EXIT_AFTER_REFUSED_KILL).expect("the child exited, and its exit is not an error");
 
-    /// What was last read of the child after a refused kill is carried into the error, with the
-    /// refusal as its source: a child still running and one whose liveness could not be read are told
-    /// apart, and one that reads `Dead` is no error.
-    #[skuld::test]
-    fn what_was_last_read_after_a_refused_kill_is_reported_with_the_refusal() {
-        let said = |last| {
-            let error =
-                after_refusal(eperm(), last, EXIT_AFTER_REFUSED_KILL).expect_err("the child was not seen to exit");
-            cosca::error::Report::new(&error).to_string()
-        };
-
-        assert!(after_refusal(eperm(), Liveness::Dead, EXIT_AFTER_REFUSED_KILL).is_ok());
-        assert!(
-            said(Liveness::Alive).contains("the kill was refused (EPERM) and the process was still running 5s later"),
-            "{}",
-            said(Liveness::Alive)
-        );
-        assert!(
-            said(Liveness::Unknown).contains(
-                "the kill was refused (EPERM) and whether the process was running could not be read 5s later"
-            ),
-            "{}",
-            said(Liveness::Unknown)
-        );
-        assert!(
-            said(Liveness::Alive).ends_with(&cosca::error::Report::new(&eperm()).to_string()),
-            "the kill's error is the source"
-        );
+        assert!(matches!(outcome, KillRootOutcome::ExitedRefusing(_)), "{outcome:?}");
     }
 
     /// A child that stays after refusing the kill is a lost wait: the refusal, naming the bound on the
@@ -627,7 +654,10 @@ mod refused_kill {
 
         let said = cosca::error::Report::new(&error).to_string();
         assert!(
-            said.contains("the kill was refused (EPERM) and the process was still running 50ms later"),
+            said.contains(
+                "the kill was refused (EPERM) and the process was still running when goetia stopped waiting, \
+                 50ms later"
+            ),
             "{said}"
         );
         assert!(
@@ -637,22 +667,50 @@ mod refused_kill {
     }
 
     /// The kill of a [`Role::Request`] the caller ends ([`Left::kill`]) is refused as a query's is, by a
-    /// child that then exits: it is ended, not a request that runs on, and nothing is said.
+    /// child that then exits: through [`waited_out`], the child is ended, its tree with it, and
+    /// nothing is said. The reaper gets the status the kill's bounded reap already took.
     #[skuld::test]
-    fn a_left_request_whose_kill_is_refused_by_a_child_that_then_exits_is_not_one_that_runs_on() {
-        let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+    fn a_left_request_whose_kill_is_refused_by_a_child_that_then_exits_is_ended_and_nothing_is_said() {
+        let mut cmd = sh("trap 'exit 7' TERM; sleep 2147483647 & echo $! >&3; wait");
+        cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
+        cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+        let Requested { mut child, reaped } = requested(cmd);
+        let descendant = descendant_on_fd3(&mut child.child);
         let _refused = test_hook::kill_fails(term_then_eperm);
+        let Spawned {
+            child,
+            role,
+            stdout,
+            stderr,
+        } = child;
+        let finished = waited_out(
+            child,
+            role,
+            stdout,
+            stderr,
+            Vec::new(),
+            Budget::Immediate.start(),
+            EXIT_AFTER_REFUSED_KILL,
+        )
+        .unwrap();
+        let Finished::Left(left) = finished else {
+            panic!("expected Left, got {finished:?}");
+        };
 
-        let warning = end_left(&child.child, EXIT_AFTER_REFUSED_KILL);
+        assert_eq!(left.kill_saying(), None);
 
-        assert_eq!(warning, None);
+        let status = reaped.recv().unwrap().unwrap();
+        assert_eq!(status.code(), Some(7), "{status:?}");
+        // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
+        descendant.0.wait().unwrap();
     }
 
     /// The bound a [`Left`]'s kill waits for a refusing child is the one [`waited_out`] was given
-    /// ([`EXIT_AFTER_REFUSED_KILL`] in production), not a bound of its own: with 50 ms it returns long
-    /// before that constant, leaving the child running, which its reaper then reaps once it exits.
+    /// ([`EXIT_AFTER_REFUSED_KILL`] in production), not a bound of its own: the warning names the 50 ms
+    /// the test gave. A child that was refused and is still running is released to its reaper, which
+    /// reaps it once it exits.
     #[skuld::test]
-    fn a_left_request_waits_the_bound_waited_out_was_given_for_a_refusing_child() {
+    fn a_left_request_says_the_bound_waited_out_was_given_when_it_cannot_be_ended() {
         let Requested { child, reaped } = requested(released_at_eof("exit 7"));
         let Spawned {
             child,
@@ -675,38 +733,21 @@ mod refused_kill {
             panic!("expected Left, got {finished:?}");
         };
 
-        let started = Instant::now();
-        left.kill();
+        let warning = left.kill_saying().expect("the child could not be ended");
 
-        // A measurement, not a wait: the constant is 100 times the bound given, and the call is not
-        // synchronized on it.
         assert!(
-            started.elapsed() < EXIT_AFTER_REFUSED_KILL,
-            "the kill waited {:?}",
-            started.elapsed()
+            warning.starts_with("warning: could not kill a request left running: "),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(
+                "the kill was refused (EPERM) and the process was still running when goetia stopped waiting, \
+                 50ms later"
+            ),
+            "{warning}"
         );
         let status = reaped.recv().unwrap().unwrap();
         assert_eq!(status.code(), Some(7), "{status:?}");
-    }
-
-    /// A [`Left`] whose child stays after refusing the kill says it runs on, naming the refusal. The
-    /// bound is an argument of [`end_left`], so this test does not wait out a real 5 s.
-    #[skuld::test]
-    fn a_left_request_that_cannot_be_ended_says_it_runs_on() {
-        let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
-        let _refused = test_hook::kill_fails(|_| eperm());
-
-        let warning = end_left(&child.child, Duration::from_millis(50)).expect("the child could not be ended");
-
-        assert!(
-            warning.starts_with("warning: could not kill a request left running, which runs on: "),
-            "{warning}"
-        );
-        assert!(
-            warning.contains("the kill was refused (EPERM) and the process was still running 50ms later"),
-            "{warning}"
-        );
-        assert!(matches!(child.child.is_alive(), cosca::identity::Liveness::Alive));
     }
 }
 
