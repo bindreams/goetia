@@ -204,6 +204,19 @@ fn an_interrupt_says_what_it_was_received_before_and_what_is_left() {
     assert!(!report.contains("no run was started"), "a launch may exist: {report}");
 }
 
+/// A followed run whose exit came without a status ended: unrecorded, exit 4.
+#[skuld::test]
+fn a_run_whose_exit_came_without_a_status_ended_unrecorded() {
+    let ended = run_ended_without_status(&frpc());
+
+    assert!(
+        matches!(&ended, Error::RunUnrecorded { id, reason }
+            if id == "frpc" && reason == "the kernel did not report it"),
+        "{ended:?}"
+    );
+    assert!(ended.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
+}
+
 /// A wait that lost the run leaves it possibly going: indeterminate, never a plain failure.
 #[skuld::test]
 fn a_run_goetia_lost_track_of_is_in_doubt() {
