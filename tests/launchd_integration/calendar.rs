@@ -3,13 +3,14 @@
 //! them is the timer's next fire, and `next_run` (which goetia computes, as launchd reports none) must be it.
 //!
 //! The lines are read from a `log stream` that is attached before the timer is armed. Every wait here is on
-//! the log's own lines, with no cap: the suite's watchdog is its bound.
+//! the log's own lines, with no cap: the suite's watchdog is its bound. (The canary is logged again while it
+//! has not come back; see [`Registrations::start`].)
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use goetia::backend::launchd::manager::Launchd;
 use goetia::manager::ServiceManager as _;
@@ -22,6 +23,10 @@ use crate::support::cron_oracle::assert_next_run_strict;
 use crate::support::tasks::{id_of, task_status};
 use crate::support::{self, Group, cmd, launchd_group};
 use crate::tasks::ChildGuard;
+
+/// How long the canary waits for a line before another is logged. Not a measure of anything: a canary that
+/// is not lost is not logged twice, and one logged twice does no harm.
+const RELOG: Duration = Duration::from_millis(100);
 
 /// The `Registered` lines of UserEventAgent, from a `log stream` that is attached when [`start`] returns.
 ///
@@ -57,24 +62,28 @@ impl Registrations {
         };
 
         // The first line is the stream's own, printed before the stream is subscribed to the log (measured: a
-        // line logged straight after it was lost). So the canary is logged, and the next line the stream
-        // prints is read: if it is not the canary, the stream may not have been attached when it was logged,
-        // and another is logged. A `logger` that fails, or a stream that ends, ends the test.
+        // line logged straight after it was lost). The second, a column header, is printed with the first
+        // event the stream delivers, and with none to deliver (the canary was lost) it never comes: in the
+        // measured run it came 55 s later, with an unrelated event. So the canary is logged again whenever
+        // `RELOG` passes with no line. That expiry proves nothing about the stream: the wait ends only on the
+        // canary coming back. A `logger` that fails, or a stream that ends, ends the test.
         registrations.next_line();
         let canary = format!("StartCalendarInterval canary {}", std::process::id());
+        cmd::run("logger", &[canary.as_str()]).expect_ok();
         loop {
-            eprintln!("PROBE logging a canary");
-            cmd::run("logger", &[canary.as_str()]).expect_ok();
-            if registrations.next_line().contains(&canary) {
-                return registrations;
+            match registrations.lines.recv_timeout(RELOG) {
+                Ok(line) if line.contains(&canary) => return registrations,
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    cmd::run("logger", &[canary.as_str()]).expect_ok();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("`log stream` ended"),
             }
         }
     }
 
     fn next_line(&self) -> String {
-        let line = self.lines.recv().expect("`log stream` ended");
-        eprintln!("PROBE stream: {line}");
-        line
+        self.lines.recv().expect("`log stream` ended")
     }
 
     /// The next fire of each of the `count` entries of the job `label`, one per `Registered` line, read in
@@ -140,7 +149,6 @@ fn next_run_is_the_earliest_fire_launchd_registered(#[fixture(launchd_group)] _g
     );
     let registrations = Registrations::start();
     let zone = system_zone().expect("the system time zone");
-    eprintln!("PROBE attached");
 
     let before = SystemTime::now();
     mgr.enable(&task_id).expect("enable");
