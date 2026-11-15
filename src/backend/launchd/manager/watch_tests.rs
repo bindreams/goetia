@@ -162,18 +162,7 @@ fn status_of(registered: Registered, deadline: Option<Deadline>) -> Option<i32> 
     registered
         .wait(deadline)
         .expect("wait")
-        .map(|exited| exited.raw_status().expect("a status"))
-}
-
-/// The kernel's report of `pid`'s exit with no status, which no real child gives a registration that asks
-/// for it: put where the registration's wait will find it, as the exit its queue read.
-pub(in crate::backend::launchd::manager) fn exit_without_status(watch: &Watch, pid: u32) {
-    watch
-        .shared
-        .kept
-        .lock()
-        .expect("the kept exits")
-        .push(Exited { pid, status: None });
+        .map(|exited| exited.status.expect("a status"))
 }
 
 /// How many events `queue` holds now, which it gives up: a poll that blocks for none.
@@ -228,20 +217,18 @@ fn a_killed_child_reports_its_signal() {
     );
 }
 
-/// An exit the kernel reported without a status is an exit: the wait answers it, and only a caller that
-/// needs the status makes it an error.
+/// An exit the kernel reported without a status is an exit: the wait answers it, with no status.
 #[skuld::test]
-fn an_exit_without_a_status_is_answered_and_a_status_required_of_it_is_an_error() {
+fn an_exit_without_a_status_is_answered_with_none() {
+    let _unreported = test_hook::statuses(0);
     let watch = watch();
-    let child = Held::new(0);
+    let mut child = Held::new(0);
     let registered = registered(&watch, child.pid());
-    exit_without_status(&watch, child.pid());
+    child.finish();
 
     let exited = registered.wait(failure_bound()).expect("wait").expect("an exit");
 
     assert_eq!(exited.status, None);
-    let e = exited.raw_status().expect_err("the exit has no status");
-    assert!(e.report().to_string().contains("without its status"), "{e:?}");
 }
 
 #[skuld::test]

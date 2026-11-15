@@ -440,6 +440,20 @@ fn a_run_arms_debug_before_kickstart_and_resumes_after_registering_the_watch() {
     assert_eq!(run.wait().expect("the exit"), Exit::Code(3));
 }
 
+/// An exit the kernel reported without a status ended the run, and its status is not known: the run is
+/// unrecorded, as one of our launches that ended before it could be followed is, not in doubt.
+#[skuld::test]
+fn a_run_whose_exit_came_without_a_status_is_unrecorded() {
+    let (fake, _launched) = held_at_once(3);
+    let tree = Tree::new();
+    let run = begun(&fake, snapshot(&tree, None));
+    let _unreported = test_hook::statuses(0);
+
+    let e = run.wait().expect_err("an exit with no status");
+
+    assert_ended_unfollowed(&e);
+}
+
 /// The log's length is read while the launch is held, and before `SIGCONT`: the file grows at the
 /// `kickstart` (before the read) and at the `SIGCONT` (after it). The run's offset is the length with the
 /// first, not an earlier one, and not the later one.

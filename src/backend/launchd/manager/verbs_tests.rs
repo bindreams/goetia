@@ -10,10 +10,7 @@ use std::time::Duration;
 use super::super::manager_tests::launchd_over;
 use super::super::task::Shown;
 use super::super::task::task_tests::{ID, Tree, marked, plists_of, service_spec, task_spec};
-use super::super::watch::{
-    test_hook,
-    watch_tests::{Held, exit_without_status},
-};
+use super::super::watch::{test_hook, watch_tests::Held};
 use super::super::write::write_tests::bootstrap;
 use super::*;
 use crate::backend::Backend as _;
@@ -560,31 +557,22 @@ fn stop_with_a_pid_that_is_not_the_jobs_any_more_is_ok_and_sends_nothing() {
 }
 
 /// `stop` waits for the run to be over and reads no status, so an exit the kernel reported without one
-/// ends the wait like any other: the pass reads again.
+/// ends the wait like any other: the stop goes on to read again, and succeeds.
 #[skuld::test]
 fn stop_takes_an_exit_the_kernel_reported_without_a_status() {
+    let _unreported = test_hook::statuses(0);
     let run = Held::new(0);
     let pid = run.pid();
-    let watch = Watch::new().expect("a kqueue");
-    exit_without_status(&watch, pid);
-    let fake = Fake::new([print(&running(pid)), print(&running(pid)), sigterm()]);
-    let tree = Tree::new();
-    let mgr = launchd_over(fake.clone());
-    let mut held = reserved(&mgr, Step::Stop);
-    let snapshot = task_snapshot(&tree, false);
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        sigterm_ending(run),
+        print(IDLE),
+    ]);
 
-    let pass = mgr
-        .stop_pass(
-            &snapshot.id,
-            Budget::Unbounded,
-            Budget::Unbounded.start(),
-            &watch,
-            &mut held,
-        )
-        .expect("a pass");
+    stopping(&fake, Budget::Unbounded).expect("a stop");
 
-    assert_eq!(pass, Pass::Again);
-    fake.assert_spent("read, confirm, signal");
+    fake.assert_spent("the run ended without a status, and the next read found none");
 }
 
 /// A pid that has exited by the time it is watched cannot be watched: the next pass reads again.
