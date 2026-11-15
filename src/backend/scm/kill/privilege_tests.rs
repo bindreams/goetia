@@ -143,13 +143,20 @@ fn failed_to_enable() -> DebugPrivilege {
 
 #[skuld::test]
 fn a_denied_open_names_the_privilege_step_that_failed() {
-    let e = failed_to_enable().explain_denial(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let denial = || io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+
+    let e = failed_to_enable().explain_denial(denial());
 
     let msg = Chain(&e).to_string();
-    assert!(msg.contains("SeDebugPrivilege"), "{msg}");
-    assert!(msg.contains("DuplicateTokenEx failed"), "{msg}");
     assert_eq!(
-        msg.matches("Access is denied").count(),
+        msg,
+        format!(
+            "open the process without SeDebugPrivilege, which could not be enabled (DuplicateTokenEx failed): {}",
+            denial()
+        )
+    );
+    assert_eq!(
+        msg.matches(&denial().to_string()).count(),
         1,
         "the open's own error is kept, once: {msg}"
     );

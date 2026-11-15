@@ -44,12 +44,14 @@ impl DebugPrivilege {
     }
 
     /// `open`'s error, with the failed privilege step named when the open was denied: the denial may
-    /// be the privilege that could not be enabled. Ends the guard, so the thread's token is back
-    /// before the error is returned. The denial stays the error's `source()`.
-    pub(super) fn explain_denial(mut self, open: io::Error) -> io::Error {
-        match self.failure.take() {
+    /// be the privilege that could not be enabled. The denial stays the error's `source()`.
+    pub(super) fn explain_denial(&self, open: io::Error) -> io::Error {
+        match &self.failure {
             Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => within(
-                format!("enabling SeDebugPrivilege for the open also failed ({})", Chain(&step)),
+                format!(
+                    "open the process without SeDebugPrivilege, which could not be enabled ({})",
+                    Chain(step)
+                ),
                 open,
             ),
             _ => open,

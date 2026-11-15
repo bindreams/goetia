@@ -47,7 +47,7 @@ pub(crate) fn run() -> ! {
     // Every host reaches here, and this read is what keeps its version marker in the linked binary.
     std::hint::black_box(&marker::MARKER);
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
-        Log::real().failure(TABLE_NAME, &format!("connect to the SCM dispatcher: {}", Chain(&e)));
+        Log::real().failure(TABLE_NAME, &dispatcher_failure(&e));
         exit::end_process(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT as i32);
     }
     exit::end_when_dispatched()
@@ -286,6 +286,11 @@ fn report_stopped(handle: StatusHandle, reported: Reported) -> std::io::Result<(
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// The line logged when the shim cannot connect to the SCM dispatcher.
+fn dispatcher_failure(e: &windows_service::Error) -> String {
+    format!("connect to the SCM dispatcher: {}", Chain(e))
 }
 
 /// The shim exits after this without a `STOPPED` report. SCM is expected to read that as a crash
