@@ -28,7 +28,7 @@ fn probe_bounded_kill_eperm() {
     let mut eperm_deadlines = Vec::new();
     let started = Instant::now();
     for i in 0..n {
-        let ms = 3 + rand() % 78;
+        let ms = 3 + rand() % 12; // a print takes about 11 ms here: centre the deadlines on it
         let mut cmd = command("/bin/launchctl", &["print", "system"]).unwrap();
         let mut reservation = Reservation::for_role(&Role::Query);
         let spawned = match spawn(&mut cmd, Role::Query, &mut reservation) {
