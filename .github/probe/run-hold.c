@@ -574,6 +574,24 @@ static void pass(int i) {
                 tally("task_info suspend_count %d (%s)", (int)ti.suspend_count, want_stop ? "held" : "unheld");
             mach_port_deallocate(mach_task_self(), t);
         }
+        /* The same reads from an unprivileged account (uid 501): does the read need root? */
+        pid_t u = fork();
+        if (u == 0) {
+            if (setgid(20) != 0 || setuid(501) != 0) _exit(255);
+            int ee = 0;
+            int a = sys_stat_of(pid, &ee), b = bsd_stat_of(pid, &ee);
+            mach_port_t t2;
+            int kr2 = task_for_pid(mach_task_self(), pid, &t2) == KERN_SUCCESS;
+            _exit(((a & 7) << 5) | ((b & 7) << 2) | kr2); /* 7 = read failed (-1) */
+        }
+        int ucode = reap(u);
+        if (ucode == 255) {
+            tally("unprivileged child: could not drop to uid 501");
+        } else {
+            int ua = (ucode >> 5) & 7, ub = (ucode >> 2) & 7;
+            tally("unprivileged (uid 501) reads: sysctl %s, proc_pidinfo %s, task_for_pid %s (%s)", sname(ua == 7 ? -1 : ua), sname(ub == 7 ? -1 : ub),
+                  (ucode & 1) ? "ok" : "denied", want_stop ? "held" : "unheld");
+        }
     }
 
     int exited = 0;
@@ -792,6 +810,30 @@ static void race(int i, long max_us, int withprint) {
     tally("after it ended, debug exit %d (37 = our fresh hold still pending)", c.code);
 }
 
+/* How long after `kickstart -p` names a held launch's pid does a `debug` still answer 37 (the hold still pending)? */
+static void lag(int i) {
+    struct cmd c, x;
+    reset();
+    lc(&c, "debug", SYS, "--start-suspended", NULL);
+    lc(&x, "kickstart", "-p", SYS, NULL);
+    pid_t p = (pid_t)atol(x.out);
+    int e1 = 0;
+    int stat = sys_stat_of(p, &e1);
+    uint64_t t0 = mach_absolute_time();
+    int tries = 0;
+    do {
+        lc(&c, "debug", SYS, "--start-suspended", NULL);
+        tries++;
+    } while (c.code == 37 && tries < 2000);
+    int64_t us = ns_of(mach_absolute_time() - t0) / 1000;
+    tally("debug after kickstart -p named a %s launch: answered 37 %d time(s) before 0 (last exit %d)", sname(stat), tries - 1, c.code);
+    if (tries > 1) anom("lag %d: %d tries, %lld us", i, tries, (long long)us);
+    lc(&c, "kill", "SIGKILL", SYS, NULL);
+    gone(p);
+    lc(&c, "debug", SYS, "--start-suspended", NULL);
+    tally("after the launch ended, debug exit %d (37 = the hold armed after it is still pending)", c.code);
+}
+
 /* ---- main ---- */
 
 int main(int argc, char **argv) {
@@ -817,6 +859,12 @@ int main(int argc, char **argv) {
         int n = atoi(argv[2]);
         for (int i = 0; i < n; i++) reply(i);
         dump("REPLY");
+        uninstall();
+    } else if (!strcmp(sc, "lag")) {
+        install(0, "sleep", 0);
+        int n = atoi(argv[2]);
+        for (int i = 0; i < n; i++) lag(i);
+        dump("LAG");
         uninstall();
     } else if (!strcmp(sc, "race")) {
         if (argc < 5) return 2;

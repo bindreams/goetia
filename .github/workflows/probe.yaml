@@ -15,18 +15,9 @@ jobs:
       fail-fast: false
       matrix:
         args:
-          - held wrap early b2b 300
-          - held wrap late b2b 300
-          - held plain early b2b 300
-          - held plain late b2b 300
-          - held wrap early spaced 200
-          - held plain late spaced 200
-          - held wrap late b2b 100 1
-          - unheld wrap early b2b 300
-          - unheld wrap late b2b 300
-          - unheld plain early b2b 300
-          - unheld plain late b2b 300
-          - race 3000 30000 1
+          - held wrap late b2b 150
+          - unheld wrap late b2b 150
+          - lag 600
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
