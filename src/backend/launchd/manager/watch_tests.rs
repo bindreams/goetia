@@ -354,11 +354,28 @@ fn launched(watch: &Watch, pid: u32) -> Registered {
     }
 }
 
-/// An interrupt sent to this process, not to this thread: a kqueue has its event for the first only, which
-/// is what a terminal's or a service manager's interrupt is. (`raise` is thread-directed.)
-fn send_interrupt() {
-    // SAFETY: `kill` takes plain integers, and every signal sent here has a handler.
-    assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGINT) }, 0, "send SIGINT");
+/// An interrupt sent to this process while SIGINT is ignored, not to a thread: a kqueue has its event for
+/// the first only, which is what a terminal's or a service manager's interrupt is, and "records all
+/// attempts to deliver a signal to a process, even if the signal has been marked as SIG_IGN" (kqueue(2)).
+/// So it reaches the queue and no handler, and no thread of the test binary has a call interrupted by
+/// it, which a handled one would do to whichever thread took it. The window's handler therefore records
+/// nothing of it, as when the handler runs after the queue has been read. The ignored disposition is the
+/// window's to put back when it closes, and the stand-in's after.
+fn send_ignored_interrupt() {
+    // SAFETY: an all-zero `sigaction` is valid; the mask is emptied before use.
+    let mut ignoring: libc::sigaction = unsafe { std::mem::zeroed() };
+    ignoring.sa_sigaction = libc::SIG_IGN;
+    // SAFETY: `ignoring` is a valid `sigaction`, a null old action is allowed, `sigemptyset` takes a valid
+    // set, and `kill` takes plain integers.
+    unsafe {
+        libc::sigemptyset(&mut ignoring.sa_mask);
+        assert_eq!(
+            libc::sigaction(libc::SIGINT, &ignoring, std::ptr::null_mut()),
+            0,
+            "ignore SIGINT"
+        );
+        assert_eq!(libc::kill(libc::getpid(), libc::SIGINT), 0, "send SIGINT");
+    }
 }
 
 fn raise_interrupt() {
@@ -428,6 +445,25 @@ fn an_interrupt_recorded_before_a_wait_ends_it_before_it_blocks() {
     assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
 }
 
+/// An interrupt wins over an exec or an exit that another read kept: a wait that reports the pid's state
+/// while an interrupt is known would have `run` resume or follow a launch after it. The poll reads and keeps
+/// the exec and the exit before the interrupt is recorded, so both are waiting when the wait begins.
+#[skuld::test]
+fn an_interrupt_wins_over_an_exec_and_an_exit_that_were_kept() {
+    let (_stand_in, window, watch) = interruptible();
+    let mut child = Held::execing(3);
+    let registered = launched(&watch, child.pid());
+    child.finish();
+    assert!(registered.has_exited().expect("poll"), "the exec and the exit are kept");
+    raise_interrupt();
+
+    assert!(matches!(
+        registered.first_exec(&window).expect("first_exec"),
+        Woke::Interrupted
+    ));
+    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
+}
+
 /// An interrupt that arrives while the wait blocks wakes it. A second process sends SIGINT to this one
 /// once its stdin closes, which a thread does as the wait begins: whether the signal lands before the wait
 /// blocks (recorded) or after (the kqueue's event), the wait ends.
@@ -445,26 +481,15 @@ fn an_interrupt_during_a_wait_wakes_it() {
     sending.join().expect("the sender's thread");
 }
 
-/// Sends an interrupt and waits until the stand-in handler has run for it: the handler that is there when
-/// it is delivered, which is not the window's, so the window records nothing of it.
-fn interrupt_before_a_window(stand_in: &StandIn) {
-    send_interrupt();
-    while stand_in.seen() == 0 {
-        std::thread::yield_now();
-    }
-}
-
 /// A signal whose event a read took out of the queue before the window's handler recorded it is not lost:
-/// the watch has it. The signal arrives before a window is open, so the queue has its event and the record
-/// has nothing; a poll then reads the event.
+/// the watch has it. The window is open first, as `run` opens it, and the queue has the signal's event
+/// while the record has nothing of it; a poll then reads the event.
 #[skuld::test]
 fn a_signal_event_read_by_a_poll_is_still_an_interrupt() {
-    let stand_in = StandIn::install();
-    let watch = Watch::new_interruptible().expect("a kqueue");
+    let (_stand_in, window, watch) = interruptible();
     let child = Held::new(0);
     let registered = launched(&watch, child.pid());
-    interrupt_before_a_window(&stand_in);
-    let window = Deferred::begin().expect("begin the window");
+    send_ignored_interrupt();
     assert!(!window.interrupted(), "the handler recorded nothing");
 
     assert!(!registered.has_exited().expect("poll"), "the poll reads the event");
@@ -476,13 +501,11 @@ fn a_signal_event_read_by_a_poll_is_still_an_interrupt() {
 /// The same for an event that the drop of another registration drained.
 #[skuld::test]
 fn a_signal_event_drained_by_a_dropped_registration_is_still_an_interrupt() {
-    let stand_in = StandIn::install();
-    let watch = Watch::new_interruptible().expect("a kqueue");
+    let (_stand_in, window, watch) = interruptible();
     let (child, other) = (Held::new(0), Held::new(0));
     let dropped = launched(&watch, other.pid());
     let registered = launched(&watch, child.pid());
-    interrupt_before_a_window(&stand_in);
-    let window = Deferred::begin().expect("begin the window");
+    send_ignored_interrupt();
     assert!(!window.interrupted(), "the handler recorded nothing");
 
     drop(dropped);
