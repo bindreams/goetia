@@ -1167,16 +1167,52 @@ fn enable_and_disable_finish_after_a_crash_on_a_real_launchd(#[fixture(launchd_g
     assert!(status.common.enabled, "{status:?}");
 }
 
-// PROBE (temporary): the flags `launchctl debug` has.
+// PROBE (temporary): does anything clear a pending `--start-suspended` hold without a launch?
 #[skuld::test]
-fn probe_debug_help(#[fixture(launchd_group)] _group: &Group) {
+fn probe_clear_a_hold(#[fixture(launchd_group)] _group: &Group) {
+    let id = support::random_test_id();
+    let task_id = id_of(&id);
+    let mgr = Launchd::new();
+    let _guard = Guard::install(&mgr, &task(&id, sleeper(), Some("0 3 * * *")));
+    mgr.enable(&task_id).expect("enable");
+    let target = format!("system/{id}");
+    let short = |run: &cmd::Run| format!("exit {:?} err {:?}", run.code, run.stderr.trim());
+    let candidates: Vec<(&str, Vec<Vec<&str>>)> = vec![
+        ("nothing (control: the hold stays)", vec![]),
+        ("debug --environment", vec![vec!["debug", &target, "--environment", "A=1"]]),
+        ("debug --stdout path", vec![vec!["debug", &target, "--stdout", "/tmp/probe-clear.log"]]),
+        ("debug --NSZombie", vec![vec!["debug", &target, "--NSZombie"]]),
+        ("debug --debug-libraries", vec![vec!["debug", &target, "--debug-libraries"]]),
+        ("debug --introspection-libraries", vec![vec!["debug", &target, "--introspection-libraries"]]),
+        ("debug --malloc-nano-allocator", vec![vec!["debug", &target, "--malloc-nano-allocator"]]),
+        ("debug --program /bin/sleep", vec![vec!["debug", &target, "--program", "/bin/sleep"]]),
+        ("debug --start-suspended again", vec![vec!["debug", &target, "--start-suspended"]]),
+        ("disable then enable", vec![vec!["disable", &target], vec!["enable", &target]]),
+        ("stop", vec![vec!["stop", &id]]),
+        ("kill SIGCONT of the job with no process", vec![vec!["kill", "SIGCONT", &target]]),
+    ];
     let mut report = String::new();
-    for args in [&["help", "debug"][..], &["help"][..], &["debug"][..], &["debug", "system/none"][..]] {
-        report.push_str(&format!("{}\n", cmd::run("launchctl", args)));
+    for (name, commands) in candidates {
+        let armed = cmd::run("launchctl", &["debug", &target, "--start-suspended"]);
+        report.push_str(&format!("== {name}\n  arm: {}\n", short(&armed)));
+        for args in commands {
+            let run = cmd::run("launchctl", &args);
+            report.push_str(&format!("  {}: {}\n", args.join(" "), short(&run)));
+        }
+        let kick = cmd::run("launchctl", &["kickstart", "-p", &target]);
+        report.push_str(&format!("  kickstart -p: {}, stdout {:?}\n", short(&kick), kick.stdout.trim()));
+        for _ in 0..3 {
+            let body = print_job(&id).stdout;
+            report.push_str(&format!(
+                "  print: state={:?} pid={:?} suspended={:?}\n",
+                print_field(&body, "state = "),
+                print_field(&body, "pid = "),
+                print_field(&body, "started suspended = ")
+            ));
+        }
+        cmd::run("launchctl", &["kill", "SIGCONT", &target]);
+        cmd::run("launchctl", &["kill", "SIGKILL", &target]);
+        kill::until(|| pid_of(&id).is_none());
     }
-    report.push_str(&format!(
-        "{}\n",
-        cmd::run("sh", &["-c", "man launchctl | col -b | grep -n -i -B3 -A40 'debug '"])
-    ));
     panic!("PROBE RESULT\n{report}");
 }
