@@ -177,14 +177,17 @@ impl Launchd {
                     .launchctl
                     .read_task_print(name, issuing, Role::Query, reservation)?;
                 match launch_shown(&still, id, pid)? {
-                    Launch::InFlight => {
+                    // A pid is one launch's for as long as it is shown, and this launch was read as not
+                    // held, so a `print` that shows the pid with no `started suspended` line (a run that
+                    // is ending may be shown so) is still that run: the registration waits for its exit.
+                    Launch::InFlight | Launch::Unreadable => {
                         never_expires(registered.wait(None)?);
                         Ok(Attempt::Again)
                     }
                     Launch::Ended => Ok(Attempt::Again),
-                    Launch::Held | Launch::Unreadable => Err(unestablished(
+                    Launch::Held => Err(unestablished(
                         id,
-                        format!("launchctl print no longer shows how the launch of process {pid} began"),
+                        format!("launchctl print now shows process {pid} as held, and it was not when it was named"),
                     )),
                 }
             }

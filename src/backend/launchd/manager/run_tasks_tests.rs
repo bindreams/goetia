@@ -712,24 +712,58 @@ fn a_confirming_print_that_shows_the_pid_without_the_hold_line_is_the_stranded_h
     }
 }
 
-/// After a scheduled run that slipped in: a confirm that shows the pid held or unreadable is the stranded
-/// hold, and one that shows it gone is the next attempt.
+/// After a scheduled run that slipped in: a confirm that shows the pid held, which it was not when it was
+/// named, is the stranded hold.
 #[skuld::test]
-fn a_slipped_in_run_whose_confirming_print_is_not_what_it_was_is_an_error() {
-    for (what, as_held) in [("shown as held", true), ("shown with no hold line", false)] {
-        let scheduled = Held::new(0);
-        let a = scheduled.pid();
-        let shown = if as_held { held(a) } else { without_hold_line(a) };
-        let fake = Fake::new([print(IDLE), debug(), kickstart(a), print(&in_flight(a)), print(&shown)]);
-        let tree = Tree::new();
+fn a_slipped_in_run_whose_confirming_print_shows_it_held_is_an_error() {
+    let scheduled = Held::new(0);
+    let a = scheduled.pid();
+    let fake = Fake::new([
+        print(IDLE),
+        debug(),
+        kickstart(a),
+        print(&in_flight(a)),
+        print(&held(a)),
+    ]);
+    let tree = Tree::new();
 
-        let (result, notes) = begin(&fake, snapshot(&tree, None));
+    let (result, notes) = begin(&fake, snapshot(&tree, None));
 
-        let e = result.err().expect(what);
-        assert_stranded(&e, what);
-        fake.assert_spent(what);
-        assert_eq!(notes, NOTE, "{what}");
-    }
+    let e = result.err().expect("a launch cannot be held and not");
+    assert_stranded(&e, "shown as held");
+    fake.assert_spent("shown as held");
+    assert_eq!(notes, NOTE);
+}
+
+/// After a scheduled run that slipped in: a confirm that shows the same pid with no hold line (a run that
+/// is ending may be shown so) is still that run, which is waited for like any other; a failure of the
+/// run is not the stranded hold.
+#[skuld::test]
+fn a_slipped_in_run_whose_confirming_print_has_no_hold_line_is_still_waited_for() {
+    let (mut scheduled, ours) = (Held::new(0), Held::new(0));
+    let (a, b) = (scheduled.pid(), ours.pid());
+    let fake = Fake::new([
+        print(IDLE),
+        debug(),
+        kickstart(a),
+        print(&in_flight(a)),
+        print(&without_hold_line(a)).then(move || {
+            scheduled.finish();
+        }),
+        debug_exiting(37),
+        kickstart(b),
+        print(&held(b)),
+        print(&held(b)),
+        sigcont_ending(ours),
+    ]);
+    let tree = Tree::new();
+
+    let (result, notes) = begin(&fake, snapshot(&tree, None));
+
+    let run = result.unwrap_or_else(|e| panic!("begin_run failed: {e}"));
+    fake.assert_spent("the run waited for, then a second attempt");
+    assert_eq!(notes, NOTE);
+    assert_eq!(run.wait().expect("the exit"), Exit::Code(0));
 }
 
 /// A note that cannot be written is an error after `debug` held the launch: the stranded hold, with the
