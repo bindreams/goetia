@@ -3,7 +3,7 @@
 # Throwaway Windows CI runner only.
 param([Parameter(Mandatory)][ValidateSet('system', 'localservice', 'networkservice', 'user')][string]$Kind)
 . "$PSScriptRoot\common.ps1"
-$Script:Folder = '\Goetia'
+$Script:TaskFolder = '\Goetia'
 Section "platform"; Show-Platform
 Initialize-Probe
 $svc = Get-ProbeService

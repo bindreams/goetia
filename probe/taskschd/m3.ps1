@@ -104,7 +104,7 @@ net user $user.Name $user.Password | Out-Null
 Section "schtasks /change: what does it reach?"
 $t = Fresh 'm3s'
 "before: flags [$(TrigFlags $t)] task Enabled=$($t.Enabled)"
-$tn = "$Script:Folder\m3s"
+$tn = "$Script:TaskFolder\m3s"
 foreach ($a in @('/disable'), @('/enable'), @('/st', '04:00'), @('/ri', '10', '/du', '01:00'), @('/ed', '2031-01-01'), @('/sd', '2030-02-02')) {
     $o = (schtasks /change /tn $tn @a 2>&1) -join ' '
     $t2 = $folder.GetTask('m3s')

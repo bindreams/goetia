@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Continue'
 $Script:Probe = 'C:\probe'
 $Script:Exe = 'C:\probe\bin\tsprobe.exe'
 $Script:Logs = 'C:\probe\logs'
-$Script:Folder = '\GoetiaProbe'
+$Script:TaskFolder = '\GoetiaProbe'   # not `$Folder`: PowerShell variables are case-insensitive
 
 function Show-Platform {
     "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
@@ -147,7 +147,7 @@ function New-TaskXml {
 
 function Get-ProbeService { $s = New-Object -ComObject Schedule.Service; $s.Connect(); $s }
 
-function Get-ProbeFolder($Svc, [string]$Path = $Script:Folder) {
+function Get-ProbeFolder($Svc, [string]$Path = $Script:TaskFolder) {
     try { return $Svc.GetFolder($Path) } catch {
         $root = $Svc.GetFolder('\')
         $null = $root.CreateFolder($Path.TrimStart('\'))
@@ -171,12 +171,12 @@ function Register-ProbeTask($Folder, [string]$Name, [string]$Xml, [hashtable]$P,
 
 function Remove-ProbeTasks($Svc) {
     try {
-        $f = $Svc.GetFolder($Script:Folder)
+        $f = $Svc.GetFolder($Script:TaskFolder)
         foreach ($t in @($f.GetTasks(1))) {
             try { foreach ($i in @($t.GetInstances(0))) { try { $i.Stop() } catch {} }; } catch {}
             try { $f.DeleteTask($t.Name, 0) } catch {}
         }
-        $Svc.GetFolder('\').DeleteFolder($Script:Folder.TrimStart('\'), 0)
+        $Svc.GetFolder('\').DeleteFolder($Script:TaskFolder.TrimStart('\'), 0)
     } catch {}
 }
 
@@ -194,7 +194,7 @@ function Run-Wait($Task) {
         return $null
     } catch { return "Run FAILED: $($_.Exception.Message.Trim()) [$(HexOf $_.Exception.HResult)]" }
 }
-function Wait-Match([string]$Path, [string]$Pattern) { while (-not (Select-String -Path $Path -Pattern $Pattern -Quiet -ErrorAction SilentlyContinue)) { } }
+function Wait-Match([string]$Path, [string]$Pattern) { while (-not ((Test-Path $Path) -and (Select-String -Path $Path -Pattern $Pattern -Quiet -ErrorAction SilentlyContinue))) { } }
 function Wait-Lines([string]$Path, [int]$N) { while (@(Get-Content $Path -ErrorAction SilentlyContinue).Count -lt $N) { } }
 
 function Initialize-Native {

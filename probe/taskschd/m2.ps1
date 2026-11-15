@@ -82,7 +82,7 @@ $shapes = [ordered]@{
 Section "GetRunTimes count capacity (the shape * * * * *)"
 $xml = New-TaskXml -P $P -Command $Script:Exe -Arguments 'act noop' -Triggers (Cal (ByDay 1) (Rep 'PT1M' 'P1D') '2027-01-01T00:00:00')
 $null = Register-ProbeTask $folder 'captest' $xml $P
-& $Script:Exe runtimes "$Script:Folder\captest" captest
+& $Script:Exe runtimes "$Script:TaskFolder\captest" captest
 
 $n = 0
 foreach ($k in $shapes.Keys) {
@@ -94,7 +94,7 @@ foreach ($k in $shapes.Keys) {
         $xml = New-TaskXml -P $P -Command $Script:Exe -Arguments 'act noop' -Triggers $shapes[$k].T -Enabled (-not $off)
         $t = Register-ProbeTask $folder $name $xml $P
         "registered; NextRunTime=$($t.NextRunTime.ToString('o')) State=$($t.State) triggers-read-back=$($t.Definition.Triggers.Count)"
-        & $Script:Exe runtimes "$Script:Folder\$name" 2027-01-01 2029-01-01 100000
+        & $Script:Exe runtimes "$Script:TaskFolder\$name" 2027-01-01 2029-01-01 100000
     } catch { "REGISTRATION REFUSED: $($_.Exception.Message) [$(HexOf $_.Exception.HResult)]" }
 }
 

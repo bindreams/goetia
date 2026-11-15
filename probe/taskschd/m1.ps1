@@ -42,8 +42,8 @@ Info $t 'before the run'
 $rt = $t.Run($null)
 Wait-Lines "$Logs\m1-during.log" 2
 Info $t 'while it runs'
-$p = [Diagnostics.Process]::GetProcessById([int]$rt.EnginePID); $null = $p.Handle
-$rt.Stop(); $p.WaitForExit(); Wait-NoInstances $t
+$proc = [Diagnostics.Process]::GetProcessById([int]$rt.EnginePID); $null = $proc.Handle
+$rt.Stop(); $proc.WaitForExit(); Wait-NoInstances $t
 Info $t 'after the run was stopped'
 
 Section "after exit 0, 7 and 0xC000013A, a Run each"
@@ -67,11 +67,11 @@ Remove-Item "$Logs\m1-killed.log" -ErrorAction SilentlyContinue
 $rt = $t.Run($null)
 Wait-Lines "$Logs\m1-killed.log" 2
 $pid_ = [uint32]$rt.EnginePID
-$p = [Diagnostics.Process]::GetProcessById([int]$pid_); $null = $p.Handle
+$proc = [Diagnostics.Process]::GetProcessById([int]$pid_); $null = $proc.Handle
 Info $t 'while the console action runs'
 Write-Host "Terminate: win32 $([Native]::Terminate($pid_, [uint32]0xC0DE0011L))"
-$p.WaitForExit()
-Info $t "at the process's exit (exit code $(HexOf $p.ExitCode))"
+$proc.WaitForExit()
+Info $t "at the process's exit (exit code $(HexOf $proc.ExitCode))"
 Wait-NoInstances $t
 Info $t 'after the listing dropped'
 
@@ -80,11 +80,11 @@ Remove-Item "$Logs\m1-stop.log" -ErrorAction SilentlyContinue
 $t = Reg 'stopped' "act ctrl $Logs\m1-stop.log block:1" $daily
 $rt = $t.Run($null)
 Wait-Lines "$Logs\m1-stop.log" 2
-$p = [Diagnostics.Process]::GetProcessById([int]$rt.EnginePID); $null = $p.Handle
+$proc = [Diagnostics.Process]::GetProcessById([int]$rt.EnginePID); $null = $proc.Handle
 Info $t 'while the console action runs'
 $rt.Stop()
-$p.WaitForExit()
-Info $t "at the process's exit (exit code $(HexOf $p.ExitCode))"
+$proc.WaitForExit()
+Info $t "at the process's exit (exit code $(HexOf $proc.ExitCode))"
 Wait-NoInstances $t
 Info $t 'after the listing dropped'
 Get-Content "$Logs\m1-stop.log"

@@ -91,8 +91,8 @@ $rt2 = $t.Run($null)
 $rt3 = $t.RunEx($null, 0, 0, $null)
 "RunEx (live instance): ok guid=$($rt3.InstanceGuid) pid=$($rt3.EnginePID)"
 "listing: $((@($t.GetInstances(0)) | ForEach-Object { "$($_.InstanceGuid)/$($_.EnginePID)" }) -join ', ')"
-$p = [Diagnostics.Process]::GetProcessById([int]$rt1.EnginePID); $null = $p.Handle
-$rt1.Stop(); $p.WaitForExit(); Wait-NoInstances $t
+$proc = [Diagnostics.Process]::GetProcessById([int]$rt1.EnginePID); $null = $proc.Handle
+$rt1.Stop(); $proc.WaitForExit(); Wait-NoInstances $t
 "action starts (ctrl action logs 2 lines + handler lines per start; count of 'start spec' lines): $(@(Get-Content "$Logs\m7-live.log" | Where-Object { $_ -match 'start spec' }).Count)"
 
 Remove-ProbeTasks $svc

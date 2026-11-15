@@ -18,7 +18,7 @@ $log = "$Logs\m5.log"; Remove-Item $log -ErrorAction SilentlyContinue
 $xml = New-TaskXml -P $P -Command $Script:Exe -Arguments "act hold $log $ev 0"
 $null = Register-ProbeTask $folder 'm5' $xml $P
 Section "handle holders of the action's process object, as $Kind"
-& $Script:Exe handles "$Script:Folder\m5" $ev $sp $Runs $log
+& $Script:Exe handles "$Script:TaskFolder\m5" $ev $sp $Runs $log
 "tsprobe exit code $LASTEXITCODE"
 Remove-ProbeTasks $svc
 Remove-ProbeUser $user

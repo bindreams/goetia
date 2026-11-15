@@ -28,7 +28,7 @@ function Reg([string]$Name, [string]$ActArgs, [string]$Trig = '', [string]$Cmd =
 function Ended([string]$Name, [string]$Exp, [int]$N, [string]$Label, [string]$Extra = '') {
     $log = "$Script:Logs\$Name.log"
     Remove-Item $log, "$log.token" -ErrorAction SilentlyContinue
-    if ($Extra) { & $Script:Exe ended "$Script:Folder\$Name" $Exp $N $Label $log $Extra } else { & $Script:Exe ended "$Script:Folder\$Name" $Exp $N $Label $log }
+    if ($Extra) { & $Script:Exe ended "$Script:TaskFolder\$Name" $Exp $N $Label $log $Extra } else { & $Script:Exe ended "$Script:TaskFolder\$Name" $Exp $N $Label $log }
     "tsprobe exit code $LASTEXITCODE"
 }
 
@@ -75,7 +75,7 @@ try {
 try {
     Section "an action that cannot start: $Kind"
     Reg 'nostart' '' '' 'C:\probe\bin\missing.exe'
-    & $Script:Exe nostart "$Script:Folder\nostart" 30
+    & $Script:Exe nostart "$Script:TaskFolder\nostart" 30
 } catch { Write-Host "NOSTART FAILED: $_" }
 
 Section "TaskScheduler Operational events during this leg, by id"
