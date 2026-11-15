@@ -540,7 +540,15 @@ fn a_start_after_a_kill_sees_the_restart_in_the_auto_restart_window(#[fixture(sy
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &listener);
+    let unit = format!("{}.service", spec.common().id);
+    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &listener, &|| {
+        let shown = cmd::run("systemctl", &["show", "--property=SubState", "--value", &unit]).expect_ok();
+        assert_eq!(
+            shown.stdout.trim(),
+            "auto-restart",
+            "the unit is in the restart delay when `start` is called"
+        );
+    });
 }
 
 /// A unit that was started too often (systemd's start limit, which goetia leaves on for a `restart: never`

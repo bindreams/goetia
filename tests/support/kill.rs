@@ -9,6 +9,7 @@
 //! backend, so no scenario here waits for the manager to catch up: a `status` straight after the kill
 //! never shows the killed process.
 
+use cosca::identity::{ProcessId, Resolved};
 use goetia::Error;
 use goetia::manager::{Budget, ServiceManager, State};
 use goetia::spec::Id;
@@ -20,6 +21,15 @@ use super::ConnectBack;
 pub fn until(mut condition: impl FnMut() -> bool) {
     while !condition() {
         std::thread::yield_now();
+    }
+}
+
+/// The identity of the running process `pid`: its start time and unique id along with the number, so
+/// that a process that is later given the same number is another.
+fn identity_of(pid: u32) -> ProcessId {
+    match ProcessId::of(pid) {
+        Resolved::Found(id) => id,
+        other => panic!("precondition: process {pid} is running ({other:?})"),
     }
 }
 
@@ -59,8 +69,15 @@ pub fn a_killed_daemon_comes_back_with_a_new_pid(mgr: &dyn ServiceManager, id: &
 /// is still waiting out its restart delay. The restart does not depend on the caller surviving the kill,
 /// and the start does not meet the killed process still running.
 /// `id` must be installed, not started, with a restart policy that restarts after a kill and a restart
-/// delay longer than a kill takes. `started` hears from the daemon each time it starts.
-pub fn a_start_after_a_kill_sees_the_restart(mgr: &dyn ServiceManager, id: &Id, started: &ConnectBack) {
+/// delay longer than a kill takes. `started` hears from the daemon each time it starts. `in_the_delay`
+/// asserts, between the kill and the start, that the manager is in the policy's restart delay, so
+/// that the scenario's window is a standing fact and not a hope.
+pub fn a_start_after_a_kill_sees_the_restart(
+    mgr: &dyn ServiceManager,
+    id: &Id,
+    started: &ConnectBack,
+    in_the_delay: &dyn Fn(),
+) {
     mgr.start(id, Budget::DEFAULT).expect("start");
     started.accept("the daemon to report in after start");
     let old_pid = mgr
@@ -69,15 +86,22 @@ pub fn a_start_after_a_kill_sees_the_restart(mgr: &dyn ServiceManager, id: &Id, 
         .common()
         .pid
         .expect("a running daemon reports a pid");
+    let old = identity_of(old_pid);
 
     mgr.kill(id).expect("kill");
+    in_the_delay();
     mgr.start(id, Budget::DEFAULT)
         .expect("a start after the kill sees the policy's restart");
 
     let after = mgr.status(id).expect("status after the start");
     assert_eq!(after.common().state, State::Running, "{after:?}");
     let new_pid = after.common().pid.expect("a running daemon reports a pid");
-    assert_ne!(new_pid, old_pid, "the start met the killed process ({after:?})");
+    // The process, not its number: a number the killed process had can be given to the new one.
+    assert_ne!(
+        identity_of(new_pid),
+        old,
+        "the start met the killed process ({after:?})"
+    );
     started.accept("the restarted daemon to report in");
 }
 
