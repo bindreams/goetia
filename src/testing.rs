@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 #[cfg(windows)]
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::time::SystemTime;
 
 #[cfg(windows)]
 use crate::error::Result;
@@ -60,6 +62,22 @@ pub fn shown_sid(sid: &[u8]) -> String {
 #[cfg(windows)]
 pub fn sid_for_account_name(account_name: &str) -> Result<Vec<u8>> {
     crate::backend::scm::manager::sid_for_account_name(account_name, None).map(|(sid, _kind)| sid)
+}
+
+/// When Task Scheduler itself says the task `id` runs between `from` and `to`: its `GetRunTimes`, the
+/// oracle the schedule tests compare the cron they translated with.
+#[cfg(windows)]
+pub fn task_run_times(id: &Id, from: SystemTime, to: SystemTime) -> Result<Vec<SystemTime>> {
+    use crate::backend::scm::instance::TaskPath;
+    crate::backend::scm::manager::task::Com.run_times(&TaskPath::of(id), from, to)
+}
+
+/// Deletes the task `\Goetia\<id>` and anything of it a test made, retrying a transient failure for
+/// about five seconds and then warning. A task that is not there is done. Never panics: it is what a
+/// guard's `Drop` calls.
+#[cfg(windows)]
+pub fn remove_task(id: &Id) {
+    crate::backend::scm::manager::task::cleanup::remove_task(id);
 }
 
 #[cfg(windows)]

@@ -96,6 +96,10 @@
 
 pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
+// The verbs that call the boundary land with the next tasks of slice 5; until then only the tests and
+// the `testing` exports reach it.
+#[expect(dead_code, reason = "the task verbs, its callers, come next")]
+pub(crate) mod task;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use identity::sid_for_account_name;
 
@@ -113,6 +117,7 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
+use self::task::{Com, TaskApi};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
@@ -146,11 +151,14 @@ use crate::spec::{AccountId, DaemonSpec, Id, Protocol, User};
 
 /// The Windows service manager. Holds no state of its own — every operation opens exactly the
 /// SCM/registry handles it needs and closes them again — only the source of `protocol: plain`
-/// services' host and the check on the folder it lives in.
+/// services' host, the check on the folder it lives in, and the boundary to Task Scheduler.
 pub struct Scm {
     /// `None` for [`Scm::new`]: no host to provide, and no files of the manager's own to sweep.
     shim: Option<Box<dyn ShimProvider>>,
     folders: FolderCheck,
+    /// Task Scheduler: the real one, unless an in-crate test put a [`TaskApi`] in its place.
+    #[expect(dead_code, reason = "the task verbs, its readers, come next")]
+    tasks: Box<dyn TaskApi>,
 }
 
 impl Scm {
@@ -161,6 +169,7 @@ impl Scm {
         Self {
             shim: None,
             folders: FolderCheck::new(CheckPermissions::Enable),
+            tasks: Box::new(Com),
         }
     }
 
@@ -172,7 +181,15 @@ impl Scm {
         Self {
             shim: Some(Box::new(provider)),
             folders: FolderCheck::new(check),
+            tasks: Box::new(Com),
         }
+    }
+
+    /// This manager over `tasks` in place of the real Task Scheduler, for in-crate tests, as
+    /// [`with_shim`](Self::with_shim) puts a provider in place of the stock host.
+    #[expect(dead_code, reason = "the tests of the task verbs, its callers, come next")]
+    pub(crate) fn with_tasks(self, tasks: Box<dyn TaskApi>) -> Self {
+        Self { tasks, ..self }
     }
 
     /// The provider, or [`Error::NoShimProvider`] for a manager built without one.

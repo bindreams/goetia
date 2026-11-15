@@ -28,9 +28,10 @@ struct Spec {
 
 const SCM: Spec = Spec {
     env: "GOETIA_TEST_SCM",
-    what: "install, start, stop and remove real Windows services, write the real registry (service keys and \
-           scratch keys under HKLM\\SOFTWARE), create local user accounts, write under %ProgramFiles% and \
-           %ProgramData%, take the machine-wide install lock, and read the Windows Event Log",
+    what: "install, start, stop and remove real Windows services, register, run and remove real Task Scheduler \
+           tasks (and their \\Goetia folder), write the real registry (service keys and scratch keys under \
+           HKLM\\SOFTWARE), create local user accounts, write under %ProgramFiles% and %ProgramData%, take the \
+           machine-wide install lock, and read the Windows Event Log",
 };
 
 const SYSTEMD: Spec = Spec {

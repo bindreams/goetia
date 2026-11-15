@@ -180,6 +180,16 @@ windows-sys = { version = "0.61", features = [
     "Wdk_Foundation",
     "Wdk_System_Registry",
 ] }
+# Task Scheduler (`backend::scm::manager::task`): COM through the typed `windows` crate, already in the lock through
+# `cosca` and `skuld`, with only COM features added. `Win32_System_Ole` is what makes `ITaskService::Connect` and
+# `RegisterTask` exist at all; `Win32_System_Time` converts the local civil times of its dates.
+windows = { version = "0.62", features = [
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Time",
+    "Win32_System_Variant",
+] }
 
 [build-dependencies]
 # Hardens every `[[bin]]` against loading a DLL from its own folder (Windows MSVC); bins fail to link on other

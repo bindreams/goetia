@@ -413,6 +413,7 @@ dependencies = [
  "skuld",
  "tempfile",
  "thiserror",
+ "windows",
  "windows-service",
  "windows-sys",
  "winreg",
