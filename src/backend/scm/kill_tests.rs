@@ -162,13 +162,9 @@ impl KillTarget for Scripted {
         }
     }
 
-    fn has_exited(&mut self, _process: &Held) -> io::Result<bool> {
-        Ok(true)
-    }
-
-    fn await_exit(&mut self, process: &Held) -> io::Result<()> {
+    fn await_exit(&mut self, process: &Held, _deadline: Deadline) -> io::Result<Waited> {
         self.log.borrow_mut().push(format!("await_exit {}", process.pid));
-        Ok(())
+        Ok(Waited::Confirmed)
     }
 
     fn await_recorded(&mut self, pid: u32, _held: Option<&Held>, deadline: Deadline) -> io::Result<Waited> {

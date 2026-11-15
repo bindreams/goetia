@@ -33,10 +33,13 @@ struct Scripted {
     failing_terminate: bool,
     failing_exit: bool,
     failing_recorded: bool,
-    /// Whether a held process is still running when asked.
+    /// Whether a held process outlasts the wait before the notice: only an unbounded wait for it ends.
     running: bool,
     /// Whether `await_recorded` is cut short by its deadline.
     expiring_recorded: bool,
+    /// Whether the manager's own lookup of the held process, in `confirm`, does not name it as the
+    /// service's, whatever pid `service_pid` still shows.
+    disowning: bool,
     log: Log,
 }
 
@@ -52,6 +55,7 @@ impl Scripted {
             failing_recorded: false,
             running: false,
             expiring_recorded: false,
+            disowning: false,
             log: Log::default(),
         }
     }
@@ -77,7 +81,7 @@ impl Scripted {
         self
     }
 
-    /// The held process has not exited when the kill looks, so the wait for it blocks.
+    /// The held process has not exited within the wait before the notice, so the wait for it blocks.
     fn running(mut self) -> Self {
         self.running = true;
         self
@@ -85,6 +89,12 @@ impl Scripted {
 
     fn expiring_recorded(mut self) -> Self {
         self.expiring_recorded = true;
+        self
+    }
+
+    /// The manager still shows the pid, and does not name the process held as the service's.
+    fn disowning(mut self) -> Self {
+        self.disowning = true;
         self
     }
 
@@ -122,6 +132,10 @@ impl KillTarget for Scripted {
         })
     }
 
+    fn confirm(&mut self, pid: u32) -> io::Result<bool> {
+        Ok(self.service_pid()? == Some(pid) && !self.disowning)
+    }
+
     fn open(&mut self, pid: u32) -> io::Result<Option<Held>> {
         self.log.borrow_mut().push(format!("open {pid}"));
         match self.opens.pop_front().expect("a scripted open") {
@@ -142,20 +156,25 @@ impl KillTarget for Scripted {
         Ok(())
     }
 
-    fn has_exited(&mut self, _process: &Held) -> io::Result<bool> {
-        Ok(!self.running)
-    }
-
     fn notice(&mut self, line: &str) {
         self.log.borrow_mut().push(format!("notice {line}"));
     }
 
-    fn await_exit(&mut self, process: &Held) -> io::Result<()> {
-        self.log.borrow_mut().push(format!("await_exit {}", process.pid));
+    fn await_exit(&mut self, process: &Held, deadline: Deadline) -> io::Result<Waited> {
+        let bounded = deadline.remaining().is_some();
+        self.log.borrow_mut().push(format!(
+            "await_exit {}{}",
+            process.pid,
+            if bounded { " for the notice" } else { "" }
+        ));
         if self.failing_exit {
             return Err(io::Error::other("wait on the process failed"));
         }
-        Ok(())
+        Ok(if bounded && self.running {
+            Waited::Expired
+        } else {
+            Waited::Confirmed
+        })
     }
 
     fn await_recorded(&mut self, pid: u32, held: Option<&Held>, deadline: Deadline) -> io::Result<Waited> {
@@ -212,15 +231,15 @@ fn the_process_is_held_from_the_open_through_the_waits_and_signalled_before_any_
             "open 100",
             "service_pid",
             "terminate 100",
-            "await_exit 100",
+            "await_exit 100 for the notice",
             "await_recorded 100",
             "close 100",
         ])
     );
 }
 
-/// A process that has not exited when the kill looks is waited for with no bound, and the verb says
-/// why it blocks, once, before the wait: a process that never exits would otherwise look like a hang.
+/// A process that outlasts the short wait is waited for with no bound, and the verb says why it
+/// blocks, once, before that wait: a process that never exits would otherwise look like a hang.
 #[skuld::test]
 fn a_wait_for_a_process_that_has_not_exited_says_why_before_it_blocks() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]).running();
@@ -233,6 +252,7 @@ fn a_wait_for_a_process_that_has_not_exited_says_why_before_it_blocks() {
             "open 100",
             "service_pid",
             "terminate 100",
+            "await_exit 100 for the notice",
             "notice frpc: waiting for process 100 to exit",
             "await_exit 100",
             "await_recorded 100",
@@ -241,7 +261,7 @@ fn a_wait_for_a_process_that_has_not_exited_says_why_before_it_blocks() {
     );
 }
 
-/// A process that has already exited is not waited for out loud: the notice is for a wait that blocks.
+/// A process that exits within the short wait is not announced: the notice is for a wait that lasts.
 #[skuld::test]
 fn a_process_that_has_exited_by_the_time_of_the_wait_is_not_announced() {
     let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]);
@@ -285,6 +305,20 @@ fn a_process_gone_before_it_was_opened_is_waited_for_in_the_manager_and_not_foll
     assert_eq!(
         target.log(),
         steps(["service_pid", "open 100", "await_recorded 100 unheld"])
+    );
+}
+
+/// The manager still shows the pid by the confirmation, but its own lookup does not name the process
+/// held as the service's: the number was given to a stranger after the service's process was reaped.
+/// It is not signalled and not waited for, as when the manager moved off the pid.
+#[skuld::test]
+fn a_held_process_the_manager_does_not_name_is_not_signalled_or_waited_for() {
+    let mut target = Scripted::new([Some(100), Some(100)], [Open::Found]).disowning();
+
+    assert_eq!(kill_service(&mut target, ID).unwrap(), KillOutcome::Ended);
+    assert_eq!(
+        target.log(),
+        steps(["service_pid", "open 100", "service_pid", "close 100"])
     );
 }
 
@@ -430,7 +464,7 @@ fn a_failed_record_wait_after_the_signal_says_the_signal_was_delivered() {
             "open 100",
             "service_pid",
             "terminate 100",
-            "await_exit 100",
+            "await_exit 100 for the notice",
             "await_recorded 100",
             "close 100",
         ])

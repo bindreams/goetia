@@ -10,7 +10,8 @@ use std::time::Duration;
 use cosca::Process;
 
 use super::systemctl::Systemctl;
-use crate::backend::kill::{KillTarget, Waited, process};
+use crate::backend::kill::process::{Reports, Signalling};
+use crate::backend::kill::{Waited, process};
 use crate::manager::budget::Deadline;
 
 /// How long [`UnitKill::await_recorded`] rests between two reads of `MainPID`. Pacing, never proof of
@@ -24,41 +25,22 @@ pub(super) struct UnitKill<'a> {
 }
 
 impl<'a> UnitKill<'a> {
-    pub(super) fn new(systemctl: &'a Systemctl, unit: String) -> Self {
-        Self { systemctl, unit }
+    pub(super) fn new(systemctl: &'a Systemctl, unit: String) -> Signalling<Self> {
+        Signalling(Self { systemctl, unit })
     }
 }
 
-impl KillTarget for UnitKill<'_> {
-    type Process = Process;
-
-    /// `MainPID`: `None` when the unit has no main process or is not loaded, which `systemctl kill`
-    /// called "No main process to kill" and "Unit not loaded".
+impl Reports for UnitKill<'_> {
+    /// `MainPID`: `None` when the unit has no main process, which `systemctl kill` called "No main process
+    /// to kill". A unit systemd has not loaded is [`Error::UnitNotLoaded`], never no process.
     fn service_pid(&mut self) -> io::Result<Option<u32>> {
         self.systemctl.main_pid_of(&self.unit).map_err(io::Error::other)
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Option<Process>> {
-        process::open(pid)
-    }
-
-    fn terminate(&mut self, held: &Process) -> io::Result<()> {
-        process::terminate(held)
-    }
-
-    fn has_exited(&mut self, held: &Process) -> io::Result<bool> {
-        process::has_exited(held)
-    }
-
-    fn await_exit(&mut self, held: &Process) -> io::Result<()> {
-        process::await_exit(held)
-    }
-
     /// The process is a zombie once it has exited, which is not systemd's record of it: `MainPID` is
     /// cleared when systemd reaps it. Every read re-checks that, and [`RECORD_RECHECK`] only paces them.
-    /// A unit systemd no longer has loaded reports no pid, which is the record. So does a `MainPID` that
-    /// is the killed pid's number and no longer the killed process: systemd reaped it and started the
-    /// unit again, and the new process was given the number.
+    /// A `MainPID` that is the killed pid's number and no longer the killed process is the record too:
+    /// systemd reaped it and started the unit again, and the new process was given the number.
     fn await_recorded(&mut self, pid: u32, held: Option<&Process>, deadline: Deadline) -> io::Result<Waited> {
         loop {
             if self.service_pid()? != Some(pid) || !process::report_is_stale(held, pid)? {

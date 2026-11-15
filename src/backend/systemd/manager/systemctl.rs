@@ -903,14 +903,11 @@ impl Systemctl {
         })
     }
 
-    /// The pid systemd reports as `unit`'s main process, in any state: `None` when it has none, or when the
-    /// unit is not loaded, which is what an inactive unit is once nothing holds it.
+    /// The pid systemd reports as `unit`'s main process, in any state: `None` when it has none. A unit
+    /// systemd has not loaded is [`Error::UnitNotLoaded`], as for [`Systemctl::status_from_unit`]: what
+    /// systemd says of a unit file it cannot see is not that unit's state.
     pub(super) fn main_pid_of(&self, unit: &str) -> Result<Option<u32>> {
-        match self.show_installed(unit, &["MainPID"]) {
-            Ok(props) => Ok(main_pid(&props)),
-            Err(Error::UnitNotLoaded { .. }) => Ok(None),
-            Err(e) => Err(e),
-        }
+        Ok(main_pid(&self.show_installed(unit, &["MainPID"])?))
     }
 
     /// A task's state, pid and invocation, from its job `unit`, in one `systemctl show`. The run in

@@ -7,7 +7,7 @@ use super::*;
 use crate::backend::Backend;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::kill::process::process_tests::Sleeper;
-use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
+use crate::backend::kill::{KillOutcome, KillTarget as _, kill_failed, kill_service};
 use crate::backend::systemd::manager::Systemd;
 use crate::backend::systemd::manager::systemctl::systemctl_tests::{booted, gate_then, on_booted};
 use crate::backend::systemd::manager::task::task_tests::{fragment, service_spec};
@@ -26,7 +26,7 @@ fn not_loaded() -> Entry {
 }
 
 /// The target of `x.service`, over `systemctl`.
-fn target(systemctl: &Systemctl) -> UnitKill<'_> {
+fn target(systemctl: &Systemctl) -> Signalling<UnitKill<'_>> {
     UnitKill::new(systemctl, "x.service".to_string())
 }
 
@@ -38,7 +38,7 @@ fn unreaped() -> (Sleeper, Process) {
         .expect("open the child")
         .expect("it is running");
     process::terminate(&held).expect("signal the child");
-    process::await_exit(&held).expect("wait for it to exit");
+    process::await_exit(&held, Bound::Unbounded.start()).expect("wait for it to exit");
     (run, held)
 }
 
@@ -63,12 +63,18 @@ fn a_unit_with_no_main_process_has_no_pid() {
     assert_eq!(target(&systemctl).service_pid().unwrap(), None);
 }
 
-/// What `systemctl kill` called "Unit x.service not loaded.": an inactive unit nothing holds.
+/// A unit systemd has not loaded is one goetia cannot see, not one with no process: the error `status`
+/// gives, never a state.
 #[skuld::test]
-fn a_unit_systemd_has_not_loaded_has_no_pid() {
+fn a_unit_systemd_has_not_loaded_is_an_error_and_never_no_process() {
     let systemctl = on_booted(Fake::new([not_loaded()]));
 
-    assert_eq!(target(&systemctl).service_pid().unwrap(), None);
+    let e = kill_failed("x", target(&systemctl).service_pid().unwrap_err());
+
+    assert!(
+        matches!(&e, Error::UnitNotLoaded { unit } if unit == "x.service"),
+        "{e:?}"
+    );
 }
 
 #[skuld::test]
@@ -156,19 +162,21 @@ fn a_reaped_process_the_manager_still_shows_is_waited_for() {
     assert_eq!(fake.calls().len(), 2);
 }
 
-/// A unit that systemd has let go of, with the process gone, reports no pid.
+/// A unit systemd reports as not loaded in the wait is no record: it is the error `status` gives.
 #[skuld::test]
-fn an_unloaded_unit_is_the_record() {
+fn an_unloaded_unit_in_the_wait_is_an_error_and_not_the_record() {
     let (run, held) = unreaped();
     let pid = run.pid();
     let systemctl = on_booted(Fake::new([show(pid), not_loaded()]));
 
-    assert_eq!(
+    let e = kill_failed(
+        "x",
         target(&systemctl)
             .await_recorded(pid, Some(&held), Bound::Unbounded.start())
-            .unwrap(),
-        Waited::Confirmed
+            .unwrap_err(),
     );
+
+    assert!(matches!(&e, Error::UnitNotLoaded { .. }), "{e:?}");
 }
 
 #[skuld::test]
@@ -223,16 +231,29 @@ fn kill_signals_the_main_process_and_returns_once_systemd_has_recorded_it() {
 
 #[skuld::test]
 fn kill_of_a_unit_with_no_main_process_is_not_running() {
-    for answer in [show(0), not_loaded()] {
-        let fake = Fake::new([answer]);
-        let systemctl = on_booted(fake.clone());
+    let fake = Fake::new([show(0)]);
+    let systemctl = on_booted(fake.clone());
 
-        assert_eq!(
-            kill_service(&mut target(&systemctl), "x").unwrap(),
-            KillOutcome::NotRunning
-        );
-        assert_eq!(fake.calls().len(), 1, "nothing but the read");
-    }
+    assert_eq!(
+        kill_service(&mut target(&systemctl), "x").unwrap(),
+        KillOutcome::NotRunning
+    );
+    assert_eq!(fake.calls().len(), 1, "nothing but the read");
+}
+
+/// What `status` says of a unit systemd has not loaded, `kill` says: it is not "not running".
+#[skuld::test]
+fn kill_of_a_unit_systemd_has_not_loaded_is_the_error_status_gives() {
+    let fake = gate_then([not_loaded()]);
+    let mgr = Systemd::with(Systemctl::new(Box::new(fake.clone()), booted));
+    let mut held = Backend::reserve(&mgr, &[Step::Kill], Budget::Unbounded).expect("reserve");
+
+    let e = Backend::kill(&mgr, fragment(&service_spec("x")), &mut held).expect_err("not loaded");
+
+    assert!(
+        matches!(&e, Error::UnitNotLoaded { unit } if unit == "x.service"),
+        "{e:?}"
+    );
 }
 
 /// The manager's version gate, which every request asks, is asked before the unit is read.

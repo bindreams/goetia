@@ -1167,7 +1167,8 @@ fn drawings() -> [Drawing; 5] {
         },
         // A task's longest `kill`: the first run finds no process, the read finds a start launchd has accepted
         // and not yet forked, the wait for the fork ends on the process, and the run that forked is killed: the
-        // read, the confirmation, and the wait for the record, whose first read still shows the pid.
+        // read, the confirmation (a read and the `procinfo` that names the process held), and the wait for
+        // the record, whose first read still shows the pid.
         Drawing {
             step: Step::Kill,
             restart: Restart::Never,
@@ -1180,6 +1181,7 @@ fn drawings() -> [Drawing; 5] {
                     printed_running(pid),
                     printed_running(pid),
                     printed_running(pid),
+                    procinfo_naming(pid),
                     printed_running(pid),
                     answer("print", SPAWN_SCHEDULED),
                 ]
@@ -2476,6 +2478,30 @@ fn printed_running(pid: u32) -> Entry {
     )
 }
 
+/// `procinfo` naming `pid` as a launch of the never-installed job.
+fn procinfo_naming(pid: u32) -> Entry {
+    reply(
+        &["procinfo", &pid.to_string()],
+        exited(0, &procinfo_of_a_launch(&never_installed(), pid), ""),
+    )
+}
+
+/// `procinfo` of a pid no job owns.
+fn procinfo_not_naming(pid: u32) -> Entry {
+    reply(
+        &["procinfo", &pid.to_string()],
+        exited(
+            0,
+            &format!(
+                "program path = /bin/sleep
+(pid {pid} is not managed by launchd)
+"
+            ),
+            "",
+        ),
+    )
+}
+
 /// `kill` of a service over `entries`, on a reservation made for [`Step::Kill`], with what it has left.
 fn kill_over(entries: impl IntoIterator<Item = Entry>) -> (Result<()>, Fake, (usize, usize)) {
     let fake = Fake::new(entries);
@@ -2498,6 +2524,7 @@ fn kill_ends_the_process_and_waits_until_launchd_stops_showing_it() {
     let (result, script, left) = kill_over([
         printed_running(pid),
         printed_running(pid),
+        procinfo_naming(pid),
         printed_running(pid),
         answer("print", SPAWN_SCHEDULED),
     ]);
@@ -2530,12 +2557,49 @@ fn kill_is_recorded_when_launchd_shows_another_pid_or_no_job() {
     ] {
         let mut run = Held::new(0);
         let pid = run.pid();
-        let (result, script, _) = kill_over([printed_running(pid), printed_running(pid), answer("print", recorded)]);
+        let (result, script, _) = kill_over([
+            printed_running(pid),
+            printed_running(pid),
+            procinfo_naming(pid),
+            answer("print", recorded),
+        ]);
 
         assert!(matches!(result, Ok(())), "{what}: {result:?}");
         script.assert_spent(what);
         assert_eq!(run.finish(), None, "{what}");
     }
+}
+
+/// `print` still shows the pid, and launchd's own lookup of the process held does not name it as the
+/// job's: launchd had reaped the service's process and the number went to a stranger. Nothing is
+/// signalled and nothing is waited for, as when `print` moves off the pid.
+#[skuld::test]
+fn kill_does_not_signal_a_process_procinfo_does_not_name() {
+    use super::watch::watch_tests::Held;
+
+    let mut stranger = Held::new(0);
+    let pid = stranger.pid();
+    let (result, script, _) = kill_over([printed_running(pid), printed_running(pid), procinfo_not_naming(pid)]);
+
+    assert!(matches!(result, Ok(())), "{result:?}");
+    script.assert_spent("the read, the confirmation, and the lookup that does not name the process");
+    assert_eq!(stranger.finish(), Some(0), "the stranger was left alone");
+}
+
+/// A `procinfo` that cannot be run says nothing about whose process it is: a failed kill, with nothing
+/// signalled.
+#[skuld::test]
+fn kill_over_a_procinfo_that_cannot_be_run_is_a_failure_and_signals_nothing() {
+    use super::watch::watch_tests::Held;
+
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let not_run = ClientError::NotRun(std::io::Error::other("no launchctl").into());
+    let (result, _script, _) = kill_over([printed_running(pid), printed_running(pid), fail(&["procinfo"], not_run)]);
+
+    let e = result.expect_err("no lookup");
+    assert!(matches!(&e, Error::Spawn { .. }), "{e:?}");
+    assert_eq!(run.finish(), Some(0), "nothing was signalled");
 }
 
 /// A job with no process, or none held, has nothing to kill: classified off the one read that starts
@@ -2572,7 +2636,12 @@ fn a_failed_read_after_the_signal_says_it_was_delivered() {
 
     let mut run = Held::new(0);
     let pid = run.pid();
-    let (result, _script, _) = kill_over([printed_running(pid), printed_running(pid), answer("print", UNREADABLE)]);
+    let (result, _script, _) = kill_over([
+        printed_running(pid),
+        printed_running(pid),
+        procinfo_naming(pid),
+        answer("print", UNREADABLE),
+    ]);
 
     let e = result.expect_err("the wait failed");
     let report = e.report().to_string();

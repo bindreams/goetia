@@ -6,27 +6,86 @@
 use std::io;
 
 use cosca::Process;
-use cosca::identity::{Liveness, ProcessId, Resolved};
+use cosca::identity::{ProcessId, Resolved};
+
+use super::{KillTarget, Waited};
+use crate::backend::bounded::{EXIT_AFTER_REFUSED_KILL, settle_kill};
+use crate::manager::budget::Deadline;
+
+/// What a Unix manager (systemd, launchd) says of a service, for [`Signalling`] to hold, signal and
+/// wait for the process by: the rest of a [`KillTarget`].
+pub(crate) trait Reports {
+    /// The pid the manager reports for the service's process, in whatever state, or `None` when it
+    /// reports none.
+    fn service_pid(&mut self) -> io::Result<Option<u32>>;
+
+    /// Whether the manager's own lookup of the held process `pid`, by number, names it as the
+    /// service's. For a manager that reports a pid it has not yet let go of after the process was
+    /// reaped, so that an unrelated process that was given the number would pass the read of
+    /// [`Self::service_pid`] alone. The default is a manager that does not.
+    fn names(&mut self, _pid: u32) -> io::Result<bool> {
+        Ok(true)
+    }
+
+    /// See [`KillTarget::await_recorded`].
+    fn await_recorded(&mut self, pid: u32, held: Option<&Process>, deadline: Deadline) -> io::Result<Waited>;
+}
+
+/// The [`KillTarget`] of a service whose manager is `R`: the process is opened, signalled and waited for
+/// through a `cosca::Process`, and `R` is the manager's side.
+pub(crate) struct Signalling<R>(pub(crate) R);
+
+impl<R: Reports> KillTarget for Signalling<R> {
+    type Process = Process;
+
+    fn service_pid(&mut self) -> io::Result<Option<u32>> {
+        self.0.service_pid()
+    }
+
+    fn confirm(&mut self, pid: u32) -> io::Result<bool> {
+        Ok(self.0.service_pid()? == Some(pid) && self.0.names(pid)?)
+    }
+
+    fn open(&mut self, pid: u32) -> io::Result<Option<Process>> {
+        open(pid)
+    }
+
+    fn terminate(&mut self, process: &Process) -> io::Result<()> {
+        terminate(process)
+    }
+
+    fn await_exit(&mut self, process: &Process, deadline: Deadline) -> io::Result<Waited> {
+        await_exit(process, deadline)
+    }
+
+    fn await_recorded(&mut self, pid: u32, held: Option<&Process>, deadline: Deadline) -> io::Result<Waited> {
+        self.0.await_recorded(pid, held, deadline)
+    }
+}
 
 /// Open the process holding `pid`; `None` if there is none.
 pub(crate) fn open(pid: u32) -> io::Result<Option<Process>> {
     Process::open_pid(pid).map_err(io::Error::other)
 }
 
-/// `SIGKILL` through the hold. A process that has exited is success.
+/// `SIGKILL` through the hold. A process that has exited is success, and so is one that is exiting:
+/// on macOS a send by audit token refuses it with `EPERM`, which is success once the process is read
+/// to have exited ([`settle_kill`]), and the refusal otherwise.
 pub(crate) fn terminate(process: &Process) -> io::Result<()> {
-    process.kill().map_err(io::Error::other)
+    settle_kill(process.kill(), || process.is_alive(), EXIT_AFTER_REFUSED_KILL)
+        .map(|_| ())
+        .map_err(io::Error::other)
 }
 
-/// Whether the process has exited (is a zombie or gone). A look that cannot tell reads as "not yet":
-/// the wait that follows it is the proof either way.
-pub(crate) fn has_exited(process: &Process) -> io::Result<bool> {
-    Ok(process.is_alive() == Liveness::Dead)
-}
-
-/// Block until the process has exited. It is a zombie by then, not necessarily reaped or recorded.
-pub(crate) fn await_exit(process: &Process) -> io::Result<()> {
-    process.wait().map_err(io::Error::other)
+/// Block until the process has exited or `deadline` passes, [`Waited::Expired`] then. It is a zombie
+/// by then, not necessarily reaped or recorded.
+pub(crate) fn await_exit(process: &Process, deadline: Deadline) -> io::Result<Waited> {
+    let exited = match deadline.remaining() {
+        None => process.wait().map(|()| true),
+        Some(left) => process.wait_timeout(left),
+    }
+    .map_err(io::Error::other)?;
+    Ok(if exited { Waited::Confirmed } else { Waited::Expired })
 }
 
 /// Whether the manager's report of `pid`, which it still shows after the process held through `held`

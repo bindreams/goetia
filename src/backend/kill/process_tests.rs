@@ -4,6 +4,7 @@
 use std::process::{Child, Command, Stdio};
 
 use super::*;
+use crate::manager::budget::Budget;
 
 /// A child that runs until it is signalled, killed and reaped on drop so a failing assert leaves
 /// nothing running.
@@ -38,6 +39,23 @@ impl Drop for Sleeper {
     }
 }
 
+/// The wait for a held process ends at the deadline it is given, with the process running, and never
+/// before it has exited: the process is neither reaped nor recorded by it.
+#[skuld::test]
+fn a_wait_for_a_running_process_expires_at_its_deadline_and_confirms_once_it_has_exited() {
+    let run = Sleeper::spawn();
+    let held = run.held();
+
+    assert_eq!(await_exit(&held, Budget::Immediate.start()).unwrap(), Waited::Expired);
+    assert_eq!(
+        await_exit(&held, Budget::Bounded(std::time::Duration::from_millis(50)).start()).unwrap(),
+        Waited::Expired
+    );
+    terminate(&held).expect("signal the child");
+    assert_eq!(await_exit(&held, Budget::Unbounded.start()).unwrap(), Waited::Confirmed);
+    assert_eq!(await_exit(&held, Budget::Immediate.start()).unwrap(), Waited::Confirmed);
+}
+
 /// A process that has exited and not been reaped has no process left to be reported, but the manager
 /// has not recorded that: its pid is still the held process's.
 #[skuld::test]
@@ -45,9 +63,8 @@ fn a_report_of_an_exited_process_not_yet_reaped_is_the_held_one_and_stale() {
     let mut run = Sleeper::spawn();
     let held = run.held();
     terminate(&held).expect("signal the child");
-    await_exit(&held).expect("wait for it to exit");
+    assert_eq!(await_exit(&held, Budget::Unbounded.start()).unwrap(), Waited::Confirmed);
 
-    assert!(has_exited(&held).unwrap());
     assert!(report_is_stale(Some(&held), run.pid()).unwrap());
     run.0.wait().expect("reap the child");
 }
@@ -70,7 +87,6 @@ fn a_report_of_a_running_held_process_is_stale() {
     let run = Sleeper::spawn();
     let held = run.held();
 
-    assert!(!has_exited(&held).unwrap());
     assert!(report_is_stale(Some(&held), run.pid()).unwrap());
 }
 

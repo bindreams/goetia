@@ -3,9 +3,11 @@
 //! an audit token (`backend::kill::process`; macOS 14.4 and later), and the wait for launchd's record
 //! is the existing wait on `print` until the job no longer shows the killed process.
 //!
-//! The confirmation after the hold is `print` again, as `stop` has it, and not `procinfo`
-//! ([`Launchctl::names_launch`](super::Launchctl)): the question the machine asks is whether the
-//! manager still reports the pid as the job's, and `print` is how it is asked everywhere else.
+//! The confirmation after the hold is `print` again, as `stop` has it, and then `launchctl procinfo` on
+//! the held pid ([`Launchctl::names_launch`](super::Launchctl)). `print` can still show a pid after
+//! launchd has reaped its process, and the number may by then be a stranger's, which is what was
+//! opened: launchd's own lookup of the process held by its number, which names the job that owns it,
+//! is what ties the process to the job.
 
 use std::io;
 
@@ -13,7 +15,8 @@ use cosca::Process;
 
 use super::{Launchctl, Until};
 use crate::backend::bounded::{Kept, Reservation, Role};
-use crate::backend::kill::{KillTarget, Waited, process};
+use crate::backend::kill::Waited;
+use crate::backend::kill::process::{Reports, Signalling};
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
 
@@ -21,42 +24,40 @@ use crate::manager::budget::Deadline;
 pub(super) struct JobKill<'a> {
     launchctl: &'a Launchctl,
     id: &'a str,
-    /// The files of the one counted call, the wait for the record, taken before anything is sent so
-    /// that a [`Error::Reservation`] means nothing was.
+    /// The files of the one counted call, taken before anything is sent so that a
+    /// [`Error::Reservation`] means nothing was: the confirmation's `procinfo` and the wait for the
+    /// record, which follow each other, read through them.
     kept: Kept,
 }
 
 impl<'a> JobKill<'a> {
-    pub(super) fn new(launchctl: &'a Launchctl, id: &'a str, reservation: &mut Reservation) -> Result<Self> {
+    pub(super) fn new(
+        launchctl: &'a Launchctl,
+        id: &'a str,
+        reservation: &mut Reservation,
+    ) -> Result<Signalling<Self>> {
         let kept = reservation
             .keep(Role::COUNTED_FILES)
             .map_err(|source| Error::Reservation { id: None, source })?;
-        Ok(Self { launchctl, id, kept })
+        Ok(Signalling(Self { launchctl, id, kept }))
     }
 }
 
-impl KillTarget for JobKill<'_> {
-    type Process = Process;
-
+impl Reports for JobKill<'_> {
     /// The pid `print` shows: `None` for a job launchd does not hold, or holds with no process.
     fn service_pid(&mut self) -> io::Result<Option<u32>> {
         self.launchctl.job_pid(self.id).map_err(io::Error::other)
     }
 
-    fn open(&mut self, pid: u32) -> io::Result<Option<Process>> {
-        process::open(pid)
-    }
-
-    fn terminate(&mut self, held: &Process) -> io::Result<()> {
-        process::terminate(held)
-    }
-
-    fn has_exited(&mut self, held: &Process) -> io::Result<bool> {
-        process::has_exited(held)
-    }
-
-    fn await_exit(&mut self, held: &Process) -> io::Result<()> {
-        process::await_exit(held)
+    /// Whether `launchctl procinfo` names `pid` as a launch of the job.
+    fn names(&mut self, pid: u32) -> io::Result<bool> {
+        let mut files = self
+            .kept
+            .again()
+            .map_err(|source| io::Error::other(Error::Reservation { id: None, source }))?;
+        self.launchctl
+            .names_launch(self.id, pid, &mut files)
+            .map_err(io::Error::other)
     }
 
     /// Reads `print` until the job shows another pid, none, or is not held, or shows the killed pid's

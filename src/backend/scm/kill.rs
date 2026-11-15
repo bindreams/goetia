@@ -193,7 +193,7 @@ pub(in crate::backend::scm) mod system {
     use crate::backend::scm::wait::{
         Armed, QueriedState, ScmActor, SystemScmActor, Waited, WantState, marked_for_deletion,
     };
-    use crate::manager::budget::{Budget, Deadline};
+    use crate::manager::budget::Deadline;
 
     use crate::backend::kill::KillTarget;
 
@@ -311,13 +311,9 @@ pub(in crate::backend::scm) mod system {
             process.terminate()
         }
 
-        fn has_exited(&mut self, process: &Held) -> io::Result<bool> {
-            has_exited(&process.handle)
-        }
-
-        fn await_exit(&mut self, process: &Held) -> io::Result<()> {
-            // The state machine has said why this blocks, if it does.
-            wait_exit_unbounded(&process.handle)
+        fn await_exit(&mut self, process: &Held, deadline: Deadline) -> io::Result<Waited> {
+            // The state machine says why a wait that lasts blocks.
+            wait_exit(&process.handle, deadline, || {})
         }
 
         /// The held handle keeps the pid from being reused, so a pid SCM reports is the process held.
@@ -437,14 +433,6 @@ pub(in crate::backend::scm) mod system {
             Some(e) => Err(e),
             None if exited => Ok(Waited::Confirmed),
             None => Ok(Waited::Expired),
-        }
-    }
-
-    /// [`wait_exit`] with no bound, for the callers that terminate the process.
-    fn wait_exit_unbounded(process: &OwnedHandle) -> io::Result<()> {
-        match wait_exit(process, Budget::Unbounded.start(), || {})? {
-            Waited::Confirmed => Ok(()),
-            Waited::Expired => unreachable!("an unbounded deadline never expires"),
         }
     }
 }

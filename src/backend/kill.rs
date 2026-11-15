@@ -19,6 +19,7 @@
 #![cfg_attr(not(any(windows, target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 use std::io;
+use std::time::Duration;
 
 use crate::error::{Chain, Error, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
@@ -80,15 +81,21 @@ pub trait KillTarget {
     /// has exited or is exiting is success: [`Self::await_exit`] is the wait.
     fn terminate(&mut self, process: &Self::Process) -> io::Result<()>;
 
-    /// Whether `process` has exited: a read of its state, not a wait.
-    fn has_exited(&mut self, process: &Self::Process) -> io::Result<bool>;
+    /// Whether the manager still vouches for `pid` as the service's process, read after `pid` was
+    /// opened: the second read of the hold. The default is [`Self::service_pid`] being `pid` again; a
+    /// manager that can show a pid after its process was reaped adds what ties the process held to the
+    /// service, not only its number.
+    fn confirm(&mut self, pid: u32) -> io::Result<bool> {
+        Ok(self.service_pid()? == Some(pid))
+    }
 
-    /// Block until `process` has exited. Unbounded: the exit is the event.
-    fn await_exit(&mut self, process: &Self::Process) -> io::Result<()>;
+    /// Block until `process` has exited. Ends at `deadline` as [`Waited::Expired`], with the process
+    /// running; an unbounded deadline never expires: the exit is the event.
+    fn await_exit(&mut self, process: &Self::Process, deadline: Deadline) -> io::Result<Waited>;
 
-    /// Say `line` where the person running the verb reads it. The state machine says why an unbounded
-    /// wait blocks; a target that has somewhere else to say it overrides this, and a test that wants to
-    /// see it does too.
+    /// Say `line` where the person running the verb reads it. The state machine says why a wait that
+    /// lasts blocks; a target that has somewhere else to say it overrides this, and a test that wants
+    /// to see it does too.
     fn notice(&mut self, line: &str) {
         eprintln!("{line}");
     }
@@ -114,14 +121,22 @@ pub(crate) fn waiting_notice(id: &str, pid: u32, terminate_failed: Option<&io::E
     terminating_failed(format!("{id}: waiting for process {pid} to exit"), terminate_failed, "").to_string()
 }
 
-/// Wait for `process`, held for `id`, to exit, and say why first when it has not: a process in
-/// uninterruptible sleep on a hung device is never signalled, and without the line the verb would look
-/// stuck.
+/// How long a kill waits for the signalled process before saying why it is still waiting. Cosmetic:
+/// the wait does not end at it, and a process that exits within it is not announced.
+const NOTICE_AFTER: Duration = Duration::from_secs(1);
+
+/// Wait for `process`, held for `id`, to exit, and say why once the wait has lasted [`NOTICE_AFTER`]: a
+/// process in uninterruptible sleep on a hung device is never signalled, and without the line the verb
+/// would look stuck. The wait itself is unbounded and ends on the exit.
 fn await_exit_saying<T: KillTarget>(target: &mut T, process: &T::Process, id: &str, pid: u32) -> io::Result<()> {
-    if !target.has_exited(process)? {
-        target.notice(&waiting_notice(id, pid, None));
+    if target.await_exit(process, Budget::Bounded(NOTICE_AFTER).start())? == Waited::Confirmed {
+        return Ok(());
     }
-    target.await_exit(process)
+    target.notice(&waiting_notice(id, pid, None));
+    match target.await_exit(process, Budget::Unbounded.start())? {
+        Waited::Confirmed => Ok(()),
+        Waited::Expired => unreachable!("an unbounded deadline never expires"),
+    }
 }
 
 /// End the service's process, or report that it has none. See the module doc for what it returns on.
@@ -200,7 +215,7 @@ pub(crate) fn hold_once<T: KillTarget>(
             };
         }
     };
-    if target.service_pid().map_err(HoldError::Read)? == Some(pid) {
+    if target.confirm(pid).map_err(HoldError::Read)? {
         Ok(Hold::Held { pid, process })
     } else {
         // Let go: the manager has moved off it.

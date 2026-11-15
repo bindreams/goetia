@@ -1356,8 +1356,9 @@ const STOP_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_STOP_CALLS);
 /// waits.
 const TASK_UNINSTALL_CALLS: usize = 2 + (1 + 1) + (1 + 1);
 const UNINSTALL_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_UNINSTALL_CALLS);
-/// A service's `kill`: the wait for launchd to stop showing the killed pid (one call, however many
-/// reads it makes). Its other reads are of no reservation, as `status`'s are not.
+/// A service's `kill`: the confirmation's `procinfo` and the wait for launchd to stop showing the killed
+/// pid, one call's files however many reads they make. Its other reads are of no reservation, as
+/// `status`'s are not.
 const SERVICE_KILL_CALLS: usize = 1;
 /// A task's longest `kill`: the wait for the killed pid, the read that finds no process, and the wait
 /// for the start launchd has accepted to fork.

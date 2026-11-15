@@ -748,11 +748,31 @@ fn a_watch_that_cannot_be_made_is_an_error_before_any_request() {
 /// A `print` of a job whose process was killed and whose restart launchd has not yet made.
 const KILLED: &str = "\tstate = spawn scheduled\n";
 
-/// The kill of a task's run, whose pid `run` is: the read, the confirmation, and the record's wait, whose
-/// first read still shows the pid.
-fn showing(run: &Held, then: Entry) -> [Entry; 4] {
+/// `launchctl procinfo` naming `pid` as a launch of the job.
+fn procinfo(pid: u32) -> Entry {
+    let block = format!(
+        "program path = /bin/sh
+
+system/{ID} = {{
+	state = running
+	pid = {pid}
+}}
+"
+    );
+    reply(&["procinfo", &pid.to_string()], exited(0, &block, ""))
+}
+
+/// The kill of a task's run, whose pid `run` is: the read, the confirmation (a read, and `procinfo`
+/// naming the process held), and the record's wait, whose first read still shows the pid.
+fn showing(run: &Held, then: Entry) -> [Entry; 5] {
     let pid = run.pid();
-    [print(&running(pid)), print(&running(pid)), print(&running(pid)), then]
+    [
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+        print(&running(pid)),
+        then,
+    ]
 }
 
 /// SIGKILL to the run through a hold, and the wait until launchd stops showing its pid, for a task as for

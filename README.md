@@ -1201,8 +1201,9 @@ return of `kill`, and a restart by SCM can overlap them.
 time limit: the exit of a process that was sent `SIGKILL` is an event, not a wait
 to bound. A process the kernel cannot end, one in uninterruptible sleep on a hung
 mount or in a stuck driver, keeps it waiting, as it keeps `stop` waiting; Ctrl-C
-ends the wait and the signal stands. On every platform, when the process has not
-exited yet, goetia prints `<id>: waiting for process <pid> to exit` to stderr.
+ends the wait and the signal stands. On every platform, when the process has still
+not exited a second after it was signalled, goetia prints
+`<id>: waiting for process <pid> to exit` to stderr.
 
 A daemon with no process, whether stopped or between runs, is an error: exit
 `1` and "is not running", because nothing was killed. A launchd task whose
