@@ -1,9 +1,11 @@
 //! The watch over real child processes, each held alive by an open stdin until the test lets it go.
 //! Nothing here needs root, launchd or a file outside the process.
 
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 
+use super::super::interrupts::interrupts_tests::StandIn;
 use super::*;
 use crate::manager::Budget;
 
@@ -24,12 +26,67 @@ impl Held {
         Held::running(&format!("read _; kill -{signal} $$"))
     }
 
+    /// A child that, once its stdin closes, execs a program that exits `code`.
+    pub(in crate::backend::launchd::manager) fn execing(code: i32) -> Held {
+        Held::running(&format!("read _; exec /bin/sh -c 'exit {code}'"))
+    }
+
+    /// The child, stopped as a held launch is: its state reads stopped from when this returns until it is
+    /// continued (`finish` continues it).
+    pub(in crate::backend::launchd::manager) fn stopped(self) -> Held {
+        let pid = self.child.id() as libc::pid_t;
+        // SAFETY: `pid` is this process's own live child; `kill` and `waitpid` take plain integers and
+        // `waitpid` a valid place for the status.
+        unsafe {
+            assert_eq!(libc::kill(pid, libc::SIGSTOP), 0, "stop the child");
+            let mut status = 0;
+            assert_eq!(
+                libc::waitpid(pid, &mut status, libc::WUNTRACED),
+                pid,
+                "wait for the stop"
+            );
+            assert!(libc::WIFSTOPPED(status), "the child stopped");
+        }
+        self
+    }
+
+    /// Closes the child's stdin, so that it goes on and ends, and returns without waiting for it.
+    pub(in crate::backend::launchd::manager) fn release(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    /// [`Self::release`], then waits for the child to have exited and leaves it unreaped: a zombie, until
+    /// `finish` or the drop reaps it.
+    pub(in crate::backend::launchd::manager) fn exit_unreaped(&mut self) {
+        self.release();
+        // SAFETY: an all-zero `siginfo_t` is a valid place for `waitid` to fill, and the pid is this
+        // process's own child. `WNOWAIT` leaves the child waitable.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let waited = libc::waitid(
+                libc::P_PID,
+                self.child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            );
+            assert_eq!(waited, 0, "wait for the child to exit");
+        }
+    }
+
+    /// A child whose program is named `xpcproxy`, as the process of a launch is until it execs: a copy of
+    /// `/bin/sh` in `dir`, which must outlive it, running `script`.
+    pub(in crate::backend::launchd::manager) fn at_xpcproxy(dir: &Path, script: &str) -> Held {
+        let copy = dir.join("xpcproxy");
+        std::fs::copy("/bin/sh", &copy).expect("copy /bin/sh");
+        Held::spawned(Command::new(&copy).args(["-c", script]))
+    }
+
     fn running(script: &str) -> Held {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", script])
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("spawn /bin/sh");
+        Held::spawned(Command::new("/bin/sh").args(["-c", script]))
+    }
+
+    fn spawned(command: &mut Command) -> Held {
+        let mut child = command.stdin(Stdio::piped()).spawn().expect("spawn the child");
         let stdin = child.stdin.take();
         Held { child, stdin }
     }
@@ -38,10 +95,14 @@ impl Held {
         self.child.id()
     }
 
-    /// Lets the child go and reaps it, so its exit has happened (and its event been queued) when this
-    /// returns. Its exit code.
+    /// Continues the child (a no-op for one that is not stopped), lets it go and reaps it, so its exit has
+    /// happened (and its event been queued) when this returns. Its exit code.
     pub(in crate::backend::launchd::manager) fn finish(&mut self) -> Option<i32> {
-        drop(self.stdin.take());
+        if self.stdin.take().is_some() {
+            // SAFETY: `kill` takes plain integers; the child is this process's own and not yet reaped, as
+            // its stdin is still held.
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT) };
+        }
         self.child.wait().expect("wait for the child").code()
     }
 }
@@ -250,4 +311,107 @@ fn deleting_a_registration_whose_exit_fired_answers_as_measured() {
     assert_eq!(pending(&registration), 1, "the event, read");
     let answer = registration.delete();
     assert_eq!(answer, Err(Errno::ENOENT), "a fired knote whose event was read");
+}
+
+// A launch's registration =============================================================================================
+
+/// An interruptible watch, and the window an interrupt is recorded in. The stand-in takes the signals that
+/// are re-raised when the window closes, and the turn that keeps another test's dispositions out of this.
+fn interruptible() -> (StandIn, Deferred, Watch) {
+    let stand_in = StandIn::install();
+    let window = Deferred::begin().expect("begin the window");
+    let watch = Watch::new_interruptible().expect("a kqueue");
+    (stand_in, window, watch)
+}
+
+/// `pid` registered as a launch, which must be alive.
+fn launched(watch: &Watch, pid: u32) -> Registered {
+    match watch.add_launch(pid).expect("add_launch") {
+        Added::Watching(registered) => registered,
+        Added::Gone => panic!("process {pid} is gone, and it was held alive"),
+    }
+}
+
+fn raise_interrupt() {
+    // SAFETY: `raise` takes a valid signal number, and the window's handler is in place.
+    assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0, "raise SIGINT");
+}
+
+/// The first exec of a launch's pid is reported, and its exit is kept for the wait that follows: exec and
+/// exit both happened before anything asked.
+#[skuld::test]
+fn a_launch_reports_its_first_exec_and_keeps_its_exit() {
+    let (_stand_in, window, watch) = interruptible();
+    let mut child = Held::execing(3);
+    let registered = launched(&watch, child.pid());
+    child.finish();
+
+    assert!(matches!(
+        registered.first_exec(&window).expect("first_exec"),
+        Woke::Exec
+    ));
+
+    assert!(
+        matches!(registered.exit(&window).expect("exit"), Woke::Exited(Some(status)) if status == 3 << 8),
+        "the exit was kept"
+    );
+}
+
+/// A launch that exits without an exec is reported as its exit.
+#[skuld::test]
+fn a_launch_that_exits_without_an_exec_is_its_exit() {
+    let (_stand_in, window, watch) = interruptible();
+    let mut child = Held::new(2);
+    let registered = launched(&watch, child.pid());
+    child.finish();
+
+    assert!(
+        matches!(registered.first_exec(&window).expect("first_exec"), Woke::Exited(Some(status)) if status == 2 << 8)
+    );
+}
+
+/// A registration made for a launch is still a registration of one pid, deleted on drop: the exec and the
+/// exit that follow queue nothing.
+#[skuld::test]
+fn a_launch_registration_dropped_early_queues_nothing() {
+    let (_stand_in, _window, watch) = interruptible();
+    let mut child = Held::execing(0);
+    drop(launched(&watch, child.pid()));
+
+    child.finish();
+
+    assert_eq!(poll(&watch.shared.queue), 0);
+}
+
+/// An interrupt recorded before the wait is seen before it blocks, whatever the pid does: neither wait
+/// returns the pid's state, and the pid is still alive.
+#[skuld::test]
+fn an_interrupt_recorded_before_a_wait_ends_it_before_it_blocks() {
+    let (_stand_in, window, watch) = interruptible();
+    let child = Held::new(0);
+    let registered = launched(&watch, child.pid());
+    raise_interrupt();
+
+    assert!(matches!(
+        registered.first_exec(&window).expect("first_exec"),
+        Woke::Interrupted
+    ));
+    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
+}
+
+/// An interrupt that arrives while the wait blocks wakes it. A second process sends SIGINT to this one
+/// once its stdin closes, which a thread does as the wait begins: whether the signal lands before the wait
+/// blocks (recorded) or after (the kqueue's event), the wait ends.
+#[skuld::test]
+fn an_interrupt_during_a_wait_wakes_it() {
+    let (_stand_in, window, watch) = interruptible();
+    let child = Held::new(0);
+    let registered = launched(&watch, child.pid());
+    let mut sender = Held::running("read _; kill -INT $PPID");
+    let sending = std::thread::spawn(move || sender.finish());
+
+    let woke = registered.exit(&window).expect("exit");
+
+    assert!(matches!(woke, Woke::Interrupted));
+    sending.join().expect("the sender's thread");
 }

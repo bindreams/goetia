@@ -240,9 +240,6 @@ pub(super) struct TaskPrint {
     /// What the read showed of the `state`, as launchd said it: what a verb that cannot conclude from
     /// `state` (an `Unknown`) names.
     pub(super) shown: Shown,
-    /// Whether the launch `print` shows was held by `launchctl debug --start-suspended`, where the read
-    /// was whole and said.
-    pub(super) started_suspended: Option<bool>,
     pub(super) last_result: Option<Exit>,
 }
 
@@ -289,7 +286,6 @@ impl Launchctl {
                 pid: None,
                 queued: false,
                 shown: Shown::Failed,
-                started_suspended: None,
                 last_result: None,
             });
         };
@@ -308,7 +304,6 @@ impl Launchctl {
             pid,
             queued: whole && state::spawn_scheduled(&body),
             shown,
-            started_suspended: whole.then(|| state::started_suspended(&body)).flatten(),
             last_result,
         })
     }

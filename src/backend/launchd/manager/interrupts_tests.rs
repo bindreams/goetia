@@ -133,6 +133,22 @@ fn a_signal_during_the_window_is_recorded_and_re_raised_after_it() {
     assert!(before.saw(libc::SIGINT));
 }
 
+/// The window says whether a signal has arrived in it, without taking the signal: it is still re-raised
+/// when the window ends.
+#[skuld::test]
+fn the_window_says_whether_a_signal_arrived_in_it() {
+    let before = StandIn::install();
+    let deferred = Deferred::begin().expect("begin");
+    assert!(!deferred.interrupted());
+
+    raise(libc::SIGHUP);
+
+    assert!(deferred.interrupted());
+    assert!(deferred.interrupted(), "asking does not take it");
+    drop(deferred);
+    assert_eq!(before.seen(), 1, "re-raised once the window is over");
+}
+
 /// Every one of the three is held, and each is re-raised as itself.
 #[skuld::test]
 fn int_term_and_hup_are_each_held_and_re_raised() {

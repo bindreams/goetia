@@ -91,15 +91,9 @@ fn a_stranded_hold_names_the_hold_and_the_ways_out_and_keeps_the_cause() {
 }
 
 #[skuld::test]
-fn a_run_that_ended_before_it_could_be_watched_or_resumed_says_which() {
-    let watched = run_unwatched(&frpc());
+fn a_run_that_ended_before_it_could_be_resumed_says_so() {
     let resumed = run_unresumed(&frpc());
 
-    assert!(
-        matches!(&watched, Error::RunUnrecorded { id, reason }
-            if id == "frpc" && reason == "it was ended before goetia could watch it (a `stop`, a `kill`, or the system)"),
-        "{watched:?}"
-    );
     assert!(
         matches!(&resumed, Error::RunUnrecorded { id, reason }
             if id == "frpc" && reason == "it was ended before goetia could resume it"),
@@ -107,23 +101,37 @@ fn a_run_that_ended_before_it_could_be_watched_or_resumed_says_which() {
     );
 }
 
-/// The retry's launch was neither held nor followable: the run is unrecorded, as a launch that ended
-/// before it could be watched is, and the pid that was started stays named.
+/// Our own `kickstart` launched a process with no hold on it: the run is unrecorded, and the pid that was
+/// started stays named.
 #[skuld::test]
-fn a_launch_goetia_started_and_does_not_follow_is_unrecorded_and_names_its_pid() {
+fn a_launch_goetia_started_unheld_is_unrecorded_and_names_its_pid() {
     let unfollowed = run_unfollowed(&frpc(), 4242);
 
-    assert_eq!(
-        unfollowed.to_string(),
-        "the launch `launchctl debug` held for this run of `frpc` was taken and ended before goetia could \
-         watch it, and the start goetia made after it launched process 4242, which goetia does not follow"
+    assert!(
+        matches!(&unfollowed, Error::RunUnrecorded { id, reason }
+            if id == "frpc"
+                && reason == "the `launchctl kickstart` goetia made for it launched process 4242 with no hold \
+                              on it, so goetia does not follow it"),
+        "{unfollowed:?}"
     );
     assert!(unfollowed.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
+}
+
+/// An interrupt that ended a wait is the cause under the stranded hold, and says what was being waited
+/// for and that no run was started.
+#[skuld::test]
+fn an_interrupted_wait_says_what_it_waited_for_and_that_no_run_was_started() {
+    let interrupted = run_interrupted(&frpc(), "a scheduled run");
+
+    assert_eq!(interrupted.to_string(), "failed to wait for a scheduled run of `frpc`");
+    assert!(!interrupted.is_indeterminate());
     assert!(
-        matches!(&unfollowed, Error::Step { source, .. }
-            if matches!(&**source, Error::RunUnrecorded { id, reason }
-                if id == "frpc" && reason == "it was ended before goetia could watch it (a `stop`, a `kill`, or the system)")),
-        "{unfollowed:?}"
+        interrupted
+            .report()
+            .to_string()
+            .contains("interrupted by SIGINT, SIGTERM or SIGHUP; no run was started"),
+        "{}",
+        interrupted.report()
     );
 }
 

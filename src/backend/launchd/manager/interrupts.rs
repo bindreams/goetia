@@ -17,7 +17,7 @@ use std::sync::{Mutex, PoisonError};
 use crate::error::{Error, Result};
 
 /// The signals a terminal, a session or a service manager ends a process with.
-const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+pub(super) const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
 /// Who holds a [`Deferred`], and what to put back when the last one is dropped.
 struct Shared {
@@ -118,6 +118,14 @@ impl Deferred {
         }
         shared.holders += 1;
         Ok(Deferred(()))
+    }
+
+    /// Whether SIGINT, SIGTERM or SIGHUP has arrived since the window opened, as far as the handler has
+    /// recorded it. Nothing is taken: the signal is still re-raised when the last window closes. The one
+    /// record of an interrupt; a wait that a signal's kqueue event woke does not need it, and one that
+    /// is about to block reads it first.
+    pub(crate) fn interrupted(&self) -> bool {
+        RECORDED.load(Ordering::SeqCst) != 0
     }
 }
 

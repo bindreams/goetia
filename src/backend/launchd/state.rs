@@ -77,39 +77,31 @@ pub(crate) fn last_result(print_body: &str) -> Option<Exit> {
     signal.rsplit(':').next()?.trim().parse().ok().map(Exit::Signal)
 }
 
-/// `started suspended = 1` or `0`: whether the launch `print` shows was held by `launchctl debug
-/// --start-suspended`. It stays `1` for the life of a held launch after it is resumed, so it says how
-/// the launch began, not whether it is stopped now.
-pub(crate) fn started_suspended(print_body: &str) -> Option<bool> {
-    match find_field(print_body, "started suspended").map(str::trim) {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
-        _ => None,
-    }
-}
-
-/// What one `launchctl print` shows of the launch `kickstart -p` named `followed`.
+/// What the kernel shows of the launch `kickstart -p` named, whose process is alive.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Launch {
-    /// The job's process is `followed` and it was launched held: the launch `run` armed `debug` for.
+    /// Stopped, and started after our `debug`: the launch that `debug` held for this run.
     Held,
-    /// The job's process is `followed` and it was not held: a run that was already in flight, which
-    /// `kickstart -p` named instead of starting one (a scheduled run that slipped in).
+    /// Stopped, and started before our `debug` returned: an older launch that took a hold, which is
+    /// resumed and waited for.
+    TookHold,
+    /// Not stopped, and started before our `debug` returned: a run already in flight (a scheduled one),
+    /// which is waited for.
     InFlight,
-    /// The job shows another process, or none: `followed` has ended.
-    Ended,
-    /// The job's process is `followed` and `print` does not say how it was launched, so it cannot be
-    /// told from either of the above.
-    Unreadable,
+    /// Not stopped, and started after our `debug`: our own `kickstart` launched it with no hold, which
+    /// goetia does not follow.
+    Unheld,
 }
 
-/// [`Launch`] from the `pid` and [`started_suspended`] of one `print`.
-pub(crate) fn launch_of(pid: Option<u32>, suspended: Option<bool>, followed: u32) -> Launch {
-    match (pid == Some(followed), suspended) {
-        (false, _) => Launch::Ended,
-        (true, Some(true)) => Launch::Held,
-        (true, Some(false)) => Launch::InFlight,
-        (true, None) => Launch::Unreadable,
+/// The [`Launch`] of a process that is `stopped` and `started` at the time shown, where `ta` is the time
+/// read after the `launchctl debug` process was reaped (both in `mach_absolute_time` units). A start
+/// after `ta` began after `debug`; one at or before it began before `debug` returned.
+pub(crate) fn launch_of(stopped: bool, started: u64, ta: u64) -> Launch {
+    match (stopped, started > ta) {
+        (true, true) => Launch::Held,
+        (true, false) => Launch::TookHold,
+        (false, false) => Launch::InFlight,
+        (false, true) => Launch::Unheld,
     }
 }
 

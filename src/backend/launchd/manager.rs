@@ -92,6 +92,7 @@ pub use super::{ENABLED_DIR, STAGING_DIR};
 use task::{Artifact, Assembled, Body};
 
 mod interrupts;
+mod proc;
 mod run;
 mod task;
 mod verbs;
@@ -880,16 +881,6 @@ enum SignalOutcome {
     NoProcess,
 }
 
-/// What `launchctl debug --start-suspended` answered.
-#[derive(Debug, PartialEq, Eq)]
-enum DebugOutcome {
-    /// The next launch of the job is now held.
-    Held,
-    /// A hold was already pending: another `run`'s, or a stranded one. The next launch is held all the
-    /// same.
-    AlreadyHeld,
-}
-
 /// What `launchctl debug` exits with for a hold that is already pending: 37, "Operation already in
 /// progress" (measured on macOS CI).
 const DEBUG_IN_PROGRESS: i32 = 37;
@@ -1131,17 +1122,19 @@ impl Launchctl {
     }
 
     /// `launchctl debug <id> --start-suspended`: the next launch of the job starts stopped, whoever starts
-    /// it, and stays so until it is sent SIGCONT. One launch only, and a hold already pending is not
-    /// replaced ([`DebugOutcome::AlreadyHeld`]), so what holds the next launch is one hold either way.
-    /// Unbounded, as [`Self::signal`] is.
-    fn debug_start_suspended(&self, id: &str, reservation: &mut Reservation) -> Result<DebugOutcome> {
+    /// it, and stays so until it is sent SIGCONT. One launch only, and a hold already pending (exit 37) is
+    /// not replaced, so what holds the next launch is one hold either way, and both answer `Ok`. Unbounded,
+    /// as [`Self::signal`] is.
+    ///
+    /// The answer is `ta`, [`proc::now`] read after the `launchctl debug` process was reaped: a launch of
+    /// the job that started after `ta` began after this call.
+    fn debug_start_suspended(&self, id: &str, reservation: &mut Reservation) -> Result<u64> {
         let target = target(id);
         let args = ["debug", target.as_str(), "--start-suspended"];
         let (status, capture) = self.request_to_end(&args, reservation)?;
-        if status.success() {
-            Ok(DebugOutcome::Held)
-        } else if status.code() == Some(DEBUG_IN_PROGRESS) {
-            Ok(DebugOutcome::AlreadyHeld)
+        let ta = proc::now();
+        if status.success() || status.code() == Some(DEBUG_IN_PROGRESS) {
+            Ok(ta)
         } else {
             Err(command_failed(&args, status, &capture.stderr))
         }
@@ -1254,11 +1247,10 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 ///
 /// `install`, `uninstall` and `kill` have a service's count and a task's (see `write`); [`needs`] takes the
 /// larger, since a reservation is made before the kind is known. A task's `run` draws within `start`'s
-/// count: its first pass is the load (a kept read and wait, the `bootstrap`, one more read), the
-/// `debug`, the `kickstart -p`, the `print`, the confirming `print` and the `SIGCONT`, 8 calls and 4
-/// reapers (9 calls where the first `print` read the launch as in flight and the next shows it held:
-/// one more confirming `print`); its one retry, which has no `debug`, makes its own reservation and
-/// draws at most the last five of these, 2 reapers.
+/// count: a pass is the `debug`, the `kickstart -p` and one `SIGCONT` (the resume, or the release of an
+/// older launch that took a hold), 3 calls and 3 reapers, and the first pass is preceded by the load (a
+/// kept read and wait, the `bootstrap`, one more read), 6 calls and 4 reapers. Each pass after the first
+/// makes its own reservation, of a start's, before its `debug`.
 const SERVICE_INSTALL_REQUESTS: usize = 1;
 /// A task's longest `install`, an update of an armed task whose job changes: the timer's `bootout`,
 /// the job's, and both `bootstrap`s. A stray timer label's `bootout` is the timer's: a plan boots out

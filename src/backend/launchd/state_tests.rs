@@ -308,25 +308,6 @@ fn has_process_reads_the_pid_for_every_state() {
     assert_eq!(has_process(""), None);
 }
 
-// started_suspended ---------------------------------------------------------------------------------------------------
-
-#[skuld::test]
-fn started_suspended_reads_both_values() {
-    let held = task_print("running", Some(4242), "last exit code = 0", Some(true));
-    let unheld = task_print("running", Some(4242), "last exit code = 0", Some(false));
-    assert_eq!(started_suspended(&held), Some(true));
-    assert_eq!(started_suspended(&unheld), Some(false));
-}
-
-#[skuld::test]
-fn started_suspended_is_none_where_print_does_not_say() {
-    assert_eq!(
-        started_suspended(&task_print("running", Some(4242), "last exit code = 0", None)),
-        None
-    );
-    assert_eq!(started_suspended("\tstarted suspended = maybe\n"), None);
-}
-
 // spawn_scheduled -----------------------------------------------------------------------------------------------------
 
 #[skuld::test]
@@ -371,15 +352,20 @@ fn exit_of_decodes_exited_and_signalled() {
 
 // launch_of -----------------------------------------------------------------------------------------------------------
 
-/// The pid `kickstart -p` printed is a held launch where `print` shows it with `started suspended = 1`,
-/// a run already in flight where it shows `0`, and ended where `print` shows another pid or none. A pid
-/// with no `started suspended` line is neither: the launch cannot be told.
+/// The launch `kickstart -p` named is told by two kernel facts: whether its process is stopped, and whether
+/// it started after `ta`, the time read after our `debug` returned. Stopped is a held launch, and one that
+/// started after `ta` began after our `debug` too.
 #[skuld::test]
-fn launch_of_tells_a_held_launch_from_a_run_in_flight_and_one_that_ended() {
-    assert_eq!(launch_of(Some(7), Some(true), 7), Launch::Held);
-    assert_eq!(launch_of(Some(7), Some(false), 7), Launch::InFlight);
-    assert_eq!(launch_of(Some(8), Some(true), 7), Launch::Ended);
-    assert_eq!(launch_of(Some(8), Some(false), 7), Launch::Ended);
-    assert_eq!(launch_of(None, None, 7), Launch::Ended);
-    assert_eq!(launch_of(Some(7), None, 7), Launch::Unreadable);
+fn launch_of_tells_our_held_launch_from_an_older_one_taking_a_hold_or_not() {
+    const TA: u64 = 1_000;
+    assert_eq!(launch_of(true, TA + 1, TA), Launch::Held);
+    assert_eq!(
+        launch_of(true, TA, TA),
+        Launch::TookHold,
+        "a start at ta is not after it"
+    );
+    assert_eq!(launch_of(true, TA - 1, TA), Launch::TookHold);
+    assert_eq!(launch_of(false, TA, TA), Launch::InFlight);
+    assert_eq!(launch_of(false, 1, TA), Launch::InFlight);
+    assert_eq!(launch_of(false, TA + 1, TA), Launch::Unheld);
 }

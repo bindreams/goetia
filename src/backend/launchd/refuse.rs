@@ -6,6 +6,7 @@
 //! `Ok`, so `install` refuses the write instead of deferring it as systemd and SCM do.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+use std::io;
 use std::path::Path;
 
 use crate::backend::launchd::generate;
@@ -97,25 +98,28 @@ pub(crate) fn stranded_hold(id: &Id, source: Error) -> Error {
     }
 }
 
-/// The held launch of `id` was gone, or not the job's any more, by the time goetia could watch it.
-pub(crate) fn run_unwatched(id: &Id) -> Error {
+/// The `kickstart -p` of a `run` of `id` launched `pid`, which no hold was on, though a hold was armed
+/// before it. It is not followed; the run is unrecorded, as one that ended unwatched is.
+pub(crate) fn run_unfollowed(id: &Id, pid: u32) -> Error {
     Error::RunUnrecorded {
         id: id.to_string(),
-        reason: "it was ended before goetia could watch it (a `stop`, a `kill`, or the system)".to_string(),
+        reason: format!(
+            "the `launchctl kickstart` goetia made for it launched process {pid} with no hold on it, so goetia \
+             does not follow it"
+        ),
     }
 }
 
-/// The retry of a `run` of `id` started `pid`, which was not held: the launch `debug` held was taken and
-/// ended unwatched, and a launch after a pending hold is held, so a second slipped-in run cannot be what
-/// `kickstart -p` named. It is not followed; the run is unrecorded, as one that ended unwatched is.
-pub(crate) fn run_unfollowed(id: &Id, pid: u32) -> Error {
-    Error::Step {
-        what: format!(
-            "the launch `launchctl debug` held for this run of `{id}` was taken and ended before goetia could \
-             watch it, and the start goetia made after it launched process {pid}, which goetia does not follow"
+/// An interrupt (SIGINT, SIGTERM or SIGHUP) ended goetia's wait for `waiting_for` (`a scheduled run`) of
+/// `id`. It is the `source` of a [`stranded_hold`]: nothing was started after it.
+pub(crate) fn run_interrupted(id: &Id, waiting_for: &str) -> Error {
+    Error::os(
+        format!("wait for {waiting_for} of `{id}`"),
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            "interrupted by SIGINT, SIGTERM or SIGHUP; no run was started",
         ),
-        source: Box::new(run_unwatched(id)),
-    }
+    )
 }
 
 /// The held launch of `id` was gone by the time goetia could resume it.

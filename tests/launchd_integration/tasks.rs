@@ -891,11 +891,27 @@ fn a_scheduled_run_beginning_right_after_ours_is_not_shown(#[fixture(launchd_gro
 /// that `kickstart -p` names the run in flight. That window is a few milliseconds, so the test opens it:
 /// `goetia daemon run` is a child process whose `launchctl` is first on its `PATH` a script that, at the
 /// first `launchctl debug` of the run, starts the job as the timer does (`launchctl kickstart`) and waits
-/// for it to be in flight. The slipped-in run is a held one: the child says it waits for it, the test
-/// releases it, and `run` then runs the task itself, shows only its own output, and holds nothing back
-/// for the next launch.
+/// for it to be in flight. The scheduled run is the [`Held`] program: the child says it waits for it, the
+/// test releases it, and `run` then runs the task itself, shows only its own output, and holds nothing
+/// back for the next launch.
 #[skuld::test]
 fn a_scheduled_run_in_flight_is_waited_for_by_run(#[fixture(launchd_group)] _group: &Group) {
+    waits_for_the_launch_that_began_first(false);
+}
+
+/// The same, where a hold was left pending by hand before: the scheduled launch takes it, so it is started
+/// stopped, and `run` finds it so: it resumes it, says it waits for it, and waits for it to end before it
+/// runs the task itself.
+#[skuld::test]
+fn a_scheduled_launch_that_took_a_stranded_hold_is_resumed_and_waited_for_by_run(
+    #[fixture(launchd_group)] _group: &Group,
+) {
+    waits_for_the_launch_that_began_first(true);
+}
+
+/// The body of the two tests above: `stranded` is whether a hold is pending when the scheduled launch
+/// begins.
+fn waits_for_the_launch_that_began_first(stranded: bool) {
     let id = support::random_test_id();
     let task_id = id_of(&id);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -908,6 +924,9 @@ fn a_scheduled_run_in_flight_is_waited_for_by_run(#[fixture(launchd_group)] _gro
         &with_logs(task(&id, held.command.clone(), Some("0 3 * * *")), &log),
     );
     mgr.enable(&task_id).expect("enable");
+    if stranded {
+        cmd::run("launchctl", &["debug", &format!("system/{id}"), "--start-suspended"]).expect_ok();
+    }
     let wrapper = bin.path().join("launchctl");
     let slipped = bin.path().join("slipped");
     fs::write(
@@ -954,7 +973,8 @@ fn a_scheduled_run_in_flight_is_waited_for_by_run(#[fixture(launchd_group)] _gro
         note,
         format!("note: a scheduled run of `{id}` is in progress; waiting for it to end before starting this run")
     );
-    // The slipped-in run is in flight and `run` waits for it: it has not started its own.
+    // The scheduled launch is in flight (resumed, where it took a hold) and `run` waits for it: it has not
+    // started its own.
     held.wait_started();
     assert_eq!(runs_of(&id), 1, "run waits for the run in flight");
     held.release();
