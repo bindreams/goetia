@@ -45,8 +45,9 @@ impl Launchd {
     /// Never `Raced`: the reads of which labels launchd holds have been made by the time a plist is
     /// found changed, and another pass would make more calls than the verb reserved, so a race is
     /// an error instead. A file written at a task's timer name, or a second install of the same id,
-    /// while install runs ends it with an error; what it had done by then stays, and a re-run starts
-    /// from what it then reads.
+    /// while install runs ends it with an error, or, for an `Update` that finds a stranger's file at the
+    /// timer's name, a foreign refusal; what it had done by then stays, and a re-run starts from what
+    /// it then reads.
     pub(super) fn write_task(
         &self,
         dirs: Dirs,
@@ -390,7 +391,8 @@ impl Executor<'_> {
             }
             Action::CheckJobIdle => {
                 // A service is refused while launchd has it at all (one that has exited is still
-                // loaded); a task while it has a process or a start launchd has accepted. A state this
+                // loaded); a task while it has a process, shows `running`, or has a start launchd has
+                // accepted. A state this
                 // cannot read as idle or as a run is refused too, saying what launchd showed.
                 let verdict = match self.old.kind {
                     DaemonKind::Service if never_expires(launchctl.is_loaded(id, deadline, reservation)?) => {
@@ -614,7 +616,7 @@ fn files_written(rest: &[Action]) -> bool {
 /// What `CheckJobIdle` read of the job.
 enum Verdict {
     Idle,
-    /// A service that is loaded, or a task with a process or an accepted start.
+    /// A service that is loaded, or a task with a process, in state `running`, or with an accepted start.
     InFlight,
     /// A task whose `print` shows a state that is neither, or could not be read: what launchd showed, as
     /// [`super::task::Shown::describe`] words it.
