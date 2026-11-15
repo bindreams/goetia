@@ -63,6 +63,7 @@ impl Registrations {
         registrations.next_line();
         let canary = format!("StartCalendarInterval canary {}", std::process::id());
         loop {
+            eprintln!("PROBE logging a canary");
             cmd::run("logger", &[canary.as_str()]).expect_ok();
             if registrations.next_line().contains(&canary) {
                 return registrations;
@@ -71,7 +72,9 @@ impl Registrations {
     }
 
     fn next_line(&self) -> String {
-        self.lines.recv().expect("`log stream` ended")
+        let line = self.lines.recv().expect("`log stream` ended");
+        eprintln!("PROBE stream: {line}");
+        line
     }
 
     /// The next fire of each of the `count` entries of the job `label`, one per `Registered` line, read in
@@ -137,6 +140,7 @@ fn next_run_is_the_earliest_fire_launchd_registered(#[fixture(launchd_group)] _g
     );
     let registrations = Registrations::start();
     let zone = system_zone().expect("the system time zone");
+    eprintln!("PROBE attached");
 
     let before = SystemTime::now();
     mgr.enable(&task_id).expect("enable");
