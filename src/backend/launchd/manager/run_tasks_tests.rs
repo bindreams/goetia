@@ -181,6 +181,12 @@ fn interrupt() {
     assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0, "raise SIGINT");
 }
 
+/// A termination, as a service manager sends it.
+fn terminate() {
+    // SAFETY: as for `interrupt`.
+    assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0, "raise SIGTERM");
+}
+
 /// A writer for the notes that runs `on_write` when the first one is written: the moment `run` is about to
 /// block on a launch it found in flight, and so the place for a test to end that launch or interrupt.
 struct Noting {
@@ -1288,6 +1294,36 @@ fn an_interrupt_before_the_release_of_an_older_launch_strands_and_sends_nothing(
     fake.assert_spent("no SIGCONT was sent");
     assert_eq!(notes, "", "nothing was waited for");
     assert_eq!(stand_in.seen(), 1);
+}
+
+/// The error names the signals the one snapshot the decision was made on holds, which are the ones recorded
+/// by then and no others: two signals recorded before the decision are both named, in order.
+#[skuld::test]
+fn the_interrupt_error_names_the_signals_recorded_by_the_decision() {
+    let stand_in = StandIn::install();
+    let (kick, launched) = our_launch(0);
+    let fake = Fake::new([
+        print(IDLE),
+        debug().then(|| {
+            terminate();
+            interrupt();
+        }),
+        kick,
+        procinfo_of(&launched),
+    ]);
+    let tree = Tree::new();
+
+    let e = failed(&fake, snapshot(&tree, None));
+
+    assert_stranded(&e, "two interrupts before the resume");
+    assert!(
+        e.report()
+            .to_string()
+            .contains("interrupted by SIGINT and SIGTERM, received before goetia resumed the launch it held"),
+        "{}",
+        e.report()
+    );
+    assert_eq!(stand_in.seen(), 2, "both re-raised once begin_run returns");
 }
 
 /// A signal the user set to be ignored (`nohup` does so for SIGHUP) stays ignored: it is no interrupt, so a

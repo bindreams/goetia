@@ -2,10 +2,18 @@
 //! process's own would be, so a re-raised signal lands there and never ends the test.
 
 use std::cell::Cell;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Mutex, MutexGuard};
+use std::thread::JoinHandle;
 
 use super::*;
+
+/// The three signals, without their names.
+fn signals() -> [libc::c_int; 3] {
+    SIGNALS.map(|(signal, _)| signal)
+}
 
 /// Dispositions belong to the process, so every test that changes them, `begin_run`'s included, takes
 /// turns, whatever runs them.
@@ -78,7 +86,7 @@ impl StandIn {
         SEEN_BITS.store(0, Ordering::SeqCst);
         let ours = action(stand_in_address());
         let mut before = [action(libc::SIG_DFL); 3];
-        for (i, &signal) in SIGNALS.iter().enumerate() {
+        for (i, signal) in signals().into_iter().enumerate() {
             // SAFETY: `ours` is a valid `sigaction`, and `before[i]` a valid place for the old one.
             let set = unsafe { libc::sigaction(signal, &ours, &mut before[i]) };
             assert_eq!(set, 0, "install the stand-in for signal {signal}");
@@ -99,7 +107,7 @@ impl StandIn {
 
     /// Every one of the three signals is the stand-in's again.
     pub(in crate::backend::launchd::manager) fn assert_back(&self) {
-        for signal in SIGNALS {
+        for signal in signals() {
             assert_eq!(handler_of(signal), stand_in_address(), "signal {signal}");
         }
     }
@@ -132,8 +140,37 @@ pub(in crate::backend::launchd::manager) fn send_to_process(signal: libc::c_int)
     assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0, "send signal {signal}");
 }
 
-/// A signal that was ignored before the window stays ignored: the window does not take it over, so it is
-/// no interrupt, it is not re-raised, and its disposition is the ignored one throughout and after.
+/// Whether a read of `fd` would not block: a `poll` that waits for nothing.
+fn readable(fd: RawFd) -> bool {
+    let mut asked = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `asked` is one valid `pollfd`, and a zero timeout does not block.
+    let ready = unsafe { libc::poll(&mut asked, 1, 0) };
+    assert!(ready >= 0, "poll {fd}: {}", io::Error::last_os_error());
+    ready == 1 && asked.revents & libc::POLLIN != 0
+}
+
+/// Whether `fd` is an open descriptor of this process.
+fn is_open(fd: RawFd) -> bool {
+    // SAFETY: `fcntl` with `F_GETFD` only reads the descriptor's flags.
+    unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+}
+
+fn errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().expect("an OS error")
+}
+
+fn set_errno(value: i32) {
+    // SAFETY: `__error` is the calling thread's `errno`.
+    unsafe { *libc::__error() = value };
+}
+
+/// A signal that was ignored before the window stays ignored: the window does not take it over, so its
+/// handler never runs, it is no interrupt and wakes nothing, it is not re-raised, and its disposition is
+/// the ignored one throughout and after.
 #[skuld::test]
 fn an_ignored_signal_stays_ignored_and_is_not_taken_over() {
     let before = StandIn::install();
@@ -142,20 +179,60 @@ fn an_ignored_signal_stays_ignored_and_is_not_taken_over() {
 
     assert_eq!(handler_of(libc::SIGHUP), libc::SIG_IGN, "left alone");
     assert_eq!(
-        deferred.signals().collect::<Vec<_>>(),
-        [libc::SIGINT, libc::SIGTERM],
-        "the signals it took over"
+        handler_of(libc::SIGINT),
+        record as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        "the others are taken over"
     );
     send_to_process(libc::SIGHUP);
-    assert!(!deferred.interrupted(), "an ignored signal is no interrupt");
+    assert!(deferred.recorded().is_none(), "an ignored signal is no interrupt");
+    assert!(!readable(deferred.wake()), "and wakes nothing");
     raise(libc::SIGINT);
-    assert!(deferred.interrupted(), "the others are still held");
+    assert!(deferred.recorded().is_some(), "the others are still held");
+    assert!(readable(deferred.wake()));
 
     drop(deferred);
 
     assert_eq!(handler_of(libc::SIGHUP), libc::SIG_IGN, "still ignored after");
     assert_eq!(before.seen(), 1, "only the interrupt that was held is re-raised");
     assert!(before.saw(libc::SIGINT) && !before.saw(libc::SIGHUP));
+}
+
+/// What a snapshot names is decided by the one read that made it: a signal that arrives after it is not in
+/// it, and a signal the window did not take over is in none.
+#[skuld::test]
+fn a_snapshot_names_the_signals_recorded_when_it_was_taken() {
+    let _before = StandIn::install();
+    ignore(libc::SIGHUP);
+    let deferred = Deferred::begin().expect("begin");
+    assert!(deferred.recorded().is_none());
+
+    raise(libc::SIGINT);
+    let first = deferred.recorded().expect("SIGINT is recorded");
+    raise(libc::SIGTERM);
+    let second = deferred.recorded().expect("both are recorded");
+    // The handler of a signal the window did not take over is never run by the system; this is the one
+    // thing that could put its bit in the record.
+    record(libc::SIGHUP);
+    let third = deferred.recorded().expect("still both");
+
+    assert_eq!(first.to_string(), "SIGINT");
+    assert_eq!(second.to_string(), "SIGINT and SIGTERM");
+    assert_eq!(third.to_string(), "SIGINT and SIGTERM", "SIGHUP was not taken over");
+}
+
+/// All three, as a sentence.
+#[skuld::test]
+fn a_snapshot_of_the_three_names_them_in_order() {
+    let _before = StandIn::install();
+    let deferred = Deferred::begin().expect("begin");
+    for signal in signals() {
+        raise(signal);
+    }
+
+    assert_eq!(
+        deferred.recorded().expect("recorded").to_string(),
+        "SIGINT, SIGTERM and SIGHUP"
+    );
 }
 
 /// One signal blocked in this thread's mask, put back when it drops.
@@ -187,66 +264,144 @@ impl Drop for Blocking {
     }
 }
 
-/// A signal the opening thread blocks is treated as an ignored one: the window does not take it over, so
-/// it is no interrupt of the window's and its disposition is the earlier one throughout and after.
-#[skuld::test]
-fn a_blocked_signal_is_not_taken_over() {
-    let before = StandIn::install();
-    let blocking = Blocking::signal(libc::SIGHUP);
-    let deferred = Deferred::begin().expect("begin");
-
-    assert_eq!(handler_of(libc::SIGHUP), stand_in_address(), "left alone");
-    assert_eq!(
-        deferred.signals().collect::<Vec<_>>(),
-        [libc::SIGINT, libc::SIGTERM],
-        "the signals it took over"
-    );
-    raise(libc::SIGINT);
-    assert!(deferred.interrupted(), "the others are still held");
-
-    drop(deferred);
-    drop(blocking);
-
-    assert_eq!(
-        handler_of(libc::SIGHUP),
-        stand_in_address(),
-        "still the earlier one after"
-    );
-    assert_eq!(before.seen(), 1, "only the interrupt that was held is re-raised");
-    assert!(before.saw(libc::SIGINT) && !before.saw(libc::SIGHUP));
+/// A thread that blocks nothing and does nothing until it is dropped, for a signal sent to it by
+/// [`Receiver::send`]: a signal that is delivered to a thread other than the one that opened the window.
+/// It is started before the test blocks anything, as a thread inherits the mask of the one that starts it.
+pub(in crate::backend::launchd::manager) struct Receiver {
+    thread: libc::pthread_t,
+    end: Option<Sender<()>>,
+    joined: Option<JoinHandle<()>>,
 }
 
-/// An interrupt is named by the signal that was recorded, or, while none is recorded, by those the
-/// window took over: a signal that stays ignored is not one it could be.
+impl Receiver {
+    pub(in crate::backend::launchd::manager) fn start() -> Receiver {
+        let (started, thread) = channel();
+        let (end, ended) = channel::<()>();
+        let joined = std::thread::spawn(move || {
+            // SAFETY: `pthread_self` has no preconditions.
+            started
+                .send(unsafe { libc::pthread_self() })
+                .expect("the test is waiting");
+            // Ends when the sender is dropped.
+            _ = ended.recv();
+        });
+        Receiver {
+            thread: thread.recv().expect("the thread started"),
+            end: Some(end),
+            joined: Some(joined),
+        }
+    }
+
+    /// Sends `signal` to this thread alone.
+    pub(in crate::backend::launchd::manager) fn send(&self, signal: libc::c_int) {
+        // SAFETY: the thread is alive, as it ends only when `self` drops.
+        assert_eq!(
+            unsafe { libc::pthread_kill(self.thread, signal) },
+            0,
+            "send signal {signal}"
+        );
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        drop(self.end.take());
+        if let Some(joined) = self.joined.take() {
+            _ = joined.join();
+        }
+    }
+}
+
+/// An interrupt makes the wake readable, and nothing reads it: it stays readable, so every wait on every
+/// queue that has it registered sees it.
 #[skuld::test]
-fn the_interrupt_is_named_by_the_signal_recorded_or_else_by_those_taken_over() {
+fn an_interrupt_makes_the_wake_readable_and_nothing_drains_it() {
+    let _before = StandIn::install();
+    let deferred = Deferred::begin().expect("begin");
+    assert!(!readable(deferred.wake()), "nothing recorded");
+
+    raise(libc::SIGTERM);
+
+    assert!(readable(deferred.wake()));
+    assert!(deferred.recorded().is_some());
+    assert!(readable(deferred.wake()), "asking drains nothing");
+}
+
+/// The wake is non-blocking and close-on-exec at both ends: a handler that finds the pipe full does not
+/// block, and a program the run starts does not inherit it.
+#[skuld::test]
+fn the_wake_is_non_blocking_and_close_on_exec() {
+    let _before = StandIn::install();
+    let deferred = Deferred::begin().expect("begin");
+    let ends = [deferred.wake(), WAKE.load(Ordering::SeqCst)];
+
+    for end in ends {
+        // SAFETY: `fcntl` reads the flags of a descriptor that is open.
+        let (status, descriptor) = unsafe { (libc::fcntl(end, libc::F_GETFL), libc::fcntl(end, libc::F_GETFD)) };
+        assert!(status & libc::O_NONBLOCK != 0, "{end} is non-blocking");
+        assert!(descriptor & libc::FD_CLOEXEC != 0, "{end} is close-on-exec");
+    }
+}
+
+/// A pipe that is full still holds an interrupt, and still reads as one: the handler's write fails, it is
+/// not waited on, and it leaves the `errno` of the code it interrupted as it was.
+#[skuld::test]
+fn a_full_pipe_loses_no_interrupt_and_the_handler_leaves_errno_alone() {
+    let _before = StandIn::install();
+    let deferred = Deferred::begin().expect("begin");
+    let write = WAKE.load(Ordering::SeqCst);
+    let byte = 0u8;
+    // Ends when the write fails, which a non-blocking pipe does when it is full.
+    // SAFETY: `write` is the open write end, and `byte` is one valid byte.
+    while unsafe { libc::write(write, (&byte as *const u8).cast(), 1) } == 1 {}
+    assert_eq!(errno(), libc::EAGAIN, "the pipe is full");
+
+    set_errno(libc::ENOENT);
+    record(libc::SIGINT);
+
+    assert_eq!(errno(), libc::ENOENT, "the handler's failed write left errno alone");
+    assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0, "and counted itself out");
+    assert_eq!(deferred.recorded().expect("recorded").to_string(), "SIGINT");
+    assert!(readable(deferred.wake()));
+}
+
+/// The last drop un-publishes the write end and then waits for a handler that is running before it closes
+/// the pipe, so a handler never writes to a closed descriptor. A running handler is stood in for by a count
+/// that the test holds; the drop is observed at its un-publishing, which is a fact of the state and not a
+/// wait of a chosen length.
+#[skuld::test]
+fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
-    assert_eq!(deferred.interrupt_signals(), "SIGINT, SIGTERM or SIGHUP");
-    drop(deferred);
+    let wake = deferred.wake();
+    IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
 
-    for (signal, name) in [
-        (libc::SIGINT, "SIGINT"),
-        (libc::SIGTERM, "SIGTERM"),
-        (libc::SIGHUP, "SIGHUP"),
-    ] {
-        let deferred = Deferred::begin().expect("begin");
-        raise(signal);
-        assert_eq!(deferred.interrupt_signals(), name);
-        drop(deferred);
+    let closing = std::thread::spawn(move || drop(deferred));
+    while WAKE.load(Ordering::SeqCst) != -1 {
+        std::thread::yield_now();
     }
-    assert_eq!(before.seen(), 3);
+    assert!(is_open(wake), "a handler is running, so the pipe is still open");
 
-    ignore(libc::SIGHUP);
-    let deferred = Deferred::begin().expect("begin");
-    assert_eq!(
-        deferred.interrupt_signals(),
-        "SIGINT or SIGTERM",
-        "SIGHUP is not one it took over"
-    );
-    raise(libc::SIGINT);
-    raise(libc::SIGTERM);
-    assert_eq!(deferred.interrupt_signals(), "SIGINT and SIGTERM", "both were recorded");
+    IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    closing.join().expect("the drop");
+    before.assert_back();
+}
+
+/// A window whose pipe cannot be made is an `Err` and installs nothing: no handler is ours, nothing is
+/// published, and no window is open.
+#[skuld::test]
+fn a_begin_that_cannot_make_the_pipe_installs_nothing() {
+    let before = StandIn::install();
+    let none = test_hook::installs(0);
+
+    let refused = Deferred::begin().err().expect("no pipe, no window");
+
+    drop(none);
+    assert!(refused.to_string().contains("interrupts"), "{refused}");
+    assert!(!OPEN.load(Ordering::SeqCst));
+    assert_eq!(WAKE.load(Ordering::SeqCst), -1, "nothing is published");
+    before.assert_back();
+    assert_eq!(SHARED.lock().unwrap_or_else(PoisonError::into_inner).holders, 0);
 }
 
 /// An interrupt that arrives in the window is held until it ends, and then reaches the handler that was
@@ -270,12 +425,12 @@ fn a_signal_during_the_window_is_recorded_and_re_raised_after_it() {
 fn the_window_says_whether_a_signal_arrived_in_it() {
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
-    assert!(!deferred.interrupted());
+    assert!(deferred.recorded().is_none());
 
     raise(libc::SIGHUP);
 
-    assert!(deferred.interrupted());
-    assert!(deferred.interrupted(), "asking does not take it");
+    assert!(deferred.recorded().is_some());
+    assert!(deferred.recorded().is_some(), "asking does not take it");
     drop(deferred);
     assert_eq!(before.seen(), 1, "re-raised once the window is over");
 }
@@ -285,20 +440,15 @@ fn the_window_says_whether_a_signal_arrived_in_it() {
 fn int_term_and_hup_are_each_held_and_re_raised() {
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
-    assert_eq!(
-        deferred.signals().collect::<Vec<_>>(),
-        SIGNALS,
-        "all three are taken over"
-    );
 
-    for signal in SIGNALS {
+    for signal in signals() {
         raise(signal);
     }
 
     assert_eq!(before.seen(), 0);
     drop(deferred);
     assert_eq!(before.seen(), 3);
-    for signal in SIGNALS {
+    for signal in signals() {
         assert!(before.saw(signal), "signal {signal}");
     }
 }
@@ -307,7 +457,7 @@ fn int_term_and_hup_are_each_held_and_re_raised() {
 fn the_previous_handler_is_restored() {
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
-    for signal in SIGNALS {
+    for signal in signals() {
         assert_eq!(
             handler_of(signal),
             record as extern "C" fn(libc::c_int) as libc::sighandler_t
@@ -353,7 +503,7 @@ fn two_overlapping_begin_runs_restore_the_signal_handlers() {
     let second = Deferred::begin().expect("second begin");
 
     drop(first);
-    for signal in SIGNALS {
+    for signal in signals() {
         assert_eq!(
             handler_of(signal),
             record as extern "C" fn(libc::c_int) as libc::sighandler_t,
@@ -406,22 +556,24 @@ fn a_handler_that_finishes_after_the_window_closed_re_raises_its_own_signal() {
 /// `begin` opens the window before it installs anything, so a signal that a handler records while it
 /// installs is held, and a `begin` whose install fails closes the window as the last drop does: the
 /// handlers it changed are back, and what was recorded meanwhile is re-raised to them once. Here the
-/// install is refused for the second signal, and a bit a handler recorded is there when it fails.
+/// install is refused for the second signal (the pipe is the first step, the first handler the second), and
+/// a bit a handler recorded is there when it fails.
 #[skuld::test]
 fn a_begin_whose_install_fails_part_way_closes_the_window_and_re_raises_what_was_recorded() {
     let before = StandIn::install();
     let term = SIGNALS
         .iter()
-        .position(|&s| s == libc::SIGTERM)
+        .position(|&(signal, _)| signal == libc::SIGTERM)
         .expect("SIGTERM is deferred");
     RECORDED.store(1 << term, Ordering::SeqCst);
-    let after_one = test_hook::installs(1);
+    let after_one = test_hook::installs(2);
 
     let refused = Deferred::begin().err().expect("the second install is refused");
 
     drop(after_one);
     assert!(refused.to_string().contains("interrupts"), "{refused}");
     assert!(!OPEN.load(Ordering::SeqCst), "the window is closed");
+    assert_eq!(WAKE.load(Ordering::SeqCst), -1, "the pipe is no longer published");
     assert_eq!(RECORDED.load(Ordering::SeqCst), 0, "what was recorded was claimed");
     assert_eq!(before.seen(), 1, "and re-raised once");
     assert!(before.saw(libc::SIGTERM));

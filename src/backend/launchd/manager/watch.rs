@@ -15,23 +15,23 @@
 //!
 //! `run` watches a launch ([`Watch::add_launch`]): its pid is also registered for `NOTE_EXEC`, and its
 //! waits ([`Registered::first_exec`], [`Registered::exit`]) end when an interrupt does. An
-//! [interruptible](Watch::new_interruptible) watch has the signals of the [`Deferred`] window registered on
-//! its queue (those it took over: a signal that was ignored or blocked stays as it was and is none of
-//! them), so a signal that arrives while a wait blocks wakes it. A signal that arrived before the wait
-//! has no event for it, so the wait reads the [`Deferred`] window's record after the registration and
-//! before it blocks, and again before each block. A signal's event that any read of the queue takes is
-//! flagged on the queue ([`Watch::interrupted`] reads the flag and the record together), so no interrupt is
-//! lost between one read and the next wait.
+//! [interruptible](Watch::new_interruptible) watch has the read end of the [`Deferred`] window's pipe
+//! registered on its queue, which its handler writes to after it records a signal. So a wait that blocks
+//! wakes on an interrupt, and a wake means only "read the record again": the wait reads the window's
+//! record before it blocks and after every wake, and the record is the interrupt. The registration is
+//! `EV_CLEAR`: an event that a read of the queue takes (a poll for an exit included) is not there again, so
+//! a wait with no window (a [`Run`](super::run::Run)'s, while another holder keeps the pipe open) is not
+//! woken over and over by it, and nothing is lost, as every wait with a window reads the record next.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::interrupts::{Deferred, SIGNALS};
+use super::interrupts::{Deferred, Interrupts};
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
 
@@ -43,17 +43,14 @@ pub(crate) struct Watch {
 /// The queue, and the events read from it for a registration other than the one that read them.
 struct Shared {
     queue: Kqueue,
-    /// Whether the queue has a window's signals registered: only then can a wait be given a [`Deferred`] window.
-    interruptible: bool,
+    /// The read end of a window's pipe registered on the queue: only a wait given that window can end on an
+    /// interrupt.
+    wake: Option<RawFd>,
     /// Taken out of the queue by one registration's `wait` or drop and not its own, so kept here for the
     /// registration whose pid it is. `status` is `None` for an exit the kernel reported without a status.
     kept: Mutex<Vec<Exited>>,
     /// The pids whose exec was read the same way, once each: later execs of a pid add nothing.
     execed: Mutex<Vec<u32>>,
-    /// Set once a signal's event has been read from the queue, by whichever read took it, and never
-    /// cleared: an interrupt ends the run. The window's handler records a signal on its own schedule,
-    /// which may follow the event, so this is the record of the event that nothing else reads again.
-    signalled: AtomicBool,
 }
 
 /// One pid's exit, read from the queue.
@@ -85,8 +82,9 @@ pub(crate) enum Woke {
     Exec,
     /// The pid exited, with its `wait(2)` status where the kernel reported one.
     Exited(Option<i32>),
-    /// An interrupt: SIGINT, SIGTERM or SIGHUP arrived in the [`Deferred`] window.
-    Interrupted,
+    /// An interrupt: SIGINT, SIGTERM or SIGHUP arrived in the [`Deferred`] window. The interrupts are the
+    /// record the wait ended on.
+    Interrupted(Interrupts),
 }
 
 /// The longest a single `kevent` call is asked to block, in seconds. A `wait` under a longer deadline
@@ -100,74 +98,55 @@ impl Watch {
         Watch::make(None)
     }
 
-    /// A watch whose queue also has the signals `window` took over registered ([`Deferred::signals`]), for
-    /// the waits that end on an interrupt: a signal that was ignored or blocked before the window stays as it
-    /// was, and the queue, which records even an ignored signal, has no event for it. Its signals are the
-    /// process's own, so a test that raises one takes the whole process's turn.
+    /// A watch whose queue also has the read end of `window`'s pipe registered ([`Deferred::wake`]), for the
+    /// waits that end on an interrupt. The pipe is closed when the window's last holder is dropped, which
+    /// removes the registration with it.
     pub(crate) fn new_interruptible(window: &Deferred) -> Result<Watch> {
-        Watch::make(Some(window))
+        Watch::make(Some(window.wake()))
     }
 
-    fn make(interruptible: Option<&Deferred>) -> Result<Watch> {
+    fn make(wake: Option<RawFd>) -> Result<Watch> {
         let queue = make_queue().map_err(|source| Error::os("make a kqueue to watch processes exit with", source))?;
         let watch = Watch {
             shared: Arc::new(Shared {
                 queue,
-                interruptible: interruptible.is_some(),
+                wake,
                 kept: Mutex::new(Vec::new()),
                 execed: Mutex::new(Vec::new()),
-                signalled: AtomicBool::new(false),
             }),
         };
-        if let Some(window) = interruptible {
+        if let Some(wake) = wake {
             watch
-                .register_signals(window)
+                .register_wake(wake)
                 .map_err(|source| Error::os("watch for interrupts on the kqueue", source))?;
         }
         Ok(watch)
     }
 
-    /// Whether an interrupt has arrived: the `window` has recorded one, or a read of the queue has taken a
-    /// signal's event. The two are read together because neither is ahead of the other: a signal's event is
-    /// raised at its generation and the handler that records it runs on its own schedule. Always `false`
-    /// for a watch that is not [interruptible](Self::new_interruptible) and a window that has none.
-    pub(crate) fn interrupted(&self, window: &Deferred) -> bool {
-        self.shared.interrupted(window)
-    }
-
-    /// Registers each of the signals `window` took over, answered by its own receipt.
-    fn register_signals(&self, window: &Deferred) -> io::Result<()> {
-        let mut changes = [blank(); SIGNALS.len()];
-        let mut count = 0;
-        for signal in window.signals() {
-            changes[count] = KEvent::new(
-                signal as usize,
-                EventFilter::EVFILT_SIGNAL,
-                EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_RECEIPT,
-                FilterFlag::empty(),
-                0,
-                0,
-            );
-            count += 1;
-        }
-        let changes = &changes[..count];
-        let mut receipts = [blank(); SIGNALS.len()];
-        let receipts = &mut receipts[..count];
+    /// Registers the read end `wake` of a window's pipe, answered by its own receipt. `EV_CLEAR`: it is an
+    /// event for each write to the pipe, and one that a read of the queue takes is not there again.
+    fn register_wake(&self, wake: RawFd) -> io::Result<()> {
+        let change = KEvent::new(
+            wake as usize,
+            EventFilter::EVFILT_READ,
+            EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_CLEAR | EvFlags::EV_RECEIPT,
+            FilterFlag::empty(),
+            0,
+            0,
+        );
+        let mut receipt = [blank()];
         let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let answered = loop {
-            match self.shared.queue.kevent(changes, receipts, Some(now)) {
+            match self.shared.queue.kevent(&[change], &mut receipt, Some(now)) {
                 Err(Errno::EINTR) => {}
                 other => break other.map_err(io::Error::from)?,
             }
         };
-        debug_assert_eq!(answered, changes.len(), "EV_RECEIPT answers each change");
-        for receipt in &receipts[..answered] {
-            match receipt.data() {
-                0 => {}
-                code => return Err(io::Error::from(Errno::from_raw(code as i32))),
-            }
+        debug_assert_eq!(answered, 1, "EV_RECEIPT answers each change");
+        match receipt[0].data() {
+            0 => Ok(()),
+            code => Err(io::Error::from(Errno::from_raw(code as i32))),
         }
-        Ok(())
     }
 
     /// Registers `pid` for its exit and the status it exits with. [`Added::Gone`] where there is no such
@@ -246,7 +225,7 @@ impl Registered {
                 io::Error::other("the kernel reported its exit without its status"),
             )),
             None => Ok(None),
-            Some(Woke::Exec | Woke::Interrupted) => unreachable!("neither was waited for"),
+            Some(Woke::Exec | Woke::Interrupted(_)) => unreachable!("neither was waited for"),
         }
     }
 
@@ -264,7 +243,7 @@ impl Registered {
 
     /// Reads the queue with a zero timeout until a read finds it empty, and keeps what it held
     /// ([`Shared::keep`]) except the events of `discarding`, a pid whose registration is being dropped. It
-    /// ends because each live registration adds at most one exit, and an exec or a signal is an event only as
+    /// ends because each live registration adds at most one exit, and an exec or a wake is an event only as
     /// it happens.
     fn poll(&self, discarding: Option<u32>) -> std::result::Result<(), Errno> {
         let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -282,7 +261,7 @@ impl Registered {
     /// Blocks until the launch's pid has exec'd for the first time, exited, or `window` has recorded an
     /// interrupt: [`Woke::Exec`] (also where its exit came with it, which a [`Self::exit`] then reports),
     /// [`Woke::Exited`] or [`Woke::Interrupted`]. Under no bound. Only for a registration of
-    /// [`Watch::add_launch`] on an [interruptible](Watch::new_interruptible) watch.
+    /// [`Watch::add_launch`] on an [interruptible](Watch::new_interruptible) watch, with its own `window`.
     pub(crate) fn first_exec(&self, window: &Deferred) -> Result<Woke> {
         Ok(self
             .next(true, Some(window), None)?
@@ -291,7 +270,7 @@ impl Registered {
 
     /// Blocks until the pid has exited ([`Woke::Exited`], whose status is of no concern to a caller that
     /// does not read it) or `window` has recorded an interrupt. Under no bound. Only on an
-    /// [interruptible](Watch::new_interruptible) watch.
+    /// [interruptible](Watch::new_interruptible) watch, with its own `window`.
     pub(crate) fn exit(self, window: &Deferred) -> Result<Woke> {
         Ok(self
             .next(false, Some(window), None)?
@@ -301,17 +280,15 @@ impl Registered {
     /// The first of: this pid's exec (where `exec`), its exit, an interrupt (where there is a `window`
     /// and the watch is interruptible), and the `deadline` (`None` iff it expired first).
     ///
-    /// The interrupt is read first (the window's record and the watch's [signalled](Shared::signalled)
-    /// flag), so that an exec or an exit that was kept with it never answers the wait: the caller resumes or
-    /// follows nothing after an interrupt. Then what was kept is taken, then the queue is waited on: an
-    /// interrupt before this point is in one of the two, and one after it is an event of the queue, which is
-    /// registered already. An event of the queue wakes the wait and is flagged by [`Shared::keep`], whether
-    /// or not the handler has recorded the signal yet, as the signal's generation and its handler's run are
-    /// not ordered.
+    /// The window's record is read first, so that an exec or an exit that was kept with an interrupt never
+    /// answers the wait: the caller resumes or follows nothing after an interrupt. Then what was kept is
+    /// taken, then the queue is waited on: an interrupt before this point is in the record, and one after it
+    /// writes the pipe, which the queue has registered already. Any wake, and an `EINTR`, only sends the wait
+    /// back to the record, which the handler sets before it writes.
     fn next(&self, exec: bool, window: Option<&Deferred>, deadline: Option<Deadline>) -> Result<Option<Woke>> {
         debug_assert!(
-            window.is_none() || self.shared.interruptible,
-            "a window needs signals registered on the queue"
+            window.is_none_or(|window| self.shared.wake == Some(window.wake())),
+            "a window needs its pipe registered on the queue"
         );
         let pid = self.pid;
         let waited_for = if exec { "exec" } else { "exit" };
@@ -323,8 +300,8 @@ impl Registered {
         };
         let mut events = [blank(); 8];
         loop {
-            if window.is_some_and(|window| self.shared.interrupted(window)) {
-                return Ok(Some(Woke::Interrupted));
+            if let Some(interrupts) = window.and_then(Deferred::recorded) {
+                return Ok(Some(Woke::Interrupted(interrupts)));
             }
             if exec && self.take_exec() {
                 return Ok(Some(Woke::Exec));
@@ -342,8 +319,8 @@ impl Registered {
                         return Ok(None);
                     }
                 }
-                // Every exit and exec read is kept, this pid's included, and a signal is flagged: the next
-                // turn takes them.
+                // Every exit and exec read is kept, this pid's included, and a wake is none of them: the next
+                // turn takes them and reads the record.
                 Ok(n) => self.shared.keep(&events[..n], None),
                 // A signal handled on this thread ends the call: the window's record is read again.
                 Err(Errno::EINTR) => {}
@@ -402,7 +379,6 @@ impl Registered {
 
     /// Removes every event of this pid from the queue and from what was kept, and leaves any other pid's
     /// kept for its registration. Whatever `delete` did or did not remove, no event of this pid is left.
-    /// A signal's event is flagged, not dropped ([`Shared::keep`]).
     fn drain(&self) {
         // A queue that cannot be read holds nothing a later wait could be handed.
         _ = self.poll(Some(self.pid));
@@ -420,18 +396,9 @@ impl Registered {
 }
 
 impl Shared {
-    /// Whether an interrupt has arrived: a signal's event has been read, or `window` has recorded one.
-    fn interrupted(&self, window: &Deferred) -> bool {
-        self.signalled.load(Ordering::SeqCst) || window.interrupted()
-    }
-
     /// Keeps the exits and the first execs among `events`, except `pid`'s where it is given: those are
-    /// the registration's own and are being discarded. A signal's event is not discarded with them: it is
-    /// kept as [`Self::signalled`].
+    /// the registration's own and are being discarded.
     fn keep(&self, events: &[KEvent], pid: Option<u32>) {
-        if events.iter().any(signalled) {
-            self.signalled.store(true, Ordering::SeqCst);
-        }
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
         kept.extend(
             events
@@ -478,11 +445,6 @@ fn exited(event: &KEvent) -> Option<Exited> {
 fn exec_of(event: &KEvent) -> Option<u32> {
     let is_exec = event.filter() == Ok(EventFilter::EVFILT_PROC) && event.fflags().contains(FilterFlag::NOTE_EXEC);
     is_exec.then(|| event.ident() as u32)
-}
-
-/// Whether `event` is a signal's.
-fn signalled(event: &KEvent) -> bool {
-    event.filter() == Ok(EventFilter::EVFILT_SIGNAL)
 }
 
 fn blank() -> KEvent {

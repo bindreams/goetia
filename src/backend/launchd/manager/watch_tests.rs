@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 
-use super::super::interrupts::interrupts_tests::{Blocking, StandIn, ignore, send_to_process};
+use super::super::interrupts::interrupts_tests::{Blocking, Receiver, StandIn, ignore, send_to_process};
 use super::*;
 use crate::manager::Budget;
 
@@ -354,18 +354,6 @@ fn launched(watch: &Watch, pid: u32) -> Registered {
     }
 }
 
-/// An interrupt sent to this process while SIGINT is ignored, not to a thread: a kqueue has its event for
-/// the first only, which is what a terminal's or a service manager's interrupt is, and "records all
-/// attempts to deliver a signal to a process, even if the signal has been marked as SIG_IGN" (kqueue(2)).
-/// So it reaches the queue and no handler, and no thread of the test binary has a call interrupted by
-/// it, which a handled one would do to whichever thread took it. The window's handler therefore records
-/// nothing of it, as when the handler runs after the queue has been read. The ignored disposition is the
-/// window's to put back when it closes, and the stand-in's after.
-fn send_ignored_interrupt() {
-    ignore(libc::SIGINT);
-    send_to_process(libc::SIGINT);
-}
-
 fn raise_interrupt() {
     // SAFETY: `raise` takes a valid signal number, and the window's handler is in place.
     assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0, "raise SIGINT");
@@ -428,9 +416,9 @@ fn an_interrupt_recorded_before_a_wait_ends_it_before_it_blocks() {
 
     assert!(matches!(
         registered.first_exec(&window).expect("first_exec"),
-        Woke::Interrupted
+        Woke::Interrupted(_)
     ));
-    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
+    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted(_)));
 }
 
 /// An interrupt wins over an exec or an exit that another read kept: a wait that reports the pid's state
@@ -450,14 +438,14 @@ fn an_interrupt_wins_over_an_exec_and_an_exit_that_were_kept() {
 
     assert!(matches!(
         registered.first_exec(&window).expect("first_exec"),
-        Woke::Interrupted
+        Woke::Interrupted(_)
     ));
-    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
+    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted(_)));
 }
 
 /// An interrupt that arrives while the wait blocks wakes it. A second process sends SIGINT to this one
 /// once its stdin closes, which a thread does as the wait begins: whether the signal lands before the wait
-/// blocks (recorded) or after (the kqueue's event), the wait ends.
+/// blocks (recorded) or after (the pipe's wake), the wait ends.
 #[skuld::test]
 fn an_interrupt_during_a_wait_wakes_it() {
     let (_stand_in, window, watch) = interruptible();
@@ -468,100 +456,83 @@ fn an_interrupt_during_a_wait_wakes_it() {
 
     let woke = registered.exit(&window).expect("exit");
 
-    assert!(matches!(woke, Woke::Interrupted));
+    assert!(matches!(woke, Woke::Interrupted(_)));
     sending.join().expect("the sender's thread");
 }
 
-/// A signal whose event a read took out of the queue before the window's handler recorded it is not lost:
-/// the watch has it. The window is open first, as `run` opens it, and the queue has the signal's event
-/// while the record has nothing of it; a poll then reads the event.
+/// A signal the opening thread blocks is the window's all the same: the handler is a process-wide one, and a
+/// signal sent to the process goes to a thread that does not block it. Sent to such a thread, it is recorded
+/// there and ends the wait of this one. (The receiver is made before anything is blocked, as a thread
+/// inherits its starter's mask.)
 #[skuld::test]
-fn a_signal_event_read_by_a_poll_is_still_an_interrupt() {
-    let (_stand_in, window, watch) = interruptible();
-    let child = Held::new(0);
-    let registered = launched(&watch, child.pid());
-    send_ignored_interrupt();
-    assert!(!window.interrupted(), "the handler recorded nothing");
-
-    assert!(
-        registered.exit_kept().expect("poll").is_none(),
-        "the poll reads the event"
-    );
-
-    assert!(watch.interrupted(&window), "the watch has it");
-    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
-}
-
-/// The same for an event that the drop of another registration drained.
-#[skuld::test]
-fn a_signal_event_drained_by_a_dropped_registration_is_still_an_interrupt() {
-    let (_stand_in, window, watch) = interruptible();
-    let (child, other) = (Held::new(0), Held::new(0));
-    let dropped = launched(&watch, other.pid());
-    let registered = launched(&watch, child.pid());
-    send_ignored_interrupt();
-    assert!(!window.interrupted(), "the handler recorded nothing");
-
-    drop(dropped);
-
-    assert!(watch.interrupted(&window), "the watch has it");
-    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
-}
-
-/// A watch that has seen no interrupt says none.
-#[skuld::test]
-fn a_watch_with_no_signal_is_not_interrupted() {
-    let (_stand_in, window, watch) = interruptible();
+fn a_signal_blocked_on_the_opening_thread_but_delivered_to_another_ends_a_wait_as_interrupted() {
+    let receiver = Receiver::start();
+    let stand_in = StandIn::install();
+    let blocking = Blocking::signal(libc::SIGTERM);
+    let window = Deferred::begin().expect("begin the window");
+    let watch = Watch::new_interruptible(&window).expect("a kqueue");
     let child = Held::new(0);
     let registered = launched(&watch, child.pid());
 
-    assert!(registered.exit_kept().expect("poll").is_none());
+    receiver.send(libc::SIGTERM);
+    let woke = registered.exit(&window).expect("exit");
 
-    assert!(!watch.interrupted(&window));
+    let Woke::Interrupted(interrupts) = woke else {
+        panic!("the wait ended by the child's exit, which is alive");
+    };
+    assert_eq!(interrupts.to_string(), "SIGTERM");
+    assert_eq!(stand_in.seen(), 0, "held back, not delivered to the earlier handler");
+    drop(window);
+    drop(blocking);
 }
 
-/// A signal that was ignored before the window is none of its signals: the queue has no event for it, so a
-/// SIGHUP sent to the process under `nohup` is no interrupt.
+/// A signal that was ignored before the window is none of its interrupts: its handler never runs, so it
+/// neither wakes the wait nor ends it. The wait ends with the child's exit, with the signal sent to the
+/// process while it blocks or before.
 #[skuld::test]
-fn an_ignored_signal_is_no_interrupt_to_the_watch() {
+fn an_ignored_signal_neither_wakes_nor_interrupts_a_wait() {
     let stand_in = StandIn::install();
     ignore(libc::SIGHUP);
     let window = Deferred::begin().expect("begin the window");
     let watch = Watch::new_interruptible(&window).expect("a kqueue");
-    let child = Held::new(0);
+    let mut child = Held::new(0);
     let registered = launched(&watch, child.pid());
+    let ending = std::thread::spawn(move || {
+        send_to_process(libc::SIGHUP);
+        child.finish()
+    });
 
-    send_to_process(libc::SIGHUP);
+    let woke = registered.exit(&window).expect("exit");
 
-    assert!(
-        registered.exit_kept().expect("poll").is_none(),
-        "the poll reads the queue"
-    );
-    assert!(!watch.interrupted(&window), "an ignored signal is no interrupt");
+    assert!(matches!(woke, Woke::Exited(Some(0))), "the child's own exit ended it");
+    assert_eq!(ending.join().expect("the child's thread"), Some(0));
     assert_eq!(stand_in.seen(), 0);
 }
 
-/// The same for a signal the opening thread blocked: the window did not take it over, so the queue has no
-/// event for it. It is then ignored, so that the one sent to the process is delivered to no handler (the
-/// queue records it all the same), and the window puts back nothing of it.
+/// Whether `queue` has an event for the wake `fd`: a poll that blocks for none, which takes the event.
+fn woken_by(queue: &Kqueue, fd: std::os::fd::RawFd) -> bool {
+    let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut events = [blank(); 8];
+    let n = queue.kevent(&[], &mut events, Some(now)).expect("poll the queue");
+    events[..n]
+        .iter()
+        .any(|event| event.filter() == Ok(EventFilter::EVFILT_READ) && event.ident() == fd as usize)
+}
+
+/// A recorded interrupt is an event on every queue that has the window's wake registered, the ones made
+/// before it and the ones made after: nothing drains the pipe, and each queue has its own event.
 #[skuld::test]
-fn a_blocked_signal_is_no_interrupt_to_the_watch() {
-    let _stand_in = StandIn::install();
-    let blocking = Blocking::signal(libc::SIGHUP);
-    let window = Deferred::begin().expect("begin the window");
-    let watch = Watch::new_interruptible(&window).expect("a kqueue");
-    let child = Held::new(0);
-    let registered = launched(&watch, child.pid());
-    ignore(libc::SIGHUP);
+fn a_recorded_interrupt_is_an_event_of_every_queue_of_the_window() {
+    let (_stand_in, window, first) = interruptible();
+    let second = Watch::new_interruptible(&window).expect("a second kqueue");
+    assert!(!woken_by(&first.shared.queue, window.wake()), "nothing recorded yet");
 
-    send_to_process(libc::SIGHUP);
+    raise_interrupt();
+    let third = Watch::new_interruptible(&window).expect("a third kqueue");
 
-    assert!(
-        registered.exit_kept().expect("poll").is_none(),
-        "the poll reads the queue"
-    );
-    assert!(!watch.interrupted(&window), "a blocked signal is no interrupt");
-    drop(blocking);
+    for (name, watch) in [("first", &first), ("second", &second), ("third", &third)] {
+        assert!(woken_by(&watch.shared.queue, window.wake()), "the {name} queue");
+    }
 }
 
 /// The exit the poll found is reported with its status, without taking it: a wait after it still reports

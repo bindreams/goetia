@@ -178,14 +178,14 @@ fn the_source_of_a_vanished_launch_does_not_say_whose_it_was() {
     assert!(!report.contains("process 4242 was not the job's launch"), "{report}");
 }
 
-/// An interrupt that ended the run is the cause under the stranded hold. It names the signals it can be,
-/// says when it was received relative to what goetia was about to do, and what is left; it makes no claim
-/// about when it came.
+/// An interrupt that ended the run is the cause under the stranded hold. It names the signals that were
+/// recorded, says when it was received relative to what goetia was about to do, and what is left; it makes
+/// no claim about when it came.
 #[skuld::test]
 fn an_interrupt_says_what_it_was_received_before_and_what_is_left() {
     let interrupted = run_interrupted(
         &frpc(),
-        "SIGINT or SIGTERM",
+        "SIGINT and SIGTERM",
         "before goetia armed a hold",
         "no hold was armed",
     );
@@ -195,7 +195,7 @@ fn an_interrupt_says_what_it_was_received_before_and_what_is_left() {
     let report = interrupted.report().to_string();
     assert!(
         report.contains(
-            "interrupted by SIGINT or SIGTERM, received before goetia armed a hold; goetia sent \
+            "interrupted by SIGINT and SIGTERM, received before goetia armed a hold; goetia sent \
              nothing after acting on it; no hold was armed"
         ),
         "{report}"
