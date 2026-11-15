@@ -65,6 +65,19 @@ pub(crate) struct Exited {
     pub(crate) status: Option<i32>,
 }
 
+impl Exited {
+    /// The raw `wait(2)` status, for a caller that cannot go on without it: an exit the kernel reported
+    /// with none is an error.
+    pub(crate) fn raw_status(self) -> Result<i32> {
+        self.status.ok_or_else(|| {
+            Error::os(
+                format!("wait for process {} to exit", self.pid),
+                io::Error::other("the kernel reported its exit without its status"),
+            )
+        })
+    }
+}
+
 /// What [`Watch::add`] found.
 pub(crate) enum Added {
     /// The pid is registered: its exit will be reported by [`Registered::wait`], even one that happens
@@ -166,6 +179,14 @@ impl Watch {
 
     /// Registers `pid` for its exit and the status it exits with. [`Added::Gone`] where there is no such
     /// process. Registrations are waited on one at a time, by one thread.
+    ///
+    /// A registration that succeeds is a registration whose exit is reported: none missed it in 535,000
+    /// passes (a root prober, a target that is not its child). The kernel refuses (`ESRCH`, [`Added::Gone`])
+    /// from the start of the process's exit, before `NOTE_EXIT` is posted, and refuses a zombie its parent
+    /// has not reaped. Measured on macOS CI (KB cc08f57: "macOS - A successful NOTE_EXIT registration on a
+    /// process that is not the caller's child never misses the exit", "macOS - kqueue refuses a NOTE_EXIT
+    /// registration once a process's exit has begun, before NOTE_EXIT is posted and before the zombie",
+    /// "macOS - kqueue refuses a NOTE_EXIT registration on a zombie its parent has not reaped").
     pub(crate) fn add(&self, pid: u32) -> Result<Added> {
         self.register(
             pid,
@@ -233,17 +254,14 @@ impl Watch {
 }
 
 impl Registered {
-    /// Blocks until the pid has exited, and answers its raw `wait(2)` status. `None` iff `deadline`
-    /// expired first, and none expires without one. An exit that happened before the wait began is
-    /// reported at once.
-    pub(crate) fn wait(self, deadline: Option<Deadline>) -> Result<Option<i32>> {
+    /// Blocks until the pid has exited, and answers the exit: its status is `None` where the kernel
+    /// reported the exit without one ([`Exited::raw_status`] makes that an error, for a caller that needs
+    /// it). `None` iff `deadline` expired first, and none expires without one. An exit that happened before
+    /// the wait began is reported at once.
+    pub(crate) fn wait(self, deadline: Option<Deadline>) -> Result<Option<Exited>> {
         let pid = self.pid;
         match self.next(false, None, deadline)? {
-            Some(Woke::Exited(Some(status))) => Ok(Some(status)),
-            Some(Woke::Exited(None)) => Err(Error::os(
-                format!("wait for process {pid} to exit"),
-                io::Error::other("the kernel reported its exit without its status"),
-            )),
+            Some(Woke::Exited(status)) => Ok(Some(Exited { pid, status })),
             None => Ok(None),
             Some(Woke::Exec | Woke::Interrupted(_)) => unreachable!("neither was waited for"),
         }

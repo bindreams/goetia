@@ -105,11 +105,13 @@ impl RunHandle for Run {
         }
     }
 
-    /// Blocks on the watch, under no bound: the run lasts as long as it lasts. A wait that failed has lost
-    /// the run, which may still be going ([`run_lost`]).
+    /// Blocks on the watch, under no bound: the run lasts as long as it lasts. A wait that failed, and an
+    /// exit the kernel reported without a status, have lost the run, which may still be going
+    /// ([`run_lost`]).
     fn wait(self) -> Result<Exit> {
-        let status = self.registered.wait(None).map_err(|e| run_lost(&self.id, e))?;
-        Ok(exit_of(never_expires(status)))
+        let lost = |e| run_lost(&self.id, e);
+        let exited = never_expires(self.registered.wait(None).map_err(lost)?);
+        Ok(exit_of(exited.raw_status().map_err(lost)?))
     }
 }
 
