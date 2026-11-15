@@ -628,15 +628,16 @@ fn enable_cases() -> Vec<EnableCase> {
             vec![CreateTimerEnabled, BootstrapTimer],
         ),
         (
-            "a job without its timer, its timer label loaded: the stray goes out once the timer is created, and the \
-             new one is loaded",
+            "a job without its timer, its timer label loaded: the stray goes out first, and the new timer is \
+             created and loaded",
             placed(true, None, BOTH),
-            vec![CreateTimerEnabled, BootoutTimer, BootstrapTimer],
+            vec![BootoutTimer, CreateTimerEnabled, BootstrapTimer],
         ),
         (
-            "a job without its timer, staged, its timer label loaded",
+            "a job without its timer, staged, its timer label loaded: the stray goes out before the job is \
+             loaded",
             placed(false, None, BOTH),
-            vec![MoveJobToEnabled, CreateTimerEnabled, BootoutTimer, BootstrapTimer],
+            vec![BootoutTimer, MoveJobToEnabled, CreateTimerEnabled, BootstrapTimer],
         ),
         (
             "a task with no schedule has no timer to create",
@@ -673,20 +674,20 @@ fn positions(plan: &[Action], of: impl Fn(Action) -> bool) -> Vec<usize> {
 }
 
 /// The rule for a timer label launchd holds with no timer file (`timer_stray`), for every plan: it is
-/// booted out once, before the idle check and the job's bootout (a fire between them would start a run
-/// that the bootout ends, as for any timer the plan boots out) and before any timer it loads. The shapes
-/// are the installed side of every row of the update and enable tables, set to hold a stray label,
-/// crossed with every new spec the update table names and, for `enable`, a task with and without a
-/// schedule.
+/// booted out once, first: before the idle check, any load of the job, the job's bootout and any load of
+/// a timer (a fire in between would start a run). The shapes are the installed side of every row of the
+/// update and enable tables, set to hold a stray label, crossed with every new spec the update table
+/// names and, for `enable`, a task with and without a schedule.
 #[skuld::test]
-fn a_stray_timer_label_is_booted_out_once_before_the_idle_check_the_job_bootout_and_the_load() {
+fn a_stray_timer_label_is_booted_out_once_first() {
     let check = |what: &str, plan: &[Action]| {
         let out = positions(plan, |action| action == BootoutTimer);
         assert_eq!(out.len(), 1, "one bootout of the stray: {what}: {plan:?}");
         for (name, behind) in [
             ("the idle check", CheckJobIdle),
+            ("the job's load", BootstrapJob),
             ("the job's bootout", BootoutJob),
-            ("the load", BootstrapTimer),
+            ("the timer's load", BootstrapTimer),
         ] {
             let at = positions(plan, |action| action == behind);
             assert!(

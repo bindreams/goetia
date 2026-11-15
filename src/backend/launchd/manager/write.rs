@@ -17,9 +17,9 @@ use tempfile::NamedTempFile;
 
 use super::verbs::{self, Quiet};
 use super::{
-    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, describe_at, ensure_dir, move_no_clobber,
-    never_expires, persist_new, persist_new_unraced, persist_over, plist_in, prepare_parent_dirs, read_artifact,
-    resolve_account, staged_tempfile, still_present,
+    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, ensure_dir, move_no_clobber, never_expires,
+    persist_new, persist_new_unraced, persist_over, plist_in, prepare_parent_dirs, read_artifact, resolve_account,
+    staged_tempfile, still_present,
 };
 use crate::backend::bounded::Reservation;
 use crate::backend::launchd::generate::{self, Plists, timer_label};
@@ -38,16 +38,14 @@ impl Launchd {
     /// either label (a hand-installed predecessor, or one still tearing down, which `start` would
     /// take for ours), then writes the job into staging and the timer after it, each refusing to
     /// replace anything. A write that fails after the job leaves a job without its timer, which is
-    /// ours: the next install is an `Update` that writes the timer. A stranger's file at the timer's
-    /// name, found then, refuses the install; so does anything else that took the name. Either way the
-    /// job it wrote is removed, and where a label was booted out the error says so
-    /// ([`Error::StaleJobBootedOut`]).
+    /// ours: the next install is an `Update` that writes the timer.
     ///
     /// An `Update` or `Stale` reads which labels launchd holds, then runs `update_plan`.
     ///
     /// Never `Raced`: the reads of which labels launchd holds have been made by the time a plist is
     /// found changed, and another pass would make more calls than the verb reserved, so a race is
-    /// an error instead.
+    /// an error instead. A file written at a task's timer name, or a second install of the same id,
+    /// while install runs ends it with a re-run error; the job plist it wrote stays.
     pub(super) fn write_task(
         &self,
         dirs: Dirs,
@@ -92,20 +90,7 @@ impl Launchd {
                 if let Some(staged) = staged_timer {
                     match persist_new(staged, &timer_target)? {
                         PersistOutcome::Written => {}
-                        PersistOutcome::Raced => {
-                            // Every way out of here undoes the job this install wrote. A request was
-                            // sent if a label was booted out, and the error then says so.
-                            let taken = if booted_out {
-                                Err(refuse::slot_taken_after_bootout(
-                                    id,
-                                    &timer_target,
-                                    describe_at(&timer_target),
-                                ))
-                            } else {
-                                timer_taken(id, &timer_target)
-                            };
-                            return remove_written_job(&job_target, taken);
-                        }
+                        PersistOutcome::Raced => return Err(refuse::changed_during_install(id, &timer_target)),
                     }
                 }
                 Ok(WriteOutcome::Done)
@@ -180,7 +165,6 @@ impl Launchd {
                     staged_timer,
                     verb: Verb::Install,
                     timer_out: false,
-                    stray_out: false,
                     // After a refusal, as the service path has it: a refused update creates nothing.
                     prepare: Some((spec, &account)),
                 }
@@ -207,7 +191,6 @@ impl Launchd {
             staged_timer: None,
             verb: Verb::Uninstall,
             timer_out: false,
-            stray_out: false,
             prepare: None,
         }
         .run(&uninstall_plan(&old), reservation)?;
@@ -252,7 +235,6 @@ impl Launchd {
             staged_timer,
             verb: Verb::Enable,
             timer_out: false,
-            stray_out: false,
             prepare: None,
         }
         .run(&plan, reservation)?;
@@ -283,7 +265,6 @@ impl Launchd {
             staged_timer: None,
             verb: Verb::Disable,
             timer_out: false,
-            stray_out: false,
             prepare: None,
         }
         .run(&disable_plan(&old), reservation)?;
@@ -335,33 +316,6 @@ fn timer_taken(id: &Id, path: &Path) -> Result<WriteOutcome> {
     }
 }
 
-/// `ended`, how a `Create` ended at its timer's name, after the job's plist at `job` was written: the
-/// job is removed again, so that nothing of this install is left behind. A job that cannot be removed
-/// never replaces `ended`: its path is told beside it, and a re-run installs over it (a job without its
-/// timer is an `Update`).
-fn remove_written_job(job: &Path, ended: Result<WriteOutcome>) -> Result<WriteOutcome> {
-    let Err(removal) = fs::remove_file(job) else {
-        return ended;
-    };
-    let leftover = format!(
-        "`{}`, the job's plist this install wrote, could not be removed ({removal}) and is left: a re-run installs \
-         over it",
-        job.display()
-    );
-    match ended {
-        Ok(WriteOutcome::Refused(Outcome::RefuseForeign { recovery })) => {
-            Ok(WriteOutcome::Refused(Outcome::RefuseForeign {
-                recovery: format!("{recovery}; also, {leftover}"),
-            }))
-        }
-        Ok(other) => unreachable!("a timer's name taken refuses only for a stranger's file, got {other:?}"),
-        Err(first) => Err(Error::Step {
-            what: leftover,
-            source: Box::new(first),
-        }),
-    }
-}
-
 /// A plan's actions, performed in order over what is on disk and in launchd.
 struct Executor<'a> {
     launchd: &'a Launchd,
@@ -380,9 +334,6 @@ struct Executor<'a> {
     /// Whether this plan booted out a timer that has a plist and has not loaded it again or removed
     /// it: an error then says the timer is not loaded, and a refusal loads it again first.
     timer_out: bool,
-    /// Whether this plan booted out a timer label that has no plist of ours (a stranger's, or a file
-    /// removed by hand) and has not tried to load a timer since: whatever ends the plan says so.
-    stray_out: bool,
     /// The directories the spec names (`cwd`, the parent of `logs`), made before the first action that
     /// changes anything a refusal could leave untouched.
     prepare: Option<(&'a DaemonSpec, &'a Account)>,
@@ -406,15 +357,13 @@ impl Executor<'_> {
         {
             prepare_parent_dirs(spec, account)?;
         }
-        // Every refusal and error of a plan leaves here, so the note of a timer label booted out and not
-        // loaded again is made in one place.
         for (at, &action) in plan.iter().enumerate() {
             match self.perform(action, reservation) {
-                Ok(Some(refusal)) => return Ok(self.stray_noted_refusal(refusal)),
+                Ok(Some(refusal)) => return Ok(refusal),
                 Ok(None) => {}
                 // `plan[at..]` still holds the action that failed: a write that failed is not done.
                 Err(e) if self.timer_out => return Err(self.timer_stranded(e, files_written(&plan[at..]))),
-                Err(e) => return Err(self.stray_noted(e)),
+                Err(e) => return Err(e),
             }
         }
         Ok(WriteOutcome::Done)
@@ -433,9 +382,8 @@ impl Executor<'_> {
         match action {
             Action::BootoutTimer => {
                 never_expires(launchctl.bootout(&timer_label, deadline, reservation)?);
-                if self.old.timer_stray() {
-                    self.stray_out = true;
-                } else {
+                // A stray has no plist to load again.
+                if !self.old.timer_stray() {
                     self.timer_out = true;
                 }
             }
@@ -450,8 +398,9 @@ impl Executor<'_> {
                     DaemonKind::Service => Verdict::Idle,
                     DaemonKind::Task => {
                         let print = launchctl.read_task_print(id, deadline, Role::Query, reservation)?;
-                        // A print with no pid is read as `stop` reads it.
-                        if print.pid.is_some() {
+                        // A state of `running` is a run, as launchd reports it; any other print with no
+                        // pid is read as `stop` reads it.
+                        if print.pid.is_some() || print.state == State::Running {
                             Verdict::InFlight
                         } else {
                             match verbs::quiet(self.id, &print) {
@@ -557,7 +506,6 @@ impl Executor<'_> {
             Action::BootstrapTimer => {
                 // A failure to load says what is left to do, which covers the timer.
                 self.timer_out = false;
-                self.stray_out = false;
                 self.load(
                     &self.timer.clone().expect("a loaded timer has a file"),
                     &timer_label,
@@ -594,8 +542,7 @@ impl Executor<'_> {
     }
 
     /// `refusal`, the job not being idle, with the timer loaded again first if this plan booted it out.
-    /// A timer that cannot be loaded again is told beside the refusal: the task is not armed. A timer
-    /// label with no plist of ours has nothing to load it from: `run` says so (see [`Self::stray_noted`]).
+    /// A timer that cannot be loaded again is told beside the refusal: the task is not armed.
     fn refuse(&mut self, refusal: Error, reservation: &mut Reservation) -> Error {
         let ours = std::mem::take(&mut self.timer_out);
         // Before any file changes, the timer's path is where it was read.
@@ -615,41 +562,6 @@ impl Executor<'_> {
                 first: Box::new(refusal),
                 then: Box::new(rearm),
             },
-        }
-    }
-
-    /// What a refusal or an error says once this plan booted out a timer label with no plist of ours
-    /// (a stranger's, or a file removed by hand), if it did: there was nothing to load it from.
-    fn stray_note(&self) -> Option<String> {
-        self.stray_out.then(|| {
-            format!(
-                "launchd held `{}`, which has no plist of goetia's to load it from, so it was booted out \
-                 and is not loaded again",
-                timer_label(self.id.as_str())
-            )
-        })
-    }
-
-    /// `error`, which ended the plan, with [`Self::stray_note`] around it.
-    fn stray_noted(&self, error: Error) -> Error {
-        match self.stray_note() {
-            Some(what) => Error::Step {
-                what,
-                source: Box::new(error),
-            },
-            None => error,
-        }
-    }
-
-    /// `outcome`, which ended the plan without an error, with [`Self::stray_note`] beside the recovery.
-    fn stray_noted_refusal(&self, outcome: WriteOutcome) -> WriteOutcome {
-        match (outcome, self.stray_note()) {
-            (WriteOutcome::Refused(Outcome::RefuseForeign { recovery }), Some(note)) => {
-                WriteOutcome::Refused(Outcome::RefuseForeign {
-                    recovery: format!("{recovery}; also, {note}"),
-                })
-            }
-            (outcome, _) => outcome,
         }
     }
 

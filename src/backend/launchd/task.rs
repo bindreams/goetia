@@ -153,9 +153,9 @@ pub(crate) fn enabled_in(timer: Option<bool>, job: Option<bool>) -> bool {
 }
 
 impl Old {
-    /// Whether launchd holds the timer's label with no timer file of goetia's (removed by hand while it
-    /// was loaded). `<id>@timer` is goetia's name, so every plan boots such a label out: it carries the
-    /// definition of a file that is gone, and would stand in for the one a plan creates or loads.
+    /// Whether launchd holds the timer's label with no timer file of goetia's. launchd's `<id>@timer` label
+    /// is goetia's; a plan that finds it loaded without goetia's timer plist boots it out first and does
+    /// not load it again.
     pub(crate) fn timer_stray(&self) -> bool {
         self.timer_loaded && self.timer.is_none()
     }
@@ -181,9 +181,7 @@ impl Old {
 ///   schedule edit.
 /// - A timer that is new is created before the job's files change, no-clobber, so a stranger's file at
 ///   its name refuses with nothing changed; one that is dropped is removed before the job is replaced.
-/// - A stray timer label ([`Old::timer_stray`]) goes out in every plan, as that same first boot-out: it
-///   would otherwise stand in for the timer the plan creates or loads, and fire between the idle check
-///   and the job's boot-out. A refusal after it says the label is not loaded again.
+/// - A stray timer label ([`Old::timer_stray`]) goes out in every plan, as that same first boot-out.
 /// - A retype, or a dropped schedule, moves an enabled job to staging first: it drops arming and boot
 ///   enrolment, so `enabled` and `enable` agree that a task with no timer has nothing to arm.
 /// - A task that is enabled ends with its job and its timer loaded, the job first: what went out is
@@ -252,8 +250,7 @@ pub(crate) fn uninstall_plan(old: &Old) -> Vec<Action> {
 /// there where a scheduled task has none). Each step is taken only where it is not already done, so
 /// running the verb again finishes what a crash left, whatever `enabled` says: a timer that moved and
 /// was not loaded is loaded, and nothing else is touched. A job launchd holds already (a `start` loaded
-/// it from staging) is not loaded again. A stray timer label ([`Old::timer_stray`]) goes out, after the
-/// timer is created where one is and before it is loaded.
+/// it from staging) is not loaded again. A stray timer label ([`Old::timer_stray`]) goes out first.
 pub(crate) fn enable_plan(old: &Old) -> Vec<Action> {
     let mut plan = Vec::new();
     let mut push = |condition: bool, action: Action| {
@@ -261,6 +258,7 @@ pub(crate) fn enable_plan(old: &Old) -> Vec<Action> {
             plan.push(action);
         }
     };
+    push(old.timer_stray(), Action::BootoutTimer);
     push(
         old.job.as_ref().is_some_and(|job| !job.enabled),
         Action::MoveJobToEnabled,
@@ -272,9 +270,6 @@ pub(crate) fn enable_plan(old: &Old) -> Vec<Action> {
     );
     let created = old.timer.is_none() && old.scheduled;
     push(created, Action::CreateTimerEnabled);
-    // A stray timer label (see [`Old::timer_stray`]) goes out once the file is there, which refuses a
-    // stranger's file at that name first, and before a timer is loaded.
-    push(old.timer_stray(), Action::BootoutTimer);
     push(
         (!old.timer_loaded || old.timer_stray()) && (old.timer.is_some() || old.scheduled),
         Action::BootstrapTimer,

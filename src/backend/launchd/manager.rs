@@ -1276,8 +1276,8 @@ const SERVICE_KILL_REQUESTS: usize = 1;
 /// process, and the signal after the wait. The wait draws no reaper.
 const TASK_KILL_REQUESTS: usize = 2;
 const KILL_REQUESTS: usize = max(SERVICE_KILL_REQUESTS, TASK_KILL_REQUESTS);
-/// A task's `enable` makes its own reservation: the `bootstrap` of the job, the `bootout` of a timer
-/// label launchd holds with no timer file, and the `bootstrap` of the timer.
+/// A task's `enable` makes its own reservation: the `bootout` of a timer label launchd holds with no
+/// timer file, the `bootstrap` of the job, and the `bootstrap` of the timer.
 const TASK_ENABLE_REQUESTS: usize = 3;
 /// A task's `disable` makes its own: the timer's `bootout`.
 const TASK_DISABLE_REQUESTS: usize = 1;
