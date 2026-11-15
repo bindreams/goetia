@@ -11,8 +11,9 @@ use std::sync::Arc;
 use crate::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
 };
-use crate::backend::scm::manager::{read_spec_blob, winapi_io};
+use crate::backend::scm::manager::read_spec_blob;
 use crate::backend::scm::wide::wide_null;
+use crate::backend::scm::win32::winapi_io;
 use crate::blob::Blob;
 use crate::error::{Chain, Error};
 use crate::spec::{DaemonSpec, Restart};

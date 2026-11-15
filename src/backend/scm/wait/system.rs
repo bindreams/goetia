@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Services::{
 use windows_sys::Win32::System::Threading::{INFINITE, SleepEx};
 
 use crate::backend::scm::exit_status::RecordedExit;
-use crate::backend::scm::manager::winapi_io;
+use crate::backend::scm::win32::winapi_io;
 
 use super::{
     Armed, Cancelled, Deadline, Observed, QueriedState, QueriedStatus, Registration, SERVICE_ACCEPT_STOP, StartReply,

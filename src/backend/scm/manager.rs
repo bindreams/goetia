@@ -131,6 +131,7 @@ use crate::backend::scm::shim::sweep::{
     ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
 use crate::backend::scm::wide::{units_until_nul, wide_null_cut};
+use crate::backend::scm::win32::winapi_io;
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
@@ -1871,16 +1872,6 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
         e,
         windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
     )
-}
-
-/// A `windows_service` failure as an `io::Error`: the OS error a `Winapi` failure wraps, whose text
-/// is the reason (the variant's own, "IO error in winapi call", names none), and any other variant
-/// (parse errors, which no call here produces) as `io::Error::other`. The one place that unwraps it.
-pub(crate) fn winapi_io(e: windows_service::Error) -> std::io::Error {
-    match e {
-        windows_service::Error::Winapi(os) => os,
-        other => std::io::Error::other(other),
-    }
 }
 
 /// A `windows_service` failure as an [`Error::Os`], shared with [`service_undetermined`] so one
