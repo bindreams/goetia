@@ -20,7 +20,7 @@
 use std::io;
 
 use crate::backend::scm::wait::Waited;
-use crate::error::{terminating_failed, within};
+use crate::error::{Chain, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
 /// What a kill did.
@@ -158,10 +158,9 @@ pub(crate) fn hold_service_process<T: KillTarget>(
                 Ok(_) => continue,
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
                 Err(read) => {
-                    return Err(HoldError::Read(ErrorWithNote::into_io(
-                        read,
-                        "after the service's process could not be opened",
-                        e,
+                    return Err(HoldError::Read(io::Error::new(
+                        read.kind(),
+                        ReadAfterRefusedOpen { read, open: e },
                     )));
                 }
             },
@@ -202,6 +201,16 @@ fn terminated_but(pid: u32, e: io::Error) -> io::Error {
         format!("process {pid} was terminated, but waiting for SCM to record the exit failed"),
         e,
     )
+}
+
+/// The service's pid could not be opened, and the read that would say whether SCM still vouches for
+/// it failed too. Both errors are the caller's to see: `read`'s text, then `open`'s in parentheses.
+/// Neither is the [`source`](std::error::Error::source), which would print it a second time.
+#[derive(Debug, thiserror::Error)]
+#[error("{} (after the service's process could not be opened: {})", Chain(read), Chain(open))]
+struct ReadAfterRefusedOpen {
+    read: io::Error,
+    open: io::Error,
 }
 
 /// Block until SCM no longer reports `pid` as the service's process: it shows none, or a different
@@ -304,9 +313,6 @@ fn waiting_notice(id: &str, pid: u32, terminate_failed: Option<&io::Error>) -> S
 
 #[cfg(windows)]
 mod privilege;
-
-mod noted;
-pub(crate) use noted::ErrorWithNote;
 
 #[cfg(all(windows, test))]
 pub(crate) use privilege::holds_debug_privilege;
@@ -484,7 +490,7 @@ pub(in crate::backend::scm) mod system {
     /// Open `pid` with `access`, with the caller's `SeDebugPrivilege` enabled for the open, as
     /// without it a `LocalService` service's process is refused. `None` if no process has that pid.
     pub(in crate::backend::scm) fn open_process_with(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {
-        let mut debug = DebugPrivilege::enable();
+        let debug = DebugPrivilege::enable();
         // SAFETY: no pointers; a null return is the failure.
         let handle = unsafe { OpenProcess(access, 0, pid) };
         if handle.is_null() {

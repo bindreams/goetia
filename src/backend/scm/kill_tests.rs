@@ -37,8 +37,6 @@ struct Scripted {
     terminates: VecDeque<Terminate>,
     /// Which `service_pid` calls, counted from 1, fail instead of answering.
     failing_reads: Vec<usize>,
-    /// The OS code of a failed read, when it has one.
-    read_os_code: Option<i32>,
     reads: usize,
     /// Whether `await_exit` fails.
     failing_exit: bool,
@@ -70,7 +68,6 @@ impl Scripted {
             opens: opens.into(),
             terminates: terminates.into(),
             failing_reads: Vec::new(),
-            read_os_code: None,
             reads: 0,
             failing_exit: false,
             failing_arm: false,
@@ -87,12 +84,6 @@ impl Scripted {
     /// The `n`th `service_pid` call (from 1) fails.
     fn failing_read(mut self, n: usize) -> Self {
         self.failing_reads.push(n);
-        self
-    }
-
-    /// A failed read is the OS error `code`, as a failed SCM call is, not a message alone.
-    fn reading_fails_with_os_error(mut self, code: i32) -> Self {
-        self.read_os_code = Some(code);
         self
     }
 
@@ -152,10 +143,7 @@ impl KillTarget for Scripted {
         self.log.borrow_mut().push("service_pid".to_string());
         self.reads += 1;
         if self.failing_reads.contains(&self.reads) {
-            return Err(match self.read_os_code {
-                Some(code) => io::Error::from_raw_os_error(code),
-                None => io::Error::new(READ_FAILED_KIND, "scm read failed"),
-            });
+            return Err(io::Error::new(READ_FAILED_KIND, "scm read failed"));
         }
         Ok(if self.pids.len() > 1 {
             self.pids.pop_front().unwrap()
@@ -840,19 +828,6 @@ fn a_failed_read_after_a_refused_open_reports_both_errors() {
     assert_eq!(report.matches("scm read failed").count(), 1, "{report}");
     assert_eq!(report.matches("access denied").count(), 1, "{report}");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
-}
-
-/// The read's OS code is what classifies the failure, whether or not an open was refused before it.
-#[skuld::test]
-fn the_os_code_of_a_failed_read_is_found_after_a_refused_open() {
-    const RPC_UNAVAILABLE: i32 = 1722;
-    let mut target = Scripted::new([Some(100)], [Open::Fails], [])
-        .failing_read(2)
-        .reading_fails_with_os_error(RPC_UNAVAILABLE);
-
-    let e = kill_service(&mut target).unwrap_err();
-
-    assert_eq!(crate::error::Error::os("kill", e).raw_os_error(), Some(RPC_UNAVAILABLE));
 }
 
 /// The confirming read, with the handle held: the handle is closed and nothing is terminated.

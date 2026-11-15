@@ -78,7 +78,7 @@ impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         for id in &self.ids {
             if let Err(e) = self.mgr.uninstall(id) {
-                eprintln!("manager::conformance cleanup: uninstall({id}) failed: {e}");
+                eprintln!("manager::conformance cleanup: uninstall({id}) failed: {}", e.report());
             }
         }
     }
@@ -146,7 +146,10 @@ fn fresh_task(
 }
 
 fn task_status(mgr: &dyn ServiceManager, id: &Id, when: &str) -> TaskStatus {
-    match mgr.status(id).unwrap_or_else(|e| panic!("status {when}: {e}")) {
+    match mgr
+        .status(id)
+        .unwrap_or_else(|e| panic!("status {when}: {}", e.report()))
+    {
         Status::Task(status) => status,
         other => panic!("a task reports a task status {when}, got {other:?} (id {id})"),
     }
@@ -396,7 +399,7 @@ fn refuses_foreign_even_with_force(mgr: &dyn ServiceManager, mk: &dyn Fn(&str) -
     for force in [false, true] {
         let outcome = mgr
             .install(&spec, force)
-            .unwrap_or_else(|e| panic!("install over a foreign id must not error, got {e}"));
+            .unwrap_or_else(|e| panic!("install over a foreign id must not error, got {}", e.report()));
         match outcome {
             crate::decide::Outcome::RefuseForeign { recovery } => {
                 assert!(!recovery.is_empty(), "recovery must be non-empty (force={force})");

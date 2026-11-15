@@ -1875,12 +1875,10 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
 
 /// A `windows_service` failure as an [`Error::Os`], shared with [`service_undetermined`] so one
 /// failure cannot be described two ways depending on which class it lands in. A `Winapi` failure
-/// is held as the `io::Error` it wraps, so the OS error is what the `Error` carries.
+/// keeps the OS error on its `source()` chain, where [`Error::raw_os_error`] finds it, and the report
+/// writes it as that error (see `write_chain`).
 fn to_error(context: &str, e: windows_service::Error) -> Error {
-    match e {
-        windows_service::Error::Winapi(io_err) => Error::os(context, io_err),
-        other => Error::os(context, other),
-    }
+    Error::os(context, e)
 }
 
 // undetermined ========================================================================================================

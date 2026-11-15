@@ -2,8 +2,6 @@
 
 use std::fmt::{self, Write as _};
 
-use crate::backend::scm::kill::ErrorWithNote;
-
 use super::escape::{write_escaped, write_escaped_keeping_layout};
 use super::{Error, Sentence};
 
@@ -164,21 +162,16 @@ pub(super) fn write_chain<'a>(
     Ok(())
 }
 
-/// The first OS error code in `e`: its own, then its source's, then that of what it embeds. An
-/// [`ErrorWithNote`] is searched as its primary error, alone. A [`Both`](Error::Both) is searched first half first; [`Error::Kept`] is searched as the error it
+/// The first OS error code in `e`: its own, then its source's, then that of what it embeds. A
+/// [`Both`](Error::Both) is searched first half first; [`Error::Kept`] is searched as the error it
 /// holds. A `cosca` list's later members, a `MembersLeft`'s `others` and a `MayHaveStarted`'s
 /// `cleanup` are not on the `source()` chain and are not searched.
 pub(crate) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
-    let io = e.downcast_ref::<std::io::Error>();
-    if let Some(code) = io.and_then(std::io::Error::raw_os_error) {
+    if let Some(code) = e
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+    {
         return Some(code);
-    }
-    // The `io::Error` that carries one is a custom one, whose `source()` skips what it carries.
-    let noted = e
-        .downcast_ref::<ErrorWithNote>()
-        .or_else(|| io?.get_ref()?.downcast_ref::<ErrorWithNote>());
-    if let Some(noted) = noted {
-        return os_error_in(noted.primary());
     }
     let ours = e
         .downcast_ref::<Error>()

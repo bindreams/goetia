@@ -196,6 +196,23 @@ fn is_access_denied_matches_only_error_access_denied() {
     assert!(!is_access_denied(&windows_service::Error::LaunchArgumentsNotSupported));
 }
 
+/// A `Winapi` failure is no `io::Error` to the `Error` that holds it; the code and the text still
+/// are the OS error's.
+#[skuld::test]
+fn a_winapi_failure_keeps_its_os_code_and_text() {
+    let winapi = || windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let e = to_error("open `x`", winapi());
+
+    assert_eq!(e.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+    assert_eq!(
+        e.report().to_string(),
+        format!(
+            "failed to open `x`: {}",
+            std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
+        )
+    );
+}
+
 // list's aggregate ====================================================================================================
 
 /// `list` collects one [`Unreadable`] per service it could not read; only the name matters to a
