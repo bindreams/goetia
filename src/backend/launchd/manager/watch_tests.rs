@@ -1,6 +1,7 @@
 //! The watch over real child processes, each held alive by an open stdin until the test lets it go.
 //! Nothing here needs root, launchd or a file outside the process.
 
+use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
@@ -78,15 +79,27 @@ impl Held {
     pub(in crate::backend::launchd::manager) fn at_xpcproxy(dir: &Path, script: &str) -> Held {
         let copy = dir.join("xpcproxy");
         std::fs::copy("/bin/sh", &copy).expect("copy /bin/sh");
-        Held::spawned(Command::new(&copy).args(["-c", script]))
+        Held::spawned(Command::new(&copy).args(["-c", &format!("echo up; {script}")]))
     }
 
     fn running(script: &str) -> Held {
-        Held::spawned(Command::new("/bin/sh").args(["-c", script]))
+        Held::spawned(Command::new("/bin/sh").args(["-c", &format!("echo up; {script}")]))
     }
 
+    /// Spawns `command`, whose script says `up` first, and returns once it has: the exec that started the
+    /// child is then over. Without this its event can reach a registration made right after the spawn
+    /// returns (seen on macOS CI), and a test that waits for the child's own exec would race it.
     fn spawned(command: &mut Command) -> Held {
-        let mut child = command.stdin(Stdio::piped()).spawn().expect("spawn the child");
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the child");
+        let mut said = String::new();
+        BufReader::new(child.stdout.take().expect("the child's stdout"))
+            .read_line(&mut said)
+            .expect("read the child's first line");
+        assert_eq!(said, "up\n", "the child's first line");
         let stdin = child.stdin.take();
         Held { child, stdin }
     }

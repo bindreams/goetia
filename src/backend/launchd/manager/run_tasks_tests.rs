@@ -902,8 +902,11 @@ fn a_kickstart_that_names_no_pid_is_the_stranded_hold_with_the_start_unconfirmed
     let e = failed(&fake, snapshot(&tree, None));
 
     assert_stranded(&e, "a kickstart with no pid");
+    assert!(e.is_indeterminate(), "the start may have happened: {e:?}");
     assert!(
-        matches!(&e, Error::Step { source, .. } if matches!(**source, Error::StartUnconfirmed { .. })),
+        matches!(&e, Error::Step { source, .. }
+            if matches!(&**source, Error::Step { source: unconfirmed, .. }
+                if matches!(**unconfirmed, Error::StartUnconfirmed { .. }))),
         "{e:?}"
     );
 }
