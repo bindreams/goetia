@@ -484,6 +484,8 @@ fn a_signal_blocked_on_the_opening_thread_but_delivered_to_another_ends_a_wait_a
     let _marked = mark_thread();
     drop(watch);
     drop(window);
+    // XNU posts a signal sent to the process to one thread it picks when it is sent, so no other thread
+    // shares this one's pending signal.
     drop(blocking);
     // Sent to the process, it is delivered to another thread, asynchronously, so it is awaited, under no
     // bound; one held pending here was delivered as the block lifted, and is counted already.
@@ -534,13 +536,14 @@ fn woken_by(queue: &Kqueue, fd: std::os::fd::RawFd) -> bool {
 /// before it and the ones made after: nothing drains the pipe, and each queue has its own event.
 #[skuld::test]
 fn a_recorded_interrupt_is_an_event_of_every_queue_of_the_window() {
-    let (_stand_in, first) = interruptible();
-    let window = first.window.as_ref().expect("an interruptible watch holds its window");
-    let second = Watch::new_interruptible(window).expect("a second kqueue");
+    let _stand_in = StandIn::install();
+    let window = Deferred::begin().expect("begin the window");
+    let first = Watch::new_interruptible(&window).expect("a first kqueue");
+    let second = Watch::new_interruptible(&window).expect("a second kqueue");
     assert!(!woken_by(&first.shared.queue, window.wake()), "nothing recorded yet");
 
     raise_interrupt();
-    let third = Watch::new_interruptible(window).expect("a third kqueue");
+    let third = Watch::new_interruptible(&window).expect("a third kqueue");
 
     for (name, watch) in [("first", &first), ("second", &second), ("third", &third)] {
         assert!(woken_by(&watch.shared.queue, window.wake()), "the {name} queue");

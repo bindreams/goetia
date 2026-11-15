@@ -117,7 +117,7 @@ impl Watch {
     /// The interrupts the watch's window has recorded so far, as of this one read: `None` where there are
     /// none, and for a watch that is not interruptible.
     pub(crate) fn recorded(&self) -> Option<Interrupts> {
-        self.window.as_ref().and_then(Deferred::recorded)
+        recorded_in(self.window.as_ref())
     }
 
     fn make(window: Option<Deferred>) -> Result<Watch> {
@@ -325,7 +325,7 @@ impl Registered {
         };
         let mut events = [blank(); 8];
         loop {
-            if let Some(interrupts) = window.and_then(Deferred::recorded) {
+            if let Some(interrupts) = recorded_in(window) {
                 return Ok(Some(Woke::Interrupted(interrupts)));
             }
             if exec && self.take_exec() {
@@ -455,6 +455,12 @@ impl Drop for Registered {
 }
 
 /// The exit `event` reports: `None` for any other event.
+/// The interrupts `window` has recorded, as of this one read, and `None` where there are none or no window:
+/// the one read of the record, which a [`Watch`] and a wait share.
+fn recorded_in(window: Option<&Deferred>) -> Option<Interrupts> {
+    window.and_then(Deferred::recorded)
+}
+
 fn exited(event: &KEvent) -> Option<Exited> {
     let is_exit = event.filter() == Ok(EventFilter::EVFILT_PROC) && event.fflags().contains(FilterFlag::NOTE_EXIT);
     is_exit.then(|| Exited {

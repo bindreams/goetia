@@ -2,6 +2,7 @@
 //! process's own would be, so a re-raised signal lands there and never ends the test.
 
 use std::cell::Cell;
+use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -49,34 +50,38 @@ impl Drop for Serial {
 /// How many signals the stand-in handler has seen, and which (bit `n` for signal `n`).
 static SEEN: AtomicUsize = AtomicUsize::new(0);
 static SEEN_BITS: AtomicU32 = AtomicU32::new(0);
-/// Whether the stand-in handler has run on a marked thread ([`mark_thread`]).
+/// Whether the stand-in handler has run on the marked thread ([`mark_thread`]).
 static SEEN_ON_MARKED: AtomicBool = AtomicBool::new(false);
+/// The marked thread's `pthread_t`, or 0 where none is marked. Read by the handler, which may not touch
+/// thread-local storage: the first access on a thread can allocate.
+static MARKED_THREAD: AtomicUsize = AtomicUsize::new(0);
 
-thread_local! {
-    /// Whether this thread is marked. Set on the thread itself, so that the handler, which runs on whichever
-    /// thread takes the signal, tells that thread from the others without comparing thread ids, which are
-    /// reused once a thread is joined.
-    static MARKED: Cell<bool> = const { Cell::new(false) };
-}
+/// The calling thread, marked until this drops. It is not `Send`: the thread that holds the mark is the one
+/// marked, and it must stay alive, not joined, until the test has looked, so that its `pthread_t` is not
+/// reused by a thread the handler runs on in between.
+pub(in crate::backend::launchd::manager) struct Marked(PhantomData<*const ()>);
 
-/// The calling thread, marked until this drops.
-pub(in crate::backend::launchd::manager) struct Marked;
-
-/// Marks the calling thread: [`StandIn::ran_on_marked`] says whether the stand-in has run on it.
+/// Marks the calling thread: [`StandIn::ran_on_marked`] says whether the stand-in has run on it. One thread
+/// is marked at a time.
 pub(in crate::backend::launchd::manager) fn mark_thread() -> Marked {
-    MARKED.set(true);
-    Marked
+    // SAFETY: `pthread_self` has no preconditions.
+    let id = unsafe { libc::pthread_self() };
+    let before = MARKED_THREAD.swap(id, Ordering::SeqCst);
+    debug_assert_eq!(before, 0, "a thread is marked already");
+    Marked(PhantomData)
 }
 
 impl Drop for Marked {
     fn drop(&mut self) {
-        MARKED.set(false);
+        MARKED_THREAD.store(0, Ordering::SeqCst);
     }
 }
 
 extern "C" fn stand_in(signal: libc::c_int) {
-    // Before the count, so that a test that waits for the count finds this set.
-    if MARKED.get() {
+    // Before the count, so that a test that waits for the count finds this set. `pthread_self` is
+    // async-signal-safe.
+    // SAFETY: `pthread_self` has no preconditions.
+    if MARKED_THREAD.load(Ordering::SeqCst) == unsafe { libc::pthread_self() } {
         SEEN_ON_MARKED.store(true, Ordering::SeqCst);
     }
     SEEN.fetch_add(1, Ordering::SeqCst);
@@ -506,17 +511,24 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
     let deferred = Deferred::begin().expect("begin");
     raise(libc::SIGINT);
 
+    let (closed, has_closed) = channel();
+    let (release, released) = channel::<()>();
     let closing = std::thread::spawn(move || {
-        // Dropped last, after the block is lifted: a signal the thread held pending is delivered to it as
-        // the block lifts, and the handler finds it marked.
+        // Dropped last, after the thread is released: a signal the thread held pending is delivered to it as
+        // the block lifts, and the handler finds it marked. The thread stays alive until the test has
+        // looked, so that its thread id is not reused in between.
         let _marked = mark_thread();
-        let _blocked = Blocking::signal(libc::SIGINT);
-        drop(deferred);
+        {
+            let _blocked = Blocking::signal(libc::SIGINT);
+            drop(deferred);
+        }
+        closed.send(()).expect("the test is waiting");
+        released.recv().expect("the test releases the thread");
     });
-    // The thread is over, its block lifted: a signal it held pending has been delivered to it by now.
-    closing.join().expect("the closing thread");
-    // A signal taken by another thread is delivered on that thread, asynchronously, so it is awaited, under
-    // no bound; one the closer held is seen already.
+    // The window is closed and the block lifted: a signal the thread held pending has been delivered to it by
+    // now. A signal taken by another thread is delivered on that thread, asynchronously, so it is awaited,
+    // under no bound; one the closer held is seen already.
+    has_closed.recv().expect("the closing thread");
     while before.seen() == 0 {
         std::thread::yield_now();
     }
@@ -526,6 +538,8 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
         !before.ran_on_marked(),
         "the signal was held by the thread that closed the window"
     );
+    release.send(()).expect("the closing thread is waiting");
+    closing.join().expect("the closing thread");
 }
 
 /// A window whose pipe cannot be made is an `Err` and installs nothing: no handler is ours, nothing is

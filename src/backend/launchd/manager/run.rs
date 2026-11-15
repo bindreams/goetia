@@ -129,11 +129,12 @@ impl Launchd {
     /// before it (while the job is loaded), are their own errors: no hold exists. Any later failure is
     /// [`stranded_hold`].
     ///
-    /// The window has two kinds of holder: the watch's, which the record is read through, and each launch's
-    /// registration's. Both are of the window their kqueue's pipe belongs to. The launch that is resumed lets
-    /// go of its hold as it becomes the [`Run`], so the window ends when this function returns, not when the
-    /// run does. It is opened here, before the watch, which only joins it: the signals are taken over before
-    /// the queue is made, and the window's pipe is there to register on it.
+    /// The window is opened here, before the watch, which only joins it: the signals are taken over before
+    /// the queue is made, and the window's pipe is there to register on it. It has three kinds of holder:
+    /// the opening `window`, dropped once the watch has joined; the watch, which the record is read
+    /// through, until this function returns; and each launch's registration, which joins the watch's
+    /// window. The launch that is resumed lets go of its hold as it becomes the [`Run`], so the window ends
+    /// when this function returns, not when the run does.
     pub(super) fn begin_task_run(
         &self,
         snapshot: Plist,
@@ -143,7 +144,9 @@ impl Launchd {
         let path = snapshot.job()?.location.path.clone();
         let Plist { id, blob, .. } = snapshot;
         let logs = blob.map_err(Error::Kept)?.spec.common().logs.clone();
-        let watch = Watch::new_interruptible(&Deferred::begin()?)?;
+        let window = Deferred::begin()?;
+        let watch = Watch::new_interruptible(&window)?;
+        drop(window);
         self.launchctl.load_job(id.as_str(), &path, reservation)?;
 
         let mut attempt = Attempt {
