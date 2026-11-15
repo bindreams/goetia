@@ -91,9 +91,7 @@ impl Registrations {
     }
 
     fn next_line(&self) -> String {
-        let line = self.lines.recv().expect("`log stream` ended");
-        eprintln!("PROBE stream: {line}");
-        line
+        self.lines.recv().expect("`log stream` ended")
     }
 
     /// The next fire of each of the `count` entries of the job `label`, one per `Registered` line.
@@ -169,15 +167,11 @@ fn next_run_is_the_earliest_fire_launchd_registered(#[fixture(launchd_group)] _g
         &mgr,
         &task(&id, ["/bin/sleep", "300"].map(String::from).to_vec(), Some(SCHEDULE)),
     );
-    eprintln!("PROBE starting the stream");
     let registrations = Registrations::start();
-    eprintln!("PROBE stream attached");
 
     let before = SystemTime::now();
     mgr.enable(&task_id).expect("enable");
-    eprintln!("PROBE enabled");
     let listed = print_job(&timer).stdout.matches("descriptor = ").count();
-    eprintln!("PROBE listed {listed}");
     assert_eq!(listed, 180, "`print` lists the entries of `{SCHEDULE}`");
     let fires = registrations.next_fires(&timer, listed);
     let earliest = *fires.iter().min().expect("a fire");
