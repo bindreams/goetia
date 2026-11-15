@@ -85,6 +85,10 @@ jobs:
         run: |
           set -euo pipefail
           manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "goetia") | .version')"
+          if [ -z "$manifest" ]; then
+            echo "::error::cargo metadata lists no package named goetia"
+            exit 1
+          fi
           if [ "$manifest" != "$VERSION" ]; then
             echo "::error::Cargo.toml declares $manifest but this dispatch asked for $VERSION"
             exit 1
