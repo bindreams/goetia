@@ -60,7 +60,8 @@ struct tally {
     long eperm_passes;
     long eperm_status[8];
     long ended_zombie, ended_gone, never_identified, kill_eperm_passes;
-    int samples;
+    int samples, guard_samples;
+    long guard_hits, esrch_zombie;
 };
 
 static void bump(long *a, int e) { a[(e >= 0 && e < MAXERR) ? e : MAXERR - 1]++; }
@@ -95,7 +96,7 @@ static void pass(int mode, struct tally *t) {
     char run[256];
     size_t rl = 0;
     int last = -2;
-    long eperm_streak = 0, iters = 0;
+    long iters = 0;
     run[0] = 0;
     for (;;) {
         audit_token_t tok = make_token(p, ver);
@@ -113,7 +114,11 @@ static void pass(int mode, struct tally *t) {
             break;
         }
         if (st0 < 0 && e != 0 && e != EPERM && e != ESRCH) break;
-        if (++iters > 5000000) { t->ended_gone += 1000000; break; } /* probe guard */
+        if (++iters > 100000) { /* probe guard */
+            t->guard_hits++;
+            if (t->guard_samples++ < 5) printf("  GUARD (mode %d): st=%d e=%d k=%d answers: %s\n", mode, st0, e, k, run);
+            break;
+        }
         bump(t->killz, k);
         if (e != last && rl + 12 < sizeof run) {
             rl += (size_t)snprintf(run + rl, sizeof run - rl, "%d,", e);
@@ -136,7 +141,7 @@ static void pass(int mode, struct tally *t) {
             if (r == 0 && now.p_uniqueid == unique) {
                 if ((uint32_t)now.p_idversion != ver) { ver = (uint32_t)now.p_idversion; continue; }
                 /* same unique id, same version, and the send was refused: ESRCH is a zombie. */
-                if (++eperm_streak > 5000000) { t->ended_gone += 1000000; break; } /* probe guard */
+                if (e == ESRCH) { t->esrch_zombie++; break; }
                 continue; /* EPERM: keep asking until it resolves */
             }
             t->ended_gone++;
@@ -150,8 +155,8 @@ static void pass(int mode, struct tally *t) {
 }
 
 static void report(int mode, struct tally *t) {
-    printf("mode %d: passes=%ld never_identified=%ld ended_zombie=%ld ended_gone=%ld\n", mode, t->passes,
-           t->never_identified, t->ended_zombie, t->ended_gone);
+    printf("mode %d: passes=%ld never_identified=%ld ended_zombie=%ld esrch_zombie=%ld ended_gone=%ld guard_hits=%ld\n",
+           mode, t->passes, t->never_identified, t->ended_zombie, t->esrch_zombie, t->ended_gone, t->guard_hits);
     for (int e = 0; e < MAXERR; e++) {
         if (t->token[e]) printf("  token-signal answer %3d (%s): %ld\n", e, e ? strerror(e) : "ok", t->token[e]);
     }

@@ -19,7 +19,7 @@ jobs:
         run: cc -O1 -Wall -o kill-eperm .github/probe/kill-eperm.c
 
       - name: Probe C, root
-        run: sudo ./kill-eperm 20000 20000 3000 8000
+        run: sudo ./kill-eperm 10000 10000 1500 4000
 
       - name: Probe C, unprivileged
-        run: ./kill-eperm 20000 20000 3000 8000
+        run: ./kill-eperm 10000 10000 1500 4000
