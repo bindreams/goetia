@@ -103,6 +103,19 @@ pub(crate) fn run_unwatched(id: &Id) -> Error {
     }
 }
 
+/// The retry of a `run` of `id` started `pid`, which was not held: the launch `debug` held was taken and
+/// ended unwatched, and a launch after a pending hold is held, so a second slipped-in run cannot be what
+/// `kickstart -p` named. It is not followed; the run is unrecorded, as one that ended unwatched is.
+pub(crate) fn run_unfollowed(id: &Id, pid: u32) -> Error {
+    Error::Step {
+        what: format!(
+            "the launch `launchctl debug` held for this run of `{id}` was taken and ended before goetia could \
+             watch it, and the start goetia made after it launched process {pid}, which goetia does not follow"
+        ),
+        source: Box::new(run_unwatched(id)),
+    }
+}
+
 /// The held launch of `id` was gone by the time goetia could resume it.
 pub(crate) fn run_unresumed(id: &Id) -> Error {
     Error::RunUnrecorded {

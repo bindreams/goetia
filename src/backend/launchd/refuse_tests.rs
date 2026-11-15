@@ -107,6 +107,26 @@ fn a_run_that_ended_before_it_could_be_watched_or_resumed_says_which() {
     );
 }
 
+/// The retry's launch was neither held nor followable: the run is unrecorded, as a launch that ended
+/// before it could be watched is, and the pid that was started stays named.
+#[skuld::test]
+fn a_launch_goetia_started_and_does_not_follow_is_unrecorded_and_names_its_pid() {
+    let unfollowed = run_unfollowed(&frpc(), 4242);
+
+    assert_eq!(
+        unfollowed.to_string(),
+        "the launch `launchctl debug` held for this run of `frpc` was taken and ended before goetia could \
+         watch it, and the start goetia made after it launched process 4242, which goetia does not follow"
+    );
+    assert!(unfollowed.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
+    assert!(
+        matches!(&unfollowed, Error::Step { source, .. }
+            if matches!(&**source, Error::RunUnrecorded { id, reason }
+                if id == "frpc" && reason == "it was ended before goetia could watch it (a `stop`, a `kill`, or the system)")),
+        "{unfollowed:?}"
+    );
+}
+
 /// A wait that lost the run leaves it possibly going: indeterminate, never a plain failure.
 #[skuld::test]
 fn a_run_goetia_lost_track_of_is_in_doubt() {

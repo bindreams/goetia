@@ -10,13 +10,15 @@
 //!
 //! A scheduled run can slip in between `run`'s read of the state and its `debug`: `kickstart -p` then
 //! names the run already in flight, and the hold stays pending. `run` waits for that run to end, then
-//! starts again, arming `debug` again (a pending hold answers "already in progress", and is the one the
-//! next launch consumes).
+//! starts again without `debug`: the pending hold is the one the next launch takes, and arming it again
+//! after a timer fire took it would leave a second hold for nobody to resume. The retry follows a launch
+//! that is held. One that ended, or is alive and not held, is [`run_unfollowed`]: after a pending hold the
+//! next launch is held, so a second slipped-in run cannot be what `kickstart -p` names.
 //!
-//! From the first `debug` to the `SIGCONT`, SIGINT, SIGTERM and SIGHUP are held back ([`Deferred`]):
-//! ending goetia there would leave a launch held and stopped. So `run` cannot be interrupted by those three
-//! while it waits for a slipped-in run. A failure in that window carries [`stranded_hold`]: the hold, or
-//! the launch it holds, stays until a `stop`, a boot-out or a later `run` ends it.
+//! From the `debug` to the `SIGCONT`, SIGINT, SIGTERM and SIGHUP are held back ([`Deferred`]): ending
+//! goetia there would leave a launch held and stopped. So `run` cannot be interrupted by those three while
+//! it waits for a slipped-in run. A failure in that window carries [`stranded_hold`]: the hold, or the
+//! launch it holds, stays until a `stop`, a boot-out or a later `run` ends it.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -27,7 +29,7 @@ use super::watch::{Added, Registered, Watch};
 use super::{Kickstarted, Launchd, Plist, SignalOutcome, never_expires};
 use crate::backend::bounded::{Reservation, Role};
 use crate::backend::launchd::generate::run_marker;
-use crate::backend::launchd::refuse::{run_lost, run_unresumed, run_unwatched, stranded_hold};
+use crate::backend::launchd::refuse::{run_lost, run_unfollowed, run_unresumed, run_unwatched, stranded_hold};
 use crate::backend::launchd::state::{Evidence, Launch, exit_of, launch_of};
 use crate::backend::{OutputSource, RunHandle};
 use crate::error::{Error, Result};
@@ -64,23 +66,27 @@ impl RunHandle for Run {
     }
 }
 
-/// How one attempt to hold a launch ended.
-enum Attempt {
+/// What `kickstart -p` and `print` showed of the launch [`Launchd::started`] made.
+enum StartedOutcome {
     /// The launch of this pid is held and `print` shows it.
     Held(u32),
-    /// What `kickstart -p` named ended, or was a run already in flight that has now ended: hold again.
-    Again,
+    /// The pid `kickstart -p` named ended, or was a run already in flight that has now ended.
+    Ended(u32),
+    /// The pid is a run already in flight, not held, and still alive after it was watched.
+    InFlight(u32, Registered),
 }
 
 impl Launchd {
     /// Holds the job's next launch, starts it, and follows its pid to the end; see the module doc.
     ///
     /// In this order: the kqueue is made, so that failing to make it holds nothing; interrupts are
-    /// deferred; the job is loaded; then attempts, each re-arming `debug`, until a launch is held; the
-    /// pid is watched and `print` confirms it is still the job's held launch; the log's length is read;
-    /// `SIGCONT` resumes it. The first attempt draws on `reservation` (made for [`Step::Start`], which the
-    /// longest path stays within), each later one on one of its own, so that no pass draws what was never
-    /// reserved. A failure after `debug` succeeded is [`stranded_hold`].
+    /// deferred; the job is loaded; `debug` holds the next launch, once; the launch is started, and if it
+    /// is a run already in flight, waited for and started again, once; the pid is watched and `print`
+    /// confirms it is still the job's held launch; the log's length is read; `SIGCONT` resumes it. The
+    /// first start draws on `reservation` (made for [`Step::Start`], which the longest path stays within),
+    /// the retry on one of its own: it makes at most `kickstart -p`, two `print`s, the confirming `print`
+    /// and the `SIGCONT`, 5 calls and 2 requests. A failure of the `debug` is its own error; any later
+    /// failure is [`stranded_hold`].
     pub(super) fn begin_task_run(
         &self,
         snapshot: Plist,
@@ -94,52 +100,34 @@ impl Launchd {
         // Held until this returns, which is after the `SIGCONT`.
         let _deferred = Deferred::begin()?;
         self.launchctl.load_job(id.as_str(), &path, reservation)?;
+        self.launchctl.debug_start_suspended(id.as_str(), reservation)?;
 
-        let mut armed = false;
-        let mut noted = false;
-        let mut later: Option<Reservation> = None;
-        let pid = loop {
-            let draws = later.as_mut().unwrap_or(&mut *reservation);
-            if let Attempt::Held(pid) = self.attempt(&id, &watch, notes, &mut noted, &mut armed, draws)? {
-                break pid;
+        let strand = |e: Error| stranded_hold(&id, e);
+        let mut retry: Option<Reservation> = None;
+        let pid = match self.started(&id, &watch, reservation).map_err(strand)? {
+            StartedOutcome::Held(pid) => pid,
+            missed => {
+                if let StartedOutcome::InFlight(_, registered) = missed {
+                    wait_for_slipped_in(&id, registered, notes).map_err(strand)?;
+                }
+                // The hold is pending, so a retry that cannot reserve is the stranded hold. The retry
+                // does not arm `debug`: the pending hold is the one the next launch takes, and so the
+                // launch that `kickstart -p` names now is held, or is a pid goetia does not follow.
+                let draws = retry.insert(flow::reserved(self, &id, &[Step::Start], Budget::Immediate).map_err(strand)?);
+                match self.started(&id, &watch, draws).map_err(strand)? {
+                    StartedOutcome::Held(pid) => pid,
+                    StartedOutcome::Ended(pid) | StartedOutcome::InFlight(pid, _) => {
+                        return Err(run_unfollowed(&id, pid));
+                    }
+                }
             }
-            // A hold is pending, so a pass that cannot reserve is the stranded hold.
-            later =
-                Some(flow::reserved(self, &id, &[Step::Start], Budget::Immediate).map_err(|e| stranded_hold(&id, e))?);
         };
-        let draws = later.as_mut().unwrap_or(reservation);
+        let draws = retry.as_mut().unwrap_or(reservation);
         self.resume(id, pid, &watch, logs, draws)
     }
 
-    /// One attempt: arms `debug`, starts the launch and reads what `print` shows of it. `armed` is
-    /// whether an earlier `debug` of this `run` succeeded, so that a hold may be pending; it is set here
-    /// once this one has.
-    fn attempt(
-        &self,
-        id: &Id,
-        watch: &Watch,
-        notes: &mut dyn Write,
-        noted: &mut bool,
-        armed: &mut bool,
-        reservation: &mut Reservation,
-    ) -> Result<Attempt> {
-        self.launchctl
-            .debug_start_suspended(id.as_str(), reservation)
-            .map_err(|e| if *armed { stranded_hold(id, e) } else { e })?;
-        *armed = true;
-        self.started(id, watch, notes, noted, reservation)
-            .map_err(|e| stranded_hold(id, e))
-    }
-
-    /// The part of an attempt after `debug` held the next launch: `kickstart -p`, then `print`.
-    fn started(
-        &self,
-        id: &Id,
-        watch: &Watch,
-        notes: &mut dyn Write,
-        noted: &mut bool,
-        reservation: &mut Reservation,
-    ) -> Result<Attempt> {
+    /// `kickstart -p`, then `print`: what the launch it names is.
+    fn started(&self, id: &Id, watch: &Watch, reservation: &mut Reservation) -> Result<StartedOutcome> {
         let name = id.as_str();
         let issuing = Budget::Unbounded.start();
         let Kickstarted::Confirmed(pid) =
@@ -157,11 +145,11 @@ impl Launchd {
             .launchctl
             .read_task_print(name, issuing, Role::Query, reservation)?;
         match launch_shown(&print, id, pid)? {
-            Launch::Held => Ok(Attempt::Held(pid)),
-            Launch::Ended => Ok(Attempt::Again),
+            Launch::Held => Ok(StartedOutcome::Held(pid)),
+            Launch::Ended => Ok(StartedOutcome::Ended(pid)),
             Launch::InFlight => {
                 let Added::Watching(registered) = watch.add(pid)? else {
-                    return Ok(Attempt::Again);
+                    return Ok(StartedOutcome::Ended(pid));
                 };
                 // A pid can be reused: wait only for the job's process that `print` still shows. A
                 // registration left by any other way out of here is deleted as it is dropped.
@@ -169,25 +157,14 @@ impl Launchd {
                     .launchctl
                     .read_task_print(name, issuing, Role::Query, reservation)?;
                 match launch_shown(&still, id, pid)? {
-                    Launch::InFlight => {
-                        if !*noted {
-                            let note = format!(
-                                "note: a scheduled run of `{id}` is in progress; waiting for it to end before \
-                                 starting this run\n"
-                            );
-                            output::show(notes, note.as_bytes())?;
-                            *noted = true;
-                        }
-                        never_expires(registered.wait(None)?);
-                        Ok(Attempt::Again)
-                    }
-                    Launch::Ended => Ok(Attempt::Again),
+                    Launch::InFlight => Ok(StartedOutcome::InFlight(pid, registered)),
+                    Launch::Ended => Ok(StartedOutcome::Ended(pid)),
                     // The first read was early: launchd can name a new launch's pid before it shows
                     // `started suspended = 1` for it (seen on CI, a `run` begun the moment another
                     // returned), and a launch that is not held cannot become so. It is the held one.
                     Launch::Held => {
                         drop(registered);
-                        Ok(Attempt::Held(pid))
+                        Ok(StartedOutcome::Held(pid))
                     }
                     Launch::Unreadable => Err(unestablished(
                         id,
@@ -251,6 +228,15 @@ impl Launchd {
             SignalOutcome::NoProcess => Err(run_unresumed(&id)),
         }
     }
+}
+
+/// Says a scheduled run of `id` is in progress, then waits for it to end: `registered` is its watch.
+fn wait_for_slipped_in(id: &Id, registered: Registered, notes: &mut dyn Write) -> Result<()> {
+    let note =
+        format!("note: a scheduled run of `{id}` is in progress; waiting for it to end before starting this run\n");
+    output::show(notes, note.as_bytes())?;
+    never_expires(registered.wait(None)?);
+    Ok(())
 }
 
 /// What `print` shows of the launch `pid`, which `kickstart -p` named. A read that failed or was not

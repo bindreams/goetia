@@ -871,8 +871,8 @@ enum SignalOutcome {
 enum DebugOutcome {
     /// The next launch of the job is now held.
     Held,
-    /// A hold was already pending: another `run`'s, a stranded one, or one an earlier attempt of this
-    /// `run` armed. The next launch is held all the same.
+    /// A hold was already pending: another `run`'s, or a stranded one. The next launch is held all the
+    /// same.
     AlreadyHeld,
 }
 
@@ -1240,11 +1240,11 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 ///
 /// `install` and `uninstall` have a service's count and a task's (see `write`); [`needs`] takes the
 /// larger, since a reservation is made before the kind is known. A task's `run` draws within `start`'s
-/// count: its first attempt is the load (a kept read and wait, the `bootstrap`, one more read), the
+/// count: its first pass is the load (a kept read and wait, the `bootstrap`, one more read), the
 /// `debug`, the `kickstart -p`, the `print`, the confirming `print` and the `SIGCONT`, 8 calls and 4
 /// reapers (9 calls where the first `print` read the launch as in flight and the next shows it held:
-/// one more confirming `print`); each later attempt makes its own reservation and draws at most the last
-/// six of these.
+/// one more confirming `print`); its one retry, which has no `debug`, makes its own reservation and
+/// draws at most the last five of these, 2 reapers.
 const SERVICE_INSTALL_REQUESTS: usize = 1;
 /// A task's longest `install`, an update of an armed task whose job changes: the timer's `bootout`,
 /// the job's, and both `bootstrap`s.

@@ -16,6 +16,7 @@ use crate::backend::Backend as _;
 use crate::backend::bounded;
 use crate::backend::client::ClientError;
 use crate::backend::client::fake::{Entry, Fake, exited, fail, reply};
+use crate::cli::ExitCode;
 use crate::spec::{DaemonSpec, TaskFields, TaskSpec};
 use crate::testing::base_fields;
 
@@ -191,6 +192,23 @@ fn assert_stranded(e: &Error, what: &str) {
     );
 }
 
+fn assert_unfollowed(e: &Error, pid: u32) {
+    assert!(
+        matches!(e, Error::Step { what, source }
+            if *what == format!(
+                "the launch `launchctl debug` held for this run of `{ID}` was taken and ended before goetia \
+                 could watch it, and the start goetia made after it launched process {pid}, which goetia \
+                 does not follow"
+            ) && matches!(**source, Error::RunUnrecorded { .. })),
+        "expected the unfollowed launch of {pid}, got {e:?}"
+    );
+    assert_eq!(
+        ExitCode::of(e),
+        ExitCode::Indeterminate,
+        "exit 4, as `RunUnrecorded` is"
+    );
+}
+
 // The order of a run ==================================================================================================
 
 /// `debug` arms the hold before `kickstart -p` starts the launch; the pid is watched before `SIGCONT` lets
@@ -311,11 +329,11 @@ fn debug_tells_a_new_hold_from_a_pending_one() {
 // A scheduled run that slips in =======================================================================================
 
 /// `kickstart -p` names the scheduled run already in flight and the hold stays pending: `run` says so
-/// once, waits for that run, and starts again, arming `debug` again (37, as the first attempt's hold is
-/// still pending). One kqueue serves both runs, and the offset is still the one taken while the second
+/// once, waits for that run, and starts again with no second `debug`: the pending hold is the one the
+/// next launch takes. One kqueue serves both runs, and the offset is still the one taken while the second
 /// launch was held.
 #[skuld::test]
-fn a_slipped_in_run_is_waited_for_then_a_fresh_attempt_re_arms_debug() {
+fn a_slipped_in_run_is_waited_for_then_started_again_without_debug() {
     let dir = tempfile::tempdir().expect("tempdir");
     let log = dir.path().join("task.log");
     let (mut scheduled, ours) = (Held::new(0), Held::new(0));
@@ -331,7 +349,6 @@ fn a_slipped_in_run_is_waited_for_then_a_fresh_attempt_re_arms_debug() {
             scheduled_run_writes();
             scheduled.finish();
         }),
-        debug_exiting(37),
         kickstart(b),
         print(&held(b)),
         print(&held(b)),
@@ -354,7 +371,6 @@ fn a_slipped_in_run_is_waited_for_then_a_fresh_attempt_re_arms_debug() {
             "kickstart",
             "print",
             "print",
-            "debug",
             "kickstart",
             "print",
             "print",
@@ -389,7 +405,6 @@ fn a_slipped_in_run_that_ended_before_it_could_be_watched_retries() {
         debug(),
         kickstart(a),
         print(&in_flight(a)),
-        debug_exiting(37),
         kickstart(b),
         print(&held(b)),
         print(&held(b)),
@@ -405,9 +420,9 @@ fn a_slipped_in_run_that_ended_before_it_could_be_watched_retries() {
 }
 
 /// The pid `kickstart -p` named is not the job's any more by the time `print` is read: it ended, and the
-/// next attempt starts. Nothing is signalled for it.
+/// next attempt starts, with no second `debug`. Nothing is signalled for it.
 #[skuld::test]
-fn an_attempt_whose_pid_is_gone_by_the_print_retries() {
+fn an_attempt_whose_pid_is_gone_by_the_print_retries_without_debug() {
     let ours = Held::new(0);
     let b = ours.pid();
     let fake = Fake::new([
@@ -415,7 +430,6 @@ fn an_attempt_whose_pid_is_gone_by_the_print_retries() {
         debug(),
         kickstart(99_999),
         print(IDLE),
-        debug(),
         kickstart(b),
         print(&held(b)),
         print(&held(b)),
@@ -428,7 +442,111 @@ fn an_attempt_whose_pid_is_gone_by_the_print_retries() {
     run.unwrap_or_else(|e| panic!("begin_run failed: {e}"));
     fake.assert_spent("the second attempt followed the first");
     assert_eq!(notes, "", "an ended launch is not a slipped-in run");
+    assert_eq!(calls_of(&fake, "debug").len(), 1, "the one pending hold is the retry's");
     assert_eq!(calls_of(&fake, "kill").len(), 1, "only the held launch is resumed");
+}
+
+/// The timer fired between the scheduled run's end and the retry: the fire's launch took the pending hold
+/// and `kickstart -p` over it names its pid, which `print` shows held. It is followed as the run's own, and
+/// no second `debug` arms a hold nobody would resume.
+#[skuld::test]
+fn a_retry_whose_launch_is_held_is_followed() {
+    let fire = Held::new(0);
+    let f = fire.pid();
+    let fake = Fake::new([
+        print(IDLE),
+        debug(),
+        kickstart(99_999),
+        print(IDLE),
+        kickstart(f),
+        print(&held(f)),
+        print(&held(f)),
+        sigcont_ending(fire),
+    ]);
+    let tree = Tree::new();
+
+    let (result, notes) = begin(&fake, snapshot(&tree, None));
+
+    let run = result.unwrap_or_else(|e| panic!("begin_run failed: {e}"));
+    fake.assert_spent("the retry followed the fire's launch");
+    assert_eq!(notes, "");
+    assert_eq!(calls_of(&fake, "debug").len(), 1, "the pending hold is the one hold");
+    assert_eq!(run.wait().expect("the exit"), Exit::Code(0));
+}
+
+/// The retry's `kickstart -p` names a launch `print` does not show held or alive: the pending hold is the
+/// next launch's, so a launch that is not held cannot be the retry's, and the retry does not start a
+/// third. The error names the process goetia started and does not follow.
+#[skuld::test]
+fn a_retry_whose_launch_reads_ended_is_run_unfollowed() {
+    let fake = Fake::new([
+        print(IDLE),
+        debug(),
+        kickstart(99_999),
+        print(IDLE),
+        kickstart(99_998),
+        print(IDLE),
+    ]);
+    let tree = Tree::new();
+
+    let (result, notes) = begin(&fake, snapshot(&tree, None));
+
+    let e = result.err().expect("the retry's launch ended unwatched");
+    assert_unfollowed(&e, 99_998);
+    fake.assert_spent("nothing was sent after the retry's read");
+    assert_eq!(notes, "");
+    assert!(calls_of(&fake, "kill").is_empty(), "nothing is resumed");
+}
+
+/// The retry's launch is not held and was confirmed alive: it is not followed, and nothing is waited for.
+/// The run it names ends while the confirming `print` is read, so a wait would return, and the note it
+/// writes would show.
+#[skuld::test]
+fn a_retry_whose_launch_is_confirmed_in_flight_is_run_unfollowed_and_not_waited_for() {
+    let mut slipped = Held::new(0);
+    let c = slipped.pid();
+    let fake = Fake::new([
+        print(IDLE),
+        debug(),
+        kickstart(99_999),
+        print(IDLE),
+        kickstart(c),
+        print(&in_flight(c)),
+        print(&in_flight(c)).then(move || {
+            slipped.finish();
+        }),
+    ]);
+    let tree = Tree::new();
+
+    let (result, notes) = begin(&fake, snapshot(&tree, None));
+
+    let e = result.err().expect("the retry's launch is not followed");
+    assert_unfollowed(&e, c);
+    fake.assert_spent("nothing was sent after the confirming read");
+    assert_eq!(notes, "", "no note: nothing was waited for");
+}
+
+/// A failure after the one `debug` that happens on the retry is the stranded hold, as on the first
+/// attempt: the hold is pending, and nothing resumed.
+#[skuld::test]
+fn a_kickstart_failure_on_the_retry_names_the_stranded_hold() {
+    let fake = Fake::new([
+        print(IDLE),
+        debug(),
+        kickstart(99_999),
+        print(IDLE),
+        reply(&["kickstart", "-p", &target()], exited(1, "", "Could not kickstart\n")),
+    ]);
+    let tree = Tree::new();
+
+    let e = failed(&fake, snapshot(&tree, None));
+
+    assert_stranded(&e, "a retry's kickstart that failed");
+    assert!(
+        matches!(&e, Error::Step { source, .. } if matches!(**source, Error::Command { .. })),
+        "the cause stays under it: {e:?}"
+    );
+    fake.assert_spent("nothing was sent after the failure");
 }
 
 // Reservations ========================================================================================================
@@ -445,7 +563,6 @@ fn a_later_pass_makes_its_own_reservation_and_the_run_draws_no_spare_it_never_re
         debug(),
         kickstart(99_999),
         print(IDLE),
-        debug(),
         kickstart(b),
         print(&held(b)),
         print(&held(b)),
@@ -851,7 +968,6 @@ fn a_registration_left_by_an_ended_slipped_in_run_is_deleted_before_the_next_att
         print(IDLE).then(move || {
             scheduled.finish();
         }),
-        debug_exiting(37),
         kickstart(b),
         print(&held(b)),
         print(&held(b)),
