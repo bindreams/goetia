@@ -57,7 +57,7 @@ $submitted = @"
     </CalendarTrigger>
     <TimeTrigger><StartBoundary>2030-06-15T12:00:00</StartBoundary></TimeTrigger>
   </Triggers>
-  <Principals><Principal id="Author"><UserId>S-1-5-19</UserId><LogonType>ServiceAccount</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Principals><Principal id="Author"><UserId>S-1-5-19</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>

@@ -102,7 +102,9 @@ function New-TaskXml {
         [string]$Description = 'goetia probe',
         [string]$RegistrationExtra = ''
     )
-    $logon = if ($P.Kind -eq 'user') { 'Password' } else { 'ServiceAccount' }
+    # `ServiceAccount` is not a value of the XML LogonType (measured: (8,35):LogonType:ServiceAccount); a service
+    # account's principal names the account and no LogonType.
+    $logon = if ($P.Kind -eq 'user') { '<LogonType>Password</LogonType>' } else { '' }
     $trig = if ($Triggers) { "<Triggers>$Triggers</Triggers>" } else { '' }
     $args_ = if ($Arguments) { "<Arguments>$(Esc $Arguments)</Arguments>" } else { '' }
     $prio = if ($Priority -ge 0) { "<Priority>$Priority</Priority>" } else { '' }
@@ -115,7 +117,7 @@ function New-TaskXml {
   <Principals>
     <Principal id="Author">
       <UserId>$(Esc $P.UserId)</UserId>
-      <LogonType>$logon</LogonType>
+      $logon
       <RunLevel>$RunLevel</RunLevel>
     </Principal>
   </Principals>
