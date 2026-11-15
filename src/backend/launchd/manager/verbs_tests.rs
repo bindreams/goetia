@@ -303,6 +303,36 @@ fn a_start_after_an_unwaited_stop_is_not_sent_when_the_read_failed() {
     }
 }
 
+/// A `print` with no pid and a state that is neither idle nor a start launchd has accepted concludes
+/// nothing, as it does for `stop`: no start is sent, and the error is `stop`'s, with what launchd showed.
+#[skuld::test]
+fn a_start_after_an_unwaited_stop_is_not_sent_over_any_read_stop_calls_unconfirmed() {
+    for (what, read, shown) in unconfirmed_reads() {
+        let tree = Tree::new();
+        let fake = Fake::new([read]);
+        let mgr = launchd_over(fake.clone());
+
+        let e = mgr
+            .request_start_after_stop(
+                task_snapshot(&tree, false),
+                &mut reserved(&mgr, Step::RequestStartAfterStop),
+            )
+            .expect_err(what);
+
+        assert!(
+            matches!(&e, Error::StopUnconfirmed { id, .. } if id == ID),
+            "{what}: {e:?}"
+        );
+        assert_eq!(e.to_string(), format!("`{ID}` may not have stopped: {shown}"), "{what}");
+        assert!(e.is_indeterminate(), "{what}: the exit code is 4");
+        fake.assert_spent("the one read");
+        assert!(
+            calls_of(&fake, "kickstart").is_empty() && calls_of(&fake, "bootstrap").is_empty(),
+            "{what}: nothing is sent"
+        );
+    }
+}
+
 // stop ================================================================================================================
 
 /// The pid `print` showed is watched, confirmed, signalled with SIGTERM by label, and waited for: the
@@ -346,11 +376,9 @@ fn stop_of_an_idle_task_is_ok() {
     }
 }
 
-/// No process and a state that is not idle, or a read that is not whole, do not establish that the job
-/// stopped: `StopUnconfirmed`, saying what launchd showed. `xpcproxy` without a pid has never been seen
-/// and is not taken for a start.
-#[skuld::test]
-fn stop_with_no_process_and_a_state_that_is_not_idle_is_unconfirmed() {
+/// Every `print` with no pid that is neither idle nor a start launchd has accepted, as the read and as
+/// the words `StopUnconfirmed` says of it.
+fn unconfirmed_reads() -> Vec<(&'static str, Entry, &'static str)> {
     let cut = Finished::Exited {
         status: ExitStatus::from_raw(0),
         capture: Capture {
@@ -360,7 +388,7 @@ fn stop_with_no_process_and_a_state_that_is_not_idle_is_unconfirmed() {
         },
     };
     let failed = "reading its job from launchd failed, so whether a process remains is not established";
-    let cases = [
+    vec![
         (
             "a state goetia does not know",
             print("\tstate = someday-new-apple-state\n"),
@@ -390,8 +418,15 @@ fn stop_with_no_process_and_a_state_that_is_not_idle_is_unconfirmed() {
             failed,
         ),
         ("a print that was not whole", reply(&["print", &target()], cut), failed),
-    ];
-    for (what, read, shown) in cases {
+    ]
+}
+
+/// No process and a state that is not idle, or a read that is not whole, do not establish that the job
+/// stopped: `StopUnconfirmed`, saying what launchd showed. `xpcproxy` without a pid has never been seen
+/// and is not taken for a start.
+#[skuld::test]
+fn stop_with_no_process_and_a_state_that_is_not_idle_is_unconfirmed() {
+    for (what, read, shown) in unconfirmed_reads() {
         let fake = Fake::new([read]);
 
         let e = stopping(&fake, Budget::DEFAULT).expect_err(what);

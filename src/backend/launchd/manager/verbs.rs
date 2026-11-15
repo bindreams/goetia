@@ -6,6 +6,7 @@
 //! run in flight, and any run that begins while it does, with SIGTERM by label, and returns when
 //! launchd shows no process.
 
+use super::task::TaskPrint;
 use super::watch::{Added, Watch};
 use super::{Launchd, Plist, SignalOutcome, UNLOAD_POLL, Until, never_expires};
 use crate::backend::bounded::{Reservation, Role};
@@ -26,6 +27,30 @@ enum Pass {
     /// found none for) or a job other than the one watched, and its view has to catch up. The pause is
     /// [`UNLOAD_POLL`], as for a wait on `print`: it spaces the reads and decides nothing.
     Behind,
+}
+
+/// What a `print` that shows no pid says of the job.
+pub(super) enum Quiet {
+    /// A start launchd has accepted and not yet forked: a run is coming.
+    Queued,
+    /// No process, and launchd holds no start (`not running`, `exited`, or a label it does not hold).
+    Idle,
+}
+
+/// `print`, which shows no pid, read as a verb that needs to know no process is left reads it. Anything
+/// else with no pid, or a read that was not whole, does not establish that none is left:
+/// [`Error::StopUnconfirmed`], which `stop` and a start sent right after an unwaited stop share.
+pub(super) fn quiet(id: &Id, print: &TaskPrint) -> Result<Quiet> {
+    if print.queued {
+        return Ok(Quiet::Queued);
+    }
+    match print.state {
+        State::Idle => Ok(Quiet::Idle),
+        _ => Err(Error::StopUnconfirmed {
+            id: id.to_string(),
+            shown: print.shown.describe(print.state),
+        }),
+    }
 }
 
 impl Launchd {
@@ -97,13 +122,12 @@ impl Launchd {
         let print = self
             .launchctl
             .read_task_print(name, Budget::Unbounded.start(), Role::Query, reservation)?;
-        if print.queued || print.pid.is_some() {
-            if print.queued {
-                self.await_queued_start(name, reservation)?;
-            }
-            if self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
-                return Ok(());
-            }
+        if print.queued {
+            self.await_queued_start(name, reservation)?;
+        }
+        let a_run_may_have_forked = print.queued || print.pid.is_some();
+        if a_run_may_have_forked && self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
+            return Ok(());
         }
         Err(Error::NotRunning { id: id.to_string() })
     }
@@ -138,18 +162,12 @@ impl Launchd {
             .launchctl
             .read_task_print(name, issuing, Role::Query, reservation)?;
         let Some(pid) = print.pid else {
-            if print.queued {
-                self.await_queued_start(name, reservation)?;
-                return Ok(Pass::Again);
-            }
-            // Idle: no process, and launchd holds no start. Anything else with no pid, or a read that
-            // was not whole, does not establish that none is left, so the stop is not reported done.
-            return match print.state {
-                State::Idle => Ok(Pass::Done),
-                _ => Err(Error::StopUnconfirmed {
-                    id: id.to_string(),
-                    shown: print.shown.describe(print.state),
-                }),
+            return match quiet(id, &print)? {
+                Quiet::Queued => {
+                    self.await_queued_start(name, reservation)?;
+                    Ok(Pass::Again)
+                }
+                Quiet::Idle => Ok(Pass::Done),
             };
         };
         // Dropped on any way out of this pass, which deletes the registration and drains the queue: a
