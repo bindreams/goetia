@@ -1365,7 +1365,7 @@ stderr:
     );
     assert_eq!(
         out,
-        "frpc: kill delivered
+        "frpc: process ended, recorded by the manager
 "
     );
     assert_eq!(fake.status(&spec.common().id).unwrap().common().state, State::Failed);
@@ -1460,7 +1460,7 @@ stderr:
     );
     assert_eq!(
         out,
-        "alpha: kill delivered
+        "alpha: process ended, recorded by the manager
 "
     );
     assert!(err.contains("beta"), "{err}");
