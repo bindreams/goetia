@@ -111,14 +111,10 @@ impl Left {
     }
 
     /// End the child and its contained tree ([`end`]). One that already exited is not an error, nor
-    /// is one that refuses the kill by exiting. One that cannot be ended is still handed to its
-    /// [`Reaper`], which reaps it once it exits, and stderr says it could not be killed.
+    /// is one that refuses the kill by exiting. One whose root cannot be killed is handed to its
+    /// [`Reaper`] as it is, its tree not torn down, and stderr says it could not be killed.
     ///
-    /// A kill refused with `EPERM` on macOS blocks its caller for up to [`EXIT_AFTER_REFUSED_KILL`] plus
-    /// one re-read while the child's exit is awaited. Such a kill can happen here and in
-    /// [`wait_bounded`], when a query's or an announced request's deadline expires, so a caller that
-    /// runs a bounded query and then this (launchd's `end_if_held` runs a `print` first) can overrun
-    /// its deadline by that twice, once for each refused kill.
+    /// How long this can block: see [`EXIT_AFTER_REFUSED_KILL`].
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn kill(mut self) {
         self.settle(Fate::Kill);
@@ -351,12 +347,7 @@ pub(crate) struct Lost {
 /// its [`Reaper`] unless the caller kills it. Nothing here makes a thread or a file: [`spawn`] made
 /// them all.
 ///
-/// Returns at the deadline, except when the kill an expiry sends is refused with `EPERM` on macOS:
-/// then the call waits for the child's exit for up to [`EXIT_AFTER_REFUSED_KILL`] plus one re-read more.
-/// That is one of two ways a call runs past its deadline: [`Left::kill`] is the other.
-///
-/// The reap that follows a sent or a refused kill is not bounded: it can block while a tracer that
-/// is not goetia holds the child's zombie.
+/// When it can return later than the deadline: see [`EXIT_AFTER_REFUSED_KILL`].
 pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, Lost> {
     let Spawned {
         child,
@@ -419,7 +410,7 @@ fn waited_out(
             })));
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
-            // `Ok` says the root is dead or has exited, so it is reaped here as after a sent kill.
+            // `Ok`: the root was sent SIGKILL, or has exited; either way the reap below waits for it.
             end(&child, refused_for)?;
             let reaped = child.wait()?;
             match expiry_disposition(reaped) {
@@ -445,8 +436,14 @@ fn waited_out(
 /// How long a child whose kill was refused with `EPERM` is given to be seen exited (macOS). A
 /// failure bound on another process, not a wait for the child to do anything: a child that refused
 /// the kill by exiting is seen within one re-read, and one still there after refusing it for another
-/// reason never will be. Only a refused kill can run a bounded call past its deadline
-/// ([`wait_bounded`], [`Left::kill`]), by this plus one re-read for each refused kill.
+/// reason never will be.
+///
+/// What runs a bounded call ([`wait_bounded`], [`Left::kill`]) past its deadline:
+/// - each kill refused with `EPERM` (macOS), by up to this plus one re-read. launchd's `end_if_held`
+///   can meet two, a `print` query's and its [`Left::kill`];
+/// - the reap after a kill, sent or refused, which is not bounded: it waits for as long as the root
+///   takes to die once signalled (a root in uninterruptible sleep) or to be released (a tracer that
+///   is not goetia holding its zombie).
 const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 
 /// End `child`: its root ([`kill_root`]), then, best-effort, its tree. The one order, for every
@@ -475,8 +472,8 @@ fn end_left(child: &cosca::Child, bound: Duration) -> Option<String> {
     })
 }
 
-/// Kill the root of `child`, the one kill an expiry makes. `Ok` says the root is dead or has exited,
-/// and has not been reaped, so it still pins its pid.
+/// Kill the root of `child`, the one kill an expiry makes. `Ok` says SIGKILL was sent to the root or
+/// the root has exited; it has not been reaped, so it still pins its pid.
 ///
 /// On macOS a child that is exiting can refuse the kill with `EPERM` (a send by audit token answers
 /// it in that window, before it answers `ESRCH`). Only `EPERM` is waited on, for `bound`
