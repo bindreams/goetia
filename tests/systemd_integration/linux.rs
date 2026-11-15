@@ -558,7 +558,7 @@ fn a_start_of_a_unit_at_its_start_limit_fails_and_says_so(#[fixture(systemd_grou
 
     let e = loop {
         match mgr.start(&id, Budget::DEFAULT) {
-            Ok(()) => mgr.kill(&id).expect("kill the running daemon"),
+            Ok(_) => mgr.kill(&id).expect("kill the running daemon"),
             Err(e) => break e,
         }
     };
