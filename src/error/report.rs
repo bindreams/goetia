@@ -98,9 +98,7 @@ impl fmt::Write for Sink<'_> {
 /// command's stderr, as [`Error::Command`]'s own `Display` leaves it out: how an error that sits
 /// inside another's sentence is written to `Display`.
 ///
-/// Not escaped: the text lands in an error's `Display`, which the sink that prints it escapes. The
-/// report does not print a [`Sentence`] through this, but writes the embedded error
-/// itself (see [`write_chain`]), so its remedies print once, last.
+/// Not escaped: error reports escape at the sink; log lines and stderr warnings print it raw.
 pub(crate) struct Chain<'a>(pub(crate) &'a (dyn std::error::Error + 'static));
 
 impl fmt::Display for Chain<'_> {

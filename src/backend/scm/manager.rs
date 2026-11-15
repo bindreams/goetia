@@ -132,6 +132,7 @@ use crate::backend::scm::shim::sweep::{
     ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
 use crate::backend::scm::wide::{units_until_nul, wide_null_cut};
+use crate::backend::scm::win32::winapi_io;
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Unnamed, WriteOutcome,
 };
@@ -1874,20 +1875,9 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
     )
 }
 
-/// A `windows_service` failure as an [`Error::Os`], shared with [`service_undetermined`] so one
-/// failure cannot be described two ways depending on which class it lands in.
-///
-/// `windows_service::Error`'s own `Display` for its `Winapi` variant is the
-/// literal string `"IO error in winapi call"` — it does not include the
-/// wrapped `io::Error`'s message at all (verified: every error surfaced
-/// through `to_error` read that and nothing else, useless for diagnosing an
-/// actual Win32 failure). Unwrap to the inner `io::Error` first, whose
-/// `Display` does carry `FormatMessage`'s real text.
+/// The OS error is the source, where [`Error::raw_os_error`] finds it (see [`winapi_io`]).
 fn to_error(context: &str, e: windows_service::Error) -> Error {
-    match e {
-        windows_service::Error::Winapi(io_err) => Error::os(context, io_err),
-        other => Error::os(context, other),
-    }
+    Error::os(context, winapi_io(e))
 }
 
 // undetermined ========================================================================================================

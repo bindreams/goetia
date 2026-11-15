@@ -174,7 +174,22 @@ all fire at minute 0. As in Vixie cron, when day-of-month or day-of-week
 starts with `*` both must match; otherwise either may, and a field starting
 with `H` counts as restricted. A schedule that starts with `*` must be quoted in
 YAML: `schedule: "*/15 * * * *"`. A task without a `schedule` is started only by
-hand. No backend installs a task yet: each refuses one.
+hand. Tasks are installed by systemd and launchd; Windows refuses them for now.
+
+A schedule is read in the machine's local time zone, and each backend does its
+own thing where daylight saving time changes the clock. A time that does not
+exist (the clocks jump forward) and a time that happens twice (they go back):
+
+- **systemd** skips the missing time, and runs the repeated one once.
+- **launchd** runs a schedule that names its hour once, at the end of the gap;
+  an hourly or every-minute schedule skips the missing hour. A repeated time
+  is read per entry launchd is given: an entry that names a date (a day, or a
+  month and a day) runs at the first pass only, and one that names no date, or
+  a weekday, runs at both. So `30 1 * * *` runs twice, and `30 1 15 * *` or
+  `30 1 * 11 *` (which names each day of November) once.
+
+`next-run` in `goetia daemon status` follows the backend: on launchd, which
+reports none, goetia computes it by these rules from the entries it gave launchd.
 
 `-f` takes a manifest file, or a directory holding `goetia.yaml`. Several
 daemons are several manifests, each installed with its own

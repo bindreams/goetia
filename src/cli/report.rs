@@ -30,7 +30,7 @@ use std::io::Write;
 
 use super::ExitCode;
 use super::support::{InstalledIndex, print_line, state_str};
-use crate::error::{Error, Reason, Sink};
+use crate::error::{Chain, Error, Reason, Sink};
 use crate::manager::Status;
 
 // Wire format =========================================================================================================
@@ -370,7 +370,7 @@ pub(crate) fn emit(report: &Report, out: &mut dyn Write, err: &mut dyn Write) ->
         Ok(()) => exit_code(report),
         Err(e) => {
             print_line(err, Some("error"), None, |sink| {
-                write!(sink, "failed to write the --json document to stdout: {e}")
+                write!(sink, "failed to write the --json document to stdout: {}", Chain(&e))
             });
             ExitCode::Error
         }

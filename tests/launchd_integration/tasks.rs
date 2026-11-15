@@ -75,7 +75,7 @@ impl Drop for StopOnDrop {
 }
 
 /// Kills and reaps a child process on drop.
-struct ChildGuard(Child);
+pub(crate) struct ChildGuard(pub(crate) Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {

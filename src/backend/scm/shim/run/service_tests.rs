@@ -14,7 +14,7 @@ use crate::backend::scm::exit_status::{
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec, TaskFields, TaskSpec};
 use crate::testing::{base_fields, service_fields};
 use cosca::Containment;
-use cosca::error::{ChildFate, Report};
+use cosca::error::ChildFate;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
 };
@@ -83,7 +83,7 @@ fn no_thread_failure() -> String {
 fn spawn_failure() -> String {
     format!(
         r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}"#,
-        cosca::error::Report::new(&not_found())
+        Chain(&not_found())
     )
 }
 
@@ -94,7 +94,7 @@ const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPower
 fn exited_tree_unkilled() -> String {
     format!(
         "terminating the process tree after the daemon ended failed: {}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
-        Report::new(&tree_kill_refused())
+        Chain(&tree_kill_refused())
     )
 }
 
@@ -237,7 +237,7 @@ fn a_spawn_error_that_may_have_left_the_daemon_running_is_the_incomplete_stop_re
         assert_eq!(launched.as_ref().err(), Some(&Reported::incomplete_stop()), "{fate:?}");
         let expected = format!(
             r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}; the daemon may still be running{NOT_RESTARTED}"#,
-            cosca::error::Report::new(&may_have_started(fate))
+            Chain(&may_have_started(fate))
         );
         assert_one_failure(&fake.take_failures(), ID, &expected);
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
@@ -458,7 +458,7 @@ fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", Report::new(&wait_failed_with_code(5))),
+        &format!("background wait on child: {}", Chain(&wait_failed_with_code(5))),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -479,7 +479,7 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", Report::new(&wait_failed())),
+        &format!("background wait on child: {}", Chain(&wait_failed())),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -513,7 +513,7 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
         &fake.take_failures(),
         ID,
         &[
-            format!("background wait on child: {}", Report::new(&wait_failed())),
+            format!("background wait on child: {}", Chain(&wait_failed())),
             tree_refused_failure(),
             fallback_refused_failure(),
         ],
@@ -679,7 +679,7 @@ fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", Report::new(&wait_failed_with_code(5))),
+        &format!("background wait on child: {}", Chain(&wait_failed_with_code(5))),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -831,7 +831,7 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("query child exit status: {}", Report::new(&wait_failed())),
+        &format!("query child exit status: {}", Chain(&wait_failed())),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -1288,6 +1288,62 @@ fn a_failed_stopped_report_says_scm_is_expected_to_read_a_crash() {
     ] {
         assert!(text.contains(part), "missing {part:?}: {text}");
     }
+}
+
+#[skuld::test]
+fn a_failed_dispatcher_connection_names_the_os_reason() {
+    let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+
+    let text = dispatcher_failure(e);
+
+    assert_eq!(
+        text,
+        format!(
+            "connect to the SCM dispatcher: {}",
+            std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
+        )
+    );
+}
+
+/// A cause that has a cause: `Chain` prints `context: cause`.
+fn chained() -> std::io::Error {
+    crate::error::within("the context", std::io::Error::other("the cause"))
+}
+
+#[skuld::test]
+fn a_refused_thread_prints_the_cause_of_the_refusal() {
+    let text = thread_refused(&["daemon".to_string()], &chained());
+
+    assert_eq!(
+        text,
+        r#"make the thread that waits on ["daemon"]: the context: the cause; it was not spawned, so nothing of this daemon is running"#
+    );
+}
+
+#[skuld::test]
+fn a_log_file_that_cannot_be_opened_prints_the_cause_of_the_failure() {
+    let text = log_open_failed(Path::new("daemon.log"), &chained());
+
+    assert_eq!(
+        text,
+        "open log file daemon.log: the context: the cause (this daemon's output will not be captured; it is still being run)"
+    );
+}
+
+/// A stdio assignment that fails asserts in a debug build, naming the cause; the release build logs
+/// the same text, which no test reaches.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn a_failed_stdio_assignment_prints_the_cause_of_the_failure() {
+    let fake = FakeGuard::new();
+    let log = fake.log();
+    let failed: Result<(), std::io::Error> = Err(chained());
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stdio_set(&log, ID, failed)))
+        .expect_err("a failed assignment asserts in a debug build");
+
+    let message = panic.downcast_ref::<String>().expect("a formatted panic message");
+    assert!(message.ends_with("failed: the context: the cause"), "{message}");
 }
 
 // The waiter of a daemon that never ran -------------------------------------------------------------------------------
