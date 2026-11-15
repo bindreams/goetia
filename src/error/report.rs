@@ -115,7 +115,9 @@ impl fmt::Display for Chain<'_> {
 /// inside its own sentence (see [`Error::sentence`]) is written there, with its remedies collected.
 ///
 /// A `cosca` error and everything below it is written by [`cosca::error::Report`], since a `source()`
-/// walk shows only the first member of a list and never a `cleanup`.
+/// walk shows only the first member of a list and never a `cleanup`. On Windows a
+/// `windows_service::Error::Winapi` is written as the OS error it wraps: its own text, "IO error in
+/// winapi call", names no reason.
 pub(super) fn write_chain<'a>(
     e: &'a (dyn std::error::Error + 'static),
     out: &mut Sink,
@@ -123,6 +125,10 @@ pub(super) fn write_chain<'a>(
 ) -> fmt::Result {
     if e.is::<cosca::error::Error>() {
         return write!(out, "{}", cosca::error::Report::new(e));
+    }
+    #[cfg(windows)]
+    if let Some(windows_service::Error::Winapi(os)) = e.downcast_ref() {
+        return write_chain(os, out, remedies);
     }
     // A `#[source]` of type `Box<Error>` reaches here as the box.
     let ours = e

@@ -27,7 +27,7 @@ pub(super) struct DebugPrivilege {
     /// `Some` once the thread token was replaced; the token to put back (`None` inside: none).
     restore: Option<Option<OwnedHandle>>,
     /// The step that failed, named by its call (see [`within`]). Absent when enabling worked and when
-    /// the token lacks the privilege.
+    /// the token lacks the privilege; taken by [`DebugPrivilege::explain_denial`].
     failure: Option<io::Error>,
 }
 
@@ -44,19 +44,33 @@ impl DebugPrivilege {
         }
     }
 
-    /// `open`'s error, with the failed privilege step named when the open was denied: the denial may
+    /// `open`'s error, with the failed privilege step added when the open was denied: the denial may
     /// be the privilege that could not be enabled. The note claims nothing of the token's privileges,
-    /// which may have held the privilege enabled before a later step failed. The denial stays the
-    /// error's `source()`.
-    pub(super) fn explain_denial(&self, open: io::Error) -> io::Error {
-        match &self.failure {
-            Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => within(
-                format!("tried after enabling SeDebugPrivilege failed ({})", Chain(step)),
-                open,
-            ),
-            _ => open,
+    /// which may have held the privilege enabled before a later step failed. The kind is the open's;
+    /// its OS code is not on the error's chain. Takes the failed step, so it explains one open.
+    pub(super) fn explain_denial(&mut self, open: io::Error) -> io::Error {
+        if open.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
+            return open;
+        }
+        match self.failure.take() {
+            Some(step) => io::Error::new(open.kind(), DeniedAfterFailedStep { open, step }),
+            None => open,
         }
     }
+}
+
+/// The open of the process was denied, and enabling `SeDebugPrivilege` for it had failed too. Both
+/// errors are the caller's to see: `open`'s text, then `step`'s in parentheses. Neither is the
+/// [`source`](std::error::Error::source), which would print it a second time.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{} (enabling SeDebugPrivilege for the open also failed: {})",
+    Chain(open),
+    Chain(step)
+)]
+struct DeniedAfterFailedStep {
+    open: io::Error,
+    step: io::Error,
 }
 
 impl Drop for DebugPrivilege {

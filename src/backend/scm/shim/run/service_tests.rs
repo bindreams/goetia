@@ -14,7 +14,7 @@ use crate::backend::scm::exit_status::{
 use crate::spec::{DaemonFields, DaemonSpec, Protocol, Restart, ServiceFields, ServiceSpec, TaskFields, TaskSpec};
 use crate::testing::{base_fields, service_fields};
 use cosca::Containment;
-use cosca::error::{ChildFate, Report};
+use cosca::error::ChildFate;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_NOT_ENOUGH_MEMORY, NO_ERROR,
 };
@@ -83,7 +83,7 @@ fn no_thread_failure() -> String {
 fn spawn_failure() -> String {
     format!(
         r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}"#,
-        cosca::error::Report::new(&not_found())
+        Chain(&not_found())
     )
 }
 
@@ -94,7 +94,7 @@ const NOT_JOB_CONTAINED: &str = r#"the daemon ["C:/Windows/System32/WindowsPower
 fn exited_tree_unkilled() -> String {
     format!(
         "terminating the process tree after the daemon ended failed: {}; its descendants may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
-        Report::new(&tree_kill_refused())
+        Chain(&tree_kill_refused())
     )
 }
 
@@ -237,7 +237,7 @@ fn a_spawn_error_that_may_have_left_the_daemon_running_is_the_incomplete_stop_re
         assert_eq!(launched.as_ref().err(), Some(&Reported::incomplete_stop()), "{fate:?}");
         let expected = format!(
             r#"spawn ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"]: {}; the daemon may still be running{NOT_RESTARTED}"#,
-            cosca::error::Report::new(&may_have_started(fate))
+            Chain(&may_have_started(fate))
         );
         assert_one_failure(&fake.take_failures(), ID, &expected);
         assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
@@ -458,7 +458,7 @@ fn a_failed_wait_is_a_shim_failure_with_the_os_error_and_the_daemon_is_dead() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", Report::new(&wait_failed_with_code(5))),
+        &format!("background wait on child: {}", Chain(&wait_failed_with_code(5))),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -479,7 +479,7 @@ fn a_failed_wait_with_no_os_error_is_the_generic_shim_failure() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", Report::new(&wait_failed())),
+        &format!("background wait on child: {}", Chain(&wait_failed())),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -513,7 +513,7 @@ fn a_failed_wait_over_an_unkillable_daemon_is_the_incomplete_stop_record() {
         &fake.take_failures(),
         ID,
         &[
-            format!("background wait on child: {}", Report::new(&wait_failed())),
+            format!("background wait on child: {}", Chain(&wait_failed())),
             tree_refused_failure(),
             fallback_refused_failure(),
         ],
@@ -679,7 +679,7 @@ fn a_failed_wait_reports_stopping_before_the_daemon_is_killed() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("background wait on child: {}", Report::new(&wait_failed_with_code(5))),
+        &format!("background wait on child: {}", Chain(&wait_failed_with_code(5))),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -831,7 +831,7 @@ fn an_exit_status_that_cannot_be_read_is_a_shim_failure() {
     assert_one_failure(
         &fake.take_failures(),
         ID,
-        &format!("query child exit status: {}", Report::new(&wait_failed())),
+        &format!("query child exit status: {}", Chain(&wait_failed())),
     );
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
@@ -1290,8 +1290,7 @@ fn a_failed_stopped_report_says_scm_is_expected_to_read_a_crash() {
     }
 }
 
-/// `windows_service::Error::Winapi` displays as "IO error in winapi call"; the line carries the
-/// wrapped OS error alone.
+/// The line carries the OS error `windows_service::Error::Winapi` wraps, not its own text.
 #[skuld::test]
 fn a_failed_dispatcher_connection_names_the_os_reason() {
     let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));

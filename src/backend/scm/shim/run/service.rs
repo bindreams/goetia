@@ -290,12 +290,7 @@ fn report_stopped(handle: StatusHandle, reported: Reported) -> std::io::Result<(
 
 /// The line logged when the shim cannot connect to the SCM dispatcher.
 fn dispatcher_failure(e: windows_service::Error) -> String {
-    // `Winapi` displays as "IO error in winapi call"; its wrapped OS error is the reason.
-    let reason: &(dyn std::error::Error + 'static) = match &e {
-        windows_service::Error::Winapi(os) => os,
-        other => other,
-    };
-    format!("connect to the SCM dispatcher: {}", Chain(reason))
+    format!("connect to the SCM dispatcher: {}", Chain(&e))
 }
 
 /// The shim exits after this without a `STOPPED` report. SCM is expected to read that as a crash

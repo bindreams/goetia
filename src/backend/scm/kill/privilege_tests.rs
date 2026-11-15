@@ -162,27 +162,18 @@ fn a_denied_open_names_the_privilege_step_that_failed() {
     assert_eq!(
         Chain(&e).to_string(),
         format!(
-            "tried after enabling SeDebugPrivilege failed (DuplicateTokenEx: {}): {}",
+            "{} (enabling SeDebugPrivilege for the open also failed: DuplicateTokenEx: {})",
+            denied_open(),
             io::Error::from_raw_os_error(ERROR_NOT_ENOUGH_MEMORY as i32),
-            denied_open()
         )
     );
     assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
 }
 
-/// The open's code stays on the error's chain, where a caller that looks for a code finds it, and
-/// not the step's.
-#[skuld::test]
-fn a_denied_open_that_names_the_step_still_carries_the_denials_code() {
-    let e = failed_to_enable().explain_denial(denied_open());
-
-    assert_eq!(crate::error::os_error_in(&e), Some(ERROR_ACCESS_DENIED as i32));
-}
-
 /// A token that lacks the privilege is not a failure of the step, so the denial stands alone.
 #[skuld::test]
 fn a_denied_open_with_no_failed_step_is_unchanged() {
-    let guard = DebugPrivilege {
+    let mut guard = DebugPrivilege {
         restore: None,
         failure: None,
     };
