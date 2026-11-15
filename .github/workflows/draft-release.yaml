@@ -291,6 +291,18 @@ jobs:
             exit 1
           }
 
+      # `libsearch_guard::verify` on what ships: the staged goetia.exe (the release build with the
+      # embedded shim) and the shim it embeds. `cargo test` only verifies the debug build.
+      - name: Verify the binaries are hardened (Windows)
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --release --locked --target "$TARGET" --example verify -- \
+            "goetia-${TARGET}/goetia.exe" "target/${TARGET}/release/goetia-shim.exe"
+
       # The staged goetia.exe alone must install, run and uninstall a
       # `protocol: plain` service: it carries the stock shim. The runner is
       # elevated; goetia puts the shim under Program Files and sweeps it on
