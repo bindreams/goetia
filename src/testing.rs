@@ -18,6 +18,11 @@ use crate::spec::{
 
 pub use crate::backend::scm::shim::acl::{CHANGE_PERMISSIONS_OF, WRITE_TO};
 
+/// The machine's time zone as goetia reads it for a task's next run, for a test that turns launchd's
+/// local dates into instants.
+#[cfg(target_os = "macos")]
+pub use crate::backend::launchd::next::system_zone;
+
 /// Runs every skuld test in the calling binary and exits; the `main` of every skuld test binary.
 /// Exits with an error first if a `GOETIA_TEST_<GROUP>` or `GOETIA_TEST_<GROUP>_CONSENT` variable, or
 /// `GOETIA_TEST_DEBUG_PRIVILEGE`, is invalid.

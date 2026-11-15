@@ -132,7 +132,7 @@ nix = { version = "0.31", features = ["fs", "dir", "user"] }
 # CLI's own optional deps are pulled in.
 libc = "0.2"
 nix = { version = "0.31", features = ["user", "fs", "dir", "event"] }
-# `spec::schedule::next`: the next fire of a task's schedule in the system time zone, which
+# `backend::launchd::next`: the next fire of a task's calendar entries in the system time zone, which
 # `launchd` (calendar intervals only, no next-fire query) cannot tell. Zones are read from
 # `/etc/localtime`'s bytes.
 jiff = "0.2.43"
@@ -193,7 +193,7 @@ libsearch-guard.workspace = true
 goetia = { path = ".", default-features = false, features = ["testing"] }
 skuld = "0.6"
 rand = "0.10"
-# `spec::schedule::next`'s tests, on every host: the default features bundle a zone database where the
+# `backend::launchd::next`'s tests, on every host: the default features bundle a zone database where the
 # host has none (Windows).
 jiff = "0.2.43"
 libsearch-guard.workspace = true

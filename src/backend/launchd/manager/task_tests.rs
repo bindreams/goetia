@@ -629,6 +629,38 @@ fn next_run_is_none_when_disarmed_for_no_schedule_and_for_a_schedule_with_no_dat
     );
 }
 
+/// `next_run` is computed from the timer's compiled entries as launchd reads them: the 02:30 of the spring
+/// day, which the clocks skip, is at the gap's end.
+#[skuld::test]
+fn next_run_follows_launchd_across_a_dst_gap() {
+    let timer = timer_of(&task_spec(Some("30 2 * * *")));
+    let new_york = || Ok(TimeZone::get("America/New_York").expect("a zone database"));
+
+    assert_eq!(
+        // 2027-03-14T06:30:00Z, 01:30 EST: the next run is 2027-03-14T07:00:00Z, 03:00 EDT.
+        next_run(timer.as_ref(), true, at(1_805_005_800), new_york).unwrap(),
+        Some(at(1_805_007_600))
+    );
+}
+
+/// A timer whose metadata holds a schedule the compiler refuses (written by a goetia whose rules differ:
+/// this one's `install` refuses it) has no next run, as one that will not decode has none.
+#[skuld::test]
+fn next_run_is_none_for_a_schedule_launchd_cannot_hold() {
+    // Both day fields restricted, and day-of-month starting with `*`: both must match, which launchd cannot.
+    let spec = task_spec(Some("0 12 */2 * 5"));
+    let timer = Artifact {
+        location: Location {
+            path: PathBuf::from("/nonexistent/goetia-task-unit@timer.plist"),
+            enabled: true,
+        },
+        text: generate::metadata_comment(&spec),
+    };
+    assert!(timer.blob().is_ok(), "the blob decodes");
+
+    assert_eq!(next_run(Some(&timer), true, at(NEW_YEAR), utc).unwrap(), None);
+}
+
 /// The armed timer is what fires, and after a crash between replacing the job and the timer the job's
 /// metadata can hold a newer schedule than the timer does: `next_run` reads the artifact it is given, and
 /// the two artifacts name different instants.
