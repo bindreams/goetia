@@ -84,7 +84,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "goetia") | .version')"
+          if [ -z "$manifest" ]; then
+            echo "::error::cargo metadata lists no package named goetia"
+            exit 1
+          fi
           if [ "$manifest" != "$VERSION" ]; then
             echo "::error::Cargo.toml declares $manifest but this dispatch asked for $VERSION"
             exit 1
@@ -290,6 +294,22 @@ jobs:
             Write-Error "zip entries use backslash separators: $($bad.FullName -join ', ')"
             exit 1
           }
+
+      # `libsearch_guard::verify` on what ships, on every row: the staged executable, and on Windows
+      # also the shim it embeds. The checker is a debug build
+      # for the runner's own host (no `--target`), and reads ELF, Mach-O and PE alike.
+      - name: Verify the binaries are hardened
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            executables=("goetia-${TARGET}/goetia.exe" "target/${TARGET}/release/goetia-shim.exe")
+          else
+            executables=("goetia-${TARGET}/goetia")
+          fi
+          cargo run -p verify-hardening --locked -- "${executables[@]}"
 
       # The staged goetia.exe alone must install, run and uninstall a
       # `protocol: plain` service: it carries the stock shim. The runner is

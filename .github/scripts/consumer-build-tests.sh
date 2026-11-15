@@ -12,7 +12,8 @@
 #      `GOETIA_SHIM_EXE`) installs, runs and uninstalls a `protocol: plain` service, leaving no shim;
 #   3. goetia's own two-stage build does the same;
 #   4. `cargo install` goetia previews the shim installed beside it (the sibling route);
-#   5. the consumer's bins pass `libsearch_guard::verify` after the README's `build.rs`.
+#   5. every executable the routes above build passes `libsearch_guard::verify` after the README's
+#      `build.rs`.
 #
 # The consumer's lockfile is resolved once online and pins one dependency below goetia's own
 # lock, so it differs from goetia's. Everything after that builds offline.
@@ -73,6 +74,18 @@ assert_no_shim() {
     fi
 }
 
+# Fails unless every executable given passes `libsearch_guard::verify`. Runs from `$repo` so it builds in
+# goetia's target directory and leaves the caller's directory alone.
+assert_hardened() {
+    local winpaths=() exe
+    for exe in "$@"; do
+        winpaths+=("$(winpath "$exe")")
+    done
+    if ! (cd "$repo" && cargo run --quiet -p verify-hardening --locked -- "${winpaths[@]}"); then
+        fail "one of these is not hardened: ${winpaths[*]} (the tool's output above names which)"
+    fi
+}
+
 # `daemon install --dry-run` names the shim by the hash of the file it was built from.
 assert_previews_shim() {
     local exe="$1" dir="$2" shim="$3" out hex
@@ -121,12 +134,12 @@ clap = "4"
 $pinned_crate = "=$pinned_version"
 
 # The build dependency is what the README tells a program that ships a stock shim; the dev
-# dependency runs `verify` on the result.
+# dependency runs verify on the result.
 [build-dependencies]
-libsearch-guard = "0.1.1"
+libsearch-guard = "0.2"
 
 [dev-dependencies]
-libsearch-guard = "0.1.1"
+libsearch-guard = "0.2"
 
 [patch.crates-io]
 goetia = { path = "$crate_dir" }
@@ -264,6 +277,7 @@ consumer_routes() {
     cargo build --bin goetia-shim --locked
     shim="$target/goetia-shim.exe"
     GOETIA_SHIM_EXE="$(winpath "$shim")" cargo build --bin goetia-consumer --features goetia-shim --locked
+    assert_hardened "$shim" "$target/goetia-consumer.exe"
     assert_previews_shim "$target/goetia-consumer.exe" "$dir" "$shim"
     round_trip "$target/goetia-consumer.exe" goetia-ci-consumer "$dir"
 }
@@ -281,11 +295,13 @@ goetia_routes() {
     shim="$target/goetia-shim.exe"
     GOETIA_SHIM_EXE="$(winpath "$shim")" cargo build --bin goetia --features goetia-shim --locked
     write_manifest "$dir" goetia-ci-two-stage
+    assert_hardened "$shim" "$target/goetia.exe"
     assert_previews_shim "$target/goetia.exe" "$dir" "$shim"
     round_trip "$target/goetia.exe" goetia-ci-two-stage "$dir"
 
     # `cargo install`: the shim is the sibling of the program.
     cargo install --path . --root "$(winpath "$install_root")" --locked --offline
+    assert_hardened "$install_root/bin/goetia.exe" "$install_root/bin/goetia-shim.exe"
     assert_previews_shim "$install_root/bin/goetia.exe" "$dir" "$install_root/bin/goetia-shim.exe"
 }
 
@@ -295,6 +311,7 @@ mkdir -p "$work"
 # and the setting persists into `goetia_routes`.
 cd "$repo"
 cargo fetch --locked
+cargo build --locked -p verify-hardening
 
 consumer_routes
 goetia_routes

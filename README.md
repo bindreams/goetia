@@ -807,7 +807,7 @@ so its integration tests and benches, fail to link, while the library still buil
 
 ```toml
 [build-dependencies]
-libsearch-guard = "0.1.1"
+libsearch-guard = "0.2"
 ```
 
 ```rust
