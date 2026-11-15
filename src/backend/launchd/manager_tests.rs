@@ -1703,14 +1703,14 @@ fn launchctl_calls_that_expire_report_the_expiry() {
     // A `bootout` takes its wait's files before it sends, so one call more than its request draws.
     let mut held = reservation(4, 8);
     let expired = |verb| launchctl_replying(verb, Finished::Expired).0;
-    let left = |verb| launchctl_replying(verb, Finished::Left(Left::new(|_| None))).0;
+    let left = |verb| launchctl_replying(verb, Finished::Left(Left::new(|_| {}))).0;
 
     let loaded = expired("print").is_loaded(id, deadline, &mut held);
     assert!(loaded.expect("an expiry is not a failure").is_none());
     let bootstrapped = left("bootstrap").bootstrap(path, deadline, &mut held);
     assert!(bootstrapped.expect("an expiry is not a failure").is_none());
     let fake = Fake::new([
-        reply(&["kickstart"], Finished::Left(Left::new(|_| None))),
+        reply(&["kickstart"], Finished::Left(Left::new(|_| {}))),
         answer("print", NOT_RUNNING),
     ]);
     let started = Launchctl::new(Box::new(fake.clone())).kickstart(
@@ -1741,7 +1741,7 @@ fn a_stop_whose_bootout_expires_is_a_wait_timeout() {
     use crate::backend::Backend;
 
     let id = never_installed();
-    let fake = Fake::new([reply(&["bootout"], Finished::Left(Left::new(|_| None)))]);
+    let fake = Fake::new([reply(&["bootout"], Finished::Left(Left::new(|_| {})))]);
     let mgr = launchd_over(fake.clone());
 
     let e = Backend::stop(&mgr, marked_plist(&id), Budget::DEFAULT, &mut reserved(&[Step::Stop])).expect_err("expired");

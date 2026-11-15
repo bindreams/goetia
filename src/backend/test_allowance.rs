@@ -1,7 +1,7 @@
 //! A setting one thread holds for the test hooks that refuse on demand: a count of how many of
-//! something it may make ([`spend`]), or a value a hook answers from ([`Allowance`]). A guard
-//! clears its setting when it drops; a hook that answers once takes the value out, so none outlives
-//! its kill, spawn or wait.
+//! something it may make ([`spend`]), or a value a hook answers from ([`Allowance`]). A count stays
+//! until its guard drops; a value that a hook takes (the kill's refusal) is gone at its first use, or
+//! when its guard drops first.
 
 use std::cell::Cell;
 use std::io;
@@ -22,8 +22,8 @@ pub(crate) fn spend(left: &'static Left, refusal: &str) -> io::Result<()> {
     }
 }
 
-/// Holds a setting of `left` until it drops, which clears it. A count is a limit ([`spend`]); any
-/// other `T` is a value a hook answers from.
+/// Holds a setting of `left` until it drops, which clears it, unless a hook has taken it first. A
+/// count is a limit ([`spend`]); any other `T` is a value a hook answers from.
 pub(crate) struct Allowance<T: 'static = usize>(&'static LocalKey<Cell<Option<T>>>);
 
 impl<T: 'static> Allowance<T> {

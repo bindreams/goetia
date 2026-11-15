@@ -255,10 +255,7 @@ pub(crate) mod fake {
     pub(crate) fn lingering(prefix: &[&str]) -> (Entry, Ended) {
         let ended = Ended::default();
         let record = ended.0.clone();
-        let left = Left::new(move |fate| {
-            *record.lock().unwrap() = Some(fate);
-            None
-        });
+        let left = Left::new(move |fate| *record.lock().unwrap() = Some(fate));
         (entry(prefix, Ok(Finished::Left(left))), ended)
     }
 

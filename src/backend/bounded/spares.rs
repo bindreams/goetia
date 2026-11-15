@@ -266,8 +266,8 @@ pub(crate) mod test_hook {
     /// How a refused kill answers: it is handed the child it refused.
     type KillRefusal = fn(&cosca::Child) -> cosca::error::Error;
 
-    /// Make this thread's next kill of a child refuse with `error(child)`, or none if the returned
-    /// guard drops first. The child receives no signal from the kill: `error` may itself act on the
+    /// Make this thread's next kill of a child refuse with `error(child)`: the setting is gone once
+    /// that kill takes it, or when the returned guard drops first. The child receives no signal from the kill: `error` may itself act on the
     /// child, as the world does between a kill's refusal and the next look at the child.
     pub(crate) fn kill_fails(error: KillRefusal) -> Allowance<KillRefusal> {
         Allowance::set(&KILL_REFUSAL, error)

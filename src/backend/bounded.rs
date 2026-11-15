@@ -85,8 +85,8 @@ pub(crate) enum Finished {
     Left(Left),
 }
 
-/// Carries a [`Fate`] out on the child a [`Left`] holds, and answers what to say on stderr of it.
-type Settle = Box<dyn FnOnce(Fate) -> Option<String> + Send>;
+/// Carries a [`Fate`] out on the child a [`Left`] holds.
+type Settle = Box<dyn FnOnce(Fate) + Send>;
 
 /// How a request left running by an expiry ends up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +106,7 @@ pub(crate) enum Fate {
 pub(crate) struct Left(Option<Settle>);
 
 impl Left {
-    pub(crate) fn new(settle: impl FnOnce(Fate) -> Option<String> + Send + 'static) -> Left {
+    pub(crate) fn new(settle: impl FnOnce(Fate) + Send + 'static) -> Left {
         Left(Some(Box::new(settle)))
     }
 
@@ -114,31 +114,26 @@ impl Left {
     /// is one that refuses the kill by exiting; one that cannot be ended is released to its
     /// [`Reaper`] ([`Fate::Release`]), and stderr says it could not be killed.
     ///
-    /// When the kill is refused with `EPERM` on macOS, this blocks its caller for up to
-    /// [`EXIT_AFTER_REFUSED_KILL`] while the child's exit is awaited, and again up to that long to
-    /// reap a child seen dead. That is on top of any overrun the caller's own deadline has had: a
-    /// caller that ran a bounded query first (launchd's `end_if_held` runs a `print`) can overrun its
-    /// deadline by the bound once there ([`wait_bounded`]) and once here.
+    /// A kill refused with `EPERM` on macOS blocks its caller for up to [`EXIT_AFTER_REFUSED_KILL`]
+    /// while the child's exit is awaited. Such a kill can happen here and in [`wait_bounded`], when
+    /// a query's or an announced request's deadline expires, so a caller that runs a bounded query
+    /// and then this (launchd's `end_if_held` runs a `print` first) can overrun its deadline by that
+    /// bound twice, once for each refused kill.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) fn kill(self) {
-        if let Some(warning) = self.kill_saying() {
-            eprintln!("{warning}");
+    pub(crate) fn kill(mut self) {
+        self.settle(Fate::Kill);
+    }
+
+    fn settle(&mut self, fate: Fate) {
+        if let Some(settle) = self.0.take() {
+            settle(fate);
         }
-    }
-
-    /// [`kill`](Left::kill), answering the warning it would print.
-    fn kill_saying(mut self) -> Option<String> {
-        self.settle(Fate::Kill)
-    }
-
-    fn settle(&mut self, fate: Fate) -> Option<String> {
-        self.0.take().and_then(|settle| settle(fate))
     }
 }
 
 impl Drop for Left {
     fn drop(&mut self) {
-        let _nothing_to_say = self.settle(Fate::Release);
+        self.settle(Fate::Release);
     }
 }
 
@@ -357,9 +352,8 @@ pub(crate) struct Lost {
 /// them all.
 ///
 /// Returns at the deadline, except when the kill an expiry sends is refused with `EPERM` on macOS:
-/// then the call waits for the child's exit for up to [`EXIT_AFTER_REFUSED_KILL`] more, and for its
-/// reap up to as long again. That is one of two ways a call runs past its deadline: [`Left::kill`]
-/// is the other.
+/// then the call waits for the child's exit for up to [`EXIT_AFTER_REFUSED_KILL`] more. That is one
+/// of two ways a call runs past its deadline: [`Left::kill`] is the other.
 pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finished, Lost> {
     let Spawned {
         child,
@@ -413,22 +407,18 @@ fn waited_out(
             // Left to the caller: see `Left`. Its output files stay open in it, and a file never
             // breaks under its writer.
             return Ok(Finished::Left(Left::new(move |fate| {
-                let warning = if fate == Fate::Kill {
-                    end_left(&child, refused_for)
-                } else {
-                    None
-                };
+                if fate == Fate::Kill
+                    && let Some(warning) = end_left(&child, refused_for)
+                {
+                    eprintln!("{warning}");
+                }
                 reaper.reap(child);
-                warning
             })));
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
-            // `Ok(None)` is what makes the reap below unable to block: the kill was sent. A refused
-            // kill's child was reaped within its bound already.
-            let reaped = match end(&child, refused_for)? {
-                Some(reaped) => reaped,
-                None => child.wait()?,
-            };
+            // `Ok` is what makes the reap below unable to block.
+            end(&child, refused_for)?;
+            let reaped = child.wait()?;
             match expiry_disposition(reaped) {
                 Disposition::WeKilledIt => return Ok(Finished::Expired),
                 Disposition::ItExitedOnItsOwn => reaped,
@@ -449,11 +439,11 @@ fn waited_out(
     Ok(Finished::Exited { status, capture })
 }
 
-/// How long a child whose kill was refused with `EPERM` is given to be seen exited, and then to be
-/// reaped (macOS): each a failure bound on another process, not a wait for it to do anything. A child
-/// that refused the kill by exiting is seen within one re-read, and one still there after refusing it
-/// for another reason never will be. Only a refused kill can run a bounded call past its deadline
-/// ([`wait_bounded`], [`Left::kill`]), and by no more than twice this.
+/// How long a child whose kill was refused with `EPERM` is given to be seen exited (macOS). A
+/// failure bound on another process, not a wait for the child to do anything: a child that refused
+/// the kill by exiting is seen within one re-read, and one still there after refusing it for another
+/// reason never will be. Only a refused kill can run a bounded call past its deadline
+/// ([`wait_bounded`], [`Left::kill`]), and by no more than this for each refused kill.
 const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 
 /// End `child`: its root ([`kill_root`]), then, best-effort, its tree. The one order, for every
@@ -461,21 +451,14 @@ const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
 /// pinning its pid and pgid, so a kill that names the tree by the root's number cannot hit another
 /// process on any platform. `Drop` runs after the reap, where cosca may skip such a kill.
 ///
-/// `Ok(None)` is a kill that was sent: the root is unreaped, and the caller reaps it, which cannot
-/// block. `Ok(Some(status))` is a refused kill whose child was seen dead: this reaped it, within
-/// `bound` ([`after_reap`]), because a `Dead` read does not make a reap safe.
-///
 /// An uncontained child (the descendant test spawns one) reports `Unsupported` for the tree, and a
 /// contained tree whose member refused SIGKILL reports `Containment`; the `Result` is discarded
 /// either way, so nothing surfaces it, and a descendant still holding a pipe is exactly what
 /// `collect` reports as `complete == false`.
-fn end(child: &cosca::Child, bound: Duration) -> Result<Option<ExitStatus>, cosca::error::Error> {
-    let killed = kill_root(child, bound)?;
+fn end(child: &cosca::Child, bound: Duration) -> Result<(), cosca::error::Error> {
+    kill_root(child, bound)?;
     let _tree_teardown = child.send_kill_tree();
-    match killed {
-        KillRootOutcome::Sent => Ok(None),
-        KillRootOutcome::ExitedRefusing(refused) => after_reap(refused, child.wait_timeout(bound)?, bound).map(Some),
-    }
+    Ok(())
 }
 
 /// [`end`] for the child of a [`Left`]: what to say on stderr if it could not be ended. It says what
@@ -489,32 +472,22 @@ fn end_left(child: &cosca::Child, bound: Duration) -> Option<String> {
     })
 }
 
-/// How [`kill_root`] went, when it did not fail.
-#[derive(Debug)]
-enum KillRootOutcome {
-    /// The kill was sent.
-    Sent,
-    /// The kill was refused with `EPERM` (the refusal), and the child was then read `Dead`.
-    ExitedRefusing(cosca::error::Error),
-}
-
 /// Kill the root of `child`, the one kill an expiry makes. `Ok` says the root is dead or has exited,
 /// and has not been reaped, so it still pins its pid.
 ///
 /// On macOS a child that is exiting can refuse the kill with `EPERM` (a send by audit token answers
 /// it in that window, before it answers `ESRCH`). Only `EPERM` is waited on, for `bound`
 /// (`after_refusal`): a child that then exits has ended on its own, as one that exits before the
-/// kill is sent, and the wait leaves it unreaped (but [`end`] reaps it, within a bound). Everywhere
-/// else, and for every other error, the refusal is returned at once.
-fn kill_root(child: &cosca::Child, bound: Duration) -> Result<KillRootOutcome, cosca::error::Error> {
+/// kill is sent, and the wait leaves it unreaped. Everywhere else, and for every other error, the
+/// refusal is returned at once.
+fn kill_root(child: &cosca::Child, bound: Duration) -> Result<(), cosca::error::Error> {
     match send_kill(child) {
-        Ok(()) => Ok(KillRootOutcome::Sent),
         // A send that goes through a pidfd does not refuse a child that is exiting: off macOS its
         // `EPERM` is real.
         Err(refused) if cfg!(target_os = "macos") && is_eperm(&refused) => {
-            after_refusal(refused, last_read(child, bound), bound).map(KillRootOutcome::ExitedRefusing)
+            after_refusal(refused, last_read(child, bound), bound)
         }
-        Err(refused) => Err(refused),
+        other => other,
     }
 }
 
@@ -556,49 +529,25 @@ fn is_eperm(e: &cosca::error::Error) -> bool {
     })
 }
 
-/// What [`kill_root`] makes of a refused kill, given the last liveness [`last_read`] read: the
-/// refusal back for a child read `Dead`, else the error that says what was seen.
-fn after_refusal(
-    refused: cosca::error::Error,
-    last: Liveness,
-    bound: Duration,
-) -> Result<cosca::error::Error, cosca::error::Error> {
+/// What [`kill_root`] makes of a refused kill, given the last liveness [`last_read`] read: no error
+/// for a child read `Dead`, else the error that says what was seen.
+fn after_refusal(refused: cosca::error::Error, last: Liveness, bound: Duration) -> Result<(), cosca::error::Error> {
     let seen = match last {
-        Liveness::Dead => return Ok(refused),
+        Liveness::Dead => return Ok(()),
         Liveness::Alive => format!("the process was still running when goetia stopped waiting, {bound:?} later"),
         Liveness::Unknown => {
             format!("whether the process was running could not be read when goetia stopped waiting, {bound:?} later")
         }
     };
-    Err(refused_by(seen, refused))
-}
-
-/// What [`end`] makes of the bounded reap of a child read `Dead` after a refused kill: its status, or
-/// the error that says it exited and could not be reaped within `bound`. cosca reads `Dead` for a
-/// zombie that only a tracer can reap too, which a reap without a bound would wait on for ever.
-fn after_reap(
-    refused: cosca::error::Error,
-    waited: Option<ExitStatus>,
-    bound: Duration,
-) -> Result<ExitStatus, cosca::error::Error> {
-    waited.ok_or_else(|| {
-        refused_by(
-            format!("the process exited, but could not be reaped within {bound:?}"),
-            refused,
-        )
-    })
-}
-
-fn refused_by(seen: String, refused: cosca::error::Error) -> cosca::error::Error {
-    cosca::error::Error::Io(io::Error::new(
+    Err(cosca::error::Error::Io(io::Error::new(
         io::ErrorKind::PermissionDenied,
         KillRefused { seen, refused },
-    ))
+    )))
 }
 
 /// A kill refused with `EPERM`, and what was seen of the child after: it was still running, or its
-/// liveness could not be read, when goetia stopped waiting; or it exited and could not be reaped in
-/// the bound. The refusal is its source. Never a claim about what the child does after that.
+/// liveness could not be read, when goetia stopped waiting. The refusal is its source. Never a claim
+/// about what the child does after that.
 #[derive(Debug, thiserror::Error)]
 #[error("the kill was refused (EPERM) and {seen}")]
 struct KillRefused {
