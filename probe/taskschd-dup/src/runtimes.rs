@@ -108,6 +108,11 @@ pub fn run(a: &[String]) -> i32 {
             }
         }
     }
+    if std::env::var_os("TSPROBE_ALL").is_some() {
+        for s in &all {
+            println!("t {}", fmt(s));
+        }
+    }
     println!("count={} window=[{}, {})", all.len(), a[1], a[2]);
     if all.is_empty() {
         return 0;
