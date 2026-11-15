@@ -614,23 +614,16 @@ mod refused_kill {
         );
     }
 
-    /// The deadline kill of a [`Role::Request`] the caller ends ([`Left::kill`]) is refused as a
-    /// query's is, by a child that then exits: the reaper reports the exit the hook's signal gave it,
-    /// and it was not killed again. (A kill sent past the hook would end it with `SIGKILL`.)
+    /// The kill of a [`Role::Request`] the caller ends ([`Left::kill`]) is refused as a query's is, by a
+    /// child that then exits: it is ended, not a request that runs on, and nothing is said.
     #[skuld::test]
-    fn a_left_request_whose_kill_is_refused_by_a_child_that_then_exits_is_reaped_as_exited() {
-        let _refused = test_hook::kill_fails(|child| {
-            // SAFETY: as in `term_then_eperm`.
-            assert_eq!(unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGUSR1) }, 0);
-            eperm()
-        });
+    fn a_left_request_whose_kill_is_refused_by_a_child_that_then_exits_is_not_one_that_runs_on() {
+        let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+        let _refused = test_hook::kill_fails(term_then_eperm);
 
-        let status = expired_request_settled_by("exit 7", |finished| match finished {
-            Finished::Left(left) => left.kill(),
-            other => panic!("expected Left, got {other:?}"),
-        });
+        let warning = end_left(&child.child, Duration::from_secs(3600));
 
-        assert_eq!(status.signal(), Some(libc::SIGUSR1), "{status:?}");
+        assert_eq!(warning, None);
     }
 
     /// A [`Left`] whose child stays after refusing the kill says it runs on, naming the refusal. The
