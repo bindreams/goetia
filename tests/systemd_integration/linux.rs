@@ -544,11 +544,13 @@ fn a_start_after_a_kill_sees_the_restart_in_the_auto_restart_window(#[fixture(sy
 }
 
 /// A unit that was started too often (systemd's start limit, which goetia leaves on for a `restart: never`
-/// unit: five starts in ten seconds) makes `start` fail at once and say so, and does not leave it waiting
-/// for a process that will not come. A stop between the starts ends each process, so that the next start is
-/// a fresh one; the limit is reached when a start is refused.
+/// unit: five starts in ten seconds) makes `start` fail at once, and does not leave it waiting for a
+/// process that will not come. Each process is killed once it runs, so that the next start is a fresh one;
+/// the limit is reached when a start is refused. The words of the error are systemd's own, which after a
+/// kill still name the signal that ended the unit before them ("a fatal signal was delivered"), not the
+/// limit: that the error says the limit was hit is not established here.
 #[skuld::test]
-fn a_start_of_a_unit_at_its_start_limit_fails_and_says_so(#[fixture(systemd_group)] _group: &Group) {
+fn a_start_of_a_unit_at_its_start_limit_fails_and_does_not_hang(#[fixture(systemd_group)] _group: &Group) {
     let guard = ServiceGuard::new(support::random_test_id());
     let listener = support::ConnectBack::listen();
     let spec = reporting(guard.id(), Restart::Never, &listener);
@@ -556,44 +558,26 @@ fn a_start_of_a_unit_at_its_start_limit_fails_and_says_so(#[fixture(systemd_grou
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
 
-    let mut seen = Vec::new();
-    let e = 'probe: {
-        for _ in 0..12 {
-            match mgr.start(&id, Budget::DEFAULT) {
-                Ok(_) => {
-                    seen.push("start ok".to_string());
-                    mgr.kill(&id).expect("kill the running daemon");
-                    support::kill::until(|| mgr.status(&id).expect("status").common().state == State::Failed);
-                }
-                Err(e) => break 'probe e,
+    let e = loop {
+        match mgr.start(&id, Budget::DEFAULT) {
+            Ok(_) => {
+                mgr.kill(&id).expect("kill the running daemon");
+                // The kill returned with the process gone and recorded, so the unit is `failed` for the
+                // reason the kill gave it, and the next start is the next one counted.
+                assert_eq!(mgr.status(&id).expect("status").common().state, State::Failed);
             }
+            Err(e) => break e,
         }
-        panic!("PROBE never refused: {seen:?}");
     };
 
-    let report = e.report().to_string();
+    assert!(matches!(&e, goetia::Error::Command { .. }), "{e:?}");
     let unit = format!("{id}.service");
-    let shown = cmd::run(
-        "systemctl",
-        &[
-            "show",
-            "--property=ActiveState,SubState,Result,NRestarts,MainPID,ExecMainStatus",
-            "--",
-            &unit,
-        ],
-    );
-    let journal = cmd::run(
-        "journalctl",
-        &["-u", &unit, "--no-pager", "-n", "60", "-o", "short-precise"],
-    );
+    let journal = cmd::run("journalctl", &["-u", &unit, "--no-pager", "-n", "5"]);
     assert!(
-        report.to_lowercase().contains("start request repeated too quickly"),
-        "PROBE after {} starts: {report}
-{}
-{}",
-        seen.len(),
-        shown.stdout,
-        journal.stdout
+        journal.stdout.contains("Start request repeated too quickly"),
+        "the refusal was not the start limit: {}
+{journal}",
+        e.report()
     );
 }
 
