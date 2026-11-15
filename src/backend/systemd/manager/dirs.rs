@@ -27,7 +27,7 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
     }
     created.hand_over()?;
     match &common.logs {
-        Some(logs) => refuse_writable_log_dir(logs, common.id.as_str()),
+        Some(logs) => refuse_writable_log_dir(logs),
         None => Ok(()),
     }
 }

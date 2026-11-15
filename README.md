@@ -443,8 +443,9 @@ owns it, since `install` is not a start and you may still be preparing it.
 - **systemd's log directory.** `install` refuses a `logs` whose directory, or any directory or symlink on
   the way to it, a user other than root can change (owned by another user, or writable by a group or by
   everyone without the sticky bit), and names who. This covers a directory that already exists. Debian
-  and Ubuntu ship `/var/log` as `root:syslog 0775`, so `logs: /var/log/app.log` is refused there; use a
-  directory of the daemon's own, `/var/log/<app>/app.log`, which `install` makes root's.
+  and Ubuntu ship `/var/log` as `root:syslog 0775`, and the group can rename what is inside it, so there
+  no log under `/var/log` is accepted, however deep; keep it under another root such as `/var/lib`, or in
+  a directory only root can change.
 - **A path that is not a directory** (a file, or a symlink that leads nowhere) is refused by both
   backends.
 - **A failed install** removes the directories it made, deepest first, by descriptor and only if they are

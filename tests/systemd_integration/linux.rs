@@ -1918,7 +1918,7 @@ fn install_makes_cwd_for_the_account_and_a_log_directory_root_keeps(#[fixture(sy
     let id = support::random_test_id();
     let guard = ServiceGuard::new(&id);
     let state = under_root("/var/lib", guard.id(), "state");
-    let logs = under_root("/var/log", guard.id(), "logs");
+    let logs = under_root("/var/lib", guard.id(), "logs");
     let _rm_state = DirGuard::new(state.clone());
     let _rm_logs = DirGuard::new(logs.clone());
     let spec = nobody_spec(guard.id(), Some(&state.join("work")), Some(&logs.join("out.log")));
@@ -1981,10 +1981,6 @@ fn install_refuses_a_log_directory_an_account_can_write(#[fixture(systemd_group)
     let err = mgr.install(&spec, false).expect_err("a group can write the directory");
     let why = refused_directory(&err, guard.id());
     assert!(why.contains("group") && why.contains(dir.to_str().unwrap()), "{why}");
-    assert!(
-        why.contains(dir.join(guard.id()).join("out.log").to_str().unwrap()),
-        "{why}"
-    );
 
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
     mgr.install(&spec, false).expect("only root can write it now");

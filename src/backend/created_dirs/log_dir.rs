@@ -14,9 +14,8 @@ use crate::error::{Error, Result};
 
 /// Refuse a log at `logs` whose directory, or any directory or symlink on the way to it, a user other
 /// than root can change: owned by another, or writable by a group or by everyone without the sticky bit
-/// that keeps entries from being renamed by others. Names the writer. `app` is the daemon's id, for
-/// the directory of its own that the error suggests.
-pub(crate) fn refuse_writable_log_dir(logs: &Path, app: &str) -> Result<()> {
+/// that keeps entries from being renamed by others. Names the writer.
+pub(crate) fn refuse_writable_log_dir(logs: &Path) -> Result<()> {
     let Some(dir) = logs.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
         return Ok(());
     };
@@ -34,22 +33,14 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, app: &str) -> Result<()> {
         .find_map(|step| writer(step).map(|writer| (step, writer)))
     {
         None => Ok(()),
-        Some((step, who)) => {
-            let own = logs.file_name().map(|file| dir.join(app).join(file));
-            let advice = match own {
-                Some(own) if step.at == dir => format!("use a directory of its own, such as {}", own.display()),
-                _ => "use a log directory that only root can change".to_string(),
-            };
-            Err(Error::DirectoryRefused {
-                path: dir.to_path_buf(),
-                why: format!(
-                    "{} {} can be changed by {who}, who could make root's open of the log (systemd opens it \
-                     before it drops privileges, and follows a symlink) write any file; {advice}",
-                    if step.link { "the symlink" } else { "the directory" },
-                    step.at.display(),
-                ),
-            })
-        }
+        Some((step, who)) => Err(Error::DirectoryRefused {
+            path: dir.to_path_buf(),
+            why: format!(
+                "{} {} can be changed by {who}, who could make root's open of the log (systemd opens it                  before it drops privileges, and follows a symlink) write any file; use a log directory                  that only root can change, under directories only root can change",
+                if step.link { "the symlink" } else { "the directory" },
+                step.at.display(),
+            ),
+        }),
     }
 }
 
