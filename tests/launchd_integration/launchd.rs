@@ -739,7 +739,7 @@ fn a_start_after_a_kill_sees_the_restart(#[fixture(launchd_group)] _group: &Grou
     let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
     let _guard = Guard::install(&mgr, &spec);
 
-    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &listener);
+    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &listener, &|| {});
 }
 
 /// Both ways a job has no process: never loaded, and loaded then booted out by `stop`. And the
