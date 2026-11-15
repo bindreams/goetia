@@ -32,6 +32,7 @@ impl<T: 'static> Allowance<T> {
     }
 
     /// Whether a hook has taken the value: for a value, not a count, which [`spend`] never takes.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn taken(&self) -> bool {
         let value = self.0.take();
         let taken = value.is_none();
