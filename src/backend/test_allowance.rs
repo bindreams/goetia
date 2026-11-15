@@ -1,5 +1,6 @@
-//! A limit on how many of something one thread may make, for the test hooks that refuse the next
-//! thread, temp file or reuse on demand.
+//! A setting one thread holds for the test hooks that refuse on demand: a count of how many of
+//! something it may make ([`spend`]), or a value a hook answers from ([`Allowance`]). It is cleared
+//! when its guard drops, or earlier if a hook takes it.
 
 use std::cell::Cell;
 use std::io;
@@ -20,17 +21,27 @@ pub(crate) fn spend(left: &'static Left, refusal: &str) -> io::Result<()> {
     }
 }
 
-/// Holds a limit on `left` until it drops, which lifts it.
-pub(crate) struct Allowance(&'static Left);
+/// Holds a setting of `left` until it drops, which clears it, unless a hook has taken it first. A
+/// count is a limit ([`spend`]); any other `T` is a value a hook answers from.
+pub(crate) struct Allowance<T: 'static = usize>(&'static LocalKey<Cell<Option<T>>>);
 
-impl Allowance {
-    pub(crate) fn set(left: &'static Left, n: usize) -> Allowance {
-        left.set(Some(n));
+impl<T: 'static> Allowance<T> {
+    pub(crate) fn set(left: &'static LocalKey<Cell<Option<T>>>, value: T) -> Allowance<T> {
+        left.set(Some(value));
         Allowance(left)
+    }
+
+    /// Whether a hook has taken the value: for a value, not a count, which [`spend`] never takes.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn taken(&self) -> bool {
+        let value = self.0.take();
+        let taken = value.is_none();
+        self.0.set(value);
+        taken
     }
 }
 
-impl Drop for Allowance {
+impl<T: 'static> Drop for Allowance<T> {
     fn drop(&mut self) {
         self.0.set(None);
     }
