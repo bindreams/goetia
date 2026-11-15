@@ -1242,7 +1242,9 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 /// larger, since a reservation is made before the kind is known. A task's `run` draws within `start`'s
 /// count: its first attempt is the load (a kept read and wait, the `bootstrap`, one more read), the
 /// `debug`, the `kickstart -p`, the `print`, the confirming `print` and the `SIGCONT`, 8 calls and 4
-/// reapers; each later attempt makes its own reservation and draws at most the last five of these.
+/// reapers (9 calls where the first `print` read the launch as in flight and the next shows it held:
+/// one more confirming `print`); each later attempt makes its own reservation and draws at most the last
+/// six of these.
 const SERVICE_INSTALL_REQUESTS: usize = 1;
 /// A task's longest `install`, an update of an armed task whose job changes: the timer's `bootout`,
 /// the job's, and both `bootstrap`s.

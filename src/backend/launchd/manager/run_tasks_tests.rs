@@ -376,7 +376,7 @@ fn a_slipped_in_run_is_waited_for_then_a_fresh_attempt_re_arms_debug() {
 }
 
 /// A scheduled run that has ended before it can be watched cannot be waited for: it is ended, and the
-/// next attempt starts. The note is still said, once.
+/// next attempt starts. The note is not said: there was nothing to wait for.
 #[skuld::test]
 fn a_slipped_in_run_that_ended_before_it_could_be_watched_retries() {
     let mut scheduled = Held::new(0);
@@ -401,7 +401,7 @@ fn a_slipped_in_run_that_ended_before_it_could_be_watched_retries() {
 
     run.unwrap_or_else(|e| panic!("begin_run failed: {e}"));
     fake.assert_spent("the second attempt followed the first");
-    assert_eq!(notes, NOTE);
+    assert_eq!(notes, "");
 }
 
 /// The pid `kickstart -p` named is not the job's any more by the time `print` is read: it ended, and the
@@ -712,10 +712,38 @@ fn a_confirming_print_that_shows_the_pid_without_the_hold_line_is_the_stranded_h
     }
 }
 
-/// After a scheduled run that slipped in: a confirm that shows the pid held, which it was not when it was
-/// named, is the stranded hold.
+/// The first `print` after `kickstart -p` can read a new launch as not held (launchd names the pid before
+/// it shows `started suspended = 1`; seen on CI when a `run` began the moment another returned). A launch
+/// that is not held cannot become so, so the confirm that shows the pid held says it is the held launch:
+/// it is resumed as the run's own, with no note, and no scheduled run is waited for.
 #[skuld::test]
-fn a_slipped_in_run_whose_confirming_print_shows_it_held_is_an_error() {
+fn a_launch_read_as_in_flight_and_then_as_held_is_the_held_launch() {
+    let child = Held::new(0);
+    let pid = child.pid();
+    let fake = Fake::new([
+        print(IDLE),
+        debug(),
+        kickstart(pid),
+        print(&in_flight(pid)),
+        print(&held(pid)),
+        print(&held(pid)),
+        sigcont_ending(child),
+    ]);
+    let tree = Tree::new();
+
+    let (result, notes) = begin(&fake, snapshot(&tree, None));
+
+    let run = result.unwrap_or_else(|e| panic!("begin_run failed: {e}"));
+    fake.assert_spent("the early read, its confirm, and the resume's");
+    assert_eq!(notes, "", "no scheduled run was in progress");
+    assert_eq!(calls_of(&fake, "debug").len(), 1, "no second attempt");
+    assert_eq!(run.wait().expect("the exit"), Exit::Code(0));
+}
+
+/// After a scheduled run that slipped in: a confirm that shows the same pid with no hold line says
+/// nothing of how it was launched, and is the stranded hold.
+#[skuld::test]
+fn a_slipped_in_run_whose_confirming_print_has_no_hold_line_is_an_error() {
     let scheduled = Held::new(0);
     let a = scheduled.pid();
     let fake = Fake::new([
@@ -723,47 +751,16 @@ fn a_slipped_in_run_whose_confirming_print_shows_it_held_is_an_error() {
         debug(),
         kickstart(a),
         print(&in_flight(a)),
-        print(&held(a)),
+        print(&without_hold_line(a)),
     ]);
     let tree = Tree::new();
 
     let (result, notes) = begin(&fake, snapshot(&tree, None));
 
-    let e = result.err().expect("a launch cannot be held and not");
-    assert_stranded(&e, "shown as held");
-    fake.assert_spent("shown as held");
-    assert_eq!(notes, NOTE);
-}
-
-/// After a scheduled run that slipped in: a confirm that shows the same pid with no hold line (a run that
-/// is ending may be shown so) is still that run, which is waited for like any other; a failure of the
-/// run is not the stranded hold.
-#[skuld::test]
-fn a_slipped_in_run_whose_confirming_print_has_no_hold_line_is_still_waited_for() {
-    let (mut scheduled, ours) = (Held::new(0), Held::new(0));
-    let (a, b) = (scheduled.pid(), ours.pid());
-    let fake = Fake::new([
-        print(IDLE),
-        debug(),
-        kickstart(a),
-        print(&in_flight(a)),
-        print(&without_hold_line(a)).then(move || {
-            scheduled.finish();
-        }),
-        debug_exiting(37),
-        kickstart(b),
-        print(&held(b)),
-        print(&held(b)),
-        sigcont_ending(ours),
-    ]);
-    let tree = Tree::new();
-
-    let (result, notes) = begin(&fake, snapshot(&tree, None));
-
-    let run = result.unwrap_or_else(|e| panic!("begin_run failed: {e}"));
-    fake.assert_spent("the run waited for, then a second attempt");
-    assert_eq!(notes, NOTE);
-    assert_eq!(run.wait().expect("the exit"), Exit::Code(0));
+    let e = result.err().expect("an unreadable confirm");
+    assert_stranded(&e, "no hold line");
+    fake.assert_spent("no hold line");
+    assert_eq!(notes, "", "nothing was waited for");
 }
 
 /// A note that cannot be written is an error after `debug` held the launch: the stranded hold, with the
@@ -782,7 +779,13 @@ fn a_note_that_cannot_be_written_is_the_stranded_hold() {
     }
     let scheduled = Held::new(0);
     let a = scheduled.pid();
-    let fake = Fake::new([print(IDLE), debug(), kickstart(a), print(&in_flight(a))]);
+    let fake = Fake::new([
+        print(IDLE),
+        debug(),
+        kickstart(a),
+        print(&in_flight(a)),
+        print(&in_flight(a)),
+    ]);
     let tree = Tree::new();
     let mgr = launchd_over(fake.clone());
     let mut handed = mgr.reserve(&[Step::Start], Budget::Immediate).expect("reserve");

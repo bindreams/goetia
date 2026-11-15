@@ -160,14 +160,6 @@ impl Launchd {
             Launch::Held => Ok(Attempt::Held(pid)),
             Launch::Ended => Ok(Attempt::Again),
             Launch::InFlight => {
-                if !*noted {
-                    let note = format!(
-                        "note: a scheduled run of `{id}` is in progress; waiting for it to end before starting this \
-                         run\n"
-                    );
-                    output::show(notes, note.as_bytes())?;
-                    *noted = true;
-                }
                 let Added::Watching(registered) = watch.add(pid)? else {
                     return Ok(Attempt::Again);
                 };
@@ -177,17 +169,29 @@ impl Launchd {
                     .launchctl
                     .read_task_print(name, issuing, Role::Query, reservation)?;
                 match launch_shown(&still, id, pid)? {
-                    // A pid is one launch's for as long as it is shown, and this launch was read as not
-                    // held, so a `print` that shows the pid with no `started suspended` line (a run that
-                    // is ending may be shown so) is still that run: the registration waits for its exit.
-                    Launch::InFlight | Launch::Unreadable => {
+                    Launch::InFlight => {
+                        if !*noted {
+                            let note = format!(
+                                "note: a scheduled run of `{id}` is in progress; waiting for it to end before \
+                                 starting this run\n"
+                            );
+                            output::show(notes, note.as_bytes())?;
+                            *noted = true;
+                        }
                         never_expires(registered.wait(None)?);
                         Ok(Attempt::Again)
                     }
                     Launch::Ended => Ok(Attempt::Again),
-                    Launch::Held => Err(unestablished(
+                    // The first read was early: launchd can name a new launch's pid before it shows
+                    // `started suspended = 1` for it (seen on CI, a `run` begun the moment another
+                    // returned), and a launch that is not held cannot become so. It is the held one.
+                    Launch::Held => {
+                        drop(registered);
+                        Ok(Attempt::Held(pid))
+                    }
+                    Launch::Unreadable => Err(unestablished(
                         id,
-                        format!("launchctl print now shows process {pid} as held, and it was not when it was named"),
+                        format!("launchctl print no longer shows how the launch of process {pid} began"),
                     )),
                 }
             }
