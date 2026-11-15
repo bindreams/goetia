@@ -545,8 +545,8 @@ fn a_start_after_a_kill_sees_the_restart_in_the_auto_restart_window(#[fixture(sy
 
 /// A unit that was started too often (systemd's start limit, which goetia leaves on for a `restart: never`
 /// unit: five starts in ten seconds) makes `start` fail at once and say so, and does not leave it waiting
-/// for a process that will not come. A `kill` between the starts ends each process, so that the next
-/// start is a fresh one; the limit is reached when a start is refused.
+/// for a process that will not come. A stop between the starts ends each process, so that the next start is
+/// a fresh one; the limit is reached when a start is refused.
 #[skuld::test]
 fn a_start_of_a_unit_at_its_start_limit_fails_and_says_so(#[fixture(systemd_group)] _group: &Group) {
     let guard = ServiceGuard::new(support::random_test_id());
@@ -558,7 +558,7 @@ fn a_start_of_a_unit_at_its_start_limit_fails_and_says_so(#[fixture(systemd_grou
 
     let e = loop {
         match mgr.start(&id, Budget::DEFAULT) {
-            Ok(_) => mgr.kill(&id).expect("kill the running daemon"),
+            Ok(_) => mgr.stop(&id, Budget::DEFAULT).expect("stop the running daemon"),
             Err(e) => break e,
         }
     };
