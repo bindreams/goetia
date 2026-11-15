@@ -156,6 +156,17 @@ fn registered(watch: &Watch, pid: u32) -> Registered {
     }
 }
 
+/// The kernel's report of `pid`'s exit with no status, which no real child gives a registration that asks
+/// for it: put where the registration's wait will find it, as the exit its queue read.
+pub(in crate::backend::launchd::manager) fn exit_without_status(watch: &Watch, pid: u32) {
+    watch
+        .shared
+        .kept
+        .lock()
+        .expect("the kept exits")
+        .push(Exited { pid, status: None });
+}
+
 /// How many events `queue` holds now, which it gives up: a poll that blocks for none.
 fn poll(queue: &Kqueue) -> usize {
     let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
