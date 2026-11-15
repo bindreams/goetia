@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use super::super::manager_tests::launchd_over;
+use super::super::task::Shown;
 use super::super::task::task_tests::{ID, Tree, marked, plists_of, service_spec, task_spec};
 use super::super::{
     INSTALL_CALLS, INSTALL_REQUESTS, TASK_DISABLE_CALLS, TASK_DISABLE_REQUESTS, TASK_ENABLE_CALLS, TASK_ENABLE_REQUESTS,
@@ -586,7 +587,31 @@ fn a_state_launchd_does_not_show_is_not_reported_as_a_run_in_flight() {
     let report = e.report().to_string();
     assert!(matches!(e, Error::Step { .. }), "{e:?}");
     assert!(!report.contains("run in flight"), "{report}");
-    assert!(report.contains("does not recognise"), "{report}");
+    let shown = Shown::State(Some("someday-new-apple-state".to_string())).describe(State::Unknown);
+    assert!(report.contains(&shown), "{report}");
+    assert!(report.contains("untouched"), "{report}");
+    fake.assert_spent("nothing is booted out");
+    assert_eq!(text_at(&tree, false, ID), old.job);
+}
+
+/// A `print` that failed is worded as `stop` words it, as a read that failed and not as a state goetia
+/// does not recognise.
+#[skuld::test]
+fn a_print_that_failed_is_worded_as_a_failed_read() {
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(Some(SCHEDULE)), false);
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), 5, ""),
+    ]);
+
+    let e = rewrite(&tree, &fake, &command("/bin/false")).expect_err("a read that failed");
+
+    let report = e.report().to_string();
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert!(report.contains(&Shown::Failed.describe(State::Unknown)), "{report}");
+    assert!(!report.contains("does not know"), "{report}");
     assert!(report.contains("untouched"), "{report}");
     fake.assert_spent("nothing is booted out");
     assert_eq!(text_at(&tree, false, ID), old.job);

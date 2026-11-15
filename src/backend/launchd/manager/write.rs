@@ -405,7 +405,7 @@ impl Executor<'_> {
             Action::CheckJobIdle => {
                 // A service is refused while launchd has it at all (one that has exited is still
                 // loaded); a task while it has a process or a start launchd has accepted. A state this
-                // cannot read as idle or as a run is refused too, and said not to be known.
+                // cannot read as idle or as a run is refused too, saying what launchd showed.
                 let verdict = match self.old.kind {
                     DaemonKind::Service if never_expires(launchctl.is_loaded(id, deadline, reservation)?) => {
                         Verdict::InFlight
@@ -418,7 +418,7 @@ impl Executor<'_> {
                         } else if print.state == State::Idle {
                             Verdict::Idle
                         } else {
-                            Verdict::Unknown
+                            Verdict::Unknown(print.shown.describe(print.state))
                         }
                     }
                 };
@@ -428,7 +428,7 @@ impl Executor<'_> {
                         let refusal = refuse::loaded_refusal(self.id, self.old.kind);
                         return Err(self.refuse(refusal, reservation));
                     }
-                    Verdict::Unknown => {
+                    Verdict::Unknown(shown) => {
                         let refusal = Error::Step {
                             what: format!(
                                 "the changed plists of `{id}` were not installed and the installed ones are \
@@ -436,7 +436,7 @@ impl Executor<'_> {
                             ),
                             source: Box::new(Error::os(
                                 format!("read whether the job of `{id}` is idle"),
-                                std::io::Error::other("launchctl print shows a state goetia does not recognise"),
+                                std::io::Error::other(shown),
                             )),
                         };
                         return Err(self.refuse(refusal, reservation));
@@ -637,8 +637,9 @@ enum Verdict {
     Idle,
     /// A service that is loaded, or a task with a process or an accepted start.
     InFlight,
-    /// A task whose `print` shows a state that is neither.
-    Unknown,
+    /// A task whose `print` shows a state that is neither, or could not be read: what launchd showed, as
+    /// [`super::task::Shown::describe`] words it.
+    Unknown(String),
 }
 
 #[cfg(test)]
