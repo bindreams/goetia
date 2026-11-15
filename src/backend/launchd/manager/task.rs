@@ -14,14 +14,16 @@ use jiff::tz::TimeZone;
 
 use super::{Launchctl, Launchd, Location, Plist, locate, read_artifact};
 use crate::backend::bounded::{Reservation, Role};
+use crate::backend::launchd::calendar;
 use crate::backend::launchd::generate::{self, timer_label};
+use crate::backend::launchd::next::{next_fire, system_zone};
 use crate::backend::launchd::state;
 use crate::backend::launchd::task::{Classified, Slot, classify};
 use crate::backend::{Decoded, ReadOutcome, Unnamed};
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
 use crate::manager::{Budget, DaemonStatus, Exit, State, Status, TaskStatus};
-use crate::spec::{DaemonKind, DaemonSpec, Id, next_fire, system_zone};
+use crate::spec::{DaemonKind, DaemonSpec, Id};
 
 // Reading =============================================================================================================
 
@@ -372,12 +374,12 @@ impl Launchd {
     }
 }
 
-/// When `timer` fires first after `now`, read from the schedule in the timer's own metadata, not the
-/// job's: the armed timer is what fires, and after a crash between replacing the job and the timer the
-/// job's metadata can hold a schedule the timer does not. `None` unless `armed` (enabled, and held by
-/// launchd), and for a timer whose metadata names no schedule or will not decode, or whose schedule has
-/// no date. The zone is asked for only when there is a schedule to read, so a disarmed task needs no
-/// time zone.
+/// When `timer` fires first after `now`, read from the entries the schedule in the timer's own metadata
+/// compiles to, not the job's: the armed timer is what fires, and after a crash between replacing the job
+/// and the timer the job's metadata can hold a schedule the timer does not. `None` unless `armed` (enabled,
+/// and held by launchd), and for a timer whose metadata names no schedule or will not decode, whose
+/// schedule has no date, or whose schedule the compiler refuses. The zone is asked for only when there are
+/// entries to read, so a disarmed task needs no time zone.
 pub(super) fn next_run(
     timer: Option<&Artifact>,
     armed: bool,
@@ -396,7 +398,13 @@ pub(super) fn next_run(
     let Some(schedule) = &task.schedule else {
         return Ok(None);
     };
-    Ok(next_fire(schedule, now, &zone()?))
+    let Ok(entries) = calendar::entries(schedule, &task.common.id) else {
+        return Ok(None);
+    };
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    Ok(next_fire(&entries, now, &zone()?))
 }
 
 #[cfg(test)]
