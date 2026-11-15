@@ -1458,7 +1458,9 @@ fn install_makes_and_hands_over_cwd_and_logs_parent_for_a_non_root_account(#[fix
     );
 }
 
-/// The daemon runs, with its `cwd` entered and its log opened by launchd as its account.
+/// The daemon runs: launchd enters its `cwd` and opens its log as its account, and the daemon writes in
+/// the `cwd`. It writes `proof` there as its first act, so the file is the event waited for, and the
+/// log has been opened by then.
 #[skuld::test]
 fn a_daemon_runs_in_the_directories_install_made_for_its_account(#[fixture(launchd_group)] _group: &Group) {
     let (nobody_uid, _) = nobody_ids();
@@ -1468,7 +1470,14 @@ fn a_daemon_runs_in_the_directories_install_made_for_its_account(#[fixture(launc
     let logs_parent = under_logs(&id, "logs");
     let _cleanup_cwd = DirGuard::new(state.clone());
     let _cleanup_logs_parent = DirGuard::new(logs_parent.clone());
-    let mut spec = service_fields(sleepy(&id));
+    let mut spec = service_fields(base_spec(
+        &id,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo started > proof; exec /bin/sleep 300".to_string(),
+        ],
+    ));
     spec.common.user = User::Name("nobody".to_string());
     spec.common.cwd = Some(state.join("work"));
     spec.common.logs = Some(logs_parent.join("out.log"));
@@ -1476,6 +1485,7 @@ fn a_daemon_runs_in_the_directories_install_made_for_its_account(#[fixture(launc
     let _guard = Guard::install(&mgr, &spec);
 
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
+    support::kill::until(|| state.join("work/proof").is_file());
 
     let log = std::fs::metadata(logs_parent.join("out.log")).expect("launchd opened the log");
     assert_eq!(log.uid(), nobody_uid, "launchd opens the log as the job's account");
