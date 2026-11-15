@@ -371,11 +371,12 @@ impl Executor<'_> {
         {
             prepare_parent_dirs(spec, account)?;
         }
-        for &action in plan {
+        for (at, &action) in plan.iter().enumerate() {
             match self.perform(action, reservation) {
                 Ok(Some(refusal)) => return Ok(refusal),
                 Ok(None) => {}
-                Err(e) if self.timer_out => return Err(self.timer_stranded(e)),
+                // `plan[at..]` still holds the action that failed: a write that failed is not done.
+                Err(e) if self.timer_out => return Err(self.timer_stranded(e, files_written(&plan[at..]))),
                 Err(e) => return Err(e),
             }
         }
@@ -588,10 +589,17 @@ impl Executor<'_> {
     }
 
     /// `error`, which ended the verb after the timer was booted out and before it was loaded again or
-    /// removed: the timer is not loaded, and running the verb again finishes it.
-    fn timer_stranded(&self, error: Error) -> Error {
+    /// removed: the timer is not loaded, and running the verb again finishes it. `files_written` is
+    /// whether every file the plan writes is in place: an install is then up to date, loads nothing, and
+    /// `enable` is what loads.
+    fn timer_stranded(&self, error: Error, files_written: bool) -> Error {
         let (id, label) = (self.id, timer_label(self.id.as_str()));
         let what = match self.verb {
+            Verb::Install if files_written => format!(
+                "`{id}`'s timer (`{label}`) was booted out and this install failed before loading it again, so it \
+                 is not loaded; the plists are already replaced, so install would find nothing to change: run \
+                 `goetia daemon enable {id}` to load what is missing"
+            ),
             Verb::Install => format!(
                 "`{id}`'s timer (`{label}`) was booted out and this install failed before loading it again, so it \
                  is not loaded: re-run install"
@@ -611,6 +619,17 @@ impl Executor<'_> {
             source: Box::new(error),
         }
     }
+}
+
+/// Whether `rest` writes no file: every `Create` and `Replace` of the job's plist and the timer's is behind
+/// it.
+fn files_written(rest: &[Action]) -> bool {
+    !rest.iter().any(|action| {
+        matches!(
+            action,
+            Action::CreateTimerFirst | Action::CreateTimerEnabled | Action::ReplaceJob | Action::ReplaceTimer
+        )
+    })
 }
 
 /// What `CheckJobIdle` read of the job.

@@ -389,6 +389,74 @@ fn a_failure_after_the_timer_went_out_names_the_timer_and_says_to_rerun() {
     assert_eq!(text_at(&tree, true, ID), old.job);
 }
 
+/// A failure after both plists were replaced leaves files that match the spec, so another install finds
+/// nothing to change and loads nothing: the headline sends the user to `enable`, which loads what is
+/// missing, not to a re-run.
+#[skuld::test]
+fn a_failed_load_after_the_plists_were_replaced_says_to_enable_not_to_rerun_install() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    let new = command("/bin/false");
+    let mut script = armed_edit(&tree);
+    script.truncate(script.len() - 2);
+    script.push(reply(
+        &["bootstrap", "system", at(&tree, true, ID).to_str().unwrap()],
+        exited(5, "", "boom"),
+    ));
+    let fake = Fake::new(script);
+
+    let e = rewrite(&tree, &fake, &new).expect_err("the job's bootstrap failed");
+
+    assert!(matches!(e, Error::Step { .. }), "{e:?}");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "`{ID}`'s timer (`{}`) was booted out and this install failed before loading it again, so it is \
+             not loaded; the plists are already replaced, so install would find nothing to change: run \
+             `goetia daemon enable {ID}` to load what is missing",
+            timer_name()
+        )
+    );
+    fake.assert_spent("the install stopped at the failed bootstrap");
+    let plists = plists_of(&new);
+    assert_eq!(text_at(&tree, true, ID), plists.job);
+    assert_eq!(text_at(&tree, true, &timer_name()), plists.timer.unwrap());
+    assert!(
+        matches!(decided(&tree, &new), Outcome::UpToDate),
+        "a second install is up to date, which is why the advice is `enable`"
+    );
+}
+
+/// The same advice only once every file is written: a failure while the timer's replacement is still
+/// to come leaves a timer that differs, which an install does load.
+#[skuld::test]
+fn a_failure_before_the_timer_was_replaced_still_says_to_rerun_install() {
+    let tree = Tree::new();
+    installed(&tree, &task_spec(Some(SCHEDULE)), true);
+    // After the job is replaced, the timer's path becomes a directory the new timer cannot replace.
+    let timer = at(&tree, true, &timer_name());
+    let obstruct = move || {
+        std::fs::remove_file(&timer).unwrap();
+        std::fs::create_dir(&timer).unwrap();
+        std::fs::write(timer.join("occupied"), "").unwrap();
+    };
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, IDLE),
+        bootout(job_label()),
+        print(job_label(), UNLOADED, "").then(obstruct),
+    ]);
+
+    let e = rewrite(&tree, &fake, &command("/bin/false")).expect_err("the timer cannot be replaced");
+
+    let text = e.to_string();
+    assert!(text.contains("re-run install"), "{text}");
+    assert!(!text.contains("enable"), "{text}");
+}
+
 /// An uninstall that fails after the timer went out says so as an uninstall: the remedy is to run it
 /// again, and re-running install would be the wrong one.
 #[skuld::test]
