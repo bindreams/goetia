@@ -26,7 +26,8 @@ use crate::error::{Chain, within};
 pub(super) struct DebugPrivilege {
     /// `Some` once the thread token was replaced; the token to put back (`None` inside: none).
     restore: Option<Option<OwnedHandle>>,
-    /// Why enabling failed. Absent when it worked and when the token lacks the privilege.
+    /// The step that failed, named by its call (see [`within`]). Absent when enabling worked and when
+    /// the token lacks the privilege.
     failure: Option<io::Error>,
 }
 
@@ -44,11 +45,13 @@ impl DebugPrivilege {
     }
 
     /// `open`'s error, with the failed privilege step named when the open was denied: the denial may
-    /// be the privilege that could not be enabled. The denial stays the error's `source()`.
+    /// be the privilege that could not be enabled. The note claims nothing of the token's privileges,
+    /// which may have held the privilege enabled before a later step failed. The denial stays the
+    /// error's `source()`.
     pub(super) fn explain_denial(&self, open: io::Error) -> io::Error {
         match &self.failure {
             Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => within(
-                format!("without SeDebugPrivilege (enabling it failed: {})", Chain(step)),
+                format!("tried after enabling SeDebugPrivilege failed ({})", Chain(step)),
                 open,
             ),
             _ => open,
@@ -100,7 +103,7 @@ fn install() -> io::Result<Option<Option<OwnedHandle>>> {
     } else {
         let e = io::Error::last_os_error();
         if e.raw_os_error() != Some(ERROR_NO_TOKEN as i32) {
-            return Err(e);
+            return Err(within("OpenThreadToken", e));
         }
         None
     };
@@ -109,7 +112,7 @@ fn install() -> io::Result<Option<Option<OwnedHandle>>> {
         None => {
             // SAFETY: as above.
             if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut token) } == 0 {
-                return Err(io::Error::last_os_error());
+                return Err(within("OpenProcessToken", io::Error::last_os_error()));
             }
             token
         }
@@ -133,7 +136,7 @@ fn install() -> io::Result<Option<Option<OwnedHandle>>> {
         )
     };
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(within("DuplicateTokenEx", io::Error::last_os_error()));
     }
     // SAFETY: a valid handle `DuplicateTokenEx` just returned.
     let copy = unsafe { OwnedHandle::from_raw_handle(copy) };
@@ -143,7 +146,7 @@ fn install() -> io::Result<Option<Option<OwnedHandle>>> {
     }
     // SAFETY: a null thread means this one; `copy` has `TOKEN_IMPERSONATE`.
     if unsafe { SetThreadToken(std::ptr::null(), copy.as_raw_handle()) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(within("SetThreadToken", io::Error::last_os_error()));
     }
     Ok(Some(previous))
 }
@@ -157,7 +160,7 @@ fn enable_in(token: RawHandle) -> io::Result<bool> {
     };
     // SAFETY: a pointer to a local, and the constant name of a privilege.
     if unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_DEBUG_NAME, &mut luid) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(within("LookupPrivilegeValueW", io::Error::last_os_error()));
     }
     let privileges = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
@@ -169,7 +172,7 @@ fn enable_in(token: RawHandle) -> io::Result<bool> {
     // SAFETY: `token` is live; `privileges` outlives the call and the optional outputs are null.
     let ok = unsafe { AdjustTokenPrivileges(token, 0, &privileges, 0, std::ptr::null_mut(), std::ptr::null_mut()) };
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(within("AdjustTokenPrivileges", io::Error::last_os_error()));
     }
     // The call succeeds for a token that lacks the privilege and says so only here.
     // SAFETY: no arguments.

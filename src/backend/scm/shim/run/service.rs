@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::backend::scm::exit_status::{
     ERROR_BAD_ARGUMENTS, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INVALID_DATA, Reported,
 };
-use crate::backend::scm::manager::{read_spec_blob, to_error};
+use crate::backend::scm::manager::read_spec_blob;
 use crate::backend::scm::wide::wide_null;
 use crate::blob::Blob;
 use crate::error::{Chain, Error};
@@ -290,7 +290,12 @@ fn report_stopped(handle: StatusHandle, reported: Reported) -> std::io::Result<(
 
 /// The line logged when the shim cannot connect to the SCM dispatcher.
 fn dispatcher_failure(e: windows_service::Error) -> String {
-    Chain(&to_error("connect to the SCM dispatcher", e)).to_string()
+    // `Winapi` displays as "IO error in winapi call"; its wrapped OS error is the reason.
+    let reason: &(dyn std::error::Error + 'static) = match &e {
+        windows_service::Error::Winapi(os) => os,
+        other => other,
+    };
+    format!("connect to the SCM dispatcher: {}", Chain(reason))
 }
 
 /// The shim exits after this without a `STOPPED` report. SCM is expected to read that as a crash

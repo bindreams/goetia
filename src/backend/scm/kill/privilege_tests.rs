@@ -7,7 +7,7 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NO_TOKEN, ERROR_SHARING_VIOLATION, LUID};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_ENOUGH_MEMORY, ERROR_SHARING_VIOLATION, LUID};
 use windows_sys::Win32::Security::{
     GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PRIVILEGE_SET, PrivilegeCheck, SE_DEBUG_NAME,
     TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
@@ -15,7 +15,7 @@ use windows_sys::Win32::Security::{
 
 use super::{DebugPrivilege, enable_in, restore_notice};
 use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
-use crate::error::Chain;
+use crate::error::{Chain, within};
 use crate::testing::groups::debug_privilege;
 
 /// The calling thread's own token, if it has one, opened to be queried.
@@ -134,9 +134,13 @@ fn dropping_puts_back_the_thread_token_that_was_there(#[fixture(debug_privilege)
 
 // Failures are reported -----------------------------------------------------------------------------------------------
 
-/// What `install` fails with in production: a bare OS error from `last_os_error`.
+/// What `install` fails with in production: a step's OS error, wrapped with the step's name. The
+/// code is not the open's.
 fn step_error() -> io::Error {
-    io::Error::from_raw_os_error(ERROR_NO_TOKEN as i32)
+    within(
+        "DuplicateTokenEx",
+        io::Error::from_raw_os_error(ERROR_NOT_ENOUGH_MEMORY as i32),
+    )
 }
 
 /// What the open fails with in production: a bare OS error.
@@ -158,8 +162,8 @@ fn a_denied_open_names_the_privilege_step_that_failed() {
     assert_eq!(
         Chain(&e).to_string(),
         format!(
-            "without SeDebugPrivilege (enabling it failed: {}): {}",
-            step_error(),
+            "tried after enabling SeDebugPrivilege failed (DuplicateTokenEx: {}): {}",
+            io::Error::from_raw_os_error(ERROR_NOT_ENOUGH_MEMORY as i32),
             denied_open()
         )
     );

@@ -1301,7 +1301,7 @@ fn a_failed_dispatcher_connection_names_the_os_reason() {
     assert_eq!(
         text,
         format!(
-            "failed to connect to the SCM dispatcher: {}",
+            "connect to the SCM dispatcher: {}",
             std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
         )
     );
