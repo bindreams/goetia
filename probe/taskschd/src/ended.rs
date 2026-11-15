@@ -495,7 +495,7 @@ pub fn run(a: &[String]) -> i32 {
                 .rev()
                 .map(|c| format!("[a-U={:+.2} b-U={:+.2} b-E={:+.2} pid={} guid={}]", ms(u, c.a), ms(u, c.b), ms(drop1, c.b), c.pid, c.guid))
                 .collect();
-            spam_note = format!("spam: {} calls; last three (U = first ended/unreadable sample, E = the listing's drop): {}", calls.len(), last3.join(" "));
+            spam_note.push_str(&format!("spam: {} calls; last three (U = first ended/unreadable sample, E = the listing's drop): {}", calls.len(), last3.join(" ")));
         }
 
         // What the action itself recorded.

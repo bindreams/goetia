@@ -11,6 +11,8 @@
   {"name": "ly-localservice", "cmd": "l.ps1 -Kind localservice -Only 'l2spam'"},
   {"name": "ly-networkservice", "cmd": "l.ps1 -Kind networkservice -Only 'l2spam'"},
   {"name": "ly-user", "cmd": "l.ps1 -Kind user -Only 'l2spam'"},
+  {"name": "lz-system", "cmd": "l.ps1 -Kind system -Only 'l1c'"},
+  {"name": "lz-user", "cmd": "l.ps1 -Kind user -Only 'l1c'"},
   {"name": "m1", "cmd": "m1.ps1"},
   {"name": "m2", "cmd": "m2.ps1"},
   {"name": "m3", "cmd": "m3.ps1"},
