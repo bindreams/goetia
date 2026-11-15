@@ -71,6 +71,7 @@ mod busctl;
 mod dirs;
 mod discover;
 mod journal;
+mod kill;
 mod run;
 mod systemctl;
 mod task;
@@ -89,6 +90,7 @@ pub(crate) use run::{JournalOutput, Run};
 use systemctl::{Held, Systemctl};
 pub(crate) use task::Fragment;
 
+use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
 use crate::backend::systemd::generate::{self, Units};
 use crate::backend::{
     Backend, Identity, InstalledDefinition, InstalledService, NativeRestart, ReadOutcome, Scan, ScanEntry, WriteOutcome,
@@ -311,8 +313,17 @@ impl Backend for Systemd {
             .stop_impl(snapshot.id().as_str(), budget, deadline, reservation)
     }
 
+    /// SIGKILL to the unit's main process, through a pidfd, once the manager and its version have been
+    /// vouched for as for any request. The pid is read from `show`, so no unit is signalled by the
+    /// name of a process another unit now holds. See [`crate::backend::kill`].
     fn kill(&self, snapshot: Fragment, reservation: &mut Held) -> Result<()> {
-        self.systemctl.kill_impl(snapshot.id().as_str(), reservation)
+        self.systemctl.require_supported(reservation)?;
+        let id = snapshot.id();
+        let unit = unit_name(id.as_str(), UnitKind::Service);
+        match kill_service(&mut kill::UnitKill::new(&self.systemctl, unit)).map_err(|e| kill_failed(id.as_str(), e))? {
+            KillOutcome::Ended => Ok(()),
+            KillOutcome::NotRunning => Err(Error::NotRunning { id: id.to_string() }),
+        }
     }
 
     /// See [`Systemd::begin_run`], which is the journal-less host's stated contract too.

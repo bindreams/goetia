@@ -4,6 +4,10 @@
 //! The daemon is the test binary in a sentinel mode that connects to the test's listener each time
 //! it starts (`sentinel::RUN_UNTIL_KILLED`, or the SCM fixture), so a start, and a restart by the
 //! manager, are events the test waits for rather than times it guesses at.
+//!
+//! `kill` returns once the killed process has exited and the manager no longer reports it, on every
+//! backend, so no scenario here waits for the manager to catch up: a `status` straight after the kill
+//! never shows the killed process.
 
 use goetia::Error;
 use goetia::manager::{Budget, ServiceManager, State};
@@ -35,6 +39,12 @@ pub fn a_killed_daemon_comes_back_with_a_new_pid(mgr: &dyn ServiceManager, id: &
 
     mgr.kill(id).expect("kill");
 
+    let right_after = mgr.status(id).expect("status straight after the kill");
+    assert_ne!(
+        right_after.common().pid,
+        Some(old_pid),
+        "kill returned while the manager still reported the killed process ({right_after:?})"
+    );
     started.accept("the daemon to be restarted by the manager after the kill");
     let after = mgr.status(id).expect("status after the restart");
     let new_pid = after.common().pid.expect("the restarted daemon reports a pid");
@@ -42,6 +52,33 @@ pub fn a_killed_daemon_comes_back_with_a_new_pid(mgr: &dyn ServiceManager, id: &
         new_pid, old_pid,
         "the manager restarted the daemon as a new process ({after:?})"
     );
+}
+
+/// A caller that wants the next process calls `start` after `kill`, and it sees the restart the policy
+/// made, or makes it now: it returns `Ok` with the daemon running as a new process, even when the policy
+/// is still waiting out its restart delay. The restart does not depend on the caller surviving the kill,
+/// and the start does not meet the killed process still running.
+/// `id` must be installed, not started, with a restart policy that restarts after a kill and a restart
+/// delay longer than a kill takes. `started` hears from the daemon each time it starts.
+pub fn a_start_after_a_kill_sees_the_restart(mgr: &dyn ServiceManager, id: &Id, started: &ConnectBack) {
+    mgr.start(id, Budget::DEFAULT).expect("start");
+    started.accept("the daemon to report in after start");
+    let old_pid = mgr
+        .status(id)
+        .expect("status before the kill")
+        .common()
+        .pid
+        .expect("a running daemon reports a pid");
+
+    mgr.kill(id).expect("kill");
+    mgr.start(id, Budget::DEFAULT)
+        .expect("a start after the kill sees the policy's restart");
+
+    let after = mgr.status(id).expect("status after the start");
+    assert_eq!(after.common().state, State::Running, "{after:?}");
+    let new_pid = after.common().pid.expect("a running daemon reports a pid");
+    assert_ne!(new_pid, old_pid, "the start met the killed process ({after:?})");
+    started.accept("the restarted daemon to report in");
 }
 
 /// A daemon whose policy is not to restart stays down after a kill, in a state that says it is not
@@ -64,15 +101,13 @@ pub fn a_killed_daemon_that_never_restarts_stays_down(
 
     mgr.kill(id).expect("kill");
 
-    // Settled: the manager has recorded the process gone and, under this policy, has nothing left to
-    // do. Anything earlier could still be a restart that has not happened yet.
-    until(|| {
-        matches!(
-            mgr.status(id).expect("status").common().state,
-            State::Stopped | State::Failed
-        )
-    });
-    let status = mgr.status(id).expect("status after the kill");
+    // Settled at once: the kill returns when the manager has recorded the process gone and, under this
+    // policy, has nothing left to do.
+    let status = mgr.status(id).expect("status straight after the kill");
+    assert!(
+        matches!(status.common().state, State::Stopped | State::Failed),
+        "kill returned before the manager recorded the exit ({status:?})"
+    );
     assert_eq!(status.common().pid, None, "a killed daemon has no process ({status:?})");
     no_restart_configured();
 }

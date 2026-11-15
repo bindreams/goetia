@@ -516,8 +516,84 @@ fn a_killed_never_restart_daemon_stays_down(#[fixture(systemd_group)] _group: &G
     });
 }
 
+/// `reporting`, with the restart delay `delay`.
+fn reporting_after(id: &str, restart: Restart, delay: Duration, listener: &support::ConnectBack) -> DaemonSpec {
+    let mut spec = service_fields(mk(id));
+    spec.common.command = vec![
+        support::current_exe_str(),
+        support::sentinel::RUN_UNTIL_KILLED.to_string(),
+        listener.port().to_string(),
+    ];
+    spec.restart = restart;
+    spec.restart_delay = Some(delay);
+    ServiceSpec::new(spec).map(DaemonSpec::from).unwrap()
+}
+
+/// After `kill`, `start` sees the restart the policy made, or makes it now, and returns `Ok`: also while
+/// the unit is in `auto-restart`, which the delay of a few seconds keeps it in for as long as a kill and a
+/// start take.
+#[skuld::test]
+fn a_start_after_a_kill_sees_the_restart_in_the_auto_restart_window(#[fixture(systemd_group)] _group: &Group) {
+    let guard = ServiceGuard::new(support::random_test_id());
+    let listener = support::ConnectBack::listen();
+    let spec = reporting_after(guard.id(), Restart::Always, Duration::from_secs(5), &listener);
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+
+    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &listener);
+}
+
+/// A unit the policy has stopped restarting because it started too often (systemd's start limit) makes
+/// `start` fail at once and say so, and does not leave it waiting for a process that will not come. The
+/// limit is reached by killing the daemon, which the policy restarts each time, until it gives up.
+#[skuld::test]
+fn a_start_of_a_unit_at_its_start_limit_fails_and_says_so(#[fixture(systemd_group)] _group: &Group) {
+    let guard = ServiceGuard::new(support::random_test_id());
+    let listener = support::ConnectBack::listen();
+    let spec = reporting(guard.id(), Restart::Always, &listener);
+    let id = spec.common().id.clone();
+    let mgr = Systemd::new();
+    mgr.install(&spec, false).expect("install");
+    mgr.start(&id, Budget::DEFAULT).expect("start");
+    let mut pid = mgr
+        .status(&id)
+        .expect("status")
+        .common()
+        .pid
+        .expect("a started daemon has a pid");
+
+    // Each kill is followed by the policy's restart, until it has restarted too often and gives up: the
+    // unit is `failed` and has no process.
+    loop {
+        mgr.kill(&id).expect("kill the running daemon");
+        let settled = loop {
+            let status = mgr.status(&id).expect("status");
+            let common = status.common();
+            if common.state == State::Failed || common.pid.is_some_and(|new| new != pid) {
+                break status;
+            }
+            std::thread::yield_now();
+        };
+        match settled.common().pid {
+            Some(new) if settled.common().state != State::Failed => pid = new,
+            _ => break,
+        }
+    }
+    assert_eq!(mgr.status(&id).expect("status").common().state, State::Failed);
+
+    let e = mgr
+        .start(&id, Budget::DEFAULT)
+        .expect_err("a unit at its start limit does not start");
+
+    let report = e.report().to_string();
+    assert!(
+        report.to_lowercase().contains("start request repeated too quickly"),
+        "the error does not say the start limit was reached: {report}"
+    );
+}
+
 /// An installed unit that was never started is not loaded; one that was stopped is loaded or not
-/// depending on what still refers to it. Both are `NotRunning`, off `systemctl kill`'s own answer.
+/// depending on what still refers to it. Both are `NotRunning`, off the read that starts the kill.
 #[skuld::test]
 fn killing_a_stopped_unit_is_not_running(#[fixture(systemd_group)] _group: &Group) {
     let guard = ServiceGuard::new(support::random_test_id());

@@ -14,9 +14,10 @@ Everything documented below — the manifest's interpolation syntax, the
 may still change** between releases. Pin a specific released version, or a
 specific commit if working ahead of one.
 
-goetia requires **systemd 242+** (2019), and refuses to install, uninstall,
-start, stop, restart, enable or disable anything on an older one, before
-writing or running anything. It checks both the running systemd and the
+On macOS goetia requires **14.4+**: `kill` holds the daemon's process by its
+identity, which the OS offers from 14.4. On Linux it requires **systemd 242+**
+(2019), and refuses to install, uninstall, start, stop, restart, enable or
+disable anything on an older one, before writing or running anything. It checks both the running systemd and the
 `systemctl` client, which is what parses `--show-transaction`. A running
 systemd it cannot ask is refused. Generated units use
 `Type=exec` (240+), which is what lets a start report a missing executable or
@@ -1160,32 +1161,45 @@ default, or give it a duration other than `0`.
 
 ## Killing a daemon
 
-`goetia daemon kill <ID...>` ends each daemon's running process as a failure.
-On systemd and launchd it returns once the signal is sent; on Windows it returns
-once SCM has recorded the exit: the service is then stopped, or already
-restarted by its restart policy. It takes no `--timeout` and does not change
-boot-enablement. What follows is the daemon's `restart` policy: an `always` or
-`on-failure` daemon comes back, a `never` one stays down. Like `stop`, it needs
-elevation, and `--json` is refused.
+`goetia daemon kill <ID...>` ends each daemon's running process as a failure,
+and returns once that process has exited and the manager no longer reports it:
+on every platform, the `status` after a `kill` does not show the killed process.
+It takes no `--timeout` and does not change boot-enablement. What follows is the
+daemon's `restart` policy: an `always` or `on-failure` daemon comes back, a
+`never` one stays down. To have the next process, run `goetia daemon start`
+after `kill`: it returns once the daemon runs, starting it now if the policy's
+delay has not yet. The restart does not depend on the `kill` command surviving,
+since the signal is sent before it waits. Like `stop`, it needs elevation, and
+`--json` is refused.
 
-It addresses the service, never a bare pid:
+It addresses the service, never a bare pid. goetia asks the manager for the
+service's process, holds it, asks again whether it is still the service's, and
+signals that held process, so the signal never reaches a stranger that took its
+pid:
 
 | Platform | What it sends                                                                                                                                                                                                                           |
 | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| systemd  | `SIGKILL` to the unit's main process alone (`systemctl kill --kill-who=main-fail`); systemd cleans up the rest of the cgroup.                                                                                                           |
-| launchd  | `launchctl kill SIGKILL system/<id>`.                                                                                                                                                                                                   |
+| systemd  | `SIGKILL` to the unit's main process alone, through a pidfd; systemd cleans up the rest of the cgroup. The process is the unit's `MainPID`.                                                                                             |
+| launchd  | `SIGKILL` to the job's process, through an audit token. The process is the pid `launchctl print` shows.                                                                                                                                 |
 | Windows  | SCM has no kill-by-service call, so goetia terminates the service's process (exit code `1`), after confirming through SCM that it is still the service's. SCM sees an unexpected exit and applies the recovery actions, as for a crash. |
+
+The process killed is the one the manager reported when `kill` began. If it
+exited on its own in the moment before the signal landed, `kill` still succeeds
+once the manager has recorded that end, and the restart policy decides what
+follows, as it would had the process exited just before `kill` ran. goetia does
+not go after a service that restarts meanwhile.
 
 On Windows with `protocol: plain` the service's process is `goetia-shim`; its Job
 Object ends the daemon and its descendants with it. Windows does not report when
 that termination has finished, so the daemon's processes can briefly outlive the
 return of `kill`, and a restart by SCM can overlap them.
 
-On Windows the process just terminated, or one already terminating (a second
-`kill`, or a daemon dying on its own), is waited for until it exits, with no
-time limit. When it has not exited yet, goetia prints
-`<id>: waiting for process <pid> to exit` to stderr; a process stuck in a
-driver request can keep it waiting.
+`kill` waits for the process to exit and for the manager to record it, with no
+time limit: the exit of a process that was sent `SIGKILL` is an event, not a wait
+to bound. A process the kernel cannot end, one in uninterruptible sleep on a hung
+mount or in a stuck driver, keeps it waiting, as it keeps `stop` waiting; Ctrl-C
+ends the wait and the signal stands. On Windows, when the process has not exited
+yet, goetia prints `<id>: waiting for process <pid> to exit` to stderr.
 
 A daemon with no process, whether stopped or between runs, is an error: exit
 `1` and "is not running", because nothing was killed. A launchd task whose

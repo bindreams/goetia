@@ -6,10 +6,12 @@
 //! run in flight, and any run that begins while it does, with SIGTERM by label, and returns when
 //! launchd shows no process.
 
+use super::kill::JobKill;
 use super::task::TaskPrint;
 use super::watch::{Added, Watch};
 use super::{Launchd, Plist, SignalOutcome, UNLOAD_POLL, Until, never_expires};
 use crate::backend::bounded::{Reservation, Role};
+use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
 use crate::backend::launchd::state::Evidence;
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
@@ -106,18 +108,19 @@ impl Launchd {
         }
     }
 
-    /// SIGKILL to the run in flight, by label. A start launchd has accepted and not yet forked
-    /// (`spawn scheduled`, no pid) is a run, as `status` and `stop` have it, but a signal reaches
-    /// nothing before the fork: `launchctl kill` answers "No such process", the start goes on, and the
-    /// run it begins would not be killed. So a signal that finds no process reads `print`. A start that
-    /// is queued is waited for until it forks, under no budget as `stop`'s wait is; a pid shown is a fork
-    /// that came after the signal. Either way the signal is sent again. An idle `print` is
-    /// [`Error::NotRunning`], as the signal's own answer said; a read that failed or was not whole, or a
-    /// no-pid state that is neither idle nor queued, is [`Error::StopUnconfirmed`] (see [`quiet`]). Draws a signal, a read, a wait and a second
-    /// signal at most.
+    /// SIGKILL to the run in flight, and the wait for launchd to stop showing it (see [`kill_service`]).
+    /// A start launchd has accepted and not yet forked (`spawn scheduled`, no pid) is a run, as `status`
+    /// and `stop` have it, but a signal reaches nothing before the fork, and the run it begins would not
+    /// be killed. So a kill that finds no process reads `print` once more. A start that is queued is
+    /// waited for until it forks, under no budget as `stop`'s wait is, and the kill is made again; a
+    /// pid shown is a fork that came after the first look, and is killed. An idle `print` is
+    /// [`Error::NotRunning`]; a read that failed or was not whole, or a no-pid state that is neither
+    /// idle nor queued, is [`Error::StopUnconfirmed`] (see [`quiet`]). Draws the kill's wait, a read and
+    /// a wait for the fork at most.
     pub(super) fn kill_task(&self, id: &Id, reservation: &mut Reservation) -> Result<()> {
         let name = id.as_str();
-        if self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
+        let mut target = JobKill::new(&self.launchctl, name, reservation)?;
+        if kill_service(&mut target).map_err(|e| kill_failed(name, e))? == KillOutcome::Ended {
             return Ok(());
         }
         let print = self
@@ -129,10 +132,10 @@ impl Launchd {
                 Quiet::Queued => self.await_queued_start(name, reservation)?,
             }
         }
-        if self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
-            return Ok(());
+        match kill_service(&mut target).map_err(|e| kill_failed(name, e))? {
+            KillOutcome::Ended => Ok(()),
+            KillOutcome::NotRunning => Err(Error::NotRunning { id: id.to_string() }),
         }
-        Err(Error::NotRunning { id: id.to_string() })
     }
 
     /// Waits for the start launchd has accepted for `name` to fork, or to turn out not to happen (see

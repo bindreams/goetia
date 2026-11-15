@@ -780,36 +780,7 @@ impl Systemctl {
     }
 }
 
-/// `systemctl kill` of `unit`'s main process with `SIGKILL`, and nothing else of it: not the control
-/// process, not the rest of the cgroup, which systemd cleans up when the main process is gone.
-///
-/// `--kill-who`, not `--kill-whom`: 245 and older do not know the second. `main-fail` rather than
-/// `main`: `main` exits `0` having signalled nobody when there is no main process, where `main-fail`
-/// fails with the answer [`no_process`] reads.
-const KILL_ARGS: [&str; 3] = ["kill", "--kill-who=main-fail", "--signal=SIGKILL"];
-
-/// Whether `stderr` is systemd saying `unit` has no process to signal, word for word: it is not
-/// loaded, which is what an inactive unit is once nothing holds it, or it is loaded and its main
-/// process is gone. Read off the kill's own answer, so no state read before it can race the kill.
-fn no_process(stderr: &str, unit: &str) -> bool {
-    stderr.contains(&format!("Unit {unit} not loaded.")) || stderr.contains("No main process to kill")
-}
-
 impl Systemctl {
-    /// `Ok` means the signal was delivered: systemd sends it before it answers, and goetia does not wait
-    /// for the process to be gone.
-    pub(super) fn kill_impl(&self, id: &str, held: &mut Held) -> Result<()> {
-        let unit = unit_name(id, UnitKind::Service);
-        let (status, capture) = self.completed(Purpose::Request, &unit_args(&KILL_ARGS, &unit), held)?;
-        if status.success() {
-            return Ok(());
-        }
-        if no_process(&String::from_utf8_lossy(&capture.stderr), &unit) {
-            return Err(Error::NotRunning { id: id.to_string() });
-        }
-        Err(failed("kill", &unit, status, &capture))
-    }
-
     /// `systemctl enable` for `id`'s unit; a failure carries systemd's words.
     pub(super) fn enable_impl(&self, id: &str, held: &mut Held) -> Result<()> {
         self.unit_file_verb(&["enable"], id, UnitKind::Service, held)
@@ -930,6 +901,16 @@ impl Systemctl {
             pid: main_pid(&props),
             enabled,
         })
+    }
+
+    /// The pid systemd reports as `unit`'s main process, in any state: `None` when it has none, or when the
+    /// unit is not loaded, which is what an inactive unit is once nothing holds it.
+    pub(super) fn main_pid_of(&self, unit: &str) -> Result<Option<u32>> {
+        match self.show_installed(unit, &["MainPID"]) {
+            Ok(props) => Ok(main_pid(&props)),
+            Err(Error::UnitNotLoaded { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// A task's state, pid and invocation, from its job `unit`, in one `systemctl show`. The run in

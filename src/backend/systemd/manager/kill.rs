@@ -1,0 +1,75 @@
+//! `kill` of a unit's main process: the target the state machine in `backend::kill` drives. The pid is
+//! read with `systemctl show`, the process is held and signalled through a pidfd (`backend::kill::process`),
+//! and the wait for the manager's record re-reads `MainPID` until it is not the killed pid.
+//!
+//! A task's job is its service unit, so a task's kill is a service's.
+
+use std::io;
+use std::time::Duration;
+
+use cosca::Process;
+
+use super::systemctl::Systemctl;
+use crate::backend::kill::{KillTarget, process};
+use crate::backend::scm::wait::Waited;
+use crate::manager::budget::Deadline;
+
+/// How long [`UnitKill::await_recorded`] rests between two reads of `MainPID`. Pacing, never proof of
+/// state: each read asks systemd, and the wait ends on its answer.
+const RECORD_RECHECK: Duration = Duration::from_millis(100);
+
+/// One unit's main process, as the manager reports it.
+pub(super) struct UnitKill<'a> {
+    systemctl: &'a Systemctl,
+    unit: String,
+}
+
+impl<'a> UnitKill<'a> {
+    pub(super) fn new(systemctl: &'a Systemctl, unit: String) -> Self {
+        Self { systemctl, unit }
+    }
+}
+
+impl KillTarget for UnitKill<'_> {
+    type Process = Process;
+
+    /// `MainPID`: `None` when the unit has no main process or is not loaded, which `systemctl kill`
+    /// called "No main process to kill" and "Unit not loaded".
+    fn service_pid(&mut self) -> io::Result<Option<u32>> {
+        self.systemctl.main_pid_of(&self.unit).map_err(io::Error::other)
+    }
+
+    fn open(&mut self, pid: u32) -> io::Result<Option<Process>> {
+        process::open(pid)
+    }
+
+    fn terminate(&mut self, held: &Process) -> io::Result<()> {
+        process::terminate(held)
+    }
+
+    fn await_exit(&mut self, held: &Process) -> io::Result<()> {
+        process::await_exit(held)
+    }
+
+    /// The process is a zombie once it has exited, which is not systemd's record of it: `MainPID` is
+    /// cleared when systemd reaps it. Every read re-checks that, and [`RECORD_RECHECK`] only paces them.
+    /// A unit systemd no longer has loaded reports no pid, which is the record.
+    fn await_recorded(&mut self, pid: u32, deadline: Deadline) -> io::Result<Waited> {
+        loop {
+            if self.service_pid()? != Some(pid) {
+                return Ok(Waited::Confirmed);
+            }
+            if deadline.expired() {
+                return Ok(Waited::Expired);
+            }
+            let pause = deadline
+                .remaining()
+                .map_or(RECORD_RECHECK, |left| left.min(RECORD_RECHECK));
+            std::thread::sleep(pause);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "kill_tests.rs"]
+mod kill_tests;

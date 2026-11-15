@@ -74,6 +74,7 @@ use std::{fs, io};
 
 use crate::backend::bounded::{self, Finished, Kept, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
+use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
 use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::state::Evidence;
 use crate::backend::launchd::task::enabled_in;
@@ -92,6 +93,7 @@ pub use super::{ENABLED_DIR, STAGING_DIR};
 use task::{Artifact, Assembled, Body};
 
 mod interrupts;
+mod kill;
 mod proc;
 mod run;
 mod task;
@@ -854,6 +856,10 @@ enum Until {
     /// accepted has forked, or has not happened and will not. `kickstart` returns before the fork, and
     /// `launchctl kill` of a job in that state signals nothing, so a `stop` waits for this first.
     ProcessOrNotScheduled,
+    /// The job's pid is not this one: `print` shows another process, or none (a job launchd holds that
+    /// has exited, or is throttled and `spawn scheduled`), or the label is not held. What the record of
+    /// a killed process is: launchd no longer shows it as the job's.
+    PidNot(u32),
 }
 
 impl Until {
@@ -868,6 +874,9 @@ impl Until {
                     let body = String::from_utf8_lossy(&capture.stdout);
                     state::has_process(&body).is_some() || !state::spawn_scheduled(&body)
                 }
+            }
+            (Until::PidNot(pid), Printed::Present(capture)) => {
+                capture.complete && state::has_process(&String::from_utf8_lossy(&capture.stdout)) != Some(pid)
             }
         }
     }
@@ -1105,9 +1114,9 @@ impl Launchctl {
 
     /// `launchctl kill <signal>` on the job `id`, never a pid: launchd signals what runs under the label
     /// now, so a pid that was reused cannot be hit. What happens next is the plist's `KeepAlive`.
-    /// Unbounded: `kill` returns as soon as launchd has the signal sent. [`SignalOutcome::NoProcess`]
+    /// Unbounded: it returns as soon as launchd has the signal sent. [`SignalOutcome::NoProcess`]
     /// is the [`is_not_found`] codes, which say the job has no process to signal; what that means is the
-    /// verb's to say.
+    /// verb's to say. `kill` does not use it: see [`kill::JobKill`].
     fn signal(&self, id: &str, signal: &str, reservation: &mut Reservation) -> Result<SignalOutcome> {
         let target = target(id);
         let args = ["kill", signal, target.as_str()];
@@ -1118,6 +1127,30 @@ impl Launchctl {
             Ok(SignalOutcome::NoProcess)
         } else {
             Err(command_failed(&args, status, &capture.stderr))
+        }
+    }
+
+    /// The pid `print` shows for the job `id`, in any state: `None` for a label launchd does not hold
+    /// and for a job it holds with no process (`spawn scheduled` included). A read that fails is an
+    /// `Err`, never no process. Unbounded, and counted in no verb's reservation: the files of the read
+    /// are made on the spot, as for `status`.
+    fn job_pid(&self, id: &str) -> Result<Option<u32>> {
+        let Some((status, capture)) = self.read_print(
+            id,
+            Budget::Unbounded.start(),
+            Role::UncountedQuery,
+            &mut Reservation::default(),
+        )?
+        else {
+            unreachable!("a call under an unbounded deadline never expires")
+        };
+        debug_assert!(capture.complete, "a read under an unbounded deadline is whole");
+        if status.success() {
+            Ok(state::has_process(&String::from_utf8_lossy(&capture.stdout)))
+        } else if is_not_found(status.code()) {
+            Ok(None)
+        } else {
+            Err(command_failed(&["print", &target(id)], status, &capture.stderr))
         }
     }
 
@@ -1285,11 +1318,8 @@ const STOP_REQUESTS: usize = 1;
 /// A task's `uninstall`: the timer's `bootout` and the job's.
 const TASK_UNINSTALL_REQUESTS: usize = 2;
 const UNINSTALL_REQUESTS: usize = max(STOP_REQUESTS, TASK_UNINSTALL_REQUESTS);
-const SERVICE_KILL_REQUESTS: usize = 1;
-/// A task's `kill` that finds a start launchd has accepted and not yet forked: the signal that finds no
-/// process, and the signal after the wait. The wait draws no reaper.
-const TASK_KILL_REQUESTS: usize = 2;
-const KILL_REQUESTS: usize = max(SERVICE_KILL_REQUESTS, TASK_KILL_REQUESTS);
+/// `kill` sends no `launchctl` request: the process is signalled through a hold, and launchd is only read.
+const KILL_REQUESTS: usize = 0;
 /// A task's `enable` makes its own reservation: the `bootout` of a timer label launchd holds with no
 /// timer file, the `bootstrap` of the job, and the `bootstrap` of the timer.
 const TASK_ENABLE_REQUESTS: usize = 3;
@@ -1319,10 +1349,12 @@ const STOP_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_STOP_CALLS);
 /// waits.
 const TASK_UNINSTALL_CALLS: usize = 2 + (1 + 1) + (1 + 1);
 const UNINSTALL_CALLS: usize = max(SERVICE_STOP_CALLS, TASK_UNINSTALL_CALLS);
-const SERVICE_KILL_CALLS: usize = SERVICE_KILL_REQUESTS;
-/// A task's longest `kill`: the signal, the read, the wait for the pid (one call, however many reads it
-/// makes), and the signal.
-const TASK_KILL_CALLS: usize = TASK_KILL_REQUESTS + 1 + 1;
+/// A service's `kill`: the wait for launchd to stop showing the killed pid (one call, however many
+/// reads it makes). Its other reads are of no reservation, as `status`'s are not.
+const SERVICE_KILL_CALLS: usize = 1;
+/// A task's longest `kill`: the wait for the killed pid, the read that finds no process, and the wait
+/// for the start launchd has accepted to fork.
+const TASK_KILL_CALLS: usize = SERVICE_KILL_CALLS + 1 + 1;
 const KILL_CALLS: usize = max(SERVICE_KILL_CALLS, TASK_KILL_CALLS);
 /// A task's longest `enable`: the two reads of which labels launchd holds, both `bootstrap`s, and the
 /// `bootout` of a stray timer label with its wait.
@@ -1826,18 +1858,20 @@ impl backend::Backend for Launchd {
             .ok_or_else(|| budget::timed_out(id.as_str(), "stopped", budget))
     }
 
-    /// SIGKILL to the job by label, for a service and a task alike: a job with no process is
-    /// [`Error::NotRunning`], classified off the kill's own answer. A task's `kill` that finds no process
+    /// SIGKILL to the job's process, for a service and a task alike, and the wait for launchd to stop
+    /// showing it: a job with no process is [`Error::NotRunning`]. A task's `kill` that finds no process
     /// while launchd has accepted a start and not yet forked it (`spawn scheduled`, which `status` calls
-    /// running) waits for the pid and then signals (see `kill_task`); a service has no such state.
+    /// running) waits for the pid and then kills (see `kill_task`); a service has no such state. See
+    /// [`crate::backend::kill`] and [`kill::JobKill`].
     fn kill(&self, snapshot: Plist, reservation: &mut Reservation) -> Result<()> {
         if snapshot.kind() == DaemonKind::Task {
             return self.kill_task(snapshot.id(), reservation);
         }
         let id = snapshot.id();
-        match self.launchctl.signal(id.as_str(), "SIGKILL", reservation)? {
-            SignalOutcome::Sent => Ok(()),
-            SignalOutcome::NoProcess => Err(Error::NotRunning { id: id.to_string() }),
+        let mut target = kill::JobKill::new(&self.launchctl, id.as_str(), reservation)?;
+        match kill_service(&mut target).map_err(|e| kill_failed(id.as_str(), e))? {
+            KillOutcome::Ended => Ok(()),
+            KillOutcome::NotRunning => Err(Error::NotRunning { id: id.to_string() }),
         }
     }
 

@@ -118,6 +118,7 @@ use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
     carried, end_on_incomplete_stop, end_process,
 };
+use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HeldProcess, HoldOutcome, hold_if_possible};
@@ -537,17 +538,17 @@ impl Backend for Scm {
         )
     }
 
-    /// See [`super::kill::kill_service`] for how the process is chosen safely. Exit code `1`
-    /// (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery actions, as for a
-    /// crash. For `protocol: plain` the process is `goetia-shim`, whose Job Object takes the daemon's
-    /// tree with it.
+    /// See [`crate::backend::kill`] for how the process is chosen safely and what the kill returns on.
+    /// Exit code `1` (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery
+    /// actions, as for a crash. For `protocol: plain` the process is `goetia-shim`, whose Job Object
+    /// takes the daemon's tree with it.
     fn kill(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.into_id();
         let (_scm, service) = open_existing(&id, "kill", ServiceAccess::QUERY_STATUS)?;
         let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
-        match super::kill::kill_service(&mut target).map_err(|e| Error::os(format!("kill `{id}`"), e))? {
-            super::kill::Killed::Terminated => Ok(()),
-            super::kill::Killed::NotRunning => Err(Error::NotRunning {
+        match kill_service(&mut target).map_err(|e| kill_failed(id.as_str(), e))? {
+            KillOutcome::Ended => Ok(()),
+            KillOutcome::NotRunning => Err(Error::NotRunning {
                 id: id.as_str().to_string(),
             }),
         }
