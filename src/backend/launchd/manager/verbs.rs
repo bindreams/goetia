@@ -111,8 +111,9 @@ impl Launchd {
     /// nothing before the fork: `launchctl kill` answers "No such process", the start goes on, and the
     /// run it begins would not be killed. So a signal that finds no process reads `print`. A start that
     /// is queued is waited for until it forks, under no budget as `stop`'s wait is; a pid shown is a fork
-    /// that came after the signal. Either way the signal is sent again. Any other `print` is
-    /// [`Error::NotRunning`], as the signal's own answer said. Draws a signal, a read, a wait and a second
+    /// that came after the signal. Either way the signal is sent again. An idle `print` is
+    /// [`Error::NotRunning`], as the signal's own answer said; a read that failed or was not whole, or a
+    /// no-pid state that is neither idle nor queued, is [`Error::StopUnconfirmed`] (see [`quiet`]). Draws a signal, a read, a wait and a second
     /// signal at most.
     pub(super) fn kill_task(&self, id: &Id, reservation: &mut Reservation) -> Result<()> {
         let name = id.as_str();
@@ -122,11 +123,13 @@ impl Launchd {
         let print = self
             .launchctl
             .read_task_print(name, Budget::Unbounded.start(), Role::Query, reservation)?;
-        if print.queued {
-            self.await_queued_start(name, reservation)?;
+        if print.pid.is_none() {
+            match quiet(id, &print)? {
+                Quiet::Idle => return Err(Error::NotRunning { id: id.to_string() }),
+                Quiet::Queued => self.await_queued_start(name, reservation)?,
+            }
         }
-        let a_run_may_have_forked = print.queued || print.pid.is_some();
-        if a_run_may_have_forked && self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
+        if self.launchctl.signal(name, "SIGKILL", reservation)? == SignalOutcome::Sent {
             return Ok(());
         }
         Err(Error::NotRunning { id: id.to_string() })

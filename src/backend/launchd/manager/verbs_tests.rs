@@ -817,6 +817,30 @@ fn kill_of_a_queued_start_that_never_forks_is_not_running() {
     fake.assert_spent("the refused signal, the read, the wait that ended on the state, and the signal");
 }
 
+/// A refused signal followed by a read that cannot say no run is left (a read that failed or was not
+/// whole, or a no-pid state that is neither idle nor queued) is `StopUnconfirmed`, as for `stop`: not a
+/// determinate `NotRunning`, and no second signal.
+#[skuld::test]
+fn kill_of_a_task_whose_read_after_the_refused_signal_is_unconfirmed_says_so() {
+    for (what, read, shown) in unconfirmed_reads() {
+        let tree = Tree::new();
+        let fake = Fake::new([sigkill(3), read]);
+        let mgr = launchd_over(fake.clone());
+        let mut held = reserved(&mgr, Step::Kill);
+
+        let e = mgr.kill(task_snapshot(&tree, false), &mut held).expect_err(what);
+
+        assert!(
+            matches!(&e, Error::StopUnconfirmed { id, .. } if id == ID),
+            "{what}: {e:?}"
+        );
+        assert_eq!(e.to_string(), format!("`{ID}` may not have stopped: {shown}"), "{what}");
+        assert!(e.is_indeterminate(), "{what}: the exit code is 4");
+        fake.assert_spent("the refused signal and the read");
+        assert_eq!(calls_of(&fake, "kill").len(), 1, "{what}: no second signal");
+    }
+}
+
 /// `restart` is a stop and then the plain start: the start that follows a stop is the request alone.
 #[skuld::test]
 fn restart_of_a_task_is_stop_then_a_plain_start() {
