@@ -170,6 +170,18 @@ fn a_denied_open_names_the_privilege_step_that_failed() {
     assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
 }
 
+/// The denial is still the open's: its code classifies the failure whether or not a step failed.
+#[skuld::test]
+fn a_denied_open_keeps_its_os_code_when_a_step_failed() {
+    let e = failed_to_enable().explain_denial(denied_open());
+
+    assert_eq!(crate::error::os_error_in(&e), Some(ERROR_ACCESS_DENIED as i32));
+    assert_eq!(
+        crate::error::Error::os("kill", e).raw_os_error(),
+        Some(ERROR_ACCESS_DENIED as i32)
+    );
+}
+
 /// A token that lacks the privilege is not a failure of the step, so the denial stands alone.
 #[skuld::test]
 fn a_denied_open_with_no_failed_step_is_unchanged() {

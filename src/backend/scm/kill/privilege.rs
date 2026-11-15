@@ -19,6 +19,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
 
+use super::ErrorWithNote;
 use crate::error::{Chain, within};
 
 /// While alive, the calling thread runs with the caller's `SeDebugPrivilege` enabled, if the caller
@@ -53,24 +54,10 @@ impl DebugPrivilege {
             return open;
         }
         match self.failure.take() {
-            Some(step) => io::Error::new(open.kind(), DeniedAfterFailedStep { open, step }),
+            Some(step) => ErrorWithNote::into_io(open, "enabling SeDebugPrivilege for the open also failed", step),
             None => open,
         }
     }
-}
-
-/// The open of the process was denied, and enabling `SeDebugPrivilege` for it had failed too. Both
-/// errors are the caller's to see: `open`'s text, then `step`'s in parentheses. Neither is the
-/// [`source`](std::error::Error::source), which would print it a second time.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{} (enabling SeDebugPrivilege for the open also failed: {})",
-    Chain(open),
-    Chain(step)
-)]
-struct DeniedAfterFailedStep {
-    open: io::Error,
-    step: io::Error,
 }
 
 impl Drop for DebugPrivilege {

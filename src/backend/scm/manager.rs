@@ -1874,14 +1874,8 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
 }
 
 /// A `windows_service` failure as an [`Error::Os`], shared with [`service_undetermined`] so one
-/// failure cannot be described two ways depending on which class it lands in.
-///
-/// `windows_service::Error`'s own `Display` for its `Winapi` variant is the
-/// literal string `"IO error in winapi call"` — it does not include the
-/// wrapped `io::Error`'s message at all (verified: every error surfaced
-/// through `to_error` read that and nothing else, useless for diagnosing an
-/// actual Win32 failure). Unwrap to the inner `io::Error` first, whose
-/// `Display` does carry `FormatMessage`'s real text.
+/// failure cannot be described two ways depending on which class it lands in. A `Winapi` failure
+/// is held as the `io::Error` it wraps, so the OS error is what the `Error` carries.
 fn to_error(context: &str, e: windows_service::Error) -> Error {
     match e {
         windows_service::Error::Winapi(io_err) => Error::os(context, io_err),

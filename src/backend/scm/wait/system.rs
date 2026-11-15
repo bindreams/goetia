@@ -26,9 +26,8 @@ use super::{
     WantState,
 };
 
-/// `windows-service`'s `Error` does not implement `Into<io::Error>` for
-/// every variant (it also carries parse errors this module never
-/// produces), so this narrows to the one case that matters here.
+/// A `windows-service` failure as an `io::Error`: the OS error a `Winapi` failure wraps, and any
+/// other variant (parse errors this module never produces) as `io::Error::other`.
 fn to_io_error(e: windows_service::Error) -> io::Error {
     match e {
         windows_service::Error::Winapi(e) => e,
