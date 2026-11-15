@@ -237,15 +237,24 @@ fn plan(old: &Old, new: &DaemonSpec) -> Vec<Action> {
     update_plan(old, &plists_of(new), new)
 }
 
+/// One row of [`update_cases`]: what the plan is for, the installed task, the new spec, the plan.
+type UpdateCase = (&'static str, Old, DaemonSpec, Vec<Action>);
+
 /// Every row of Decision 15's plan, and where Decision 12's order (a timer is created before anything
 /// changes, removed before its job is replaced) puts each action.
 #[skuld::test]
 fn update_plan_table() {
+    for (what, old, new, expected) in update_cases() {
+        assert_eq!(plan(&old, &new), expected, "{what}");
+    }
+}
+
+fn update_cases() -> Vec<UpdateCase> {
     let armed = installed(&scheduled("a", "30 3 * * *"), true, BOTH);
     let disarmed = installed(&scheduled("a", "30 3 * * *"), false, NOTHING);
 
     // `a` and `b` are different programs, so a different job: the timer's metadata holds the command too.
-    let cases: Vec<(&str, Old, DaemonSpec, Vec<Action>)> = vec![
+    vec![
         (
             "no change",
             installed(&scheduled("a", "30 3 * * *"), true, BOTH),
@@ -342,6 +351,18 @@ fn update_plan_table() {
             vec![BootoutTimer, CheckJobIdle, BootoutJob, ReplaceJob, BootstrapJob],
         ),
         (
+            "a timer label launchd holds with no timer file, nothing else changing: it goes out all the same",
+            installed(&unscheduled("a"), true, BOTH),
+            rename(unscheduled("a"), "another name"),
+            vec![BootoutTimer, ReplaceJob],
+        ),
+        (
+            "a timer label launchd holds with no timer file, a service updated: it goes out with the job",
+            installed(&service("a"), false, BOTH),
+            service("b"),
+            vec![BootoutTimer, CheckJobIdle, BootoutJob, ReplaceJob],
+        ),
+        (
             "a task with no schedule, no change but the metadata",
             installed(&unscheduled("a"), false, NOTHING),
             rename(unscheduled("a"), "another name"),
@@ -374,13 +395,14 @@ fn update_plan_table() {
             vec![CreateTimerFirst, BootoutTimer, ReplaceJob],
         ),
         (
-            "schedule added and command changed, a timer label loaded with no timer file: it goes out once, first",
+            "schedule added and command changed, a timer label loaded with no timer file: it goes out once, \
+             after the new timer is created",
             installed(&unscheduled("a"), true, BOTH),
             scheduled("b", "30 3 * * *"),
             vec![
-                BootoutTimer,
                 CheckJobIdle,
                 CreateTimerFirst,
+                BootoutTimer,
                 BootoutJob,
                 ReplaceJob,
                 BootstrapJob,
@@ -475,10 +497,7 @@ fn update_plan_table() {
             service("a"),
             vec![ReplaceJob],
         ),
-    ];
-    for (what, old, new, expected) in cases {
-        assert_eq!(plan(&old, &new), expected, "{what}");
-    }
+    ]
 }
 
 /// `spec` named `name`: a change to the metadata only, which no plist key renders.
@@ -553,7 +572,16 @@ fn placed(job_enabled: bool, timer_enabled: Option<bool>, held: Held) -> Old {
 /// an early return on `enabled` would never finish.
 #[skuld::test]
 fn enable_plan_table() {
-    let cases: Vec<(&str, Old, Vec<Action>)> = vec![
+    for (what, old, expected) in enable_cases() {
+        assert_eq!(enable_plan(&old), expected, "{what}");
+    }
+}
+
+/// One row of [`enable_cases`]: what the plan is for, the installed task, the plan.
+type EnableCase = (&'static str, Old, Vec<Action>);
+
+fn enable_cases() -> Vec<EnableCase> {
+    vec![
         (
             "everything staged, nothing loaded",
             placed(false, Some(false), NOTHING),
@@ -623,9 +651,67 @@ fn enable_plan_table() {
             placed(true, Some(true), TIMER),
             vec![BootstrapJob],
         ),
-    ];
-    for (what, old, expected) in cases {
-        assert_eq!(enable_plan(&old), expected, "{what}");
+    ]
+}
+
+/// `old` as it is when launchd holds the timer's label and there is no file for it.
+fn with_stray_timer(old: &Old) -> Old {
+    Old {
+        timer: None,
+        timer_loaded: true,
+        ..old.clone()
+    }
+}
+
+/// Where the actions of `plan` that `of` picks are.
+fn positions(plan: &[Action], of: fn(Action) -> bool) -> Vec<usize> {
+    plan.iter()
+        .enumerate()
+        .filter(|&(_, &action)| of(action))
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// The rule for a timer label launchd holds with no timer file (`timer_stray`), for every plan: it is
+/// booted out once, after any timer file the plan creates (so a stranger's file at the name refuses
+/// before anything goes out) and before any timer it loads. The shapes are the installed side of every
+/// row of the update and enable tables, set to hold a stray label, crossed with every new spec the update
+/// table names and, for `enable`, a task with and without a schedule.
+#[skuld::test]
+fn a_stray_timer_label_is_booted_out_once_between_the_create_and_the_load() {
+    let is_create = |action| matches!(action, CreateTimerFirst | CreateTimerEnabled);
+    let check = |what: &str, plan: &[Action]| {
+        let out = positions(plan, |action| action == BootoutTimer);
+        assert_eq!(out.len(), 1, "one bootout of the stray: {what}: {plan:?}");
+        let created = positions(plan, is_create);
+        assert!(
+            created.iter().all(|&c| c < out[0]),
+            "the bootout comes after the create: {what}: {plan:?}"
+        );
+        let loaded = positions(plan, |action| action == BootstrapTimer);
+        assert!(
+            loaded.iter().all(|&l| out[0] < l),
+            "the bootout comes before the load: {what}: {plan:?}"
+        );
+    };
+
+    let rows = update_cases();
+    let news: Vec<&DaemonSpec> = rows.iter().map(|(_, _, new, _)| new).collect();
+    for (what, old, _, _) in &rows {
+        let old = with_stray_timer(old);
+        assert!(old.timer_stray(), "{what}");
+        for new in &news {
+            check(&format!("update: {what}"), &plan(&old, new));
+        }
+    }
+    for (what, old, _) in enable_cases() {
+        for scheduled in [true, false] {
+            let old = Old {
+                scheduled,
+                ..with_stray_timer(&old)
+            };
+            check(&format!("enable (scheduled {scheduled}): {what}"), &enable_plan(&old));
+        }
     }
 }
 

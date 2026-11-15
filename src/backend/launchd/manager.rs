@@ -1261,8 +1261,8 @@ fn request(reservation: &mut Reservation) -> Result<Role> {
 /// draws at most the last five of these, 2 reapers.
 const SERVICE_INSTALL_REQUESTS: usize = 1;
 /// A task's longest `install`, an update of an armed task whose job changes: the timer's `bootout`,
-/// the job's, and both `bootstrap`s. An update that boots out a stray timer label is shorter: its job is
-/// not booted out.
+/// the job's, and both `bootstrap`s. A stray timer label's `bootout` is the timer's: a plan boots out
+/// one timer label, so it adds nothing.
 const TASK_INSTALL_REQUESTS: usize = 4;
 const INSTALL_REQUESTS: usize = max(SERVICE_INSTALL_REQUESTS, TASK_INSTALL_REQUESTS);
 const START_REQUESTS: usize = 5;
