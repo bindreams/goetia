@@ -33,6 +33,20 @@ types = ["rust"]
 files = '(^|/)tests/|_tests\.rs$'
 
 [[repos.hooks]]
+id = "error-through-chain"
+name = "an error is put into text through Chain"
+# `{e}` and `e.to_string()` print one layer and lose the causes below it; `crate::error::Chain`
+# prints all of them. By name, per line: a placeholder or `.to_string()` whose value is named e, err,
+# error, source, cause, failure or why. A positional argument is caught on the line of its format
+# string only, and an error under another name passes. Lines with a panic or an assertion are not
+# checked. Test code and test support are exempt, and so is `sweep.rs`, whose `why` is a sentence.
+entry = '''^(?!.*(?:panic!|assert|unreachable!|expect\())(?=.*(?:\{(?:e|err|error|source|cause|failure|why)\}|\b(?:e|err|error|source|cause|failure|why)\.to_string\(\)|"[^"]*\{(?::[^}]*)?\}[^"]*",\s*[&*]*(?:e|err|error|source|cause|failure|why)\s*[,)]))'''
+language = "pygrep"
+types = ["rust"]
+files = '^src/'
+exclude = '(_tests\.rs|^src/testing|(^|/)test_support\.rs|^src/error/report\.rs|^src/backend/scm/shim/sweep\.rs|^src/manager/(conformance|fake)\.rs)'
+
+[[repos.hooks]]
 id = "cargo-fmt"
 name = "cargo fmt"
 entry = "cargo fmt"

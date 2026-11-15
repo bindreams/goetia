@@ -6,6 +6,7 @@
 //! token for the open alone, so the rest of the process never sees the change. A token that does not
 //! hold the privilege is left as it is: the open then fails or succeeds on its own terms.
 
+use std::fmt;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
@@ -18,6 +19,8 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
 };
+
+use crate::error::Chain;
 
 /// While alive, the calling thread runs with the caller's `SeDebugPrivilege` enabled, if the caller
 /// holds it. Dropping restores the thread's earlier token.
@@ -42,15 +45,40 @@ impl DebugPrivilege {
     }
 
     /// `open`'s error, with the failed privilege step named when the open was denied: the denial may
-    /// be the privilege that could not be enabled.
-    pub(super) fn explain_denial(&self, open: io::Error) -> io::Error {
-        match &self.failure {
-            Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => io::Error::new(
-                open.kind(),
-                format!("{open} (enabling SeDebugPrivilege for the open also failed: {step})"),
-            ),
+    /// be the privilege that could not be enabled. Ends the guard, so the thread's token is back
+    /// before the error is returned. The denial stays the error's `source()`.
+    pub(super) fn explain_denial(mut self, open: io::Error) -> io::Error {
+        match self.failure.take() {
+            Some(step) if open.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                io::Error::new(open.kind(), DeniedAfterPrivilegeFailure { open, step })
+            }
             _ => open,
         }
+    }
+}
+
+/// A denied open, and the privilege step that failed before it: the denial's own error stays the
+/// `source()`, so a search for the OS code of the denial finds it.
+#[derive(Debug)]
+struct DeniedAfterPrivilegeFailure {
+    open: io::Error,
+    step: io::Error,
+}
+
+impl fmt::Display for DeniedAfterPrivilegeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} (enabling SeDebugPrivilege for the open also failed: {})",
+            Chain(&self.open),
+            Chain(&self.step)
+        )
+    }
+}
+
+impl std::error::Error for DeniedAfterPrivilegeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.open)
     }
 }
 
@@ -64,7 +92,7 @@ impl Drop for DebugPrivilege {
                 // The thread keeps the privileged token, so this is said in release builds too.
                 let e = io::Error::last_os_error();
                 eprintln!("{}", restore_notice(&e));
-                debug_assert!(false, "SetThreadToken: {e}");
+                debug_assert!(false, "SetThreadToken: {}", Chain(&e));
             }
         }
     }
@@ -72,7 +100,10 @@ impl Drop for DebugPrivilege {
 
 /// The warning for a thread token that could not be put back.
 fn restore_notice(e: &io::Error) -> String {
-    format!("warning: SetThreadToken failed to restore the thread's token after enabling SeDebugPrivilege: {e}")
+    format!(
+        "warning: SetThreadToken failed to restore the thread's token after enabling SeDebugPrivilege: {}",
+        Chain(e)
+    )
 }
 
 /// Impersonate a privileged copy of the thread's effective token. `Ok(Some(previous))` when

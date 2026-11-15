@@ -40,7 +40,7 @@ use nix::sys::stat::Mode;
 use crate::backend::systemd::generate::{self, Units};
 use crate::backend::{Decoded, InstalledDefinition, InstalledService, ReadOutcome, Unnamed};
 use crate::decide::ExternalConfig;
-use crate::error::{Error, Result};
+use crate::error::{Chain, Error, Result};
 use crate::spec::{DaemonKind, Id};
 
 use super::task::{Body, Fragment, Timer};
@@ -81,10 +81,10 @@ impl ReadFailure {
     #[cfg(test)]
     pub(super) fn detail(&self) -> String {
         format!(
-            "failed to {op} {path}: {source}",
+            "failed to {op} {path}: {}",
+            Chain(&self.source),
             op = self.op,
-            path = self.path.display(),
-            source = self.source
+            path = self.path.display()
         )
     }
 

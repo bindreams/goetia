@@ -27,7 +27,7 @@ pub(crate) use spares::test_hook;
 pub(crate) use spares::{Reaper, Reservation};
 
 use crate::backend::unreaped::release_unreaped;
-use crate::error::within;
+use crate::error::{Chain, within};
 use crate::manager::budget::Deadline;
 
 // command =============================================================================================================
@@ -272,7 +272,7 @@ impl SpawnError {
 impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpawnError::NotRun(e) | SpawnError::MayHaveRun(e) => write!(f, "{}", cosca::error::Report::new(e)),
+            SpawnError::NotRun(e) | SpawnError::MayHaveRun(e) => write!(f, "{}", Chain(e)),
         }
     }
 }
@@ -394,7 +394,7 @@ fn waited_out(
                 {
                     eprintln!(
                         "warning: could not kill a request left running, which runs on: {}",
-                        cosca::error::Report::new(&e)
+                        Chain(&e)
                     );
                 }
                 reaper.reap(child);

@@ -151,6 +151,32 @@ fn a_denied_open_names_the_privilege_step_that_failed() {
     assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
 }
 
+/// The denial's code stays on the error's chain, where a caller that looks for a code finds it.
+#[skuld::test]
+fn a_denied_open_that_names_the_step_still_carries_the_denials_code() {
+    let e = failed_to_enable().explain_denial(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+
+    assert_eq!(crate::error::os_error_in(&e), Some(ERROR_ACCESS_DENIED as i32));
+}
+
+/// The step's own causes are in the text too, not only its top message.
+#[skuld::test]
+fn a_denied_open_names_the_causes_of_the_step_that_failed() {
+    #[derive(Debug, thiserror::Error)]
+    #[error("DuplicateTokenEx failed")]
+    struct Step(#[source] io::Error);
+    let step = io::Error::other(Step(io::Error::other("the token is not for this user")));
+    let guard = DebugPrivilege {
+        restore: None,
+        failure: Some(step),
+    };
+
+    let e = guard.explain_denial(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+
+    let msg = e.to_string();
+    assert!(msg.contains("the token is not for this user"), "{msg}");
+}
+
 /// A token that lacks the privilege is not a failure of the step, so the denial stands alone.
 #[skuld::test]
 fn a_denied_open_with_no_failed_step_is_unchanged() {
