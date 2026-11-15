@@ -630,42 +630,24 @@ fn next_run_is_none_when_disarmed_for_no_schedule_and_for_a_schedule_with_no_dat
 }
 
 /// The armed timer is what fires, and after a crash between replacing the job and the timer the job's
-/// metadata can hold a newer schedule than the timer does.
+/// metadata can hold a newer schedule than the timer does: `next_run` reads the artifact it is given, and
+/// the two artifacts name different instants.
 #[skuld::test]
 fn next_run_comes_from_the_timers_blob() {
-    let timers = task_spec(Some("30 3 * * *"));
-    let jobs = task_spec(Some("0 0 1 7 *"));
-    let mut plist = snapshot(&timers, true, true);
-    plist.job = snapshot(&jobs, true, true).job;
-    plist.blob = snapshot(&jobs, true, true).blob;
-    let zone = system_zone().expect("the machine's time zone");
-    let before = SystemTime::now();
-    // The job's `print` and the timer's, which launchd holds.
-    let (mgr, _) = printing(&[(NOT_LOADED.0, String::new()), (0, String::new())]);
+    let timer = snapshot(&task_spec(Some("30 3 * * *")), true, true).timer;
+    let job = snapshot(&task_spec(Some("0 0 1 7 *")), true, true).job;
 
-    let next = status_of(&mgr, &plist).next_run.expect("an armed timer's next run");
-
-    let DaemonSpec::Task(timer_task) = &timers else {
-        unreachable!()
-    };
-    let DaemonSpec::Task(job_task) = &jobs else {
-        unreachable!()
-    };
-    let (timer_schedule, job_schedule) = (
-        timer_task.schedule.as_ref().unwrap(),
-        job_task.schedule.as_ref().unwrap(),
-    );
-    let just_before = next - Duration::from_secs(60);
-    assert!(next > before);
     assert_eq!(
-        next_fire(timer_schedule, just_before, &zone),
-        Some(next),
-        "a fire of the timer's schedule"
+        next_run(timer.as_ref(), true, at(NEW_YEAR), utc).unwrap(),
+        // 2026-01-01T03:30:00Z.
+        Some(at(1_767_238_200)),
+        "the timer's schedule"
     );
-    assert_ne!(
-        next_fire(job_schedule, just_before, &zone),
-        Some(next),
-        "and not of the job's"
+    assert_eq!(
+        next_run(job.as_ref(), true, at(NEW_YEAR), utc).unwrap(),
+        // 2026-07-01T00:00:00Z.
+        Some(at(1_782_864_000)),
+        "the job's, which is not the timer's"
     );
 }
 
@@ -679,9 +661,10 @@ fn a_disarmed_task_has_no_next_run() {
 }
 
 /// `next_run` fails when the time zone it needs cannot be read, and `task_state` makes the one `print`
-/// and nothing else. That `live_status` returns `next_run`'s failure is not shown here.
+/// and nothing else. That `live_status` returns `next_run`'s failure is not shown here: `task_status`
+/// reads the zone itself.
 #[skuld::test]
-fn a_failing_zone_read_fails_status_but_not_task_state() {
+fn a_failing_zone_read_fails_next_run_but_not_task_state() {
     let timer = timer_of(&task_spec(Some("30 3 * * *")));
     let unreadable = || {
         Err(Error::os(
