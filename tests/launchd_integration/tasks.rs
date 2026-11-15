@@ -27,7 +27,7 @@ use crate::launchd::{
     Guard, UNIT_DIR_EXCLUSIVE, base_spec, enabled_path, is_loaded, print_field, print_job, staging_path,
     timer_enabled_path, timer_staging_path,
 };
-use crate::support::cron_oracle::assert_next_run;
+use crate::support::cron_oracle::assert_next_run_strict;
 use crate::support::tasks::{
     Held, Lines, assert_same_text, id_of, run_task, sh, status_with_result, task_status, with_logs,
 };
@@ -146,7 +146,7 @@ fn editing_a_task_after_it_ran_works(#[fixture(launchd_group)] _group: &Group) {
 
         assert!(matches!(outcome, Outcome::Update { .. }), "{what}: {outcome:?}");
         assert!(status.common.enabled, "{what}: still armed: {status:?}");
-        assert_next_run(&status, schedule, &task_id, before, after);
+        assert_next_run_strict(&status, schedule, &task_id, before, after);
         assert!(
             is_loaded(&id) && is_loaded(&timer_of(&id)),
             "{what}: both are loaded again"
@@ -304,7 +304,7 @@ fn enable_arms_and_disable_disarms(#[fixture(launchd_group)] _group: &Group) {
         );
         assert!(is_loaded(&id) && is_loaded(&timer_of(&id)), "`{text}`: both are loaded");
         assert!(status.common.enabled, "`{text}`: {status:?}");
-        assert_next_run(&status, text, &task_id, before, after);
+        assert_next_run_strict(&status, text, &task_id, before, after);
 
         mgr.disable(&task_id).expect("disable");
 
@@ -1096,7 +1096,7 @@ fn a_month_range_with_every_day_installs_as_month_day_pairs_and_is_armed(#[fixtu
     let after = SystemTime::now();
 
     assert!(is_loaded(&id) && is_loaded(&timer_of(&id)));
-    assert_next_run(&status, "0 3 * 3-5 *", &task_id, before, after);
+    assert_next_run_strict(&status, "0 3 * 3-5 *", &task_id, before, after);
 }
 
 /// A date that never exists (30 February) leaves a timer with no calendar: it is armed, and never fires.

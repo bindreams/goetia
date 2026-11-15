@@ -23,20 +23,37 @@ const MINUTE: u64 = 60;
 /// rendering bug yields a future time from another calendar; both are still caught. (launchd's
 /// `next_run` is computed by goetia from the clock it reads, so the first is never needed there.)
 pub fn expected_next_runs(text: &str, id: &Id, before: SystemTime, after: SystemTime) -> [SystemTime; 3] {
+    let schedule = parse(text, id);
+    let [next_before, next_after] = strict_next_runs(&schedule, before, after);
+    [latest_minute_at_or_before(&schedule, before), next_before, next_after]
+}
+
+/// The next minute after `before` and the next after `after`: what `next_run` may read when the clock
+/// does not step back.
+fn strict_next_runs(schedule: &Schedule, before: SystemTime, after: SystemTime) -> [SystemTime; 2] {
+    [next_minute_after(schedule, before), next_minute_after(schedule, after)]
+}
+
+fn parse(text: &str, id: &Id) -> Schedule {
     let seed = HashSeed {
         hostname: "testing",
         id,
     };
-    let schedule = Schedule::parse(text, &seed).expect("a schedule");
-    [
-        latest_minute_at_or_before(&schedule, before),
-        next_minute_after(&schedule, before),
-        next_minute_after(&schedule, after),
-    ]
+    Schedule::parse(text, &seed).expect("a schedule")
 }
 
+/// `next_run` is one of [`expected_next_runs`]: for systemd, whose clock may step back.
 pub fn assert_next_run(status: &TaskStatus, text: &str, id: &Id, before: SystemTime, after: SystemTime) {
-    let expected = expected_next_runs(text, id, before, after);
+    assert_in(status, text, &expected_next_runs(text, id, before, after));
+}
+
+/// `next_run` is the next minute after `before` or the next after `after`, and never the minute at or
+/// before `before`: for launchd, whose `next_run` goetia computes from the clock it reads.
+pub fn assert_next_run_strict(status: &TaskStatus, text: &str, id: &Id, before: SystemTime, after: SystemTime) {
+    assert_in(status, text, &strict_next_runs(&parse(text, id), before, after));
+}
+
+fn assert_in(status: &TaskStatus, text: &str, expected: &[SystemTime]) {
     assert!(
         status.next_run.is_some_and(|next| expected.contains(&next)),
         "`{text}`: next_run {:?}, the cron says {expected:?}",
