@@ -182,12 +182,25 @@ fn not_found(error: &windows::core::Error) -> bool {
 /// `read` of one item of a listing, as `None` if the item went after the listing was counted: such a
 /// listing is a snapshot without it, not a failure. Any other failure is the read's.
 ///
-/// L1: a vanished task is "not found"; a vanished instance reads `SCHED_E_TASK_NOT_RUNNING` (its
-/// `EnginePID` fails with it as the run ends).
+/// A task that went reads "not found" ([`not_found`]).
 fn unless_gone<T>(read: windows::core::Result<T>) -> windows::core::Result<Option<T>> {
     match read {
         Ok(value) => Ok(Some(value)),
-        Err(e) if not_found(&e) || e.code() == SCHED_E_TASK_NOT_RUNNING => Ok(None),
+        Err(e) if not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `read` of an instance's `EnginePID`, as `None` if the instance has ended: the entry stays in the
+/// listing a moment after the run, and no longer offers its pid. Any other failure is the read's.
+///
+/// Measured (KB note "A listed instance's pid was always the action's own process, and the entry
+/// became unreadable before the pid was freed"): the end of a run is the only failure the read has,
+/// always `SCHED_E_TASK_NOT_RUNNING`.
+fn unless_ended<T>(read: windows::core::Result<T>) -> windows::core::Result<Option<T>> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.code() == SCHED_E_TASK_NOT_RUNNING => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -204,20 +217,18 @@ fn split(path: &str) -> (&str, &str) {
 }
 
 /// What each listed instance tells: its GUID text and its process. An instance that ended while the
-/// listing was read is not in it ([`unless_gone`]).
+/// listing was read is not in it ([`unless_ended`]).
 fn listed(task: &IRegisteredTask) -> windows::core::Result<Vec<(IRunningTask, String, u32)>> {
     // SAFETY: calls on live interfaces; collection items are numbered from 1.
     unsafe {
         let running = task.GetInstances(0)?;
         let mut found = Vec::new();
         for index in 1..=running.Count()? {
-            let item = || {
-                let instance = running.get_Item(&VARIANT::from(index))?;
-                let guid = instance.InstanceGuid()?.to_string();
-                let pid = instance.EnginePID()?;
-                Ok((instance, guid, pid))
-            };
-            found.extend(unless_gone(item())?);
+            let instance = running.get_Item(&VARIANT::from(index))?;
+            let guid = instance.InstanceGuid()?.to_string();
+            if let Some(pid) = unless_ended(instance.EnginePID())? {
+                found.push((instance, guid, pid));
+            }
         }
         Ok(found)
     }
