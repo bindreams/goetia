@@ -64,9 +64,9 @@ pub(crate) fn slot_taken_after_bootout(id: &Id, path: &Path, found: Occupant) ->
 }
 
 /// The error for a plist that was taken, or removed, under `install` after it had made a `launchctl`
-/// call. A second pass would need more calls than `install` reserved, so the install ends. Mostly
-/// nothing was sent and no plist written; a task's `Create` that finds its timer's name taken has
-/// written the job's plist already, which the re-run reads as goetia's and finishes.
+/// call. A second pass would need more calls than `install` reserved, so the install ends, and what it
+/// had done stays: a bootout already sent, and for a task's `Create` the job's plist. The re-run
+/// starts from what it then reads.
 pub(crate) fn changed_during_install(id: &Id, path: &Path) -> Error {
     Error::ConcurrentChange {
         id: id.to_string(),
