@@ -260,14 +260,16 @@ pub(crate) mod test_hook {
             const { std::cell::RefCell::new(None) };
         static WAIT_FAILS: std::cell::RefCell<Option<fn() -> cosca::error::Error>> =
             const { std::cell::RefCell::new(None) };
-        static KILL_FAILS: std::cell::RefCell<Option<fn(&cosca::Child) -> cosca::error::Error>> =
-            const { std::cell::RefCell::new(None) };
+        static KILL_FAILS: std::cell::RefCell<Option<KillRefusal>> = const { std::cell::RefCell::new(None) };
     }
+
+    /// How a refused kill answers: it is handed the child it refused.
+    type KillRefusal = fn(&cosca::Child) -> cosca::error::Error;
 
     /// Make this thread's next deadline kill of a child refuse with `error(child)`, the child
     /// receiving no signal from it: `error` may itself act on the child, as the world does between
     /// a kill's refusal and the next look at the child.
-    pub(crate) fn kill_fails(error: fn(&cosca::Child) -> cosca::error::Error) {
+    pub(crate) fn kill_fails(error: KillRefusal) {
         KILL_FAILS.set(Some(error));
     }
 
