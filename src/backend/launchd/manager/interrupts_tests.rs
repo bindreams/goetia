@@ -268,6 +268,12 @@ impl Joined {
             std::panic::resume_unwind(payload);
         }
     }
+
+    /// Fails the test: with the thread's own panic where it had one, joined first, and with `why` otherwise.
+    fn fail(self, why: &str) -> ! {
+        self.finish();
+        panic!("{why}");
+    }
 }
 
 impl Drop for Joined {
@@ -488,13 +494,16 @@ fn the_last_drop_waits_for_a_running_handler_before_it_closes_the_pipe() {
     let running = Running::enter();
 
     closing.0 = Some(std::thread::spawn(move || drop(deferred)));
-    // Also ends if the closing thread does, so that its panic fails the test rather than hanging it.
-    while WAKE.load(Ordering::SeqCst) != -1 && !closing.ended() {
+    // The closing thread must block while the handler runs: it ending at all, with or without a panic, is
+    // the failure, and ends the wait rather than hanging it.
+    while WAKE.load(Ordering::SeqCst) != -1 {
+        if closing.ended() {
+            closing.fail("the closing thread ended while a handler was running");
+        }
         std::thread::yield_now();
     }
-    if WAKE.load(Ordering::SeqCst) != -1 {
-        closing.finish();
-        panic!("the closing thread ended without un-publishing the pipe");
+    if closing.ended() {
+        closing.fail("the closing thread ended while a handler was running");
     }
     assert!(is_open(wake), "a handler is running, so the pipe is still open");
 
@@ -563,9 +572,7 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
     // now. A signal taken by another thread is delivered on that thread, asynchronously, so it is awaited,
     // under no bound; one the closer held is seen already.
     if has_closed.recv().is_err() {
-        // It ended without closing: fail with its own panic.
-        closing.finish();
-        panic!("the closing thread ended without closing the window");
+        closing.fail("the closing thread ended without closing the window");
     }
     while before.seen() == 0 {
         std::thread::yield_now();
