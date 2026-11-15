@@ -666,7 +666,7 @@ fn restart_of_a_task_is_stop_then_a_plain_start() {
     let tree = Tree::new();
     let snapshot = || task_snapshot(&tree, false);
     let job = snapshot().job().unwrap().location.path.clone();
-    let fake = Fake::new([print(IDLE), not_loaded(), bootstrap(&job), kickstart()]);
+    let fake = Fake::new([print(IDLE), print(IDLE), not_loaded(), bootstrap(&job), kickstart()]);
     let mgr = launchd_over(fake.clone());
     let mut held = mgr
         .reserve(&[Step::Stop, Step::RequestStartAfterStop], Budget::DEFAULT)
@@ -675,7 +675,7 @@ fn restart_of_a_task_is_stop_then_a_plain_start() {
     mgr.stop(snapshot(), Budget::DEFAULT, &mut held).expect("a stop");
     mgr.request_start_after_stop(snapshot(), &mut held).expect("a start");
 
-    fake.assert_spent("the stop's read, then the load and the plain kick");
+    fake.assert_spent("the stop's read, the start's read of the job, then the load and the plain kick");
     assert_never_booted_out(&fake);
 }
 
