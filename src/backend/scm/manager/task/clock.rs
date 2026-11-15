@@ -10,13 +10,19 @@ use windows::Win32::System::Time::{
 
 /// 100 ns ticks from 1601-01-01, the epoch of a `FILETIME`, to 1970-01-01.
 const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+const TICKS_PER_SECOND: u64 = 10_000_000;
 
-/// The instant a `FILETIME` names.
-fn instant_of(file_time: FILETIME) -> SystemTime {
+/// The span of `ticks` 100 ns ticks, exact for every count a `u64` holds.
+fn span_of(ticks: u64) -> Duration {
+    Duration::new(ticks / TICKS_PER_SECOND, (ticks % TICKS_PER_SECOND) as u32 * 100)
+}
+
+/// The instant a `FILETIME` names, or `None` past what a `SystemTime` holds.
+fn instant_of(file_time: FILETIME) -> Option<SystemTime> {
     let ticks = u64::from(file_time.dwHighDateTime) << 32 | u64::from(file_time.dwLowDateTime);
     match ticks.checked_sub(UNIX_EPOCH_TICKS) {
-        Some(after) => UNIX_EPOCH + Duration::from_nanos(after.saturating_mul(100)),
-        None => UNIX_EPOCH - Duration::from_nanos((UNIX_EPOCH_TICKS - ticks).saturating_mul(100)),
+        Some(after) => UNIX_EPOCH.checked_add(span_of(after)),
+        None => UNIX_EPOCH.checked_sub(span_of(UNIX_EPOCH_TICKS - ticks)),
     }
 }
 
@@ -41,7 +47,7 @@ pub(super) fn local_to_system(local: &SYSTEMTIME) -> Option<SystemTime> {
         TzSpecificLocalTimeToSystemTime(None, local, &mut utc).ok()?;
         SystemTimeToFileTime(&utc, &mut file_time).ok()?;
     }
-    Some(instant_of(file_time))
+    instant_of(file_time)
 }
 
 /// The machine's civil time at `time`, or `None` for an instant the OS cannot place.

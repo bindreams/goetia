@@ -99,7 +99,9 @@ pub(crate) trait TaskApi: Send + Sync {
     /// Starts the task now and returns the run it listed.
     fn run(&self, path: &TaskPath) -> Result<Started>;
 
-    /// Asks Task Scheduler to end the run `instance`. A run it no longer lists is done.
+    /// Asks Task Scheduler to end the run `instance`. A run it no longer lists is done. A run it lists
+    /// that has already ended makes Task Scheduler's `Stop` fail (`SCHED_E_TASK_NOT_RUNNING`, L3):
+    /// that error is returned as it is, for the caller to judge.
     fn stop(&self, path: &TaskPath, instance: &InstanceId) -> Result<()>;
 }
 

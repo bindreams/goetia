@@ -28,8 +28,9 @@ fn ole_date_maps_the_sentinels_m1_measured_to_none() {
     assert_eq!(ole_date(f64::NEG_INFINITY), None);
 }
 
+// A zone-wide window: on a runner whose zone is UTC this cannot tell a local reading from a UTC one.
 #[skuld::test]
-fn ole_date_reads_a_date_as_local_time() {
+fn ole_date_lands_within_a_zone_of_the_digits_read_as_utc() {
     let read = ole_date(OLE_UNIX_EPOCH + 18_000.5).expect("a date after the sentinel is a time");
 
     let as_utc = UNIX_EPOCH + Duration::from_secs(18_000 * 86_400 + 43_200);

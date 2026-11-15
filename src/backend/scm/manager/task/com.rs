@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use windows::Win32::Foundation::SYSTEMTIME;
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_DIR_NOT_EMPTY, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, RPC_E_CHANGED_MODE,
+    SCHED_E_TASK_NOT_RUNNING,
 };
 #[cfg(any(test, feature = "testing"))]
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -96,8 +97,9 @@ impl Session {
         unsafe { self.service.GetFolder(&BSTR::from(path)) }
     }
 
-    /// Runs `f` on the task at `path`: `None` if there is no such task, whether it was never there or
-    /// went while `f` ran.
+    /// Runs `f` on the task at `path`: `None` if the lookup finds no such task, and then `f` is not
+    /// run. What `f` itself fails with, including a "not found", is `f`'s error: only the lookup says
+    /// a task is not there.
     fn with_task<T>(
         &self,
         path: &str,
@@ -115,11 +117,7 @@ impl Session {
             Err(e) if not_found(&e) => return Ok(None),
             Err(e) => return Err(failed(e)),
         };
-        match f(&task) {
-            Ok(value) => Ok(Some(value)),
-            Err(e) if not_found(&e) => Ok(None),
-            Err(e) => Err(failed(e)),
-        }
+        f(&task).map(Some).map_err(failed)
     }
 
     /// Removes `parent` if nothing is in it. A folder somebody put a task in meanwhile, or already
@@ -181,6 +179,19 @@ fn not_found(error: &windows::core::Error) -> bool {
     is(error, ERROR_FILE_NOT_FOUND) || is(error, ERROR_PATH_NOT_FOUND)
 }
 
+/// `read` of one item of a listing, as `None` if the item went after the listing was counted: such a
+/// listing is a snapshot without it, not a failure. Any other failure is the read's.
+///
+/// L1: a vanished task is "not found"; a vanished instance reads `SCHED_E_TASK_NOT_RUNNING` (its
+/// `EnginePID` fails with it as the run ends).
+fn unless_gone<T>(read: windows::core::Result<T>) -> windows::core::Result<Option<T>> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if not_found(&e) || e.code() == SCHED_E_TASK_NOT_RUNNING => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn not_installed(path: &TaskPath) -> Error {
     Error::NotInstalled {
         id: path.name().to_owned(),
@@ -192,17 +203,21 @@ fn split(path: &str) -> (&str, &str) {
     path.rsplit_once('\\').unwrap_or(("", path))
 }
 
-/// What a listed instance tells: its GUID text and its process.
+/// What each listed instance tells: its GUID text and its process. An instance that ended while the
+/// listing was read is not in it ([`unless_gone`]).
 fn listed(task: &IRegisteredTask) -> windows::core::Result<Vec<(IRunningTask, String, u32)>> {
     // SAFETY: calls on live interfaces; collection items are numbered from 1.
     unsafe {
         let running = task.GetInstances(0)?;
         let mut found = Vec::new();
         for index in 1..=running.Count()? {
-            let instance = running.get_Item(&VARIANT::from(index))?;
-            let guid = instance.InstanceGuid()?.to_string();
-            let pid = instance.EnginePID()?;
-            found.push((instance, guid, pid));
+            let item = || {
+                let instance = running.get_Item(&VARIANT::from(index))?;
+                let guid = instance.InstanceGuid()?.to_string();
+                let pid = instance.EnginePID()?;
+                Ok((instance, guid, pid))
+            };
+            found.extend(unless_gone(item())?);
         }
         Ok(found)
     }
@@ -346,12 +361,9 @@ impl TaskApi for Com {
             let tasks = folder.GetTasks(TASK_ENUM_HIDDEN.0).map_err(failed)?;
             let mut names = Vec::new();
             for index in 1..=tasks.Count().map_err(failed)? {
-                match tasks.get_Item(&VARIANT::from(index)).and_then(|task| task.Name()) {
-                    Ok(name) => names.push(name.to_string()),
-                    // Deleted since it was counted.
-                    Err(e) if not_found(&e) => {}
-                    Err(e) => return Err(failed(e)),
-                }
+                // A task deleted since it was counted is not in the listing.
+                let name = tasks.get_Item(&VARIANT::from(index)).and_then(|task| task.Name());
+                names.extend(unless_gone(name).map_err(failed)?.map(|name| name.to_string()));
             }
             Ok(names)
         }

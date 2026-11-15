@@ -1,7 +1,9 @@
-//! The real Task Scheduler behind [`Com`]. Every test registers real tasks, so all of them are in the
-//! `scm` group and run on CI. They hold the machine-wide install lock, as every verb that registers
-//! or removes a task does: the tests of one binary run as separate processes, and the folder
-//! `\Goetia` is created and removed with its tasks.
+//! The real Task Scheduler behind [`Com`]. Every test that registers real tasks is in the `scm` group
+//! and runs on CI; they hold the machine-wide install lock, as every verb that registers or removes a
+//! task does: the tests of one binary run as separate processes, and the folder `\Goetia` is created
+//! and removed with its tasks. The tests that take no group (`unless_gone`) touch nothing.
+
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, SCHED_E_TASK_NOT_RUNNING, WIN32_ERROR};
 
 use super::*;
 use crate::backend::scm::manager::task::cleanup::remove_task;
@@ -204,13 +206,67 @@ fn a_run_is_listed_and_a_stop_ends_it(#[fixture(scm_group)] _group: &Group) {
         listed.iter().any(|i| i.id == started.id),
         "{listed:?} lacks {started:?}"
     );
+    // Held while the instance is listed (Decision 12); the run is over when its process has exited, not
+    // when the listing drops, which it may do late.
+    let pid = started.pid.expect("a listed run has a process");
+    let process = cosca::Process::open_pid(pid)
+        .expect("open the run's process")
+        .expect("the run's process exists while it is listed");
+
     Com.stop(&path, &started.id).unwrap();
-    // The listing drops the instance once the engine has ended it: the real condition, re-read.
-    while !Com.instances(&path).unwrap().is_empty() {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+
+    process.wait().expect("wait for the run's process");
+}
+
+fn error_of(code: WIN32_ERROR) -> windows::core::Error {
+    windows::core::Error::from(HRESULT::from_win32(code.0))
+}
+
+// L1: an item of a listing that is gone when it is read fails with a "not found" code or with
+// SCHED_E_TASK_NOT_RUNNING (an instance that has ended).
+#[skuld::test]
+fn a_listed_item_that_went_is_skipped() {
+    for gone in [
+        error_of(ERROR_FILE_NOT_FOUND),
+        error_of(ERROR_PATH_NOT_FOUND),
+        windows::core::Error::from(SCHED_E_TASK_NOT_RUNNING),
+    ] {
+        let code = gone.code();
+        assert!(matches!(unless_gone::<u32>(Err(gone)), Ok(None)), "{code:?}");
     }
-    // A stop of an instance no longer listed is done.
-    Com.stop(&path, &started.id).unwrap();
+}
+
+#[skuld::test]
+fn a_listed_item_that_fails_for_another_reason_fails_the_read() {
+    let failed = unless_gone::<u32>(Err(error_of(ERROR_ACCESS_DENIED))).unwrap_err();
+
+    assert_eq!(failed.code(), HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+    assert!(matches!(unless_gone(Ok(7_u32)), Ok(Some(7))));
+}
+
+#[skuld::test]
+fn only_the_lookup_decides_that_a_task_is_missing(#[fixture(scm_group)] _group: &Group) {
+    let _lock = InstallLock::acquire().unwrap();
+    let (_guard, path) = TaskGuard::new("goetia-com-lookup");
+    let (_absent_guard, absent) = TaskGuard::new("goetia-com-lookup-absent");
+    Com.register(&path, &xml(1, "found", ""), &system(), None, false)
+        .unwrap();
+    let session = Session::open().unwrap();
+
+    // A "not found" from what is done to a task that was found is that operation's error.
+    let found = session.with_task(path.as_str(), "operate on", |_| {
+        Err::<(), _>(error_of(ERROR_FILE_NOT_FOUND))
+    });
+    assert!(matches!(found, Err(Error::Os { .. })), "{found:?}");
+
+    // A task that is not there is `None`, and nothing is done to it.
+    let done = std::cell::Cell::new(false);
+    let missing = session.with_task(absent.as_str(), "operate on", |_| {
+        done.set(true);
+        Ok(())
+    });
+    assert!(matches!(missing, Ok(None)), "{missing:?}");
+    assert!(!done.get());
 }
 
 #[skuld::test]
