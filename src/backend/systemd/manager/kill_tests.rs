@@ -9,8 +9,9 @@ use crate::backend::Backend;
 use crate::backend::client::fake::{Entry, Fake, exited, reply};
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
 use crate::backend::scm::test_support::{spent, unbounded};
+use crate::backend::systemd::manager::Systemd;
 use crate::backend::systemd::manager::systemctl::systemctl_tests::{booted, gate_then, on_booted};
-use crate::backend::systemd::manager::task_tests::{fragment, service_spec};
+use crate::backend::systemd::manager::task::task_tests::{fragment, service_spec};
 use crate::error::Error;
 use crate::manager::{Budget, Step};
 

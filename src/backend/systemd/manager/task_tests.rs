@@ -35,7 +35,7 @@ pub(in crate::backend::systemd::manager) fn task_spec(id: &str, command: &str, s
     task(id, vec![command.to_string()], schedule)
 }
 
-fn service_spec(id: &str) -> DaemonSpec {
+pub(in crate::backend::systemd::manager) fn service_spec(id: &str) -> DaemonSpec {
     ServiceSpec::new(base_fields(id, vec!["/bin/true".to_string()]))
         .map(DaemonSpec::from)
         .expect("a service")
