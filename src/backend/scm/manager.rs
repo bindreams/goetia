@@ -1874,9 +1874,7 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
     )
 }
 
-/// A `windows_service` failure as an [`Error::Os`], shared with [`service_undetermined`] so one
-/// failure cannot be described two ways depending on which class it lands in. The OS error is the
-/// source, where [`Error::raw_os_error`] finds it (see [`winapi_io`]).
+/// The OS error is the source, where [`Error::raw_os_error`] finds it (see [`winapi_io`]).
 fn to_error(context: &str, e: windows_service::Error) -> Error {
     Error::os(context, winapi_io(e))
 }

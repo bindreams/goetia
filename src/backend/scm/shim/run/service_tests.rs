@@ -1290,7 +1290,6 @@ fn a_failed_stopped_report_says_scm_is_expected_to_read_a_crash() {
     }
 }
 
-/// The line carries the OS error `windows_service::Error::Winapi` wraps, not its own text.
 #[skuld::test]
 fn a_failed_dispatcher_connection_names_the_os_reason() {
     let e = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
@@ -1304,6 +1303,47 @@ fn a_failed_dispatcher_connection_names_the_os_reason() {
             std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
         )
     );
+}
+
+/// A cause that has a cause: `Chain` prints `context: cause`.
+fn chained() -> std::io::Error {
+    crate::error::within("the context", std::io::Error::other("the cause"))
+}
+
+#[skuld::test]
+fn a_refused_thread_prints_the_cause_of_the_refusal() {
+    let text = thread_refused(&["daemon".to_string()], &chained());
+
+    assert_eq!(
+        text,
+        r#"make the thread that waits on ["daemon"]: the context: the cause; it was not spawned, so nothing of this daemon is running"#
+    );
+}
+
+#[skuld::test]
+fn a_log_file_that_cannot_be_opened_prints_the_cause_of_the_failure() {
+    let text = log_open_failed(Path::new("daemon.log"), &chained());
+
+    assert_eq!(
+        text,
+        "open log file daemon.log: the context: the cause (this daemon's output will not be captured; it is still being run)"
+    );
+}
+
+/// A stdio assignment that fails asserts in a debug build, naming the cause; the release build logs
+/// the same text, which no test reaches.
+#[cfg(debug_assertions)]
+#[skuld::test]
+fn a_failed_stdio_assignment_prints_the_cause_of_the_failure() {
+    let fake = FakeGuard::new();
+    let log = fake.log();
+    let failed: Result<(), std::io::Error> = Err(chained());
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stdio_set(&log, ID, failed)))
+        .expect_err("a failed assignment asserts in a debug build");
+
+    let message = panic.downcast_ref::<String>().expect("a formatted panic message");
+    assert!(message.ends_with("failed: the context: the cause"), "{message}");
 }
 
 // The waiter of a daemon that never ran -------------------------------------------------------------------------------

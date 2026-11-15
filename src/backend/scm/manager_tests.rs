@@ -196,8 +196,7 @@ fn is_access_denied_matches_only_error_access_denied() {
     assert!(!is_access_denied(&windows_service::Error::LaunchArgumentsNotSupported));
 }
 
-/// `windows_service::Error::Winapi` displays as "IO error in winapi call": `to_error` keeps the OS
-/// error it wraps as the source, so the code and the reason are found and written.
+/// The variant's own Display names no reason, so the wrapped OS error must be the source.
 #[skuld::test]
 fn a_winapi_failure_keeps_its_os_error_as_the_source() {
     use std::error::Error as _;

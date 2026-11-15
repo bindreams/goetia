@@ -289,7 +289,6 @@ fn report_stopped(handle: StatusHandle, reported: Reported) -> std::io::Result<(
     Ok(())
 }
 
-/// The line logged when the shim cannot connect to the SCM dispatcher.
 fn dispatcher_failure(e: windows_service::Error) -> String {
     format!("connect to the SCM dispatcher: {}", Chain(&winapi_io(e)))
 }
