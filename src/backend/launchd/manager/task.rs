@@ -317,14 +317,22 @@ impl Launchctl {
     /// A read that fails or is not whole says no, as [`Self::read_task_print`] degrades it, so that an
     /// unprivileged `status` still answers. `Err` iff `launchctl` could not be run at all.
     fn holds(&self, label: &str) -> Result<bool> {
-        let read = self.read_print(
-            label,
-            Budget::Unbounded.start(),
-            Role::UncountedQuery,
-            &mut Reservation::default(),
-        )?;
+        let (deadline, role, mut reservation) = uncounted();
+        let read = self.read_print(label, deadline, role, &mut reservation)?;
         Ok(matches!(read, Some((status, capture)) if status.success() && capture.complete))
     }
+
+    /// One [`Self::read_task_print`] that no reservation counts (see [`uncounted`]).
+    fn uncounted_task_print(&self, id: &str) -> Result<TaskPrint> {
+        let (deadline, role, mut reservation) = uncounted();
+        self.read_task_print(id, deadline, role, &mut reservation)
+    }
+}
+
+/// What a `print` that no reservation counts is read with: `status` and `list` have no budget of their
+/// own, and neither counted these reads. No deadline, as `print` answers at once and its body is whole.
+fn uncounted() -> (Deadline, Role, Reservation) {
+    (Budget::Unbounded.start(), Role::UncountedQuery, Reservation::default())
 }
 
 impl Launchd {
@@ -333,13 +341,7 @@ impl Launchd {
     /// next: only for an enabled timer that launchd holds, which a second `print` reads. `last_run` is
     /// not known: launchd keeps no time of it.
     pub(super) fn task_status(&self, snapshot: &Plist) -> Result<Status> {
-        // `status` and `list` have no budget of their own, and neither counted this read.
-        let print = self.launchctl.read_task_print(
-            snapshot.id.as_str(),
-            Budget::Unbounded.start(),
-            Role::UncountedQuery,
-            &mut Reservation::default(),
-        )?;
+        let print = self.launchctl.uncounted_task_print(snapshot.id.as_str())?;
         let enabled = snapshot.enabled();
         // A timer in the enabled directory that launchd does not hold (an `enable` or an install that
         // stopped before loading it) fires nothing, as a systemd timer that is not active has no next
@@ -362,12 +364,7 @@ impl Launchd {
     /// system's time zone) cannot refuse a `run`.
     pub(super) fn task_run_state(&self, snapshot: &Plist) -> Result<State> {
         self.launchctl
-            .read_task_print(
-                snapshot.id.as_str(),
-                Budget::Unbounded.start(),
-                Role::UncountedQuery,
-                &mut Reservation::default(),
-            )
+            .uncounted_task_print(snapshot.id.as_str())
             .map(|print| print.state)
     }
 }
