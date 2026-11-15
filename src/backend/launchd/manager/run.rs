@@ -76,7 +76,9 @@ use super::watch::{Added, Registered, Watch, Woke};
 use super::{Kickstarted, Launchd, Plist, SignalOutcome, never_expires};
 use crate::backend::bounded::Reservation;
 use crate::backend::launchd::generate::run_marker;
-use crate::backend::launchd::refuse::{run_interrupted, run_lost, run_unresumed, stranded_hold};
+use crate::backend::launchd::refuse::{
+    run_ended_without_status, run_interrupted, run_lost, run_unresumed, stranded_hold,
+};
 use crate::backend::launchd::state::{Evidence, Launch, Then, exit_of, launch_of, launch_unknown};
 use crate::backend::{OutputSource, RunHandle};
 use crate::error::{Error, Result};
@@ -106,10 +108,14 @@ impl RunHandle for Run {
     }
 
     /// Blocks on the watch, under no bound: the run lasts as long as it lasts. A wait that failed has lost
-    /// the run, which may still be going ([`run_lost`]).
+    /// the run, which may still be going ([`run_lost`]). An exit the kernel reported without a status is
+    /// the run's end with its result unknown ([`run_ended_without_status`]).
     fn wait(self) -> Result<Exit> {
-        let status = self.registered.wait(None).map_err(|e| run_lost(&self.id, e))?;
-        Ok(exit_of(never_expires(status)))
+        let exited = never_expires(self.registered.wait(None).map_err(|e| run_lost(&self.id, e))?);
+        match exited.status {
+            Some(status) => Ok(exit_of(status)),
+            None => Err(run_ended_without_status(&self.id)),
+        }
     }
 }
 
