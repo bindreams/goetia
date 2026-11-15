@@ -476,7 +476,7 @@ fn end_left(child: &cosca::Child, bound: Duration) -> Option<String> {
 ///
 /// On macOS a child that is exiting can refuse the kill with `EPERM` (a send by audit token answers
 /// it in that window, before it answers `ESRCH`). Only `EPERM` is waited on, for `bound`
-/// ([`after_refusal`]): a child that then exits has ended on its own, as one that exits before the
+/// (`after_refusal`): a child that then exits has ended on its own, as one that exits before the
 /// kill is sent, and the wait leaves it unreaped. Everywhere else, and for every other error, the
 /// refusal is returned at once.
 fn kill_root(child: &cosca::Child, bound: Duration) -> Result<(), cosca::error::Error> {
