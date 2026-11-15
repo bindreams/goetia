@@ -156,6 +156,15 @@ fn registered(watch: &Watch, pid: u32) -> Registered {
     }
 }
 
+/// The `wait(2)` status of the exit `registered` waits for, which must have one; `None` iff `deadline`
+/// expired first.
+fn status_of(registered: Registered, deadline: Option<Deadline>) -> Option<i32> {
+    registered
+        .wait(deadline)
+        .expect("wait")
+        .map(|exited| exited.status.expect("a status"))
+}
+
 /// How many events `queue` holds now, which it gives up: a poll that blocks for none.
 fn poll(queue: &Kqueue) -> usize {
     let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -177,7 +186,7 @@ fn watch_reports_a_childs_exit_status_after_it_ended_quickly() {
 
     assert_eq!(child.finish(), Some(3));
 
-    assert_eq!(registered.wait(failure_bound()).expect("wait"), Some(3 << 8));
+    assert_eq!(status_of(registered, failure_bound()), Some(3 << 8));
 }
 
 #[skuld::test]
@@ -187,7 +196,7 @@ fn one_kqueue_serves_two_pids_in_turn() {
         let mut child = Held::new(code);
         let registered = registered(&watch, child.pid());
         child.finish();
-        assert_eq!(registered.wait(failure_bound()).expect("wait"), Some(code << 8));
+        assert_eq!(status_of(registered, failure_bound()), Some(code << 8));
     }
 }
 
@@ -200,12 +209,26 @@ fn a_killed_child_reports_its_signal() {
     child.child.kill().expect("kill the child");
     child.child.wait().expect("reap it");
 
-    let status = registered.wait(failure_bound()).expect("wait").expect("an exit");
+    let status = status_of(registered, failure_bound()).expect("an exit");
 
     assert_eq!(
         crate::backend::launchd::state::exit_of(status),
         crate::manager::Exit::Signal(9)
     );
+}
+
+/// An exit the kernel reported without a status is an exit: the wait answers it, with no status.
+#[skuld::test]
+fn an_exit_without_a_status_is_answered_with_none() {
+    let _unreported = test_hook::statuses(0);
+    let watch = watch();
+    let mut child = Held::new(0);
+    let registered = registered(&watch, child.pid());
+    child.finish();
+
+    let exited = registered.wait(failure_bound()).expect("wait").expect("an exit");
+
+    assert_eq!(exited.status, None);
 }
 
 #[skuld::test]
@@ -223,7 +246,7 @@ fn wait_with_an_expired_deadline_is_none() {
     let child = Held::new(0);
     let registered = registered(&watch, child.pid());
 
-    assert_eq!(registered.wait(Some(Budget::Immediate.start())).expect("wait"), None);
+    assert_eq!(status_of(registered, Some(Budget::Immediate.start())), None);
 }
 
 /// An exit that is already queued is reported past a deadline that has expired, as a poll.
@@ -234,10 +257,7 @@ fn an_exit_already_queued_is_reported_under_an_expired_deadline() {
     let registered = registered(&watch, child.pid());
     child.finish();
 
-    assert_eq!(
-        registered.wait(Some(Budget::Immediate.start())).expect("wait"),
-        Some(2 << 8)
-    );
+    assert_eq!(status_of(registered, Some(Budget::Immediate.start())), Some(2 << 8));
 }
 
 #[skuld::test]
@@ -296,7 +316,7 @@ fn dropping_a_registration_keeps_a_siblings_exit_for_it() {
     drop(dropped);
 
     assert_eq!(poll(&watch.shared.queue), 0, "the drain read everything the queue held");
-    assert_eq!(sibling.wait(failure_bound()).expect("wait"), Some(5 << 8));
+    assert_eq!(status_of(sibling, failure_bound()), Some(5 << 8));
 }
 
 /// A wait for one pid takes that pid's exit and keeps another's, which was read first, for its own wait.
@@ -309,8 +329,8 @@ fn a_wait_keeps_the_exits_it_reads_for_other_pids() {
     first.finish();
     second.finish();
 
-    assert_eq!(other.wait(failure_bound()).expect("wait"), Some(5 << 8));
-    assert_eq!(one.wait(failure_bound()).expect("wait"), Some(3 << 8));
+    assert_eq!(status_of(other, failure_bound()), Some(5 << 8));
+    assert_eq!(status_of(one, failure_bound()), Some(3 << 8));
 }
 
 /// What deleting a registration answers, measured: where its event fired and was not read, it is still
@@ -603,7 +623,7 @@ fn exit_kept_reports_an_exit_and_its_status_without_taking_it() {
     assert_eq!(exit.status, Some(3 << 8));
     assert!(registered.exit_kept().expect("poll again").is_some(), "not taken");
 
-    assert_eq!(registered.wait(failure_bound()).expect("wait"), Some(3 << 8));
+    assert_eq!(status_of(registered, failure_bound()), Some(3 << 8));
 }
 
 /// A poll for the exit keeps the exec it reads for the wait for the exec.

@@ -556,6 +556,25 @@ fn stop_with_a_pid_that_is_not_the_jobs_any_more_is_ok_and_sends_nothing() {
     );
 }
 
+/// `stop` waits for the run to be over and reads no status, so an exit the kernel reported without one
+/// ends the wait like any other: the stop goes on to read again, and succeeds.
+#[skuld::test]
+fn stop_takes_an_exit_the_kernel_reported_without_a_status() {
+    let _unreported = test_hook::statuses(0);
+    let run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new([
+        print(&running(pid)),
+        print(&running(pid)),
+        sigterm_ending(run),
+        print(IDLE),
+    ]);
+
+    stopping(&fake, Budget::Unbounded).expect("a stop");
+
+    fake.assert_spent("the run ended without a status, and the next read found none");
+}
+
 /// A pid that has exited by the time it is watched cannot be watched: the next pass reads again.
 #[skuld::test]
 fn stop_with_a_pid_that_has_exited_reads_again() {
