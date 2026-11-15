@@ -5,9 +5,7 @@
 //! pre-`main` initializer linked). On Linux and macOS it checks that the binary carries no RPATH/RUNPATH or
 //! `@rpath` search relative to itself.
 //!
-//! These are the debug-profile bins. CI runs the same check on the executables that ship, with
-//! `tools/verify-hardening`: in `consumer-build` on Windows (the two-stage and installed builds) and in
-//! `draft-release` on every row (the release build).
+//! These are the debug-profile bins.
 
 fn main() {
     goetia::testing::run_all();

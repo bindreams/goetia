@@ -13,8 +13,7 @@
 #   3. goetia's own two-stage build does the same;
 #   4. `cargo install` goetia previews the shim installed beside it (the sibling route);
 #   5. every executable the routes above build passes `libsearch_guard::verify` after the README's
-#      `build.rs`: the consumer's bins (its own `tests/hardening.rs` in the one-stage build, then
-#      `tools/verify-hardening` on the two-stage pair), goetia's two-stage pair and the installed pair.
+#      `build.rs`.
 #
 # The consumer's lockfile is resolved once online and pins one dependency below goetia's own
 # lock, so it differs from goetia's. Everything after that builds offline.
@@ -75,9 +74,8 @@ assert_no_shim() {
     fi
 }
 
-# Fails unless every executable given passes `libsearch_guard::verify`. `tools/verify-hardening` names
-# each one that does not; the failure names the whole set. It runs from `$repo`, so it builds in goetia's
-# target directory and leaves the caller's directory alone.
+# Fails unless every executable given passes `libsearch_guard::verify`. Runs from `$repo` so it builds in
+# goetia's target directory and leaves the caller's directory alone.
 assert_hardened() {
     local winpaths=() exe
     for exe in "$@"; do

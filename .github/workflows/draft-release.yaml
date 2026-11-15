@@ -84,7 +84,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "goetia") | .version')"
           if [ "$manifest" != "$VERSION" ]; then
             echo "::error::Cargo.toml declares $manifest but this dispatch asked for $VERSION"
             exit 1
@@ -292,7 +292,7 @@ jobs:
           }
 
       # `libsearch_guard::verify` on what ships, on every row: the staged executable, and on Windows
-      # also the shim it embeds. `cargo test` only verifies the debug build. The checker is a debug build
+      # also the shim it embeds. The checker is a debug build
       # for the runner's own host (no `--target`), and reads ELF, Mach-O and PE alike.
       - name: Verify the binaries are hardened
         env:

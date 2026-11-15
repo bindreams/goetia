@@ -105,7 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "goetia") | .version')"
           if [ "$manifest" != "$VERSION" ]; then
             echo "::error::Checked-out commit $SHA declares $manifest but this dispatch asked for $VERSION"
             exit 1
