@@ -211,7 +211,7 @@ fn a_run_whose_exit_came_without_a_status_ended_unrecorded() {
 
     assert!(
         matches!(&ended, Error::RunUnrecorded { id, reason }
-            if id == "frpc" && reason == "the kernel reported the run's exit without a status"),
+            if id == "frpc" && reason == "the kernel did not report it"),
         "{ended:?}"
     );
     assert!(ended.is_indeterminate(), "exit 4, as `RunUnrecorded` is");
