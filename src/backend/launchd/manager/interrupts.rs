@@ -3,7 +3,9 @@
 //! From the `launchctl debug` that holds the next launch until the `SIGCONT` that resumes it, an
 //! interrupt that ended goetia would leave the job's next launch held and stopped. So a [`Deferred`]
 //! makes SIGINT, SIGTERM and SIGHUP be recorded instead, and re-raises each one the window recorded once
-//! the last [`Deferred`] is dropped, to whatever handled it before.
+//! the last [`Deferred`] is dropped, to whatever handled it before. A signal that was ignored when the
+//! window opened (`nohup` ignores SIGHUP) is not taken over: it stays ignored, and
+//! [`Deferred::signals`] names the ones that are.
 //!
 //! It is a process-wide handler, not a mask: `run` has already spawned the thread that waits for the run,
 //! and a signal sent to the process goes to any thread that does not block it, so a mask on the calling
@@ -22,8 +24,9 @@ pub(super) const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc:
 /// Who holds a [`Deferred`], and what to put back when the last one is dropped.
 struct Shared {
     holders: usize,
-    /// The dispositions of [`SIGNALS`] before the first holder, while there is one.
-    previous: Option<[libc::sigaction; 3]>,
+    /// The dispositions of [`SIGNALS`] before the first holder, while there is one, and the mask of those
+    /// the window took over (bit `i` for `SIGNALS[i]`): a signal that was ignored is left as it was.
+    previous: Option<([libc::sigaction; 3], u32)>,
 }
 
 static SHARED: Mutex<Shared> = Mutex::new(Shared {
@@ -68,7 +71,10 @@ extern "C" fn record(signal: libc::c_int) {
 
 /// One count of the window in which interrupts are recorded, not acted on. While any is alive the
 /// handlers are goetia's; the last one dropped puts the previous ones back and re-raises what arrived.
-pub(crate) struct Deferred(());
+pub(crate) struct Deferred {
+    /// The mask of the signals the window took over, as when this holder joined it.
+    taken: u32,
+}
 
 impl Deferred {
     /// Joins the window, opening it (saving the previous dispositions and installing the recording
@@ -104,7 +110,7 @@ impl Deferred {
         if shared.holders == 0 {
             OPEN.store(true, Ordering::SeqCst);
             match install() {
-                Ok(previous) => shared.previous = Some(previous),
+                Ok(installed) => shared.previous = Some(installed),
                 Err(source) => {
                     // `install` put back what it changed. Closed under the lock, as `Drop` does, so a
                     // concurrent `begin` cannot open a window that this close then shuts; re-raised after
@@ -117,7 +123,18 @@ impl Deferred {
             }
         }
         shared.holders += 1;
-        Ok(Deferred(()))
+        let taken = shared.previous.as_ref().map_or(0, |&(_, taken)| taken);
+        Ok(Deferred { taken })
+    }
+
+    /// The signals of [`SIGNALS`] the window took over: those that were not ignored when it opened. The
+    /// others stay ignored throughout, so nothing may wait for them or count them as an interrupt.
+    pub(crate) fn signals(&self) -> impl Iterator<Item = libc::c_int> + use<> {
+        let taken = self.taken;
+        SIGNALS
+            .into_iter()
+            .enumerate()
+            .filter_map(move |(bit, signal)| (taken & (1 << bit) != 0).then_some(signal))
     }
 
     /// Whether SIGINT, SIGTERM or SIGHUP has arrived since the window opened, as far as the handler has
@@ -137,8 +154,8 @@ impl Drop for Deferred {
             if shared.holders > 0 {
                 return;
             }
-            if let Some(previous) = shared.previous.take() {
-                restore(&previous);
+            if let Some((previous, taken)) = shared.previous.take() {
+                restore(&previous, taken);
             }
             close()
         };
@@ -166,8 +183,10 @@ fn reraise(recorded: u32) {
     }
 }
 
-/// Installs [`record`] for [`SIGNALS`], giving back what each had. All or none.
-fn install() -> io::Result<[libc::sigaction; 3]> {
+/// Installs [`record`] for the signals of [`SIGNALS`] that are not ignored, giving back what each had and
+/// the mask of those it took over. A signal that is ignored (`nohup` ignores SIGHUP) is left alone: the user
+/// set it so, and it stays so. All or none.
+fn install() -> io::Result<([libc::sigaction; 3], u32)> {
     // SAFETY: an all-zero `sigaction` is a valid value (no handler, no flags); the mask is then emptied.
     let mut ours: libc::sigaction = unsafe { std::mem::zeroed() };
     ours.sa_sigaction = record as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -178,25 +197,40 @@ fn install() -> io::Result<[libc::sigaction; 3]> {
 
     // SAFETY: as above.
     let mut previous: [libc::sigaction; 3] = unsafe { std::mem::zeroed() };
+    let mut taken = 0;
     for (i, &signal) in SIGNALS.iter().enumerate() {
+        // SAFETY: a null new action only reads, into `previous[i]`, a valid place for the old one.
+        if unsafe { libc::sigaction(signal, std::ptr::null(), &mut previous[i]) } != 0 {
+            let failed = io::Error::last_os_error();
+            restore(&previous[..i], taken);
+            return Err(failed);
+        }
+        if previous[i].sa_sigaction == libc::SIG_IGN {
+            continue;
+        }
         #[cfg(test)]
         if let Err(refused) = test_hook::install() {
-            restore(&previous[..i]);
+            restore(&previous[..i], taken);
             return Err(refused);
         }
         // SAFETY: `ours` is a valid `sigaction`, and `previous[i]` a valid place for the old one.
         if unsafe { libc::sigaction(signal, &ours, &mut previous[i]) } != 0 {
             let failed = io::Error::last_os_error();
-            restore(&previous[..i]);
+            restore(&previous[..i], taken);
             return Err(failed);
         }
+        taken |= 1 << i;
     }
-    Ok(previous)
+    Ok((previous, taken))
 }
 
-/// Puts `previous` back for the first signals of [`SIGNALS`]. Cleanup: it never fails the caller.
-fn restore(previous: &[libc::sigaction]) {
-    for (&signal, old) in SIGNALS.iter().zip(previous) {
+/// Puts `previous` back for the first signals of [`SIGNALS`] that `taken` has a bit for. Cleanup: it never
+/// fails the caller.
+fn restore(previous: &[libc::sigaction], taken: u32) {
+    for (bit, (&signal, old)) in SIGNALS.iter().zip(previous).enumerate() {
+        if taken & (1 << bit) == 0 {
+            continue;
+        }
         // SAFETY: `old` is a `sigaction` this process read from the kernel.
         let put_back = unsafe { libc::sigaction(signal, old, std::ptr::null_mut()) };
         debug_assert_eq!(put_back, 0, "restoring the handler of signal {signal} failed");

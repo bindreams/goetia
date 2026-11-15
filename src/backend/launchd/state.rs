@@ -108,39 +108,40 @@ pub(crate) enum Launch {
     /// Not stopped, and started before our `debug` returned: a run already in flight (a scheduled one),
     /// which is waited for.
     InFlight,
-    /// The run ends, with this error. Every end is decided here, with its error, so that nothing else
-    /// makes one.
-    Ends(Error),
 }
 
-/// The [`Launch`] of the pid `kickstart -p` named for a run of `id`: `started` is its start time with what
-/// the reads showed after it, or `None` where no start time was read (the pid was gone when it was
-/// registered, or at the read). `ta` is the time read after the `launchctl debug` process was reaped (both
-/// in `mach_absolute_time` units): a start after `ta` began after `debug`; one at or before it began
-/// before `debug` returned.
+/// The end of a `run` whose launch has no start time: the pid `kickstart -p` named was gone when it was
+/// registered, or at the read of its start. Whose launch it was is not known, so it is in doubt, in the
+/// stranded hold ([`run_vanished`]). Every end is decided here or in [`launch_of`], so that nothing else
+/// makes one.
+pub(crate) fn launch_unknown(id: &Id, pid: u32) -> Error {
+    stranded_hold(id, run_vanished(id, pid))
+}
+
+/// The [`Launch`] of the pid `kickstart -p` named for a run of `id`, or the end of the run: `started` is its
+/// start time and `then` what the reads showed after it. `ta` is the time read after the `launchctl debug`
+/// process was reaped (both in `mach_absolute_time` units): a start after `ta` began after `debug`; one at
+/// or before it began before `debug` returned.
 ///
 /// | reads | the launch is | result |
 /// | --- | --- | --- |
-/// | no start time, or [`Then::Stranger`] | not known: this run's, or a scheduled run's | ends: [`run_vanished`], in the stranded hold |
+/// | [`Then::Stranger`] | not known: this run's, or a scheduled run's | ends: [`launch_unknown`] |
 /// | gone, started after `ta` | ours, which ended before goetia could follow it | ends: [`run_ended_unfollowed`] |
 /// | running, started after `ta` | ours, our `kickstart`'s, with no hold | ends: [`run_unfollowed`] |
 /// | gone, started at or before `ta` | an older one, that is over | [`Launch::Ended`] |
 /// | stopped, started after `ta` | the one `debug` held | [`Launch::Held`] |
 /// | stopped, started at or before `ta` | an older one that took a hold | [`Launch::TookHold`] |
 /// | running, started at or before `ta` | a run in flight | [`Launch::InFlight`] |
-pub(crate) fn launch_of(started: Option<(u64, Then)>, ta: u64, id: &Id, pid: u32) -> Launch {
-    let Some((started, then)) = started else {
-        return Launch::Ends(stranded_hold(id, run_vanished(id, pid)));
-    };
+pub(crate) fn launch_of(started: u64, then: Then, ta: u64, id: &Id, pid: u32) -> Result<Launch, Error> {
     let ours = started > ta;
     match (then, ours) {
-        (Then::Stranger, _) => Launch::Ends(stranded_hold(id, run_vanished(id, pid))),
-        (Then::Process { stopped: true }, true) => Launch::Held,
-        (Then::Process { stopped: true }, false) => Launch::TookHold,
-        (Then::Process { stopped: false }, false) => Launch::InFlight,
-        (Then::Process { stopped: false }, true) => Launch::Ends(run_unfollowed(id, pid)),
-        (Then::Gone(_), false) => Launch::Ended,
-        (Then::Gone(status), true) => Launch::Ends(run_ended_unfollowed(id, status)),
+        (Then::Stranger, _) => Err(launch_unknown(id, pid)),
+        (Then::Process { stopped: true }, true) => Ok(Launch::Held),
+        (Then::Process { stopped: true }, false) => Ok(Launch::TookHold),
+        (Then::Process { stopped: false }, false) => Ok(Launch::InFlight),
+        (Then::Process { stopped: false }, true) => Err(run_unfollowed(id, pid)),
+        (Then::Gone(_), false) => Ok(Launch::Ended),
+        (Then::Gone(status), true) => Err(run_ended_unfollowed(id, status)),
     }
 }
 

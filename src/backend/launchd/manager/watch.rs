@@ -15,8 +15,9 @@
 //!
 //! `run` watches a launch ([`Watch::add_launch`]): its pid is also registered for `NOTE_EXEC`, and its
 //! waits ([`Registered::first_exec`], [`Registered::exit`]) end when an interrupt does. An
-//! [interruptible](Watch::new_interruptible) watch has `SIGINT`, `SIGTERM` and `SIGHUP` registered on its
-//! queue, so a signal that arrives while a wait blocks wakes it. A signal that arrived before the wait
+//! [interruptible](Watch::new_interruptible) watch has the signals of the [`Deferred`] window registered on
+//! its queue (those it took over: a signal that was ignored stays ignored and is none of them), so a signal
+//! that arrives while a wait blocks wakes it. A signal that arrived before the wait
 //! has no event for it, so the wait reads the [`Deferred`] window's record after the registration and
 //! before it blocks, and again before each block. A signal's event that any read of the queue takes is
 //! flagged on the queue ([`Watch::interrupted`] reads the flag and the record together), so no interrupt is
@@ -30,7 +31,7 @@ use std::time::Duration;
 use nix::errno::Errno;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
-use super::interrupts::{Deferred, SIGNALS};
+use super::interrupts::Deferred;
 use crate::error::{Error, Result};
 use crate::manager::budget::Deadline;
 
@@ -42,7 +43,7 @@ pub(crate) struct Watch {
 /// The queue, and the events read from it for a registration other than the one that read them.
 struct Shared {
     queue: Kqueue,
-    /// Whether the queue has [`SIGNALS`] registered: only then can a wait be given a [`Deferred`] window.
+    /// Whether the queue has a window's signals registered: only then can a wait be given a [`Deferred`] window.
     interruptible: bool,
     /// Taken out of the queue by one registration's `wait` or drop and not its own, so kept here for the
     /// registration whose pid it is. `status` is `None` for an exit the kernel reported without a status.
@@ -56,9 +57,11 @@ struct Shared {
 }
 
 /// One pid's exit, read from the queue.
-struct Exited {
+#[derive(Clone, Copy)]
+pub(crate) struct Exited {
     pid: u32,
-    status: Option<i32>,
+    /// The raw `wait(2)` status, `None` for an exit the kernel reported without one.
+    pub(crate) status: Option<i32>,
 }
 
 /// What [`Watch::add`] found.
@@ -94,29 +97,31 @@ impl Watch {
     /// Made before a verb sends its first request, so that failing to make it (a process out of file
     /// descriptors) strands nothing.
     pub(crate) fn new() -> Result<Watch> {
-        Watch::make(false)
+        Watch::make(None)
     }
 
-    /// A watch whose queue also has [`SIGNALS`] registered, for the waits that end on an interrupt. Its
-    /// signals are the process's own, so a test that raises one takes the whole process's turn.
-    pub(crate) fn new_interruptible() -> Result<Watch> {
-        Watch::make(true)
+    /// A watch whose queue also has the signals `window` took over registered ([`Deferred::signals`]), for
+    /// the waits that end on an interrupt: a signal that was ignored before the window stays ignored, and the
+    /// queue, which records even an ignored signal, has no event for it. Its signals are the process's own,
+    /// so a test that raises one takes the whole process's turn.
+    pub(crate) fn new_interruptible(window: &Deferred) -> Result<Watch> {
+        Watch::make(Some(window))
     }
 
-    fn make(interruptible: bool) -> Result<Watch> {
+    fn make(interruptible: Option<&Deferred>) -> Result<Watch> {
         let queue = make_queue().map_err(|source| Error::os("make a kqueue to watch processes exit with", source))?;
         let watch = Watch {
             shared: Arc::new(Shared {
                 queue,
-                interruptible,
+                interruptible: interruptible.is_some(),
                 kept: Mutex::new(Vec::new()),
                 execed: Mutex::new(Vec::new()),
                 signalled: AtomicBool::new(false),
             }),
         };
-        if interruptible {
+        if let Some(window) = interruptible {
             watch
-                .register_signals()
+                .register_signals(window)
                 .map_err(|source| Error::os("watch for interrupts on the kqueue", source))?;
         }
         Ok(watch)
@@ -130,19 +135,22 @@ impl Watch {
         self.shared.interrupted(window)
     }
 
-    /// Registers each of [`SIGNALS`], answered by its own receipt.
-    fn register_signals(&self) -> io::Result<()> {
-        let changes = SIGNALS.map(|signal| {
-            KEvent::new(
-                signal as usize,
-                EventFilter::EVFILT_SIGNAL,
-                EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_RECEIPT,
-                FilterFlag::empty(),
-                0,
-                0,
-            )
-        });
-        let mut receipts = [blank(); SIGNALS.len()];
+    /// Registers each of the signals `window` took over, answered by its own receipt.
+    fn register_signals(&self, window: &Deferred) -> io::Result<()> {
+        let changes: Vec<KEvent> = window
+            .signals()
+            .map(|signal| {
+                KEvent::new(
+                    signal as usize,
+                    EventFilter::EVFILT_SIGNAL,
+                    EvFlags::EV_ADD | EvFlags::EV_ENABLE | EvFlags::EV_RECEIPT,
+                    FilterFlag::empty(),
+                    0,
+                    0,
+                )
+            })
+            .collect();
+        let mut receipts = vec![blank(); changes.len()];
         let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let answered = loop {
             match self.shared.queue.kevent(&changes, &mut receipts, Some(now)) {
@@ -150,7 +158,7 @@ impl Watch {
                 other => break other.map_err(io::Error::from)?,
             }
         };
-        debug_assert_eq!(answered, SIGNALS.len(), "EV_RECEIPT answers each change");
+        debug_assert_eq!(answered, changes.len(), "EV_RECEIPT answers each change");
         for receipt in &receipts[..answered] {
             match receipt.data() {
                 0 => {}
@@ -240,16 +248,16 @@ impl Registered {
         }
     }
 
-    /// Whether the pid has exited, read without blocking and without taking the exit: the queue is read
-    /// until it is empty, what it holds is kept for the waits, and the exit, if one is kept, is reported.
-    /// `run` accepts a read of the pid by number only where this says no after it: an exit is no later than
-    /// its event, and until the pid is reaped it names no other process.
-    pub(crate) fn has_exited(&self) -> Result<bool> {
+    /// The exit of the pid, if it has happened: read without blocking and without taking the exit. The queue
+    /// is read until it is empty, what it holds is kept for the waits, and the exit, if one is kept, is
+    /// reported with its status. `run` accepts a read of the pid by number only where this says none after
+    /// it: an exit is no later than its event, and until the pid is reaped it names no other process.
+    pub(crate) fn exit_kept(&self) -> Result<Option<Exited>> {
         let pid = self.pid;
         self.poll(None)
             .map_err(|errno| Error::os(format!("poll process {pid} for its exit"), io::Error::from(errno)))?;
         let kept = self.shared.kept.lock().unwrap_or_else(PoisonError::into_inner);
-        Ok(kept.iter().any(|exited| exited.pid == pid))
+        Ok(kept.iter().find(|exited| exited.pid == pid).copied())
     }
 
     /// Reads the queue with a zero timeout until a read finds it empty, and keeps what it held

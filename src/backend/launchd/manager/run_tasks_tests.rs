@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use super::super::interrupts::interrupts_tests::{StandIn, seen, serial};
+use super::super::interrupts::interrupts_tests::{StandIn, ignore, seen, send_to_process, serial};
 use super::super::manager_tests::launchd_over;
 use super::super::task::task_tests::{ID, Tree, marked, plists_of, task_spec};
 use super::super::watch::test_hook;
@@ -860,6 +860,10 @@ fn a_launch_that_ends_during_the_procinfo_is_gone_at_the_read() {
     let e = failed(&fake, snapshot(&tree, None));
 
     assert_ended_unfollowed(&e);
+    assert!(
+        matches!(&e, Error::RunUnrecorded { reason, .. } if reason.contains("(the process's status: exit code 0)")),
+        "the exit the watch kept is shown, though the read that raced it was discarded: {e:?}"
+    );
     fake.assert_spent("nothing was sent after the procinfo");
 }
 
@@ -1209,30 +1213,113 @@ fn a_sigcont_that_ends_in_doubt_says_the_run_may_have_started() {
 
 // Interrupts ==========================================================================================================
 
-/// SIGINT, SIGTERM and SIGHUP are held from before the first `debug` to after the `SIGCONT`, and
-/// re-raised once `begin_run` returns: the window is `begin_run` itself.
+/// Nothing is started after an interrupt: one recorded at any time before the `SIGCONT` that resumes our
+/// launch ends the run as the stranded hold, and no `SIGCONT` is sent, whichever call it came in. One that
+/// comes after that `SIGCONT` is held back until `begin_run` returns, and re-raised then, once: the run is
+/// followed, and the interrupt is the caller's.
 #[skuld::test]
-fn an_interrupt_during_begin_run_is_held_until_it_returns() {
+fn an_interrupt_before_the_resume_strands_and_one_after_it_is_held() {
     let stand_in = StandIn::install();
+    let (kick, launched) = our_launch(0);
+    let fake = Fake::new([print(IDLE), debug().then(interrupt), kick, procinfo_of(&launched)]);
+    let tree = Tree::new();
+
+    let e = failed(&fake, snapshot(&tree, None));
+
+    assert_interrupted(&e, "an interrupt before the resume");
+    assert!(
+        e.report()
+            .to_string()
+            .contains("before goetia resumed the launch it held; goetia sent nothing after acting on it; that launch waits stopped"),
+        "{}",
+        e.report()
+    );
+    fake.assert_spent("no SIGCONT was sent after the interrupt");
+    assert_eq!(calls_of(&fake, "kill").len(), 0);
+    assert_eq!(stand_in.seen(), 1, "re-raised once begin_run returns");
+
     let (kick, launched) = our_launch(0);
     let ending = launched.clone();
     let fake = Fake::new([
         print(IDLE),
-        debug().then(interrupt),
+        debug(),
         kick,
         procinfo_of(&launched),
         sigcont().then(move || {
-            assert_eq!(seen(), 0, "still held at the resume");
+            interrupt();
+            assert_eq!(seen(), 1, "held at the resume: not re-raised yet");
             ending.finish();
         }),
     ]);
     let tree = Tree::new();
-    assert_eq!(stand_in.seen(), 0);
 
     let run = begun(&fake, snapshot(&tree, None));
 
-    assert_eq!(stand_in.seen(), 1, "re-raised once, after the resume");
+    assert_eq!(stand_in.seen(), 2, "re-raised once, after begin_run returned");
     assert!(stand_in.saw(libc::SIGINT));
+    assert_eq!(run.wait().expect("the exit"), Exit::Code(0));
+}
+
+/// The same rule for the `SIGCONT` that releases an older launch which took the hold: an interrupt recorded
+/// before it ends the run, and the launch is not released.
+#[skuld::test]
+fn an_interrupt_before_the_release_of_an_older_launch_strands_and_sends_nothing() {
+    let stand_in = StandIn::install();
+    let older = Held::new(0).stopped();
+    let fake = Fake::new([
+        print(IDLE),
+        debug().then(interrupt),
+        kickstart(older.pid()),
+        procinfo(older.pid()),
+    ]);
+    let tree = Tree::new();
+
+    let (result, notes) = begin(&fake, snapshot(&tree, None));
+
+    let e = result.err().expect("the interrupt ended the run");
+    assert_interrupted(&e, "an interrupt before the release");
+    assert!(
+        e.report()
+            .to_string()
+            .contains("before goetia released the launch that took the hold"),
+        "{}",
+        e.report()
+    );
+    fake.assert_spent("no SIGCONT was sent");
+    assert_eq!(notes, "", "nothing was waited for");
+    assert_eq!(stand_in.seen(), 1);
+}
+
+/// A signal the user set to be ignored (`nohup` does so for SIGHUP) stays ignored: it is no interrupt, so a
+/// wait for a scheduled run goes on to the run's own launch.
+#[skuld::test]
+fn an_ignored_signal_during_a_wait_does_not_interrupt_it() {
+    let stand_in = StandIn::install();
+    ignore(libc::SIGHUP);
+    let mut scheduled = Held::new(0);
+    let a = scheduled.pid();
+    let (kick, ours) = our_launch(0);
+    let fake = Fake::new([
+        print(IDLE),
+        debug(),
+        kickstart(a),
+        procinfo(a),
+        debug(),
+        kick,
+        procinfo_of(&ours),
+        sigcont_ending(&ours),
+    ]);
+    let tree = Tree::new();
+    let mut notes = Noting::on_write(move || {
+        send_to_process(libc::SIGHUP);
+        scheduled.finish();
+    });
+
+    let run = begin_with(&fake, snapshot(&tree, None), &mut notes).unwrap_or_else(|e| panic!("begin_run failed: {e}"));
+
+    fake.assert_spent("the second pass followed the first");
+    assert_eq!(notes.text(), NOTE);
+    assert_eq!(stand_in.seen(), 0, "an ignored signal is not re-raised either");
     assert_eq!(run.wait().expect("the exit"), Exit::Code(0));
 }
 
@@ -1248,9 +1335,10 @@ fn an_interrupt_during_the_load_ends_the_run_before_any_hold() {
 
     assert!(matches!(&e, Error::Os { .. }), "no hold is stranded: {e:?}");
     assert!(
-        e.report()
-            .to_string()
-            .contains("interrupted by SIGINT, SIGTERM or SIGHUP while the job was loaded; goetia sent nothing"),
+        e.report().to_string().contains(
+            "interrupted by SIGINT, SIGTERM or SIGHUP, received before goetia armed a hold; goetia sent \
+                 nothing after acting on it; no hold was armed"
+        ),
         "{}",
         e.report()
     );

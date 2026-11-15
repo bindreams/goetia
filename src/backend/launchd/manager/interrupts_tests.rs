@@ -109,13 +109,58 @@ impl StandIn {
 
 impl Drop for StandIn {
     fn drop(&mut self) {
-        restore(&self.before);
+        restore(&self.before, ALL);
     }
 }
 
 fn raise(signal: libc::c_int) {
     // SAFETY: `raise` takes a valid signal number, and every one raised here has a handler.
     assert_eq!(unsafe { libc::raise(signal) }, 0, "raise {signal}");
+}
+
+/// Sets `signal` to be ignored, as `nohup` does SIGHUP. A [`StandIn`] taken before it puts the earlier
+/// disposition back.
+pub(in crate::backend::launchd::manager) fn ignore(signal: libc::c_int) {
+    // SAFETY: an all-zero `sigaction` is valid; the mask is emptied before use.
+    let mut ignoring: libc::sigaction = unsafe { std::mem::zeroed() };
+    ignoring.sa_sigaction = libc::SIG_IGN;
+    unsafe { libc::sigemptyset(&mut ignoring.sa_mask) };
+    // SAFETY: `ignoring` is a valid `sigaction`, and a null old action is allowed.
+    let set = unsafe { libc::sigaction(signal, &ignoring, std::ptr::null_mut()) };
+    assert_eq!(set, 0, "ignore signal {signal}");
+}
+
+/// Sends `signal` to this process, not to a thread: what a terminal or a service manager does, and the only
+/// kind a kqueue has an event for.
+pub(in crate::backend::launchd::manager) fn send_to_process(signal: libc::c_int) {
+    // SAFETY: `kill` takes plain integers.
+    assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0, "send signal {signal}");
+}
+
+/// A signal that was ignored before the window stays ignored: the window does not take it over, so it is
+/// no interrupt, it is not re-raised, and its disposition is the ignored one throughout and after.
+#[skuld::test]
+fn an_ignored_signal_stays_ignored_and_is_not_taken_over() {
+    let before = StandIn::install();
+    ignore(libc::SIGHUP);
+    let deferred = Deferred::begin().expect("begin");
+
+    assert_eq!(handler_of(libc::SIGHUP), libc::SIG_IGN, "left alone");
+    assert_eq!(
+        deferred.signals().collect::<Vec<_>>(),
+        [libc::SIGINT, libc::SIGTERM],
+        "the signals it took over"
+    );
+    send_to_process(libc::SIGHUP);
+    assert!(!deferred.interrupted(), "an ignored signal is no interrupt");
+    raise(libc::SIGINT);
+    assert!(deferred.interrupted(), "the others are still held");
+
+    drop(deferred);
+
+    assert_eq!(handler_of(libc::SIGHUP), libc::SIG_IGN, "still ignored after");
+    assert_eq!(before.seen(), 1, "only the interrupt that was held is re-raised");
+    assert!(before.saw(libc::SIGINT) && !before.saw(libc::SIGHUP));
 }
 
 /// An interrupt that arrives in the window is held until it ends, and then reaches the handler that was
@@ -154,6 +199,11 @@ fn the_window_says_whether_a_signal_arrived_in_it() {
 fn int_term_and_hup_are_each_held_and_re_raised() {
     let before = StandIn::install();
     let deferred = Deferred::begin().expect("begin");
+    assert_eq!(
+        deferred.signals().collect::<Vec<_>>(),
+        SIGNALS,
+        "all three are taken over"
+    );
 
     for signal in SIGNALS {
         raise(signal);

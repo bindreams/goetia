@@ -164,22 +164,37 @@ fn a_launch_that_was_gone_or_another_process_before_it_could_be_watched_is_in_do
     assert!(vanished.is_indeterminate());
 }
 
-/// An interrupt that ended the run is the cause under the stranded hold, and says when it arrived. Its text
-/// is true wherever that was, the start of a launch included: it says what goetia did after the interrupt,
-/// not what had happened before.
+/// The source says what is true of every way in: the pid was gone at the registration or at the read of its
+/// start, or `launchctl procinfo` did not name it. It does not say whose launch it was.
 #[skuld::test]
-fn an_interrupt_says_when_it_arrived_and_that_nothing_was_sent_after() {
-    let interrupted = run_interrupted(&frpc(), "while the job was loaded");
+fn the_source_of_a_vanished_launch_does_not_say_whose_it_was() {
+    let vanished = run_vanished(&frpc(), 4242);
+
+    let report = vanished.report().to_string();
+    assert!(
+        report.contains("process 4242 was gone, or was not the job's launch"),
+        "{report}"
+    );
+    assert!(!report.contains("process 4242 was not the job's launch"), "{report}");
+}
+
+/// An interrupt that ended the run is the cause under the stranded hold. It says when it was received
+/// relative to what goetia was about to do, and what is left; it makes no claim about when it came.
+#[skuld::test]
+fn an_interrupt_says_what_it_was_received_before_and_what_is_left() {
+    let interrupted = run_interrupted(&frpc(), "before goetia armed a hold", "no hold was armed");
 
     assert_eq!(interrupted.to_string(), "failed to start the run of `frpc`");
     assert!(!interrupted.is_indeterminate());
     let report = interrupted.report().to_string();
     assert!(
         report.contains(
-            "interrupted by SIGINT, SIGTERM or SIGHUP while the job was loaded; goetia sent nothing after it"
+            "interrupted by SIGINT, SIGTERM or SIGHUP, received before goetia armed a hold; goetia sent \
+             nothing after acting on it; no hold was armed"
         ),
         "{report}"
     );
+    assert!(!report.contains("while goetia waited"), "{report}");
     assert!(!report.contains("no run was started"), "a launch may exist: {report}");
 }
 

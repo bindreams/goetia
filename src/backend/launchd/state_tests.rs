@@ -362,15 +362,15 @@ fn id() -> Id {
 }
 
 /// `launch_of` of a process that started at `started` and then stood as `then`.
-fn launch(then: Then, started: u64) -> Launch {
-    launch_of(Some((started, then)), TA, &id(), PID)
+fn launch(then: Then, started: u64) -> std::result::Result<Launch, Error> {
+    launch_of(started, then, TA, &id(), PID)
 }
 
 /// The error a launch that ends the run carries.
-fn ends(launch: Launch) -> Error {
+fn ends(launch: std::result::Result<Launch, Error>) -> Error {
     match launch {
-        Launch::Ends(error) => error,
-        other => panic!("the run was to end, got {other:?}"),
+        Err(error) => error,
+        Ok(other) => panic!("the run was to end, got {other:?}"),
     }
 }
 
@@ -385,14 +385,14 @@ fn is_stranded(error: &Error) -> bool {
 #[skuld::test]
 fn launch_of_tells_our_held_launch_from_an_older_one_taking_a_hold_or_not() {
     let alive = |stopped| Then::Process { stopped };
-    assert!(matches!(launch(alive(true), TA + 1), Launch::Held));
+    assert!(matches!(launch(alive(true), TA + 1), Ok(Launch::Held)));
     assert!(
-        matches!(launch(alive(true), TA), Launch::TookHold),
+        matches!(launch(alive(true), TA), Ok(Launch::TookHold)),
         "a start at ta is not after it"
     );
-    assert!(matches!(launch(alive(true), TA - 1), Launch::TookHold));
-    assert!(matches!(launch(alive(false), TA), Launch::InFlight));
-    assert!(matches!(launch(alive(false), 1), Launch::InFlight));
+    assert!(matches!(launch(alive(true), TA - 1), Ok(Launch::TookHold)));
+    assert!(matches!(launch(alive(false), TA), Ok(Launch::InFlight)));
+    assert!(matches!(launch(alive(false), 1), Ok(Launch::InFlight)));
 }
 
 /// Our own launch that is running and not held was started by our `kickstart` with no hold on it: not
@@ -417,7 +417,7 @@ fn an_older_launch_that_is_gone_starts_another_pass() {
     for started in [1, TA - 1, TA] {
         for status in [None, Some(3 << 8)] {
             assert!(
-                matches!(launch(Then::Gone(status), started), Launch::Ended),
+                matches!(launch(Then::Gone(status), started), Ok(Launch::Ended)),
                 "gone with {status:?}, started at {started}"
             );
         }
@@ -452,7 +452,7 @@ fn our_launch_that_is_gone_ended_before_goetia_could_follow_it() {
 /// is not known, so the run ends in doubt, in the stranded hold.
 #[skuld::test]
 fn a_launch_with_no_start_time_is_in_doubt_in_the_stranded_hold() {
-    let e = ends(launch_of(None, TA, &id(), PID));
+    let e = launch_unknown(&id(), PID);
 
     assert!(is_stranded(&e), "{e:?}");
     assert!(

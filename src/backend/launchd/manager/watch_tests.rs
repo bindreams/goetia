@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 
-use super::super::interrupts::interrupts_tests::StandIn;
+use super::super::interrupts::interrupts_tests::{StandIn, ignore, send_to_process};
 use super::*;
 use crate::manager::Budget;
 
@@ -342,7 +342,7 @@ fn deleting_a_registration_whose_exit_fired_answers_as_measured() {
 fn interruptible() -> (StandIn, Deferred, Watch) {
     let stand_in = StandIn::install();
     let window = Deferred::begin().expect("begin the window");
-    let watch = Watch::new_interruptible().expect("a kqueue");
+    let watch = Watch::new_interruptible(&window).expect("a kqueue");
     (stand_in, window, watch)
 }
 
@@ -362,20 +362,8 @@ fn launched(watch: &Watch, pid: u32) -> Registered {
 /// nothing of it, as when the handler runs after the queue has been read. The ignored disposition is the
 /// window's to put back when it closes, and the stand-in's after.
 fn send_ignored_interrupt() {
-    // SAFETY: an all-zero `sigaction` is valid; the mask is emptied before use.
-    let mut ignoring: libc::sigaction = unsafe { std::mem::zeroed() };
-    ignoring.sa_sigaction = libc::SIG_IGN;
-    // SAFETY: `ignoring` is a valid `sigaction`, a null old action is allowed, `sigemptyset` takes a valid
-    // set, and `kill` takes plain integers.
-    unsafe {
-        libc::sigemptyset(&mut ignoring.sa_mask);
-        assert_eq!(
-            libc::sigaction(libc::SIGINT, &ignoring, std::ptr::null_mut()),
-            0,
-            "ignore SIGINT"
-        );
-        assert_eq!(libc::kill(libc::getpid(), libc::SIGINT), 0, "send SIGINT");
-    }
+    ignore(libc::SIGINT);
+    send_to_process(libc::SIGINT);
 }
 
 fn raise_interrupt() {
@@ -454,7 +442,10 @@ fn an_interrupt_wins_over_an_exec_and_an_exit_that_were_kept() {
     let mut child = Held::execing(3);
     let registered = launched(&watch, child.pid());
     child.finish();
-    assert!(registered.has_exited().expect("poll"), "the exec and the exit are kept");
+    assert!(
+        registered.exit_kept().expect("poll").is_some(),
+        "the exec and the exit are kept"
+    );
     raise_interrupt();
 
     assert!(matches!(
@@ -492,7 +483,10 @@ fn a_signal_event_read_by_a_poll_is_still_an_interrupt() {
     send_ignored_interrupt();
     assert!(!window.interrupted(), "the handler recorded nothing");
 
-    assert!(!registered.has_exited().expect("poll"), "the poll reads the event");
+    assert!(
+        registered.exit_kept().expect("poll").is_none(),
+        "the poll reads the event"
+    );
 
     assert!(watch.interrupted(&window), "the watch has it");
     assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
@@ -521,23 +515,45 @@ fn a_watch_with_no_signal_is_not_interrupted() {
     let child = Held::new(0);
     let registered = launched(&watch, child.pid());
 
-    assert!(!registered.has_exited().expect("poll"));
+    assert!(registered.exit_kept().expect("poll").is_none());
 
     assert!(!watch.interrupted(&window));
 }
 
-/// Whether the pid has exited is read without blocking and without taking the exit: a wait after it still
-/// reports it, and so does a second poll.
+/// A signal that was ignored before the window is none of its signals: the queue has no event for it, so a
+/// SIGHUP sent to the process under `nohup` is no interrupt.
 #[skuld::test]
-fn has_exited_reports_an_exit_without_taking_it() {
+fn an_ignored_signal_is_no_interrupt_to_the_watch() {
+    let stand_in = StandIn::install();
+    ignore(libc::SIGHUP);
+    let window = Deferred::begin().expect("begin the window");
+    let watch = Watch::new_interruptible(&window).expect("a kqueue");
+    let child = Held::new(0);
+    let registered = launched(&watch, child.pid());
+
+    send_to_process(libc::SIGHUP);
+
+    assert!(
+        registered.exit_kept().expect("poll").is_none(),
+        "the poll reads the queue"
+    );
+    assert!(!watch.interrupted(&window), "an ignored signal is no interrupt");
+    assert_eq!(stand_in.seen(), 0);
+}
+
+/// The exit the poll found is reported with its status, without taking it: a wait after it still reports
+/// it, and so does a second poll.
+#[skuld::test]
+fn exit_kept_reports_an_exit_and_its_status_without_taking_it() {
     let watch = watch();
     let mut child = Held::new(3);
     let registered = registered(&watch, child.pid());
 
-    assert!(!registered.has_exited().expect("poll"));
+    assert!(registered.exit_kept().expect("poll").is_none());
     child.finish();
-    assert!(registered.has_exited().expect("poll"), "the exit");
-    assert!(registered.has_exited().expect("poll again"), "not taken");
+    let exit = registered.exit_kept().expect("poll").expect("the exit");
+    assert_eq!(exit.status, Some(3 << 8));
+    assert!(registered.exit_kept().expect("poll again").is_some(), "not taken");
 
     assert_eq!(registered.wait(failure_bound()).expect("wait"), Some(3 << 8));
 }
@@ -550,7 +566,7 @@ fn a_poll_keeps_the_exec_for_the_wait_for_it() {
     let registered = launched(&watch, child.pid());
     child.finish();
 
-    assert!(registered.has_exited().expect("poll"));
+    assert!(registered.exit_kept().expect("poll").is_some());
 
     assert!(matches!(
         registered.first_exec(&window).expect("first_exec"),
