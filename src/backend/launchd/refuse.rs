@@ -77,8 +77,9 @@ pub(crate) fn changed_during_install(id: &Id, path: &Path) -> Error {
 // A run `begin_run` could not carry through ===========================================================================
 
 /// `source`, a failure after `launchctl debug` held the next launch of `id`: the run was not started, and
-/// the hold stays until a launch consumes it. A launch held and not resumed waits stopped, so the error
-/// says what ends it. The cause stays under it, so a request left in doubt is still indeterminate, and
+/// the hold stays until a launch consumes it. A launch held and not resumed waits stopped, and `run`
+/// refuses it as running, so the error says what ends it: a `stop` for a launch, a `run` for a hold no
+/// launch has taken. The cause stays under it, so a request left in doubt is still indeterminate, and
 /// then the run may have started: only a failure that left nothing in doubt says it did not.
 pub(crate) fn stranded_hold(id: &Id, source: Error) -> Error {
     let run = if source.is_indeterminate() {
@@ -88,9 +89,9 @@ pub(crate) fn stranded_hold(id: &Id, source: Error) -> Error {
     };
     Error::Step {
         what: format!(
-            "`launchctl debug` held the next launch of `{id}` and {run}: that launch, a \
-             scheduled run or the next `run`, may wait stopped until `goetia daemon stop {id}` or `goetia \
-             daemon run {id}` ends it"
+            "`launchctl debug` held the next launch of `{id}` and {run}: a launch that took the hold waits \
+             stopped until `goetia daemon stop {id}` ends it, and a hold no launch has taken is consumed by \
+             the next `goetia daemon run {id}`"
         ),
         source: Box::new(source),
     }
