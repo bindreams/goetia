@@ -45,7 +45,9 @@ if ($Kind -eq 'user') {
     } catch { "Run FAILED: $($_.Exception.Message.Trim()) [$(HexOf $_.Exception.HResult)]" }
     "first Run without the right: LastTaskResult=$(HexOf $t.LastTaskResult); output written: $(Test-Path $out)"
     "  $(Info $t 'status')"
-    "TaskScheduler Operational events for that Run:"
+    # An observation window (not a synchronisation): the events of a failed logon are written a little after the Run.
+    Start-Sleep -Seconds 5
+    "TaskScheduler Operational events for that Run (after a 5 s observation window):"
     Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-TaskScheduler/Operational'; StartTime = $t0 } -ErrorAction SilentlyContinue | Sort-Object TimeCreated | ForEach-Object { "  id $($_.Id) $($_.TimeCreated.ToString('HH:mm:ss.fff')) $(($_.Message -split "`n")[0])" }
     Grant-Right $user.Name 'SeBatchLogonRight'
     Remove-Item $out -ErrorAction SilentlyContinue

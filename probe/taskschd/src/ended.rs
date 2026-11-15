@@ -47,6 +47,7 @@ struct Agg {
     linger_exit_ms: Vec<f64>,
     unreadable_ms: Vec<f64>,
     first_bad_ms: Vec<f64>,
+    reuse_ms: Vec<f64>,
     starts: BTreeMap<usize, u64>,
 }
 
@@ -59,33 +60,38 @@ impl Agg {
 struct Churn {
     log: Arc<Mutex<Vec<(u32, u64, u64)>>>, // pid, creation time, our clock at creation
     stop: Arc<AtomicBool>,
-    th: Option<std::thread::JoinHandle<()>>,
+    th: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// Three threads creating and reaping tiny processes, so pids are freed and handed out again as fast as they can be.
 fn start_churn() -> Churn {
     let log = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
-    let (l2, s2) = (log.clone(), stop.clone());
     let exe = std::env::current_exe().unwrap();
-    let th = std::thread::spawn(move || {
-        while !s2.load(Ordering::Relaxed) {
-            let t0 = now_ft();
-            let Ok(mut c) = std::process::Command::new(&exe)
-                .args(["act", "noop"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            else {
-                continue;
-            };
-            let pid = c.id();
-            let ct = probe_pid(pid).map(|p| p.ct).unwrap_or(0);
-            l2.lock().unwrap().push((pid, ct, t0));
-            let _ = c.wait();
-        }
-    });
-    Churn { log, stop, th: Some(th) }
+    let th = (0..3)
+        .map(|_| {
+            let (l2, s2, exe) = (log.clone(), stop.clone(), exe.clone());
+            std::thread::spawn(move || {
+                while !s2.load(Ordering::Relaxed) {
+                    let t0 = now_ft();
+                    let Ok(mut c) = std::process::Command::new(&exe)
+                        .args(["act", "noop"])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                    else {
+                        continue;
+                    };
+                    let pid = c.id();
+                    let ct = probe_pid(pid).map(|p| p.ct).unwrap_or(0);
+                    l2.lock().unwrap().push((pid, ct, t0));
+                    let _ = c.wait();
+                }
+            })
+        })
+        .collect();
+    Churn { log, stop, th }
 }
 
 fn lr(t: &IRegisteredTask) -> String {
@@ -106,19 +112,64 @@ fn r2s<T: std::fmt::Debug>(r: Result<T>) -> String {
     }
 }
 
+struct Call {
+    a: u64,
+    b: u64,
+    pid: u32,
+    guid: String,
+    err: Option<String>,
+}
+
+/// `l2spam*`: calls Run / RunEx in a tight loop from its own thread from the first run's start until a call returns an
+/// instance with a pid (a start), so some calls land in the ended-but-listed window; each call is timed.
+fn spam(path: String, kind: u8, stop: Arc<AtomicBool>) -> Vec<Call> {
+    com_init();
+    let t = task(&path).expect("task in the spam thread");
+    let mut v = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        let a = now_ft();
+        // SAFETY: plain COM calls.
+        let r = unsafe {
+            match kind {
+                0 => t.Run(&VARIANT::default()),
+                1 => t.RunEx(&VARIANT::default(), 0, 0, &BSTR::new()),
+                _ => t.RunEx(&VARIANT::default(), 2, 0, &BSTR::new()),
+            }
+        };
+        let b = now_ft();
+        match r {
+            Ok(rt) => {
+                let pid = unsafe { rt.EnginePID() }.unwrap_or(0);
+                let guid = unsafe { rt.InstanceGuid() }.map(|x| x.to_string()).unwrap_or_default();
+                v.push(Call { a, b, pid, guid, err: None });
+                if pid != 0 {
+                    break;
+                }
+            }
+            Err(e) => {
+                v.push(Call { a, b, pid: 0, guid: String::new(), err: Some(hr(&e)) });
+                break;
+            }
+        }
+    }
+    v
+}
+
 /// What the experiment does in the window. Returns a note and the second instance's guid if one was returned.
-fn hook(exp: &str, path: &str, t: &IRegisteredTask, it: Option<&IRunningTask>, agg: &mut Agg) -> (String, Option<String>) {
-    let fresh = task(path).ok();
-    let before = format!("{} fresh[{}]", lr(t), fresh.as_ref().map(lr).unwrap_or_default());
+fn hook(exp: &str, _path: &str, t: &IRegisteredTask, it: Option<&IRunningTask>, agg: &mut Agg) -> (String, Option<String>) {
+    // The experiment's own call is made first, with nothing between the sample and the call.
     // SAFETY: plain COM calls.
     unsafe {
+        let early: Option<Result<IRunningTask>> = match exp {
+            "l2run" => Some(t.Run(&VARIANT::default())),
+            "l2runex0" => Some(t.RunEx(&VARIANT::default(), 0, 0, &BSTR::new())),
+            "l2runex2" => Some(t.RunEx(&VARIANT::default(), 2, 0, &BSTR::new())),
+            _ => None,
+        };
+        let before = lr(t);
         match exp {
             "l2run" | "l2runex0" | "l2runex2" => {
-                let r = match exp {
-                    "l2run" => t.Run(&VARIANT::default()),
-                    "l2runex0" => t.RunEx(&VARIANT::default(), 0, 0, &BSTR::new()),
-                    _ => t.RunEx(&VARIANT::default(), 2, 0, &BSTR::new()),
-                };
+                let r = early.unwrap();
                 match r {
                     Ok(rt) => {
                         let g = rt.InstanceGuid().map(|b| b.to_string()).unwrap_or_default();
@@ -174,6 +225,12 @@ pub fn run(a: &[String]) -> i32 {
     let churn = a.get(5).map(|s| s == "churn").unwrap_or(false);
     let settle_ms: f64 = if exp == "fire" { 1500.0 } else { 0.0 };
     let l2 = exp.starts_with("l2") || exp == "fire";
+    let spam_kind: Option<u8> = match exp {
+        "l2spam" => Some(0),
+        "l2spamex0" => Some(1),
+        "l2spamex2" => Some(2),
+        _ => None,
+    };
     let t = task(path).expect("task");
     let mut agg = Agg::default();
     let ch = if churn { Some(start_churn()) } else { None };
@@ -200,6 +257,11 @@ pub fn run(a: &[String]) -> i32 {
         let t_ret = now_ft();
         let guid = unsafe { rt.InstanceGuid() }.map(|b| b.to_string()).unwrap_or_default();
         let run_pid = unsafe { rt.EnginePID() }.unwrap_or(0);
+        let spam_stop = Arc::new(AtomicBool::new(false));
+        let spam_h = spam_kind.map(|k| {
+            let (p, s) = (path.to_string(), spam_stop.clone());
+            std::thread::spawn(move || spam(p, k, s))
+        });
 
         let mut obs: Vec<(u32, u64)> = Vec::new();
         let (mut samples, mut alive, mut exited) = (0u64, 0u64, 0u64);
@@ -354,8 +416,41 @@ pub fn run(a: &[String]) -> i32 {
                 break;
             }
         }
+        spam_stop.store(true, Ordering::Relaxed);
+        let calls = spam_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
         let drop1 = drop1.unwrap_or_else(now_ft);
         let after = lr(&t);
+        if exp == "l1" && i <= 3 {
+            // Nothing is listed now.
+            let r = unsafe { t.Stop(0) };
+            agg.t(format!("IRegisteredTask::Stop(0) with nothing running: {}", r2s(r)));
+        }
+        let mut spam_note = String::new();
+        if !calls.is_empty() {
+            for c in &calls {
+                let phase = if c.a >= drop1 {
+                    "after the listing dropped"
+                } else if bad_first.map_or(false, |u| c.a >= u) {
+                    "in the ended-but-listed window"
+                } else {
+                    "before the window (the first instance alive)"
+                };
+                let out = if c.err.is_some() { "error" } else if c.pid != 0 { "started an instance with a pid" } else { "returned an instance with no pid (ignored)" };
+                agg.t(format!("Run-call issued {phase}: {out}"));
+                if let Some(e) = &c.err {
+                    agg.t(format!("Run-call error {e}"));
+                }
+            }
+            let u = bad_first.unwrap_or(drop1);
+            let last3: Vec<String> = calls
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .map(|c| format!("[a-U={:+.2} b-U={:+.2} b-E={:+.2} pid={} guid={}]", ms(u, c.a), ms(u, c.b), ms(drop1, c.b), c.pid, c.guid))
+                .collect();
+            spam_note = format!("spam: {} calls; last three (U = first ended/unreadable sample, E = the listing's drop): {}", calls.len(), last3.join(" "));
+        }
 
         // What the action itself recorded.
         let all = lines(actlog);
@@ -386,6 +481,11 @@ pub fn run(a: &[String]) -> i32 {
         }
         let mut coll = String::new();
         if let Some(ch) = &ch {
+            // The first churn process created with the action's pid after this run began: how long after the drop?
+            let first = ch.log.lock().unwrap().iter().filter(|(p, _, tc)| *p == rec_pid && *tc >= t_run).map(|(_, _, tc)| *tc).min();
+            if let Some(tc) = first {
+                agg.reuse_ms.push(ms(drop1, tc));
+            }
             let hit: Vec<_> = ch.log.lock().unwrap().iter().filter(|(p, _, tc)| *p == rec_pid && *tc >= t_run && *tc <= drop1).cloned().collect();
             if !hit.is_empty() {
                 agg.t("CHURN: a new process got the action's pid before the listing dropped");
@@ -434,7 +534,7 @@ pub fn run(a: &[String]) -> i32 {
         let tl = timeline.iter().map(|(t, s)| format!("+{t:.1}ms {s}")).collect::<Vec<_>>().join(" | ");
         println!(
             "run {i}: guid={guid} run_pid={run_pid} rec_pid={rec_pid} run_ret_ms={:.1} samples={samples} alive={alive} exited={exited} \
-             window_ms={} exit_to_drop_ms={} starts={} second2_listed={seen2} {second} {note} after[{after}] {} {coll} timeline: {tl}",
+             window_ms={} exit_to_drop_ms={} starts={} second2_listed={seen2} {second} {note} after[{after}] {} {coll} {spam_note} timeline: {tl}",
             ms(t_run, t_ret),
             linger_seen.map(|v| format!("{v:.2}")).unwrap_or("-".into()),
             linger_exit.map(|v| format!("{v:.2}")).unwrap_or("-".into()),
@@ -445,7 +545,7 @@ pub fn run(a: &[String]) -> i32 {
 
     if let Some(mut c) = ch {
         c.stop.store(true, Ordering::Relaxed);
-        if let Some(th) = c.th.take() {
+        for th in c.th.drain(..) {
             let _ = th.join();
         }
         let n = c.log.lock().unwrap().len();
@@ -460,6 +560,14 @@ pub fn run(a: &[String]) -> i32 {
     println!("first bad sample (ended or unreadable) ms after Run returned: {}", stats(agg.first_bad_ms.clone()));
     println!("bad (ended or unreadable) duration ms: {}", stats(agg.unreadable_ms.clone()));
     println!("pid0 runs={} duration_ms: {}", agg.pid0_runs, stats(agg.pid0_ms.clone()));
+    if churn {
+        println!(
+            "the action's pid was handed to a churn process in {} of {} runs; the start of that CreateProcess relative to the listing's drop, ms (negative = before the drop): {}",
+            agg.reuse_ms.len(),
+            agg.runs,
+            stats(agg.reuse_ms.clone())
+        );
+    }
     println!("action starts per run: {:?}", agg.starts);
     for (k, v) in &agg.shapes {
         println!("shape of the listing over a run: {k}: {v} runs");
