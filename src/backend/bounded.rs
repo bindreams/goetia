@@ -380,7 +380,7 @@ fn waited_out(
         return Err(e);
     }
     let waited = match deadline.at() {
-        Some(at) => child.wait_deadline(at).inspect_err(|e| eprintln!("PROBE_WAIT_ERR {e:?}"))?,
+        Some(at) => child.wait_deadline(at)?,
         None => Some(child.wait()?), // no timeout value is invented for an unbounded deadline
     };
     let status = match (waited, role) {
@@ -402,14 +402,7 @@ fn waited_out(
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
             // The root first, and its `Ok` is what makes the reap below unable to block.
-            if let Err(e) = child.kill() {
-                let ps = std::process::Command::new("ps")
-                    .args(["-o", "stat=", "-p", &child.pid().to_string()])
-                    .output()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-                eprintln!("PROBE_KILL_ERR pid={} ps={ps:?} {e:?}", child.pid());
-                return Err(e);
-            }
+            kill_root(&child)?;
             // Then the tree, best-effort. This runs BEFORE the reap below, while the killed
             // root is still a zombie pinning its pid and pgid, so a kill that names the tree
             // by the root's number cannot hit another process on any platform. `Drop` (at the
@@ -438,6 +431,15 @@ fn waited_out(
         complete: stdout_whole && stderr_whole,
     };
     Ok(Finished::Exited { status, capture })
+}
+
+/// [`cosca::Child::kill`], the one kill an expired query or announced request makes.
+fn kill_root(child: &cosca::Child) -> Result<(), cosca::error::Error> {
+    #[cfg(test)]
+    if let Some(e) = test_hook::killing(child) {
+        return Err(e);
+    }
+    child.kill()
 }
 
 /// The rest of `stream`, after `heard`: a file read back whole, or a pipe collected until its EOF or
@@ -608,7 +610,3 @@ fn expiry_disposition(reaped: ExitStatus) -> Disposition {
 #[cfg(test)]
 #[path = "bounded_tests.rs"]
 mod bounded_tests;
-
-#[cfg(test)]
-#[path = "bounded_probe.rs"]
-mod bounded_probe;

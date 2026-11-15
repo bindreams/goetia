@@ -245,7 +245,7 @@ pub(super) fn make_file() -> io::Result<File> {
 // test_hook ===========================================================================================================
 
 /// Test controls: per-thread limits on temp files and reuses, a per-thread spawn count, injected
-/// spawn and wait failures, and a reader of a reservation.
+/// spawn, wait and kill failures, and a reader of a reservation.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::Cell;
@@ -260,6 +260,20 @@ pub(crate) mod test_hook {
             const { std::cell::RefCell::new(None) };
         static WAIT_FAILS: std::cell::RefCell<Option<fn() -> cosca::error::Error>> =
             const { std::cell::RefCell::new(None) };
+        static KILL_FAILS: std::cell::RefCell<Option<fn(&cosca::Child) -> cosca::error::Error>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Make this thread's next deadline kill of a child refuse with `error(child)`, the child
+    /// receiving no signal from it: `error` may itself act on the child, as the world does between
+    /// a kill's refusal and the next look at the child.
+    pub(crate) fn kill_fails(error: fn(&cosca::Child) -> cosca::error::Error) {
+        KILL_FAILS.set(Some(error));
+    }
+
+    /// The refusal [`kill_fails`] set up for this kill of `child`, if any.
+    pub(in crate::backend::bounded) fn killing(child: &cosca::Child) -> Option<cosca::error::Error> {
+        KILL_FAILS.take().map(|error| error(child))
     }
 
     /// Make this thread's next wait on a spawned child fail with `error()`, the child already

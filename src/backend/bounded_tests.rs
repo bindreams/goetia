@@ -361,6 +361,32 @@ fn an_announced_request_that_ends_unannounced_is_reported_exited() {
     }
 }
 
+/// A child that is exiting when the deadline's kill reaches it can refuse the kill (macOS answers
+/// EPERM to a send by audit token in that window), and it has exited by the time anyone looks: that
+/// is the child's own exit, as if it had ended before the kill was sent.
+///
+/// The child traps SIGTERM and announces only once the trap is set, so the hook's SIGTERM, standing
+/// for the exit that raced the kill, is answered with exit 7 and never with the default action.
+#[skuld::test]
+fn a_kill_refused_at_the_deadline_by_a_child_that_has_exited_is_reported_exited() {
+    let child = spawned(
+        sh("trap 'exit 7' TERM; echo 'request issued' >&2; sleep 2147483647 & wait"),
+        Role::AnnouncedRequest(announced),
+    );
+    test_hook::kill_fails(|child| {
+        // SAFETY: `kill` takes a pid and a signal and touches no memory; the child is this call's own.
+        assert_eq!(unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGTERM) }, 0);
+        io::Error::from_raw_os_error(libc::EPERM).into()
+    });
+
+    let finished = wait_bounded(child, Budget::Immediate.start());
+
+    match finished {
+        Ok(Finished::Exited { status, .. }) => assert_eq!(status.code(), Some(7)),
+        other => panic!("expected the child's own exit, got {other:?}"),
+    }
+}
+
 /// What the child wrote while issuing its request is kept: it is the start of the diagnostic.
 #[skuld::test]
 fn what_an_announced_request_wrote_before_announcing_is_kept() {
