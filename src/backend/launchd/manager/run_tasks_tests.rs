@@ -451,11 +451,12 @@ fn a_run_whose_exit_came_without_a_status_is_unrecorded() {
 
     let e = run.wait().expect_err("an exit with no status");
 
-    assert!(
-        matches!(&e, Error::RunUnrecorded { id, reason }
-            if id == ID && reason == "the kernel reported its exit without one"),
-        "{e:?}"
+    // The wording is `refuse_tests`'s; here, that this is that error, and that it says the run ended.
+    assert_eq!(
+        e.to_string(),
+        run_ended_without_status(&ID.parse().expect("the id")).to_string()
     );
+    assert!(e.to_string().contains("ended"), "{e}");
 }
 
 /// The log's length is read while the launch is held, and before `SIGCONT`: the file grows at the

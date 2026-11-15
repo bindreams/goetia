@@ -432,9 +432,8 @@ impl Shared {
         kept.extend(
             events
                 .iter()
-                // The discarded pid's events go before `exited`, which spends the test hook's allowance.
-                .filter(|event| event.filter() != Ok(EventFilter::EVFILT_PROC) || Some(event.ident() as u32) != pid)
-                .filter_map(exited),
+                .filter_map(exited)
+                .filter(|exited| Some(exited.pid) != pid),
         );
         drop(kept);
         let mut execed = self.execed.lock().unwrap_or_else(PoisonError::into_inner);
@@ -519,7 +518,8 @@ pub(crate) mod test_hook {
     }
 
     /// Let this thread read only `n` more exits with their status: every later exit it reads is reported
-    /// without one, as the kernel may report it, until the returned guard drops.
+    /// without one, as the kernel may report it, until the returned guard drops. An exit counts when it is
+    /// read off the queue, whether or not a wait then uses it.
     pub(crate) fn statuses(n: usize) -> Allowance {
         Allowance::set(&STATUSES, n)
     }
