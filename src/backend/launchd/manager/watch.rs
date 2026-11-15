@@ -196,12 +196,8 @@ impl Registered {
     /// Removes every event of this pid from the queue and from what was kept, and leaves any other pid's
     /// kept for its registration. Whatever `delete` did or did not remove, no event of this pid is left.
     ///
-    /// It reads the queue with a zero timeout until a read finds it empty. Each read takes its events out
-    /// of the queue and this adds none back (what it keeps for others goes to `kept`), and after `delete`
-    /// the knote is gone, so this pid adds no more. Another live registration can still add its exit while
-    /// this runs, but each adds at most one (a process exits once) and only finitely many are live, so
-    /// the queue is empty after finitely many reads and the loop ends on that empty read, not after a
-    /// count or a time.
+    /// Reads with a zero timeout until a read finds the queue empty; it ends because each live
+    /// registration adds at most one exit and this adds none.
     fn drain(&self) {
         let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let mut events = [blank(); 8];

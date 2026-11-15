@@ -13,7 +13,7 @@
 //!   and so blocks on launchd's respawn throttle whenever the job has respawn history, as a
 //!   crash-looping `restart: always` job has once launchd has run it. The throttle is launchd's
 //!   `ThrottleInterval`: goetia writes it from `spec.restart_delay` when `restart` is not `never`,
-//!   and launchd's default is about 10s (measured 10.02s, 10.01-10.03s). The throttle runs from the
+//!   and launchd's default is about 10s. The throttle runs from the
 //!   job's last fork, not from the kick, and the budget from the verb's entry. `WaitTimeout` occurs
 //!   when the throttle left at the kick outlasts the budget left then: under the default throttle
 //!   and [`Budget::DEFAULT`] (10s), only for a verb entered within about 20ms of the last fork.

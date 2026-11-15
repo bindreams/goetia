@@ -11,7 +11,6 @@ use crate::spec::{DaemonKind, DaemonSpec};
 
 /// What one file name (`<id>.plist` or `<id>@timer.plist`) holds in the two directories a plist can
 /// be in.
-// `Marked` holds a whole `Blob`, as `ReadOutcome::Marked` does through its snapshot; same call.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum Slot {
