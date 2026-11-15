@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 /// Task Scheduler itself, reached through COM.
 pub(crate) struct Com;
 
-// The apartment ----------------------------------------------------------------------------------------------------
+// The apartment -------------------------------------------------------------------------------------------------------
 
 /// COM initialised on this thread (multithreaded apartment) for as long as the value lives. Not
 /// `Send`: the initialisation belongs to the thread that made it.
@@ -212,7 +212,7 @@ fn instance_id(guid: &str) -> Result<InstanceId> {
     InstanceId::parse(guid).ok_or_else(|| Error::os("read an instance", format!("`{guid}` is not a GUID")))
 }
 
-// The trait --------------------------------------------------------------------------------------------------------
+// The trait -----------------------------------------------------------------------------------------------------------
 
 impl Com {
     fn register_at(
