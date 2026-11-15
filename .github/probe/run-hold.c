@@ -254,9 +254,6 @@ static const char *shape(const char *out, char *buf, size_t cap) {
 
 /* ---- the job ---- */
 
-static const char *tag_prog; /* "true" or "sleep" */
-static int tag_wrap;
-
 static void xml_text(FILE *f, const char *s) {
     for (; *s; s++) {
         if (*s == '&')
@@ -737,6 +734,7 @@ static void spin_us(long us) {
 static void race(int i, long max_us, int withprint) {
     struct cmd c, d, k2, pr;
     long runs0 = -1, runs1 = -1, pid1 = -1;
+    char state1[64] = "";
     reset();
     lc(&c, "debug", SYS, "--start-suspended", NULL);
     if (c.code) tally("H0 debug exit %d", c.code);
@@ -757,6 +755,10 @@ static void race(int i, long max_us, int withprint) {
         lc(&pr, "print", SYS, NULL);
         runs1 = field(pr.out, "runs = ");
         pid1 = field(pr.out, "pid = ");
+        const char *s = strstr(pr.out, "\n\tstate = ");
+        snprintf(state1, sizeof state1, "%s", s ? s + 10 : "(none)");
+        char *nl = strchr(state1, '\n');
+        if (nl) *nl = 0;
     }
     lc(&k2, "kickstart", "-p", SYS, NULL);
     pid_t q = (pid_t)atol(k2.out);
@@ -782,7 +784,8 @@ static void race(int i, long max_us, int withprint) {
              (long long)(diff_ns(ta, tb) / 1000));
     }
     if (withprint)
-        tally("print after our debug: pid attached %s, runs increase since before %ld (start %s)", pid1 > 0 ? "yes" : "no", runs1 - runs0, where);
+        tally("print after our debug: state [%s], pid attached %s, runs increase since before %ld (start %s)", state1, pid1 > 0 ? "yes" : "no",
+              runs1 - runs0, where);
     lc(&c, "kill", "SIGKILL", SYS, NULL);
     if (p > 0) gone(p);
     lc(&c, "debug", SYS, "--start-suspended", NULL);
@@ -805,7 +808,7 @@ int main(int argc, char **argv) {
     srand(12345);
     const char *sc = argv[1];
     if (!strcmp(sc, "held") || !strcmp(sc, "unheld")) {
-        if (argc < 7) return 2;
+        if (argc < 6) return 2;
         sanity();
         run_passes(!strcmp(sc, "held"), !strcmp(argv[2], "wrap"), !strcmp(argv[3], "late"), !strcmp(argv[4], "spaced"), atoi(argv[5]),
                    argc > 6 ? atoi(argv[6]) : 0);

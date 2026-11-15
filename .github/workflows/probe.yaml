@@ -26,10 +26,6 @@ jobs:
       - name: Build
         run: cc -O1 -Wall -o run-hold .github/probe/run-hold.c
 
-      - name: M4 replies
-        if: always()
-        run: sudo ./run-hold reply 60
-
       - name: M1 held, wrap, early, back-to-back
         if: always()
         run: sudo ./run-hold held wrap early b2b 500
@@ -74,13 +70,9 @@ jobs:
         if: always()
         run: sudo ./run-hold unheld plain late b2b 400
 
-      - name: M4 race, no prints
-        if: always()
-        run: sudo ./run-hold race 1500 30000 0
-
       - name: M4 race, with prints
         if: always()
-        run: sudo ./run-hold race 800 30000 1
+        run: sudo ./run-hold race 3000 30000 1
 
       - name: Clean up
         if: always()
