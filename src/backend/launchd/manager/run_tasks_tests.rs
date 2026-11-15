@@ -90,6 +90,11 @@ impl Launched {
         self.with(Held::release);
     }
 
+    /// Answers the process's first `read`, and leaves it blocked on its next.
+    fn advance(&self) {
+        self.with(Held::advance);
+    }
+
     fn with<T>(&self, then: impl FnOnce(&mut Held) -> T) -> T {
         then(self.0.lock().unwrap().as_mut().expect("the process was made"))
     }
@@ -179,6 +184,19 @@ impl std::io::Write for Noting {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// A scheduled run in flight, which ends as `run` begins to wait for it: its pid, and the notes writer that
+/// ends it. A pass over it ends, and another is made.
+fn in_flight_ending() -> (u32, Noting) {
+    let mut scheduled = Held::new(0);
+    let pid = scheduled.pid();
+    (
+        pid,
+        Noting::on_write(move || {
+            scheduled.finish();
+        }),
+    )
 }
 
 fn call(args: &[&str]) -> Vec<String> {
@@ -296,6 +314,20 @@ fn assert_interrupted(e: &Error, what: &str) {
         "{what}: {}",
         e.report()
     );
+}
+
+/// The in-doubt error of a launch that was gone before goetia could watch it, inside the stranded hold:
+/// the hold is pending, and whose launch it was is not known.
+fn assert_vanished(e: &Error, pid: u32) {
+    assert_stranded(e, "a launch that vanished");
+    assert!(
+        matches!(e, Error::Step { source, .. }
+            if matches!(&**source, Error::RequestInDoubt { request, reached: true, note: Some(note), .. }
+                if request == &format!("launchctl kickstart -p system/{ID}")
+                    && note.starts_with(&format!("the launch it named, process {pid}, ended before goetia could watch it")))),
+        "{e:?}"
+    );
+    assert!(e.is_indeterminate(), "exit 4: the run may have started: {e:?}");
 }
 
 fn assert_unfollowed(e: &Error, pid: u32) {
@@ -573,66 +605,84 @@ fn an_unheld_launch_started_after_debug_is_run_unfollowed() {
     assert_eq!(notes, "", "nothing was waited for");
 }
 
-/// The pid `kickstart -p` named is gone by the time it is registered: it ended, and the run starts over,
-/// with a note for nothing.
+/// The pid `kickstart -p` named is gone by the time it is registered: goetia never saw it, so it cannot say
+/// whose launch it was (this run's, which may have failed to start, or a scheduled run's). The run ends in
+/// doubt, in the stranded hold, and no pass follows: the script holds no second `debug`.
 #[skuld::test]
-fn a_launch_that_is_gone_at_the_registration_starts_the_run_over() {
+fn a_launch_that_is_gone_at_the_registration_is_in_doubt_and_starts_no_second_pass() {
     let mut gone = Held::new(0);
     let a = gone.pid();
     gone.finish();
-    let (kick, ours) = our_launch(0);
-    let fake = Fake::new([print(IDLE), debug(), kickstart(a), debug(), kick, sigcont_ending(&ours)]);
+    let fake = Fake::new([print(IDLE), debug(), kickstart(a)]);
     let tree = Tree::new();
 
     let (run, notes) = begin(&fake, snapshot(&tree, None));
 
-    run.unwrap_or_else(|e| panic!("begin_run failed: {e}"));
-    fake.assert_spent("the second pass followed the first");
+    assert_vanished(&run.err().expect("the launch vanished"), a);
+    fake.assert_spent("nothing was sent after the kickstart");
     assert_eq!(notes, "", "an ended launch is not waited for");
-    assert_eq!(calls_of(&fake, "kill").len(), 1, "only our own launch is resumed");
 }
 
-/// A launch that has exited and is not reaped is no process either way it is read, and the run starts over.
+/// A launch that has exited and is not reaped is no process to the watch or to a read: the same.
 #[skuld::test]
-fn a_launch_that_exited_unreaped_starts_the_run_over() {
+fn a_launch_that_exited_unreaped_is_in_doubt_and_starts_no_second_pass() {
     let mut zombie = Held::new(0);
     let a = zombie.pid();
     zombie.exit_unreaped();
-    let (kick, ours) = our_launch(0);
-    let fake = Fake::new([print(IDLE), debug(), kickstart(a), debug(), kick, sigcont_ending(&ours)]);
+    let fake = Fake::new([print(IDLE), debug(), kickstart(a)]);
     let tree = Tree::new();
 
     let (run, notes) = begin(&fake, snapshot(&tree, None));
 
-    run.unwrap_or_else(|e| panic!("begin_run failed: {e}"));
-    fake.assert_spent("the second pass followed the first");
+    assert_vanished(&run.err().expect("the launch vanished"), a);
+    fake.assert_spent("nothing was sent after the kickstart");
     assert_eq!(notes, "");
 }
 
-/// A launch whose program is `xpcproxy` is waited for its exec before it is read. It is let go as the call
-/// that names it returns, so its exec comes after, or before, the registration: either way the run goes on
-/// to its own launch.
+/// Our own launch, which started after the `debug`, is no different when it is gone at the registration:
+/// it is in doubt too.
+#[skuld::test]
+fn our_launch_that_is_gone_at_the_registration_is_in_doubt_too() {
+    let (kick, launched) = kickstart_launching(|| {
+        let mut ended = Held::new(0);
+        ended.finish();
+        ended
+    });
+    let fake = Fake::new([print(IDLE), debug(), kick]);
+    let tree = Tree::new();
+
+    let (run, _) = begin(&fake, snapshot(&tree, None));
+
+    assert_vanished(&run.err().expect("the launch vanished"), launched.pid());
+    fake.assert_spent("nothing was sent after the kickstart");
+}
+
+/// A launch whose program is `xpcproxy` is waited for its exec before it is read. It is answered as the
+/// call that names it returns, so its exec comes after, or before, the registration, and the program it
+/// execs goes on running until the note says the run waits for it: either way it is a run in flight, and
+/// the run goes on to its own launch.
 #[skuld::test]
 fn an_xpcproxy_launch_that_execs_is_read_after_the_exec_and_the_run_goes_on() {
     let dir = tempfile::tempdir().expect("tempdir");
     let proxy = Launched::of(Held::at_xpcproxy(dir.path(), "read _; exec /bin/sh -c 'read _'"));
     let a = proxy.pid();
-    // The hook lets it go and drops its own handle; this one keeps the process until the test ends.
-    let _alive = proxy.clone();
+    let (answered, ended) = (proxy.clone(), proxy.clone());
     let (kick, ours) = our_launch(0);
     let fake = Fake::new([
         print(IDLE),
         debug(),
-        kickstart(a).then(move || proxy.release()),
+        kickstart(a).then(move || answered.advance()),
         debug_exiting(37),
         kick,
         sigcont_ending(&ours),
     ]);
     let tree = Tree::new();
+    let mut notes = Noting::on_write(move || ended.release());
 
-    let run = begun(&fake, snapshot(&tree, None));
+    let run = begin_with(&fake, snapshot(&tree, None), &mut notes).unwrap_or_else(|e| panic!("begin_run failed: {e}"));
 
     fake.assert_spent("the second pass followed the first");
+    assert_eq!(notes.text(), NOTE, "the exec'd program is a run in flight");
     assert_eq!(calls_of(&fake, "kill").len(), 1, "only our own launch is resumed");
     assert_eq!(run.wait().expect("the exit"), Exit::Code(0));
 }
@@ -644,16 +694,14 @@ fn an_xpcproxy_launch_that_execs_is_read_after_the_exec_and_the_run_goes_on() {
 /// assertion.
 #[skuld::test]
 fn a_later_pass_makes_its_own_reservation_and_the_first_draws_only_what_it_was_handed() {
-    let mut gone = Held::new(0);
-    let a = gone.pid();
-    gone.finish();
+    let (a, mut notes) = in_flight_ending();
     let (kick, ours) = our_launch(0);
     let fake = Fake::new([print(IDLE), debug(), kickstart(a), debug(), kick, sigcont_ending(&ours)]);
     let tree = Tree::new();
     // The load's read, `debug` and `kickstart -p`: three calls, two requests.
     let mut handed = Reservation::make(2, 3 * Role::COUNTED_FILES).expect("a reservation");
 
-    let (run, _) = begin_on(&fake, snapshot(&tree, None), &mut handed);
+    let run = begin_noting(&fake, snapshot(&tree, None), &mut handed, &mut notes);
 
     run.unwrap_or_else(|e| panic!("begin_run failed: {e}"));
     assert_eq!(
@@ -666,15 +714,13 @@ fn a_later_pass_makes_its_own_reservation_and_the_first_draws_only_what_it_was_h
 /// A later pass that cannot reserve is the stranded hold: the first pass's `debug` left one pending.
 #[skuld::test]
 fn a_later_pass_that_cannot_reserve_returns_the_stranded_hold_error() {
-    let mut gone = Held::new(0);
-    let a = gone.pid();
-    gone.finish();
+    let (a, mut notes) = in_flight_ending();
     let fake = Fake::new([print(IDLE), debug(), kickstart(a)]);
     let tree = Tree::new();
     let mut handed = Reservation::make(2, 3 * Role::COUNTED_FILES).expect("a reservation");
     let _short = bounded::test_hook::temp_files(0);
 
-    let (run, _) = begin_on(&fake, snapshot(&tree, None), &mut handed);
+    let run = begin_noting(&fake, snapshot(&tree, None), &mut handed, &mut notes);
 
     let e = run.err().expect("the second pass cannot reserve");
     assert_stranded(&e, "a reservation that failed");
@@ -843,9 +889,7 @@ fn a_kickstart_failure_after_debug_names_the_stranded_hold() {
 /// resumed.
 #[skuld::test]
 fn a_kickstart_failure_on_a_later_pass_names_the_stranded_hold() {
-    let mut gone = Held::new(0);
-    let a = gone.pid();
-    gone.finish();
+    let (a, mut notes) = in_flight_ending();
     let fake = Fake::new([
         print(IDLE),
         debug(),
@@ -855,7 +899,9 @@ fn a_kickstart_failure_on_a_later_pass_names_the_stranded_hold() {
     ]);
     let tree = Tree::new();
 
-    let e = failed(&fake, snapshot(&tree, None));
+    let e = begin_with(&fake, snapshot(&tree, None), &mut notes)
+        .err()
+        .expect("the second pass's kickstart failed");
 
     assert_stranded(&e, "a later pass's kickstart that failed");
     fake.assert_spent("nothing was sent after the failure");
@@ -876,13 +922,13 @@ fn a_debug_failure_other_than_37_is_its_error_and_nothing_was_held() {
 /// A `debug` that failed on a later pass is the stranded hold: the first pass armed one.
 #[skuld::test]
 fn a_debug_failure_on_a_later_pass_names_the_stranded_hold() {
-    let mut gone = Held::new(0);
-    let a = gone.pid();
-    gone.finish();
+    let (a, mut notes) = in_flight_ending();
     let fake = Fake::new([print(IDLE), debug(), kickstart(a), debug_exiting(5)]);
     let tree = Tree::new();
 
-    let e = failed(&fake, snapshot(&tree, None));
+    let e = begin_with(&fake, snapshot(&tree, None), &mut notes)
+        .err()
+        .expect("the second pass's debug failed");
 
     assert_stranded(&e, "a later pass's debug that failed");
     fake.assert_spent("nothing was sent after the failed debug");
@@ -965,6 +1011,29 @@ fn an_interrupt_during_begin_run_is_held_until_it_returns() {
     assert_eq!(stand_in.seen(), 1, "re-raised once, after the resume");
     assert!(stand_in.saw(libc::SIGINT));
     assert_eq!(run.wait().expect("the exit"), Exit::Code(0));
+}
+
+/// An interrupt recorded while the job loads ends the run before the first `debug`: no hold exists, so the
+/// error is the interrupt itself and not the stranded hold, and nothing is sent after it.
+#[skuld::test]
+fn an_interrupt_during_the_load_ends_the_run_before_any_hold() {
+    let stand_in = StandIn::install();
+    let fake = Fake::new([print(IDLE).then(interrupt)]);
+    let tree = Tree::new();
+
+    let e = failed(&fake, snapshot(&tree, None));
+
+    assert!(matches!(&e, Error::Os { .. }), "no hold is stranded: {e:?}");
+    assert!(
+        e.report()
+            .to_string()
+            .contains("interrupted by SIGINT, SIGTERM or SIGHUP"),
+        "{}",
+        e.report()
+    );
+    fake.assert_spent("nothing was sent after the interrupt");
+    assert_eq!(calls_of(&fake, "debug").len(), 0, "no hold was armed");
+    assert_eq!(stand_in.seen(), 1, "the interrupt is re-raised once begin_run returns");
 }
 
 /// A `run` that fails puts the signal handlers back too.

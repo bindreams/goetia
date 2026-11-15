@@ -514,8 +514,9 @@ pub enum Error {
     #[error("the manager does not say whether `{id}` is running, so `run` did not start it")]
     RunStateUnknown { id: String },
 
-    /// The manager ended the start before any run began, as the journal records (a job result and no
-    /// Starting entry), so the task did not run. `reason` is the manager's. Not indeterminate: goetia
+    /// The manager ended the start before any run began, so the task did not run: as the journal records
+    /// (a job result and no Starting entry), or as the kernel shows of a launch that ended before its
+    /// program started (launchd). `reason` is the manager's, or the kernel's. Not indeterminate: goetia
     /// established that nothing ran.
     #[error("`{id}` did not run: {reason}")]
     RunNotStarted { id: String, reason: String },

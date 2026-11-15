@@ -11,22 +11,27 @@
 //! `kickstart -p` names the pid of the job's process, which is the launch `debug` held only if no other
 //! launch got there first: a scheduled run can be in flight, or can have taken a pending hold. So a pass
 //! tells what the pid is from the kernel, not from `print`, which lags the launch ([`super::proc`]). The
-//! pid is registered for its exec and exit; where its program is still `xpcproxy` its first exec is
-//! waited for, and then its state and start time are read. With `ta` the time read after the `launchctl
-//! debug` process was reaped:
+//! pid is registered for its exec and exit, and its start time is read at once (it is read of a process
+//! that is still `xpcproxy` too). Where its program is `xpcproxy` its first exec is waited for, and then
+//! its state is read, which is only a fact of the launch after the exec. A read by pid counts only if the
+//! watch shows no exit for the pid after it: otherwise the process is gone at that read. With `ta` the time
+//! read after the `launchctl debug` process was reaped:
 //!
 //! | process | started | the launch is | `run` |
 //! | --- | --- | --- | --- |
+//! | gone at the registration, or at the read of its start | | not known: this run's, or a scheduled run's | ends: [`run_vanished`], in doubt |
+//! | exited before its exec | after `ta` | ours, whose program never started | ends: [`run_not_started`] |
+//! | gone at a later read | after `ta` | ours, which ended before goetia could follow it | ends: [`run_ended_unfollowed`] |
 //! | stopped | after `ta` | the one `debug` held | resumes it, and follows it |
-//! | stopped | at or before `ta` | an older one that took a hold | resumes it, waits for its exit, starts over |
-//! | running | at or before `ta` | a run in flight | waits for its exit, starts over |
-//! | running | after `ta` | our own `kickstart`'s, with no hold | [`run_unfollowed`] |
-//! | gone | | | starts over |
+//! | running | after `ta` | our own `kickstart`'s, with no hold | ends: [`run_unfollowed`] |
+//! | exited before its exec, or gone at a later read | at or before `ta` | an older one, that is over | starts another pass |
+//! | stopped | at or before `ta` | an older one that took a hold | resumes it, waits for its exit, starts another pass |
+//! | running | at or before `ta` | a run in flight | waits for its exit, starts another pass |
 //!
-//! Starting over is another pass with a fresh `debug`: a hold the older launch took is gone, and one it
-//! did not take is still pending and the `debug` is refused as pending (exit 37), which is the same hold.
-//! No pass count is limited: a pass ends in a launch followed, or in a launch some other `run` or the
-//! timer made that has now ended. Each pass reserves before its first request.
+//! Another pass is a fresh `debug`: a hold the older launch took is gone, and one it did not take is still
+//! pending and the `debug` is refused as pending (exit 37), which is the same hold. No pass count is
+//! limited: a pass that does not end the `run` waited for a launch some other `run` or the timer made, and
+//! it has now ended. Each pass reserves before its first request.
 //!
 //! A launch that took a hold before launchd handled our `debug` started before `debug` returned, so its
 //! start is at or before `ta`; one of ours is after it. Measured (macOS CI, root): 0 of 3957 older launches
@@ -42,7 +47,7 @@
 //! by the next `goetia daemon run`.
 
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use super::interrupts::Deferred;
@@ -51,8 +56,11 @@ use super::watch::{Added, Registered, Watch, Woke};
 use super::{Kickstarted, Launchd, Plist, SignalOutcome, never_expires};
 use crate::backend::bounded::Reservation;
 use crate::backend::launchd::generate::run_marker;
-use crate::backend::launchd::refuse::{run_interrupted, run_lost, run_unfollowed, run_unresumed, stranded_hold};
-use crate::backend::launchd::state::{Evidence, Launch, exit_of, launch_of};
+use crate::backend::launchd::refuse::{
+    run_ended_unfollowed, run_interrupted, run_lost, run_not_started, run_unfollowed, run_unresumed, run_vanished,
+    stranded_hold,
+};
+use crate::backend::launchd::state::{Evidence, Launch, Then, exit_of, launch_of};
 use crate::backend::{OutputSource, RunHandle};
 use crate::error::{Error, Result};
 use crate::manager::{Budget, Exit, Step, flow, output};
@@ -97,8 +105,9 @@ impl Launchd {
     /// and `SIGCONT` of the held launch, `SIGCONT` of an older launch that took a hold and a wait for its
     /// exit, a wait for a run's exit, or the end of the `run`. The first pass draws on `reservation` (made
     /// for [`Step::Start`], which the longest first pass stays within: the load, `debug`, `kickstart -p`
-    /// and `SIGCONT`), each later one on its own. A failure of the first `debug` is its own error; any
-    /// later failure is [`stranded_hold`].
+    /// and `SIGCONT`), each later one on its own. A failure of the first `debug`, and an interrupt recorded
+    /// before it (while the job loads), are their own errors: no hold exists. Any later failure is
+    /// [`stranded_hold`].
     pub(super) fn begin_task_run(
         &self,
         snapshot: Plist,
@@ -122,12 +131,12 @@ impl Launchd {
         };
         let mut own: Option<Reservation> = None;
         loop {
-            let armed = own.is_some();
+            let first = own.is_none();
             let draws = match own.as_mut() {
                 Some(own) => own,
                 None => &mut *reservation,
             };
-            if let Some(run) = attempt.pass(draws, armed)? {
+            if let Some(run) = attempt.pass(draws, first)? {
                 return Ok(run);
             }
             own =
@@ -148,23 +157,26 @@ struct Attempt<'a> {
 
 impl Attempt<'_> {
     /// One pass, which `reservation` covers: `Some` is the launch `debug` held, resumed. `None` is a launch
-    /// that is over or has ended and was not this run's, and another pass is to be made. `armed` is whether
-    /// an earlier pass armed a hold.
-    fn pass(&mut self, reservation: &mut Reservation, armed: bool) -> Result<Option<Run>> {
+    /// that is over or has ended and was not this run's, and another pass is to be made. `first` is whether
+    /// it is the first pass: before its `debug` no hold exists, so a failure of the `debug` and an interrupt
+    /// recorded before it are their own errors, and any other failure is [`stranded_hold`].
+    fn pass(&mut self, reservation: &mut Reservation, first: bool) -> Result<Option<Run>> {
         let id = self.id;
         let name = id.as_str();
         let strand = |e: Error| stranded_hold(id, e);
-        // An interrupt that arrived while an earlier pass waited and its exit came with it: nothing is
-        // started after it.
-        if armed && self.window.interrupted() {
-            return Err(strand(run_interrupted(id, "a scheduled run")));
+        let before_debug = |e: Error| if first { e } else { strand(e) };
+        // An interrupt recorded while the job loaded, or that arrived while an earlier pass waited and its
+        // exit came with it: nothing is started after it.
+        if self.watch.interrupted(self.window) {
+            let waited_for = if first { "the load" } else { "a scheduled run" };
+            return Err(before_debug(run_interrupted(id, waited_for)));
         }
 
         let ta = self
             .launchd
             .launchctl
             .debug_start_suspended(name, reservation)
-            .map_err(|e| if armed { strand(e) } else { e })?;
+            .map_err(before_debug)?;
         let issuing = Budget::Unbounded.start();
         let Kickstarted::Confirmed(pid) = never_expires(
             self.launchd
@@ -180,12 +192,13 @@ impl Attempt<'_> {
 
         // Registered before anything reads the pid: what happens to it from here on is an event.
         let Added::Watching(registered) = self.watch.add_launch(pid).map_err(strand)? else {
-            return Ok(None);
+            return Err(strand(run_vanished(id, pid)));
         };
-        let Some(launch) = self.read_launch(pid, ta, &registered)? else {
-            return Ok(None);
-        };
-        match launch {
+        match self.read_launch(pid, ta, &registered)? {
+            Launch::Lost => Err(strand(run_vanished(id, pid))),
+            Launch::Ended => Ok(None),
+            Launch::NotStarted(status) => Err(run_not_started(id, status)),
+            Launch::Unrecorded => Err(run_ended_unfollowed(id, pid)),
             Launch::Held => self.resume(pid, registered, reservation).map(Some),
             Launch::TookHold => {
                 // Whether the launch is still the label's does not matter: it is waited for either way.
@@ -200,32 +213,58 @@ impl Attempt<'_> {
         }
     }
 
-    /// The [`Launch`] `pid` is, from the kernel. Where its program is `xpcproxy` its first exec is waited
-    /// for first, under no bound: the exec is certain to come (measured), and from it the process is
-    /// stopped if it is held. `None` where the process is gone, or exits before it execs.
-    fn read_launch(&self, pid: u32, ta: u64, registered: &Registered) -> Result<Option<Launch>> {
+    /// The [`Launch`] `pid` is, from the kernel: its start time is read at once, and [`Self::then_of`] says
+    /// what became of it. [`Launch::Lost`] where there is no process at the start time's read.
+    fn read_launch(&self, pid: u32, ta: u64, registered: &Registered) -> Result<Launch> {
+        let Some(started) = self.seen(pid, registered, proc::started)? else {
+            return Ok(Launch::Lost);
+        };
+        Ok(launch_of(self.then_of(pid, registered)?, started, ta))
+    }
+
+    /// What became of `pid` after its start time was read. Where its program is `xpcproxy` its first exec
+    /// is waited for, under no bound: the exec is certain to come (measured), and from it the process is
+    /// stopped if it is held. A launch that exits before it execs is [`Then::ExitedBeforeExec`], with its
+    /// status, which only a path read before the exit counts toward.
+    fn then_of(&self, pid: u32, registered: &Registered) -> Result<Then> {
         let id = self.id;
         let strand = |e: Error| stranded_hold(id, e);
-        let read = |source: std::io::Error| {
-            strand(Error::os(
-                format!("read what the kernel shows of process {pid}"),
-                source,
-            ))
-        };
-        let Some(path) = proc::path_of(pid).map_err(read)? else {
-            return Ok(None);
+        let Some(path) = self.seen(pid, registered, proc::path_of)? else {
+            return Ok(Then::Gone);
         };
         if path.file_name() == Some(OsStr::new("xpcproxy")) {
             match registered.first_exec(self.window).map_err(strand)? {
                 Woke::Exec => {}
-                Woke::Exited(_) => return Ok(None),
+                Woke::Exited(status) => return Ok(Then::ExitedBeforeExec(status)),
                 Woke::Interrupted => return Err(strand(run_interrupted(id, "the start"))),
             }
         }
-        let Some(process) = proc::read(pid).map_err(read)? else {
+        Ok(match self.seen(pid, registered, proc::stopped)? {
+            Some(stopped) => Then::Process { stopped },
+            None => Then::Gone,
+        })
+    }
+
+    /// What `read` says of `pid`, where it counts: `None` where there is no such process, and where the
+    /// watch shows an exit of `pid` after the read, as the pid may be another process's by then.
+    fn seen<T>(
+        &self,
+        pid: u32,
+        registered: &Registered,
+        read: impl FnOnce(u32) -> io::Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        let id = self.id;
+        let strand = |e: Error| stranded_hold(id, e);
+        let value = read(pid).map_err(|source| {
+            strand(Error::os(
+                format!("read what the kernel shows of process {pid}"),
+                source,
+            ))
+        })?;
+        if value.is_some() && registered.has_exited().map_err(strand)? {
             return Ok(None);
-        };
-        Ok(Some(launch_of(process.stopped, process.started, ta)))
+        }
+        Ok(value)
     }
 
     /// Says a scheduled run is in progress, then waits for the launch `registered` to exit, ending on an

@@ -142,7 +142,8 @@ pub trait ServiceManager {
     ///
     /// Everything the run wrote before it ended has been written to `out` when `run` returns. A task
     /// with no `logs` file has no output to show: one note says so, and `run` waits for the run to end.
-    /// [`Error::RunNotStarted`] means the manager ended the start before a run began (no Starting entry);
+    /// [`Error::RunNotStarted`] means the manager ended the start before a run began (no Starting entry, or
+    /// a launch the kernel shows ended before its program started);
     /// [`Error::RunUnrecorded`] that the run's exit could not be established; a wait that lost track of
     /// the run is [`Error::RequestInDoubt`], which does not say it ended. If showing the
     /// output fails the run is still waited for: the wait's error is returned if it failed, else a

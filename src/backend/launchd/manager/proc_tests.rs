@@ -4,53 +4,51 @@
 use super::super::watch::watch_tests::Held;
 use super::*;
 
-/// A live child is not stopped, and its start time is a `mach_absolute_time` between the reads either side
-/// of its spawn.
+/// A live child started at a `mach_absolute_time` between the reads either side of its spawn.
 #[skuld::test]
-fn a_live_process_reads_running_and_started_between_two_clock_reads() {
+fn a_live_process_started_between_two_clock_reads() {
     let before = now();
     let child = Held::new(0);
     let after = now();
 
-    let process = read(child.pid()).expect("read").expect("a live process");
+    let started = started(child.pid()).expect("read").expect("a live process");
 
-    assert!(!process.stopped);
     assert!(
-        before <= process.started && process.started <= after,
-        "{before} <= {} <= {after}",
-        process.started
+        before <= started && started <= after,
+        "{before} <= {started} <= {after}"
     );
 }
 
 #[skuld::test]
-fn a_stopped_process_reads_stopped() {
-    let child = Held::new(0).stopped();
+fn a_live_process_reads_running_and_a_stopped_one_reads_stopped() {
+    let running = Held::new(0);
+    let stopped = Held::new(0).stopped();
 
-    let process = read(child.pid()).expect("read").expect("a live process");
-
-    assert!(process.stopped);
+    assert_eq!(self::stopped(running.pid()).expect("read"), Some(false));
+    assert_eq!(self::stopped(stopped.pid()).expect("read"), Some(true));
 }
 
-/// A process that has exited and is not reaped is no process to `read`, and asking its path is no error:
-/// `run` reads the path first.
+/// A process that has exited and is not reaped is no process to `stopped`, and asking its path is no
+/// error: `run` reads the path before the state.
 #[skuld::test]
-fn an_exited_unreaped_process_reads_as_none_and_its_path_is_no_error() {
+fn an_exited_unreaped_process_is_not_stopped_or_running_and_its_path_is_no_error() {
     let mut child = Held::new(0);
     let pid = child.pid();
     child.exit_unreaped();
 
-    assert!(read(pid).expect("read").is_none());
+    assert_eq!(stopped(pid).expect("read"), None);
     path_of(pid).expect("the path of a zombie is no error");
 }
 
-/// A pid that has been reaped is no process, for either read: the answer is not an error.
+/// A pid that has been reaped is no process, for any read: the answer is not an error.
 #[skuld::test]
 fn a_reaped_pid_reads_as_none() {
     let mut child = Held::new(0);
     let pid = child.pid();
     child.finish();
 
-    assert!(read(pid).expect("read").is_none());
+    assert_eq!(started(pid).expect("read"), None);
+    assert_eq!(stopped(pid).expect("read"), None);
     assert!(path_of(pid).expect("path").is_none());
 }
 

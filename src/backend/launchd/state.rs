@@ -77,9 +77,34 @@ pub(crate) fn last_result(print_body: &str) -> Option<Exit> {
     signal.rsplit(':').next()?.trim().parse().ok().map(Exit::Signal)
 }
 
-/// What the kernel shows of the launch `kickstart -p` named, whose process is alive.
+/// What the kernel showed of the process `kickstart -p` named, once its start time was read: how it stands
+/// after its exec, or that it did not get there.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Then {
+    /// No process at a later read, or one the watch showed had exited after it.
+    Gone,
+    /// The path read `xpcproxy`, and the process exited with no exec: with its `wait(2)` status, where the
+    /// kernel reported one.
+    ExitedBeforeExec(Option<i32>),
+    /// Alive after its exec, `stopped` or not.
+    Process { stopped: bool },
+}
+
+/// What `run` makes of the launch `kickstart -p` named.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Launch {
+    /// No process when it was registered, or at the read of its start time: goetia never saw it, so whose
+    /// launch it was is not known. The run ends in doubt.
+    Lost,
+    /// An older launch that is over: it started at or before our `debug` returned and is gone, or exited
+    /// before its exec. Another pass is made.
+    Ended,
+    /// Started after our `debug`, and exited before its exec, with its `wait(2)` status where the kernel
+    /// reported one: our launch, whose program never started. The run ends, not started.
+    NotStarted(Option<i32>),
+    /// Started after our `debug`, and gone at a read after its exec: our launch, which ended before goetia
+    /// could follow it. The run ends, unrecorded.
+    Unrecorded,
     /// Stopped, and started after our `debug`: the launch that `debug` held for this run.
     Held,
     /// Stopped, and started before our `debug` returned: an older launch that took a hold, which is
@@ -93,15 +118,20 @@ pub(crate) enum Launch {
     Unheld,
 }
 
-/// The [`Launch`] of a process that is `stopped` and `started` at the time shown, where `ta` is the time
-/// read after the `launchctl debug` process was reaped (both in `mach_absolute_time` units). A start
-/// after `ta` began after `debug`; one at or before it began before `debug` returned.
-pub(crate) fn launch_of(stopped: bool, started: u64, ta: u64) -> Launch {
-    match (stopped, started > ta) {
-        (true, true) => Launch::Held,
-        (true, false) => Launch::TookHold,
-        (false, false) => Launch::InFlight,
-        (false, true) => Launch::Unheld,
+/// The [`Launch`] of a process that `started` at the time shown and then stood as `then`, where `ta` is the
+/// time read after the `launchctl debug` process was reaped (both in `mach_absolute_time` units). A start
+/// after `ta` began after `debug`; one at or before it began before `debug` returned. [`Launch::Lost`] is
+/// not decided here: it is a process whose start time was never read.
+pub(crate) fn launch_of(then: Then, started: u64, ta: u64) -> Launch {
+    let ours = started > ta;
+    match (then, ours) {
+        (Then::Process { stopped: true }, true) => Launch::Held,
+        (Then::Process { stopped: true }, false) => Launch::TookHold,
+        (Then::Process { stopped: false }, false) => Launch::InFlight,
+        (Then::Process { stopped: false }, true) => Launch::Unheld,
+        (Then::Gone | Then::ExitedBeforeExec(_), false) => Launch::Ended,
+        (Then::Gone, true) => Launch::Unrecorded,
+        (Then::ExitedBeforeExec(status), true) => Launch::NotStarted(status),
     }
 }
 

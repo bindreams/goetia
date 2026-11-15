@@ -1,7 +1,7 @@
 //! The watch over real child processes, each held alive by an open stdin until the test lets it go.
 //! Nothing here needs root, launchd or a file outside the process.
 
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
@@ -49,6 +49,14 @@ impl Held {
             assert!(libc::WIFSTOPPED(status), "the child stopped");
         }
         self
+    }
+
+    /// Answers the child's first `read` with a line and leaves its stdin open: a script that reads again
+    /// (a program it execs) goes on blocking until `release`.
+    pub(in crate::backend::launchd::manager) fn advance(&mut self) {
+        let stdin = self.stdin.as_mut().expect("the child's stdin is open");
+        stdin.write_all(b"\n").expect("write a line to the child");
+        stdin.flush().expect("flush the child's stdin");
     }
 
     /// Closes the child's stdin, so that it goes on and ends, and returns without waiting for it.
@@ -428,4 +436,85 @@ fn an_interrupt_during_a_wait_wakes_it() {
 
     assert!(matches!(woke, Woke::Interrupted));
     sending.join().expect("the sender's thread");
+}
+
+/// A signal whose event a read took out of the queue before the window's handler recorded it is not lost:
+/// the watch has it. The signal arrives before a window is open, so the queue has its event and the record
+/// has nothing; a poll then reads the event.
+#[skuld::test]
+fn a_signal_event_read_by_a_poll_is_still_an_interrupt() {
+    let _stand_in = StandIn::install();
+    let watch = Watch::new_interruptible().expect("a kqueue");
+    let child = Held::new(0);
+    let registered = launched(&watch, child.pid());
+    raise_interrupt();
+    let window = Deferred::begin().expect("begin the window");
+    assert!(!window.interrupted(), "the handler recorded nothing");
+
+    assert!(!registered.has_exited().expect("poll"), "the poll reads the event");
+
+    assert!(watch.interrupted(&window), "the watch has it");
+    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
+}
+
+/// The same for an event that the drop of another registration drained.
+#[skuld::test]
+fn a_signal_event_drained_by_a_dropped_registration_is_still_an_interrupt() {
+    let _stand_in = StandIn::install();
+    let watch = Watch::new_interruptible().expect("a kqueue");
+    let (child, other) = (Held::new(0), Held::new(0));
+    let dropped = launched(&watch, other.pid());
+    let registered = launched(&watch, child.pid());
+    raise_interrupt();
+    let window = Deferred::begin().expect("begin the window");
+    assert!(!window.interrupted(), "the handler recorded nothing");
+
+    drop(dropped);
+
+    assert!(watch.interrupted(&window), "the watch has it");
+    assert!(matches!(registered.exit(&window).expect("exit"), Woke::Interrupted));
+}
+
+/// A watch that has seen no interrupt says none.
+#[skuld::test]
+fn a_watch_with_no_signal_is_not_interrupted() {
+    let (_stand_in, window, watch) = interruptible();
+    let child = Held::new(0);
+    let registered = launched(&watch, child.pid());
+
+    assert!(!registered.has_exited().expect("poll"));
+
+    assert!(!watch.interrupted(&window));
+}
+
+/// Whether the pid has exited is read without blocking and without taking the exit: a wait after it still
+/// reports it, and so does a second poll.
+#[skuld::test]
+fn has_exited_reports_an_exit_without_taking_it() {
+    let watch = watch();
+    let mut child = Held::new(3);
+    let registered = registered(&watch, child.pid());
+
+    assert!(!registered.has_exited().expect("poll"));
+    child.finish();
+    assert!(registered.has_exited().expect("poll"), "the exit");
+    assert!(registered.has_exited().expect("poll again"), "not taken");
+
+    assert_eq!(registered.wait(failure_bound()).expect("wait"), Some(3 << 8));
+}
+
+/// A poll for the exit keeps the exec it reads for the wait for the exec.
+#[skuld::test]
+fn a_poll_keeps_the_exec_for_the_wait_for_it() {
+    let (_stand_in, window, watch) = interruptible();
+    let mut child = Held::execing(3);
+    let registered = launched(&watch, child.pid());
+    child.finish();
+
+    assert!(registered.has_exited().expect("poll"));
+
+    assert!(matches!(
+        registered.first_exec(&window).expect("first_exec"),
+        Woke::Exec
+    ));
 }

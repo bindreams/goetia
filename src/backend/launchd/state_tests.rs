@@ -352,20 +352,56 @@ fn exit_of_decodes_exited_and_signalled() {
 
 // launch_of -----------------------------------------------------------------------------------------------------------
 
-/// The launch `kickstart -p` named is told by two kernel facts: whether its process is stopped, and whether
+const TA: u64 = 1_000;
+
+/// A process that is alive after its exec is told by two kernel facts: whether it is stopped, and whether
 /// it started after `ta`, the time read after our `debug` returned. Stopped is a held launch, and one that
 /// started after `ta` began after our `debug` too.
 #[skuld::test]
 fn launch_of_tells_our_held_launch_from_an_older_one_taking_a_hold_or_not() {
-    const TA: u64 = 1_000;
-    assert_eq!(launch_of(true, TA + 1, TA), Launch::Held);
+    let alive = |stopped| Then::Process { stopped };
+    assert_eq!(launch_of(alive(true), TA + 1, TA), Launch::Held);
     assert_eq!(
-        launch_of(true, TA, TA),
+        launch_of(alive(true), TA, TA),
         Launch::TookHold,
         "a start at ta is not after it"
     );
-    assert_eq!(launch_of(true, TA - 1, TA), Launch::TookHold);
-    assert_eq!(launch_of(false, TA, TA), Launch::InFlight);
-    assert_eq!(launch_of(false, 1, TA), Launch::InFlight);
-    assert_eq!(launch_of(false, TA + 1, TA), Launch::Unheld);
+    assert_eq!(launch_of(alive(true), TA - 1, TA), Launch::TookHold);
+    assert_eq!(launch_of(alive(false), TA, TA), Launch::InFlight);
+    assert_eq!(launch_of(alive(false), 1, TA), Launch::InFlight);
+    assert_eq!(launch_of(alive(false), TA + 1, TA), Launch::Unheld);
+}
+
+/// A launch that started at or before `ta` is not this run's, so however it ended, `run` makes another
+/// pass: it never ends the run.
+#[skuld::test]
+fn an_older_launch_that_is_gone_or_exits_before_its_exec_starts_another_pass() {
+    for started in [1, TA - 1, TA] {
+        assert_eq!(
+            launch_of(Then::Gone, started, TA),
+            Launch::Ended,
+            "gone, started at {started}"
+        );
+        assert_eq!(
+            launch_of(Then::ExitedBeforeExec(Some(3 << 8)), started, TA),
+            Launch::Ended,
+            "exited before its exec, started at {started}"
+        );
+    }
+}
+
+/// A launch that started after `ta` is `run`'s own: one that exits before its exec did not start its
+/// program, with the status it exited with, and one that is gone at a later read ended before goetia could
+/// follow it. Neither starts another pass.
+#[skuld::test]
+fn our_launch_that_exits_before_its_exec_did_not_start_and_one_that_is_gone_is_unrecorded() {
+    assert_eq!(
+        launch_of(Then::ExitedBeforeExec(Some(3 << 8)), TA + 1, TA),
+        Launch::NotStarted(Some(3 << 8))
+    );
+    assert_eq!(
+        launch_of(Then::ExitedBeforeExec(None), TA + 1, TA),
+        Launch::NotStarted(None)
+    );
+    assert_eq!(launch_of(Then::Gone, TA + 1, TA), Launch::Unrecorded);
 }

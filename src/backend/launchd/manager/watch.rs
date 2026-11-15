@@ -17,10 +17,13 @@
 //! waits ([`Registered::first_exec`], [`Registered::exit`]) end when an interrupt does. An
 //! [interruptible](Watch::new_interruptible) watch has `SIGINT`, `SIGTERM` and `SIGHUP` registered on its
 //! queue, so a signal that arrives while a wait blocks wakes it. A signal that arrived before the wait
-//! has no event, so the wait reads the [`Deferred`] window's record after the registration and before it
-//! blocks, and again before each block.
+//! has no event for it, so the wait reads the [`Deferred`] window's record after the registration and
+//! before it blocks, and again before each block. A signal's event that any read of the queue takes is
+//! flagged on the queue ([`Watch::interrupted`] reads the flag and the record together), so no interrupt is
+//! lost between one read and the next wait.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -46,6 +49,10 @@ struct Shared {
     kept: Mutex<Vec<Exited>>,
     /// The pids whose exec was read the same way, once each: later execs of a pid add nothing.
     execed: Mutex<Vec<u32>>,
+    /// Set once a signal's event has been read from the queue, by whichever read took it, and never
+    /// cleared: an interrupt ends the run. The window's handler records a signal on its own schedule,
+    /// which may follow the event, so this is the record of the event that nothing else reads again.
+    signalled: AtomicBool,
 }
 
 /// One pid's exit, read from the queue.
@@ -104,6 +111,7 @@ impl Watch {
                 interruptible,
                 kept: Mutex::new(Vec::new()),
                 execed: Mutex::new(Vec::new()),
+                signalled: AtomicBool::new(false),
             }),
         };
         if interruptible {
@@ -112,6 +120,14 @@ impl Watch {
                 .map_err(|source| Error::os("watch for interrupts on the kqueue", source))?;
         }
         Ok(watch)
+    }
+
+    /// Whether an interrupt has arrived: the `window` has recorded one, or a read of the queue has taken a
+    /// signal's event. The two are read together because neither is ahead of the other: a signal's event is
+    /// raised at its generation and the handler that records it runs on its own schedule. Always `false`
+    /// for a watch that is not [interruptible](Self::new_interruptible) and a window that has none.
+    pub(crate) fn interrupted(&self, window: &Deferred) -> bool {
+        self.shared.interrupted(window)
     }
 
     /// Registers each of [`SIGNALS`], answered by its own receipt.
@@ -224,6 +240,31 @@ impl Registered {
         }
     }
 
+    /// Whether the pid has exited, read without blocking and without taking the exit: the queue is read
+    /// until it is empty, what it holds is kept for the waits, and the exit, if one is kept, is reported.
+    /// `run` accepts a read of the pid by number only where this says no after it: an exit is no later than
+    /// its event, and until the pid is reaped it names no other process.
+    pub(crate) fn has_exited(&self) -> Result<bool> {
+        let pid = self.pid;
+        let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut events = [blank(); 8];
+        loop {
+            match self.shared.queue.kevent(&[], &mut events, Some(now)) {
+                Ok(0) => break,
+                Ok(n) => self.shared.keep(&events[..n], None),
+                Err(Errno::EINTR) => {}
+                Err(errno) => {
+                    return Err(Error::os(
+                        format!("poll process {pid} for its exit"),
+                        io::Error::from(errno),
+                    ));
+                }
+            }
+        }
+        let kept = self.shared.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(kept.iter().any(|exited| exited.pid == pid))
+    }
+
     /// Blocks until the launch's pid has exec'd for the first time, exited, or `window` has recorded an
     /// interrupt: [`Woke::Exec`] (also where its exit came with it, which a [`Self::exit`] then reports),
     /// [`Woke::Exited`] or [`Woke::Interrupted`]. Under no bound. Only for a registration of
@@ -246,17 +287,24 @@ impl Registered {
     /// The first of: this pid's exec (where `exec`), its exit, an interrupt (where there is a `window`
     /// and the watch is interruptible), and the `deadline` (`None` iff it expired first).
     ///
-    /// What was kept is taken first, then the window's record is read, then the queue is waited on: an
-    /// interrupt before this point is in the record, and one after it is an event of the queue, which is
-    /// registered already. An event of the queue wakes the wait whether or not the handler has recorded the
-    /// signal yet, as the signal's generation and its handler's run are not ordered.
+    /// What was kept is taken first, then the interrupt is read (the window's record and the watch's
+    /// [signalled](Shared::signalled) flag), then the queue is waited on: an interrupt before this point is
+    /// in one of the two, and one after it is an event of the queue, which is registered already. An event
+    /// of the queue wakes the wait and is flagged by [`Shared::keep`], whether or not the handler has
+    /// recorded the signal yet, as the signal's generation and its handler's run are not ordered.
     fn next(&self, exec: bool, window: Option<&Deferred>, deadline: Option<Deadline>) -> Result<Option<Woke>> {
         debug_assert!(
             window.is_none() || self.shared.interruptible,
             "a window needs signals registered on the queue"
         );
         let pid = self.pid;
-        let waiting = |errno: Errno| Error::os(format!("wait for process {pid} to exit"), io::Error::from(errno));
+        let waited_for = if exec { "exec" } else { "exit" };
+        let waiting = |errno: Errno| {
+            Error::os(
+                format!("wait for process {pid} to {waited_for}"),
+                io::Error::from(errno),
+            )
+        };
         let mut events = [blank(); 8];
         loop {
             if exec && self.take_exec() {
@@ -265,7 +313,7 @@ impl Registered {
             if let Some(exited) = self.take_kept() {
                 return Ok(Some(Woke::Exited(exited.status)));
             }
-            if window.is_some_and(Deferred::interrupted) {
+            if window.is_some_and(|window| self.shared.interrupted(window)) {
                 return Ok(Some(Woke::Interrupted));
             }
             // Asked again with what is left each time: the kernel's clock is not the deadline's, and
@@ -278,13 +326,9 @@ impl Registered {
                         return Ok(None);
                     }
                 }
-                // Every exit and exec read is kept, this pid's included: the next turn takes it.
-                Ok(n) => {
-                    self.shared.keep(&events[..n], None);
-                    if window.is_some() && events[..n].iter().any(signalled) {
-                        return Ok(Some(Woke::Interrupted));
-                    }
-                }
+                // Every exit and exec read is kept, this pid's included, and a signal is flagged: the next
+                // turn takes them.
+                Ok(n) => self.shared.keep(&events[..n], None),
                 // A signal handled on this thread ends the call: the window's record is read again.
                 Err(Errno::EINTR) => {}
                 Err(errno) => return Err(waiting(errno)),
@@ -345,7 +389,7 @@ impl Registered {
     ///
     /// Reads with a zero timeout until a read finds the queue empty; it ends because each live
     /// registration adds at most one exit, and an exec or a signal is an event only as it happens.
-    /// A signal's event is dropped here: whoever waits next reads the window's record first.
+    /// A signal's event is flagged, not dropped ([`Shared::keep`]).
     fn drain(&self) {
         let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let mut events = [blank(); 8];
@@ -372,9 +416,18 @@ impl Registered {
 }
 
 impl Shared {
+    /// Whether an interrupt has arrived: a signal's event has been read, or `window` has recorded one.
+    fn interrupted(&self, window: &Deferred) -> bool {
+        self.signalled.load(Ordering::SeqCst) || window.interrupted()
+    }
+
     /// Keeps the exits and the first execs among `events`, except `pid`'s where it is given: those are
-    /// the registration's own and are being discarded.
+    /// the registration's own and are being discarded. A signal's event is not discarded with them: it is
+    /// kept as [`Self::signalled`].
     fn keep(&self, events: &[KEvent], pid: Option<u32>) {
+        if events.iter().any(signalled) {
+            self.signalled.store(true, Ordering::SeqCst);
+        }
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
         kept.extend(
             events

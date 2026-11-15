@@ -121,9 +121,9 @@ impl Deferred {
     }
 
     /// Whether SIGINT, SIGTERM or SIGHUP has arrived since the window opened, as far as the handler has
-    /// recorded it. Nothing is taken: the signal is still re-raised when the last window closes. The one
-    /// record of an interrupt; a wait that a signal's kqueue event woke does not need it, and one that
-    /// is about to block reads it first.
+    /// recorded it. Nothing is taken: the signal is still re-raised when the last window closes. The handler
+    /// may run after the signal's kqueue event was read, so `run` reads this together with the watch's flag
+    /// of that event ([`Watch::interrupted`](super::watch::Watch::interrupted)).
     pub(crate) fn interrupted(&self) -> bool {
         RECORDED.load(Ordering::SeqCst) != 0
     }
