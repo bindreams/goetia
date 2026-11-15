@@ -196,13 +196,22 @@ fn is_access_denied_matches_only_error_access_denied() {
     assert!(!is_access_denied(&windows_service::Error::LaunchArgumentsNotSupported));
 }
 
-/// A `Winapi` failure is no `io::Error` to the `Error` that holds it; the code and the text still
-/// are the OS error's.
+/// `windows_service::Error::Winapi` displays as "IO error in winapi call": `to_error` keeps the OS
+/// error it wraps as the source, so the code and the reason are found and written.
 #[skuld::test]
-fn a_winapi_failure_keeps_its_os_code_and_text() {
-    let winapi = || windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
-    let e = to_error("open `x`", winapi());
+fn a_winapi_failure_keeps_its_os_error_as_the_source() {
+    use std::error::Error as _;
 
+    let e = to_error(
+        "open `x`",
+        windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)),
+    );
+
+    let source = e
+        .source()
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the source is the io::Error");
+    assert_eq!(source.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
     assert_eq!(e.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
     assert_eq!(
         e.report().to_string(),

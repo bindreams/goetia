@@ -1873,12 +1873,21 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
     )
 }
 
+/// A `windows_service` failure as an `io::Error`: the OS error a `Winapi` failure wraps, whose text
+/// is the reason (the variant's own, "IO error in winapi call", names none), and any other variant
+/// (parse errors, which no call here produces) as `io::Error::other`. The one place that unwraps it.
+pub(crate) fn winapi_io(e: windows_service::Error) -> std::io::Error {
+    match e {
+        windows_service::Error::Winapi(os) => os,
+        other => std::io::Error::other(other),
+    }
+}
+
 /// A `windows_service` failure as an [`Error::Os`], shared with [`service_undetermined`] so one
-/// failure cannot be described two ways depending on which class it lands in. A `Winapi` failure
-/// keeps the OS error on its `source()` chain, where [`Error::raw_os_error`] finds it, and the report
-/// writes it as that error (see `write_chain`).
+/// failure cannot be described two ways depending on which class it lands in. The OS error is the
+/// source, where [`Error::raw_os_error`] finds it (see [`winapi_io`]).
 fn to_error(context: &str, e: windows_service::Error) -> Error {
-    Error::os(context, e)
+    Error::os(context, winapi_io(e))
 }
 
 // undetermined ========================================================================================================

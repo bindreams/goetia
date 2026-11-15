@@ -332,21 +332,6 @@ fn a_cosca_error_below_a_goetia_error_is_written_as_cosca_reports_it() {
     assert_eq!(text, format!("failed to run `tool`: {expected}"));
 }
 
-/// `windows_service::Error::Winapi` displays as "IO error in winapi call"; the report writes the OS
-/// error it wraps, as it is the reason.
-#[cfg(windows)]
-#[skuld::test]
-fn a_winapi_error_is_written_as_the_os_error_it_wraps() {
-    let winapi = || windows_service::Error::Winapi(std::io::Error::from_raw_os_error(DENIED));
-    let expected = std::io::Error::from_raw_os_error(DENIED).to_string();
-
-    assert_eq!(Chain(&winapi()).to_string(), expected);
-    assert_eq!(
-        Error::spawn("tool", winapi()).report().to_string(),
-        format!("failed to run `tool`: {expected}")
-    );
-}
-
 // os_error_in ---------------------------------------------------------------------------------------------------------
 
 /// `ERROR_ACCESS_DENIED` and `ERROR_PATH_NOT_FOUND`.
