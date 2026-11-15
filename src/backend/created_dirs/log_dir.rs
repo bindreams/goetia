@@ -26,20 +26,22 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, handing: &[PendingHandOver]) 
         return Ok(());
     };
     let walked = walk(dir, &[])?;
-    if !matches!(walked.end, End::Whole(_)) {
+    let End::Whole(end) = walked.end else {
         return Err(Error::os_at(
             "stat",
             dir,
             std::io::Error::from(std::io::ErrorKind::NotFound),
         ));
-    }
-    let last = walked.trail.len() - 1;
-    for (n, step) in walked.trail.iter().enumerate() {
+    };
+    for step in &walked.trail {
+        // The log lands in the directory the path resolves to, whatever step the walk reached it by:
+        // `.` and `..`, or a link to either, bring it back to one it has passed.
+        let leaf = !step.link && step.stat.st_dev == end.st_dev && step.stat.st_ino == end.st_ino;
         let kind = if step.link { "the symlink" } else { "the directory" };
         let handed = handing
             .iter()
             .find(|pending| !step.link && pending.dev == step.stat.st_dev && pending.ino == step.stat.st_ino);
-        let reason = match (handed, writer(step, n == last)) {
+        let reason = match (handed, writer(step, leaf)) {
             (Some(pending), _) => format!(
                 "{kind} {} will belong to {}, to whom this install hands {} once it has made every directory, \
                  who could",
@@ -63,7 +65,7 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, handing: &[PendingHandOver]) 
 }
 
 /// Who besides root can change what `step` passed, if anyone: its owner, or the group or everyone
-/// who can write a directory. The sticky bit excuses that unless `leaf`, the log's own directory.
+/// who can write a directory. The sticky bit excuses that unless `leaf`, the directory the log lands in.
 fn writer(step: &Step, leaf: bool) -> Option<String> {
     if step.stat.st_uid != 0 {
         return Some(format!("its owner {}", account_text(step.stat.st_uid)));

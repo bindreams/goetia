@@ -149,6 +149,24 @@ fn a_link_as_the_log_directory_is_judged_by_every_directory_its_target_is_under(
     );
 }
 
+/// A link to `.` as the log's directory leaves the walk in the sticky directory the link is in: that
+/// directory is where the log lands, so it is judged as the log's own, not as an ancestor.
+#[skuld::test(labels = [ELEVATED])]
+fn a_link_to_dot_makes_its_directory_the_log_directory_whatever_step_reached_it() {
+    let layout = Layout::new();
+    let sticky = layout.system().join("tmp");
+    fs::create_dir(&sticky).unwrap();
+    chmod(&sticky, 0o1777);
+    symlink(".", sticky.join("x")).unwrap();
+
+    let why = refused(&sticky.join("x/out.log"));
+
+    assert!(
+        why.contains("every user") && why.contains(sticky.to_str().unwrap()),
+        "{why}"
+    );
+}
+
 /// `/` is a directory root owns, and a path that ends in `..` is the directory above.
 #[skuld::test(labels = [ELEVATED])]
 fn a_log_in_the_root_directory_or_beside_a_dotdot_is_accepted() {

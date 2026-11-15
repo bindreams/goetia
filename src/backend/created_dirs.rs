@@ -21,7 +21,8 @@
 //!
 //! An install that fails, or leaves a definition other than the one it wrote, removes what it made,
 //! deepest first, by descriptor: an entry is unlinked only if it is still the directory that was made
-//! and is empty, and a symlink is never followed.
+//! and is empty, and a symlink is never followed. One that could not be opened when it was made cannot
+//! be told from what is at its name later: it is left, and reported.
 
 #[cfg(target_os = "linux")]
 mod log_dir;
@@ -111,7 +112,8 @@ struct Made {
     name: OsString,
     parent: Parent,
     /// The directory itself, opened without following a symlink straight after its `mkdirat`; `None`
-    /// if that open failed, in which case it is removed by name.
+    /// if that open failed, in which case it cannot be told from what is at its name later, and the
+    /// undo leaves it.
     held: Option<Held>,
     /// Whom it is handed to, if anyone.
     hand: Option<Owner>,
@@ -359,13 +361,15 @@ impl CreatedDirs {
     fn remove(&self, index: usize) -> std::result::Result<(), String> {
         let made = &self.made[index];
         let parent = fd_of(&self.made, &made.parent).ok_or("the directory above it was not held")?;
-        if let Some(held) = &made.held {
-            match fstatat(parent, made.name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-                Ok(now) if now.st_dev == held.dev && now.st_ino == held.ino => {}
-                Ok(_) => return Err("it is no longer the directory the install made".to_string()),
-                Err(Errno::ENOENT) => return Ok(()),
-                Err(e) => return Err(e.to_string()),
-            }
+        let held = made
+            .held
+            .as_ref()
+            .ok_or("it could not be opened when it was made, so what is at its name cannot be told from it")?;
+        match fstatat(parent, made.name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(now) if now.st_dev == held.dev && now.st_ino == held.ino => {}
+            Ok(_) => return Err("it is no longer the directory the install made".to_string()),
+            Err(Errno::ENOENT) => return Ok(()),
+            Err(e) => return Err(e.to_string()),
         }
         match unlinkat(parent, made.name.as_os_str(), UnlinkatFlags::RemoveDir) {
             Ok(()) | Err(Errno::ENOENT | Errno::ENOTEMPTY | Errno::EEXIST) => Ok(()),

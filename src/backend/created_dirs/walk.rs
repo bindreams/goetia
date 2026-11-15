@@ -51,8 +51,8 @@ pub(super) const SEARCH: OFlag = OFlag::O_PATH;
 #[cfg(not(target_os = "linux"))]
 pub(super) const SEARCH: OFlag = OFlag::O_SEARCH;
 
-/// Symlinks one walk follows before it gives up on a cycle: the kernel's own bound, Linux's
-/// `MAXSYMLINKS` (macOS's is 32).
+/// Symlinks one walk follows before it gives up on a cycle: the kernel's own `ELOOP` bound, Linux's
+/// `MAXSYMLINKS` in `include/linux/namei.h` (40) and macOS's `MAXSYMLINKS` in `sys/param.h` (32).
 #[cfg(target_os = "linux")]
 const SYMLINK_LIMIT: usize = 40;
 #[cfg(not(target_os = "linux"))]
@@ -171,13 +171,17 @@ pub(super) fn walk(dir: &Path, roots: &[PathBuf]) -> Result<Walk> {
         ));
     }
     let search = OFlag::O_DIRECTORY | SEARCH | OFlag::O_CLOEXEC;
-    let root_ids: Vec<(libc::dev_t, libc::ino_t)> = roots
-        .iter()
-        .filter_map(|root| {
-            let fd = open(root.as_path(), search, Mode::empty()).ok()?;
-            fstat(&fd).ok().map(|stat| (stat.st_dev, stat.st_ino))
-        })
-        .collect();
+    // A root that is not there is no root; one that cannot be opened for any other reason is an error.
+    let mut root_ids: Vec<(libc::dev_t, libc::ino_t)> = Vec::new();
+    for root in roots {
+        let fd = match open(root.as_path(), search, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) => continue,
+            Err(e) => return Err(Error::os_at("open", root, e)),
+        };
+        let stat = fstat(&fd).map_err(|e| Error::os_at("stat", root, e))?;
+        root_ids.push((stat.st_dev, stat.st_ino));
+    }
     let open_root = || open("/", search, Mode::empty()).map_err(|e| Error::os_at("open", "/", e));
     let id_of = |stat: &FileStat| (stat.st_dev, stat.st_ino);
 

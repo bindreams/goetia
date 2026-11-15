@@ -307,6 +307,35 @@ fn create_stops_at_a_symlink_loop() {
     );
 }
 
+/// Only a root that is not there is not a root: one that cannot be opened for another reason says so.
+#[skuld::test(labels = [ELEVATED])]
+fn create_fails_when_a_root_cannot_be_opened_for_a_reason_other_than_not_being_there() {
+    let layout = Layout::new();
+    let file = layout.outside().join("file");
+    fs::write(&file, b"x").unwrap();
+    let mut dirs = CreatedDirs::under(vec![file.clone(), layout.system()]);
+
+    let err = dirs
+        .create(&layout.system(), None)
+        .expect_err("a root that is a file cannot be searched");
+
+    assert!(
+        std::error::Error::source(&err).is_some_and(|source| source.to_string().contains("Not a directory"))
+            && err.to_string().contains(file.to_str().unwrap()),
+        "{err:?}"
+    );
+}
+
+#[skuld::test(labels = [ELEVATED])]
+fn create_ignores_a_root_that_does_not_exist() {
+    let layout = Layout::new();
+    let mut dirs = CreatedDirs::under(vec![layout.base().join("nowhere"), layout.system()]);
+
+    dirs.create(&layout.system().join("a"), None).unwrap();
+
+    assert!(layout.system().join("a").is_dir());
+}
+
 #[skuld::test(labels = [ELEVATED])]
 fn create_refuses_a_relative_path() {
     let layout = Layout::new();
@@ -644,6 +673,21 @@ fn drop_leaves_a_directory_that_is_no_longer_the_one_made() {
     drop(dirs);
 
     assert!(dir.is_dir());
+}
+
+/// A directory whose open failed after `mkdirat` cannot be told from whatever is at its name now.
+#[skuld::test(labels = [ELEVATED])]
+fn drop_leaves_a_directory_it_could_not_identify() {
+    let layout = Layout::new();
+    let mut dirs = make_chain(&layout);
+    let victim = layout.system().join("a/b/c");
+    dirs.made[2].held = None;
+    fs::remove_dir(&victim).unwrap();
+    fs::create_dir(&victim).unwrap();
+
+    drop(dirs);
+
+    assert!(victim.is_dir());
 }
 
 #[skuld::test(labels = [ELEVATED])]
