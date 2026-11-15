@@ -113,6 +113,15 @@ pub(crate) fn run_unfollowed(id: &Id, pid: u32) -> Error {
     }
 }
 
+/// The followed run of `id` ended, and the kernel reported its exit without a status. The run happened;
+/// its result is unknown.
+pub(crate) fn run_ended_without_status(id: &Id) -> Error {
+    Error::RunUnrecorded {
+        id: id.to_string(),
+        reason: "it ended, and the kernel reported its exit without a status".to_string(),
+    }
+}
+
 /// The launch of a `run` of `id` started after the `run`'s `debug` and ended before goetia could follow it:
 /// gone at a read, or exited before its first exec. `status` is the `wait(2)` status the watch kept for
 /// the process, where it kept one: the process's, which is not necessarily the program's. The run is
