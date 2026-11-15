@@ -143,14 +143,13 @@ fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
     }
 }
 
-/// SIGKILLs a pid on drop, so a descendant a test let escape dies however the test ends.
-struct KillOnDrop(libc::pid_t);
+/// Kills a process on drop, so a descendant a test let escape dies however the test ends. It kills
+/// through the handle, which never names a successor of the pid.
+struct KillOnDrop(cosca::Process);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.0, libc::SIGKILL);
-        }
+        let _ = self.0.kill();
     }
 }
 
@@ -186,7 +185,11 @@ fn a_heard_stream_a_descendant_holds_is_read_only_until_the_deadline() {
     let mut answers = io::BufReader::new(child.child.fd_read_end(3.into()).unwrap());
     let mut line = String::new();
     answers.read_line(&mut line).unwrap();
-    let _descendant = KillOnDrop(line.trim().parse().unwrap());
+    let _descendant = KillOnDrop(
+        cosca::Process::open_pid(line.trim().parse().unwrap())
+            .unwrap()
+            .expect("the descendant is alive"),
+    );
     let status = child.child.wait().unwrap();
     assert!(status.success(), "{status:?}");
 
@@ -363,17 +366,29 @@ fn an_announced_request_that_ends_unannounced_is_reported_exited() {
 
 /// A child that is exiting when the deadline's kill reaches it can refuse the kill (macOS answers
 /// EPERM to a send by audit token in that window), and it has exited by the time anyone looks: that
-/// is the child's own exit, as if it had ended before the kill was sent.
+/// is the child's own exit, as if it had ended before the kill was sent, and its contained tree is
+/// ended all the same.
 ///
-/// The child traps SIGTERM and announces only once the trap is set, so the hook's SIGTERM, standing
-/// for the exit that raced the kill, is answered with exit 7 and never with the default action.
+/// The child traps SIGTERM and tells the test its descendant's pid only once the trap is set, so
+/// the hook's SIGTERM, standing for the exit that raced the kill, is answered with exit 7 and never
+/// with the default action. The descendant outlives the child unless the tree is ended: the test
+/// watches it die, and kills it however the test ends.
 #[skuld::test]
 fn a_kill_refused_at_the_deadline_by_a_child_that_has_exited_is_reported_exited() {
-    let child = spawned(
-        sh("trap 'exit 7' TERM; echo 'request issued' >&2; sleep 2147483647 & wait"),
-        Role::AnnouncedRequest(announced),
+    let mut cmd = sh("trap 'exit 7' TERM; sleep 2147483647 & echo $! >&3; wait");
+    cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+    let mut child = spawned(cmd, Role::Query);
+    let mut line = String::new();
+    io::BufReader::new(child.child.fd_read_end(3.into()).unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    // Opened while it is alive: after the kill its pid may name another process.
+    let descendant = KillOnDrop(
+        cosca::Process::open_pid(line.trim().parse().unwrap())
+            .unwrap()
+            .expect("the descendant is alive"),
     );
-    test_hook::kill_fails(|child| {
+    let _refused = test_hook::kill_fails(|child| {
         // SAFETY: `kill` takes a pid and a signal and touches no memory; the child is this call's own.
         assert_eq!(unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGTERM) }, 0);
         io::Error::from_raw_os_error(libc::EPERM).into()
@@ -382,9 +397,34 @@ fn a_kill_refused_at_the_deadline_by_a_child_that_has_exited_is_reported_exited(
     let finished = wait_bounded(child, Budget::Immediate.start());
 
     match finished {
-        Ok(Finished::Exited { status, .. }) => assert_eq!(status.code(), Some(7)),
+        Ok(Finished::Exited { status, capture }) => {
+            assert_eq!(status.code(), Some(7));
+            assert!(capture.complete, "{capture:?}");
+        }
         other => panic!("expected the child's own exit, got {other:?}"),
     }
+    // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
+    descendant.0.wait().unwrap();
+}
+
+/// The deadline kill of a [`Role::Request`] the caller ends ([`Left::kill`]) is refused as the
+/// query's is, and the child is a child that has exited: the reaper reports the exit the hook's
+/// signal gave it, and it was not killed again. (A kill sent past the hook would end it with
+/// `SIGKILL`.)
+#[skuld::test]
+fn a_left_request_whose_kill_is_refused_by_a_child_that_has_exited_is_reaped_as_exited() {
+    let _refused = test_hook::kill_fails(|child| {
+        // SAFETY: as in the test above.
+        assert_eq!(unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGUSR1) }, 0);
+        io::Error::from_raw_os_error(libc::EPERM).into()
+    });
+
+    let status = expired_request_settled_by("exit 7", |finished| match finished {
+        Finished::Left(left) => left.kill(),
+        other => panic!("expected Left, got {other:?}"),
+    });
+
+    assert_eq!(status.signal(), Some(libc::SIGUSR1), "{status:?}");
 }
 
 /// A refused kill after which the child is still there is the kill's error, not a verdict on the
@@ -393,7 +433,7 @@ fn a_kill_refused_at_the_deadline_by_a_child_that_has_exited_is_reported_exited(
 #[skuld::test]
 fn a_kill_refused_at_the_deadline_by_a_child_that_stays_is_the_kills_error() {
     let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
-    test_hook::kill_fails(|_| io::Error::from_raw_os_error(libc::EPERM).into());
+    let _refused = test_hook::kill_fails(|_| io::Error::from_raw_os_error(libc::EPERM).into());
 
     let lost = wait_bounded(child, Budget::Immediate.start()).expect_err("the child is still running");
 
