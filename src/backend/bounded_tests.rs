@@ -143,15 +143,28 @@ fn a_child_whose_descendant_holds_the_pipe_still_returns_on_expiry() {
     }
 }
 
-/// SIGKILLs a pid on drop, so a descendant a test let escape dies however the test ends.
-struct KillOnDrop(libc::pid_t);
+/// Kills a process on drop, so a descendant a test let escape dies however the test ends. It kills
+/// through the handle, which never names a successor of the pid.
+struct KillOnDrop(cosca::Process);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.0, libc::SIGKILL);
-        }
+        let _ = self.0.kill();
     }
+}
+
+/// The descendant a child announces on its fd 3 (`echo $! >&3`), opened while it is alive: after a
+/// kill its pid may name another process.
+fn descendant_on_fd3(child: &mut cosca::Child) -> KillOnDrop {
+    let mut line = String::new();
+    io::BufReader::new(child.fd_read_end(3.into()).unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    KillOnDrop(
+        cosca::Process::open_pid(line.trim().parse().unwrap())
+            .unwrap()
+            .expect("the descendant is alive"),
+    )
 }
 
 /// A child that exits on its own while a descendant it let escape holds both its pipes: each heard
@@ -186,7 +199,11 @@ fn a_heard_stream_a_descendant_holds_is_read_only_until_the_deadline() {
     let mut answers = io::BufReader::new(child.child.fd_read_end(3.into()).unwrap());
     let mut line = String::new();
     answers.read_line(&mut line).unwrap();
-    let _descendant = KillOnDrop(line.trim().parse().unwrap());
+    let _descendant = KillOnDrop(
+        cosca::Process::open_pid(line.trim().parse().unwrap())
+            .unwrap()
+            .expect("the descendant is alive"),
+    );
     let status = child.child.wait().unwrap();
     assert!(status.success(), "{status:?}");
 
@@ -361,6 +378,282 @@ fn an_announced_request_that_ends_unannounced_is_reported_exited() {
     }
 }
 
+fn eperm() -> cosca::error::Error {
+    io::Error::from_raw_os_error(libc::EPERM).into()
+}
+
+/// [`Left::kill`] ends the tree before the reaper reaps the root, as a query's expiry does: the
+/// reaper detaches the child, which never ends a tree, so a descendant is left running unless the
+/// kill ended it. The test watches the descendant die, and kills it however the test ends.
+#[skuld::test]
+fn a_left_request_the_caller_kills_takes_its_descendant_with_it() {
+    let mut cmd = sh("sleep 2147483647 & echo $! >&3; read line; exit 7");
+    cmd.stdin(cosca::Stdio::pipe_in()).unwrap();
+    cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+    let mut request = requested(cmd);
+    let descendant = descendant_on_fd3(&mut request.child.child);
+
+    let finished = wait_bounded(request.child, Budget::Immediate.start()).unwrap();
+    match finished {
+        Finished::Left(left) => left.kill(),
+        other => panic!("expected Left, got {other:?}"),
+    }
+
+    let status = request.reaped.recv().unwrap().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
+    descendant.0.wait().unwrap();
+}
+
+/// A refusal other than `EPERM` is returned at once, whatever it is: the bound here is an hour, which
+/// a wait on this child would last.
+#[skuld::test]
+fn a_kill_refused_for_another_reason_than_eperm_is_returned_without_waiting() {
+    type Refusal = fn(&cosca::Child) -> cosca::error::Error;
+    type Is = fn(&cosca::error::Error) -> bool;
+    let refusals: [(Refusal, Is); 2] = [
+        (
+            |_| io::Error::from_raw_os_error(libc::EACCES).into(),
+            |e| matches!(e, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EACCES)),
+        ),
+        (
+            |_| cosca::error::Error::Unassessable {
+                detail: "pid 1 cannot be signalled".into(),
+                source: None,
+            },
+            |e| matches!(e, cosca::error::Error::Unassessable { .. }),
+        ),
+    ];
+    for (refusal, is_it) in refusals {
+        let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+        let _refused = test_hook::kill_fails(refusal);
+
+        let error = kill_root(&child.child, Duration::from_secs(3600)).expect_err("the kill is refused");
+
+        assert!(is_it(&error), "the refusal is returned as it came: {error:?}");
+    }
+}
+
+/// A kill refused with `EPERM` is a real refusal off macOS, where a send goes through a pidfd: it is
+/// returned at once, as it came, whatever the bound.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn a_kill_refused_with_eperm_is_returned_at_once_off_macos() {
+    let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+    let _refused = test_hook::kill_fails(|_| eperm());
+
+    let error = kill_root(&child.child, Duration::from_secs(3600)).expect_err("the kill is refused");
+
+    assert!(
+        matches!(&error, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
+        "{error:?}"
+    );
+}
+
+/// On macOS a child that is exiting can refuse the deadline's kill (a send by audit token answers
+/// `EPERM` in that window, before it answers `ESRCH`). The kill is scripted to refuse here, by the
+/// hook.
+#[cfg(target_os = "macos")]
+mod refused_kill {
+    use super::*;
+
+    /// A refused kill that signals the child with SIGTERM first, as the exit that raced the kill does.
+    fn term_then_eperm(child: &cosca::Child) -> cosca::error::Error {
+        // SAFETY: `kill` takes a pid and a signal and touches no memory; the child is this call's own.
+        assert_eq!(unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGTERM) }, 0);
+        eperm()
+    }
+
+    /// [`term_then_eperm`], and the child has exited, and is not reaped, before the refusal: it is
+    /// gone by the time anyone registers for its exit.
+    fn term_then_exited_then_eperm(child: &cosca::Child) -> cosca::error::Error {
+        let refusal = term_then_eperm(child);
+        // SAFETY: an all-zero `siginfo_t` is a valid place for `waitid` to fill, and the pid is this
+        // process's own child. `WNOWAIT` leaves the child waitable.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let waited = libc::waitid(
+                libc::P_PID,
+                child.pid() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            );
+            assert_eq!(waited, 0, "wait for the child to exit");
+        }
+        refusal
+    }
+
+    /// The child traps SIGTERM and tells the test its descendant's pid only once the trap is set, so
+    /// the hook's SIGTERM, standing for the exit that raced the kill, is answered with exit 7 and never
+    /// with the default action. What the trap writes is read back, so the output is read after the
+    /// exit. The descendant outlives the child unless the tree is ended: the test watches it die, and
+    /// kills it however the test ends.
+    fn trapping(role: Role, trap: &str) -> (Spawned, KillOnDrop) {
+        let mut cmd = sh(&format!("trap '{trap}' TERM; sleep 2147483647 & echo $! >&3; wait"));
+        cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+        let mut child = spawned(cmd, role);
+        let descendant = descendant_on_fd3(&mut child.child);
+        (child, descendant)
+    }
+
+    /// The child is exiting when the deadline's kill reaches it: the kill is refused, and the child
+    /// then exits within the bound. That is the child's own exit, as if it had ended before the kill
+    /// was sent, and its contained tree is ended all the same.
+    #[skuld::test]
+    fn a_kill_refused_at_the_deadline_by_a_child_that_then_exits_is_reported_exited() {
+        let (child, descendant) = trapping(Role::Query, "echo bye; exit 7");
+        let _refused = test_hook::kill_fails(term_then_eperm);
+
+        let finished = wait_bounded(child, Budget::Immediate.start());
+
+        match finished {
+            Ok(Finished::Exited { status, capture }) => {
+                assert_eq!(status.code(), Some(7));
+                assert_eq!(capture.stdout, b"bye\n");
+            }
+            other => panic!("expected the child's own exit, got {other:?}"),
+        }
+        // Event-driven, with no timeout to choose: it hangs if the descendant was left running.
+        descendant.0.wait().unwrap();
+    }
+
+    /// The child has exited, and is not reaped, before anything registers for its exit: a pid the
+    /// kernel no longer has to watch is an exit all the same.
+    #[skuld::test]
+    fn a_kill_refused_at_the_deadline_by_a_child_already_gone_is_reported_exited() {
+        let (child, descendant) = trapping(Role::Query, "exit 7");
+        let _refused = test_hook::kill_fails(term_then_exited_then_eperm);
+
+        let finished = wait_bounded(child, Budget::Immediate.start());
+
+        match finished {
+            Ok(Finished::Exited { status, .. }) => assert_eq!(status.code(), Some(7)),
+            other => panic!("expected the child's own exit, got {other:?}"),
+        }
+        descendant.0.wait().unwrap();
+    }
+
+    /// The same refusal of an [`Role::AnnouncedRequest`], whose streams are pipes read as written: the
+    /// child's own exit, its tree ended, and a capture that says what the spent deadline left of it:
+    /// what was heard, not established whole.
+    #[skuld::test]
+    fn a_kill_refused_at_the_deadline_of_an_announced_request_that_then_exits_is_reported_exited() {
+        let mut cmd = sh("trap 'exit 7' TERM; sleep 2147483647 & echo $! >&3; echo 'request issued' >&2; wait");
+        cmd.fd(3, cosca::Stdio::pipe_out()).unwrap();
+        let mut child = spawned(cmd, Role::AnnouncedRequest(announced));
+        let descendant = descendant_on_fd3(&mut child.child);
+        let _refused = test_hook::kill_fails(term_then_eperm);
+
+        let finished = wait_bounded(child, Budget::Immediate.start());
+
+        match finished {
+            Ok(Finished::Exited { status, capture }) => {
+                assert_eq!(status.code(), Some(7));
+                assert!(announced(&capture.stderr), "{capture:?}");
+                assert!(!capture.complete, "the spent deadline ended the read: {capture:?}");
+            }
+            other => panic!("expected the child's own exit, got {other:?}"),
+        }
+        descendant.0.wait().unwrap();
+    }
+
+    /// A kill refused with `EPERM` that is cosca's wrapped one (an `io::Error` of kind
+    /// `PermissionDenied` with no code, the `EPERM` its source) is the same refusal.
+    #[skuld::test]
+    fn a_kill_refused_with_a_wrapped_eperm_by_a_child_that_then_exits_is_not_an_error() {
+        let (child, _descendant) = trapping(Role::Query, "exit 7");
+        let _refused = test_hook::kill_fails(|child| {
+            let _ = term_then_eperm(child);
+            cosca::error::Error::Io(io::Error::new(
+                ErrorKind::PermissionDenied,
+                Wrapped(io::Error::from_raw_os_error(libc::EPERM)),
+            ))
+        });
+
+        kill_root(&child.child, Duration::from_secs(3600)).expect("the child exited, and its exit is not an error");
+    }
+
+    /// What cosca's `io_context` makes of an error: its text, and the error itself as the source.
+    #[derive(Debug, thiserror::Error)]
+    #[error("pid 1: its identity could not be read; SIGKILL not sent")]
+    struct Wrapped(#[source] io::Error);
+
+    /// A child that stays after refusing the kill is a lost wait: the refusal, naming the bound on the
+    /// wait for the child's exit, with the kill's own error as its source. The expiry of that wait is
+    /// not read as an exit. The bound is an argument of [`waited_out`] ([`EXIT_AFTER_REFUSED_KILL`] in
+    /// production), so this test does not wait out a real 5 s.
+    #[skuld::test]
+    fn a_deadline_kill_refused_by_a_child_that_stays_is_a_lost_wait_naming_the_bound() {
+        let Spawned {
+            child,
+            role,
+            stdout,
+            stderr,
+        } = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+        let _refused = test_hook::kill_fails(|_| eperm());
+
+        let error = waited_out(
+            child,
+            role,
+            stdout,
+            stderr,
+            Vec::new(),
+            Budget::Immediate.start(),
+            Duration::from_millis(50),
+        )
+        .expect_err("the child is still running");
+
+        let said = cosca::error::Report::new(&error).to_string();
+        assert!(
+            said.contains("the kill was refused (EPERM) and the process had not exited 50ms later"),
+            "{said}"
+        );
+        assert!(
+            said.ends_with(&cosca::error::Report::new(&eperm()).to_string()),
+            "the kill's error is the source: {said}"
+        );
+    }
+
+    /// The deadline kill of a [`Role::Request`] the caller ends ([`Left::kill`]) is refused as a
+    /// query's is, by a child that then exits: the reaper reports the exit the hook's signal gave it,
+    /// and it was not killed again. (A kill sent past the hook would end it with `SIGKILL`.)
+    #[skuld::test]
+    fn a_left_request_whose_kill_is_refused_by_a_child_that_then_exits_is_reaped_as_exited() {
+        let _refused = test_hook::kill_fails(|child| {
+            // SAFETY: as in `term_then_eperm`.
+            assert_eq!(unsafe { libc::kill(child.pid() as libc::pid_t, libc::SIGUSR1) }, 0);
+            eperm()
+        });
+
+        let status = expired_request_settled_by("exit 7", |finished| match finished {
+            Finished::Left(left) => left.kill(),
+            other => panic!("expected Left, got {other:?}"),
+        });
+
+        assert_eq!(status.signal(), Some(libc::SIGUSR1), "{status:?}");
+    }
+
+    /// A [`Left`] whose child stays after refusing the kill says it runs on, naming the refusal. The
+    /// bound is an argument of [`end_left`], so this test does not wait out a real 5 s.
+    #[skuld::test]
+    fn a_left_request_that_cannot_be_ended_says_it_runs_on() {
+        let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+        let _refused = test_hook::kill_fails(|_| eperm());
+
+        let warning = end_left(&child.child, Duration::from_millis(50)).expect("the child could not be ended");
+
+        assert!(
+            warning.starts_with("warning: could not kill a request left running, which runs on: "),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("the kill was refused (EPERM) and the process had not exited 50ms later"),
+            "{warning}"
+        );
+        assert!(matches!(child.child.is_alive(), cosca::identity::Liveness::Alive));
+    }
+}
+
 /// What the child wrote while issuing its request is kept: it is the start of the diagnostic.
 #[skuld::test]
 fn what_an_announced_request_wrote_before_announcing_is_kept() {
@@ -438,8 +731,29 @@ fn expired_request_released_by_its_reaper(then: &str) -> ExitStatus {
 /// [`expired_request_released_by_its_reaper`], with what the caller does with the expiry given as
 /// `settle`: it holds the child until `settle` returns, and a [`Left`] it drops is released.
 fn expired_request_settled_by(then: &str, settle: impl FnOnce(Finished)) -> ExitStatus {
+    let request = requested(released_at_eof(then));
+
+    let finished = wait_bounded(request.child, Budget::Immediate.start()).unwrap();
+
+    settle(finished);
+    request
+        .reaped
+        .recv()
+        .expect("a request left running must be reaped once it exits")
+        .expect("waiting on the child")
+}
+
+/// A [`Role::Request`] spawned from `cmd`, whose stdin is a pipe, and what its reaper reports.
+struct Requested {
+    child: Spawned,
+    reaped: mpsc::Receiver<Result<ExitStatus, cosca::error::Error>>,
+}
+
+/// `cmd` as a [`Role::Request`]. Its reaper holds the write end of the child's stdin and drops it
+/// only once the child is the reaper's and the reaper is waiting.
+fn requested(cmd: cosca::Command) -> Requested {
     let (writer_tx, writer_rx) = mpsc::channel::<cosca::PipeWriter>();
-    let (tx, rx) = mpsc::channel();
+    let (tx, reaped) = mpsc::channel();
     let reaper = Reaper::with(
         move |child| {
             drop(writer_rx.recv());
@@ -448,15 +762,9 @@ fn expired_request_settled_by(then: &str, settle: impl FnOnce(Finished)) -> Exit
         move |status| tx.send(status).expect("the test is still receiving"),
     )
     .unwrap();
-    let mut child = spawned(released_at_eof(then), Role::Request(reaper));
+    let mut child = spawned(cmd, Role::Request(reaper));
     writer_tx.send(child.child.stdin().expect("stdin is piped")).unwrap();
-
-    let finished = wait_bounded(child, Budget::Immediate.start()).unwrap();
-
-    settle(finished);
-    rx.recv()
-        .expect("a request left running must be reaped once it exits")
-        .expect("waiting on the child")
+    Requested { child, reaped }
 }
 
 /// The child the reaper tests hand their reaper: runs `then` at EOF on its stdin, a pipe the test

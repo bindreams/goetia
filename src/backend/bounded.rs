@@ -363,10 +363,13 @@ pub(crate) fn wait_bounded(spawned: Spawned, deadline: Deadline) -> Result<Finis
         }
     }
     let announced = matches!(&role, Role::AnnouncedRequest(issued) if issued(&heard));
-    waited_out(child, role, stdout, stderr, heard, deadline).map_err(|error| Lost { error, announced })
+    waited_out(child, role, stdout, stderr, heard, deadline, EXIT_AFTER_REFUSED_KILL)
+        .map_err(|error| Lost { error, announced })
 }
 
 /// [`wait_bounded`] once the request is out: the wait for its answer, and the output it wrote.
+/// `refused_for` is how long a refused kill waits for the child's exit ([`EXIT_AFTER_REFUSED_KILL`]
+/// in production).
 fn waited_out(
     child: cosca::Child,
     role: Role,
@@ -374,6 +377,7 @@ fn waited_out(
     stderr: Stream,
     heard: Vec<u8>,
     deadline: Deadline,
+    refused_for: Duration,
 ) -> Result<Finished, cosca::error::Error> {
     #[cfg(test)]
     if let Some(e) = test_hook::waiting() {
@@ -390,28 +394,16 @@ fn waited_out(
             // breaks under its writer.
             return Ok(Finished::Left(Left::new(move |fate| {
                 if fate == Fate::Kill
-                    && let Err(e) = child.kill()
+                    && let Some(warning) = end_left(&child, EXIT_AFTER_REFUSED_KILL)
                 {
-                    eprintln!(
-                        "warning: could not kill a request left running, which runs on: {}",
-                        cosca::error::Report::new(&e)
-                    );
+                    eprintln!("{warning}");
                 }
                 reaper.reap(child);
             })));
         }
         (None, Role::Query | Role::UncountedQuery | Role::AnnouncedRequest(_)) => {
-            // The root first, and its `Ok` is what makes the reap below unable to block.
-            child.kill()?;
-            // Then the tree, best-effort. This runs BEFORE the reap below, while the killed
-            // root is still a zombie pinning its pid and pgid, so a kill that names the tree
-            // by the root's number cannot hit another process on any platform. `Drop` (at the
-            // end of this function) runs after the reap, where cosca may skip such a kill. An
-            // uncontained child (the descendant test spawns one) reports `Unsupported` here, and a
-            // contained tree whose member refused SIGKILL reports `Containment`; the `Result` is
-            // discarded either way, so nothing surfaces it, and a descendant still holding a pipe
-            // is exactly what `collect` reports as `complete == false`.
-            let _tree_teardown = child.send_kill_tree();
+            // `Ok` is what makes the reap below unable to block.
+            end(&child, refused_for)?;
             let reaped = child.wait()?;
             match expiry_disposition(reaped) {
                 Disposition::WeKilledIt => return Ok(Finished::Expired),
@@ -431,6 +423,49 @@ fn waited_out(
         complete: stdout_whole && stderr_whole,
     };
     Ok(Finished::Exited { status, capture })
+}
+
+/// How long a child whose kill was refused with `EPERM` is given to be seen exited.
+const EXIT_AFTER_REFUSED_KILL: Duration = Duration::from_secs(5);
+
+/// End `child`: its root ([`kill_root`]), then, best-effort, its tree. The one order, for every
+/// caller: the tree is ended BEFORE the root is reaped, while the killed root is still a zombie
+/// pinning its pid and pgid, so a kill that names the tree by the root's number cannot hit another
+/// process on any platform. `Drop` runs after the reap, where cosca may skip such a kill.
+///
+/// An uncontained child (the descendant test spawns one) reports `Unsupported` for the tree, and a
+/// contained tree whose member refused SIGKILL reports `Containment`; the `Result` is discarded
+/// either way, so nothing surfaces it, and a descendant still holding a pipe is exactly what
+/// `collect` reports as `complete == false`.
+fn end(child: &cosca::Child, bound: Duration) -> Result<(), cosca::error::Error> {
+    kill_root(child, bound)?;
+    let _tree_teardown = child.send_kill_tree();
+    Ok(())
+}
+
+/// [`end`] for the child of a [`Left`]: what to say on stderr if it cannot be ended and so runs on.
+fn end_left(child: &cosca::Child, bound: Duration) -> Option<String> {
+    end(child, bound).err().map(|e| {
+        format!(
+            "warning: could not kill a request left running, which runs on: {}",
+            cosca::error::Report::new(&e)
+        )
+    })
+}
+
+/// Kill the root of `child`, the one kill an expiry makes. `Ok` says the root is dead or has exited,
+/// and has not been reaped, so it still pins its pid.
+fn kill_root(child: &cosca::Child, _bound: Duration) -> Result<(), cosca::error::Error> {
+    send_kill(child)
+}
+
+/// [`cosca::Child::kill`], the kill [`kill_root`] sends.
+fn send_kill(child: &cosca::Child) -> Result<(), cosca::error::Error> {
+    #[cfg(test)]
+    if let Some(e) = test_hook::killing(child) {
+        return Err(e);
+    }
+    child.kill()
 }
 
 /// The rest of `stream`, after `heard`: a file read back whole, or a pipe collected until its EOF or
