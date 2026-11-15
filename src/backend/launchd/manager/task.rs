@@ -312,12 +312,26 @@ impl Launchctl {
             last_result,
         })
     }
+
+    /// Whether launchd holds `label`, from one `print` read as `status` reads: counted by no reservation.
+    /// A read that fails or is not whole says no, as [`Self::read_task_print`] degrades it, so that an
+    /// unprivileged `status` still answers. `Err` iff `launchctl` could not be run at all.
+    fn holds(&self, label: &str) -> Result<bool> {
+        let read = self.read_print(
+            label,
+            Budget::Unbounded.start(),
+            Role::UncountedQuery,
+            &mut Reservation::default(),
+        )?;
+        Ok(matches!(read, Some((status, capture)) if status.success() && capture.complete))
+    }
 }
 
 impl Launchd {
     /// A task's status: its job's state and last result from one `print`, whether its timer is
-    /// enabled (the timer's directory; the job's for a task with no timer), and when the armed timer
-    /// fires next. `last_run` is not known: launchd keeps no time of it.
+    /// enabled (the timer's directory; the job's for a task with no timer), and when the timer fires
+    /// next: only for an enabled timer that launchd holds, which a second `print` reads. `last_run` is
+    /// not known: launchd keeps no time of it.
     pub(super) fn task_status(&self, snapshot: &Plist) -> Result<Status> {
         // `status` and `list` have no budget of their own, and neither counted this read.
         let print = self.launchctl.read_task_print(
@@ -331,7 +345,11 @@ impl Launchd {
             .as_ref()
             .or(snapshot.job.as_ref())
             .is_some_and(|artifact| artifact.location.enabled);
-        let next_run = next_run(snapshot.timer.as_ref(), enabled, SystemTime::now(), system_zone)?;
+        // A timer in the enabled directory that launchd does not hold (an `enable` or an install that
+        // stopped before loading it) fires nothing, as a systemd timer that is not active has no next
+        // elapse.
+        let armed = enabled && snapshot.timer.is_some() && self.launchctl.holds(&timer_label(snapshot.id.as_str()))?;
+        let next_run = next_run(snapshot.timer.as_ref(), armed, SystemTime::now(), system_zone)?;
         Ok(Status::Task(TaskStatus {
             common: DaemonStatus {
                 state: print.state,
@@ -360,9 +378,10 @@ impl Launchd {
 
 /// When `timer` fires first after `now`, read from the schedule in the timer's own metadata, not the
 /// job's: the armed timer is what fires, and after a crash between replacing the job and the timer the
-/// job's metadata can hold a schedule the timer does not. `None` unless `armed`, and for a timer whose
-/// metadata names no schedule or will not decode, or whose schedule has no date. The zone is asked
-/// for only when there is a schedule to read, so a disarmed task needs no time zone.
+/// job's metadata can hold a schedule the timer does not. `None` unless `armed` (enabled, and held by
+/// launchd), and for a timer whose metadata names no schedule or will not decode, or whose schedule has
+/// no date. The zone is asked for only when there is a schedule to read, so a disarmed task needs no
+/// time zone.
 pub(super) fn next_run(
     timer: Option<&Artifact>,
     armed: bool,

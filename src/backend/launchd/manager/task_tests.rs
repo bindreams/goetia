@@ -470,11 +470,13 @@ fn regenerate_takes_the_timer_from_its_own_metadata() {
 
 // status ==============================================================================================================
 
+/// The job's `print` carries its state and last result; the timer's is asked only where it can matter,
+/// for a timer in the enabled directory, and only to know whether launchd holds it.
 #[skuld::test]
-fn a_task_status_reads_print_once() {
+fn a_task_status_reads_the_job_and_an_enabled_timer() {
     let spec = task_spec(Some("30 3 * * *"));
     let body = print_body("running", Some(4242), "last terminating signal = Killed: 9");
-    let (mgr, fake) = printing(&[(0, body)]);
+    let (mgr, fake) = printing(&[(0, body), (0, String::new())]);
 
     let status = status_of(&mgr, &snapshot(&spec, true, true));
 
@@ -483,8 +485,58 @@ fn a_task_status_reads_print_once() {
     assert!(status.common.enabled);
     assert_eq!(status.last_result, Some(Exit::Signal(9)));
     assert_eq!(status.last_run, None);
-    fake.assert_spent("one print");
-    assert_eq!(fake.calls().len(), 1);
+    fake.assert_spent("the job's print and the timer's");
+    assert_eq!(
+        fake.calls(),
+        [
+            vec!["print".to_string(), format!("system/{ID}")],
+            vec!["print".to_string(), format!("system/{}", timer_stem())],
+        ]
+    );
+}
+
+/// A timer launchd does not hold fires nothing: it is in the enabled directory (boot enrolment, so
+/// `enabled` is true), and `next_run` is empty, as systemd's is for a timer that is not active. The
+/// crash state of an `enable` that moved the timer and did not load it, and of an install that failed
+/// before loading it again, are this.
+#[skuld::test]
+fn an_enabled_timer_that_launchd_does_not_hold_has_no_next_run() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let (mgr, fake) = printing(&[(NOT_LOADED.0, String::new()), (NOT_LOADED.0, String::new())]);
+
+    let status = status_of(&mgr, &snapshot(&spec, true, true));
+
+    assert!(status.common.enabled);
+    assert_eq!(status.next_run, None);
+    fake.assert_spent("the job's print and the timer's");
+}
+
+/// A read of the timer that fails says nothing is armed, as a failed read of the job says its state is
+/// unknown: an unprivileged `status` still answers.
+#[skuld::test]
+fn a_timer_read_that_fails_leaves_next_run_empty_and_status_answering() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let denied = (1, "Could not print: Operation not permitted\n".to_string());
+    let (mgr, fake) = printing(&[(NOT_LOADED.0, String::new()), denied]);
+
+    let status = status_of(&mgr, &snapshot(&spec, true, true));
+
+    assert!(status.common.enabled);
+    assert_eq!(status.next_run, None);
+    fake.assert_spent("the job's print and the timer's");
+}
+
+/// A timer in staging is not armed, so launchd is not asked about it.
+#[skuld::test]
+fn a_staged_timer_is_not_asked_about() {
+    let spec = task_spec(Some("30 3 * * *"));
+    let (mgr, fake) = printing(&[(NOT_LOADED.0, String::new())]);
+
+    let status = status_of(&mgr, &snapshot(&spec, false, false));
+
+    assert!(!status.common.enabled);
+    assert_eq!(status.next_run, None);
+    fake.assert_spent("the job's print only");
 }
 
 #[skuld::test]
@@ -517,7 +569,8 @@ fn enabled_is_the_timers_directory() {
     let scheduled = task_spec(Some("30 3 * * *"));
     // (the job's directory, the timer's): the timer's decides.
     for (job_enabled, timer_enabled) in [(true, false), (false, true), (true, true), (false, false)] {
-        let (mgr, _) = printing(&[(NOT_LOADED.0, String::new())]);
+        // The job's `print`, and the timer's where it is in the enabled directory.
+        let (mgr, _) = printing(&[(NOT_LOADED.0, String::new()), (NOT_LOADED.0, String::new())]);
         let status = status_of(&mgr, &snapshot(&scheduled, job_enabled, timer_enabled));
         assert_eq!(
             status.common.enabled, timer_enabled,
@@ -587,7 +640,8 @@ fn next_run_comes_from_the_timers_blob() {
     plist.blob = snapshot(&jobs, true, true).blob;
     let zone = system_zone().expect("the machine's time zone");
     let before = SystemTime::now();
-    let (mgr, _) = printing(&[(NOT_LOADED.0, String::new())]);
+    // The job's `print` and the timer's, which launchd holds.
+    let (mgr, _) = printing(&[(NOT_LOADED.0, String::new()), (0, String::new())]);
 
     let next = status_of(&mgr, &plist).next_run.expect("an armed timer's next run");
 
