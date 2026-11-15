@@ -69,8 +69,9 @@ pub(in crate::backend::launchd::manager) struct Marked {
 pub(in crate::backend::launchd::manager) fn mark_thread() -> Marked {
     // SAFETY: `pthread_self` has no preconditions.
     let id = unsafe { libc::pthread_self() };
-    let before = MARKED_THREAD.swap(id, Ordering::SeqCst);
-    debug_assert_eq!(before, 0, "a thread is marked already");
+    // Stores nothing where a mark is held, so a failed call leaves no mark behind.
+    let marked = MARKED_THREAD.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst);
+    assert!(marked.is_ok(), "a thread is marked already");
     Marked {
         id,
         _unsend: PhantomData,
@@ -549,7 +550,8 @@ fn a_re_raised_signal_reaches_the_previous_handler_though_the_closing_thread_blo
         "the signal was held by the thread that closed the window"
     );
     release.send(()).expect("the closing thread is waiting");
-    drop(closing);
+    let thread = closing.0.take().expect("the closing thread was spawned");
+    thread.join().expect("the closing thread");
 }
 
 /// A window whose pipe cannot be made is an `Err` and installs nothing: no handler is ours, nothing is
