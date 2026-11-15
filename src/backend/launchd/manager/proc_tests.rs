@@ -64,5 +64,6 @@ fn the_path_is_the_programs() {
     let plain = path_of(plain.pid()).expect("path").expect("a live process");
 
     assert_eq!(named.file_name().and_then(|name| name.to_str()), Some("xpcproxy"));
-    assert_eq!(plain.file_name().and_then(|name| name.to_str()), Some("sh"));
+    // `/bin/sh` is a stub that execs the selected shell: what the process is now is that shell's.
+    assert_ne!(plain.file_name().and_then(|name| name.to_str()), Some("xpcproxy"));
 }

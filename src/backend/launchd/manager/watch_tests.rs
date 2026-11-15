@@ -75,10 +75,11 @@ impl Held {
     }
 
     /// A child whose program is named `xpcproxy`, as the process of a launch is until it execs: a copy of
-    /// `/bin/sh` in `dir`, which must outlive it, running `script`.
+    /// `/bin/bash` in `dir`, which must outlive it, running `script`. Not `/bin/sh`, which on macOS is a
+    /// stub that execs the selected shell, so the process would stop being `xpcproxy` at once.
     pub(in crate::backend::launchd::manager) fn at_xpcproxy(dir: &Path, script: &str) -> Held {
         let copy = dir.join("xpcproxy");
-        std::fs::copy("/bin/sh", &copy).expect("copy /bin/sh");
+        std::fs::copy("/bin/bash", &copy).expect("copy /bin/bash");
         Held::spawned(Command::new(&copy).args(["-c", &format!("echo up; {script}")]))
     }
 
