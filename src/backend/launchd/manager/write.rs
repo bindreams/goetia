@@ -15,10 +15,11 @@ use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
+use super::verbs::{self, Quiet};
 use super::{
-    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, State, ensure_dir, move_no_clobber, never_expires,
-    persist_new, persist_new_unraced, persist_over, plist_in, prepare_parent_dirs, read_artifact, resolve_account,
-    staged_tempfile, still_present,
+    Account, Artifact, Dirs, Launchd, PersistOutcome, Plist, Role, describe_at, ensure_dir, move_no_clobber,
+    never_expires, persist_new, persist_new_unraced, persist_over, plist_in, prepare_parent_dirs, read_artifact,
+    resolve_account, staged_tempfile, still_present,
 };
 use crate::backend::bounded::Reservation;
 use crate::backend::launchd::generate::{self, Plists, timer_label};
@@ -38,7 +39,9 @@ impl Launchd {
     /// take for ours), then writes the job into staging and the timer after it, each refusing to
     /// replace anything. A write that fails after the job leaves a job without its timer, which is
     /// ours: the next install is an `Update` that writes the timer. A stranger's file at the timer's
-    /// name, found then, refuses the install, and the job it wrote is removed.
+    /// name, found then, refuses the install; so does anything else that took the name. Either way the
+    /// job it wrote is removed, and where a label was booted out the error says so
+    /// ([`Error::StaleJobBootedOut`]).
     ///
     /// An `Update` or `Stale` reads which labels launchd holds, then runs `update_plan`.
     ///
@@ -90,20 +93,18 @@ impl Launchd {
                     match persist_new(staged, &timer_target)? {
                         PersistOutcome::Written => {}
                         PersistOutcome::Raced => {
-                            let taken = timer_taken(id, &timer_target)?;
-                            // A refusal says nothing was changed, so the job this install wrote goes.
-                            if matches!(taken, WriteOutcome::Refused(_)) {
-                                fs::remove_file(&job_target).map_err(|e| Error::Step {
-                                    what: format!(
-                                        "the install of `{id}` was refused for the file at its timer's name, and \
-                                         the job's plist it wrote could not be removed: remove `{}`, or re-run \
-                                         install once the timer's name is free",
-                                        job_target.display()
-                                    ),
-                                    source: Box::new(Error::os_at("remove", &job_target, e)),
-                                })?;
-                            }
-                            return Ok(taken);
+                            // Every way out of here undoes the job this install wrote. A request was
+                            // sent if a label was booted out, and the error then says so.
+                            let taken = if booted_out {
+                                Err(refuse::slot_taken_after_bootout(
+                                    id,
+                                    &timer_target,
+                                    describe_at(&timer_target),
+                                ))
+                            } else {
+                                timer_taken(id, &timer_target)
+                            };
+                            return remove_written_job(&job_target, taken);
                         }
                     }
                 }
@@ -334,6 +335,33 @@ fn timer_taken(id: &Id, path: &Path) -> Result<WriteOutcome> {
     }
 }
 
+/// `ended`, how a `Create` ended at its timer's name, after the job's plist at `job` was written: the
+/// job is removed again, so that nothing of this install is left behind. A job that cannot be removed
+/// never replaces `ended`: its path is told beside it, and a re-run installs over it (a job without its
+/// timer is an `Update`).
+fn remove_written_job(job: &Path, ended: Result<WriteOutcome>) -> Result<WriteOutcome> {
+    let Err(removal) = fs::remove_file(job) else {
+        return ended;
+    };
+    let leftover = format!(
+        "`{}`, the job's plist this install wrote, could not be removed ({removal}) and is left: a re-run installs \
+         over it",
+        job.display()
+    );
+    match ended {
+        Ok(WriteOutcome::Refused(Outcome::RefuseForeign { recovery })) => {
+            Ok(WriteOutcome::Refused(Outcome::RefuseForeign {
+                recovery: format!("{recovery}; also, {leftover}"),
+            }))
+        }
+        Ok(other) => unreachable!("a timer's name taken refuses only for a stranger's file, got {other:?}"),
+        Err(first) => Err(Error::Step {
+            what: leftover,
+            source: Box::new(first),
+        }),
+    }
+}
+
 /// A plan's actions, performed in order over what is on disk and in launchd.
 struct Executor<'a> {
     launchd: &'a Launchd,
@@ -403,10 +431,10 @@ impl Executor<'_> {
         match action {
             Action::BootoutTimer => {
                 never_expires(launchctl.bootout(&timer_label, deadline, reservation)?);
-                if self.old.timer.is_some() {
-                    self.timer_out = true;
-                } else {
+                if self.old.timer_stray() {
                     self.stray_out = true;
+                } else {
+                    self.timer_out = true;
                 }
             }
             Action::CheckJobIdle => {
@@ -420,12 +448,15 @@ impl Executor<'_> {
                     DaemonKind::Service => Verdict::Idle,
                     DaemonKind::Task => {
                         let print = launchctl.read_task_print(id, deadline, Role::Query, reservation)?;
-                        if print.pid.is_some() || print.state == State::Running {
+                        // A print with no pid is read as `stop` reads it.
+                        if print.pid.is_some() {
                             Verdict::InFlight
-                        } else if print.state == State::Idle {
-                            Verdict::Idle
                         } else {
-                            Verdict::Unknown(print.shown.describe(print.state))
+                            match verbs::quiet(self.id, &print) {
+                                Ok(Quiet::Queued) => Verdict::InFlight,
+                                Ok(Quiet::Idle) => Verdict::Idle,
+                                Err(_) => Verdict::Unknown(print.shown.describe(print.state)),
+                            }
                         }
                     }
                 };

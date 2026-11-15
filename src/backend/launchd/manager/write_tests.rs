@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use super::super::State;
 use super::super::manager_tests::launchd_over;
 use super::super::task::Shown;
 use super::super::task::task_tests::{ID, Tree, damaged, marked, plists_of, service_spec, task_spec};
@@ -215,22 +216,92 @@ fn stale_labels() -> Vec<Entry> {
     ]
 }
 
-/// A stranger's file at the timer's name, found after the job was written, refuses the install as a
-/// stranger's file is refused at `read`: the job this install wrote is removed again, so nothing of it
-/// is left behind and the refusal's "nothing was changed" is true.
+/// Whatever is found at the timer's name after the job was written (a stranger's file, a directory, a
+/// timer another install of goetia's wrote) ends the install, and the job this install wrote is removed
+/// again: nothing of it is left behind, so a refusal's "nothing was changed" is true.
 #[skuld::test]
-fn a_create_refused_for_a_strangers_timer_removes_the_job_it_wrote() {
+fn a_create_that_finds_the_timers_name_taken_removes_the_job_it_wrote() {
+    let spec = task_spec(Some(SCHEDULE));
+    // A `Create` over `tree`, which holds only what is at the timer's name: the job is gone after it.
+    let created_over = |tree: &Tree, what: &str| -> Result<WriteOutcome> {
+        let fake = Fake::new([print(timer_target(), UNLOADED, ""), print(job_label(), UNLOADED, "")]);
+        let outcome = create(tree, &fake, &spec);
+        assert!(!exists(tree, false, ID), "{what}: the job this install wrote is gone");
+        let left: Vec<_> = std::fs::read_dir(tree.dir(false)).unwrap().collect();
+        assert_eq!(left.len(), 1, "{what}: only the timer's name is left: {left:?}");
+        outcome
+    };
+
     let tree = Tree::new();
     tree.put(false, &timer_name(), "a stranger's file\n");
-    let fake = Fake::new([print(timer_target(), UNLOADED, ""), print(job_label(), UNLOADED, "")]);
-
-    let recovery = refused_as_foreign(create(&tree, &fake, &task_spec(Some(SCHEDULE))));
-
+    let recovery = refused_as_foreign(created_over(&tree, "a stranger's file"));
     assert!(recovery.contains(&timer_name()), "{recovery}");
+
+    let tree = Tree::new();
+    std::fs::create_dir(at(&tree, false, &timer_name())).unwrap();
+    refused_as_foreign(created_over(&tree, "a directory"));
+
+    let tree = Tree::new();
+    tree.put(false, &timer_name(), plists_of(&spec).timer.unwrap());
+    let e = created_over(&tree, "a timer another install wrote")
+        .expect_err("another install's timer is a concurrent change");
+    assert!(matches!(e, Error::ConcurrentChange { .. }), "{e:?}");
+}
+
+/// A `Create` that booted out a label and then finds the timer's name taken has sent a request: it says
+/// the label was booted out and the daemon is not installed, not that nothing changed, and removes the
+/// job it wrote.
+#[skuld::test]
+fn a_create_that_booted_out_a_label_and_finds_the_timers_name_taken_says_so() {
+    let tree = Tree::new();
+    tree.put(false, &timer_name(), "a stranger's file\n");
+    let fake = Fake::new([
+        print(timer_target(), LOADED, ""),
+        bootout(timer_target()),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), UNLOADED, ""),
+    ]);
+
+    let e = create(&tree, &fake, &task_spec(Some(SCHEDULE))).expect_err("the timer's name was taken");
+
+    let taken = at(&tree, false, &timer_name());
+    assert!(
+        matches!(&e, Error::StaleJobBootedOut { path, .. } if *path == taken),
+        "{e:?}"
+    );
+    fake.assert_spent("nothing is sent after the race");
     assert!(!exists(&tree, false, ID), "the job this install wrote is gone");
     assert_eq!(text_at(&tree, false, &timer_name()), "a stranger's file\n");
-    let left: Vec<_> = std::fs::read_dir(tree.dir(false)).unwrap().collect();
-    assert_eq!(left.len(), 1, "only the stranger's file is left: {left:?}");
+}
+
+/// A job that cannot be removed (here a directory, which `remove_file` refuses) never replaces the
+/// refusal: the stranger's path and the recovery stay, and the leftover is named beside them.
+#[skuld::test]
+fn a_job_that_cannot_be_removed_is_named_beside_the_refusal() {
+    let tree = Tree::new();
+    let job = at(&tree, false, ID);
+    std::fs::create_dir(&job).unwrap();
+    let stranger = at(&tree, false, &timer_name());
+    let refusal = || {
+        Ok(WriteOutcome::Refused(Outcome::RefuseForeign {
+            recovery: super::super::task::foreign_timer_recovery(std::slice::from_ref(&stranger)),
+        }))
+    };
+
+    let recovery = refused_as_foreign(remove_written_job(&job, refusal()));
+
+    assert!(recovery.contains(&stranger.display().to_string()), "{recovery}");
+    assert!(recovery.contains("remove or rename it, and re-run"), "{recovery}");
+    assert!(recovery.contains(&job.display().to_string()), "{recovery}");
+
+    let e = remove_written_job(
+        &job,
+        Err(refuse::changed_during_install(&Id::try_from(ID).unwrap(), &stranger)),
+    )
+    .expect_err("the first failure stays");
+    let report = e.report().to_string();
+    assert!(report.contains(&stranger.display().to_string()), "{report}");
+    assert!(report.contains(&job.display().to_string()), "{report}");
 }
 
 /// A job whose timer was not written (a failure after the job) is ours, and an `Update` that writes the
@@ -618,6 +689,33 @@ fn a_state_launchd_does_not_show_is_not_reported_as_a_run_in_flight() {
     let shown = Shown::State(Some("someday-new-apple-state".to_string())).describe(State::Unknown);
     assert!(report.contains(&shown), "{report}");
     assert!(report.contains("untouched"), "{report}");
+    fake.assert_spent("nothing is booted out");
+    assert_eq!(text_at(&tree, false, ID), old.job);
+}
+
+/// A start launchd has accepted and not yet forked shows no pid, and is a run in flight as `stop` has it.
+#[skuld::test]
+fn a_queued_start_is_a_run_in_flight() {
+    let tree = Tree::new();
+    let old = installed(&tree, &task_spec(Some(SCHEDULE)), false);
+    let fake = Fake::new([
+        print(job_label(), LOADED, IDLE),
+        print(timer_target(), UNLOADED, ""),
+        print(job_label(), LOADED, "\tstate = spawn scheduled\n"),
+    ]);
+
+    let e = rewrite(&tree, &fake, &command("/bin/false")).expect_err("a start is queued");
+
+    assert!(
+        matches!(
+            e,
+            Error::LoadedJob {
+                kind: DaemonKind::Task,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
     fake.assert_spent("nothing is booted out");
     assert_eq!(text_at(&tree, false, ID), old.job);
 }
