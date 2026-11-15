@@ -544,11 +544,12 @@ fn a_start_after_a_kill_sees_the_restart_in_the_auto_restart_window(#[fixture(sy
 }
 
 /// A unit that was started too often (systemd's start limit, which goetia leaves on for a `restart: never`
-/// unit: five starts in ten seconds) makes `start` fail at once, and does not leave it waiting for a
-/// process that will not come. Each process is killed once it runs, so that the next start is a fresh one;
-/// the limit is reached when a start is refused. The words of the error are systemd's own, which after a
-/// kill still name the signal that ended the unit before them ("a fatal signal was delivered"), not the
-/// limit: that the error says the limit was hit is not established here.
+/// unit: `StartLimitBurst` starts in the interval) makes `start` fail at once, and does not leave it waiting
+/// for a process that will not come. Each process is killed once it runs, so that the next start is a fresh
+/// one; the limit is reached when a start is refused, which is after `StartLimitBurst` of them. The words of
+/// the error are systemd's own, which after a kill still name the signal that ended the unit before them
+/// ("a fatal signal was delivered"), not the limit: that the error says the limit was hit is not
+/// established here.
 #[skuld::test]
 fn a_start_of_a_unit_at_its_start_limit_fails_and_does_not_hang(#[fixture(systemd_group)] _group: &Group) {
     let guard = ServiceGuard::new(support::random_test_id());
@@ -557,10 +558,24 @@ fn a_start_of_a_unit_at_its_start_limit_fails_and_does_not_hang(#[fixture(system
     let id = spec.common().id.clone();
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
+    let unit = format!("{id}.service");
+    let burst: usize = cmd::run("systemctl", &["show", "--property=StartLimitBurst", "--value", &unit])
+        .expect_ok()
+        .stdout
+        .trim()
+        .parse()
+        .expect("systemd shows the unit's StartLimitBurst as a number");
 
+    let mut starts = 0;
     let e = loop {
+        // A start past the burst that was not refused means the limit is not what this test thinks it is.
+        assert!(
+            starts <= burst,
+            "{starts} starts went through a unit whose StartLimitBurst is {burst}"
+        );
         match mgr.start(&id, Budget::DEFAULT) {
             Ok(_) => {
+                starts += 1;
                 mgr.kill(&id).expect("kill the running daemon");
                 // The kill returned with the process gone and recorded, so the unit is `failed` for the
                 // reason the kill gave it, and the next start is the next one counted.
@@ -571,8 +586,10 @@ fn a_start_of_a_unit_at_its_start_limit_fails_and_does_not_hang(#[fixture(system
     };
 
     assert!(matches!(&e, goetia::Error::Command { .. }), "{e:?}");
-    let unit = format!("{id}.service");
-    let journal = cmd::run("journalctl", &["-u", &unit, "--no-pager", "-n", "5"]);
+    // The journal is written by another process: ask it to have everything, and read the whole unit's
+    // log, where the line is one of a few and no later entry can push it out.
+    cmd::run("journalctl", &["--sync"]).expect_ok();
+    let journal = cmd::run("journalctl", &["-u", &unit, "--no-pager"]);
     assert!(
         journal.stdout.contains("Start request repeated too quickly"),
         "the refusal was not the start limit: {}
