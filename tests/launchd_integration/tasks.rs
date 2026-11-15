@@ -1167,45 +1167,57 @@ fn enable_and_disable_finish_after_a_crash_on_a_real_launchd(#[fixture(launchd_g
     assert!(status.common.enabled, "{status:?}");
 }
 
-// PROBE (temporary): what `print` shows of `started suspended` right after `debug` and `kickstart -p`.
+// PROBE (temporary): the `launchctl` calls of `goetia daemon run`, logged, until one fails.
 #[skuld::test]
-fn probe_print_after_a_held_kickstart(#[fixture(launchd_group)] _group: &Group) {
+fn probe_run_until_it_fails(#[fixture(launchd_group)] _group: &Group) {
     let id = support::random_test_id();
-    let task_id = id_of(&id);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("task.log");
+    let bin = tempfile::tempdir().expect("tempdir");
     let mgr = Launchd::new();
-    let _guard = Guard::install(&mgr, &task(&id, sh("exit 0"), Some("* * * * *")));
-    mgr.enable(&task_id).expect("enable");
-    let timer = timer_of(&id);
-    let fires = runs_of(&timer);
-    let target = format!("system/{id}");
-    let fields = |body: &str| {
+    let _guard = Guard::install(&mgr, &with_logs(task(&id, sh("echo first-run"), None), &log));
+    let calls = bin.path().join("calls");
+    let wrapper = bin.path().join("launchctl");
+    fs::write(
+        &wrapper,
         format!(
-            "state={:?} pid={:?} suspended={:?} runs={:?}",
-            print_field(body, "state = "),
-            print_field(body, "pid = "),
-            print_field(body, "started suspended = "),
-            print_field(body, "runs = ")
-        )
-    };
+            "#!/bin/sh\n\
+             out=$(/bin/launchctl \"$@\")\n\
+             rc=$?\n\
+             echo \"$* -> $rc\" >> \"{calls}\"\n\
+             if [ \"$1\" = print ]; then echo \"$out\" | grep -E '^[[:space:]]*(state|pid|started suspended|runs|last exit code) = ' >> \"{calls}\"; fi\n\
+             if [ \"$1\" = kickstart ]; then echo \"stdout: $out\" >> \"{calls}\"; fi\n\
+             printf '%s\\n' \"$out\"\n\
+             exit $rc\n",
+            calls = calls.display()
+        ),
+    )
+    .expect("write the launchctl wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod the wrapper");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string())
+    );
     let mut report = String::new();
-    let mut i = 0;
-    while runs_of(&timer) < fires + 2 {
-        i += 1;
-        let before = runs_of(&timer);
-        let debug = cmd::run("launchctl", &["debug", &target, "--start-suspended"]);
-        let kick = cmd::run("launchctl", &["kickstart", "-p", &target]).expect_ok();
-        let reads: Vec<String> = (0..3).map(|_| fields(&print_job(&id).stdout)).collect();
-        if reads.iter().any(|read| !read.contains("suspended=Some(\"1\")")) {
-            report.push_str(&format!(
-                "#{i} timer runs {before} -> {} debug={:?} kickstart={:?}\n  {}\n",
-                runs_of(&timer),
-                debug.code,
-                kick.stdout.trim(),
-                reads.join("\n  ")
-            ));
+    for i in 1..=80 {
+        drop(fs::remove_file(&calls));
+        let output = Command::new(env!("CARGO_BIN_EXE_goetia"))
+            .args(["daemon", "run", id.as_str()])
+            .env("PATH", &path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run goetia");
+        if !output.status.success() || output.stdout != b"first-run\n" {
+            report = format!(
+                "iteration {i}: exit {:?}\nstdout: {:?}\nstderr: {}\ncalls:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                fs::read_to_string(&calls).unwrap_or_default()
+            );
+            break;
         }
-        cmd::run("launchctl", &["kill", "SIGCONT", &target]).expect_ok();
-        kill::until(|| pid_of(&id).is_none());
     }
-    panic!("PROBE RESULT after {i} iterations\n{report}");
+    panic!("PROBE RESULT\n{report}");
 }
