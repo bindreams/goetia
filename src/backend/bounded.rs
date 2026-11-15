@@ -467,12 +467,9 @@ fn end(child: &cosca::Child, bound: Duration) -> Result<KillRootOutcome, cosca::
 /// [`end`] for the child of a [`Left`]: what to say on stderr if it could not be ended. It says what
 /// failed, not what became of the child: the child is released to its reaper either way.
 fn end_left(child: &cosca::Child, bound: Duration) -> Option<String> {
-    end(child, bound).err().map(|e| {
-        format!(
-            "warning: could not kill a request left running: {}",
-            Chain(&e)
-        )
-    })
+    end(child, bound)
+        .err()
+        .map(|e| format!("warning: could not kill a request left running: {}", Chain(&e)))
 }
 
 /// How [`kill_root`] ended the root.
