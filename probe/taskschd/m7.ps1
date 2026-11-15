@@ -61,7 +61,7 @@ foreach ($k in 'oncepast-disabled-swa', 'fixedpast-disabled-swa') {
 # the same by XML
 foreach ($k in 'oncepast-disabled-swa') {
     $t = $folder.GetTask($k)
-    "xml readback trigger Enabled: $(($t.Xml -split "`n" | Where-Object { $_ -match 'Enabled' }) -join ' ')"
+    "xml readback of the triggers: $(([regex]::Match($t.Xml, '(?s)<Triggers>.*?</Triggers>')).Value)"
 }
 Write-Host "observing for $Watch s ..."
 Start-Sleep -Seconds $Watch

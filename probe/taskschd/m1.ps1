@@ -33,7 +33,7 @@ $t = Reg 'never-notrig' "act rec $Logs\m1.log 0" '';    Info $t 'never run, no t
 $t = Reg 'never-alloff' "act rec $Logs\m1.log 0" $futureOff; Info $t 'never run, every trigger disabled'
 $t = Reg 'never-daily' "act rec $Logs\m1.log 0" $daily; Info $t 'never run, an enabled daily trigger'
 $t = Reg 'never-dailyoff' "act rec $Logs\m1.log 0" $dailyOff; Info $t 'never run, a disabled daily trigger'
-$t = Reg 'never-taskoff' "act rec $Logs\m1.log 0" $daily '' $false; Info $t 'never run, the task itself disabled (Settings/Enabled false)'
+$t = Reg 'never-taskoff' "act rec $Logs\m1.log 0" $daily -Enabled $false; Info $t 'never run, the task itself disabled (Settings/Enabled false)'
 
 Section "during a run"
 Remove-Item "$Logs\m1-during.log" -ErrorAction SilentlyContinue

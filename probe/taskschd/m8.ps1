@@ -35,8 +35,18 @@ $out = "$Logs\m8-$Kind.txt"; Remove-Item $out -ErrorAction SilentlyContinue
 $t = Reg $P 'm8' "act self $out task=\Goetia\m8 rundir=$dir"
 if ($Kind -eq 'user') {
     "The account has no SeBatchLogonRight yet. Registration succeeded."
-    $e = Run-Wait $t
-    "first Run without the right: $(if ($e) { $e } else { 'Run returned ok' }); LastTaskResult=$(HexOf $t.LastTaskResult); output written: $(Test-Path $out)"
+    wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
+    $t0 = Get-Date
+    try {
+        $rt = $t.Run($null)
+        "Run returned guid=$($rt.InstanceGuid) pid=$($rt.EnginePID) state=$($rt.State)"
+        "listing right after Run: $((@($t.GetInstances(0)) | ForEach-Object { "$($_.InstanceGuid)/$($_.EnginePID)" }) -join ', ')"
+        Wait-NoInstances $t
+    } catch { "Run FAILED: $($_.Exception.Message.Trim()) [$(HexOf $_.Exception.HResult)]" }
+    "first Run without the right: LastTaskResult=$(HexOf $t.LastTaskResult); output written: $(Test-Path $out)"
+    "  $(Info $t 'status')"
+    "TaskScheduler Operational events for that Run:"
+    Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-TaskScheduler/Operational'; StartTime = $t0 } -ErrorAction SilentlyContinue | Sort-Object TimeCreated | ForEach-Object { "  id $($_.Id) $($_.TimeCreated.ToString('HH:mm:ss.fff')) $(($_.Message -split "`n")[0])" }
     Grant-Right $user.Name 'SeBatchLogonRight'
     Remove-Item $out -ErrorAction SilentlyContinue
     $e = Run-Wait $t

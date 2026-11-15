@@ -57,13 +57,18 @@ jobs:
           New-Item -ItemType Directory -Force probe-results | Out-Null
           Set-Location probe/taskschd
           & ./${{ matrix.cmd }} *>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE/probe-results/${{ matrix.name }}.txt"
+          exit 0
+
+      - name: Collect the actions' own logs
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path C:\probe\logs) { Copy-Item C:\probe\logs probe-results\logs -Recurse -Force }
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: probe-${{ matrix.name }}
-          path: |
-            probe-results/
-            C:\probe\logs\
+          path: probe-results/
           if-no-files-found: ignore

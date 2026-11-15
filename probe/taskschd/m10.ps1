@@ -113,5 +113,19 @@ else {
     Wait-Lines $out 1
     "SYSTEM's own sc stop Schedule, from a task:"; Get-Content $out
     "state afterwards: $(& $q)"
-    "restore: $(sc.exe start Schedule 2>&1 | Out-String)"
+    # Wait on the real condition (the job's timeout is the failure bound).
+    while ((sc.exe query Schedule | Out-String) -notmatch 'STOPPED') { }
+    "after SYSTEM stopped it: $(& $q)"
+    foreach ($try in 1, 2) {
+        "Connect() with the service stopped (attempt $try):"
+        try { $s = New-Object -ComObject Schedule.Service; $s.Connect(); "  Connect ok" } catch { "  Connect FAILED $($_.Exception.Message.Trim()) [$(HexOf $_.Exception.HResult)]" }
+        try { $s = New-Object -ComObject Schedule.Service; $s.Connect(); $null = $s.GetFolder('\'); "  GetFolder ok" } catch { "  GetFolder FAILED $($_.Exception.Message.Trim()) [$(HexOf $_.Exception.HResult)]" }
+        "  schtasks /query: $((schtasks /query /fo csv /nh 2>&1 | Select-Object -First 2) -join ' | ') (exit $LASTEXITCODE)"
+        "  state: $((sc.exe query Schedule | Select-String 'STATE') -join '')"
+    }
+    "admin sc start: $(sc.exe start Schedule 2>&1 | Out-String)"
+    "admin Start-Service: $(try { Start-Service Schedule -ErrorAction Stop; 'ok' } catch { 'FAILED ' + $_.Exception.Message })"
+    "state: $((sc.exe query Schedule | Select-String 'STATE') -join '')"
+    "SYSTEM can start it again? (the engine is down, so no task can carry the command: only a service-level start by another route is left)"
+    try { $s = New-Object -ComObject Schedule.Service; $s.Connect(); "Connect after the restart attempts: ok" } catch { "Connect after the restart attempts: FAILED [$(HexOf $_.Exception.HResult)]" }
 }

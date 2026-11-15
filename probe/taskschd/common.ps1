@@ -14,6 +14,8 @@ function Show-Platform {
     "Caption=$((Get-CimInstance Win32_OperatingSystem).Caption) Version=$((Get-CimInstance Win32_OperatingSystem).Version)"
     "whoami=$(whoami) timezone=$((Get-TimeZone).Id) now=$((Get-Date).ToString('o'))"
     "PowerShell=$($PSVersionTable.PSVersion)"
+    $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    "UAC: EnableLUA=$($pol.EnableLUA) FilterAdministratorToken=$($pol.FilterAdministratorToken) LocalAccountTokenFilterPolicy=$($pol.LocalAccountTokenFilterPolicy) ConsentPromptBehaviorAdmin=$($pol.ConsentPromptBehaviorAdmin)"
 }
 
 function Initialize-Probe {

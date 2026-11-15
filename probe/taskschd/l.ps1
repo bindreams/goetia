@@ -37,15 +37,19 @@ try {
     Reg 'l1' "act rec $Script:Logs\l1.log 7"
     Ended 'l1' 'l1' $Runs "L1 $Kind quiet"
 
-    Section "L1 with pid churn: $Kind, $Runs runs"
-    Reg 'l1c' "act rec $Script:Logs\l1c.log 7"
-    Ended 'l1c' 'l1' $Runs "L1 $Kind churn" 'churn'
+    Section "L1 quiet, an action that lives about 30 ms: $Kind, $Runs runs"
+    Reg 'l1s' "act rec $Script:Logs\l1s.log 7 spin_ms=30"
+    Ended 'l1s' 'l1' $Runs "L1 $Kind quiet 30ms"
+
+    Section "L1 with pid churn, an action that lives about 30 ms: $Kind, $Runs runs"
+    Reg 'l1c' "act rec $Script:Logs\l1c.log 7 spin_ms=30"
+    Ended 'l1c' 'l1' $Runs "L1 $Kind churn 30ms" 'churn'
 } catch { Write-Host "L1 FAILED: $_" }
 
 try {
     foreach ($exp in 'l2run', 'l2runex0', 'l2runex2') {
         Section "L2 $exp : $Kind, 100 runs"
-        Reg $exp "act rec $Script:Logs\$exp.log 0"
+        Reg $exp "act rec $Script:Logs\$exp.log 0 spin_ms=20"
         Ended $exp $exp 100 "L2 $Kind $exp"
     }
 } catch { Write-Host "L2 FAILED: $_" }
@@ -53,7 +57,7 @@ try {
 try {
     foreach ($exp in 'l3stop', 'l3taskstop') {
         Section "L3 $exp : $Kind"
-        Reg $exp "act rec $Script:Logs\$exp.log 0"
+        Reg $exp "act rec $Script:Logs\$exp.log 0 spin_ms=20"
         Ended $exp $exp 100 "L3 $Kind $exp"
     }
 } catch { Write-Host "L3 FAILED: $_" }

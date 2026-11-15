@@ -30,6 +30,13 @@ function Flatten([string]$xml) {
     , $out.ToArray()
 }
 
+# The text of /Task/Data as an XML parser reads it out of the readback (CDATA and entities resolved).
+function XmlData([string]$xml) {
+    $d = New-Object System.Xml.XmlDocument; $d.PreserveWhitespace = $true; $d.LoadXml($xml)
+    $n = $d.GetElementsByTagName('Data')
+    if ($n.Count -gt 0) { $n[0].InnerText } else { $null }
+}
+
 $P = Get-Principal 'system'
 $submitted = @"
 <?xml version="1.0" encoding="UTF-16"?>
@@ -117,7 +124,7 @@ foreach ($k in @($cases.Keys)) {
         $t = Register-ProbeTask $folder "data-$k" $xml $P
         $viaDef = $t.Definition.Data
         $m = [regex]::Match($t.Xml, '(?s)<Data>(.*?)</Data>')
-        $viaXml = if ($m.Success) { [System.Net.WebUtility]::HtmlDecode($m.Groups[1].Value) } else { $null }
+        $viaXml = XmlData $t.Xml
         $wantBytes = [Text.Encoding]::UTF8.GetBytes($want)
         $defBytes = if ($null -ne $viaDef) { [Text.Encoding]::UTF8.GetBytes($viaDef) } else { @() }
         "data[$k]: Definition.Data equals what XML parsing gives: $($viaDef -ceq $want) (len want $($want.Length), got $($viaDef.Length)); Xml has a <Data> element: $($m.Success); its decoded text equals: $($viaXml -ceq $want)"
@@ -133,7 +140,7 @@ foreach ($k in 'lf', 'crlf-as-char-refs', 'big-64k', 'unicode') {
         $d = $t.Definition; $d.Data = $want
         $t = $folder.RegisterTaskDefinition("datacom-$k", $d, 4, $null, $null, 0)
         $m = [regex]::Match($t.Xml, '(?s)<Data>(.*?)</Data>')
-        "datacom[$k]: Definition.Data back equals: $($t.Definition.Data -ceq $want); Xml carries it as an element: $($m.Success); decoded equal: $($m.Success -and ([System.Net.WebUtility]::HtmlDecode($m.Groups[1].Value) -ceq $want))"
+        "datacom[$k]: Definition.Data back equals: $($t.Definition.Data -ceq $want); Xml carries it as an element: $($m.Success); decoded equal: $((XmlData $t.Xml) -ceq $want)"
         if ($k -eq 'crlf-as-char-refs') { "   Xml's Data element text: $($m.Groups[1].Value)" }
     } catch { "datacom[$k]: FAILED $($_.Exception.Message) [$(HexOf $_.Exception.HResult)]" }
 }
@@ -143,6 +150,17 @@ try {
     $null = Register-ProbeTask $folder 'data-in-reginfo' $xml $P
     "registered"
 } catch { "REFUSED: $($_.Exception.Message) [$(HexOf $_.Exception.HResult)]" }
+
+Section "M4.4b a minimal registration: what Task Scheduler adds (Date, Author, URI, defaults)"
+$xml = New-TaskXml -P $P -Command $Script:Exe -Arguments 'act noop' -Triggers '<TimeTrigger><StartBoundary>2030-06-15T12:00:00</StartBoundary></TimeTrigger>'
+$t = Register-ProbeTask $folder 'minimal' $xml $P
+"----- submitted"; $xml
+"----- readback"; $t.Xml
+"----- readback as a user task (password logon)"
+$PU = Get-Principal 'user' $user
+$xml = New-TaskXml -P $PU -Command $Script:Exe -Arguments 'act noop'
+$t = Register-ProbeTask $folder 'minimal-user' $xml $PU
+$t.Xml
 
 Section "M4.5 task path case"
 $xml = New-TaskXml -P $P -Command $Script:Exe -Arguments 'act noop'

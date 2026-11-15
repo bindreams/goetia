@@ -22,13 +22,9 @@ function Principal($t) { $p = $t.Definition.Principal; "UserId=$($p.UserId) Logo
 # Does a Run still work as the stored user? (the action reports the token's user sid.)
 function Try-Run($t, [string]$Label) {
     Remove-Item $out -ErrorAction SilentlyContinue
-    try {
-        $rt = $t.Run($null)
-        $p = [Diagnostics.Process]::GetProcessById([int]$rt.EnginePID); $null = $p.Handle; $p.WaitForExit()
-        Wait-NoInstances $t
-        $sid = (Get-Content $out -ErrorAction SilentlyContinue | Where-Object { $_ -like 'token-user-sid=*' })
-        "  Run after '$Label': ok, LastTaskResult=$(HexOf $t.LastTaskResult), $sid (user sid is $($user.Sid))"
-    } catch { "  Run after '$Label': FAILED $($_.Exception.Message) [$(HexOf $_.Exception.HResult)], LastTaskResult=$(HexOf $t.LastTaskResult)" }
+    $e = Run-Wait $t
+    $sid = (Get-Content $out -ErrorAction SilentlyContinue | Where-Object { $_ -like 'token-user-sid=*' })
+    "  Run after '$Label': $(if ($e) { $e } else { 'Run returned ok' }); the action ran: $([bool]$sid) $sid; LastTaskResult=$(HexOf $t.LastTaskResult) LastRunTime=$($t.LastRunTime.ToString('o'))"
 }
 function Attempt([string]$Label, [scriptblock]$Do, [string]$Name) {
     Section $Label
@@ -93,6 +89,7 @@ Attempt "Xml edited; RegisterTask(TASK_UPDATE, user, password, TASK_LOGON_PASSWO
 # 8. The password changed behind the task's back: do stored credentials follow? (control: the stored one is stale)
 Section "control: the account's password is changed, then a null-password update, then Run (is the stored one really used?)"
 $t = Fresh 'm3h'
+Try-Run $t 'a first Run, the password still right'
 net user $user.Name 'Pb1!changedXYZ12' | Out-Null
 Try-Run $t 'the account password changed after registration (the stored one is now stale)'
 $d = $t.Definition; $d.Triggers.Item(1).Enabled = $false

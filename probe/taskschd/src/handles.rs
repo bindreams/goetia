@@ -63,6 +63,30 @@ impl Snap {
     }
 }
 
+/// The image name of a process we cannot open (a protected one), or of one that is still alive but unnamed otherwise.
+fn toolhelp_name(pid: u32) -> String {
+    use windows::Win32::System::Diagnostics::ToolHelp::*;
+    // SAFETY: the snapshot handle is closed before return; the entry struct is live and sized.
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return "?".into();
+        };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = String::from("?(exited or unlisted)");
+        let mut ok = Process32FirstW(snap, &mut e).is_ok();
+        while ok {
+            if e.th32ProcessID == pid {
+                let n = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
+                found = String::from_utf16_lossy(&e.szExeFile[..n]);
+                break;
+            }
+            ok = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+        found
+    }
+}
+
 fn enable_debug_privilege() -> bool {
     // SAFETY: plain calls; the token handle is closed.
     unsafe {
@@ -115,7 +139,7 @@ pub fn run(a: &[String]) -> i32 {
             .entry(pid)
             .or_insert_with(|| {
                 let img = image_of(pid as u32);
-                let base = img.rsplit('\\').next().unwrap_or("?").to_owned();
+                let base = if img == "?" { toolhelp_name(pid as u32) } else { img.rsplit('\\').next().unwrap_or("?").to_owned() };
                 format!("{pid}:{base}")
             })
             .clone()

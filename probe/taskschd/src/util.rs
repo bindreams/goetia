@@ -74,6 +74,34 @@ pub fn instances(t: &IRegisteredTask) -> Result<Vec<Inst>> {
     }
 }
 
+/// One listing entry read step by step: any step can fail on its own (an entry whose process ended reads with an error).
+pub struct Item {
+    pub it: Option<IRunningTask>,
+    pub guid: std::result::Result<String, String>,
+    pub pid: std::result::Result<u32, String>,
+}
+
+/// The listing, with each entry's reads kept separately. Err is the failing step's HRESULT of GetInstances or Count.
+pub fn instances_raw(t: &IRegisteredTask) -> std::result::Result<Vec<Item>, String> {
+    // SAFETY: plain COM calls.
+    unsafe {
+        let coll = t.GetInstances(0).map_err(|e| format!("GetInstances {}", hr(&e)))?;
+        let n = coll.Count().map_err(|e| format!("Count {}", hr(&e)))?;
+        let mut out = Vec::new();
+        for i in 1..=n {
+            match coll.get_Item(&VARIANT::from(i)) {
+                Err(e) => out.push(Item { it: None, guid: Err(format!("get_Item {}", hr(&e))), pid: Err(format!("get_Item {}", hr(&e))) }),
+                Ok(it) => {
+                    let guid = it.InstanceGuid().map(|b| b.to_string()).map_err(|e| format!("InstanceGuid {}", hr(&e)));
+                    let pid = it.EnginePID().map_err(|e| format!("EnginePID {}", hr(&e)));
+                    out.push(Item { it: Some(it), guid, pid });
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 pub fn same_guid(a: &str, b: &str) -> bool {
     a.trim_matches(|c| c == '{' || c == '}').eq_ignore_ascii_case(b.trim_matches(|c| c == '{' || c == '}'))
 }
