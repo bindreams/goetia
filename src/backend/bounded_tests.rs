@@ -427,20 +427,64 @@ fn a_left_request_whose_kill_is_refused_by_a_child_that_has_exited_is_reaped_as_
     assert_eq!(status.signal(), Some(libc::SIGUSR1), "{status:?}");
 }
 
-/// A refused kill after which the child is still there is the kill's error, not a verdict on the
-/// child: the wait that looks for its exit is bounded ([`EXIT_AFTER_REFUSED_KILL`]), and its expiry
-/// is not read as an exit. The one test here that waits out a real bound.
-#[skuld::test]
-fn a_kill_refused_at_the_deadline_by_a_child_that_stays_is_the_kills_error() {
-    let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
-    let _refused = test_hook::kill_fails(|_| io::Error::from_raw_os_error(libc::EPERM).into());
+fn eperm() -> cosca::error::Error {
+    io::Error::from_raw_os_error(libc::EPERM).into()
+}
 
-    let lost = wait_bounded(child, Budget::Immediate.start()).expect_err("the child is still running");
+/// A refused kill after which the child is still there is the refusal, naming the bound on the wait
+/// for the child's exit and what was seen, with the kill's own error as its source: the expiry of
+/// that wait is not read as an exit. The bound is the call's argument ([`EXIT_AFTER_REFUSED_KILL`]
+/// in production), so no test waits out a real 5 s.
+#[skuld::test]
+fn a_kill_refused_with_eperm_by_a_child_that_stays_is_the_refusal_naming_the_bound() {
+    let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+    let _refused = test_hook::kill_fails(|_| eperm());
+
+    let error = kill_root(&child.child, Duration::from_millis(50)).expect_err("the child is still running");
+
+    let said = cosca::error::Report::new(&error).to_string();
+    assert!(
+        said.contains("the kill was refused (EPERM) and the process had not exited 50ms later"),
+        "{said}"
+    );
+    assert!(
+        said.ends_with(&eperm().to_string()),
+        "the kill's error is the source: {said}"
+    );
+}
+
+/// Only `EPERM` waits for the child's exit: a kill refused for any other reason is returned at
+/// once, as it was. The bound here is an hour, which a wait on this child would last.
+#[skuld::test]
+fn a_kill_refused_for_another_reason_than_eperm_is_returned_without_waiting() {
+    let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+    let _refused = test_hook::kill_fails(|_| io::Error::from_raw_os_error(libc::EACCES).into());
+
+    let error = kill_root(&child.child, Duration::from_secs(3600)).expect_err("the kill is refused");
 
     assert!(
-        matches!(&lost.error, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
-        "{lost:?}"
+        matches!(&error, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EACCES)),
+        "{error:?}"
     );
+}
+
+/// A wait for the child's exit that failed is reported with the refusal, not thrown away.
+#[skuld::test]
+fn a_failed_wait_after_a_refused_kill_is_reported_with_the_refusal() {
+    let error = after_refusal(
+        eperm(),
+        Err(io::Error::other("the wait failed").into()),
+        EXIT_AFTER_REFUSED_KILL,
+    )
+    .expect_err("the child was not seen to exit");
+
+    let said = cosca::error::Report::new(&error).to_string();
+    assert!(
+        said.contains("the kill was refused (EPERM) and waiting for it to exit failed"),
+        "{said}"
+    );
+    assert!(said.contains("the wait failed"), "{said}");
+    assert!(said.ends_with(&eperm().to_string()), "{said}");
 }
 
 /// What the child wrote while issuing its request is kept: it is the start of the diagnostic.
