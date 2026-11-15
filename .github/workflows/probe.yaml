@@ -1,0 +1,49 @@
+name: Probe
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  noteexit:
+    name: noteexit ${{ matrix.name }} (macos)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: single-es
+            args: single 150000 300 -80 200 1
+          - name: single-noes
+            args: single 150000 300 -80 200 0
+          - name: single-fine
+            args: single 200000 300 -20 100 1
+          - name: witness
+            args: witness 30000 1000 150
+          - name: zombie-es
+            args: zombie 2000 1
+          - name: zombie-noes
+            args: zombie 2000 0
+          - name: launchd-es
+            args: launchd 2500 12000 1
+          - name: launchd-noes
+            args: launchd 2500 12000 0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Platform
+        run: |
+          sw_vers
+          uname -a
+          echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+          sysctl hw.model hw.ncpu
+
+      - name: Build
+        run: cc -O1 -Wall -o noteexit .github/probe/noteexit.c
+
+      - name: Probe
+        run: sudo ./noteexit ${{ matrix.args }}
