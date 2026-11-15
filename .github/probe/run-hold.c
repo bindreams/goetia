@@ -533,7 +533,7 @@ static void pass(int i) {
 
     int at_xpcproxy = post.path_ok && !strcmp(post.base, "xpcproxy");
     struct ev e;
-    int got = next_ev(&e, at_xpcproxy ? 5000 : (O_held ? 1000 : 300));
+    int got = next_ev(&e, at_xpcproxy ? 5000 : (O_held ? 250 : 150));
     int exec = got && (e.fflags & NOTE_EXEC);
     tally("registered; right after: path %s, sys %s, bsd %s; event %s", post.base, sname(post.sys_stat), sname(post.bsd_stat),
           got ? evname(e.fflags) : "none");

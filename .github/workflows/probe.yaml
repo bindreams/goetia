@@ -8,9 +8,25 @@ permissions:
 
 jobs:
   run-hold:
-    name: Probe run-hold (macos)
+    name: Probe ${{ matrix.args }} (macos)
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        args:
+          - held wrap early b2b 300
+          - held wrap late b2b 300
+          - held plain early b2b 300
+          - held plain late b2b 300
+          - held wrap early spaced 200
+          - held plain late spaced 200
+          - held wrap late b2b 100 1
+          - unheld wrap early b2b 300
+          - unheld wrap late b2b 300
+          - unheld plain early b2b 300
+          - unheld plain late b2b 300
+          - race 3000 30000 1
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -26,53 +42,8 @@ jobs:
       - name: Build
         run: cc -O1 -Wall -o run-hold .github/probe/run-hold.c
 
-      - name: M1 held, wrap, early, back-to-back
-        if: always()
-        run: sudo ./run-hold held wrap early b2b 500
-
-      - name: M1 held, wrap, late, back-to-back
-        if: always()
-        run: sudo ./run-hold held wrap late b2b 500
-
-      - name: M1 held, plain, early, back-to-back
-        if: always()
-        run: sudo ./run-hold held plain early b2b 500
-
-      - name: M1 held, plain, late, back-to-back
-        if: always()
-        run: sudo ./run-hold held plain late b2b 500
-
-      - name: M1 held, wrap, early, spaced
-        if: always()
-        run: sudo ./run-hold held wrap early spaced 300
-
-      - name: M1 held, plain, late, spaced
-        if: always()
-        run: sudo ./run-hold held plain late spaced 300
-
-      - name: M1 held, wrap, late, back-to-back, goetia's throttle of 1
-        if: always()
-        run: sudo ./run-hold held wrap late b2b 100 1
-
-      - name: M2 unheld, wrap, early
-        if: always()
-        run: sudo ./run-hold unheld wrap early b2b 400
-
-      - name: M2 unheld, wrap, late
-        if: always()
-        run: sudo ./run-hold unheld wrap late b2b 400
-
-      - name: M2 unheld, plain, early
-        if: always()
-        run: sudo ./run-hold unheld plain early b2b 400
-
-      - name: M2 unheld, plain, late
-        if: always()
-        run: sudo ./run-hold unheld plain late b2b 400
-
-      - name: M4 race, with prints
-        if: always()
-        run: sudo ./run-hold race 3000 30000 1
+      - name: Probe
+        run: sudo ./run-hold ${{ matrix.args }}
 
       - name: Clean up
         if: always()
