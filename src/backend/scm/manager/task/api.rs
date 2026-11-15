@@ -1,6 +1,6 @@
 //! The one boundary to Task Scheduler. [`TaskApi`] is the whole of what goetia asks of it, in plain
 //! strings and numbers: `Com` answers from the real service, and the test `Fake` from a table. An
-//! error is [`Error::os`]-shaped with the HRESULT kept in its source, or [`Error::NotInstalled`] where
+//! error is `Error::os`-shaped with the HRESULT kept in its source, or `Error::NotInstalled` where
 //! the query completed and found no such task.
 //!
 //! Every method takes its own COM apartment for its duration, so a verb on the caller's thread and the

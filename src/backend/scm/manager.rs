@@ -98,7 +98,7 @@ pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
 // The verbs that call the boundary land with the next tasks of slice 5; until then only the tests and
 // the `testing` exports reach it.
-#[expect(dead_code, reason = "the task verbs, its callers, come next")]
+#[allow(dead_code, reason = "the task verbs, its callers, come next")]
 pub(crate) mod task;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use identity::sid_for_account_name;
@@ -157,7 +157,7 @@ pub struct Scm {
     shim: Option<Box<dyn ShimProvider>>,
     folders: FolderCheck,
     /// Task Scheduler: the real one, unless an in-crate test put a [`TaskApi`] in its place.
-    #[expect(dead_code, reason = "the task verbs, its readers, come next")]
+    #[allow(dead_code, reason = "the task verbs, its readers, come next")]
     tasks: Box<dyn TaskApi>,
 }
 
@@ -187,7 +187,7 @@ impl Scm {
 
     /// This manager over `tasks` in place of the real Task Scheduler, for in-crate tests, as
     /// [`with_shim`](Self::with_shim) puts a provider in place of the stock host.
-    #[expect(dead_code, reason = "the tests of the task verbs, its callers, come next")]
+    #[allow(dead_code, reason = "the tests of the task verbs, its callers, come next")]
     pub(crate) fn with_tasks(self, tasks: Box<dyn TaskApi>) -> Self {
         Self { tasks, ..self }
     }

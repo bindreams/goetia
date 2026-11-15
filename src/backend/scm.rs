@@ -4,8 +4,7 @@ pub mod exit_status;
 pub mod generate;
 // Pure, so it builds and is tested on every host; only the Windows backend uses it, and its task verbs
 // come next.
-#[cfg_attr(windows, expect(dead_code, reason = "the task verbs, its callers, come next"))]
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code, reason = "off Windows nothing calls it; on it, the task verbs come next")]
 pub(crate) mod instance;
 pub(crate) mod kill;
 #[cfg(windows)]
