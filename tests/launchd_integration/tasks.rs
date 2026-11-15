@@ -1166,3 +1166,17 @@ fn enable_and_disable_finish_after_a_crash_on_a_real_launchd(#[fixture(launchd_g
     let status = task_status(&mgr, &task_id);
     assert!(status.common.enabled, "{status:?}");
 }
+
+// PROBE (temporary): the flags `launchctl debug` has.
+#[skuld::test]
+fn probe_debug_help(#[fixture(launchd_group)] _group: &Group) {
+    let mut report = String::new();
+    for args in [&["help", "debug"][..], &["help"][..], &["debug"][..], &["debug", "system/none"][..]] {
+        report.push_str(&format!("{}\n", cmd::run("launchctl", args)));
+    }
+    report.push_str(&format!(
+        "{}\n",
+        cmd::run("sh", &["-c", "man launchctl | col -b | grep -n -i -B3 -A40 'debug '"])
+    ));
+    panic!("PROBE RESULT\n{report}");
+}
