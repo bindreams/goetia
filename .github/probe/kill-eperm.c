@@ -72,7 +72,7 @@ static void pass(int mode, struct tally *t) {
             _exit(0);
         }
         if (mode == 1) execl("/usr/bin/true", "true", (char *)0);
-        if (mode == 2) {
+        if (mode >= 2) {
             int dn = open("/dev/null", O_WRONLY);
             dup2(dn, 1);
             dup2(dn, 2);
@@ -89,6 +89,7 @@ static void pass(int mode, struct tally *t) {
     }
     uint64_t unique = u.p_uniqueid;
     uint32_t ver = (uint32_t)u.p_idversion;
+    if (mode == 3) usleep(rand() % 60000);
     int saw_eperm = 0, saw_kill_eperm = 0;
     char run[256];
     size_t rl = 0;
@@ -97,7 +98,9 @@ static void pass(int mode, struct tally *t) {
     run[0] = 0;
     for (;;) {
         audit_token_t tok = make_token(p, ver);
-        int e = proc_signal_with_audittoken(&tok, 0);
+        /* Signal 0 is EINVAL to the token call: SIGCONT stands in for it (harmless to a running
+         * child). Mode 3 sends SIGKILL, the signal cosca sends, after a random delay. */
+        int e = proc_signal_with_audittoken(&tok, mode == 3 ? SIGKILL : SIGCONT);
         int k = kill(p, 0) == 0 ? 0 : errno;
         bump(t->token, e);
         bump(t->killz, k);
@@ -156,7 +159,7 @@ static void report(int mode, struct tally *t) {
 int main(int argc, char **argv) {
     printf("uid=%d\n", (int)getuid());
     srand((unsigned)time(0));
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode < 4; mode++) {
         long n = argc > mode + 1 ? atol(argv[mode + 1]) : 1000;
         struct tally *t = calloc(1, sizeof *t);
         for (long i = 0; i < n; i++) pass(mode, t);
