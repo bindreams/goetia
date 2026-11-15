@@ -172,6 +172,20 @@ with `H` counts as restricted. A schedule that starts with `*` must be quoted in
 YAML: `schedule: "*/15 * * * *"`. A task without a `schedule` is started only by
 hand. No backend installs a task yet: each refuses one.
 
+A schedule is read in the machine's local time zone, and each backend does its
+own thing where daylight saving time changes the clock. A time that does not
+exist (the clocks jump forward) and a time that happens twice (they go back):
+
+- **systemd** skips the missing time, and runs the repeated one once.
+- **launchd** runs a schedule that names its hour once, at the end of the gap;
+  an hourly or every-minute schedule skips the missing hour. A repeated time
+  runs twice, at both passes, for a daily, hourly, every-minute or day-of-week
+  schedule, and once, at the first, for a schedule with a day of the month (and
+  a month).
+
+`next-run` in `goetia daemon status` follows the backend: on launchd, which
+reports none, goetia computes it by these rules from the entries it gave launchd.
+
 `-f` takes a manifest file, or a directory holding `goetia.yaml`. Several
 daemons are several manifests, each installed with its own
 `goetia daemon install -f <file>`; manifests in one directory share its
