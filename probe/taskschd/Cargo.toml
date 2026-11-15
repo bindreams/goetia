@@ -1,0 +1,31 @@
+[package]
+name = "tsprobe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its own workspace: never part of goetia's.
+[workspace]
+
+[dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_EventLog",
+    "Win32_System_JobObjects",
+    "Win32_System_Ole",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+] }
+
+[profile.release]
+opt-level = 2
