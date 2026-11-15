@@ -1,0 +1,25 @@
+name: Probe
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  probe-c:
+    name: Probe C (macos)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build
+        run: cc -O1 -Wall -o kill-eperm .github/probe/kill-eperm.c
+
+      - name: Probe C, root
+        run: sudo ./kill-eperm 20000 20000 3000
+
+      - name: Probe C, unprivileged
+        run: ./kill-eperm 20000 20000 3000
