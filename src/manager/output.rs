@@ -348,8 +348,8 @@ impl Marked {
             note(
                 out,
                 &format!(
-                    "note: the marker line of this run is not in {}, so its output is not shown: the file was \
-                     emptied or replaced after the run began\n",
+                    "note: the marker line of this run is not in {}, so its output is not shown: the run ended \
+                     before it wrote its marker, or the file was emptied or replaced after the run began\n",
                     path.display()
                 ),
             )?;

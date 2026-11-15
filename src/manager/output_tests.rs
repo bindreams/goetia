@@ -297,8 +297,8 @@ fn marked(path: PathBuf, offset: u64, inv: &str) -> OutputSource {
 /// The note of a run whose marker is not in its file.
 fn no_marker_note(path: &Path) -> String {
     format!(
-        "note: the marker line of this run is not in {}, so its output is not shown: the file was \
-         emptied or replaced after the run began\n",
+        "note: the marker line of this run is not in {}, so its output is not shown: the run ended before it \
+         wrote its marker, or the file was emptied or replaced after the run began\n",
         path.display()
     )
 }
