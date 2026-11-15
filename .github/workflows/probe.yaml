@@ -1,0 +1,89 @@
+name: Probe
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  run-hold:
+    name: Probe run-hold (macos)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Platform
+        run: |
+          sw_vers
+          uname -a
+          echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+          csrutil status || true
+          id
+
+      - name: Build
+        run: cc -O1 -Wall -o run-hold .github/probe/run-hold.c
+
+      - name: M4 replies
+        if: always()
+        run: sudo ./run-hold reply 60
+
+      - name: M1 held, wrap, early, back-to-back
+        if: always()
+        run: sudo ./run-hold held wrap early b2b 500
+
+      - name: M1 held, wrap, late, back-to-back
+        if: always()
+        run: sudo ./run-hold held wrap late b2b 500
+
+      - name: M1 held, plain, early, back-to-back
+        if: always()
+        run: sudo ./run-hold held plain early b2b 500
+
+      - name: M1 held, plain, late, back-to-back
+        if: always()
+        run: sudo ./run-hold held plain late b2b 500
+
+      - name: M1 held, wrap, early, spaced
+        if: always()
+        run: sudo ./run-hold held wrap early spaced 300
+
+      - name: M1 held, plain, late, spaced
+        if: always()
+        run: sudo ./run-hold held plain late spaced 300
+
+      - name: M1 held, wrap, late, back-to-back, goetia's throttle of 1
+        if: always()
+        run: sudo ./run-hold held wrap late b2b 100 1
+
+      - name: M2 unheld, wrap, early
+        if: always()
+        run: sudo ./run-hold unheld wrap early b2b 400
+
+      - name: M2 unheld, wrap, late
+        if: always()
+        run: sudo ./run-hold unheld wrap late b2b 400
+
+      - name: M2 unheld, plain, early
+        if: always()
+        run: sudo ./run-hold unheld plain early b2b 400
+
+      - name: M2 unheld, plain, late
+        if: always()
+        run: sudo ./run-hold unheld plain late b2b 400
+
+      - name: M4 race, no prints
+        if: always()
+        run: sudo ./run-hold race 1500 30000 0
+
+      - name: M4 race, with prints
+        if: always()
+        run: sudo ./run-hold race 800 30000 1
+
+      - name: Clean up
+        if: always()
+        run: |
+          sudo launchctl bootout system/goetia.probe.runhold || true
+          sudo rm -f /Library/LaunchDaemons/goetia.probe.runhold.plist /tmp/goetia-probe-runhold.log
