@@ -173,8 +173,12 @@ fn names_lists_only_the_goetia_folder(#[fixture(scm_group)] _group: &Group) {
     assert_eq!(Com.names().unwrap(), vec!["goetia-com-names".to_owned()]);
 }
 
+// M10: Task Scheduler leaves a folder when its last task goes; `delete` asks to remove the folder after
+// every delete, and the folder refuses (`ERROR_DIR_NOT_EMPTY`) while a task is in it.
 #[skuld::test]
-fn deleting_the_last_task_removes_the_folder(#[fixture(scm_group)] _group: &Group) {
+fn a_delete_leaves_the_folder_while_a_task_is_in_it_and_removes_it_after_the_last(
+    #[fixture(scm_group)] _group: &Group,
+) {
     let _lock = InstallLock::acquire().unwrap();
     let (_first_guard, first) = TaskGuard::new("goetia-com-last-1");
     let (_second_guard, second) = TaskGuard::new("goetia-com-last-2");
@@ -188,6 +192,17 @@ fn deleting_the_last_task_removes_the_folder(#[fixture(scm_group)] _group: &Grou
 
     assert!(!folder_exists(TASK_FOLDER));
     assert_eq!(Com.names().unwrap(), Vec::<String>::new());
+}
+
+#[skuld::test]
+fn a_delete_of_a_missing_task_removes_the_empty_folder_it_leaves_behind(#[fixture(scm_group)] _group: &Group) {
+    let _lock = InstallLock::acquire().unwrap();
+    let (_guard, path) = TaskGuard::new("goetia-com-leftover");
+    Session::open().unwrap().ensure_folder(TASK_FOLDER).unwrap();
+
+    assert!(!Com.delete(&path).unwrap());
+
+    assert!(!folder_exists(TASK_FOLDER));
 }
 
 #[skuld::test]

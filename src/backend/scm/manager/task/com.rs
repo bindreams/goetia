@@ -120,26 +120,12 @@ impl Session {
         f(&task).map(Some).map_err(failed)
     }
 
-    /// Removes `parent` if nothing is in it. A folder somebody put a task in meanwhile, or already
-    /// removed, is not this call's to settle.
-    fn remove_folder_if_empty(&self, parent: &str) -> Result<()> {
+    /// Asks to remove the folder `parent`. Task Scheduler refuses a folder that holds a task or a
+    /// folder, which is then not this call's to settle, and one that is already gone is done.
+    fn remove_folder(&self, parent: &str) -> Result<()> {
         let failed = |e| Error::os(format!("remove the folder `{parent}`"), e);
-        let folder = match self.folder(parent) {
-            Ok(folder) => folder,
-            Err(e) if not_found(&e) => return Ok(()),
-            Err(e) => return Err(failed(e)),
-        };
-        // SAFETY: calls on live interfaces.
-        let used = unsafe {
-            let tasks = folder.GetTasks(TASK_ENUM_HIDDEN.0).and_then(|tasks| tasks.Count());
-            let folders = folder.GetFolders(0).and_then(|folders| folders.Count());
-            tasks.and_then(|tasks| folders.map(|folders| tasks + folders))
-        }
-        .map_err(failed)?;
-        if used != 0 {
-            return Ok(());
-        }
-        // M10: deleting a folder that is gone or that has filled up is the other writer's doing.
+        // M10: a folder that holds a task is refused with `ERROR_DIR_NOT_EMPTY`; one that is not there
+        // reads "not found".
         // SAFETY: a call on a live interface with a live BSTR.
         match self
             .folder(r"\")
@@ -302,7 +288,7 @@ impl Com {
             Err(e) if not_found(&e) => false,
             Err(e) => return Err(failed(e)),
         };
-        session.remove_folder_if_empty(parent)?;
+        session.remove_folder(parent)?;
         Ok(existed)
     }
 
