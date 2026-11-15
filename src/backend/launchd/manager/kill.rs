@@ -1,7 +1,7 @@
 //! `kill` of a job's process: the target the state machine in `backend::kill` drives, for a service
 //! and a task alike. The pid is read from `launchctl print`, the process is held and signalled through
 //! an audit token (`backend::kill::process`; macOS 14.4 and later), and the wait for launchd's record
-//! is the existing wait on `print` until the job no longer shows the killed pid.
+//! is the existing wait on `print` until the job no longer shows the killed process.
 //!
 //! The confirmation after the hold is `print` again, as `stop` has it, and not `procinfo`
 //! ([`Launchctl::names_launch`](super::Launchctl)): the question the machine asks is whether the
