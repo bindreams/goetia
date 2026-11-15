@@ -29,6 +29,16 @@ fn rejects_a_number_with_no_unit() {
 }
 
 #[skuld::test]
+fn a_refused_duration_is_quoted_with_the_parser_reason() {
+    let message = parse_timeout("1").unwrap_err();
+
+    assert_eq!(
+        message,
+        "`1` is not a duration (e.g. `30s`, `2m30s`): time unit needed, for example 1sec or 1ms"
+    );
+}
+
+#[skuld::test]
 fn budget_defaults_to_ten_seconds_when_no_flag_is_given() {
     assert_eq!(args(None, false).budget(), Budget::Bounded(Duration::from_secs(10)));
     assert_eq!(args(None, false).budget(), Budget::DEFAULT);

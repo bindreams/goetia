@@ -26,6 +26,21 @@ fn sh(script: &str) -> cosca::Command {
     command("/bin/sh", &["-c", script]).unwrap()
 }
 
+/// A refused spawn prints its cause, whichever side of the exec it fell on.
+#[skuld::test]
+fn a_spawn_error_prints_the_cause_of_the_refusal() {
+    let refusal = || cosca::error::Error::Io(within("make the pipe", io::Error::other("the cause")));
+
+    assert_eq!(
+        SpawnError::NotRun(refusal()).to_string(),
+        "an I/O operation failed: make the pipe: the cause"
+    );
+    assert_eq!(
+        SpawnError::MayHaveRun(refusal()).to_string(),
+        "an I/O operation failed: make the pipe: the cause"
+    );
+}
+
 // wait_bounded, through `command` =====================================================================================
 
 #[skuld::test]
@@ -514,6 +529,25 @@ fn a_kill_refused_with_eperm_is_returned_at_once_off_macos() {
     assert!(
         matches!(&error, cosca::error::Error::Io(e) if e.raw_os_error() == Some(libc::EPERM)),
         "{error:?}"
+    );
+}
+
+/// The warning prints the cause of the refusal, not only the refusal's own text. A refusal other than
+/// `EPERM` is returned at once on every platform.
+#[skuld::test]
+fn the_warning_for_a_left_request_that_cannot_be_ended_prints_the_cause() {
+    let child = spawned(command("sleep", &["2147483647"]).unwrap(), Role::Query);
+    let _refused = test_hook::kill_fails(|_| {
+        cosca::error::Error::Io(within("send the kill", io::Error::other("the signal was refused")))
+    });
+
+    let warning = end_left(&child.child, Duration::from_millis(50)).expect("the child could not be ended");
+
+    assert!(
+        warning.ends_with(
+            "could not kill a request left running: an I/O operation failed: send the kill: the signal was refused"
+        ),
+        "{warning}"
     );
 }
 

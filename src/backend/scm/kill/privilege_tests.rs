@@ -15,6 +15,7 @@ use windows_sys::Win32::Security::{
 
 use super::{DebugPrivilege, enable_in, restore_notice};
 use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
+use crate::error::within;
 use crate::testing::groups::debug_privilege;
 
 /// The calling thread's own token, if it has one, opened to be queried.
@@ -178,4 +179,17 @@ fn the_restore_notice_names_the_call_and_the_error() {
     assert!(notice.starts_with("warning: "), "{notice}");
     assert!(notice.contains("SetThreadToken"), "{notice}");
     assert!(notice.contains("the token handle is invalid"), "{notice}");
+}
+
+#[skuld::test]
+fn the_restore_notice_prints_the_cause_of_the_error() {
+    let notice = restore_notice(&within(
+        "the token was refused",
+        io::Error::other("the handle is invalid"),
+    ));
+
+    assert!(
+        notice.ends_with("the token was refused: the handle is invalid"),
+        "{notice}"
+    );
 }

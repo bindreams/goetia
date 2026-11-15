@@ -81,10 +81,10 @@ impl ReadFailure {
     #[cfg(test)]
     pub(super) fn detail(&self) -> String {
         format!(
-            "failed to {op} {path}: {source}",
+            "failed to {op} {path}: {}",
+            crate::error::Chain(&self.source),
             op = self.op,
-            path = self.path.display(),
-            source = self.source
+            path = self.path.display()
         )
     }
 

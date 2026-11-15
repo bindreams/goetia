@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::os::fake::{Fake, kill_refused, tree_kill_refused};
 use super::stop_bus::Supervisor;
+use crate::error::Chain;
 
 /// What a spawn of a bare binary name not found on `PATH` fails with: `Io(NotFound)` and no OS
 /// error code (`os_tests` pins it against `Real`, with the absolute-path case, which carries
@@ -39,7 +40,7 @@ pub(crate) fn assert_failures(lines: &[String], id: &str, expected: &[String]) {
 pub(crate) fn tree_refused_failure() -> String {
     format!(
         "terminating the daemon's process tree failed: {}; falling back to killing the direct child only (its own descendants, if any, cannot be reached without a containment mechanism)",
-        cosca::error::Report::new(&tree_kill_refused())
+        Chain(&tree_kill_refused())
     )
 }
 
@@ -47,6 +48,6 @@ pub(crate) fn tree_refused_failure() -> String {
 pub(crate) fn fallback_refused_failure() -> String {
     format!(
         "fallback kill: {}; the daemon was neither killed nor reaped and may still be running — SCM is told the service stopped with Win32 exit code 0, so that it does not start a second copy beside it, and with service-specific exit code 1003 as the record of this failure",
-        cosca::error::Report::new(&kill_refused())
+        Chain(&kill_refused())
     )
 }
