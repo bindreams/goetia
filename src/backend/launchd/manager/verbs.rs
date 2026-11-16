@@ -14,7 +14,7 @@ use super::task::TaskPrint;
 use super::watch::{Added, Watch};
 use super::{Launchd, Plist, SignalOutcome, UNLOAD_POLL, Until, never_expires};
 use crate::backend::bounded::{Reservation, Role};
-use crate::backend::kill::{KillOutcome, KillTarget as _, kill_failed, kill_service};
+use crate::backend::kill::{KillOutcome, KillTarget as _, Waited, kill_failed, kill_service};
 use crate::backend::launchd::state::Evidence;
 use crate::error::{Error, Result};
 use crate::manager::budget::{self, Deadline};
@@ -285,9 +285,10 @@ impl Launchd {
             return Ok(Pass::Again);
         }
         target.terminate(&held).map_err(|e| kill_failed(name, e))?;
-        match registered.wait(Some(deadline))? {
-            Some(_) => Ok(Pass::Again),
-            None => Err(budget::timed_out(name, "stopped", budget)),
+        // The wait for the exit is on the hold too: the watch is spent by the wait that ran out.
+        match target.await_exit(&held, deadline).map_err(|e| kill_failed(name, e))? {
+            Waited::Confirmed => Ok(Pass::Again),
+            Waited::Expired => Err(budget::timed_out(name, "stopped", budget)),
         }
     }
 }
