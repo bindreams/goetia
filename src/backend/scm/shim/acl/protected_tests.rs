@@ -138,4 +138,10 @@ mod windows {
             ])
         );
     }
+
+    // What the runs descriptor grants is read back from a real directory by `runs_tests`.
+    #[skuld::test]
+    fn the_runs_descriptor_refuses_bytes_that_are_not_a_sid() {
+        assert!(Descriptor::for_runs(&vec![1, 2, 3]).is_err());
+    }
 }

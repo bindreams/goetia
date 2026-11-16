@@ -153,3 +153,18 @@ fn setting_the_daemon_log_again_to_the_same_path_is_accepted() {
 
     assert_eq!(fake.take_channel_calls(), vec![appended(&daemon, true), reported()]);
 }
+
+#[skuld::test]
+fn program_data_is_the_known_folder_and_logging_uses_it() {
+    let program_data = crate::backend::scm::folder::program_data().unwrap();
+
+    assert_eq!(
+        program_data.to_str().map(str::to_lowercase),
+        std::env::var("ProgramData").ok().map(|dir| dir.to_lowercase()),
+        "the known folder is where the environment says it is, unless a process redirects the variable"
+    );
+    assert_eq!(
+        Log::real().default_log_path("svc"),
+        program_data.join("Goetia").join("logs").join("svc.log")
+    );
+}

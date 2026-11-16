@@ -47,18 +47,15 @@ pub(in crate::backend::scm) use stock::folder_in;
 
 #[cfg(windows)]
 mod stock {
-    use std::ffi::OsString;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read, Write as _};
-    use std::os::windows::ffi::OsStringExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
     use sha2::{Digest as _, Sha256};
     use tempfile::Builder;
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles;
 
     use super::super::acl::{
         Descriptor, FolderCheck, ObjectSecurity, is_as_wanted, is_unreadable, read_object, require_acls_under,
@@ -66,7 +63,7 @@ mod stock {
     use super::super::marker::read_retrying;
     use super::super::provider::{ShimProvider, require_absolute};
     use super::super::sweep::{SweepFailure, sweep_folder};
-    use crate::backend::scm::wide::units_until_nul;
+    use crate::backend::scm::folder::known_folder;
     use crate::error::{Error, Result};
     use crate::shim::HostCommand;
 
@@ -239,33 +236,7 @@ mod stock {
 
     /// `%ProgramFiles%\Goetia`.
     pub(super) fn default_dir() -> Result<PathBuf> {
-        let mut path: *mut u16 = std::ptr::null_mut();
-        // SAFETY: the folder ID is a static; `KF_FLAG_DEFAULT` and no token ask for the machine's
-        // folder; `path` is a valid out-pointer.
-        let hresult = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut path) };
-        let found = if hresult >= 0 {
-            // SAFETY: on success `path` is a NUL-terminated string that is live until freed below.
-            Ok(PathBuf::from(OsString::from_wide(unsafe { units_until_nul(path) })))
-        } else {
-            Err(locate_error(hresult))
-        };
-        // SAFETY: `path` is null or what `SHGetKnownFolderPath` allocated, which the caller frees
-        // with `CoTaskMemFree` whether or not the call succeeded.
-        unsafe { CoTaskMemFree(path.cast()) };
-        found.map(|program_files| program_files.join(DEFAULT_FOLDER))
-    }
-
-    /// The error for `SHGetKnownFolderPath` failing with `hresult`. A Win32 error wrapped as an
-    /// `HRESULT` is read as that error.
-    pub(super) fn locate_error(hresult: i32) -> Error {
-        const FACILITY_WIN32: u32 = 0x8007_0000;
-        let code = hresult as u32;
-        let source = if code & 0xFFFF_0000 == FACILITY_WIN32 {
-            io::Error::from_raw_os_error((code & 0xFFFF) as i32)
-        } else {
-            io::Error::other(format!("HRESULT {code:#010x}"))
-        };
-        Error::os("locate %ProgramFiles%", source)
+        known_folder(&FOLDERID_ProgramFiles, "%ProgramFiles%").map(|program_files| program_files.join(DEFAULT_FOLDER))
     }
 
     /// The folder a stock shim goes in: `dir`, or the default one. A relative one is

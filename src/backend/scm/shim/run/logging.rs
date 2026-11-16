@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use super::os::{Channels, Real, Severity};
+use crate::backend::scm::folder::program_data;
 
 /// The shim's failure log: composes the two channels for one service run. One shim serves one
 /// service, so one daemon log path.
@@ -34,9 +35,13 @@ impl Log {
         }
     }
 
-    /// The production log: the real channels, defaulting to `%ProgramData%\Goetia\logs\`.
+    /// The production log: the real channels, defaulting to `%ProgramData%\Goetia\logs\`
+    /// ([`program_data`]). A machine that cannot name its `%ProgramData%` leaves the file channels
+    /// with `C:\ProgramData`, which fails to open where it is not there, and the Event Log still
+    /// gets every line.
     pub(crate) fn real() -> Log {
-        Log::new(Arc::new(Real), programdata_dir().join("Goetia").join("logs"))
+        let program_data = program_data().unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"));
+        Log::new(Arc::new(Real), program_data.join("Goetia").join("logs"))
     }
 
     /// `<default dir>\<id>.log` — derivable from `id` alone. This is where a failure goes before
@@ -86,12 +91,6 @@ impl Log {
             .any(|path| self.channels.append(path, &line).is_ok());
         self.channels.event_log(severity, &line);
     }
-}
-
-fn programdata_dir() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
 }
 
 fn failure_line(id: &str, message: &str) -> String {

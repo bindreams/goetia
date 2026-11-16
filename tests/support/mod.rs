@@ -97,8 +97,7 @@ pub fn program_data() -> PathBuf {
 }
 
 /// Where the shim of service `id` writes a failure it reports before it has read the daemon's
-/// config: `<program_data>\Goetia\logs\<id>.log`. `program_data` is the real `%ProgramData%`
-/// ([`program_data`]), or the one a test gave the service through its `Environment` value.
+/// config: `<program_data>\Goetia\logs\<id>.log`, with the machine's `%ProgramData%` ([`program_data`]).
 #[cfg(windows)]
 pub fn shim_default_log(program_data: &std::path::Path, id: &str) -> PathBuf {
     program_data.join("Goetia").join("logs").join(format!("{id}.log"))

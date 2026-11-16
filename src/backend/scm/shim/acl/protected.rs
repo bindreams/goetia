@@ -37,18 +37,20 @@ mod system {
     use std::os::windows::io::FromRawHandle as _;
     use std::path::{Path, PathBuf};
 
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        ACL, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PSID, SECURITY_ATTRIBUTES,
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
     };
 
     use super::super::{ObjectSecurity, system::describe};
+    use crate::backend::scm::sid::{Sid, try_sid_display};
     use crate::backend::scm::wide::wide_null;
     use crate::error::{Error, Result};
 
@@ -83,6 +85,22 @@ mod system {
         /// The permissions of the install lock.
         pub(crate) fn for_lock() -> Result<Self> {
             Self::from_sddl(LOCK)
+        }
+
+        /// The permissions of a task's run-record directory: SYSTEM and Administrators have full
+        /// control and `principal`, the account the task runs as, may modify (`0x1301bf`: read,
+        /// write, run and delete, but not change permissions or take ownership); all inherited by
+        /// what is made in it. A SID that is not whole is an error.
+        pub(crate) fn for_runs(principal: &Sid) -> Result<Self> {
+            let principal = try_sid_display(principal).ok_or_else(|| {
+                Error::os(
+                    "build the permissions of a run-record directory",
+                    io::Error::other("the account is not a whole SID"),
+                )
+            })?;
+            Self::from_sddl(&format!(
+                "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{principal})"
+            ))
         }
 
         /// A descriptor written as SDDL.
@@ -161,6 +179,34 @@ mod system {
             // for the call.
             if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
                 return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        /// Makes this descriptor's DACL, protected, the DACL of the existing folder or file `path`,
+        /// and of what inherits from it. The owner is left as it is.
+        pub(crate) fn set_dacl(&self, path: &Path) -> io::Result<()> {
+            let wide = wide_null(path)?;
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let (mut present, mut defaulted) = (0, 0);
+            // SAFETY: `self.raw` is live until `drop`; the out-pointers are valid lvalues.
+            if unsafe { GetSecurityDescriptorDacl(self.raw, &mut present, &mut dacl, &mut defaulted) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `wide` is NUL-terminated; `dacl` points into `self.raw`, which is live for the call.
+            let status = unsafe {
+                SetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null(),
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(status as i32));
             }
             Ok(())
         }

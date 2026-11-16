@@ -1,6 +1,6 @@
 use super::*;
 use crate::backend::scm::sid::{sid_from_parts, system};
-use crate::elevation::test_support::open_process_token;
+use crate::elevation::test_support::process_user_sid;
 
 #[skuld::test]
 fn root_resolves_to_an_empty_unused_identity() {
@@ -265,32 +265,6 @@ fn the_account_this_test_runs_as_is_accepted_if_it_is_a_user_and_refused_if_it_i
         let err = result.expect_err("not a user account");
         assert!(err.to_string().contains("is not a user account"), "{err}");
     }
-}
-
-/// The user SID of this process's token.
-fn process_user_sid() -> Vec<u8> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-
-    let token = open_process_token(TOKEN_QUERY).expect("the process token");
-    // 8-byte alignment for `TOKEN_USER`, which the buffer holds.
-    let mut buf = vec![0u64; 64];
-    let mut needed = 0;
-    // SAFETY: `token` is live with `TOKEN_QUERY`; `buf` is the size passed.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            buf.as_mut_ptr().cast(),
-            (buf.len() * 8) as u32,
-            &mut needed,
-        )
-    };
-    assert_ne!(ok, 0, "GetTokenInformation: {}", std::io::Error::last_os_error());
-    // SAFETY: the call filled the buffer with a `TOKEN_USER`, whose `Sid` points into it.
-    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    // SAFETY: a valid SID in `buf`, which is live.
-    unsafe { crate::backend::scm::sid::copy_sid(sid) }.expect("the token user is a SID")
 }
 
 #[skuld::test]

@@ -213,21 +213,6 @@ mod windows {
     }
 
     #[skuld::test]
-    fn locate_error_names_program_files() {
-        // The facility of a Win32 error, and `E_FAIL`.
-        for hresult in [0x8007_0057_u32 as i32, 0x8000_4005_u32 as i32] {
-            match locate_error(hresult) {
-                Error::Os { what, path, source } => {
-                    assert_eq!(what, "locate %ProgramFiles%");
-                    assert_eq!(path, None);
-                    assert!(!source.to_string().is_empty());
-                }
-                other => panic!("expected an OS error, got {other:?}"),
-            }
-        }
-    }
-
-    #[skuld::test]
     fn the_default_folder_is_goetia_under_program_files() {
         let dir = default_dir().unwrap();
 
