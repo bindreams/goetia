@@ -1,0 +1,4 @@
+[
+  {"name": "n-user", "cmd": "n.ps1 -Kind user"},
+  {"name": "n-system", "cmd": "n.ps1 -Kind system"}
+]
