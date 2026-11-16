@@ -38,7 +38,9 @@ pub(crate) fn file_time_of(time: SystemTime) -> Option<FILETIME> {
     })
 }
 
-/// The instant the machine's civil time `local` is, or `None` for a time the OS cannot place.
+/// The instant the machine's civil time `local` is, or `None` for a time the OS cannot place. Only
+/// `run_times`, which production never asks, reads it: `ole_date` reads a zone it is given.
+#[cfg(any(test, feature = "testing"))]
 pub(super) fn local_to_system(local: &SYSTEMTIME) -> Option<SystemTime> {
     local_to_system_in(None, local)
 }
