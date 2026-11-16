@@ -6,7 +6,7 @@
 pub(crate) mod api;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) mod cleanup;
-mod clock;
+pub(crate) mod clock;
 mod com;
 #[cfg(test)]
 pub(crate) mod fake;

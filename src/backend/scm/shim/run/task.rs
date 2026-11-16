@@ -16,10 +16,10 @@ use std::ffi::OsString;
 use std::io::{self, Write as _};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
 
-use windows_sys::Win32::Foundation::{ERROR_INVALID_DATA, FALSE, FILETIME, TRUE};
+use windows_sys::Win32::Foundation::{ERROR_INVALID_DATA, FALSE, TRUE};
 use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, SetConsoleCtrlHandler};
-use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows_sys::core::BOOL;
 
 use super::exit;
@@ -30,6 +30,7 @@ use super::stop_bus::{StopBus, Supervisor};
 use crate::backend::scm::exit_status::Reported;
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::{InstanceId, TaskPath};
+use crate::backend::scm::manager::task::clock::file_time_of;
 use crate::backend::scm::manager::task::{Com, TaskApi};
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
 use crate::backend::scm::task_xml::{TASK_MODE_ARG, extract_from_data};
@@ -184,15 +185,15 @@ fn own_instance(id: &str, api: &dyn TaskApi, path: &TaskPath, own_pid: u32, log:
 // The run -------------------------------------------------------------------------------------------------------------
 
 /// Writes the run's marker as a line of its own into the log, before the program is spawned: the
-/// program's output is appended after it. A failure is logged and the program runs, as it does when
-/// its log cannot be opened.
+/// program's output is appended after it. A failed write is logged and the program runs. A log that
+/// cannot be opened is not said here: the program's own open of the same file, which follows, reports
+/// it, so one fault is one line.
 fn write_marker(supervisor: &Supervisor, id: &str, logs: &Path, instance: &InstanceId) {
     let line = format!("{}\n", instance.marker());
-    let written = supervisor
-        .os
-        .open_log(logs)
-        .and_then(|mut file| file.write_all(line.as_bytes()));
-    if let Err(e) = written {
+    let Ok(mut file) = supervisor.os.open_log(logs) else {
+        return;
+    };
+    if let Err(e) = file.write_all(line.as_bytes()) {
         supervisor.log.failure(
             id,
             &format!(
@@ -223,15 +224,12 @@ fn ended_as(outcome: PassOutcome) -> (Option<RunOutcome>, u32) {
     }
 }
 
-/// Now, as a `FILETIME`: what a record's `started` holds.
+/// Now, as a `FILETIME`: what a record's `started` holds, which only orders runs, so a clock that
+/// cannot be read as one is 0.
 fn file_time_now() -> u64 {
-    let mut now = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    // SAFETY: `now` is a live `FILETIME` the call fills.
-    unsafe { GetSystemTimeAsFileTime(&mut now) };
-    u64::from(now.dwHighDateTime) << 32 | u64::from(now.dwLowDateTime)
+    file_time_of(SystemTime::now()).map_or(0, |time| {
+        u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime)
+    })
 }
 
 // The close event -----------------------------------------------------------------------------------------------------

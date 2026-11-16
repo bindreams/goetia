@@ -41,8 +41,8 @@ pub(super) const TABLE_NAME: &str = "goetia-shim";
 /// Called from `main()`. Hands control to SCM, and never returns normally. [`finish`] records what
 /// every path that reports `STOPPED` reported, and the dispatcher returns once SCM has processed it,
 /// so this ends the process with the record (see [`exit`]); the paths that cannot report one end it
-/// themselves, with a code from `crate::backend::scm::exit_status`. Reads no process arguments: the
-/// service name comes from SCM.
+/// themselves, with a code from `crate::backend::scm::exit_status`. Reads no process arguments itself
+/// (`super::run` did, to choose this mode): the service name comes from SCM.
 pub(crate) fn run() -> ! {
     if let Err(e) = service_dispatcher::start(TABLE_NAME, ffi_service_main) {
         Log::real().failure(TABLE_NAME, &dispatcher_failure(e));

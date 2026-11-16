@@ -544,6 +544,36 @@ fn a_run_with_no_instance_writes_no_marker() {
     run.finish();
 }
 
+/// The marker's open and the program's own open are of one file: when it cannot be opened that is
+/// one fault, said once (by the program's open, which names that its output is not captured).
+#[skuld::test]
+fn a_log_that_cannot_be_opened_is_reported_once() {
+    let run = Run::of(&spec_logging_to(Some(LOGS))).listed().program(exits(0));
+    run.fake.will_fail_open_log(Path::new(LOGS));
+    run.fake.will_fail_open_log(Path::new(LOGS));
+
+    assert_eq!(run.run(), 0);
+
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with(&format!("goetia-shim[{ID}]: open log file {LOGS}: ")),
+        "{failures:?}"
+    );
+}
+
+/// A record says when the run began, as a `FILETIME` of the machine's clock.
+#[skuld::test]
+fn a_record_carries_the_time_the_run_began() {
+    let run = Run::of(&spec_logging_to(None)).listed().program(exits(0));
+
+    assert_eq!(run.run(), 0);
+
+    // 2020-01-01 as a `FILETIME`: any clock that is right is past it.
+    assert!(run.record().unwrap().started > 132_223_104_000_000_000);
+    run.finish();
+}
+
 // What cannot be recorded =============================================================================================
 
 #[skuld::test]

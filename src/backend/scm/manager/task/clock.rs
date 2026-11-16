@@ -27,7 +27,7 @@ fn instant_of(file_time: FILETIME) -> Option<SystemTime> {
 }
 
 /// The `FILETIME` of `time`, or `None` before 1601 or past what one holds.
-fn file_time_of(time: SystemTime) -> Option<FILETIME> {
+pub(crate) fn file_time_of(time: SystemTime) -> Option<FILETIME> {
     let ticks = match time.duration_since(UNIX_EPOCH) {
         Ok(after) => UNIX_EPOCH_TICKS.checked_add(u64::try_from(after.as_nanos() / 100).ok()?)?,
         Err(before) => UNIX_EPOCH_TICKS.checked_sub(u64::try_from(before.duration().as_nanos() / 100).ok()?)?,
