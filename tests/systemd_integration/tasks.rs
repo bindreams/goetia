@@ -173,15 +173,15 @@ fn stdout_end(id: &str) -> Option<String> {
         .map(|entry| field(entry, "__CURSOR").expect("an entry has a cursor").to_string())
 }
 
-/// The stdout lines of the run `id`'s unit wrote after `after` ([`stdout_end`] from before the run),
-/// as the journal stores them and as `run` reads them: the entries of the stream the newest of them
-/// is in (a run has one `_STREAM_ID`, and a run is over when `run` has returned), through the one
-/// query `run` reads its output by, the unit's stdout entries (`_SYSTEMD_UNIT=` and
-/// `_TRANSPORT=stdout`). Journald can store a line twice across a file rotation, in a copy indexed
-/// under some fields and not others (systemd/systemd#29016; knowledge base: "journald can store a
-/// stdout line twice across a journal file rotation", d95f1aa), so a read by another field, such as
-/// `_STREAM_ID=`, can show once what `run` shows twice. This, and not `seq`'s text, is what `run` is
-/// compared with. Without the stream's first line, the `goetia-run` marker the unit's wrapper prints,
+/// The stdout lines of the run `id`'s unit started after `after` ([`stdout_end`] from before the run),
+/// as the journal stores them and as `run` reads them: the entries of the stream whose first line
+/// after `after` is a `goetia-run` marker, through the one query `run` reads its output by, the
+/// unit's stdout entries (`_SYSTEMD_UNIT=` and `_TRANSPORT=stdout`). A late line of an earlier run
+/// that lands after `after` is of another stream and is not taken. Journald can store a line twice
+/// across a file rotation, in a copy indexed under some fields and not others (systemd/systemd#29016;
+/// knowledge base: "journald can store a stdout line twice across a journal file rotation", d95f1aa),
+/// so a read by another field, such as `_STREAM_ID=`, can show once what `run` shows twice. This, and
+/// not `seq`'s text, is what `run` is compared with. Without the stream's first line, the marker,
 /// which `run` does not show.
 ///
 /// Covers newline-terminated text lines only: an entry with no `MESSAGE` or with a `_LINE_BREAK`
@@ -192,29 +192,27 @@ fn newest_stream_text(id: &str, after: Option<&str>) -> Vec<u8> {
     let mut query = vec![unit.as_str(), "_TRANSPORT=stdout"];
     query.extend(from.as_deref());
     let entries = journal(&query);
-    let stream =
-        field(entries.last().expect("a run wrote a stdout line"), "_STREAM_ID").expect("a stdout entry has a stream");
-    let mut own = entries
+    let marker = entries
         .iter()
-        .filter(|entry| field(entry, "_STREAM_ID") == Some(stream));
-    let marker = field(own.next().expect("the stream has entries"), "MESSAGE").expect("the marker is text");
-    assert!(
-        marker.starts_with("goetia-run "),
-        "the stream starts with the marker: {marker}"
-    );
-    own.flat_map(|entry| {
-        assert!(
-            entry.get("_LINE_BREAK").is_none(),
-            "a line this helper does not cover: {entry}"
-        );
-        format!(
-            "{}
-",
-            field(entry, "MESSAGE").expect("a line of the run is text")
-        )
-        .into_bytes()
-    })
-    .collect()
+        .position(|entry| field(entry, "MESSAGE").is_some_and(|text| text.starts_with("goetia-run ")))
+        .expect("the run's marker is in the journal");
+    let stream = field(&entries[marker], "_STREAM_ID").expect("a stdout entry has a stream");
+    entries[marker + 1..]
+        .iter()
+        .filter(|entry| field(entry, "_STREAM_ID") == Some(stream))
+        .flat_map(|entry| {
+            assert!(
+                entry.get("_LINE_BREAK").is_none(),
+                "a line this helper does not cover: {entry}"
+            );
+            let mut line = field(entry, "MESSAGE")
+                .expect("a line of the run is text")
+                .as_bytes()
+                .to_vec();
+            line.push(b'\n');
+            line
+        })
+        .collect()
 }
 
 /// Panics unless `got` holds every line of `want`, in order. Lines of its own besides are fine: the
