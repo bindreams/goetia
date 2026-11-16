@@ -656,9 +656,12 @@ fn make_refuses_what_appeared_at_the_final_name_after_the_walk_and_leaves_it_as_
             "a stranger's directory" => "owned by uid 4242",
             "a file" => "a file",
             "a symlink to a directory" => "a symlink",
-            _ => "directory",
+            _ => "uses it",
         };
-        assert!(why.contains(says) && why.contains("cannot use") == (kind != "a root-owned directory"), "{kind}: {err:?}");
+        assert!(
+            why.contains(says) && why.contains("cannot use") == (kind != "a root-owned directory"),
+            "{kind}: {err:?}"
+        );
         drop(dirs);
         assert_eq!(leftovers(&layout.system()), Vec::<String>::new(), "{kind}");
         assert_eq!(fs::read_dir(layout.outside()).unwrap().count(), 0, "{kind}");
@@ -682,9 +685,7 @@ fn make_refuses_what_appeared_at_the_final_name_after_the_walk_and_leaves_it_as_
 /// still lets an install that worked before work.
 #[cfg(target_os = "linux")]
 #[skuld::test(labels = [ELEVATED])]
-fn create_uses_an_existing_directory_below_a_group_writable_one_that_cannot_be_read(
-    #[fixture(root_dirs)] _root: &(),
-) {
+fn create_uses_an_existing_directory_below_a_group_writable_one_that_cannot_be_read(#[fixture(root_dirs)] _root: &()) {
     let layout = Layout::new();
     fs::set_permissions(layout.base(), fs::Permissions::from_mode(0o711)).unwrap();
     let shared = layout.outside().join("shared");

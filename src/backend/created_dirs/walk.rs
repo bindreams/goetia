@@ -69,23 +69,24 @@ pub(super) struct Step {
     pub(super) stat: FileStat,
     /// For a symlink, the directory that holds it, as the walk read it. `None` for a directory.
     pub(super) holder: Option<FileStat>,
-    /// Whether a directory has an access ACL, so that the group bits of its mode are the ACL's mask and
-    /// say what the accounts it names can do, not what its group can. Only read where the group-write
-    /// bit is set, the one case in which it changes what the log check judges, and only on Linux.
+    /// For a directory, the descriptor the walk read it through, so that what is read of it later is
+    /// the directory that was judged, not a name looked up again. `None` for a symlink. Only the Linux
+    /// log check reads it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(super) acl: bool,
+    pub(super) dir: Option<OwnedFd>,
 }
 
 impl Step {
     /// A directory the walk entered, which `fd` holds.
     fn directory(at: PathBuf, fd: BorrowedFd<'_>, stat: FileStat) -> Result<Self> {
-        let acl = stat.st_mode as libc::mode_t & libc::S_IWGRP != 0
-            && has_access_acl(fd).map_err(|e| Error::os_at("read the ACL of", &at, e))?;
+        let dir = fd
+            .try_clone_to_owned()
+            .map_err(|e| Error::os_at("duplicate a handle to", &at, e))?;
         Ok(Self {
             at,
             stat,
             holder: None,
-            acl,
+            dir: Some(dir),
         })
     }
 
@@ -95,7 +96,7 @@ impl Step {
             at,
             stat,
             holder: Some(holder),
-            acl: false,
+            dir: None,
         }
     }
 
@@ -113,33 +114,6 @@ impl Step {
         let owner_replaces = mode & libc::S_ISVTX != 0 && mode & (libc::S_IWGRP | libc::S_IWOTH) != 0;
         (owner_replaces && self.stat.st_uid != 0).then_some(self.stat.st_uid)
     }
-}
-
-/// Whether the directory `dir` has an access ACL: an extended attribute that exists only where the ACL
-/// has an entry beyond the mode's own. `fgetxattr` refuses an `O_PATH` descriptor, so the directory is
-/// opened again through it, which is the same directory, not a name looked up again.
-#[cfg(target_os = "linux")]
-fn has_access_acl(dir: BorrowedFd<'_>) -> io::Result<bool> {
-    let again = openat(
-        dir,
-        ".",
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    // An empty buffer asks only whether the attribute is there, and how large it is.
-    let mut size_only = [0u8; 0];
-    match rustix::fs::fgetxattr(&again, "system.posix_acl_access", &mut size_only) {
-        Ok(_) => Ok(true),
-        // No ACL, or a file system that has none.
-        Err(rustix::io::Errno::NODATA | rustix::io::Errno::OPNOTSUPP) => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Only the Linux log check reads it.
-#[cfg(not(target_os = "linux"))]
-fn has_access_acl(_dir: BorrowedFd<'_>) -> io::Result<bool> {
-    Ok(false)
 }
 
 /// How a directory is opened to be searched. On Linux an `O_PATH` descriptor needs no read

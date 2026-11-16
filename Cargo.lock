@@ -406,7 +406,6 @@ dependencies = [
  "memchr",
  "nix",
  "rand",
- "rustix",
  "serde",
  "serde_json",
  "sha2",

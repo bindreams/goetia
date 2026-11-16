@@ -124,8 +124,6 @@ libc = "0.2"
 # same version the launchd backend already takes. `dir` and `user` are for `backend::created_dirs`, which
 # reads a directory it made through its descriptor and names the account that can write a log directory.
 nix = { version = "0.31", features = ["fs", "dir", "user"] }
-# `xattr`, for `backend::created_dirs`: whether a directory carries a POSIX ACL (`nix` has no extended attributes).
-rustix = { version = "1", default-features = false, features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Unconditional (not behind the `cli` feature): the launchd backend itself

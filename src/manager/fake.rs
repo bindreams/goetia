@@ -805,9 +805,8 @@ impl Fake {
 pub struct FakeScope(Arc<Mutex<Store>>);
 
 impl crate::backend::Settle for FakeScope {
-    fn settle(&mut self, standing: impl FnOnce() -> Standing) {
-        // Asked outside the lock: the answer takes it.
-        drop(standing());
+    /// Nothing was made, so the standing is not asked (see [`Settle`](crate::backend::Settle)).
+    fn settle(&mut self, _standing: impl FnOnce() -> Standing) {
         self.0.lock().expect("Fake mutex poisoned").settles += 1;
     }
 }

@@ -202,7 +202,11 @@ fn an_install_settles_after_every_write_and_a_scope_that_made_nothing_is_never_a
     fake.seed_write_races("frpc", 2);
     fake.install(&mk("frpc"), false).unwrap();
     assert_eq!(fake.settles(), 3);
-    assert_eq!(fake.standings(), 0, "a scope that made nothing has nothing to keep or take back");
+    assert_eq!(
+        fake.standings(),
+        0,
+        "a scope that made nothing has nothing to keep or take back"
+    );
 }
 
 /// What the interloper wrote is read afresh and decided on, whichever of `decide`'s rows it hits.

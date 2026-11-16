@@ -514,21 +514,44 @@ impl CreatedDirs {
 
     /// Why `name` in `dir` is taken: by a directory this install made (the spec names one directory
     /// twice, under two spellings, on a file system that ignores case), or by something that appeared
-    /// while the install ran.
+    /// while the install ran, which is left as it is and is said for what it is: only a root-owned
+    /// directory is one that running the install again uses.
     fn taken_why(&self, dir: &OwnedFd, name: &OsStr) -> String {
-        let same = fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok_and(|taken| {
-            self.made
-                .iter()
-                .filter_map(|made| made.held.as_ref())
-                .any(|held| (held.dev, held.ino) == (taken.st_dev, taken.st_ino))
-        });
-        if same {
-            "two paths in the spec name the same directory, under two spellings (a file system that ignores \
-             case): use one spelling"
-        } else {
-            "it appeared while the install ran, and is left as it is; running the install again uses it"
+        const APPEARED: &str = "it appeared while the install ran, and is left as it is";
+        let Ok(taken) = fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+            // It is gone again, or cannot be read: what it was is not known.
+            return format!("{APPEARED}; run the install again to read it again");
+        };
+        let ours = self
+            .made
+            .iter()
+            .filter_map(|made| made.held.as_ref())
+            .any(|held| (held.dev, held.ino) == (taken.st_dev, taken.st_ino));
+        if ours {
+            return "two paths in the spec name the same directory, under two spellings (a file system that \
+             ignores case): use one spelling"
+                .to_string();
         }
-        .to_string()
+        match SFlag::from_bits_truncate(taken.st_mode) & SFlag::S_IFMT {
+            SFlag::S_IFDIR if taken.st_uid == 0 => format!("{APPEARED}; running the install again uses it"),
+            SFlag::S_IFDIR => format!(
+                "{APPEARED}; it is a directory owned by uid {}, not root, and root does not create inside what \
+                 an account owns, so the install cannot use it: remove it, then run the install again",
+                taken.st_uid
+            ),
+            SFlag::S_IFLNK => format!(
+                "{APPEARED}; it is a symlink, which the install cannot use in place of the directory it made: \
+                 remove it, then run the install again"
+            ),
+            SFlag::S_IFREG => format!(
+                "{APPEARED}; it is a file, which the install cannot use as a directory: remove it, then run the \
+                 install again"
+            ),
+            _ => format!(
+                "{APPEARED}; it is not a directory, so the install cannot use it: remove it, then run the \
+                 install again"
+            ),
+        }
     }
 
     /// Judge the directory just made, and open it up to `0755`.
