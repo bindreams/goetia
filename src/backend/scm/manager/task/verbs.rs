@@ -24,7 +24,7 @@ use super::live::{Liveness, probe};
 use super::read::live_runs;
 use super::{TaskApi, TaskPath};
 use crate::backend::kill::{
-    Hold, HoldError, KillOutcome, KillTarget, Waited, hold_once, kill_failed, kill_service, wait_saying, waiting_notice,
+    Hold, HoldError, KillTarget, Waited, hold_once, kill_failed, kill_service, wait_saying, waiting_notice,
 };
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::instance::InstanceId;
@@ -88,6 +88,21 @@ struct RunTarget<'a, P: Processes> {
     path: &'a TaskPath,
     instance: InstanceId,
     processes: &'a mut P,
+    /// The run's process, when a caller opened it beforehand ([`hold_all`]): the machine takes it in
+    /// place of an open, and confirms it as it confirms any.
+    held: Option<P::Held>,
+}
+
+impl<'a, P: Processes> RunTarget<'a, P> {
+    fn new(tasks: &'a dyn TaskApi, path: &'a TaskPath, instance: InstanceId, processes: &'a mut P) -> Self {
+        Self {
+            tasks,
+            path,
+            instance,
+            processes,
+            held: None,
+        }
+    }
 }
 
 impl<P: Processes> KillTarget for RunTarget<'_, P> {
@@ -106,7 +121,10 @@ impl<P: Processes> KillTarget for RunTarget<'_, P> {
     }
 
     fn open(&mut self, pid: u32) -> io::Result<Option<P::Held>> {
-        self.processes.open(pid)
+        match self.held.take() {
+            Some(held) => Ok(Some(held)),
+            None => self.processes.open(pid),
+        }
     }
 
     fn terminate(&mut self, process: &P::Held) -> io::Result<()> {
@@ -141,12 +159,7 @@ pub(super) fn hold_run<P: Processes>(
     processes: &mut P,
 ) -> Result<Option<P::Held>> {
     let pid = instance.pid;
-    let mut target = RunTarget {
-        tasks,
-        path,
-        instance: instance.id,
-        processes,
-    };
+    let mut target = RunTarget::new(tasks, path, instance.id, processes);
     match hold_once(&mut target, Budget::Unbounded.start()) {
         Ok(Hold::Held { process, .. }) => Ok(Some(process)),
         Ok(Hold::NoProcess | Hold::Ended { .. }) => Ok(None),
@@ -183,6 +196,40 @@ fn send_stop(tasks: &dyn TaskApi, path: &TaskPath, instance: &Instance) -> Resul
         Err(e) if is_not_running(&e) || gone(&e) => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Sends the `Stop` of every run in `instances`, whatever one of them came to: the failures are
+/// reported together, after every run has been asked.
+fn send_stops<'a>(
+    tasks: &dyn TaskApi,
+    path: &TaskPath,
+    instances: impl IntoIterator<Item = &'a Instance>,
+) -> Result<()> {
+    let failures: Vec<Error> = instances
+        .into_iter()
+        .filter_map(|instance| send_stop(tasks, path, instance).err())
+        .collect();
+    Error::both_all(failures).map_or(Ok(()), Err)
+}
+
+/// The process of every run in `live`, held, each confirmed by a second read of the listing. A run
+/// with no process any more (see [`hold_run`]) is left out. Held before anything is done to any of them,
+/// so a run whose process cannot be opened fails the call with nothing sent.
+fn hold_all<P: Processes>(
+    tasks: &dyn TaskApi,
+    operation: &str,
+    id: &Id,
+    path: &TaskPath,
+    live: Vec<Instance>,
+    processes: &mut P,
+) -> Result<Vec<(Instance, P::Held)>> {
+    let mut held = Vec::new();
+    for instance in live {
+        if let Some(process) = hold_run(tasks, operation, id, path, &instance, processes)? {
+            held.push((instance, process));
+        }
+    }
+    Ok(held)
 }
 
 /// Waits for `process`, the held process of `instance`, to exit. Under no bound it says why it blocks
@@ -235,28 +282,14 @@ pub(super) fn stop_runs<P: Processes>(
         Err(e) => return Err(e),
     };
     if !budget.waits() {
-        for instance in &live {
-            send_stop(tasks, &path, instance)?;
-        }
+        send_stops(tasks, &path, &live)?;
         return Ok(Vec::new());
     }
 
-    let mut held = Vec::new();
-    for instance in live {
-        if let Some(process) = hold_run(tasks, operation, id, &path, &instance, processes)? {
-            held.push((instance, process));
-        }
-    }
-    for (instance, _) in &held {
-        send_stop(tasks, &path, instance)?;
-    }
+    let held = hold_all(tasks, operation, id, &path, live, processes)?;
+    send_stops(tasks, &path, held.iter().map(|(instance, _)| instance))?;
     for (instance, process) in &held {
-        let mut target = RunTarget {
-            tasks,
-            path: &path,
-            instance: instance.id,
-            processes: &mut *processes,
-        };
+        let mut target = RunTarget::new(tasks, &path, instance.id, &mut *processes);
         await_run(&mut target, id, instance.pid, process, budget, deadline)?;
     }
     Ok(held.into_iter().map(|(instance, _)| instance.id).collect())
@@ -311,9 +344,11 @@ impl Scm {
         self.task_kill_with(id, &mut System)
     }
 
-    /// Ends every run of the task that is alive through its held process ([`kill_service`] over each),
-    /// whatever the others came to: a run that cannot be ended is an error beside the ones that were.
-    /// None alive is [`Error::NotRunning`].
+    /// Ends every run of the task that is alive through its held process ([`kill_service`] over each).
+    /// Every process is held before the first is terminated, so a run whose process cannot be opened
+    /// fails the call with nothing killed; once they are, a run that cannot be ended is an error beside
+    /// the ones that were. None alive is [`Error::NotRunning`]; a run with no process any more has
+    /// ended.
     pub(super) fn task_kill_with<P: Processes>(&self, id: &Id, processes: &mut P) -> Result<()> {
         let path = TaskPath::of(id);
         let live = match live_runs(&*self.tasks, "kill", id, &path, |pid| processes.alive(pid)) {
@@ -321,27 +356,20 @@ impl Scm {
             Err(e) if gone(&e) => Vec::new(),
             Err(e) => return Err(e),
         };
-        let mut ended = false;
+        if live.is_empty() {
+            return Err(Error::NotRunning { id: id.to_string() });
+        }
+        let held = hold_all(&*self.tasks, "kill", id, &path, live, processes)?;
         let mut failures = Vec::new();
-        for instance in live {
-            let mut target = RunTarget {
-                tasks: &*self.tasks,
-                path: &path,
-                instance: instance.id,
-                processes: &mut *processes,
-            };
-            match kill_service(&mut target, id.as_str()).map_err(|e| kill_failed(id.as_str(), e)) {
-                Ok(KillOutcome::Ended) => ended = true,
-                // The listing dropped it since it was read: it is over.
-                Ok(KillOutcome::NotRunning) => {}
-                Err(e) => failures.push(e),
+        for (instance, process) in held {
+            let mut target = RunTarget::new(&*self.tasks, &path, instance.id, &mut *processes);
+            target.held = Some(process);
+            // `NotRunning` is a run the listing dropped since: it is over.
+            if let Err(e) = kill_service(&mut target, id.as_str()).map_err(|e| kill_failed(id.as_str(), e)) {
+                failures.push(e);
             }
         }
-        match Error::both_all(failures) {
-            Some(failed) => Err(failed),
-            None if ended => Ok(()),
-            None => Err(Error::NotRunning { id: id.to_string() }),
-        }
+        Error::both_all(failures).map_or(Ok(()), Err)
     }
 }
 

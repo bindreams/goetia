@@ -6,11 +6,17 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
-use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm};
+use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, snapshot_of};
 use super::*;
+use crate::backend::Backend;
+use crate::backend::scm::manager::WindowsSnapshot;
 use crate::backend::scm::manager::task::api::Started;
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::runs::RunOutcome;
+use crate::backend::scm::test_support::task_spec;
+
+/// A pid no process has: Windows pids are far below it.
+const NO_SUCH_PID: u32 = 0xFFFF_FFFC;
 
 fn instances_call() -> Call {
     Call::Instances(PATH.to_owned())
@@ -228,19 +234,18 @@ fn stop_and_kill_end_every_live_instance() {
     );
     fake.finish();
 
-    // And a kill: both are terminated, each through its own held process.
+    // And a kill: both are held first, then each is terminated through its own held process.
     let fake = Fake::new();
-    fake.on_instances(two())
-        .on_instances(two())
-        .on_instances(two())
-        .on_instances(two())
-        .on_instances(two());
+    for _ in 0..9 {
+        fake.on_instances(two());
+    }
     let mut machine = Machine::new(&fake, &[100, 200]);
     scm(&fake).task_kill_with(&id(), &mut machine).unwrap();
-    assert_eq!(machine.held, [100, 200]);
+    assert_eq!(machine.held, [100, 200], "each is opened once");
     assert_eq!(
-        machine.terminated.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
-        [100, 200]
+        machine.terminated,
+        [(100, 7), (200, 9)],
+        "after the live read, both holds (a read and its confirmation each), and the first's own confirmation"
     );
     assert_eq!(
         machine.waited.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
@@ -268,6 +273,33 @@ fn an_instance_that_cannot_be_opened_fails_the_stop_before_any_stop_is_sent() {
     assert!(failed.report().to_string().contains("denied access"), "{failed}");
     assert!(!fake.calls().iter().any(|call| matches!(call, Call::Stop(..))));
     assert!(machine.waited.is_empty());
+}
+
+/// A `Stop` that fails for one run does not keep the others from being sent theirs: every run is asked,
+/// and the failure is reported.
+#[skuld::test]
+fn a_failed_stop_of_one_run_does_not_keep_the_others_from_being_stopped() {
+    for budget in [Budget::Immediate, Budget::Unbounded] {
+        let (_dir, _path, runs) = records();
+        let fake = Fake::new();
+        for _ in 0..5 {
+            fake.on_instances(two());
+        }
+        fake.on_stop(Err(Error::os("stop an instance", io::Error::other("denied"))))
+            .on_stop(Ok(()));
+        let mut machine = Machine::new(&fake, &[100, 200]);
+
+        let failed = stopped(&fake, &mut machine, &runs, budget).unwrap_err();
+
+        assert!(failed.report().to_string().contains("denied"), "{budget:?}: {failed}");
+        let stops: Vec<Call> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, Call::Stop(..)))
+            .collect();
+        assert_eq!(stops, [stop_call(1), stop_call(2)], "{budget:?}");
+        assert!(machine.waited.is_empty(), "{budget:?}: a failed stop is not waited for");
+    }
 }
 
 // No listing wait -----------------------------------------------------------------------------------------------------
@@ -320,22 +352,44 @@ fn kill_terminates_through_the_held_handle_after_the_second_read_confirms_it() {
     let fake = Fake::new();
     fake.on_instances(one(4242))
         .on_instances(one(4242))
+        .on_instances(one(4242))
+        .on_instances(one(4242))
         .on_instances(one(4242));
     let mut machine = Machine::new(&fake, &[4242]);
 
     scm(&fake).task_kill_with(&id(), &mut machine).unwrap();
 
-    assert_eq!(machine.held, [4242]);
+    assert_eq!(machine.held, [4242], "the process is opened once, by the hold");
     assert_eq!(
         machine.terminated,
-        [(4242, 3)],
-        "after the live read, the hold's read and its second read"
+        [(4242, 5)],
+        "after the live read, the hold's read and its second read, and the kill's own confirmation"
     );
-    assert_eq!(machine.waited, [(4242, 3)]);
+    assert_eq!(machine.waited, [(4242, 5)]);
     assert!(
         !fake.calls().iter().any(|call| matches!(call, Call::Stop(..))),
         "no Stop is sent"
     );
+    fake.finish();
+}
+
+/// Every process is held before the first is terminated: a refusal on the second run leaves the first
+/// alive, with the kill failed and nothing sent.
+#[skuld::test]
+fn a_refusal_on_the_second_run_leaves_the_first_unkilled() {
+    let fake = Fake::new();
+    // The probe, the first run's hold and its second read, the second run's hold, and the read that
+    // tells a refusal from a stale pid.
+    for _ in 0..5 {
+        fake.on_instances(two());
+    }
+    let mut machine = Machine::new(&fake, &[100, 200]);
+    machine.denied = vec![200];
+
+    let failed = scm(&fake).task_kill_with(&id(), &mut machine).unwrap_err();
+
+    assert!(failed.report().to_string().contains("denied access"), "{failed}");
+    assert!(machine.terminated.is_empty(), "nothing is terminated");
     fake.finish();
 }
 
@@ -401,20 +455,26 @@ fn a_start_that_started_nothing_is_still_a_start_that_was_accepted() {
 /// is gone: the stop finds nothing to wait for, and the start is made all the same.
 #[skuld::test]
 fn restart_stops_then_starts_and_starts_when_an_ended_instance_is_still_listed() {
-    let (_dir, _path, runs) = records();
     let fake = Fake::new();
-    fake.on_instances(one(4242)).on_run(Ok(Started {
+    // The entry is listed and its process is not there: no process has this pid.
+    fake.on_instances(one(NO_SUCH_PID)).on_run(Ok(Started {
         id: instance_id(2),
         pid: Some(5252),
     }));
-    let mut machine = Machine::new(&fake, &[]);
     let manager = scm(&fake);
+    let task = || WindowsSnapshot::Task(snapshot_of(&task_spec(None), false));
 
-    manager
-        .task_stop_with("stop", &id(), Budget::Unbounded, &runs, &mut machine)
-        .unwrap();
-    manager.task_start(&id()).unwrap();
+    // The arms a restart goes through: a stop that does not wait, then `request_start_after_stop`.
+    Backend::stop(&manager, task(), Budget::Immediate, &mut ()).unwrap();
+    Backend::request_start_after_stop(&manager, task(), &mut ()).unwrap();
 
     assert_eq!(fake.calls(), [instances_call(), Call::Run(PATH.to_owned())]);
     fake.finish();
+}
+
+/// Task Scheduler has no restart of its own, so a task has no native one: `restart` is the stop and the
+/// start above.
+#[skuld::test]
+fn a_task_has_no_native_restart() {
+    assert!(Backend::request_restart(&Scm::new()).is_none());
 }

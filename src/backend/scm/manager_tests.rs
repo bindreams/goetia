@@ -1585,3 +1585,25 @@ fn apply_refuses_an_account_that_is_no_user_before_the_password(#[fixture(env)] 
         assert!(matches!(err, Error::AccountLookup { .. }), "`{name}`: {err:?}");
     }
 }
+
+/// `run` refuses a service before it asks for a run, so a service that reaches `begin_run` is a
+/// mistake of the caller: it is not a task.
+#[skuld::test]
+fn begin_run_of_a_service_is_not_a_task() {
+    let snapshot = ScmSnapshot::new(
+        Id::try_from("frpc").unwrap(),
+        Ok(blob_of(crate::spec::Protocol::Native)),
+        (Parameters::default(), None),
+    );
+
+    match crate::backend::Backend::begin_run(
+        &Scm::new(),
+        WindowsSnapshot::Service(snapshot),
+        &mut (),
+        &mut Vec::new(),
+    ) {
+        Err(Error::NotATask { id }) => assert_eq!(id, "frpc"),
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("a service began a run"),
+    }
+}

@@ -223,6 +223,31 @@ fn runs_until_ended(listener: &ConnectBack) -> Vec<String> {
     ]
 }
 
+/// What ends a run for a test that fails while a `run` thread waits for it. A `thread::scope` joins its
+/// threads when the body panics, and the `run` thread waits on a live shim, so without this a failing
+/// assertion in the scope is a hang that leaves the task and its program running. Made right after the
+/// thread is spawned; dropped, it removes the task, which stops its run and waits for the shim to exit,
+/// so the thread returns. [`Self::defuse`] once the test has ended the run itself.
+struct EndsTheRunOnPanic<'a>(Option<&'a Id>);
+
+impl<'a> EndsTheRunOnPanic<'a> {
+    fn new(id: &'a Id) -> Self {
+        Self(Some(id))
+    }
+
+    fn defuse(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for EndsTheRunOnPanic<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.0 {
+            remove_task(id);
+        }
+    }
+}
+
 /// A `run` of `id` on its own thread, started before the program is released: its result once it ends.
 fn run_of(mgr: &Scm, id: &Id) -> Result<Exit, Error> {
     mgr.run(id, &mut Vec::new())
@@ -287,9 +312,11 @@ fn stop_ends_a_run_and_run_reports_the_stopped_code(#[fixture(scm_group)] _group
 
     std::thread::scope(|scope| {
         let run = scope.spawn(|| run_of(&mgr, id));
+        let ends_the_run = EndsTheRunOnPanic::new(id);
         listener.accept("the task's program to start");
 
         mgr.stop(id, Budget::DEFAULT).expect("stop");
+        ends_the_run.defuse();
 
         let exit = run.join().expect("the run thread").expect("run");
         assert_eq!(exit, Exit::Code(0xC000_013A_u32 as i32), "a stopped run's code");
@@ -310,9 +337,11 @@ fn kill_ends_a_run_and_run_reports_unrecorded(#[fixture(scm_group)] _group: &Gro
 
     std::thread::scope(|scope| {
         let run = scope.spawn(|| run_of(&mgr, id));
+        let ends_the_run = EndsTheRunOnPanic::new(id);
         listener.accept("the task's program to start");
 
         mgr.kill(id).expect("kill");
+        ends_the_run.defuse();
 
         let failed = run
             .join()
