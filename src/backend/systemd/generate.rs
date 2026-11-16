@@ -110,10 +110,7 @@ fn with_goetia_section(mut body: String, spec: &DaemonSpec) -> String {
 /// A service's unit, up to the `[X-Goetia]` section.
 fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
     refuse_unrepresentable(&service.common, id)?;
-    service
-        .stop_action
-        .send_signal
-        .refuse(BackendKind::Systemd, &service.common.id)?;
+    service.stop_action.refuse(BackendKind::Systemd, &service.common.id)?;
     let mut out = String::new();
 
     out.push_str("[Unit]\n");
@@ -158,9 +155,7 @@ fn service_unit(service: &ServiceSpec, id: &Identity) -> Result<String, Error> {
 /// look like a guarantee.
 fn task_unit(task: &TaskSpec, id: &Identity) -> Result<String, Error> {
     refuse_unrepresentable(&task.common, id)?;
-    task.stop_action
-        .send_signal
-        .refuse(BackendKind::Systemd, &task.common.id)?;
+    task.stop_action.refuse(BackendKind::Systemd, &task.common.id)?;
     refuse_env_sh_resets(&task.common, &RESET_BY_SH, "a task")?;
     let mut out = String::new();
 

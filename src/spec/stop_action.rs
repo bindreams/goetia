@@ -80,6 +80,23 @@ impl StopAction {
     }
 }
 
+impl StopAction {
+    /// What `backend`'s generator refuses of this stop action, as the error of `id`: a signal the
+    /// backend cannot send ([`StopSignal::refuse`]) and, on launchd, a wait it cannot give
+    /// ([`launchd_timeout_defect`]). A spec from a blob arrives at a generator without `resolve`.
+    /// Windows is judged by its own generator, which also needs what the manifest wrote.
+    pub(crate) fn refuse(&self, backend: BackendKind, id: &Id) -> Result<(), Error> {
+        self.send_signal.refuse(backend, id)?;
+        match backend {
+            BackendKind::Launchd => match launchd_timeout_defect(self.send_signal, self.timeout) {
+                Some(message) => Err(invalid(id, &message)),
+                None => Ok(()),
+            },
+            BackendKind::Systemd | BackendKind::Scm => Ok(()),
+        }
+    }
+}
+
 impl Default for StopAction {
     fn default() -> Self {
         StopAction {
@@ -287,6 +304,27 @@ fn rt_offset(rest: &str, sign: char, max: u8) -> Option<u8> {
 }
 
 // Judging a daemon ====================================================================================================
+
+/// The longest wait launchd honours: macOS 26.4 and later cut any `ExitTimeOut` to this (measured;
+/// Apple does not document it).
+pub(crate) const LAUNCHD_MAX_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Why launchd cannot wait `timeout` for a daemon that is asked to stop with `signal`, or `None`: a
+/// wait over [`LAUNCHD_MAX_TIMEOUT`], and no timeout (a wait with no limit) for any signal but `kill`,
+/// which waits for nothing. Refused rather than cut, on every macOS.
+pub(crate) fn launchd_timeout_defect(signal: StopSignal, timeout: Option<Duration>) -> Option<String> {
+    let cap = "launchd cuts any wait to 60 s (macOS 26.4 and later, measured)";
+    match timeout {
+        Some(timeout) if timeout > LAUNCHD_MAX_TIMEOUT => Some(format!(
+            "`stop-action.timeout` {timeout:?} is refused on launchd: {cap}; write 60s or less"
+        )),
+        None if signal != StopSignal::Kill => Some(format!(
+            "`stop-action.timeout: null` is refused on launchd: {cap}, so it has no wait without a limit; \
+             write 60s or less"
+        )),
+        _ => None,
+    }
+}
 
 /// Why Windows cannot honour a `stop-action` the manifest wrote, or `None`. A task is stopped by
 /// Task Scheduler, and a `protocol: native` service by SCM's own stop: in neither does goetia send a

@@ -382,27 +382,19 @@ pub(crate) fn id_of_timer_stem(stem: &str) -> Option<&str> {
 
 const TIMER_SUFFIX: &str = "@timer";
 
-/// The `ExitTimeOut` that stands for no timeout: launchd's largest integer of 32 bits, which it
-/// honours and, since macOS 26.4, cuts to its own cap of 60 s. A larger one (int64 and uint32 max
-/// measured) is read as unset, which waits 5 s: see the KB note "macOS launchd - ExitTimeOut
-/// 9223372036854775807 and 4294967295 are read as unset, 2147483647 is honoured and cut to 60".
-///
-/// The owner's choice of value for `timeout: null` is pending; this is the one constant to change.
-pub(crate) const NO_EXIT_TIMEOUT: u64 = 2_147_483_647;
-
 /// The `ExitTimeOut` of `kill`: launchd sends SIGTERM, and SIGKILL one second later. Not `0`, which
 /// `launchd.plist(5)` documents as no limit: it ends the job at once on macOS 15 and 26 (measured),
 /// but macOS 14 cannot be measured (GitHub no longer has a runner for it), and a `kill` that never
 /// kills is worse than one that waits a second.
 const KILL_EXIT_TIMEOUT: u64 = 1;
 
-/// `ExitTimeOut` of `stop_action`: its timeout in whole seconds, [`NO_EXIT_TIMEOUT`] for none, and
-/// [`KILL_EXIT_TIMEOUT`] for `kill`.
+/// `ExitTimeOut` of `stop_action`: its timeout in whole seconds, and [`KILL_EXIT_TIMEOUT`] for `kill`.
+/// Only for an action [`StopAction::refuse`] let through, which has a timeout unless it is `kill`.
 fn exit_time_out(stop_action: &StopAction) -> u64 {
     match (stop_action.send_signal, stop_action.timeout) {
         (StopSignal::Kill, _) => KILL_EXIT_TIMEOUT,
         (_, Some(timeout)) => timeout.as_secs(),
-        (_, None) => NO_EXIT_TIMEOUT,
+        (_, None) => unreachable!("a stop action with no timeout is refused for launchd before it is written"),
     }
 }
 
@@ -492,7 +484,7 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
     let mut dict = String::new();
     match spec {
         DaemonSpec::Service(s) => {
-            s.stop_action.send_signal.refuse(BackendKind::Launchd, &s.common.id)?;
+            s.stop_action.refuse(BackendKind::Launchd, &s.common.id)?;
             push_job_head(&mut dict, &s.common, id, &s.common.command);
 
             push_keep_alive(&mut dict, INDENT, s.restart);
@@ -507,9 +499,7 @@ fn job_plist(spec: &DaemonSpec, id: &Identity) -> Result<String, Error> {
             push_logs(&mut dict, &s.common);
         }
         DaemonSpec::Task(task) => {
-            task.stop_action
-                .send_signal
-                .refuse(BackendKind::Launchd, &task.common.id)?;
+            task.stop_action.refuse(BackendKind::Launchd, &task.common.id)?;
             let argv = task_argv(task)?;
             push_job_head(&mut dict, &task.common, id, &argv);
 

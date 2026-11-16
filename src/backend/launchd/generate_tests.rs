@@ -1238,23 +1238,29 @@ fn exit_time_out(spec: &DaemonSpec) -> u64 {
 
 #[skuld::test]
 fn exit_time_out_is_the_timeout_in_whole_seconds() {
-    for seconds in [1, 5, 30, 59, 60, 61, 3600, 86_400] {
+    for seconds in [1, 5, 30, 59, 60] {
         assert_eq!(exit_time_out(&terminate_after(Some(seconds))), seconds);
+    }
+}
+
+/// A spec from a blob reaches the generator without `resolve`: launchd's cap is refused here too.
+#[skuld::test]
+fn a_timeout_over_launchds_cap_and_no_timeout_are_refused_naming_the_cap() {
+    for (seconds, said) in [(Some(61), "61s"), (Some(86_400), "86400s"), (None, "timeout: null")] {
+        let err = plist(&terminate_after(seconds), &minimal_identity()).unwrap_err();
+        let Error::Invalid { message, .. } = &err else {
+            panic!("expected Error::Invalid, got {err:?}");
+        };
+        assert!(
+            message.contains("60 s") && message.contains(said),
+            "{seconds:?}: {message}"
+        );
     }
 }
 
 #[skuld::test]
 fn the_default_is_thirty_seconds_not_launchds_five() {
     assert_eq!(exit_time_out(&minimal_spec()), 30);
-}
-
-/// KB note "macOS launchd - ExitTimeOut 9223372036854775807 and 4294967295 are read as unset,
-/// 2147483647 is honoured and cut to 60": a value that does not fit 32 bits waits 5 s, so no timeout is
-/// the largest one that does.
-#[skuld::test]
-fn no_timeout_is_the_largest_value_launchd_reads() {
-    assert_eq!(exit_time_out(&terminate_after(None)), 2_147_483_647);
-    assert_eq!(NO_EXIT_TIMEOUT, i32::MAX as u64);
 }
 
 /// `ExitTimeOut` 0 is documented as no limit, and measured as SIGKILL at once on macOS 15 and 26, but
@@ -1275,9 +1281,9 @@ fn a_task_has_the_same_exit_time_out_as_a_service() {
         (
             StopAction {
                 send_signal: StopSignal::Terminate,
-                timeout: None,
+                timeout: Some(Duration::from_secs(60)),
             },
-            2_147_483_647,
+            60,
         ),
         (
             StopAction {

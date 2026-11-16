@@ -212,8 +212,9 @@ stop-action:
 Either key may be left out, and `stop-action: {}` is the default. A stop sends
 `send-signal`; a daemon that has not exited after `timeout` is ended by the
 manager. `timeout: null` is the one `null` a manifest may write, and means no
-timeout: the manager waits as long as the platform allows. A `timeout` that is
-not a whole number of seconds, or is under `1s` or over `24h`, is refused.
+timeout: the manager waits as long as the platform allows, which launchd
+refuses (see below). A `timeout` that is not a whole number of seconds, or is
+under `1s` or over `24h`, is refused.
 `stop-action` applies to a service and to a task alike (a task's stop ends the
 run in flight), and can be set per backend, leaf by leaf: a `backend-specific`
 entry that writes only `timeout` keeps the base's `send-signal`.
@@ -245,13 +246,14 @@ records the end as it does.
   `KillSignal=SIGKILL` and no `TimeoutStopSec=`, so systemd's own default still
   bounds a process the kernel holds.
 - **launchd** writes `ExitTimeOut`. launchd sends `SIGTERM` and nothing else,
-  and `SIGKILL` once `ExitTimeOut` is over. `timeout: null` writes `2147483647`,
-  the largest value launchd reads: a larger one (measured: `9223372036854775807`
-  and `4294967295`) is read as unset, and the job is killed after 5 s. **macOS
-  26.4 and later cap the wait at 60 s**, so any `timeout` over `60s`, `null`
-  included, waits 60 s there. launchd sends `SIGTERM` to the job's whole process
-  group, but `SIGKILL` only to the job's process, so a descendant that ignores
-  `SIGTERM` outlives a stop. `kill` writes an `ExitTimeOut` of `1`: launchd
+  and `SIGKILL` once `ExitTimeOut` is over. **macOS 26.4 and later cut any
+  `ExitTimeOut` to 60 s** (measured; Apple does not document it), so launchd
+  refuses a `timeout` over `60s`, and `timeout: null` for any signal but `kill`,
+  on every macOS version, naming the cap: it would be cut on some and honoured
+  on others. `kill` waits for nothing and has no timeout to refuse. launchd
+  sends `SIGTERM` to the job's whole process group, but `SIGKILL` only to the
+  job's process, so a descendant that ignores `SIGTERM` outlives a stop. `kill`
+  writes an `ExitTimeOut` of `1`: launchd
   sends `SIGTERM`, and `SIGKILL` a second later. `0`, which `launchd.plist(5)`
   documents as no limit, ends the job at once on macOS 15.7 (Intel) and 26
   (measured), but macOS 14, which goetia supports, could not be measured:

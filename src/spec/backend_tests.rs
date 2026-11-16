@@ -426,6 +426,13 @@ fn supplies_signal() -> Supplied {
     }
 }
 
+fn supplies_timeout() -> Supplied {
+    Supplied {
+        stop_timeout: true,
+        ..Supplied::NONE
+    }
+}
+
 #[skuld::test]
 fn the_native_backend_refuses_a_signal_it_cannot_send_wherever_the_manifest_wrote_it() {
     let quit = with_stop(Shaped::Parsed(StopSignal::Quit), Shaped::Absent);
@@ -513,10 +520,59 @@ fn windows_refuses_a_stop_action_on_a_task() {
     for backend in [BackendKind::Systemd, BackendKind::Launchd] {
         assert!(
             backend
-                .refuse(&task(Shaped::Parsed(StopSignal::Terminate), Shaped::Parsed(None)))
+                .refuse(&task(Shaped::Parsed(StopSignal::Terminate), thirty()))
                 .is_ok()
         );
     }
+}
+
+#[skuld::test]
+fn launchd_refuses_a_wait_over_its_cap_and_a_wait_without_a_limit() {
+    let seconds = |n| Shaped::Parsed(Some(Duration::from_secs(n)));
+    for timeout in [seconds(61), seconds(86_400), Shaped::Parsed(None)] {
+        let refused = BackendKind::Launchd
+            .refuse(&with_stop(Shaped::Parsed(StopSignal::Terminate), timeout))
+            .unwrap_err();
+        assert_eq!(refused.field, Some(Field::StopTimeout));
+        assert!(Error::from(refused).to_string().contains("60 s"));
+    }
+    // An absent signal is `terminate`, so `null` beside it is a wait without a limit too.
+    assert!(
+        BackendKind::Launchd
+            .refuse(&with_stop(Shaped::Absent, Shaped::Parsed(None)))
+            .is_err()
+    );
+    for (signal, timeout) in [
+        (Shaped::Parsed(StopSignal::Terminate), seconds(60)),
+        (Shaped::Parsed(StopSignal::Terminate), seconds(1)),
+        (Shaped::Absent, Shaped::Absent),
+        // `kill` waits for nothing: no timeout is its default.
+        (Shaped::Parsed(StopSignal::Kill), Shaped::Parsed(None)),
+        (Shaped::Parsed(StopSignal::Kill), Shaped::Absent),
+        // A signal a `$` still holds may be `kill`: a later pass judges the `null`.
+        (Shaped::Deferred, Shaped::Parsed(None)),
+        (Shaped::Parsed(StopSignal::Terminate), Shaped::Deferred),
+    ] {
+        assert!(BackendKind::Launchd.refuse(&with_stop(signal, timeout)).is_ok());
+    }
+    // The other backends have no such cap.
+    for backend in [BackendKind::Systemd, BackendKind::Scm] {
+        assert!(backend.refuse(&with_stop(Shaped::Absent, seconds(86_400))).is_ok());
+    }
+}
+
+#[skuld::test]
+fn launchd_judges_only_the_timeout_an_override_wrote() {
+    let long = with_stop(Shaped::Absent, Shaped::Parsed(Some(Duration::from_secs(90))));
+    assert!(
+        BackendKind::Launchd
+            .error(&long, &Supplied::NONE, Substitution::Pending)
+            .is_ok()
+    );
+    let refused = BackendKind::Launchd
+        .error(&long, &supplies_timeout(), Substitution::Pending)
+        .unwrap_err();
+    assert_eq!(refused.field, Some(Field::StopTimeout));
 }
 
 #[skuld::test]

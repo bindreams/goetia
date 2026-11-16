@@ -44,7 +44,7 @@ use super::field::Field;
 use super::interpolate::Substitution;
 use super::overrides::Supplied;
 use super::resolve::{FieldValues, Refused, dir_join, directory_is_to_blame, invalid};
-use super::stop_action::{ScmDaemon, StopField, Written, scm_defect};
+use super::stop_action::{ScmDaemon, StopField, Written, launchd_timeout_defect, scm_defect};
 use super::vars::is_valid_name;
 use super::{
     AccountId, DaemonFields, DaemonKind, Id, Protocol, Restart, Schedule, StopAction, StopSignal, User, Warning,
@@ -263,8 +263,8 @@ impl BackendKind {
 
 // stop-action's refusals ==============================================================================================
 
-/// What `backend` cannot honour of the `stop-action` `spec` carries: the signal it cannot send, and
-/// on Windows a stop Task Scheduler or a native service decides itself. `only` limits the verdict to
+/// What `backend` cannot honour of the `stop-action` `spec` carries: the signal it cannot send, on
+/// launchd a wait it cannot give, and on Windows a stop Task Scheduler or a native service decides itself. `only` limits the verdict to
 /// what an override supplied (see [`Supplied`]); `None` judges whatever the merged spec holds.
 ///
 /// A value a `$` still holds is not judged: a later pass knows it.
@@ -277,6 +277,24 @@ fn stop_action_refusal(backend: BackendKind, spec: &ShapedSpec, only: Option<&Su
         && let Some(defect) = signal.defect(backend)
     {
         return Err(Refused::at(Field::StopSignal, invalid(&spec.id, &defect)));
+    }
+    // The leaves as resolve will settle them: an absent one is its default, a deferred one is not known.
+    let signal = match &spec.stop_signal {
+        Shaped::Parsed(signal) => Some(*signal),
+        Shaped::Absent => Some(StopAction::default().send_signal),
+        Shaped::Deferred => None,
+    };
+    let timeout = match (&spec.stop_timeout, signal) {
+        (Shaped::Parsed(timeout), _) => Some(*timeout),
+        (Shaped::Absent, Some(signal)) => Some(StopAction::default_timeout(signal)),
+        (Shaped::Absent, None) | (Shaped::Deferred, _) => None,
+    };
+    if backend == BackendKind::Launchd
+        && timeout_in_play
+        && let (Some(signal), Some(timeout)) = (signal, timeout)
+        && let Some(defect) = launchd_timeout_defect(signal, timeout)
+    {
+        return Err(Refused::at(Field::StopTimeout, invalid(&spec.id, &defect)));
     }
     if backend != BackendKind::Scm {
         return Ok(());
@@ -292,17 +310,6 @@ fn stop_action_refusal(backend: BackendKind, spec: &ShapedSpec, only: Option<&Su
         (DaemonKind::Service, Shaped::Parsed(protocol)) => ScmDaemon::of_service(*protocol),
         (DaemonKind::Service, Shaped::Absent) => ScmDaemon::PlainService,
         (DaemonKind::Service, Shaped::Deferred) => return Ok(()),
-    };
-    // The leaves as resolve will settle them: an absent one is its default, a deferred one is not known.
-    let signal = match &spec.stop_signal {
-        Shaped::Parsed(signal) => Some(*signal),
-        Shaped::Absent => Some(StopAction::default().send_signal),
-        Shaped::Deferred => None,
-    };
-    let timeout = match (&spec.stop_timeout, signal) {
-        (Shaped::Parsed(timeout), _) => Some(*timeout),
-        (Shaped::Absent, Some(signal)) => Some(StopAction::default_timeout(signal)),
-        (Shaped::Absent, None) | (Shaped::Deferred, _) => None,
     };
     let known = Written::of_leaves(signal, timeout);
     let written = Written {

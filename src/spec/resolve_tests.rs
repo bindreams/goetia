@@ -3724,6 +3724,51 @@ fn a_leaf_that_is_the_default_is_not_a_stop_action_windows_refuses() {
 }
 
 #[skuld::test]
+fn launchd_refuses_a_timeout_over_its_cap_and_no_timeout_in_its_own_override_from_any_host() {
+    for (line, reason) in [
+        ("stop-action: {timeout: 61s}", "61s"),
+        ("stop-action: {timeout: 24h}", "86400s"),
+        ("stop-action: {timeout: null}", "timeout: null"),
+        ("stop-action: {send-signal: terminate, timeout: null}", "timeout: null"),
+    ] {
+        let yaml = format!("{SERVICE}backend-specific:\n  launchd:\n    {line}\n");
+        let msg = resolve_yaml(&yaml).unwrap_err().to_string();
+        assert!(
+            msg.starts_with("daemon `frpc`: backend-specific.launchd: `stop-action.timeout")
+                && msg.contains("launchd")
+                && msg.contains("60 s")
+                && msg.contains(reason),
+            "{line}: {msg}"
+        );
+    }
+}
+
+#[skuld::test]
+fn launchd_takes_a_timeout_up_to_its_cap_and_kill_with_no_wait() {
+    for line in [
+        "stop-action: {timeout: 1s}",
+        "stop-action: {timeout: 60s}",
+        "stop-action: kill",
+        "stop-action: {send-signal: kill, timeout: null}",
+    ] {
+        let yaml = format!("{SERVICE}backend-specific:\n  launchd:\n    {line}\n");
+        if let Err(err) = resolve_yaml(&yaml) {
+            panic!("{line}: {err}");
+        }
+    }
+}
+
+#[skuld::test]
+fn the_base_timeout_is_judged_for_launchd_only_when_launchd_is_the_native_backend() {
+    let yaml = format!("{SERVICE}stop-action: {{timeout: 90s}}\n");
+    let resolved = resolve_yaml(&yaml);
+    match BackendKind::native().expect("the tests run where there is a service manager") {
+        BackendKind::Launchd => assert!(resolved.unwrap_err().to_string().contains("60 s")),
+        BackendKind::Systemd | BackendKind::Scm => assert!(resolved.is_ok()),
+    }
+}
+
+#[skuld::test]
 fn an_override_writes_the_native_backends_leaves_over_the_bases() {
     let native = BackendKind::native().expect("the tests run where there is a service manager");
     let base = format!("{SERVICE}stop-action: {{timeout: 90s}}\n");
