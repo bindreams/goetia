@@ -565,7 +565,7 @@ fn a_start_of_a_unit_at_its_start_limit_fails_and_does_not_hang(#[fixture(system
     let id = spec.common().id.clone();
     let mgr = Systemd::new();
     mgr.install(&spec, false).expect("install");
-    write_dropin_text(&id, "[Unit]\nStartLimitIntervalSec=1h\n");
+    write_dropin_text(guard.id(), "[Unit]\nStartLimitIntervalSec=1h\n");
     let unit = format!("{id}.service");
     let burst: usize = cmd::run("systemctl", &["show", "--property=StartLimitBurst", "--value", &unit])
         .expect_ok()
