@@ -12,7 +12,7 @@
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
-use super::verbs::{Processes, System};
+use super::verbs::{Processes, System, gone};
 use super::{TaskApi, TaskPath, TaskSnapshot};
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
@@ -162,19 +162,20 @@ impl Scm {
     }
 
     /// [`Self::task_write`] with the record directory `runs`, `processes` (which judge the old task's
-    /// run) and `prepare`, which sees to what the machine must hold for the account. All come before the
-    /// first request to Task Scheduler that changes anything. [`WriteOutcome::Raced`] when the task
-    /// existed for a create or was gone for an update.
+    /// run) and `prepare`, which sees to what the machine must hold for the account. `prepare` comes
+    /// before the first request to Task Scheduler. [`WriteOutcome::Raced`] when the task existed for a
+    /// create or was gone for an update.
     ///
     /// An account is the same when the stored principal's SID is the new account's, and then the task
     /// is updated in place. Otherwise (a stored principal that cannot be told is a change) Task
     /// Scheduler would keep the security descriptor the task was registered with, which names the old
     /// account only and so leaves the task unreadable by the new account's shim. So the task is
-    /// registered again: refused while the old one runs (its shim still writes its record, and the
-    /// permissions of the record directory are for the new account only), then, with everything acquired,
-    /// the registration alone is deleted (its records stay) and created with the armed state it had.
-    /// A failure between the delete and the create leaves nothing at the id, which an install that runs
-    /// again creates (disarmed: `enable` arms it).
+    /// registered again ([`Self::task_register_again`]): disabled, refused while the old one runs (its
+    /// shim still writes its record, and the permissions of the record directory are for the new
+    /// account only), then, with the record directory made, the registration alone is deleted (its
+    /// records stay) and created with the armed state it had. A failure between the delete and the
+    /// create leaves nothing at the id, which an install that runs again creates (disarmed: `enable`
+    /// arms it).
     pub(super) fn task_write_with<P: Processes>(
         &self,
         spec: &DaemonSpec,
@@ -187,27 +188,79 @@ impl Scm {
         let id = &spec.common().id;
         let prepared = prepare(&definition.account())?;
         let changed = snapshot.filter(|old| stored_principal(old.registered()).as_ref() != Some(&prepared.principal));
-        if let Some(old) = changed {
-            self.refuse_account_change_while_running(old, |pid| processes.alive(pid))?;
-        }
-        task_records(id, runs, &prepared)?;
         match changed {
-            None => self.task_register(
-                id,
-                definition,
-                snapshot.is_some_and(TaskSnapshot::armed),
-                snapshot.is_some(),
-                &prepared,
-            ),
-            Some(old) => {
-                match self.tasks.delete(&TaskPath::of(id)) {
-                    // The task is gone; a folder that stays is still there for the create.
-                    Ok(_) | Err(Error::TaskFolderKept { .. }) => {}
-                    Err(e) => return Err(e),
-                }
-                self.task_register(id, definition, old.armed(), false, &prepared)
+            None => {
+                task_records(id, runs, &prepared)?;
+                self.task_register(
+                    id,
+                    definition,
+                    snapshot.is_some_and(TaskSnapshot::armed),
+                    snapshot.is_some(),
+                    &prepared,
+                )
             }
+            Some(old) => self.task_register_again(old, definition, runs, processes, &prepared),
         }
+    }
+
+    /// The account change of [`Self::task_write_with`]. The task is disabled first (its own flag, as an
+    /// uninstall does it, which needs no password): a scheduled fire between the check of its runs and the
+    /// delete would start a run as the old account that nothing waits for. Then, in order, nothing runs
+    /// ([`Error::AccountChangeRunning`]), the record directory is made, the task is deleted, and created
+    /// with the armed state it had. A failure after the disable puts the flag back as it was found (a task
+    /// found disabled is not touched), and a flag that cannot be put back is reported with the failure.
+    fn task_register_again<P: Processes>(
+        &self,
+        old: &TaskSnapshot,
+        definition: &TaskXml,
+        runs: &Runs,
+        processes: &mut P,
+        prepared: &Prepared,
+    ) -> Result<WriteOutcome> {
+        let id = old.id();
+        let path = TaskPath::of(id);
+        let disabled = TaskXml::task_enabled(&old.registered().xml)
+            && match self.tasks.set_enabled(&path, false) {
+                Ok(()) => true,
+                // The task is gone: there is nothing to put back.
+                Err(e) if gone(&e) => false,
+                Err(e) => return Err(e),
+            };
+        match self.replace_task(old, definition, runs, processes, prepared) {
+            Err(failed) if disabled => Err(match self.tasks.set_enabled(&path, true) {
+                Ok(()) => failed,
+                Err(e) if gone(&e) => failed,
+                Err(e) => Error::both_all([
+                    failed,
+                    Error::Step {
+                        what: format!("enable `{id}` again"),
+                        source: Box::new(e),
+                    },
+                ])
+                .expect("two errors"),
+            }),
+            written => written,
+        }
+    }
+
+    /// [`Self::task_register_again`] from the check of the runs on.
+    fn replace_task<P: Processes>(
+        &self,
+        old: &TaskSnapshot,
+        definition: &TaskXml,
+        runs: &Runs,
+        processes: &mut P,
+        prepared: &Prepared,
+    ) -> Result<WriteOutcome> {
+        let id = old.id();
+        self.refuse_account_change_while_running(old, |pid| processes.alive(pid))?;
+        task_records(id, runs, prepared)?;
+        match self.tasks.delete(&TaskPath::of(id)) {
+            // The task is gone; a folder that stays is still there for the create.
+            Ok(_) | Err(Error::TaskFolderKept { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        self.task_register(id, definition, old.armed(), false, prepared)
     }
 
     /// Refuses installing `old`, a task, as another account while it runs:

@@ -233,7 +233,8 @@ fn a_task_installed_as_another_account_is_deleted_and_created_with_the_armed_sta
         let record = records_dir(&dir).join("0123456789abcdef0123456789abcdef.json");
         std::fs::write(&record, "{}").unwrap();
         let fake = Fake::new();
-        fake.on_instances(Ok(Vec::new()))
+        fake.on_set_enabled(Ok(()))
+            .on_instances(Ok(Vec::new()))
             .on_delete(Ok(true))
             .on_register(Ok(Registration::Created));
 
@@ -249,14 +250,17 @@ fn a_task_installed_as_another_account_is_deleted_and_created_with_the_armed_sta
             .unwrap();
 
         assert!(matches!(outcome, WriteOutcome::Done), "{outcome:?}");
+        // The disable is first: a scheduled fire between the check of the old account's runs and the delete
+        // would start a run as the old account that nothing waits for.
         assert_eq!(
             fake.calls(),
             [
+                Call::SetEnabled(PATH.to_owned(), false),
                 Call::Instances(PATH.to_owned()),
                 Call::Delete(PATH.to_owned()),
                 register_call(&new, armed, service("S-1-5-20"), None, false),
             ],
-            "armed={armed}: a create, after the delete"
+            "armed={armed}: disabled, checked, deleted, created"
         );
         assert!(record.is_file(), "the old account's record stays");
         assert!(
@@ -275,7 +279,9 @@ fn a_task_that_runs_is_not_installed_as_another_account() {
     let old = as_service("LocalService");
     let new = as_service("NetworkService");
     let fake = Fake::new();
-    fake.on_instances(Ok(vec![running_run()]));
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![running_run()]))
+        .on_set_enabled(Ok(()));
 
     let refused = scm(&fake)
         .task_write_with(
@@ -295,8 +301,12 @@ fn a_task_that_runs_is_not_installed_as_another_account() {
     );
     assert_eq!(
         fake.calls(),
-        [Call::Instances(PATH.to_owned())],
-        "the task is untouched"
+        [
+            Call::SetEnabled(PATH.to_owned(), false),
+            Call::Instances(PATH.to_owned()),
+            Call::SetEnabled(PATH.to_owned(), true),
+        ],
+        "the task is as it was: enabled again"
     );
     assert!(
         !records_dir(&dir).exists(),
@@ -347,7 +357,8 @@ fn a_stored_principal_that_cannot_be_read_is_an_account_change() {
     };
     assert_ne!(no_principal.xml, installed.xml, "the principal is gone");
     let fake = Fake::new();
-    fake.on_instances(Ok(Vec::new()))
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
         .on_delete(Ok(true))
         .on_register(Ok(Registration::Created));
 
@@ -403,7 +414,8 @@ fn a_folder_that_stays_after_the_delete_does_not_stop_the_create() {
     let new = as_service("NetworkService");
     let (_dir, runs) = made_records();
     let fake = Fake::new();
-    fake.on_instances(Ok(Vec::new()))
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
         .on_delete(Err(Error::TaskFolderKept {
             task: PATH.to_owned(),
             folder: r"\Goetia".to_owned(),
@@ -434,11 +446,14 @@ fn a_raced_create_and_a_failed_delete_after_an_account_change() {
     let new = as_service("NetworkService");
     let (_dir, runs) = made_records();
     let fake = Fake::new();
-    fake.on_instances(Ok(Vec::new()))
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
         .on_delete(Ok(true))
         .on_register(Ok(Registration::Raced))
+        .on_set_enabled(Ok(()))
         .on_instances(Ok(Vec::new()))
-        .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))));
+        .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))))
+        .on_set_enabled(Ok(()));
     let scm = scm(&fake);
     let write = || {
         scm.task_write_with(
@@ -463,6 +478,161 @@ fn a_raced_create_and_a_failed_delete_after_an_account_change() {
             .count(),
         1,
         "a delete that fails creates nothing"
+    );
+    fake.finish();
+}
+
+/// A failure after the disable puts the enabled flag back, whichever step failed: the check of the old
+/// account's runs (the refusal above), the record directory, the delete. A create that failed after the
+/// delete finds no task to enable, which is no second failure.
+#[skuld::test]
+fn a_failure_after_the_disable_puts_the_enabled_flag_back_and_is_the_writes_error() {
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let enabled_again = Call::SetEnabled(PATH.to_owned(), true);
+    let disabled = Call::SetEnabled(PATH.to_owned(), false);
+    let instances = Call::Instances(PATH.to_owned());
+    let delete = Call::Delete(PATH.to_owned());
+
+    // The record directory cannot be made (its parents are not there).
+    let (_dir, runs) = records();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_set_enabled(Ok(()));
+    let failed = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap_err();
+    assert!(failed.to_string().contains("run records"), "{failed}");
+    assert_eq!(
+        fake.calls(),
+        [disabled.clone(), instances.clone(), enabled_again.clone()]
+    );
+    fake.finish();
+
+    // The delete fails: the task is there, enabled again.
+    let (_dir, runs) = made_records();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))))
+        .on_set_enabled(Ok(()));
+    let failed = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap_err();
+    assert!(failed.to_string().contains("delete"), "{failed}");
+    assert_eq!(
+        fake.calls(),
+        [
+            disabled.clone(),
+            instances.clone(),
+            delete.clone(),
+            enabled_again.clone()
+        ]
+    );
+    fake.finish();
+
+    // The create fails after the delete: no task is there to enable, and the create's error is the write's.
+    let (_dir, runs) = made_records();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Ok(true))
+        .on_register(Err(Error::os("register", std::io::Error::other("denied"))))
+        .on_set_enabled(Err(Error::NotInstalled { id: "nightly".into() }));
+    let failed = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap_err();
+    assert!(matches!(failed, Error::Os { .. }), "{failed:?}");
+    assert!(failed.to_string().contains("register"), "{failed}");
+    assert_eq!(fake.calls().first(), Some(&disabled));
+    assert_eq!(fake.calls().last(), Some(&enabled_again));
+    fake.finish();
+}
+
+/// A flag that cannot be put back is reported with the failure that made it necessary.
+#[skuld::test]
+fn an_enabled_flag_that_cannot_be_put_back_is_reported_with_the_failure() {
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let (_dir, runs) = made_records();
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))))
+        .on_set_enabled(Err(Error::os("enable", std::io::Error::other("busy"))));
+
+    let failed = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&snapshot_of(&old, true)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap_err();
+
+    let report = failed.report().to_string();
+    assert!(report.contains("denied") && report.contains("busy"), "{report}");
+    fake.finish();
+}
+
+/// A task found disabled is disabled already: nothing is disabled, and nothing is enabled if the write
+/// fails (what is put back is what was found).
+#[skuld::test]
+fn a_task_found_disabled_is_left_disabled_by_a_write_that_fails() {
+    let old = as_service("LocalService");
+    let new = as_service("NetworkService");
+    let installed = registered_task(&old, true);
+    let found = Registered {
+        xml: installed
+            .xml
+            .replacen("<Settings>", "<Settings><Enabled>false</Enabled>", 1),
+        data: installed.data.clone(),
+    };
+    assert!(!TaskXml::task_enabled(&found.xml), "the task's own flag is false");
+    let (_dir, runs) = made_records();
+    let fake = Fake::new();
+    fake.on_instances(Ok(Vec::new()))
+        .on_delete(Err(Error::os("delete", std::io::Error::other("denied"))));
+
+    let failed = scm(&fake)
+        .task_write_with(
+            &new,
+            &definition(&new),
+            Some(&TaskSnapshot::new(id(), Ok(blob(&old)), found)),
+            &runs,
+            &mut Running(vec![]),
+            prepared(users(), None),
+        )
+        .unwrap_err();
+
+    assert!(failed.to_string().contains("delete"), "{failed}");
+    assert_eq!(
+        fake.calls(),
+        [Call::Instances(PATH.to_owned()), Call::Delete(PATH.to_owned())]
     );
     fake.finish();
 }
@@ -495,6 +665,7 @@ fn reinstall_with_another_user_rewrites_the_record_directorys_dacl() {
     let fake = Fake::new();
     // The second write changes the account, so the task is deleted and created.
     fake.on_register(Ok(Registration::Created))
+        .on_set_enabled(Ok(()))
         .on_instances(Ok(Vec::new()))
         .on_delete(Ok(true))
         .on_register(Ok(Registration::Created));

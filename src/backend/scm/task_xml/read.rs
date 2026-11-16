@@ -116,6 +116,12 @@ impl TaskXml {
             .collect())
     }
 
+    /// Whether the task's own flag, `Settings/Enabled`, is true: what `set_enabled` changes, apart from
+    /// the triggers' flags. XML that cannot be read says nothing, which is Task Scheduler's default, true.
+    pub(crate) fn task_enabled(xml: &str) -> bool {
+        document(xml).map_or(true, |document| own_flag_is_true(document.root_element()))
+    }
+
     /// Whether every trigger of `xml` is enabled, and the task itself is (`Settings/Enabled`, which
     /// Task Scheduler leaves out while it is true): a task that is not enabled is started by nothing.
     /// A task with no trigger is not armed, and neither is XML that cannot be read.
