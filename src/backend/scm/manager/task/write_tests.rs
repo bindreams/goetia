@@ -79,7 +79,7 @@ fn root() -> TaskAccount {
     TaskAccount::Service("S-1-5-18".to_owned())
 }
 
-// Install ==============================================================================================================
+// Install =============================================================================================================
 
 #[skuld::test]
 fn install_of_a_task_creates_it_disarmed() {
@@ -181,7 +181,7 @@ fn a_changed_task_is_updated_in_place_over_the_installed_one() {
     assert_eq!(fake.calls(), [register_call(&rescheduled, false, root(), None, true)]);
 }
 
-// The record directory ----------------------------------------------------------------------------------------------
+// The record directory ------------------------------------------------------------------------------------------------
 
 fn trustees_of(dir: &std::path::Path) -> Vec<Sid> {
     let file = OpenOptions::new()
