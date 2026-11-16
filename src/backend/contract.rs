@@ -11,7 +11,6 @@
 //! marker, so a backend cannot act on a service goetia did not create. The blanket impl is the one
 //! place that turns an id into a snapshot.
 
-use std::convert::Infallible;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -254,17 +253,6 @@ pub(crate) struct Marker {
     /// Whether a run can have begun before `offset` was measured: a timer started it between the state
     /// read and the request, and the request joined it. Its marker is then before `offset`.
     pub(crate) earlier_start_possible: bool,
-}
-
-/// What a backend whose tasks are not built yet answers [`Backend::begin_run`] with.
-impl RunHandle for Infallible {
-    fn output(&self) -> OutputSource {
-        match *self {}
-    }
-
-    fn wait(self) -> Result<Exit> {
-        match self {}
-    }
 }
 
 /// One [`Backend`]'s native restart of a service the gate passed.

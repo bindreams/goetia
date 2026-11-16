@@ -1,0 +1,138 @@
+//! What the tests of a task's verbs share: the fixtures of the one task `nightly`, its record
+//! directory, and the machine's processes as a table the test states.
+
+use std::io;
+use std::path::PathBuf;
+
+use tempfile::TempDir;
+
+use super::TaskSnapshot;
+use super::api::Instance;
+use super::fake::Fake;
+use super::live::Liveness;
+use super::verbs::Processes;
+use crate::backend::kill::Waited;
+use crate::backend::scm::instance::InstanceId;
+use crate::backend::scm::manager::Scm;
+use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
+use crate::backend::scm::test_support::registered_task;
+use crate::blob::Blob;
+use crate::elevation::test_support::process_user_sid;
+use crate::manager::budget::Deadline;
+use crate::spec::{DaemonSpec, Id};
+
+pub(super) fn id() -> Id {
+    Id::try_from("nightly").unwrap()
+}
+
+pub(super) const PATH: &str = r"\Goetia\nightly";
+
+pub(super) fn instance_id(n: u8) -> InstanceId {
+    InstanceId::parse(&format!("{n:032x}")).unwrap()
+}
+
+pub(super) fn instance(n: u8, pid: u32) -> Instance {
+    Instance {
+        id: instance_id(n),
+        pid,
+    }
+}
+
+/// A manager whose Task Scheduler is `fake`.
+pub(super) fn scm(fake: &Fake) -> Scm {
+    Scm::new().with_tasks(Box::new(fake.clone()))
+}
+
+pub(super) fn snapshot_of(spec: &DaemonSpec, armed: bool) -> TaskSnapshot {
+    let blob = Blob {
+        schema: 1,
+        version: crate::version().to_string(),
+        spec: spec.clone(),
+    };
+    TaskSnapshot::new(id(), Ok(blob), registered_task(spec, armed))
+}
+
+/// The task's record directory in a temporary `%ProgramData%`, made as an install makes it, for the
+/// account this test runs as (the test removes it).
+pub(super) fn records() -> (TempDir, PathBuf, Runs) {
+    let dir = tempfile::tempdir().unwrap();
+    let runs = Runs::of(dir.path(), &id());
+    runs.ensure(&process_user_sid()).unwrap();
+    let path = dir.path().join("Goetia").join("runs").join("nightly");
+    (dir, path, runs)
+}
+
+pub(super) fn record(n: u8, outcome: RunOutcome) -> RunRecord {
+    RunRecord {
+        instance: instance_id(n),
+        started: 1,
+        outcome,
+    }
+}
+
+/// The machine's processes, as the test says: `alive` pids run, `holdable` ones can be opened,
+/// `denied` ones are refused, and waiting for a `lingering` one runs out its deadline. Waiting for any
+/// other runs `on_exit` (what the shim does as it ends). Every call notes how many calls the
+/// scheduler had had by then.
+pub(super) struct Machine {
+    fake: Fake,
+    pub alive: Vec<u32>,
+    pub holdable: Vec<u32>,
+    pub denied: Vec<u32>,
+    pub lingering: Vec<u32>,
+    pub held: Vec<u32>,
+    pub terminated: Vec<(u32, usize)>,
+    pub waited: Vec<(u32, usize)>,
+    pub on_exit: Box<dyn FnMut(u32) + Send>,
+}
+
+impl Machine {
+    /// Every pid in `alive` runs and can be held.
+    pub(super) fn new(fake: &Fake, alive: &[u32]) -> Self {
+        Self {
+            fake: fake.clone(),
+            alive: alive.to_vec(),
+            holdable: alive.to_vec(),
+            denied: Vec::new(),
+            lingering: Vec::new(),
+            held: Vec::new(),
+            terminated: Vec::new(),
+            waited: Vec::new(),
+            on_exit: Box::new(|_| {}),
+        }
+    }
+}
+
+impl Processes for Machine {
+    type Held = u32;
+
+    fn alive(&mut self, pid: u32) -> io::Result<Liveness> {
+        Ok(if self.alive.contains(&pid) {
+            Liveness::Alive
+        } else {
+            Liveness::Gone
+        })
+    }
+
+    fn open(&mut self, pid: u32) -> io::Result<Option<u32>> {
+        self.held.push(pid);
+        if self.denied.contains(&pid) {
+            return Err(io::Error::from_raw_os_error(5));
+        }
+        Ok(self.holdable.contains(&pid).then_some(pid))
+    }
+
+    fn terminate(&mut self, held: &u32) -> io::Result<()> {
+        self.terminated.push((*held, self.fake.calls().len()));
+        Ok(())
+    }
+
+    fn await_exit(&mut self, held: &u32, _deadline: Deadline) -> io::Result<Waited> {
+        self.waited.push((*held, self.fake.calls().len()));
+        if self.lingering.contains(held) {
+            return Ok(Waited::Expired);
+        }
+        (self.on_exit)(*held);
+        Ok(Waited::Confirmed)
+    }
+}

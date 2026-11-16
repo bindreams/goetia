@@ -118,7 +118,7 @@ use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHAN
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 use self::registry::RegistryReadOutcome;
-use self::task::{Com, Purpose, TaskApi, TaskSnapshot, combined, which};
+use self::task::{Com, Purpose, TaskApi, TaskRun, TaskSnapshot, combined, which};
 use super::exit_status::ERROR_SERVICE_DOES_NOT_EXIST;
 use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
@@ -621,12 +621,6 @@ fn purpose_of(spec: &DaemonSpec) -> Purpose {
     }
 }
 
-/// The refusal the verbs that start, stop and run a task give until the run side of the task half
-/// lands: a task is installed, read, listed and reported, but nothing starts one yet.
-fn task_verbs_pending(id: &Id) -> Error {
-    crate::backend::cannot_run_tasks("the Windows service manager", id)
-}
-
 impl Backend for Scm {
     type Definition = WindowsDefinition;
     type Snapshot = WindowsSnapshot;
@@ -634,7 +628,7 @@ impl Backend for Scm {
     /// and deletes shim files, for this process and every other, takes it.
     type InstallScope = Option<InstallLock>;
     type Reservation = ();
-    type Run = std::convert::Infallible;
+    type Run = TaskRun;
 
     fn begin_install(
         &self,
@@ -776,39 +770,47 @@ impl Backend for Scm {
     fn start(&self, snapshot: WindowsSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => self.service_start(snapshot, budget),
-            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+            WindowsSnapshot::Task(snapshot) => self.task_start(snapshot.id()),
         }
     }
 
+    /// A task's start does not depend on what its stop left listed: an ended run that is still listed
+    /// does not stop Task Scheduler from accepting it (L2).
     fn request_start_after_stop(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => self.service_request_start_after_stop(snapshot),
-            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+            WindowsSnapshot::Task(snapshot) => self.task_start(snapshot.id()),
         }
     }
 
     fn stop(&self, snapshot: WindowsSnapshot, budget: Budget, _reservation: &mut ()) -> Result<()> {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => self.service_stop(snapshot, budget),
-            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+            WindowsSnapshot::Task(snapshot) => self.task_stop(snapshot.id(), budget),
         }
     }
 
     fn kill(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => self.service_kill(snapshot),
-            WindowsSnapshot::Task(snapshot) => Err(task_verbs_pending(snapshot.id())),
+            WindowsSnapshot::Task(snapshot) => self.task_kill(snapshot.id()),
         }
     }
 
-    /// Interim: no task runs yet.
+    /// Starts the task and holds the run it began (see [`Scm::task_begin_run_with`]). A service is not
+    /// a task: `run` has refused it before it gets here.
     fn begin_run(
         &self,
         snapshot: WindowsSnapshot,
         _reservation: &mut (),
         _notes: &mut dyn std::io::Write,
-    ) -> Result<std::convert::Infallible> {
-        Err(task_verbs_pending(snapshot.id()))
+    ) -> Result<TaskRun> {
+        match snapshot {
+            WindowsSnapshot::Service(snapshot) => Err(Error::NotATask {
+                id: snapshot.id().to_string(),
+            }),
+            WindowsSnapshot::Task(snapshot) => self.task_begin_run(snapshot),
+        }
     }
 }
 

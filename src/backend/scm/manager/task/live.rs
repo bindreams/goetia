@@ -10,7 +10,7 @@ use crate::backend::scm::kill::system::is_running;
 
 /// What a probe says of the process of one listed instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Liveness {
+pub(crate) enum Liveness {
     Alive,
     /// No such process, or its object is signalled: the run has ended.
     Gone,

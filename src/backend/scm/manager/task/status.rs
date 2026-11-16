@@ -10,8 +10,9 @@ const NOT_RUN: i32 = 0x0004_1303;
 /// `SCHED_S_TASK_TERMINATED`: what `LastTaskResult` reads after any `Stop`, whatever the program
 /// exited with.
 const TERMINATED: i32 = 0x0004_1306;
-/// What a console close event ends a process with (`STATUS_CONTROL_C_EXIT`).
-const CLOSED: u32 = 0xC000_013A;
+/// What a console close event ends a process with (`STATUS_CONTROL_C_EXIT`): the code of a run that a
+/// stop ended.
+pub(super) const CLOSED: u32 = 0xC000_013A;
 
 /// How the last finished run ended, from Task Scheduler's `LastTaskResult`.
 ///

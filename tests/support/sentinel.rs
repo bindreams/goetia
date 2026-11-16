@@ -39,6 +39,11 @@ pub const REPORT_UID: &str = "--goetia-report-uid";
 #[cfg(unix)]
 pub const CONTAINED_CHILD: &str = "--goetia-contained-child";
 
+/// `<exe> --goetia-print-and-exit <code> <text>`: print `<text> <pid>` on a line and exit with `<code>`.
+/// The pid tells one run's line from another's.
+#[cfg(windows)]
+pub const PRINT_AND_EXIT: &str = "--goetia-print-and-exit";
+
 /// `<exe> --goetia-service-host <service-name> <start-port> <stop-port>`:
 /// a minimal SCM-aware service. Without one, `sc start` would fail with
 /// ERROR_SERVICE_REQUEST_TIMEOUT and the registry probe would be claiming to
@@ -72,6 +77,12 @@ pub fn run_if_requested() -> bool {
         Some(SERVICE_HOST) => {
             windows::run(&args[2]);
             true
+        }
+        #[cfg(windows)]
+        Some(PRINT_AND_EXIT) => {
+            println!("{} {}", args[3], std::process::id());
+            std::io::stdout().flush().expect("flush stdout");
+            std::process::exit(args[2].parse().expect("exit code argument"));
         }
         _ => false,
     }

@@ -41,6 +41,10 @@ fn main() {
     // one-shot helper child process (`install_helper`), not a test run.
     #[cfg(windows)]
     {
+        // A task's program: this binary, run by the shim in a mode that connects back or prints.
+        if support::sentinel::run_if_requested() {
+            return;
+        }
         if fixture::run_if_requested() {
             return;
         }

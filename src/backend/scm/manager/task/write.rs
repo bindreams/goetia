@@ -12,7 +12,7 @@
 
 use super::api::{Registered, Registration};
 use super::live::Liveness;
-use super::remove::{Processes, System};
+use super::verbs::{Processes, System};
 use super::{TaskApi, TaskPath, TaskSnapshot};
 use crate::backend::scm::folder::program_data;
 use crate::backend::scm::generate::{self, ScmRegistration, WindowsDefinition};
@@ -92,7 +92,7 @@ pub(super) fn prepare(account: &TaskAccount, written: Option<Written<'_>>) -> Re
 
 /// The account a stored task is registered as: the blob's when it reads, which is what the install
 /// registered, and otherwise its principal's, so that a task whose blob will not decode can still be
-/// registered again (an `uninstall` disarms it first).
+/// enabled and disabled.
 pub(super) fn stored_account(registered: &Registered) -> Result<TaskAccount> {
     match TaskXml::parse(&registered.xml, &registered.data) {
         Ok(definition) => Ok(definition.account()),

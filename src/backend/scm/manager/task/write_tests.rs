@@ -590,11 +590,19 @@ impl Processes for Running {
         })
     }
 
-    fn hold(&mut self, pid: u32) -> std::io::Result<Option<()>> {
+    fn open(&mut self, pid: u32) -> std::io::Result<Option<()>> {
         unreachable!("a retype stops nothing: pid {pid} was held")
     }
 
-    fn wait_for_exit(&mut self, _: ()) -> std::io::Result<()> {
+    fn terminate(&mut self, _: &()) -> std::io::Result<()> {
+        unreachable!("a retype stops nothing")
+    }
+
+    fn await_exit(
+        &mut self,
+        _: &(),
+        _: crate::manager::budget::Deadline,
+    ) -> std::io::Result<crate::backend::kill::Waited> {
         unreachable!("a retype stops nothing")
     }
 }

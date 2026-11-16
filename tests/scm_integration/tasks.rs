@@ -1,20 +1,22 @@
 //! Tasks on the real Task Scheduler: the write side (install, change between a service and a task,
-//! `enable`, `disable`, `uninstall`) through the public manager. Every test registers and removes
-//! real tasks and takes the machine-wide install lock, so it needs elevation like the rest of this
-//! binary (`scm_group`), and shares the labels the lock's own tests poll by.
-//!
-//! A task is only registered here, never started: running one is the shim's own suite.
+//! `enable`, `disable`, `uninstall`) and running one (`start`, `stop`, `kill`, `run`), through the
+//! public manager. Every test registers and removes real tasks and takes the machine-wide install
+//! lock, so it needs elevation like the rest of this binary (`scm_group`), and shares the labels the
+//! lock's own tests poll by. A task's program is this binary, in one of the sentinel modes.
+
+use std::path::Path;
 
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::error::Error;
-use goetia::manager::{ServiceManager as _, State, Status, TaskStatus};
+use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status, TaskStatus};
 use goetia::spec::{DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, TaskSpec, User};
 use goetia::testing::{remove_task, service_fields, task};
 
 use crate::common::conformance_mk;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
-use crate::support::{self, Group, ServiceGuard, scm_group};
+use crate::support::sentinel::{PRINT_AND_EXIT, RUN_UNTIL_KILLED};
+use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group};
 
 const SCHEDULE: &str = "30 3 * * *";
 
@@ -187,4 +189,157 @@ fn a_service_changes_to_a_task_and_back(#[fixture(scm_group)] _group: &Group) {
         );
         mgr.uninstall(id).expect("uninstall");
     }
+}
+
+// Running =============================================================================================================
+
+/// The task `id` whose program is `command` and whose output goes to `logs` where it has one. It has
+/// no schedule: only a test starts it.
+fn task_running(id: &Id, command: Vec<String>, logs: Option<&Path>) -> DaemonSpec {
+    let DaemonSpec::Task(spec) = task(id.as_str(), command, None) else {
+        unreachable!("`testing::task` builds a task")
+    };
+    let mut fields = spec.into_fields();
+    fields.common.logs = logs.map(Path::to_path_buf);
+    TaskSpec::new(fields).map(DaemonSpec::from).expect("a valid task")
+}
+
+/// This binary, told to print a line and exit with `code`.
+fn prints_and_exits(code: i32, text: &str) -> Vec<String> {
+    vec![
+        support::current_exe_str(),
+        PRINT_AND_EXIT.to_owned(),
+        code.to_string(),
+        text.to_owned(),
+    ]
+}
+
+/// This binary, told to connect to `listener` and then run until it is stopped or killed.
+fn runs_until_ended(listener: &ConnectBack) -> Vec<String> {
+    vec![
+        support::current_exe_str(),
+        RUN_UNTIL_KILLED.to_owned(),
+        listener.port().to_string(),
+    ]
+}
+
+/// A `run` of `id` on its own thread, started before the program is released: its result once it ends.
+fn run_of(mgr: &Scm, id: &Id) -> Result<Exit, Error> {
+    mgr.run(id, &mut Vec::new())
+}
+
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn run_returns_the_programs_exit_and_its_lines(#[fixture(scm_group)] _group: &Group) {
+    // Declared first, so it goes last: the task is removed before the directory its log is in.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let spec = task_running(id, prints_and_exits(7, "hello"), Some(&dir.path().join("job.log")));
+    mgr.install(&spec, false).expect("install");
+
+    let mut out = Vec::new();
+    let exit = mgr.run(id, &mut out).expect("run");
+
+    assert_eq!(exit, Exit::Code(7), "the program's own exit");
+    let out = String::from_utf8(out).expect("the program wrote text");
+    assert!(
+        out.lines().count() == 1 && out.starts_with("hello "),
+        "the run's line, and no marker: {out:?}"
+    );
+    assert_eq!(task_status(&mgr, id).common.state, State::Idle);
+    mgr.uninstall(id).expect("uninstall");
+}
+
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(scm_group)] _group: &Group) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let spec = task_running(id, prints_and_exits(0, "run"), Some(&dir.path().join("job.log")));
+    mgr.install(&spec, false).expect("install");
+
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    mgr.run(id, &mut first).expect("the first run");
+    mgr.run(id, &mut second).expect("the second run");
+
+    let (first, second) = (
+        String::from_utf8(first).expect("text"),
+        String::from_utf8(second).expect("text"),
+    );
+    assert_eq!(first.lines().count(), 1, "{first:?}");
+    assert_eq!(second.lines().count(), 1, "only the second run's own line: {second:?}");
+    assert_ne!(first, second, "each run prints its own process's id");
+    mgr.uninstall(id).expect("uninstall");
+}
+
+/// A stop ends the run through Task Scheduler, which gives the program its close event: the program ends
+/// as a console process does, and the shim records it as a stop.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn stop_ends_a_run_and_run_reports_the_stopped_code(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let listener = ConnectBack::listen();
+    mgr.install(&task_running(id, runs_until_ended(&listener), None), false)
+        .expect("install");
+
+    std::thread::scope(|scope| {
+        let run = scope.spawn(|| run_of(&mgr, id));
+        listener.accept("the task's program to start");
+
+        mgr.stop(id, Budget::DEFAULT).expect("stop");
+
+        let exit = run.join().expect("the run thread").expect("run");
+        assert_eq!(exit, Exit::Code(0xC000_013A_u32 as i32), "a stopped run's code");
+    });
+    assert_eq!(task_status(&mgr, id).common.state, State::Idle);
+    mgr.uninstall(id).expect("uninstall");
+}
+
+/// A kill ends the shim's process, which writes no record: the run's exit is unknown.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn kill_ends_a_run_and_run_reports_unrecorded(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let listener = ConnectBack::listen();
+    mgr.install(&task_running(id, runs_until_ended(&listener), None), false)
+        .expect("install");
+
+    std::thread::scope(|scope| {
+        let run = scope.spawn(|| run_of(&mgr, id));
+        listener.accept("the task's program to start");
+
+        mgr.kill(id).expect("kill");
+
+        let failed = run
+            .join()
+            .expect("the run thread")
+            .expect_err("a killed run has no exit");
+        assert!(matches!(failed, Error::RunUnrecorded { .. }), "{failed:?}");
+    });
+    assert_eq!(task_status(&mgr, id).common.state, State::Idle);
+    mgr.uninstall(id).expect("uninstall");
+}
+
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn run_refuses_a_run_in_flight(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let listener = ConnectBack::listen();
+    mgr.install(&task_running(id, runs_until_ended(&listener), None), false)
+        .expect("install");
+    mgr.start(id, Budget::DEFAULT).expect("start");
+    listener.accept("the task's program to start");
+
+    let refused = run_of(&mgr, id).expect_err("a run in flight is not run again");
+    assert!(matches!(refused, Error::AlreadyRunning { .. }), "{refused:?}");
+    assert_eq!(task_status(&mgr, id).common.state, State::Running);
+
+    mgr.stop(id, Budget::DEFAULT).expect("stop");
+    assert_eq!(task_status(&mgr, id).common.state, State::Idle);
+    mgr.uninstall(id).expect("uninstall");
 }

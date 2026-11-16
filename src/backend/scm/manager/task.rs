@@ -14,7 +14,11 @@ pub(crate) mod fake;
 mod live;
 mod read;
 mod remove;
+mod run;
 mod status;
+#[cfg(test)]
+mod support;
+mod verbs;
 mod write;
 
 pub(crate) use api::TaskApi;
@@ -22,5 +26,6 @@ pub(in crate::backend::scm) use classify::{Purpose, which};
 pub(crate) use com::Com;
 pub(crate) use read::TaskSnapshot;
 pub(in crate::backend::scm) use read::combined;
+pub(crate) use run::TaskRun;
 
 use crate::backend::scm::instance::TaskPath;

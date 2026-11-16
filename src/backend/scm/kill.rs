@@ -231,6 +231,12 @@ pub(in crate::backend::scm) mod system {
     }
 
     impl Held {
+        /// Opens the process `pid` with the rights a kill and a wait need, or `None` if no process has
+        /// that pid. The hold of every target of the state machine, a task's included.
+        pub(in crate::backend::scm) fn open(pid: u32) -> io::Result<Option<Held>> {
+            Ok(open_process_with(pid, PROCESS_ACCESS)?.map(|handle| Held { handle, pid }))
+        }
+
         /// Says on stderr why nothing returns while `id`'s process runs, and why it is still
         /// running if ending it failed.
         pub(in crate::backend::scm) fn notice(&self, id: &str, terminate_failed: Option<&io::Error>) {
@@ -295,7 +301,7 @@ pub(in crate::backend::scm) mod system {
         }
 
         fn open(&mut self, pid: u32) -> io::Result<Option<Held>> {
-            Ok(open_process_with(pid, PROCESS_ACCESS)?.map(|handle| Held { handle, pid }))
+            Held::open(pid)
         }
 
         fn terminate(&mut self, process: &Held) -> io::Result<()> {

@@ -44,9 +44,12 @@ struct Script {
     delete: VecDeque<Result<bool>>,
     instances: VecDeque<Result<Vec<Instance>>>,
     info: VecDeque<Result<TaskInfo>>,
-    run: VecDeque<Result<Started>>,
+    run: VecDeque<Result<(Started, Option<Effect>)>>,
     stop: VecDeque<Result<()>>,
 }
+
+/// What happens in the world while a call is answered: a run that ends, a record the shim writes.
+type Effect = Box<dyn FnOnce() + Send>;
 
 /// The test [`TaskApi`]. Clones share one script, so a test keeps a handle after the manager takes one.
 #[derive(Clone, Default)]
@@ -127,7 +130,16 @@ impl Fake {
     }
 
     pub(crate) fn on_run(&self, reply: Result<Started>) -> &Self {
-        lock(&self.0).run.push_back(reply);
+        lock(&self.0).run.push_back(reply.map(|started| (started, None)));
+        self
+    }
+
+    /// [`Self::on_run`], where `during` happens before the reply is given: what the world does while the
+    /// scheduler starts the task.
+    pub(crate) fn on_run_during(&self, reply: Result<Started>, during: impl FnOnce() + Send + 'static) -> &Self {
+        lock(&self.0)
+            .run
+            .push_back(reply.map(|started| (started, Some(Box::new(during) as Effect))));
         self
     }
 
@@ -197,7 +209,11 @@ impl TaskApi for Fake {
     }
 
     fn run(&self, path: &TaskPath) -> Result<Started> {
-        self.answer(Call::Run(path.as_str().to_owned()), |s| &mut s.run)
+        let (started, during) = self.answer(Call::Run(path.as_str().to_owned()), |s| &mut s.run)?;
+        if let Some(during) = during {
+            during();
+        }
+        Ok(started)
     }
 
     fn stop(&self, path: &TaskPath, instance: &InstanceId) -> Result<()> {

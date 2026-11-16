@@ -6,62 +6,21 @@
 //! next `uninstall` reads and completes: a task that is registered and disabled, a task that is gone
 //! with its records left (`uninstall` of an id that is absent removes them), or nothing.
 
-use std::io;
-use std::os::windows::io::OwnedHandle;
 use std::path::PathBuf;
 
-use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
-
-use super::api::{Registered, is_not_running};
-use super::live::{Liveness, probe};
+use super::api::Registered;
+use super::verbs::{Processes, System, gone};
 use super::{TaskPath, TaskSnapshot};
 use crate::backend::InstalledService;
 use crate::backend::scm::folder::program_data;
-use crate::backend::scm::instance::InstanceId;
 use crate::backend::scm::kill::HoldOutcome;
-use crate::backend::scm::kill::system::{open_process_with, wait_exit};
-use crate::backend::scm::manager::{Scm, Uninstalled, open_refused, shim_exe};
-use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
+use crate::backend::scm::manager::{Scm, Uninstalled, shim_exe};
+use crate::backend::scm::runs::Runs;
 use crate::backend::scm::shim::lock::InstallLock;
 use crate::backend::scm::task_xml::TaskXml;
 use crate::error::{Error, Result};
 use crate::manager::Budget;
 use crate::spec::Id;
-
-/// The processes of the runs a task lists, as a removal asks about them: whether one is alive, a hold
-/// on one, and the wait for it to exit. [`System`] is the machine's; a test states them.
-pub(super) trait Processes {
-    /// An open process, which keeps its pid from being given to another.
-    type Held;
-
-    /// Whether the process behind `pid` runs. A process that cannot be judged is the error, never alive.
-    fn alive(&mut self, pid: u32) -> io::Result<Liveness>;
-
-    /// The process behind `pid` held open, or `None` if there is no such process.
-    fn hold(&mut self, pid: u32) -> io::Result<Option<Self::Held>>;
-
-    /// Blocks until `held` has exited. The exit is the event: there is no bound.
-    fn wait_for_exit(&mut self, held: Self::Held) -> io::Result<()>;
-}
-
-/// The machine's own processes.
-pub(super) struct System;
-
-impl Processes for System {
-    type Held = OwnedHandle;
-
-    fn alive(&mut self, pid: u32) -> io::Result<Liveness> {
-        probe(pid)
-    }
-
-    fn hold(&mut self, pid: u32) -> io::Result<Option<OwnedHandle>> {
-        open_process_with(pid, PROCESS_SYNCHRONIZE)
-    }
-
-    fn wait_for_exit(&mut self, held: OwnedHandle) -> io::Result<()> {
-        wait_exit(&held, Budget::Unbounded.start(), || {}).map(|_| ())
-    }
-}
 
 /// Where a failed removal left the task, which is what its message may promise.
 enum Left {
@@ -93,22 +52,6 @@ fn uninstall_failed(id: &Id, left: Left, cause: Error) -> Error {
         what,
         source: Box::new(cause),
     }
-}
-
-/// What a stop whose shim recorded that it could not end the program's process tree leaves: the program
-/// may still run, and the task is kept, disabled, until a stop ends it.
-fn incomplete_stop(id: &Id) -> Error {
-    uninstall_failed(
-        id,
-        Left::Disabled,
-        Error::os(
-            format!("stop `{id}`"),
-            io::Error::other(
-                "run stopped: goetia-shim recorded that it could not end the program's process tree, so the program \
-                 may still be running",
-            ),
-        ),
-    )
 }
 
 /// The shim file the stored task runs, when its file name is that of one a provider placed (the one
@@ -187,26 +130,8 @@ impl Scm {
             Err(e) => return Err(uninstall_failed(id, Left::Unknown, e)),
         }
 
-        let stopped = self
-            .stop_runs(id, &path, processes)
+        self.task_stop_with("uninstall", id, Budget::Unbounded, runs, processes)
             .map_err(|e| uninstall_failed(id, Left::Disabled, e))?;
-        for instance in &stopped {
-            match runs.read(instance) {
-                Ok(Some(RunRecord {
-                    outcome: RunOutcome::IncompleteStop,
-                    ..
-                })) => return Err(incomplete_stop(id)),
-                Ok(_) => {}
-                // A record that cannot be read does not say the stop was complete.
-                Err(e) => {
-                    return Err(uninstall_failed(
-                        id,
-                        Left::Disabled,
-                        Error::os(format!("read the record of `{id}`'s stopped run"), e),
-                    ));
-                }
-            }
-        }
 
         self.tasks
             .delete(&path)
@@ -219,54 +144,6 @@ impl Scm {
             )
         })
     }
-
-    /// Stops every run of the task at `path` that is alive and waits for its process to exit, and says
-    /// which. A listing is not proof that a run is alive, so each entry's process is judged; Task
-    /// Scheduler holds its own handle to a run's process while it lists the pid, so a process held
-    /// and then found still listed is the run's, and one that is not listed any more is not touched,
-    /// since its pid may be another process's. A `Stop` that finds the run ended is a stop. A task
-    /// that is gone has no runs.
-    fn stop_runs<P: Processes>(&self, id: &Id, path: &TaskPath, processes: &mut P) -> Result<Vec<InstanceId>> {
-        let live = match self.live_runs("uninstall", id, path, |pid| processes.alive(pid)) {
-            Ok(live) => live,
-            Err(e) if gone(&e) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        let mut stopped = Vec::new();
-        for instance in live {
-            let pid = instance.pid;
-            let held = processes.hold(pid).map_err(|e| {
-                open_refused(
-                    "uninstall",
-                    &format!("the process of `{id}`'s run (pid {pid})"),
-                    &format!("open the process of `{id}`'s run (pid {pid}) to wait for its exit"),
-                    e,
-                )
-            })?;
-            let Some(held) = held else { continue };
-            match self.tasks.instances(path) {
-                Ok(listed) if listed.contains(&instance) => {}
-                Ok(_) => continue,
-                Err(e) if gone(&e) => continue,
-                Err(e) => return Err(e),
-            }
-            match self.tasks.stop(path, &instance.id) {
-                Ok(()) => {}
-                Err(e) if is_not_running(&e) || gone(&e) => {}
-                Err(e) => return Err(e),
-            }
-            processes
-                .wait_for_exit(held)
-                .map_err(|e| Error::os(format!("wait for `{id}`'s run (pid {pid}) to exit"), e))?;
-            stopped.push(instance.id);
-        }
-        Ok(stopped)
-    }
-}
-
-/// Whether `error` says the task is not there.
-fn gone(error: &Error) -> bool {
-    matches!(error.cause(), Error::NotInstalled { .. })
 }
 
 #[cfg(test)]

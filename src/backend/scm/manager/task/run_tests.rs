@@ -1,0 +1,430 @@
+//! Which run a `run` follows, and how it follows it, over the table-driven fake of Task Scheduler, with
+//! the run records in a temporary directory and the machine's processes a table the test states.
+
+use std::fs;
+use std::io;
+use std::path::Path;
+
+use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, snapshot_of};
+use super::*;
+use crate::backend::scm::manager::task::fake::{Call, Fake};
+use crate::backend::scm::runs::RunOutcome;
+use crate::backend::scm::test_support::task_spec;
+use crate::spec::{DaemonSpec, TaskSpec};
+
+fn named(n: u8, pid: u32) -> Started {
+    Started {
+        id: instance_id(n),
+        pid: Some(pid),
+    }
+}
+
+fn unnamed(n: u8) -> Started {
+    Started {
+        id: instance_id(n),
+        pid: None,
+    }
+}
+
+fn written(n: u8, started: u64, outcome: RunOutcome) -> RunRecord {
+    RunRecord {
+        instance: instance_id(n),
+        started,
+        outcome,
+    }
+}
+
+// identify ------------------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_named_instance_that_is_live_is_followed_by_the_pid_it_is_listed_with() {
+    let live = [instance(2, 200), instance(1, 100)];
+
+    assert_eq!(
+        identify(Some(&named(1, 4242)), &live, &[]),
+        Identity::Live {
+            id: instance_id(1),
+            pid: 100
+        }
+    );
+}
+
+#[skuld::test]
+fn a_named_instance_that_is_not_live_reads_its_own_record() {
+    let appeared = [written(1, 5, RunOutcome::Exited(3))];
+
+    assert_eq!(
+        identify(Some(&named(1, 4242)), &[], &appeared),
+        Identity::Done(appeared[0].clone())
+    );
+}
+
+#[skuld::test]
+fn a_named_instance_that_is_not_live_and_has_no_record_is_unrecorded() {
+    assert_eq!(identify(Some(&named(1, 4242)), &[], &[]), Identity::Unrecorded);
+}
+
+/// A scheduled run that ended before this one's start leaves its record in the directory too: the
+/// record the `Run` named is the one that counts, and no other.
+#[skuld::test]
+fn a_named_instances_record_is_not_taken_for_a_scheduled_runs_earlier_one() {
+    let scheduled = written(9, 1, RunOutcome::Exited(7));
+    let own = written(1, 2, RunOutcome::Exited(0));
+
+    assert_eq!(
+        identify(Some(&named(1, 4242)), &[], &[scheduled.clone(), own.clone()]),
+        Identity::Done(own.clone())
+    );
+    assert_eq!(
+        identify(Some(&named(1, 4242)), &[], &[own.clone(), scheduled]),
+        Identity::Done(own)
+    );
+}
+
+/// Two records and neither is the one named: nothing says which is ours.
+#[skuld::test]
+fn a_named_instance_with_other_records_only_is_unrecorded() {
+    let others = [
+        written(8, 1, RunOutcome::Exited(1)),
+        written(9, 2, RunOutcome::Exited(2)),
+    ];
+
+    assert_eq!(identify(Some(&named(1, 4242)), &[], &others), Identity::Unrecorded);
+}
+
+/// A named instance is followed even when a scheduled run is live beside it.
+#[skuld::test]
+fn a_named_live_instance_is_followed_beside_another_live_one() {
+    let live = [instance(9, 900), instance(1, 100)];
+
+    assert_eq!(
+        identify(Some(&named(1, 100)), &live, &[]),
+        Identity::Live {
+            id: instance_id(1),
+            pid: 100
+        }
+    );
+}
+
+/// M7: a `Run` against a live run under `IgnoreNew` returns a fresh GUID with no pid, which is never
+/// listed. One run is live, and it began after the command was asked: it is the run followed.
+#[skuld::test]
+fn a_start_that_named_nothing_follows_the_one_live_instance() {
+    assert_eq!(
+        identify(Some(&unnamed(1)), &[instance(9, 900)], &[]),
+        Identity::Live {
+            id: instance_id(9),
+            pid: 900
+        }
+    );
+    assert_eq!(
+        identify(None, &[instance(9, 900)], &[]),
+        Identity::Live {
+            id: instance_id(9),
+            pid: 900
+        }
+    );
+}
+
+#[skuld::test]
+fn a_run_that_started_nothing_is_not_live_and_is_unrecorded() {
+    assert_eq!(identify(Some(&unnamed(1)), &[], &[]), Identity::Unrecorded);
+}
+
+#[skuld::test]
+fn a_start_that_named_nothing_reads_the_one_record_that_appeared() {
+    let appeared = [written(9, 5, RunOutcome::Stopped)];
+
+    assert_eq!(
+        identify(Some(&unnamed(1)), &[], &appeared),
+        Identity::Done(appeared[0].clone())
+    );
+}
+
+/// The user's own concurrent start: several runs ended since the pin, and the earliest to begin is the
+/// one taken, whatever order the records are given in.
+#[skuld::test]
+fn a_start_that_named_nothing_reads_the_earliest_of_several_records() {
+    let late = written(1, 9, RunOutcome::Exited(1));
+    let early = written(2, 3, RunOutcome::Exited(2));
+
+    assert_eq!(
+        identify(Some(&unnamed(7)), &[], &[late.clone(), early.clone()]),
+        Identity::Done(early)
+    );
+}
+
+/// Several live and none named (L2's overlap, or the user's own concurrent start): nothing says which
+/// is ours.
+#[skuld::test]
+fn several_live_and_none_named_is_unrecorded() {
+    let live = [instance(8, 800), instance(9, 900)];
+
+    assert_eq!(identify(Some(&unnamed(1)), &live, &[]), Identity::Unrecorded);
+    assert_eq!(
+        identify(Some(&unnamed(1)), &live, &[written(7, 1, RunOutcome::Exited(0))]),
+        Identity::Unrecorded
+    );
+}
+
+// begin_run -----------------------------------------------------------------------------------------------------------
+
+fn spec_with_logs(logs: &Path) -> DaemonSpec {
+    let DaemonSpec::Task(task) = task_spec(None) else {
+        unreachable!("`task_spec` builds a task")
+    };
+    let mut fields = task.into_fields();
+    fields.common.logs = Some(logs.to_owned());
+    DaemonSpec::from(TaskSpec::new(fields).expect("a task with logs"))
+}
+
+fn begin<P: Processes>(fake: &Fake, spec: &DaemonSpec, runs: Runs, processes: P) -> Result<TaskRun<P>> {
+    scm(fake).task_begin_run_with(snapshot_of(spec, false), runs, processes)
+}
+
+/// The error of a `begin_run` that failed: a run is no `Debug`, so `unwrap_err` is not for it.
+fn failure<T>(begun: Result<T>) -> Error {
+    match begun {
+        Ok(_) => panic!("the run began"),
+        Err(e) => e,
+    }
+}
+
+/// The pin is taken, and the directory listed, before `Run` is called: a record that appeared after
+/// the pin is this run's candidate, and one that was already there is not.
+#[skuld::test]
+fn begin_run_takes_the_pin_and_lists_before_run_is_called() {
+    let (dir, path, runs) = records();
+    let older = Runs::of(dir.path(), &id());
+    older.write(&written(9, 0, RunOutcome::Exited(7))).unwrap();
+    let fake = Fake::new();
+    let shim = Runs::of(dir.path(), &id());
+    fake.on_run_during(Ok(unnamed(1)), move || {
+        let pins = fs::read_dir(&path)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().ends_with(".pin"))
+            .count();
+        assert_eq!(pins, 1, "the pin is held when Run is called");
+        shim.write(&written(1, 5, RunOutcome::Exited(0))).unwrap();
+    })
+    .on_instances(Ok(Vec::new()));
+
+    let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
+
+    assert_eq!(
+        fake.calls(),
+        [Call::Run(PATH.to_owned()), Call::Instances(PATH.to_owned())]
+    );
+    assert_eq!(run.wait().unwrap(), Exit::Code(0), "the older record is not this run's");
+    fake.finish();
+}
+
+#[skuld::test]
+fn begin_run_does_not_reach_run_when_the_pin_cannot_be_taken() {
+    let (_dir, path, runs) = records();
+    fs::remove_dir_all(&path).unwrap();
+    let fake = Fake::new();
+
+    let failed = failure(begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])));
+
+    assert!(failed.report().to_string().contains("run records"), "{failed}");
+    assert_eq!(fake.calls(), [], "nothing was sent");
+}
+
+#[skuld::test]
+fn a_failed_run_is_the_calls_error_and_reads_nothing() {
+    let (_dir, _path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Err(Error::os("start", io::Error::other("denied"))));
+
+    let failed = failure(begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])));
+
+    assert!(!matches!(failed, Error::RunUnrecorded { .. }), "{failed:?}");
+    assert_eq!(fake.calls(), [Call::Run(PATH.to_owned())]);
+}
+
+/// The run began and goetia cannot tell which it was: the run may have happened.
+#[skuld::test]
+fn a_listing_that_fails_after_the_start_leaves_the_run_unrecorded() {
+    let (_dir, _path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Err(Error::os("list the runs", io::Error::other("busy"))));
+
+    let failed = failure(begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])));
+
+    assert!(matches!(failed, Error::RunUnrecorded { .. }), "{failed:?}");
+    assert!(failed.report().to_string().contains("busy"), "{failed}");
+}
+
+/// The process is waited for, and only then is the record read: the shim writes it as it ends.
+#[skuld::test]
+fn wait_blocks_on_the_held_process_and_then_reads_the_record() {
+    let (dir, _path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]));
+    let mut machine = Machine::new(&fake, &[4242]);
+    let shim = Runs::of(dir.path(), &id());
+    machine.on_exit = Box::new(move |_| shim.write(&record(1, RunOutcome::Exited(3))).unwrap());
+
+    let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
+    assert_eq!(run.wait().unwrap(), Exit::Code(3));
+    fake.finish();
+}
+
+/// A process that is gone when it is opened has ended: its record, which its shim wrote before it
+/// exited, is read by its instance.
+#[skuld::test]
+fn a_process_gone_at_the_open_reads_the_record_by_the_instance() {
+    let (dir, _path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]));
+    let mut machine = Machine::new(&fake, &[4242]);
+    machine.holdable.clear();
+    Runs::of(dir.path(), &id())
+        .write(&record(1, RunOutcome::Exited(4)))
+        .unwrap();
+
+    let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
+
+    assert_eq!(run.wait().unwrap(), Exit::Code(4));
+    fake.finish();
+}
+
+#[skuld::test]
+fn wait_is_unrecorded_when_the_process_ended_and_no_record_exists() {
+    let (_dir, _path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]));
+    let machine = Machine::new(&fake, &[4242]);
+
+    let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
+    let failed = run.wait().unwrap_err();
+
+    assert!(
+        matches!(&failed, Error::RunUnrecorded { reason, .. } if reason == UNRECORDED),
+        "{failed:?}"
+    );
+    assert_eq!(
+        UNRECORDED,
+        "it was stopped or killed, Windows shut down, goetia-shim failed, or the task could not log on (a \
+         missing logon right or a changed password starts nothing and raises nothing); see the task's log"
+    );
+}
+
+#[skuld::test]
+fn exited_stopped_and_incomplete_records_map_to_their_results() {
+    for (outcome, expected) in [
+        (RunOutcome::Exited(0), Some(Exit::Code(0))),
+        (RunOutcome::Exited(7), Some(Exit::Code(7))),
+        (
+            RunOutcome::Exited(0xC0DE_0011),
+            Some(Exit::Code(0xC0DE_0011_u32 as i32)),
+        ),
+        (RunOutcome::Stopped, Some(Exit::Code(0xC000_013A_u32 as i32))),
+        (RunOutcome::IncompleteStop, None),
+    ] {
+        let (dir, _path, runs) = records();
+        let shim = Runs::of(dir.path(), &id());
+        let fake = Fake::new();
+        // The run ended while `Run` was being answered.
+        fake.on_run_during(Ok(named(1, 4242)), move || shim.write(&record(1, outcome)).unwrap())
+            .on_instances(Ok(Vec::new()));
+
+        let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
+        let waited = run.wait();
+
+        match expected {
+            Some(exit) => assert_eq!(waited.unwrap(), exit, "{outcome:?}"),
+            None => {
+                let failed = waited.unwrap_err();
+                let report = failed.report().to_string();
+                assert!(report.contains("could not end the program's process tree"), "{report}");
+            }
+        }
+    }
+}
+
+/// L2: the ended run's entry is still listed, and its process is gone: the run's end is the process's,
+/// and nothing reads the listing again to see it drop.
+#[skuld::test]
+fn the_end_of_a_run_does_not_wait_for_the_listing_to_drop() {
+    let (dir, _path, runs) = records();
+    let shim = Runs::of(dir.path(), &id());
+    let fake = Fake::new();
+    fake.on_run_during(Ok(named(1, 4242)), move || {
+        shim.write(&record(1, RunOutcome::Exited(0))).unwrap();
+    })
+    .on_instances(Ok(vec![instance(1, 4242)]));
+
+    let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
+
+    assert_eq!(run.wait().unwrap(), Exit::Code(0));
+    fake.finish();
+}
+
+// output --------------------------------------------------------------------------------------------------------------
+
+#[skuld::test]
+fn a_run_with_logs_names_the_marker_of_its_instance_and_may_have_an_earlier_start() {
+    let (dir, _path, runs) = records();
+    let log = dir.path().join("job.log");
+    fs::write(&log, b"earlier\n").unwrap();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242)))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]));
+    let machine = Machine::new(&fake, &[4242]);
+
+    let run = begin(&fake, &spec_with_logs(&log), runs, machine).unwrap();
+
+    let OutputSource::LogFile { path, offset, marker } = run.output() else {
+        panic!("a task with logs has a log file to follow");
+    };
+    assert_eq!(path, log);
+    assert_eq!(offset, 8, "the log's length before the run was requested");
+    let marker = marker.expect("every run marks its start");
+    assert_eq!(marker.prefix, "goetia-run");
+    assert_eq!(marker.line, format!("goetia-run {}", instance_id(1).hex()));
+    assert_eq!(marker.id_len, 32);
+    assert!(marker.earlier_start_possible);
+}
+
+#[skuld::test]
+fn a_run_without_logs_has_no_output_source() {
+    let (_dir, _path, runs) = records();
+    let fake = Fake::new();
+    fake.on_run(Ok(named(1, 4242))).on_instances(Ok(Vec::new()));
+
+    let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();
+
+    assert!(matches!(run.output(), OutputSource::None));
+}
+
+/// A start that was ignored never writes a marker: the run still ends, unrecorded, and the marker it
+/// names is the GUID `Run` returned.
+#[skuld::test]
+fn a_run_that_never_writes_its_marker_still_ends_and_is_unrecorded() {
+    let (dir, _path, runs) = records();
+    let log = dir.path().join("job.log");
+    let fake = Fake::new();
+    fake.on_run(Ok(unnamed(1))).on_instances(Ok(Vec::new()));
+
+    let run = begin(&fake, &spec_with_logs(&log), runs, Machine::new(&fake, &[])).unwrap();
+
+    let OutputSource::LogFile { offset, marker, .. } = run.output() else {
+        panic!("a task with logs has a log file to follow");
+    };
+    assert_eq!(offset, 0, "a log that is not there is empty");
+    assert_eq!(marker.unwrap().line, format!("goetia-run {}", instance_id(1).hex()));
+    assert!(matches!(run.wait().unwrap_err(), Error::RunUnrecorded { .. }));
+}

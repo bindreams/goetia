@@ -4,118 +4,22 @@
 
 use std::cell::Cell;
 use std::io;
-use std::path::PathBuf;
 
-use tempfile::TempDir;
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
+use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, snapshot_of};
 use super::*;
 use crate::backend::ReadOutcome;
-use crate::backend::scm::instance::InstanceId;
-use crate::backend::scm::manager::task::api::{Instance, Registration};
+use crate::backend::kill::Waited;
+use crate::backend::scm::manager::task::api::Registration;
 use crate::backend::scm::manager::task::fake::{Call, Fake};
+use crate::backend::scm::manager::task::live::Liveness;
 use crate::backend::scm::manager::task::write::Prepared;
+use crate::backend::scm::runs::RunOutcome;
 use crate::backend::scm::sid::system;
 use crate::backend::scm::test_support::{registered_task, task_host, task_spec, task_spec_as};
-use crate::blob::Blob;
-use crate::elevation::test_support::process_user_sid;
-use crate::spec::{DaemonSpec, User};
-
-fn id() -> Id {
-    Id::try_from("nightly").unwrap()
-}
-
-const PATH: &str = r"\Goetia\nightly";
-
-fn instance_id(n: u8) -> InstanceId {
-    InstanceId::parse(&format!("{n:032x}")).unwrap()
-}
-
-fn instance(n: u8, pid: u32) -> Instance {
-    Instance {
-        id: instance_id(n),
-        pid,
-    }
-}
-
-fn scm(fake: &Fake) -> Scm {
-    Scm::new().with_tasks(Box::new(fake.clone()))
-}
-
-fn snapshot_of(spec: &DaemonSpec, armed: bool) -> TaskSnapshot {
-    let blob = Blob {
-        schema: 1,
-        version: crate::version().to_string(),
-        spec: spec.clone(),
-    };
-    TaskSnapshot::new(id(), Ok(blob), registered_task(spec, armed))
-}
-
-/// The task's record directory in a temporary `%ProgramData%`, made as an install makes it, for the
-/// account this test runs as (the test removes it).
-fn records() -> (TempDir, PathBuf, Runs) {
-    let dir = tempfile::tempdir().unwrap();
-    let runs = Runs::of(dir.path(), &id());
-    runs.ensure(&process_user_sid()).unwrap();
-    let path = dir.path().join("Goetia").join("runs").join("nightly");
-    (dir, path, runs)
-}
-
-fn record(n: u8, outcome: RunOutcome) -> RunRecord {
-    RunRecord {
-        instance: instance_id(n),
-        started: 1,
-        outcome,
-    }
-}
-
-/// The machine's processes, as the test says: `alive` pids run, `holdable` ones can be opened, and
-/// waiting for one runs `on_exit` (what the shim does as it ends) and notes how many calls the
-/// scheduler had had by then.
-struct Machine {
-    fake: Fake,
-    alive: Vec<u32>,
-    holdable: Vec<u32>,
-    held: Vec<u32>,
-    waited: Vec<(u32, usize)>,
-    on_exit: Box<dyn FnMut(u32)>,
-}
-
-impl Machine {
-    fn new(fake: &Fake, alive: &[u32]) -> Self {
-        Self {
-            fake: fake.clone(),
-            alive: alive.to_vec(),
-            holdable: alive.to_vec(),
-            held: Vec::new(),
-            waited: Vec::new(),
-            on_exit: Box::new(|_| {}),
-        }
-    }
-}
-
-impl Processes for Machine {
-    type Held = u32;
-
-    fn alive(&mut self, pid: u32) -> io::Result<Liveness> {
-        Ok(if self.alive.contains(&pid) {
-            Liveness::Alive
-        } else {
-            Liveness::Gone
-        })
-    }
-
-    fn hold(&mut self, pid: u32) -> io::Result<Option<u32>> {
-        self.held.push(pid);
-        Ok(self.holdable.contains(&pid).then_some(pid))
-    }
-
-    fn wait_for_exit(&mut self, held: u32) -> io::Result<()> {
-        self.waited.push((held, self.fake.calls().len()));
-        (self.on_exit)(held);
-        Ok(())
-    }
-}
+use crate::manager::budget::Deadline;
+use crate::spec::User;
 
 fn disable_call() -> Call {
     Call::SetEnabled(PATH.to_owned(), false)
@@ -131,6 +35,7 @@ fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Ok(()))
@@ -149,6 +54,7 @@ fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
             disable_call(),
             Call::Instances(PATH.to_owned()),
             Call::Instances(PATH.to_owned()),
+            Call::Instances(PATH.to_owned()),
             Call::Stop(PATH.to_owned(), instance_id(1)),
             Call::Delete(PATH.to_owned()),
         ],
@@ -157,7 +63,7 @@ fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
     assert_eq!(machine.held, [4242], "the run's process is held before it is stopped");
     assert_eq!(
         machine.waited,
-        [(4242, 4)],
+        [(4242, 5)],
         "its exit is waited for after the stop and before the delete"
     );
     assert!(!records_dir.exists(), "the records go with the task");
@@ -200,6 +106,7 @@ fn uninstall_of_an_incomplete_stop_leaves_the_task_disabled() {
     fake.on_set_enabled(Ok(()))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Ok(()));
     let mut machine = Machine::new(&fake, &[4242]);
     let shim = Runs::of(dir.path(), &id());
@@ -221,6 +128,7 @@ fn uninstall_of_an_incomplete_stop_leaves_the_task_disabled() {
             disable_call(),
             Call::Instances(PATH.to_owned()),
             Call::Instances(PATH.to_owned()),
+            Call::Instances(PATH.to_owned()),
             Call::Stop(PATH.to_owned(), instance_id(1)),
         ],
         "no delete"
@@ -237,6 +145,7 @@ fn a_record_that_cannot_be_read_fails_the_uninstall_and_keeps_the_task() {
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Ok(()));
@@ -319,8 +228,10 @@ fn every_live_instance_is_stopped() {
     fake.on_set_enabled(Ok(()))
         .on_instances(both())
         .on_instances(both())
-        .on_stop(Ok(()))
         .on_instances(both())
+        .on_instances(both())
+        .on_instances(both())
+        .on_stop(Ok(()))
         .on_stop(Ok(()))
         .on_delete(Ok(true));
     let mut machine = Machine::new(&fake, &[100, 200]);
@@ -384,6 +295,7 @@ fn a_run_that_ended_after_it_was_held_is_not_stopped_or_waited_for() {
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
         .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(Vec::new()))
         .on_delete(Ok(true));
     let mut machine = Machine::new(&fake, &[4242]);
@@ -406,6 +318,7 @@ fn a_stop_that_finds_the_run_ended_is_a_stop() {
     fake.on_set_enabled(Ok(()))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
+        .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Err(Error::os(
             "stop an instance",
             windows::core::Error::from(SCHED_E_TASK_NOT_RUNNING),
@@ -426,6 +339,7 @@ fn any_other_failure_of_a_stop_fails_the_uninstall_and_deletes_nothing() {
     let spec = task_spec(Some("30 3 * * *"));
     let fake = Fake::new();
     fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_instances(Ok(vec![instance(1, 4242)]))
         .on_stop(Err(Error::os("stop an instance", io::Error::other("denied"))));
@@ -453,10 +367,13 @@ fn a_process_that_cannot_be_judged_fails_the_uninstall_before_a_stop() {
         fn alive(&mut self, _: u32) -> io::Result<Liveness> {
             Err(io::Error::from_raw_os_error(5))
         }
-        fn hold(&mut self, _: u32) -> io::Result<Option<()>> {
+        fn open(&mut self, _: u32) -> io::Result<Option<()>> {
             unreachable!("a process that cannot be judged is not held")
         }
-        fn wait_for_exit(&mut self, _: ()) -> io::Result<()> {
+        fn terminate(&mut self, _: &()) -> io::Result<()> {
+            unreachable!()
+        }
+        fn await_exit(&mut self, _: &(), _: Deadline) -> io::Result<Waited> {
             unreachable!()
         }
     }

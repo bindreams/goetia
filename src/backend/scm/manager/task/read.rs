@@ -139,7 +139,7 @@ impl Scm {
         alive: impl FnMut(u32) -> io::Result<Liveness>,
     ) -> Result<Status> {
         let path = TaskPath::of(&snapshot.id);
-        let live = self.live_runs("status", &snapshot.id, &path, alive)?;
+        let live = live_runs(&*self.tasks, "status", &snapshot.id, &path, alive)?;
         let info = self.tasks.info(&path)?;
         Ok(Status::Task(task_status(&info, &live, snapshot.armed())))
     }
@@ -153,39 +153,39 @@ impl Scm {
         snapshot: &TaskSnapshot,
         alive: impl FnMut(u32) -> io::Result<Liveness>,
     ) -> Result<State> {
-        let live = self.live_runs("run", &snapshot.id, &TaskPath::of(&snapshot.id), alive)?;
+        let live = live_runs(&*self.tasks, "run", &snapshot.id, &TaskPath::of(&snapshot.id), alive)?;
         Ok(run_state(&live).0)
     }
+}
 
-    /// The runs of the task at `path` that are alive, for the verb `operation`. The listing that
-    /// failed is its own error. A process that cannot be judged is the error too, worded as
-    /// [`open_refused`] words a denial: a task that runs as another account (SYSTEM, LocalService,
-    /// an Administrator's own elevated task) has a process that only an Administrator may open, so
-    /// from any other prompt its state cannot be told, and re-running as Administrator clears it.
-    pub(super) fn live_runs(
-        &self,
-        operation: &str,
-        id: &Id,
-        path: &TaskPath,
-        alive: impl FnMut(u32) -> io::Result<Liveness>,
-    ) -> Result<Vec<Instance>> {
-        let listed = self.tasks.instances(path)?;
-        let judged = Cell::new(None);
-        let mut alive = alive;
-        live_instances(listed, |pid| {
-            judged.set(Some(pid));
-            alive(pid)
-        })
-        .map_err(|e| {
-            let pid = judged.get().unwrap_or_default();
-            open_refused(
-                operation,
-                &format!("the process of `{id}`'s run (pid {pid})"),
-                &format!("open the process of `{id}`'s run (pid {pid}) to check that it runs"),
-                e,
-            )
-        })
-    }
+/// The runs of the task at `path` that are alive, for the verb `operation`. The listing that failed is
+/// its own error. A process that cannot be judged is the error too, worded as [`open_refused`] words a
+/// denial: a task that runs as another account (SYSTEM, LocalService, an Administrator's own elevated
+/// task) has a process that only an Administrator may open, so from any other prompt its state cannot
+/// be told, and re-running as Administrator clears it.
+pub(super) fn live_runs(
+    tasks: &dyn TaskApi,
+    operation: &str,
+    id: &Id,
+    path: &TaskPath,
+    alive: impl FnMut(u32) -> io::Result<Liveness>,
+) -> Result<Vec<Instance>> {
+    let listed = tasks.instances(path)?;
+    let judged = Cell::new(None);
+    let mut alive = alive;
+    live_instances(listed, |pid| {
+        judged.set(Some(pid));
+        alive(pid)
+    })
+    .map_err(|e| {
+        let pid = judged.get().unwrap_or_default();
+        open_refused(
+            operation,
+            &format!("the process of `{id}`'s run (pid {pid})"),
+            &format!("open the process of `{id}`'s run (pid {pid}) to check that it runs"),
+            e,
+        )
+    })
 }
 
 // Every task ----------------------------------------------------------------------------------------------------------
