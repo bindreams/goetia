@@ -203,6 +203,24 @@ fn a_directory_of_its_own_is_suggested_only_under_a_root(#[fixture(root_dirs)] _
     assert!(why.contains("under"), "{why}");
 }
 
+/// The advice is a courtesy: a root that cannot be opened (here, one below a regular file) never
+/// hides the refusal it would have decorated, which then carries the advice that needs no root.
+#[skuld::test(labels = [ELEVATED])]
+fn an_unopenable_root_does_not_hide_the_refusal(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let dir = layout.system().join("opt/logs");
+    fs::create_dir_all(&dir).unwrap();
+    chmod(&dir, 0o775);
+    let file = layout.system().join("a-file");
+    fs::write(&file, b"").unwrap();
+    let broken_root = CreatedDirs::under(vec![file.join("root")]);
+
+    let why = refused_by(&broken_root, &dir.join("app.log"));
+
+    assert!(why.contains("can be changed by"), "{why}");
+    assert!(!why.contains("such as") && why.contains("journal"), "{why}");
+}
+
 /// Trusting the group of a root-owned ancestor does not trust everyone, or an account.
 #[skuld::test(labels = [ELEVATED])]
 fn an_ancestor_everyone_can_write_without_the_sticky_bit_or_an_account_owns_is_refused_though_a_group_can_write_it(
