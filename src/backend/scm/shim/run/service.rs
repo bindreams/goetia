@@ -308,6 +308,51 @@ fn stopped_report_failure(e: &std::io::Error) -> String {
 // One pass ============================================================================================================
 
 /// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
+/// stop, and tell SCM how it ended: [`run_pass`], reported.
+pub(super) fn run_daemon(
+    spec: &DaemonSpec,
+    supervisor: &Supervisor,
+    id: &str,
+    on_running: impl FnOnce(),
+    on_stopping: impl FnOnce(),
+) -> Reported {
+    run_pass(spec, supervisor, id, on_running, on_stopping).reported()
+}
+
+/// How one pass ended, before it is read as anything: what the service tells SCM
+/// ([`PassOutcome::reported`]) and what a task records.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PassOutcome {
+    /// The daemon exited on its own, with its tree terminated; `None` when its exit status could not
+    /// be had, which is already logged.
+    Exited(Option<i32>),
+    /// A stop was accepted, and the daemon's tree was terminated. It wins over the exit code the
+    /// teardown made the daemon leave, and over a failed wait.
+    Stopped,
+    /// Something of the daemon's tree may still be running, after a stop, a failure, or an exit
+    /// whose tree could not be terminated.
+    IncompleteStop,
+    /// The wait on the daemon failed, with this OS error if it has one, and the tree was terminated.
+    WaitFailed(Option<i32>),
+    /// Launching failed, with what [`launch`] reports for it: a failure of the shim's, or an
+    /// incomplete stop for a daemon that may have started.
+    NotRun(Reported),
+}
+
+impl PassOutcome {
+    /// What the service tells SCM, and what the pass returned before it was an outcome.
+    pub(super) fn reported(self) -> Reported {
+        match self {
+            PassOutcome::Exited(code) => exit_report(code),
+            PassOutcome::Stopped => Reported::Clean,
+            PassOutcome::IncompleteStop => Reported::incomplete_stop(),
+            PassOutcome::WaitFailed(os_error) => Reported::shim_failure(os_error),
+            PassOutcome::NotRun(reported) => reported,
+        }
+    }
+}
+
+/// Launch the daemon, report `RUNNING` through `on_running`, wait for the daemon to end or for a
 /// stop, and say how it ended.
 ///
 /// `on_stopping` is called exactly once, after `on_running` and before the daemon's tree is torn
@@ -320,17 +365,23 @@ fn stopped_report_failure(e: &std::io::Error) -> String {
 /// non-zero Win32 code or, when no Job Object contains it or cosca cannot say a failed spawn ended
 /// it, the incomplete stop. `start_via_notify` reads both as a failed start under every restart
 /// policy.
-fn run_daemon(
+///
+/// An exited daemon is an outcome only once the tree it left is terminated: a `start` that lands
+/// once SCM reads `STOPPED` must not run beside survivors, and a failure SCM restarts must not
+/// either. If the tree cannot be terminated the outcome is the incomplete stop. "Terminated" is
+/// `send_kill_tree` succeeding on the Job Object `launch` requires: the kill was sent, not waited
+/// out (see `Supervisor::wait_for_child_or_stop`).
+pub(super) fn run_pass(
     spec: &DaemonSpec,
     supervisor: &Supervisor,
     id: &str,
     on_running: impl FnOnce(),
     on_stopping: impl FnOnce(),
-) -> Reported {
+) -> PassOutcome {
     let log = &*supervisor.log;
     let (child, waiter) = match launch(spec, supervisor, id) {
         Ok(launched) => launched,
-        Err(reported) => return reported,
+        Err(reported) => return PassOutcome::NotRun(reported),
     };
     on_running();
 
@@ -351,30 +402,33 @@ fn run_daemon(
                     None
                 }
             };
-            end_tree_before_report(supervisor.bus.settle(exit_report(code)), child.as_ref(), log, id)
+            // A stop accepted before this decision wins over a failure: `settle` then says something
+            // other than the candidate. A clean exit and a stop accepted after the wait ended read
+            // alike.
+            let candidate = exit_report(code);
+            let stop_won = supervisor.bus.settle(candidate) != candidate;
+            if !terminate_exited_tree(child.as_ref(), log, id) {
+                PassOutcome::IncompleteStop
+            } else if stop_won {
+                PassOutcome::Stopped
+            } else {
+                PassOutcome::Exited(code)
+            }
         }
         // The failure is already logged; the daemon's tree was terminated, so it is the shim that
-        // failed.
-        WaitOutcome::WaitFailed { os_error } => supervisor.bus.settle(Reported::shim_failure(os_error)),
+        // failed, unless a stop was accepted first.
+        WaitOutcome::WaitFailed { os_error } => {
+            let candidate = Reported::shim_failure(os_error);
+            if supervisor.bus.settle(candidate) == candidate {
+                PassOutcome::WaitFailed(os_error)
+            } else {
+                PassOutcome::Stopped
+            }
+        }
         // `wait_for_child_or_stop` terminated the tree before returning this.
-        WaitOutcome::Stopping => Reported::Clean,
+        WaitOutcome::Stopping => PassOutcome::Stopped,
         // Still reports STOPPED so the service stays stoppable and uninstallable.
-        WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => Reported::incomplete_stop(),
-    }
-}
-
-/// An exited daemon is reported only once the tree it left is terminated, whatever `settled` is: a
-/// `start` that lands once SCM reads `STOPPED` must not run beside survivors, and a failure SCM
-/// restarts must not either. If the tree cannot be terminated, SCM must not restart and the service
-/// must not read as cleanly stopped: the incomplete stop.
-///
-/// "Terminated" is `send_kill_tree` succeeding on the Job Object `launch` requires: the kill was
-/// sent, not waited out (see `Supervisor::wait_for_child_or_stop`).
-fn end_tree_before_report(settled: Reported, child: &dyn Spawned, log: &Log, id: &str) -> Reported {
-    if terminate_exited_tree(child, log, id) {
-        settled
-    } else {
-        Reported::incomplete_stop()
+        WaitOutcome::DaemonMayRun | WaitOutcome::TreeMayRun => PassOutcome::IncompleteStop,
     }
 }
 

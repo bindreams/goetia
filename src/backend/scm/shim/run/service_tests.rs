@@ -603,6 +603,95 @@ fn a_clean_exit_whose_tree_is_terminated_is_clean() {
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
 }
 
+/// What a pass ended as, for one way a pass can end: the process the fake spawns (`None`: the
+/// spawn is refused), whether a stop is requested once the daemon is running, and the outcome the
+/// pass must have and the report SCM must be told for it.
+struct Ending {
+    spawn: fn() -> Option<FakeProcess>,
+    stop: bool,
+    outcome: PassOutcome,
+    reported: Reported,
+}
+
+fn endings() -> Vec<Ending> {
+    fn tree_ends(process: FakeProcess) -> Option<FakeProcess> {
+        Some(process.send_kill_tree(KillReply::Ends))
+    }
+    vec![
+        Ending {
+            spawn: || tree_ends(FakeProcess::new().exited(7)),
+            stop: false,
+            outcome: PassOutcome::Exited(Some(7)),
+            reported: Reported::DaemonExit(7),
+        },
+        Ending {
+            spawn: || tree_ends(FakeProcess::new().exited(0)),
+            stop: false,
+            outcome: PassOutcome::Exited(Some(0)),
+            reported: Reported::Clean,
+        },
+        Ending {
+            spawn: || Some(FakeProcess::running()),
+            stop: true,
+            outcome: PassOutcome::Stopped,
+            reported: Reported::Clean,
+        },
+        Ending {
+            spawn: || tree_ends(FakeProcess::new().wait(WaitReply::Fails(Some(5)))),
+            stop: false,
+            outcome: PassOutcome::WaitFailed(Some(5)),
+            reported: Reported::shim_failure(Some(5)),
+        },
+        Ending {
+            spawn: || None,
+            stop: false,
+            outcome: PassOutcome::NotRun(Reported::shim_failure(Some(ERROR_FILE_NOT_FOUND as i32))),
+            reported: Reported::shim_failure(Some(ERROR_FILE_NOT_FOUND as i32)),
+        },
+    ]
+}
+
+/// One pass over a fresh `Fake` set up as `ending` says, with `pass` run on it.
+fn pass_of<T>(ending: &Ending, pass: impl FnOnce(&Supervisor, &mut dyn FnMut()) -> T) -> T {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+    fake.will_make_thread();
+    match (ending.spawn)() {
+        Some(process) => fake.will_spawn(process),
+        None => fake.will_refuse_spawn(not_found()),
+    }
+    let stop = ending.stop;
+    let bus = Arc::clone(&supervisor.bus);
+    let mut on_running = move || {
+        if stop {
+            assert!(bus.request_stop());
+        }
+    };
+    let passed = pass(&supervisor, &mut on_running);
+    // The failures a pass logs are the same in both, and pinned by the tests that provoke them.
+    let _ = fake.take_failures();
+    assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    passed
+}
+
+/// `run_daemon` is `run_pass` with its outcome turned into what SCM is told, however a pass ends,
+/// so the task mode that reads the outcome and the service that reads the report see one pass.
+#[skuld::test]
+fn run_daemon_is_run_pass_then_reported() {
+    for ending in endings() {
+        let outcome = pass_of(&ending, |supervisor, on_running| {
+            run_pass(&spec(), supervisor, ID, on_running, || {})
+        });
+        let reported = pass_of(&ending, |supervisor, on_running| {
+            super::run_daemon(&spec(), supervisor, ID, on_running, || {})
+        });
+
+        assert_eq!(outcome, ending.outcome);
+        assert_eq!(outcome.reported(), ending.reported);
+        assert_eq!(reported, ending.reported);
+    }
+}
+
 // STOP_PENDING --------------------------------------------------------------------------------------------------------
 
 /// `run_daemon` with both reports recorded: how many tree kills had been attempted at each
