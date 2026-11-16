@@ -95,11 +95,10 @@ jobs:
         run: cargo nextest archive --locked --archive-file nextest-archive.tar.zst
 
       # About 1 in 10 first logons of a new local user blocks for good in the User Profile Service's call
-      # to the Sync Center profile notification handler, and the suite makes three such users (a service
-      # and two tasks). Removing the handler's registration ends it: no first logon stalled in 144
-      # (knowledge base: "Windows - A password-logon task's first start under a new local user can block
-      # for good in the User Profile Service's call to the Sync Center notification handler"). The subkey
-      # is found by its CLSID, so a changed image fails this step instead of going unnoticed.
+      # to the Sync Center profile notification handler. Removing its registration avoids it. The subkey
+      # is found by CLSID, so a changed image fails this step. Measurements: the knowledge base's
+      # "Windows - A password-logon task's first start under a new local user can block for good in the
+      # User Profile Service's call to the Sync Center notification handler".
       - name: Remove the Sync Center profile notification handler
         if: runner.os == 'Windows'
         shell: pwsh

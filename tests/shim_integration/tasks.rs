@@ -67,8 +67,7 @@ fn a_task_run_by_the_shim_records_its_exit(#[fixture(scm_group)] _group: &Group)
     mgr.uninstall(&id).expect("uninstall");
 }
 
-/// A stop ends the run through Task Scheduler. Until the shim's own stop path waits for the program's exit
-/// (goetia#263), the shim ends its tree at once and writes one record, `Stopped`.
+/// A stop ends the run through Task Scheduler; the shim ends its tree at once and writes one record, `Stopped`.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
 fn ending_the_instance_records_stopped_and_the_child_tree_is_gone(#[fixture(scm_group)] _group: &Group) {
     let id = task_id();

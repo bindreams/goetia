@@ -142,7 +142,7 @@ fn a_start_that_named_no_pid_but_whose_own_run_left_a_record_follows_that_record
     );
     // One other run alive: not the one followed.
     assert_eq!(
-        identify(Some(&unnamed(1)), &[instance(9, 900)], &[own.clone()]),
+        identify(Some(&unnamed(1)), &[instance(9, 900)], std::slice::from_ref(&own)),
         Identity::Done(own.clone())
     );
     // Several others alive: not unrecorded.
