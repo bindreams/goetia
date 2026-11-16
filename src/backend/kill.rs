@@ -19,7 +19,7 @@
 use std::io;
 use std::time::Duration;
 
-use crate::error::{Chain, Error, carried, terminating_failed, within};
+use crate::error::{Error, carried, terminating_failed, within};
 use crate::manager::budget::{Budget, Deadline};
 
 #[cfg(unix)]
@@ -231,7 +231,7 @@ pub(crate) fn hold_once<T: KillTarget>(
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
                 Err(read) => Err(HoldError::Read(io::Error::new(
                     read.kind(),
-                    ReadAfterRefusedOpen { read, open: e },
+                    Error::ReadFailedAfterRefusedOpen { read, open: e },
                 ))),
             };
         }
@@ -285,17 +285,6 @@ fn not_signalled(pid: u32, e: io::Error) -> io::Error {
         format!("process {pid} was held and confirmed as the service's, but signalling it failed"),
         e,
     )
-}
-
-/// The service's pid could not be opened, and the read that would say whether the manager still
-/// vouches for it failed too. Both errors are the caller's to see: `read`'s text, then `open`'s in
-/// parentheses. Neither is the [`source`](std::error::Error::source), which would print it a second
-/// time.
-#[derive(Debug, thiserror::Error)]
-#[error("{} (after the service's process could not be opened: {})", Chain(read), Chain(open))]
-struct ReadAfterRefusedOpen {
-    read: io::Error,
-    open: io::Error,
 }
 
 #[cfg(test)]

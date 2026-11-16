@@ -153,16 +153,20 @@ pub(super) fn write_chain<'a>(
     Ok(())
 }
 
-/// The first OS error code in `e`: its own, then its source's, then that of what it embeds. A
-/// [`Both`](Error::Both) is searched first half first; [`Error::Kept`] is searched as the error it
+/// The first OS error code in `e`: its own, then its source's, then that of what it embeds. An error
+/// of ours that an [`io::Error`](std::io::Error) carries is searched as itself. A [`Both`](Error::Both) is searched first half first; [`Error::Kept`] is searched as the error it
 /// holds. A `cosca` list's later members, a `MembersLeft`'s `others` and a `MayHaveStarted`'s
 /// `cleanup` are not on the `source()` chain and are not searched.
 pub(crate) fn os_error_in(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
-    if let Some(code) = e
-        .downcast_ref::<std::io::Error>()
-        .and_then(std::io::Error::raw_os_error)
-    {
-        return Some(code);
+    if let Some(io) = e.downcast_ref::<std::io::Error>() {
+        if let Some(code) = io.raw_os_error() {
+            return Some(code);
+        }
+        // A custom `io::Error`'s `source()` is its payload's source, which skips an error of ours
+        // passed through it, so that one is searched itself.
+        if let Some(payload) = io.get_ref().filter(|payload| payload.is::<Error>()) {
+            return os_error_in(payload);
+        }
     }
     let ours = e
         .downcast_ref::<Error>()

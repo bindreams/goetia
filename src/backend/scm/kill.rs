@@ -346,7 +346,7 @@ pub(in crate::backend::scm) mod system {
     /// Open `pid` with `access`, with the caller's `SeDebugPrivilege` enabled for the open, as
     /// without it a `LocalService` service's process is refused. `None` if no process has that pid.
     pub(in crate::backend::scm) fn open_process_with(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {
-        let debug = DebugPrivilege::enable();
+        let mut debug = DebugPrivilege::enable();
         // SAFETY: no pointers; a null return is the failure.
         let handle = unsafe { OpenProcess(access, 0, pid) };
         if handle.is_null() {

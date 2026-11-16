@@ -126,6 +126,14 @@ fn indeterminate_errors_are_exactly_the_in_doubt_ones() {
             blob: Arc::new(Error::blob(String::new())),
             source: Box::new(not_installed()),
         },
+        Error::OpenRefusedAfterPrivilegeStep {
+            open: std::io::Error::other("x"),
+            step: std::io::Error::other("y"),
+        },
+        Error::ReadFailedAfterRefusedOpen {
+            read: std::io::Error::other("x"),
+            open: std::io::Error::other("y"),
+        },
         Error::AlreadyExists { path: PathBuf::new() },
         Error::ConcurrentChange { id: id(), path: None },
         Error::QuarantineStranded {
@@ -1220,6 +1228,29 @@ fn the_os_error_of_an_embedded_error_is_found() {
 
     assert_eq!(embedded.raw_os_error(), Some(8));
     assert_eq!(blob_unreadable.raw_os_error(), Some(9));
+}
+
+/// A target passes goetia's own error through an `io::Error`, and an OS failure wraps that: the code
+/// the embedded error carries is still found.
+#[skuld::test]
+fn the_os_error_inside_an_error_carried_by_an_io_error_is_found() {
+    let carried = || {
+        std::io::Error::other(Error::LoadedStateInDoubt {
+            id: "x".to_string(),
+            read_failed: Box::new(os_code(8)),
+            restore_failed: None,
+        })
+    };
+
+    assert_eq!(Error::os("read", carried()).raw_os_error(), Some(8));
+    assert_eq!(
+        Error::os("read", crate::error::within("the read", carried())).raw_os_error(),
+        Some(8)
+    );
+    assert_eq!(
+        Error::os("read", std::io::Error::other(not_installed())).raw_os_error(),
+        None
+    );
 }
 
 #[skuld::test]

@@ -7,7 +7,7 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, OwnedHandle, RawHandle};
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, LUID};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_ENOUGH_MEMORY, ERROR_SHARING_VIOLATION, LUID};
 use windows_sys::Win32::Security::{
     GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PRIVILEGE_SET, PrivilegeCheck, SE_DEBUG_NAME,
     TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics,
@@ -15,7 +15,7 @@ use windows_sys::Win32::Security::{
 
 use super::{DebugPrivilege, enable_in, restore_notice};
 use crate::elevation::test_support::{self, ThreadTokenReset, process_token_copy, token_without_privileges};
-use crate::error::within;
+use crate::error::{Error, os_error_in, within};
 use crate::testing::groups::debug_privilege;
 
 /// The calling thread's own token, if it has one, opened to be queried.
@@ -134,35 +134,74 @@ fn dropping_puts_back_the_thread_token_that_was_there(#[fixture(debug_privilege)
 
 // Failures are reported -----------------------------------------------------------------------------------------------
 
+/// The failed step as the production steps build it: its call named by `within`.
 fn failed_to_enable() -> DebugPrivilege {
     DebugPrivilege {
         restore: None,
-        failure: Some(io::Error::other("DuplicateTokenEx failed")),
+        failure: Some(within(
+            "DuplicateTokenEx",
+            io::Error::from_raw_os_error(ERROR_NOT_ENOUGH_MEMORY as i32),
+        )),
+    }
+}
+
+fn denied() -> io::Error {
+    io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
+}
+
+/// The open first, then the step that failed with its reason: each printed once.
+#[skuld::test]
+fn a_denied_open_names_the_privilege_step_that_failed() {
+    let e = failed_to_enable().explain_denial(denied());
+
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "{} (enabling SeDebugPrivilege for the open also failed: DuplicateTokenEx: {})",
+            denied(),
+            io::Error::from_raw_os_error(ERROR_NOT_ENOUGH_MEMORY as i32),
+        )
+    );
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    let report = Error::os("kill", e).report().to_string();
+    assert_eq!(report.matches(&denied().to_string()).count(), 1, "{report}");
+    assert_eq!(report.matches("DuplicateTokenEx").count(), 1, "{report}");
+}
+
+/// The denial's code is the open's, with a failed step and without one.
+#[skuld::test]
+fn a_denied_open_keeps_its_os_code_whether_or_not_a_step_failed() {
+    let mut no_step = DebugPrivilege {
+        restore: None,
+        failure: None,
+    };
+    for e in [
+        failed_to_enable().explain_denial(denied()),
+        no_step.explain_denial(denied()),
+    ] {
+        assert_eq!(Error::os("kill", e).raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
     }
 }
 
 #[skuld::test]
-fn a_denied_open_names_the_privilege_step_that_failed() {
-    let e = failed_to_enable().explain_denial(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+fn a_denied_open_with_the_failed_step_is_found_by_os_error_in() {
+    let e = failed_to_enable().explain_denial(denied());
 
-    let msg = e.to_string();
-    assert!(msg.contains("SeDebugPrivilege"), "{msg}");
-    assert!(msg.contains("DuplicateTokenEx failed"), "{msg}");
-    assert!(msg.contains("Access is denied"), "the open's own error is kept: {msg}");
-    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(os_error_in(&e), Some(ERROR_ACCESS_DENIED as i32));
 }
 
 /// A token that lacks the privilege is not a failure of the step, so the denial stands alone.
 #[skuld::test]
 fn a_denied_open_with_no_failed_step_is_unchanged() {
-    let guard = DebugPrivilege {
+    let mut guard = DebugPrivilege {
         restore: None,
         failure: None,
     };
 
-    let e = guard.explain_denial(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+    let e = guard.explain_denial(denied());
 
     assert_eq!(e.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+    assert_eq!(e.to_string(), denied().to_string());
 }
 
 #[skuld::test]

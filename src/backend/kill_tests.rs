@@ -20,6 +20,8 @@ enum Open {
     Found,
     Gone,
     Fails,
+    /// Fails with an OS error of this code.
+    FailsWithOsError(i32),
 }
 
 /// What the manager answers each `service_pid`, and what each `open` does. The signal and the waits
@@ -29,6 +31,8 @@ struct Scripted {
     opens: VecDeque<Open>,
     /// Which `service_pid` calls, counted from 1, fail instead of answering.
     failing_reads: Vec<usize>,
+    /// The OS error code the failed reads carry, if they carry one.
+    read_os_error: Option<i32>,
     reads: usize,
     failing_terminate: bool,
     failing_exit: bool,
@@ -52,6 +56,7 @@ impl Scripted {
             pids: pids.into(),
             opens: opens.into(),
             failing_reads: Vec::new(),
+            read_os_error: None,
             reads: 0,
             failing_terminate: false,
             failing_exit: false,
@@ -67,6 +72,12 @@ impl Scripted {
     /// The `n`th `service_pid` call (from 1) fails.
     fn failing_read(mut self, n: usize) -> Self {
         self.failing_reads.push(n);
+        self
+    }
+
+    /// The failed reads carry an OS error of this code.
+    fn reading_fails_with_os_error(mut self, code: i32) -> Self {
+        self.read_os_error = Some(code);
         self
     }
 
@@ -132,7 +143,10 @@ impl KillTarget for Scripted {
         self.log.borrow_mut().push("service_pid".to_string());
         self.reads += 1;
         if self.failing_reads.contains(&self.reads) {
-            return Err(io::Error::new(READ_FAILED_KIND, "manager read failed"));
+            return Err(match self.read_os_error {
+                Some(code) => io::Error::from_raw_os_error(code),
+                None => io::Error::new(READ_FAILED_KIND, "manager read failed"),
+            });
         }
         Ok(if self.pids.len() > 1 {
             self.pids.pop_front().unwrap()
@@ -154,6 +168,7 @@ impl KillTarget for Scripted {
             })),
             Open::Gone => Ok(None),
             Open::Fails => Err(io::Error::other("access denied")),
+            Open::FailsWithOsError(code) => Err(io::Error::from_raw_os_error(code)),
         }
     }
 
@@ -546,6 +561,30 @@ fn a_failed_read_after_a_refused_open_reports_both_errors() {
     assert_eq!(report.matches("manager read failed").count(), 1, "{report}");
     assert_eq!(report.matches("access denied").count(), 1, "{report}");
     assert_eq!(target.log(), steps(["service_pid", "open 100", "service_pid"]));
+}
+
+/// The code of the failure is the read's, the primary error; the refused open is named after it.
+#[skuld::test]
+fn the_os_code_of_a_failed_read_is_found_after_a_refused_open() {
+    const READ_CODE: i32 = 1722;
+    const OPEN_CODE: i32 = 5;
+    let mut target = Scripted::new([Some(100)], [Open::FailsWithOsError(OPEN_CODE)])
+        .failing_read(2)
+        .reading_fails_with_os_error(READ_CODE);
+
+    let e = kill_service(&mut target, ID).unwrap_err();
+    let failed = kill_failed(ID, e);
+
+    assert_eq!(failed.raw_os_error(), Some(READ_CODE));
+    let read = io::Error::from_raw_os_error(READ_CODE).to_string();
+    let open = io::Error::from_raw_os_error(OPEN_CODE).to_string();
+    assert_eq!(
+        failed.to_string(),
+        format!("{read} (after the service's process could not be opened: {open})")
+    );
+    let report = failed.report().to_string();
+    assert_eq!(report.matches(&read).count(), 1, "{report}");
+    assert_eq!(report.matches(&open).count(), 1, "{report}");
 }
 
 /// The confirming read, with the process held: it is let go and nothing is signalled.
