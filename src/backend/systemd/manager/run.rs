@@ -23,12 +23,10 @@
 //!   read at the next run's Starting entry: a run's lines can land after it.
 //! - The terminal entry can precede most of a chatty run's output, so once the run has ended the
 //!   output's follower is stopped, the journal is synced, and the rest of the unit's lines is read
-//!   after the last line of the stream shown. The follower and the rest share one query,
-//!   [`stdout_query`] (the unit's stdout lines), and must stay identical, which is the guarantee: the
-//!   stream is picked out of what both read. Journald can store a line twice across a file rotation,
-//!   the old copy indexed under some fields and not others (knowledge base: "journald can store a
-//!   stdout line twice across a journal file rotation"), so a rest read by `_STREAM_ID=` would show a
-//!   copy or not by where the follower stopped. The run shows what the unit's lines hold, as stored.
+//!   after the last line of the stream shown. Follower and rest share [`stdout_query`] and must stay
+//!   identical: journald can store a line twice across a rotation, indexed under some fields only
+//!   (knowledge base: "journald can store a stdout line twice across a journal file rotation"), so a
+//!   `_STREAM_ID=` rest would show a copy or not by where the follower stopped.
 //! - journald's rate limit can drop the marker. Then, and only after the terminal entry, the sync
 //!   and one more read of the unit's lines, the run shows a note, and its exit is still the run's.
 //! - A task with a `logs` file writes the marker there too, as the first line of each run. The file
@@ -500,8 +498,7 @@ pub(crate) struct JournalOutput {
 impl JournalOutput {
     /// Copies the run's output to `out` until the run has ended, which is when `ended` is closed:
     /// each line of the stream as it is written, then, once the follower is stopped and the journal
-    /// synced, the stream's lines among the unit's lines that follower had not yet delivered
-    /// (read through the same query). The marker line is not shown.
+    /// synced, the stream's lines it had not yet delivered. The marker line is not shown.
     ///
     /// A run whose marker is not in the journal after all that (journald's rate limit dropped it)
     /// shows a note instead of lines ([`NO_MARKER`]); that is no failure. Any other failure ends the
@@ -558,7 +555,7 @@ impl JournalOutput {
 }
 
 /// `_SYSTEMD_UNIT=<unit> _TRANSPORT=stdout`: the unit's own lines, of every run it has. A run's output
-/// is followed and read after by this query alone and the two must stay the same (see the module doc).
+/// is followed and read after by this query alone (see the module doc).
 fn stdout_query(unit: &str) -> Vec<Match> {
     vec![Match::new("_SYSTEMD_UNIT", unit), Match::new("_TRANSPORT", "stdout")]
 }
@@ -615,10 +612,9 @@ fn live(selection: &mut Selection, follower: &mut dyn Follower, out: &mut dyn Wr
     Ok(())
 }
 
-/// What the run wrote that the follower had not delivered, after the journal is synced: the unit's
-/// lines (`query`, the follower's own) after the marker's stream's last line shown, which `selection`
-/// reduces to the stream, or, when the follower never met the marker, after `from`, searched for it
-/// once more. With none, the note ([`NO_MARKER`]).
+/// What the run wrote that the follower had not delivered, after the journal is synced: `query`'s
+/// lines after the stream's last line shown or, when the follower never met the marker, after `from`,
+/// searched for the marker once more. With none, the note ([`NO_MARKER`]).
 fn rest(
     journal: &dyn Journal,
     query: &[Match],

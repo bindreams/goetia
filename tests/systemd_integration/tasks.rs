@@ -173,22 +173,16 @@ fn stdout_end(id: &str) -> Option<String> {
         .map(|entry| field(entry, "__CURSOR").expect("an entry has a cursor").to_string())
 }
 
-/// The stdout lines of the newest run of `id`'s unit (the run that has just returned), written after
-/// `after` ([`stdout_end`] from before the run), as the journal stores them and as `run` reads them:
-/// the unit's stdout entries (`_SYSTEMD_UNIT=` and `_TRANSPORT=stdout`), the one query `run` reads its
-/// output by, from the run's own `goetia-run <INVOCATION_ID>` marker on. Journald can store a line
-/// twice across a file rotation, in a copy indexed under some fields and not others
-/// (systemd/systemd#29016; knowledge base: "journald can store a stdout line twice across a journal
-/// file rotation", d95f1aa), so a read by another field, such as `_STREAM_ID=`, can show once what
-/// `run` shows twice. This, and not `seq`'s text, is what `run` is compared with. Without the marker,
-/// which `run` does not show.
+/// The stdout lines of the newest run of `id`'s unit, written after `after` ([`stdout_end`] from
+/// before the run), read by the one query `run` reads by (`_SYSTEMD_UNIT=` + `_TRANSPORT=stdout`),
+/// from the run's own `goetia-run <INVOCATION_ID>` marker on, without the marker. Not `_STREAM_ID=`: a
+/// rotation duplicate indexed under the unit's fields only would show here once what `run` shows
+/// twice.
 ///
-/// Panics when the entries after `after` are not exactly the run's own stream with its marker first:
-/// a line of an earlier run's stream that landed after `after` means `run` may have missed a late
-/// line of that earlier run.
+/// Panics when the entries after `after` are not exactly the run's own stream with its marker first.
 ///
 /// Covers newline-terminated text lines only: an entry with no `MESSAGE` or with a `_LINE_BREAK`
-/// panics, where `run` would show it by its own rules.
+/// panics.
 fn run_stream_text(id: &str, after: Option<&str>) -> Vec<u8> {
     let invocation = started_invocations(id).pop().expect("a run started");
     let marker = format!("goetia-run {invocation}");
@@ -201,7 +195,7 @@ fn run_stream_text(id: &str, after: Option<&str>) -> Vec<u8> {
     assert_eq!(
         field(first, "MESSAGE"),
         Some(marker.as_str()),
-        "the first stdout entry after the run began is not its marker: a line of an earlier run landed after it, so `run` may have missed a late line of that run"
+        "the first stdout entry after the run began is not its marker: a late line of an earlier run, which `run` may have missed"
     );
     let stream = field(first, "_STREAM_ID").expect("a stdout entry has a stream");
     entries[1..]
@@ -210,7 +204,7 @@ fn run_stream_text(id: &str, after: Option<&str>) -> Vec<u8> {
             assert_eq!(
                 field(entry, "_STREAM_ID"),
                 Some(stream),
-                "a line of another stream landed after the run began, so `run` may have missed a late line of an earlier run: {entry}"
+                "a stdout entry after the run began is of another stream: a late line of an earlier run, which `run` may have missed: {entry}"
             );
             assert!(
                 entry.get("_LINE_BREAK").is_none(),
@@ -870,9 +864,10 @@ fn a_line_of_5000_bytes_and_a_control_byte_arrive_whole(#[fixture(systemd_group)
     assert_eq!(out, want);
 }
 
-/// A run starts right behind a chatty one (the first run's lines can still be on their way to the
-/// journal) and shows none of its lines: what it shows is its own stream in the journal, which holds
-/// `second-run` and nothing of the first run's.
+/// A run starts right behind a chatty one and shows none of its lines: what it shows is its own stream
+/// in the journal, which holds `second-run` and nothing of the first run's. The second run starts
+/// after the first `run` has synced and returned, so any first-run line after `before` is a line
+/// `run` missed.
 #[skuld::test(labels = [JOURNALD_CONFIG], serial = JOURNALD_CONFIG)]
 fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(systemd_group)] _group: &Group) {
     let _journald = JournaldConf::unlimited();

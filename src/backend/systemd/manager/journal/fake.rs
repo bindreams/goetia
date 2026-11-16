@@ -1,10 +1,8 @@
 //! A test journal: entries stated newest first, followers that deliver what they are given and then
 //! wait to be stopped, and a record of what was asked.
 //!
-//! What is scripted is delivered whatever the query matched, with one exception that models the real
-//! journal: an entry can be [`Fake::unindexed`] under a field, which journald leaves it when it stores
-//! an entry twice across a file rotation (the old copy is linked into some fields' chains and not
-//! others). A `follow`, `read_after` or `newest_first` that matches on that field does not see it.
+//! What is scripted is delivered whatever the query matched, except an entry made [`Fake::unindexed`]
+//! under a field, as journald leaves a stored-twice entry across a file rotation.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,8 +31,15 @@ struct State {
     /// The cursor `tail` answers, and how many times it was asked.
     tail: Option<String>,
     tails: usize,
-    /// `(cursor, field)`: the entry at `cursor` is in no query that matches on `field`.
-    unindexed: Vec<(String, String)>,
+    unindexed: Vec<Unindexed>,
+}
+
+/// The entry at `cursor` is in no query that matches on `field`.
+struct Unindexed {
+    cursor: String,
+    field: String,
+    /// A query that matched on `field` has withheld the entry.
+    withheld: bool,
 }
 
 /// What one follower delivers.
@@ -115,15 +120,30 @@ impl Fake {
         self.script(Script { entries, ends: true })
     }
 
-    /// The entry at `cursor` is not indexed under `field`: no `follow` or `read_after` that matches on
-    /// `field` delivers it, though one that does not does.
+    /// The entry at `cursor` is in no query that matches on `field`.
     pub(in crate::backend::systemd::manager) fn unindexed(self, cursor: &str, field: &str) -> Fake {
-        self.state
-            .lock()
-            .unwrap()
-            .unindexed
-            .push((cursor.to_string(), field.to_string()));
+        self.state.lock().unwrap().unindexed.push(Unindexed {
+            cursor: cursor.to_string(),
+            field: field.to_string(),
+            withheld: false,
+        });
         self
+    }
+
+    /// Panics unless every [`Fake::unindexed`] pair withheld an entry from a query that matched on its
+    /// field: a cursor that matches no entry tests nothing.
+    pub(in crate::backend::systemd::manager) fn assert_spent(&self) {
+        let state = self.state.lock().unwrap();
+        let idle: Vec<(&str, &str)> = state
+            .unindexed
+            .iter()
+            .filter(|u| !u.withheld)
+            .map(|u| (u.cursor.as_str(), u.field.as_str()))
+            .collect();
+        assert!(
+            idle.is_empty(),
+            "unindexed (cursor, field) that withheld nothing: {idle:?}"
+        );
     }
 
     fn script(self, script: Script) -> Fake {
@@ -188,15 +208,19 @@ impl Fake {
 
     /// What of `entries` a query that asked for `matches` sees.
     fn seen(&self, entries: Vec<Entry>, matches: &[Match]) -> Vec<Entry> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         entries
             .into_iter()
             .filter(|entry| {
                 let cursor = entry.get("__CURSOR");
-                !state
-                    .unindexed
-                    .iter()
-                    .any(|(at, field)| Some(at.as_str()) == cursor && matches.iter().any(|m| m.is(field)))
+                let mut seen = true;
+                for u in &mut state.unindexed {
+                    if Some(u.cursor.as_str()) == cursor && matches.iter().any(|m| m.is(&u.field)) {
+                        u.withheld = true;
+                        seen = false;
+                    }
+                }
+                seen
             })
             .collect()
     }

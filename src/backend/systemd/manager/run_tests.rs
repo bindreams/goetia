@@ -939,7 +939,7 @@ fn output_is_the_lines_of_the_markers_stream_minus_the_marker() {
     assert_eq!(
         journal.read_after_calls(),
         [(stdout_query("x.service"), Some("c6".to_string()))],
-        "what is left is read through the unit's own lines, as the live read was, after the stream's last line shown"
+        "what is left is read through the unit's lines, after the stream's last line shown"
     );
 }
 
@@ -961,9 +961,9 @@ fn the_rest_of_the_stream_shows_only_the_stream() {
     assert_eq!(String::from_utf8(out).unwrap(), "mine\nalso mine\n");
 }
 
-/// A copy of a line journald stored twice across a file rotation is indexed under the unit's fields and
-/// not under `_STREAM_ID`. The live read and the rest both go through the unit's lines, so both show
-/// it: where the follower stopped does not decide which copies the run shows.
+/// A copy of a line journald stored twice across a file rotation is indexed under the unit's fields
+/// and not `_STREAM_ID`. Both reads go through the unit's lines, so where the follower stopped does
+/// not decide whether it shows.
 #[skuld::test]
 fn a_copy_indexed_by_the_unit_and_not_by_the_stream_is_shown_in_the_live_part_and_in_the_rest() {
     let journal = JournalFake::new(Vec::new())
@@ -989,6 +989,7 @@ c
 c
 "
     );
+    journal.assert_spent();
 }
 
 /// The marker is the first line of its stream only: the same text again is the program's.
