@@ -31,3 +31,13 @@ fn dotdot_at_the_root_stays_at_the_root_and_must_open_it() {
     assert_eq!(chain, [(1, 1)]);
     assert!(!step_up(&mut chain, (1, 5)));
 }
+
+/// macOS reports a name that changed under the walk as `EAGAIN`, which says nothing of what happened or
+/// what to do.
+#[skuld::test]
+fn a_path_that_changed_under_the_walk_says_so_and_says_to_run_the_install_again() {
+    let said = changed_while_read().to_string();
+
+    assert!(said.contains("changed while it was being read"), "{said}");
+    assert!(said.contains("running the install again reads it again"), "{said}");
+}

@@ -435,11 +435,14 @@ the roots: create it first. A directory that already exists is used as it is, wh
 owns it, since `install` is not a start and you may still be preparing it.
 
 - **What it makes.** Every missing component, owned by root, `0755`. It makes a directory only where every
-  directory and symlink on the way (resolved, so `..` and links count) is root's: a path through a
-  directory an account owns is refused, which includes a directory an earlier install handed to its
-  account (a second daemon's `cwd` below it). The path is judged as written, every directory it names
-  included (one it leaves through `..` too), because the service manager resolves it by name when it
-  starts.
+  directory on the way (resolved, so `..` and links count) is root's: a path through a directory an
+  account owns is refused, which includes a directory an earlier install handed to its account (a second
+  daemon's `cwd` below it). A symlink on the way is judged by the directory that holds it, not by its
+  owner, since only whoever can write that directory can replace the link. The exception is a holder that
+  is sticky and that a group or everyone can write (like `/tmp`), where the owner of an entry can delete
+  it and make another: a symlink there that root does not own is refused. The path is judged as written,
+  every directory it names included (one it leaves through `..` too), because the service manager
+  resolves it by name when it starts.
 - **Who gets what.** Only the deepest directory of a path is handed over, and only where the daemon's
   account has to write it: `cwd` goes to a non-root `user` (and its primary group) on both backends; the
   log directory goes to it on launchd, which opens the log as that user. On systemd the log directory
@@ -460,12 +463,14 @@ owns it, since `install` is not a start and you may still be preparing it.
 - **What is judged, and when.** The checks above judge the paths as they are when `install` runs. A change
   made during or after it, by hand or by another goetia command running at the same time, is not judged;
   see [the concurrent-verb boundary](#the-boundary-that-is-guaranteed-and-the-two-that-are-not).
-- **systemd's log directory.** `install` refuses a `logs` whose directory, or any directory or symlink on
-  the way to it, a user other than root can change (owned by another user, or writable by a group or by
-  everyone), and names who. The sticky bit excuses a writable directory above the log's, which it keeps
-  others from renaming, but not the log's own directory, where it does not keep them from making an
-  entry (a symlink at the log's name). A log that already exists is refused when it is a symlink or an
-  account's file. A log in or under the `cwd` that is to be handed to the account is refused. All of this
+- **systemd's log directory.** `install` refuses a `logs` whose directory, or any directory on the way to
+  it, a user other than root can change (owned by another user, or writable by a group or by everyone),
+  and names who. The sticky bit excuses a writable directory above the log's, which it keeps others from
+  renaming, but not the log's own directory, where it does not keep them from making an entry (a symlink
+  at the log's name). A symlink on the way is judged by the directory that holds it, as for any path
+  (above): where that directory is sticky and a group or everyone can write it, a symlink that root does
+  not own is refused too, since its owner can replace it. A log that already exists is refused when it is
+  a symlink or an account's file. A log in or under the `cwd` that is to be handed to the account is refused. All of this
   is judged before any directory is made and covers a directory that already exists, except that a log
   directory that is the `cwd`, or in it, is found when `install` reaches the `cwd` (on a file system that
   ignores case two names can be one directory), and what it made is then taken back. Debian

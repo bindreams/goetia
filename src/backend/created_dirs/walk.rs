@@ -67,7 +67,25 @@ pub(super) enum End {
 pub(super) struct Step {
     pub(super) at: PathBuf,
     pub(super) stat: FileStat,
-    pub(super) link: bool,
+    /// For a symlink, the directory that holds it, as the walk read it. `None` for a directory.
+    pub(super) holder: Option<FileStat>,
+}
+
+impl Step {
+    pub(super) fn is_link(&self) -> bool {
+        self.holder.is_some()
+    }
+
+    /// The uid of the owner of a symlink that is not root and can replace it: where the holder is sticky
+    /// and a group or everyone can write it (`/tmp`), whoever owns an entry can delete it and make
+    /// another at its name, so the link leads where its owner chooses. A link anywhere else is judged
+    /// by the directory that holds it, which the walk passed too: only whoever can write that can
+    /// replace it.
+    pub(super) fn owner_who_can_replace(&self) -> Option<libc::uid_t> {
+        let mode = self.holder.as_ref()?.st_mode as libc::mode_t;
+        let owner_replaces = mode & libc::S_ISVTX != 0 && mode & (libc::S_IWGRP | libc::S_IWOTH) != 0;
+        (owner_replaces && self.stat.st_uid != 0).then_some(self.stat.st_uid)
+    }
 }
 
 /// How a directory is opened to be searched. On Linux an `O_PATH` descriptor needs no read
@@ -116,7 +134,7 @@ impl Entry {
 /// entry is opened `O_PATH | O_NOFOLLOW` and judged by `fstat` of that descriptor, which for a link is
 /// the link itself, and a link is read through the same descriptor.
 #[cfg(target_os = "linux")]
-pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<Entry>> {
+pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Entry>> {
     let fd = match openat(
         parent,
         name,
@@ -125,7 +143,7 @@ pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<
     ) {
         Ok(fd) => fd,
         Err(Errno::ENOENT) => return Ok(None),
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     };
     let stat = fstat(&fd)?;
     Ok(Some(match SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT {
@@ -140,13 +158,13 @@ pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<
 /// descriptor to read it through (`O_SYMLINK` opens it, but it cannot be read from the descriptor),
 /// so a directory is opened `O_SEARCH | O_NOFOLLOW` and judged by `fstat` of that descriptor, which
 /// must be the inode the name had; a link is read by name and the name must still be the link that
-/// was judged afterwards. A change in between is an error, never a guess.
+/// was judged afterwards. A change in between is an error ([`changed_while_read`]), never a guess.
 #[cfg(not(target_os = "linux"))]
-pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<Entry>> {
+pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Entry>> {
     let named = match fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(Errno::ENOENT) => return Ok(None),
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     };
     let same = |a: &FileStat, b: &FileStat| a.st_dev == b.st_dev && a.st_ino == b.st_ino;
     match SFlag::from_bits_truncate(named.st_mode) & SFlag::S_IFMT {
@@ -159,7 +177,7 @@ pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<
             )?;
             let held = fstat(&fd)?;
             if !same(&named, &held) {
-                return Err(Errno::EAGAIN);
+                return Err(changed_while_read());
             }
             Ok(Some(Entry::Dir(fd, held)))
         }
@@ -167,11 +185,18 @@ pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> nix::Result<Option<
             let target = readlinkat(parent, name)?;
             match fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
                 Ok(again) if same(&named, &again) => Ok(Some(Entry::Link(named, target))),
-                _ => Err(Errno::EAGAIN),
+                _ => Err(changed_while_read()),
             }
         }
         _ => Ok(Some(Entry::Other(named))),
     }
+}
+
+/// The error for a name that changed between the two reads of it that [`entry`] compares, which only
+/// macOS makes.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn changed_while_read() -> io::Error {
+    io::Error::other("the path changed while it was being read; running the install again reads it again")
 }
 
 /// Resolve `dir`, which must be absolute, from `/` one component at a time, on descriptors, following
@@ -199,7 +224,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
     let mut trail = vec![Step {
         at: PathBuf::from("/"),
         stat,
-        link: false,
+        holder: None,
     }];
     // Where `cur` is, as far as the walk can tell, for naming what it passed.
     let mut shown = PathBuf::from("/");
@@ -238,7 +263,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
             trail.push(Step {
                 at: shown.clone(),
                 stat,
-                link: false,
+                holder: None,
             });
             cur = up;
             continue;
@@ -252,10 +277,11 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
             continue;
         };
         if let Entry::Link(stat, _) = &found {
+            let holder = fstat(&cur).map_err(|e| Error::os_at("stat", &shown, e))?;
             trail.push(Step {
                 at: at.clone(),
                 stat: *stat,
-                link: true,
+                holder: Some(holder),
             });
         }
         // A link as the last component is walked to its target like one in the middle, so that every
@@ -264,7 +290,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
             let Entry::Dir(dir, stat) = found else {
                 return Err(Error::NotADirectory { path: so_far });
             };
-            trail.push(Step { at, stat, link: false });
+            trail.push(Step { at, stat, holder: None });
             chain.push(id_of(&stat));
             return Ok(Walk {
                 end: End::Whole { dir, stat },
@@ -277,7 +303,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
                 trail.push(Step {
                     at: at.clone(),
                     stat,
-                    link: false,
+                    holder: None,
                 });
                 chain.push(id_of(&stat));
                 cur = fd;

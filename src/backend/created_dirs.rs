@@ -10,10 +10,12 @@
 //! - **Walk.** Where something is missing, [`walk()`] resolves the path on descriptors, and every
 //!   directory it passed through must be owned by root: root does not create inside a directory an
 //!   account owns. A symlink is judged by the directory that holds it, not by its owner: the owner of
-//!   a link cannot change where it leads, and only whoever can write the holder can replace it. Modes
-//!   are not judged: a root-owned directory others can write is accepted (the administrator's
-//!   exposure). Where writability matters the caller judges it: for a log systemd opens as root,
-//!   `refuse_writable_log_dir` (Linux).
+//!   a link cannot change where it leads, and only whoever can write the holder can replace it. The
+//!   exception is a holder that is sticky and that a group or everyone can write (`/tmp`), where the
+//!   owner of an entry can delete it and make another: a link there is refused unless root owns it.
+//!   Modes are otherwise not judged: a root-owned directory others can write is accepted (the
+//!   administrator's exposure). Where writability matters the caller judges it: for a log systemd
+//!   opens as root, `refuse_writable_log_dir` (Linux).
 //! - **Making.** The first missing component of a path is made beside where it will be, under a
 //!   temporary name (`.goetia-` and a random one), and the rest inside it under their final names. A
 //!   later path whose missing part starts at the same component of the same directory is made in that
@@ -66,7 +68,7 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, unlinkat};
 
 #[cfg(target_os = "linux")]
 pub(crate) use log_dir::refuse_writable_log_dir;
-use walk::{End, Walk, open_beneath, walk};
+use walk::{End, Step, Walk, open_beneath, walk};
 
 use super::account::describe_uid;
 use super::{Settle, Standing};
@@ -165,6 +167,9 @@ struct Made {
     plan_owner: Option<Owner>,
     /// Whether it has been: the account may write in it from then on.
     handed: bool,
+    /// Whether a plan that hands nothing over has passed through it or ended at it: it is root's for that
+    /// path, so no later plan may hand it over.
+    passed: bool,
     /// Whether the undo could not remove it. What a directory above it then holds is that.
     left: bool,
 }
@@ -227,15 +232,10 @@ impl CreatedDirs {
                     ),
                 });
             }
-            if let Some(step) = found.trail.iter().find(|step| !step.link && step.stat.st_uid != 0) {
+            if let Some(why) = found.trail.iter().find_map(account_can_change) {
                 return Err(Error::DirectoryRefused {
                     path: dir.to_path_buf(),
-                    why: format!(
-                        "the directory {} is owned by uid {}, not root, and root does not create inside what an \
-                         account can change; create it first",
-                        step.at.display(),
-                        step.stat.st_uid
-                    ),
+                    why,
                 });
             }
         }
@@ -391,6 +391,7 @@ impl CreatedDirs {
             hand,
             plan_owner,
             handed: false,
+            passed: false,
             left: false,
         });
         let made = &self.made[index];
@@ -412,11 +413,12 @@ impl CreatedDirs {
         Ok(index)
     }
 
-    /// A plan that hands nothing over passes through or ends at `dir`, which an earlier plan of this call
-    /// made. If that plan handed it to an account, this path is it or lies in it: the other half of
-    /// [`hand_to_one_owner`](Self::hand_to_one_owner)'s refusal, so that the two orders agree.
-    fn reach(&self, dir: usize, hand_to: Option<Owner>) -> Result<usize> {
-        let made = &self.made[dir];
+    /// A plan passes through or ends at `dir`, which an earlier plan of this call made. If this plan hands
+    /// nothing over and that plan handed `dir` to an account, this path is it or lies in it: the other half
+    /// of [`hand_to_one_owner`](Self::hand_to_one_owner)'s refusal, so that the two orders agree. A plan
+    /// that hands nothing over is recorded as having passed, for the same refusal from the other side.
+    fn reach(&mut self, dir: usize, hand_to: Option<Owner>) -> Result<usize> {
+        let made = &mut self.made[dir];
         match (hand_to, made.hand) {
             (None, Some(owner)) => Err(Error::DirectoryRefused {
                 path: made.path.clone(),
@@ -426,6 +428,10 @@ impl CreatedDirs {
                     describe_uid(owner.uid.as_raw())
                 ),
             }),
+            (None, None) => {
+                made.passed = true;
+                Ok(dir)
+            }
             _ => Ok(dir),
         }
     }
@@ -449,13 +455,14 @@ impl CreatedDirs {
             }
             Some(_) => {}
             // A plan that hands nothing over is not this one's to hand over: that directory is root's, and
-            // a path that is to be the account's cannot be it or hold it. One that hands over is.
-            None if ours.plan_owner.is_none() => {
+            // a path that is to be the account's cannot be it or hold it. One that hands over is, unless a
+            // plan that hands nothing over has passed through it since.
+            None if ours.plan_owner.is_none() || ours.passed => {
                 return Err(Error::DirectoryRefused {
                     path: path.to_path_buf(),
                     why: format!(
-                        "it is, or lies above, a directory this install made for another path of the spec, which \
-                         is not handed to an account, and this path is to be handed to {}: keep the two paths \
+                        "it is, or lies above, a directory that another path of the spec, which is not handed to an \
+                         account, made or passes through, and this path is to be handed to {}: keep the two paths \
                          apart",
                         describe_uid(owner.uid.as_raw())
                     ),
@@ -523,7 +530,10 @@ impl CreatedDirs {
             .as_ref()
             .expect("a directory is judged through the descriptor it was opened by");
         let empty = is_empty(&held.dir).map_err(|e| Error::os_at("read", &at, e))?;
-        judge(stat, empty).map_err(|why| Error::DirectoryRefused { path: at.clone(), why })?;
+        judge(stat, empty).map_err(|why| Error::DirectoryRefused {
+            path: made.path.clone(),
+            why: format!("{why} (while it was being made at {})", at.display()),
+        })?;
         fchmod(&held.dir, Mode::from_bits_truncate(0o755)).map_err(|e| Error::os_at("chmod", &at, e))?;
         Ok(())
     }
@@ -623,12 +633,32 @@ impl CreatedDirs {
     }
 }
 
+/// Why root does not create below `step`, if an account can change what it leads to or holds: a
+/// directory the account owns, or a symlink it owns in a sticky directory others can write.
+fn account_can_change(step: &Step) -> Option<String> {
+    if let Some(uid) = step.owner_who_can_replace() {
+        return Some(format!(
+            "the symlink {} is owned by uid {uid}, not root, and is in a directory that others can write, where \
+             the sticky bit lets its owner replace it with one that leads anywhere; create it first",
+            step.at.display(),
+        ));
+    }
+    (!step.is_link() && step.stat.st_uid != 0).then(|| {
+        format!(
+            "the directory {} is owned by uid {}, not root, and root does not create inside what an account \
+             can change; create it first",
+            step.at.display(),
+            step.stat.st_uid
+        )
+    })
+}
+
 /// The mode a directory is made with: private until it is judged, whatever the umask.
 const PRIVATE: Mode = Mode::from_bits_truncate(0o700);
 
 /// A name for the tree a plan is made in until it is put in place.
 fn temporary_name() -> OsString {
-    format!(".goetia-{:016x}", RandomState::new().hash_one(std::process::id())).into()
+    format!(".goetia-{:016x}", RandomState::new().hash_one(())).into()
 }
 
 /// Rename `from` in `from_dir` to `to` in `to_dir`, unless something is at `to`: then `EEXIST`, and

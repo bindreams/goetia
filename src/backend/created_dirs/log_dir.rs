@@ -5,7 +5,9 @@
 //! at the log's name before the first start, and whoever can write an ancestor of it can rename the
 //! directory away and make one of their own. The directory is therefore refused while an account other
 //! than root can change it, as it is when install runs. A symlink on the way is judged by the
-//! directory that holds it, which the walk passed too: its owner cannot change where it leads.
+//! directory that holds it, which the walk passed too: its owner cannot change where it leads. Where
+//! that directory is sticky and a group or everyone can write it (`/tmp`), the owner of an entry can
+//! delete it and make another, so a link there is refused unless root owns it.
 
 use std::path::Path;
 
@@ -29,14 +31,15 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan) -> Result<()> {
     for step in &plan.found.trail {
         // The log lands in the directory the path resolves to, whatever step the walk reached it by:
         // `.` and `..`, or a link to either, bring it back to one it has passed.
-        let leaf = !step.link
+        let leaf = !step.is_link()
             && matches!(&plan.found.end, End::Whole { stat, .. }
                 if step.stat.st_dev == stat.st_dev && step.stat.st_ino == stat.st_ino);
         let Some(who) = writer(step, leaf) else { continue };
+        let kind = if step.is_link() { "symlink" } else { "directory" };
         return Err(Error::DirectoryRefused {
             path: dir.to_path_buf(),
             why: format!(
-                "the directory {} can be changed by {who}, who could {LED_ASTRAY}",
+                "the {kind} {} can be changed by {who}, who could {LED_ASTRAY}",
                 step.at.display()
             ),
         });
@@ -72,10 +75,16 @@ const LED_ASTRAY: &str = "make root's open of the log (systemd opens it before i
 
 /// Who besides root can change what `step` passed, if anyone: the owner of a directory, or the group or
 /// everyone who can write it. The sticky bit excuses that unless `leaf`, the directory the log lands
-/// in. A symlink has no one: whoever can write its holder is named at the holder's own step.
+/// in. A symlink has no one but its owner where its holder is sticky and others can write it; otherwise
+/// whoever can write its holder is named at the holder's own step.
 fn writer(step: &Step, leaf: bool) -> Option<String> {
-    if step.link {
-        return None;
+    if step.is_link() {
+        return step.owner_who_can_replace().map(|uid| {
+            format!(
+                "its owner {}, who can replace it in the sticky directory that holds it",
+                describe_uid(uid)
+            )
+        });
     }
     if step.stat.st_uid != 0 {
         return Some(format!("its owner {}", describe_uid(step.stat.st_uid)));
