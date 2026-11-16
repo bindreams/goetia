@@ -4,7 +4,7 @@ use super::verbs::{Processes, System, stop_runs};
 use super::{Com, TaskApi};
 use crate::backend::scm::instance::TaskPath;
 use crate::backend::scm::shim::lock::InstallLock;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::manager::Budget;
 use crate::spec::Id;
 use crate::testing::cleanup::{CLEANUP_BOUND, retrying, warn_left_behind};
@@ -55,6 +55,8 @@ fn remove_task_with<P: Processes, L>(
         tasks
             .delete(&path)
             .err()
+            // The task is gone; a folder left empty is not what the guard removes.
+            .filter(|e| !matches!(e, Error::TaskFolderKept { .. }))
             .map(|e| format!("delete the task `{}`: {}", path.as_str(), e.report()))
     }));
 }

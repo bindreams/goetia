@@ -141,6 +141,30 @@ fn a_stop_that_fails_does_not_stop_the_delete() {
     fake.finish();
 }
 
+/// A delete that took the task and could not remove the folder it left empty has done what the guard is
+/// for: it is not asked again, and nothing is warned of.
+#[skuld::test]
+fn a_folder_left_after_the_delete_is_no_failed_delete() {
+    let fake = Fake::new();
+    fake.on_set_enabled(Ok(()))
+        .on_instances(Ok(Vec::new()))
+        .on_delete(Err(Error::TaskFolderKept {
+            task: PATH.to_owned(),
+            folder: r"\Goetia".to_owned(),
+            source: Box::new(Error::os("remove", std::io::Error::other("in use"))),
+        }));
+
+    removed(&fake, &[]);
+
+    let deletes = fake
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, Call::Delete(_)))
+        .count();
+    assert_eq!(deletes, 1, "not retried");
+    fake.finish();
+}
+
 /// Disabling is best effort: a task that is not there, or that cannot be disabled, is still deleted, and
 /// nothing panics.
 #[skuld::test]
