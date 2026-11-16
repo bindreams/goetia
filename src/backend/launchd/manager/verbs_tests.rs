@@ -962,7 +962,9 @@ fn stop_under_immediate_of_a_queued_start_waits_for_the_pid_then_signals() {
     let calls = fake.calls();
     let first_signal = calls.iter().position(|call| call[0] == "kill").unwrap();
     assert!(
-        calls[..first_signal].iter().all(|call| call[0] == "print"),
+        calls[..first_signal]
+            .iter()
+            .all(|call| call[0] == "print" || call[0] == "procinfo"),
         "no signal is sent before the pid shows: {calls:?}"
     );
     assert_eq!(calls_of(&fake, "kill").len(), 1);
