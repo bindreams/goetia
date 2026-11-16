@@ -56,13 +56,16 @@ try {
 
     if ($Kind -eq 'user') {
         Section "N2a put_Enabled(false) then DeleteTask, with no password, after the account's password changed"
-        $t = Reg 'n2a' "act rec $Logs\n2a.log 0" (Daily $far)
-        net user $user.Name ('Pc2!' + [guid]::NewGuid().ToString('N').Substring(0, 10)) | Out-Null
+        $changed = New-ProbeUser 'gprobenp'
+        $Pc = Get-Principal 'user' $changed
+        $t = Reg 'n2a' "act rec $Logs\n2a.log 0" (Daily $far) $Pc
+        net user $changed.Name ('Pc2!' + [guid]::NewGuid().ToString('N').Substring(0, 10)) | Out-Null
         "  the account's password is changed (the stored one is stale)"
         $t = $folder.GetTask('n2a')
         Disable-NoPassword $t
         Show 'after' ($folder.GetTask('n2a'))
         Delete-NoPassword 'n2a'
+        Remove-ProbeUser $changed
 
         Section "N2b put_Enabled(false) then DeleteTask, with no password, after the account was deleted"
         $gone = New-ProbeUser 'gprobend'
