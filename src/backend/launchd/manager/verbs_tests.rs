@@ -645,21 +645,49 @@ fn stop_under_a_bounded_budget_expires_into_wait_timeout_and_leaves_the_signal()
     fake.assert_spent("the signal was sent, and nothing after it");
 }
 
+/// The wait that ends while a run still has its grace to answer SIGTERM says what that costs: nothing
+/// sends SIGKILL after it, and `goetia daemon kill` does. A wait that ends with no grace pending has
+/// nothing to say of it.
+#[skuld::test]
+fn a_wait_that_ends_inside_the_grace_names_the_limit_and_one_that_does_not_stays_plain() {
+    let recovery = |action: StopAction| {
+        let run = Held::new(0);
+        let pid = run.pid();
+        let fake = Fake::new([print(&running(pid)), print(&running(pid)), sigterm()]);
+        match stopping_as(&fake, Budget::Bounded(Duration::from_millis(100)), action) {
+            Err(Error::WaitTimeout { recovery, .. }) => recovery,
+            other => panic!("expected a wait timeout, got {other:?}"),
+        }
+    };
+
+    let in_grace = recovery(StopAction::default());
+    assert!(
+        in_grace.contains("SIGKILL") && in_grace.contains("goetia daemon kill"),
+        "{in_grace}"
+    );
+
+    let no_grace = recovery(StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: None,
+    });
+    assert!(!no_grace.contains("goetia daemon kill"), "{no_grace}");
+}
+
 /// A stop that ignores SIGTERM for as long as the `timeout` is escalated: SIGKILL is sent when it is over,
 /// and the stop returns once the run is gone. The `timeout` is the grace the user configured, as it is
-/// for systemd's `TimeoutStopSec=`.
+/// for systemd's `TimeoutStopSec=`. The SIGKILL goes to the process held, not to the label: the fake has
+/// no `kill SIGKILL` to answer, and the run still dies of the signal.
 #[skuld::test]
 fn stop_sends_sigkill_to_a_run_that_ignores_sigterm_for_the_timeout() {
-    let run = Held::new(0);
+    let mut run = Held::new(0);
     let pid = run.pid();
     let fake = Fake::new([
         print(&running(pid)),
         print(&running(pid)),
         sigterm(),
-        // The pass after the timeout reads the same run, and ends it.
+        // The pass after the timeout reads the same run, kills it, and reads again.
         print(&running(pid)),
         print(&running(pid)),
-        sigkill_ending(run),
         print(IDLE),
     ]);
     let action = StopAction {
@@ -669,14 +697,43 @@ fn stop_sends_sigkill_to_a_run_that_ignores_sigterm_for_the_timeout() {
 
     stopping_as(&fake, Budget::Unbounded, action).expect("a stop that ends the run");
 
-    fake.assert_spent("SIGTERM, then the timeout, then SIGKILL");
-    assert_eq!(
-        calls_of(&fake, "kill"),
-        [
-            ["kill", "SIGTERM", target().as_str()],
-            ["kill", "SIGKILL", target().as_str()]
-        ]
-    );
+    fake.assert_spent("SIGTERM, then the timeout, then the kill of the process held");
+    assert_eq!(calls_of(&fake, "kill"), [["kill", "SIGTERM", target().as_str()]]);
+    assert_eq!(run.finish(), None, "the run died of a signal, not of its own exit");
+}
+
+/// The wait for a queued start's pid is not spent from the caller's budget: a stop whose budget is the
+/// `timeout` and a margin still gives the run that follows the whole `timeout` before the kill, however
+/// long launchd's throttle held the start.
+#[skuld::test]
+fn a_queued_starts_wait_does_not_spend_the_grace_of_the_run_that_follows() {
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let throttled = Duration::from_secs(2);
+    let fake = Fake::new([
+        print(QUEUED),
+        print(QUEUED),
+        print(QUEUED).then(move || std::thread::sleep(throttled)),
+        print(&running(pid)),
+        print(&running(pid)),
+        print(&running(pid)),
+        sigterm(),
+        print(&running(pid)),
+        print(&running(pid)),
+        print(IDLE),
+    ]);
+    let action = StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(StopAction::MIN_TIMEOUT),
+    };
+    // Less than the throttle plus the `timeout`, as the default of a stop has the `timeout` and a margin.
+    let budget = Budget::Bounded(Duration::from_millis(2500));
+
+    stopping_as(&fake, budget, action).expect("the run is killed once its timeout is over");
+
+    fake.assert_spent("the queued start, SIGTERM, the timeout, and the kill");
+    assert_eq!(calls_of(&fake, "kill"), [["kill", "SIGTERM", target().as_str()]]);
+    assert_eq!(run.finish(), None, "the run died of a signal, not of its own exit");
 }
 
 /// `send-signal: kill` sends SIGKILL at once, and no SIGTERM.
@@ -751,6 +808,21 @@ fn the_sigkill_is_for_the_run_whose_timeout_ran_out_and_not_for_the_next() {
     fake.assert_spent("each run was told to stop once");
     assert_eq!(calls_of(&fake, "kill").len(), 2);
     assert!(calls_of(&fake, "kill").iter().all(|call| call[1] == "SIGTERM"));
+}
+
+/// The grace of a run starts at its first SIGTERM, and a later pass that finds the same run does not
+/// restart it; another run has a grace of its own.
+#[skuld::test]
+fn a_runs_grace_starts_at_its_first_sigterm_and_is_not_restarted() {
+    let mut ending = Ending::of(Some(StopAction {
+        send_signal: StopSignal::Terminate,
+        timeout: Some(StopAction::MIN_TIMEOUT),
+    }));
+
+    let first = ending.grace_end(7, Duration::from_secs(1));
+
+    assert_eq!(ending.grace_end(7, Duration::from_secs(60)), first);
+    assert_ne!(ending.grace_end(8, Duration::from_secs(60)), first);
 }
 
 /// `Immediate` waits for no exit: the signal is sent and the stop returns.

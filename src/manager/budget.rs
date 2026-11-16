@@ -120,6 +120,30 @@ pub fn timed_out(id: &str, awaited: &'static str, budget: Budget) -> crate::Erro
     }
 }
 
+/// [`timed_out`] for a `stop` of a launchd task whose wait ended while the run still had its
+/// `stop-action` `timeout` to answer SIGTERM: goetia sends the SIGKILL after it only while it waits, so
+/// the error says nothing will, and what ends the run.
+pub fn timed_out_inside_grace(id: &str, budget: Budget) -> crate::Error {
+    match timed_out(id, "stopped", budget) {
+        crate::Error::WaitTimeout {
+            id,
+            awaited,
+            waited,
+            recovery,
+        } => crate::Error::WaitTimeout {
+            recovery: format!(
+                "{recovery} The run was sent SIGTERM and has the `stop-action` timeout to answer it; goetia \
+                 sends SIGKILL after that only while it waits, so with this wait ended nothing will: \
+                 `goetia daemon kill {id}` ends it."
+            ),
+            id,
+            awaited,
+            waited,
+        },
+        other => other,
+    }
+}
+
 /// The [`crate::Error::ProcessWaitTimeout`] constructor: a `stop` that SCM confirmed ran out of
 /// `budget` waiting for the service's process `pid` to exit.
 ///
