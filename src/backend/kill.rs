@@ -212,6 +212,17 @@ pub(crate) fn hold_once<T: KillTarget>(
     let Some(pid) = target.service_pid().map_err(HoldError::Read)? else {
         return Ok(Hold::NoProcess);
     };
+    hold_pid(target, pid, deadline)
+}
+
+/// [`hold_once`] for a `pid` the caller has read from the manager itself, as a caller does that sets up
+/// something on the pid (a watch) before it holds it. The manager is asked only whether it still vouches
+/// for `pid`, and the answer is never [`Hold::NoProcess`].
+pub(crate) fn hold_pid<T: KillTarget>(
+    target: &mut T,
+    pid: u32,
+    deadline: Deadline,
+) -> std::result::Result<Hold<T::Process>, HoldError> {
     let process = match target.open(pid) {
         Ok(Some(process)) => process,
         // The process is gone and the manager has not yet recorded it.

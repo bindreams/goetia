@@ -57,8 +57,9 @@ impl Budget {
         }
     }
 
-    /// [`Self::start`] as of `now`, so a test can hold the instant fixed.
-    fn start_at(self, now: Instant) -> Deadline {
+    /// [`Self::start`] as of `now`: a test can hold the instant fixed, and a verb that moves its budget
+    /// ([`Self::extended`]) derives the deadline from the instant it began, so the two cannot drift.
+    pub(crate) fn start_at(self, now: Instant) -> Deadline {
         match self {
             Budget::Immediate => Deadline(Some(now)),
             Budget::Bounded(d) => Deadline(now.checked_add(d)),

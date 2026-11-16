@@ -669,6 +669,44 @@ fn holding_keeps_the_process_once_the_manager_confirms_its_pid() {
     assert_eq!(target.log().last().map(String::as_str), Some("close 100"));
 }
 
+// A pid already read --------------------------------------------------------------------------------------------------
+
+/// A caller that has read the manager's pid itself (a launchd stop, which watches it before it holds it)
+/// holds that pid: the manager is not asked for it again, only whether it still vouches for it.
+#[skuld::test]
+fn a_pid_the_caller_read_is_held_without_reading_the_manager_for_it() {
+    let mut target = Scripted::new([Some(100)], [Open::Found]);
+
+    let Ok(Hold::Held { pid, process }) = hold_pid(&mut target, 100, Budget::Unbounded.start()) else {
+        panic!("a held process");
+    };
+
+    assert_eq!(pid, 100);
+    assert_eq!(target.log(), steps(["open 100", "service_pid"]));
+    drop(process);
+}
+
+/// The failed-open rule is the one `hold_once` has: a refusal only while the manager still names the pid.
+#[skuld::test]
+fn an_open_that_failed_on_a_pid_the_caller_read_is_a_refusal_only_while_the_manager_names_it() {
+    let mut named = Scripted::new([Some(100)], [Open::Fails]);
+    let error = hold_pid(&mut named, 100, Budget::Unbounded.start()).expect_err("a refusal");
+    assert!(
+        matches!(&error, HoldError::Refused(e) if e.to_string() == "access denied"),
+        "{error:?}"
+    );
+    assert_eq!(named.log(), steps(["open 100", "service_pid"]));
+
+    for moved_off in [Some(200), None] {
+        let mut gone = Scripted::new([moved_off], [Open::Fails]);
+        let hold = hold_pid(&mut gone, 100, Budget::Unbounded.start()).expect("an ended process, not a refusal");
+        assert!(
+            matches!(hold, Hold::Ended { pid: 100, held: None }),
+            "{moved_off:?}: {hold:?}"
+        );
+    }
+}
+
 // The error of a kill -------------------------------------------------------------------------------------------------
 
 /// An error of goetia's own that a target passed through an `io::Error` is itself again, so a caller

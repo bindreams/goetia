@@ -7,6 +7,8 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cosca::identity::{ProcessId, Resolved};
+
 use super::super::manager_tests::{launchd_over, procinfo_not_naming};
 use super::super::task::Shown;
 use super::super::task::task_tests::{ID, Tree, marked, plists_of, service_spec, task_spec};
@@ -967,6 +969,42 @@ fn the_sigkill_is_for_the_run_whose_timeout_ran_out_and_not_for_the_next() {
     assert!(calls_of(&fake, "kill").iter().all(|call| call[1] == "SIGTERM"));
     assert_eq!(second.finish(), None, "the second run died of a signal");
     drop(first);
+}
+
+/// A run's SIGTERM and grace are kept for its identity, not its pid: the same process is the run that was
+/// sent SIGTERM, and another process that was given its pid, or any other run, is a new one.
+#[skuld::test]
+fn a_runs_sigterm_is_kept_for_its_identity_and_a_reused_pid_with_a_new_identity_is_a_new_run() {
+    let (a, b) = (Held::new(0), Held::new(0));
+    let found = |pid| match ProcessId::of(pid) {
+        Resolved::Found(id) => id,
+        _ => panic!("a live process has an identity"),
+    };
+    let (run, other) = (found(a.pid()), found(b.pid()));
+    // The same pid, another start: what a process that was given the number later is.
+    let mut record = run.to_record().expect("a record of a live process");
+    record.token = record.token.wrapping_add(1);
+    let reused = ProcessId::try_from(&record).expect("an identity of the same pid and another start");
+    assert_ne!(reused, run, "the same pid is not the same run");
+    let end = Budget::Bounded(StopAction::MIN_TIMEOUT).start();
+    let mut course = Course::new(None, Budget::Unbounded, Watch::new().expect("a kqueue"));
+    assert_eq!(course.termed(run), None, "nothing was sent yet");
+
+    course.termed = Some(Termed {
+        run,
+        grace_end: Some(end),
+    });
+
+    assert_eq!(
+        course.termed(run),
+        Some(Termed {
+            run,
+            grace_end: Some(end)
+        }),
+        "the run found again keeps the grace that began at its SIGTERM"
+    );
+    assert_eq!(course.termed(reused), None, "a reused pid is a run with its own grace");
+    assert_eq!(course.termed(other), None);
 }
 
 /// `Immediate` waits for no exit: the signal is sent and the stop returns.
