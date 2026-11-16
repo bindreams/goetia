@@ -720,6 +720,28 @@ fn a_killed_never_restart_daemon_stays_down(#[fixture(launchd_group)] _group: &G
     });
 }
 
+/// After `kill`, `start` sees the restart the policy made, or makes it now, and returns `Ok`: launchd
+/// holds the restart behind its throttle, and `start` is a `kickstart` of the job it holds.
+#[skuld::test]
+fn a_start_after_a_kill_sees_the_restart(#[fixture(launchd_group)] _group: &Group) {
+    let mgr = Launchd::new();
+    let listener = ConnectBack::listen();
+    let mut spec = service_fields(base_spec(
+        &support::random_test_id(),
+        vec![
+            support::current_exe_str(),
+            support::sentinel::RUN_UNTIL_KILLED.to_string(),
+            listener.port().to_string(),
+        ],
+    ));
+    spec.restart = Restart::Always;
+    spec.restart_delay = Some(Duration::from_secs(5));
+    let spec = ServiceSpec::new(spec).map(DaemonSpec::from).unwrap();
+    let _guard = Guard::install(&mgr, &spec);
+
+    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &listener);
+}
+
 /// Both ways a job has no process: never loaded, and loaded then booted out by `stop`. And the
 /// third, which only a job launchd keeps loaded can show: a `restart: never` job that was killed
 /// stays loaded with no process, and a second kill finds nothing to signal.
@@ -736,7 +758,11 @@ fn killing_a_job_with_no_process_is_not_running(#[fixture(launchd_group)] _group
     mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
     listener.accept("the daemon to report in after start");
     mgr.kill(&spec.common().id).expect("kill");
-    support::kill::until(|| mgr.status(&spec.common().id).expect("status").common().state != State::Running);
+    assert_ne!(
+        mgr.status(&spec.common().id).expect("status").common().state,
+        State::Running,
+        "kill returned while the job was still shown running"
+    );
     support::kill::killing_a_stopped_daemon_is_not_running(&get_manager, &spec.common().id);
 
     mgr.stop(&spec.common().id, Budget::DEFAULT).expect("stop");

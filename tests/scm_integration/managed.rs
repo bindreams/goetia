@@ -352,28 +352,24 @@ fn a_killed_never_restart_daemon_stays_down(#[fixture(scm_group)] _group: &Group
     });
 }
 
-/// `kill` returns once SCM has recorded the exit, so for a service that never restarts the first
-/// `status` after it reads not-running and has no pid. The shared `a_killed_daemon_that_never_restarts_stays_down` waits for that state
-/// instead; this is the contract it hides.
+/// After `kill`, `start` sees the restart the recovery action made, or makes it now: the service is
+/// `STOPPED` while SCM waits out the action's delay, and a `start` from there starts it.
 #[skuld::test]
-fn kill_returns_once_scm_has_recorded_the_exit(#[fixture(scm_group)] _group: &Group) {
+fn a_start_after_a_kill_sees_the_restart(#[fixture(scm_group)] _group: &Group) {
     let mgr = Scm::new();
     let id = support::random_test_id();
     let _guard = ServiceGuard::new(&id);
     let (started, stopped) = (ConnectBack::listen(), ConnectBack::listen());
-    let spec = reporting(&id, Restart::Never, &started, &stopped);
+    let spec = ServiceSpec::new(ServiceFields {
+        restart: Restart::OnFailure,
+        restart_delay: Some(Duration::from_secs(5)),
+        ..support::base_fields(&id, fixture_command(&id, started.port(), stopped.port(), "plain"))
+    })
+    .map(DaemonSpec::from)
+    .unwrap();
     mgr.install(&spec, false).expect("install");
-    mgr.start(&spec.common().id, Budget::DEFAULT).expect("start");
-    started.accept("the fixture to report SERVICE_RUNNING");
 
-    mgr.kill(&spec.common().id).expect("kill");
-
-    let status = mgr.status(&spec.common().id).expect("status straight after the kill");
-    assert!(
-        matches!(status.common().state, State::Stopped | State::Failed),
-        "kill returned before SCM recorded the exit ({status:?})"
-    );
-    assert_eq!(status.common().pid, None, "a killed daemon has no process ({status:?})");
+    support::kill::a_start_after_a_kill_sees_the_restart(&mgr, &spec.common().id, &started);
 }
 
 #[skuld::test]

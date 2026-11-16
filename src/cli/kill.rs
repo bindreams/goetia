@@ -12,9 +12,9 @@ use crate::manager::ServiceManager;
 #[derive(ClapArgs, Debug)]
 pub struct Args {
     /// Daemon ids whose running process to kill, as a failure (SIGKILL, or the platform's
-    /// equivalent). Returns once that is delivered (on Windows, once SCM has recorded the
-    /// exit: the service is then stopped, or already restarted by its restart policy); what follows
-    /// is the daemon's restart policy. A daemon that is not running is an error.
+    /// equivalent). Returns once the process has exited and the manager no longer reports it, on
+    /// every platform; what follows is the daemon's restart policy, and `start` after `kill` brings
+    /// the next process up. A daemon that is not running is an error.
     #[arg(required = true)]
     pub ids: Vec<String>,
 }
@@ -33,7 +33,7 @@ pub fn run(
             get_manager,
             is_elevated,
             verb: &|mgr, id| mgr.kill(id),
-            verb_past_tense: "kill delivered",
+            verb_past_tense: "process ended, recorded by the manager",
             absent_is_success: false,
         },
         out,
