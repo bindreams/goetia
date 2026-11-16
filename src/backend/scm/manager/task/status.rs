@@ -19,7 +19,11 @@ pub(super) const CLOSED: u32 = 0xC000_013A;
 /// The result is the program's exit code verbatim, as the bit pattern of an `i32`, except for the
 /// statuses Task Scheduler writes in its place: a run that has not finished, or never started, has no
 /// exit, and one that was stopped ended as a console close event ends a process. Never a Task
-/// Scheduler status shown as a code.
+/// Scheduler status shown as a code. The shim's own codes (a failure of the shim, a refusal) are exit
+/// codes of the action's process like any, so they show as the last result when the shim ends with
+/// them on its own. After a stop the result is `TERMINATED` whatever the shim ends with, so a stop
+/// that could not end everything (1003) shows as stopped here: the run's record, and the log, say
+/// more.
 pub(super) fn exit_of(last_result: i32) -> Option<Exit> {
     match last_result {
         NOT_RUN | RUNNING => None,

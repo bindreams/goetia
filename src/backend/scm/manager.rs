@@ -96,10 +96,6 @@
 
 pub(in crate::backend::scm) mod identity;
 pub(in crate::backend::scm) mod registry;
-// What reads Task Scheduler is in use. `register`, `delete`, `run` and `stop`, and what only they need,
-// land with the write and run verbs of slice 5, and until then are reached by tests and the `testing`
-// exports.
-#[allow(dead_code, reason = "the task verbs that write and run, its callers, come next")]
 pub(crate) mod task;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use identity::sid_for_account_name;

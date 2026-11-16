@@ -145,18 +145,6 @@ pub enum WindowsDefinition {
     Task(TaskXml),
 }
 
-impl WindowsDefinition {
-    /// The shim host a task's action runs, without the task-mode arguments. A service has none to
-    /// report here: its host is read from its own configuration.
-    #[allow(dead_code, reason = "the Windows backend's task verbs read it")]
-    pub(crate) fn host(&self) -> Option<HostCommand> {
-        match self {
-            WindowsDefinition::Service(_) => None,
-            WindowsDefinition::Task(task) => Some(task.host()),
-        }
-    }
-}
-
 impl fmt::Display for WindowsDefinition {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

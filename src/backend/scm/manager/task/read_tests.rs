@@ -132,7 +132,10 @@ fn the_host_a_task_is_regenerated_with_is_the_installed_actions_not_a_providers(
     // `Scm::new()` has no provider: a regeneration that asked for a host would fail.
     let regenerated = Scm::new().task_regenerate(&spec, &snapshot).unwrap();
 
-    assert_eq!(regenerated.host(), Some(moved));
+    let crate::backend::scm::generate::WindowsDefinition::Task(task) = regenerated else {
+        panic!("a task regenerated as {regenerated:?}");
+    };
+    assert_eq!(task.host(), moved);
 }
 
 #[skuld::test]

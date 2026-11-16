@@ -835,11 +835,14 @@ fn a_native_service_never_asks_for_a_host_and_a_task_always_does() {
 #[skuld::test]
 fn a_windows_definition_names_its_task_host() {
     let task = registration(&spec(), &identity(), &|| Ok(host())).unwrap();
-    assert_eq!(task.host(), Some(host()));
+    let WindowsDefinition::Task(definition) = &task else {
+        panic!("a task registered as {task:?}");
+    };
+    assert_eq!(definition.host(), host());
     assert_eq!(task.to_string(), built(&spec()).to_string(), "Display delegates");
     let native = DaemonSpec::from(
         crate::spec::ServiceSpec::new(crate::testing::base_fields("frpc", vec![program("frpc")])).unwrap(),
     );
     let service = registration(&native, &identity(), &|| Ok(host())).unwrap();
-    assert_eq!(service.host(), None);
+    assert!(matches!(service, WindowsDefinition::Service(_)), "{service:?}");
 }
