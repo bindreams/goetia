@@ -881,9 +881,8 @@ impl Until<'_> {
             }
             (Until::Recorded { pid, held }, Printed::Present(capture)) => {
                 capture.complete
-                    && (state::has_process(&String::from_utf8_lossy(&capture.stdout)) != Some(pid)
-                        || !process::report_is_stale(held, pid)
-                            .map_err(|e| Error::os(format!("read what has process {pid}"), e))?)
+                    && process::recorded(state::has_process(&String::from_utf8_lossy(&capture.stdout)), held, pid)
+                        .map_err(|e| Error::os(format!("read what has process {pid}"), e))?
             }
         })
     }
@@ -951,16 +950,22 @@ impl Launchctl {
     /// read, never the body of `print`'s output.
     fn is_loaded(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<bool>> {
         Ok(self
-            .print(id, deadline, reservation)?
+            .print(id, deadline, Role::Query, reservation)?
             .map(|printed| matches!(printed, Printed::Present(_))))
     }
 
     /// `launchctl print` for `id`. `Ok(None)` iff `deadline` expired. Any failure but the not-found codes
     /// is an `Err`.
-    fn print(&self, id: &str, deadline: Deadline, reservation: &mut Reservation) -> Result<Option<Printed>> {
+    fn print(
+        &self,
+        id: &str,
+        deadline: Deadline,
+        role: Role,
+        reservation: &mut Reservation,
+    ) -> Result<Option<Printed>> {
         let target = target(id);
         let args = ["print", target.as_str()];
-        let Finished::Exited { status, capture } = self.run(&args, deadline, Role::Query, reservation)? else {
+        let Finished::Exited { status, capture } = self.run(&args, deadline, role, reservation)? else {
             return Ok(None);
         };
         if status.success() {
@@ -1109,7 +1114,7 @@ impl Launchctl {
             } else {
                 deadline
             };
-            match self.print(id, read_deadline, &mut reread(id, kept)?)? {
+            match self.print(id, read_deadline, Role::Query, &mut reread(id, kept)?)? {
                 Some(printed) if until.reached(&printed)? => return Ok(Some(())),
                 Some(_) if !spent => {}
                 Some(_) | None => return Ok(None),
@@ -1142,22 +1147,18 @@ impl Launchctl {
     /// `Err`, never no process. Unbounded, and counted in no verb's reservation: the files of the read
     /// are made on the spot, as for `status`.
     fn job_pid(&self, id: &str) -> Result<Option<u32>> {
-        let Some((status, capture)) = self.read_print(
+        let printed = self.print(
             id,
             Budget::Unbounded.start(),
             Role::UncountedQuery,
             &mut Reservation::default(),
-        )?
-        else {
-            unreachable!("a call under an unbounded deadline never expires")
-        };
-        debug_assert!(capture.complete, "a read under an unbounded deadline is whole");
-        if status.success() {
-            Ok(state::has_process(&String::from_utf8_lossy(&capture.stdout)))
-        } else if is_not_found(status.code()) {
-            Ok(None)
-        } else {
-            Err(command_failed(&["print", &target(id)], status, &capture.stderr))
+        )?;
+        match printed.expect("a call under an unbounded deadline never expires") {
+            Printed::Absent => Ok(None),
+            Printed::Present(capture) => {
+                debug_assert!(capture.complete, "a read under an unbounded deadline is whole");
+                Ok(state::has_process(&String::from_utf8_lossy(&capture.stdout)))
+            }
         }
     }
 
@@ -1233,7 +1234,7 @@ impl Launchctl {
         // The one read of the label that parses `print`'s body, for the one question its exit code
         // cannot answer: whether the job is being torn down.
         let mut held = reread(id, &kept)?;
-        let loaded = match never_expires(self.print(id, issuing, &mut held)?) {
+        let loaded = match never_expires(self.print(id, issuing, Role::Query, &mut held)?) {
             Printed::Absent => false,
             Printed::Present(capture) => {
                 debug_assert!(capture.complete, "a read under an unbounded deadline is whole");

@@ -43,7 +43,7 @@ impl Reports for UnitKill<'_> {
     /// systemd reaped it and started the unit again, and the new process was given the number.
     fn await_recorded(&mut self, pid: u32, held: Option<&Process>, deadline: Deadline) -> io::Result<Waited> {
         loop {
-            if self.service_pid()? != Some(pid) || !process::report_is_stale(held, pid)? {
+            if process::recorded(self.service_pid()?, held, pid)? {
                 return Ok(Waited::Confirmed);
             }
             if deadline.expired() {

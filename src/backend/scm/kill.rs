@@ -87,7 +87,7 @@ pub(crate) fn hold_service_process<T: KillTarget>(
         match hold_once(target, deadline)? {
             Hold::NoProcess => return Ok(None),
             Hold::Held { pid, process } => return Ok(Some((pid, process))),
-            Hold::Ended => {}
+            Hold::Ended { .. } => {}
         }
     }
 }

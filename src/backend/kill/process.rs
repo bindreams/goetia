@@ -6,7 +6,7 @@
 use std::io;
 
 use cosca::Process;
-use cosca::identity::{ProcessId, Resolved};
+use cosca::identity::{Liveness, ProcessId, Resolved};
 
 use super::{KillTarget, Waited};
 use crate::backend::bounded::{EXIT_AFTER_REFUSED_KILL, settle_kill};
@@ -42,8 +42,23 @@ impl<R: Reports> KillTarget for Signalling<R> {
         self.0.service_pid()
     }
 
-    fn confirm(&mut self, pid: u32) -> io::Result<bool> {
-        Ok(self.0.service_pid()? == Some(pid) && self.0.names(pid)?)
+    /// The manager shows `pid` and names the process held as the service's. A manager that shows `pid`
+    /// without naming it has either reaped the process held, which is not the service's now (`false`:
+    /// not signalled, and the manager's record is waited for), or the process held is alive and cannot
+    /// be tied to the service: an error, since it is neither the service's nor an ended process.
+    fn confirm(&mut self, pid: u32, process: &Process) -> io::Result<bool> {
+        if self.0.service_pid()? != Some(pid) {
+            return Ok(false);
+        }
+        if self.0.names(pid)? {
+            return Ok(true);
+        }
+        match process.is_alive() {
+            Liveness::Dead => Ok(false),
+            Liveness::Alive | Liveness::Unknown => Err(io::Error::other(format!(
+                "process {pid} could not be confirmed as the service's: the manager reports it, but its own lookup of the process does not name the service"
+            ))),
+        }
     }
 
     fn open(&mut self, pid: u32) -> io::Result<Option<Process>> {
@@ -86,6 +101,13 @@ pub(crate) fn await_exit(process: &Process, deadline: Deadline) -> io::Result<Wa
     }
     .map_err(io::Error::other)?;
     Ok(if exited { Waited::Confirmed } else { Waited::Expired })
+}
+
+/// Whether the manager has recorded the end of `pid`'s process, held through `held`: its report of the
+/// service's pid is another pid or none, or is `pid` on a process other than the one held
+/// ([`report_is_stale`]). The one rule of "recorded" for every manager that reports a pid.
+pub(crate) fn recorded(reported: Option<u32>, held: Option<&Process>, pid: u32) -> io::Result<bool> {
+    Ok(reported != Some(pid) || !report_is_stale(held, pid)?)
 }
 
 /// Whether the manager's report of `pid`, which it still shows after the process held through `held`

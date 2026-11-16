@@ -2570,17 +2570,22 @@ fn kill_is_recorded_when_launchd_shows_another_pid_or_no_job() {
 }
 
 /// `print` still shows the pid, and launchd's own lookup of the process held does not name it as the
-/// job's: launchd had reaped the service's process and the number went to a stranger. Nothing is
-/// signalled and nothing is waited for, as when `print` moves off the pid.
+/// job's, and the process is alive: it cannot be tied to the job, so the kill is an error that says so.
+/// Nothing is signalled, and it never reads as a kill that worked.
 #[skuld::test]
-fn kill_does_not_signal_a_process_procinfo_does_not_name() {
+fn kill_of_a_live_process_procinfo_does_not_name_is_an_error_and_signals_nothing() {
     use super::watch::watch_tests::Held;
 
     let mut stranger = Held::new(0);
     let pid = stranger.pid();
     let (result, script, _) = kill_over([printed_running(pid), printed_running(pid), procinfo_not_naming(pid)]);
 
-    assert!(matches!(result, Ok(())), "{result:?}");
+    let e = result.expect_err("a process not confirmed as the job's");
+    let report = e.report().to_string();
+    assert!(
+        report.contains(&format!("process {pid} could not be confirmed")),
+        "{report}"
+    );
     script.assert_spent("the read, the confirmation, and the lookup that does not name the process");
     assert_eq!(stranger.finish(), Some(0), "the stranger was left alone");
 }

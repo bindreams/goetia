@@ -7,7 +7,9 @@
 //! the held pid ([`Launchctl::names_launch`](super::Launchctl)). `print` can still show a pid after
 //! launchd has reaped its process, and the number may by then be a stranger's, which is what was
 //! opened: launchd's own lookup of the process held by its number, which names the job that owns it,
-//! is what ties the process to the job.
+//! is what ties the process to the job. A process that exited meanwhile is not the job's and is not
+//! signalled; a live one `print` shows that `procinfo` does not name is an error, never a kill that
+//! signalled nothing and said it worked.
 
 use std::io;
 

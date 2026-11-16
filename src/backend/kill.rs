@@ -82,10 +82,14 @@ pub trait KillTarget {
     fn terminate(&mut self, process: &Self::Process) -> io::Result<()>;
 
     /// Whether the manager still vouches for `pid` as the service's process, read after `pid` was
-    /// opened: the second read of the hold. The default is [`Self::service_pid`] being `pid` again; a
-    /// manager that can show a pid after its process was reaped adds what ties the process held to the
-    /// service, not only its number.
-    fn confirm(&mut self, pid: u32) -> io::Result<bool> {
+    /// opened as `process`: the second read of the hold. The default is [`Self::service_pid`] being
+    /// `pid` again; a manager that can show a pid after its process was reaped adds what ties the
+    /// process held to the service, not only its number.
+    ///
+    /// `false` is the process held not being the service's, because it has exited or the manager has
+    /// moved off it. A live process the manager still shows and cannot tie to the service is an error:
+    /// it is neither ended nor the service's.
+    fn confirm(&mut self, pid: u32, _process: &Self::Process) -> io::Result<bool> {
         Ok(self.service_pid()? == Some(pid))
     }
 
@@ -148,11 +152,15 @@ pub fn kill_service<T: KillTarget>(target: &mut T, id: &str) -> io::Result<KillO
         Err(HoldError::Expired { .. }) => unreachable!("an unbounded deadline never expires"),
         Err(HoldError::Refused(e) | HoldError::Read(e)) => Err(e),
         Ok(Hold::NoProcess) => Ok(KillOutcome::NotRunning),
-        // The manager moved off the pid, or let go of one whose process was gone. A held process was
-        // then gone too, or a stranger that took its pid: neither is waited for.
-        Ok(Hold::Ended) => Ok(KillOutcome::Ended),
+        // The process held is not the service's, or was gone: it is not signalled, and a manager may
+        // still report its pid for a moment, so the kill waits for the record as after a signal.
+        Ok(Hold::Ended { pid, held }) => match target.await_recorded(pid, held.as_ref(), Budget::Unbounded.start()) {
+            Ok(Waited::Confirmed) => Ok(KillOutcome::Ended),
+            Ok(Waited::Expired) => unreachable!("an unbounded deadline never expires"),
+            Err(e) => Err(e),
+        },
         Ok(Hold::Held { pid, process }) => {
-            target.terminate(&process)?;
+            target.terminate(&process).map_err(|e| not_signalled(pid, e))?;
             await_exit_saying(target, &process, id, pid).map_err(|e| signalled_but(pid, e))?;
             match target.await_recorded(pid, Some(&process), Budget::Unbounded.start()) {
                 Ok(Waited::Confirmed) => Ok(KillOutcome::Ended),
@@ -170,11 +178,12 @@ pub(crate) enum Hold<P> {
     NoProcess,
     /// The service's process, opened, and confirmed by a second read of the manager.
     Held { pid: u32, process: P },
-    /// The pid the manager reported is no longer the service's: the process was gone before it could
-    /// be opened, and the manager has recorded that, or the manager moved off the pid between the
-    /// open and the confirmation. A process opened by then is let go, not waited for: it is gone or
-    /// somebody else's.
-    Ended,
+    /// The process `pid` the manager reported is not the service's: it was gone before it could be
+    /// opened, the manager moved off the pid between the open and the confirmation, or the process
+    /// opened (`held`) is not the service's. Nothing is signalled. The manager may still report `pid`
+    /// for a moment (it learns of an exit after it has happened), so what a caller who needs the
+    /// manager's record waits for is [`KillTarget::await_recorded`] over `pid` and `held`.
+    Ended { pid: u32, held: Option<P> },
 }
 
 /// The service's process and its pid, opened and held, once: what everything that acts on a service's
@@ -196,7 +205,7 @@ pub(crate) fn hold_once<T: KillTarget>(
         // The process is gone and the manager has not yet recorded it.
         Ok(None) => {
             return match target.await_recorded(pid, None, deadline).map_err(HoldError::Read)? {
-                Waited::Confirmed => Ok(Hold::Ended),
+                Waited::Confirmed => Ok(Hold::Ended { pid, held: None }),
                 Waited::Expired => Err(HoldError::Expired { pid }),
             };
         }
@@ -206,7 +215,7 @@ pub(crate) fn hold_once<T: KillTarget>(
                 Ok(Some(now)) if now == pid => Err(HoldError::Refused(e)),
                 // The manager has moved on: the pid was a process that exited, or somebody else's,
                 // and `e` is superseded by that.
-                Ok(_) => Ok(Hold::Ended),
+                Ok(_) => Ok(Hold::Ended { pid, held: None }),
                 // Cannot tell a refusal from a stale pid; both errors are the caller's to see.
                 Err(read) => Err(HoldError::Read(io::Error::new(
                     read.kind(),
@@ -215,12 +224,13 @@ pub(crate) fn hold_once<T: KillTarget>(
             };
         }
     };
-    if target.confirm(pid).map_err(HoldError::Read)? {
+    if target.confirm(pid, &process).map_err(HoldError::Read)? {
         Ok(Hold::Held { pid, process })
     } else {
-        // Let go: the manager has moved off it.
-        drop(process);
-        Ok(Hold::Ended)
+        Ok(Hold::Ended {
+            pid,
+            held: Some(process),
+        })
     }
 }
 
@@ -253,6 +263,15 @@ impl From<HoldError> for io::Error {
 fn signalled_but(pid: u32, e: io::Error) -> io::Error {
     within(
         format!("process {pid} was signalled, but waiting for it to exit and for the manager to record that failed"),
+        e,
+    )
+}
+
+/// `e`, the failure to signal the process `pid`, which was held and confirmed as the service's: the
+/// signal was not delivered, and the error says which process it was.
+fn not_signalled(pid: u32, e: io::Error) -> io::Error {
+    within(
+        format!("process {pid} was held and confirmed as the service's, but signalling it failed"),
         e,
     )
 }
