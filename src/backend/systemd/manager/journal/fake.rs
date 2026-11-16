@@ -4,7 +4,7 @@
 //! What is scripted is delivered whatever the query matched, with one exception that models the real
 //! journal: an entry can be [`Fake::unindexed`] under a field, which journald leaves it when it stores
 //! an entry twice across a file rotation (the old copy is linked into some fields' chains and not
-//! others). A query that matches on that field does not see the entry.
+//! others). A `follow`, `read_after` or `newest_first` that matches on that field does not see it.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -226,7 +226,7 @@ impl Journal for Fake {
             return Err(Fake::unread());
         }
         Ok(Box::new(Scripted {
-            entries: self.entries.clone().into_iter(),
+            entries: self.seen(self.entries.clone(), matches).into_iter(),
             then_fails: self.then_fails,
             state: Arc::clone(&self.state),
         }))

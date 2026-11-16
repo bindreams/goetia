@@ -934,7 +934,7 @@ fn output_is_the_lines_of_the_markers_stream_minus_the_marker() {
     assert_eq!(
         journal.followed(),
         [(stdout_query("x.service"), Some("c1".to_string()))],
-        "the unit's own lines after the run's Starting entry"
+        "the unit's own lines after where the journal ended before the request"
     );
     assert_eq!(
         journal.read_after_calls(),
@@ -1018,7 +1018,8 @@ fn a_run_that_printed_nothing_shows_nothing_and_no_note() {
 }
 
 /// A marker the follower had not delivered when the run ended is found by the final read of the
-/// unit's lines after the run's Starting entry, and the run's lines are the stream's from there.
+/// unit's lines after where the journal ended before the request, and the run's lines are the
+/// stream's from there.
 #[skuld::test]
 fn a_marker_the_follower_did_not_deliver_is_found_by_the_final_read() {
     let log = Log::default();
