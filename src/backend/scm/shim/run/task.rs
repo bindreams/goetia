@@ -16,10 +16,10 @@ use std::ffi::OsString;
 use std::io::{self, Write as _};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use windows_sys::Win32::Foundation::{ERROR_INVALID_DATA, FALSE, TRUE};
-use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, SetConsoleCtrlHandler};
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler};
 use windows_sys::core::BOOL;
 
 use super::exit;
@@ -87,10 +87,12 @@ pub(super) fn run(id: &str) -> ! {
 /// program's own, or the stop's ([`STOPPED_EXIT`]), or the incomplete stop's, or a shim failure's.
 ///
 /// In order, every failure before the program starts logged: reads the task through `api` (a service's
-/// blob is refused), finds its own instance by `own_pid`, sets the diagnostics log, writes the run's
-/// marker as the first line of `logs` when there is one, runs the program, and writes the one record
-/// into `runs`. A task with no listed instance, and a record that cannot be written, are logged and
-/// do not stop the program or change its code.
+/// blob is refused), waits for its own instance by `own_pid` to be listed ([`own_instance`]), sets the
+/// diagnostics log, writes the run's marker as the first line of `logs` when there is one, runs the
+/// program, and writes the one record into `runs`. A listing that cannot be read, and a record that
+/// cannot be written, are logged and do not stop the program or change its code. A stop during the
+/// wait starts no program: the run is recorded stopped, or logged unrecorded, and ends with the stop's
+/// code.
 pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs: Option<&Runs>, own_pid: u32) -> u32 {
     let log = &*supervisor.log;
     let (spec, path) = match own_spec(id, api) {
@@ -100,7 +102,14 @@ pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs:
             return stop.reported.process_exit_code() as u32;
         }
     };
-    let instance = own_instance(id, api, &path, own_pid, log);
+    let instance = match own_instance(id, api, &path, own_pid, supervisor) {
+        OwnInstanceOutcome::Listed(instance) => Some(instance),
+        OwnInstanceOutcome::Unread => None,
+        OwnInstanceOutcome::Stopped(instance) => {
+            record_run(log, id, runs, instance, file_time_now(), Some(RunOutcome::Stopped));
+            return STOPPED_EXIT;
+        }
+    };
     set_daemon_log(log, id, &spec);
     if let (Some(logs), Some(instance)) = (spec.common().logs.as_deref(), &instance) {
         write_marker(supervisor, id, logs, instance);
@@ -108,8 +117,20 @@ pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs:
 
     let started = file_time_now();
     let (record, code) = ended_as(run_pass(&spec, supervisor, id, || {}, || {}));
+    record_run(log, id, runs, instance, started, record);
+    code
+}
 
-    if let (Some(runs), Some(instance), Some(outcome)) = (runs, instance, record)
+/// Writes the run's record when it has everything one needs; a write that fails is logged.
+fn record_run(
+    log: &Log,
+    id: &str,
+    runs: Option<&Runs>,
+    instance: Option<InstanceId>,
+    started: u64,
+    outcome: Option<RunOutcome>,
+) {
+    if let (Some(runs), Some(instance), Some(outcome)) = (runs, instance, outcome)
         && let Err(e) = runs.write(&RunRecord {
             instance,
             started,
@@ -118,7 +139,6 @@ pub(super) fn run_in(id: &str, supervisor: &Supervisor, api: &dyn TaskApi, runs:
     {
         log.failure(id, &format!("write the run record: {}", Chain(&e)));
     }
-    code
 }
 
 // The task ------------------------------------------------------------------------------------------------------------
@@ -157,27 +177,76 @@ fn own_spec(id: &str, api: &dyn TaskApi) -> Result<(DaemonSpec, TaskPath), SpecS
     }
 }
 
-/// The run's own instance: the one Task Scheduler lists with the shim's pid. `None`, logged, when it
-/// cannot be found; the run then has no name to record under, and the program runs anyway.
-fn own_instance(id: &str, api: &dyn TaskApi, path: &TaskPath, own_pid: u32, log: &Log) -> Option<InstanceId> {
-    const ANYWAY: &str = "the run is not recorded; the program is run anyway";
-    match api.instances(path) {
-        Ok(instances) => {
-            let own = instances
+/// How the wait for the run's own instance ended.
+enum OwnInstanceOutcome {
+    /// Task Scheduler lists an instance with the shim's pid.
+    Listed(InstanceId),
+    /// The listing could not be read; said in the log. The run has no name to record under, and the
+    /// program runs anyway.
+    Unread,
+    /// A stop arrived while no such instance was listed, so no program is to start. Holds the
+    /// instance when the read the stop woke found it; when it did not, that is said in the log.
+    Stopped(Option<InstanceId>),
+}
+
+/// The pace of the re-reads of Task Scheduler's listing while it does not hold the shim yet. Each
+/// read decides; the pace only keeps the loop from spinning.
+const LISTING_PACE: Duration = Duration::from_millis(100);
+
+/// Waits for the run's own instance: the one Task Scheduler lists with the shim's pid. Task Scheduler
+/// lists a run once it has started the action's process, which can be after that process reads the
+/// listing, so a listing without the shim is read again, paced and without a cap: the shim is the
+/// instance's process, and a task that was stopped or deleted meanwhile ends it. A failed read ends
+/// the wait ([`OwnInstanceOutcome::Unread`]); a stop does too, after one more read.
+fn own_instance(
+    id: &str,
+    api: &dyn TaskApi,
+    path: &TaskPath,
+    own_pid: u32,
+    supervisor: &Supervisor,
+) -> OwnInstanceOutcome {
+    let log = &supervisor.log;
+    let read = || {
+        api.instances(path).map(|instances| {
+            instances
                 .iter()
                 .find(|instance| instance.pid == own_pid)
-                .map(|instance| instance.id);
+                .map(|instance| instance.id)
+        })
+    };
+    loop {
+        match read() {
+            Ok(Some(own)) => return OwnInstanceOutcome::Listed(own),
+            Ok(None) => {}
+            Err(e) => {
+                log.failure(
+                    id,
+                    &format!(
+                        "list the task's instances: {}: the run is not recorded; the program is run anyway",
+                        e.report()
+                    ),
+                );
+                return OwnInstanceOutcome::Unread;
+            }
+        }
+        if supervisor.bus.stopped_within(LISTING_PACE) {
+            let own = match read() {
+                Ok(own) => own,
+                Err(e) => {
+                    log.failure(id, &format!("list the task's instances: {}", e.report()));
+                    None
+                }
+            };
             if own.is_none() {
                 log.failure(
                     id,
-                    &format!("no listed instance of this task has process id {own_pid}: {ANYWAY}"),
+                    &format!(
+                        "stopped before the program started, and no listed instance of this task has process id \
+                         {own_pid}: the run is not recorded"
+                    ),
                 );
             }
-            own
-        }
-        Err(e) => {
-            log.failure(id, &format!("list the task's instances: {}: {ANYWAY}", e.report()));
-            None
+            return OwnInstanceOutcome::Stopped(own);
         }
     }
 }
@@ -255,14 +324,24 @@ extern "system" fn control_handler(event: u32) -> BOOL {
     }
 }
 
-/// The handler's answer to `event`. A close event requests a stop and never returns; every other
-/// event is left to the default handler (`FALSE`).
+/// The handler's answer to `event`:
+///
+/// - `CTRL_CLOSE_EVENT` requests a stop and never returns.
+/// - `CTRL_C_EVENT` and `CTRL_BREAK_EVENT` are swallowed (`TRUE`). The program shares the shim's
+///   console, so one it raises or one aimed at the console's group arrives at the shim too; the program
+///   gets its own copy and decides for itself, and the default handler would end the shim, and the run
+///   with it, with no record.
+/// - Every other event (`CTRL_LOGOFF_EVENT`, `CTRL_SHUTDOWN_EVENT`) is left to the default handler
+///   (`FALSE`).
 fn on_event(bus: &StopBus, event: u32) -> BOOL {
-    if event != CTRL_CLOSE_EVENT {
-        return FALSE;
+    match event {
+        CTRL_CLOSE_EVENT => {
+            bus.request_stop();
+            hold_until_the_process_ends()
+        }
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => TRUE,
+        _ => FALSE,
     }
-    bus.request_stop();
-    hold_until_the_process_ends()
 }
 
 /// Holds the system's handler thread: Windows ends the process once the handler returns or its

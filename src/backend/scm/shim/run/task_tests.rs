@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, FALSE};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, FALSE, TRUE};
 use windows_sys::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
 };
@@ -90,6 +90,8 @@ impl Run {
         let dir = tempfile::tempdir().unwrap();
         let id = Id::try_from(ID).unwrap();
         let runs = Runs::of(dir.path(), &id);
+        // Made plainly: naming Administrators as an owner needs an elevated token.
+        std::fs::create_dir_all(dir.path().join("Goetia").join("runs").join(ID)).unwrap();
         runs.ensure(&process_user_sid()).unwrap();
         let fake = FakeGuard::new();
         let supervisor = supervisor(&fake);
@@ -486,12 +488,31 @@ fn the_close_handler_only_requests_a_stop() {
     assert_eq!(run.finish(), Vec::<String>::new());
 }
 
+/// The program shares the shim's console, so a CTRL_C or CTRL_BREAK that the program raises (or that
+/// reaches the console's group) arrives at the shim too. The program gets its own copy and decides for
+/// itself; the shim must not end with it, or the run would end with no record.
 #[skuld::test]
-fn other_control_events_return_false() {
+fn ctrl_c_and_ctrl_break_are_swallowed_and_ask_for_nothing() {
     let fake = FakeGuard::new();
     let supervisor = supervisor(&fake);
 
-    for event in [CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
+    for event in [CTRL_C_EVENT, CTRL_BREAK_EVENT] {
+        assert_eq!(on_event(&supervisor.bus, event), TRUE, "event {event}");
+    }
+
+    assert_eq!(
+        supervisor.bus.settle(Reported::DaemonExit(7)),
+        Reported::DaemonExit(7),
+        "a CTRL_C or CTRL_BREAK reached the bus as a stop"
+    );
+}
+
+#[skuld::test]
+fn logoff_and_shutdown_are_left_to_the_default_handler() {
+    let fake = FakeGuard::new();
+    let supervisor = supervisor(&fake);
+
+    for event in [CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
         assert_eq!(on_event(&supervisor.bus, event), FALSE, "event {event}");
     }
 
@@ -535,11 +556,12 @@ fn without_logs_the_programs_output_goes_to_nul() {
 }
 
 /// With no instance there is no marker to write, since no run can be named, and the program still
-/// runs.
+/// runs. A listing that cannot be read is the one way a run has none.
 #[skuld::test]
 fn a_run_with_no_instance_writes_no_marker() {
     let run = Run::of(&spec_logging_to(Some(LOGS)));
-    run.api.on_instances(Ok(vec![]));
+    run.api
+        .on_instances(Err(Error::os("list the task's instances", io::Error::other("refused"))));
     let run = run.program(exits(0));
 
     assert_eq!(run.run(), 0);
@@ -581,43 +603,122 @@ fn a_record_carries_the_time_the_run_began() {
 // What cannot be recorded =============================================================================================
 
 #[skuld::test]
-fn a_missing_instance_runs_the_program_and_writes_no_record() {
-    let cases: [(crate::error::Result<Vec<Instance>>, String); 2] = [
-        (
-            Ok(vec![Instance {
-                id: instance(),
-                pid: OWN_PID + 1,
-            }]),
-            format!(
-                "no listed instance of this task has process id {OWN_PID}: the run is not recorded; the program is run anyway"
-            ),
-        ),
-        (
-            Err(Error::os("list the task's instances", io::Error::other("refused"))),
-            "list the task's instances: refused".to_string(),
-        ),
-    ];
-    for (reply, message) in cases {
-        let run = Run::of(&spec_logging_to(None));
-        run.api.on_instances(reply);
-        let run = run.program(exits(5));
-        let pin = run.runs.pin().unwrap();
+fn an_unreadable_listing_runs_the_program_and_writes_no_record() {
+    let run = Run::of(&spec_logging_to(None));
+    run.api
+        .on_instances(Err(Error::os("list the task's instances", io::Error::other("refused"))));
+    let run = run.program(exits(5));
+    let pin = run.runs.pin().unwrap();
 
-        let code = run.run();
+    let code = run.run();
 
-        assert_eq!(code, 5, "the program's code is returned all the same");
-        assert_eq!(
-            run.runs.appeared(&pin).unwrap(),
-            vec![],
-            "a record was written for no run"
-        );
-        let failures = run.finish();
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(
-            failures[0].starts_with(&format!("goetia-shim[{ID}]: ")) && failures[0].contains(&message),
-            "{failures:?}"
-        );
-    }
+    assert_eq!(code, 5, "the program's code is returned all the same");
+    assert_eq!(
+        run.runs.appeared(&pin).unwrap(),
+        vec![],
+        "a record was written for no run"
+    );
+    let failures = run.finish();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with(&format!("goetia-shim[{ID}]: "))
+            && failures[0].contains("list the task's instances: refused")
+            && failures[0].contains("the run is not recorded; the program is run anyway"),
+        "{failures:?}"
+    );
+}
+
+// The wait for the run's own instance =================================================================================
+
+/// Task Scheduler lists a run once it has started it, which can be after the shim reads the listing:
+/// the shim reads again, and the program starts when its own instance is listed.
+#[skuld::test]
+fn a_listing_that_misses_the_shim_is_read_again_and_the_run_is_recorded() {
+    let run = Run::of(&spec_logging_to(Some(LOGS)));
+    run.api.on_instances(Ok(vec![])).on_instances(Ok(listed()));
+    let run = run.program(exits(0));
+
+    assert_eq!(run.run(), 0);
+
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(0)));
+    assert_eq!(
+        run.fake.opened_log_text(0),
+        "goetia-run 6f9619ff8b86d011b42d00c04fc964ff\n",
+        "the marker names the instance the second read found"
+    );
+    assert_eq!(run.finish(), Vec::<String>::new());
+}
+
+/// A listing that holds other processes' instances only is not the shim's: it is read again.
+#[skuld::test]
+fn a_listing_of_other_processes_is_read_again() {
+    let others = vec![Instance {
+        id: InstanceId::parse(&format!("{:032x}", 7)).unwrap(),
+        pid: OWN_PID + 1,
+    }];
+    let run = Run::of(&spec_logging_to(None));
+    run.api.on_instances(Ok(others)).on_instances(Ok(listed()));
+    let run = run.program(exits(3));
+
+    assert_eq!(run.run(), 3);
+
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Exited(3)));
+    assert_eq!(run.finish(), Vec::<String>::new());
+}
+
+/// A stop that arrives while the instance is not listed starts no program. The run is recorded stopped
+/// when the instance is found by the read the stop wakes.
+#[skuld::test]
+fn a_stop_while_the_instance_is_not_listed_starts_nothing_and_records_the_run_stopped() {
+    let run = Run::of(&spec_logging_to(Some(LOGS)));
+    run.api.on_instances(Ok(vec![])).on_instances(Ok(listed()));
+    let api = StopsDuring {
+        inner: run.api.clone(),
+        bus: Arc::clone(&run.supervisor.bus),
+        at: Read::Instances,
+    };
+
+    let code = run_in(ID, &run.supervisor, &api, Some(&run.runs), OWN_PID);
+
+    assert_eq!(code, STOPPED);
+    assert_eq!(without_start(run.record()), recorded(RunOutcome::Stopped));
+    assert_eq!(run.fake.calls(Op::Spawn), 0, "no program was started");
+    assert_eq!(
+        run.fake.calls(Op::OpenLog),
+        0,
+        "no marker was written for a run that began nothing"
+    );
+    assert_eq!(run.fake.take_failures(), Vec::<String>::new());
+    run.api.finish();
+}
+
+/// When the read the stop wakes still does not hold the instance, the run has no name to record under:
+/// that is logged, and the process still ends with the stop's code.
+#[skuld::test]
+fn a_stop_while_the_instance_is_not_listed_and_never_found_is_logged_unrecorded() {
+    let run = Run::of(&spec_logging_to(None));
+    run.api.on_instances(Ok(vec![])).on_instances(Ok(vec![]));
+    let api = StopsDuring {
+        inner: run.api.clone(),
+        bus: Arc::clone(&run.supervisor.bus),
+        at: Read::Instances,
+    };
+    let pin = run.runs.pin().unwrap();
+
+    let code = run_in(ID, &run.supervisor, &api, Some(&run.runs), OWN_PID);
+
+    assert_eq!(code, STOPPED);
+    assert_eq!(run.runs.appeared(&pin).unwrap(), vec![]);
+    assert_eq!(run.fake.calls(Op::Spawn), 0);
+    let failures = run.fake.take_failures();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].contains(&format!("no listed instance of this task has process id {OWN_PID}"))
+            && failures[0].contains("stopped before the program started")
+            && failures[0].contains("the run is not recorded"),
+        "{failures:?}"
+    );
+    run.api.finish();
 }
 
 #[skuld::test]
