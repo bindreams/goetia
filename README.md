@@ -463,26 +463,32 @@ owns it, since `install` is not a start and you may still be preparing it.
 - **What is judged, and when.** The checks above judge the paths as they are when `install` runs. A change
   made during or after it, by hand or by another goetia command running at the same time, is not judged;
   see [the concurrent-verb boundary](#the-boundary-that-is-guaranteed-and-the-two-that-are-not).
-- **systemd's log directory.** `install` refuses a `logs` whose directory, or any directory on the way to
-  it, a user other than root can change (owned by another user, or writable by everyone), and names who.
-  Above the log's own directory, the group of a directory root owns is trusted, as systemd's own
-  `LogsDirectory=` trusts it: Debian and Ubuntu ship `/var/log` as `root:syslog 0775`, and
-  `/var/log/<app>/app.log` is accepted there. Only the group is trusted, not the accounts a POSIX ACL names:
-  where a directory has an ACL its group bits are the ACL's mask, so one that can be written is judged as
-  writable by everyone (refused unless it is sticky). The log's own directory is judged strictly: a group
-  that can write it is refused too, so `/var/log/app.log` is refused on Debian and Ubuntu, and the error
-  suggests `/var/log/<app>/app.log` where `install` would make that directory (it is under the places
-  above); anywhere else it says to use a directory only root can change, or to drop `logs:` and log to the
-  journal. The sticky bit excuses a directory everyone can write above the log's, which
-  it keeps others from renaming, but not the log's own directory, where it does not keep them from making
-  an entry (a symlink at the log's name). A symlink on the way is judged by the directory that holds it,
-  as for any path (above): where that directory is sticky and a group or everyone can write it, a
-  symlink that root does not own is refused too, since its owner can replace it. A log that already
-  exists is refused when it is a symlink or an account's file. A log in or under the `cwd` that is to be
-  handed to the account is refused. All of this is judged before any directory is made and covers a
-  directory that already exists, except that a log directory that is the `cwd`, or in it, is found when
-  `install` reaches the `cwd` (on a file system that ignores case two names can be one directory), and
-  what it made is then taken back.
+- **The log directory of a job whose log root opens.** On systemd that is every daemon (it opens `append:`
+  as root, before it drops privileges); on launchd it is a job whose `user` is root (uid 0, by any
+  spelling), since launchd opens `StandardOutPath` as the job's user. A launchd job that runs as another
+  user has its log opened as that user, and its log's directory is not judged. For such a log, `install`
+  refuses a `logs` whose directory, or any directory on the way to it, a user other than root can change
+  (owned by another user, or writable by everyone), and names who. Above the log's own directory, the
+  group of a directory root owns is trusted, as systemd's own `LogsDirectory=` trusts it: Debian and Ubuntu
+  ship `/var/log` as `root:syslog 0775`, and `/var/log/<app>/app.log` is accepted there; macOS ships
+  `/Library/Logs` as `root:admin 0775`. Only the group is trusted, not the accounts an ACL names: where a
+  directory has an ACL its group bits are the ACL's mask, so one that can be written is judged as writable
+  by everyone (refused unless it is sticky). The ACL is read from the directory the path resolved to, which
+  needs no read permission on it: on Linux a POSIX, NFSv4 or CIFS ACL (an NFSv4 or CIFS file system always
+  has one, so a group-writable directory there is judged as writable by everyone), on macOS an extended ACL
+  (`chmod +a`). The log's own directory is judged strictly: a group that can write it is refused too, so
+  `/var/log/app.log` is refused on Debian and Ubuntu, and the error suggests `/var/log/<app>/app.log` where
+  `install` would make that directory (it is under the places above); anywhere else it says to use a
+  directory only root can change, or to drop `logs:` (on systemd, to log to the journal). The sticky bit
+  excuses a directory everyone can write above the log's, which it keeps others from renaming, but not the
+  log's own directory, where it does not keep them from making an entry (a symlink at the log's name). A
+  symlink on the way is judged by the directory that holds it, as for any path (above): where that
+  directory is sticky and a group or everyone can write it, a symlink that root does not own is refused too,
+  since its owner can replace it. A log that already exists is refused when it is a symlink or an account's
+  file. A log in or under the `cwd` that is to be handed to the account is refused. All of this is judged
+  before any directory is made and covers a directory that already exists, except that a log directory that
+  is the `cwd`, or in it, is found when `install` reaches the `cwd` (on a file system that ignores case two
+  names can be one directory), and what it made is then taken back.
 - **A path that is not a directory** (a file, or a symlink that leads nowhere) is refused by both
   backends.
 - **An account with no passwd entry.** On launchd a `user` with no passwd entry is an error. On systemd a

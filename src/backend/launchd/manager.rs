@@ -77,7 +77,7 @@ use cosca::Process;
 use crate::backend::account::{Account, resolve_account};
 use crate::backend::bounded::{self, Finished, Kept, Left, Reservation, Role};
 use crate::backend::client::{Client, ClientError, Real, Wait};
-use crate::backend::created_dirs::{CreatedDirs, Planned};
+use crate::backend::created_dirs::{CreatedDirs, Planned, refuse_writable_log_dir};
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service, process};
 use crate::backend::launchd::generate::Plists;
 use crate::backend::launchd::state::Evidence;
@@ -467,21 +467,24 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// is to be handed to, which root is not.
 /// launchd opens the log and enters `cwd` as the job's user, so a non-root daemon whose
 /// `StandardOutPath` is in a root-only directory fails at launch with an opaque status, and a missing
-/// `WorkingDirectory` refuses the job outright. Every refusal is here, before anything is made or
-/// anything else is changed.
+/// `WorkingDirectory` refuses the job outright. A job that runs as root opens its log as root, which
+/// follows a symlink there, so its log's directory is judged for what an account can do with it
+/// (`refuse_writable_log_dir`); a job that runs as another user opens it as that user and is not.
+/// Every refusal is here, before anything is made or anything else is changed.
 fn plan_parent_dirs(spec: &DaemonSpec, account: &Account, created: &CreatedDirs) -> Result<Planned> {
     let owner = account.owner()?;
-    let parent_of_logs = spec
-        .common()
+    let common = spec.common();
+    let parent_of_logs = common
         .logs
         .as_deref()
         .and_then(Path::parent)
         .filter(|parent| !parent.as_os_str().is_empty());
-    let mut plans = Vec::new();
-    for dir in spec.common().cwd.as_deref().into_iter().chain(parent_of_logs) {
-        plans.push((created.plan(dir)?, owner));
+    let cwd = common.cwd.as_deref().map(|cwd| created.plan(cwd)).transpose()?;
+    let log = parent_of_logs.map(|parent| created.plan(parent)).transpose()?;
+    if let (true, Some(log), Some(logs)) = (account.uid.is_root(), &log, &common.logs) {
+        refuse_writable_log_dir(logs, log, common.id.as_str(), created)?;
     }
-    Ok(plans)
+    Ok(cwd.into_iter().chain(log).map(|plan| (plan, owner)).collect())
 }
 
 /// Make `cwd` itself and the parent of `logs` where they are missing, world-readable and searchable,
