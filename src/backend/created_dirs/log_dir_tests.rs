@@ -92,6 +92,74 @@ fn the_log_directory_itself_is_refused_when_everyone_can_write_it_though_it_is_s
     assert!(refused(&dir.join("app.log")).contains("group"));
 }
 
+/// Debian's and Ubuntu's `/var/log` is `root:syslog 0775`. The group of a directory root owns is trusted
+/// as an ancestor, as systemd's own `LogsDirectory=` trusts it, when the log's directory is root's.
+#[skuld::test(labels = [ELEVATED])]
+fn an_ancestor_a_group_can_write_is_accepted_when_the_log_directory_is_roots() {
+    let layout = Layout::new();
+    let var_log = layout.system().join("var/log");
+    let dir = var_log.join("app");
+    fs::create_dir_all(&dir).unwrap();
+    chmod(&var_log, 0o775);
+
+    check(&dir.join("app.log")).unwrap();
+
+    // A directory that is to be made is root's, and so is as safe.
+    let dirs = CreatedDirs::under(vec![layout.system()]);
+    checked(&dirs, &var_log.join("new/app.log")).unwrap();
+    assert!(!var_log.join("new").exists(), "the check makes nothing");
+}
+
+/// The log's own directory keeps the strict rule: a log directly in a directory a group can write is
+/// refused, whatever its ancestors are.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_directly_in_a_directory_a_group_can_write_is_refused_though_its_ancestors_may_be_group_writable() {
+    let layout = Layout::new();
+    let var = layout.system().join("var");
+    let var_log = var.join("log");
+    fs::create_dir_all(&var_log).unwrap();
+    chmod(&var_log, 0o775);
+
+    let why = refused(&var_log.join("app.log"));
+    assert!(why.contains("group") && why.contains(var_log.to_str().unwrap()), "{why}");
+
+    chmod(&var, 0o775);
+    let why = refused(&var_log.join("app.log"));
+    assert!(why.contains(var_log.to_str().unwrap()), "names the log's directory: {why}");
+}
+
+/// Trusting the group of a root-owned ancestor does not trust everyone, or an account.
+#[skuld::test(labels = [ELEVATED])]
+fn an_ancestor_everyone_can_write_without_the_sticky_bit_or_an_account_owns_is_refused_though_a_group_can_write_it()
+{
+    for mode in [0o757, 0o777, 0o772] {
+        let layout = Layout::new();
+        let ancestor = layout.system().join("log");
+        let dir = ancestor.join("app");
+        fs::create_dir_all(&dir).unwrap();
+        chmod(&ancestor, mode);
+
+        let why = refused(&dir.join("app.log"));
+        assert!(
+            why.contains("every user") && why.contains(ancestor.to_str().unwrap()),
+            "{mode:o}: {why}"
+        );
+    }
+
+    let layout = Layout::new();
+    let ancestor = layout.system().join("log");
+    let dir = ancestor.join("app");
+    fs::create_dir_all(&dir).unwrap();
+    give_to_a_stranger(&ancestor);
+    chmod(&ancestor, 0o775);
+
+    let why = refused(&dir.join("app.log"));
+    assert!(
+        why.contains(&format!("uid {STRANGER}")) && why.contains(ancestor.to_str().unwrap()),
+        "{why}"
+    );
+}
+
 #[skuld::test(labels = [ELEVATED])]
 fn an_ancestor_an_account_can_change_is_refused_though_the_directory_is_roots() {
     let layout = Layout::new();
