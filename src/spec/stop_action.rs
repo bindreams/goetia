@@ -532,9 +532,21 @@ pub(super) struct RawStopAction {
     /// The `timeout` is the base's, kept under an override that wrote its own `send-signal`. If that
     /// signal is `kill`, which has no timeout of its own, it is dropped rather than refused.
     pub timeout_from_base: bool,
-    /// With [`RawStopAction::timeout_from_base`], the signal of the base that the override's replaced. A base
-    /// `kill`'s `timeout: null` is that signal's own, and the override's other signal does not take it.
-    pub base_signal: Option<String>,
+    /// The signal of the base that the override's replaced. A base `kill`'s `timeout: null` is that signal's
+    /// own, and the override's other signal does not take it; and a base signal that is not one is refused
+    /// though nothing else uses it.
+    pub base_signal: Option<BaseSignal>,
+}
+
+/// A base `send-signal:` that an override's replaced, as far as substitution has taken it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BaseSignal {
+    /// As authored: it may still hold `${...}` references.
+    Written(String),
+    /// Substituted; `from_env` says whether `.env` supplied any of it.
+    Substituted { text: String, from_env: bool },
+    /// Could not be substituted (an unset variable): not known to be anything, `kill` included.
+    Unsubstituted,
 }
 
 /// `timeout:` as authored: the one field where `null` is a value.
@@ -555,7 +567,7 @@ impl RawStopAction {
         RawStopAction {
             send_signal: self.send_signal.clone().or(base.send_signal.clone()),
             timeout_from_base,
-            base_signal: base.send_signal.filter(|_| timeout_from_base),
+            base_signal: self.send_signal.as_ref().and(base.send_signal).map(BaseSignal::Written),
             timeout: self.timeout.clone().or(base.timeout),
         }
     }

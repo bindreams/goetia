@@ -63,7 +63,7 @@ use std::collections::BTreeSet;
 
 use super::field::Field;
 use super::raw::RawSpec;
-use super::stop_action::RawTimeout;
+use super::stop_action::{BaseSignal, RawTimeout};
 use super::user::{AccountId, RawUser};
 use super::vars::Vars;
 use crate::error::{Error, Result};
@@ -366,14 +366,21 @@ pub(super) fn spec(raw: &mut RawSpec, vars: &Vars) -> Result<BTreeSet<Field>> {
         if let Some(RawTimeout::Text(text)) = &mut stop_action.timeout {
             substitute(text, Field::StopTimeout, vars, &mut from_env)?;
         }
-        // Only says whether a `null` timeout was a `kill`'s. Text that does not substitute stays as written, and
-        // is an unknown signal to `shape_stop_action`: not for this pass to refuse. Its `.env` is no part of
-        // what the signal's errors blame.
-        if let Some(text) = &mut stop_action.base_signal {
+        // The base's signal, which the override replaced, is not what the override's errors blame: it is
+        // substituted apart from the override's, and says itself whether `.env` supplied it. Text that does
+        // not substitute is no error of this pass: it is a signal not known to be anything.
+        if let Some(BaseSignal::Written(text)) = &mut stop_action.base_signal {
             let mut substituted = text.clone();
-            if substitute(&mut substituted, Field::StopSignal, vars, &mut BTreeSet::new()).is_ok() {
-                *text = substituted;
-            }
+            let mut supplied = BTreeSet::new();
+            stop_action.base_signal = Some(
+                match substitute(&mut substituted, Field::StopSignal, vars, &mut supplied) {
+                    Ok(()) => BaseSignal::Substituted {
+                        text: substituted,
+                        from_env: !supplied.is_empty(),
+                    },
+                    Err(_) => BaseSignal::Unsubstituted,
+                },
+            );
         }
     }
 
@@ -488,7 +495,7 @@ pub(super) fn spec_would_change(raw: &RawSpec) -> bool {
         .any(|field| field.as_deref().is_some_and(would_substitution_change))
         || stop_action.as_ref().is_some_and(|action| {
             action.send_signal.as_deref().is_some_and(would_substitution_change)
-                || action.base_signal.as_deref().is_some_and(would_substitution_change)
+                || matches!(&action.base_signal, Some(BaseSignal::Written(text)) if would_substitution_change(text))
                 || matches!(&action.timeout, Some(RawTimeout::Text(text)) if would_substitution_change(text))
         })
         || command.iter().flatten().any(|arg| would_substitution_change(arg))

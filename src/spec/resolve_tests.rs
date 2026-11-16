@@ -3944,6 +3944,51 @@ fn a_plainly_invalid_base_signal_is_refused_beside_an_override_signal() {
     }
 }
 
+/// A base signal that substitutes into something that is not a signal is refused, whether the override beside it
+/// replaced a `null` timeout, a timeout, or nothing: the override's signal does not make the base's no longer to
+/// refuse. It names the value, and `.env` when `.env` supplied it; the override did not write it.
+#[skuld::test]
+fn a_base_signal_that_does_not_parse_once_substituted_is_refused_naming_the_value_and_its_source(
+    #[fixture(temp_dir)] dir: &Path,
+) {
+    for &native in HOST_BACKENDS {
+        for beside in ["timeout: null", "timeout: 30s", "timeout: '${T}'", ""] {
+            let yaml = format!(
+                "{SERVICE}stop-action: {{send-signal: '${{B}}', {beside}}}\n\
+                 backend-specific:\n  {native}:\n    stop-action: terminate\n"
+            );
+            write_fixture(dir, &yaml, Some("B=bogus\nT=30s\n"));
+
+            let refused = resolve_as(parse_manifest(&yaml), dir, Some(native))
+                .expect_err(&format!("{native}: {beside}: a base signal that is not one is refused"))
+                .to_string();
+
+            assert!(refused.contains("bogus"), "{native}: {beside}: {refused}");
+            assert!(refused.contains("from .env"), "{native}: {beside}: {refused}");
+            assert!(!refused.contains("backend-specific"), "{native}: {beside}: {refused}");
+        }
+    }
+}
+
+/// The same refusal for a value the manifest's own default supplied: `.env` is not blamed.
+#[skuld::test]
+fn a_base_signal_that_a_default_makes_invalid_is_refused_without_blaming_env(#[fixture(temp_dir)] dir: &Path) {
+    for &native in HOST_BACKENDS {
+        let yaml = format!(
+            "{SERVICE}stop-action: {{send-signal: '${{B:-bogus}}', timeout: null}}\n\
+             backend-specific:\n  {native}:\n    stop-action: terminate\n"
+        );
+        write_fixture(dir, &yaml, Some("OTHER=1\n"));
+
+        let refused = resolve_as(parse_manifest(&yaml), dir, Some(native))
+            .expect_err("a base signal that is not one is refused")
+            .to_string();
+
+        assert!(refused.contains("bogus"), "{native}: {refused}");
+        assert!(!refused.contains(".env"), "{native}: {refused}");
+    }
+}
+
 /// A base signal that cannot be substituted is not known to be anything but `kill`: the `null` beside it
 /// is not known to be the signal's own, so the override's other signal does not inherit it, and has its
 /// own default.

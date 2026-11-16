@@ -383,7 +383,7 @@ pub(super) fn systemd_path_refusal(
             field.path(),
             base_dir.display(),
         );
-        return Err(Refused::of_manifest_dir(invalid(id, &message)));
+        return Err(Refused::unattributed(invalid(id, &message)));
     }
     let message = match defect {
         PathDefect::ParentDir => format!("{described}; write the path without `..`"),

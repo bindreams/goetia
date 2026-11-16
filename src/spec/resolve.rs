@@ -55,7 +55,9 @@ use super::field::Field;
 use super::interpolate::{self, Substitution};
 use super::overrides::Supplied;
 use super::raw::RawSpec;
-use super::stop_action::{RawStopAction, RawTimeout, kill_with_timeout, parse_stop_signal, parse_stop_timeout};
+use super::stop_action::{
+    BaseSignal, RawStopAction, RawTimeout, kill_with_timeout, parse_stop_signal, parse_stop_timeout,
+};
 use super::user::{AccountId, RawUser, User};
 use super::vars::Vars;
 use super::{
@@ -285,8 +287,9 @@ impl Refused {
         }
     }
 
-    /// An error no field's text is to blame for: the manifest directory's (`-f`).
-    pub(super) fn of_manifest_dir(err: Error) -> Self {
+    /// An error that carries its own blame, and that no field's text is to blame for in the merged
+    /// spec: the manifest directory's (`-f`), or a value the override replaced.
+    pub(super) fn unattributed(err: Error) -> Self {
         Refused { field: None, err }
     }
 
@@ -459,19 +462,32 @@ fn shape_stop_action(
             parse_stop_timeout(id, text).map(Some)
         })?,
     };
+    // The base's signal, which the override replaced, is shaped whether or not it is used. A plainly invalid
+    // one never gets here: the base is shaped alone first (`Pending`), which refuses it. One that
+    // substituted into something that is not a signal is refused here; `None` is one that did not substitute
+    // at all, which is not known to be anything.
+    let base_signal = match action.base_signal {
+        None => Some(Shaped::Absent),
+        Some(BaseSignal::Written(text)) => Some(shape(
+            id,
+            Field::StopSignal,
+            Some(text),
+            substitution,
+            parse_stop_signal,
+        )?),
+        Some(BaseSignal::Substituted { text, from_env }) => Some(
+            shape(id, Field::StopSignal, Some(text), substitution, parse_stop_signal)
+                .map_err(|refused| refused_in_the_base(refused, from_env))?,
+        ),
+        Some(BaseSignal::Unsubstituted) => None,
+    };
     if timeout_from_base && matches!(timeout, Shaped::Parsed(None)) && !matches!(signal, Shaped::Deferred) {
-        // A plainly invalid base signal never gets here: the base is shaped alone first (`Pending`), which
-        // refuses it. An error here is a signal that did not substitute or did not parse once it had; it is
-        // the base's to refuse and unknown here: the `null` beside it is not known to be its own, so it is
-        // not handed on.
-        let base_signal = match action.base_signal {
-            Some(text) => shape(id, Field::StopSignal, Some(text), substitution, parse_stop_signal),
-            None => Ok(Shaped::Absent),
-        };
+        // The `null` is the base `kill`'s own unless the base's signal is another one, and a base signal not
+        // known to be anything may have been `kill`: it is not handed on.
         match (&signal, base_signal) {
             (Shaped::Parsed(StopSignal::Kill), _) => {}
-            (_, Ok(Shaped::Parsed(StopSignal::Kill)) | Err(_)) => return Ok((signal, Shaped::Absent)),
-            (_, Ok(Shaped::Deferred)) => return Ok((signal, Shaped::Deferred)),
+            (_, None | Some(Shaped::Parsed(StopSignal::Kill))) => return Ok((signal, Shaped::Absent)),
+            (_, Some(Shaped::Deferred)) => return Ok((signal, Shaped::Deferred)),
             _ => {}
         }
     }
@@ -484,6 +500,24 @@ fn shape_stop_action(
             invalid(id, &kill_with_timeout(*timeout)),
         )),
         _ => Ok((signal, timeout)),
+    }
+}
+
+/// `refused`, an error of the base's `send-signal` that an override replaced: the base's own to refuse, and
+/// `.env`'s when `.env` supplied it, never the override's.
+fn refused_in_the_base(refused: Refused, from_env: bool) -> Refused {
+    let from_env: BTreeSet<Field> = from_env.then_some(Field::StopSignal).into_iter().collect();
+    match refused.attributed(&from_env) {
+        Error::Invalid {
+            daemon,
+            message,
+            source,
+        } => Refused::unattributed(Error::Invalid {
+            daemon,
+            message: format!("in the base, whose `send-signal` the override replaced: {message}"),
+            source,
+        }),
+        other => Refused::unattributed(other),
     }
 }
 
@@ -942,7 +976,7 @@ fn check_resolved(id: &Id, field: PathField, raw: &str, resolved: &Path, join: D
         ),
     );
     Err(if from_directory {
-        Refused::of_manifest_dir(err)
+        Refused::unattributed(err)
     } else {
         Refused::at(field.field(), err)
     })
