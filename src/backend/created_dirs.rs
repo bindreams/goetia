@@ -300,7 +300,7 @@ impl CreatedDirs {
             if let (Some(pending), Parent::Existing(dir)) = (&made.pending, &made.parent)
                 && pending == name
             {
-                let dir = fstat(dir).map_err(|e| Error::os_at("stat", self.at(index), e))?;
+                let dir = fstat(dir).map_err(|e| os_while_making("stat", &made.path, &self.at(index), e))?;
                 if (dir.st_dev, dir.st_ino) == (holder.st_dev, holder.st_ino) {
                     return Ok(Some(index));
                 }
@@ -331,7 +331,14 @@ impl CreatedDirs {
                 Ok(()) => break temporary,
                 // Taken (by an install that was stopped, or by another): another name.
                 Err(Errno::EEXIST) => {}
-                Err(e) => return Err(Error::os_at("create directory", path.with_file_name(&temporary), e)),
+                Err(e) => {
+                    return Err(os_while_making(
+                        "create directory",
+                        path,
+                        &path.with_file_name(&temporary),
+                        e,
+                    ));
+                }
             }
         };
         self.record(
@@ -354,6 +361,7 @@ impl CreatedDirs {
         hand: Option<Owner>,
         plan_owner: Option<Owner>,
     ) -> Result<usize> {
+        let above = parent;
         let parent = Parent::Made(parent);
         let parent_fd = fd_of(&self.made, &parent).expect("a directory is made only below one that is held");
         match mkdirat(parent_fd, name, PRIVATE) {
@@ -366,7 +374,9 @@ impl CreatedDirs {
                         .to_string(),
                 });
             }
-            Err(e) => return Err(Error::os_at("create directory", path, e)),
+            Err(e) => {
+                return Err(os_while_making("create directory", path, &self.at(above).join(name), e));
+            }
         }
         self.record(parent, path, name.to_owned(), None, hand, plan_owner)
     }
@@ -493,7 +503,7 @@ impl CreatedDirs {
                          ({e}), which goetia needs to make it appear only in its final state"
                     ),
                 },
-                e => Error::os_at("put in place", made.path.clone(), e),
+                e => os_while_making("put in place", &made.path, &self.at(index), e),
             })?;
             let made = &mut self.made[index];
             made.name = to;
@@ -544,8 +554,14 @@ impl CreatedDirs {
         for index in 0..self.made.len() {
             let made = &self.made[index];
             if let (Some(owner), Some(held), false) = (made.hand, &made.held, made.handed) {
-                fchown(&held.dir, Some(owner.uid), owner.gid)
-                    .map_err(|e| Error::os_at(format!("hand over to uid {}", owner.uid), self.at(index), e))?;
+                fchown(&held.dir, Some(owner.uid), owner.gid).map_err(|e| {
+                    os_while_making(
+                        &format!("hand over to uid {}", owner.uid),
+                        &made.path,
+                        &self.at(index),
+                        e,
+                    )
+                })?;
                 self.made[index].handed = true;
             }
         }
@@ -560,7 +576,7 @@ impl CreatedDirs {
         for made in &self.made {
             unplaced.push(made.pending.is_some() || matches!(made.parent, Parent::Made(parent) if unplaced[parent]));
         }
-        self.undo_where(|index| unplaced[index]);
+        self.undo_where(|index| unplaced[index], Removal::Unplaced);
         self.made.clear();
     }
 
@@ -617,17 +633,14 @@ impl CreatedDirs {
     /// Remove what can be removed, deepest first, since each was made after its parent. A directory
     /// that stays keeps its ancestors, which then hold content.
     fn undo(&mut self) {
-        self.undo_where(|_| true);
+        self.undo_where(|_| true, Removal::AfterFailure);
     }
 
     /// [`undo`](Self::undo) for the directories `which` selects, by index.
-    fn undo_where(&mut self, which: impl Fn(usize) -> bool) {
+    fn undo_where(&mut self, which: impl Fn(usize) -> bool, removal: Removal) {
         for index in (0..self.made.len()).rev().filter(|&index| which(index)) {
             if let Err(e) = self.remove(index) {
-                report(format_args!(
-                    "could not remove {}, which the failed install created: {e}",
-                    self.at(index).display()
-                ));
+                report(format_args!("{}", removal_failure(&self.at(index), &e, removal)));
             }
         }
     }
@@ -651,6 +664,24 @@ fn account_can_change(step: &Step) -> Option<String> {
             step.stat.st_uid
         )
     })
+}
+
+/// Why a directory is being removed.
+#[derive(Debug, Clone, Copy)]
+enum Removal {
+    /// The install failed.
+    AfterFailure,
+    /// It is part of a tree that was never put in place.
+    Unplaced,
+}
+
+/// What is said of a directory at `at` that could not be removed, for the reason `e`.
+fn removal_failure(at: &Path, e: &str, removal: Removal) -> String {
+    let made = match removal {
+        Removal::AfterFailure => "which the failed install created",
+        Removal::Unplaced => "which the install was making and never put in place",
+    };
+    format!("could not remove {}, {made}: {e}", at.display())
 }
 
 /// The mode a directory is made with: private until it is judged, whatever the umask.

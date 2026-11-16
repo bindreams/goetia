@@ -185,6 +185,8 @@ struct Store {
     writes: usize,
     /// Times an install settled its scope.
     settles: usize,
+    /// Times an install asked for the definition's standing.
+    standings: usize,
     calls: Vec<(&'static str, String)>,
     prepared: Vec<(Vec<Step>, Budget)>,
     /// What a run of each task does, by id; absent means a clean exit and no output.
@@ -643,6 +645,13 @@ impl Fake {
         state.settles
     }
 
+    /// How many times an install asked whether the definition it wrote stands: a read-back a write
+    /// that is known to have landed does not need.
+    pub fn standings(&self) -> usize {
+        let state = self.state.lock().expect("Fake mutex poisoned");
+        state.standings
+    }
+
     /// The steps and budget every reservation was asked for, in order, failed
     /// ones included: [`ServiceManager::prepare`]'s, and one for each verb run
     /// outside a sequence.
@@ -796,7 +805,9 @@ impl Fake {
 pub struct FakeScope(Arc<Mutex<Store>>);
 
 impl crate::backend::Settle for FakeScope {
-    fn settle(&mut self, _standing: impl FnOnce() -> Standing) {
+    fn settle(&mut self, standing: impl FnOnce() -> Standing) {
+        // Asked outside the lock: the answer takes it.
+        drop(standing());
         self.0.lock().expect("Fake mutex poisoned").settles += 1;
     }
 }
@@ -962,6 +973,7 @@ impl crate::backend::Backend for Fake {
 
     /// The fake's scope makes nothing but the entry.
     fn standing(&self, _spec: &DaemonSpec, _definition: &String) -> Standing {
+        self.state.lock().expect("Fake mutex poisoned").standings += 1;
         Standing::Yes
     }
 

@@ -790,6 +790,40 @@ fn a_made_directory_that_is_not_roots_is_refused_and_removed_with_the_rest(#[fix
     }
 }
 
+/// Where the first directory of a tree is made, the name of the OS error is the spec's path, and the
+/// temporary name it was being made under is said too.
+#[cfg(target_os = "linux")]
+#[skuld::test(labels = [ELEVATED])]
+fn a_directory_that_cannot_be_made_names_the_specs_path_and_the_temporary_name_it_was_made_under(
+    #[fixture(root_dirs)] _root: &(),
+) {
+    let layout = Layout::new();
+    let parent = layout.system().join("closed");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut dirs = layout.dirs();
+    let plan = dirs.plan(&parent.join("new")).unwrap();
+
+    let result = {
+        let _fs = Fsuid::set(STRANGER);
+        dirs.make(vec![(plan, None)])
+    };
+
+    let err = result.expect_err("the stranger cannot write the directory");
+    let Error::Os { what, path, source } = &err else {
+        panic!("expected an OS error, got {err:?}")
+    };
+    assert_eq!(what, "create directory");
+    assert_eq!(path.as_deref(), Some(parent.join("new").as_path()), "{err}");
+    assert!(
+        source.to_string().contains(&format!(
+            "(while it was being made at {}",
+            parent.join(".goetia-").display()
+        )),
+        "{err}"
+    );
+}
+
 /// The temporary name means nothing to whoever wrote the spec: an OS error while the directory is made
 /// names the path the spec wrote, and says where the directory is until it is placed.
 #[skuld::test]
@@ -1086,10 +1120,12 @@ fn a_make_whose_hand_over_fails_is_an_error_and_the_guard_removes_every_director
 
     let err = result.expect_err("root without the right to give a directory away cannot hand one over");
     assert!(err.to_string().contains("hand over"), "{err}");
+    let said = err.report().to_string();
     let temporary = leftovers(&layout.system());
     assert!(
-        temporary.iter().any(|name| err.to_string().contains(name.as_str())) && !err.to_string().contains("system/a"),
-        "the error names where the directory is, not where it is to be: {err}"
+        temporary.iter().any(|name| said.contains(name.as_str()))
+            && said.contains(layout.system().join("a/b").to_str().unwrap()),
+        "the error names the path the spec wrote and where the directory is: {said}"
     );
     for made in ["logs", "a"] {
         assert!(
@@ -1405,6 +1441,27 @@ fn drop_keeps_the_directories_while_a_panic_unwinds(#[fixture(root_dirs)] _root:
         owner_of(&path),
         (STRANGER, STRANGER),
         "kept, as handed over when it was made"
+    );
+}
+
+/// What an undo says of a directory it could not remove depends on how it came to be made: one of a
+/// tree that was never put in place belongs to no definition, and the install did not fail.
+#[skuld::test]
+fn a_directory_that_could_not_be_removed_is_described_by_how_it_was_made() {
+    let at = Path::new("/var/lib/app");
+
+    let undone = removal_failure(at, "it holds a file", Removal::AfterFailure);
+    let unplaced = removal_failure(at, "it holds a file", Removal::Unplaced);
+
+    assert_eq!(
+        undone,
+        "could not remove /var/lib/app, which the failed install created: it holds a file"
+    );
+    assert!(unplaced.contains("never put in place"), "{unplaced}");
+    assert!(!unplaced.contains("failed install"), "{unplaced}");
+    assert!(
+        unplaced.contains("/var/lib/app") && unplaced.ends_with("it holds a file"),
+        "{unplaced}"
     );
 }
 

@@ -69,9 +69,36 @@ pub(super) struct Step {
     pub(super) stat: FileStat,
     /// For a symlink, the directory that holds it, as the walk read it. `None` for a directory.
     pub(super) holder: Option<FileStat>,
+    /// Whether a directory has an access ACL, so that the group bits of its mode are the ACL's mask and
+    /// say what the accounts it names can do, not what its group can. Only read where the group-write
+    /// bit is set, the one case in which it changes what the log check judges, and only on Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) acl: bool,
 }
 
 impl Step {
+    /// A directory the walk entered, which `fd` holds.
+    fn directory(at: PathBuf, fd: BorrowedFd<'_>, stat: FileStat) -> Result<Self> {
+        let acl = stat.st_mode as libc::mode_t & libc::S_IWGRP != 0
+            && has_access_acl(fd).map_err(|e| Error::os_at("read the ACL of", &at, e))?;
+        Ok(Self {
+            at,
+            stat,
+            holder: None,
+            acl,
+        })
+    }
+
+    /// A symlink the walk followed, in the directory `holder` that held it.
+    fn link(at: PathBuf, stat: FileStat, holder: FileStat) -> Self {
+        Self {
+            at,
+            stat,
+            holder: Some(holder),
+            acl: false,
+        }
+    }
+
     pub(super) fn is_link(&self) -> bool {
         self.holder.is_some()
     }
@@ -86,6 +113,33 @@ impl Step {
         let owner_replaces = mode & libc::S_ISVTX != 0 && mode & (libc::S_IWGRP | libc::S_IWOTH) != 0;
         (owner_replaces && self.stat.st_uid != 0).then_some(self.stat.st_uid)
     }
+}
+
+/// Whether the directory `dir` has an access ACL: an extended attribute that exists only where the ACL
+/// has an entry beyond the mode's own. `fgetxattr` refuses an `O_PATH` descriptor, so the directory is
+/// opened again through it, which is the same directory, not a name looked up again.
+#[cfg(target_os = "linux")]
+fn has_access_acl(dir: BorrowedFd<'_>) -> io::Result<bool> {
+    let again = openat(
+        dir,
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    // An empty buffer asks only whether the attribute is there, and how large it is.
+    let mut size_only = [0u8; 0];
+    match rustix::fs::fgetxattr(&again, "system.posix_acl_access", &mut size_only) {
+        Ok(_) => Ok(true),
+        // No ACL, or a file system that has none.
+        Err(rustix::io::Errno::NODATA | rustix::io::Errno::OPNOTSUPP) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Only the Linux log check reads it.
+#[cfg(not(target_os = "linux"))]
+fn has_access_acl(_dir: BorrowedFd<'_>) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// How a directory is opened to be searched. On Linux an `O_PATH` descriptor needs no read
@@ -174,7 +228,8 @@ pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<E
                 name,
                 SEARCH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
                 Mode::empty(),
-            )?;
+            )
+            .map_err(open_failure_after_seeing_a_directory)?;
             let held = fstat(&fd)?;
             if !same(&named, &held) {
                 return Err(changed_while_read());
@@ -189,6 +244,16 @@ pub(super) fn entry(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<E
             }
         }
         _ => Ok(Some(Entry::Other(named))),
+    }
+}
+
+/// What [`entry`] makes of a failure to open a name that `fstatat` has just seen as a directory.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn open_failure_after_seeing_a_directory(errno: Errno) -> io::Error {
+    match errno {
+        // It was replaced by a link or a file in between: the change [`changed_while_read`] says.
+        Errno::ELOOP | Errno::ENOTDIR => changed_while_read(),
+        errno => errno.into(),
     }
 }
 
@@ -221,11 +286,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
     let stat = fstat(&cur).map_err(|e| Error::os_at("stat", "/", e))?;
     // The directories from `/` to `cur`, `..` and symlinks resolved.
     let mut chain = vec![id_of(&stat)];
-    let mut trail = vec![Step {
-        at: PathBuf::from("/"),
-        stat,
-        holder: None,
-    }];
+    let mut trail = vec![Step::directory(PathBuf::from("/"), cur.as_fd(), stat)?];
     // Where `cur` is, as far as the walk can tell, for naming what it passed.
     let mut shown = PathBuf::from("/");
     // The requested path up to the component being taken, which is what is created.
@@ -260,11 +321,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
                 ));
             }
             shown.pop();
-            trail.push(Step {
-                at: shown.clone(),
-                stat,
-                holder: None,
-            });
+            trail.push(Step::directory(shown.clone(), up.as_fd(), stat)?);
             cur = up;
             continue;
         }
@@ -278,11 +335,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
         };
         if let Entry::Link(stat, _) = &found {
             let holder = fstat(&cur).map_err(|e| Error::os_at("stat", &shown, e))?;
-            trail.push(Step {
-                at: at.clone(),
-                stat: *stat,
-                holder: Some(holder),
-            });
+            trail.push(Step::link(at.clone(), *stat, holder));
         }
         // A link as the last component is walked to its target like one in the middle, so that every
         // directory its target is under reaches the trail.
@@ -290,7 +343,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
             let Entry::Dir(dir, stat) = found else {
                 return Err(Error::NotADirectory { path: so_far });
             };
-            trail.push(Step { at, stat, holder: None });
+            trail.push(Step::directory(at, dir.as_fd(), stat)?);
             chain.push(id_of(&stat));
             return Ok(Walk {
                 end: End::Whole { dir, stat },
@@ -300,11 +353,7 @@ pub(super) fn walk(dir: &Path) -> Result<Walk> {
         }
         match found {
             Entry::Dir(fd, stat) => {
-                trail.push(Step {
-                    at: at.clone(),
-                    stat,
-                    holder: None,
-                });
+                trail.push(Step::directory(at.clone(), fd.as_fd(), stat)?);
                 chain.push(id_of(&stat));
                 cur = fd;
                 shown = at;

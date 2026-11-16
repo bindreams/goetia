@@ -123,8 +123,8 @@ pub(crate) trait Backend {
     ) -> Result<WriteOutcome>;
 
     /// Whether the definition a [`Self::write`] was to leave is in place, read the way
-    /// this backend reads one. Asked after every write, failed or not, and only if the write made
-    /// something to keep or take back. Every backend states it: one whose scope makes nothing says
+    /// this backend reads one. Asked after every write that did not return [`WriteOutcome::Done`] (which
+    /// is known to have landed), failed or not, and only if the write made something to keep or take back. Every backend states it: one whose scope makes nothing says
     /// [`Standing::Yes`].
     fn standing(&self, spec: &DaemonSpec, definition: &Self::Definition) -> Standing;
 

@@ -204,7 +204,12 @@ pub(crate) fn install<B: Backend>(
                     &mut scope,
                     reservation,
                 );
-                scope.settle(|| b.standing(spec, &desired));
+                // A write that landed knows its definition stands; any other end has to ask.
+                if matches!(written, Ok(WriteOutcome::Done)) {
+                    scope.settle(|| Standing::Yes);
+                } else {
+                    scope.settle(|| b.standing(spec, &desired));
+                }
                 match written? {
                     WriteOutcome::Done => return Ok(outcome),
                     WriteOutcome::Refused(refusal) => return Ok(refusal),

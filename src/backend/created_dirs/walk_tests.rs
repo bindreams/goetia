@@ -41,3 +41,21 @@ fn a_path_that_changed_under_the_walk_says_so_and_says_to_run_the_install_again(
     assert!(said.contains("changed while it was being read"), "{said}");
     assert!(said.contains("running the install again reads it again"), "{said}");
 }
+
+/// macOS opens a name that `fstatat` saw as a directory with `O_NOFOLLOW`: if it was replaced by a link or
+/// a file in between, the open says `ELOOP` or `ENOTDIR`, which is the same change, not a fault of the path.
+#[skuld::test]
+fn a_directory_that_became_a_link_or_a_file_before_it_was_opened_is_a_change() {
+    for errno in [Errno::ELOOP, Errno::ENOTDIR] {
+        let said = open_failure_after_seeing_a_directory(errno);
+
+        assert_eq!(said.to_string(), changed_while_read().to_string(), "{errno}");
+    }
+}
+
+#[skuld::test]
+fn any_other_failure_to_open_a_directory_is_kept_as_it_is() {
+    let said = open_failure_after_seeing_a_directory(Errno::EACCES);
+
+    assert_eq!(said.raw_os_error(), Some(libc::EACCES));
+}

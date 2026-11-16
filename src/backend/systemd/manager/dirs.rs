@@ -3,7 +3,9 @@
 
 use std::path::Path;
 
-use crate::backend::account::{Account, find_uid, resolve_account};
+use nix::unistd::Uid;
+
+use crate::backend::account::{find_uid, resolve_account};
 use crate::backend::created_dirs::{CreatedDirs, Owner, refuse_writable_log_dir};
 use crate::error::{Error, Result};
 use crate::spec::{AccountId, DaemonSpec, User};
@@ -21,10 +23,11 @@ use crate::spec::{AccountId, DaemonSpec, User};
 /// found when [`CreatedDirs::make`] reaches `cwd` (a file system that ignores case makes two names
 /// one directory), and what was made is then taken back. Runs while still elevated.
 ///
-/// A `user` that is a number systemd will not run is refused where the definition is rendered for an
-/// install (see [`numeric_account`]), not here. Here an account is looked up only when `cwd` is to be
-/// made and handed to it: an install that hands nothing over does not need it to exist yet (`sysusers`
-/// or a package may make it later), and an unknown one then fails before anything is made.
+/// A `user` that is a number systemd will never run is refused where the definition is rendered for an
+/// install (see [`numeric_uid`]), not here. Here an account is looked up only when `cwd` is to be made
+/// and handed to it: an install that hands nothing over does not need it to exist yet (`sysusers` or a
+/// package may make it later), and an unknown name then fails before anything is made. A uid with no
+/// passwd entry is handed the directory by number, with the group left as it was made.
 pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -> Result<()> {
     let common = spec.common();
     let logs_parent = common
@@ -36,7 +39,7 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
     let cwd = common.cwd.as_deref().map(|cwd| created.plan(cwd)).transpose()?;
 
     if let (Some(logs), Some(log)) = (&common.logs, &log) {
-        refuse_writable_log_dir(logs, log, common.id.as_str())?;
+        refuse_writable_log_dir(logs, log, common.id.as_str(), created)?;
     }
     let owner = match &cwd {
         Some(cwd) if cwd.makes() => owner_of(&common.user)?,
@@ -52,26 +55,29 @@ pub(super) fn ensure_parent_dirs(spec: &DaemonSpec, created: &mut CreatedDirs) -
 }
 
 /// Whom `cwd` is handed to for `user`. Root, by any spelling (uid 0 is root whatever names it), is
-/// handed nothing: the directory is already root's.
+/// handed nothing: the directory is already root's. A uid that no passwd entry has is handed it by
+/// number, with no group to read, so the group stays as made.
 fn owner_of(user: &User) -> Result<Option<Owner>> {
-    if matches!(user, User::Root) {
-        return Ok(None);
-    }
-    match numeric_account(user)? {
-        Some(account) => account.owner(),
+    match numeric_uid(user)? {
+        Some(0) => Ok(None),
+        Some(uid) => match find_uid(uid)? {
+            Some(account) => account.owner(),
+            None => Owner::new(Uid::from_raw(uid), None).map(Some),
+        },
+        None if matches!(user, User::Root) => Ok(None),
         None => resolve_account(user)?.owner(),
     }
 }
 
-/// The account `user` is, if it is a number: a uid, or a name that is the canonical decimal spelling of
+/// The uid `user` is, if it is a number: a uid, or a name that is the canonical decimal spelling of
 /// one (digits only, no sign, no leading zero except `0`), which systemd reads as a uid and never looks
 /// up as the name of an account made of digits. Any other spelling is a name, so `None`.
 ///
-/// An error where systemd will not run a unit as that uid (measured on systemd 255): one with no passwd
-/// entry fails every start with `217/USER`, and 65535 and 4294967295, which `uid_is_valid` refuses, do
-/// not load. The refusal is the spec's, so `render_for_install` makes it, for `preview_install` and
-/// `install` alike.
-pub(super) fn numeric_account(user: &User) -> Result<Option<Account>> {
+/// An error for 65535 and 4294967295, which `uid_is_valid` refuses: systemd does not load a unit that
+/// names them (measured on systemd 255). Any other uid is accepted, whether or not a passwd entry has it
+/// yet, as a name is: until the account exists every start of the unit fails with `217/USER`. The
+/// refusal is the spec's, so `render_for_install` makes it, for `preview_install` and `install` alike.
+pub(super) fn numeric_uid(user: &User) -> Result<Option<u32>> {
     let uid = match user {
         User::Id(AccountId::Uid(uid)) => *uid,
         User::Name(name) => match canonical_uid(name) {
@@ -80,16 +86,13 @@ pub(super) fn numeric_account(user: &User) -> Result<Option<Account>> {
         },
         User::Root | User::Id(AccountId::Sid(_)) => return Ok(None),
     };
-    let wont_run = |why: &str| Error::AccountLookup {
-        detail: format!("systemd will not run a unit as uid {uid}: {why}"),
-        source: None,
-    };
     if uid == 0xFFFF || uid == u32::MAX {
-        return Err(wont_run("it is not a valid uid"));
+        return Err(Error::AccountLookup {
+            detail: format!("systemd will not run a unit as uid {uid}: it is not a valid uid"),
+            source: None,
+        });
     }
-    find_uid(uid)?
-        .map(Some)
-        .ok_or_else(|| wont_run("no passwd entry has it, and every start of the unit would fail"))
+    Ok(Some(uid))
 }
 
 fn canonical_uid(name: &str) -> Option<u32> {

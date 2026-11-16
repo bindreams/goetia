@@ -28,6 +28,9 @@ fn no_entry() -> User {
     User::Name(NO_ENTRY.to_string())
 }
 
+/// A uid no passwd database has.
+const NO_ENTRY_UID: u32 = 4_242_424;
+
 /// An account with a passwd entry that is not root's, on every host the suite runs on.
 const NOBODY: u32 = 65534;
 
@@ -83,16 +86,13 @@ fn an_account_with_an_entry_is_handed_the_cwd_before_the_write_starts(#[fixture(
     assert_eq!(fs::metadata(&cwd).unwrap().uid(), NOBODY);
 }
 
-/// systemd fails every start of a unit run as a uid no passwd entry has (`217/USER`), and does not load
-/// one that names 65535 or 4294967295 (not valid uids). Such a spec is refused where the definition is
-/// rendered for an install, which is where `preview_install` and `install` both go, and not where a
-/// definition is rendered for `status` and `list`: an account that was removed since is no reason they
-/// cannot show the unit.
+/// systemd does not load a unit that names 65535 or 4294967295 (not valid uids). Such a spec is refused
+/// where the definition is rendered for an install, which is where `preview_install` and `install` both
+/// go, and not where a definition is rendered for `status` and `list`: an account that was removed since
+/// is no reason they cannot show the unit.
 #[skuld::test]
-fn a_user_systemd_will_not_run_is_refused_when_rendered_for_an_install_and_not_otherwise() {
+fn a_user_that_is_not_a_valid_uid_is_refused_when_rendered_for_an_install_and_not_otherwise() {
     let users = [
-        User::Id(AccountId::Uid(4_242_424)),
-        User::Name("4242424".to_string()),
         User::Id(AccountId::Uid(0xFFFF)),
         User::Name("65535".to_string()),
         User::Id(AccountId::Uid(u32::MAX)),
@@ -115,17 +115,67 @@ fn a_user_systemd_will_not_run_is_refused_when_rendered_for_an_install_and_not_o
     }
 }
 
-/// A number is a uid to systemd, never the name of an account whose name is those digits, and a uid with
-/// an entry is the entry's account: `0` is root.
+/// A uid with no passwd entry yet is accepted, as a name that is not created yet is: the account may be
+/// made by a package or `sysusers` after the install, and until then every start fails with `217/USER`
+/// (the README says so).
 #[skuld::test]
-fn a_user_that_is_a_number_is_the_account_of_that_uid() {
-    for user in [User::Id(AccountId::Uid(0)), User::Name("0".to_string())] {
-        let account = numeric_account(&user)
-            .unwrap_or_else(|e| panic!("{user:?}: {e}"))
-            .expect("a number is an account by its uid");
+fn a_uid_with_no_passwd_entry_is_accepted_when_rendered_for_an_install() {
+    let systemd = Systemd::default();
+
+    for user in [
+        User::Id(AccountId::Uid(NO_ENTRY_UID)),
+        User::Name(NO_ENTRY_UID.to_string()),
+    ] {
+        assert!(
+            find_uid(NO_ENTRY_UID).unwrap().is_none(),
+            "the test needs a uid no passwd entry has"
+        );
+
+        systemd
+            .render_for_install(&spec(user.clone(), None, None))
+            .unwrap_or_else(|e| panic!("{user:?}: {e}"));
+    }
+}
+
+/// The directory is made and handed to the number: the daemon runs as it once the account exists, and
+/// there is no primary group to read, so the group stays as the directory was made.
+#[skuld::test(labels = [ELEVATED])]
+fn a_cwd_is_handed_to_a_uid_with_no_passwd_entry_by_number(#[fixture(root_dirs)] _root: &()) {
+    for user in [
+        User::Id(AccountId::Uid(NO_ENTRY_UID)),
+        User::Name(NO_ENTRY_UID.to_string()),
+    ] {
+        let layout = Layout::new();
+        let probe = layout.system().join("probe");
+        fs::create_dir(&probe).unwrap();
+        let cwd = layout.system().join("work");
+        let mut created = CreatedDirs::under(vec![layout.system()]);
+
+        ensure_parent_dirs(&spec(user.clone(), Some(&cwd), None), &mut created)
+            .unwrap_or_else(|e| panic!("{user:?}: {e}"));
+
+        let handed = fs::metadata(&cwd).unwrap();
+        assert_eq!(handed.uid(), NO_ENTRY_UID, "{user:?}");
         assert_eq!(
-            (account.name.as_str(), account.uid.as_raw(), account.gid.as_raw()),
-            ("root", 0, 0),
+            handed.gid(),
+            fs::metadata(&probe).unwrap().gid(),
+            "{user:?}: the group is as made"
+        );
+    }
+}
+
+/// A number is a uid to systemd, never the name of an account whose name is those digits.
+#[skuld::test]
+fn a_user_that_is_a_number_is_that_uid() {
+    for (user, uid) in [
+        (User::Id(AccountId::Uid(0)), 0),
+        (User::Name("0".to_string()), 0),
+        (User::Id(AccountId::Uid(NO_ENTRY_UID)), NO_ENTRY_UID),
+        (User::Name(NO_ENTRY_UID.to_string()), NO_ENTRY_UID),
+    ] {
+        assert_eq!(
+            numeric_uid(&user).unwrap_or_else(|e| panic!("{user:?}: {e}")),
+            Some(uid),
             "{user:?}"
         );
     }
@@ -148,13 +198,13 @@ fn a_user_that_is_not_the_canonical_spelling_of_a_number_is_a_name() {
     ] {
         let user = User::Name(spelling.to_string());
         assert!(
-            numeric_account(&user)
+            numeric_uid(&user)
                 .unwrap_or_else(|e| panic!("{spelling:?}: {e}"))
                 .is_none(),
             "{spelling:?}"
         );
     }
-    assert!(numeric_account(&User::Root).unwrap().is_none());
+    assert!(numeric_uid(&User::Root).unwrap().is_none());
 }
 
 /// A write that fails after the directories are made takes them back, handed over as they were: the

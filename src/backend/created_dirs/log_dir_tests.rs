@@ -18,15 +18,41 @@ fn check(logs: &Path) -> Result<()> {
 
 fn checked(dirs: &CreatedDirs, logs: &Path) -> Result<()> {
     let plan = dirs.plan(logs.parent().unwrap())?;
-    refuse_writable_log_dir(logs, &plan, "app")
+    refuse_writable_log_dir(logs, &plan, "app", dirs)
 }
 
-/// The reason of a refusal.
+/// The reason of a refusal, with no root to make anything under.
 fn refused(logs: &Path) -> String {
-    match check(logs) {
+    refused_by(&CreatedDirs::under(Vec::new()), logs)
+}
+
+fn refused_by(dirs: &CreatedDirs, logs: &Path) -> String {
+    match checked(dirs, logs) {
         Err(Error::DirectoryRefused { why, .. }) => why,
         other => panic!("expected a refusal of {}, got {other:?}", logs.display()),
     }
+}
+
+/// Give `path` an access ACL that names the stranger, as `setfacl -m u:4242:rwx` leaves it: the group
+/// bits of the mode then read as the ACL's mask.
+fn name_the_stranger_in_the_acl(path: &Path) {
+    const NO_ID: u32 = u32::MAX;
+    let mut acl = 2u32.to_le_bytes().to_vec(); // POSIX_ACL_XATTR_VERSION
+    for (tag, perm, id) in [
+        (0x01u16, 7u16, NO_ID), // ACL_USER_OBJ
+        (0x02, 7, STRANGER),    // ACL_USER
+        (0x04, 5, NO_ID),       // ACL_GROUP_OBJ
+        (0x10, 7, NO_ID),       // ACL_MASK
+        (0x20, 5, NO_ID),       // ACL_OTHER
+    ] {
+        acl.extend([tag.to_le_bytes().as_slice(), &perm.to_le_bytes(), &id.to_le_bytes()].concat());
+    }
+    rustix::fs::setxattr(path, "system.posix_acl_access", &acl, rustix::fs::XattrFlags::empty()).unwrap_or_else(|e| {
+        panic!(
+            "set a POSIX ACL on {}: {e} (the file system under /tmp needs ACLs)",
+            path.display()
+        )
+    });
 }
 
 #[skuld::test(labels = [ELEVATED])]
@@ -129,8 +155,9 @@ fn a_log_directly_in_a_directory_a_group_can_write_is_refused_though_its_ancesto
     let var_log = var.join("log");
     fs::create_dir_all(&var_log).unwrap();
     chmod(&var_log, 0o775);
+    let under_a_root = CreatedDirs::under(vec![layout.system()]);
 
-    let why = refused(&var_log.join("app.log"));
+    let why = refused_by(&under_a_root, &var_log.join("app.log"));
     assert!(
         why.contains("group") && why.contains(var_log.to_str().unwrap()),
         "{why}"
@@ -141,11 +168,27 @@ fn a_log_directly_in_a_directory_a_group_can_write_is_refused_though_its_ancesto
     );
 
     chmod(&var, 0o775);
-    let why = refused(&var_log.join("app.log"));
+    let why = refused_by(&under_a_root, &var_log.join("app.log"));
     assert!(
         why.contains(var_log.to_str().unwrap()),
         "names the log's directory: {why}"
     );
+}
+
+/// A directory made for the log is made only under a root: a log directory that is not under one is
+/// not told to make one, whatever its own mode says, and is told what does work.
+#[skuld::test(labels = [ELEVATED])]
+fn a_directory_of_its_own_is_suggested_only_under_a_root(#[fixture(root_dirs)] _root: &()) {
+    let layout = Layout::new();
+    let dir = layout.system().join("opt/logs");
+    fs::create_dir_all(&dir).unwrap();
+    chmod(&dir, 0o775);
+
+    let why = refused(&dir.join("app.log"));
+
+    assert!(!why.contains("such as"), "no root to make it under: {why}");
+    assert!(why.contains("journal"), "{why}");
+    assert!(why.contains("under"), "{why}");
 }
 
 /// Trusting the group of a root-owned ancestor does not trust everyone, or an account.
@@ -183,6 +226,55 @@ fn an_ancestor_everyone_can_write_without_the_sticky_bit_or_an_account_owns_is_r
     // A directory made in the log's own account-owned directory would be refused as well: no suggestion.
     let why = refused(&ancestor.join("app.log"));
     assert!(!why.contains("such as"), "{why}");
+}
+
+/// With a POSIX ACL the group bits of the mode are the ACL's mask, so a group-write bit says an account
+/// the ACL names can write the directory, not that its group can: the group is trusted, not the
+/// entries, and such a directory is judged as one others can write.
+#[skuld::test(labels = [ELEVATED])]
+fn an_ancestor_whose_acl_names_an_account_is_refused_though_its_group_bits_allow_writing(
+    #[fixture(root_dirs)] _root: &(),
+) {
+    let layout = Layout::new();
+    let var_log = layout.system().join("var/log");
+    let dir = var_log.join("app");
+    fs::create_dir_all(&dir).unwrap();
+    chmod(&var_log, 0o775);
+    name_the_stranger_in_the_acl(&var_log);
+    assert_eq!(
+        fs::metadata(&var_log).unwrap().permissions().mode() & 0o070,
+        0o070,
+        "the mask is what the group bits read"
+    );
+
+    let why = refused(&dir.join("app.log"));
+
+    assert!(why.contains(var_log.to_str().unwrap()) && why.contains("ACL"), "{why}");
+
+    // As for an ancestor others can write, the sticky bit excuses it.
+    chmod(&var_log, 0o1775);
+    check(&dir.join("app.log")).unwrap();
+}
+
+/// The log's own directory is refused for a group that can write it, and an ACL says whom it is.
+#[skuld::test(labels = [ELEVATED])]
+fn a_log_directory_whose_acl_names_an_account_is_refused_with_no_directory_of_its_own_suggested(
+    #[fixture(root_dirs)] _root: &(),
+) {
+    let layout = Layout::new();
+    let dir = layout.system().join("var/log");
+    fs::create_dir_all(&dir).unwrap();
+    chmod(&dir, 0o775);
+    name_the_stranger_in_the_acl(&dir);
+    let under_a_root = CreatedDirs::under(vec![layout.system()]);
+
+    let why = refused_by(&under_a_root, &dir.join("app.log"));
+
+    assert!(why.contains("ACL"), "{why}");
+    assert!(
+        !why.contains("such as"),
+        "a directory made inside would be refused as an ancestor too: {why}"
+    );
 }
 
 #[skuld::test(labels = [ELEVATED])]

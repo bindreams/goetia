@@ -185,10 +185,10 @@ impl Backend for Systemd {
     }
 
     /// [`Self::render`], refusing a numeric `user` systemd will not run (see
-    /// [`dirs::numeric_account`]). Only here: `status` and `list` render with [`Self::render`], and an
+    /// [`dirs::numeric_uid`]). Only here: `status` and `list` render with [`Self::render`], and an
     /// account removed since the install is no reason they cannot show the unit.
     fn render_for_install(&self, spec: &DaemonSpec) -> Result<Units> {
-        dirs::numeric_account(&spec.common().user)?;
+        dirs::numeric_uid(&spec.common().user)?;
         self.render(spec)
     }
 

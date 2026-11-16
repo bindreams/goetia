@@ -467,9 +467,13 @@ owns it, since `install` is not a start and you may still be preparing it.
   it, a user other than root can change (owned by another user, or writable by everyone), and names who.
   Above the log's own directory, the group of a directory root owns is trusted, as systemd's own
   `LogsDirectory=` trusts it: Debian and Ubuntu ship `/var/log` as `root:syslog 0775`, and
-  `/var/log/<app>/app.log` is accepted there. The log's own directory is judged strictly: a group that can
-  write it is refused too, so `/var/log/app.log` is refused on Debian and Ubuntu, and the error suggests
-  `/var/log/<app>/app.log`. The sticky bit excuses a directory everyone can write above the log's, which
+  `/var/log/<app>/app.log` is accepted there. Only the group is trusted, not the accounts a POSIX ACL names:
+  where a directory has an ACL its group bits are the ACL's mask, so one that can be written is judged as
+  writable by everyone (refused unless it is sticky). The log's own directory is judged strictly: a group
+  that can write it is refused too, so `/var/log/app.log` is refused on Debian and Ubuntu, and the error
+  suggests `/var/log/<app>/app.log` where `install` would make that directory (it is under the places
+  above); anywhere else it says to use a directory only root can change, or to drop `logs:` and log to the
+  journal. The sticky bit excuses a directory everyone can write above the log's, which
   it keeps others from renaming, but not the log's own directory, where it does not keep them from making
   an entry (a symlink at the log's name). A symlink on the way is judged by the directory that holds it,
   as for any path (above): where that directory is sticky and a group or everyone can write it, a
@@ -484,11 +488,12 @@ owns it, since `install` is not a start and you may still be preparing it.
 - **An account with no passwd entry.** On launchd a `user` with no passwd entry is an error. On systemd a
   `user` that is a number (a uid, or a name written `"1000"`: digits only, no sign, no leading zero) is that
   uid, as systemd reads `User=`, and is never looked up as the name of an account made of digits. `install`
-  refuses one that systemd will not run, on every install, before it makes anything: a uid with no passwd
-  entry (every start of the unit would fail with `217/USER`), and 65535 and 4294967295 (systemd does not load
-  a unit that names them). A `user` that is a name is looked up only when `install` makes a `cwd` to hand to
-  it: one that does not exist yet, with no `cwd` or one that exists, installs as it did. uid 0, by any
-  spelling, is root and is handed nothing, on both backends.
+  refuses 65535 and 4294967295 on every install, before it makes anything: systemd does not load a unit that
+  names them. A `user` that is a name is looked up only when `install` makes a `cwd` to hand to it: one that
+  does not exist yet, with no `cwd` or one that exists, installs as it did. A uid with no passwd entry is
+  accepted like a name not created yet, and its `cwd` is handed to the number, with the group left as it was
+  made. Until the account exists every start of the unit fails with `217/USER`. uid 0, by any spelling, is
+  root and is handed nothing, on both backends.
 - **A failed install** removes the directories it made, deepest first, by descriptor and only if they are
   still empty. It keeps them when the definition it wrote stands, and when it cannot tell whether it does
   (the unit or plist cannot be read back): it then says so and keeps them, since removing them could
