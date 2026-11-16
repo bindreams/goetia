@@ -164,30 +164,59 @@ fn counted(count: u32) -> Vec<u8> {
     (1..=count).flat_map(|n| format!("{n}\n").into_bytes()).collect()
 }
 
-/// The stdout lines of `id`'s newest run, as the journal stores them: the entries of the stream the
-/// unit's newest stdout entry is in (a run has one `_STREAM_ID`, and a run is over when `run` has
-/// returned). `run` shows the journal as stored, which journald can store with a line twice across
-/// a file rotation (systemd/systemd#29016), so this, and not `seq`'s text, is what `run` is compared
-/// with. Without the stream's first line, the `goetia-run` marker the unit's wrapper prints, which
-/// `run` does not show.
-fn newest_stream_text(id: &str) -> Vec<u8> {
+/// The cursor of the newest stdout entry of `id`'s unit, or `None` for a unit with none: what a run
+/// that has not started yet writes is after it.
+fn stdout_end(id: &str) -> Option<String> {
     let unit = format!("_SYSTEMD_UNIT={}", unit_of(id));
-    let newest = journal(&[&unit, "_TRANSPORT=stdout", "-r", "-n", "1"]);
-    let stream = field(newest.first().expect("a run wrote a stdout line"), "_STREAM_ID")
-        .expect("a stdout entry has a stream")
-        .to_string();
-    let lines: Vec<String> = journal(&[&format!("_STREAM_ID={stream}")])
-        .iter()
-        .map(|entry| field(entry, "MESSAGE").expect("a line of the run is text").to_string())
-        .collect();
-    let (marker, output) = lines.split_first().expect("a stream has its marker");
-    assert!(
-        marker.starts_with("goetia-run "),
-        "the stream starts with the marker: {marker}"
+    journal(&[&unit, "_TRANSPORT=stdout", "-r", "-n", "1"])
+        .first()
+        .map(|entry| field(entry, "__CURSOR").expect("an entry has a cursor").to_string())
+}
+
+/// The stdout lines of the newest run of `id`'s unit, written after `after` ([`stdout_end`] from
+/// before the run), read by the one query `run` reads by (`_SYSTEMD_UNIT=` + `_TRANSPORT=stdout`),
+/// from the run's own `goetia-run <INVOCATION_ID>` marker on, without the marker. Not `_STREAM_ID=`: a
+/// rotation duplicate indexed under the unit's fields only would show here once what `run` shows
+/// twice.
+///
+/// Panics when the entries after `after` are not exactly the run's own stream with its marker first.
+///
+/// Covers newline-terminated text lines only: an entry with no `MESSAGE` or with a `_LINE_BREAK`
+/// panics.
+fn run_stream_text(id: &str, after: Option<&str>) -> Vec<u8> {
+    let invocation = started_invocations(id).pop().expect("a run started");
+    let marker = format!("goetia-run {invocation}");
+    let unit = format!("_SYSTEMD_UNIT={}", unit_of(id));
+    let from = after.map(|cursor| format!("--after-cursor={cursor}"));
+    let mut query = vec![unit.as_str(), "_TRANSPORT=stdout"];
+    query.extend(from.as_deref());
+    let entries = journal(&query);
+    let first = entries.first().expect("a run wrote a stdout line");
+    assert_eq!(
+        field(first, "MESSAGE"),
+        Some(marker.as_str()),
+        "the first stdout entry after the run began is not its marker: a late line of an earlier run, which `run` may have missed"
     );
-    output
+    let stream = field(first, "_STREAM_ID").expect("a stdout entry has a stream");
+    entries[1..]
         .iter()
-        .flat_map(|line| format!("{line}\n").into_bytes())
+        .flat_map(|entry| {
+            assert_eq!(
+                field(entry, "_STREAM_ID"),
+                Some(stream),
+                "a stdout entry after the run began is of another stream: a late line of an earlier run, which `run` may have missed: {entry}"
+            );
+            assert!(
+                entry.get("_LINE_BREAK").is_none(),
+                "a line this helper does not cover: {entry}"
+            );
+            let mut line = field(entry, "MESSAGE")
+                .expect("a line of the run is text")
+                .as_bytes()
+                .to_vec();
+            line.push(b'\n');
+            line
+        })
         .collect()
 }
 
@@ -797,10 +826,11 @@ fn run_returns_every_line_of_a_chatty_run(#[fixture(systemd_group)] _group: &Gro
     let want = counted(20000);
 
     for n in 1..=20 {
+        let before = stdout_end(&id);
         let (exit, out) = run_task(&mgr, &task_id);
 
         assert_eq!(exit, Exit::Code(0));
-        let journaled = newest_stream_text(&id);
+        let journaled = run_stream_text(&id, before.as_deref());
         assert_same_text(n, &out, &journaled);
         assert_holds_in_order(n, &journaled, &want);
     }
@@ -834,9 +864,10 @@ fn a_line_of_5000_bytes_and_a_control_byte_arrive_whole(#[fixture(systemd_group)
     assert_eq!(out, want);
 }
 
-/// A run starts right behind a chatty one (the first run's lines can still be on their way to the
-/// journal) and shows none of its lines: what it shows is its own stream in the journal, which holds
-/// `second-run` and nothing of the first run's.
+/// A run starts right behind a chatty one and shows none of its lines: what it shows is its own stream
+/// in the journal, which holds `second-run` and nothing of the first run's. The second run starts
+/// after the first `run` has synced and returned, so any first-run line after `before` is a line
+/// `run` missed.
 #[skuld::test(labels = [JOURNALD_CONFIG], serial = JOURNALD_CONFIG)]
 fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(systemd_group)] _group: &Group) {
     let _journald = JournaldConf::unlimited();
@@ -854,14 +885,16 @@ fn a_second_run_shows_none_of_the_first_runs_lines(#[fixture(systemd_group)] _gr
     let first = counted(20000);
 
     for n in 1..=20 {
+        let before = stdout_end(&id);
         let (_, out) = run_task(&mgr, &task_id);
-        let journaled = newest_stream_text(&id);
+        let journaled = run_stream_text(&id, before.as_deref());
         assert_same_text(n, &out, &journaled);
         assert_holds_in_order(n, &journaled, &first);
 
+        let before = stdout_end(&id);
         let (exit, out) = run_task(&mgr, &task_id);
         assert_eq!(exit, Exit::Code(0));
-        let journaled = newest_stream_text(&id);
+        let journaled = run_stream_text(&id, before.as_deref());
         assert_same_text(n, &out, &journaled);
         assert_holds_in_order(n, &journaled, b"second-run\n");
         assert!(
