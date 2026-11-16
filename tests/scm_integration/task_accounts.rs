@@ -6,6 +6,7 @@ use std::process::{Command, Output};
 use goetia::error::Error;
 use goetia::manager::{Budget, Exit, ServiceManager as _, State};
 use goetia::spec::{Id, User};
+use goetia::testing::remove_task;
 
 use crate::install_helper::TASK_AS;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
@@ -138,13 +139,15 @@ fn record_files(id: &Id) -> Vec<String> {
     names
 }
 
-/// A task installed again as another user: the record directory's permissions name the new user, who
+/// A task installed as another user over the records of the first: the record directory's permissions name the new user, who
 /// writes its record and prunes the one the first user's run left. The first user's record carries an
 /// entry for that user only, so the new one deletes it through the directory's own delete-child right.
 /// The prune is waited for with no cap, since it is a state of the directory: a prune that fails hangs the
 /// test.
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
-fn a_task_installed_again_as_another_user_still_records_and_prunes(#[fixture(scm_group)] _group: &Group) {
+fn a_task_installed_as_another_user_over_the_first_users_records_still_records_and_prunes(
+    #[fixture(scm_group)] _group: &Group,
+) {
     // Declared first, so the accounts go after the task, whose logon they are.
     let first = format!("gt{:08x}", rand::random::<u32>());
     let second = format!("gt{:08x}", rand::random::<u32>());
@@ -172,6 +175,11 @@ fn a_task_installed_again_as_another_user_still_records_and_prunes(#[fixture(scm
     let first_records = record_files(id);
     assert_eq!(first_records.len(), 1, "{first_records:?}");
 
+    // The task goes and its records stay, so the install that follows finds the directory there and sets
+    // its permissions for the new user. (An in-place update of the task to another user leaves the task
+    // unreadable by that user's shim, which is not what this tests.)
+    remove_task(id);
+    assert!(!task_exists(id) && records_of(id).is_dir());
     assert_succeeded(
         "install as the second user",
         &as_user("install", id, &second, &host, &command),
