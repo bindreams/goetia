@@ -154,7 +154,9 @@ impl Runs {
 
     /// Writes the record of a run, replacing one of the same instance, then prunes. The record is
     /// whole once this returns `Ok`; a prune that cannot remove a file leaves it for the next write.
-    pub(crate) fn write(&self, record: &RunRecord) -> io::Result<()> {
+    /// What the prune could not do, and a failure of its own (not a file that is gone or held), is
+    /// returned as one line each for the caller to log: it never fails the write.
+    pub(crate) fn write(&self, record: &RunRecord) -> io::Result<Vec<String>> {
         let name = record.instance.hex();
         let temp = self.dir.join(format!("{name}{TEMP}"));
         let body = serde_json::to_vec(&Stored {
@@ -174,8 +176,7 @@ impl Runs {
             let _ = fs::remove_file(&temp);
             return Err(e);
         }
-        self.prune(&record.instance);
-        Ok(())
+        Ok(self.prune(&record.instance))
     }
 
     /// The record of the run `instance`, if it has one.
@@ -254,9 +255,9 @@ impl Runs {
 
     /// After a write of `own`: deletes the pins nothing holds, and when no pin is held, every record
     /// but `own` and every temp file. A file that cannot be removed now (a write in flight holds its
-    /// temp file) is for the next write.
-    fn prune(&self, own: &InstanceId) {
-        self.prune_listing(own, || self.entries());
+    /// temp file) is for the next write. Returns what went wrong that is not that.
+    fn prune(&self, own: &InstanceId) -> Vec<String> {
+        self.prune_listing(own, || self.entries())
     }
 
     /// [`Runs::prune`] over `list`, which is called twice: the first listing decides what may be
@@ -265,17 +266,49 @@ impl Runs {
     /// second shows it; a pin taken after the first listing has every record of the first in its own
     /// listing. One listing would rest on the order a directory read returns a pin and a record in,
     /// which is not promised; pins read first would miss a pin taken between the two.
-    fn prune_listing(&self, own: &InstanceId, list: impl Fn() -> io::Result<Vec<Entry>>) {
-        let Ok(entries) = list() else { return };
-        let Ok(pins) = list() else { return };
+    ///
+    /// Returns what went wrong, one line each, besides a file that is gone or held. A pin that cannot be
+    /// opened says nothing about a handle: it is taken as not held, since reading it as held would stop
+    /// every later prune for good. Access denied is a pin a previous principal left (no entry for this
+    /// one) or a pin whose delete is pending, which Windows reports alike; the directory lets this
+    /// principal delete entries, so the pin is deleted, which a pending one refuses (told).
+    fn prune_listing(&self, own: &InstanceId, list: impl Fn() -> io::Result<Vec<Entry>>) -> Vec<String> {
+        let listing = |e: io::Error| {
+            vec![format!(
+                "list the run records in {} to prune them: {e}",
+                self.dir.display()
+            )]
+        };
+        let entries = match list() {
+            Ok(entries) => entries,
+            Err(e) => return listing(e),
+        };
+        let pins = match list() {
+            Ok(pins) => pins,
+            Err(e) => return listing(e),
+        };
+        let mut problems = Vec::new();
         let mut held = false;
         for entry in &pins {
             if let Entry::Pin(path) = entry {
-                held |= files::is_held(path);
+                match files::is_held(path) {
+                    Ok(pinned) => held |= pinned,
+                    Err(e) => {
+                        let said = format!("open the pin {} to tell whether a run holds it: {e}", path.display());
+                        // Taken as not held, whatever the failure was.
+                        if e.kind() != io::ErrorKind::PermissionDenied {
+                            problems.push(said);
+                        } else if let Err(removed) = fs::remove_file(path)
+                            && removed.kind() != io::ErrorKind::NotFound
+                        {
+                            problems.push(format!("{said}; and remove it: {removed}"));
+                        }
+                    }
+                }
             }
         }
         if held {
-            return;
+            return problems;
         }
         for entry in entries {
             let doomed = match entry {
@@ -283,8 +316,14 @@ impl Runs {
                 Entry::Temp(path) => path,
                 Entry::Record(_) | Entry::Pin(_) => continue,
             };
-            let _ = fs::remove_file(doomed);
+            if let Err(e) = fs::remove_file(&doomed)
+                && e.kind() != io::ErrorKind::NotFound
+                && !files::is_sharing_violation(&e)
+            {
+                problems.push(format!("remove {}: {e}", doomed.display()));
+            }
         }
+        problems
     }
 
     /// What the directory holds that is goetia's, in no order.

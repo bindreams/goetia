@@ -182,16 +182,54 @@ fn a_prune_reads_the_records_before_the_pins() {
 }
 
 #[skuld::test]
-fn a_write_in_flight_keeps_its_temp_file_from_a_prune() {
+fn a_write_in_flight_keeps_its_temp_file_from_a_prune_and_is_no_problem() {
     let (_dir, runs) = fixture();
     // Another run's write, between creating its temp file and renaming it.
     let in_flight = runs.dir.join(format!("{}.json.tmp", instance(2).hex()));
     let held = files::create_temp(&in_flight).unwrap();
 
-    runs.write(&record(1, 1)).unwrap();
+    let problems = runs.write(&record(1, 1)).unwrap();
 
     assert!(in_flight.exists(), "a prune cannot delete what a write holds");
+    assert_eq!(
+        problems,
+        Vec::<String>::new(),
+        "a file that is held is for the next write"
+    );
     drop(held);
+}
+
+/// A prune that cannot list the directory says so, and does not fail the write.
+#[skuld::test]
+fn a_listing_that_fails_is_a_problem_of_the_prune() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+
+    let problems = runs.prune_listing(&instance(1), || Err(io::Error::other("listing denied")));
+
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("listing denied"), "{problems:?}");
+}
+
+/// A file whose delete is pending (another handle has it open) cannot be opened, deleted or listed as
+/// anything but denied: a removal that fails so is told, and the prune goes on to the rest.
+#[skuld::test]
+fn a_removal_that_fails_is_a_problem_and_the_rest_are_removed() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let stuck = runs.dir.join(file_of(&instance(2)));
+    let holder = files::create_pin(&stuck).unwrap();
+    let reader = OpenOptions::new().read(true).open(&stuck).unwrap();
+    drop(holder);
+    let doomed = runs.dir.join(format!("{}.json.tmp", instance(3).hex()));
+    fs::write(&doomed, "").unwrap();
+
+    let problems = runs.write(&record(4, 4)).unwrap();
+
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains(&file_of(&instance(2))), "{problems:?}");
+    assert!(!doomed.exists() && runs.read(&instance(1)).unwrap().is_none());
+    drop(reader);
 }
 
 #[skuld::test]
@@ -238,6 +276,48 @@ fn a_stale_pin_is_deleted_and_does_not_stop_pruning() {
 
     assert!(!stale.exists(), "the stale pin is deleted");
     assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
+}
+
+/// A pin that a previous principal's `run` left (a power cut) has entries for that principal alone, since
+/// a directory's new permissions are never given to what is in it: the new principal, whose write finds
+/// it, cannot open it at all (not even for a delete) and has only what the directory gives, deleting
+/// entries. It is no live pin: the write deletes it and prunes, and has nothing to report.
+#[skuld::test]
+fn a_stale_pin_the_writing_account_has_no_entry_on_is_deleted_and_does_not_stop_pruning() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let stale = runs.dir.join("pin-old.pin");
+    fs::write(&stale, "").unwrap();
+    Descriptor::from_sddl("D:P(A;;FA;;;SY)(A;;FA;;;BA)")
+        .unwrap()
+        .set_dacl(&stale)
+        .unwrap();
+
+    let problems = runs.write(&record(2, 2)).unwrap();
+
+    assert!(!stale.exists(), "the stale pin is deleted");
+    assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
+    assert_eq!(problems, Vec::<String>::new());
+}
+
+/// A pin that cannot be opened or deleted for any reason (here its delete is pending: Windows reports
+/// that as access denied too) is told, and is not taken as held: no run waits on a pin whose holder has
+/// closed it, and reading it as held would stop every later prune.
+#[skuld::test]
+fn a_pin_that_can_be_neither_opened_nor_deleted_is_a_problem_and_is_taken_as_not_held() {
+    let (_dir, runs) = fixture();
+    runs.write(&record(1, 1)).unwrap();
+    let pending = runs.dir.join("pin-odd.pin");
+    let holder = files::create_pin(&pending).unwrap();
+    let reader = OpenOptions::new().read(true).open(&pending).unwrap();
+    drop(holder);
+
+    let problems = runs.write(&record(2, 2)).unwrap();
+
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("pin-odd.pin"), "{problems:?}");
+    assert_eq!(instances_kept(&runs, &[instance(1), instance(2)]), [false, true]);
+    drop(reader);
 }
 
 #[skuld::test]

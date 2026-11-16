@@ -7,7 +7,7 @@ use std::io;
 
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
-use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, snapshot_of};
+use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, shim_writes, snapshot_of};
 use super::*;
 use crate::backend::ReadOutcome;
 use crate::backend::kill::Waited;
@@ -42,7 +42,7 @@ fn uninstall_of_a_running_task_stops_it_then_deletes_it_and_its_records() {
         .on_delete(Ok(true));
     let mut machine = Machine::new(&fake, &[4242]);
     let shim = Runs::of(dir.path(), &id());
-    machine.on_exit = Box::new(move |_| shim.write(&record(1, RunOutcome::Stopped)).unwrap());
+    machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::Stopped)));
 
     scm(&fake)
         .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)
@@ -134,7 +134,7 @@ fn uninstall_of_an_incomplete_stop_leaves_the_task_disabled() {
         .on_stop(Ok(()));
     let mut machine = Machine::new(&fake, &[4242]);
     let shim = Runs::of(dir.path(), &id());
-    machine.on_exit = Box::new(move |_| shim.write(&record(1, RunOutcome::IncompleteStop)).unwrap());
+    machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::IncompleteStop)));
 
     let failed = scm(&fake)
         .task_remove_with(&snapshot_of(&spec, true), &runs, &mut machine)

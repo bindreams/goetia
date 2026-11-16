@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::SCHED_E_TASK_NOT_RUNNING;
 
-use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, snapshot_of};
+use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, shim_writes, snapshot_of};
 use super::*;
 use crate::backend::Backend;
 use crate::backend::scm::manager::WindowsSnapshot;
@@ -69,7 +69,7 @@ fn stop_sends_the_stop_then_waits_for_the_process_and_reports_an_incomplete_reco
         .on_stop(Ok(()));
     let mut machine = Machine::new(&fake, &[4242]);
     let shim = Runs::of(dir.path(), &id());
-    machine.on_exit = Box::new(move |_| shim.write(&record(1, RunOutcome::IncompleteStop)).unwrap());
+    machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::IncompleteStop)));
 
     let failed = stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap_err();
 
@@ -95,7 +95,7 @@ fn stop_of_a_run_whose_record_says_stopped_is_a_stop() {
         .on_stop(Ok(()));
     let mut machine = Machine::new(&fake, &[4242]);
     let shim = Runs::of(dir.path(), &id());
-    machine.on_exit = Box::new(move |_| shim.write(&record(1, RunOutcome::Stopped)).unwrap());
+    machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::Stopped)));
 
     stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap();
 
@@ -271,7 +271,7 @@ fn a_later_runs_write_does_not_prune_an_earlier_runs_incomplete_stop_before_it_i
             100 => record(1, RunOutcome::IncompleteStop),
             _ => record(2, RunOutcome::Stopped),
         };
-        shim.write(&record).unwrap();
+        shim_writes(&shim, &record);
     });
 
     let failed = stopped(&fake, &mut machine, &runs, Budget::Unbounded).unwrap_err();

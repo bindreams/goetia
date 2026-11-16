@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, snapshot_of};
+use super::super::support::{Machine, PATH, id, instance, instance_id, record, records, scm, shim_writes, snapshot_of};
 use super::*;
 use crate::backend::scm::manager::task::fake::{Call, Fake};
 use crate::backend::scm::runs::RunOutcome;
@@ -298,7 +298,7 @@ fn wait_blocks_on_the_held_process_and_then_reads_the_record() {
         .on_instances(Ok(vec![instance(1, 4242)]));
     let mut machine = Machine::new(&fake, &[4242]);
     let shim = Runs::of(dir.path(), &id());
-    machine.on_exit = Box::new(move |_| shim.write(&record(1, RunOutcome::Exited(3))).unwrap());
+    machine.on_exit = Box::new(move |_| shim_writes(&shim, &record(1, RunOutcome::Exited(3))));
 
     let run = begin(&fake, &task_spec(None), runs, machine).unwrap();
     assert_eq!(run.wait().unwrap(), Exit::Code(3));
@@ -366,7 +366,7 @@ fn exited_stopped_and_incomplete_records_map_to_their_results() {
         let shim = Runs::of(dir.path(), &id());
         let fake = Fake::new();
         // The run ended while `Run` was being answered.
-        fake.on_run_during(Ok(named(1, 4242)), move || shim.write(&record(1, outcome)).unwrap())
+        fake.on_run_during(Ok(named(1, 4242)), move || shim_writes(&shim, &record(1, outcome)))
             .on_instances(Ok(Vec::new()));
 
         let run = begin(&fake, &task_spec(None), runs, Machine::new(&fake, &[])).unwrap();

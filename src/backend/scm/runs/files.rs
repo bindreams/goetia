@@ -8,9 +8,10 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows_sys::Win32::Foundation::{ERROR_SHARING_VIOLATION, GENERIC_WRITE, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_RENAME_INFO, FILE_SHARE_READ, FileRenameInfo, SetFileInformationByHandle,
+    DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_RENAME_INFO, FILE_SHARE_READ, FileRenameInfo, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 
 /// Creates `path`, or empties what an interrupted write left there, for a record's bytes. Others
@@ -73,17 +74,33 @@ pub(super) fn create_pin(path: &Path) -> io::Result<File> {
 
 /// Whether some handle holds the pin file `path`, and the pin is live. An exclusive open succeeds
 /// only on a file that nothing holds (a pin left by a power cut), and that file goes with the handle
-/// it was opened with. Any failure to open it, sharing violation or a pending delete among them,
-/// counts as held; a file that is gone is not.
-pub(super) fn is_held(path: &Path) -> bool {
+/// it was opened with. A sharing violation says a handle holds it; a file that is gone is not held.
+/// Any other failure is returned: it says nothing about a handle. Access denied is the one to expect: a
+/// pin a previous principal left has no entry for this one, and a file whose delete is pending
+/// (another handle is open on it, its holder closed it) fails an open with access denied too, so the
+/// two cannot be told apart by the open.
+///
+/// It asks for no more than the delete needs (`DELETE` and `SYNCHRONIZE`, which `CreateFile` always
+/// adds), no read.
+pub(super) fn is_held(path: &Path) -> io::Result<bool> {
     match OpenOptions::new()
-        .read(true)
-        .access_mode(GENERIC_READ | DELETE)
+        .access_mode(DELETE | SYNCHRONIZE)
         .share_mode(0)
         .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
         .open(path)
     {
-        Ok(_stale) => false,
-        Err(e) => e.kind() != io::ErrorKind::NotFound,
+        Ok(_stale) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) if is_sharing_violation(&e) => Ok(true),
+        Err(e) => Err(e),
     }
 }
+
+/// Whether `error` says another handle has the file open without sharing what was asked.
+pub(super) fn is_sharing_violation(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+}
+
+#[cfg(test)]
+#[path = "files_tests.rs"]
+mod files_tests;

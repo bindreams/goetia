@@ -130,14 +130,19 @@ fn record_run(
     started: u64,
     outcome: Option<RunOutcome>,
 ) {
-    if let (Some(runs), Some(instance), Some(outcome)) = (runs, instance, outcome)
-        && let Err(e) = runs.write(&RunRecord {
+    if let (Some(runs), Some(instance), Some(outcome)) = (runs, instance, outcome) {
+        match runs.write(&RunRecord {
             instance,
             started,
             outcome,
-        })
-    {
-        log.failure(id, &format!("write the run record: {}", Chain(&e)));
+        }) {
+            Ok(problems) => {
+                for problem in problems {
+                    log.warning(id, &format!("prune the run records: {problem}"));
+                }
+            }
+            Err(e) => log.failure(id, &format!("write the run record: {}", Chain(&e))),
+        }
     }
 }
 
