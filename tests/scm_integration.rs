@@ -31,6 +31,9 @@ mod kill;
 #[path = "scm_integration/managed.rs"]
 mod managed;
 #[cfg(windows)]
+#[path = "scm_integration/probe_hang.rs"]
+mod probe_hang;
+#[cfg(windows)]
 #[path = "scm_integration/task_accounts.rs"]
 mod task_accounts;
 #[cfg(windows)]

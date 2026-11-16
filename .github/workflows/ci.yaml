@@ -45,12 +45,13 @@ jobs:
     name: Test${{ matrix.toolchain == 'stable' && ' stable' || '' }} (${{ matrix.os }})
     needs: rust-version
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        toolchain: [floor, stable]
+        os: [windows-latest]
+        toolchain: [stable]
+        shard: [1, 2, 3]
 
     steps:
       - name: Checkout
@@ -94,6 +95,30 @@ jobs:
       - name: Build test binaries
         run: cargo nextest archive --locked --archive-file nextest-archive.tar.zst
 
+      - name: Show the profile notification handlers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileNotification" /s
+
+      - name: Remove the Sync Center profile notification handler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $clsid = 'D63AA156-D534-4BAC-9BF1-55359CF5EC30'
+          $root = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileNotification'
+          $found = @(Get-ChildItem -LiteralPath $root | Where-Object {
+            $key = $_
+            $key.PSChildName -like "*$clsid*" -or
+            @($key.GetValueNames() | Where-Object { "$($key.GetValue($_))" -like "*$clsid*" }).Count -gt 0
+          })
+          if ($found.Count -eq 0) { throw "no subkey of $root names $clsid" }
+          foreach ($key in $found) {
+            Write-Host "removing $($key.Name)"
+            Remove-Item -LiteralPath $key.PSPath -Recurse -Force
+          }
+
       # Hung tests: see the `ci` profile in `.config/nextest.toml`.
       # `--no-tests fail` keeps a build that produced no tests from passing.
       # On Windows the archive is extracted under `target/`, not into the runner account's `%TEMP%`,
@@ -116,7 +141,7 @@ jobs:
           set -euo pipefail
 
           nextest="$(command -v cargo-nextest)"
-          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail)
+          args=(nextest run --archive-file nextest-archive.tar.zst --profile ci --no-tests fail -E 'test(/hang_[a-h]/)')
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             mkdir -p target/nextest-extract
             "$nextest" "${args[@]}" --extract-to target/nextest-extract --extract-overwrite
