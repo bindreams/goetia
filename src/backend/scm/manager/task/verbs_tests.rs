@@ -452,15 +452,18 @@ fn a_start_that_started_nothing_is_still_a_start_that_was_accepted() {
 }
 
 /// `restart` is a stop and then a start. The run that was stopped can still be listed, and its process
-/// is gone: the stop finds nothing to wait for, and the start is made all the same.
+/// is gone: the stop finds nothing to wait for, the start's own read finds no run alive, and the start is
+/// made all the same.
 #[skuld::test]
 fn restart_stops_then_starts_and_starts_when_an_ended_instance_is_still_listed() {
     let fake = Fake::new();
     // The entry is listed and its process is not there: no process has this pid.
-    fake.on_instances(one(NO_SUCH_PID)).on_run(Ok(Started {
-        id: instance_id(2),
-        pid: Some(5252),
-    }));
+    fake.on_instances(one(NO_SUCH_PID))
+        .on_instances(one(NO_SUCH_PID))
+        .on_run(Ok(Started {
+            id: instance_id(2),
+            pid: Some(5252),
+        }));
     let manager = scm(&fake);
     let task = || WindowsSnapshot::Task(snapshot_of(&task_spec(None), false));
 
@@ -468,8 +471,76 @@ fn restart_stops_then_starts_and_starts_when_an_ended_instance_is_still_listed()
     Backend::stop(&manager, task(), Budget::Immediate, &mut ()).unwrap();
     Backend::request_start_after_stop(&manager, task(), &mut ()).unwrap();
 
-    assert_eq!(fake.calls(), [instances_call(), Call::Run(PATH.to_owned())]);
+    assert_eq!(
+        fake.calls(),
+        [instances_call(), instances_call(), Call::Run(PATH.to_owned())]
+    );
     fake.finish();
+}
+
+/// `restart --timeout 0` sends the stop and does not wait for it. A run that is still alive when the start
+/// is asked for would make Task Scheduler accept the `Run` and start nothing (`IgnoreNew`, M7), so the
+/// start is refused, naming the run's pid, and no `Run` is sent.
+#[skuld::test]
+fn a_start_after_an_unwaited_stop_is_refused_while_a_run_is_still_alive() {
+    let fake = Fake::new();
+    fake.on_instances(one(4242));
+    let mut machine = Machine::new(&fake, &[4242]);
+
+    let refused = scm(&fake)
+        .task_request_start_after_stop_with(&id(), &mut machine)
+        .unwrap_err();
+
+    assert!(matches!(refused, Error::StillRunning { pid: 4242, .. }), "{refused:?}");
+    assert!(!refused.is_indeterminate(), "nothing was sent");
+    assert_eq!(fake.calls(), [instances_call()], "one read, and no `Run`");
+    fake.finish();
+}
+
+/// Every run alive is a reason to refuse, not only the first listed: the first listed may be an ended one
+/// whose entry lingers.
+#[skuld::test]
+fn a_start_after_an_unwaited_stop_is_refused_when_only_a_later_listed_run_is_alive() {
+    let fake = Fake::new();
+    fake.on_instances(Ok(vec![instance(1, NO_SUCH_PID), instance(2, 200)]));
+    let mut machine = Machine::new(&fake, &[200]);
+
+    let refused = scm(&fake)
+        .task_request_start_after_stop_with(&id(), &mut machine)
+        .unwrap_err();
+
+    assert!(matches!(refused, Error::StillRunning { pid: 200, .. }), "{refused:?}");
+    assert_eq!(fake.calls(), [instances_call()]);
+}
+
+/// A run whose liveness cannot be judged is not a run that is gone: the start is not sent over it.
+#[skuld::test]
+fn a_start_after_an_unwaited_stop_is_not_sent_when_a_runs_liveness_cannot_be_judged() {
+    struct Unjudgeable;
+    impl Processes for Unjudgeable {
+        type Held = u32;
+        fn alive(&mut self, _: u32) -> io::Result<Liveness> {
+            Err(io::Error::other("cannot be told"))
+        }
+        fn open(&mut self, _: u32) -> io::Result<Option<u32>> {
+            unreachable!("a start holds no process")
+        }
+        fn terminate(&mut self, _: &u32) -> io::Result<()> {
+            unreachable!("a start terminates nothing")
+        }
+        fn await_exit(&mut self, _: &u32, _: Deadline) -> io::Result<Waited> {
+            unreachable!("a start waits for nothing")
+        }
+    }
+    let fake = Fake::new();
+    fake.on_instances(one(4242));
+
+    let failed = scm(&fake)
+        .task_request_start_after_stop_with(&id(), &mut Unjudgeable)
+        .unwrap_err();
+
+    assert!(!matches!(failed, Error::StillRunning { .. }), "{failed:?}");
+    assert_eq!(fake.calls(), [instances_call()], "no `Run`");
 }
 
 /// Task Scheduler has no restart of its own, so a task has no native one: `restart` is the stop and the

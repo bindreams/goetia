@@ -1233,9 +1233,9 @@ fn error_messages_and_exit_class() {
         ),
         (
             Error::StillRunning { id: id(), pid: 4242 },
-            "`nightly` still has the run that was sent SIGTERM (pid 4242), and launchd starts no new run of a task \
-             while one is in flight, so no start was issued; `goetia daemon start nightly` starts one once it has \
-             exited, and `goetia daemon restart nightly` without `--timeout 0` waits for the exit",
+            "`nightly` still has the run that was asked to stop (pid 4242), and the service manager starts no new \
+             run of a task while one is in flight, so no start was issued; `goetia daemon start nightly` starts \
+             one once it has exited, and `goetia daemon restart nightly` without `--timeout 0` waits for the exit",
             false,
         ),
         (

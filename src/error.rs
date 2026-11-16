@@ -504,13 +504,15 @@ pub enum Error {
     #[error("`{id}` is already running: `run` needs an idle task (`goetia daemon stop {id}` ends the run in flight)")]
     AlreadyRunning { id: String },
 
-    /// A start requested right after a stop nobody waited for (`restart --timeout 0` of a launchd task)
-    /// found the run that was sent SIGTERM still alive, and so issued no start: launchd starts no new
-    /// run of a task while one is in flight. Determinate: nothing was sent.
+    /// A start requested right after a stop nobody waited for (`restart --timeout 0` of a launchd or
+    /// Windows task) found the run that was asked to stop still alive, and so issued no start: the
+    /// manager starts no new run of a task while one is in flight (launchd starts nothing and answers
+    /// success; Task Scheduler under `IgnoreNew` accepts the start and begins nothing). Determinate:
+    /// nothing was sent.
     #[error(
-        "`{id}` still has the run that was sent SIGTERM (pid {pid}), and launchd starts no new run of a task \
-         while one is in flight, so no start was issued; `goetia daemon start {id}` starts one once it has \
-         exited, and `goetia daemon restart {id}` without `--timeout 0` waits for the exit"
+        "`{id}` still has the run that was asked to stop (pid {pid}), and the service manager starts no new run \
+         of a task while one is in flight, so no start was issued; `goetia daemon start {id}` starts one once \
+         it has exited, and `goetia daemon restart {id}` without `--timeout 0` waits for the exit"
     )]
     StillRunning { id: String, pid: u32 },
 

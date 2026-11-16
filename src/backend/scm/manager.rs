@@ -775,11 +775,12 @@ impl Backend for Scm {
     }
 
     /// A task's start does not depend on what its stop left listed: an ended run that is still listed
-    /// does not stop Task Scheduler from accepting it (L2).
+    /// does not stop Task Scheduler from accepting it (L2). A run still alive refuses it
+    /// ([`Error::StillRunning`]), since Task Scheduler would accept the start and begin nothing.
     fn request_start_after_stop(&self, snapshot: WindowsSnapshot, _reservation: &mut ()) -> Result<()> {
         match snapshot {
             WindowsSnapshot::Service(snapshot) => self.service_request_start_after_stop(snapshot),
-            WindowsSnapshot::Task(snapshot) => self.task_start(snapshot.id()),
+            WindowsSnapshot::Task(snapshot) => self.task_request_start_after_stop(snapshot.id()),
         }
     }
 

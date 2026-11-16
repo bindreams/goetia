@@ -313,10 +313,36 @@ fn check_stopped(id: &Id, runs: &Runs, stopped: &[InstanceId]) -> Result<()> {
 
 impl Scm {
     /// `start` of a task: Task Scheduler is asked to run it, and the call returns once it has accepted.
-    /// A run that is alive makes it start nothing (`IgnoreNew`), which is no failure. It is also the
-    /// start of a restart, whether or not the run it follows is still listed (L2).
+    /// A run that is alive makes it start nothing (`IgnoreNew`), which is no failure. A restart's start
+    /// is [`Self::task_request_start_after_stop`], which refuses over a run that is alive.
     pub(in crate::backend::scm) fn task_start(&self, id: &Id) -> Result<()> {
         self.tasks.run(&TaskPath::of(id)).map(|_| ())
+    }
+
+    /// The start of a restart: [`Self::task_request_start_after_stop_with`] over the machine's processes.
+    pub(in crate::backend::scm) fn task_request_start_after_stop(&self, id: &Id) -> Result<()> {
+        self.task_request_start_after_stop_with(id, &mut System)
+    }
+
+    /// The start a restart makes once its stop has been sent, which `restart --timeout 0` did not wait
+    /// for. A run still alive makes Task Scheduler accept the `Run` and start nothing (`IgnoreNew`, M7),
+    /// so it is refused with [`Error::StillRunning`] naming that run, as launchd's task path is, and
+    /// nothing is sent. An ended run that is still listed is no run (L2): the start is made.
+    pub(super) fn task_request_start_after_stop_with<P: Processes>(&self, id: &Id, processes: &mut P) -> Result<()> {
+        let path = TaskPath::of(id);
+        let live = match live_runs(&*self.tasks, "start", id, &path, |pid| processes.alive(pid)) {
+            Ok(live) => live,
+            // The task is gone: the start says so.
+            Err(e) if gone(&e) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        if let Some(run) = live.first() {
+            return Err(Error::StillRunning {
+                id: id.to_string(),
+                pid: run.pid,
+            });
+        }
+        self.task_start(id)
     }
 
     /// `stop` of a task: [`Self::task_stop_with`] over the machine's processes and the task's records.
