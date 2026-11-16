@@ -3702,37 +3702,31 @@ type: task
 command: [bin/frpc]
 protocol: native
 ";
-    // Written, but what Windows would do anyway: nothing was asked of it.
-    for (manifest, line) in [
-        (task, "stop-action: terminate"),
-        (task, "stop-action: {timeout: 30s}"),
-        (task, "stop-action: {send-signal: terminate, timeout: 30s}"),
-        (native, "stop-action: terminate"),
-        (native, "stop-action: {send-signal: terminate, timeout: 5s}"),
-        (task, "stop-action: kill"),
+    // Written, but what Windows would do anyway: nothing was asked of it. `kill` is a signal.
+    for (manifest, line, refused) in [
+        (task, "stop-action: terminate", false),
+        (task, "stop-action: {timeout: 30s}", false),
+        (task, "stop-action: {send-signal: terminate, timeout: 30s}", false),
+        (native, "stop-action: terminate", false),
+        (native, "stop-action: {send-signal: terminate, timeout: 5s}", false),
+        (task, "stop-action: kill", true),
     ] {
-        let want_refused = line == "stop-action: kill";
-        // In the scm override...
-        let yaml = format!(
-            "{manifest}backend-specific:
+        let yaml = format!("{manifest}backend-specific:
   scm:
     {line}
-"
-        );
+");
         assert_eq!(
             resolve_yaml(&yaml).is_err(),
-            want_refused,
+            refused,
             "{line} in scm's override of {manifest}"
         );
-        // ...and in the base, which the native backend judges: here the base is Windows'.
+        // The base is judged by the native backend alone, which is Windows' here.
         if BackendKind::native() == Some(BackendKind::Scm) {
-            let yaml = format!(
-                "{manifest}{line}
-"
-            );
+            let yaml = format!("{manifest}{line}
+");
             assert_eq!(
                 resolve_yaml(&yaml).is_err(),
-                want_refused,
+                refused,
                 "{line} in the base of {manifest}"
             );
         }
@@ -3765,28 +3759,18 @@ fn an_override_writes_the_native_backends_leaves_over_the_bases() {
 
 #[skuld::test]
 fn an_override_that_sends_kill_does_not_inherit_the_bases_timeout() {
-    let base = format!(
-        "{SERVICE}stop-action: {{send-signal: quit, timeout: 90s}}
-"
-    );
+    // The base is the native backend's to judge too, so it is a signal every backend sends.
+    let base = format!("{SERVICE}stop-action: {{send-signal: terminate, timeout: 90s}}\n");
     for backend in BackendKind::ALL {
-        let yaml = format!(
-            "{base}backend-specific:
-  {backend}:
-    stop-action: kill
-"
-        );
+        let yaml = format!("{base}backend-specific:\n  {backend}:\n    stop-action: kill\n");
         if let Err(err) = resolve_yaml(&yaml) {
             panic!("{backend}: {err}");
         }
     }
+    // The review's case: the native backend's override replaces a base `quit, 90s` with `kill`.
     let native = BackendKind::native().expect("the tests run where there is a service manager");
-    let yaml = format!(
-        "{base}backend-specific:
-  {native}:
-    stop-action: kill
-"
-    );
+    let base = format!("{SERVICE}stop-action: {{send-signal: quit, timeout: 90s}}\n");
+    let yaml = format!("{base}backend-specific:\n  {native}:\n    stop-action: kill\n");
     assert_eq!(
         stop_action_of(&yaml),
         StopAction {
@@ -3798,10 +3782,7 @@ fn an_override_that_sends_kill_does_not_inherit_the_bases_timeout() {
 
 #[skuld::test]
 fn an_override_that_sends_kill_and_writes_a_timeout_is_still_refused() {
-    let base = format!(
-        "{SERVICE}stop-action: {{send-signal: quit, timeout: 90s}}
-"
-    );
+    let base = format!("{SERVICE}stop-action: {{timeout: 90s}}\n");
     for (backend, msg) in refused_per_backend(&base, "stop-action: {send-signal: kill, timeout: 5s}") {
         assert!(
             msg.starts_with(&format!(
@@ -3821,10 +3802,7 @@ fn a_substituted_kill_in_an_override_does_not_inherit_the_bases_timeout(#[fixtur
             "id: frpc\ncommand: ['/bin/frpc']\nstop-action: {{send-signal: quit, timeout: 90s}}\n\
              backend-specific:\n  {native}:\n    stop-action: '${{S}}'\n"
         ),
-        Some(
-            "S=kill
-",
-        ),
+        Some("S=kill\n"),
     );
     let (spec, _) = load(dir).unwrap();
     let DaemonSpec::Service(service) = spec else {
