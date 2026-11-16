@@ -19,6 +19,7 @@ use crate::backend::scm::instance::{InstanceId, TaskPath};
 use crate::backend::scm::manager::task::api::{Instance, Registered, TaskApi};
 use crate::backend::scm::manager::task::fake::Fake as TaskFake;
 use crate::backend::scm::runs::{RunOutcome, RunRecord, Runs};
+use crate::backend::scm::shim::run::os::Parents;
 use crate::backend::scm::shim::run::os::fake::{FakeGuard, FakeProcess, KillReply, Op, WaitReply, WaiterEnd};
 use crate::backend::scm::shim::run::test_support::{
     assert_failures, assert_one_failure, fallback_refused_failure, not_found, supervisor, tree_refused_failure,
@@ -540,6 +541,11 @@ fn the_marker_line_is_the_first_line_of_the_log() {
         "the first thing in the log is the run's marker, named by the instance's 32 hex digits"
     );
     assert_eq!(run.fake.opened_log_path(0), Path::new(LOGS));
+    assert_eq!(
+        run.fake.opened_log_parents(0),
+        Parents::Create,
+        "the user's own `logs` has its folders made"
+    );
     assert_eq!(run.finish(), Vec::<String>::new());
 }
 

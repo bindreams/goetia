@@ -121,6 +121,7 @@ use super::wait::{
     carried, end_on_incomplete_stop, end_process,
 };
 use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
+use crate::backend::scm::folder::{make_goetia_folders, program_data};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration, WindowsDefinition};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HeldProcess, HoldOutcome, hold_if_possible};
@@ -346,6 +347,10 @@ impl Scm {
     fn begin_hosted_install(&self, rendered: HostCommand) -> Result<InstallLock> {
         let shim = self.provider()?;
         let lock = InstallLock::acquire()?;
+        // Made here, by an elevated process, for the shim to write in: it runs as the daemon's account
+        // and makes no folder. Always judged, whatever `folders` is: no caller guarantees them.
+        let judge = FolderCheck::new(CheckPermissions::Enable);
+        make_goetia_folders(&program_data()?, |path| judge.check(path))?;
         self.sweep_before_install(shim);
         let provided = shim.provide(&self.folders)?;
         let provided = confirm_provided(rendered, provided)?;

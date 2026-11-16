@@ -23,6 +23,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 use super::*;
+use crate::backend::scm::shim::run::os::Parents;
 use crate::backend::scm::shim::run::os::fake::{
     FakeGuard, FakeProcess, KillReply, NO_THREAD, OPEN_LOG_FAILED, Op, WaitReply, WaiterEnd, tree_kill_refused,
     wait_failed, wait_failed_with_code,
@@ -339,6 +340,29 @@ fn a_daemon_with_no_logs_and_no_default_log_directory_is_logged_and_still_runs()
     // The un-handed waiter ends on drop; consume its end.
     drop(launched);
     assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+}
+
+/// A service's output goes where its `logs:` says, whose folders are the user's own to name and are made;
+/// with no `logs:` it goes to the default log, whose folder an elevated install made and the shim, which
+/// runs as the service's account, makes no folder for.
+#[skuld::test]
+fn the_daemons_log_has_its_folders_made_only_when_it_is_the_users_own() {
+    for (logs, parents) in [
+        (Some(PathBuf::from(DAEMON_LOG)), Parents::Create),
+        (None, Parents::Never),
+    ] {
+        let fake = FakeGuard::new();
+        let daemon = FakeProcess::new();
+        fake.will_make_thread();
+        fake.will_spawn(daemon.clone());
+
+        let launched = launch(&spec_logging_to(logs.clone()), &supervisor(&fake), ID);
+
+        assert!(launched.is_ok(), "{logs:?}");
+        assert_eq!(fake.opened_log_parents(0), parents, "{logs:?}");
+        drop(launched);
+        assert_eq!(fake.waiter_end(0), WaiterEnd::Returned);
+    }
 }
 
 // run_daemon ==========================================================================================================

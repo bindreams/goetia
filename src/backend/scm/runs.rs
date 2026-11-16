@@ -23,7 +23,8 @@
 //!
 //! The folders above it are goetia's to make ([`Runs::ensure_roots`]): a standard user can create
 //! `%ProgramData%\Goetia` first, so one that exists must be one goetia could trust, and `runs` must
-//! be as goetia makes it. Neither is repaired.
+//! be as goetia makes it. None is repaired. `Goetia` and its `logs` are made by an elevated install
+//! ([`make_goetia_folders`]) and never by a shim.
 
 mod files;
 
@@ -35,7 +36,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 
-use super::shim::acl::{Descriptor, FolderCheck, is_as_wanted, missing_components, read_path, require_acls_under};
+use super::folder::{goetia_folder, make_goetia_folders};
+use super::shim::acl::{Descriptor, FolderCheck, is_as_wanted, missing_components, read_path};
 use super::sid::Sid;
 use crate::error::{Error, Result};
 use crate::spec::Id;
@@ -103,18 +105,16 @@ impl Runs {
     /// The records of task `id` under `program_data`: `<program_data>\Goetia\runs\<id>`.
     pub(crate) fn of(program_data: &std::path::Path, id: &Id) -> Runs {
         Runs {
-            dir: program_data.join("Goetia").join("runs").join(id.to_string()),
+            dir: goetia_folder(program_data).join("runs").join(id.to_string()),
         }
     }
 
-    /// Sees to the folders above the task's directory, `<ProgramData>\Goetia` and `Goetia\runs`, which
-    /// a standard user can make before goetia does (`%ProgramData%` lets any user create a folder
-    /// in it). Neither is ever adopted or repaired:
+    /// Sees to the folders above the task's directory, which a standard user can make before goetia
+    /// does (`%ProgramData%` lets any user create a folder in it). None is ever adopted or repaired:
     ///
-    /// - `Goetia` that is missing is made with Administrators as its owner and the entries
-    ///   `%ProgramData%` gives, as the services' logs folder under it has always had. One that is there
-    ///   must pass `folders` over its whole chain, as the shim's folder does, or it is refused
-    ///   ([`Error::FolderUnsafe`]); one that appears after it was found missing is refused too.
+    /// - `Goetia` and `Goetia\logs` are [`make_goetia_folders`]'s, judged by `folders`: one that is
+    ///   missing is made, one that is there must pass over its whole chain or it is refused
+    ///   ([`Error::FolderUnsafe`]), and one that appears after it was found missing is refused too.
     /// - `runs` that is missing is made with [`Descriptor::for_folder`]. One that is there must be as
     ///   that is (owner, protection and entries), or it is refused ([`Error::FolderNotAsMade`]).
     ///
@@ -122,16 +122,8 @@ impl Runs {
     pub(crate) fn ensure_roots(&self, folders: &FolderCheck) -> Result<()> {
         let runs_root = self.dir.parent().expect("a task's directory is in `runs`");
         let goetia = runs_root.parent().expect("`runs` is in `Goetia`");
-        // Before anything is made, so that a `Goetia` under an unsafe ancestor is refused without a
-        // trace: of a folder that is missing this judges its first existing ancestor.
-        folders.check(goetia)?;
-        require_acls_under(goetia)?;
-        let missing = missing_components(goetia)?;
-        if !missing.is_empty() {
-            Descriptor::for_goetia()?.create_each(&missing)?;
-            // After: what the folder inherits from an ancestor is only judged now it is there.
-            folders.check(goetia)?;
-        }
+        let program_data = goetia.parent().expect("`Goetia` is in `%ProgramData%`");
+        make_goetia_folders(program_data, |path| folders.check(path))?;
         let wanted = Descriptor::for_folder()?;
         let missing = missing_components(runs_root)?;
         if !missing.is_empty() {

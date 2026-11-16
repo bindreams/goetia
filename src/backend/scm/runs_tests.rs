@@ -509,6 +509,9 @@ fn a_runs_folder_that_is_there_and_is_not_as_wanted_is_refused_and_left_alone() 
     let runs = Runs::of(dir.path(), &id());
     let root = dir.path().join("Goetia").join("runs");
     fs::create_dir_all(&root).unwrap();
+    // `Goetia\logs` is there too: making it names Administrators as its owner, which a test that needs no
+    // elevation leaves to the `scm` group's.
+    fs::create_dir_all(crate::backend::scm::folder::logs_folder(dir.path())).unwrap();
 
     let refused = runs.ensure_roots(&disabled()).unwrap_err();
 

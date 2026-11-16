@@ -341,10 +341,30 @@ fn a_task_with_no_logs_leaves_no_log_and_reports_nothing(#[fixture(temp_dir)] di
 fn append_creates_missing_directories_and_writes_the_line(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("Goetia").join("logs").join("x.log");
 
-    Real.append(&path, "the line").expect("append");
+    Real.append(&path, "the line", Parents::Create).expect("append");
 
     assert_eq!(
         std::fs::read_to_string(&path).expect("the file was written"),
+        "the line\n"
+    );
+}
+
+/// The shim makes no folder under `Goetia` (an elevated install does): its default log, opened with
+/// [`Parents::Never`], is an append failure when the folder is not there, and nothing is made.
+#[skuld::test]
+fn append_makes_no_directory_when_told_never_to_and_fails_when_it_is_missing(#[fixture(temp_dir)] dir: &Path) {
+    let missing = dir.join("Goetia").join("logs");
+
+    let result = Real.append(&missing.join("x.log"), "the line", Parents::Never);
+
+    assert_eq!(result.expect_err("no folder").kind(), io::ErrorKind::NotFound);
+    assert!(!dir.join("Goetia").exists(), "a folder was made");
+
+    std::fs::create_dir_all(&missing).expect("the folder an install made");
+    Real.append(&missing.join("x.log"), "the line", Parents::Never)
+        .expect("append where the folder is");
+    assert_eq!(
+        std::fs::read_to_string(missing.join("x.log")).expect("the file was written"),
         "the line\n"
     );
 }
@@ -353,8 +373,8 @@ fn append_creates_missing_directories_and_writes_the_line(#[fixture(temp_dir)] d
 fn append_appends_rather_than_truncates(#[fixture(temp_dir)] dir: &Path) {
     let path = dir.join("x.log");
 
-    Real.append(&path, "first").expect("append");
-    Real.append(&path, "second").expect("append");
+    Real.append(&path, "first", Parents::Create).expect("append");
+    Real.append(&path, "second", Parents::Create).expect("append");
 
     assert_eq!(
         std::fs::read_to_string(&path).expect("the file was written"),
@@ -368,7 +388,7 @@ fn append_fails_and_writes_nothing_when_the_path_cannot_be_opened(#[fixture(temp
     std::fs::write(&file, "x").expect("a regular file to use as a parent");
 
     // A directory cannot be created under a regular file.
-    let result = Real.append(&file.join("x.log"), "lost");
+    let result = Real.append(&file.join("x.log"), "lost", Parents::Create);
 
     assert!(result.is_err());
     assert_eq!(std::fs::read_to_string(&file).expect("the file is untouched"), "x");
@@ -383,11 +403,25 @@ fn open_log_fails_with_the_os_reason_when_the_path_cannot_be_opened(#[fixture(te
 
     // A directory cannot be created under a regular file.
     let refused = Real
-        .open_log(&file.join("daemon.log"))
+        .open_log(&file.join("daemon.log"), Parents::Create)
         .expect_err("a log under a regular file");
 
     assert!(refused.raw_os_error().is_some(), "no OS reason: {refused:?}");
     assert_eq!(std::fs::read_to_string(&file).expect("the file is untouched"), "x");
+}
+
+/// The daemon's default output is opened as the default failure log is: no folder is made for it.
+#[skuld::test]
+fn open_log_makes_no_directory_when_told_never_to(#[fixture(temp_dir)] dir: &Path) {
+    let log = dir.join("Goetia").join("logs").join("daemon.log");
+
+    let refused = Real.open_log(&log, Parents::Never).expect_err("no folder");
+
+    assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+    assert!(!dir.join("Goetia").exists(), "a folder was made");
+    Real.open_log(&log, Parents::Create)
+        .expect("a user's own `logs` parents are made");
+    assert!(log.is_file());
 }
 
 /// Records each `write` call; fails them all when `fail` is set.
