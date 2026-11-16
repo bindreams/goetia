@@ -36,9 +36,8 @@ use crate::error::{Error, Result};
 /// one there (it is under one of its roots), suggests a directory of its own named for `app`, the
 /// daemon's id.
 ///
-/// The suggestion is a courtesy: a root that cannot be opened never hides the refusal. Unless a root that
-/// opens holds the directory, the refusal says which roots could not be read, and its advice names only
-/// the roots that opened.
+/// Whether the log's directory is under a root is asked here only when the suggestion depends on it, of a
+/// directory that exists (`plan` asks it of one that does not): a root that cannot be read fails the check.
 pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, created: &CreatedDirs) -> Result<()> {
     let Some(dir) = logs.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
         return Ok(());
@@ -61,28 +60,23 @@ pub(crate) fn refuse_writable_log_dir(logs: &Path, plan: &Plan, app: &str, creat
             continue;
         };
         let kind = if step.is_link() { "symlink" } else { "directory" };
-        let roots = plan.found.under_root(&created.roots);
         let advice = match logs.file_name() {
-            Some(file) if leaf && ancestor_passes && roots.under => {
+            Some(file) if leaf && ancestor_passes && created.under_a_root(&plan.found, dir)? => {
                 format!(
                     "use a directory of its own, such as {}, or one that only root can change",
                     dir.join(app).join(file).display()
                 )
             }
             _ => format!(
-                "use a log directory that only root can change, under directories only root can change{}, or \
-                 drop `logs:` to log to the journal",
-                created
-                    .roots_text(&roots.unopened)
-                    .map(|roots| format!(" (a missing one is made under {roots})"))
-                    .unwrap_or_default()
+                "use a log directory that only root can change, under directories only root can change (a missing \
+                 one is made under {}), or drop `logs:` to log to the journal",
+                created.roots_text()
             ),
         };
-        let note = roots.note().map(|note| format!(" ({note})")).unwrap_or_default();
         return Err(Error::DirectoryRefused {
             path: dir.to_path_buf(),
             why: format!(
-                "the {kind} {} can be changed by {who}, who could {LED_ASTRAY}; {advice}{note}",
+                "the {kind} {} can be changed by {who}, who could {LED_ASTRAY}; {advice}",
                 step.at.display()
             ),
         });
