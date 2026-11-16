@@ -4,65 +4,48 @@
 //! lock, so it needs elevation like the rest of this binary (`scm_group`), and shares the labels the
 //! lock's own tests poll by. A task's program is this binary, in one of the sentinel modes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use goetia::backend::scm::manager::Scm;
 use goetia::decide::Outcome;
 use goetia::error::Error;
-use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status, TaskStatus};
-use goetia::spec::{DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, TaskSpec, User};
-use goetia::testing::{remove_task, service_fields, task};
+use goetia::manager::{Budget, Exit, ServiceManager as _, State, Status, TaskStatus, conformance};
+use goetia::spec::{DaemonSpec, Id, Protocol, ServiceFields, ServiceSpec, User};
+use goetia::testing::service_fields;
 
 use crate::common::conformance_mk;
 use crate::managed::UNIT_DIR_EXCLUSIVE;
 use crate::support::sentinel::{PRINT_AND_EXIT, RUN_UNTIL_KILLED};
-use crate::support::{self, ConnectBack, Group, ServiceGuard, scm_group};
+use crate::support::windows_tasks::{EndsTheRunOnPanic, task_spec};
+use crate::support::{self, ConnectBack, Group, ServiceGuard, kill, scm_group};
 
-const SCHEDULE: &str = "30 3 * * *";
+pub(crate) const SCHEDULE: &str = "30 3 * * *";
 
-/// Removes the task `id`, its run records and a service of the same id when it goes out of scope, and
-/// before the test begins, in case an earlier run left them. Declared before the thing it removes.
-struct TaskGuard {
-    id: Id,
-    _service: ServiceGuard,
+/// A fresh test id, and what removes the task of that id, its run records and a service of it when the
+/// guard goes out of scope (`ServiceGuard`). Declared before the thing it removes.
+pub(crate) struct TaskGuard {
+    pub id: Id,
+    _guard: ServiceGuard,
 }
 
 impl TaskGuard {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let id = Id::try_from(support::random_test_id().as_str()).expect("a test id is an id");
-        let guard = Self {
-            _service: ServiceGuard::new(id.as_str()),
+        Self {
+            _guard: ServiceGuard::new(id.as_str()),
             id,
-        };
-        guard.remove();
-        guard
-    }
-
-    fn remove(&self) {
-        remove_task(&self.id);
-        support::cleanup::remove_or_warn(&records_of(&self.id), true);
-    }
-}
-
-impl Drop for TaskGuard {
-    fn drop(&mut self) {
-        self.remove();
+        }
     }
 }
 
 /// Where the shim of task `id` writes its run records.
-fn records_of(id: &Id) -> std::path::PathBuf {
-    support::program_data().join("Goetia").join("runs").join(id.as_str())
+pub(crate) fn records_of(id: &Id) -> PathBuf {
+    support::task_records(id.as_str())
 }
 
 /// The task `id`, run by `user`, on a schedule: its program is never started here.
-fn task_as(id: &Id, user: User, schedule: Option<&str>) -> DaemonSpec {
-    let DaemonSpec::Task(spec) = task(id.as_str(), vec![support::current_exe_str()], schedule) else {
-        unreachable!("`testing::task` builds a task")
-    };
-    let mut fields = spec.into_fields();
-    fields.common.user = user;
-    TaskSpec::new(fields).map(DaemonSpec::from).expect("a valid task")
+pub(crate) fn task_as(id: &Id, user: User, schedule: Option<&str>) -> DaemonSpec {
+    task_spec(id, vec![support::current_exe_str()], schedule, user, None)
 }
 
 fn service_as(id: &Id, protocol: Protocol) -> DaemonSpec {
@@ -73,11 +56,24 @@ fn service_as(id: &Id, protocol: Protocol) -> DaemonSpec {
     DaemonSpec::from(ServiceSpec::new(fields).expect("a valid service"))
 }
 
-fn task_status(mgr: &Scm, id: &Id) -> TaskStatus {
+pub(crate) fn task_status(mgr: &Scm, id: &Id) -> TaskStatus {
     match mgr.status(id).expect("status of a task") {
         Status::Task(status) => status,
         Status::Service(status) => panic!("`{id}` reads as a service: {status:?}"),
     }
+}
+
+/// The status of `id` once its run has ended and Task Scheduler has recorded how: idle, with a last
+/// result. Read again with no cap, since the run's end is a state of the machine and not a time.
+pub(crate) fn status_once_ended(mgr: &Scm, id: &Id) -> TaskStatus {
+    let mut found = None;
+    kill::until(|| {
+        let status = task_status(mgr, id);
+        let ended = status.common.state == State::Idle && status.last_result.is_some();
+        found = Some(status);
+        ended
+    });
+    found.expect("a status was read")
 }
 
 #[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
@@ -195,17 +191,12 @@ fn a_service_changes_to_a_task_and_back(#[fixture(scm_group)] _group: &Group) {
 
 /// The task `id` whose program is `command` and whose output goes to `logs` where it has one. It has
 /// no schedule: only a test starts it.
-fn task_running(id: &Id, command: Vec<String>, logs: Option<&Path>) -> DaemonSpec {
-    let DaemonSpec::Task(spec) = task(id.as_str(), command, None) else {
-        unreachable!("`testing::task` builds a task")
-    };
-    let mut fields = spec.into_fields();
-    fields.common.logs = logs.map(Path::to_path_buf);
-    TaskSpec::new(fields).map(DaemonSpec::from).expect("a valid task")
+pub(crate) fn task_running(id: &Id, command: Vec<String>, logs: Option<&Path>) -> DaemonSpec {
+    task_spec(id, command, None, User::Root, logs)
 }
 
 /// This binary, told to print a line and exit with `code`.
-fn prints_and_exits(code: i32, text: &str) -> Vec<String> {
+pub(crate) fn prints_and_exits(code: i32, text: &str) -> Vec<String> {
     vec![
         support::current_exe_str(),
         PRINT_AND_EXIT.to_owned(),
@@ -215,37 +206,12 @@ fn prints_and_exits(code: i32, text: &str) -> Vec<String> {
 }
 
 /// This binary, told to connect to `listener` and then run until it is stopped or killed.
-fn runs_until_ended(listener: &ConnectBack) -> Vec<String> {
+pub(crate) fn runs_until_ended(listener: &ConnectBack) -> Vec<String> {
     vec![
         support::current_exe_str(),
         RUN_UNTIL_KILLED.to_owned(),
         listener.port().to_string(),
     ]
-}
-
-/// What ends a run for a test that fails while a `run` thread waits for it. A `thread::scope` joins its
-/// threads when the body panics, and the `run` thread waits on a live shim, so without this a failing
-/// assertion in the scope is a hang that leaves the task and its program running. Made right after the
-/// thread is spawned; dropped, it removes the task, which stops its run and waits for the shim to exit,
-/// so the thread returns. [`Self::defuse`] once the test has ended the run itself.
-struct EndsTheRunOnPanic<'a>(Option<&'a Id>);
-
-impl<'a> EndsTheRunOnPanic<'a> {
-    fn new(id: &'a Id) -> Self {
-        Self(Some(id))
-    }
-
-    fn defuse(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for EndsTheRunOnPanic<'_> {
-    fn drop(&mut self) {
-        if let Some(id) = self.0 {
-            remove_task(id);
-        }
-    }
 }
 
 /// A `run` of `id` on its own thread, started before the program is released: its result once it ends.
@@ -371,4 +337,271 @@ fn run_refuses_a_run_in_flight(#[fixture(scm_group)] _group: &Group) {
     mgr.stop(id, Budget::DEFAULT).expect("stop");
     assert_eq!(task_status(&mgr, id).common.state, State::Idle);
     mgr.uninstall(id).expect("uninstall");
+}
+
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn start_returns_before_the_run_ends(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let listener = ConnectBack::listen();
+    mgr.install(&task_running(id, runs_until_ended(&listener), None), false)
+        .expect("install");
+
+    // The program runs until it is stopped, so a `start` that waited for the run to end would never
+    // return: it returns once Task Scheduler has accepted the run.
+    mgr.start(id, Budget::DEFAULT).expect("start");
+
+    listener.accept("the task's program to start");
+    let status = task_status(&mgr, id);
+    assert_eq!(status.common.state, State::Running);
+    assert_eq!(status.last_result, None, "no run has ended");
+    mgr.stop(id, Budget::DEFAULT).expect("stop");
+    mgr.uninstall(id).expect("uninstall");
+}
+
+/// `restart --timeout 0` sends the stop and asks for the start without waiting for the run to end. A
+/// run still alive makes Task Scheduler accept the `Run` and begin nothing, so the start is refused
+/// naming it. No stop is sent here, so the run is alive whatever the timing.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn a_start_after_an_unwaited_stop_is_refused_while_the_run_is_alive(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let listener = ConnectBack::listen();
+    mgr.install(&task_running(id, runs_until_ended(&listener), None), false)
+        .expect("install");
+    mgr.start(id, Budget::DEFAULT).expect("start");
+    listener.accept("the task's program to start");
+    let pid = task_status(&mgr, id).common.pid.expect("a running task has a pid");
+
+    let refused = mgr
+        .request_start_after_stop(id)
+        .expect_err("a start over a run still alive is refused");
+
+    assert!(matches!(refused, Error::StillRunning { .. }), "{refused:?}");
+    let status = task_status(&mgr, id);
+    assert_eq!(status.common.state, State::Running);
+    assert_eq!(status.common.pid, Some(pid), "the run it refused to start over");
+    mgr.stop(id, Budget::DEFAULT).expect("stop");
+    mgr.uninstall(id).expect("uninstall");
+}
+
+/// `run` of a task with no `logs` shows why it shows nothing, and still returns the run's exit.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn run_of_a_task_without_logs_says_why_it_shows_no_output(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    mgr.install(&task_running(id, prints_and_exits(3, "hello"), None), false)
+        .expect("install");
+
+    let mut out = Vec::new();
+    let exit = mgr.run(id, &mut out).expect("run");
+
+    assert_eq!(exit, Exit::Code(3));
+    let out = String::from_utf8(out).expect("text");
+    assert!(
+        out.contains("has no `logs` file, so its output is not shown"),
+        "the note that says why: {out:?}"
+    );
+    assert!(
+        !out.contains("hello"),
+        "the program's line has nowhere to be read from: {out:?}"
+    );
+    mgr.uninstall(id).expect("uninstall");
+}
+
+/// An ended run stays in Task Scheduler's listing for a few milliseconds, and a `run` straight after it
+/// is neither refused as a run in flight nor made to wait for the listing.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn run_right_after_a_finished_run_is_not_refused_while_the_listing_lingers(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    mgr.install(&task_running(id, prints_and_exits(0, "run"), None), false)
+        .expect("install");
+
+    for which in ["first", "second", "third"] {
+        let exit = mgr
+            .run(id, &mut Vec::new())
+            .unwrap_or_else(|e| panic!("the {which} run, straight after the one before: {}", e.report()));
+        assert_eq!(exit, Exit::Code(0), "{which}");
+    }
+    mgr.uninstall(id).expect("uninstall");
+}
+
+/// A task whose definition changes after it has run is rewritten, and its next run is the new one's.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn editing_a_task_after_it_ran_works(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    mgr.install(&task_running(id, prints_and_exits(1, "before"), None), false)
+        .expect("install");
+    assert_eq!(mgr.run(id, &mut Vec::new()).expect("the first run"), Exit::Code(1));
+
+    let edited = mgr
+        .install(&task_running(id, prints_and_exits(2, "after"), None), false)
+        .expect("the edit");
+
+    assert!(matches!(edited, Outcome::Update { .. }), "{edited:?}");
+    assert_eq!(
+        mgr.run(id, &mut Vec::new()).expect("a run of the edited task"),
+        Exit::Code(2)
+    );
+    mgr.uninstall(id).expect("uninstall");
+}
+
+/// An uninstall of a task that is armed and running disarms it, ends the run and waits for the shim to
+/// exit, then removes the task.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_of_a_running_armed_task_ends_it(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    let listener = ConnectBack::listen();
+    let spec = task_spec(id, runs_until_ended(&listener), Some(SCHEDULE), User::Root, None);
+    mgr.install(&spec, false).expect("install");
+    mgr.enable(id).expect("enable");
+    mgr.start(id, Budget::DEFAULT).expect("start");
+    listener.accept("the task's program to start");
+    let pid = task_status(&mgr, id).common.pid.expect("a running task has a pid");
+    let shim = kill::identity_of(pid);
+
+    mgr.uninstall(id).expect("uninstall of a running, armed task");
+
+    let gone = mgr.status(id).expect_err("the task is gone");
+    assert!(matches!(gone.cause(), Error::NotInstalled { .. }), "{gone:?}");
+    assert!(
+        !kill::is_still_reported(Some(pid), shim),
+        "the uninstall returned while the shim (pid {pid}) was still running"
+    );
+    assert!(!records_of(id).exists(), "its records go with it");
+}
+
+/// The tasks Task Scheduler lists under `\Goetia`, by the names `schtasks` gives them.
+fn goetia_folder_tasks() -> Vec<String> {
+    let listing = support::cmd::run("schtasks.exe", &["/query", "/fo", "csv", "/nh"]).expect_ok();
+    listing
+        .stdout
+        .lines()
+        .filter_map(|line| line.split(',').next())
+        .map(|name| name.trim_matches('"'))
+        .filter(|name| name.to_ascii_lowercase().starts_with(r"\goetia\"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether Task Scheduler has the folder `\Goetia`.
+pub(crate) fn goetia_folder_exists() -> bool {
+    support::cmd::run("schtasks.exe", &["/query", "/tn", r"\Goetia\"]).ok()
+}
+
+/// Whether Task Scheduler has the task `\Goetia\<id>`.
+pub(crate) fn task_exists(id: &Id) -> bool {
+    support::cmd::run("schtasks.exe", &["/query", "/tn", &format!(r"\Goetia\{id}")]).ok()
+}
+
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn uninstall_removes_the_task_its_records_and_the_empty_folder(#[fixture(scm_group)] _group: &Group) {
+    let guard = TaskGuard::new();
+    let id = &guard.id;
+    let mgr = support::stock_shim_manager();
+    mgr.install(&task_running(id, prints_and_exits(0, "run"), None), false)
+        .expect("install");
+    mgr.run(id, &mut Vec::new()).expect("a run, which leaves a record");
+    assert_eq!(
+        goetia_folder_tasks(),
+        [format!(r"\Goetia\{id}")],
+        "precondition: this is the only task in the folder, so its removal empties it"
+    );
+    assert!(records_of(id).is_dir(), "precondition: the run left its records");
+
+    mgr.uninstall(id).expect("uninstall");
+
+    assert!(!task_exists(id), "the task");
+    assert!(!records_of(id).exists(), "its records");
+    assert!(!goetia_folder_exists(), "the folder it was the last task of");
+}
+
+/// An id held by something goetia did not make is refused by an install of either kind, with or without
+/// `--force`, and what holds it is left as it was. A foreign service and a foreign task each hold the id
+/// against both a task and a service.
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn an_id_held_by_a_foreign_service_or_task_is_refused_both_ways(#[fixture(scm_group)] _group: &Group) {
+    let mgr = support::stock_shim_manager();
+    let refused = |holder: &str, id: &Id| {
+        let specs = [
+            ("a task", task_as(id, User::Root, Some(SCHEDULE))),
+            ("a service", service_as(id, Protocol::Native)),
+        ];
+        for (what, spec) in specs {
+            for force in [false, true] {
+                let outcome = mgr
+                    .install(&spec, force)
+                    .unwrap_or_else(|e| panic!("{holder}, {what}, force {force}: {}", e.report()));
+                assert!(
+                    matches!(outcome, Outcome::RefuseForeign { .. }),
+                    "{holder} holds the id against {what} (force {force}): {outcome:?}"
+                );
+            }
+        }
+    };
+
+    let service = TaskGuard::new();
+    support::cmd::run(
+        "sc.exe",
+        &[
+            "create",
+            service.id.as_str(),
+            "binPath=",
+            &support::current_exe_str(),
+            "start=",
+            "demand",
+        ],
+    )
+    .expect_ok();
+    refused("a foreign service", &service.id);
+    assert!(
+        support::cmd::run("sc.exe", &["query", service.id.as_str()]).ok(),
+        "the foreign service is still there"
+    );
+    assert!(!task_exists(&service.id), "and no task was made beside it");
+
+    let task = TaskGuard::new();
+    support::cmd::run(
+        "schtasks.exe",
+        &[
+            "/create",
+            "/tn",
+            &format!(r"\Goetia\{}", task.id),
+            "/tr",
+            "cmd.exe /c exit 0",
+            "/sc",
+            "onstart",
+            "/ru",
+            "SYSTEM",
+            "/f",
+        ],
+    )
+    .expect_ok();
+    refused("a foreign task", &task.id);
+    assert!(task_exists(&task.id), "the foreign task is still there");
+    assert!(
+        !support::cmd::run("sc.exe", &["query", task.id.as_str()]).ok(),
+        "and no service was made beside it"
+    );
+    assert!(!records_of(&task.id).exists(), "nor any records");
+}
+
+#[skuld::test(labels = [UNIT_DIR_EXCLUSIVE], serial = UNIT_DIR_EXCLUSIVE)]
+fn windows_passes_task_conformance(#[fixture(scm_group)] _group: &Group) {
+    let mgr = support::stock_shim_manager();
+    // Every task `run_tasks` makes, with a schedule and without, runs until it is stopped.
+    let listener = ConnectBack::listen();
+    conformance::run_tasks(&mgr, &|id, schedule| {
+        let id = Id::try_from(id).expect("a conformance id is an id");
+        task_spec(&id, runs_until_ended(&listener), schedule, User::Root, None)
+    });
 }

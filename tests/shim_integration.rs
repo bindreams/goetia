@@ -40,6 +40,9 @@ mod simple;
 #[cfg(windows)]
 #[path = "shim_integration/supervisor_integration.rs"]
 mod supervisor_integration;
+#[cfg(windows)]
+#[path = "shim_integration/tasks.rs"]
+mod tasks;
 
 fn main() {
     #[cfg(windows)]

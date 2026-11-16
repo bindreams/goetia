@@ -1,6 +1,6 @@
 use super::*;
 use crate::spec::HashSeed;
-use crate::testing::cron_matches;
+use crate::testing::{FIRING_SCHEDULES, cron_matches};
 
 const ID: &str = "nightly";
 
@@ -187,47 +187,17 @@ fn assert_fires_as_cron_says(texts: &[&str]) {
 
 #[skuld::test]
 fn compiled_triggers_fire_exactly_when_the_cron_says() {
-    assert_fires_as_cron_says(&[
-        "30 3 * * *",
-        "H 3 * * *",
-        "0 9-17 * * 1-5",
-        "*/15 9-17 * * 1-5",
-        "*/7 * * * *",
-        // Days of the month no month has, beside a weekday: the weekdays alone.
-        "0 0 30 2 1",
-        "0 0 */2 * *",
-        "0 0 29-31 * *",
-        "0 0 * 6 1",
-        "0 3 * 3-5 *",
-        "* * * * *",
-        "5,35 */3 * * *",
-    ]);
+    assert_fires_as_cron_says(FIRING_SCHEDULES[0]);
 }
 
 #[skuld::test]
 fn a_time_with_no_single_progression_still_fires_exactly_when_the_cron_says() {
-    assert_fires_as_cron_says(&[
-        // A class of minutes over two runs of hours, a lone minute, and hours in no run.
-        "0,15,30,45 9-11,14-16 * * *",
-        "1,2,4,7 0,1,3,5,7,9,11 * * *",
-        "0,15,30,45,7 9-17 * * 1-5",
-        // A step that does not divide 60, in one hour and in all of them.
-        "*/7 3 * * *",
-        "*/7 9-17 * * 1-5",
-        "0,10,20 22,23,0 * * *",
-        "17 */5 * * *",
-        "0 * * * *",
-        "0 0-4,7,9-12,14,17,20-23 * * 1",
-        "0,1 * * * *",
-        "0 0,1,2,3,5,6,8,10,11,13,14,16,17,19,21,22 * * *",
-        "0,1 0,1,2,3,5,6,8,10,11,13,14,16,17,19,21,22 * * *",
-    ]);
+    assert_fires_as_cron_says(FIRING_SCHEDULES[1]);
 }
 
 #[skuld::test]
 fn a_fifth_occurrence_of_a_weekday_runs_through_the_last_week() {
-    // August 2027 has five Mondays, and so does May 2028: `Last` is the fifth in those months.
-    assert_fires_as_cron_says(&["0 0 * 8 1", "0 0 * 5 1"]);
+    assert_fires_as_cron_says(FIRING_SCHEDULES[2]);
 }
 
 // Shapes ==============================================================================================================

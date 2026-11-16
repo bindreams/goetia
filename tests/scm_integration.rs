@@ -31,6 +31,12 @@ mod kill;
 #[path = "scm_integration/managed.rs"]
 mod managed;
 #[cfg(windows)]
+#[path = "scm_integration/task_accounts.rs"]
+mod task_accounts;
+#[cfg(windows)]
+#[path = "scm_integration/task_schedule.rs"]
+mod task_schedule;
+#[cfg(windows)]
 #[path = "scm_integration/tasks.rs"]
 mod tasks;
 

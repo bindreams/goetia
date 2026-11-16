@@ -26,6 +26,8 @@ pub mod service_guard;
 #[cfg(unix)]
 pub mod tasks;
 #[cfg(windows)]
+pub mod windows_tasks;
+#[cfg(windows)]
 pub mod world_readable_exe;
 
 use std::fs;
@@ -68,8 +70,15 @@ pub const SCM_SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
 /// without caring where its host comes from uses this.
 #[cfg(windows)]
 pub fn stock_shim_manager() -> goetia::backend::scm::manager::Scm {
+    shim_manager_at(PathBuf::from(env!("CARGO_BIN_EXE_goetia-shim")))
+}
+
+/// [`stock_shim_manager`] for the shim at `shim`: a copy that an account which cannot run the build tree
+/// can run (see [`WorldReadableExe`]).
+#[cfg(windows)]
+pub fn shim_manager_at(shim: PathBuf) -> goetia::backend::scm::manager::Scm {
     goetia::backend::scm::manager::Scm::with_shim(
-        goetia::shim::StandaloneShim::new(PathBuf::from(env!("CARGO_BIN_EXE_goetia-shim")), vec![]),
+        goetia::shim::StandaloneShim::new(shim, vec![]),
         goetia::shim::CheckPermissions::Disable,
     )
 }
@@ -92,6 +101,12 @@ pub fn random_test_id() -> String {
 #[cfg(windows)]
 pub fn program_data() -> PathBuf {
     goetia::testing::program_data()
+}
+
+/// Where the shim of task `id` writes its run records: `<program_data>\Goetia\runs\<id>`.
+#[cfg(windows)]
+pub fn task_records(id: &str) -> PathBuf {
+    program_data().join("Goetia").join("runs").join(id)
 }
 
 /// Where the shim of service `id` writes a failure it reports before it has read the daemon's

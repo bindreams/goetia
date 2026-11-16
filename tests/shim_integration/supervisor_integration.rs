@@ -161,7 +161,7 @@ fn stop_kills_the_whole_process_tree(#[fixture(scm_group)] _group: &Group) {
 /// `/FO CSV` quotes each field, so a literal `"<pid>"` substring is
 /// unambiguous for the range of pids a test process ever reports (never
 /// contained inside another field like an image name).
-fn pid_is_alive(pid: &str) -> bool {
+pub(crate) fn pid_is_alive(pid: &str) -> bool {
     let out = support::cmd::run("tasklist.exe", &["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
     out.ok() && out.stdout.contains(&format!("\"{pid}\""))
 }
