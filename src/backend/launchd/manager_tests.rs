@@ -871,7 +871,20 @@ fn marked_plist(id: &Id) -> Plist {
 
 /// [`marked_plist`] of a job with `restart`: `Always` is the one `start`'s corrective cycle runs for.
 fn marked_plist_restarting(id: &Id, restart: Restart) -> Plist {
-    let text = sample_plist_restarting(id.as_str(), restart);
+    marked_plist_of(id, sample_plist_restarting(id.as_str(), restart))
+}
+
+/// A marked plist for a task, as [`marked_plist`] is for a service: `kill` and `stop` act on a task's
+/// run by its kind.
+fn marked_task_plist(id: &Id) -> Plist {
+    marked_plist_of(
+        id,
+        super::task::task_tests::plists_of(&super::task::task_tests::task_spec(None)).job,
+    )
+}
+
+/// The plist `text` is the job of, with no file behind it.
+fn marked_plist_of(id: &Id, text: String) -> Plist {
     let blob = generate::extract(&text)
         .transpose()
         .expect("sample_plist carries the marker");
@@ -910,7 +923,7 @@ fn a_reservation_holds_what_its_steps_count() {
         (&[Step::Install], (4, 18)),
         (&[Step::Start], (5, 26)),
         (&[Step::Stop], (1, 6)),
-        (&[Step::Kill], (2, 8)),
+        (&[Step::Kill], (0, 6)),
         (&[Step::Uninstall], (2, 12)),
         (&[Step::RequestStartAfterStop], (5, 26)),
         (&[Step::Stop, Step::Start], (6, 32)),
@@ -955,14 +968,22 @@ struct Drawing {
     /// The step it is counted under.
     step: Step,
     restart: Restart,
-    /// Its longest path, call for call.
-    calls: &'static [(&'static str, Answer)],
+    /// The job it acts on: a service's, or a task's where the verb's longest path is a task's.
+    plist: fn(&Id, Restart) -> Plist,
+    /// Its longest path, call for call, given the pid of a real child: a path that holds a process
+    /// has `print` show it.
+    calls: fn(u32) -> Vec<Entry>,
     /// The requests and calls that path makes: what `needs` counts when it is `step`'s longest.
     drew: (usize, usize),
     run: fn(&Launchd, Plist, &mut Reservation) -> Result<()>,
 }
 
-/// Every verb that draws, down its longest path.
+/// The calls of a path that shows no process of its own.
+fn fixed(calls: &[(&str, Answer)]) -> Vec<Entry> {
+    calls.iter().map(|&(verb, a)| answer(verb, a)).collect()
+}
+
+/// Every verb that draws, down its longest path. `kill`'s holds a real process, which the test hands it.
 fn drawings() -> [Drawing; 5] {
     use crate::backend::Backend;
 
@@ -970,7 +991,8 @@ fn drawings() -> [Drawing; 5] {
         Drawing {
             step: Step::Start,
             restart: Restart::Always,
-            calls: &START_LONGEST,
+            plist: marked_plist_restarting,
+            calls: |_| fixed(&START_LONGEST),
             drew: (START_REQUESTS, START_CALLS),
             run: |mgr, plist, reservation| Backend::start(mgr, plist, Budget::DEFAULT, reservation),
         },
@@ -978,29 +1000,49 @@ fn drawings() -> [Drawing; 5] {
         Drawing {
             step: Step::RequestStartAfterStop,
             restart: Restart::Always,
-            calls: &START_NOT_WAITING,
+            plist: marked_plist_restarting,
+            calls: |_| fixed(&START_NOT_WAITING),
             drew: (2, 5),
             run: |mgr, plist, reservation| Backend::request_start_after_stop(mgr, plist, reservation),
         },
         Drawing {
             step: Step::Stop,
             restart: Restart::Never,
-            calls: &BOOTOUT,
+            plist: marked_plist_restarting,
+            calls: |_| fixed(&BOOTOUT),
             drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| Backend::stop(mgr, plist, Budget::DEFAULT, reservation),
         },
+        // A task's longest `kill`: the first run finds no process, the read finds a start launchd has accepted
+        // and not yet forked, the wait for the fork ends on the process, and the run that forked is killed: the
+        // read, the confirmation (a read and the `procinfo` that names the process held), and the wait for
+        // the record, whose first read still shows the pid.
         Drawing {
             step: Step::Kill,
             restart: Restart::Never,
-            calls: &[("kill", DONE)],
-            drew: (SERVICE_KILL_REQUESTS, SERVICE_KILL_CALLS),
+            plist: |id, _| marked_task_plist(id),
+            calls: |pid| {
+                vec![
+                    answer("print", SPAWN_SCHEDULED),
+                    answer("print", SPAWN_SCHEDULED),
+                    answer("print", SPAWN_SCHEDULED),
+                    printed_running(pid),
+                    printed_running(pid),
+                    printed_running(pid),
+                    procinfo_naming(pid),
+                    printed_running(pid),
+                    answer("print", SPAWN_SCHEDULED),
+                ]
+            },
+            drew: (KILL_REQUESTS, TASK_KILL_CALLS),
             run: |mgr, plist, reservation| Backend::kill(mgr, plist, reservation),
         },
         // The `bootout`, and then the removal of a plist nothing backs, which fails.
         Drawing {
             step: Step::Uninstall,
             restart: Restart::Never,
-            calls: &BOOTOUT,
+            plist: marked_plist_restarting,
+            calls: |_| fixed(&BOOTOUT),
             drew: (STOP_REQUESTS, SERVICE_STOP_CALLS),
             run: |mgr, plist, reservation| match Backend::uninstall(mgr, plist, reservation) {
                 Err(Error::Os { what, source, .. })
@@ -1023,12 +1065,17 @@ fn drawings() -> [Drawing; 5] {
 /// a real child.
 #[skuld::test]
 fn every_verb_draws_what_its_step_counts() {
+    use super::watch::watch_tests::Held;
+
     let id = never_installed();
     for drawing in drawings() {
-        let (mgr, script) = scripted(drawing.calls);
+        // A verb that holds a process holds this one; one that does not leaves it be.
+        let child = Held::new(0);
+        let script = Fake::new((drawing.calls)(child.pid()));
+        let mgr = launchd_over(script.clone());
         let mut held = reserved(&[drawing.step]);
 
-        let result = (drawing.run)(&mgr, marked_plist_restarting(&id, drawing.restart), &mut held);
+        let result = (drawing.run)(&mgr, (drawing.plist)(&id, drawing.restart), &mut held);
 
         result.unwrap_or_else(|e| panic!("{:?}: {e:?}", drawing.step));
         script.assert_spent(&format!("{:?}'s longest path", drawing.step));
@@ -1049,22 +1096,26 @@ fn every_verb_draws_what_its_step_counts() {
 /// build that has debug assertions: an undercount cannot pass an ordinary test.
 #[skuld::test]
 fn a_verb_handed_one_item_too_few_trips_the_assertion() {
+    use super::watch::watch_tests::Held;
+
     let id = never_installed();
     for drawing in drawings() {
         let (requests, calls) = drawing.drew;
         for (what, (reapers, files)) in [
-            ("reaper", (requests - 1, calls * Role::COUNTED_FILES)),
+            ("reaper", (requests.saturating_sub(1), calls * Role::COUNTED_FILES)),
             ("temp file", (requests, calls * Role::COUNTED_FILES - 1)),
         ] {
-            let (mgr, script) = scripted(drawing.calls);
+            // A verb that draws no reaper cannot be a reaper short.
+            if what == "reaper" && requests == 0 {
+                continue;
+            }
+            let child = Held::new(0);
+            let script = Fake::new((drawing.calls)(child.pid()));
+            let mgr = launchd_over(script.clone());
             let mut short = Reservation::make(reapers, files).expect("make a reservation");
 
             let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                drop((drawing.run)(
-                    &mgr,
-                    marked_plist_restarting(&id, drawing.restart),
-                    &mut short,
-                ));
+                drop((drawing.run)(&mgr, (drawing.plist)(&id, drawing.restart), &mut short));
             }));
 
             let payload = drawn.expect_err(&format!("{:?}: a {what} short went unnoticed", drawing.step));
@@ -2160,16 +2211,6 @@ fn a_kickstart_that_outlasts_the_budget_is_left_running_when_the_print_fails() {
 
 // kill ================================================================================================================
 
-/// `kill` of a service over `id`, with `answer` standing in for what `launchctl kill` says: unchanged
-/// by the one `signal` that a task's `stop` and `kill` share.
-fn kill_answered(answer: Answer) -> (Result<()>, Fake) {
-    let script = table(&[("kill", answer)]);
-    let mgr = launchd_over(script.clone());
-    let mut held = reserved(&[Step::Kill]);
-    let result = backend::Backend::kill(&mgr, marked_plist(&never_installed()), &mut held);
-    (result, script)
-}
-
 /// `signal` says what launchctl answered and names no verb's error: exit `0` is sent, and `3` and `113`,
 /// the two ways launchd says the job has no process, are `NoProcess`. The signal is the caller's.
 #[skuld::test]
@@ -2183,7 +2224,7 @@ fn signal_maps_exit_3_and_113_to_no_process_and_0_to_sent() {
     for (answer, expected) in cases {
         let script = table(&[("kill", answer)]);
         let launchctl = Launchctl::new(Box::new(script.clone()));
-        let mut held = reserved(&[Step::Kill]);
+        let mut held = reserved(&[Step::Stop]);
 
         let outcome = launchctl.signal(id.as_str(), "SIGTERM", &mut held);
 
@@ -2193,7 +2234,7 @@ fn signal_maps_exit_3_and_113_to_no_process_and_0_to_sent() {
     let script = table(&[("kill", (1, "", "Operation not permitted\n"))]);
     let launchctl = Launchctl::new(Box::new(script));
     let e = launchctl
-        .signal(id.as_str(), "SIGTERM", &mut reserved(&[Step::Kill]))
+        .signal(id.as_str(), "SIGTERM", &mut reserved(&[Step::Stop]))
         .expect_err("refused");
     assert!(matches!(&e, Error::Command { .. }), "{e:?}");
 }
@@ -2275,59 +2316,209 @@ fn names_launch_is_an_error_when_launchctl_cannot_be_run() {
     assert!(matches!(&e, Error::Spawn { .. }), "{e:?}");
 }
 
-/// SIGKILL to the job by label, in the system domain; the signal is named so a failure of the job
-/// is what launchd records, whatever `restart` then does.
+// kill of a service ===================================================================================================
+
+/// A `print` that shows the job running as `pid`.
+fn printed_running(pid: u32) -> Entry {
+    reply(
+        &["print"],
+        exited(0, &format!("\tstate = running\n\tpid = {pid}\n"), ""),
+    )
+}
+
+/// `procinfo` naming `pid` as a launch of the never-installed job.
+fn procinfo_naming(pid: u32) -> Entry {
+    reply(
+        &["procinfo", &pid.to_string()],
+        exited(0, &procinfo_of_a_launch(&never_installed(), pid), ""),
+    )
+}
+
+/// `procinfo` of a pid no job owns.
+fn procinfo_not_naming(pid: u32) -> Entry {
+    reply(
+        &["procinfo", &pid.to_string()],
+        exited(
+            0,
+            &format!("program path = /bin/sleep\n(pid {pid} is not managed by launchd)\n"),
+            "",
+        ),
+    )
+}
+
+/// `kill` of a service over `entries`, on a reservation made for [`Step::Kill`], with what it has left.
+fn kill_over(entries: impl IntoIterator<Item = Entry>) -> (Result<()>, Fake, (usize, usize)) {
+    let fake = Fake::new(entries);
+    let mgr = launchd_over(fake.clone());
+    let mut held = reserved(&[Step::Kill]);
+    let result = backend::Backend::kill(&mgr, marked_plist(&never_installed()), &mut held);
+    (result, fake, bounded::test_hook::left(&held))
+}
+
+/// SIGKILL to the job's process through a hold, and the wait until `print` stops showing its pid: the
+/// read, the confirmation (with its `procinfo`), and the wait's reads. No `launchctl kill` is sent, and the wait is the
+/// only call the reservation counts.
 #[skuld::test]
-fn kill_sends_sigkill_to_the_job_in_the_system_domain() {
-    let id = never_installed();
-    let (result, script) = kill_answered(DONE);
+fn kill_ends_the_process_and_waits_until_launchd_stops_showing_it() {
+    use super::watch::watch_tests::Held;
+
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    // Still shown after the process is gone, then the job restarts under the throttle: no pid.
+    let (result, script, left) = kill_over([
+        printed_running(pid),
+        printed_running(pid),
+        procinfo_naming(pid),
+        printed_running(pid),
+        answer("print", SPAWN_SCHEDULED),
+    ]);
 
     assert!(matches!(result, Ok(())), "{result:?}");
-    assert_eq!(script.calls(), [["kill", "SIGKILL", format!("system/{id}").as_str()]]);
+    script.assert_spent("the read, the confirmation and its lookup, and the wait's two reads");
+    assert!(
+        script
+            .calls()
+            .iter()
+            .all(|call| call[0] == "print" || call[0] == "procinfo"),
+        "no `launchctl kill` is sent: {:?}",
+        script.calls()
+    );
+    assert_eq!(run.finish(), None, "the process was signalled to its end");
     assert_eq!(
-        script.waits(),
-        [Waited {
-            role: RoleKind::Request,
-            bounded: false
-        }]
+        left,
+        (0, (KILL_CALLS - SERVICE_KILL_CALLS) * Role::COUNTED_FILES),
+        "a service's kill draws one counted call: the wait"
     );
 }
 
-/// The two ways launchd says there is no process to signal: the job is not loaded (113), or it is
-/// loaded and has no process (3, "No such process"). Classified off the kill's own answer — a
-/// separate `print` first would leave a window for the job to exit between the two.
+/// What ends the wait is that `print` does not show the killed pid: another pid (a restart under no
+/// throttle) is as good as none, and a label launchd no longer holds is as good as either.
+#[skuld::test]
+fn kill_is_recorded_when_launchd_shows_another_pid_or_no_job() {
+    use super::watch::watch_tests::Held;
+
+    for (what, recorded) in [
+        ("another pid", RUNNING_AGAIN),
+        ("no job", NOT_LOADED),
+        ("no process", NOT_RUNNING),
+    ] {
+        let mut run = Held::new(0);
+        let pid = run.pid();
+        let (result, script, _) = kill_over([
+            printed_running(pid),
+            printed_running(pid),
+            procinfo_naming(pid),
+            answer("print", recorded),
+        ]);
+
+        assert!(matches!(result, Ok(())), "{what}: {result:?}");
+        script.assert_spent(what);
+        assert_eq!(run.finish(), None, "{what}");
+    }
+}
+
+/// `print` still shows the pid and launchd's own lookup of the process held does not name it as the
+/// job's, the live process being a stranger that was given the number after launchd reaped the job's
+/// process: the stranger is not signalled, and the kill waits for the record, which is `print` moving off
+/// the pid. It does not report that as a failure.
+#[skuld::test]
+fn kill_of_a_live_process_procinfo_does_not_name_signals_nothing_and_waits_for_the_record() {
+    use super::watch::watch_tests::Held;
+
+    let mut stranger = Held::new(0);
+    let pid = stranger.pid();
+    let (result, script, _) = kill_over([
+        printed_running(pid),
+        printed_running(pid),
+        procinfo_not_naming(pid),
+        printed_running(pid),
+        answer("print", SPAWN_SCHEDULED),
+    ]);
+
+    assert!(matches!(result, Ok(())), "{result:?}");
+    script.assert_spent(
+        "the read, the confirmation and its lookup, then the wait's reads: the process held is the stranger",
+    );
+    assert_eq!(stranger.finish(), Some(0), "the stranger was left alone");
+}
+
+/// A `procinfo` that cannot be run says nothing about whose process it is: a failed kill, with nothing
+/// signalled.
+#[skuld::test]
+fn kill_over_a_procinfo_that_cannot_be_run_is_a_failure_and_signals_nothing() {
+    use super::watch::watch_tests::Held;
+
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let not_run = ClientError::NotRun(std::io::Error::other("no launchctl").into());
+    let (result, _script, _) = kill_over([printed_running(pid), printed_running(pid), fail(&["procinfo"], not_run)]);
+
+    let e = result.expect_err("no lookup");
+    assert!(matches!(&e, Error::Spawn { .. }), "{e:?}");
+    assert_eq!(run.finish(), Some(0), "nothing was signalled");
+}
+
+/// A job with no process, or none held, has nothing to kill: classified off the one read that starts
+/// the kill.
 #[skuld::test]
 fn kill_of_a_job_with_no_process_is_not_running() {
-    for answer in [(3, "", ""), NOT_LOADED] {
+    for answer in [NOT_RUNNING, SPAWN_SCHEDULED, NOT_LOADED] {
         let id = never_installed();
-        let (result, script) = kill_answered(answer);
+        let (result, script, _) = kill_over([self::answer("print", answer)]);
 
-        let e = result.expect_err("no process to signal");
+        let e = result.expect_err("no process to kill");
         assert!(
             matches!(&e, Error::NotRunning { id: named } if named == id.as_str()),
             "{answer:?}: {e:?}"
         );
-        script.assert_spent("a kill classified off its own answer, with no read before it");
+        script.assert_spent("one read, and nothing signalled");
     }
 }
 
-/// Any other refusal is a failure of the request, with launchctl's words.
+/// A `print` that failed is a failure, with launchctl's words: never read as "nothing was running".
 #[skuld::test]
-fn kill_refused_for_any_other_reason_is_a_plain_failure() {
-    let (result, _script) = kill_answered((1, "", "Operation not permitted\n"));
+fn kill_over_a_print_that_fails_is_a_plain_failure() {
+    let (result, _script, _) = kill_over([answer("print", UNREADABLE)]);
 
-    let e = result.expect_err("refused");
-    assert!(
-        matches!(&e, Error::Command { stderr, .. } if stderr.contains("Operation not permitted")),
-        "{e:?}"
-    );
+    let e = result.expect_err("an unreadable job");
+    assert!(matches!(&e, Error::Command { .. }), "{e:?}");
+}
+
+/// A read that fails after the signal is delivered says so: the process is ending, and a caller must not
+/// retry as if nothing had been sent.
+#[skuld::test]
+fn a_failed_read_after_the_signal_says_it_was_delivered() {
+    use super::watch::watch_tests::Held;
+
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let (result, _script, _) = kill_over([
+        printed_running(pid),
+        printed_running(pid),
+        procinfo_naming(pid),
+        answer("print", UNREADABLE),
+    ]);
+
+    let e = result.expect_err("the wait failed");
+    let report = e.report().to_string();
+    assert!(report.contains("was signalled"), "{report}");
+    assert_eq!(run.finish(), None, "the signal stands");
 }
 
 // wait_print ==========================================================================================================
 
 /// A wait for `until` over `calls`, which it makes as one call's files kept once, and the table.
-fn waiting(until: Until, deadline: Deadline, calls: &[(&str, Answer)]) -> (Result<Option<()>>, Fake) {
-    let script = table(calls);
+fn waiting(until: Until<'_>, deadline: Deadline, calls: &[(&str, Answer)]) -> (Result<Option<()>>, Fake) {
+    waiting_over(until, deadline, calls.iter().map(|&(verb, a)| answer(verb, a)))
+}
+
+/// [`waiting`] over `entries`, for a table whose answers name a pid that is only known at run time.
+fn waiting_over(
+    until: Until<'_>,
+    deadline: Deadline,
+    entries: impl IntoIterator<Item = Entry>,
+) -> (Result<Option<()>>, Fake) {
+    let script = Fake::new(entries);
     let launchctl = Launchctl::new(Box::new(script.clone()));
     let kept = reservation(0, 1)
         .keep(Role::COUNTED_FILES)
@@ -2406,6 +2597,108 @@ fn wait_print_until_unloaded_is_the_wait_for_the_label_to_go() {
     script.assert_spent("it waited past a process and a job tearing down");
     let (still_loaded, _) = waiting(Until::Unloaded, Budget::Immediate.start(), &[("print", NOT_RUNNING)]);
     assert!(matches!(still_loaded, Ok(None)), "{still_loaded:?}");
+}
+
+/// The record of a killed process is that `print` no longer shows it as the job's: it goes on while the
+/// pid is shown over the process held, in any state, and ends on another pid, on none, and on a label
+/// launchd does not hold.
+#[skuld::test]
+fn wait_print_until_the_pid_is_not_the_killed_one() {
+    use super::watch::watch_tests::Held;
+
+    let forever = Budget::Unbounded.start();
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let held = process::open(pid).expect("open the child").expect("it is running");
+    let cases: [(&str, Answer); 4] = [
+        ("another pid", RUNNING_AGAIN),
+        ("no process", SPAWN_SCHEDULED),
+        ("an exited job", NOT_RUNNING),
+        ("a label launchd does not hold", NOT_LOADED),
+    ];
+    for (what, recorded) in cases {
+        let (result, script) = waiting_over(
+            Until::Recorded { pid, held: Some(&held) },
+            forever,
+            [printed_running(pid), printed_running(pid), answer("print", recorded)],
+        );
+
+        assert!(matches!(result, Ok(Some(()))), "{what}: {result:?}");
+        script.assert_spent(&format!("two reads that show the pid, then {what}"));
+    }
+    let (still_shown, _) = waiting_over(
+        Until::Recorded { pid, held: Some(&held) },
+        Budget::Immediate.start(),
+        [printed_running(pid)],
+    );
+    assert!(matches!(still_shown, Ok(None)), "{still_shown:?}");
+    run.finish();
+}
+
+/// launchd started the job again and the new process was given the number of the one killed: `print`
+/// shows the same pid on a process that is not the one held, and launchd's own lookup of it names the
+/// job, so the end of the held one is recorded. A process that was gone before it could be held is the
+/// same: nothing held is what has the number now.
+#[skuld::test]
+fn wait_print_until_the_number_of_the_killed_pid_is_another_process_the_job_owns() {
+    use super::watch::watch_tests::Held;
+
+    let mut killed = Held::new(0);
+    let held = process::open(killed.pid())
+        .expect("open the child")
+        .expect("it is running");
+    let mut newcomer = Held::new(0);
+    // `newcomer`'s pid stands in for the number the killed process had.
+    let pid = newcomer.pid();
+    for (what, held) in [("a held process", Some(&held)), ("nothing held", None)] {
+        let (result, script) = waiting_over(
+            Until::Recorded { pid, held },
+            Budget::Unbounded.start(),
+            [printed_running(pid), procinfo_naming(pid)],
+        );
+
+        assert!(matches!(result, Ok(Some(()))), "{what}: {result:?}");
+        script.assert_spent(&format!(
+            "one read and the lookup that names the job: {what}, and another process has the pid"
+        ));
+    }
+    killed.finish();
+    newcomer.finish();
+}
+
+/// `print` can show a pid after launchd reaped its process, and the number can be a stranger's by then:
+/// a process other than the one held that launchd's lookup does not name as the job's is not the job's
+/// new process, so the report is stale and the wait goes on until `print` moves off the pid.
+#[skuld::test]
+fn wait_print_goes_on_while_the_number_of_the_killed_pid_is_a_stranger() {
+    use super::watch::watch_tests::Held;
+
+    let mut killed = Held::new(0);
+    let held = process::open(killed.pid())
+        .expect("open the child")
+        .expect("it is running");
+    let mut stranger = Held::new(0);
+    let pid = stranger.pid();
+    for (what, held) in [("a held process", Some(&held)), ("nothing held", None)] {
+        let (result, script) = waiting_over(
+            Until::Recorded { pid, held },
+            Budget::Unbounded.start(),
+            [
+                printed_running(pid),
+                procinfo_not_naming(pid),
+                printed_running(pid),
+                procinfo_not_naming(pid),
+                answer("print", NOT_RUNNING),
+            ],
+        );
+
+        assert!(matches!(result, Ok(Some(()))), "{what}: {result:?}");
+        script.assert_spent(&format!(
+            "two reads a stranger answers, then `print` moves off the pid: {what}"
+        ));
+    }
+    killed.finish();
+    stranger.finish();
 }
 
 // A changed spec over a loaded job ====================================================================================

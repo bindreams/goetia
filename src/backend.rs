@@ -18,6 +18,7 @@ pub(crate) mod client;
 mod contract;
 #[cfg(unix)]
 pub(crate) mod created_dirs;
+pub(crate) mod kill;
 pub mod launchd;
 pub mod scm;
 pub(crate) mod standby;

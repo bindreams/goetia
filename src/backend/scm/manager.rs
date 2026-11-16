@@ -118,6 +118,7 @@ use super::wait::{
     EndProcessOutcome, IncompleteStop, ProcessWaitFailure, SettleError, StopAndAwaitExitOutcome, StopSent, Waited,
     carried, end_on_incomplete_stop, end_process,
 };
+use crate::backend::kill::{KillOutcome, kill_failed, kill_service};
 use crate::backend::scm::generate::{self, FailureActions as GenFailureActions, ScmRegistration};
 use crate::backend::scm::kill::system::Held;
 use crate::backend::scm::kill::{HeldProcess, HoldOutcome, hold_if_possible};
@@ -131,6 +132,7 @@ use crate::backend::scm::shim::sweep::{
     ProviderFolder, SweepFailure, left_behind_text, normalise, referenced_hosts, second_folder, sweep_folder,
 };
 use crate::backend::scm::wide::{units_until_nul, wide_null_cut};
+use crate::backend::scm::win32::winapi_io;
 use crate::backend::{
     Backend, Decoded, InstalledDefinition, InstalledService, ReadOutcome, Scan, ScanEntry, Settle, Standing, Unnamed,
     WriteOutcome,
@@ -548,17 +550,17 @@ impl Backend for Scm {
         )
     }
 
-    /// See [`super::kill::kill_service`] for how the process is chosen safely. Exit code `1`
-    /// (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery actions, as for a
-    /// crash. For `protocol: plain` the process is `goetia-shim`, whose Job Object takes the daemon's
-    /// tree with it.
+    /// See [`crate::backend::kill`] for how the process is chosen safely and what the kill returns on.
+    /// Exit code `1` (`TerminateProcess`): SCM sees an unexpected exit and applies the recovery
+    /// actions, as for a crash. For `protocol: plain` the process is `goetia-shim`, whose Job Object
+    /// takes the daemon's tree with it.
     fn kill(&self, snapshot: ScmSnapshot, _reservation: &mut ()) -> Result<()> {
         let id = snapshot.into_id();
         let (_scm, service) = open_existing(&id, "kill", ServiceAccess::QUERY_STATUS)?;
         let mut target = super::kill::SystemKillTarget::new(service, id.as_str().to_string());
-        match super::kill::kill_service(&mut target).map_err(|e| Error::os(format!("kill `{id}`"), e))? {
-            super::kill::Killed::Terminated => Ok(()),
-            super::kill::Killed::NotRunning => Err(Error::NotRunning {
+        match kill_service(&mut target, id.as_str()).map_err(|e| kill_failed(id.as_str(), e))? {
+            KillOutcome::Ended => Ok(()),
+            KillOutcome::NotRunning => Err(Error::NotRunning {
                 id: id.as_str().to_string(),
             }),
         }
@@ -1884,20 +1886,9 @@ fn is_access_denied(e: &windows_service::Error) -> bool {
     )
 }
 
-/// A `windows_service` failure as an [`Error::Os`], shared with [`service_undetermined`] so one
-/// failure cannot be described two ways depending on which class it lands in.
-///
-/// `windows_service::Error`'s own `Display` for its `Winapi` variant is the
-/// literal string `"IO error in winapi call"` — it does not include the
-/// wrapped `io::Error`'s message at all (verified: every error surfaced
-/// through `to_error` read that and nothing else, useless for diagnosing an
-/// actual Win32 failure). Unwrap to the inner `io::Error` first, whose
-/// `Display` does carry `FormatMessage`'s real text.
+/// The OS error is the source, where [`Error::raw_os_error`] finds it (see [`winapi_io`]).
 fn to_error(context: &str, e: windows_service::Error) -> Error {
-    match e {
-        windows_service::Error::Winapi(io_err) => Error::os(context, io_err),
-        other => Error::os(context, other),
-    }
+    Error::os(context, winapi_io(e))
 }
 
 // undetermined ========================================================================================================

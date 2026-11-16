@@ -745,16 +745,41 @@ fn a_watch_that_cannot_be_made_is_an_error_before_any_request() {
 
 // kill ================================================================================================================
 
-fn sigkill(code: i32) -> Entry {
-    reply(&["kill", "SIGKILL", &target()], exited(code, "", ""))
+/// A `print` of a job whose process was killed and whose restart launchd has not yet made.
+const KILLED: &str = "\tstate = spawn scheduled\n";
+
+/// `launchctl procinfo` naming `pid` as a launch of the job.
+fn procinfo(pid: u32) -> Entry {
+    let block = format!("program path = /bin/sh\n\nsystem/{ID} = {{\n\tstate = running\n\tpid = {pid}\n}}\n");
+    reply(&["procinfo", &pid.to_string()], exited(0, &block, ""))
 }
 
-/// SIGKILL by label, for a task as for a service; a job with no process, and no start launchd has
-/// accepted, is `NotRunning`.
+/// The kill of a task's run, whose pid `run` is: the read, the confirmation (a read, and `procinfo`
+/// naming the process held), and the record's wait, whose first read still shows the pid.
+fn showing(run: &Held, then: Entry) -> [Entry; 5] {
+    let pid = run.pid();
+    [
+        print(&running(pid)),
+        print(&running(pid)),
+        procinfo(pid),
+        print(&running(pid)),
+        then,
+    ]
+}
+
+/// SIGKILL to the run through a hold, and the wait until launchd stops showing its pid, for a task as for
+/// a service: no `launchctl kill` is sent. A job with no process, and no start launchd has accepted, is
+/// `NotRunning`, after the read that found no pid and the one that asks what that means.
 #[skuld::test]
-fn kill_of_a_task_is_the_sigkill_by_label_and_not_running_when_idle() {
+fn kill_of_a_task_ends_its_run_and_not_running_when_idle() {
     let tree = Tree::new();
-    let fake = Fake::new([sigkill(0), sigkill(3), print(IDLE), sigkill(113), not_loaded()]);
+    let mut run = Held::new(0);
+    let fake = Fake::new(showing(&run, print(KILLED)).into_iter().chain([
+        print(IDLE),
+        print(IDLE),
+        not_loaded(),
+        not_loaded(),
+    ]));
     let mgr = launchd_over(fake.clone());
     let mut held = mgr.reserve(&[Step::Kill; 3], Budget::Unbounded).expect("reserve");
 
@@ -766,65 +791,74 @@ fn kill_of_a_task_is_the_sigkill_by_label_and_not_running_when_idle() {
         assert!(matches!(&e, Error::NotRunning { id } if id == ID), "{e:?}");
     }
 
-    fake.assert_spent("three kills, each by label, and a read after each that found no process");
+    fake.assert_spent("a kill that read the run and waited for it to go, and two that found none");
+    assert!(
+        calls_of(&fake, "kill").is_empty(),
+        "the signal is not a launchctl request"
+    );
+    assert_eq!(run.finish(), None, "the run was signalled to its end");
 }
 
 /// `kickstart` returns before the fork, so a `kill` straight after a `start` finds a start launchd has
-/// accepted and no process: `launchctl kill` answers "No such process" and the run goes ahead. `status`
-/// calls that moment `Running`, so the kill waits for the pid, as `stop` does, and then sends the
-/// signal. The longest path draws exactly what a kill reserved.
+/// accepted and no process: nothing can be signalled, and the run goes ahead. `status` calls that moment
+/// `Running`, so the kill waits for the pid, as `stop` does, and then kills it. The longest path draws
+/// exactly what a kill reserved.
 #[skuld::test]
 fn kill_of_a_task_whose_start_is_still_queued_waits_for_the_pid_and_kills_it() {
     let tree = Tree::new();
-    let fake = Fake::new([
-        sigkill(3),
-        print(QUEUED),
-        print(QUEUED),
-        print(&running(4242)),
-        sigkill(0),
-    ]);
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new(
+        [print(QUEUED), print(QUEUED), print(QUEUED), print(&running(pid))]
+            .into_iter()
+            .chain(showing(&run, print(KILLED))),
+    );
     let mgr = launchd_over(fake.clone());
     let mut held = reserved(&mgr, Step::Kill);
 
     mgr.kill(task_snapshot(&tree, false), &mut held)
         .expect("a kill of a queued start");
 
-    fake.assert_spent("the refused signal, the read, the wait for the pid, and the signal");
-    assert_eq!(
-        calls_of(&fake, "kill").len(),
-        2,
-        "one SIGKILL before the pid, one after"
-    );
+    fake.assert_spent("the first look, the read, the wait for the pid, and the kill of the run that forked");
+    assert!(calls_of(&fake, "kill").is_empty());
     assert_never_booted_out(&fake);
     assert_eq!(
         bounded::test_hook::left(&held),
         (0, 0),
         "the longest path spends the kill's reservation exactly"
     );
+    assert_eq!(run.finish(), None);
 }
 
-/// A start that forks between the refused signal and the read shows its pid: it is signalled again, with
-/// no wait.
+/// A start that forks between the first look and the read shows its pid: it is killed, with no wait for
+/// the fork.
 #[skuld::test]
-fn kill_of_a_start_that_forked_after_the_signal_kills_the_run() {
+fn kill_of_a_start_that_forked_after_the_first_look_kills_the_run() {
     let tree = Tree::new();
-    let fake = Fake::new([sigkill(3), print(&running(4242)), sigkill(0)]);
+    let mut run = Held::new(0);
+    let pid = run.pid();
+    let fake = Fake::new(
+        [print(IDLE), print(&running(pid))]
+            .into_iter()
+            .chain(showing(&run, print(KILLED))),
+    );
     let mgr = launchd_over(fake.clone());
     let mut held = reserved(&mgr, Step::Kill);
 
     mgr.kill(task_snapshot(&tree, false), &mut held)
         .expect("a kill of the run that forked");
 
-    fake.assert_spent("the refused signal, the read that shows the pid, and the signal");
+    fake.assert_spent("the first look, the read that shows the pid, and the kill");
     assert_never_booted_out(&fake);
+    assert_eq!(run.finish(), None);
 }
 
 /// A start that is accepted and then does not happen leaves `spawn scheduled` with no pid: the wait
-/// ends on the state, and the signal that follows finds no process.
+/// ends on the state, and the kill that follows finds no process.
 #[skuld::test]
 fn kill_of_a_queued_start_that_never_forks_is_not_running() {
     let tree = Tree::new();
-    let fake = Fake::new([sigkill(3), print(QUEUED), print(IDLE), sigkill(3)]);
+    let fake = Fake::new([print(QUEUED), print(QUEUED), print(QUEUED), print(IDLE), print(IDLE)]);
     let mgr = launchd_over(fake.clone());
     let mut held = reserved(&mgr, Step::Kill);
 
@@ -833,17 +867,17 @@ fn kill_of_a_queued_start_that_never_forks_is_not_running() {
         .expect_err("there is nothing to kill");
 
     assert!(matches!(&e, Error::NotRunning { id } if id == ID), "{e:?}");
-    fake.assert_spent("the refused signal, the read, the wait that ended on the state, and the signal");
+    fake.assert_spent("the first look, the read, the wait that ended on the state, and the second look");
 }
 
-/// A refused signal followed by a read that cannot say no run is left (a read that failed or was not
-/// whole, or a no-pid state that is neither idle nor queued) is `StopUnconfirmed`, as for `stop`: not a
-/// determinate `NotRunning`, and no second signal.
+/// A first look that finds no pid, followed by a read that cannot say no run is left (a read that failed
+/// or was not whole, or a no-pid state that is neither idle nor queued) is `StopUnconfirmed`, as for
+/// `stop`: not a determinate `NotRunning`, and nothing is killed.
 #[skuld::test]
-fn kill_of_a_task_whose_read_after_the_refused_signal_is_unconfirmed_says_so() {
+fn kill_of_a_task_whose_read_after_the_first_look_is_unconfirmed_says_so() {
     for (what, read, shown) in unconfirmed_reads() {
         let tree = Tree::new();
-        let fake = Fake::new([sigkill(3), read]);
+        let fake = Fake::new([print(IDLE), read]);
         let mgr = launchd_over(fake.clone());
         let mut held = reserved(&mgr, Step::Kill);
 
@@ -855,8 +889,7 @@ fn kill_of_a_task_whose_read_after_the_refused_signal_is_unconfirmed_says_so() {
         );
         assert_eq!(e.to_string(), format!("`{ID}` may not have stopped: {shown}"), "{what}");
         assert!(e.is_indeterminate(), "{what}: the exit code is 4");
-        fake.assert_spent("the refused signal and the read");
-        assert_eq!(calls_of(&fake, "kill").len(), 1, "{what}: no second signal");
+        fake.assert_spent("the first look and the read");
     }
 }
 

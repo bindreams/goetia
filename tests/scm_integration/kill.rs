@@ -10,7 +10,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::Duration;
 
 use goetia::backend::scm::manager::Scm;
-use goetia::manager::{Budget, ServiceManager as _, State};
+use goetia::manager::{Budget, ServiceManager as _};
 use goetia::spec::{DaemonFields, DaemonSpec, ServiceFields, ServiceSpec, User};
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GetLastError, LUID};
 use windows_sys::Win32::Security::{
@@ -120,6 +120,13 @@ fn kill_with_the_privilege_disabled(user: User) {
     mgr.install(&spec, false).expect("install");
     mgr.start(&spec.common().id, Budget::Unbounded).expect("start");
     started.accept("the fixture to report SERVICE_RUNNING");
+    let old = support::kill::identity_of(
+        mgr.status(&spec.common().id)
+            .expect("status before the kill")
+            .common()
+            .pid
+            .expect("a running service reports a pid"),
+    );
 
     {
         let _disabled = DebugPrivilegeDisabled::new();
@@ -127,12 +134,12 @@ fn kill_with_the_privilege_disabled(user: User) {
             .expect("kill with SeDebugPrivilege held but disabled");
     }
 
-    support::kill::until(|| {
-        matches!(
-            mgr.status(&spec.common().id).expect("status").common().state,
-            State::Stopped | State::Failed
-        )
-    });
+    // `kill` returns once SCM has recorded the exit, so the process is not the one still reported.
+    let right_after = mgr.status(&spec.common().id).expect("status straight after the kill");
+    assert!(
+        !support::kill::is_still_reported(right_after.common().pid, old),
+        "kill returned while SCM still reported the killed process ({right_after:?})"
+    );
 }
 
 #[skuld::test]
